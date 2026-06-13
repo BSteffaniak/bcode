@@ -177,11 +177,19 @@ impl TokioPluginTuiHost {
 
 impl PluginTuiHost for TokioPluginTuiHost {
     fn spawn(&self, task: PluginTask) {
-        drop(self.handle.spawn(task));
+        let redraw_sender = self.redraw_sender.clone();
+        drop(self.handle.spawn(async move {
+            task.await;
+            let _ = redraw_sender.send(());
+        }));
     }
 
     fn spawn_blocking(&self, task: Box<dyn FnOnce() + Send + 'static>) {
-        drop(self.handle.spawn_blocking(task));
+        let redraw_sender = self.redraw_sender.clone();
+        drop(self.handle.spawn_blocking(move || {
+            task();
+            let _ = redraw_sender.send(());
+        }));
     }
 
     fn request_redraw(&self) {

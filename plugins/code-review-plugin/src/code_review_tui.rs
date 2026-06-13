@@ -152,7 +152,6 @@ impl CodeReviewSurface {
             file_store: AsyncValueStore::new(),
         };
         surface.app.queue_selected_file_load();
-        surface.ensure_selected_repository_file_load();
         Ok(surface)
     }
 
@@ -167,8 +166,9 @@ impl CodeReviewSurface {
         self.app.take_session_to_open()
     }
 
-    fn ensure_selected_repository_file_load(&mut self) -> bool {
+    fn ensure_selected_repository_file_load(&mut self, host: &dyn PluginTuiHost) -> bool {
         ensure_selected_repository_file_load(
+            host,
             &self.client,
             &self.repo_path,
             &mut self.app,
@@ -283,10 +283,10 @@ impl PluginTuiSurface for CodeReviewSurface {
         crate::code_review_tui_render::render(&mut self.app, frame);
     }
 
-    fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
+    fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
         let mut needs_redraw = handle_event_no_resize(&mut self.app, event);
         self.app.queue_selected_file_load();
-        if self.ensure_selected_repository_file_load() {
+        if self.ensure_selected_repository_file_load(host) {
             needs_redraw = true;
         }
         if self.app.should_exit {
@@ -302,8 +302,8 @@ impl PluginTuiSurface for CodeReviewSurface {
         }
     }
 
-    fn poll(&mut self, _host: &dyn PluginTuiHost) -> PluginTuiAction {
-        let mut needs_redraw = false;
+    fn poll(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        let mut needs_redraw = self.ensure_selected_repository_file_load(host);
         while let Ok(update) = self.file_store.try_recv() {
             self.file_store.apply(update);
             sync_repository_file_store(&mut self.app, &self.file_store);
@@ -539,6 +539,7 @@ async fn handle_pending_draft_save(
 }
 
 fn ensure_selected_repository_file_load(
+    host: &dyn PluginTuiHost,
     client: &BcodeClient,
     repo_path: &Path,
     app: &mut ReviewApp,
@@ -549,7 +550,7 @@ fn ensure_selected_repository_file_load(
     };
     let client = client.clone();
     let repo_path = repo_path.to_path_buf();
-    let started = file_store.ensure(path, move |path| async move {
+    let started = file_store.ensure(host, path, move |path| async move {
         load_repository_file(&client, repo_path, path)
             .await
             .map_err(|error| error.to_string())

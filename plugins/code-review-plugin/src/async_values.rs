@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 
+use bcode_plugin_sdk::tui::PluginTuiHost;
 use tokio::sync::mpsc;
 
 /// Cached state for an asynchronously loaded value.
@@ -73,7 +74,7 @@ where
     }
 
     /// Ensure `key` is loading or ready without blocking the caller.
-    pub fn ensure<F, Fut>(&mut self, key: K, load: F) -> bool
+    pub fn ensure<F, Fut>(&mut self, host: &dyn PluginTuiHost, key: K, load: F) -> bool
     where
         F: FnOnce(K) -> Fut + Send + 'static,
         Fut: Future<Output = Result<V, String>> + Send + 'static,
@@ -87,10 +88,10 @@ where
         self.values.insert(key.clone(), AsyncValue::Loading);
         self.in_flight.insert(key.clone());
         let sender = self.sender.clone();
-        tokio::spawn(async move {
+        host.spawn(Box::pin(async move {
             let result = load(key.clone()).await;
             let _ = sender.send(AsyncValueUpdate { key, result });
-        });
+        }));
         true
     }
 
