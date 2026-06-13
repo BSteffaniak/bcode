@@ -20,12 +20,12 @@ use std::ffi::{CStr, CString};
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::Instant;
 use thiserror::Error;
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 /// Default plugin manifest file name.
 pub const DEFAULT_PLUGIN_MANIFEST_FILE: &str = "bcode-plugin.toml";
@@ -964,6 +964,67 @@ pub struct PluginExecutorStatus {
     pub failed: u64,
 }
 
+#[derive(Debug)]
+struct PluginResourceLimiter {
+    global: Arc<Semaphore>,
+    per_session: Mutex<BTreeMap<String, Arc<Semaphore>>>,
+    max_per_session: usize,
+}
+
+#[derive(Debug)]
+struct PluginResourcePermit {
+    _global: OwnedSemaphorePermit,
+    _session: Option<OwnedSemaphorePermit>,
+}
+
+impl PluginResourceLimiter {
+    fn new(max_global: usize, max_per_session: usize) -> Self {
+        Self {
+            global: Arc::new(Semaphore::new(max_global.max(1))),
+            per_session: Mutex::default(),
+            max_per_session: max_per_session.max(1),
+        }
+    }
+
+    async fn acquire(
+        &self,
+        scope: &PluginInvocationScope,
+    ) -> Result<PluginResourcePermit, PluginLoadError> {
+        let session = match scope {
+            PluginInvocationScope::Global => None,
+            PluginInvocationScope::Session { session_id, .. } => {
+                let semaphore = self.session_semaphore(session_id);
+                Some(semaphore.acquire_owned().await.map_err(|_| {
+                    PluginLoadError::PluginNotLoaded("plugin resource limiter".to_string())
+                })?)
+            }
+        };
+        let global =
+            self.global.clone().acquire_owned().await.map_err(|_| {
+                PluginLoadError::PluginNotLoaded("plugin resource limiter".to_string())
+            })?;
+        Ok(PluginResourcePermit {
+            _global: global,
+            _session: session,
+        })
+    }
+
+    fn session_semaphore(&self, session_id: &str) -> Arc<Semaphore> {
+        self.per_session
+            .lock()
+            .expect("plugin resource limiter session map locks")
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(self.max_per_session)))
+            .clone()
+    }
+}
+
+impl Default for PluginResourceLimiter {
+    fn default() -> Self {
+        Self::new(64, 4)
+    }
+}
+
 #[derive(Debug, Default)]
 struct PluginExecutorMetrics {
     running: AtomicUsize,
@@ -1061,6 +1122,7 @@ pub struct StreamingServiceInvocation {
     pub response: oneshot::Receiver<Result<ServiceResponse, PluginLoadError>>,
     pub events: mpsc::UnboundedReceiver<Vec<u8>>,
     pub cancel: PluginInvocationCancelHandle,
+    resource_permit: Option<Arc<PluginResourcePermit>>,
 }
 
 /// Handle to a plugin-local executor.
@@ -1190,6 +1252,7 @@ impl PluginExecutorHandle {
             response: response_receiver,
             events: event_receiver,
             cancel,
+            resource_permit: None,
         })
     }
     async fn invoke_service_scoped(
@@ -1420,6 +1483,7 @@ pub struct PluginRuntimeHost {
     executors: Arc<BTreeMap<String, Arc<PluginExecutorHandle>>>,
     configs: Arc<BTreeMap<String, ResolvedPluginConfig>>,
     tui_registries: Arc<BTreeMap<String, PluginTuiRegistry>>,
+    resources: Arc<PluginResourceLimiter>,
 }
 
 impl PluginRuntimeHost {
@@ -1560,6 +1624,7 @@ impl PluginRuntimeHost {
             .service_policy(plugin_id, &interface_id)
             .and_then(|policy| policy.class)
             .unwrap_or_else(|| classify_invocation(&interface_id, &operation));
+        let _resource_permit = self.resources.acquire(&scope).await?;
         executor
             .invoke_service_scoped(interface_id, operation, payload, class, scope, None)
             .await
@@ -1619,7 +1684,8 @@ impl PluginRuntimeHost {
             id: invocation_id,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
-        executor
+        let resource_permit = self.resources.acquire(&scope).await?;
+        let mut invocation = executor
             .start_service_with_events_scoped(
                 interface_id,
                 operation,
@@ -1633,7 +1699,9 @@ impl PluginRuntimeHost {
                 response_receiver,
                 event_receiver,
             )
-            .await
+            .await?;
+        invocation.resource_permit = Some(Arc::new(resource_permit));
+        Ok(invocation)
     }
 
     /// Invoke a service operation by service interface ID.
@@ -1843,6 +1911,7 @@ impl From<PluginHost> for PluginRuntimeHost {
             executors: Arc::new(executors),
             configs: Arc::new(configs),
             tui_registries: Arc::new(tui_registries),
+            resources: Arc::default(),
         }
     }
 }
@@ -2746,24 +2815,25 @@ library = "libexample_plugin.dylib"
             .expect("runtime builds");
 
         tokio.block_on(async {
-            let mut invocation = runtime
+            let StreamingServiceInvocation {
+                response,
+                mut events,
+                cancel: _,
+                resource_permit,
+            } = runtime
                 .invoke_service_with_events("events", "events", "run", Vec::new())
                 .await
                 .expect("service should start");
-            let event = invocation.events.recv().await.expect("event should emit");
-            let response = invocation
-                .response
+            let event = events.recv().await.expect("event should emit");
+            let response = response
                 .await
                 .expect("response sender should stay alive")
                 .expect("service should invoke");
 
             assert_eq!(event, b"event".to_vec());
-            let thread_event = invocation
-                .events
-                .recv()
-                .await
-                .expect("thread event should emit");
+            let thread_event = events.recv().await.expect("thread event should emit");
             assert_eq!(thread_event, b"thread-event".to_vec());
+            drop(resource_permit);
             assert_eq!(response.payload, b"ok");
         });
     }
