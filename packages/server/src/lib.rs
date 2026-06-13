@@ -181,19 +181,51 @@ impl ClientEventSink {
     }
 
     async fn send(&self, event: Event) -> Result<(), CodecError> {
+        let event_kind = client_event_kind(&event);
         let envelope = event_envelope(&event)?;
-        let mut writer = self.writer.lock().await;
-        tokio::time::timeout(
-            CLIENT_EVENT_SEND_TIMEOUT,
-            send_envelope(&mut *writer, &envelope),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            Err(CodecError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("timed out sending event to client {}", self.client_id),
-            )))
-        })
+        let started_at = Instant::now();
+        let result = {
+            let mut writer = self.writer.lock().await;
+            tokio::time::timeout(
+                CLIENT_EVENT_SEND_TIMEOUT,
+                send_envelope(&mut *writer, &envelope),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(CodecError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("timed out sending event to client {}", self.client_id),
+                )))
+            })
+        };
+        let elapsed = started_at.elapsed();
+        if elapsed >= CLIENT_EVENT_SEND_TIMEOUT {
+            tracing::warn!(
+                target: "bcode_server::client_events",
+                client_id = %self.client_id,
+                event_kind,
+                elapsed_ms = elapsed.as_millis(),
+                "client event send reached timeout threshold"
+            );
+        } else {
+            tracing::debug!(
+                target: "bcode_server::client_events",
+                client_id = %self.client_id,
+                event_kind,
+                elapsed_ms = elapsed.as_millis(),
+                "client event sent"
+            );
+        }
+        result
+    }
+}
+
+const fn client_event_kind(event: &Event) -> &'static str {
+    match event {
+        Event::Session(_) => "session",
+        Event::SessionLive(_) => "session_live",
+        Event::RuntimeWork(_) => "runtime_work",
+        Event::SessionCatalogUpdated { .. } => "session_catalog_updated",
     }
 }
 
