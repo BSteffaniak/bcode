@@ -842,14 +842,67 @@ pub enum PluginInvocationClass {
     Service,
 }
 
-/// Runtime isolation category for a plugin operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PluginOperationKind {
-    /// Short lifecycle, discovery, metadata, or policy operation.
-    Control,
-    /// Turn, tool, subprocess, network stream, or other user/session data-plane operation.
-    Data,
+/// Ownership scope for a plugin invocation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PluginInvocationScope {
+    /// Daemon-owned invocation without a specific client/session owner.
+    #[default]
+    Global,
+    /// Invocation owned by a client/session execution path.
+    Session {
+        /// Client that initiated or owns the invocation, when known.
+        #[serde(default)]
+        client_id: Option<String>,
+        /// Session that owns the invocation.
+        session_id: String,
+        /// Model/provider turn that owns the invocation, when applicable.
+        #[serde(default)]
+        turn_id: Option<String>,
+        /// Runtime work item represented by this invocation, when applicable.
+        #[serde(default)]
+        work_id: Option<String>,
+    },
+}
+
+impl PluginInvocationScope {
+    /// Construct a session-owned invocation scope.
+    #[must_use]
+    pub fn session(session_id: impl Into<String>) -> Self {
+        Self::Session {
+            client_id: None,
+            session_id: session_id.into(),
+            turn_id: None,
+            work_id: None,
+        }
+    }
+
+    /// Return this scope with a client owner attached.
+    #[must_use]
+    pub fn with_client_id(mut self, client_id: impl Into<String>) -> Self {
+        if let Self::Session { client_id: id, .. } = &mut self {
+            *id = Some(client_id.into());
+        }
+        self
+    }
+
+    /// Return this scope with a turn owner attached.
+    #[must_use]
+    pub fn with_turn_id(mut self, turn_id: impl Into<String>) -> Self {
+        if let Self::Session { turn_id: id, .. } = &mut self {
+            *id = Some(turn_id.into());
+        }
+        self
+    }
+
+    /// Return this scope with a runtime work owner attached.
+    #[must_use]
+    pub fn with_work_id(mut self, work_id: impl Into<String>) -> Self {
+        if let Self::Session { work_id: id, .. } = &mut self {
+            *id = Some(work_id.into());
+        }
+        self
+    }
 }
 
 /// Runtime plugin invocation identifier.
@@ -971,7 +1024,7 @@ struct PluginInvocation {
     id: PluginInvocationId,
     class: PluginInvocationClass,
     enqueued_at: Instant,
-    kind: PluginOperationKind,
+    scope: PluginInvocationScope,
     interface_id: String,
     operation: String,
     payload: Vec<u8>,
@@ -1065,18 +1118,48 @@ impl PluginExecutorHandle {
         let (response, response_receiver) = oneshot::channel();
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
         let invocation_id = next_plugin_invocation_id();
-        let kind = classify_operation_kind(&interface_id, &operation, class);
         let cancel = PluginInvocationCancelHandle {
             id: invocation_id,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
+        self.start_service_with_events_scoped(
+            interface_id,
+            operation,
+            payload,
+            class,
+            PluginInvocationScope::Global,
+            invocation_id,
+            cancel,
+            response,
+            event_sender,
+            response_receiver,
+            event_receiver,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_service_with_events_scoped(
+        &self,
+        interface_id: String,
+        operation: String,
+        payload: Vec<u8>,
+        class: PluginInvocationClass,
+        scope: PluginInvocationScope,
+        invocation_id: PluginInvocationId,
+        cancel: PluginInvocationCancelHandle,
+        response: oneshot::Sender<Result<ServiceResponse, PluginLoadError>>,
+        event_sender: mpsc::UnboundedSender<Vec<u8>>,
+        response_receiver: oneshot::Receiver<Result<ServiceResponse, PluginLoadError>>,
+        event_receiver: mpsc::UnboundedReceiver<Vec<u8>>,
+    ) -> Result<StreamingServiceInvocation, PluginLoadError> {
         match &self.executor {
             PluginExecutorKind::Exclusive(sender) => {
                 let invocation = PluginInvocation {
                     id: invocation_id,
                     class,
                     enqueued_at: Instant::now(),
-                    kind,
+                    scope: scope.clone(),
                     interface_id,
                     operation,
                     payload,
@@ -1107,7 +1190,7 @@ impl PluginExecutorHandle {
                     id: invocation_id,
                     class,
                     enqueued_at: Instant::now(),
-                    kind,
+                    scope,
                     interface_id,
                     operation,
                     payload,
@@ -1134,21 +1217,21 @@ impl PluginExecutorHandle {
             cancel,
         })
     }
-    async fn invoke_service_inner(
+    async fn invoke_service_scoped(
         &self,
         interface_id: String,
         operation: String,
         payload: Vec<u8>,
         class: PluginInvocationClass,
+        scope: PluginInvocationScope,
         event_sender: Option<mpsc::UnboundedSender<Vec<u8>>>,
     ) -> Result<ServiceResponse, PluginLoadError> {
         let invocation_id = next_plugin_invocation_id();
-        let kind = classify_operation_kind(&interface_id, &operation, class);
         let invocation = PluginInvocation {
             id: invocation_id,
             class,
             enqueued_at: Instant::now(),
-            kind,
+            scope,
             interface_id,
             operation,
             payload,
@@ -1197,17 +1280,6 @@ impl PluginExecutorHandle {
                 .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?
             }
         }
-    }
-
-    async fn invoke_service(
-        &self,
-        interface_id: String,
-        operation: String,
-        payload: Vec<u8>,
-        class: PluginInvocationClass,
-    ) -> Result<ServiceResponse, PluginLoadError> {
-        self.invoke_service_inner(interface_id, operation, payload, class, None)
-            .await
     }
 
     async fn handle_event(&self, topic: String, payload: Vec<u8>) -> Result<(), PluginLoadError> {
@@ -1478,6 +1550,29 @@ impl PluginRuntimeHost {
         operation: impl Into<String>,
         payload: Vec<u8>,
     ) -> Result<ServiceResponse, PluginLoadError> {
+        self.invoke_service_scoped(
+            plugin_id,
+            interface_id,
+            operation,
+            payload,
+            PluginInvocationScope::Global,
+        )
+        .await
+    }
+
+    /// Invoke a service operation on a loaded plugin by ID with explicit ownership scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the plugin is not loaded or service invocation fails.
+    pub async fn invoke_service_scoped(
+        &self,
+        plugin_id: &str,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        payload: Vec<u8>,
+        scope: PluginInvocationScope,
+    ) -> Result<ServiceResponse, PluginLoadError> {
         let interface_id = interface_id.into();
         let operation = operation.into();
         let executor = self
@@ -1491,7 +1586,7 @@ impl PluginRuntimeHost {
             .and_then(|policy| policy.class)
             .unwrap_or_else(|| classify_invocation(&interface_id, &operation));
         executor
-            .invoke_service(interface_id, operation, payload, class)
+            .invoke_service_scoped(interface_id, operation, payload, class, scope, None)
             .await
     }
 
@@ -1540,8 +1635,14 @@ impl PluginRuntimeHost {
             .registry
             .service_registry
             .unique_provider(interface_id)?;
-        self.invoke_service(plugin_id, interface_id, operation, payload)
-            .await
+        self.invoke_service_scoped(
+            plugin_id,
+            interface_id,
+            operation,
+            payload,
+            PluginInvocationScope::Global,
+        )
+        .await
     }
 
     /// Invoke a service operation on a loaded plugin by ID with JSON payloads.
@@ -1566,6 +1667,33 @@ impl PluginRuntimeHost {
         let payload = serde_json::to_vec(request).map_err(PluginServiceCallError::RequestEncode)?;
         let response = self
             .invoke_service(plugin_id, interface_id, operation, payload)
+            .await?;
+        decode_service_response(response)
+    }
+
+    /// Invoke a service operation on a loaded plugin by ID with JSON payloads and explicit scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the typed request cannot be encoded, invocation fails, the plugin
+    /// returns a service error, or the typed response cannot be decoded.
+    pub async fn invoke_service_json_scoped<Q, R>(
+        &self,
+        plugin_id: &str,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        request: &Q,
+        scope: PluginInvocationScope,
+    ) -> Result<R, PluginServiceCallError>
+    where
+        Q: Serialize + Sync,
+        R: DeserializeOwned,
+    {
+        let interface_id = interface_id.into();
+        let operation = operation.into();
+        let payload = serde_json::to_vec(request).map_err(PluginServiceCallError::RequestEncode)?;
+        let response = self
+            .invoke_service_scoped(plugin_id, interface_id, operation, payload, scope)
             .await?;
         decode_service_response(response)
     }
@@ -1720,7 +1848,7 @@ fn execute_plugin_service_invocation(
         plugin_id = %plugin.manifest.id,
         invocation_id = invocation.id.get(),
         class = ?invocation.class,
-        kind = ?invocation.kind,
+        scope = ?invocation.scope,
         queue_wait_ms = invocation.enqueued_at.elapsed().as_millis(),
         interface_id = %invocation.interface_id,
         operation = %invocation.operation,
@@ -1806,7 +1934,7 @@ fn spawn_exclusive_plugin_executor(
                         plugin_id = %plugin.manifest.id,
                         invocation_id = invocation.id.get(),
                         class = ?invocation.class,
-                        kind = ?invocation.kind,
+                        scope = ?invocation.scope,
                         queue_wait_ms = invocation.enqueued_at.elapsed().as_millis(),
                         interface_id = %invocation.interface_id,
                         operation = %invocation.operation,
@@ -1907,34 +2035,6 @@ fn classify_invocation(interface_id: &str, operation: &str) -> PluginInvocationC
         }
         ("bcode.agent_profile", "evaluate_tool_call") => PluginInvocationClass::Control,
         _ => PluginInvocationClass::Service,
-    }
-}
-
-fn classify_operation_kind(
-    interface_id: &str,
-    operation: &str,
-    class: PluginInvocationClass,
-) -> PluginOperationKind {
-    match (interface_id, operation) {
-        ("bcode.tool/v1", "list_tools")
-        | ("bcode.model-provider/v1", "capabilities" | "models" | "validate_config") => {
-            return PluginOperationKind::Control;
-        }
-        ("bcode.tool/v1", "invoke_tool")
-        | (
-            "bcode.model-provider/v1",
-            "start_turn" | "poll_turn_events" | "cancel_turn" | "finish_turn" | "native_web_search",
-        ) => return PluginOperationKind::Data,
-        _ => {}
-    }
-    match class {
-        PluginInvocationClass::ToolExecution | PluginInvocationClass::ModelProvider => {
-            PluginOperationKind::Data
-        }
-        PluginInvocationClass::Control
-        | PluginInvocationClass::Query
-        | PluginInvocationClass::EventDelivery
-        | PluginInvocationClass::Service => PluginOperationKind::Control,
     }
 }
 
@@ -2559,30 +2659,20 @@ library = "libexample_plugin.dylib"
     }
 
     #[test]
-    fn classifies_data_plane_operation_kind_explicitly() {
+    fn invocation_scope_builders_attach_session_ownership() {
+        let scope = PluginInvocationScope::session("session-1")
+            .with_client_id("client-1")
+            .with_turn_id("turn-1")
+            .with_work_id("work-1");
+
         assert_eq!(
-            classify_operation_kind(
-                "bcode.tool/v1",
-                "invoke_tool",
-                PluginInvocationClass::ToolExecution,
-            ),
-            PluginOperationKind::Data
-        );
-        assert_eq!(
-            classify_operation_kind(
-                "bcode.model-provider/v1",
-                "start_turn",
-                PluginInvocationClass::ModelProvider,
-            ),
-            PluginOperationKind::Data
-        );
-        assert_eq!(
-            classify_operation_kind(
-                "bcode.model-provider/v1",
-                "models",
-                PluginInvocationClass::Query,
-            ),
-            PluginOperationKind::Control
+            scope,
+            PluginInvocationScope::Session {
+                client_id: Some("client-1".to_string()),
+                session_id: "session-1".to_string(),
+                turn_id: Some("turn-1".to_string()),
+                work_id: Some("work-1".to_string()),
+            }
         );
     }
 
