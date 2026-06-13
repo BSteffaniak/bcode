@@ -30,6 +30,7 @@ use bcode_model::{
     OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse, ProviderTurnEvent,
     ReasoningEffort, StartTurnResponse, TokenUsage,
 };
+use bcode_plugin::PluginInvocationScope;
 use bcode_session::{CatalogLoadStatus, SessionManager, lease::SessionLeaseOwnerContext};
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, ProviderStreamEvent,
@@ -255,6 +256,7 @@ impl SessionTurnPermit {
 
 #[derive(Debug, Clone)]
 struct ActiveSessionTurn {
+    client_id: ClientId,
     turn_id: String,
     cancel_state: Arc<TurnCancelState>,
 }
@@ -2915,7 +2917,7 @@ async fn process_user_message_command(
     match append_turn_user_message(state, permit, client_id, text).await {
         Ok(Some(user_event)) => {
             suggest_skills_for_prompt(state, permit.session_id(), &user_event).await;
-            run_model_turn(state, permit, &user_event, runtime_context).await;
+            run_model_turn(state, permit, &user_event, client_id, runtime_context).await;
         }
         Ok(None) => {
             append_system_event(
@@ -2981,7 +2983,7 @@ async fn process_skill_invocation_command(
                     arguments,
                 },
             );
-            run_model_turn(state, permit, &user_event, runtime_context).await;
+            run_model_turn(state, permit, &user_event, client_id, runtime_context).await;
         }
         Ok(None) => {
             append_system_event(
@@ -4837,9 +4839,14 @@ async fn poll_compaction_summary(
         let poll = PollTurnEventsRequest {
             provider_turn_id: provider_turn_id.to_string(),
         };
-        let response = poll_model_turn(state, selection.provider_plugin_id.as_deref(), &poll)
-            .await
-            .map_err(CompactionError::Provider)?;
+        let response = poll_model_turn(
+            state,
+            session_id,
+            selection.provider_plugin_id.as_deref(),
+            &poll,
+        )
+        .await
+        .map_err(CompactionError::Provider)?;
         if response.events.is_empty() {
             idle_for = wait_for_compaction_progress(&state.model_streaming, idle_for).await?;
             continue;
@@ -5089,6 +5096,7 @@ async fn run_model_turn(
     state: &ServerState,
     permit: &mut SessionTurnPermit,
     trigger_event: &bcode_session_models::SessionEvent,
+    client_id: ClientId,
     runtime_context: Option<ClientRuntimeContext>,
 ) {
     let session_id = permit.enter_turn();
@@ -5106,6 +5114,7 @@ async fn run_model_turn(
     state.active_session_turns.lock().await.insert(
         session_id,
         ActiveSessionTurn {
+            client_id,
             turn_id: turn_id.clone(),
             cancel_state: Arc::clone(&cancel_state),
         },
@@ -5404,6 +5413,56 @@ fn provider_error_message(error: &bcode_model::ProviderError) -> String {
     format!("model error {}: {}", error.code, error.message)
 }
 
+fn plugin_scope_for_session_turn(
+    session_id: SessionId,
+    active_turn: &ActiveSessionTurn,
+) -> PluginInvocationScope {
+    PluginInvocationScope::session(session_id.to_string())
+        .with_client_id(active_turn.client_id.to_string())
+        .with_turn_id(active_turn.turn_id.clone())
+        .with_work_id(format!("model_{}", active_turn.turn_id))
+}
+
+async fn active_plugin_scope_for_session(
+    state: &ServerState,
+    session_id: SessionId,
+) -> PluginInvocationScope {
+    state
+        .active_session_turns
+        .lock()
+        .await
+        .get(&session_id)
+        .map_or_else(PluginInvocationScope::default, |active_turn| {
+            plugin_scope_for_session_turn(session_id, active_turn)
+        })
+}
+
+fn plugin_scope_for_tool_call(
+    session_id: SessionId,
+    active_turn: &ActiveSessionTurn,
+    tool_call_id: &str,
+) -> PluginInvocationScope {
+    PluginInvocationScope::session(session_id.to_string())
+        .with_client_id(active_turn.client_id.to_string())
+        .with_turn_id(active_turn.turn_id.clone())
+        .with_work_id(format!("tool_{tool_call_id}"))
+}
+
+async fn active_plugin_scope_for_tool_call(
+    state: &ServerState,
+    session_id: SessionId,
+    tool_call_id: &str,
+) -> PluginInvocationScope {
+    state
+        .active_session_turns
+        .lock()
+        .await
+        .get(&session_id)
+        .map_or_else(PluginInvocationScope::default, |active_turn| {
+            plugin_scope_for_tool_call(session_id, active_turn, tool_call_id)
+        })
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_model_turn_round(
     state: &ServerState,
@@ -5421,11 +5480,13 @@ async fn run_model_turn_round(
         ));
     }
     let start_timer = state.metrics.timer();
-    let start = invoke_model_provider_json_blocking::<_, StartTurnResponse>(
+    let scope = active_plugin_scope_for_session(state, session_id).await;
+    let start = invoke_model_provider_json_blocking_scoped::<_, StartTurnResponse>(
         state,
         provider_plugin_id.map(ToString::to_string),
         OP_START_TURN,
         request.clone(),
+        scope,
     )
     .await;
     state.metrics.record_histogram(
@@ -5617,7 +5678,7 @@ async fn poll_model_turn_events(
             provider_turn_id: provider_turn_id.to_string(),
         };
         let poll_timer = state.metrics.timer();
-        let response = poll_model_turn(state, provider_plugin_id, &poll).await;
+        let response = poll_model_turn(state, session_id, provider_plugin_id, &poll).await;
         state.metrics.record_histogram(
             "model.provider.poll_turn_events_duration_ms",
             poll_timer.elapsed_ms(),
@@ -5782,14 +5843,17 @@ async fn wait_for_model_progress_or_timeout(
 
 async fn poll_model_turn(
     state: &ServerState,
+    session_id: SessionId,
     provider_plugin_id: Option<&str>,
     poll: &PollTurnEventsRequest,
 ) -> Result<PollTurnEventsResponse, String> {
-    invoke_model_provider_json_blocking::<_, PollTurnEventsResponse>(
+    let scope = active_plugin_scope_for_session(state, session_id).await;
+    invoke_model_provider_json_blocking_scoped::<_, PollTurnEventsResponse>(
         state,
         provider_plugin_id.map(ToString::to_string),
         OP_POLL_TURN_EVENTS,
         poll.clone(),
+        scope,
     )
     .await
 }
@@ -6372,30 +6436,48 @@ where
     Q: serde::Serialize + Send + Sync + 'static,
     R: serde::de::DeserializeOwned + Send + 'static,
 {
-    match provider_plugin_id.as_deref() {
-        Some(provider_plugin_id) => {
-            state
-                .plugins
-                .invoke_service_json::<_, R>(
-                    provider_plugin_id,
-                    MODEL_PROVIDER_INTERFACE_ID,
-                    operation,
-                    &request,
-                )
-                .await
-        }
-        None => {
-            state
-                .plugins
-                .invoke_service_by_interface_json::<_, R>(
-                    MODEL_PROVIDER_INTERFACE_ID,
-                    operation,
-                    &request,
-                )
-                .await
-        }
-    }
-    .map_err(|error| error.to_string())
+    invoke_model_provider_json_blocking_scoped(
+        state,
+        provider_plugin_id,
+        operation,
+        request,
+        PluginInvocationScope::Global,
+    )
+    .await
+}
+
+async fn invoke_model_provider_json_blocking_scoped<Q, R>(
+    state: &ServerState,
+    provider_plugin_id: Option<String>,
+    operation: &'static str,
+    request: Q,
+    scope: PluginInvocationScope,
+) -> Result<R, String>
+where
+    Q: serde::Serialize + Send + Sync + 'static,
+    R: serde::de::DeserializeOwned + Send + 'static,
+{
+    let provider_plugin_id = if let Some(provider_plugin_id) = provider_plugin_id.as_deref() {
+        provider_plugin_id
+    } else {
+        state
+            .plugins
+            .registry()
+            .service_registry()
+            .unique_provider(MODEL_PROVIDER_INTERFACE_ID)
+            .map_err(|error| error.to_string())?
+    };
+    state
+        .plugins
+        .invoke_service_json_scoped::<_, R>(
+            provider_plugin_id,
+            MODEL_PROVIDER_INTERFACE_ID,
+            operation,
+            &request,
+            scope,
+        )
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -7375,13 +7457,15 @@ async fn invoke_model_tool(
         cancellation_path: Some(cancellation_path.clone()),
     };
     let payload = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+    let scope = active_plugin_scope_for_tool_call(state, session_id, &call.id).await;
     let mut invocation = state
         .plugins
-        .invoke_service_with_events(
+        .invoke_service_with_events_scoped(
             &plugin_id,
             TOOL_SERVICE_INTERFACE_ID,
             OP_INVOKE_TOOL,
             payload,
+            scope,
         )
         .await
         .map_err(|error| error.to_string())?;

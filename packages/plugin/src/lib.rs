@@ -768,7 +768,12 @@ impl PluginServiceRegistry {
         self.providers.get(interface_id)
     }
 
-    fn unique_provider(&self, interface_id: &str) -> Result<&str, PluginLoadError> {
+    /// Return the unique plugin ID that provides a service interface.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the interface is not registered or has multiple providers.
+    pub fn unique_provider(&self, interface_id: &str) -> Result<&str, PluginLoadError> {
         let Some(providers) = self.providers.get(interface_id) else {
             return Err(PluginLoadError::ServiceNotRegistered(
                 interface_id.to_string(),
@@ -1106,36 +1111,6 @@ impl PluginExecutorHandle {
     pub fn status(&self) -> PluginExecutorStatus {
         self.metrics
             .snapshot(self.manifest.id.clone(), self.concurrency)
-    }
-
-    async fn start_service_with_events(
-        &self,
-        interface_id: String,
-        operation: String,
-        payload: Vec<u8>,
-        class: PluginInvocationClass,
-    ) -> Result<StreamingServiceInvocation, PluginLoadError> {
-        let (response, response_receiver) = oneshot::channel();
-        let (event_sender, event_receiver) = mpsc::unbounded_channel();
-        let invocation_id = next_plugin_invocation_id();
-        let cancel = PluginInvocationCancelHandle {
-            id: invocation_id,
-            cancelled: Arc::new(AtomicBool::new(false)),
-        };
-        self.start_service_with_events_scoped(
-            interface_id,
-            operation,
-            payload,
-            class,
-            PluginInvocationScope::Global,
-            invocation_id,
-            cancel,
-            response,
-            event_sender,
-            response_receiver,
-            event_receiver,
-        )
-        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1602,6 +1577,29 @@ impl PluginRuntimeHost {
         operation: impl Into<String>,
         payload: Vec<u8>,
     ) -> Result<StreamingServiceInvocation, PluginLoadError> {
+        self.invoke_service_with_events_scoped(
+            plugin_id,
+            interface_id,
+            operation,
+            payload,
+            PluginInvocationScope::Global,
+        )
+        .await
+    }
+
+    /// Invoke a service operation on a loaded plugin by ID with explicit ownership scope and events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the plugin is not loaded or service invocation fails.
+    pub async fn invoke_service_with_events_scoped(
+        &self,
+        plugin_id: &str,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        payload: Vec<u8>,
+        scope: PluginInvocationScope,
+    ) -> Result<StreamingServiceInvocation, PluginLoadError> {
         let interface_id = interface_id.into();
         let operation = operation.into();
         let executor = self
@@ -1614,8 +1612,27 @@ impl PluginRuntimeHost {
             .service_policy(plugin_id, &interface_id)
             .and_then(|policy| policy.class)
             .unwrap_or_else(|| classify_invocation(&interface_id, &operation));
+        let (response, response_receiver) = oneshot::channel();
+        let (event_sender, event_receiver) = mpsc::unbounded_channel();
+        let invocation_id = next_plugin_invocation_id();
+        let cancel = PluginInvocationCancelHandle {
+            id: invocation_id,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
         executor
-            .start_service_with_events(interface_id, operation, payload, class)
+            .start_service_with_events_scoped(
+                interface_id,
+                operation,
+                payload,
+                class,
+                scope,
+                invocation_id,
+                cancel,
+                response,
+                event_sender,
+                response_receiver,
+                event_receiver,
+            )
             .await
     }
 
