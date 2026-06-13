@@ -43,16 +43,20 @@ const OPENAI_NAMESPACED_DIALECT_SETTING: &str = "openai.dialect";
 
 /// OpenAI-compatible model provider plugin.
 pub struct OpenAiCompatibleProviderPlugin {
+    state: Mutex<OpenAiCompatibleProviderState>,
+    runtime: Result<ProviderRuntime, String>,
+}
+
+#[derive(Debug, Default)]
+struct OpenAiCompatibleProviderState {
     next_turn: u64,
     turns: BTreeMap<String, TurnState>,
-    runtime: Result<ProviderRuntime, String>,
 }
 
 impl Default for OpenAiCompatibleProviderPlugin {
     fn default() -> Self {
         Self {
-            next_turn: 0,
-            turns: BTreeMap::new(),
+            state: Mutex::default(),
             runtime: ProviderRuntime::new().map_err(|error| error.to_string()),
         }
     }
@@ -88,8 +92,20 @@ impl TurnState {
     }
 }
 
+impl ConcurrentRustPlugin for OpenAiCompatibleProviderPlugin {
+    fn invoke_service_concurrent(&self, context: NativeServiceContext) -> ServiceResponse {
+        self.invoke_provider_service(&context)
+    }
+}
+
 impl RustPlugin for OpenAiCompatibleProviderPlugin {
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        self.invoke_provider_service(&context)
+    }
+}
+
+impl OpenAiCompatibleProviderPlugin {
+    fn invoke_provider_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         if context.request.interface_id != MODEL_PROVIDER_INTERFACE_ID {
             return ServiceResponse::error(
                 "unsupported_interface",
@@ -112,9 +128,7 @@ impl RustPlugin for OpenAiCompatibleProviderPlugin {
             ),
         }
     }
-}
 
-impl OpenAiCompatibleProviderPlugin {
     fn native_web_search(&self, request: &ServiceRequest) -> ServiceResponse {
         let request = match request.payload_json::<NativeWebSearchRequest>() {
             Ok(request) => request,
@@ -130,16 +144,21 @@ impl OpenAiCompatibleProviderPlugin {
         }
     }
 
-    fn start_turn(&mut self, request: &ServiceRequest) -> ServiceResponse {
+    fn start_turn(&self, request: &ServiceRequest) -> ServiceResponse {
         let request = match request.payload_json::<ModelTurnRequest>() {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
-        self.next_turn += 1;
-        let provider_turn_id = format!("openai-compatible-turn-{}", self.next_turn);
+        let mut state = self
+            .state
+            .lock()
+            .expect("openai-compatible provider state lock should not be poisoned");
+        state.next_turn += 1;
+        let provider_turn_id = format!("openai-compatible-turn-{}", state.next_turn);
         let turn = TurnState::default();
         turn.push(ProviderTurnEvent::TurnStarted);
-        self.turns.insert(provider_turn_id.clone(), turn.clone());
+        state.turns.insert(provider_turn_id.clone(), turn.clone());
+        drop(state);
         match &self.runtime {
             Ok(runtime) => {
                 runtime.spawn(async move {
@@ -157,6 +176,9 @@ impl OpenAiCompatibleProviderPlugin {
             Err(error) => return invalid_request(&error),
         };
         let events = self
+            .state
+            .lock()
+            .expect("openai-compatible provider state lock should not be poisoned")
             .turns
             .get(&request.provider_turn_id)
             .map_or_else(Vec::new, TurnState::drain);
@@ -168,18 +190,31 @@ impl OpenAiCompatibleProviderPlugin {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
-        if let Some(turn) = self.turns.get(&request.provider_turn_id) {
+        let turn = self
+            .state
+            .lock()
+            .expect("openai-compatible provider state lock should not be poisoned")
+            .turns
+            .get(&request.provider_turn_id)
+            .cloned();
+        if let Some(turn) = turn {
             turn.cancel();
         }
         json_response(&AckResponse::default())
     }
 
-    fn finish_turn(&mut self, request: &ServiceRequest) -> ServiceResponse {
+    fn finish_turn(&self, request: &ServiceRequest) -> ServiceResponse {
         let request = match request.payload_json::<FinishTurnRequest>() {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
-        if let Some(turn) = self.turns.remove(&request.provider_turn_id) {
+        let turn = self
+            .state
+            .lock()
+            .expect("openai-compatible provider state lock should not be poisoned")
+            .turns
+            .remove(&request.provider_turn_id);
+        if let Some(turn) = turn {
             turn.cancel();
         }
         json_response(&AckResponse::default())
@@ -3947,7 +3982,7 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
 #[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(
+    bcode_plugin_sdk::static_concurrent_plugin_vtable!(
         OpenAiCompatibleProviderPlugin,
         include_str!("../bcode-plugin.toml")
     )
@@ -4804,7 +4839,7 @@ mod tests {
     }
 }
 
-bcode_plugin_sdk::export_plugin!(
+bcode_plugin_sdk::export_concurrent_plugin!(
     OpenAiCompatibleProviderPlugin,
     include_str!("../bcode-plugin.toml")
 );
