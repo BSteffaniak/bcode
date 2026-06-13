@@ -11,7 +11,8 @@ use bcode_config::TuiThinkingConfig;
 use bcode_session_models::{
     ClientId, RuntimeWorkId, RuntimeWorkKind, SessionEvent, SessionEventKind, SessionId,
     SessionInputHistoryEntry, SessionProjectionKind, SessionSummary, SessionTitleSource,
-    SessionTokenUsage, ToolInvocationStreamEvent, ToolOutputStream,
+    SessionTokenUsage, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
+    ToolInvocationStreamEvent, ToolOutputStream,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::TextMotion;
@@ -32,6 +33,63 @@ use super::{
     transcript::{TranscriptItem, TranscriptItemKind, transcript_items_from_events_with_reasoning},
     transcript_document::TranscriptDocument,
 };
+
+#[test]
+fn provider_tool_call_delta_trace_does_not_replace_status() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_status("thinking".to_owned());
+    app.absorb_session_event(&SessionEvent {
+        schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+        sequence: 1,
+        session_id,
+        provenance: None,
+        kind: SessionEventKind::TraceEvent {
+            trace: Box::new(SessionTraceEvent {
+                timestamp_ms: 0,
+                turn_id: Some("turn-1".to_owned()),
+                phase: SessionTracePhase::ModelProviderEvent,
+                payload: SessionTracePayload::ProviderEvent {
+                    event_type: "tool_call_delta".to_owned(),
+                    detail: None,
+                },
+            }),
+        },
+    });
+
+    assert_eq!(app.status(), "thinking");
+}
+
+#[test]
+fn provider_tool_call_progress_status_formats_bytes() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.absorb_session_event(&SessionEvent {
+        schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+        sequence: 1,
+        session_id,
+        provenance: None,
+        kind: SessionEventKind::TraceEvent {
+            trace: Box::new(SessionTraceEvent {
+                timestamp_ms: 0,
+                turn_id: Some("turn-1".to_owned()),
+                phase: SessionTracePhase::ModelProviderEvent,
+                payload: SessionTracePayload::ProviderStreamEvent(
+                    bcode_session_models::ProviderStreamEvent::ToolCallProgress {
+                        tool_call_id: "call-1".to_owned(),
+                        tool_name: "filesystem.write".to_owned(),
+                        argument_bytes: 1536,
+                    },
+                ),
+            }),
+        },
+    });
+
+    assert_eq!(
+        app.status(),
+        "provider stream tool assembled: filesystem.write (1.5 KiB)"
+    );
+}
 
 #[test]
 fn running_tool_elapsed_invalidations_are_frame_capped() {

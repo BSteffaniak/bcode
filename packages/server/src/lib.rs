@@ -5850,9 +5850,6 @@ async fn handle_provider_turn_event(
                     },
                 )
                 .await;
-            } else {
-                append_provider_event_trace(state, session_id, turn_id, "tool_call_delta", None)
-                    .await;
             }
         }
     }

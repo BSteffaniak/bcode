@@ -2232,7 +2232,7 @@ impl BmuxApp {
                 self.apply_provider_stream_event(event);
             }
             SessionTracePayload::ProviderEvent { event_type, detail } => {
-                if matches!(event_type.as_str(), "tool_call_delta" | "warning" | "error") {
+                if matches!(event_type.as_str(), "warning" | "error") {
                     let detail = detail
                         .clone()
                         .unwrap_or_else(|| format!("provider event: {event_type}"));
@@ -2278,8 +2278,10 @@ impl BmuxApp {
                 argument_bytes,
                 ..
             } => {
-                let detail =
-                    format!("provider stream tool assembled: {tool_name} ({argument_bytes} bytes)");
+                let detail = format!(
+                    "provider stream tool assembled: {tool_name} ({})",
+                    format_provider_bytes(*argument_bytes)
+                );
                 self.set_activity(ActivityState::ProviderStream {
                     detail: detail.clone(),
                 });
@@ -2580,6 +2582,22 @@ fn compact_u64(value: u64) -> String {
         format!("{whole}.{decimal}k")
     } else {
         value.to_string()
+    }
+}
+
+fn format_provider_bytes(bytes: usize) -> String {
+    const KIB: usize = 1024;
+    const MIB: usize = KIB * 1024;
+    if bytes >= MIB {
+        let whole = bytes / MIB;
+        let decimal = (bytes % MIB) * 10 / MIB;
+        format!("{whole}.{decimal} MiB")
+    } else if bytes >= KIB {
+        let whole = bytes / KIB;
+        let decimal = (bytes % KIB) * 10 / KIB;
+        format!("{whole}.{decimal} KiB")
+    } else {
+        format!("{bytes} B")
     }
 }
 
