@@ -226,11 +226,19 @@ fn action_buttons() -> [ActionButton; 2] {
 
 const fn action_styles() -> ActionRowStyles {
     ActionRowStyles {
-        button: Style::new().fg(Color::BrightWhite),
-        focused_button: Style::new()
+        normal: Style::new().fg(Color::BrightWhite),
+        focused: Style::new()
             .fg(Color::Black)
             .bg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
+        hovered: Style::new()
+            .fg(Color::BrightWhite)
+            .add_modifier(Modifier::UNDERLINE),
+        pressed: Style::new()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        disabled: Style::new().fg(Color::BrightBlack),
     }
 }
 
