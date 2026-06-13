@@ -445,6 +445,25 @@ impl BcodeClient {
         self
     }
 
+    /// Ensure a compatible local daemon is available when auto-start is enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when daemon acquisition fails or this client is configured
+    /// to require an already-running daemon.
+    pub async fn ensure_daemon_available(&self) -> Result<(), ClientError> {
+        if self.daemon_availability == DaemonAvailability::RequireRunning {
+            return Ok(());
+        }
+        ensure_daemon_running(&EnsureDaemonOptions {
+            endpoint: self.endpoint.clone(),
+            quiet: true,
+            log_path: bcode_daemon_lifecycle::default_daemon_log_path(),
+        })
+        .await?;
+        Ok(())
+    }
+
     /// Create an event-driven session catalog watcher.
     ///
     /// # Errors
@@ -1343,24 +1362,27 @@ impl BcodeClient {
     }
 
     async fn send_request(&self, request: Request) -> Result<ResponsePayload, ClientError> {
-        let mut connection = self.connect("bcode-cli").await?;
-        match connection.send_request(request.clone()).await {
-            Ok(response) => Ok(response),
-            Err(error)
-                if self.daemon_availability == DaemonAvailability::AutoStart
-                    && error.is_daemon_unavailable() =>
-            {
-                ensure_daemon_running(&EnsureDaemonOptions {
-                    endpoint: self.endpoint.clone(),
-                    quiet: true,
-                    log_path: bcode_daemon_lifecycle::default_daemon_log_path(),
-                })
-                .await?;
-                let mut connection = self.connect_once("bcode-cli").await?;
-                connection.send_request(request).await
+        let mut last_error = None;
+        for _ in 0..3 {
+            match self.send_request_once(request.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if self.daemon_availability == DaemonAvailability::AutoStart
+                        && error.is_daemon_unavailable() =>
+                {
+                    last_error = Some(error);
+                    self.ensure_daemon_available().await?;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => Err(error),
         }
+        Err(last_error.unwrap_or(ClientError::UnexpectedResponse))
+    }
+
+    async fn send_request_once(&self, request: Request) -> Result<ResponsePayload, ClientError> {
+        let mut connection = self.connect("bcode-cli").await?;
+        connection.send_request(request).await
     }
 
     /// Open a long-lived connection to the daemon.
@@ -1369,22 +1391,22 @@ impl BcodeClient {
     ///
     /// Returns an error when the daemon cannot be reached or rejects the handshake.
     pub async fn connect(&self, client_name: &str) -> Result<ClientConnection, ClientError> {
-        match self.connect_once(client_name).await {
-            Ok(connection) => Ok(connection),
-            Err(error)
-                if self.daemon_availability == DaemonAvailability::AutoStart
-                    && error.is_daemon_unavailable() =>
-            {
-                ensure_daemon_running(&EnsureDaemonOptions {
-                    endpoint: self.endpoint.clone(),
-                    quiet: true,
-                    log_path: bcode_daemon_lifecycle::default_daemon_log_path(),
-                })
-                .await?;
-                self.connect_once(client_name).await
+        let mut last_error = None;
+        for _ in 0..3 {
+            match self.connect_once(client_name).await {
+                Ok(connection) => return Ok(connection),
+                Err(error)
+                    if self.daemon_availability == DaemonAvailability::AutoStart
+                        && error.is_daemon_unavailable() =>
+                {
+                    last_error = Some(error);
+                    self.ensure_daemon_available().await?;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => Err(error),
         }
+        Err(last_error.unwrap_or(ClientError::UnexpectedResponse))
     }
 
     async fn connect_once(&self, client_name: &str) -> Result<ClientConnection, ClientError> {

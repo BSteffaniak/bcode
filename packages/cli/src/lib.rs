@@ -3201,12 +3201,9 @@ fn dynamic_library_name(library_stem: &str) -> String {
 
 async fn ensure_server_running() -> Result<(), CliError> {
     ensure_bundled_plugins_installed()?;
-    bcode_daemon_lifecycle::ensure_daemon_running(&bcode_daemon_lifecycle::EnsureDaemonOptions {
-        endpoint: default_endpoint(),
-        quiet: true,
-        log_path: daemon_log_path(),
-    })
-    .await?;
+    BcodeClient::default_endpoint()
+        .ensure_daemon_available()
+        .await?;
     Ok(())
 }
 

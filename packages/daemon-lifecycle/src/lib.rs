@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 /// Current daemon registry record schema version.
@@ -379,6 +379,24 @@ pub enum DaemonStartError {
     },
 }
 
+impl DaemonStartError {
+    /// Return true when startup likely lost a race to an already-running daemon.
+    #[must_use]
+    pub fn is_existing_daemon_race(&self) -> bool {
+        match self {
+            Self::Exited { recent_log, .. }
+            | Self::StartTimeout { recent_log, .. }
+            | Self::HealthCheckFailed { recent_log, .. } => {
+                recent_log.contains("refusing to replace live IPC socket")
+                    || recent_log.contains("another bcode daemon is listening")
+                    || recent_log.contains("Address already in use")
+            }
+            Self::Io(error) => error.kind() == std::io::ErrorKind::AddrInUse,
+            Self::Lifecycle(_) => false,
+        }
+    }
+}
+
 /// Ensure the current namespace daemon is running, starting it when needed.
 ///
 /// # Errors
@@ -387,8 +405,7 @@ pub enum DaemonStartError {
 /// or the daemon does not pass bounded readiness checks.
 pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), DaemonStartError> {
     cleanup_stale_daemon_records().await?;
-    cleanup_stale_endpoint(&options.endpoint)?;
-    if ping_ready(&options.endpoint).await {
+    if probe_daemon_ready(&options.endpoint).await {
         if !options.quiet {
             println!("server already running");
             println!("namespace: {}", daemon_namespace());
@@ -397,7 +414,18 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
         return Ok(());
     }
 
+    let lock = StartupLock::acquire()?;
+    cleanup_stale_daemon_records().await?;
     cleanup_stale_endpoint(&options.endpoint)?;
+    if probe_daemon_ready(&options.endpoint).await {
+        drop(lock);
+        if !options.quiet {
+            println!("server already running");
+            println!("namespace: {}", daemon_namespace());
+            println!("log: {}", options.log_path.display());
+        }
+        return Ok(());
+    }
 
     if let Some(parent) = options.log_path.parent() {
         fs::create_dir_all(parent)?;
@@ -418,13 +446,25 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
         .stderr(std::process::Stdio::from(stderr_log))
         .spawn()?;
 
-    wait_for_server_ready(&options.endpoint, &mut child, &options.log_path).await?;
-    if !options.quiet {
-        println!("server started");
-        println!("namespace: {}", daemon_namespace());
-        println!("log: {}", options.log_path.display());
+    match wait_for_server_ready(&options.endpoint, &mut child, &options.log_path).await {
+        Ok(()) => {
+            drop(lock);
+            if !options.quiet {
+                println!("server started");
+                println!("namespace: {}", daemon_namespace());
+                println!("log: {}", options.log_path.display());
+            }
+            Ok(())
+        }
+        Err(error) if error.is_existing_daemon_race() => {
+            if wait_for_existing_daemon(&options.endpoint).await {
+                drop(lock);
+                return Ok(());
+            }
+            Err(error)
+        }
+        Err(error) => Err(error),
     }
-    Ok(())
 }
 
 /// Return the default daemon log path for the current namespace.
@@ -440,6 +480,56 @@ pub fn default_daemon_log_path() -> PathBuf {
     )
 }
 
+#[derive(Debug)]
+struct StartupLock {
+    path: PathBuf,
+}
+
+impl StartupLock {
+    fn acquire() -> Result<Self, DaemonStartError> {
+        let path = bcode_config::default_state_dir()
+            .join("daemons")
+            .join(format!("{}.lock", daemon_namespace()));
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        for _ in 0..100 {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    writeln!(file, "pid={}", std::process::id())?;
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let _ = fs::remove_file(&path);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                writeln!(file, "pid={}", std::process::id())?;
+                Ok(Self { path })
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+impl Drop for StartupLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 async fn wait_for_server_ready(
     endpoint: &IpcEndpoint,
     child: &mut tokio::process::Child,
@@ -447,7 +537,7 @@ async fn wait_for_server_ready(
 ) -> Result<(), DaemonStartError> {
     for _ in 0..50 {
         if ping_ready(endpoint).await {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
             if let Some(status) = child.try_wait()? {
                 return Err(DaemonStartError::Exited {
                     status: status.to_string(),
@@ -464,13 +554,17 @@ async fn wait_for_server_ready(
             });
         }
         if let Some(status) = child.try_wait()? {
-            return Err(DaemonStartError::Exited {
+            let error = DaemonStartError::Exited {
                 status: status.to_string(),
                 log_path: log_path.display().to_string(),
                 recent_log: recent_log_excerpt(log_path),
-            });
+            };
+            if error.is_existing_daemon_race() && wait_for_existing_daemon(endpoint).await {
+                return Ok(());
+            }
+            return Err(error);
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     Err(DaemonStartError::StartTimeout {
@@ -481,9 +575,29 @@ async fn wait_for_server_ready(
 
 async fn ping_ready(endpoint: &IpcEndpoint) -> bool {
     matches!(
-        tokio::time::timeout(std::time::Duration::from_millis(250), ping_once(endpoint)).await,
+        tokio::time::timeout(Duration::from_millis(500), ping_once(endpoint)).await,
         Ok(Ok(()))
     )
+}
+
+async fn probe_daemon_ready(endpoint: &IpcEndpoint) -> bool {
+    for delay in [25, 50, 100, 200, 400] {
+        if ping_ready(endpoint).await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+    }
+    false
+}
+
+async fn wait_for_existing_daemon(endpoint: &IpcEndpoint) -> bool {
+    for delay in [50, 100, 200, 400, 800, 1_000] {
+        if ping_ready(endpoint).await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+    }
+    false
 }
 
 async fn ping_once(endpoint: &IpcEndpoint) -> Result<(), bcode_ipc::CodecError> {
@@ -520,7 +634,7 @@ async fn cleanup_stale_daemon_records() -> Result<(), DaemonLifecycleError> {
         let Some(endpoint) = record.endpoint.to_ipc_endpoint() else {
             continue;
         };
-        if ping_ready(&endpoint).await {
+        if probe_daemon_ready(&endpoint).await {
             continue;
         }
         remove_record_path(&path)?;
@@ -547,6 +661,10 @@ fn cleanup_stale_endpoint(endpoint: &IpcEndpoint) -> Result<(), DaemonLifecycleE
 #[cfg(unix)]
 fn remove_stale_unix_socket_path(path: &Path) -> Result<(), DaemonLifecycleError> {
     if !is_bcode_socket_path(path) || unix_socket_has_listener(path) {
+        return Ok(());
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    if unix_socket_has_listener(path) {
         return Ok(());
     }
     match fs::remove_file(path) {
