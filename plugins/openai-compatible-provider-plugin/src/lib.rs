@@ -196,6 +196,7 @@ struct Settings {
     fallback_model: String,
     model_ids: Vec<String>,
     model_ids_are_explicit: bool,
+    request_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -849,16 +850,13 @@ async fn stream_chat_completion_inner(
             "run `bcode login openai` (or `bcode login xai`) for ChatGPT subscription auth or set BCODE_OPENAI_API_KEY/OPENAI_API_KEY (or BCODE_XAI_API_KEY/XAI_API_KEY) for API-key auth",
         ));
     }
-    let client = Client::builder()
-        .timeout(Duration::from_mins(2))
-        .build()
-        .map_err(|error| {
-            provider_error(
-                "client_build_failed",
-                ProviderErrorCategory::ProviderInternal,
-                error.to_string(),
-            )
-        })?;
+    let client = model_stream_client(settings.request_timeout).map_err(|error| {
+        provider_error(
+            "client_build_failed",
+            ProviderErrorCategory::ProviderInternal,
+            error.to_string(),
+        )
+    })?;
     let model_id = resolve_model_id_for_turn(&settings, request, turn).await;
     match (&settings.auth, settings.dialect) {
         (AuthSettings::ApiKey(api_key), OpenAiCompatibleDialect::ChatCompletions) => {
@@ -890,6 +888,14 @@ async fn stream_chat_completion_inner(
         )),
         (AuthSettings::Missing, _) => unreachable!("missing auth handled above"),
     }
+}
+
+fn model_stream_client(request_timeout: Option<Duration>) -> Result<Client, reqwest::Error> {
+    let mut builder = Client::builder();
+    if let Some(timeout) = request_timeout {
+        builder = builder.timeout(timeout);
+    }
+    builder.build()
 }
 
 async fn resolve_model_id_for_turn(
@@ -1037,13 +1043,7 @@ async fn read_stream_events(
         }
         tokio::select! {
             chunk = response.chunk() => {
-                let Some(chunk) = chunk.map_err(|error| {
-                    provider_error(
-                        "stream_read_failed",
-                        ProviderErrorCategory::Network,
-                        error.to_string(),
-                    )
-                })? else {
+                let Some(chunk) = chunk.map_err(|error| stream_read_error(&error))? else {
                     return Ok(StreamOutcome::Finished);
                 };
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
@@ -1073,13 +1073,7 @@ async fn read_responses_stream_events(
         }
         tokio::select! {
             chunk = response.chunk() => {
-                let Some(chunk) = chunk.map_err(|error| {
-                    provider_error(
-                        "stream_read_failed",
-                        ProviderErrorCategory::Network,
-                        error.to_string(),
-                    )
-                })? else {
+                let Some(chunk) = chunk.map_err(|error| stream_read_error(&error))? else {
                     return Ok(if saw_tool_call { StreamOutcome::ToolCall } else { StreamOutcome::Finished });
                 };
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
@@ -2982,6 +2976,17 @@ fn settings_for_context(context: &ProviderRequestContext) -> Settings {
         }
     });
     let dialect = resolve_dialect(&auth, context);
+    let request_timeout = optional_duration_from_context_or_env(
+        context,
+        "request_timeout_secs",
+        "openai.request_timeout_secs",
+        [
+            "BCODE_XAI_REQUEST_TIMEOUT_SECS",
+            "XAI_REQUEST_TIMEOUT_SECS",
+            "BCODE_OPENAI_REQUEST_TIMEOUT_SECS",
+            "OPENAI_REQUEST_TIMEOUT_SECS",
+        ],
+    );
     Settings {
         auth,
         auth_diagnostics,
@@ -2991,6 +2996,7 @@ fn settings_for_context(context: &ProviderRequestContext) -> Settings {
         fallback_model,
         model_ids,
         model_ids_are_explicit: model_ids_env.is_some(),
+        request_timeout,
     }
 }
 
@@ -3764,6 +3770,22 @@ fn first_context_or_env<const N: usize>(
         .or_else(|| first_context_env(context, env_names))
 }
 
+fn optional_duration_from_context_or_env<const N: usize>(
+    context: &ProviderRequestContext,
+    key: &str,
+    namespaced_key: &str,
+    env_names: [&str; N],
+) -> Option<Duration> {
+    first_context_or_env(context, key, namespaced_key, env_names)
+        .as_deref()
+        .and_then(parse_positive_duration_secs)
+}
+
+fn parse_positive_duration_secs(value: &str) -> Option<Duration> {
+    let secs = value.trim().parse::<u64>().ok()?;
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
 fn resolve_dialect(
     auth: &AuthSettings,
     context: &ProviderRequestContext,
@@ -3873,6 +3895,24 @@ fn is_context_length_error(code: &str, message: &str) -> bool {
                 || message.contains("overflow")))
 }
 
+fn stream_read_error(error: &reqwest::Error) -> ProviderError {
+    if error.is_timeout() {
+        provider_error(
+            "stream_read_timeout",
+            ProviderErrorCategory::Timeout,
+            format!(
+                "provider stream timed out while reading response body. This usually means an explicit OpenAI-compatible request timeout was configured; by default Bcode does not set a total timeout for model streams. underlying error: {error}"
+            ),
+        )
+    } else {
+        provider_error(
+            "stream_read_failed",
+            ProviderErrorCategory::Network,
+            format!("provider stream failed while reading response body: {error}"),
+        )
+    }
+}
+
 fn provider_error(
     code: impl Into<String>,
     category: ProviderErrorCategory,
@@ -3939,7 +3979,32 @@ mod tests {
             fallback_model: DEFAULT_MODEL_ID.to_string(),
             model_ids: vec!["model".to_string()],
             model_ids_are_explicit: true,
+            request_timeout: None,
         }
+    }
+
+    #[test]
+    fn model_stream_client_defaults_to_no_total_timeout() {
+        assert!(model_stream_client(None).is_ok());
+    }
+
+    #[test]
+    fn request_timeout_setting_is_disabled_by_default() {
+        let context = ProviderRequestContext::default();
+        let settings = settings_for_context(&context);
+
+        assert_eq!(settings.request_timeout, None);
+    }
+
+    #[test]
+    fn request_timeout_setting_can_be_configured() {
+        let mut context = ProviderRequestContext::default();
+        context
+            .settings
+            .insert("openai.request_timeout_secs".to_string(), "17".to_string());
+        let settings = settings_for_context(&context);
+
+        assert_eq!(settings.request_timeout, Some(Duration::from_secs(17)));
     }
 
     fn test_chatgpt_auth() -> AuthSettings {
