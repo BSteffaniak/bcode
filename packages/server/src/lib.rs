@@ -8649,6 +8649,9 @@ fn plugin_service_summaries(
 }
 
 async fn publish_session_event(state: &ServerState, event: &bcode_session_models::SessionEvent) {
+    if let Ok(session) = state.sessions.session_summary(event.session_id).await {
+        state.session_catalog.upsert_native_session(session).await;
+    }
     state
         .metrics
         .record_event("session.event", 1, session_event_metric_labels(event));
