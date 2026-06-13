@@ -47,7 +47,7 @@ const PROMPT_CACHE_UNSUPPORTED_REASON: &str = "prompt_cache_unsupported";
 
 /// Amazon Bedrock model provider plugin.
 pub struct BedrockProviderPlugin {
-    turns: TurnStore,
+    turns: Mutex<TurnStore>,
     discovery: Arc<Mutex<DiscoveryCache>>,
     runtime: Result<ProviderRuntime, String>,
 }
@@ -55,15 +55,37 @@ pub struct BedrockProviderPlugin {
 impl Default for BedrockProviderPlugin {
     fn default() -> Self {
         Self {
-            turns: TurnStore::default(),
+            turns: Mutex::default(),
             discovery: Arc::default(),
             runtime: ProviderRuntime::new().map_err(|error| error.to_string()),
         }
     }
 }
 
+impl ConcurrentRustPlugin for BedrockProviderPlugin {
+    fn activate_concurrent(&self) -> Result<(), PluginError> {
+        self.activate_provider();
+        Ok(())
+    }
+
+    fn invoke_service_concurrent(&self, context: NativeServiceContext) -> ServiceResponse {
+        self.invoke_provider_service(&context)
+    }
+}
+
 impl RustPlugin for BedrockProviderPlugin {
     fn activate(&mut self) -> Result<(), PluginError> {
+        self.activate_provider();
+        Ok(())
+    }
+
+    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        self.invoke_provider_service(&context)
+    }
+}
+
+impl BedrockProviderPlugin {
+    fn activate_provider(&self) {
         match load_compatibility_cache() {
             Ok(compatibility) => {
                 if let Ok(mut discovery) = self.discovery.lock() {
@@ -81,10 +103,9 @@ impl RustPlugin for BedrockProviderPlugin {
         if let Ok(runtime) = &self.runtime {
             warm_discovery_cache(runtime, self.discovery.clone(), Settings::resolve(None));
         }
-        Ok(())
     }
 
-    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+    fn invoke_provider_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         if context.request.interface_id != MODEL_PROVIDER_INTERFACE_ID {
             return ServiceResponse::error(
                 "unsupported_interface",
@@ -105,15 +126,17 @@ impl RustPlugin for BedrockProviderPlugin {
             ),
         }
     }
-}
 
-impl BedrockProviderPlugin {
-    fn start_turn(&mut self, request: &ServiceRequest) -> ServiceResponse {
+    fn start_turn(&self, request: &ServiceRequest) -> ServiceResponse {
         let request = match request.payload_json::<ModelTurnRequest>() {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
-        let (provider_turn_id, turn) = self.turns.insert_started("bedrock-turn");
+        let (provider_turn_id, turn) = self
+            .turns
+            .lock()
+            .expect("bedrock turn store lock should not be poisoned")
+            .insert_started("bedrock-turn");
         match &self.runtime {
             Ok(runtime) => {
                 let discovery = self.discovery.clone();
@@ -131,9 +154,12 @@ impl BedrockProviderPlugin {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
-        json_response(&PollTurnEventsResponse {
-            events: self.turns.drain(&request.provider_turn_id),
-        })
+        let events = self
+            .turns
+            .lock()
+            .expect("bedrock turn store lock should not be poisoned")
+            .drain(&request.provider_turn_id);
+        json_response(&PollTurnEventsResponse { events })
     }
 
     fn cancel_turn(&self, request: &ServiceRequest) -> ServiceResponse {
@@ -141,16 +167,22 @@ impl BedrockProviderPlugin {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
-        self.turns.cancel(&request.provider_turn_id);
+        self.turns
+            .lock()
+            .expect("bedrock turn store lock should not be poisoned")
+            .cancel(&request.provider_turn_id);
         json_response(&AckResponse::default())
     }
 
-    fn finish_turn(&mut self, request: &ServiceRequest) -> ServiceResponse {
+    fn finish_turn(&self, request: &ServiceRequest) -> ServiceResponse {
         let request = match request.payload_json::<FinishTurnRequest>() {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
-        self.turns.finish(&request.provider_turn_id);
+        self.turns
+            .lock()
+            .expect("bedrock turn store lock should not be poisoned")
+            .finish(&request.provider_turn_id);
         json_response(&AckResponse::default())
     }
 }
@@ -1942,13 +1974,16 @@ fn json_value_to_document(value: &serde_json::Value) -> Document {
 #[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(
+    bcode_plugin_sdk::static_concurrent_plugin_vtable!(
         BedrockProviderPlugin,
         include_str!("../bcode-plugin.toml")
     )
 }
 
-bcode_plugin_sdk::export_plugin!(BedrockProviderPlugin, include_str!("../bcode-plugin.toml"));
+bcode_plugin_sdk::export_concurrent_plugin!(
+    BedrockProviderPlugin,
+    include_str!("../bcode-plugin.toml")
+);
 
 #[cfg(test)]
 fn document_to_json_value(document: &Document) -> serde_json::Value {

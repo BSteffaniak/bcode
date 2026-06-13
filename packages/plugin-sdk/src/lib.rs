@@ -512,6 +512,24 @@ pub fn deactivate_export<P: RustPlugin>(instance: &'static Mutex<P>) -> i32 {
 /// Trait implemented by native Rust plugins that can handle service calls without holding the
 /// SDK-managed plugin instance mutex for the duration of the call.
 pub trait ConcurrentRustPlugin: RustPlugin + Sync {
+    /// Called when the host activates the plugin using shared plugin state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when activation fails.
+    fn activate_concurrent(&self) -> Result<(), PluginError> {
+        Ok(())
+    }
+
+    /// Called when the host deactivates the plugin using shared plugin state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when deactivation fails.
+    fn deactivate_concurrent(&self) -> Result<(), PluginError> {
+        Ok(())
+    }
+
     /// Invoke a plugin-provided service operation with shared plugin state.
     fn invoke_service_concurrent(&self, context: NativeServiceContext) -> ServiceResponse {
         ServiceResponse::error(
@@ -590,6 +608,18 @@ pub fn invoke_service_with_emitter_export<P: RustPlugin>(
         Err(_) => return SERVICE_STATUS_PLUGIN_UNAVAILABLE,
     };
     write_service_response(&response, output_ptr, output_capacity, output_len, events)
+}
+
+#[doc(hidden)]
+#[must_use]
+pub fn activate_concurrent_export<P: ConcurrentRustPlugin>(instance: &'static Arc<P>) -> i32 {
+    result_to_exit_code(instance.activate_concurrent())
+}
+
+#[doc(hidden)]
+#[must_use]
+pub fn deactivate_concurrent_export<P: ConcurrentRustPlugin>(instance: &'static Arc<P>) -> i32 {
+    result_to_exit_code(instance.deactivate_concurrent())
 }
 
 /// Decode and invoke a concurrent service with an explicit invocation-scoped event emitter.
@@ -968,12 +998,14 @@ macro_rules! export_concurrent_plugin {
 
         #[unsafe(no_mangle)]
         pub extern "C" fn bcode_plugin_activate_v1() -> i32 {
-            $crate::EXIT_OK
+            let instance = $crate::plugin_instance_arc::<$plugin>(&BCODE_PLUGIN_INSTANCE);
+            $crate::activate_concurrent_export(instance)
         }
 
         #[unsafe(no_mangle)]
         pub extern "C" fn bcode_plugin_deactivate_v1() -> i32 {
-            $crate::EXIT_OK
+            let instance = $crate::plugin_instance_arc::<$plugin>(&BCODE_PLUGIN_INSTANCE);
+            $crate::deactivate_concurrent_export(instance)
         }
 
         #[unsafe(no_mangle)]
@@ -1110,11 +1142,23 @@ macro_rules! static_concurrent_plugin_vtable {
         fn handle_event(_: *const std::ffi::c_void, _: *const u8, _: usize) -> i32 {
             $crate::EVENT_STATUS_OK
         }
+        fn activate(instance: *const std::ffi::c_void) -> i32 {
+            let instance =
+                unsafe { &*(instance.cast::<std::sync::OnceLock<std::sync::Arc<$plugin>>>()) };
+            let instance = $crate::plugin_instance_arc::<$plugin>(instance);
+            $crate::activate_concurrent_export(instance)
+        }
+        fn deactivate(instance: *const std::ffi::c_void) -> i32 {
+            let instance =
+                unsafe { &*(instance.cast::<std::sync::OnceLock<std::sync::Arc<$plugin>>>()) };
+            let instance = $crate::plugin_instance_arc::<$plugin>(instance);
+            $crate::deactivate_concurrent_export(instance)
+        }
         $crate::StaticPluginVtable {
             instance: (&BCODE_STATIC_PLUGIN_INSTANCE as *const _) as *const std::ffi::c_void,
             manifest,
-            activate: |_| $crate::EXIT_OK,
-            deactivate: |_| $crate::EXIT_OK,
+            activate,
+            deactivate,
             invoke_service,
             invoke_service_streaming,
             handle_event,
