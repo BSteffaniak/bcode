@@ -797,13 +797,13 @@ impl PluginServiceRegistry {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PluginConcurrencyConfig {
-    /// Serialize invocations for this plugin or service.
+    /// Allow the runtime to execute invocations concurrently.
     #[default]
+    Concurrent,
+    /// Serialize invocations for this plugin or service.
     Exclusive,
     /// Allow up to `max` concurrent invocations.
     Limited { max: usize },
-    /// Allow the runtime to execute invocations concurrently.
-    Concurrent,
 }
 
 impl From<&PluginConcurrencyConfig> for PluginConcurrency {
@@ -819,13 +819,13 @@ impl From<&PluginConcurrencyConfig> for PluginConcurrency {
 /// Plugin service execution concurrency policy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PluginConcurrency {
-    /// Serialize invocations for this plugin on a dedicated worker.
+    /// Allow unconstrained concurrent plugin execution.
     #[default]
+    Concurrent,
+    /// Serialize invocations for this plugin on a dedicated worker.
     Exclusive,
     /// Reserve support for bounded concurrent plugin execution.
     Limited(usize),
-    /// Reserve support for unconstrained concurrent plugin execution.
-    Concurrent,
 }
 
 /// Plugin invocation scheduling class.
@@ -3100,6 +3100,29 @@ library = "libexample_plugin.dylib"
         ));
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn omitted_manifest_concurrency_defaults_to_concurrent() {
+        let manifest: PluginManifest = toml::from_str(&format!(
+            r#"
+id = "example.plugin"
+name = "Example Plugin"
+version = "0.1.0"
+
+[runtime]
+type = "native"
+abi_version = {CURRENT_PLUGIN_ABI_VERSION}
+library = "libexample_plugin.dylib"
+"#,
+        ))
+        .expect("manifest should parse");
+
+        assert_eq!(manifest.concurrency, PluginConcurrencyConfig::Concurrent);
+        assert_eq!(
+            PluginConcurrency::from(&manifest.concurrency),
+            PluginConcurrency::Concurrent
+        );
     }
 
     #[allow(clippy::too_many_lines)]
