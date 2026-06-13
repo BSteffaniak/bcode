@@ -21,6 +21,11 @@ use std::time::Duration;
 /// Deterministic fake model provider.
 #[derive(Default)]
 pub struct FakeProviderPlugin {
+    state: Mutex<FakeProviderState>,
+}
+
+#[derive(Debug, Default)]
+struct FakeProviderState {
     next_turn: u64,
     turns: BTreeMap<String, FakeTurn>,
 }
@@ -57,8 +62,20 @@ impl FakeTurn {
     }
 }
 
+impl ConcurrentRustPlugin for FakeProviderPlugin {
+    fn invoke_service_concurrent(&self, context: NativeServiceContext) -> ServiceResponse {
+        self.invoke_provider_service(&context)
+    }
+}
+
 impl RustPlugin for FakeProviderPlugin {
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        self.invoke_provider_service(&context)
+    }
+}
+
+impl FakeProviderPlugin {
+    fn invoke_provider_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         if context.request.interface_id != MODEL_PROVIDER_INTERFACE_ID {
             return ServiceResponse::error(
                 "unsupported_interface",
@@ -84,20 +101,22 @@ impl RustPlugin for FakeProviderPlugin {
             ),
         }
     }
-}
 
-impl FakeProviderPlugin {
-    fn start_turn(&mut self, request: &ServiceRequest) -> ServiceResponse {
+    fn start_turn(&self, request: &ServiceRequest) -> ServiceResponse {
         let request = match request.payload_json::<ModelTurnRequest>() {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
-        self.next_turn += 1;
-        let provider_turn_id = format!("fake-turn-{}", self.next_turn);
+        let mut state = self
+            .state
+            .lock()
+            .expect("fake provider state lock should not be poisoned");
+        state.next_turn += 1;
+        let provider_turn_id = format!("fake-turn-{}", state.next_turn);
         let user_text = last_user_text(&request.messages);
         let tool_result = last_tool_result(&request.messages);
         let tool_call = if tool_result.is_none() {
-            fake_tool_call(&user_text, self.next_turn)
+            fake_tool_call(&user_text, state.next_turn)
         } else {
             None
         };
@@ -107,7 +126,8 @@ impl FakeProviderPlugin {
         );
         let turn = FakeTurn::default();
         turn.push(ProviderTurnEvent::TurnStarted);
-        self.turns.insert(provider_turn_id.clone(), turn.clone());
+        state.turns.insert(provider_turn_id.clone(), turn.clone());
+        drop(state);
         if let Some(tool_call) = tool_call {
             finish_fake_tool_turn(&turn, tool_call);
         } else if let Some(delay) = fake_delay() {
@@ -124,6 +144,9 @@ impl FakeProviderPlugin {
             Err(error) => return invalid_request(&error),
         };
         let events = self
+            .state
+            .lock()
+            .expect("fake provider state lock should not be poisoned")
             .turns
             .get(&request.provider_turn_id)
             .map_or_else(Vec::new, FakeTurn::drain);
@@ -135,18 +158,31 @@ impl FakeProviderPlugin {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
-        if let Some(turn) = self.turns.get(&request.provider_turn_id) {
+        let turn = self
+            .state
+            .lock()
+            .expect("fake provider state lock should not be poisoned")
+            .turns
+            .get(&request.provider_turn_id)
+            .cloned();
+        if let Some(turn) = turn {
             turn.cancel();
         }
         json_response(&AckResponse::default())
     }
 
-    fn finish_turn(&mut self, request: &ServiceRequest) -> ServiceResponse {
+    fn finish_turn(&self, request: &ServiceRequest) -> ServiceResponse {
         let request = match request.payload_json::<FinishTurnRequest>() {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
-        if let Some(turn) = self.turns.remove(&request.provider_turn_id) {
+        let turn = self
+            .state
+            .lock()
+            .expect("fake provider state lock should not be poisoned")
+            .turns
+            .remove(&request.provider_turn_id);
+        if let Some(turn) = turn {
             turn.cancel();
         }
         json_response(&AckResponse::default())
@@ -304,10 +340,13 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
 #[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(
+    bcode_plugin_sdk::static_concurrent_plugin_vtable!(
         FakeProviderPlugin,
         include_str!("../bcode-plugin.toml")
     )
 }
 
-bcode_plugin_sdk::export_plugin!(FakeProviderPlugin, include_str!("../bcode-plugin.toml"));
+bcode_plugin_sdk::export_concurrent_plugin!(
+    FakeProviderPlugin,
+    include_str!("../bcode-plugin.toml")
+);
