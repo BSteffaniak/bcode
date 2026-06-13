@@ -87,7 +87,29 @@ fn provider_tool_call_progress_status_formats_bytes() {
 
     assert_eq!(
         app.status(),
-        "provider stream tool assembled: filesystem.write (1.5 KiB)"
+        "assembling filesystem.write arguments (1.5 KiB received)"
+    );
+}
+
+#[test]
+fn live_provider_tool_call_progress_updates_status() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
+        session_id,
+        kind: bcode_session_models::SessionLiveEventKind::ProviderStreamProgress {
+            turn_id: "turn-1".to_owned(),
+            event: bcode_session_models::ProviderStreamEvent::ToolCallProgress {
+                tool_call_id: "call-1".to_owned(),
+                tool_name: "filesystem.write".to_owned(),
+                argument_bytes: 4096,
+            },
+        },
+    });
+
+    assert_eq!(
+        app.status(),
+        "assembling filesystem.write arguments (4.0 KiB received)"
     );
 }
 

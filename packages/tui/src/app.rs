@@ -1317,6 +1317,9 @@ impl BmuxApp {
                 self.viewport.preserve_for_append();
                 self.apply_tool_stream_event(event, SessionEventApplication::Live);
             }
+            SessionLiveEventKind::ProviderStreamProgress { event, .. } => {
+                self.apply_provider_stream_event(event);
+            }
         }
     }
 
@@ -2279,7 +2282,7 @@ impl BmuxApp {
                 ..
             } => {
                 let detail = format!(
-                    "provider stream tool assembled: {tool_name} ({})",
+                    "assembling {tool_name} arguments ({} received)",
                     format_provider_bytes(*argument_bytes)
                 );
                 self.set_activity(ActivityState::ProviderStream {

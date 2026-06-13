@@ -271,6 +271,13 @@ pub enum SessionLiveEventKind {
     AssistantReasoningDelta { turn_id: String, text: String },
     /// Raw live tool output emitted while a tool is running.
     ToolOutputDelta { event: ToolInvocationStreamEvent },
+    /// Live-only provider stream progress for active model turns.
+    ProviderStreamProgress {
+        /// Model turn associated with this progress update.
+        turn_id: String,
+        /// Coalesced provider stream progress event.
+        event: ProviderStreamEvent,
+    },
 }
 
 /// Product-facing derived view over durable session history.

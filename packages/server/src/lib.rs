@@ -4036,7 +4036,10 @@ struct ToolArgumentStreamProgress {
     call_id: String,
     name: String,
     argument_bytes: usize,
+    last_emitted_argument_bytes: usize,
+    next_byte_threshold: usize,
     emitted_progress_events: usize,
+    force_emit_final: bool,
 }
 
 #[derive(Debug, Default)]
@@ -4242,12 +4245,18 @@ impl ModelStreamAccumulator {
 }
 
 impl ModelStreamProgress {
+    const INITIAL_TOOL_PROGRESS_THRESHOLD: usize = 4 * 1024;
+    const MAX_TOOL_PROGRESS_EVENTS: usize = 64;
+
     fn start_tool_call(&mut self, call_id: String, name: String) {
         self.active_tool_call = Some(ToolArgumentStreamProgress {
             call_id,
             name,
             argument_bytes: 0,
+            last_emitted_argument_bytes: 0,
+            next_byte_threshold: Self::INITIAL_TOOL_PROGRESS_THRESHOLD,
             emitted_progress_events: 0,
+            force_emit_final: false,
         });
     }
 
@@ -4261,6 +4270,7 @@ impl ModelStreamProgress {
         }
         if let Some(active) = self.active_tool_call.as_mut() {
             active.argument_bytes = serialized_tool_argument_len(&call.arguments);
+            active.force_emit_final = true;
         }
     }
 
@@ -4282,15 +4292,29 @@ impl ModelStreamProgress {
         }
     }
 
-    fn take_tool_progress_event(
-        &mut self,
-        max_progress_events: usize,
-    ) -> Option<ProviderToolCallProgress> {
+    fn take_tool_progress_event(&mut self) -> Option<ProviderToolCallProgress> {
         let active = self.active_tool_call.as_mut()?;
-        if active.emitted_progress_events >= max_progress_events {
+        if !active.force_emit_final {
+            if active.emitted_progress_events >= Self::MAX_TOOL_PROGRESS_EVENTS {
+                return None;
+            }
+            if active.argument_bytes < active.next_byte_threshold {
+                return None;
+            }
+        } else if active.argument_bytes == active.last_emitted_argument_bytes {
             return None;
         }
+        active.force_emit_final = false;
         active.emitted_progress_events = active.emitted_progress_events.saturating_add(1);
+        active.last_emitted_argument_bytes = active.argument_bytes;
+        while active.next_byte_threshold <= active.argument_bytes {
+            let next = active.next_byte_threshold.saturating_mul(2);
+            if next == active.next_byte_threshold {
+                active.next_byte_threshold = usize::MAX;
+                break;
+            }
+            active.next_byte_threshold = next;
+        }
         Some(ProviderToolCallProgress {
             tool_call_id: active.call_id.clone(),
             tool_name: active.name.clone(),
@@ -5677,7 +5701,7 @@ async fn wait_for_model_progress_or_timeout(
     let warning_after = Duration::from_secs(state.model_streaming.no_progress_warning_secs);
     let timeout_after = Duration::from_secs(state.model_streaming.no_progress_timeout_secs);
     if !*warned && idle_for >= warning_after {
-        append_provider_stream_event_trace(
+        publish_provider_stream_progress_live(
             state,
             session_id,
             "model-stream",
@@ -5808,7 +5832,7 @@ async fn handle_provider_turn_event(
             handle_provider_metadata_event(state, session_id, turn_id, key, value).await;
         }
         ProviderTurnEvent::TurnStarted => {
-            append_provider_stream_event_trace(
+            publish_provider_stream_progress_live(
                 state,
                 session_id,
                 turn_id,
@@ -5818,7 +5842,7 @@ async fn handle_provider_turn_event(
         }
         ProviderTurnEvent::ToolCallStarted { call_id, name } => {
             stream_progress.start_tool_call(call_id.clone(), name.clone());
-            append_provider_stream_event_trace(
+            publish_provider_stream_progress_live(
                 state,
                 session_id,
                 turn_id,
@@ -5836,10 +5860,8 @@ async fn handle_provider_turn_event(
         }
         ProviderTurnEvent::ToolCallDelta { call_id, delta } => {
             stream_progress.record_tool_call_delta(&call_id, delta.len());
-            if let Some(progress) = stream_progress
-                .take_tool_progress_event(state.model_streaming.max_tool_progress_events)
-            {
-                append_provider_stream_event_trace(
+            if let Some(progress) = stream_progress.take_tool_progress_event() {
+                publish_provider_stream_progress_live(
                     state,
                     session_id,
                     turn_id,
@@ -5935,7 +5957,7 @@ async fn handle_provider_tool_call_finished_event(
     call: bcode_model::ToolCall,
     stream: &mut ModelStreamAccumulator,
 ) {
-    append_provider_stream_event_trace(
+    publish_provider_stream_progress_live(
         state,
         session_id,
         turn_id,
@@ -5946,7 +5968,7 @@ async fn handle_provider_tool_call_finished_event(
         },
     )
     .await;
-    append_provider_stream_event_trace(
+    publish_provider_stream_progress_live(
         state,
         session_id,
         turn_id,
@@ -6000,20 +6022,22 @@ async fn handle_provider_metadata_event(
     update_provider_metadata_state(state, session_id, &key, value).await;
 }
 
-async fn append_provider_stream_event_trace(
+async fn publish_provider_stream_progress_live(
     state: &ServerState,
     session_id: SessionId,
     turn_id: &str,
     event: ProviderStreamEvent,
 ) {
-    append_trace_event(
-        state,
-        session_id,
-        Some(turn_id.to_string()),
-        SessionTracePhase::ModelProviderEvent,
-        SessionTracePayload::ProviderStreamEvent(event),
-    )
-    .await;
+    let _ = state
+        .sessions
+        .publish_live_event(
+            session_id,
+            SessionLiveEventKind::ProviderStreamProgress {
+                turn_id: turn_id.to_string(),
+                event,
+            },
+        )
+        .await;
 }
 
 async fn append_provider_event_trace(
