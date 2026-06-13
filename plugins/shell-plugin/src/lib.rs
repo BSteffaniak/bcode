@@ -32,23 +32,33 @@ const MAX_INLINE_TERMINAL_OUTPUT_BYTES: usize = 16 * 1024;
 #[derive(Default)]
 pub struct ShellPlugin;
 
+impl ConcurrentRustPlugin for ShellPlugin {
+    fn invoke_service_concurrent(&self, context: NativeServiceContext) -> ServiceResponse {
+        invoke_shell_service(&context)
+    }
+}
+
 impl RustPlugin for ShellPlugin {
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
-        if context.request.interface_id != TOOL_SERVICE_INTERFACE_ID {
-            return ServiceResponse::error(
-                "unsupported_interface",
-                "unsupported shell plugin service interface",
-            );
-        }
+        invoke_shell_service(&context)
+    }
+}
 
-        match context.request.operation.as_str() {
-            OP_LIST_TOOLS => list_tools(&context.request),
-            OP_INVOKE_TOOL => invoke_tool(&context),
-            _ => ServiceResponse::error(
-                "unsupported_operation",
-                "unsupported tool service operation",
-            ),
-        }
+fn invoke_shell_service(context: &NativeServiceContext) -> ServiceResponse {
+    if context.request.interface_id != TOOL_SERVICE_INTERFACE_ID {
+        return ServiceResponse::error(
+            "unsupported_interface",
+            "unsupported shell plugin service interface",
+        );
+    }
+
+    match context.request.operation.as_str() {
+        OP_LIST_TOOLS => list_tools(&context.request),
+        OP_INVOKE_TOOL => invoke_tool(context),
+        _ => ServiceResponse::error(
+            "unsupported_operation",
+            "unsupported tool service operation",
+        ),
     }
 }
 
@@ -926,10 +936,13 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
 #[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(ShellPlugin, include_str!("../bcode-plugin.toml"))
+    bcode_plugin_sdk::static_concurrent_plugin_vtable!(
+        ShellPlugin,
+        include_str!("../bcode-plugin.toml")
+    )
 }
 
-bcode_plugin_sdk::export_plugin!(ShellPlugin, include_str!("../bcode-plugin.toml"));
+bcode_plugin_sdk::export_concurrent_plugin!(ShellPlugin, include_str!("../bcode-plugin.toml"));
 
 #[cfg(test)]
 mod tests {

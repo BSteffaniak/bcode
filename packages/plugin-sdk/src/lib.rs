@@ -10,10 +10,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
 use std::ffi::{CString, c_char, c_void};
 use std::sync::{
-    Arc,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
-use std::sync::{Mutex, OnceLock};
 
 /// ABI-safe callback used by plugins to emit incremental service events.
 pub type ServiceEventCallback = extern "C" fn(*const u8, usize, *mut c_void);
@@ -510,6 +509,61 @@ pub fn deactivate_export<P: RustPlugin>(instance: &'static Mutex<P>) -> i32 {
     })
 }
 
+/// Trait implemented by native Rust plugins that can handle service calls without holding the
+/// SDK-managed plugin instance mutex for the duration of the call.
+pub trait ConcurrentRustPlugin: RustPlugin + Sync {
+    /// Invoke a plugin-provided service operation with shared plugin state.
+    fn invoke_service_concurrent(&self, context: NativeServiceContext) -> ServiceResponse {
+        ServiceResponse::error(
+            "unsupported_service",
+            format!(
+                "plugin '{}' does not support service '{}:{}'",
+                context.plugin_id, context.request.interface_id, context.request.operation
+            ),
+        )
+    }
+}
+
+#[doc(hidden)]
+pub fn plugin_instance_arc<P: ConcurrentRustPlugin>(
+    instance: &'static OnceLock<Arc<P>>,
+) -> &'static Arc<P> {
+    instance.get_or_init(|| Arc::new(P::default()))
+}
+
+/// Encode and write a service response to ABI output buffers.
+#[doc(hidden)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn write_service_response(
+    response: &ServiceResponse,
+    output_ptr: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+    events: ServiceEventEmitter,
+) -> i32 {
+    let Ok(encoded) = serde_json::to_vec(response) else {
+        return SERVICE_STATUS_ENCODE_FAILED;
+    };
+
+    unsafe {
+        *output_len = encoded.len();
+    }
+    if output_ptr.is_null() || output_capacity < encoded.len() {
+        if events.is_available() {
+            emit_service_response_chunks(events, &encoded);
+            unsafe {
+                *output_len = 0;
+            }
+            return SERVICE_STATUS_OK;
+        }
+        return SERVICE_STATUS_BUFFER_TOO_SMALL;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+    }
+    SERVICE_STATUS_OK
+}
+
 /// Decode and invoke a service with an explicit invocation-scoped event emitter.
 #[doc(hidden)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -535,27 +589,77 @@ pub fn invoke_service_with_emitter_export<P: RustPlugin>(
         Ok(mut plugin) => plugin.invoke_service(context),
         Err(_) => return SERVICE_STATUS_PLUGIN_UNAVAILABLE,
     };
-    let Ok(encoded) = serde_json::to_vec(&response) else {
-        return SERVICE_STATUS_ENCODE_FAILED;
-    };
+    write_service_response(&response, output_ptr, output_capacity, output_len, events)
+}
 
-    unsafe {
-        *output_len = encoded.len();
+/// Decode and invoke a concurrent service with an explicit invocation-scoped event emitter.
+#[doc(hidden)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn invoke_concurrent_service_with_emitter_export<P: ConcurrentRustPlugin>(
+    instance: &'static Arc<P>,
+    input_ptr: *const u8,
+    input_len: usize,
+    output_ptr: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+    events: ServiceEventEmitter,
+) -> i32 {
+    if input_ptr.is_null() || output_len.is_null() {
+        return SERVICE_STATUS_INVALID_ARGUMENT;
     }
-    if output_ptr.is_null() || output_capacity < encoded.len() {
-        if events.is_available() {
-            emit_service_response_chunks(events, &encoded);
-            unsafe {
-                *output_len = 0;
-            }
-            return SERVICE_STATUS_OK;
-        }
-        return SERVICE_STATUS_BUFFER_TOO_SMALL;
-    }
-    unsafe {
-        std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
-    }
-    SERVICE_STATUS_OK
+
+    let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
+    let Ok(mut context) = serde_json::from_slice::<NativeServiceContext>(input) else {
+        return SERVICE_STATUS_DECODE_FAILED;
+    };
+    context.events = events;
+    let response = instance.invoke_service_concurrent(context);
+    write_service_response(&response, output_ptr, output_capacity, output_len, events)
+}
+
+#[doc(hidden)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn invoke_concurrent_service_export<P: ConcurrentRustPlugin>(
+    instance: &'static Arc<P>,
+    input_ptr: *const u8,
+    input_len: usize,
+    output_ptr: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+) -> i32 {
+    invoke_concurrent_service_with_emitter_export(
+        instance,
+        input_ptr,
+        input_len,
+        output_ptr,
+        output_capacity,
+        output_len,
+        ServiceEventEmitter::default(),
+    )
+}
+
+#[doc(hidden)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[allow(clippy::too_many_arguments)]
+pub fn invoke_concurrent_service_streaming_export<P: ConcurrentRustPlugin>(
+    instance: &'static Arc<P>,
+    input_ptr: *const u8,
+    input_len: usize,
+    output_ptr: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+    event_callback: Option<ServiceEventCallback>,
+    event_user_data: *mut c_void,
+) -> i32 {
+    invoke_concurrent_service_with_emitter_export(
+        instance,
+        input_ptr,
+        input_len,
+        output_ptr,
+        output_capacity,
+        output_len,
+        ServiceEventEmitter::new(event_callback, event_user_data),
+    )
 }
 
 const SERVICE_RESPONSE_CHUNK_DATA_SIZE: usize = 256 * 1024;
@@ -849,6 +953,81 @@ macro_rules! export_plugin {
     };
 }
 
+#[macro_export]
+macro_rules! export_concurrent_plugin {
+    ($plugin:ty, $manifest_toml:expr) => {
+        static BCODE_PLUGIN_INSTANCE: std::sync::OnceLock<std::sync::Arc<$plugin>> =
+            std::sync::OnceLock::new();
+        static BCODE_PLUGIN_MANIFEST: std::sync::OnceLock<Option<std::ffi::CString>> =
+            std::sync::OnceLock::new();
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn bcode_plugin_manifest_v1() -> *const std::ffi::c_char {
+            $crate::manifest_toml_ptr($manifest_toml, &BCODE_PLUGIN_MANIFEST)
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn bcode_plugin_activate_v1() -> i32 {
+            $crate::EXIT_OK
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn bcode_plugin_deactivate_v1() -> i32 {
+            $crate::EXIT_OK
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn bcode_plugin_invoke_service_v1(
+            input_ptr: *const u8,
+            input_len: usize,
+            output_ptr: *mut u8,
+            output_capacity: usize,
+            output_len: *mut usize,
+        ) -> i32 {
+            let instance = $crate::plugin_instance_arc::<$plugin>(&BCODE_PLUGIN_INSTANCE);
+            $crate::invoke_concurrent_service_export(
+                instance,
+                input_ptr,
+                input_len,
+                output_ptr,
+                output_capacity,
+                output_len,
+            )
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn bcode_plugin_invoke_service_streaming_v1(
+            input_ptr: *const u8,
+            input_len: usize,
+            output_ptr: *mut u8,
+            output_capacity: usize,
+            output_len: *mut usize,
+            event_callback: Option<$crate::ServiceEventCallback>,
+            event_user_data: *mut std::ffi::c_void,
+        ) -> i32 {
+            let instance = $crate::plugin_instance_arc::<$plugin>(&BCODE_PLUGIN_INSTANCE);
+            $crate::invoke_concurrent_service_streaming_export(
+                instance,
+                input_ptr,
+                input_len,
+                output_ptr,
+                output_capacity,
+                output_len,
+                event_callback,
+                event_user_data,
+            )
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn bcode_plugin_handle_event_v1(
+            _input_ptr: *const u8,
+            _input_len: usize,
+        ) -> i32 {
+            $crate::EVENT_STATUS_OK
+        }
+    };
+}
+
 /// Build a static plugin vtable for a [`RustPlugin`] implementation.
 #[macro_export]
 macro_rules! static_plugin_vtable {
@@ -873,17 +1052,89 @@ macro_rules! static_plugin_vtable {
     }};
 }
 
+#[macro_export]
+macro_rules! static_concurrent_plugin_vtable {
+    ($plugin:ty, $manifest_toml:expr) => {{
+        static BCODE_STATIC_PLUGIN_INSTANCE: std::sync::OnceLock<std::sync::Arc<$plugin>> =
+            std::sync::OnceLock::new();
+        fn manifest(
+            cached: &'static std::sync::OnceLock<Option<std::ffi::CString>>,
+        ) -> *const std::ffi::c_char {
+            $crate::static_manifest_export($manifest_toml, cached)
+        }
+        fn invoke_service(
+            instance: *const std::ffi::c_void,
+            input_ptr: *const u8,
+            input_len: usize,
+            output_ptr: *mut u8,
+            output_capacity: usize,
+            output_len: *mut usize,
+        ) -> i32 {
+            let instance =
+                unsafe { &*(instance.cast::<std::sync::OnceLock<std::sync::Arc<$plugin>>>()) };
+            let instance = $crate::plugin_instance_arc::<$plugin>(instance);
+            $crate::invoke_concurrent_service_export(
+                instance,
+                input_ptr,
+                input_len,
+                output_ptr,
+                output_capacity,
+                output_len,
+            )
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn invoke_service_streaming(
+            instance: *const std::ffi::c_void,
+            input_ptr: *const u8,
+            input_len: usize,
+            output_ptr: *mut u8,
+            output_capacity: usize,
+            output_len: *mut usize,
+            event_callback: Option<$crate::ServiceEventCallback>,
+            event_user_data: *mut std::ffi::c_void,
+        ) -> i32 {
+            let instance =
+                unsafe { &*(instance.cast::<std::sync::OnceLock<std::sync::Arc<$plugin>>>()) };
+            let instance = $crate::plugin_instance_arc::<$plugin>(instance);
+            $crate::invoke_concurrent_service_streaming_export(
+                instance,
+                input_ptr,
+                input_len,
+                output_ptr,
+                output_capacity,
+                output_len,
+                event_callback,
+                event_user_data,
+            )
+        }
+        fn handle_event(_: *const std::ffi::c_void, _: *const u8, _: usize) -> i32 {
+            $crate::EVENT_STATUS_OK
+        }
+        $crate::StaticPluginVtable {
+            instance: (&BCODE_STATIC_PLUGIN_INSTANCE as *const _) as *const std::ffi::c_void,
+            manifest,
+            activate: |_| $crate::EXIT_OK,
+            deactivate: |_| $crate::EXIT_OK,
+            invoke_service,
+            invoke_service_streaming,
+            handle_event,
+            tui_registry: None,
+        }
+    }};
+}
+
 /// Common imports for plugin authors.
 pub mod prelude {
     pub use crate::{
-        CURRENT_PLUGIN_ABI_VERSION, DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL,
+        CURRENT_PLUGIN_ABI_VERSION, ConcurrentRustPlugin, DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL,
         EVENT_STATUS_DECODE_FAILED, EVENT_STATUS_INVALID_ARGUMENT, EVENT_STATUS_OK,
         EVENT_STATUS_PLUGIN_UNAVAILABLE, EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, NativeEventContext,
         NativeServiceContext, PluginError, PluginEvent, RustPlugin,
         SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_DECODE_FAILED,
         SERVICE_STATUS_ENCODE_FAILED, SERVICE_STATUS_INVALID_ARGUMENT, SERVICE_STATUS_OK,
         SERVICE_STATUS_PLUGIN_UNAVAILABLE, ServiceError, ServiceEventCallback, ServiceEventEmitter,
-        ServiceRequest, ServiceResponse, StaticPluginVtable, StreamingServiceFn, export_plugin,
+        ServiceRequest, ServiceResponse, StaticPluginVtable, StreamingServiceFn,
+        export_concurrent_plugin, export_plugin, static_concurrent_plugin_vtable,
         static_plugin_vtable,
         tui::{
             PluginTuiAction, PluginTuiHost, PluginTuiRegistry, PluginTuiSurface,
