@@ -968,6 +968,7 @@ pub struct PluginExecutorStatus {
 struct PluginResourceLimiter {
     global: Arc<Semaphore>,
     per_session: Mutex<BTreeMap<String, Arc<Semaphore>>>,
+    max_global: usize,
     max_per_session: usize,
 }
 
@@ -975,13 +976,18 @@ struct PluginResourceLimiter {
 struct PluginResourcePermit {
     _global: OwnedSemaphorePermit,
     _session: Option<OwnedSemaphorePermit>,
+    wait_ms: u128,
+    active_global: usize,
+    active_session: Option<usize>,
 }
 
 impl PluginResourceLimiter {
     fn new(max_global: usize, max_per_session: usize) -> Self {
+        let max_global = max_global.max(1);
         Self {
-            global: Arc::new(Semaphore::new(max_global.max(1))),
+            global: Arc::new(Semaphore::new(max_global)),
             per_session: Mutex::default(),
+            max_global,
             max_per_session: max_per_session.max(1),
         }
     }
@@ -990,6 +996,7 @@ impl PluginResourceLimiter {
         &self,
         scope: &PluginInvocationScope,
     ) -> Result<PluginResourcePermit, PluginLoadError> {
+        let started_at = Instant::now();
         let session = match scope {
             PluginInvocationScope::Global => None,
             PluginInvocationScope::Session { session_id, .. } => {
@@ -1006,7 +1013,27 @@ impl PluginResourceLimiter {
         Ok(PluginResourcePermit {
             _global: global,
             _session: session,
+            wait_ms: started_at.elapsed().as_millis(),
+            active_global: self
+                .max_global
+                .saturating_sub(self.global.available_permits()),
+            active_session: self.active_session_count(scope),
         })
+    }
+
+    fn active_session_count(&self, scope: &PluginInvocationScope) -> Option<usize> {
+        match scope {
+            PluginInvocationScope::Global => None,
+            PluginInvocationScope::Session { session_id, .. } => self
+                .per_session
+                .lock()
+                .expect("plugin resource limiter session map locks")
+                .get(session_id)
+                .map(|semaphore| {
+                    self.max_per_session
+                        .saturating_sub(semaphore.available_permits())
+                }),
+        }
     }
 
     fn session_semaphore(&self, session_id: &str) -> Arc<Semaphore> {
@@ -1624,7 +1651,18 @@ impl PluginRuntimeHost {
             .service_policy(plugin_id, &interface_id)
             .and_then(|policy| policy.class)
             .unwrap_or_else(|| classify_invocation(&interface_id, &operation));
-        let _resource_permit = self.resources.acquire(&scope).await?;
+        let resource_permit = self.resources.acquire(&scope).await?;
+        tracing::debug!(
+            target: "bcode_plugin::resources",
+            plugin_id = %plugin_id,
+            interface_id = %interface_id,
+            operation = %operation,
+            scope = ?scope,
+            wait_ms = resource_permit.wait_ms,
+            active_global = resource_permit.active_global,
+            active_session = ?resource_permit.active_session,
+            "plugin resource slot acquired"
+        );
         executor
             .invoke_service_scoped(interface_id, operation, payload, class, scope, None)
             .await
@@ -1685,6 +1723,17 @@ impl PluginRuntimeHost {
             cancelled: Arc::new(AtomicBool::new(false)),
         };
         let resource_permit = self.resources.acquire(&scope).await?;
+        tracing::debug!(
+            target: "bcode_plugin::resources",
+            plugin_id = %plugin_id,
+            interface_id = %interface_id,
+            operation = %operation,
+            scope = ?scope,
+            wait_ms = resource_permit.wait_ms,
+            active_global = resource_permit.active_global,
+            active_session = ?resource_permit.active_session,
+            "plugin resource slot acquired"
+        );
         let mut invocation = executor
             .start_service_with_events_scoped(
                 interface_id,
