@@ -42,14 +42,18 @@ use super::pending_submission::PendingSubmission;
 use super::pending_submissions::PendingSubmissions;
 use super::runtime_work_view::RuntimeWorkViewState;
 use super::temporal::next_elapsed_invalidation_capped;
+use super::tool_invocation_view::{
+    TerminalInvocationItemContext, ToolInvocationPresentationInput, ToolInvocationRequestContext,
+    apply_tool_invocation_presentation,
+};
 use super::tool_present::{
     ShellResultPresentation, ToolResultPresentation, tool_result_presentation,
 };
 use super::transcript::{
-    FileEditPhase, TranscriptItem, TranscriptItemKind, file_change_presentation_item,
-    live_tool_preview_anchor_item, model_usage_item, permission_request_item,
-    permission_result_item, streaming_terminal_output_item, streaming_tool_output_item,
-    tool_request_item, tool_result_item, transcript_items_from_events_with_reasoning,
+    FileEditPhase, TranscriptItem, TranscriptItemKind, live_tool_preview_anchor_item,
+    model_usage_item, permission_request_item, permission_result_item,
+    streaming_terminal_output_item, streaming_tool_output_item, tool_request_item,
+    tool_result_item, transcript_items_from_events_with_reasoning,
 };
 use super::transcript_document::TranscriptDocument;
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
@@ -269,17 +273,13 @@ impl SessionEventApplication {
     }
 }
 
-#[derive(Clone, Copy)]
-struct TerminalInvocationPresentation<'a> {
-    tool_call_id: &'a str,
-    started_at_ms: Option<u64>,
-    finished_at_ms: Option<u64>,
-    is_error: bool,
-    exit_code: Option<i32>,
-    timed_out: bool,
-    output: &'a str,
-    columns: u16,
-    rows: u16,
+fn terminal_dimensions(presentation: &ToolInvocationPresentation) -> Option<(u16, u16)> {
+    match presentation {
+        ToolInvocationPresentation::Terminal { columns, rows, .. } => {
+            Some(((*columns).max(1), (*rows).max(1)))
+        }
+        ToolInvocationPresentation::FileChange { .. } => None,
+    }
 }
 
 impl BmuxApp {
@@ -2011,93 +2011,44 @@ impl BmuxApp {
         is_error: bool,
         presentation: &ToolInvocationPresentation,
     ) {
-        self.presented_tool_results.insert(tool_call_id.to_owned());
-        match presentation {
-            ToolInvocationPresentation::Terminal {
-                exit_code,
-                timed_out,
-                output,
-                columns,
-                rows,
-                ..
-            } => self.apply_terminal_invocation_presentation(TerminalInvocationPresentation {
+        let request_context =
+            self.tool_call_contexts
+                .get(tool_call_id)
+                .map(|context| ToolInvocationRequestContext {
+                    tool_name: context.tool_name.as_str(),
+                });
+        let terminal_context = self.streamed_tool_results.get(tool_call_id).map(|context| {
+            TerminalInvocationItemContext {
+                index: context.index,
+            }
+        });
+        let effects = apply_tool_invocation_presentation(
+            &mut self.transcript,
+            ToolInvocationPresentationInput {
                 tool_call_id,
                 started_at_ms,
                 finished_at_ms,
                 is_error,
-                exit_code: *exit_code,
-                timed_out: *timed_out,
-                output,
-                columns: (*columns).max(1),
-                rows: (*rows).max(1),
-            }),
-            ToolInvocationPresentation::FileChange {
-                tool_name,
-                summary,
-                path,
-            } => {
-                if !self.tool_call_contexts.contains_key(tool_call_id) {
-                    self.transcript.push(file_change_presentation_item(
-                        tool_call_id,
-                        tool_name,
-                        summary,
-                        path.as_deref(),
-                        is_error,
-                    ));
-                }
-            }
-        }
-    }
-
-    fn apply_terminal_invocation_presentation(
-        &mut self,
-        event: TerminalInvocationPresentation<'_>,
-    ) {
-        if let Some(context) = self.streamed_tool_results.get(event.tool_call_id)
-            && let Some(index) = context.index
-            && let Some(item) = self.transcript.get_mut(index)
-        {
-            item.apply_terminal_presentation(
-                event.output.to_owned(),
-                event.exit_code,
-                event.timed_out,
-                event.is_error,
-                event.finished_at_ms,
-            );
-            if let Some(context) = self.streamed_tool_results.get_mut(event.tool_call_id) {
-                context.saw_output = true;
-            }
-            return;
-        }
-        let tool_context = self.tool_call_contexts.get(event.tool_call_id);
-        self.transcript.push(streaming_terminal_output_item(
-            event.tool_call_id,
-            tool_context.map(|context| context.tool_name.as_str()),
-            event.output,
-            event.columns,
-            event.rows,
-            event.started_at_ms,
-        ));
-        let index = self.transcript.len().saturating_sub(1);
-        if let Some(item) = self.transcript.get_mut(index) {
-            item.apply_terminal_presentation(
-                event.output.to_owned(),
-                event.exit_code,
-                event.timed_out,
-                event.is_error,
-                event.finished_at_ms,
-            );
-        }
-        self.streamed_tool_results.insert(
-            event.tool_call_id.to_owned(),
-            StreamedToolResultContext {
-                index: Some(index),
-                columns: event.columns,
-                rows: event.rows,
-                started_at_ms: event.started_at_ms,
-                saw_output: true,
+                presentation,
+                request_context,
+                terminal_context,
             },
         );
+        if effects.suppress_final_result {
+            self.presented_tool_results.insert(tool_call_id.to_owned());
+        }
+        if effects.terminal_saw_output {
+            self.streamed_tool_results.insert(
+                tool_call_id.to_owned(),
+                StreamedToolResultContext {
+                    index: effects.terminal_index,
+                    columns: terminal_dimensions(presentation).map_or(120, |(columns, _)| columns),
+                    rows: terminal_dimensions(presentation).map_or(24, |(_, rows)| rows),
+                    started_at_ms,
+                    saw_output: true,
+                },
+            );
+        }
     }
 
     fn apply_tool_stream_event(

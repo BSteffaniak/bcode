@@ -8,6 +8,10 @@ use bcode_session_models::{
 };
 
 use super::diff_extract::{FileEditTranscript, file_edit_from_tool_request};
+use super::tool_invocation_view::{
+    TerminalInvocationItemContext, ToolInvocationPresentationInput, ToolInvocationRequestContext,
+    apply_tool_invocation_presentation,
+};
 
 /// Lifecycle phase for a file edit/write preview.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -766,7 +770,7 @@ fn push_transcript_item_from_event(
             is_error,
             presentation,
         } => {
-            apply_tool_invocation_presentation(
+            apply_tool_invocation_presentation_event(
                 items,
                 tool_calls,
                 streamed_tool_results,
@@ -970,155 +974,62 @@ struct ToolPresentationEventRef<'a> {
     presentation: &'a ToolInvocationPresentation,
 }
 
-fn apply_tool_invocation_presentation(
+fn apply_tool_invocation_presentation_event(
     items: &mut Vec<TranscriptItem>,
     tool_calls: &BTreeMap<String, ToolCallContext>,
     streamed_tool_results: &mut BTreeMap<String, StreamedToolReplayContext>,
     presented_tool_results: &mut BTreeSet<String>,
     event: ToolPresentationEventRef<'_>,
 ) {
-    match event.presentation {
-        ToolInvocationPresentation::Terminal {
-            exit_code,
-            timed_out,
-            output,
-            columns,
-            rows,
-            ..
-        } => apply_terminal_invocation_presentation(
-            items,
-            tool_calls,
-            streamed_tool_results,
-            presented_tool_results,
-            TerminalPresentationEventRef {
-                tool_call_id: event.tool_call_id,
-                started_at_ms: event.started_at_ms,
-                finished_at_ms: event.finished_at_ms,
-                is_error: event.is_error,
-                exit_code: *exit_code,
-                timed_out: *timed_out,
-                output,
-                columns: (*columns).max(1),
-                rows: (*rows).max(1),
-            },
-        ),
-        ToolInvocationPresentation::FileChange {
-            tool_name,
-            summary,
-            path,
-        } => apply_file_change_invocation_presentation(
-            items,
-            tool_calls,
-            presented_tool_results,
-            FileChangePresentationEventRef {
-                tool_call_id: event.tool_call_id,
-                tool_name,
-                summary,
-                path: path.as_deref(),
-                is_error: event.is_error,
-            },
-        ),
-    }
-}
-
-#[derive(Clone, Copy)]
-struct FileChangePresentationEventRef<'a> {
-    tool_call_id: &'a str,
-    tool_name: &'a str,
-    summary: &'a str,
-    path: Option<&'a str>,
-    is_error: bool,
-}
-
-fn apply_file_change_invocation_presentation(
-    items: &mut Vec<TranscriptItem>,
-    tool_calls: &BTreeMap<String, ToolCallContext>,
-    presented_tool_results: &mut BTreeSet<String>,
-    event: FileChangePresentationEventRef<'_>,
-) {
-    presented_tool_results.insert(event.tool_call_id.to_owned());
-    if tool_calls.contains_key(event.tool_call_id) {
-        return;
-    }
-    items.push(file_change_presentation_item(
-        event.tool_call_id,
-        event.tool_name,
-        event.summary,
-        event.path,
-        event.is_error,
-    ));
-}
-
-#[derive(Clone, Copy)]
-struct TerminalPresentationEventRef<'a> {
-    tool_call_id: &'a str,
-    started_at_ms: Option<u64>,
-    finished_at_ms: Option<u64>,
-    is_error: bool,
-    exit_code: Option<i32>,
-    timed_out: bool,
-    output: &'a str,
-    columns: u16,
-    rows: u16,
-}
-
-fn apply_terminal_invocation_presentation(
-    items: &mut Vec<TranscriptItem>,
-    tool_calls: &BTreeMap<String, ToolCallContext>,
-    streamed_tool_results: &mut BTreeMap<String, StreamedToolReplayContext>,
-    presented_tool_results: &mut BTreeSet<String>,
-    event: TerminalPresentationEventRef<'_>,
-) {
-    presented_tool_results.insert(event.tool_call_id.to_owned());
-    let context = tool_calls.get(event.tool_call_id);
-    let index = streamed_tool_results
+    let request_context =
+        tool_calls
+            .get(event.tool_call_id)
+            .map(|context| ToolInvocationRequestContext {
+                tool_name: context.tool_name.as_str(),
+            });
+    let terminal_context = streamed_tool_results
         .get(event.tool_call_id)
-        .and_then(|replay| replay.index);
-    if let Some(index) = index
-        && let Some(item) = items.get_mut(index)
-    {
-        item.apply_terminal_presentation(
-            event.output.to_owned(),
-            event.exit_code,
-            event.timed_out,
-            event.is_error,
-            event.finished_at_ms,
-        );
-        if let Some(replay) = streamed_tool_results.get_mut(event.tool_call_id) {
-            replay.finished_at_ms = event.finished_at_ms;
-            replay.saw_output = true;
-        }
-        return;
-    }
-    items.push(streaming_terminal_output_item(
-        event.tool_call_id,
-        context.map(|context| context.tool_name.as_str()),
-        event.output,
-        event.columns,
-        event.rows,
-        event.started_at_ms,
-    ));
-    let index = items.len().saturating_sub(1);
-    if let Some(item) = items.get_mut(index) {
-        item.apply_terminal_presentation(
-            event.output.to_owned(),
-            event.exit_code,
-            event.timed_out,
-            event.is_error,
-            event.finished_at_ms,
-        );
-    }
-    streamed_tool_results.insert(
-        event.tool_call_id.to_owned(),
-        StreamedToolReplayContext {
-            index: Some(index),
-            columns: event.columns,
-            rows: event.rows,
+        .map(|context| TerminalInvocationItemContext {
+            index: context.index,
+        });
+    let effects = apply_tool_invocation_presentation(
+        items,
+        ToolInvocationPresentationInput {
+            tool_call_id: event.tool_call_id,
             started_at_ms: event.started_at_ms,
             finished_at_ms: event.finished_at_ms,
-            saw_output: true,
+            is_error: event.is_error,
+            presentation: event.presentation,
+            request_context,
+            terminal_context,
         },
     );
+    if effects.suppress_final_result {
+        presented_tool_results.insert(event.tool_call_id.to_owned());
+    }
+    if effects.terminal_saw_output {
+        streamed_tool_results.insert(
+            event.tool_call_id.to_owned(),
+            StreamedToolReplayContext {
+                index: effects.terminal_index,
+                columns: terminal_dimensions(event.presentation)
+                    .map_or(120, |(columns, _)| columns),
+                rows: terminal_dimensions(event.presentation).map_or(24, |(_, rows)| rows),
+                started_at_ms: event.started_at_ms,
+                finished_at_ms: event.finished_at_ms,
+                saw_output: true,
+            },
+        );
+    }
+}
+
+fn terminal_dimensions(presentation: &ToolInvocationPresentation) -> Option<(u16, u16)> {
+    match presentation {
+        ToolInvocationPresentation::Terminal { columns, rows, .. } => {
+            Some(((*columns).max(1), (*rows).max(1)))
+        }
+        ToolInvocationPresentation::FileChange { .. } => None,
+    }
 }
 
 fn apply_tool_invocation_stream_event(
