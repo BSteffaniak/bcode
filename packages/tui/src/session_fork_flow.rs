@@ -48,18 +48,22 @@ pub async fn fork_current_session<W: Write>(
     if submission.switch_after_create {
         let new_session_id = result.session.id;
         session_flow::switch_session(io.terminal, services.client, chat, new_session_id)?;
-        if submission.install_draft
-            && let Some(draft) = draft.as_deref()
-        {
-            chat.app.replace_composer_with(draft);
+        if submission.install_draft {
+            if let Some(draft) = draft.as_deref() {
+                chat.app.replace_composer_with(draft);
+            }
+        } else {
+            chat.app.replace_composer_with("");
         }
         chat.app
             .set_status("forked session and switched".to_owned());
     } else {
-        if submission.install_draft
-            && let Some(draft) = draft.as_deref()
-        {
-            chat.app.replace_composer_with(draft);
+        if submission.install_draft {
+            if let Some(draft) = draft.as_deref() {
+                chat.app.replace_composer_with(draft);
+            }
+        } else {
+            chat.app.replace_composer_with("");
         }
         chat.app
             .set_status(format!("forked session {}", result.session.id));
@@ -123,6 +127,9 @@ pub async fn clone_current_session<W: Write>(
         &format!("[clone] {source_title}"),
     );
     let submission = run_dialog(io, chat, &mut dialog).await?;
+    if !submission.install_draft {
+        chat.app.replace_composer_with("");
+    }
     let result = services
         .client
         .clone_session(session_id, submission.name)
