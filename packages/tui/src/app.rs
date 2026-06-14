@@ -16,6 +16,10 @@ struct LiveToolPreviewState {
     tool_name: String,
     argument_bytes: usize,
     preview: LiveToolArgumentPreview,
+    revision: u64,
+    snapshots_received: u64,
+    duplicates_skipped: u64,
+    truncated_snapshots: u64,
 }
 use bcode_skill_models::SkillSource;
 use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
@@ -140,6 +144,10 @@ pub struct BmuxApp {
     tool_call_contexts: BTreeMap<String, ToolCallContext>,
     streamed_tool_results: BTreeMap<String, StreamedToolResultContext>,
     live_tool_previews: BTreeMap<String, LiveToolPreviewState>,
+    live_preview_revision: u64,
+    live_preview_frames_requested: u64,
+    live_preview_duplicates_skipped: u64,
+    live_preview_truncated_snapshots: u64,
     runtime_work: RuntimeWorkViewState,
     diff_panel: DiffPanel,
     pending_submissions: PendingSubmissions,
@@ -294,6 +302,10 @@ impl BmuxApp {
             tool_call_contexts: BTreeMap::new(),
             streamed_tool_results: BTreeMap::new(),
             live_tool_previews: BTreeMap::new(),
+            live_preview_revision: 0,
+            live_preview_frames_requested: 0,
+            live_preview_duplicates_skipped: 0,
+            live_preview_truncated_snapshots: 0,
             runtime_work: RuntimeWorkViewState::default(),
             diff_panel: DiffPanel::new(),
             pending_submissions: PendingSubmissions::default(),
@@ -456,7 +468,10 @@ impl BmuxApp {
     /// Return revision for layout-affecting transcript collection changes.
     #[must_use]
     pub const fn transcript_projection_revision(&self) -> u64 {
-        self.transcript.revision()
+        self.transcript
+            .revision()
+            .saturating_add(self.live_preview_revision)
+            .saturating_add(self.live_preview_frames_requested)
     }
 
     /// Return revision for layout-affecting pending submission changes.
@@ -1625,6 +1640,7 @@ impl BmuxApp {
 
     fn mark_live_preview_dirty(&mut self) {
         self.live_preview_frame.dirty = true;
+        self.live_preview_frames_requested = self.live_preview_frames_requested.saturating_add(1);
         if self.live_preview_frame.next_frame_at.is_none() {
             self.live_preview_frame.next_frame_at =
                 Some(Instant::now() + LIVE_PREVIEW_FRAME_INTERVAL);
@@ -2219,6 +2235,53 @@ impl BmuxApp {
         }
     }
 
+    fn record_live_preview_state(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        argument_bytes: usize,
+        preview: &LiveToolArgumentPreview,
+    ) -> bool {
+        let truncated = live_tool_preview_truncated(preview);
+        if let Some(state) = self.live_tool_previews.get_mut(tool_call_id) {
+            state.snapshots_received = state.snapshots_received.saturating_add(1);
+            if state.preview == *preview && state.argument_bytes == argument_bytes {
+                state.duplicates_skipped = state.duplicates_skipped.saturating_add(1);
+                self.live_preview_duplicates_skipped =
+                    self.live_preview_duplicates_skipped.saturating_add(1);
+                return false;
+            }
+            tool_name.clone_into(&mut state.tool_name);
+            state.argument_bytes = argument_bytes;
+            state.preview = preview.clone();
+            state.revision = state.revision.saturating_add(1);
+            if truncated {
+                state.truncated_snapshots = state.truncated_snapshots.saturating_add(1);
+                self.live_preview_truncated_snapshots =
+                    self.live_preview_truncated_snapshots.saturating_add(1);
+            }
+        } else {
+            self.live_tool_previews.insert(
+                tool_call_id.to_owned(),
+                LiveToolPreviewState {
+                    tool_name: tool_name.to_owned(),
+                    argument_bytes,
+                    preview: preview.clone(),
+                    revision: 1,
+                    snapshots_received: 1,
+                    duplicates_skipped: 0,
+                    truncated_snapshots: u64::from(truncated),
+                },
+            );
+            if truncated {
+                self.live_preview_truncated_snapshots =
+                    self.live_preview_truncated_snapshots.saturating_add(1);
+            }
+        }
+        self.live_preview_revision = self.live_preview_revision.saturating_add(1);
+        true
+    }
+
     fn apply_live_tool_argument_preview(
         &mut self,
         tool_call_id: &str,
@@ -2226,14 +2289,9 @@ impl BmuxApp {
         argument_bytes: usize,
         preview: &LiveToolArgumentPreview,
     ) {
-        self.live_tool_previews.insert(
-            tool_call_id.to_owned(),
-            LiveToolPreviewState {
-                tool_name: tool_name.to_owned(),
-                argument_bytes,
-                preview: preview.clone(),
-            },
-        );
+        if !self.record_live_preview_state(tool_call_id, tool_name, argument_bytes, preview) {
+            return;
+        }
         match preview {
             LiveToolArgumentPreview::FileEdit(file_preview) => self.apply_live_file_edit_preview(
                 tool_call_id,
@@ -2890,6 +2948,14 @@ fn working_directory_changed_message(
         old_working_directory.display(),
         new_working_directory.display()
     )
+}
+
+const fn live_tool_preview_truncated(preview: &LiveToolArgumentPreview) -> bool {
+    match preview {
+        LiveToolArgumentPreview::FileEdit(file) => file.truncated,
+        LiveToolArgumentPreview::ShellCommand(shell) => shell.truncated,
+        LiveToolArgumentPreview::Query(query) => query.truncated,
+    }
 }
 
 const fn event_breaks_sticky_entry_anchor(event: &SessionEvent) -> bool {
