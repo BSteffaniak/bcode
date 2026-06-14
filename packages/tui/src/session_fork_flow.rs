@@ -2,6 +2,10 @@
 
 use std::io::Write;
 
+use bcode_session_models::{
+    SessionEvent, SessionEventKind, SessionHistoryCursor, SessionHistoryDirection,
+    SessionHistoryQuery,
+};
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
@@ -15,7 +19,7 @@ use super::{TuiError, session_fork_dialog, session_fork_dialog_render};
 /// Open the fork dialog for the current session.
 pub async fn fork_current_session<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
-    _services: &TuiServices<'_>,
+    services: &TuiServices<'_>,
     chat: &mut ActiveChat,
 ) -> Result<(), TuiError> {
     let Some(session_id) = chat.app.session_id() else {
@@ -30,10 +34,74 @@ pub async fn fork_current_session<W: Write>(
         session_fork_dialog::SessionForkDialogMode::Fork,
         &format!("[fork] {source_title}"),
     );
-    run_dialog(io, chat, &mut dialog).await?;
-    chat.app
-        .set_status("prompt selection for fork is not implemented yet".to_owned());
+    let submission = run_dialog(io, chat, &mut dialog).await?;
+    let Some(prompt) = latest_user_prompt_before_tail(services, session_id).await? else {
+        chat.app
+            .set_status("no user prompt found to fork from".to_owned());
+        return Ok(());
+    };
+    let result = services
+        .client
+        .fork_session(session_id, prompt.sequence, submission.name)
+        .await?;
+    let draft = result.draft.or(Some(prompt.text));
+    if submission.switch_after_create {
+        let new_session_id = result.session.id;
+        session_flow::switch_session(io.terminal, services.client, chat, new_session_id)?;
+        if submission.install_draft
+            && let Some(draft) = draft.as_deref()
+        {
+            chat.app.replace_composer_with(draft);
+        }
+        chat.app
+            .set_status("forked session and switched".to_owned());
+    } else {
+        if submission.install_draft
+            && let Some(draft) = draft.as_deref()
+        {
+            chat.app.replace_composer_with(draft);
+        }
+        chat.app
+            .set_status(format!("forked session {}", result.session.id));
+    }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForkPromptCandidate {
+    sequence: u64,
+    text: String,
+}
+
+async fn latest_user_prompt_before_tail(
+    services: &TuiServices<'_>,
+    session_id: bcode_session_models::SessionId,
+) -> Result<Option<ForkPromptCandidate>, TuiError> {
+    let page = services
+        .client
+        .session_history_page(
+            session_id,
+            SessionHistoryQuery {
+                cursor: Some(SessionHistoryCursor { sequence: u64::MAX }),
+                limit: 256,
+                direction: SessionHistoryDirection::Backward,
+            },
+        )
+        .await?;
+    Ok(page
+        .events
+        .iter()
+        .find_map(user_prompt_candidate_from_event))
+}
+
+fn user_prompt_candidate_from_event(event: &SessionEvent) -> Option<ForkPromptCandidate> {
+    let SessionEventKind::UserMessage { text, .. } = &event.kind else {
+        return None;
+    };
+    Some(ForkPromptCandidate {
+        sequence: event.sequence,
+        text: text.clone(),
+    })
 }
 
 /// Open the clone dialog for the current session, create the clone, and optionally switch to it.
