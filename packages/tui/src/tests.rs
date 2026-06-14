@@ -9,10 +9,11 @@ use bcode_agent_profile::AgentInfo;
 use bcode_client::AttachedSessionHistory;
 use bcode_config::TuiThinkingConfig;
 use bcode_session_models::{
-    ClientId, RuntimeWorkId, RuntimeWorkKind, SessionEvent, SessionEventKind, SessionId,
-    SessionInputHistoryEntry, SessionProjectionKind, SessionSummary, SessionTitleSource,
-    SessionTokenUsage, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
-    ToolInvocationStreamEvent, ToolOutputStream,
+    ClientId, LiveFileEditPreview, LiveShellCommandPreview, LiveToolArgumentPreview, RuntimeWorkId,
+    RuntimeWorkKind, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
+    SessionProjectionKind, SessionSummary, SessionTitleSource, SessionTokenUsage,
+    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ToolInvocationStreamEvent,
+    ToolOutputStream,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::TextMotion;
@@ -3135,5 +3136,148 @@ fn thinking_dialog_cycles_fallback_values_when_provider_values_are_unknown() {
     assert_eq!(
         dialog.summary_values_source(),
         bcode_model::ModelReasoningCapabilitySource::GenericFallback
+    );
+}
+
+#[test]
+fn live_shell_command_preview_streams_before_final_request_and_is_replaced() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
+        session_id,
+        kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
+            turn_id: "turn-1".to_owned(),
+            tool_call_id: "call_shell".to_owned(),
+            tool_name: "shell_run".to_owned(),
+            argument_bytes: 36,
+            preview: LiveToolArgumentPreview::ShellCommand(LiveShellCommandPreview {
+                command_prefix: "cargo test -p bcode_tui".to_owned(),
+                cwd: Some("/repo".to_owned()),
+                argument_bytes: 36,
+                truncated: false,
+            }),
+        },
+    });
+
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 20));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+    assert!(
+        output.contains("Tool call · shell_run · streaming preview"),
+        "{output}"
+    );
+    assert!(
+        output.contains("command: cargo test -p bcode_tui"),
+        "{output}"
+    );
+    assert!(output.contains("cwd: /repo"), "{output}");
+
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call_shell".to_owned(),
+            tool_name: "shell_run".to_owned(),
+            arguments_json: serde_json::json!({
+                "command": "cargo test -p bcode_tui",
+                "cwd": "/repo",
+            })
+            .to_string(),
+        },
+    ));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 20));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+    assert!(output.contains("Tool · shell_run"), "{output}");
+    assert!(!output.contains("streaming preview"), "{output}");
+    assert!(
+        output.contains("command: cargo test -p bcode_tui"),
+        "{output}"
+    );
+}
+
+#[test]
+fn live_file_preview_updates_without_duplicates_and_final_replaces_it() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    for contents in ["fn main", "fn main() {\n    println!(\"hi\");\n}"] {
+        app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
+                turn_id: "turn-1".to_owned(),
+                tool_call_id: "call_write".to_owned(),
+                tool_name: "filesystem_write".to_owned(),
+                argument_bytes: contents.len(),
+                preview: LiveToolArgumentPreview::FileEdit(LiveFileEditPreview {
+                    path: Some("src/main.rs".to_owned()),
+                    old_text_prefix: None,
+                    new_text_prefix: contents.to_owned(),
+                    argument_bytes: contents.len(),
+                    truncated: false,
+                }),
+            },
+        });
+    }
+
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 30));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+    assert_eq!(output.matches("streaming preview").count(), 1, "{output}");
+    assert!(output.contains("+     println!(\"hi\");"), "{output}");
+    assert!(!output.contains("Ready to apply"), "{output}");
+
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call_write".to_owned(),
+            tool_name: "filesystem_write".to_owned(),
+            arguments_json: serde_json::json!({
+                "path": "src/main.rs",
+                "contents": "fn main() {\n    println!(\"hi\");\n}",
+            })
+            .to_string(),
+        },
+    ));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 30));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+    assert!(output.contains("Ready to apply · Writing file"), "{output}");
+    assert!(!output.contains("streaming preview"), "{output}");
+}
+
+#[test]
+fn live_file_preview_renders_truncation_note_and_received_bytes() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
+        session_id,
+        kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
+            turn_id: "turn-1".to_owned(),
+            tool_call_id: "call_write".to_owned(),
+            tool_name: "filesystem_write".to_owned(),
+            argument_bytes: 2048,
+            preview: LiveToolArgumentPreview::FileEdit(LiveFileEditPreview {
+                path: Some("src/lib.rs".to_owned()),
+                old_text_prefix: None,
+                new_text_prefix: "pub fn demo() {}".to_owned(),
+                argument_bytes: 2048,
+                truncated: true,
+            }),
+        },
+    });
+
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 24));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+    assert!(output.contains("received: 2.0 KiB"), "{output}");
+    assert!(
+        output.contains("preview truncated by live display limit"),
+        "{output}"
     );
 }

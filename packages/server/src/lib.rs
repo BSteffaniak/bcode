@@ -4537,6 +4537,7 @@ fn live_file_edit_preview_from_arguments(
         path,
         old_text_prefix,
         new_text_prefix: new_text.value,
+        argument_bytes: arguments.len(),
         truncated: arguments_truncated || new_text.truncated,
     })
 }
@@ -4551,6 +4552,7 @@ fn live_shell_command_preview_from_arguments(
     Some(LiveShellCommandPreview {
         command_prefix: command.value,
         cwd,
+        argument_bytes: arguments.len(),
         truncated: arguments_truncated || command.truncated,
     })
 }
@@ -6234,7 +6236,7 @@ async fn handle_provider_turn_event(
                     progress.tool_call_id,
                     progress.tool_name,
                     progress.argument_bytes,
-                    preview,
+                    live_tool_argument_preview_with_bytes(preview, progress.argument_bytes),
                 )
                 .await;
             }
@@ -6359,7 +6361,10 @@ async fn handle_provider_tool_call_finished_event(
             call.id.clone(),
             call.name.clone(),
             serialized_tool_argument_len(&call.arguments),
-            preview,
+            live_tool_argument_preview_with_bytes(
+                preview,
+                serialized_tool_argument_len(&call.arguments),
+            ),
         )
         .await;
     }
@@ -6433,6 +6438,21 @@ async fn publish_provider_stream_progress_live(
             },
         )
         .await;
+}
+
+const fn live_tool_argument_preview_with_bytes(
+    mut preview: LiveToolArgumentPreview,
+    argument_bytes: usize,
+) -> LiveToolArgumentPreview {
+    match &mut preview {
+        LiveToolArgumentPreview::FileEdit(file) => {
+            file.argument_bytes = argument_bytes;
+        }
+        LiveToolArgumentPreview::ShellCommand(shell) => {
+            shell.argument_bytes = argument_bytes;
+        }
+    }
+    preview
 }
 
 async fn publish_tool_argument_preview_live(

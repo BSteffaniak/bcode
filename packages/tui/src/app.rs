@@ -45,11 +45,28 @@ use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
 use super::transcript_viewport::TranscriptViewport;
 
 const MANUAL_TRANSCRIPT_SCROLL_GRACE: Duration = Duration::from_millis(450);
+const LIVE_PREVIEW_FRAME_INVALIDATION_KEY: &str = "live-preview-frame";
+const LIVE_PREVIEW_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const TRANSCRIPT_SCROLL_ANIMATION_DURATION: Duration = Duration::from_millis(180);
 const TRANSCRIPT_SCROLL_ANIMATION_FRAME: Duration = Duration::from_millis(16);
 const TRANSCRIPT_SCROLL_ANIMATION_INVALIDATION_KEY: &str = "transcript-scroll-animation";
 const LATEST_BAR_ANIMATION_INVALIDATION_KEY: &str = "latest-bar-animation";
 const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(420);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LivePreviewFrameState {
+    dirty: bool,
+    next_frame_at: Option<Instant>,
+}
+
+impl LivePreviewFrameState {
+    const fn new() -> Self {
+        Self {
+            dirty: false,
+            next_frame_at: None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TranscriptScrollAnimation {
@@ -139,6 +156,7 @@ pub struct BmuxApp {
     tui_config: TuiConfig,
     exit: ExitState,
     cursor: CursorBlink,
+    live_preview_frame: LivePreviewFrameState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -291,6 +309,7 @@ impl BmuxApp {
             tui_config: TuiConfig::default(),
             exit: ExitState::default(),
             cursor: CursorBlink::new(),
+            live_preview_frame: LivePreviewFrameState::new(),
         };
         app.absorb_history(history);
         app
@@ -1555,6 +1574,12 @@ impl BmuxApp {
                 self.next_latest_bar_invalidation(now),
             ));
         }
+        if self.live_preview_frame.dirty {
+            requests.push(InvalidationRequest::new(
+                InvalidationKey::new(LIVE_PREVIEW_FRAME_INVALIDATION_KEY),
+                self.live_preview_frame.next_frame_at.unwrap_or(now),
+            ));
+        }
         requests.extend(self.tool_elapsed_invalidation_requests(now, now_system));
         requests
     }
@@ -1576,12 +1601,24 @@ impl BmuxApp {
                 }
             } else if is_latest_bar_animation_invalidation(key) {
                 invalidation.merge(UiInvalidation::Paint)
+            } else if is_live_preview_frame_invalidation(key) {
+                self.live_preview_frame.dirty = false;
+                self.live_preview_frame.next_frame_at = None;
+                invalidation.merge(UiInvalidation::Layout)
             } else if is_tool_elapsed_invalidation(key) {
                 invalidation.merge(UiInvalidation::Layout)
             } else {
                 invalidation
             }
         })
+    }
+
+    fn mark_live_preview_dirty(&mut self) {
+        self.live_preview_frame.dirty = true;
+        if self.live_preview_frame.next_frame_at.is_none() {
+            self.live_preview_frame.next_frame_at =
+                Some(Instant::now() + LIVE_PREVIEW_FRAME_INTERVAL);
+        }
     }
 
     fn latest_bar_active(&self, now: Instant) -> bool {
@@ -2218,6 +2255,7 @@ impl BmuxApp {
             ));
         }
         self.set_file_activity(tool_name);
+        self.mark_live_preview_dirty();
         self.status = format!(
             "streaming {} · {} received",
             preview.path.as_deref().unwrap_or("file change"),
@@ -2259,6 +2297,7 @@ impl BmuxApp {
                 format_provider_bytes(argument_bytes)
             ),
         });
+        self.mark_live_preview_dirty();
         self.status = format!(
             "streaming command · {} received",
             format_provider_bytes(argument_bytes)
@@ -2590,6 +2629,10 @@ fn is_tool_elapsed_invalidation(key: &InvalidationKey) -> bool {
 
 fn is_latest_bar_animation_invalidation(key: &InvalidationKey) -> bool {
     key.as_str() == LATEST_BAR_ANIMATION_INVALIDATION_KEY
+}
+
+fn is_live_preview_frame_invalidation(key: &InvalidationKey) -> bool {
+    key.as_str() == LIVE_PREVIEW_FRAME_INVALIDATION_KEY
 }
 
 fn is_transcript_scroll_animation_invalidation(key: &InvalidationKey) -> bool {

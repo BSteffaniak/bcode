@@ -74,6 +74,8 @@ pub enum TranscriptItemKind {
         old_text_prefix: Option<String>,
         /// Best-effort new text prefix.
         new_text_prefix: String,
+        /// Total assembled argument bytes received so far.
+        argument_bytes: usize,
         /// Whether preview text was truncated.
         truncated: bool,
     },
@@ -87,6 +89,8 @@ pub enum TranscriptItemKind {
         command_prefix: String,
         /// Best-effort working directory.
         cwd: Option<String>,
+        /// Total assembled argument bytes received so far.
+        argument_bytes: usize,
         /// Whether preview text was truncated.
         truncated: bool,
     },
@@ -358,6 +362,7 @@ impl TranscriptItem {
             path,
             old_text_prefix,
             new_text_prefix,
+            argument_bytes,
             truncated,
         } = &mut self.kind
         else {
@@ -370,6 +375,7 @@ impl TranscriptItem {
         path.clone_from(&preview.path);
         old_text_prefix.clone_from(&preview.old_text_prefix);
         new_text_prefix.clone_from(&preview.new_text_prefix);
+        *argument_bytes = preview.argument_bytes;
         *truncated = preview.truncated;
         self.text.clone_from(&preview.new_text_prefix);
         self.streaming = true;
@@ -389,6 +395,7 @@ impl TranscriptItem {
             tool_name: item_tool_name,
             command_prefix,
             cwd,
+            argument_bytes,
             truncated,
         } = &mut self.kind
         else {
@@ -400,6 +407,7 @@ impl TranscriptItem {
         tool_name.clone_into(item_tool_name);
         preview.command_prefix.clone_into(command_prefix);
         cwd.clone_from(&preview.cwd);
+        *argument_bytes = preview.argument_bytes;
         *truncated = preview.truncated;
         self.text.clone_from(&preview.command_prefix);
         self.streaming = true;
@@ -536,6 +544,7 @@ pub fn live_file_edit_preview_item(
             path: preview.path.clone(),
             old_text_prefix: preview.old_text_prefix.clone(),
             new_text_prefix: preview.new_text_prefix.clone(),
+            argument_bytes: preview.argument_bytes,
             truncated: preview.truncated,
         },
     )
@@ -557,6 +566,7 @@ pub fn live_shell_command_preview_item(
             tool_name: tool_name.to_owned(),
             command_prefix: preview.command_prefix.clone(),
             cwd: preview.cwd.clone(),
+            argument_bytes: preview.argument_bytes,
             truncated: preview.truncated,
         },
     )

@@ -682,16 +682,20 @@ fn push_transcript_item_rows(
             path,
             old_text_prefix,
             new_text_prefix,
+            argument_bytes,
             truncated,
             ..
         } => {
             push_live_file_edit_preview_rows(
                 rows,
-                tool_name,
-                path.as_deref(),
-                old_text_prefix.as_deref(),
-                new_text_prefix,
-                *truncated,
+                &LiveFileEditPreviewRenderContext {
+                    tool_name,
+                    path: path.as_deref(),
+                    old_text_prefix: old_text_prefix.as_deref(),
+                    new_text_prefix,
+                    argument_bytes: *argument_bytes,
+                    truncated: *truncated,
+                },
                 width,
             );
         }
@@ -699,6 +703,7 @@ fn push_transcript_item_rows(
             tool_name,
             command_prefix,
             cwd,
+            argument_bytes,
             truncated,
             ..
         } => {
@@ -707,6 +712,7 @@ fn push_transcript_item_rows(
                 tool_name,
                 command_prefix,
                 cwd.as_deref(),
+                *argument_bytes,
                 *truncated,
                 width,
             );
@@ -937,19 +943,24 @@ fn file_tool_action(tool_name: &str, streaming: bool) -> &'static str {
     }
 }
 
+struct LiveFileEditPreviewRenderContext<'a> {
+    tool_name: &'a str,
+    path: Option<&'a str>,
+    old_text_prefix: Option<&'a str>,
+    new_text_prefix: &'a str,
+    argument_bytes: usize,
+    truncated: bool,
+}
+
 fn push_live_file_edit_preview_rows(
     rows: &mut Vec<Line>,
-    tool_name: &str,
-    path: Option<&str>,
-    old_text_prefix: Option<&str>,
-    new_text_prefix: &str,
-    truncated: bool,
+    context: &LiveFileEditPreviewRenderContext<'_>,
     width: u16,
 ) {
     push_wrapped_styled_text(
         rows,
         Vec::new(),
-        &format!("Tool call · {tool_name} · streaming preview"),
+        &format!("Tool call · {} · streaming preview", context.tool_name),
         width,
         Style::new().fg(Color::Cyan),
         Style::new().fg(Color::Cyan),
@@ -959,17 +970,26 @@ fn push_live_file_edit_preview_rows(
         vec![Span::styled("  ", muted_style())],
         &format!(
             "Streaming preview · {}",
-            file_write_mode_label(tool_name, old_text_prefix.unwrap_or_default().is_empty())
+            file_write_mode_label(
+                context.tool_name,
+                context.old_text_prefix.unwrap_or_default().is_empty(),
+            )
         ),
         width,
         file_edit_phase_style(FileEditPhase::Pending),
         muted_style(),
     );
-    if let Some(path) = path {
+    if let Some(path) = context.path {
         push_kv_row(rows, "path", path, width);
     }
-    push_streaming_added_content_rows(rows, new_text_prefix, width);
-    if truncated {
+    push_kv_row(
+        rows,
+        "received",
+        &format_preview_bytes(context.argument_bytes),
+        width,
+    );
+    push_streaming_added_content_rows(rows, context.new_text_prefix, width);
+    if context.truncated {
         push_wrapped_styled_text(
             rows,
             vec![Span::styled("  ", muted_style())],
@@ -1012,11 +1032,28 @@ fn push_streaming_added_content_rows(rows: &mut Vec<Line>, content: &str, width:
     }
 }
 
+fn format_preview_bytes(bytes: usize) -> String {
+    const KIB: usize = 1024;
+    const MIB: usize = KIB * 1024;
+    if bytes >= MIB {
+        let whole = bytes / MIB;
+        let decimal = (bytes % MIB) * 10 / MIB;
+        format!("{whole}.{decimal} MiB")
+    } else if bytes >= KIB {
+        let whole = bytes / KIB;
+        let decimal = (bytes % KIB) * 10 / KIB;
+        format!("{whole}.{decimal} KiB")
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 fn push_shell_preview_rows(
     rows: &mut Vec<Line>,
     tool_name: &str,
     command_prefix: &str,
     cwd: Option<&str>,
+    argument_bytes: usize,
     truncated: bool,
     width: u16,
 ) {
@@ -1032,6 +1069,12 @@ fn push_shell_preview_rows(
     if let Some(cwd) = cwd {
         push_kv_row(rows, "cwd", cwd, width);
     }
+    push_kv_row(
+        rows,
+        "received",
+        &format_preview_bytes(argument_bytes),
+        width,
+    );
     if truncated {
         push_wrapped_styled_text(
             rows,

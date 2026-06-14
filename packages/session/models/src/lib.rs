@@ -312,6 +312,8 @@ pub struct LiveFileEditPreview {
     pub old_text_prefix: Option<String>,
     /// Best-effort new text prefix extracted from partial arguments.
     pub new_text_prefix: String,
+    /// Total assembled argument bytes received so far.
+    pub argument_bytes: usize,
     /// Whether the preview content was truncated by live-preview limits.
     pub truncated: bool,
 }
@@ -323,6 +325,8 @@ pub struct LiveShellCommandPreview {
     pub command_prefix: String,
     /// Best-effort working directory extracted from partial arguments.
     pub cwd: Option<String>,
+    /// Total assembled argument bytes received so far.
+    pub argument_bytes: usize,
     /// Whether the preview content was truncated by live-preview limits.
     pub truncated: bool,
 }
