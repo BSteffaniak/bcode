@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use bcode_session_models::{
-    SessionEvent, SessionEventKind, SessionTokenUsage, ToolInvocationPresentation,
-    ToolInvocationStreamEvent, ToolOutputStream,
+    SessionEvent, SessionEventKind, SessionTokenUsage, ShellRunResult, ToolInvocationPresentation,
+    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
 };
 
 use super::diff_extract::{FileEditTranscript, file_edit_from_tool_request};
@@ -728,8 +728,21 @@ fn push_transcript_item_from_event(
             tool_call_id,
             result,
             is_error,
+            semantic_result,
             ..
         } => {
+            if let Some(semantic_result) = semantic_result {
+                apply_semantic_tool_result(
+                    items,
+                    tool_call_id,
+                    tool_calls.get(tool_call_id),
+                    streamed_tool_results.get_mut(tool_call_id),
+                    semantic_result,
+                    *is_error,
+                );
+                presented_tool_results.insert(tool_call_id.clone());
+                return;
+            }
             let should_render_final = if let Some(replay) =
                 streamed_tool_results.get_mut(tool_call_id)
             {
@@ -876,8 +889,18 @@ fn non_streaming_transcript_item_from_event(
             tool_call_id,
             result,
             is_error,
+            semantic_result,
             ..
         } => {
+            if let Some(semantic_result) = semantic_result {
+                return semantic_tool_result_item(
+                    tool_call_id,
+                    tool_calls.get(tool_call_id),
+                    None,
+                    semantic_result,
+                    *is_error,
+                );
+            }
             if streamed_tool_results
                 .get(tool_call_id)
                 .is_some_and(|replay| replay.saw_output)
@@ -1024,6 +1047,181 @@ fn apply_tool_invocation_presentation_event(
             },
         );
     }
+}
+
+fn apply_semantic_tool_result(
+    items: &mut Vec<TranscriptItem>,
+    tool_call_id: &str,
+    context: Option<&ToolCallContext>,
+    replay: Option<&mut StreamedToolReplayContext>,
+    result: &ToolInvocationResult,
+    is_error: bool,
+) {
+    match result {
+        ToolInvocationResult::ShellRun {
+            result:
+                ShellRunResult::Terminal {
+                    exit_code,
+                    timed_out,
+                    output_tail,
+                    columns,
+                    rows,
+                    ..
+                },
+        } => {
+            let started_at_ms = replay.as_ref().and_then(|replay| replay.started_at_ms);
+            let finished_at_ms = replay.as_ref().and_then(|replay| replay.finished_at_ms);
+            if let Some(index) = replay.as_ref().and_then(|replay| replay.index)
+                && let Some(item) = items.get_mut(index)
+            {
+                item.apply_terminal_presentation(
+                    output_tail.clone(),
+                    *exit_code,
+                    *timed_out,
+                    is_error,
+                    finished_at_ms,
+                );
+                return;
+            }
+            let mut item = streaming_terminal_output_item(
+                tool_call_id,
+                context.map(|context| context.tool_name.as_str()),
+                output_tail,
+                (*columns).max(1),
+                (*rows).max(1),
+                started_at_ms,
+            );
+            item.apply_terminal_presentation(
+                output_tail.clone(),
+                *exit_code,
+                *timed_out,
+                is_error,
+                finished_at_ms,
+            );
+            items.push(item);
+        }
+        _ => {
+            if let Some(item) =
+                semantic_tool_result_item(tool_call_id, context, None, result, is_error)
+            {
+                items.push(item);
+            }
+        }
+    }
+}
+
+fn semantic_tool_result_item(
+    tool_call_id: &str,
+    context: Option<&ToolCallContext>,
+    replay: Option<&mut StreamedToolReplayContext>,
+    result: &ToolInvocationResult,
+    is_error: bool,
+) -> Option<TranscriptItem> {
+    match result {
+        ToolInvocationResult::ShellRun { result } => {
+            semantic_shell_result_item(tool_call_id, context, replay, result, is_error)
+        }
+        ToolInvocationResult::FileChange { result } => context.is_none().then(|| {
+            file_change_presentation_item(
+                tool_call_id,
+                &result.tool_name,
+                &result.summary,
+                result.path.as_deref(),
+                is_error,
+            )
+        }),
+        ToolInvocationResult::Text { text } => Some(tool_result_item(
+            tool_call_id,
+            context.map(|context| context.tool_name.as_str()),
+            context.map(|context| context.arguments_json.as_str()),
+            text,
+            is_error,
+        )),
+        ToolInvocationResult::Json { value } => Some(tool_result_item(
+            tool_call_id,
+            context.map(|context| context.tool_name.as_str()),
+            context.map(|context| context.arguments_json.as_str()),
+            value,
+            is_error,
+        )),
+    }
+}
+
+fn semantic_shell_result_item(
+    tool_call_id: &str,
+    context: Option<&ToolCallContext>,
+    replay: Option<&mut StreamedToolReplayContext>,
+    result: &ShellRunResult,
+    is_error: bool,
+) -> Option<TranscriptItem> {
+    match result {
+        ShellRunResult::Terminal {
+            exit_code,
+            timed_out,
+            output_tail,
+            columns,
+            rows,
+            ..
+        } => {
+            if replay.as_ref().and_then(|replay| replay.index).is_some() {
+                return None;
+            }
+            let mut item = streaming_terminal_output_item(
+                tool_call_id,
+                context.map(|context| context.tool_name.as_str()),
+                output_tail,
+                (*columns).max(1),
+                (*rows).max(1),
+                replay.as_ref().and_then(|replay| replay.started_at_ms),
+            );
+            item.apply_terminal_presentation(
+                output_tail.clone(),
+                *exit_code,
+                *timed_out,
+                is_error,
+                replay.as_ref().and_then(|replay| replay.finished_at_ms),
+            );
+            Some(item)
+        }
+        ShellRunResult::Captured { .. } => Some(tool_result_item(
+            tool_call_id,
+            context.map(|context| context.tool_name.as_str()),
+            context.map(|context| context.arguments_json.as_str()),
+            &captured_shell_result_text(result),
+            is_error,
+        )),
+    }
+}
+
+fn captured_shell_result_text(result: &ShellRunResult) -> String {
+    let ShellRunResult::Captured {
+        exit_code,
+        timed_out,
+        cancelled,
+        stdout,
+        stderr,
+        stdout_truncated,
+        stderr_truncated,
+        ..
+    } = result
+    else {
+        return String::new();
+    };
+    let mut text = format!(
+        "exit_code: {}\ntimed_out: {timed_out}\ncancelled: {cancelled}",
+        exit_code.map_or_else(|| "null".to_owned(), |code| code.to_string())
+    );
+    text.push_str("\nstdout:\n");
+    text.push_str(stdout);
+    if *stdout_truncated {
+        text.push_str("\n[stdout truncated]");
+    }
+    text.push_str("\nstderr:\n");
+    text.push_str(stderr);
+    if *stderr_truncated {
+        text.push_str("\n[stderr truncated]");
+    }
+    text
 }
 
 fn terminal_dimensions(presentation: &ToolInvocationPresentation) -> Option<(u16, u16)> {
