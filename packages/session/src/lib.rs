@@ -123,101 +123,15 @@ impl SessionStore {
 
     fn load_catalog(&self) -> Result<BTreeMap<SessionId, SessionState>, SessionStoreError> {
         let mut sessions = BTreeMap::new();
-        if !self.root.exists() {
+        if !self.catalog_db_path().exists() {
             return Ok(sessions);
         }
 
-        for summary in self.load_session_manifests()? {
+        for summary in self.load_global_catalog_summaries()? {
             sessions.insert(summary.id, SessionState::from_catalog_summary(summary));
         }
 
-        if self.catalog_db_path().exists() {
-            match self.load_global_catalog_summaries() {
-                Ok(summaries) => {
-                    for summary in summaries {
-                        sessions
-                            .entry(summary.id)
-                            .or_insert_with(|| SessionState::from_catalog_summary(summary));
-                    }
-                }
-                Err(error) => {
-                    eprintln!("failed to load scoped session catalog DB: {error}");
-                }
-            }
-        }
-
-        for entry in fs::read_dir(&self.root)? {
-            let path = entry?.path();
-            if path.is_dir()
-                && let Some(session_id) = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .and_then(|name| name.parse::<SessionId>().ok())
-            {
-                if sessions.contains_key(&session_id) {
-                    continue;
-                }
-                match self.load_db_session_state(session_id) {
-                    Ok(Some(state)) => {
-                        sessions.insert(session_id, state);
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        eprintln!("skipping unreadable DB session {session_id}: {error}");
-                    }
-                }
-            }
-        }
-
         Ok(sessions)
-    }
-
-    fn load_session_manifests(&self) -> Result<Vec<SessionSummary>, SessionStoreError> {
-        let mut summaries = Vec::new();
-        for entry in fs::read_dir(&self.root)? {
-            let path = entry?.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let Some(session_id) = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(|name| name.parse::<SessionId>().ok())
-            else {
-                continue;
-            };
-            match self.load_session_manifest(session_id) {
-                Ok(Some(summary)) => summaries.push(summary),
-                Ok(None) => {}
-                Err(error) => {
-                    eprintln!("skipping unreadable session manifest {session_id}: {error}");
-                }
-            }
-        }
-        Ok(summaries)
-    }
-
-    fn load_session_manifest(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Option<SessionSummary>, SessionStoreError> {
-        let path = self.session_manifest_path(session_id);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let contents = fs::read(&path)?;
-        let manifest: SessionManifest = serde_json::from_slice(&contents)
-            .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-        if manifest.schema_version != SESSION_MANIFEST_SCHEMA_VERSION {
-            return Ok(None);
-        }
-        if manifest.summary.id != session_id {
-            return Err(SessionStoreError::CatalogLoad(format!(
-                "session manifest id mismatch: expected {session_id}, found {}",
-                manifest.summary.id
-            )));
-        }
-        Ok(Some(manifest.summary))
     }
 
     pub(crate) fn write_session_manifest(
@@ -286,68 +200,6 @@ impl SessionStore {
         })
         .join()
         .map_err(|_| SessionStoreError::CatalogLoad("global catalog loader panicked".to_string()))?
-    }
-
-    fn load_db_session_state(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Option<SessionState>, SessionStoreError> {
-        let db_path = db::session_db_path(&self.root, session_id);
-        if !db_path.exists() {
-            return Ok(None);
-        }
-        let root = self.root.clone();
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-            runtime.block_on(async move {
-                let db = db::SessionDb::open_turso_in_root(session_id, &root)
-                    .await
-                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-                let Some(db_state) = db
-                    .session_state()
-                    .await
-                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?
-                else {
-                    return Ok(None);
-                };
-                if db_state.session_id != session_id {
-                    return Err(SessionStoreError::CatalogLoad(format!(
-                        "session DB state id mismatch: expected {session_id}, found {}",
-                        db_state.session_id
-                    )));
-                }
-                let expected_last_sequence = db
-                    .last_event_sequence()
-                    .await
-                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?
-                    .unwrap_or(db_state.last_event_seq);
-                let load_status = if db_state.last_event_seq < expected_last_sequence {
-                    SessionLoadStatusKind::SummaryOnly
-                } else {
-                    SessionLoadStatusKind::Current
-                };
-                let activity_bounds = db
-                    .activity_bounds()
-                    .await
-                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-                let created_at_ms = activity_bounds
-                    .map(|(created_at_ms, _)| created_at_ms)
-                    .or(db_state.updated_at_ms)
-                    .unwrap_or_else(current_unix_millis);
-                let updated_at_ms = db_state
-                    .updated_at_ms
-                    .or_else(|| activity_bounds.map(|(_, updated_at_ms)| updated_at_ms))
-                    .unwrap_or(created_at_ms);
-                let mut state = SessionState::from_db_state(db_state, created_at_ms, updated_at_ms);
-                state.load_status = load_status;
-                Ok(Some(state))
-            })
-        })
-        .join()
-        .map_err(|_| SessionStoreError::CatalogLoad("DB session loader panicked".to_string()))?
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -3556,14 +3408,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn catalog_load_uses_manifest_without_opening_session_db() {
+    async fn catalog_load_uses_global_catalog_without_opening_session_db() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let session = manager
-            .create_session(
-                Some("manifest catalog".to_string()),
-                test_working_directory(),
-            )
+            .create_session(Some("global catalog".to_string()), test_working_directory())
             .await
             .expect("session should create");
         drop(manager);
@@ -3583,7 +3432,7 @@ mod tests {
         let sessions = restored.cached_sessions(&test_working_directory()).await;
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, session.id);
-        assert_eq!(sessions[0].name.as_deref(), Some("manifest catalog"));
+        assert_eq!(sessions[0].name.as_deref(), Some("global catalog"));
 
         std::fs::rename(hidden_db, session_db).expect("restore session db");
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
@@ -3712,7 +3561,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lazy_catalog_skips_unreadable_db_session_without_failing() {
+    async fn lazy_catalog_ignores_uncataloged_db_session() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
         let good = manager
@@ -3732,7 +3581,7 @@ mod tests {
         restored
             .wait_catalog_loaded()
             .await
-            .expect("catalog load should tolerate one unreadable session");
+            .expect("catalog load should not inspect uncataloged session DBs");
         let sessions = restored.cached_sessions(&test_working_directory()).await;
         assert!(sessions.iter().any(|session| session.id == good.id));
         assert!(!sessions.iter().any(|session| session.id == bad_id));
