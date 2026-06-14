@@ -26,6 +26,8 @@ pub enum SlashCommandOutcome {
     OpenForkSessionWizard,
     /// Switch to a newly cloned session.
     SessionCloned { session_id: SessionId },
+    /// Open Ralph loop start dialog.
+    OpenRalphStartDialog,
     /// Open skill picker.
     PickSkill,
     /// Invoke a skill after creating an active session if needed.
@@ -307,6 +309,21 @@ async fn cwd_command(
         "working directory set to {}",
         session.working_directory.display()
     )))
+}
+
+async fn ralph_command(parts: &[&str]) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
+    match parts.get(1).copied() {
+        Some("start") | None => Ok(SlashCommandOutcome::OpenRalphStartDialog),
+        Some("run" | "stop" | "status" | "audit" | "replan" | "open") => Ok(
+            SlashCommandOutcome::Handled(
+                "Ralph loop orchestration is not implemented yet; use /ralph start to create an isolated work area"
+                    .to_owned(),
+            ),
+        ),
+        Some(_) => Ok(SlashCommandOutcome::Handled(
+            "usage: /ralph [start|run|stop|status|audit|replan|open]".to_owned(),
+        )),
+    }
 }
 
 async fn worktree_command(
@@ -616,6 +633,7 @@ pub async fn execute(
                 session_id: result.session.id,
             })
         }
+        "ralph" => ralph_command(&parts).await,
         "skills" => Ok(SlashCommandOutcome::PickSkill),
         "skill" => {
             if parts.get(1) == Some(&"describe") {

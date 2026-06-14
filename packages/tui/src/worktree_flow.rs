@@ -34,6 +34,39 @@ pub async fn create_for_current_session<W: Write>(
     services: &TuiServices<'_>,
     chat: &mut ActiveChat,
 ) -> Result<(), TuiError> {
+    create_with_dialog(io, services, chat, WorkAreaDialogMode::Worktree).await
+}
+
+/// Start a Ralph loop by creating an isolated work area.
+pub async fn start_ralph_loop<W: Write>(
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
+) -> Result<(), TuiError> {
+    create_with_dialog(io, services, chat, WorkAreaDialogMode::RalphLoop).await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkAreaDialogMode {
+    Worktree,
+    RalphLoop,
+}
+
+impl WorkAreaDialogMode {
+    const fn empty_name_status(self) -> &'static str {
+        match self {
+            Self::Worktree => "worktree name is required",
+            Self::RalphLoop => "Ralph loop name is required",
+        }
+    }
+}
+
+async fn create_with_dialog<W: Write>(
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
+    mode: WorkAreaDialogMode,
+) -> Result<(), TuiError> {
     let current_session_id = chat.app.session_id();
     let default_name = current_session_id.map_or_else(
         || "new-session".to_owned(),
@@ -43,10 +76,18 @@ pub async fn create_for_current_session<W: Write>(
                 .map_or_else(|| format!("session-{session_id}"), ToString::to_string)
         },
     );
-    let mut dialog = worktree_create_dialog::WorktreeCreateDialog::new(
-        &default_name,
-        current_session_id.is_some(),
-    );
+    let mut dialog = match mode {
+        WorkAreaDialogMode::Worktree => worktree_create_dialog::WorktreeCreateDialog::new(
+            &default_name,
+            current_session_id.is_some(),
+        ),
+        WorkAreaDialogMode::RalphLoop => {
+            worktree_create_dialog::WorktreeCreateDialog::new_ralph_loop(
+                &default_name,
+                current_session_id.is_some(),
+            )
+        }
+    };
     loop {
         io.terminal.resize(helpers::terminal_area()?);
         io.terminal
@@ -68,7 +109,7 @@ pub async fn create_for_current_session<W: Write>(
                 KeyCode::Enter => {
                     let name = dialog.name_text();
                     if name.is_empty() {
-                        chat.app.set_status("worktree name is required".to_owned());
+                        chat.app.set_status(mode.empty_name_status().to_owned());
                         continue;
                     }
                     let target = dialog.target();
@@ -99,7 +140,7 @@ pub async fn create_for_current_session<W: Write>(
                             no_setup: false,
                         })
                         .await?;
-                    handle_created_worktree(io, services, chat, response, target)?;
+                    handle_created_worktree(io, services, chat, response, target, mode)?;
                     return Ok(());
                 }
                 KeyCode::Left
@@ -171,33 +212,39 @@ fn handle_created_worktree<W: Write>(
     chat: &mut ActiveChat,
     response: bcode_worktree_models::WorktreeCreateResponse,
     target: worktree_create_dialog::WorktreeCreateTarget,
+    mode: WorkAreaDialogMode,
 ) -> Result<(), TuiError> {
     let path = response.path.clone();
+    let work_area_label = match mode {
+        WorkAreaDialogMode::Worktree => "worktree",
+        WorkAreaDialogMode::RalphLoop => "Ralph isolated work area",
+    };
     match target {
         worktree_create_dialog::WorktreeCreateTarget::CurrentSession => {
             if let Some(session) = response.session {
                 chat.app.apply_session_summary(&session);
             }
             chat.app.push_system_note(format!(
-                "Created worktree for current session\n* Path: {}",
+                "Created {work_area_label} for current session\n* Path: {}",
                 path.display()
             ));
-            chat.app.set_status("created worktree".to_owned());
+            chat.app.set_status(format!("created {work_area_label}"));
         }
         worktree_create_dialog::WorktreeCreateTarget::NewSession => {
             let Some(session) = response.session else {
-                chat.app
-                    .set_status("created worktree, but no session was returned".to_owned());
+                chat.app.set_status(format!(
+                    "created {work_area_label}, but no session was returned"
+                ));
                 return Ok(());
             };
             let session_id = session.id;
             chat.app.push_system_note(format!(
-                "Created worktree with new session\n* Path: {}\n* Session: {session_id}",
+                "Created {work_area_label} with new session\n* Path: {}\n* Session: {session_id}",
                 path.display()
             ));
             session_flow::switch_session(io.terminal, services.client, chat, session_id)?;
             chat.app
-                .set_status("created worktree and switched session".to_owned());
+                .set_status(format!("created {work_area_label} and switched session"));
         }
     }
     Ok(())

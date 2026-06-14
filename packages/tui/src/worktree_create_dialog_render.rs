@@ -13,7 +13,7 @@ const MODAL_BG: Color = Color::Black;
 
 /// Render the worktree create dialog.
 pub fn render_dialog(dialog: &mut WorktreeCreateDialog, frame: &mut Frame<'_>) {
-    let modal = modal_frame();
+    let modal = modal_frame(dialog.title());
     modal.render(frame.area(), frame);
     let content = modal.content_area(frame.area());
     let mut row = content.y;
@@ -30,7 +30,7 @@ pub fn render_dialog(dialog: &mut WorktreeCreateDialog, frame: &mut Frame<'_>) {
         dialog.focus() == WorktreeCreateFocus::Base,
     );
     render_line(&base, &modal, content, &mut row, frame);
-    let help = help_line();
+    let help = help_line(dialog.create_label());
     render_line(&help, &modal, content, &mut row, frame);
     let status = Line::from_spans(vec![Span::styled(
         dialog.status().to_owned(),
@@ -39,12 +39,12 @@ pub fn render_dialog(dialog: &mut WorktreeCreateDialog, frame: &mut Frame<'_>) {
     render_line(&status, &modal, content, &mut row, frame);
 }
 
-fn modal_frame() -> ModalFrame {
+fn modal_frame(title: &str) -> ModalFrame {
     ModalFrame::new(
         ModalSizing::new(Size::new(56, 10), Size::new(80, 12), Insets::all(4)),
         ModalTheme::dark(Color::Cyan),
     )
-    .title(" Create worktree ")
+    .title(format!(" {title} "))
     .padding(Insets::new(1, 2, 1, 2))
     .placement(ModalPlacement::UpperThird)
 }
@@ -59,13 +59,13 @@ fn render_name_field(
     if *row >= content.bottom() {
         return;
     }
-    let label = "Name: ";
+    let label = format!("{}: ", dialog.name_label());
     let label_width = u16::try_from(label.len()).unwrap_or(u16::MAX);
     let line_area = Rect::new(content.x, *row, content.width, 1);
     modal.render_line(
         line_area,
         &Line::from_spans(vec![Span::styled(
-            label,
+            label.as_str(),
             Style::new().add_modifier(Modifier::BOLD).bg(MODAL_BG),
         )]),
         frame,
@@ -105,13 +105,13 @@ fn render_line(
     *row = row.saturating_add(1);
 }
 
-fn help_line() -> Line {
+fn help_line(create_label: &str) -> Line {
     Line::from_spans(vec![
         Span::styled(
             "Enter",
             Style::new().add_modifier(Modifier::BOLD).bg(MODAL_BG),
         ),
-        Span::styled(" create  ", Style::new().bg(MODAL_BG)),
+        Span::styled(format!(" {create_label}  "), Style::new().bg(MODAL_BG)),
         Span::styled(
             "Tab",
             Style::new().add_modifier(Modifier::BOLD).bg(MODAL_BG),

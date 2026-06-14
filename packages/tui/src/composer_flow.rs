@@ -40,6 +40,7 @@ fn is_slash_command_name(command: &str) -> bool {
             | "rescan-imports"
             | "runtime"
             | "status"
+            | "ralph"
     )
 }
 
@@ -60,6 +61,7 @@ fn is_draft_safe_slash_command(command: &str) -> bool {
             | "skill"
             | "thinking"
             | "rescan-imports"
+            | "ralph"
     )
 }
 
@@ -210,6 +212,10 @@ async fn handle_slash_command<W: Write>(
             session_flow::switch_session(io.terminal, services.client, chat, session_id)?;
             chat.app
                 .set_status("cloned session and switched".to_owned());
+        }
+        slash_commands::SlashCommandOutcome::OpenRalphStartDialog => {
+            chat.app.clear_pending_submission(message);
+            worktree_flow::start_ralph_loop(io, services, chat).await?;
         }
         slash_commands::SlashCommandOutcome::ToggleDiff => {
             chat.app.clear_pending_submission(message);
