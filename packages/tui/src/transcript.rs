@@ -744,6 +744,23 @@ fn push_transcript_item_from_event(
                 presented_tool_results.insert(tool_call_id.clone());
                 return;
             }
+            if let Some(legacy_result) = legacy_semantic_tool_result(
+                tool_calls
+                    .get(tool_call_id)
+                    .map(|context| context.tool_name.as_str()),
+                result,
+            ) {
+                apply_semantic_tool_result(
+                    items,
+                    tool_call_id,
+                    tool_calls.get(tool_call_id),
+                    streamed_tool_results.get_mut(tool_call_id),
+                    &legacy_result,
+                    *is_error,
+                );
+                presented_tool_results.insert(tool_call_id.clone());
+                return;
+            }
             let should_render_final = if let Some(replay) =
                 streamed_tool_results.get_mut(tool_call_id)
             {
@@ -902,6 +919,20 @@ fn non_streaming_transcript_item_from_event(
                     *is_error,
                 );
             }
+            if let Some(legacy_result) = legacy_semantic_tool_result(
+                tool_calls
+                    .get(tool_call_id)
+                    .map(|context| context.tool_name.as_str()),
+                result,
+            ) {
+                return semantic_tool_result_item(
+                    tool_call_id,
+                    tool_calls.get(tool_call_id),
+                    None,
+                    &legacy_result,
+                    *is_error,
+                );
+            }
             if streamed_tool_results
                 .get(tool_call_id)
                 .is_some_and(|replay| replay.saw_output)
@@ -976,6 +1007,88 @@ fn working_directory_changed_message(
         "Working directory changed from `{}` to `{}`. Treat prior file/path assumptions as possibly stale unless reconfirmed.",
         old_working_directory.display(),
         new_working_directory.display()
+    )
+}
+
+fn legacy_semantic_tool_result(
+    tool_name: Option<&str>,
+    result: &str,
+) -> Option<ToolInvocationResult> {
+    let value = serde_json::from_str::<serde_json::Value>(result).ok()?;
+    if value.get("mode")?.as_str()? != "terminal" {
+        return None;
+    }
+    let output = value
+        .get("output")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    Some(ToolInvocationResult::ShellRun {
+        result: ShellRunResult::Terminal {
+            exit_code: value
+                .get("exit_code")
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|code| i32::try_from(code).ok()),
+            timed_out: value
+                .get("timed_out")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or_default(),
+            cancelled: value
+                .get("cancelled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or_default(),
+            output_tail: legacy_terminal_output_text(tool_name, &value, &output),
+            output_truncated: value
+                .get("output_truncated")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or_default(),
+            output_bytes: value
+                .get("output_bytes")
+                .and_then(serde_json::Value::as_u64),
+            retained_output_bytes: value
+                .get("retained_output_bytes")
+                .and_then(serde_json::Value::as_u64),
+            columns: value
+                .get("columns")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|columns| u16::try_from(columns).ok())
+                .unwrap_or(120),
+            rows: value
+                .get("rows")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|rows| u16::try_from(rows).ok())
+                .unwrap_or(24),
+        },
+    })
+}
+
+fn legacy_terminal_output_text(
+    tool_name: Option<&str>,
+    value: &serde_json::Value,
+    output: &str,
+) -> String {
+    if !value
+        .get("output_truncated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_default()
+    {
+        return output.to_owned();
+    }
+    let Some(output_bytes) = value
+        .get("output_bytes")
+        .and_then(serde_json::Value::as_u64)
+    else {
+        return output.to_owned();
+    };
+    let Some(retained_output_bytes) = value
+        .get("retained_output_bytes")
+        .and_then(serde_json::Value::as_u64)
+    else {
+        return output.to_owned();
+    };
+    format!(
+        "{} output truncated; showing {retained_output_bytes} of {output_bytes} bytes\n{output}",
+        tool_name.unwrap_or("terminal")
     )
 }
 
