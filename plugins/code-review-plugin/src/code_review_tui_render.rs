@@ -349,11 +349,11 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             }
             if app.review.is_repository_review() {
                 return format!(
-                    " j/k move  enter open/toggle  ←/→ collapse/expand  f picker  : line  / search  n/N next/prev  M attention  u/i file-open  P/O global-open  ! attention-sidebar  c comment  C review-comment  w viewed  W/I unviewed  V/E all-viewed/unviewed  v range  x publish  a ask Bcode  t sidebar-tab:{sidebar}  b sidebar:{sidebar}  ? {help}  q exit "
+                    " j/k move  enter open/toggle  ←/→ collapse/expand  f picker  : line  / search  n/N next/prev  M attention  u/i file-open  P/O global-open  ! attention-sidebar  c comment  C review-comment  w viewed  W/I unviewed  V/E all-viewed/unviewed  H hide-viewed  v range  x publish  a ask Bcode  t sidebar-tab:{sidebar}  b sidebar:{sidebar}  ? {help}  q exit "
                 );
             }
             format!(
-                " j/k move  [/]/ thread  {{/}} draft  Enter fold/action  r resolve  R resolved  T filter  U expand  Z collapse  n/p file  J/K hunk  c comment/reply  C review-comment  v range  x publish  a ask Bcode  o open session  e edit  D delete draft  t sidebar-tab  b sidebar:{sidebar}  ? {help}  q exit "
+                " j/k move  [/]/ thread  {{/}} draft  Enter fold/action  r resolve  R resolved  T filter  H hide-viewed  U expand  Z collapse  n/p file  J/K hunk  c comment/reply  C review-comment  v range  x publish  a ask Bcode  o open session  e edit  D delete draft  t sidebar-tab  b sidebar:{sidebar}  ? {help}  q exit "
             )
         },
         |message| format!(" {message}"),
@@ -533,21 +533,30 @@ fn render_files(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         render_file_tree(app, area, frame, visible_rows);
         return;
     }
-    if app.selected_file < app.file_scroll {
-        app.file_scroll = app.selected_file;
+    let visible_files = app.visible_file_indices();
+    let focused_row = visible_files
+        .iter()
+        .position(|index| *index == app.selected_file)
+        .unwrap_or(0);
+    if focused_row < app.file_scroll {
+        app.file_scroll = focused_row;
     }
-    if app.selected_file >= app.file_scroll.saturating_add(visible_rows) {
-        app.file_scroll = app
-            .selected_file
-            .saturating_sub(visible_rows.saturating_sub(1));
+    if focused_row >= app.file_scroll.saturating_add(visible_rows) {
+        app.file_scroll = focused_row.saturating_sub(visible_rows.saturating_sub(1));
+    }
+    if app.file_scroll >= visible_files.len() {
+        app.file_scroll = visible_files.len().saturating_sub(1);
     }
 
     for row in 0..visible_rows {
         let y = area
             .y
             .saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
-        let index = app.file_scroll.saturating_add(row);
+        let visible_index = app.file_scroll.saturating_add(row);
         let line_area = Rect::new(area.x, y, area.width, 1);
+        let Some(index) = visible_files.get(visible_index).copied() else {
+            continue;
+        };
         if let Some(file) = app.review.files.get(index) {
             render_file_row(
                 file,
@@ -560,12 +569,12 @@ fn render_files(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             );
             app.register_mouse_region(
                 line_area,
-                ReviewMouseAction::SelectFile(index),
+                ReviewMouseAction::SelectFile(visible_index),
                 "select file",
             );
             app.register_mouse_region(
                 Rect::new(line_area.x, line_area.y, 4.min(line_area.width), 1),
-                ReviewMouseAction::ToggleFileViewed(index),
+                ReviewMouseAction::ToggleFileViewed(visible_index),
                 "toggle viewed",
             );
         }
@@ -903,6 +912,8 @@ fn render_file_row(
 ) {
     let style = if selected {
         Style::new().fg(Color::Black).bg(Color::White)
+    } else if viewed {
+        Style::new().fg(Color::BrightBlack).bg(Color::Black)
     } else {
         Style::new().fg(Color::White).bg(Color::Black)
     };
@@ -1412,7 +1423,14 @@ fn render_source_view_row(
     let Some(source_row) = view_row.source_row else {
         return render_display_row(display_row);
     };
-    let rendered = render_display_row(display_row);
+    let show_comment_affordance = source_row == app.selected_diff_line
+        && matches!(
+            display_row.source,
+            ReviewDisplayRowSource::Added
+                | ReviewDisplayRowSource::Removed
+                | ReviewDisplayRowSource::Context
+        );
+    let rendered = render_display_row_with_affordance(show_comment_affordance, display_row);
     let mut line = rendered.line;
     if let Some(marker) = app.draft_marker_at(app.selected_file, source_row) {
         line.spans
@@ -1448,6 +1466,15 @@ fn render_file_view_row(
     if line_number.trim().is_empty() {
         spans.push(Span::styled(content.to_string(), style));
     } else {
+        if source_row == app.selected_diff_line {
+            spans.insert(
+                0,
+                Span::styled(
+                    "+",
+                    style.patch(Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                ),
+            );
+        }
         spans.extend(highlighted_source_spans(
             syntax_highlighter,
             can_highlight,
@@ -1584,6 +1611,25 @@ fn highlighted_source_spans(
             )
         })
         .collect()
+}
+
+fn render_display_row_with_affordance(
+    show_comment_affordance: bool,
+    row: &ReviewDisplayRow,
+) -> RenderedRow {
+    let mut rendered = render_display_row(row);
+    if show_comment_affordance {
+        rendered.line.spans.insert(
+            0,
+            Span::styled(
+                "+",
+                rendered
+                    .style
+                    .patch(Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            ),
+        );
+    }
+    rendered
 }
 
 fn render_display_row(row: &ReviewDisplayRow) -> RenderedRow {

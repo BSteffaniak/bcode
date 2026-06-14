@@ -1768,6 +1768,7 @@ fn handle_review_navigation_key(app: &mut ReviewApp, key: KeyCode) -> bool {
         KeyCode::Char('P') => app.select_next_open_thread_global(),
         KeyCode::Char('R') => app.toggle_show_resolved_threads(),
         KeyCode::Char('r') => app.toggle_selected_thread_resolved(),
+        KeyCode::Char('H') => app.toggle_hide_viewed_files(),
         KeyCode::Char('U') => app.expand_all_inline_threads(),
         KeyCode::Char('Z') => app.collapse_all_inline_threads(),
         KeyCode::Char('J') => app.select_next_hunk(),
@@ -3446,6 +3447,8 @@ pub struct ReviewApp {
     pub resolved_review_threads: BTreeSet<String>,
     /// Whether resolved inline review threads are visible.
     pub show_resolved_threads: bool,
+    /// Whether viewed files are hidden from the file sidebar.
+    pub hide_viewed_files: bool,
     /// Session id to open after leaving review mode.
     pub session_to_open: Option<SessionId>,
     last_file_area: Option<Rect>,
@@ -3507,6 +3510,7 @@ impl ReviewApp {
             collapsed_review_threads: BTreeSet::new(),
             resolved_review_threads: BTreeSet::new(),
             show_resolved_threads: true,
+            hide_viewed_files: false,
             session_to_open: None,
             last_file_area: None,
             last_diff_area: None,
@@ -4577,9 +4581,9 @@ impl ReviewApp {
                 let selected = self.select_thread(index);
                 self.jump_to_selected_thread() || selected
             }
-            ReviewMouseAction::SelectFile(index) => self.select_file(index),
+            ReviewMouseAction::SelectFile(index) => self.select_visible_file(index),
             ReviewMouseAction::ToggleFileViewed(index) => {
-                if !self.select_file(index) && index >= self.review.files.len() {
+                if !self.select_visible_file(index) && index >= self.visible_file_indices().len() {
                     return false;
                 }
                 self.toggle_selected_file_viewed()
@@ -5887,6 +5891,28 @@ impl ReviewApp {
         }
     }
 
+    /// Return indices for files visible in the changed-file sidebar.
+    #[must_use]
+    pub fn visible_file_indices(&self) -> Vec<usize> {
+        self.review
+            .files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, file)| {
+                (!self.hide_viewed_files || !self.viewed_files.contains(file.display_path()))
+                    .then_some(index)
+            })
+            .collect()
+    }
+
+    /// Select a file by visible changed-file sidebar index.
+    pub fn select_visible_file(&mut self, visible_index: usize) -> bool {
+        let Some(index) = self.visible_file_indices().get(visible_index).copied() else {
+            return false;
+        };
+        self.select_file(index)
+    }
+
     /// Return whether the file at index is marked viewed.
     #[must_use]
     pub fn file_viewed(&self, index: usize) -> bool {
@@ -5920,6 +5946,20 @@ impl ReviewApp {
         (viewed, total)
     }
 
+    /// Toggle whether viewed files are hidden from the changed-file sidebar.
+    pub fn toggle_hide_viewed_files(&mut self) -> bool {
+        self.hide_viewed_files = !self.hide_viewed_files;
+        if self.hide_viewed_files {
+            self.status_message = Some("hiding viewed files in sidebar".to_string());
+            if self.file_viewed(self.selected_file) && !self.unviewed_file_indices().is_empty() {
+                let _ = self.select_next_unviewed_file();
+            }
+        } else {
+            self.status_message = Some("showing viewed files in sidebar".to_string());
+        }
+        true
+    }
+
     /// Toggle viewed state for the selected review file.
     pub fn toggle_selected_file_viewed(&mut self) -> bool {
         let Some(path) = self.selected_file_path() else {
@@ -5935,6 +5975,9 @@ impl ReviewApp {
             self.workspace.viewed_files.insert(path.clone());
             self.pending_workspace_save = true;
             self.status_message = Some(format!("marked {path} viewed"));
+            if self.hide_viewed_files && !self.unviewed_file_indices().is_empty() {
+                let _ = self.select_next_unviewed_file();
+            }
         }
         true
     }
