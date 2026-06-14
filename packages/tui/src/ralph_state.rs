@@ -8,6 +8,60 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const RALPH_STATE_SUBDIR: &str = "ralph";
 const PROGRESS_DOC_FILE_NAME: &str = "progress.md";
 const LOOP_METADATA_FILE_NAME: &str = "loop.json";
+const CONTEXT_PACK_FILE_NAME: &str = "context-pack.json";
+const AUDIT_HISTORY_FILE_NAME: &str = "audit-history.jsonl";
+
+/// Ralph loop lifecycle status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RalphLoopStatus {
+    /// Loop was created and has local state.
+    Created,
+    /// Loop is collecting or refreshing conversation context.
+    Planning,
+    /// Loop is waiting for user approval.
+    AwaitingApproval,
+    /// Loop is running a bounded work iteration.
+    Running,
+    /// Loop is auditing repository state against the progress doc.
+    Auditing,
+    /// Loop is updating the remaining plan.
+    Replanning,
+    /// Loop stopped before completion.
+    Stopped,
+    /// Loop is blocked on validation, permission, or a user question.
+    Blocked,
+    /// Loop is complete.
+    Done,
+}
+
+impl RalphLoopStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Planning => "planning",
+            Self::AwaitingApproval => "awaiting_approval",
+            Self::Running => "running",
+            Self::Auditing => "auditing",
+            Self::Replanning => "replanning",
+            Self::Stopped => "stopped",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+        }
+    }
+}
+
+const ALL_RALPH_LOOP_STATUSES: [RalphLoopStatus; 9] = [
+    RalphLoopStatus::Created,
+    RalphLoopStatus::Planning,
+    RalphLoopStatus::AwaitingApproval,
+    RalphLoopStatus::Running,
+    RalphLoopStatus::Auditing,
+    RalphLoopStatus::Replanning,
+    RalphLoopStatus::Stopped,
+    RalphLoopStatus::Blocked,
+    RalphLoopStatus::Done,
+];
 
 /// Created Ralph loop state paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +72,10 @@ pub struct CreatedRalphLoopState {
     pub progress_doc_path: PathBuf,
     /// Loop metadata path.
     pub metadata_path: PathBuf,
+    /// Context pack sidecar path.
+    pub context_pack_path: PathBuf,
+    /// Audit history sidecar path.
+    pub audit_history_path: PathBuf,
 }
 
 /// Create initial local state for a Ralph loop.
@@ -42,6 +100,11 @@ pub fn create_initial_loop_state(
         &paths.progress_doc_path,
         initial_progress_doc(loop_name, repo_root, session_title, &paths),
     )?;
+    std::fs::write(
+        &paths.context_pack_path,
+        initial_context_pack(loop_name, session_title)?,
+    )?;
+    std::fs::write(&paths.audit_history_path, [])?;
     Ok(paths)
 }
 
@@ -76,7 +139,7 @@ pub fn record_work_area(
     );
     metadata.insert(
         "status".to_owned(),
-        Value::String("work_area_created".to_owned()),
+        Value::String(RalphLoopStatus::Running.as_str().to_owned()),
     );
     metadata.insert(
         "updated_at_ms".to_owned(),
@@ -114,6 +177,8 @@ fn allocate_loop_paths(
             return Ok(CreatedRalphLoopState {
                 progress_doc_path: state_dir.join(PROGRESS_DOC_FILE_NAME),
                 metadata_path: state_dir.join(LOOP_METADATA_FILE_NAME),
+                context_pack_path: state_dir.join(CONTEXT_PACK_FILE_NAME),
+                audit_history_path: state_dir.join(AUDIT_HISTORY_FILE_NAME),
                 state_dir,
             });
         }
@@ -128,8 +193,13 @@ struct LoopMetadata<'a> {
     repo_root: &'a Path,
     repo_id: String,
     progress_doc_path: &'a Path,
-    status: &'static str,
+    status: RalphLoopStatus,
+    stop_reason: Option<&'static str>,
+    max_iterations: u64,
+    no_progress_limit: u64,
     iteration_count: u64,
+    context_pack_path: &'a Path,
+    audit_history_path: &'a Path,
     created_at_ms: u128,
     updated_at_ms: u128,
 }
@@ -148,8 +218,13 @@ impl<'a> LoopMetadata<'a> {
             repo_root,
             repo_id: repo_state_id(repo_root),
             progress_doc_path: &paths.progress_doc_path,
-            status: "created",
+            status: RalphLoopStatus::Created,
+            stop_reason: None,
+            max_iterations: 5,
+            no_progress_limit: 2,
             iteration_count: 0,
+            context_pack_path: &paths.context_pack_path,
+            audit_history_path: &paths.audit_history_path,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
         }
@@ -190,6 +265,24 @@ fn initial_progress_doc(
         progress_doc = paths.progress_doc_path.display(),
         state_dir = paths.state_dir.display()
     )
+}
+
+fn initial_context_pack(
+    loop_name: &str,
+    session_title: Option<&str>,
+) -> Result<Vec<u8>, RalphStateError> {
+    let value = serde_json::json!({
+        "loop_name": loop_name,
+        "session_title": session_title,
+        "status": "placeholder",
+        "known_loop_statuses": ALL_RALPH_LOOP_STATUSES.map(RalphLoopStatus::as_str),
+        "notes": [
+            "Conversation context capture is not implemented yet.",
+            "This sidecar reserves the durable state location for bounded context packs."
+        ],
+        "created_at_ms": now_ms(),
+    });
+    serde_json::to_vec_pretty(&value).map_err(RalphStateError::Json)
 }
 
 fn repo_state_id(repo_root: &Path) -> String {
