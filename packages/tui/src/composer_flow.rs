@@ -7,7 +7,8 @@ use bcode_session_models::SessionId;
 use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::ActiveChat;
 use super::{
-    TuiError, model_flow, session_flow, skill_flow, slash_commands, thinking_dialog, worktree_flow,
+    TuiError, model_flow, session_flow, session_fork_flow, skill_flow, slash_commands,
+    thinking_dialog, worktree_flow,
 };
 
 /// Result of submitting staged composer text.
@@ -195,8 +196,7 @@ async fn handle_slash_command<W: Write>(
         }
         slash_commands::SlashCommandOutcome::OpenForkSessionWizard => {
             chat.app.clear_pending_submission(message);
-            chat.app
-                .set_status("session fork wizard is not implemented yet".to_owned());
+            session_fork_flow::fork_current_session(io, services, chat).await?;
         }
         slash_commands::SlashCommandOutcome::SessionCloned { session_id } => {
             chat.app.clear_pending_submission(message);

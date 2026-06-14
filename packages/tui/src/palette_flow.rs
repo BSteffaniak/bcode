@@ -12,7 +12,7 @@ use super::helpers;
 use super::picker_mouse::command_palette_row_from_mouse;
 use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::{self, ActiveChat};
-use super::{TuiError, model_flow, skill_flow, worktree_flow};
+use super::{TuiError, model_flow, session_fork_flow, skill_flow, worktree_flow};
 
 /// Handle one key while the command palette is open.
 pub async fn handle_palette_key<W: Write>(
@@ -153,19 +153,10 @@ async fn execute_session_command<W: Write>(
             .await?;
         }
         PaletteCommand::ForkSession => {
-            chat.app
-                .set_status("session fork wizard is not implemented yet".to_owned());
+            session_fork_flow::fork_current_session(io, services, chat).await?;
         }
         PaletteCommand::CloneSession => {
-            let Some(session_id) = chat.app.session_id() else {
-                chat.app.set_status("No active session".to_owned());
-                return Ok(());
-            };
-            let result = services.client.clone_session(session_id, None).await?;
-            let new_session_id = result.session.id;
-            session_flow::switch_session(io.terminal, services.client, chat, new_session_id)?;
-            chat.app
-                .set_status("cloned session and switched".to_owned());
+            session_fork_flow::clone_current_session(io, services, chat).await?;
         }
         _ => {}
     }
