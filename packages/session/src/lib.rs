@@ -135,6 +135,10 @@ impl SessionStore {
         }
 
         for summary in self.load_global_catalog_summaries()? {
+            let summary = match self.load_session_manifest(summary.id) {
+                Ok(Some(manifest_summary)) => manifest_summary,
+                Ok(None) | Err(_) => summary,
+            };
             sessions.insert(summary.id, SessionState::from_catalog_summary(summary));
         }
 
@@ -1468,8 +1472,10 @@ impl SessionManager {
                 .await?;
             sequence_map.insert(event.sequence, copied.sequence);
         }
-        self.append_event(session.id, marker).await?;
-        self.session_summary(session.id).await
+        self.append_event(session.id, marker.clone()).await?;
+        let mut summary = self.session_summary(session.id).await?;
+        summary.fork = session_fork_summary_from_marker(&marker);
+        Ok(summary)
     }
 
     /// Return active tool runs from the DB read model.
@@ -2444,6 +2450,29 @@ impl SessionState {
     }
 }
 
+fn session_fork_summary_from_marker(marker: &SessionEventKind) -> Option<SessionForkSummary> {
+    if let SessionEventKind::SessionForked {
+        source_session_id,
+        source_title,
+        source_cutoff_sequence,
+        source_prompt_sequence,
+        forked_at_ms,
+        kind,
+    } = marker
+    {
+        Some(SessionForkSummary {
+            source_session_id: *source_session_id,
+            source_title: source_title.clone(),
+            source_cutoff_sequence: *source_cutoff_sequence,
+            source_prompt_sequence: *source_prompt_sequence,
+            forked_at_ms: *forked_at_ms,
+            kind: *kind,
+        })
+    } else {
+        None
+    }
+}
+
 fn copy_event_provenance(event: &SessionEvent) -> SessionEventProvenance {
     let source_locator = format!(
         "bcode://session/{}/event/{}",
@@ -3237,6 +3266,171 @@ mod tests {
             &event.kind,
             SessionEventKind::SystemMessage { text } if text == "system"
         )));
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn fork_session_from_prompt_copies_history_before_prompt_and_returns_draft() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("source".to_string()), test_working_directory())
+            .await
+            .expect("session should be created");
+        manager
+            .append_model_changed(session.id, "provider".to_string(), "model".to_string())
+            .await
+            .expect("model should append");
+        manager
+            .append_user_message(session.id, ClientId::new(), "first prompt".to_string())
+            .await
+            .expect("first prompt should append");
+        manager
+            .append_assistant_message(session.id, "first response".to_string())
+            .await
+            .expect("assistant response should append");
+        let second_prompt = manager
+            .append_user_message(session.id, ClientId::new(), "second prompt".to_string())
+            .await
+            .expect("second prompt should append")
+            .into_iter()
+            .find(|event| matches!(event.kind, SessionEventKind::UserMessage { .. }))
+            .expect("user message event should exist");
+        manager
+            .append_assistant_message(session.id, "second response".to_string())
+            .await
+            .expect("second response should append");
+
+        let result = manager
+            .fork_session_from_prompt(session.id, second_prompt.sequence, None)
+            .await
+            .expect("session should fork");
+
+        assert_ne!(result.session.id, session.id);
+        assert_eq!(result.session.name.as_deref(), Some("[fork] source"));
+        assert_eq!(result.draft.as_deref(), Some("second prompt"));
+        assert_eq!(
+            result.session.fork.as_ref().map(|fork| fork.kind),
+            Some(SessionForkKind::Fork)
+        );
+        assert_eq!(
+            result
+                .session
+                .fork
+                .as_ref()
+                .and_then(|fork| fork.source_prompt_sequence),
+            Some(second_prompt.sequence)
+        );
+
+        let fork_history = manager
+            .session_history(result.session.id)
+            .await
+            .expect("fork history should load");
+        assert!(fork_history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ModelChanged { provider, model }
+                if provider == "provider" && model == "model"
+        )));
+        assert!(fork_history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::UserMessage { text, .. } if text == "first prompt"
+        )));
+        assert!(fork_history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::AssistantMessage { text } if text == "first response"
+        )));
+        assert!(!fork_history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::UserMessage { text, .. } if text == "second prompt"
+        )));
+        assert!(fork_history.iter().any(|event| {
+            matches!(
+                &event.kind,
+                SessionEventKind::SessionForked {
+                    source_session_id,
+                    kind: SessionForkKind::Fork,
+                    ..
+                } if *source_session_id == session.id
+            )
+        }));
+        let copied = fork_history
+            .iter()
+            .find(|event| matches!(event.kind, SessionEventKind::AssistantMessage { .. }))
+            .expect("copied assistant message should exist");
+        assert!(copied.provenance.is_some());
+
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let restored_sessions = restored.list_sessions(&test_working_directory()).await;
+        let restored_fork = restored_sessions
+            .iter()
+            .find(|summary| summary.id == result.session.id)
+            .expect("fork should be listed after restore");
+        assert_eq!(
+            restored_fork.fork.as_ref().map(|fork| fork.kind),
+            Some(SessionForkKind::Fork)
+        );
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn clone_session_copies_full_history_and_records_provenance() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("source".to_string()), test_working_directory())
+            .await
+            .expect("session should be created");
+        manager
+            .append_user_message(session.id, ClientId::new(), "prompt".to_string())
+            .await
+            .expect("prompt should append");
+        manager
+            .append_assistant_message(session.id, "response".to_string())
+            .await
+            .expect("response should append");
+
+        let result = manager
+            .clone_session(session.id, None)
+            .await
+            .expect("session should clone");
+
+        assert_ne!(result.session.id, session.id);
+        assert_eq!(result.session.name.as_deref(), Some("[clone] source"));
+        assert_eq!(result.draft, None);
+        assert_eq!(
+            result.session.fork.as_ref().map(|fork| fork.kind),
+            Some(SessionForkKind::Clone)
+        );
+
+        let clone_history = manager
+            .session_history(result.session.id)
+            .await
+            .expect("clone history should load");
+        assert!(clone_history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::UserMessage { text, .. } if text == "prompt"
+        )));
+        assert!(clone_history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::AssistantMessage { text } if text == "response"
+        )));
+        assert!(clone_history.iter().any(|event| {
+            matches!(
+                &event.kind,
+                SessionEventKind::SessionForked {
+                    source_session_id,
+                    kind: SessionForkKind::Clone,
+                    ..
+                } if *source_session_id == session.id
+            )
+        }));
+        assert!(
+            clone_history
+                .iter()
+                .all(|event| event.session_id == result.session.id)
+        );
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
