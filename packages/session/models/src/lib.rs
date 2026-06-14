@@ -271,8 +271,8 @@ pub enum SessionLiveEventKind {
     AssistantReasoningDelta { turn_id: String, text: String },
     /// Raw live tool output emitted while a tool is running.
     ToolOutputDelta { event: ToolInvocationStreamEvent },
-    /// Live-only file edit/write preview derived from partial tool-call arguments.
-    FileEditPreview {
+    /// Live-only tool argument preview derived from partial tool-call arguments.
+    ToolArgumentPreview {
         /// Model turn associated with this preview update.
         turn_id: String,
         /// Provider tool call identifier.
@@ -281,8 +281,8 @@ pub enum SessionLiveEventKind {
         tool_name: String,
         /// Total assembled argument bytes received so far.
         argument_bytes: usize,
-        /// Partial file edit/write preview.
-        preview: LiveFileEditPreview,
+        /// Partial tool argument preview.
+        preview: LiveToolArgumentPreview,
     },
     /// Live-only provider stream progress for active model turns.
     ProviderStreamProgress {
@@ -291,6 +291,16 @@ pub enum SessionLiveEventKind {
         /// Coalesced provider stream progress event.
         event: ProviderStreamEvent,
     },
+}
+
+/// Live-only tool argument preview derived from partial tool-call arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveToolArgumentPreview {
+    /// File edit/write preview.
+    FileEdit(LiveFileEditPreview),
+    /// Shell command preview.
+    ShellCommand(LiveShellCommandPreview),
 }
 
 /// Live-only file edit/write preview derived from partial tool-call arguments.
@@ -302,6 +312,17 @@ pub struct LiveFileEditPreview {
     pub old_text_prefix: Option<String>,
     /// Best-effort new text prefix extracted from partial arguments.
     pub new_text_prefix: String,
+    /// Whether the preview content was truncated by live-preview limits.
+    pub truncated: bool,
+}
+
+/// Live-only shell command preview derived from partial tool-call arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveShellCommandPreview {
+    /// Best-effort command prefix extracted from partial arguments.
+    pub command_prefix: String,
+    /// Best-effort working directory extracted from partial arguments.
+    pub cwd: Option<String>,
     /// Whether the preview content was truncated by live-preview limits.
     pub truncated: bool,
 }

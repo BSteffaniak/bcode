@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use bcode_session_models::{
-    LiveFileEditPreview, SessionEvent, SessionEventKind, SessionTokenUsage,
-    ToolInvocationStreamEvent, ToolOutputStream,
+    LiveFileEditPreview, LiveShellCommandPreview, SessionEvent, SessionEventKind,
+    SessionTokenUsage, ToolInvocationStreamEvent, ToolOutputStream,
 };
 
 use super::diff_extract::{FileEditTranscript, file_edit_from_tool_request};
@@ -61,6 +61,19 @@ pub enum TranscriptItemKind {
         file_edit_phase: Option<FileEditPhase>,
         /// Whether this item was derived from live-only partial tool arguments.
         live_preview: bool,
+    },
+    /// Live-only shell command preview with structured metadata.
+    ShellPreview {
+        /// Provider tool call identifier.
+        tool_call_id: String,
+        /// Tool name.
+        tool_name: String,
+        /// Best-effort command prefix.
+        command_prefix: String,
+        /// Best-effort working directory.
+        cwd: Option<String>,
+        /// Whether preview text was truncated.
+        truncated: bool,
     },
     /// Tool-call result with structured metadata.
     ToolResult {
@@ -348,6 +361,36 @@ impl TranscriptItem {
         true
     }
 
+    /// Update this item from a live-only partial shell command preview.
+    pub fn set_live_shell_command_preview(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        preview: &LiveShellCommandPreview,
+    ) -> bool {
+        let TranscriptItemKind::ShellPreview {
+            tool_call_id: item_tool_call_id,
+            tool_name: item_tool_name,
+            command_prefix,
+            cwd,
+            truncated,
+        } = &mut self.kind
+        else {
+            return false;
+        };
+        if item_tool_call_id != tool_call_id {
+            return false;
+        }
+        tool_name.clone_into(item_tool_name);
+        preview.command_prefix.clone_into(command_prefix);
+        cwd.clone_from(&preview.cwd);
+        *truncated = preview.truncated;
+        self.text.clone_from(&preview.command_prefix);
+        self.streaming = true;
+        self.bump_revision();
+        true
+    }
+
     /// Return semantic item kind.
     #[must_use]
     pub const fn kind(&self) -> &TranscriptItemKind {
@@ -502,6 +545,27 @@ fn live_preview_arguments_json(preview: &LiveFileEditPreview) -> String {
         "truncated": preview.truncated,
     })
     .to_string()
+}
+
+/// Build a transcript item for a live-only partial shell command preview.
+#[must_use]
+pub fn live_shell_command_preview_item(
+    tool_call_id: &str,
+    tool_name: &str,
+    preview: &LiveShellCommandPreview,
+) -> TranscriptItem {
+    TranscriptItem::with_kind(
+        "Tool",
+        preview.command_prefix.clone(),
+        true,
+        TranscriptItemKind::ShellPreview {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: tool_name.to_owned(),
+            command_prefix: preview.command_prefix.clone(),
+            cwd: preview.cwd.clone(),
+            truncated: preview.truncated,
+        },
+    )
 }
 
 /// Build a streaming transcript item for live terminal output.

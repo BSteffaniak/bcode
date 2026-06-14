@@ -639,6 +639,7 @@ fn has_file_preview_before(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn push_transcript_item_rows(
     rows: &mut Vec<Line>,
     transcript: &[TranscriptItem],
@@ -674,6 +675,22 @@ fn push_transcript_item_rows(
                 inline_diff_config,
             };
             push_tool_request_rows(rows, item, &context, width);
+        }
+        TranscriptItemKind::ShellPreview {
+            tool_name,
+            command_prefix,
+            cwd,
+            truncated,
+            ..
+        } => {
+            push_shell_preview_rows(
+                rows,
+                tool_name,
+                command_prefix,
+                cwd.as_deref(),
+                *truncated,
+                width,
+            );
         }
         TranscriptItemKind::ToolResult {
             tool_call_id,
@@ -897,6 +914,39 @@ fn file_tool_action(tool_name: &str, streaming: bool) -> &'static str {
         (_, true) => "File change …",
         (_, false) => "File change preview",
     }
+}
+
+fn push_shell_preview_rows(
+    rows: &mut Vec<Line>,
+    tool_name: &str,
+    command_prefix: &str,
+    cwd: Option<&str>,
+    truncated: bool,
+    width: u16,
+) {
+    push_wrapped_styled_text(
+        rows,
+        Vec::new(),
+        &format!("Tool call · {tool_name} · streaming preview"),
+        width,
+        Style::new().fg(Color::Cyan),
+        Style::new().fg(Color::Cyan),
+    );
+    push_kv_row(rows, "command", command_prefix, width);
+    if let Some(cwd) = cwd {
+        push_kv_row(rows, "cwd", cwd, width);
+    }
+    if truncated {
+        push_wrapped_styled_text(
+            rows,
+            vec![Span::styled("  ", muted_style())],
+            "preview truncated by live display limit",
+            width,
+            muted_style(),
+            muted_style(),
+        );
+    }
+    rows.push(Line::default());
 }
 
 fn push_terminal_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) {

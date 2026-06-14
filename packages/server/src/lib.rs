@@ -33,11 +33,12 @@ use bcode_model::{
 use bcode_plugin::PluginInvocationScope;
 use bcode_session::{CatalogLoadStatus, SessionManager, lease::SessionLeaseOwnerContext};
 use bcode_session_models::{
-    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, LiveFileEditPreview, ModelTurnOutcome,
-    ProviderStreamEvent, ProviderToolCallProgress, RuntimeWorkId, RuntimeWorkKind,
-    RuntimeWorkStatus, SessionEventKind, SessionId, SessionLiveEventKind, SessionTokenUsage,
-    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ToolInvocationStreamEvent,
-    ToolOutputStream as SessionToolOutputStream, TraceBlobRef, TraceRedaction,
+    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, LiveFileEditPreview, LiveShellCommandPreview,
+    LiveToolArgumentPreview, ModelTurnOutcome, ProviderStreamEvent, ProviderToolCallProgress,
+    RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind, SessionId,
+    SessionLiveEventKind, SessionTokenUsage, SessionTraceEvent, SessionTracePayload,
+    SessionTracePhase, ToolInvocationStreamEvent, ToolOutputStream as SessionToolOutputStream,
+    TraceBlobRef, TraceRedaction,
 };
 use bcode_skill::{SkillRegistry, SkillRegistryOptions, SkillSourceRoot};
 use bcode_skill_models::{
@@ -4119,7 +4120,7 @@ struct ToolArgumentStreamProgress {
     force_emit_final: bool,
     preview_arguments: String,
     preview_arguments_truncated: bool,
-    last_emitted_preview: Option<LiveFileEditPreview>,
+    last_emitted_preview: Option<LiveToolArgumentPreview>,
 }
 
 #[derive(Debug, Default)]
@@ -4330,7 +4331,7 @@ impl ModelStreamProgress {
     const TOOL_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(100);
     const MAX_TOOL_PROGRESS_EVENTS: usize = 512;
     const TOOL_ARGUMENT_PREVIEW_MAX_BYTES: usize = 128 * 1024;
-    const FILE_EDIT_PREVIEW_MAX_CHARS: usize = 32 * 1024;
+    const TOOL_ARGUMENT_FIELD_PREVIEW_MAX_CHARS: usize = 32 * 1024;
 
     fn start_tool_call(&mut self, call_id: String, name: String) {
         self.active_tool_call = Some(ToolArgumentStreamProgress {
@@ -4438,17 +4439,22 @@ impl ModelStreamProgress {
         })
     }
 
-    fn take_file_edit_preview(&mut self) -> Option<LiveFileEditPreview> {
+    fn take_tool_argument_preview(&mut self) -> Option<LiveToolArgumentPreview> {
         let active = self.active_tool_call.as_mut()?;
-        if !is_file_edit_tool_name(&active.name) {
-            return None;
-        }
-        let mut preview = live_file_edit_preview_from_arguments(
+        let mut preview = live_tool_argument_preview_from_arguments(
+            &active.name,
             &active.preview_arguments,
             active.preview_arguments_truncated,
-            Self::FILE_EDIT_PREVIEW_MAX_CHARS,
+            Self::TOOL_ARGUMENT_FIELD_PREVIEW_MAX_CHARS,
         )?;
-        preview.truncated |= active.preview_arguments_truncated;
+        match &mut preview {
+            LiveToolArgumentPreview::FileEdit(file) => {
+                file.truncated |= active.preview_arguments_truncated;
+            }
+            LiveToolArgumentPreview::ShellCommand(shell) => {
+                shell.truncated |= active.preview_arguments_truncated;
+            }
+        }
         if active
             .last_emitted_preview
             .as_ref()
@@ -4484,6 +4490,37 @@ fn is_file_edit_tool_name(tool_name: &str) -> bool {
     )
 }
 
+fn is_shell_tool_name(tool_name: &str) -> bool {
+    matches!(
+        tool_name
+            .replace(['-', '.'], "_")
+            .to_ascii_lowercase()
+            .as_str(),
+        "shell" | "shell_run" | "filesystem_shell_run" | "bash"
+    )
+}
+
+fn live_tool_argument_preview_from_arguments(
+    tool_name: &str,
+    arguments: &str,
+    arguments_truncated: bool,
+    max_chars: usize,
+) -> Option<LiveToolArgumentPreview> {
+    if is_file_edit_tool_name(tool_name) {
+        return live_file_edit_preview_from_arguments(arguments, arguments_truncated, max_chars)
+            .map(LiveToolArgumentPreview::FileEdit);
+    }
+    if is_shell_tool_name(tool_name) {
+        return live_shell_command_preview_from_arguments(
+            arguments,
+            arguments_truncated,
+            max_chars,
+        )
+        .map(LiveToolArgumentPreview::ShellCommand);
+    }
+    None
+}
+
 fn live_file_edit_preview_from_arguments(
     arguments: &str,
     arguments_truncated: bool,
@@ -4501,6 +4538,20 @@ fn live_file_edit_preview_from_arguments(
         old_text_prefix,
         new_text_prefix: new_text.value,
         truncated: arguments_truncated || new_text.truncated,
+    })
+}
+
+fn live_shell_command_preview_from_arguments(
+    arguments: &str,
+    arguments_truncated: bool,
+    max_chars: usize,
+) -> Option<LiveShellCommandPreview> {
+    let command = partial_json_string_field(arguments, &["command"], max_chars)?;
+    let cwd = partial_json_string_field(arguments, &["cwd"], max_chars).map(|field| field.value);
+    Some(LiveShellCommandPreview {
+        command_prefix: command.value,
+        cwd,
+        truncated: arguments_truncated || command.truncated,
     })
 }
 
@@ -6177,8 +6228,8 @@ async fn handle_provider_turn_event(
                 let tool_call_id = progress.tool_call_id;
                 let tool_name = progress.tool_name;
                 let argument_bytes = progress.argument_bytes;
-                if let Some(preview) = stream_progress.take_file_edit_preview() {
-                    publish_file_edit_preview_live(
+                if let Some(preview) = stream_progress.take_tool_argument_preview() {
+                    publish_tool_argument_preview_live(
                         state,
                         session_id,
                         turn_id,
@@ -6296,14 +6347,13 @@ async fn handle_provider_tool_call_finished_event(
         },
     )
     .await;
-    if is_file_edit_tool_name(&call.name)
-        && let Some(preview) = live_file_edit_preview_from_arguments(
-            &call.arguments.to_string(),
-            false,
-            ModelStreamProgress::FILE_EDIT_PREVIEW_MAX_CHARS,
-        )
-    {
-        publish_file_edit_preview_live(
+    if let Some(preview) = live_tool_argument_preview_from_arguments(
+        &call.name,
+        &call.arguments.to_string(),
+        false,
+        ModelStreamProgress::TOOL_ARGUMENT_FIELD_PREVIEW_MAX_CHARS,
+    ) {
+        publish_tool_argument_preview_live(
             state,
             session_id,
             turn_id,
@@ -6386,20 +6436,20 @@ async fn publish_provider_stream_progress_live(
         .await;
 }
 
-async fn publish_file_edit_preview_live(
+async fn publish_tool_argument_preview_live(
     state: &ServerState,
     session_id: SessionId,
     turn_id: &str,
     tool_call_id: String,
     tool_name: String,
     argument_bytes: usize,
-    preview: LiveFileEditPreview,
+    preview: LiveToolArgumentPreview,
 ) {
     let _ = state
         .sessions
         .publish_live_event(
             session_id,
-            SessionLiveEventKind::FileEditPreview {
+            SessionLiveEventKind::ToolArgumentPreview {
                 turn_id: turn_id.to_string(),
                 tool_call_id,
                 tool_name,

@@ -5,9 +5,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use bcode_config::{TuiConfig, TuiInlineDiffConfig, TuiThinkingConfig};
 use bcode_session_models::{
-    ModelTurnOutcome, ProviderStreamEvent, SessionEvent, SessionEventKind, SessionHistoryCursor,
-    SessionId, SessionInputHistoryEntry, SessionLiveEvent, SessionLiveEventKind, SessionTraceEvent,
-    SessionTracePayload, SessionTracePhase, ToolInvocationStreamEvent, ToolOutputStream,
+    LiveToolArgumentPreview, ModelTurnOutcome, ProviderStreamEvent, SessionEvent, SessionEventKind,
+    SessionHistoryCursor, SessionId, SessionInputHistoryEntry, SessionLiveEvent,
+    SessionLiveEventKind, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
+    ToolInvocationStreamEvent, ToolOutputStream,
 };
 use bcode_skill_models::SkillSource;
 use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
@@ -35,9 +36,9 @@ use super::tool_present::{
 };
 use super::transcript::{
     FileEditPhase, TranscriptItem, TranscriptItemKind, live_file_edit_preview_item,
-    model_usage_item, permission_request_item, permission_result_item,
-    streaming_terminal_output_item, streaming_tool_output_item, tool_request_item,
-    tool_result_item, transcript_items_from_events_with_reasoning,
+    live_shell_command_preview_item, model_usage_item, permission_request_item,
+    permission_result_item, streaming_terminal_output_item, streaming_tool_output_item,
+    tool_request_item, tool_result_item, transcript_items_from_events_with_reasoning,
 };
 use super::transcript_document::TranscriptDocument;
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
@@ -1318,7 +1319,7 @@ impl BmuxApp {
                 self.viewport.preserve_for_append();
                 self.apply_tool_stream_event(event, SessionEventApplication::Live);
             }
-            SessionLiveEventKind::FileEditPreview {
+            SessionLiveEventKind::ToolArgumentPreview {
                 tool_call_id,
                 tool_name,
                 argument_bytes,
@@ -1330,7 +1331,7 @@ impl BmuxApp {
                         .bottom_row(self.transcript_layout.total_rows()),
                 );
                 self.viewport.preserve_for_append();
-                self.apply_live_file_edit_preview(
+                self.apply_live_tool_argument_preview(
                     tool_call_id,
                     tool_name,
                     *argument_bytes,
@@ -1782,6 +1783,9 @@ impl BmuxApp {
                     TranscriptItemKind::ToolRequest {
                         tool_call_id: item_tool_call_id,
                         ..
+                    } | TranscriptItemKind::ShellPreview {
+                        tool_call_id: item_tool_call_id,
+                        ..
                     } if item_tool_call_id == tool_call_id
                 )
             },
@@ -2158,6 +2162,30 @@ impl BmuxApp {
         }
     }
 
+    fn apply_live_tool_argument_preview(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        argument_bytes: usize,
+        preview: &LiveToolArgumentPreview,
+    ) {
+        match preview {
+            LiveToolArgumentPreview::FileEdit(file_preview) => self.apply_live_file_edit_preview(
+                tool_call_id,
+                tool_name,
+                argument_bytes,
+                file_preview,
+            ),
+            LiveToolArgumentPreview::ShellCommand(shell_preview) => self
+                .apply_live_shell_command_preview(
+                    tool_call_id,
+                    tool_name,
+                    argument_bytes,
+                    shell_preview,
+                ),
+        }
+    }
+
     fn apply_live_file_edit_preview(
         &mut self,
         tool_call_id: &str,
@@ -2190,6 +2218,46 @@ impl BmuxApp {
         self.status = format!(
             "streaming {} · {} received",
             preview.path.as_deref().unwrap_or("file change"),
+            format_provider_bytes(argument_bytes)
+        );
+    }
+
+    fn apply_live_shell_command_preview(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        argument_bytes: usize,
+        preview: &bcode_session_models::LiveShellCommandPreview,
+    ) {
+        let updated = self.transcript.mutate_rev_find(
+            |item| {
+                matches!(
+                    item.kind(),
+                    TranscriptItemKind::ShellPreview {
+                        tool_call_id: item_tool_call_id,
+                        ..
+                    } if item_tool_call_id == tool_call_id
+                )
+            },
+            |item| {
+                let _ = item.set_live_shell_command_preview(tool_call_id, tool_name, preview);
+            },
+        );
+        if updated.is_none() {
+            self.transcript.push(live_shell_command_preview_item(
+                tool_call_id,
+                tool_name,
+                preview,
+            ));
+        }
+        self.set_activity(ActivityState::ProviderStream {
+            detail: format!(
+                "streaming {tool_name} command ({} received)",
+                format_provider_bytes(argument_bytes)
+            ),
+        });
+        self.status = format!(
+            "streaming command · {} received",
             format_provider_bytes(argument_bytes)
         );
     }
