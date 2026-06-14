@@ -7820,10 +7820,7 @@ async fn execute_model_tool(
     let presentation = result
         .presentation
         .as_ref()
-        .map(service_tool_presentation_to_session)
-        .or_else(|| {
-            tool_invocation_presentation_from_result(&call.name, &call.arguments, &result.output)
-        });
+        .map(service_tool_presentation_to_session);
     let artifact_output = result.full_output.as_deref().unwrap_or(&result.output);
     let output_blob = (state.observability.persist_tool_io || state.observability.debug_enabled())
         .then(|| {
@@ -8940,97 +8937,6 @@ async fn append_tool_presentation_event(
         Ok(event) => publish_session_event(state, &event).await,
         Err(error) => eprintln!("failed to append tool presentation: {error}"),
     }
-}
-
-fn tool_invocation_presentation_from_result(
-    tool_name: &str,
-    arguments: &serde_json::Value,
-    result: &str,
-) -> Option<ToolInvocationPresentation> {
-    if let Some(presentation) = terminal_tool_invocation_presentation(tool_name, result) {
-        return Some(presentation);
-    }
-    file_change_tool_invocation_presentation(tool_name, arguments, result)
-}
-
-fn terminal_tool_invocation_presentation(
-    tool_name: &str,
-    result: &str,
-) -> Option<ToolInvocationPresentation> {
-    if tool_name != "shell.run" {
-        return None;
-    }
-    let value = serde_json::from_str::<serde_json::Value>(result).ok()?;
-    if value.get("mode")?.as_str()? != "terminal" {
-        return None;
-    }
-    Some(ToolInvocationPresentation::Terminal {
-        exit_code: value
-            .get("exit_code")
-            .and_then(serde_json::Value::as_i64)
-            .and_then(|code| i32::try_from(code).ok()),
-        timed_out: value
-            .get("timed_out")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        cancelled: value
-            .get("cancelled")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        output: value
-            .get("output")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        output_truncated: value
-            .get("output_truncated")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        output_bytes: value
-            .get("output_bytes")
-            .and_then(serde_json::Value::as_u64),
-        retained_output_bytes: value
-            .get("retained_output_bytes")
-            .and_then(serde_json::Value::as_u64),
-        columns: value
-            .get("columns")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|columns| u16::try_from(columns).ok())
-            .unwrap_or(120)
-            .max(1),
-        rows: value
-            .get("rows")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|rows| u16::try_from(rows).ok())
-            .unwrap_or(24)
-            .max(1),
-    })
-}
-
-fn file_change_tool_invocation_presentation(
-    tool_name: &str,
-    arguments: &serde_json::Value,
-    result: &str,
-) -> Option<ToolInvocationPresentation> {
-    let normalized = normalized_tool_name(tool_name);
-    if !matches!(
-        normalized.as_str(),
-        "filesystem_write" | "write" | "filesystem_edit" | "edit"
-    ) {
-        return None;
-    }
-    Some(ToolInvocationPresentation::FileChange {
-        tool_name: tool_name.to_owned(),
-        summary: result.to_owned(),
-        path: arguments
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned),
-    })
-}
-
-fn normalized_tool_name(tool_name: &str) -> String {
-    tool_name.replace('.', "_")
 }
 
 fn service_tool_presentation_to_session(
