@@ -44,6 +44,29 @@ pub fn show_status(chat: &mut ActiveChat) -> Result<(), TuiError> {
     Ok(())
 }
 
+/// Build and show a Ralph orchestration prompt for the current repository.
+pub fn show_prompt(
+    chat: &mut ActiveChat,
+    kind: ralph_state::RalphPromptKind,
+) -> Result<(), TuiError> {
+    let repo_root = current_repo_root(chat)?;
+    let Some(summary) = ralph_state::latest_loop(&repo_root)? else {
+        chat.app
+            .set_status("no Ralph loops for current repository".to_owned());
+        return Ok(());
+    };
+    let prompt = ralph_state::build_prompt(&summary, kind)?;
+    chat.app.push_system_note(format!(
+        "Ralph prompt prepared\n* Loop: {}\n* Progress doc: {}\n\n{}",
+        summary.loop_name,
+        summary.progress_doc_path.display(),
+        prompt
+    ));
+    chat.app
+        .set_status("Ralph prompt prepared; submit manually when ready".to_owned());
+    Ok(())
+}
+
 /// Show latest Ralph progress doc path for the current repository.
 pub fn open_progress(chat: &mut ActiveChat) -> Result<(), TuiError> {
     let repo_root = current_repo_root(chat)?;

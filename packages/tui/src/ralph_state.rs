@@ -163,6 +163,76 @@ fn update_fingerprint(fingerprint: &mut u64, bytes: &[u8]) {
     *fingerprint = fingerprint.wrapping_mul(FNV_PRIME);
 }
 
+/// Ralph orchestration prompt kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RalphPromptKind {
+    /// Bounded work iteration prompt.
+    Work,
+    /// Audit prompt.
+    Audit,
+    /// Replan prompt.
+    Replan,
+}
+
+/// Build a Ralph orchestration prompt from the latest progress doc state.
+///
+/// # Errors
+///
+/// Returns an error when the progress doc cannot be read.
+pub fn build_prompt(
+    summary: &RalphLoopSummary,
+    kind: RalphPromptKind,
+) -> Result<String, RalphStateError> {
+    let progress_doc = std::fs::read_to_string(&summary.progress_doc_path)?;
+    Ok(match kind {
+        RalphPromptKind::Work => work_prompt(summary, &progress_doc),
+        RalphPromptKind::Audit => audit_prompt(summary, &progress_doc),
+        RalphPromptKind::Replan => replan_prompt(summary, &progress_doc),
+    })
+}
+
+fn work_prompt(summary: &RalphLoopSummary, progress_doc: &str) -> String {
+    format!(
+        "Read the Ralph progress doc below, complete exactly one meaningful bounded chunk, update the doc honestly, and run relevant validation if practical.\n\n\
+         Constraints:\n\
+         * Do not mark checklist items complete unless verified.\n\
+         * Preserve completed work and decisions.\n\
+         * Stop and ask if permission, validation, or product intent is unclear.\n\
+         * Keep changes focused on the progress doc goal.\n\n\
+         Ralph loop: {loop_name}\n\
+         Progress doc path: {progress_doc_path}\n\
+         Checked items: {checked}\n\
+         Unchecked items: {unchecked}\n\n\
+         Progress doc:\n\n{progress_doc}",
+        loop_name = summary.loop_name,
+        progress_doc_path = summary.progress_doc_path.display(),
+        checked = summary.checklist_summary.checked_count,
+        unchecked = summary.checklist_summary.unchecked_count
+    )
+}
+
+fn audit_prompt(summary: &RalphLoopSummary, progress_doc: &str) -> String {
+    format!(
+        "Audit the repository state against this Ralph progress doc. Verify completed checklist items, validation claims, decisions, and handoff notes. Do not implement new work except minimal inspection needed for the audit. Convert unverified completed items back to unchecked items and record blockers/questions.\n\n\
+         Ralph loop: {loop_name}\n\
+         Progress doc path: {progress_doc_path}\n\n\
+         Progress doc:\n\n{progress_doc}",
+        loop_name = summary.loop_name,
+        progress_doc_path = summary.progress_doc_path.display()
+    )
+}
+
+fn replan_prompt(summary: &RalphLoopSummary, progress_doc: &str) -> String {
+    format!(
+        "Replan this Ralph progress doc. Preserve verified completed work, decisions, and validation results. Convert incomplete or unverified work into clear unchecked checklist items. Keep the plan bounded and actionable for the next single work iteration.\n\n\
+         Ralph loop: {loop_name}\n\
+         Progress doc path: {progress_doc_path}\n\n\
+         Progress doc:\n\n{progress_doc}",
+        loop_name = summary.loop_name,
+        progress_doc_path = summary.progress_doc_path.display()
+    )
+}
+
 /// Input for Ralph loop stop-decision evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RalphStopDecisionInput {

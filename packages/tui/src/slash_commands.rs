@@ -32,6 +32,8 @@ pub enum SlashCommandOutcome {
     ShowRalphStatus,
     /// Show the latest Ralph progress doc path.
     OpenRalphProgress,
+    /// Build a Ralph work prompt.
+    BuildRalphPrompt(super::ralph_state::RalphPromptKind),
     /// Open skill picker.
     PickSkill,
     /// Invoke a skill after creating an active session if needed.
@@ -320,9 +322,18 @@ fn ralph_command(parts: &[&str]) -> SlashCommandOutcome {
         Some("start") | None => SlashCommandOutcome::OpenRalphStartDialog,
         Some("status") => SlashCommandOutcome::ShowRalphStatus,
         Some("open") => SlashCommandOutcome::OpenRalphProgress,
-        Some("run" | "stop" | "audit" | "replan") => SlashCommandOutcome::Handled(
-            "Ralph loop orchestration is not implemented yet".to_owned(),
-        ),
+        Some("run") => {
+            SlashCommandOutcome::BuildRalphPrompt(super::ralph_state::RalphPromptKind::Work)
+        }
+        Some("audit") => {
+            SlashCommandOutcome::BuildRalphPrompt(super::ralph_state::RalphPromptKind::Audit)
+        }
+        Some("replan") => {
+            SlashCommandOutcome::BuildRalphPrompt(super::ralph_state::RalphPromptKind::Replan)
+        }
+        Some("stop") => {
+            SlashCommandOutcome::Handled("Ralph stop is not implemented yet".to_owned())
+        }
         Some(_) => SlashCommandOutcome::Handled(
             "usage: /ralph [start|run|stop|status|audit|replan|open]".to_owned(),
         ),
