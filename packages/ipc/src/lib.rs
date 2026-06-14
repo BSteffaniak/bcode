@@ -1090,7 +1090,8 @@ fn default_socket_path() -> PathBuf {
 mod tests {
     use super::*;
     use bcode_session_models::{
-        CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEventKind, SessionId, SessionSummary,
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEventKind, SessionForkResult, SessionId,
+        SessionSummary,
     };
 
     #[test]
@@ -1166,6 +1167,64 @@ mod tests {
         for (path, encoded) in cases {
             assert_eq!(encoded, fixture_bytes(path), "fixture changed: {path}");
         }
+    }
+
+    #[test]
+    fn fork_session_request_and_response_round_trip() {
+        let source_session_id: SessionId = "00000000-0000-0000-0000-000000000001"
+            .parse()
+            .expect("source session id should parse");
+        let request = Request::ForkSession {
+            source_session_id,
+            prompt_sequence: 42,
+            name: Some("[fork] source".to_owned()),
+        };
+
+        let encoded = encode(&request).expect("request should encode");
+        let decoded: Request = decode(&encoded).expect("request should decode");
+
+        assert_eq!(decoded, request);
+
+        let session = test_session_summary("[fork] source");
+        let response = Response::Ok(ResponsePayload::SessionForked {
+            session: session.clone(),
+            draft: Some("selected prompt".to_owned()),
+        });
+
+        let encoded = encode(&response).expect("response should encode");
+        let decoded: Response = decode(&encoded).expect("response should decode");
+
+        assert_eq!(decoded, response);
+        let Response::Ok(ResponsePayload::SessionForked { session, draft }) = decoded else {
+            panic!("decoded response should be session_forked");
+        };
+        assert_eq!(session.name.as_deref(), Some("[fork] source"));
+        assert_eq!(draft.as_deref(), Some("selected prompt"));
+    }
+
+    #[test]
+    fn clone_session_request_and_result_round_trip() {
+        let source_session_id: SessionId = "00000000-0000-0000-0000-000000000001"
+            .parse()
+            .expect("source session id should parse");
+        let request = Request::CloneSession {
+            source_session_id,
+            name: Some("[clone] source".to_owned()),
+        };
+
+        let encoded = encode(&request).expect("request should encode");
+        let decoded: Request = decode(&encoded).expect("request should decode");
+
+        assert_eq!(decoded, request);
+
+        let result = SessionForkResult {
+            session: test_session_summary("[clone] source"),
+            draft: None,
+        };
+        let encoded = encode(&result).expect("result should encode");
+        let decoded: SessionForkResult = decode(&encoded).expect("result should decode");
+
+        assert_eq!(decoded, result);
     }
 
     #[test]
@@ -1253,6 +1312,25 @@ mod tests {
         )
         .expect("fixture should be readable");
         decode_hex(hex.trim()).expect("fixture should contain hex")
+    }
+
+    fn test_session_summary(name: &str) -> SessionSummary {
+        let session_id: SessionId = "00000000-0000-0000-0000-000000000002"
+            .parse()
+            .expect("session id should parse");
+        SessionSummary {
+            id: session_id,
+            name: Some(name.to_owned()),
+            explicit_name: Some(name.to_owned()),
+            derived_title: None,
+            title_source: bcode_session_models::SessionTitleSource::Explicit,
+            client_count: 0,
+            created_at_ms: 10,
+            updated_at_ms: 20,
+            working_directory: "/tmp/bcode-ipc-test".into(),
+            import: None,
+            fork: None,
+        }
     }
 
     fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
