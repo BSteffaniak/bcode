@@ -16,8 +16,8 @@ use bcode_ipc::{
 };
 use bcode_session_models::{
     ClientId, ProjectionWindowRequest, RuntimeWorkId, RuntimeWorkStatus, SessionEvent,
-    SessionEventKind, SessionHistoryPage, SessionHistoryQuery, SessionId, SessionInputHistoryEntry,
-    SessionSummary,
+    SessionEventKind, SessionForkResult, SessionHistoryPage, SessionHistoryQuery, SessionId,
+    SessionInputHistoryEntry, SessionSummary,
 };
 use bcode_skill_models::{SkillId, SkillList, SkillManifest};
 use std::collections::BTreeMap;
@@ -573,6 +573,56 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::SessionCreated { session } => Ok(session),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Fork a session from a selected user prompt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn fork_session(
+        &self,
+        source_session_id: SessionId,
+        prompt_sequence: u64,
+        name: Option<String>,
+    ) -> Result<SessionForkResult, ClientError> {
+        match self
+            .send_request(Request::ForkSession {
+                source_session_id,
+                prompt_sequence,
+                name,
+            })
+            .await?
+        {
+            ResponsePayload::SessionForked { session, draft } => {
+                Ok(SessionForkResult { session, draft })
+            }
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Clone a session's full history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn clone_session(
+        &self,
+        source_session_id: SessionId,
+        name: Option<String>,
+    ) -> Result<SessionForkResult, ClientError> {
+        match self
+            .send_request(Request::CloneSession {
+                source_session_id,
+                name,
+            })
+            .await?
+        {
+            ResponsePayload::SessionForked { session, draft } => {
+                Ok(SessionForkResult { session, draft })
+            }
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

@@ -707,6 +707,7 @@ fn header_uses_attach_summary_title_when_recent_history_lacks_title_events() {
         updated_at_ms: 2,
         working_directory: "/tmp/bcode-tui-test".into(),
         import: None,
+        fork: None,
     });
     let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 10));
     let mut frame = Frame::new(&mut buffer);
@@ -732,6 +733,7 @@ fn live_session_rename_overrides_attach_summary_title() {
         updated_at_ms: 2,
         working_directory: "/tmp/bcode-tui-test".into(),
         import: None,
+        fork: None,
     });
 
     app.absorb_session_event(&event(
@@ -3149,6 +3151,7 @@ fn session_summary(session_id: SessionId) -> SessionSummary {
         updated_at_ms: 2,
         working_directory: "/tmp/bcode-tui-test".into(),
         import: None,
+        fork: None,
     }
 }
 

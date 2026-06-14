@@ -4457,6 +4457,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::ToolInvocationPresentation { .. } => "tool_invocation_presentation",
+        SessionEventKind::SessionForked { .. } => "session_forked",
     }
 }
 
@@ -4918,6 +4919,16 @@ fn print_non_trace_session_event(event: &SessionEvent) {
             event.sequence,
             message.as_deref().unwrap_or("")
         ),
+        SessionEventKind::SessionForked {
+            source_session_id,
+            kind,
+            ..
+        } => {
+            println!(
+                "#{} session {:?} from {source_session_id}",
+                event.sequence, kind
+            );
+        }
         SessionEventKind::TraceEvent { .. } => {}
     }
 }

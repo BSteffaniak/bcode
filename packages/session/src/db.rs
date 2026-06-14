@@ -1521,6 +1521,7 @@ const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::ToolInvocationPresentation { .. } => "tool_invocation_presentation",
+        SessionEventKind::SessionForked { .. } => "session_forked",
     }
 }
 
@@ -1622,6 +1623,7 @@ fn session_summary_from_catalog_row(
         updated_at_ms: required_i64(row, "updated_at_ms").map(i64_to_u64)?,
         working_directory,
         import: None,
+        fork: None,
     })
 }
 
@@ -1759,6 +1761,10 @@ const fn event_created_at_ms(event: &SessionEvent) -> Option<u64> {
         }
         | SessionEventKind::SessionImported {
             imported_at_ms: invoked_at_ms,
+            ..
+        }
+        | SessionEventKind::SessionForked {
+            forked_at_ms: invoked_at_ms,
             ..
         } => Some(*invoked_at_ms),
         SessionEventKind::RuntimeWorkStarted { started_at_ms, .. }

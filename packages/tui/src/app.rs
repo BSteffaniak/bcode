@@ -2980,6 +2980,7 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::ModelTurnFinished { .. }
         | SessionEventKind::SessionRenamed { .. }
         | SessionEventKind::SessionImported { .. }
+        | SessionEventKind::SessionForked { .. }
         | SessionEventKind::SkillActivated { .. }
         | SessionEventKind::SkillDeactivated { .. }
         | SessionEventKind::SkillContextLoaded { .. }

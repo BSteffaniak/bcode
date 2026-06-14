@@ -1563,6 +1563,25 @@ async fn handle_request(
         Request::DeleteSession { session_id } => {
             handle_delete_session(request_id, state, writer, session_id).await
         }
+        Request::ForkSession {
+            source_session_id,
+            prompt_sequence,
+            name,
+        } => {
+            handle_fork_session(
+                request_id,
+                state,
+                writer,
+                source_session_id,
+                prompt_sequence,
+                name,
+            )
+            .await
+        }
+        Request::CloneSession {
+            source_session_id,
+            name,
+        } => handle_clone_session(request_id, state, writer, source_session_id, name).await,
         Request::SessionHistory { session_id } => {
             handle_session_history(request_id, client_id, state, writer, session_id).await
         }
@@ -2330,6 +2349,82 @@ async fn handle_delete_session(
                     "session_delete_failed",
                     error.to_string(),
                 )),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_clone_session(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    source_session_id: SessionId,
+    name: Option<String>,
+) -> Result<(), ServerError> {
+    match state.sessions.clone_session(source_session_id, name).await {
+        Ok(result) => {
+            state
+                .session_catalog
+                .upsert_native_session(result.session.clone())
+                .await;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionForked {
+                    session: result.session,
+                    draft: result.draft,
+                }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "session_clone_failed",
+                    error.to_string(),
+                )),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_fork_session(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    source_session_id: SessionId,
+    prompt_sequence: u64,
+    name: Option<String>,
+) -> Result<(), ServerError> {
+    match state
+        .sessions
+        .fork_session_from_prompt(source_session_id, prompt_sequence, name)
+        .await
+    {
+        Ok(result) => {
+            state
+                .session_catalog
+                .upsert_native_session(result.session.clone())
+                .await;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionForked {
+                    session: result.session,
+                    draft: result.draft,
+                }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("session_fork_failed", error.to_string())),
             )
             .await
         }
@@ -9510,6 +9605,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::ToolInvocationPresentation { .. } => "tool_invocation_presentation",
+        SessionEventKind::SessionForked { .. } => "session_forked",
     }
 }
 

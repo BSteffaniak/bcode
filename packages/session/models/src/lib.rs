@@ -13,7 +13,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 21;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 22;
 
 /// Unique session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -106,6 +106,8 @@ pub struct SessionSummary {
     pub working_directory: PathBuf,
     #[serde(default)]
     pub import: Option<SessionImportSummary>,
+    #[serde(default)]
+    pub fork: Option<SessionForkSummary>,
 }
 
 impl SessionSummary {
@@ -127,6 +129,40 @@ pub struct SessionImportSummary {
     pub source_display_name: String,
     pub external_session_id: String,
     pub imported_at_ms: u64,
+}
+
+/// Durable fork/clone operation kind for session provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionForkKind {
+    /// A new session copied from a source session up to a selected prompt.
+    Fork,
+    /// A new session copied from the full source session history.
+    Clone,
+}
+
+/// Display/provenance metadata for forked or cloned sessions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionForkSummary {
+    pub source_session_id: SessionId,
+    #[serde(default)]
+    pub source_title: Option<String>,
+    #[serde(default)]
+    pub source_cutoff_sequence: Option<u64>,
+    #[serde(default)]
+    pub source_prompt_sequence: Option<u64>,
+    pub forked_at_ms: u64,
+    pub kind: SessionForkKind,
+}
+
+/// Result of creating a forked or cloned session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionForkResult {
+    /// Newly created session summary.
+    pub session: SessionSummary,
+    /// Draft text the caller may install in the composer after attaching.
+    #[serde(default)]
+    pub draft: Option<String>,
 }
 
 /// Direction for paged session history reads.
@@ -1073,5 +1109,17 @@ pub enum SessionEventKind {
         finished_at_ms: Option<u64>,
         is_error: bool,
         presentation: ToolInvocationPresentation,
+    },
+    /// Durable provenance marker for sessions forked or cloned from another session.
+    SessionForked {
+        source_session_id: SessionId,
+        #[serde(default)]
+        source_title: Option<String>,
+        #[serde(default)]
+        source_cutoff_sequence: Option<u64>,
+        #[serde(default)]
+        source_prompt_sequence: Option<u64>,
+        forked_at_ms: u64,
+        kind: SessionForkKind,
     },
 }

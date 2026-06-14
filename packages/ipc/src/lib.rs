@@ -306,6 +306,15 @@ pub enum Request {
         source_id: String,
         external_session_id: String,
     },
+    ForkSession {
+        source_session_id: SessionId,
+        prompt_sequence: u64,
+        name: Option<String>,
+    },
+    CloneSession {
+        source_session_id: SessionId,
+        name: Option<String>,
+    },
     RefreshSessionCatalog {
         #[serde(default)]
         working_directory: Option<PathBuf>,
@@ -618,6 +627,10 @@ pub enum ResponsePayload {
     ExternalSessionImported {
         session: SessionSummary,
         warnings: Vec<SessionImportWarning>,
+    },
+    SessionForked {
+        session: SessionSummary,
+        draft: Option<String>,
     },
     SessionCatalogRefreshed {
         sessions: Vec<SessionSummary>,
@@ -1171,6 +1184,7 @@ mod tests {
             updated_at_ms: 20,
             working_directory: "/tmp/bcode-ipc-test".into(),
             import: None,
+            fork: None,
         };
         let response = Response::Ok(ResponsePayload::Attached {
             session_id,

@@ -20,9 +20,10 @@ use bcode_metrics::MetricsRegistry;
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, ProjectionWindow,
     ProjectionWindowRequest, SessionEvent, SessionEventKind, SessionEventProvenance,
-    SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery, SessionId,
-    SessionImportSummary, SessionInputHistoryEntry, SessionLiveEvent, SessionLiveEventKind,
-    SessionSummary, SessionTitleSource, SessionTokenUsage, SessionTraceEvent, TraceBlobRef,
+    SessionForkKind, SessionForkResult, SessionForkSummary, SessionHistoryDirection,
+    SessionHistoryPage, SessionHistoryQuery, SessionId, SessionImportSummary,
+    SessionInputHistoryEntry, SessionLiveEvent, SessionLiveEventKind, SessionSummary,
+    SessionTitleSource, SessionTokenUsage, SessionTraceEvent, TraceBlobRef,
 };
 use lease::{SessionLeaseGuard, SessionLeaseOwnerContext};
 use serde::{Deserialize, Serialize};
@@ -68,6 +69,12 @@ pub enum SessionError {
     /// Session database is unavailable for this operation.
     #[error("session database is unavailable: {0}")]
     DbUnavailable(SessionId),
+    /// Selected fork prompt could not be found.
+    #[error("selected fork prompt not found in session {session_id}: sequence {sequence}")]
+    ForkPromptNotFound {
+        session_id: SessionId,
+        sequence: u64,
+    },
     /// Session is owned by another daemon or cannot be leased.
     #[error(transparent)]
     Lease(#[from] lease::SessionLeaseError),
@@ -955,6 +962,7 @@ impl SessionManager {
             updated_at_ms: now_ms,
             working_directory: working_directory.clone(),
             import: None,
+            fork: None,
         };
         let state = SessionState {
             summary: summary.clone(),
@@ -1339,6 +1347,129 @@ impl SessionManager {
     ) -> Result<Vec<SessionInputHistoryEntry>, SessionError> {
         let handle = self.session_handle(session_id).await?;
         handle.input_history().await
+    }
+
+    /// Fork a session from a selected user prompt into a new session.
+    ///
+    /// The selected prompt is returned as draft text and is not appended to the new session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source session does not exist, the prompt cannot be found,
+    /// or the copied events cannot be persisted.
+    pub async fn fork_session_from_prompt(
+        &self,
+        source_session_id: SessionId,
+        prompt_sequence: u64,
+        name: Option<String>,
+    ) -> Result<SessionForkResult, SessionError> {
+        let source = self.session_summary(source_session_id).await?;
+        let events = self.session_history(source_session_id).await?;
+        let Some(prompt_event) = events
+            .iter()
+            .find(|event| event.sequence == prompt_sequence)
+        else {
+            return Err(SessionError::ForkPromptNotFound {
+                session_id: source_session_id,
+                sequence: prompt_sequence,
+            });
+        };
+        let SessionEventKind::UserMessage { text: draft, .. } = &prompt_event.kind else {
+            return Err(SessionError::ForkPromptNotFound {
+                session_id: source_session_id,
+                sequence: prompt_sequence,
+            });
+        };
+        let copied_events = events
+            .iter()
+            .filter(|event| event.sequence < prompt_sequence)
+            .cloned()
+            .collect::<Vec<_>>();
+        let source_title = Some(source.display_title().to_string());
+        let forked_at_ms = self.next_activity_timestamp_ms();
+        let fork_name = normalize_session_name(name)
+            .or_else(|| Some(format!("[fork] {}", source.display_title())));
+        let session = self
+            .copy_session_events(
+                fork_name,
+                source.working_directory,
+                copied_events,
+                SessionEventKind::SessionForked {
+                    source_session_id,
+                    source_title,
+                    source_cutoff_sequence: prompt_sequence.checked_sub(1),
+                    source_prompt_sequence: Some(prompt_sequence),
+                    forked_at_ms,
+                    kind: SessionForkKind::Fork,
+                },
+            )
+            .await?;
+        Ok(SessionForkResult {
+            session,
+            draft: Some(draft.clone()),
+        })
+    }
+
+    /// Clone a session's complete event history into a new session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source session does not exist or the copied events cannot be
+    /// persisted.
+    pub async fn clone_session(
+        &self,
+        source_session_id: SessionId,
+        name: Option<String>,
+    ) -> Result<SessionForkResult, SessionError> {
+        let source = self.session_summary(source_session_id).await?;
+        let events = self.session_history(source_session_id).await?;
+        let source_title = Some(source.display_title().to_string());
+        let source_cutoff_sequence = events.last().map(|event| event.sequence);
+        let forked_at_ms = self.next_activity_timestamp_ms();
+        let clone_name = normalize_session_name(name)
+            .or_else(|| Some(format!("[clone] {}", source.display_title())));
+        let session = self
+            .copy_session_events(
+                clone_name,
+                source.working_directory,
+                events,
+                SessionEventKind::SessionForked {
+                    source_session_id,
+                    source_title,
+                    source_cutoff_sequence,
+                    source_prompt_sequence: None,
+                    forked_at_ms,
+                    kind: SessionForkKind::Clone,
+                },
+            )
+            .await?;
+        Ok(SessionForkResult {
+            session,
+            draft: None,
+        })
+    }
+
+    async fn copy_session_events(
+        &self,
+        name: Option<String>,
+        working_directory: PathBuf,
+        events: Vec<SessionEvent>,
+        marker: SessionEventKind,
+    ) -> Result<SessionSummary, SessionError> {
+        let session = self.create_session(name, working_directory).await?;
+        let mut sequence_map = BTreeMap::new();
+        for event in events {
+            if !is_copyable_fork_event(&event.kind) {
+                continue;
+            }
+            let kind = rewrite_copied_event_kind(event.kind.clone(), &sequence_map);
+            let copied = self
+                .append_event_with_provenance(session.id, kind, Some(copy_event_provenance(&event)))
+                .await?;
+            sequence_map.insert(event.sequence, copied.sequence);
+        }
+        self.append_event(session.id, marker).await?;
+        self.session_summary(session.id).await
     }
 
     /// Return active tool runs from the DB read model.
@@ -2174,6 +2305,7 @@ impl SessionState {
                 updated_at_ms,
                 working_directory: working_directory.clone(),
                 import: None,
+                fork: None,
             },
             working_directory,
             clients: BTreeSet::new(),
@@ -2248,6 +2380,23 @@ impl SessionState {
                     self.summary.title_source = SessionTitleSource::Imported;
                 }
             }
+            SessionEventKind::SessionForked {
+                source_session_id,
+                source_title,
+                source_cutoff_sequence,
+                source_prompt_sequence,
+                forked_at_ms,
+                kind,
+            } => {
+                self.summary.fork = Some(SessionForkSummary {
+                    source_session_id: *source_session_id,
+                    source_title: source_title.clone(),
+                    source_cutoff_sequence: *source_cutoff_sequence,
+                    source_prompt_sequence: *source_prompt_sequence,
+                    forked_at_ms: *forked_at_ms,
+                    kind: *kind,
+                });
+            }
             SessionEventKind::UserMessage { text, .. } => {
                 self.has_user_message = true;
                 if self.summary.derived_title.is_none() {
@@ -2292,6 +2441,47 @@ impl SessionState {
             events.push(event.clone());
         }
         let _ = self.sender.send(event);
+    }
+}
+
+fn copy_event_provenance(event: &SessionEvent) -> SessionEventProvenance {
+    let source_locator = format!(
+        "bcode://session/{}/event/{}",
+        event.session_id, event.sequence
+    );
+    SessionEventProvenance {
+        source_event_id: Some(event.sequence.to_string()),
+        source_timestamp_ms: None,
+        source_locator: Some(source_locator),
+    }
+}
+
+const fn is_copyable_fork_event(kind: &SessionEventKind) -> bool {
+    !matches!(
+        kind,
+        SessionEventKind::SessionCreated { .. }
+            | SessionEventKind::ClientAttached { .. }
+            | SessionEventKind::ClientDetached { .. }
+            | SessionEventKind::SessionForked { .. }
+    )
+}
+
+fn rewrite_copied_event_kind(
+    kind: SessionEventKind,
+    sequence_map: &BTreeMap<u64, u64>,
+) -> SessionEventKind {
+    match kind {
+        SessionEventKind::ContextCompacted {
+            summary,
+            compacted_through_sequence,
+        } => SessionEventKind::ContextCompacted {
+            summary,
+            compacted_through_sequence: sequence_map
+                .get(&compacted_through_sequence)
+                .copied()
+                .unwrap_or(compacted_through_sequence),
+        },
+        other => other,
     }
 }
 
@@ -2445,9 +2635,9 @@ mod tests {
     use bcode_session_models::{
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProviderStreamEvent, RuntimeWorkId,
         RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance,
-        SessionId, SessionLiveEvent, SessionLiveEventKind, SessionTraceEvent, SessionTracePayload,
-        SessionTracePhase, ToolInvocationPresentation, ToolInvocationStreamEvent, ToolOutputStream,
-        TraceBlobRef,
+        SessionForkKind, SessionId, SessionLiveEvent, SessionLiveEventKind, SessionTraceEvent,
+        SessionTracePayload, SessionTracePhase, ToolInvocationPresentation,
+        ToolInvocationStreamEvent, ToolOutputStream, TraceBlobRef,
     };
     use bcode_skill_models::{SkillActivationMode, SkillId};
     use serde::Serialize;
@@ -4089,6 +4279,18 @@ mod tests {
                         columns: 80,
                         rows: 24,
                     },
+                },
+            ),
+            (
+                36,
+                "SessionForked",
+                SessionEventKind::SessionForked {
+                    source_session_id: SessionId::new(),
+                    source_title: Some("source".to_string()),
+                    source_cutoff_sequence: Some(2),
+                    source_prompt_sequence: Some(3),
+                    forked_at_ms: 1,
+                    kind: SessionForkKind::Fork,
                 },
             ),
         ]
