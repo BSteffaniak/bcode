@@ -722,6 +722,22 @@ fn push_transcript_item_rows(
                 width,
             );
         }
+        TranscriptItemKind::FileChangePresentation {
+            tool_name,
+            summary,
+            path,
+            is_error,
+            ..
+        } => {
+            push_file_change_presentation_rows(
+                rows,
+                tool_name,
+                summary,
+                path.as_deref(),
+                *is_error,
+                width,
+            );
+        }
         TranscriptItemKind::TerminalOutput { .. } => {
             push_terminal_transcript_item_rows(rows, item, width);
         }
@@ -760,6 +776,37 @@ fn push_transcript_item_rows(
             push_detail_block(rows, item.role(), item.text(), Color::BrightBlack, width);
         }
     }
+}
+
+fn push_file_change_presentation_rows(
+    rows: &mut Vec<Line>,
+    tool_name: &str,
+    summary: &str,
+    path: Option<&str>,
+    is_error: bool,
+    width: u16,
+) {
+    let title = if is_error {
+        "File change failed"
+    } else {
+        "File changed"
+    };
+    let color = if is_error { Color::Red } else { Color::Green };
+    push_wrapped_styled_text(
+        rows,
+        vec![Span::styled(
+            format!("{title} · "),
+            Style::new().fg(color).add_modifier(Modifier::BOLD),
+        )],
+        tool_name,
+        width,
+        muted_style(),
+        muted_style(),
+    );
+    if let Some(path) = path {
+        push_kv_row(rows, "path", path, width);
+    }
+    push_kv_row(rows, "result", summary, width);
 }
 
 fn push_assistant_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) {

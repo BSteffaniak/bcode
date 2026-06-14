@@ -46,10 +46,10 @@ use super::tool_present::{
     ShellResultPresentation, ToolResultPresentation, tool_result_presentation,
 };
 use super::transcript::{
-    FileEditPhase, TranscriptItem, TranscriptItemKind, live_tool_preview_anchor_item,
-    model_usage_item, permission_request_item, permission_result_item,
-    streaming_terminal_output_item, streaming_tool_output_item, tool_request_item,
-    tool_result_item, transcript_items_from_events_with_reasoning,
+    FileEditPhase, TranscriptItem, TranscriptItemKind, file_change_presentation_item,
+    live_tool_preview_anchor_item, model_usage_item, permission_request_item,
+    permission_result_item, streaming_terminal_output_item, streaming_tool_output_item,
+    tool_request_item, tool_result_item, transcript_items_from_events_with_reasoning,
 };
 use super::transcript_document::TranscriptDocument;
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
@@ -2031,7 +2031,21 @@ impl BmuxApp {
                 columns: (*columns).max(1),
                 rows: (*rows).max(1),
             }),
-            ToolInvocationPresentation::FileChange { .. } => {}
+            ToolInvocationPresentation::FileChange {
+                tool_name,
+                summary,
+                path,
+            } => {
+                if !self.tool_call_contexts.contains_key(tool_call_id) {
+                    self.transcript.push(file_change_presentation_item(
+                        tool_call_id,
+                        tool_name,
+                        summary,
+                        path.as_deref(),
+                        is_error,
+                    ));
+                }
+            }
         }
     }
 

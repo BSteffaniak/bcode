@@ -82,6 +82,19 @@ pub enum TranscriptItemKind {
         /// Whether the tool failed.
         is_error: bool,
     },
+    /// Durable filesystem write/edit presentation.
+    FileChangePresentation {
+        /// Provider tool call identifier.
+        tool_call_id: String,
+        /// Tool name that produced the change.
+        tool_name: String,
+        /// Human-readable result summary.
+        summary: String,
+        /// Best-effort target path.
+        path: Option<String>,
+        /// Whether the tool failed.
+        is_error: bool,
+    },
     /// Live or replayed terminal output from a tool.
     TerminalOutput {
         /// Provider tool call identifier.
@@ -491,6 +504,30 @@ pub fn live_tool_preview_anchor_item(tool_call_id: &str, tool_name: &str) -> Tra
         TranscriptItemKind::LiveToolPreviewAnchor {
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.to_owned(),
+        },
+    )
+}
+
+/// Build a durable file-change presentation item.
+#[must_use]
+pub fn file_change_presentation_item(
+    tool_call_id: &str,
+    tool_name: &str,
+    summary: &str,
+    path: Option<&str>,
+    is_error: bool,
+) -> TranscriptItem {
+    let text = path.map_or_else(|| summary.to_owned(), |path| format!("{summary}: {path}"));
+    TranscriptItem::with_kind(
+        if is_error { "Tool error" } else { "Tool" },
+        text,
+        false,
+        TranscriptItemKind::FileChangePresentation {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: tool_name.to_owned(),
+            summary: summary.to_owned(),
+            path: path.map(ToOwned::to_owned),
+            is_error,
         },
     )
 }
@@ -965,10 +1002,51 @@ fn apply_tool_invocation_presentation(
                 rows: (*rows).max(1),
             },
         ),
-        ToolInvocationPresentation::FileChange { .. } => {
-            presented_tool_results.insert(event.tool_call_id.to_owned());
-        }
+        ToolInvocationPresentation::FileChange {
+            tool_name,
+            summary,
+            path,
+        } => apply_file_change_invocation_presentation(
+            items,
+            tool_calls,
+            presented_tool_results,
+            FileChangePresentationEventRef {
+                tool_call_id: event.tool_call_id,
+                tool_name,
+                summary,
+                path: path.as_deref(),
+                is_error: event.is_error,
+            },
+        ),
     }
+}
+
+#[derive(Clone, Copy)]
+struct FileChangePresentationEventRef<'a> {
+    tool_call_id: &'a str,
+    tool_name: &'a str,
+    summary: &'a str,
+    path: Option<&'a str>,
+    is_error: bool,
+}
+
+fn apply_file_change_invocation_presentation(
+    items: &mut Vec<TranscriptItem>,
+    tool_calls: &BTreeMap<String, ToolCallContext>,
+    presented_tool_results: &mut BTreeSet<String>,
+    event: FileChangePresentationEventRef<'_>,
+) {
+    presented_tool_results.insert(event.tool_call_id.to_owned());
+    if tool_calls.contains_key(event.tool_call_id) {
+        return;
+    }
+    items.push(file_change_presentation_item(
+        event.tool_call_id,
+        event.tool_name,
+        event.summary,
+        event.path,
+        event.is_error,
+    ));
 }
 
 #[derive(Clone, Copy)]
