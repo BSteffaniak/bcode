@@ -677,6 +677,24 @@ fn push_transcript_item_rows(
             };
             push_tool_request_rows(rows, item, &context, width);
         }
+        TranscriptItemKind::FileEditPreview {
+            tool_name,
+            path,
+            old_text_prefix,
+            new_text_prefix,
+            truncated,
+            ..
+        } => {
+            push_live_file_edit_preview_rows(
+                rows,
+                tool_name,
+                path.as_deref(),
+                old_text_prefix.as_deref(),
+                new_text_prefix,
+                *truncated,
+                width,
+            );
+        }
         TranscriptItemKind::ShellPreview {
             tool_name,
             command_prefix,
@@ -916,6 +934,81 @@ fn file_tool_action(tool_name: &str, streaming: bool) -> &'static str {
         ("filesystem_edit" | "edit", false) => "Edit preview",
         (_, true) => "File change …",
         (_, false) => "File change preview",
+    }
+}
+
+fn push_live_file_edit_preview_rows(
+    rows: &mut Vec<Line>,
+    tool_name: &str,
+    path: Option<&str>,
+    old_text_prefix: Option<&str>,
+    new_text_prefix: &str,
+    truncated: bool,
+    width: u16,
+) {
+    push_wrapped_styled_text(
+        rows,
+        Vec::new(),
+        &format!("Tool call · {tool_name} · streaming preview"),
+        width,
+        Style::new().fg(Color::Cyan),
+        Style::new().fg(Color::Cyan),
+    );
+    push_wrapped_styled_text(
+        rows,
+        vec![Span::styled("  ", muted_style())],
+        &format!(
+            "Streaming preview · {}",
+            file_write_mode_label(tool_name, old_text_prefix.unwrap_or_default().is_empty())
+        ),
+        width,
+        file_edit_phase_style(FileEditPhase::Pending),
+        muted_style(),
+    );
+    if let Some(path) = path {
+        push_kv_row(rows, "path", path, width);
+    }
+    push_streaming_added_content_rows(rows, new_text_prefix, width);
+    if truncated {
+        push_wrapped_styled_text(
+            rows,
+            vec![Span::styled("  ", muted_style())],
+            "preview truncated by live display limit",
+            width,
+            muted_style(),
+            muted_style(),
+        );
+    }
+    rows.push(Line::default());
+}
+
+fn push_streaming_added_content_rows(rows: &mut Vec<Line>, content: &str, width: u16) {
+    const MAX_STREAMING_FILE_PREVIEW_LINES: usize = 24;
+    let mut shown = 0usize;
+    for line in content.lines().take(MAX_STREAMING_FILE_PREVIEW_LINES) {
+        push_wrapped_styled_text(
+            rows,
+            vec![Span::styled(
+                "  + ",
+                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+            )],
+            line,
+            width,
+            Style::new().fg(Color::Green),
+            muted_style(),
+        );
+        shown = shown.saturating_add(1);
+    }
+    let total = content.lines().count();
+    if total > shown {
+        push_wrapped_styled_text(
+            rows,
+            vec![Span::styled("  ", muted_style())],
+            &format!("… {} preview lines hidden …", total - shown),
+            width,
+            muted_style(),
+            muted_style(),
+        );
     }
 }
 

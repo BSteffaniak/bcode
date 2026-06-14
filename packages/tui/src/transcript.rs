@@ -62,6 +62,21 @@ pub enum TranscriptItemKind {
         /// Whether this item was derived from live-only partial tool arguments.
         live_preview: bool,
     },
+    /// Live-only file edit/write preview with lightweight rendering.
+    FileEditPreview {
+        /// Provider tool call identifier.
+        tool_call_id: String,
+        /// Tool name.
+        tool_name: String,
+        /// Best-effort file path.
+        path: Option<String>,
+        /// Best-effort old text prefix.
+        old_text_prefix: Option<String>,
+        /// Best-effort new text prefix.
+        new_text_prefix: String,
+        /// Whether preview text was truncated.
+        truncated: bool,
+    },
     /// Live-only shell command preview with structured metadata.
     ShellPreview {
         /// Provider tool call identifier.
@@ -337,25 +352,26 @@ impl TranscriptItem {
         tool_name: &str,
         preview: &LiveFileEditPreview,
     ) -> bool {
-        let TranscriptItemKind::ToolRequest {
+        let TranscriptItemKind::FileEditPreview {
             tool_call_id: item_tool_call_id,
             tool_name: item_tool_name,
-            arguments_json,
-            file_edit,
-            file_edit_phase,
-            live_preview,
+            path,
+            old_text_prefix,
+            new_text_prefix,
+            truncated,
         } = &mut self.kind
         else {
             return false;
         };
-        if item_tool_call_id != tool_call_id || !*live_preview {
+        if item_tool_call_id != tool_call_id {
             return false;
         }
         tool_name.clone_into(item_tool_name);
-        *arguments_json = live_preview_arguments_json(preview);
-        *file_edit = Some(file_edit_from_live_preview(preview));
-        *file_edit_phase = Some(FileEditPhase::Pending);
-        self.text = pretty_jsonish(arguments_json);
+        path.clone_from(&preview.path);
+        old_text_prefix.clone_from(&preview.old_text_prefix);
+        new_text_prefix.clone_from(&preview.new_text_prefix);
+        *truncated = preview.truncated;
+        self.text.clone_from(&preview.new_text_prefix);
         self.streaming = true;
         self.bump_revision();
         true
@@ -510,41 +526,19 @@ pub fn live_file_edit_preview_item(
     tool_name: &str,
     preview: &LiveFileEditPreview,
 ) -> TranscriptItem {
-    let arguments_json = live_preview_arguments_json(preview);
     TranscriptItem::with_kind(
         "Tool",
-        pretty_jsonish(&arguments_json),
+        preview.new_text_prefix.clone(),
         true,
-        TranscriptItemKind::ToolRequest {
+        TranscriptItemKind::FileEditPreview {
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.to_owned(),
-            arguments_json,
-            file_edit: Some(file_edit_from_live_preview(preview)),
-            file_edit_phase: Some(FileEditPhase::Pending),
-            live_preview: true,
+            path: preview.path.clone(),
+            old_text_prefix: preview.old_text_prefix.clone(),
+            new_text_prefix: preview.new_text_prefix.clone(),
+            truncated: preview.truncated,
         },
     )
-}
-
-fn file_edit_from_live_preview(preview: &LiveFileEditPreview) -> FileEditTranscript {
-    FileEditTranscript::new(
-        preview
-            .path
-            .clone()
-            .unwrap_or_else(|| "streaming file".to_owned()),
-        preview.old_text_prefix.clone().unwrap_or_default(),
-        preview.new_text_prefix.clone(),
-    )
-}
-
-fn live_preview_arguments_json(preview: &LiveFileEditPreview) -> String {
-    serde_json::json!({
-        "path": preview.path.as_deref().unwrap_or("streaming file"),
-        "old_text": preview.old_text_prefix.as_deref().unwrap_or(""),
-        "new_text": preview.new_text_prefix,
-        "truncated": preview.truncated,
-    })
-    .to_string()
 }
 
 /// Build a transcript item for a live-only partial shell command preview.

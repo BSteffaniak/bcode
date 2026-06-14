@@ -1783,6 +1783,9 @@ impl BmuxApp {
                     TranscriptItemKind::ToolRequest {
                         tool_call_id: item_tool_call_id,
                         ..
+                    } | TranscriptItemKind::FileEditPreview {
+                        tool_call_id: item_tool_call_id,
+                        ..
                     } | TranscriptItemKind::ShellPreview {
                         tool_call_id: item_tool_call_id,
                         ..
@@ -2197,7 +2200,7 @@ impl BmuxApp {
             |item| {
                 matches!(
                     item.kind(),
-                    TranscriptItemKind::ToolRequest {
+                    TranscriptItemKind::FileEditPreview {
                         tool_call_id: item_tool_call_id,
                         ..
                     } if item_tool_call_id == tool_call_id
@@ -2282,6 +2285,9 @@ impl BmuxApp {
                 matches!(
                     item.kind(),
                     TranscriptItemKind::ToolRequest {
+                        tool_call_id: item_tool_call_id,
+                        ..
+                    } | TranscriptItemKind::FileEditPreview {
                         tool_call_id: item_tool_call_id,
                         ..
                     } if item_tool_call_id == tool_call_id

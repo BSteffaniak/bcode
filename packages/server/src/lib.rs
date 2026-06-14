@@ -6224,30 +6224,29 @@ async fn handle_provider_turn_event(
         }
         ProviderTurnEvent::ToolCallDelta { call_id, delta } => {
             stream_progress.record_tool_call_delta(&call_id, &delta);
+            if let Some(progress) = stream_progress.tool_progress_snapshot()
+                && let Some(preview) = stream_progress.take_tool_argument_preview()
+            {
+                publish_tool_argument_preview_live(
+                    state,
+                    session_id,
+                    turn_id,
+                    progress.tool_call_id,
+                    progress.tool_name,
+                    progress.argument_bytes,
+                    preview,
+                )
+                .await;
+            }
             if let Some(progress) = stream_progress.take_tool_progress_event() {
-                let tool_call_id = progress.tool_call_id;
-                let tool_name = progress.tool_name;
-                let argument_bytes = progress.argument_bytes;
-                if let Some(preview) = stream_progress.take_tool_argument_preview() {
-                    publish_tool_argument_preview_live(
-                        state,
-                        session_id,
-                        turn_id,
-                        tool_call_id.clone(),
-                        tool_name.clone(),
-                        argument_bytes,
-                        preview,
-                    )
-                    .await;
-                }
                 publish_provider_stream_progress_live(
                     state,
                     session_id,
                     turn_id,
                     ProviderStreamEvent::ToolCallProgress {
-                        tool_call_id,
-                        tool_name,
-                        argument_bytes,
+                        tool_call_id: progress.tool_call_id,
+                        tool_name: progress.tool_name,
+                        argument_bytes: progress.argument_bytes,
                     },
                 )
                 .await;
