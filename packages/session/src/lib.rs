@@ -134,6 +134,137 @@ impl SessionStore {
         Ok(sessions)
     }
 
+    fn backfill_catalog(&self) -> Result<Vec<SessionSummary>, SessionStoreError> {
+        let mut summaries = self.load_session_manifests()?;
+        summaries.extend(self.load_legacy_catalog_summaries()?);
+        summaries.sort_by(|left, right| {
+            left.id
+                .cmp(&right.id)
+                .then_with(|| right.updated_at_ms.cmp(&left.updated_at_ms))
+        });
+        summaries.dedup_by_key(|summary| summary.id);
+        summaries.sort_by(|left, right| right.updated_at_ms.cmp(&left.updated_at_ms));
+        if summaries.is_empty() {
+            return Ok(summaries);
+        }
+
+        self.write_global_catalog_summaries(&summaries)?;
+        Ok(summaries)
+    }
+
+    fn load_session_manifests(&self) -> Result<Vec<SessionSummary>, SessionStoreError> {
+        let mut summaries = Vec::new();
+        if !self.root.exists() {
+            return Ok(summaries);
+        }
+        for entry in fs::read_dir(&self.root)? {
+            let path = entry?.path();
+            if !path.is_dir() || path.file_name().is_some_and(|name| name == "catalogs") {
+                continue;
+            }
+            let Some(session_id) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.parse::<SessionId>().ok())
+            else {
+                continue;
+            };
+            match self.load_session_manifest(session_id) {
+                Ok(Some(summary)) => summaries.push(summary),
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("skipping unreadable session manifest {session_id}: {error}");
+                }
+            }
+        }
+        Ok(summaries)
+    }
+
+    fn load_session_manifest(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<SessionSummary>, SessionStoreError> {
+        let path = self.session_manifest_path(session_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let contents = fs::read(&path)?;
+        let manifest: SessionManifest = serde_json::from_slice(&contents)
+            .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+        if manifest.schema_version != SESSION_MANIFEST_SCHEMA_VERSION {
+            return Ok(None);
+        }
+        if manifest.summary.id != session_id {
+            return Err(SessionStoreError::CatalogLoad(format!(
+                "session manifest id mismatch: expected {session_id}, found {}",
+                manifest.summary.id
+            )));
+        }
+        Ok(Some(manifest.summary))
+    }
+
+    fn load_legacy_catalog_summaries(&self) -> Result<Vec<SessionSummary>, SessionStoreError> {
+        if self.catalog_namespace().is_none() || !db::global_catalog_db_path(&self.root).exists() {
+            return Ok(Vec::new());
+        }
+        Self::load_catalog_summaries_at_path(db::global_catalog_db_path(&self.root))
+    }
+
+    fn load_catalog_summaries_at_path(
+        path: PathBuf,
+    ) -> Result<Vec<SessionSummary>, SessionStoreError> {
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+            runtime.block_on(async move {
+                let catalog = db::GlobalSessionDb::open_turso_without_catalog_lock(&path)
+                    .await
+                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+                catalog
+                    .list_sessions()
+                    .await
+                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))
+            })
+        })
+        .join()
+        .map_err(|_| SessionStoreError::CatalogLoad("catalog loader panicked".to_string()))?
+    }
+
+    fn write_global_catalog_summaries(
+        &self,
+        summaries: &[SessionSummary],
+    ) -> Result<(), SessionStoreError> {
+        let root = self.root.clone();
+        let namespace = self.catalog_namespace();
+        let summaries = summaries.to_vec();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+            runtime.block_on(async move {
+                let catalog = match namespace.as_deref() {
+                    Some(namespace) => {
+                        db::GlobalSessionDb::open_turso_in_root_namespace(&root, namespace).await
+                    }
+                    None => db::GlobalSessionDb::open_turso_in_root(&root).await,
+                }
+                .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+                for summary in summaries {
+                    catalog
+                        .upsert_session(&summary, &db::session_db_path(&root, summary.id))
+                        .await
+                        .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+                }
+                Ok(())
+            })
+        })
+        .join()
+        .map_err(|_| SessionStoreError::CatalogLoad("catalog writer panicked".to_string()))?
+    }
+
     pub(crate) fn write_session_manifest(
         &self,
         summary: &SessionSummary,
@@ -715,6 +846,34 @@ impl SessionManager {
                 SessionStoreError::CatalogLoad("session catalog status channel closed".to_string())
             })?;
         }
+    }
+
+    /// Backfill the current catalog DB from bounded legacy summary sources.
+    ///
+    /// This scans manifest sidecars and the legacy global catalog DB, but does not open per-session
+    /// DBs or replay event logs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if catalog backfill fails.
+    pub async fn backfill_catalog(&self) -> Result<Vec<SessionSummary>, SessionStoreError> {
+        let Some(store) = self.store.clone() else {
+            return Ok(Vec::new());
+        };
+        let summaries = store.backfill_catalog().await?;
+        if summaries.is_empty() {
+            return Ok(summaries);
+        }
+        let mut inner = self.inner.lock().await;
+        for summary in &summaries {
+            inner.sessions.entry(summary.id).or_insert_with(|| {
+                SessionHandle::new(
+                    SessionState::from_catalog_summary(summary.clone()),
+                    Some(store.clone()),
+                )
+            });
+        }
+        Ok(summaries)
     }
 
     /// Return first-class health for one session without event-log replay or repair.

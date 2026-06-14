@@ -907,6 +907,24 @@ impl ServerState {
                 }
             }
         });
+
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            match state.sessions.backfill_catalog().await {
+                Ok(summaries) => {
+                    for summary in summaries {
+                        state.session_catalog.upsert_native_session(summary).await;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "bcode_server::session_catalog",
+                        %error,
+                        "session catalog backfill failed"
+                    );
+                }
+            }
+        });
     }
 
     fn start_idle_shutdown_watcher(self: &Arc<Self>, idle_after: Duration) {

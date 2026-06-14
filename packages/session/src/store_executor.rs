@@ -35,6 +35,13 @@ impl SessionStoreExecutor {
         spawn_blocking(move || store.load_catalog()).await?
     }
 
+    pub async fn backfill_catalog(
+        &self,
+    ) -> Result<Vec<bcode_session_models::SessionSummary>, SessionStoreError> {
+        let store = self.store.clone();
+        spawn_blocking(move || store.backfill_catalog()).await?
+    }
+
     pub(crate) async fn write_session_manifest(
         &self,
         summary: bcode_session_models::SessionSummary,
