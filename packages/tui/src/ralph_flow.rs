@@ -2,6 +2,7 @@
 
 use std::io::Write;
 
+use bcode_session_models::{SessionHistoryDirection, SessionHistoryQuery};
 use bcode_worktree_models::WorktreeCreateRequest;
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_text_edit::SelectionMode;
@@ -56,6 +57,24 @@ pub async fn start_loop<W: Write>(
                         &repo_root,
                         chat.app.session_title(),
                     )?;
+                    if let Some(session_id) = chat.app.session_id() {
+                        let history = services
+                            .client
+                            .session_history_page(
+                                session_id,
+                                SessionHistoryQuery {
+                                    cursor: None,
+                                    limit: 64,
+                                    direction: SessionHistoryDirection::Backward,
+                                },
+                            )
+                            .await?;
+                        ralph_state::write_context_pack(
+                            &state,
+                            chat.app.session_title(),
+                            &history.events,
+                        )?;
+                    }
                     let work_area = services
                         .client
                         .create_worktree(WorktreeCreateRequest {

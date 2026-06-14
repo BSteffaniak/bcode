@@ -1,5 +1,6 @@
 //! Local Ralph loop state management for the TUI.
 
+use bcode_session_models::{SessionEvent, SessionEventKind};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
@@ -108,6 +109,29 @@ pub fn create_initial_loop_state(
     Ok(paths)
 }
 
+/// Write a bounded conversation context pack for a Ralph loop.
+///
+/// # Errors
+///
+/// Returns an error when the context pack cannot be encoded or written.
+pub fn write_context_pack(
+    state: &CreatedRalphLoopState,
+    session_title: Option<&str>,
+    events: &[SessionEvent],
+) -> Result<(), RalphStateError> {
+    let pack = ContextPack::from_events(session_title, events);
+    std::fs::write(
+        &state.context_pack_path,
+        serde_json::to_vec_pretty(&pack).map_err(RalphStateError::Json)?,
+    )?;
+    update_metadata_field(
+        state,
+        "status",
+        Value::String(RalphLoopStatus::Planning.as_str().to_owned()),
+    )?;
+    Ok(())
+}
+
 /// Record the isolated work area created for a Ralph loop.
 ///
 /// # Errors
@@ -120,9 +144,7 @@ pub fn record_work_area(
     branch: Option<&str>,
     session_id: Option<&str>,
 ) -> Result<(), RalphStateError> {
-    let bytes = std::fs::read(&state.metadata_path)?;
-    let mut metadata =
-        serde_json::from_slice::<Map<String, Value>>(&bytes).map_err(RalphStateError::Json)?;
+    let mut metadata = read_metadata(state)?;
     metadata.insert(
         "work_area_path".to_owned(),
         Value::String(work_area_path.display().to_string()),
@@ -145,11 +167,38 @@ pub fn record_work_area(
         "updated_at_ms".to_owned(),
         Value::from(now_ms().to_string()),
     );
+    write_metadata(state, &metadata)?;
+    Ok(())
+}
+
+fn read_metadata(state: &CreatedRalphLoopState) -> Result<Map<String, Value>, RalphStateError> {
+    let bytes = std::fs::read(&state.metadata_path)?;
+    serde_json::from_slice::<Map<String, Value>>(&bytes).map_err(RalphStateError::Json)
+}
+
+fn write_metadata(
+    state: &CreatedRalphLoopState,
+    metadata: &Map<String, Value>,
+) -> Result<(), RalphStateError> {
     std::fs::write(
         &state.metadata_path,
-        serde_json::to_vec_pretty(&metadata).map_err(RalphStateError::Json)?,
+        serde_json::to_vec_pretty(metadata).map_err(RalphStateError::Json)?,
     )?;
     Ok(())
+}
+
+fn update_metadata_field(
+    state: &CreatedRalphLoopState,
+    key: &str,
+    value: Value,
+) -> Result<(), RalphStateError> {
+    let mut metadata = read_metadata(state)?;
+    metadata.insert(key.to_owned(), value);
+    metadata.insert(
+        "updated_at_ms".to_owned(),
+        Value::from(now_ms().to_string()),
+    );
+    write_metadata(state, &metadata)
 }
 
 /// Return the default Ralph state root for a repository.
@@ -184,6 +233,77 @@ fn allocate_loop_paths(
         }
     }
     Err(RalphStateError::LoopNameExhausted(loop_name.to_owned()))
+}
+
+#[derive(Debug, Serialize)]
+struct ContextPack<'a> {
+    session_title: Option<&'a str>,
+    event_count: usize,
+    events: Vec<ContextPackEvent>,
+    created_at_ms: u128,
+}
+
+impl<'a> ContextPack<'a> {
+    fn from_events(session_title: Option<&'a str>, events: &[SessionEvent]) -> Self {
+        Self {
+            session_title,
+            event_count: events.len(),
+            events: events
+                .iter()
+                .filter_map(ContextPackEvent::from_session_event)
+                .collect(),
+            created_at_ms: now_ms(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ContextPackEvent {
+    sequence: u64,
+    kind: &'static str,
+    text: String,
+}
+
+impl ContextPackEvent {
+    fn from_session_event(event: &SessionEvent) -> Option<Self> {
+        let (kind, text) = match &event.kind {
+            SessionEventKind::UserMessage { text, .. } => ("user_message", text.as_str()),
+            SessionEventKind::AssistantMessage { text } => ("assistant_message", text.as_str()),
+            SessionEventKind::SystemMessage { text } => ("system_message", text.as_str()),
+            SessionEventKind::ContextCompacted { summary, .. } => {
+                ("context_compacted", summary.as_str())
+            }
+            SessionEventKind::SkillInvoked {
+                skill_id,
+                arguments,
+                ..
+            } => {
+                return Some(Self {
+                    sequence: event.sequence,
+                    kind: "skill_invoked",
+                    text: format!("{skill_id}: {arguments}"),
+                });
+            }
+            _ => return None,
+        };
+        Some(Self {
+            sequence: event.sequence,
+            kind,
+            text: truncate_context_text(text),
+        })
+    }
+}
+
+fn truncate_context_text(text: &str) -> String {
+    const MAX_CONTEXT_EVENT_CHARS: usize = 4_000;
+    let mut output = String::new();
+    for ch in text.chars().take(MAX_CONTEXT_EVENT_CHARS) {
+        output.push(ch);
+    }
+    if text.chars().count() > MAX_CONTEXT_EVENT_CHARS {
+        output.push('…');
+    }
+    output
 }
 
 #[derive(Debug, Serialize)]
