@@ -13,6 +13,12 @@ impl TranscriptLayoutSignature {
     pub const fn new(value: String) -> Self {
         Self(value)
     }
+
+    /// Return the signature text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Fingerprint for inputs used to prepare transcript layout.

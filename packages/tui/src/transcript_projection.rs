@@ -169,5 +169,16 @@ fn transcript_item_signature(
     item: &TranscriptItem,
     input: &TranscriptLayoutInput<'_>,
 ) -> TranscriptLayoutSignature {
-    render::transcript_item_signature(item, input.width, input.inline_diff_config)
+    let base = render::transcript_item_signature(item, input.width, input.inline_diff_config);
+    let live_preview_revision = match item.kind() {
+        super::transcript::TranscriptItemKind::LiveToolPreviewAnchor { tool_call_id, .. } => input
+            .live_tool_previews
+            .get(tool_call_id)
+            .map_or(0, |preview| preview.revision),
+        _ => 0,
+    };
+    TranscriptLayoutSignature::new(format!(
+        "{};live-preview-rev:{live_preview_revision}",
+        base.as_str()
+    ))
 }
