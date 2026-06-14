@@ -12,14 +12,14 @@ use bcode_session_models::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LiveToolPreviewState {
-    tool_name: String,
-    argument_bytes: usize,
-    preview: LiveToolArgumentPreview,
-    revision: u64,
-    snapshots_received: u64,
-    duplicates_skipped: u64,
-    truncated_snapshots: u64,
+pub struct LiveToolPreviewState {
+    pub tool_name: String,
+    pub argument_bytes: usize,
+    pub preview: LiveToolArgumentPreview,
+    pub revision: u64,
+    pub snapshots_received: u64,
+    pub duplicates_skipped: u64,
+    pub truncated_snapshots: u64,
 }
 use bcode_skill_models::SkillSource;
 use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
@@ -46,11 +46,10 @@ use super::tool_present::{
     ShellResultPresentation, ToolResultPresentation, tool_result_presentation,
 };
 use super::transcript::{
-    FileEditPhase, TranscriptItem, TranscriptItemKind, live_file_edit_preview_item,
-    live_query_preview_item, live_shell_command_preview_item, model_usage_item,
-    permission_request_item, permission_result_item, streaming_terminal_output_item,
-    streaming_tool_output_item, tool_request_item, tool_result_item,
-    transcript_items_from_events_with_reasoning,
+    FileEditPhase, TranscriptItem, TranscriptItemKind, live_tool_preview_anchor_item,
+    model_usage_item, permission_request_item, permission_result_item,
+    streaming_terminal_output_item, streaming_tool_output_item, tool_request_item,
+    tool_result_item, transcript_items_from_events_with_reasoning,
 };
 use super::transcript_document::TranscriptDocument;
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
@@ -478,6 +477,12 @@ impl BmuxApp {
     #[must_use]
     pub const fn pending_submissions_projection_revision(&self) -> u64 {
         self.pending_submissions.revision()
+    }
+
+    /// Return live preview state by tool call id.
+    #[must_use]
+    pub const fn live_tool_previews(&self) -> &BTreeMap<String, LiveToolPreviewState> {
+        &self.live_tool_previews
     }
 
     /// Return changed-file summaries inferred from edit tool calls.
@@ -1839,9 +1844,6 @@ impl BmuxApp {
             },
         );
         self.live_tool_previews.remove(tool_call_id);
-        let _ = self
-            .transcript
-            .remove_rev_find(|item| item.is_live_preview_for(tool_call_id));
         let item = tool_request_item(tool_call_id, tool_name, arguments_json);
         let replaced = self.transcript.mutate_rev_find(
             |existing| {
@@ -1850,17 +1852,8 @@ impl BmuxApp {
                     TranscriptItemKind::ToolRequest {
                         tool_call_id: item_tool_call_id,
                         ..
-                    } | TranscriptItemKind::FileEditPreview {
-                        tool_call_id: item_tool_call_id,
-                        ..
-                    } | TranscriptItemKind::ShellPreview {
-                        tool_call_id: item_tool_call_id,
-                        ..
-                    } | TranscriptItemKind::QueryPreview {
-                        tool_call_id: item_tool_call_id,
-                        ..
                     } if item_tool_call_id == tool_call_id
-                )
+                ) || existing.is_live_preview_anchor_for(tool_call_id)
             },
             |existing| *existing = item.clone(),
         );
@@ -2292,143 +2285,53 @@ impl BmuxApp {
         if !self.record_live_preview_state(tool_call_id, tool_name, argument_bytes, preview) {
             return;
         }
+        self.ensure_live_tool_preview_anchor(tool_call_id, tool_name);
         match preview {
-            LiveToolArgumentPreview::FileEdit(file_preview) => self.apply_live_file_edit_preview(
-                tool_call_id,
-                tool_name,
-                argument_bytes,
-                file_preview,
-            ),
-            LiveToolArgumentPreview::ShellCommand(shell_preview) => self
-                .apply_live_shell_command_preview(
-                    tool_call_id,
-                    tool_name,
-                    argument_bytes,
-                    shell_preview,
-                ),
-            LiveToolArgumentPreview::Query(query_preview) => self.apply_live_query_preview(
-                tool_call_id,
-                tool_name,
-                argument_bytes,
-                query_preview,
-            ),
+            LiveToolArgumentPreview::FileEdit(_) => {
+                self.set_file_activity(tool_name);
+                self.status = format!(
+                    "streaming file change · {} received",
+                    format_provider_bytes(argument_bytes)
+                );
+            }
+            LiveToolArgumentPreview::ShellCommand(_) => {
+                self.set_activity(ActivityState::ProviderStream {
+                    detail: format!(
+                        "streaming {tool_name} command ({} received)",
+                        format_provider_bytes(argument_bytes)
+                    ),
+                });
+                self.status = format!(
+                    "streaming command · {} received",
+                    format_provider_bytes(argument_bytes)
+                );
+            }
+            LiveToolArgumentPreview::Query(_) => {
+                self.set_activity(ActivityState::ProviderStream {
+                    detail: format!(
+                        "streaming {tool_name} arguments ({} received)",
+                        format_provider_bytes(argument_bytes)
+                    ),
+                });
+                self.status = format!(
+                    "streaming {tool_name} · {} received",
+                    format_provider_bytes(argument_bytes)
+                );
+            }
         }
+        self.mark_live_preview_dirty();
     }
 
-    fn apply_live_file_edit_preview(
-        &mut self,
-        tool_call_id: &str,
-        tool_name: &str,
-        argument_bytes: usize,
-        preview: &bcode_session_models::LiveFileEditPreview,
-    ) {
-        let updated = self.transcript.mutate_rev_find(
-            |item| {
-                matches!(
-                    item.kind(),
-                    TranscriptItemKind::FileEditPreview {
-                        tool_call_id: item_tool_call_id,
-                        ..
-                    } if item_tool_call_id == tool_call_id
-                )
-            },
-            |item| {
-                let _ = item.set_live_file_edit_preview(tool_call_id, tool_name, preview);
-            },
-        );
-        if updated.is_none() {
-            self.transcript.push(live_file_edit_preview_item(
-                tool_call_id,
-                tool_name,
-                preview,
-            ));
+    fn ensure_live_tool_preview_anchor(&mut self, tool_call_id: &str, tool_name: &str) {
+        if self
+            .transcript
+            .iter()
+            .any(|item| item.is_live_preview_anchor_for(tool_call_id))
+        {
+            return;
         }
-        self.set_file_activity(tool_name);
-        self.mark_live_preview_dirty();
-        self.status = format!(
-            "streaming {} · {} received",
-            preview.path.as_deref().unwrap_or("file change"),
-            format_provider_bytes(argument_bytes)
-        );
-    }
-
-    fn apply_live_shell_command_preview(
-        &mut self,
-        tool_call_id: &str,
-        tool_name: &str,
-        argument_bytes: usize,
-        preview: &bcode_session_models::LiveShellCommandPreview,
-    ) {
-        let updated = self.transcript.mutate_rev_find(
-            |item| {
-                matches!(
-                    item.kind(),
-                    TranscriptItemKind::ShellPreview {
-                        tool_call_id: item_tool_call_id,
-                        ..
-                    } if item_tool_call_id == tool_call_id
-                )
-            },
-            |item| {
-                let _ = item.set_live_shell_command_preview(tool_call_id, tool_name, preview);
-            },
-        );
-        if updated.is_none() {
-            self.transcript.push(live_shell_command_preview_item(
-                tool_call_id,
-                tool_name,
-                preview,
-            ));
-        }
-        self.set_activity(ActivityState::ProviderStream {
-            detail: format!(
-                "streaming {tool_name} command ({} received)",
-                format_provider_bytes(argument_bytes)
-            ),
-        });
-        self.mark_live_preview_dirty();
-        self.status = format!(
-            "streaming command · {} received",
-            format_provider_bytes(argument_bytes)
-        );
-    }
-
-    fn apply_live_query_preview(
-        &mut self,
-        tool_call_id: &str,
-        tool_name: &str,
-        argument_bytes: usize,
-        preview: &bcode_session_models::LiveQueryPreview,
-    ) {
-        let updated = self.transcript.mutate_rev_find(
-            |item| {
-                matches!(
-                    item.kind(),
-                    TranscriptItemKind::QueryPreview {
-                        tool_call_id: item_tool_call_id,
-                        ..
-                    } if item_tool_call_id == tool_call_id
-                )
-            },
-            |item| {
-                let _ = item.set_live_query_preview(tool_call_id, tool_name, preview);
-            },
-        );
-        if updated.is_none() {
-            self.transcript
-                .push(live_query_preview_item(tool_call_id, tool_name, preview));
-        }
-        self.set_activity(ActivityState::ProviderStream {
-            detail: format!(
-                "streaming {tool_name} arguments ({} received)",
-                format_provider_bytes(argument_bytes)
-            ),
-        });
-        self.mark_live_preview_dirty();
-        self.status = format!(
-            "streaming {tool_name} · {} received",
-            format_provider_bytes(argument_bytes)
-        );
+        self.transcript
+            .push(live_tool_preview_anchor_item(tool_call_id, tool_name));
     }
 
     fn permission_tool_call_id(&self, permission_id: &str) -> Option<String> {
@@ -2453,17 +2356,8 @@ impl BmuxApp {
                     TranscriptItemKind::ToolRequest {
                         tool_call_id: item_tool_call_id,
                         ..
-                    } | TranscriptItemKind::FileEditPreview {
-                        tool_call_id: item_tool_call_id,
-                        ..
-                    } | TranscriptItemKind::ShellPreview {
-                        tool_call_id: item_tool_call_id,
-                        ..
-                    } | TranscriptItemKind::QueryPreview {
-                        tool_call_id: item_tool_call_id,
-                        ..
                     } if item_tool_call_id == tool_call_id
-                )
+                ) || item.is_live_preview_anchor_for(tool_call_id)
             },
             TranscriptItem::finish_streaming,
         );

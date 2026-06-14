@@ -101,16 +101,6 @@ impl TranscriptDocument {
         Some(index)
     }
 
-    /// Remove the newest item matching `predicate` and return it.
-    pub fn remove_rev_find(
-        &mut self,
-        predicate: impl Fn(&TranscriptItem) -> bool,
-    ) -> Option<TranscriptItem> {
-        let index = self.items.iter().rposition(predicate)?;
-        self.bump_revision();
-        Some(self.items.remove(index))
-    }
-
     const fn bump_revision(&mut self) {
         self.revision = self.revision.saturating_add(1);
     }

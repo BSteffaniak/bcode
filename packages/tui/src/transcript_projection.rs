@@ -3,7 +3,7 @@
 use bcode_config::TuiInlineDiffConfig;
 use bmux_tui::geometry::Rect;
 
-use super::app::BmuxApp;
+use super::app::{BmuxApp, LiveToolPreviewState};
 use super::pending_submission::PendingSubmission;
 use super::render;
 use super::transcript::TranscriptItem;
@@ -72,6 +72,7 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
         transcript_rows: |index| {
             render::transcript_item_rows(
                 input.transcript,
+                input.live_tool_previews,
                 index,
                 input.width,
                 input.inline_diff_config,
@@ -96,6 +97,7 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
 struct TranscriptLayoutInput<'a> {
     width: u16,
     transcript: &'a [TranscriptItem],
+    live_tool_previews: &'a std::collections::BTreeMap<String, LiveToolPreviewState>,
     pending: &'a [PendingSubmission],
     transcript_projection_revision: u64,
     pending_submissions_projection_revision: u64,
@@ -109,6 +111,7 @@ impl<'a> TranscriptLayoutInput<'a> {
         Self {
             width,
             transcript: app.transcript(),
+            live_tool_previews: app.live_tool_previews(),
             pending: app.pending_submissions(),
             transcript_projection_revision: app.transcript_projection_revision(),
             pending_submissions_projection_revision: app.pending_submissions_projection_revision(),
@@ -124,7 +127,21 @@ impl<'a> TranscriptLayoutInput<'a> {
             .iter()
             .map(|item| {
                 let elapsed = render::terminal_elapsed_signature_fragment(item).unwrap_or_default();
-                format!("{}:{}:{elapsed}", item.id().get(), item.revision())
+                let live_preview_revision = match item.kind() {
+                    super::transcript::TranscriptItemKind::LiveToolPreviewAnchor {
+                        tool_call_id,
+                        ..
+                    } => self
+                        .live_tool_previews
+                        .get(tool_call_id)
+                        .map_or(0, |preview| preview.revision),
+                    _ => 0,
+                };
+                format!(
+                    "{}:{}:{elapsed}:live-preview:{live_preview_revision}",
+                    item.id().get(),
+                    item.revision()
+                )
             })
             .collect::<Vec<_>>()
             .join(",");

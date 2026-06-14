@@ -1,9 +1,11 @@
 //! TUI rendering.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use bcode_config::TuiInlineDiffConfig;
 use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
+use bcode_session_models::LiveToolArgumentPreview;
 use bmux_terminal_grid::{
     Color as GridColor, GridLimits, PhysicalRow, Style as GridStyle, TerminalGrid,
     TerminalGridStream,
@@ -23,7 +25,7 @@ use bmux_tui::style::{Color, Modifier};
 use bmux_tui_components::text_input::TextInputControl;
 
 use super::activity::ActivityState;
-use super::app::{BmuxApp, composer_policy};
+use super::app::{BmuxApp, LiveToolPreviewState, composer_policy};
 use super::diff_extract::FileEditTranscript;
 use super::pending_submission::{PendingSubmission, PendingSubmissionState};
 use super::tool_present::{
@@ -543,12 +545,20 @@ fn render_changed_files(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
 
 pub fn transcript_item_rows(
     transcript: &[TranscriptItem],
+    live_tool_previews: &BTreeMap<String, LiveToolPreviewState>,
     index: usize,
     width: u16,
     inline_diff_config: TuiInlineDiffConfig,
 ) -> Vec<Line> {
     let mut rows = Vec::new();
-    push_transcript_item_rows(&mut rows, transcript, index, width, inline_diff_config);
+    push_transcript_item_rows(
+        &mut rows,
+        transcript,
+        live_tool_previews,
+        index,
+        width,
+        inline_diff_config,
+    );
     rows
 }
 
@@ -643,6 +653,7 @@ fn has_file_preview_before(
 fn push_transcript_item_rows(
     rows: &mut Vec<Line>,
     transcript: &[TranscriptItem],
+    live_tool_previews: &BTreeMap<String, LiveToolPreviewState>,
     index: usize,
     width: u16,
     inline_diff_config: TuiInlineDiffConfig,
@@ -677,54 +688,16 @@ fn push_transcript_item_rows(
             };
             push_tool_request_rows(rows, item, &context, width);
         }
-        TranscriptItemKind::FileEditPreview {
+        TranscriptItemKind::LiveToolPreviewAnchor {
+            tool_call_id,
             tool_name,
-            path,
-            old_text_prefix,
-            new_text_prefix,
-            argument_bytes,
-            truncated,
-            ..
         } => {
-            push_live_file_edit_preview_rows(
-                rows,
-                &LiveFileEditPreviewRenderContext {
-                    tool_name,
-                    path: path.as_deref(),
-                    old_text_prefix: old_text_prefix.as_deref(),
-                    new_text_prefix,
-                    argument_bytes: *argument_bytes,
-                    truncated: *truncated,
-                },
-                width,
-            );
-        }
-        TranscriptItemKind::ShellPreview {
-            tool_name,
-            command_prefix,
-            cwd,
-            argument_bytes,
-            truncated,
-            ..
-        } => {
-            push_shell_preview_rows(
+            push_live_tool_preview_anchor_rows(
                 rows,
                 tool_name,
-                command_prefix,
-                cwd.as_deref(),
-                *argument_bytes,
-                *truncated,
+                live_tool_previews.get(tool_call_id),
                 width,
             );
-        }
-        TranscriptItemKind::QueryPreview {
-            tool_name,
-            fields,
-            argument_bytes,
-            truncated,
-            ..
-        } => {
-            push_query_preview_rows(rows, tool_name, fields, *argument_bytes, *truncated, width);
         }
         TranscriptItemKind::ToolResult {
             tool_call_id,
@@ -949,6 +922,65 @@ fn file_tool_action(tool_name: &str, streaming: bool) -> &'static str {
         ("filesystem_edit" | "edit", false) => "Edit preview",
         (_, true) => "File change …",
         (_, false) => "File change preview",
+    }
+}
+
+fn push_live_tool_preview_anchor_rows(
+    rows: &mut Vec<Line>,
+    fallback_tool_name: &str,
+    state: Option<&LiveToolPreviewState>,
+    width: u16,
+) {
+    let Some(state) = state else {
+        push_wrapped_styled_text(
+            rows,
+            Vec::new(),
+            &format!("Tool call · {fallback_tool_name} · streaming preview"),
+            width,
+            Style::new().fg(Color::Cyan),
+            Style::new().fg(Color::Cyan),
+        );
+        push_wrapped_styled_text(
+            rows,
+            vec![Span::styled("  ", muted_style())],
+            "assembling arguments …",
+            width,
+            muted_style(),
+            muted_style(),
+        );
+        rows.push(Line::default());
+        return;
+    };
+    match &state.preview {
+        LiveToolArgumentPreview::FileEdit(file) => push_live_file_edit_preview_rows(
+            rows,
+            &LiveFileEditPreviewRenderContext {
+                tool_name: &state.tool_name,
+                path: file.path.as_deref(),
+                old_text_prefix: file.old_text_prefix.as_deref(),
+                new_text_prefix: &file.new_text_prefix,
+                argument_bytes: state.argument_bytes,
+                truncated: file.truncated,
+            },
+            width,
+        ),
+        LiveToolArgumentPreview::ShellCommand(shell) => push_shell_preview_rows(
+            rows,
+            &state.tool_name,
+            &shell.command_prefix,
+            shell.cwd.as_deref(),
+            state.argument_bytes,
+            shell.truncated,
+            width,
+        ),
+        LiveToolArgumentPreview::Query(query) => push_query_preview_rows(
+            rows,
+            &state.tool_name,
+            &query.fields,
+            state.argument_bytes,
+            query.truncated,
+            width,
+        ),
     }
 }
 
