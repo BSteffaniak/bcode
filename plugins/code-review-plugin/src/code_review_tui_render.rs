@@ -856,8 +856,11 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             let kind = review_thread_kind_label(thread.thread_kind);
             let severity = review_thread_severity_label(thread.severity);
             let path_label = thread.anchor.scope_label();
+            let agent_status = app
+                .agent_status_for_anchor(&thread.anchor)
+                .map_or(String::new(), |status| format!("  🤖 {status}"));
             let text = format!(
-                " {marker} {status} {kind}/{severity} {path_label} {line_label} x{}  {body}",
+                " {marker} {status} {kind}/{severity} {path_label} {line_label} x{}  {body}{agent_status}",
                 thread.draft_count
             );
             frame.write_line_with_fallback_style(
@@ -936,9 +939,23 @@ fn render_thread_detail(
         x = render_header_button(app, frame, x, action_y, label, action, false);
     }
     let body = thread.latest_body.lines().next().unwrap_or_default();
-    if area.height > 3 {
+    let body_y = if let Some(agent_status) = app.agent_status_for_anchor(&thread.anchor)
+        && area.height > 3
+    {
         frame.write_line(
             Rect::new(area.x, area.y.saturating_add(3), area.width, 1),
+            &Line::from_spans(vec![Span::styled(
+                truncate_to_display_width(&format!("🤖 {agent_status}"), usize::from(area.width)),
+                Style::new().fg(Color::Cyan).bg(Color::Black),
+            )]),
+        );
+        4
+    } else {
+        3
+    };
+    if area.height > body_y {
+        frame.write_line(
+            Rect::new(area.x, area.y.saturating_add(body_y), area.width, 1),
             &Line::from_spans(vec![Span::styled(
                 truncate_to_display_width(body, usize::from(area.width)),
                 Style::new().fg(Color::White).bg(Color::Black),

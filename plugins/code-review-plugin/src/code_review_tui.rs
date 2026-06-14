@@ -649,6 +649,7 @@ async fn handle_pending_agent_session(
     app: &mut ReviewApp,
     ask: PendingAgentSession,
 ) {
+    app.set_agent_status(&ask.anchor, "sending follow-up to linked session");
     if let Some(session_id) = app.session_id_for_anchor(&ask.anchor) {
         if let Ok(session_id) = session_id.parse::<SessionId>() {
             let prompt = app.agent_session_prompt(&ask);
@@ -657,24 +658,30 @@ async fn handle_pending_agent_session(
                 .await
             {
                 Ok(_) => {
+                    app.set_agent_status(&ask.anchor, format!("sent follow-up to {session_id}"));
                     app.status_message = Some(format!(
                         "sent review follow-up to linked session {session_id}"
                     ));
                 }
                 Err(error) => {
+                    app.set_agent_status(&ask.anchor, format!("follow-up failed: {error}"));
                     app.status_message = Some(format!("failed to send review follow-up: {error}"));
                 }
             }
         } else {
+            app.set_agent_status(&ask.anchor, "linked session id is invalid");
             app.status_message = Some("linked session id is invalid".to_string());
         }
     } else {
+        app.set_agent_status(&ask.anchor, "creating Bcode session");
         match create_agent_session(client, repo_path, review_target, app, ask.clone()).await {
             Ok(session_id) => {
                 app.mark_thread_session(&ask.anchor, session_id.to_string());
+                app.set_agent_status(&ask.anchor, format!("session linked: {session_id}"));
                 app.status_message = Some(format!("created Bcode session {session_id}"));
             }
             Err(error) => {
+                app.set_agent_status(&ask.anchor, format!("session failed: {error}"));
                 app.status_message = Some(format!("failed to create Bcode session: {error}"));
             }
         }
@@ -3446,6 +3453,8 @@ pub struct ReviewApp {
     pub pending_workspace_reload: bool,
     /// Review thread awaiting Bcode session creation.
     pub pending_agent_session: Option<PendingAgentSession>,
+    /// Latest visible Bcode agent/session status by review thread key.
+    pub agent_thread_statuses: BTreeMap<String, String>,
     /// Active range selection start row, if any.
     pub range_selection_start: Option<usize>,
     mouse_range_selection_start: Option<usize>,
@@ -3514,6 +3523,7 @@ impl ReviewApp {
             pending_workspace_save: false,
             pending_workspace_reload: false,
             pending_agent_session: None,
+            agent_thread_statuses: BTreeMap::new(),
             range_selection_start: None,
             mouse_range_selection_start: None,
             mouse_range_selection_dragged: false,
@@ -6859,6 +6869,19 @@ impl ReviewApp {
         self.pending_agent_session.take()
     }
 
+    /// Latest visible Bcode agent/session status for an anchor.
+    #[must_use]
+    pub fn agent_status_for_anchor(&self, anchor: &ReviewCommentAnchor) -> Option<&str> {
+        let key = Self::thread_key_for_anchor(anchor);
+        self.agent_thread_statuses.get(&key).map(String::as_str)
+    }
+
+    /// Set latest visible Bcode agent/session status for an anchor.
+    pub fn set_agent_status(&mut self, anchor: &ReviewCommentAnchor, status: impl Into<String>) {
+        let key = Self::thread_key_for_anchor(anchor);
+        self.agent_thread_statuses.insert(key, status.into());
+    }
+
     /// Return linked session id for an anchor.
     #[must_use]
     pub fn session_id_for_anchor(&self, anchor: &ReviewCommentAnchor) -> Option<&str> {
@@ -7471,6 +7494,19 @@ impl ReviewApp {
             .and_then(|comments| comments.last())
             .map(|comment| comment.body.clone());
         self.pending_agent_session = Some(PendingAgentSession { anchor, draft_body });
+        if let Some(pending_anchor) = self
+            .pending_agent_session
+            .as_ref()
+            .map(|pending| pending.anchor.clone())
+        {
+            self.set_agent_status(
+                &pending_anchor,
+                existing_session.as_ref().map_or(
+                    "queued Bcode session creation",
+                    |_| "queued Bcode follow-up",
+                ),
+            );
+        }
         self.status_message = Some(existing_session.map_or_else(
             || "creating Bcode session for review thread".to_string(),
             |session_id| format!("sending review follow-up to linked session {session_id}"),
