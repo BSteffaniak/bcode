@@ -192,3 +192,47 @@ impl SessionForkDialog {
 pub const fn name_input_policy() -> TextInputPolicy {
     TextInputPolicy::chat_composer()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{SessionForkDialog, SessionForkDialogFocus, SessionForkDialogMode};
+
+    #[test]
+    fn fork_dialog_defaults_switch_and_install_draft() {
+        let dialog = SessionForkDialog::new(SessionForkDialogMode::Fork, "[fork] source");
+
+        assert_eq!(dialog.mode(), SessionForkDialogMode::Fork);
+        assert_eq!(dialog.name_text(), "[fork] source");
+        assert!(dialog.switch_after_create());
+        assert!(dialog.install_draft());
+        assert_eq!(dialog.focus(), SessionForkDialogFocus::Name);
+    }
+
+    #[test]
+    fn clone_dialog_defaults_switch_and_carry_draft_disabled() {
+        let dialog = SessionForkDialog::new(SessionForkDialogMode::Clone, "[clone] source");
+
+        assert_eq!(dialog.mode(), SessionForkDialogMode::Clone);
+        assert_eq!(dialog.name_text(), "[clone] source");
+        assert!(dialog.switch_after_create());
+        assert!(!dialog.install_draft());
+    }
+
+    #[test]
+    fn dialog_submission_reflects_toggled_options() {
+        let mut dialog = SessionForkDialog::new(SessionForkDialogMode::Fork, "custom");
+
+        dialog.focus_next();
+        assert_eq!(dialog.focus(), SessionForkDialogFocus::SwitchAfterCreate);
+        dialog.value_next();
+        dialog.focus_next();
+        assert_eq!(dialog.focus(), SessionForkDialogFocus::InstallDraft);
+        dialog.value_next();
+
+        let submission = dialog.submission();
+        assert_eq!(submission.mode, SessionForkDialogMode::Fork);
+        assert_eq!(submission.name.as_deref(), Some("custom"));
+        assert!(!submission.switch_after_create);
+        assert!(!submission.install_draft);
+    }
+}
