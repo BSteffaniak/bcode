@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use bcode_config::TuiInlineDiffConfig;
 use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
-use bcode_session_models::LiveToolArgumentPreview;
+use bcode_session_models::{LiveFileEditPreview, LiveToolArgumentPreview};
 use bmux_terminal_grid::{
     Color as GridColor, GridLimits, PhysicalRow, Style as GridStyle, TerminalGrid,
     TerminalGridStream,
@@ -697,6 +697,7 @@ fn push_transcript_item_rows(
                 tool_name,
                 live_tool_previews.get(tool_call_id),
                 width,
+                inline_diff_config,
             );
         }
         TranscriptItemKind::ToolResult {
@@ -930,6 +931,7 @@ fn push_live_tool_preview_anchor_rows(
     fallback_tool_name: &str,
     state: Option<&LiveToolPreviewState>,
     width: u16,
+    inline_diff_config: TuiInlineDiffConfig,
 ) {
     let Some(state) = state else {
         push_wrapped_styled_text(
@@ -956,11 +958,9 @@ fn push_live_tool_preview_anchor_rows(
             rows,
             &LiveFileEditPreviewRenderContext {
                 tool_name: &state.tool_name,
-                path: file.path.as_deref(),
-                old_text_prefix: file.old_text_prefix.as_deref(),
-                new_text_prefix: &file.new_text_prefix,
+                preview: file,
                 argument_bytes: state.argument_bytes,
-                truncated: file.truncated,
+                inline_diff_config,
             },
             width,
         ),
@@ -986,11 +986,9 @@ fn push_live_tool_preview_anchor_rows(
 
 struct LiveFileEditPreviewRenderContext<'a> {
     tool_name: &'a str,
-    path: Option<&'a str>,
-    old_text_prefix: Option<&'a str>,
-    new_text_prefix: &'a str,
+    preview: &'a LiveFileEditPreview,
     argument_bytes: usize,
-    truncated: bool,
+    inline_diff_config: TuiInlineDiffConfig,
 }
 
 fn push_live_file_edit_preview_rows(
@@ -1006,31 +1004,25 @@ fn push_live_file_edit_preview_rows(
         Style::new().fg(Color::Cyan),
         Style::new().fg(Color::Cyan),
     );
-    push_wrapped_styled_text(
-        rows,
-        vec![Span::styled("  ", muted_style())],
-        &format!(
-            "Streaming preview · {}",
-            file_write_mode_label(
-                context.tool_name,
-                context.old_text_prefix.unwrap_or_default().is_empty(),
-            )
-        ),
-        width,
-        file_edit_phase_style(FileEditPhase::Pending),
-        muted_style(),
-    );
-    if let Some(path) = context.path {
-        push_kv_row(rows, "path", path, width);
-    }
     push_kv_row(
         rows,
         "received",
         &format_preview_bytes(context.argument_bytes),
         width,
     );
-    push_streaming_added_content_rows(rows, context.new_text_prefix, width);
-    if context.truncated {
+
+    let edit = file_edit_from_live_preview(context.preview);
+    push_file_edit_preview_rows(
+        rows,
+        &edit,
+        width,
+        context.inline_diff_config,
+        Some(FileEditPhase::Pending),
+        true,
+        context.tool_name,
+    );
+
+    if context.preview.truncated {
         push_wrapped_styled_text(
             rows,
             vec![Span::styled("  ", muted_style())],
@@ -1043,34 +1035,15 @@ fn push_live_file_edit_preview_rows(
     rows.push(Line::default());
 }
 
-fn push_streaming_added_content_rows(rows: &mut Vec<Line>, content: &str, width: u16) {
-    const MAX_STREAMING_FILE_PREVIEW_LINES: usize = 24;
-    let mut shown = 0usize;
-    for line in content.lines().take(MAX_STREAMING_FILE_PREVIEW_LINES) {
-        push_wrapped_styled_text(
-            rows,
-            vec![Span::styled(
-                "  + ",
-                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
-            )],
-            line,
-            width,
-            Style::new().fg(Color::Green),
-            muted_style(),
-        );
-        shown = shown.saturating_add(1);
-    }
-    let total = content.lines().count();
-    if total > shown {
-        push_wrapped_styled_text(
-            rows,
-            vec![Span::styled("  ", muted_style())],
-            &format!("… {} preview lines hidden …", total - shown),
-            width,
-            muted_style(),
-            muted_style(),
-        );
-    }
+fn file_edit_from_live_preview(preview: &LiveFileEditPreview) -> FileEditTranscript {
+    FileEditTranscript::new(
+        preview
+            .path
+            .clone()
+            .unwrap_or_else(|| "<streaming file>".to_owned()),
+        preview.old_text_prefix.clone().unwrap_or_default(),
+        preview.new_text_prefix.clone(),
+    )
 }
 
 fn format_preview_bytes(bytes: usize) -> String {

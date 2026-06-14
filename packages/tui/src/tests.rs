@@ -3226,7 +3226,14 @@ fn live_file_preview_updates_without_duplicates_and_final_replaces_it() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
     assert_eq!(output.matches("streaming preview").count(), 1, "{output}");
-    assert!(output.contains("+     println!(\"hi\");"), "{output}");
+    assert!(
+        output.contains("Streaming preview · Writing file"),
+        "{output}"
+    );
+    assert!(output.contains("src/main.rs  +3 -0"), "{output}");
+    assert!(output.contains("┌"), "{output}");
+    assert!(output.contains("+   2"), "{output}");
+    assert!(output.contains("println!(\"hi\");"), "{output}");
     assert!(!output.contains("Ready to apply"), "{output}");
 
     app.absorb_session_event(&event(
@@ -3279,5 +3286,46 @@ fn live_file_preview_renders_truncation_note_and_received_bytes() {
     assert!(
         output.contains("preview truncated by live display limit"),
         "{output}"
+    );
+}
+
+#[test]
+fn live_file_preview_uses_syntax_highlighted_inline_diff_renderer() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
+        session_id,
+        kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
+            turn_id: "turn-1".to_owned(),
+            tool_call_id: "call_write".to_owned(),
+            tool_name: "filesystem_write".to_owned(),
+            argument_bytes: 36,
+            preview: LiveToolArgumentPreview::FileEdit(LiveFileEditPreview {
+                path: Some("src/lib.rs".to_owned()),
+                old_text_prefix: None,
+                new_text_prefix: "pub fn demo() {\n    println!(\"hi\");\n}".to_owned(),
+                argument_bytes: 36,
+                truncated: false,
+            }),
+        },
+    });
+
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 30));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+    let row = output_line_y(&buffer, "pub fn demo").unwrap();
+
+    assert!(
+        output.contains("Streaming preview · Writing file"),
+        "{output}"
+    );
+    assert!(output.contains("src/lib.rs  +3 -0"), "{output}");
+    assert!(
+        (0..buffer.area().width).any(|column| buffer
+            .get(Point::new(column, row))
+            .and_then(|cell| cell.style.fg)
+            .is_some_and(|color| !matches!(color, bmux_tui::style::Color::Green))),
+        "expected syntax-colored spans on live file preview row:\n{output}"
     );
 }
