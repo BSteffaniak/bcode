@@ -38,7 +38,7 @@ pub async fn fork_current_session<W: Write>(
         session_fork_dialog::SessionForkDialogMode::Fork,
         &format!("[fork] {source_title}"),
     );
-    let submission = run_dialog(io, chat, &mut dialog).await?;
+    let submission = run_dialog(io, &mut dialog).await?;
     let Some(prompt) = select_prompt_for_fork(io, services, session_id).await? else {
         chat.app.set_status("fork canceled".to_owned());
         return Ok(());
@@ -106,8 +106,11 @@ async fn select_prompt_for_fork<W: Write>(
                 KeyCode::Down if selected + 1 < prompts.len() => selected += 1,
                 _ => {}
             },
-            Event::Paste(_) | Event::Mouse(_) => {}
-            Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick | Event::User(_) => {}
+            Event::Paste(_)
+            | Event::Mouse(_)
+            | Event::Focus(FocusEvent::Gained | FocusEvent::Lost)
+            | Event::Tick
+            | Event::User(_) => {}
         }
     }
 }
@@ -145,13 +148,7 @@ fn user_prompt_candidate_from_event(event: &SessionEvent) -> Option<ForkPromptCa
 }
 
 fn render_prompt_picker(frame: &mut Frame<'_>, prompts: &[ForkPromptCandidate], selected: usize) {
-    let modal = ModalFrame::new(
-        ModalSizing::new(Size::new(72, 12), Size::new(96, 18), Insets::all(4)),
-        ModalTheme::dark(Color::Cyan),
-    )
-    .title(" Select fork prompt ")
-    .padding(Insets::new(1, 2, 1, 2))
-    .placement(ModalPlacement::UpperThird);
+    let modal = prompt_picker_modal();
     modal.render(frame.area(), frame);
     let content = modal.content_area(frame.area());
     let mut row = content.y;
@@ -160,37 +157,62 @@ fn render_prompt_picker(frame: &mut Frame<'_>, prompts: &[ForkPromptCandidate], 
         &modal,
         content,
         &mut row,
-        Line::from_spans(vec![Span::styled(
+        &Line::from_spans(vec![Span::styled(
             "Choose the prompt to edit in the forked session",
             Style::new().fg(Color::BrightBlack).bg(Color::Black),
         )]),
     );
     for (index, prompt) in prompts.iter().take(10).enumerate() {
-        let selected_style = if index == selected {
-            Style::new()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::new().fg(Color::White).bg(Color::Black)
-        };
-        render_picker_line(
-            frame,
-            &modal,
-            content,
-            &mut row,
-            Line::from_spans(vec![
-                Span::styled(format!("#{:<4} ", prompt.sequence), selected_style),
-                Span::styled(one_line(&prompt.text), selected_style),
-            ]),
-        );
+        render_picker_prompt_line(frame, &modal, content, &mut row, prompt, index == selected);
     }
+    render_picker_help(frame, &modal, content, &mut row);
+}
+
+fn prompt_picker_modal() -> ModalFrame {
+    ModalFrame::new(
+        ModalSizing::new(Size::new(72, 12), Size::new(96, 18), Insets::all(4)),
+        ModalTheme::dark(Color::Cyan),
+    )
+    .title(" Select fork prompt ")
+    .padding(Insets::new(1, 2, 1, 2))
+    .placement(ModalPlacement::UpperThird)
+}
+
+fn render_picker_prompt_line(
+    frame: &mut Frame<'_>,
+    modal: &ModalFrame,
+    content: Rect,
+    row: &mut u16,
+    prompt: &ForkPromptCandidate,
+    selected: bool,
+) {
+    let selected_style = if selected {
+        Style::new()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(Color::White).bg(Color::Black)
+    };
     render_picker_line(
         frame,
-        &modal,
+        modal,
         content,
-        &mut row,
-        Line::from_spans(vec![
+        row,
+        &Line::from_spans(vec![
+            Span::styled(format!("#{:<4} ", prompt.sequence), selected_style),
+            Span::styled(one_line(&prompt.text), selected_style),
+        ]),
+    );
+}
+
+fn render_picker_help(frame: &mut Frame<'_>, modal: &ModalFrame, content: Rect, row: &mut u16) {
+    render_picker_line(
+        frame,
+        modal,
+        content,
+        row,
+        &Line::from_spans(vec![
             Span::styled(
                 "Enter",
                 Style::new().add_modifier(Modifier::BOLD).bg(Color::Black),
@@ -215,12 +237,12 @@ fn render_picker_line(
     modal: &ModalFrame,
     content: Rect,
     row: &mut u16,
-    line: Line,
+    line: &Line,
 ) {
     if *row >= content.bottom() {
         return;
     }
-    modal.render_line(Rect::new(content.x, *row, content.width, 1), &line, frame);
+    modal.render_line(Rect::new(content.x, *row, content.width, 1), line, frame);
     *row = row.saturating_add(1);
 }
 
@@ -252,7 +274,7 @@ pub async fn clone_current_session<W: Write>(
         session_fork_dialog::SessionForkDialogMode::Clone,
         &format!("[clone] {source_title}"),
     );
-    let submission = run_dialog(io, chat, &mut dialog).await?;
+    let submission = run_dialog(io, &mut dialog).await?;
     if !submission.install_draft {
         chat.app.replace_composer_with("");
     }
@@ -275,7 +297,6 @@ pub async fn clone_current_session<W: Write>(
 
 async fn run_dialog<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
-    chat: &mut ActiveChat,
     dialog: &mut session_fork_dialog::SessionForkDialog,
 ) -> Result<session_fork_dialog::SessionForkDialogSubmission, TuiError> {
     loop {
@@ -293,7 +314,6 @@ async fn run_dialog<W: Write>(
                 let _ = TextInputControl::new(&session_fork_dialog::name_input_policy())
                     .handle_paste(dialog.name_mut(), &text);
             }
-            Event::Paste(_) => {}
             Event::Key(stroke) => match stroke.key {
                 KeyCode::Escape => return Err(TuiError::Canceled),
                 KeyCode::Tab => dialog.focus_next(),
@@ -306,9 +326,11 @@ async fn run_dialog<W: Write>(
                 }
                 _ => {}
             },
-            Event::Mouse(_) => {}
-            Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick | Event::User(_) => {}
+            Event::Paste(_)
+            | Event::Mouse(_)
+            | Event::Focus(FocusEvent::Gained | FocusEvent::Lost)
+            | Event::Tick
+            | Event::User(_) => {}
         }
-        let _ = &chat;
     }
 }

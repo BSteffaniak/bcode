@@ -1187,7 +1187,7 @@ mod tests {
 
         let session = test_session_summary("[fork] source");
         let response = Response::Ok(ResponsePayload::SessionForked {
-            session: session.clone(),
+            session,
             draft: Some("selected prompt".to_owned()),
         });
 

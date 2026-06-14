@@ -141,7 +141,7 @@ impl SessionForkDialog {
     }
 
     /// Move focus to the next field.
-    pub fn focus_next(&mut self) {
+    pub const fn focus_next(&mut self) {
         self.focus = match self.focus {
             SessionForkDialogFocus::Mode => SessionForkDialogFocus::Name,
             SessionForkDialogFocus::Name => SessionForkDialogFocus::SwitchAfterCreate,
@@ -151,7 +151,7 @@ impl SessionForkDialog {
     }
 
     /// Move selected value backward for focused non-text fields.
-    pub fn value_previous(&mut self) {
+    pub const fn value_previous(&mut self) {
         match self.focus {
             SessionForkDialogFocus::Mode => self.mode = self.mode.previous(),
             SessionForkDialogFocus::SwitchAfterCreate => {
@@ -163,7 +163,7 @@ impl SessionForkDialog {
     }
 
     /// Move selected value forward for focused non-text fields.
-    pub fn value_next(&mut self) {
+    pub const fn value_next(&mut self) {
         match self.focus {
             SessionForkDialogFocus::Mode => self.mode = self.mode.next(),
             SessionForkDialogFocus::SwitchAfterCreate => {

@@ -100,6 +100,7 @@ async fn open_thinking_settings(
     )))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_slash_command<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
