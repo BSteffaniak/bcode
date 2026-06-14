@@ -4118,8 +4118,7 @@ struct ToolArgumentStreamProgress {
     last_emitted_at: Option<Instant>,
     emitted_progress_events: usize,
     force_emit_final: bool,
-    preview_arguments: String,
-    preview_arguments_truncated: bool,
+    preview_fields: StreamingJsonStringFields,
     last_emitted_preview: Option<LiveToolArgumentPreview>,
 }
 
@@ -4330,7 +4329,6 @@ impl ModelStreamProgress {
     const TOOL_PROGRESS_MIN_BYTES: usize = 1024;
     const TOOL_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(100);
     const MAX_TOOL_PROGRESS_EVENTS: usize = 512;
-    const TOOL_ARGUMENT_PREVIEW_MAX_BYTES: usize = 128 * 1024;
     const TOOL_ARGUMENT_FIELD_PREVIEW_MAX_CHARS: usize = 32 * 1024;
 
     fn start_tool_call(&mut self, call_id: String, name: String) {
@@ -4342,8 +4340,7 @@ impl ModelStreamProgress {
             last_emitted_at: None,
             emitted_progress_events: 0,
             force_emit_final: false,
-            preview_arguments: String::new(),
-            preview_arguments_truncated: false,
+            preview_fields: StreamingJsonStringFields::default(),
             last_emitted_preview: None,
         });
     }
@@ -4359,11 +4356,7 @@ impl ModelStreamProgress {
         if let Some(active) = self.active_tool_call.as_mut() {
             active.argument_bytes = serialized_tool_argument_len(&call.arguments);
             active.force_emit_final = true;
-            active.preview_arguments.clear();
-            active
-                .preview_arguments
-                .push_str(&call.arguments.to_string());
-            active.preview_arguments_truncated = false;
+            active.preview_fields = StreamingJsonStringFields::from_json_value(&call.arguments);
         }
     }
 
@@ -4382,23 +4375,7 @@ impl ModelStreamProgress {
             && active.call_id == call_id
         {
             active.argument_bytes = active.argument_bytes.saturating_add(delta.len());
-            if active.preview_arguments.len() < Self::TOOL_ARGUMENT_PREVIEW_MAX_BYTES {
-                let remaining = Self::TOOL_ARGUMENT_PREVIEW_MAX_BYTES
-                    .saturating_sub(active.preview_arguments.len());
-                let take = delta
-                    .char_indices()
-                    .map(|(index, _)| index)
-                    .chain(std::iter::once(delta.len()))
-                    .take_while(|index| *index <= remaining)
-                    .last()
-                    .unwrap_or(0);
-                active.preview_arguments.push_str(&delta[..take]);
-                if take < delta.len() {
-                    active.preview_arguments_truncated = true;
-                }
-            } else {
-                active.preview_arguments_truncated = true;
-            }
+            active.preview_fields.push(delta);
         }
     }
 
@@ -4441,23 +4418,7 @@ impl ModelStreamProgress {
 
     fn take_tool_argument_preview(&mut self) -> Option<LiveToolArgumentPreview> {
         let active = self.active_tool_call.as_mut()?;
-        let mut preview = live_tool_argument_preview_from_arguments(
-            &active.name,
-            &active.preview_arguments,
-            active.preview_arguments_truncated,
-            Self::TOOL_ARGUMENT_FIELD_PREVIEW_MAX_CHARS,
-        )?;
-        match &mut preview {
-            LiveToolArgumentPreview::FileEdit(file) => {
-                file.truncated |= active.preview_arguments_truncated;
-            }
-            LiveToolArgumentPreview::ShellCommand(shell) => {
-                shell.truncated |= active.preview_arguments_truncated;
-            }
-            LiveToolArgumentPreview::Query(query) => {
-                query.truncated |= active.preview_arguments_truncated;
-            }
-        }
+        let preview = live_tool_argument_preview_from_fields(&active.name, &active.preview_fields)?;
         if active
             .last_emitted_preview
             .as_ref()
@@ -4503,69 +4464,55 @@ fn is_shell_tool_name(tool_name: &str) -> bool {
     )
 }
 
-fn live_tool_argument_preview_from_arguments(
+fn live_tool_argument_preview_from_fields(
     tool_name: &str,
-    arguments: &str,
-    arguments_truncated: bool,
-    max_chars: usize,
+    fields: &StreamingJsonStringFields,
 ) -> Option<LiveToolArgumentPreview> {
     if is_file_edit_tool_name(tool_name) {
-        return live_file_edit_preview_from_arguments(arguments, arguments_truncated, max_chars)
-            .map(LiveToolArgumentPreview::FileEdit);
+        return live_file_edit_preview_from_fields(fields).map(LiveToolArgumentPreview::FileEdit);
     }
     if is_shell_tool_name(tool_name) {
-        return live_shell_command_preview_from_arguments(
-            arguments,
-            arguments_truncated,
-            max_chars,
-        )
-        .map(LiveToolArgumentPreview::ShellCommand);
+        return live_shell_command_preview_from_fields(fields)
+            .map(LiveToolArgumentPreview::ShellCommand);
     }
-    live_query_preview_from_arguments(tool_name, arguments, arguments_truncated, max_chars)
-        .map(LiveToolArgumentPreview::Query)
+    live_query_preview_from_fields(tool_name, fields).map(LiveToolArgumentPreview::Query)
 }
 
-fn live_file_edit_preview_from_arguments(
-    arguments: &str,
-    arguments_truncated: bool,
-    max_chars: usize,
+fn live_file_edit_preview_from_fields(
+    fields: &StreamingJsonStringFields,
 ) -> Option<LiveFileEditPreview> {
-    let path = partial_json_string_field(arguments, &["path", "file_path", "file"], max_chars)
+    let path = fields
+        .field(&["path", "file_path", "file"])
         .map(|field| field.value);
-    let old_text_prefix =
-        partial_json_string_field(arguments, &["old_text", "old_string"], max_chars)
-            .map(|field| field.value);
-    let new_text =
-        partial_json_string_field(arguments, &["new_text", "contents", "content"], max_chars)?;
+    let old_text_prefix = fields
+        .field(&["old_text", "old_string"])
+        .map(|field| field.value);
+    let new_text = fields.field(&["new_text", "contents", "content"])?;
     Some(LiveFileEditPreview {
         path,
         old_text_prefix,
         new_text_prefix: new_text.value,
-        argument_bytes: arguments.len(),
-        truncated: arguments_truncated || new_text.truncated,
+        argument_bytes: fields.input_bytes,
+        truncated: new_text.truncated,
     })
 }
 
-fn live_shell_command_preview_from_arguments(
-    arguments: &str,
-    arguments_truncated: bool,
-    max_chars: usize,
+fn live_shell_command_preview_from_fields(
+    fields: &StreamingJsonStringFields,
 ) -> Option<LiveShellCommandPreview> {
-    let command = partial_json_string_field(arguments, &["command"], max_chars)?;
-    let cwd = partial_json_string_field(arguments, &["cwd"], max_chars).map(|field| field.value);
+    let command = fields.field(&["command"])?;
+    let cwd = fields.field(&["cwd"]).map(|field| field.value);
     Some(LiveShellCommandPreview {
         command_prefix: command.value,
         cwd,
-        argument_bytes: arguments.len(),
-        truncated: arguments_truncated || command.truncated,
+        argument_bytes: fields.input_bytes,
+        truncated: command.truncated,
     })
 }
 
-fn live_query_preview_from_arguments(
+fn live_query_preview_from_fields(
     tool_name: &str,
-    arguments: &str,
-    arguments_truncated: bool,
-    max_chars: usize,
+    fields: &StreamingJsonStringFields,
 ) -> Option<LiveQueryPreview> {
     let field_names: &[&str] = match tool_name
         .replace(['-', '.'], "_")
@@ -4578,104 +4525,282 @@ fn live_query_preview_from_arguments(
         "git_clone" | "github_clone" => &["url", "destination", "ref", "branch"],
         _ => return None,
     };
-    let mut fields = std::collections::BTreeMap::new();
-    let mut truncated = arguments_truncated;
+    let mut preview_fields = BTreeMap::new();
+    let mut truncated = false;
     for name in field_names {
-        if let Some(field) = partial_json_string_field(arguments, &[*name], max_chars) {
+        if let Some(field) = fields.field(&[*name]) {
             truncated |= field.truncated;
-            fields.insert((*name).to_owned(), field.value);
+            preview_fields.insert((*name).to_owned(), field.value);
         }
     }
-    if fields.is_empty() {
+    if preview_fields.is_empty() {
         return None;
     }
     Some(LiveQueryPreview {
-        fields,
-        argument_bytes: arguments.len(),
+        fields: preview_fields,
+        argument_bytes: fields.input_bytes,
         truncated,
     })
 }
 
+#[derive(Debug, Clone)]
 struct PartialJsonStringField {
     value: String,
     truncated: bool,
 }
 
-fn partial_json_string_field(
-    input: &str,
-    names: &[&str],
-    max_chars: usize,
-) -> Option<PartialJsonStringField> {
-    names
-        .iter()
-        .find_map(|name| partial_json_string_field_by_name(input, name, max_chars))
+#[derive(Debug, Clone, Default)]
+struct StreamingJsonStringFields {
+    input_bytes: usize,
+    fields: BTreeMap<String, PartialJsonStringField>,
+    parser: StreamingJsonStringFieldParser,
 }
 
-fn partial_json_string_field_by_name(
-    input: &str,
-    name: &str,
-    max_chars: usize,
-) -> Option<PartialJsonStringField> {
-    let needle = format!("\"{name}\"");
-    let start = input.find(&needle)?;
-    let after_name = &input[start + needle.len()..];
-    let colon = after_name.find(':')?;
-    let after_colon = after_name[colon + 1..].trim_start();
-    let body = after_colon.strip_prefix('"')?;
-    Some(decode_partial_json_string(body, max_chars))
-}
+impl StreamingJsonStringFields {
+    const FIELD_VALUE_MAX_CHARS: usize = ModelStreamProgress::TOOL_ARGUMENT_FIELD_PREVIEW_MAX_CHARS;
 
-fn decode_partial_json_string(input: &str, max_chars: usize) -> PartialJsonStringField {
-    let mut value = String::new();
-    let mut chars = input.chars();
-    while let Some(ch) = chars.next() {
-        if value.chars().count() >= max_chars {
-            return PartialJsonStringField {
-                value,
-                truncated: true,
-            };
-        }
-        match ch {
-            '"' => {
-                return PartialJsonStringField {
-                    value,
-                    truncated: false,
-                };
+    fn from_json_value(value: &serde_json::Value) -> Self {
+        let mut fields = Self {
+            input_bytes: serialized_tool_argument_len(value),
+            ..Self::default()
+        };
+        if let serde_json::Value::Object(object) = value {
+            for (key, value) in object {
+                if let Some(value) = value.as_str() {
+                    fields.insert_field(key, value, false);
+                }
             }
-            '\\' => match chars.next() {
-                Some('n') => value.push('\n'),
-                Some('r') => value.push('\r'),
-                Some('t') => value.push('\t'),
-                Some('"') => value.push('"'),
-                Some('\\') => value.push('\\'),
-                Some('/') => value.push('/'),
-                Some('b') => value.push('\u{0008}'),
-                Some('f') => value.push('\u{000c}'),
-                Some('u') => decode_partial_unicode_escape(&mut chars, &mut value),
-                Some(other) => value.push(other),
-                None => break,
-            },
-            other => value.push(other),
         }
+        fields
+    }
+
+    fn push(&mut self, delta: &str) {
+        self.input_bytes = self.input_bytes.saturating_add(delta.len());
+        let updates = self.parser.push(delta);
+        for update in updates {
+            self.fields.insert(update.name, update.field);
+        }
+    }
+
+    fn field(&self, names: &[&str]) -> Option<PartialJsonStringField> {
+        names
+            .iter()
+            .find_map(|name| self.fields.get(*name).cloned())
+    }
+
+    fn insert_field(&mut self, name: &str, value: &str, truncated: bool) {
+        let mut field = decode_partial_json_string_from_value(value, Self::FIELD_VALUE_MAX_CHARS);
+        field.truncated |= truncated;
+        self.fields.insert(name.to_owned(), field);
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct StreamingJsonStringFieldParser {
+    state: JsonFieldParserState,
+    key: String,
+    value: String,
+    value_chars: usize,
+    value_truncated: bool,
+    escape: JsonStringEscapeState,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum JsonFieldParserState {
+    #[default]
+    SeekingKey,
+    InKey,
+    AfterKey,
+    BeforeValue,
+    InStringValue,
+    SkippingValue,
+}
+
+#[derive(Debug, Clone, Default)]
+enum JsonStringEscapeState {
+    #[default]
+    None,
+    Escape,
+    Unicode {
+        digits: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct StreamingJsonStringFieldUpdate {
+    name: String,
+    field: PartialJsonStringField,
+}
+
+impl StreamingJsonStringFieldParser {
+    fn push(&mut self, input: &str) -> Vec<StreamingJsonStringFieldUpdate> {
+        let mut updates = Vec::new();
+        for ch in input.chars() {
+            self.push_char(ch, &mut updates);
+        }
+        if matches!(self.state, JsonFieldParserState::InStringValue) {
+            updates.push(self.current_update(true));
+        }
+        updates
+    }
+
+    fn push_char(&mut self, ch: char, updates: &mut Vec<StreamingJsonStringFieldUpdate>) {
+        match self.state {
+            JsonFieldParserState::SeekingKey => {
+                if ch == '"' {
+                    self.key.clear();
+                    self.escape = JsonStringEscapeState::None;
+                    self.state = JsonFieldParserState::InKey;
+                }
+            }
+            JsonFieldParserState::InKey => match self.decode_string_char(ch) {
+                JsonStringChar::Char(decoded) => self.key.push(decoded),
+                JsonStringChar::End => self.state = JsonFieldParserState::AfterKey,
+                JsonStringChar::Pending => {}
+            },
+            JsonFieldParserState::AfterKey => {
+                if ch == ':' {
+                    self.state = JsonFieldParserState::BeforeValue;
+                } else if !ch.is_whitespace() {
+                    self.state = JsonFieldParserState::SeekingKey;
+                }
+            }
+            JsonFieldParserState::BeforeValue => {
+                if ch == '"' {
+                    self.value.clear();
+                    self.value_chars = 0;
+                    self.value_truncated = false;
+                    self.escape = JsonStringEscapeState::None;
+                    self.state = JsonFieldParserState::InStringValue;
+                } else if !ch.is_whitespace() {
+                    self.state = JsonFieldParserState::SkippingValue;
+                }
+            }
+            JsonFieldParserState::InStringValue => match self.decode_string_char(ch) {
+                JsonStringChar::Char(decoded) => self.push_value_char(decoded),
+                JsonStringChar::End => {
+                    updates.push(self.current_update(false));
+                    self.state = JsonFieldParserState::SeekingKey;
+                }
+                JsonStringChar::Pending => {}
+            },
+            JsonFieldParserState::SkippingValue => {
+                if ch == ',' || ch == '}' {
+                    self.state = JsonFieldParserState::SeekingKey;
+                }
+            }
+        }
+    }
+
+    fn push_value_char(&mut self, ch: char) {
+        if self.value_chars < StreamingJsonStringFields::FIELD_VALUE_MAX_CHARS {
+            self.value.push(ch);
+            self.value_chars = self.value_chars.saturating_add(1);
+        } else {
+            self.value_truncated = true;
+        }
+    }
+
+    fn current_update(&self, partial: bool) -> StreamingJsonStringFieldUpdate {
+        StreamingJsonStringFieldUpdate {
+            name: self.key.clone(),
+            field: PartialJsonStringField {
+                value: self.value.clone(),
+                truncated: self.value_truncated || partial,
+            },
+        }
+    }
+
+    fn decode_string_char(&mut self, ch: char) -> JsonStringChar {
+        match &mut self.escape {
+            JsonStringEscapeState::None => match ch {
+                '"' => JsonStringChar::End,
+                '\\' => {
+                    self.escape = JsonStringEscapeState::Escape;
+                    JsonStringChar::Pending
+                }
+                other => JsonStringChar::Char(other),
+            },
+            JsonStringEscapeState::Escape => match ch {
+                'n' => {
+                    self.escape = JsonStringEscapeState::None;
+                    JsonStringChar::Char('\n')
+                }
+                'r' => {
+                    self.escape = JsonStringEscapeState::None;
+                    JsonStringChar::Char('\r')
+                }
+                't' => {
+                    self.escape = JsonStringEscapeState::None;
+                    JsonStringChar::Char('\t')
+                }
+                '"' => {
+                    self.escape = JsonStringEscapeState::None;
+                    JsonStringChar::Char('"')
+                }
+                '\\' => {
+                    self.escape = JsonStringEscapeState::None;
+                    JsonStringChar::Char('\\')
+                }
+                '/' => {
+                    self.escape = JsonStringEscapeState::None;
+                    JsonStringChar::Char('/')
+                }
+                'b' => {
+                    self.escape = JsonStringEscapeState::None;
+                    JsonStringChar::Char('\u{0008}')
+                }
+                'f' => {
+                    self.escape = JsonStringEscapeState::None;
+                    JsonStringChar::Char('\u{000c}')
+                }
+                'u' => {
+                    self.escape = JsonStringEscapeState::Unicode {
+                        digits: String::new(),
+                    };
+                    JsonStringChar::Pending
+                }
+                other => {
+                    self.escape = JsonStringEscapeState::None;
+                    JsonStringChar::Char(other)
+                }
+            },
+            JsonStringEscapeState::Unicode { digits } => {
+                digits.push(ch);
+                if digits.len() < 4 {
+                    return JsonStringChar::Pending;
+                }
+                let decoded = u32::from_str_radix(digits, 16)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .unwrap_or('\u{FFFD}');
+                self.escape = JsonStringEscapeState::None;
+                JsonStringChar::Char(decoded)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonStringChar {
+    Char(char),
+    End,
+    Pending,
+}
+
+fn decode_partial_json_string_from_value(value: &str, max_chars: usize) -> PartialJsonStringField {
+    let mut truncated = false;
+    let mut output = String::new();
+    for (index, ch) in value.chars().enumerate() {
+        if index >= max_chars {
+            truncated = true;
+            break;
+        }
+        output.push(ch);
     }
     PartialJsonStringField {
-        value,
-        truncated: true,
-    }
-}
-
-fn decode_partial_unicode_escape(chars: &mut std::str::Chars<'_>, output: &mut String) {
-    let mut code = String::with_capacity(4);
-    for _ in 0..4 {
-        let Some(ch) = chars.next() else {
-            return;
-        };
-        code.push(ch);
-    }
-    if let Ok(value) = u32::from_str_radix(&code, 16)
-        && let Some(ch) = char::from_u32(value)
-    {
-        output.push(ch);
+        value: output,
+        truncated,
     }
 }
 
@@ -6387,12 +6512,8 @@ async fn handle_provider_tool_call_finished_event(
         },
     )
     .await;
-    if let Some(preview) = live_tool_argument_preview_from_arguments(
-        &call.name,
-        &call.arguments.to_string(),
-        false,
-        ModelStreamProgress::TOOL_ARGUMENT_FIELD_PREVIEW_MAX_CHARS,
-    ) {
+    let preview_fields = StreamingJsonStringFields::from_json_value(&call.arguments);
+    if let Some(preview) = live_tool_argument_preview_from_fields(&call.name, &preview_fields) {
         publish_tool_argument_preview_live(
             state,
             session_id,
@@ -10845,31 +10966,22 @@ mod tests {
     }
     #[test]
     fn live_preview_extraction_supports_shell_file_and_query_tools() {
-        let shell = live_tool_argument_preview_from_arguments(
-            "shell_run",
-            r#"{"command":"cargo test","cwd":"/repo"}"#,
-            false,
-            1024,
-        )
-        .expect("shell preview");
+        let mut shell_fields = StreamingJsonStringFields::default();
+        shell_fields.push(r#"{"command":"cargo test","cwd":"/repo"}"#);
+        let shell = live_tool_argument_preview_from_fields("shell_run", &shell_fields)
+            .expect("shell preview");
         assert!(matches!(shell, LiveToolArgumentPreview::ShellCommand(_)));
 
-        let file = live_tool_argument_preview_from_arguments(
-            "filesystem_write",
-            r#"{"path":"src/lib.rs","contents":"pub fn demo() {}"}"#,
-            false,
-            1024,
-        )
-        .expect("file preview");
+        let mut file_fields = StreamingJsonStringFields::default();
+        file_fields.push(r#"{"path":"src/lib.rs","contents":"pub fn demo() {}"}"#);
+        let file = live_tool_argument_preview_from_fields("filesystem_write", &file_fields)
+            .expect("file preview");
         assert!(matches!(file, LiveToolArgumentPreview::FileEdit(_)));
 
-        let query = live_tool_argument_preview_from_arguments(
-            "web_search",
-            r#"{"query":"rust tui","provider":"brave"}"#,
-            false,
-            1024,
-        )
-        .expect("query preview");
+        let mut query_fields = StreamingJsonStringFields::default();
+        query_fields.push(r#"{"query":"rust tui","provider":"brave"}"#);
+        let query = live_tool_argument_preview_from_fields("web_search", &query_fields)
+            .expect("query preview");
         let LiveToolArgumentPreview::Query(query) = query else {
             panic!("expected query preview");
         };
@@ -10896,15 +11008,50 @@ mod tests {
     }
 
     #[test]
-    fn partial_json_string_field_handles_partial_escape_and_unicode() {
-        let escaped =
-            partial_json_string_field(r#"{"command":"echo \"hi\" \u263A"#, &["command"], 1024)
-                .expect("partial command");
-        assert_eq!(escaped.value, "echo \"hi\" ☺");
+    fn streaming_json_fields_capture_path_after_large_contents() {
+        let mut fields = StreamingJsonStringFields::default();
+        fields.push("{\"contents\":\"");
+        fields.push(&"pub fn hello() {}\n".repeat(40_000));
+        fields.push("\",\"path\":\"src/hello.rs\"}");
 
-        let truncated = partial_json_string_field(r#"{"command":"abcdef"}"#, &["command"], 3)
-            .expect("truncated command");
-        assert_eq!(truncated.value, "abc");
-        assert!(truncated.truncated);
+        let contents = fields.field(&["contents"]).expect("contents field");
+        assert!(contents.value.starts_with("pub fn hello"));
+        assert!(contents.truncated);
+        let path = fields.field(&["path"]).expect("path field");
+        assert_eq!(path.value, "src/hello.rs");
+
+        let preview = live_tool_argument_preview_from_fields("filesystem_write", &fields)
+            .expect("file preview");
+        let LiveToolArgumentPreview::FileEdit(file) = preview else {
+            panic!("expected file edit preview");
+        };
+        assert_eq!(file.path.as_deref(), Some("src/hello.rs"));
+        assert!(file.new_text_prefix.starts_with("pub fn hello"));
+        assert!(file.truncated);
+    }
+
+    #[test]
+    fn streaming_json_fields_handle_split_names_and_escapes() {
+        let mut fields = StreamingJsonStringFields::default();
+        fields.push(r#"{"comm"#);
+        fields.push(r#"and":"echo \"hi\" \u263A"}"#);
+        let command = fields.field(&["command"]).expect("command field");
+        assert_eq!(command.value, "echo \"hi\" ☺");
+        assert!(!command.truncated);
+    }
+
+    #[test]
+    fn streaming_json_fields_handle_partial_escape_and_unicode() {
+        let mut fields = StreamingJsonStringFields::default();
+        fields.push(r#"{"command":"echo \"hi\" \u263A"#);
+        let command = fields.field(&["command"]).expect("partial command");
+        assert_eq!(command.value, "echo \"hi\" ☺");
+        assert!(command.truncated);
+
+        let mut fields = StreamingJsonStringFields::default();
+        fields.push(r#"{"command":"abcdef"}"#);
+        let command = fields.field(&["command"]).expect("command");
+        assert_eq!(command.value, "abcdef");
+        assert!(!command.truncated);
     }
 }
