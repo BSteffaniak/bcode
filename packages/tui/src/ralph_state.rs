@@ -163,6 +163,80 @@ fn update_fingerprint(fingerprint: &mut u64, bytes: &[u8]) {
     *fingerprint = fingerprint.wrapping_mul(FNV_PRIME);
 }
 
+/// Input for Ralph loop stop-decision evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RalphStopDecisionInput {
+    /// Current lifecycle status.
+    pub status: RalphLoopStatus,
+    /// Completed iteration count.
+    pub iteration_count: u64,
+    /// Maximum allowed work iterations.
+    pub max_iterations: u64,
+    /// Consecutive iterations with no checklist fingerprint change.
+    pub no_progress_count: u64,
+    /// Maximum allowed consecutive no-progress iterations.
+    pub no_progress_limit: u64,
+    /// Progress doc checklist summary.
+    pub checklist_summary: ProgressDocChecklistSummary,
+    /// Whether a permission denial blocked the loop.
+    pub permission_denied: bool,
+    /// Whether validation is currently blocked.
+    pub validation_blocked: bool,
+    /// Whether the loop needs a user answer before proceeding.
+    pub user_question: bool,
+}
+
+/// Ralph loop stop decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RalphStopDecision {
+    /// Continue the loop.
+    Continue,
+    /// Stop because the progress doc appears complete and needs final audit.
+    CompletionCandidate,
+    /// Stop because the maximum iteration count was reached.
+    MaxIterations,
+    /// Stop because repeated iterations made no checklist progress.
+    RepeatedNoProgress,
+    /// Stop because permission was denied.
+    PermissionDenied,
+    /// Stop because validation is blocked.
+    ValidationBlocked,
+    /// Stop because a user answer is required.
+    UserQuestion,
+    /// Stop because the loop is already in a terminal status.
+    TerminalStatus,
+}
+
+/// Decide whether a Ralph loop should stop before another work iteration.
+#[must_use]
+pub const fn decide_stop(input: RalphStopDecisionInput) -> RalphStopDecision {
+    if matches!(
+        input.status,
+        RalphLoopStatus::Stopped | RalphLoopStatus::Done
+    ) {
+        return RalphStopDecision::TerminalStatus;
+    }
+    if input.permission_denied {
+        return RalphStopDecision::PermissionDenied;
+    }
+    if input.validation_blocked {
+        return RalphStopDecision::ValidationBlocked;
+    }
+    if input.user_question {
+        return RalphStopDecision::UserQuestion;
+    }
+    if input.checklist_summary.is_completion_candidate() {
+        return RalphStopDecision::CompletionCandidate;
+    }
+    if input.max_iterations > 0 && input.iteration_count >= input.max_iterations {
+        return RalphStopDecision::MaxIterations;
+    }
+    if input.no_progress_limit > 0 && input.no_progress_count >= input.no_progress_limit {
+        return RalphStopDecision::RepeatedNoProgress;
+    }
+    RalphStopDecision::Continue
+}
+
 /// Summary of a discoverable Ralph loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RalphLoopSummary {
@@ -263,13 +337,22 @@ fn read_loop_summary(metadata_path: &Path) -> Result<Option<RalphLoopSummary>, R
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
         iteration_count: metadata_u64(&metadata, "iteration_count"),
-        next_action: next_action_for_status(
-            metadata
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown"),
+        next_action: next_action_for_decision(decide_stop(RalphStopDecisionInput {
+            status: status_from_str(
+                metadata
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+            ),
+            iteration_count: metadata_u64(&metadata, "iteration_count"),
+            max_iterations: metadata_u64(&metadata, "max_iterations"),
+            no_progress_count: metadata_u64(&metadata, "no_progress_count"),
+            no_progress_limit: metadata_u64(&metadata, "no_progress_limit"),
             checklist_summary,
-        )
+            permission_denied: false,
+            validation_blocked: false,
+            user_question: false,
+        }))
         .to_owned(),
         checklist_summary,
         updated_at_ms: metadata_u128(&metadata, "updated_at_ms"),
@@ -298,23 +381,32 @@ fn metadata_u64(metadata: &Map<String, Value>, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn next_action_for_status(
-    status: &str,
-    checklist_summary: ProgressDocChecklistSummary,
-) -> &'static str {
-    if checklist_summary.is_completion_candidate() && status != "done" {
-        return "audit completion candidate before marking done";
-    }
+fn status_from_str(status: &str) -> RalphLoopStatus {
     match status {
-        "created" | "planning" => "review generated progress doc",
-        "awaiting_approval" => "approve or edit progress doc before running",
-        "running" => "wait for current work iteration or stop the loop",
-        "auditing" => "review audit results",
-        "replanning" => "review updated unchecked plan items",
-        "stopped" => "run /ralph status, inspect blockers, then restart manually",
-        "blocked" => "resolve blocker or answer the pending question",
-        "done" => "review validation results and final handoff notes",
-        _ => "inspect Ralph state and progress doc",
+        "created" => RalphLoopStatus::Created,
+        "planning" => RalphLoopStatus::Planning,
+        "awaiting_approval" => RalphLoopStatus::AwaitingApproval,
+        "running" => RalphLoopStatus::Running,
+        "auditing" => RalphLoopStatus::Auditing,
+        "replanning" => RalphLoopStatus::Replanning,
+        "stopped" => RalphLoopStatus::Stopped,
+        "done" => RalphLoopStatus::Done,
+        _ => RalphLoopStatus::Blocked,
+    }
+}
+
+const fn next_action_for_decision(decision: RalphStopDecision) -> &'static str {
+    match decision {
+        RalphStopDecision::Continue => "run the next bounded work iteration",
+        RalphStopDecision::CompletionCandidate => "audit completion candidate before marking done",
+        RalphStopDecision::MaxIterations => "inspect progress and replan before continuing",
+        RalphStopDecision::RepeatedNoProgress => {
+            "replan because recent iterations made no progress"
+        }
+        RalphStopDecision::PermissionDenied => "resolve permission denial before continuing",
+        RalphStopDecision::ValidationBlocked => "resolve validation blocker before continuing",
+        RalphStopDecision::UserQuestion => "answer the pending question before continuing",
+        RalphStopDecision::TerminalStatus => "review final state and handoff notes",
     }
 }
 
@@ -582,6 +674,7 @@ struct LoopMetadata<'a> {
     stop_reason: Option<&'static str>,
     max_iterations: u64,
     no_progress_limit: u64,
+    no_progress_count: u64,
     iteration_count: u64,
     context_pack_path: &'a Path,
     audit_history_path: &'a Path,
@@ -607,6 +700,7 @@ impl<'a> LoopMetadata<'a> {
             stop_reason: None,
             max_iterations: 5,
             no_progress_limit: 2,
+            no_progress_count: 0,
             iteration_count: 0,
             context_pack_path: &paths.context_pack_path,
             audit_history_path: &paths.audit_history_path,
@@ -840,5 +934,69 @@ mod tests {
         let first = analyze_progress_doc_text("- [ ] first\n");
         let second = analyze_progress_doc_text("- [ ] second\n");
         assert_ne!(first.checklist_fingerprint, second.checklist_fingerprint);
+    }
+
+    #[test]
+    fn stop_decision_detects_completion_candidate() {
+        let decision = decide_stop(RalphStopDecisionInput {
+            status: RalphLoopStatus::Running,
+            iteration_count: 1,
+            max_iterations: 5,
+            no_progress_count: 0,
+            no_progress_limit: 2,
+            checklist_summary: analyze_progress_doc_text("- [x] done\n"),
+            permission_denied: false,
+            validation_blocked: false,
+            user_question: false,
+        });
+        assert_eq!(decision, RalphStopDecision::CompletionCandidate);
+    }
+
+    #[test]
+    fn stop_decision_prioritizes_blockers() {
+        let decision = decide_stop(RalphStopDecisionInput {
+            status: RalphLoopStatus::Running,
+            iteration_count: 5,
+            max_iterations: 5,
+            no_progress_count: 2,
+            no_progress_limit: 2,
+            checklist_summary: analyze_progress_doc_text("- [ ] pending\n"),
+            permission_denied: true,
+            validation_blocked: true,
+            user_question: true,
+        });
+        assert_eq!(decision, RalphStopDecision::PermissionDenied);
+    }
+
+    #[test]
+    fn stop_decision_detects_max_iterations() {
+        let decision = decide_stop(RalphStopDecisionInput {
+            status: RalphLoopStatus::Running,
+            iteration_count: 5,
+            max_iterations: 5,
+            no_progress_count: 0,
+            no_progress_limit: 2,
+            checklist_summary: analyze_progress_doc_text("- [ ] pending\n"),
+            permission_denied: false,
+            validation_blocked: false,
+            user_question: false,
+        });
+        assert_eq!(decision, RalphStopDecision::MaxIterations);
+    }
+
+    #[test]
+    fn stop_decision_detects_repeated_no_progress() {
+        let decision = decide_stop(RalphStopDecisionInput {
+            status: RalphLoopStatus::Running,
+            iteration_count: 1,
+            max_iterations: 5,
+            no_progress_count: 2,
+            no_progress_limit: 2,
+            checklist_summary: analyze_progress_doc_text("- [ ] pending\n"),
+            permission_denied: false,
+            validation_blocked: false,
+            user_question: false,
+        });
+        assert_eq!(decision, RalphStopDecision::RepeatedNoProgress);
     }
 }
