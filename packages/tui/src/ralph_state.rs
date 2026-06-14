@@ -79,6 +79,142 @@ pub struct CreatedRalphLoopState {
     pub audit_history_path: PathBuf,
 }
 
+/// Summary of a discoverable Ralph loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RalphLoopSummary {
+    /// User-facing loop name.
+    pub loop_name: String,
+    /// Current lifecycle status.
+    pub status: String,
+    /// Loop state directory.
+    pub state_dir: PathBuf,
+    /// Canonical progress document path.
+    pub progress_doc_path: PathBuf,
+    /// Isolated work area path, when created.
+    pub work_area_path: Option<PathBuf>,
+    /// Session ID rooted at the isolated work area, when created.
+    pub session_id: Option<String>,
+    /// Completed iteration count.
+    pub iteration_count: u64,
+    /// Suggested next action.
+    pub next_action: String,
+    updated_at_ms: u128,
+}
+
+/// Return the most recently updated Ralph loop for a repository.
+///
+/// # Errors
+///
+/// Returns an error when state directory entries or metadata files cannot be
+/// read. Missing repository state is treated as an empty result.
+pub fn latest_loop(repo_root: &Path) -> Result<Option<RalphLoopSummary>, RalphStateError> {
+    let root = repo_state_root(repo_root);
+    if !root.exists() {
+        return Ok(None);
+    }
+    let mut latest = None;
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let metadata_path = entry.path().join(LOOP_METADATA_FILE_NAME);
+        if !metadata_path.exists() {
+            continue;
+        }
+        let Some(summary) = read_loop_summary(&metadata_path)? else {
+            continue;
+        };
+        if latest
+            .as_ref()
+            .is_none_or(|current: &RalphLoopSummary| summary.updated_at_ms > current.updated_at_ms)
+        {
+            latest = Some(summary);
+        }
+    }
+    Ok(latest)
+}
+
+fn read_loop_summary(metadata_path: &Path) -> Result<Option<RalphLoopSummary>, RalphStateError> {
+    let bytes = std::fs::read(metadata_path)?;
+    let metadata =
+        serde_json::from_slice::<Map<String, Value>>(&bytes).map_err(RalphStateError::Json)?;
+    let Some(state_dir) = metadata_path.parent().map(Path::to_path_buf) else {
+        return Ok(None);
+    };
+    let progress_doc_path = metadata
+        .get("progress_doc_path")
+        .and_then(Value::as_str)
+        .map_or_else(|| state_dir.join(PROGRESS_DOC_FILE_NAME), PathBuf::from);
+    Ok(Some(RalphLoopSummary {
+        loop_name: metadata
+            .get("loop_name")
+            .and_then(Value::as_str)
+            .unwrap_or("Ralph loop")
+            .to_owned(),
+        status: metadata
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned(),
+        state_dir,
+        progress_doc_path,
+        work_area_path: metadata
+            .get("work_area_path")
+            .and_then(Value::as_str)
+            .map(PathBuf::from),
+        session_id: metadata
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        iteration_count: metadata_u64(&metadata, "iteration_count"),
+        next_action: next_action_for_status(
+            metadata
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+        )
+        .to_owned(),
+        updated_at_ms: metadata_u128(&metadata, "updated_at_ms"),
+    }))
+}
+
+fn metadata_u128(metadata: &Map<String, Value>, key: &str) -> u128 {
+    metadata
+        .get(key)
+        .and_then(|value| match value {
+            Value::Number(number) => number.as_u64().map(u128::from),
+            Value::String(text) => text.parse::<u128>().ok(),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+fn metadata_u64(metadata: &Map<String, Value>, key: &str) -> u64 {
+    metadata
+        .get(key)
+        .and_then(|value| match value {
+            Value::Number(number) => number.as_u64(),
+            Value::String(text) => text.parse::<u64>().ok(),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+fn next_action_for_status(status: &str) -> &'static str {
+    match status {
+        "created" | "planning" => "review generated progress doc",
+        "awaiting_approval" => "approve or edit progress doc before running",
+        "running" => "wait for current work iteration or stop the loop",
+        "auditing" => "review audit results",
+        "replanning" => "review updated unchecked plan items",
+        "stopped" => "run /ralph status, inspect blockers, then restart manually",
+        "blocked" => "resolve blocker or answer the pending question",
+        "done" => "review validation results and final handoff notes",
+        _ => "inspect Ralph state and progress doc",
+    }
+}
+
 /// Create initial local state for a Ralph loop.
 ///
 /// # Errors

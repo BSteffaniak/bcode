@@ -217,6 +217,14 @@ async fn handle_slash_command<W: Write>(
             chat.app.clear_pending_submission(message);
             ralph_flow::start_loop(io, services, chat).await?;
         }
+        slash_commands::SlashCommandOutcome::ShowRalphStatus => {
+            chat.app.clear_pending_submission(message);
+            ralph_flow::show_status(chat)?;
+        }
+        slash_commands::SlashCommandOutcome::OpenRalphProgress => {
+            chat.app.clear_pending_submission(message);
+            ralph_flow::open_progress(chat)?;
+        }
         slash_commands::SlashCommandOutcome::ToggleDiff => {
             chat.app.clear_pending_submission(message);
             let _changed = chat.app.toggle_diff_visible();

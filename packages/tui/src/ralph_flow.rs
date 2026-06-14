@@ -16,6 +16,57 @@ use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::ActiveChat;
 use super::{TuiError, ralph_start_dialog, ralph_start_dialog_render, ralph_state};
 
+/// Show latest Ralph loop status for the current repository.
+pub fn show_status(chat: &mut ActiveChat) -> Result<(), TuiError> {
+    let repo_root = current_repo_root(chat)?;
+    let Some(summary) = ralph_state::latest_loop(&repo_root)? else {
+        chat.app
+            .set_status("no Ralph loops for current repository".to_owned());
+        return Ok(());
+    };
+    chat.app.push_system_note(format!(
+        "Ralph loop status\n* Loop: {}\n* Status: {}\n* Iterations: {}\n* Next: {}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}",
+        summary.loop_name,
+        summary.status,
+        summary.iteration_count,
+        summary.next_action,
+        summary.progress_doc_path.display(),
+        summary.state_dir.display(),
+        summary
+            .work_area_path
+            .as_ref()
+            .map_or_else(|| "<none>".to_owned(), |path| path.display().to_string()),
+        summary.session_id.as_deref().unwrap_or("<none>")
+    ));
+    chat.app.set_status("Ralph status shown".to_owned());
+    Ok(())
+}
+
+/// Show latest Ralph progress doc path for the current repository.
+pub fn open_progress(chat: &mut ActiveChat) -> Result<(), TuiError> {
+    let repo_root = current_repo_root(chat)?;
+    let Some(summary) = ralph_state::latest_loop(&repo_root)? else {
+        chat.app
+            .set_status("no Ralph loops for current repository".to_owned());
+        return Ok(());
+    };
+    chat.app.push_system_note(format!(
+        "Ralph progress doc\n* Loop: {}\n* Path: {}",
+        summary.loop_name,
+        summary.progress_doc_path.display()
+    ));
+    chat.app
+        .set_status("Ralph progress doc path shown".to_owned());
+    Ok(())
+}
+
+fn current_repo_root(chat: &ActiveChat) -> Result<std::path::PathBuf, TuiError> {
+    chat.app
+        .working_directory()
+        .map_or_else(std::env::current_dir, |path| Ok(path.to_path_buf()))
+        .map_err(TuiError::Io)
+}
+
 /// Start the Ralph loop setup flow.
 pub async fn start_loop<W: Write>(
     io: &mut TuiIo<'_, '_, W>,

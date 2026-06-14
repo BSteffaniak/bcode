@@ -28,6 +28,10 @@ pub enum SlashCommandOutcome {
     SessionCloned { session_id: SessionId },
     /// Open Ralph loop start dialog.
     OpenRalphStartDialog,
+    /// Show Ralph loop status.
+    ShowRalphStatus,
+    /// Show the latest Ralph progress doc path.
+    OpenRalphProgress,
     /// Open skill picker.
     PickSkill,
     /// Invoke a skill after creating an active session if needed.
@@ -314,11 +318,11 @@ async fn cwd_command(
 fn ralph_command(parts: &[&str]) -> SlashCommandOutcome {
     match parts.get(1).copied() {
         Some("start") | None => SlashCommandOutcome::OpenRalphStartDialog,
-        Some("run" | "stop" | "status" | "audit" | "replan" | "open") => {
-            SlashCommandOutcome::Handled(
-                "Ralph loop orchestration is not implemented yet".to_owned(),
-            )
-        }
+        Some("status") => SlashCommandOutcome::ShowRalphStatus,
+        Some("open") => SlashCommandOutcome::OpenRalphProgress,
+        Some("run" | "stop" | "audit" | "replan") => SlashCommandOutcome::Handled(
+            "Ralph loop orchestration is not implemented yet".to_owned(),
+        ),
         Some(_) => SlashCommandOutcome::Handled(
             "usage: /ralph [start|run|stop|status|audit|replan|open]".to_owned(),
         ),
