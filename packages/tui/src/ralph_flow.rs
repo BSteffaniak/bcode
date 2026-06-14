@@ -74,6 +74,9 @@ pub async fn start_loop<W: Write>(
                             chat.app.session_title(),
                             &history.events,
                         )?;
+                        ralph_state::generate_progress_doc_from_context(
+                            &state, &loop_name, &repo_root,
+                        )?;
                     }
                     let work_area = services
                         .client

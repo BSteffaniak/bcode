@@ -1,7 +1,7 @@
 //! Local Ralph loop state management for the TUI.
 
 use bcode_session_models::{SessionEvent, SessionEventKind};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -132,6 +132,32 @@ pub fn write_context_pack(
     Ok(())
 }
 
+/// Generate the local progress doc from the current context pack.
+///
+/// # Errors
+///
+/// Returns an error when the context pack cannot be read or decoded, or when
+/// the progress doc cannot be written.
+pub fn generate_progress_doc_from_context(
+    state: &CreatedRalphLoopState,
+    loop_name: &str,
+    repo_root: &Path,
+) -> Result<(), RalphStateError> {
+    let bytes = std::fs::read(&state.context_pack_path)?;
+    let context_pack =
+        serde_json::from_slice::<ContextPack>(&bytes).map_err(RalphStateError::Json)?;
+    std::fs::write(
+        &state.progress_doc_path,
+        progress_doc_from_context(loop_name, repo_root, state, &context_pack),
+    )?;
+    update_metadata_field(
+        state,
+        "status",
+        Value::String(RalphLoopStatus::AwaitingApproval.as_str().to_owned()),
+    )?;
+    Ok(())
+}
+
 /// Record the isolated work area created for a Ralph loop.
 ///
 /// # Errors
@@ -235,18 +261,18 @@ fn allocate_loop_paths(
     Err(RalphStateError::LoopNameExhausted(loop_name.to_owned()))
 }
 
-#[derive(Debug, Serialize)]
-struct ContextPack<'a> {
-    session_title: Option<&'a str>,
+#[derive(Debug, Serialize, Deserialize)]
+struct ContextPack {
+    session_title: Option<String>,
     event_count: usize,
     events: Vec<ContextPackEvent>,
     created_at_ms: u128,
 }
 
-impl<'a> ContextPack<'a> {
-    fn from_events(session_title: Option<&'a str>, events: &[SessionEvent]) -> Self {
+impl ContextPack {
+    fn from_events(session_title: Option<&str>, events: &[SessionEvent]) -> Self {
         Self {
-            session_title,
+            session_title: session_title.map(ToOwned::to_owned),
             event_count: events.len(),
             events: events
                 .iter()
@@ -257,10 +283,10 @@ impl<'a> ContextPack<'a> {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ContextPackEvent {
     sequence: u64,
-    kind: &'static str,
+    kind: String,
     text: String,
 }
 
@@ -280,7 +306,7 @@ impl ContextPackEvent {
             } => {
                 return Some(Self {
                     sequence: event.sequence,
-                    kind: "skill_invoked",
+                    kind: "skill_invoked".to_owned(),
                     text: format!("{skill_id}: {arguments}"),
                 });
             }
@@ -288,7 +314,7 @@ impl ContextPackEvent {
         };
         Some(Self {
             sequence: event.sequence,
-            kind,
+            kind: kind.to_owned(),
             text: truncate_context_text(text),
         })
     }
@@ -403,6 +429,90 @@ fn initial_context_pack(
         "created_at_ms": now_ms(),
     });
     serde_json::to_vec_pretty(&value).map_err(RalphStateError::Json)
+}
+
+fn progress_doc_from_context(
+    loop_name: &str,
+    repo_root: &Path,
+    paths: &CreatedRalphLoopState,
+    context_pack: &ContextPack,
+) -> String {
+    let latest_user_goal = context_pack
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.kind == "user_message")
+        .map_or(
+            "Review the captured context and refine this goal.",
+            |event| event.text.as_str(),
+        );
+    let recent_context = context_pack
+        .events
+        .iter()
+        .rev()
+        .take(8)
+        .map(|event| {
+            format!(
+                "- `{}` #{}: {}",
+                event.kind,
+                event.sequence,
+                markdown_line(&event.text)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let recent_context = if recent_context.is_empty() {
+        "- No active-session context was captured. Replace this section manually.".to_owned()
+    } else {
+        recent_context
+    };
+    format!(
+        "# Ralph Loop: {loop_name}\n\n\
+         ## Purpose\n\n\
+         {goal}\n\n\
+         ## Current status\n\n\
+         - **State:** Awaiting approval\n\
+         - **Repository:** `{repo_root}`\n\
+         - **Captured events:** {event_count}\n\n\
+         ## Captured context\n\n\
+         {recent_context}\n\n\
+         ## Definition of done\n\n\
+         - [ ] Confirm the generated goal and checklist match the intended work.\n\
+         - [ ] Confirm or create the isolated work area for this Ralph loop.\n\
+         - [ ] Implement the planned changes in bounded iterations.\n\
+         - [ ] Audit the repository state against this progress doc.\n\
+         - [ ] Run relevant validation and record the results.\n\n\
+         ## Practical checklist\n\n\
+         - [ ] Refine this generated progress doc before starting long-running work.\n\
+         - [ ] Convert captured context into specific implementation tasks.\n\
+         - [ ] Keep completed work checked only after it is actually verified.\n\n\
+         ## Decisions\n\n\
+         - Ralph created this progress doc in Bcode state, outside the repository.\n\n\
+         ## Blockers and questions\n\n\
+         - [ ] Confirm the generated checklist reflects the goal before starting long-running work.\n\n\
+         ## Session handoff notes\n\n\
+         - Canonical progress doc path: `{progress_doc}`\n\
+         - Ralph state directory: `{state_dir}`\n\
+         - Context pack path: `{context_pack}`\n",
+        goal = markdown_paragraph(latest_user_goal),
+        repo_root = repo_root.display(),
+        event_count = context_pack.event_count,
+        progress_doc = paths.progress_doc_path.display(),
+        state_dir = paths.state_dir.display(),
+        context_pack = paths.context_pack_path.display()
+    )
+}
+
+fn markdown_paragraph(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn markdown_line(text: &str) -> String {
+    markdown_paragraph(text).replace('`', "'")
 }
 
 fn repo_state_id(repo_root: &Path) -> String {
