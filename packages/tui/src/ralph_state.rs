@@ -79,6 +79,90 @@ pub struct CreatedRalphLoopState {
     pub audit_history_path: PathBuf,
 }
 
+/// Markdown checklist summary for a Ralph progress doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgressDocChecklistSummary {
+    /// Number of checked checklist items.
+    pub checked_count: usize,
+    /// Number of unchecked checklist items.
+    pub unchecked_count: usize,
+    /// Stable fingerprint for checklist lines.
+    pub checklist_fingerprint: u64,
+}
+
+impl ProgressDocChecklistSummary {
+    /// Return whether the checklist has no remaining unchecked items.
+    #[must_use]
+    pub const fn is_completion_candidate(self) -> bool {
+        self.checked_count > 0 && self.unchecked_count == 0
+    }
+}
+
+/// Analyze checklist state from markdown text.
+#[must_use]
+pub fn analyze_progress_doc_text(text: &str) -> ProgressDocChecklistSummary {
+    let mut summary = ProgressDocChecklistSummary {
+        checked_count: 0,
+        unchecked_count: 0,
+        checklist_fingerprint: FNV_OFFSET_BASIS,
+    };
+    for line in text.lines().filter_map(checklist_line) {
+        match line.state {
+            ChecklistState::Checked => {
+                summary.checked_count = summary.checked_count.saturating_add(1);
+            }
+            ChecklistState::Unchecked => {
+                summary.unchecked_count = summary.unchecked_count.saturating_add(1);
+            }
+        }
+        update_fingerprint(
+            &mut summary.checklist_fingerprint,
+            line.normalized.as_bytes(),
+        );
+    }
+    summary
+}
+
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChecklistState {
+    Checked,
+    Unchecked,
+}
+
+struct ChecklistLine<'a> {
+    state: ChecklistState,
+    normalized: &'a str,
+}
+
+fn checklist_line(line: &str) -> Option<ChecklistLine<'_>> {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("- [ ]") {
+        return Some(ChecklistLine {
+            state: ChecklistState::Unchecked,
+            normalized: rest.trim(),
+        });
+    }
+    let rest = trimmed
+        .strip_prefix("- [x]")
+        .or_else(|| trimmed.strip_prefix("- [X]"))?;
+    Some(ChecklistLine {
+        state: ChecklistState::Checked,
+        normalized: rest.trim(),
+    })
+}
+
+fn update_fingerprint(fingerprint: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *fingerprint ^= u64::from(*byte);
+        *fingerprint = fingerprint.wrapping_mul(FNV_PRIME);
+    }
+    *fingerprint ^= u64::from(b'\n');
+    *fingerprint = fingerprint.wrapping_mul(FNV_PRIME);
+}
+
 /// Summary of a discoverable Ralph loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RalphLoopSummary {
@@ -98,6 +182,8 @@ pub struct RalphLoopSummary {
     pub iteration_count: u64,
     /// Suggested next action.
     pub next_action: String,
+    /// Progress doc checklist summary.
+    pub checklist_summary: ProgressDocChecklistSummary,
     updated_at_ms: u128,
 }
 
@@ -146,6 +232,15 @@ fn read_loop_summary(metadata_path: &Path) -> Result<Option<RalphLoopSummary>, R
         .get("progress_doc_path")
         .and_then(Value::as_str)
         .map_or_else(|| state_dir.join(PROGRESS_DOC_FILE_NAME), PathBuf::from);
+    let checklist_summary = if progress_doc_path.exists() {
+        analyze_progress_doc_text(&std::fs::read_to_string(&progress_doc_path)?)
+    } else {
+        ProgressDocChecklistSummary {
+            checked_count: 0,
+            unchecked_count: 0,
+            checklist_fingerprint: FNV_OFFSET_BASIS,
+        }
+    };
     Ok(Some(RalphLoopSummary {
         loop_name: metadata
             .get("loop_name")
@@ -173,8 +268,10 @@ fn read_loop_summary(metadata_path: &Path) -> Result<Option<RalphLoopSummary>, R
                 .get("status")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown"),
+            checklist_summary,
         )
         .to_owned(),
+        checklist_summary,
         updated_at_ms: metadata_u128(&metadata, "updated_at_ms"),
     }))
 }
@@ -201,7 +298,13 @@ fn metadata_u64(metadata: &Map<String, Value>, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn next_action_for_status(status: &str) -> &'static str {
+fn next_action_for_status(
+    status: &str,
+    checklist_summary: ProgressDocChecklistSummary,
+) -> &'static str {
+    if checklist_summary.is_completion_candidate() && status != "done" {
+        return "audit completion candidate before marking done";
+    }
     match status {
         "created" | "planning" => "review generated progress doc",
         "awaiting_approval" => "approve or edit progress doc before running",
@@ -712,5 +815,30 @@ mod tests {
     fn repo_state_root_uses_bcode_state_dir() {
         let root = repo_state_root(Path::new("/tmp/example repo"));
         assert!(root.ends_with(Path::new("ralph/tmp-example-repo")));
+    }
+
+    #[test]
+    fn analyzes_progress_doc_checklists() {
+        let summary = analyze_progress_doc_text(
+            "# Progress\n\n- [x] done\n- [ ] pending\n  - [X] nested done\nnot a checklist\n",
+        );
+        assert_eq!(summary.checked_count, 2);
+        assert_eq!(summary.unchecked_count, 1);
+        assert!(!summary.is_completion_candidate());
+    }
+
+    #[test]
+    fn detects_completion_candidates() {
+        let summary = analyze_progress_doc_text("- [x] implemented\n- [X] validated\n");
+        assert_eq!(summary.checked_count, 2);
+        assert_eq!(summary.unchecked_count, 0);
+        assert!(summary.is_completion_candidate());
+    }
+
+    #[test]
+    fn checklist_fingerprint_changes_when_items_change() {
+        let first = analyze_progress_doc_text("- [ ] first\n");
+        let second = analyze_progress_doc_text("- [ ] second\n");
+        assert_ne!(first.checklist_fingerprint, second.checklist_fingerprint);
     }
 }

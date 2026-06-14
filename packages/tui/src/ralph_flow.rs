@@ -25,10 +25,12 @@ pub fn show_status(chat: &mut ActiveChat) -> Result<(), TuiError> {
         return Ok(());
     };
     chat.app.push_system_note(format!(
-        "Ralph loop status\n* Loop: {}\n* Status: {}\n* Iterations: {}\n* Next: {}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}",
+        "Ralph loop status\n* Loop: {}\n* Status: {}\n* Iterations: {}\n* Checklist: {} checked, {} unchecked\n* Next: {}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}",
         summary.loop_name,
         summary.status,
         summary.iteration_count,
+        summary.checklist_summary.checked_count,
+        summary.checklist_summary.unchecked_count,
         summary.next_action,
         summary.progress_doc_path.display(),
         summary.state_dir.display(),
