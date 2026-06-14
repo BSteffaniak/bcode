@@ -34,9 +34,10 @@ use super::tool_present::{
     ShellResultPresentation, ToolResultPresentation, tool_result_presentation,
 };
 use super::transcript::{
-    FileEditPhase, TranscriptItem, TranscriptItemKind, model_usage_item, permission_request_item,
-    permission_result_item, streaming_terminal_output_item, streaming_tool_output_item,
-    tool_request_item, tool_result_item, transcript_items_from_events_with_reasoning,
+    FileEditPhase, TranscriptItem, TranscriptItemKind, live_file_edit_preview_item,
+    model_usage_item, permission_request_item, permission_result_item,
+    streaming_terminal_output_item, streaming_tool_output_item, tool_request_item,
+    tool_result_item, transcript_items_from_events_with_reasoning,
 };
 use super::transcript_document::TranscriptDocument;
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
@@ -1317,6 +1318,25 @@ impl BmuxApp {
                 self.viewport.preserve_for_append();
                 self.apply_tool_stream_event(event, SessionEventApplication::Live);
             }
+            SessionLiveEventKind::FileEditPreview {
+                tool_call_id,
+                tool_name,
+                argument_bytes,
+                preview,
+                ..
+            } => {
+                self.pending_visual_overflow_bottom = Some(
+                    self.viewport
+                        .bottom_row(self.transcript_layout.total_rows()),
+                );
+                self.viewport.preserve_for_append();
+                self.apply_live_file_edit_preview(
+                    tool_call_id,
+                    tool_name,
+                    *argument_bytes,
+                    preview,
+                );
+            }
             SessionLiveEventKind::ProviderStreamProgress { event, .. } => {
                 self.apply_provider_stream_event(event);
             }
@@ -1754,8 +1774,22 @@ impl BmuxApp {
                 arguments_json: arguments_json.to_owned(),
             },
         );
-        self.transcript
-            .push(tool_request_item(tool_call_id, tool_name, arguments_json));
+        let item = tool_request_item(tool_call_id, tool_name, arguments_json);
+        let replaced = self.transcript.mutate_rev_find(
+            |existing| {
+                matches!(
+                    existing.kind(),
+                    TranscriptItemKind::ToolRequest {
+                        tool_call_id: item_tool_call_id,
+                        ..
+                    } if item_tool_call_id == tool_call_id
+                )
+            },
+            |existing| *existing = item.clone(),
+        );
+        if replaced.is_none() {
+            self.transcript.push(item);
+        }
         if let Some(status) = edit_summary {
             self.set_file_activity(tool_name);
             self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Pending);
@@ -2122,6 +2156,42 @@ impl BmuxApp {
                 break;
             }
         }
+    }
+
+    fn apply_live_file_edit_preview(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        argument_bytes: usize,
+        preview: &bcode_session_models::LiveFileEditPreview,
+    ) {
+        let updated = self.transcript.mutate_rev_find(
+            |item| {
+                matches!(
+                    item.kind(),
+                    TranscriptItemKind::ToolRequest {
+                        tool_call_id: item_tool_call_id,
+                        ..
+                    } if item_tool_call_id == tool_call_id
+                )
+            },
+            |item| {
+                let _ = item.set_live_file_edit_preview(tool_call_id, tool_name, preview);
+            },
+        );
+        if updated.is_none() {
+            self.transcript.push(live_file_edit_preview_item(
+                tool_call_id,
+                tool_name,
+                preview,
+            ));
+        }
+        self.set_file_activity(tool_name);
+        self.status = format!(
+            "streaming {} · {} received",
+            preview.path.as_deref().unwrap_or("file change"),
+            format_provider_bytes(argument_bytes)
+        );
     }
 
     fn permission_tool_call_id(&self, permission_id: &str) -> Option<String> {

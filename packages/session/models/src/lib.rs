@@ -271,6 +271,19 @@ pub enum SessionLiveEventKind {
     AssistantReasoningDelta { turn_id: String, text: String },
     /// Raw live tool output emitted while a tool is running.
     ToolOutputDelta { event: ToolInvocationStreamEvent },
+    /// Live-only file edit/write preview derived from partial tool-call arguments.
+    FileEditPreview {
+        /// Model turn associated with this preview update.
+        turn_id: String,
+        /// Provider tool call identifier.
+        tool_call_id: String,
+        /// User-facing tool name.
+        tool_name: String,
+        /// Total assembled argument bytes received so far.
+        argument_bytes: usize,
+        /// Partial file edit/write preview.
+        preview: LiveFileEditPreview,
+    },
     /// Live-only provider stream progress for active model turns.
     ProviderStreamProgress {
         /// Model turn associated with this progress update.
@@ -278,6 +291,19 @@ pub enum SessionLiveEventKind {
         /// Coalesced provider stream progress event.
         event: ProviderStreamEvent,
     },
+}
+
+/// Live-only file edit/write preview derived from partial tool-call arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveFileEditPreview {
+    /// Best-effort file path extracted from partial arguments.
+    pub path: Option<String>,
+    /// Best-effort old text prefix extracted from partial arguments.
+    pub old_text_prefix: Option<String>,
+    /// Best-effort new text prefix extracted from partial arguments.
+    pub new_text_prefix: String,
+    /// Whether the preview content was truncated by live-preview limits.
+    pub truncated: bool,
 }
 
 /// Product-facing derived view over durable session history.

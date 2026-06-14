@@ -33,11 +33,11 @@ use bcode_model::{
 use bcode_plugin::PluginInvocationScope;
 use bcode_session::{CatalogLoadStatus, SessionManager, lease::SessionLeaseOwnerContext};
 use bcode_session_models::{
-    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, ProviderStreamEvent,
-    ProviderToolCallProgress, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind,
-    SessionId, SessionLiveEventKind, SessionTokenUsage, SessionTraceEvent, SessionTracePayload,
-    SessionTracePhase, ToolInvocationStreamEvent, ToolOutputStream as SessionToolOutputStream,
-    TraceBlobRef, TraceRedaction,
+    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, LiveFileEditPreview, ModelTurnOutcome,
+    ProviderStreamEvent, ProviderToolCallProgress, RuntimeWorkId, RuntimeWorkKind,
+    RuntimeWorkStatus, SessionEventKind, SessionId, SessionLiveEventKind, SessionTokenUsage,
+    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ToolInvocationStreamEvent,
+    ToolOutputStream as SessionToolOutputStream, TraceBlobRef, TraceRedaction,
 };
 use bcode_skill::{SkillRegistry, SkillRegistryOptions, SkillSourceRoot};
 use bcode_skill_models::{
@@ -4117,6 +4117,9 @@ struct ToolArgumentStreamProgress {
     last_emitted_at: Option<Instant>,
     emitted_progress_events: usize,
     force_emit_final: bool,
+    preview_arguments: String,
+    preview_arguments_truncated: bool,
+    last_emitted_preview: Option<LiveFileEditPreview>,
 }
 
 #[derive(Debug, Default)]
@@ -4326,6 +4329,8 @@ impl ModelStreamProgress {
     const TOOL_PROGRESS_MIN_BYTES: usize = 1024;
     const TOOL_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(100);
     const MAX_TOOL_PROGRESS_EVENTS: usize = 512;
+    const TOOL_ARGUMENT_PREVIEW_MAX_BYTES: usize = 128 * 1024;
+    const FILE_EDIT_PREVIEW_MAX_CHARS: usize = 32 * 1024;
 
     fn start_tool_call(&mut self, call_id: String, name: String) {
         self.active_tool_call = Some(ToolArgumentStreamProgress {
@@ -4336,6 +4341,9 @@ impl ModelStreamProgress {
             last_emitted_at: None,
             emitted_progress_events: 0,
             force_emit_final: false,
+            preview_arguments: String::new(),
+            preview_arguments_truncated: false,
+            last_emitted_preview: None,
         });
     }
 
@@ -4350,6 +4358,11 @@ impl ModelStreamProgress {
         if let Some(active) = self.active_tool_call.as_mut() {
             active.argument_bytes = serialized_tool_argument_len(&call.arguments);
             active.force_emit_final = true;
+            active.preview_arguments.clear();
+            active
+                .preview_arguments
+                .push_str(&call.arguments.to_string());
+            active.preview_arguments_truncated = false;
         }
     }
 
@@ -4363,11 +4376,28 @@ impl ModelStreamProgress {
         }
     }
 
-    fn record_tool_call_delta(&mut self, call_id: &str, byte_len: usize) {
+    fn record_tool_call_delta(&mut self, call_id: &str, delta: &str) {
         if let Some(active) = self.active_tool_call.as_mut()
             && active.call_id == call_id
         {
-            active.argument_bytes = active.argument_bytes.saturating_add(byte_len);
+            active.argument_bytes = active.argument_bytes.saturating_add(delta.len());
+            if active.preview_arguments.len() < Self::TOOL_ARGUMENT_PREVIEW_MAX_BYTES {
+                let remaining = Self::TOOL_ARGUMENT_PREVIEW_MAX_BYTES
+                    .saturating_sub(active.preview_arguments.len());
+                let take = delta
+                    .char_indices()
+                    .map(|(index, _)| index)
+                    .chain(std::iter::once(delta.len()))
+                    .take_while(|index| *index <= remaining)
+                    .last()
+                    .unwrap_or(0);
+                active.preview_arguments.push_str(&delta[..take]);
+                if take < delta.len() {
+                    active.preview_arguments_truncated = true;
+                }
+            } else {
+                active.preview_arguments_truncated = true;
+            }
         }
     }
 
@@ -4408,6 +4438,28 @@ impl ModelStreamProgress {
         })
     }
 
+    fn take_file_edit_preview(&mut self) -> Option<LiveFileEditPreview> {
+        let active = self.active_tool_call.as_mut()?;
+        if !is_file_edit_tool_name(&active.name) {
+            return None;
+        }
+        let mut preview = live_file_edit_preview_from_arguments(
+            &active.preview_arguments,
+            active.preview_arguments_truncated,
+            Self::FILE_EDIT_PREVIEW_MAX_CHARS,
+        )?;
+        preview.truncated |= active.preview_arguments_truncated;
+        if active
+            .last_emitted_preview
+            .as_ref()
+            .is_some_and(|last| last == &preview)
+        {
+            return None;
+        }
+        active.last_emitted_preview = Some(preview.clone());
+        Some(preview)
+    }
+
     fn tool_progress_snapshot(&self) -> Option<ProviderToolCallProgress> {
         let active = self.active_tool_call.as_ref()?;
         Some(ProviderToolCallProgress {
@@ -4420,6 +4472,119 @@ impl ModelStreamProgress {
 
 fn serialized_tool_argument_len(arguments: &serde_json::Value) -> usize {
     serde_json::to_vec(arguments).map_or(0, |encoded| encoded.len())
+}
+
+fn is_file_edit_tool_name(tool_name: &str) -> bool {
+    matches!(
+        tool_name
+            .replace(['-', '.'], "_")
+            .to_ascii_lowercase()
+            .as_str(),
+        "filesystem_write" | "write" | "filesystem_edit" | "edit"
+    )
+}
+
+fn live_file_edit_preview_from_arguments(
+    arguments: &str,
+    arguments_truncated: bool,
+    max_chars: usize,
+) -> Option<LiveFileEditPreview> {
+    let path = partial_json_string_field(arguments, &["path", "file_path", "file"], max_chars)
+        .map(|field| field.value);
+    let old_text_prefix =
+        partial_json_string_field(arguments, &["old_text", "old_string"], max_chars)
+            .map(|field| field.value);
+    let new_text =
+        partial_json_string_field(arguments, &["new_text", "contents", "content"], max_chars)?;
+    Some(LiveFileEditPreview {
+        path,
+        old_text_prefix,
+        new_text_prefix: new_text.value,
+        truncated: arguments_truncated || new_text.truncated,
+    })
+}
+
+struct PartialJsonStringField {
+    value: String,
+    truncated: bool,
+}
+
+fn partial_json_string_field(
+    input: &str,
+    names: &[&str],
+    max_chars: usize,
+) -> Option<PartialJsonStringField> {
+    names
+        .iter()
+        .find_map(|name| partial_json_string_field_by_name(input, name, max_chars))
+}
+
+fn partial_json_string_field_by_name(
+    input: &str,
+    name: &str,
+    max_chars: usize,
+) -> Option<PartialJsonStringField> {
+    let needle = format!("\"{name}\"");
+    let start = input.find(&needle)?;
+    let after_name = &input[start + needle.len()..];
+    let colon = after_name.find(':')?;
+    let after_colon = after_name[colon + 1..].trim_start();
+    let body = after_colon.strip_prefix('"')?;
+    Some(decode_partial_json_string(body, max_chars))
+}
+
+fn decode_partial_json_string(input: &str, max_chars: usize) -> PartialJsonStringField {
+    let mut value = String::new();
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        if value.chars().count() >= max_chars {
+            return PartialJsonStringField {
+                value,
+                truncated: true,
+            };
+        }
+        match ch {
+            '"' => {
+                return PartialJsonStringField {
+                    value,
+                    truncated: false,
+                };
+            }
+            '\\' => match chars.next() {
+                Some('n') => value.push('\n'),
+                Some('r') => value.push('\r'),
+                Some('t') => value.push('\t'),
+                Some('"') => value.push('"'),
+                Some('\\') => value.push('\\'),
+                Some('/') => value.push('/'),
+                Some('b') => value.push('\u{0008}'),
+                Some('f') => value.push('\u{000c}'),
+                Some('u') => decode_partial_unicode_escape(&mut chars, &mut value),
+                Some(other) => value.push(other),
+                None => break,
+            },
+            other => value.push(other),
+        }
+    }
+    PartialJsonStringField {
+        value,
+        truncated: true,
+    }
+}
+
+fn decode_partial_unicode_escape(chars: &mut std::str::Chars<'_>, output: &mut String) {
+    let mut code = String::with_capacity(4);
+    for _ in 0..4 {
+        let Some(ch) = chars.next() else {
+            return;
+        };
+        code.push(ch);
+    }
+    if let Ok(value) = u32::from_str_radix(&code, 16)
+        && let Some(ch) = char::from_u32(value)
+    {
+        output.push(ch);
+    }
 }
 
 #[derive(Default)]
@@ -6007,16 +6172,31 @@ async fn handle_provider_turn_event(
             append_provider_event_trace(state, session_id, turn_id, "reasoning_delta", None).await;
         }
         ProviderTurnEvent::ToolCallDelta { call_id, delta } => {
-            stream_progress.record_tool_call_delta(&call_id, delta.len());
+            stream_progress.record_tool_call_delta(&call_id, &delta);
             if let Some(progress) = stream_progress.take_tool_progress_event() {
+                let tool_call_id = progress.tool_call_id;
+                let tool_name = progress.tool_name;
+                let argument_bytes = progress.argument_bytes;
+                if let Some(preview) = stream_progress.take_file_edit_preview() {
+                    publish_file_edit_preview_live(
+                        state,
+                        session_id,
+                        turn_id,
+                        tool_call_id.clone(),
+                        tool_name.clone(),
+                        argument_bytes,
+                        preview,
+                    )
+                    .await;
+                }
                 publish_provider_stream_progress_live(
                     state,
                     session_id,
                     turn_id,
                     ProviderStreamEvent::ToolCallProgress {
-                        tool_call_id: progress.tool_call_id,
-                        tool_name: progress.tool_name,
-                        argument_bytes: progress.argument_bytes,
+                        tool_call_id,
+                        tool_name,
+                        argument_bytes,
                     },
                 )
                 .await;
@@ -6116,6 +6296,24 @@ async fn handle_provider_tool_call_finished_event(
         },
     )
     .await;
+    if is_file_edit_tool_name(&call.name)
+        && let Some(preview) = live_file_edit_preview_from_arguments(
+            &call.arguments.to_string(),
+            false,
+            ModelStreamProgress::FILE_EDIT_PREVIEW_MAX_CHARS,
+        )
+    {
+        publish_file_edit_preview_live(
+            state,
+            session_id,
+            turn_id,
+            call.id.clone(),
+            call.name.clone(),
+            serialized_tool_argument_len(&call.arguments),
+            preview,
+        )
+        .await;
+    }
     publish_provider_stream_progress_live(
         state,
         session_id,
@@ -6183,6 +6381,30 @@ async fn publish_provider_stream_progress_live(
             SessionLiveEventKind::ProviderStreamProgress {
                 turn_id: turn_id.to_string(),
                 event,
+            },
+        )
+        .await;
+}
+
+async fn publish_file_edit_preview_live(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+    tool_call_id: String,
+    tool_name: String,
+    argument_bytes: usize,
+    preview: LiveFileEditPreview,
+) {
+    let _ = state
+        .sessions
+        .publish_live_event(
+            session_id,
+            SessionLiveEventKind::FileEditPreview {
+                turn_id: turn_id.to_string(),
+                tool_call_id,
+                tool_name,
+                argument_bytes,
+                preview,
             },
         )
         .await;

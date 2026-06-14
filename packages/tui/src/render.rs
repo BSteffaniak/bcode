@@ -663,6 +663,7 @@ fn push_transcript_item_rows(
             arguments_json,
             file_edit,
             file_edit_phase,
+            ..
         } => {
             let context = ToolRequestRenderContext {
                 tool_call_id,
@@ -1523,13 +1524,18 @@ fn push_file_edit_preview_rows(
 ) {
     let summary = edit.summary();
     let phase = phase.unwrap_or(FileEditPhase::Applied);
+    let phase_label = if phase == FileEditPhase::Pending && edit.old_text_is_empty() {
+        "Streaming preview"
+    } else {
+        phase.label()
+    };
     let phase_style = file_edit_phase_style(phase);
     push_wrapped_styled_text(
         rows,
         vec![Span::styled("  ", muted_style())],
         &format!(
             "{} · {}",
-            phase.label(),
+            phase_label,
             file_write_mode_label(tool_name, edit.old_text_is_empty())
         ),
         width,

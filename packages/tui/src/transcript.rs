@@ -3,7 +3,8 @@
 use std::collections::BTreeMap;
 
 use bcode_session_models::{
-    SessionEvent, SessionEventKind, SessionTokenUsage, ToolInvocationStreamEvent, ToolOutputStream,
+    LiveFileEditPreview, SessionEvent, SessionEventKind, SessionTokenUsage,
+    ToolInvocationStreamEvent, ToolOutputStream,
 };
 
 use super::diff_extract::{FileEditTranscript, file_edit_from_tool_request};
@@ -58,6 +59,8 @@ pub enum TranscriptItemKind {
         file_edit: Option<FileEditTranscript>,
         /// Lifecycle phase for file edit/write previews.
         file_edit_phase: Option<FileEditPhase>,
+        /// Whether this item was derived from live-only partial tool arguments.
+        live_preview: bool,
     },
     /// Tool-call result with structured metadata.
     ToolResult {
@@ -314,6 +317,37 @@ impl TranscriptItem {
         true
     }
 
+    /// Update this item from a live-only partial file edit preview.
+    pub fn set_live_file_edit_preview(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        preview: &LiveFileEditPreview,
+    ) -> bool {
+        let TranscriptItemKind::ToolRequest {
+            tool_call_id: item_tool_call_id,
+            tool_name: item_tool_name,
+            arguments_json,
+            file_edit,
+            file_edit_phase,
+            live_preview,
+        } = &mut self.kind
+        else {
+            return false;
+        };
+        if item_tool_call_id != tool_call_id || !*live_preview {
+            return false;
+        }
+        tool_name.clone_into(item_tool_name);
+        *arguments_json = live_preview_arguments_json(preview);
+        *file_edit = Some(file_edit_from_live_preview(preview));
+        *file_edit_phase = Some(FileEditPhase::Pending);
+        self.text = pretty_jsonish(arguments_json);
+        self.streaming = true;
+        self.bump_revision();
+        true
+    }
+
     /// Return semantic item kind.
     #[must_use]
     pub const fn kind(&self) -> &TranscriptItemKind {
@@ -420,9 +454,54 @@ pub fn tool_request_item(
             arguments_json: arguments_json.to_owned(),
             file_edit,
             file_edit_phase: streaming.then_some(FileEditPhase::Pending),
+            live_preview: false,
         },
     )
     .with_streaming(streaming)
+}
+
+/// Build a transcript item for a live-only partial file edit preview.
+#[must_use]
+pub fn live_file_edit_preview_item(
+    tool_call_id: &str,
+    tool_name: &str,
+    preview: &LiveFileEditPreview,
+) -> TranscriptItem {
+    let arguments_json = live_preview_arguments_json(preview);
+    TranscriptItem::with_kind(
+        "Tool",
+        pretty_jsonish(&arguments_json),
+        true,
+        TranscriptItemKind::ToolRequest {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: tool_name.to_owned(),
+            arguments_json,
+            file_edit: Some(file_edit_from_live_preview(preview)),
+            file_edit_phase: Some(FileEditPhase::Pending),
+            live_preview: true,
+        },
+    )
+}
+
+fn file_edit_from_live_preview(preview: &LiveFileEditPreview) -> FileEditTranscript {
+    FileEditTranscript::new(
+        preview
+            .path
+            .clone()
+            .unwrap_or_else(|| "streaming file".to_owned()),
+        preview.old_text_prefix.clone().unwrap_or_default(),
+        preview.new_text_prefix.clone(),
+    )
+}
+
+fn live_preview_arguments_json(preview: &LiveFileEditPreview) -> String {
+    serde_json::json!({
+        "path": preview.path.as_deref().unwrap_or("streaming file"),
+        "old_text": preview.old_text_prefix.as_deref().unwrap_or(""),
+        "new_text": preview.new_text_prefix,
+        "truncated": preview.truncated,
+    })
+    .to_string()
 }
 
 /// Build a streaming transcript item for live terminal output.

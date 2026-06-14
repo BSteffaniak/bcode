@@ -18,6 +18,16 @@ pub struct FileEditTranscript {
 }
 
 impl FileEditTranscript {
+    /// Build a file-edit transcript from known text snapshots.
+    #[must_use]
+    pub const fn new(path: String, old_text: String, new_text: String) -> Self {
+        Self {
+            path,
+            old_text,
+            new_text,
+        }
+    }
+
     /// Return whether the preview has no known previous contents.
     #[must_use]
     pub const fn old_text_is_empty(&self) -> bool {
@@ -67,11 +77,11 @@ pub fn file_edit_from_tool_request(
         .or_else(|| value.get("content"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    Some(FileEditTranscript {
-        path: path.to_owned(),
-        old_text: old_text.to_owned(),
-        new_text: new_text.to_owned(),
-    })
+    Some(FileEditTranscript::new(
+        path.to_owned(),
+        old_text.to_owned(),
+        new_text.to_owned(),
+    ))
 }
 
 /// Extract a file diff preview from a filesystem tool request.
