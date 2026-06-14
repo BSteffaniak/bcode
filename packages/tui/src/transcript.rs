@@ -3,7 +3,8 @@
 use std::collections::BTreeMap;
 
 use bcode_session_models::{
-    SessionEvent, SessionEventKind, SessionTokenUsage, ToolInvocationStreamEvent, ToolOutputStream,
+    SessionEvent, SessionEventKind, SessionTokenUsage, ToolInvocationPresentation,
+    ToolInvocationStreamEvent, ToolOutputStream,
 };
 
 use super::diff_extract::{FileEditTranscript, file_edit_from_tool_request};
@@ -295,6 +296,36 @@ impl TranscriptItem {
             *terminal_finished_at_ms = finished_at_ms;
             self.bump_revision();
         }
+    }
+
+    /// Replace terminal output with bounded final presentation text and metadata.
+    pub fn apply_terminal_presentation(
+        &mut self,
+        output: String,
+        exit_code: Option<i32>,
+        timed_out: bool,
+        is_error: bool,
+        finished_at_ms: Option<u64>,
+    ) {
+        if let TranscriptItemKind::TerminalOutput {
+            output: terminal_output,
+            finished_at_ms: terminal_finished_at_ms,
+            exit_code: terminal_exit_code,
+            timed_out: terminal_timed_out,
+            is_error: terminal_error,
+            ..
+        } = &mut self.kind
+        {
+            *terminal_output = output;
+            if finished_at_ms.is_some() {
+                *terminal_finished_at_ms = finished_at_ms;
+            }
+            *terminal_exit_code = exit_code;
+            *terminal_timed_out = Some(timed_out);
+            *terminal_error = is_error;
+        }
+        self.streaming = false;
+        self.bump_revision();
     }
 
     /// Mark this transcript item as no longer streaming.
@@ -686,6 +717,26 @@ fn push_transcript_item_from_event(
                 items.push(item);
             }
         }
+        SessionEventKind::ToolInvocationPresentation {
+            tool_call_id,
+            started_at_ms,
+            finished_at_ms,
+            is_error,
+            presentation,
+        } => {
+            apply_tool_invocation_presentation(
+                items,
+                tool_calls,
+                streamed_tool_results,
+                ToolPresentationEventRef {
+                    tool_call_id,
+                    started_at_ms: *started_at_ms,
+                    finished_at_ms: *finished_at_ms,
+                    is_error: *is_error,
+                    presentation,
+                },
+            );
+        }
         SessionEventKind::ToolInvocationStream { event } => {
             apply_tool_invocation_stream_event(items, tool_calls, streamed_tool_results, event);
         }
@@ -780,10 +831,7 @@ fn non_streaming_transcript_item_from_event(
             is_error,
             ..
         } => {
-            if streamed_tool_results
-                .get(tool_call_id)
-                .is_some_and(|stream| stream.saw_output)
-            {
+            if streamed_tool_results.contains_key(tool_call_id) {
                 return None;
             }
             let context = tool_calls.get(tool_call_id);
@@ -868,6 +916,80 @@ fn terminal_shell_result_metadata(result: &str) -> Option<(Option<i32>, bool)> {
         .and_then(|code| i32::try_from(code).ok());
     let timed_out = value.get("timed_out")?.as_bool()?;
     Some((exit_code, timed_out))
+}
+
+#[derive(Clone, Copy)]
+struct ToolPresentationEventRef<'a> {
+    tool_call_id: &'a str,
+    started_at_ms: Option<u64>,
+    finished_at_ms: Option<u64>,
+    is_error: bool,
+    presentation: &'a ToolInvocationPresentation,
+}
+
+fn apply_tool_invocation_presentation(
+    items: &mut Vec<TranscriptItem>,
+    tool_calls: &BTreeMap<String, ToolCallContext>,
+    streamed_tool_results: &mut BTreeMap<String, StreamedToolReplayContext>,
+    event: ToolPresentationEventRef<'_>,
+) {
+    let ToolInvocationPresentation::Terminal {
+        exit_code,
+        timed_out,
+        output,
+        columns,
+        rows,
+        ..
+    } = event.presentation;
+    let context = tool_calls.get(event.tool_call_id);
+    let index = streamed_tool_results
+        .get(event.tool_call_id)
+        .and_then(|replay| replay.index);
+    if let Some(index) = index
+        && let Some(item) = items.get_mut(index)
+    {
+        item.apply_terminal_presentation(
+            output.clone(),
+            *exit_code,
+            *timed_out,
+            event.is_error,
+            event.finished_at_ms,
+        );
+        if let Some(replay) = streamed_tool_results.get_mut(event.tool_call_id) {
+            replay.finished_at_ms = event.finished_at_ms;
+            replay.saw_output = true;
+        }
+        return;
+    }
+    items.push(streaming_terminal_output_item(
+        event.tool_call_id,
+        context.map(|context| context.tool_name.as_str()),
+        output,
+        (*columns).max(1),
+        (*rows).max(1),
+        event.started_at_ms,
+    ));
+    let index = items.len().saturating_sub(1);
+    if let Some(item) = items.get_mut(index) {
+        item.apply_terminal_presentation(
+            output.clone(),
+            *exit_code,
+            *timed_out,
+            event.is_error,
+            event.finished_at_ms,
+        );
+    }
+    streamed_tool_results.insert(
+        event.tool_call_id.to_owned(),
+        StreamedToolReplayContext {
+            index: Some(index),
+            columns: (*columns).max(1),
+            rows: (*rows).max(1),
+            started_at_ms: event.started_at_ms,
+            finished_at_ms: event.finished_at_ms,
+            saw_output: true,
+        },
+    );
 }
 
 fn apply_tool_invocation_stream_event(

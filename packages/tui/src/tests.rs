@@ -12,8 +12,8 @@ use bcode_session_models::{
     ClientId, LiveFileEditPreview, LiveShellCommandPreview, LiveToolArgumentPreview, RuntimeWorkId,
     RuntimeWorkKind, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
     SessionProjectionKind, SessionSummary, SessionTitleSource, SessionTokenUsage,
-    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ToolInvocationStreamEvent,
-    ToolOutputStream,
+    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ToolInvocationPresentation,
+    ToolInvocationStreamEvent, ToolOutputStream,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::TextMotion;
@@ -2898,6 +2898,27 @@ fn streamed_terminal_tool_events(session_id: SessionId) -> Vec<SessionEvent> {
         event(
             session_id,
             5,
+            SessionEventKind::ToolInvocationPresentation {
+                tool_call_id: "call-stream".to_owned(),
+                started_at_ms: Some(1_000),
+                finished_at_ms: Some(2_500),
+                is_error: false,
+                presentation: ToolInvocationPresentation::Terminal {
+                    exit_code: Some(7),
+                    timed_out: true,
+                    cancelled: false,
+                    output: "final duplicate tail".to_owned(),
+                    output_truncated: false,
+                    output_bytes: Some("final duplicate tail".len() as u64),
+                    retained_output_bytes: Some("final duplicate tail".len() as u64),
+                    columns: 120,
+                    rows: 40,
+                },
+            },
+        ),
+        event(
+            session_id,
+            6,
             SessionEventKind::ToolCallFinished {
                 tool_call_id: "call-stream".to_owned(),
                 result: serde_json::json!({
@@ -2915,6 +2936,91 @@ fn streamed_terminal_tool_events(session_id: SessionId) -> Vec<SessionEvent> {
             },
         ),
     ]
+}
+
+#[test]
+fn terminal_presentation_without_live_delta_renders_terminal_history() {
+    let session_id = SessionId::new();
+    let events = vec![
+        event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-no-live".to_owned(),
+                tool_name: "shell.run".to_owned(),
+                arguments_json: "{}".to_owned(),
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Started {
+                    tool_call_id: "call-no-live".to_owned(),
+                    tool_name: "shell.run".to_owned(),
+                    terminal: true,
+                    columns: Some(80),
+                    rows: Some(24),
+                    started_at_ms: Some(1_000),
+                },
+            },
+        ),
+        event(
+            session_id,
+            3,
+            SessionEventKind::ToolInvocationPresentation {
+                tool_call_id: "call-no-live".to_owned(),
+                started_at_ms: Some(1_000),
+                finished_at_ms: Some(1_250),
+                is_error: false,
+                presentation: ToolInvocationPresentation::Terminal {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    cancelled: false,
+                    output: String::new(),
+                    output_truncated: false,
+                    output_bytes: Some(0),
+                    retained_output_bytes: Some(0),
+                    columns: 80,
+                    rows: 24,
+                },
+            },
+        ),
+        event(
+            session_id,
+            4,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "call-no-live".to_owned(),
+                result: serde_json::json!({
+                    "mode": "terminal",
+                    "exit_code": 0,
+                    "timed_out": false,
+                    "output": "",
+                    "output_truncated": false,
+                    "columns": 80,
+                    "rows": 24,
+                })
+                .to_string(),
+                is_error: false,
+                output: None,
+            },
+        ),
+    ];
+
+    let app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
+    let terminal_count = app
+        .transcript()
+        .iter()
+        .filter(|item| matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. }))
+        .count();
+    let tool_result_count = app
+        .transcript()
+        .iter()
+        .filter(|item| matches!(item.kind(), TranscriptItemKind::ToolResult { .. }))
+        .count();
+
+    assert_eq!(terminal_count, 1);
+    assert_eq!(tool_result_count, 0);
 }
 
 fn session_summary(session_id: SessionId) -> SessionSummary {

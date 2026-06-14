@@ -1520,6 +1520,7 @@ const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ToolInvocationStream { .. } => "tool_invocation_stream",
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
+        SessionEventKind::ToolInvocationPresentation { .. } => "tool_invocation_presentation",
     }
 }
 
@@ -1775,6 +1776,10 @@ const fn event_created_at_ms(event: &SessionEvent) -> Option<u64> {
         }
         | SessionEventKind::ModelTurnCancelRequested {
             requested_at_ms: started_at_ms,
+            ..
+        }
+        | SessionEventKind::ToolInvocationPresentation {
+            finished_at_ms: started_at_ms,
             ..
         } => *started_at_ms,
         _ => None,

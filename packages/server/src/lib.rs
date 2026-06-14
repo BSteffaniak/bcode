@@ -37,8 +37,8 @@ use bcode_session_models::{
     LiveShellCommandPreview, LiveToolArgumentPreview, ModelTurnOutcome, ProviderStreamEvent,
     ProviderToolCallProgress, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind,
     SessionId, SessionLiveEventKind, SessionTokenUsage, SessionTraceEvent, SessionTracePayload,
-    SessionTracePhase, ToolInvocationStreamEvent, ToolOutputStream as SessionToolOutputStream,
-    TraceBlobRef, TraceRedaction,
+    SessionTracePhase, ToolInvocationPresentation, ToolInvocationStreamEvent,
+    ToolOutputStream as SessionToolOutputStream, TraceBlobRef, TraceRedaction,
 };
 use bcode_skill::{SkillRegistry, SkillRegistryOptions, SkillSourceRoot};
 use bcode_skill_models::{
@@ -7814,6 +7814,7 @@ async fn execute_model_tool(
             content: Vec::new(),
             full_output: None,
         });
+    let presentation = tool_invocation_presentation_from_result(&call.name, &result.output);
     let artifact_output = result.full_output.as_deref().unwrap_or(&result.output);
     let output_blob = (state.observability.persist_tool_io || state.observability.debug_enabled())
         .then(|| {
@@ -7839,6 +7840,18 @@ async fn execute_model_tool(
         },
     )
     .await;
+    if let Some(presentation) = presentation {
+        append_tool_presentation_event(
+            state,
+            session_id,
+            call.id.clone(),
+            None,
+            Some(current_unix_millis()),
+            result.is_error,
+            presentation,
+        )
+        .await;
+    }
     append_tool_finished_event(
         state,
         session_id,
@@ -8806,6 +8819,88 @@ async fn append_runtime_work_cancel_requested_event(
     }
 }
 
+async fn append_tool_presentation_event(
+    state: &ServerState,
+    session_id: SessionId,
+    tool_call_id: String,
+    started_at_ms: Option<u64>,
+    finished_at_ms: Option<u64>,
+    is_error: bool,
+    presentation: ToolInvocationPresentation,
+) {
+    match state
+        .sessions
+        .append_event(
+            session_id,
+            SessionEventKind::ToolInvocationPresentation {
+                tool_call_id,
+                started_at_ms,
+                finished_at_ms,
+                is_error,
+                presentation,
+            },
+        )
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => eprintln!("failed to append tool presentation: {error}"),
+    }
+}
+
+fn tool_invocation_presentation_from_result(
+    tool_name: &str,
+    result: &str,
+) -> Option<ToolInvocationPresentation> {
+    if tool_name != "shell.run" {
+        return None;
+    }
+    let value = serde_json::from_str::<serde_json::Value>(result).ok()?;
+    if value.get("mode")?.as_str()? != "terminal" {
+        return None;
+    }
+    Some(ToolInvocationPresentation::Terminal {
+        exit_code: value
+            .get("exit_code")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|code| i32::try_from(code).ok()),
+        timed_out: value
+            .get("timed_out")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        cancelled: value
+            .get("cancelled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        output: value
+            .get("output")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        output_truncated: value
+            .get("output_truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        output_bytes: value
+            .get("output_bytes")
+            .and_then(serde_json::Value::as_u64),
+        retained_output_bytes: value
+            .get("retained_output_bytes")
+            .and_then(serde_json::Value::as_u64),
+        columns: value
+            .get("columns")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|columns| u16::try_from(columns).ok())
+            .unwrap_or(120)
+            .max(1),
+        rows: value
+            .get("rows")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|rows| u16::try_from(rows).ok())
+            .unwrap_or(24)
+            .max(1),
+    })
+}
+
 async fn append_tool_finished_event(
     state: &ServerState,
     session_id: SessionId,
@@ -9339,6 +9434,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ToolInvocationStream { .. } => "tool_invocation_stream",
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
+        SessionEventKind::ToolInvocationPresentation { .. } => "tool_invocation_presentation",
     }
 }
 

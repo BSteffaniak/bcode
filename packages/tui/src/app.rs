@@ -8,7 +8,7 @@ use bcode_session_models::{
     LiveToolArgumentPreview, ModelTurnOutcome, ProviderStreamEvent, SessionEvent, SessionEventKind,
     SessionHistoryCursor, SessionId, SessionInputHistoryEntry, SessionLiveEvent,
     SessionLiveEventKind, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
-    ToolInvocationStreamEvent, ToolOutputStream,
+    ToolInvocationPresentation, ToolInvocationStreamEvent, ToolOutputStream,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1446,6 +1446,19 @@ impl BmuxApp {
                 self.active_tool_calls.remove(tool_call_id);
                 self.push_tool_result(tool_call_id, result, *is_error, application);
             }
+            SessionEventKind::ToolInvocationPresentation {
+                tool_call_id,
+                started_at_ms,
+                finished_at_ms,
+                is_error,
+                presentation,
+            } => self.apply_tool_invocation_presentation(
+                tool_call_id,
+                *started_at_ms,
+                *finished_at_ms,
+                *is_error,
+                presentation,
+            ),
             SessionEventKind::ToolInvocationStream { event } => {
                 self.apply_tool_stream_event(event, application);
             }
@@ -1965,6 +1978,69 @@ impl BmuxApp {
             }
         }
         self.finish_tool_request_preview(tool_call_id);
+    }
+
+    fn apply_tool_invocation_presentation(
+        &mut self,
+        tool_call_id: &str,
+        started_at_ms: Option<u64>,
+        finished_at_ms: Option<u64>,
+        is_error: bool,
+        presentation: &ToolInvocationPresentation,
+    ) {
+        let ToolInvocationPresentation::Terminal {
+            exit_code,
+            timed_out,
+            output,
+            columns,
+            rows,
+            ..
+        } = presentation;
+        if let Some(context) = self.streamed_tool_results.get(tool_call_id)
+            && let Some(index) = context.index
+            && let Some(item) = self.transcript.get_mut(index)
+        {
+            item.apply_terminal_presentation(
+                output.clone(),
+                *exit_code,
+                *timed_out,
+                is_error,
+                finished_at_ms,
+            );
+            if let Some(context) = self.streamed_tool_results.get_mut(tool_call_id) {
+                context.saw_output = true;
+            }
+            return;
+        }
+        let tool_context = self.tool_call_contexts.get(tool_call_id);
+        self.transcript.push(streaming_terminal_output_item(
+            tool_call_id,
+            tool_context.map(|context| context.tool_name.as_str()),
+            output,
+            (*columns).max(1),
+            (*rows).max(1),
+            started_at_ms,
+        ));
+        let index = self.transcript.len().saturating_sub(1);
+        if let Some(item) = self.transcript.get_mut(index) {
+            item.apply_terminal_presentation(
+                output.clone(),
+                *exit_code,
+                *timed_out,
+                is_error,
+                finished_at_ms,
+            );
+        }
+        self.streamed_tool_results.insert(
+            tool_call_id.to_owned(),
+            StreamedToolResultContext {
+                index: Some(index),
+                columns: (*columns).max(1),
+                rows: (*rows).max(1),
+                started_at_ms,
+                saw_output: true,
+            },
+        );
     }
 
     fn apply_tool_stream_event(
@@ -2857,6 +2933,7 @@ const fn event_breaks_sticky_entry_anchor(event: &SessionEvent) -> bool {
         &event.kind,
         SessionEventKind::ToolCallRequested { .. }
             | SessionEventKind::ToolInvocationStream { .. }
+            | SessionEventKind::ToolInvocationPresentation { .. }
             | SessionEventKind::PermissionRequested { .. }
     )
 }
@@ -2881,6 +2958,7 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::RuntimeWorkProgress { .. }
         | SessionEventKind::RuntimeWorkFinished { .. }
         | SessionEventKind::ToolInvocationStream { .. }
+        | SessionEventKind::ToolInvocationPresentation { .. }
         | SessionEventKind::AssistantReasoningDelta { .. }
         | SessionEventKind::AssistantReasoningMessage { .. } => true,
         SessionEventKind::SkillSuggested { reason, .. } => reason.is_some(),

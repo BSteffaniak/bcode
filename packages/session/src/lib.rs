@@ -2446,7 +2446,8 @@ mod tests {
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProviderStreamEvent, RuntimeWorkId,
         RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance,
         SessionId, SessionLiveEvent, SessionLiveEventKind, SessionTraceEvent, SessionTracePayload,
-        SessionTracePhase, ToolInvocationStreamEvent, ToolOutputStream, TraceBlobRef,
+        SessionTracePhase, ToolInvocationPresentation, ToolInvocationStreamEvent, ToolOutputStream,
+        TraceBlobRef,
     };
     use bcode_skill_models::{SkillActivationMode, SkillId};
     use serde::Serialize;
@@ -4067,6 +4068,27 @@ mod tests {
                     source_display_name: "Pi".to_string(),
                     external_session_id: "external".to_string(),
                     imported_at_ms: 1,
+                },
+            ),
+            (
+                35,
+                "ToolInvocationPresentation",
+                SessionEventKind::ToolInvocationPresentation {
+                    tool_call_id: "call".to_string(),
+                    started_at_ms: Some(1),
+                    finished_at_ms: Some(2),
+                    is_error: false,
+                    presentation: ToolInvocationPresentation::Terminal {
+                        exit_code: Some(0),
+                        timed_out: false,
+                        cancelled: false,
+                        output: "ok".to_string(),
+                        output_truncated: false,
+                        output_bytes: Some(2),
+                        retained_output_bytes: Some(2),
+                        columns: 80,
+                        rows: 24,
+                    },
                 },
             ),
         ]

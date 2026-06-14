@@ -20,7 +20,7 @@ use serde_json::json;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_TERMINAL_COLUMNS: u16 = 120;
@@ -176,6 +176,7 @@ fn run_shell_tool(
             full_output: None,
         };
     }
+    let now_ms = current_unix_millis();
     emit_tool_stream_event(
         events,
         &ToolInvocationStreamEvent::Started {
@@ -184,7 +185,7 @@ fn run_shell_tool(
             terminal: arguments.terminal,
             columns: arguments.terminal.then_some(arguments.terminal_columns()),
             rows: arguments.terminal.then_some(arguments.terminal_rows()),
-            started_at_ms: None,
+            started_at_ms: Some(now_ms),
         },
     );
     emit_tool_status(
@@ -226,7 +227,7 @@ fn run_shell_tool(
             tool_call_id: tool_call_id.to_owned(),
             sequence: 0,
             is_error: response.is_error,
-            finished_at_ms: None,
+            finished_at_ms: Some(current_unix_millis()),
         },
     );
     response
@@ -760,6 +761,14 @@ where
         bytes.extend_from_slice(&buffer[..retained]);
     }
     Ok(limit_output_bytes(&bytes, DEFAULT_MAX_OUTPUT_BYTES))
+}
+
+fn current_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 fn emit_tool_output_delta(

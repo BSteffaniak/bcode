@@ -243,6 +243,14 @@ impl TranscriptProjectionBuilder {
                 self.flush_streams();
                 self.apply_tool_stream(event.sequence, stream);
             }
+            SessionEventKind::ToolInvocationPresentation {
+                tool_call_id,
+                presentation,
+                ..
+            } => {
+                self.flush_streams();
+                self.apply_tool_presentation(event.sequence, tool_call_id, presentation);
+            }
             SessionEventKind::ToolCallFinished {
                 tool_call_id,
                 result,
@@ -355,6 +363,28 @@ impl TranscriptProjectionBuilder {
         if matches!(event, ToolInvocationStreamEvent::OutputDelta { .. }) {
             invocation.saw_stream_output = true;
         }
+    }
+
+    fn apply_tool_presentation(
+        &mut self,
+        sequence: u64,
+        tool_call_id: &str,
+        presentation: &bcode_session_models::ToolInvocationPresentation,
+    ) {
+        let invocation = self
+            .tool_invocations
+            .entry(tool_call_id.to_owned())
+            .or_insert(PendingToolInvocation {
+                start_sequence: sequence,
+                end_sequence: sequence,
+                content_bytes: 0,
+                saw_stream_output: true,
+            });
+        invocation.end_sequence = sequence;
+        invocation.saw_stream_output = true;
+        invocation.content_bytes = invocation
+            .content_bytes
+            .saturating_add(tool_presentation_content_bytes(presentation));
     }
 
     fn finish_tool_invocation(&mut self, tool_call_id: &str, sequence: u64, result_bytes: usize) {
@@ -495,6 +525,14 @@ const fn tool_stream_content_bytes(event: &ToolInvocationStreamEvent) -> usize {
         ToolInvocationStreamEvent::OutputDelta { text, .. }
         | ToolInvocationStreamEvent::Status { message: text, .. } => text.len(),
         ToolInvocationStreamEvent::Finished { .. } => 0,
+    }
+}
+
+const fn tool_presentation_content_bytes(
+    presentation: &bcode_session_models::ToolInvocationPresentation,
+) -> usize {
+    match presentation {
+        bcode_session_models::ToolInvocationPresentation::Terminal { output, .. } => output.len(),
     }
 }
 
