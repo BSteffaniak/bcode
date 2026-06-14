@@ -213,10 +213,6 @@ async fn handle_slash_command<W: Write>(
             chat.app
                 .set_status("cloned session and switched".to_owned());
         }
-        slash_commands::SlashCommandOutcome::OpenRalphStartDialog => {
-            chat.app.clear_pending_submission(message);
-            worktree_flow::start_ralph_loop(io, services, chat).await?;
-        }
         slash_commands::SlashCommandOutcome::ToggleDiff => {
             chat.app.clear_pending_submission(message);
             let _changed = chat.app.toggle_diff_visible();

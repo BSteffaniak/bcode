@@ -18,9 +18,6 @@ pub enum WorktreeCreateFocus {
 /// Worktree create dialog state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeCreateDialog {
-    title: String,
-    name_label: String,
-    create_label: String,
     name: TextInputState,
     target: WorktreeCreateTarget,
     base: WorktreeCreateBase,
@@ -33,37 +30,6 @@ impl WorktreeCreateDialog {
     /// Create a worktree create dialog.
     #[must_use]
     pub fn new(default_name: &str, current_session_available: bool) -> Self {
-        Self::new_with_labels(
-            "Create worktree",
-            "Name",
-            "create",
-            default_name,
-            current_session_available,
-            "Enter name, Tab changes field, ←/→ changes value, Enter creates",
-        )
-    }
-
-    /// Create a Ralph loop setup dialog.
-    #[must_use]
-    pub fn new_ralph_loop(default_name: &str, current_session_available: bool) -> Self {
-        Self::new_with_labels(
-            "Start Ralph loop",
-            "Ralph loop",
-            "start",
-            default_name,
-            current_session_available,
-            "Enter loop name, Tab changes field, ←/→ changes value, Enter starts",
-        )
-    }
-
-    fn new_with_labels(
-        title: &str,
-        name_label: &str,
-        create_label: &str,
-        default_name: &str,
-        current_session_available: bool,
-        status: &str,
-    ) -> Self {
         let mut name = TextEditBuffer::from_text(default_name);
         name.move_cursor_with_selection(TextMotion::Start, SelectionMode::Extend);
         let target = if current_session_available {
@@ -72,14 +38,11 @@ impl WorktreeCreateDialog {
             WorktreeCreateTarget::NewSession
         };
         Self {
-            title: title.to_owned(),
-            name_label: name_label.to_owned(),
-            create_label: create_label.to_owned(),
             name: TextInputState::new(name),
             target,
             base: WorktreeCreateBase::Head,
             focus: WorktreeCreateFocus::Name,
-            status: status.to_owned(),
+            status: "Enter name, Tab changes field, ←/→ changes value, Enter creates".to_owned(),
             current_session_available,
         }
     }
@@ -88,24 +51,6 @@ impl WorktreeCreateDialog {
     #[must_use]
     pub const fn focus(&self) -> WorktreeCreateFocus {
         self.focus
-    }
-
-    /// Return dialog title.
-    #[must_use]
-    pub fn title(&self) -> &str {
-        &self.title
-    }
-
-    /// Return label for the name field.
-    #[must_use]
-    pub fn name_label(&self) -> &str {
-        &self.name_label
-    }
-
-    /// Return the action label shown in help text.
-    #[must_use]
-    pub fn create_label(&self) -> &str {
-        &self.create_label
     }
 
     /// Return name input state.
@@ -157,7 +102,7 @@ impl WorktreeCreateDialog {
         };
     }
 
-    /// Select previous value for the focused choice field.
+    /// Move current choice backward.
     pub const fn previous_choice(&mut self) {
         match self.focus {
             WorktreeCreateFocus::Name => {}
@@ -166,7 +111,7 @@ impl WorktreeCreateDialog {
         }
     }
 
-    /// Select next value for the focused choice field.
+    /// Move current choice forward.
     pub const fn next_choice(&mut self) {
         match self.focus {
             WorktreeCreateFocus::Name => {}
