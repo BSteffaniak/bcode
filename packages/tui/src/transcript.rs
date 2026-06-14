@@ -878,7 +878,10 @@ fn non_streaming_transcript_item_from_event(
             is_error,
             ..
         } => {
-            if streamed_tool_results.contains_key(tool_call_id) {
+            if streamed_tool_results
+                .get(tool_call_id)
+                .is_some_and(|replay| replay.saw_output)
+            {
                 return None;
             }
             let context = tool_calls.get(tool_call_id);
