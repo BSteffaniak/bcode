@@ -10102,6 +10102,98 @@ mod tests {
     }
 
     #[test]
+    fn tool_stream_sequence_normalization_is_monotonic_per_call() {
+        let mut sequences = BTreeMap::new();
+        let first = normalize_tool_stream_event_sequence(
+            ServiceToolInvocationStreamEvent::Started {
+                tool_call_id: "call-a".to_string(),
+                tool_name: "shell.run".to_string(),
+                sequence: 99,
+                terminal: true,
+                columns: Some(80),
+                rows: Some(24),
+                started_at_ms: Some(1),
+            },
+            &mut sequences,
+        );
+        let second = normalize_tool_stream_event_sequence(
+            ServiceToolInvocationStreamEvent::Status {
+                tool_call_id: "call-a".to_string(),
+                sequence: 99,
+                message: "running".to_string(),
+            },
+            &mut sequences,
+        );
+        let other_call = normalize_tool_stream_event_sequence(
+            ServiceToolInvocationStreamEvent::Finished {
+                tool_call_id: "call-b".to_string(),
+                sequence: 99,
+                is_error: false,
+                finished_at_ms: Some(2),
+            },
+            &mut sequences,
+        );
+
+        assert!(matches!(
+            first,
+            ToolInvocationStreamEvent::Started { sequence: 1, .. }
+        ));
+        assert!(matches!(
+            second,
+            ToolInvocationStreamEvent::Status { sequence: 2, .. }
+        ));
+        assert!(matches!(
+            other_call,
+            ToolInvocationStreamEvent::Finished { sequence: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn service_tool_presentation_maps_to_session_presentation() {
+        let terminal =
+            service_tool_presentation_to_session(&ServiceToolInvocationPresentation::Terminal {
+                exit_code: Some(0),
+                timed_out: false,
+                cancelled: false,
+                output: "ok".to_string(),
+                output_truncated: false,
+                output_bytes: Some(2),
+                retained_output_bytes: Some(2),
+                columns: 0,
+                rows: 0,
+            });
+        assert_eq!(
+            terminal,
+            ToolInvocationPresentation::Terminal {
+                exit_code: Some(0),
+                timed_out: false,
+                cancelled: false,
+                output: "ok".to_string(),
+                output_truncated: false,
+                output_bytes: Some(2),
+                retained_output_bytes: Some(2),
+                columns: 1,
+                rows: 1,
+            }
+        );
+
+        let file_change =
+            service_tool_presentation_to_session(&ServiceToolInvocationPresentation::FileChange {
+                tool_name: "filesystem.write".to_string(),
+                summary: "wrote 2 bytes".to_string(),
+                path: Some("file.txt".to_string()),
+            });
+        assert_eq!(
+            file_change,
+            ToolInvocationPresentation::FileChange {
+                tool_name: "filesystem.write".to_string(),
+                summary: "wrote 2 bytes".to_string(),
+                path: Some("file.txt".to_string()),
+            }
+        );
+    }
+
+    #[test]
     fn model_poll_progress_requires_meaningful_stream_events() {
         assert!(model_event_is_progress(&ProviderTurnEvent::TextDelta {
             text: "hello".to_string(),
