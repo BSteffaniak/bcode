@@ -311,17 +311,17 @@ async fn cwd_command(
     )))
 }
 
-async fn ralph_command(parts: &[&str]) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
+fn ralph_command(parts: &[&str]) -> SlashCommandOutcome {
     match parts.get(1).copied() {
-        Some("start") | None => Ok(SlashCommandOutcome::OpenRalphStartDialog),
+        Some("start") | None => SlashCommandOutcome::OpenRalphStartDialog,
         Some("run" | "stop" | "status" | "audit" | "replan" | "open") => {
-            Ok(SlashCommandOutcome::Handled(
+            SlashCommandOutcome::Handled(
                 "Ralph loop orchestration is not implemented yet".to_owned(),
-            ))
+            )
         }
-        Some(_) => Ok(SlashCommandOutcome::Handled(
+        Some(_) => SlashCommandOutcome::Handled(
             "usage: /ralph [start|run|stop|status|audit|replan|open]".to_owned(),
-        )),
+        ),
     }
 }
 
@@ -632,7 +632,7 @@ pub async fn execute(
                 session_id: result.session.id,
             })
         }
-        "ralph" => ralph_command(&parts).await,
+        "ralph" => Ok(ralph_command(&parts)),
         "skills" => Ok(SlashCommandOutcome::PickSkill),
         "skill" => {
             if parts.get(1) == Some(&"describe") {
