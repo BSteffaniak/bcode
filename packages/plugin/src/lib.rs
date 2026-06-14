@@ -1155,8 +1155,8 @@ pub enum StreamingServiceInvocationEvent {
 /// Running streaming plugin service invocation.
 #[derive(Debug)]
 pub struct StreamingServiceInvocation {
-    pub response: oneshot::Receiver<Result<ServiceResponse, PluginLoadError>>,
-    pub events: mpsc::UnboundedReceiver<Vec<u8>>,
+    response: oneshot::Receiver<Result<ServiceResponse, PluginLoadError>>,
+    events: mpsc::UnboundedReceiver<Vec<u8>>,
     pub cancel: PluginInvocationCancelHandle,
     resource_permit: Option<Arc<PluginResourcePermit>>,
 }
