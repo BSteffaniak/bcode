@@ -44,6 +44,7 @@ pub(crate) mod provider_picker_render;
 pub(crate) mod ralph_flow;
 pub(crate) mod ralph_start_dialog;
 pub(crate) mod ralph_start_dialog_render;
+pub(crate) mod ralph_state;
 pub(crate) mod render;
 pub(crate) mod runtime;
 mod runtime_context;
@@ -110,9 +111,9 @@ pub enum TuiError {
     /// Plugin service error.
     #[error("plugin service error {code}: {message}")]
     PluginService { code: String, message: String },
-    /// JSON error.
-    #[error("JSON error: {0}")]
-    Json(#[from] serde_json::Error),
+    /// Ralph state error.
+    #[error("Ralph state error: {0}")]
+    RalphState(#[from] ralph_state::RalphStateError),
     /// Session storage is unavailable for normal runtime access.
     #[error("session unavailable: {session_id}: {reason}")]
     SessionUnavailable {

@@ -12,7 +12,7 @@ use super::helpers;
 use super::keymap::BmuxKeyMap;
 use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::ActiveChat;
-use super::{TuiError, ralph_start_dialog, ralph_start_dialog_render};
+use super::{TuiError, ralph_start_dialog, ralph_start_dialog_render, ralph_state};
 
 /// Start the Ralph loop setup flow.
 pub async fn start_loop<W: Write>(
@@ -46,10 +46,21 @@ pub async fn start_loop<W: Write>(
                         dialog.set_status("Ralph loop name is required");
                         continue;
                     }
+                    let repo_root = chat
+                        .app
+                        .working_directory()
+                        .map_or_else(std::env::current_dir, |path| Ok(path.to_path_buf()))?;
+                    let state = ralph_state::create_initial_loop_state(
+                        &loop_name,
+                        &repo_root,
+                        chat.app.session_title(),
+                    )?;
                     chat.app.push_system_note(format!(
-                        "Ralph loop setup captured\n* Loop: {loop_name}\n* Next: create Ralph-owned progress-doc/work-area architecture"
+                        "Ralph loop created\n* Loop: {loop_name}\n* Progress doc: {}\n* State: {}\n* Next: capture conversation context and create an isolated work area",
+                        state.progress_doc_path.display(),
+                        state.state_dir.display()
                     ));
-                    chat.app.set_status("Ralph loop setup captured".to_owned());
+                    chat.app.set_status("Ralph loop created".to_owned());
                     return Ok(());
                 }
                 _ => handle_loop_name_key(&mut dialog, services.keymap, stroke),
