@@ -1996,6 +1996,44 @@ mod tests {
     }
 
     #[test]
+    fn write_and_edit_responses_include_file_change_presentation() {
+        let root = temp_dir("presentation");
+        let write_response = tool_write(
+            serde_json::json!({
+                "path": root.join("file.txt"),
+                "contents": "hello",
+            }),
+            None,
+        );
+        assert!(matches!(
+            write_response.presentation,
+            Some(ToolInvocationPresentation::FileChange {
+                tool_name,
+                summary,
+                path: Some(_),
+            }) if tool_name == "filesystem.write" && summary == "wrote 5 bytes"
+        ));
+
+        let edit_response = tool_edit(
+            serde_json::json!({
+                "path": root.join("file.txt"),
+                "old_text": "hello",
+                "new_text": "hello world",
+            }),
+            None,
+        );
+        assert!(matches!(
+            edit_response.presentation,
+            Some(ToolInvocationPresentation::FileChange {
+                tool_name,
+                summary,
+                path: Some(_),
+            }) if tool_name == "filesystem.edit" && summary == "applied 1 replacement"
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn rust_grep_enforces_timeout() {
         let root = temp_dir("grep-timeout");
         std::fs::write(root.join("file.txt"), "needle\n").expect("write file");

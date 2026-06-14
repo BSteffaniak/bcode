@@ -1099,6 +1099,59 @@ mod tests {
     }
 
     #[test]
+    fn process_response_includes_structured_terminal_presentation() {
+        let output = LimitedOutput {
+            text: "hello".to_string(),
+            original_bytes: 5,
+            retained_bytes: 5,
+            truncated: false,
+        };
+        let (encoded, full_encoded) = encode_terminal_output(
+            TerminalShellStatus {
+                exit_code: 0,
+                success: true,
+                timed_out: false,
+                cancelled: false,
+            },
+            &output,
+            80,
+            24,
+        )
+        .expect("terminal output encodes");
+        let inline_output = limit_terminal_inline_output(&output);
+        let response = ToolInvocationResponse {
+            output: encoded,
+            is_error: false,
+            content: Vec::new(),
+            full_output: Some(full_encoded),
+            presentation: Some(ToolInvocationPresentation::Terminal {
+                exit_code: Some(0),
+                timed_out: false,
+                cancelled: false,
+                output: inline_output.text,
+                output_truncated: inline_output.truncated,
+                output_bytes: Some(u64::try_from(inline_output.original_bytes).unwrap_or(u64::MAX)),
+                retained_output_bytes: Some(
+                    u64::try_from(inline_output.retained_bytes).unwrap_or(u64::MAX),
+                ),
+                columns: 80,
+                rows: 24,
+            }),
+        };
+
+        assert!(matches!(
+            response.presentation,
+            Some(ToolInvocationPresentation::Terminal {
+                exit_code: Some(0),
+                output,
+                columns: 80,
+                rows: 24,
+                ..
+            }) if output == "hello"
+        ));
+    }
+
+    #[test]
     fn terminal_result_tail_marks_truncation_and_byte_counts() {
         let output = LimitedOutput {
             text: format!("{}tail", "x".repeat(MAX_INLINE_TERMINAL_OUTPUT_BYTES + 128)),
