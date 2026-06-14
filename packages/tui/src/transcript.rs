@@ -333,6 +333,7 @@ impl TranscriptItem {
             ..
         } = &mut self.kind
         {
+            self.text = output.clone();
             *terminal_output = output;
             if finished_at_ms.is_some() {
                 *terminal_finished_at_ms = finished_at_ms;

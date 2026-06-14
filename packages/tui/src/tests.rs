@@ -12,8 +12,8 @@ use bcode_session_models::{
     ClientId, LiveFileEditPreview, LiveShellCommandPreview, LiveToolArgumentPreview, RuntimeWorkId,
     RuntimeWorkKind, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
     SessionProjectionKind, SessionSummary, SessionTitleSource, SessionTokenUsage,
-    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ToolInvocationPresentation,
-    ToolInvocationStreamEvent, ToolOutputStream,
+    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ShellRunResult,
+    ToolInvocationPresentation, ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::TextMotion;
@@ -1218,6 +1218,7 @@ fn transcript_renders_tool_blocks_with_structure_and_pretty_arguments() {
                 result: "ok".to_owned(),
                 is_error: false,
                 output: None,
+                semantic_result: None,
             },
         ),
     ];
@@ -1328,6 +1329,7 @@ fn live_file_edit_card_shows_permission_and_applied_phases() {
             result: "edited src/lib.rs".to_owned(),
             is_error: false,
             output: None,
+            semantic_result: None,
         },
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 40));
@@ -1508,6 +1510,7 @@ fn transcript_renders_shell_output_with_ansi_and_limits() {
                 ),
                 is_error: false,
                 output: None,
+                semantic_result: None,
             },
         ),
     ];
@@ -1569,6 +1572,7 @@ fn transcript_renders_terminal_shell_output_without_unbounded_row_request() {
                 .to_string(),
                 is_error: false,
                 output: None,
+                semantic_result: None,
             },
         ),
     ];
@@ -1606,6 +1610,7 @@ fn transcript_renders_terminal_shell_output_without_viewport_padding() {
             .to_string(),
             is_error: false,
             output: None,
+            semantic_result: None,
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
@@ -1642,6 +1647,7 @@ fn transcript_renders_truncated_terminal_shell_output_as_terminal() {
             .to_string(),
             is_error: false,
             output: None,
+            semantic_result: None,
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
@@ -1826,6 +1832,7 @@ fn streamed_terminal_output_updates_header_after_final_result() {
             .to_string(),
             is_error: true,
             output: None,
+            semantic_result: None,
         },
     ));
 
@@ -2523,6 +2530,7 @@ fn assistant_response_after_tool_loop_transitions_to_message_top() {
             result: "done".to_owned(),
             is_error: false,
             output: None,
+            semantic_result: None,
         },
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
@@ -2711,6 +2719,7 @@ fn streamed_tool_output_is_not_duplicated_by_final_result() {
             result: "first\n".to_owned(),
             is_error: false,
             output: None,
+            semantic_result: None,
         },
     ));
 
@@ -2888,6 +2897,7 @@ fn file_change_presentation_events(
             result: "duplicate write result".to_owned(),
             is_error: false,
             output: None,
+            semantic_result: None,
         },
     ));
     events
@@ -2929,6 +2939,7 @@ fn streamed_tool_without_output_renders_final_result() {
                 result: "final result".to_owned(),
                 is_error: false,
                 output: None,
+                semantic_result: None,
             },
         ),
     ];
@@ -3048,6 +3059,7 @@ fn streamed_terminal_tool_events(session_id: SessionId) -> Vec<SessionEvent> {
                 .to_string(),
                 is_error: false,
                 output: None,
+                semantic_result: None,
             },
         ),
     ]
@@ -3119,6 +3131,7 @@ fn terminal_presentation_without_live_delta_renders_terminal_history() {
                 .to_string(),
                 is_error: false,
                 output: None,
+                semantic_result: None,
             },
         ),
     ];
@@ -3137,6 +3150,180 @@ fn terminal_presentation_without_live_delta_renders_terminal_history() {
 
     assert_eq!(terminal_count, 1);
     assert_eq!(tool_result_count, 0);
+}
+
+#[test]
+fn semantic_terminal_result_without_stream_renders_terminal_not_raw_json() {
+    let session_id = SessionId::new();
+    let events = vec![event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call-semantic-terminal".to_owned(),
+            result: r#"{"mode":"terminal","output":"raw json"}"#.to_owned(),
+            is_error: false,
+            output: None,
+            semantic_result: Some(ToolInvocationResult::ShellRun {
+                result: ShellRunResult::Terminal {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    cancelled: false,
+                    output_tail: "ansi tail\n".to_owned(),
+                    output_truncated: false,
+                    output_bytes: Some(10),
+                    retained_output_bytes: Some(10),
+                    columns: 100,
+                    rows: 40,
+                },
+            }),
+        },
+    )];
+
+    let transcript = transcript_items_from_events_with_reasoning(&events, true);
+    let terminal_items = transcript
+        .iter()
+        .filter(|item| matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. }))
+        .collect::<Vec<_>>();
+
+    assert_eq!(terminal_items.len(), 1);
+    assert_eq!(terminal_items[0].text(), "ansi tail\n");
+    assert!(!terminal_items[0].text().contains(r#""mode":"terminal""#));
+    assert!(!terminal_items[0].streaming());
+    assert!(!transcript.iter().any(|item| {
+        matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
+            && item.text().contains(r#""mode":"terminal""#)
+    }));
+}
+
+#[test]
+fn semantic_terminal_result_finishes_existing_stream_item() {
+    let session_id = SessionId::new();
+    let events = vec![
+        event(
+            session_id,
+            1,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Started {
+                    tool_call_id: "call-stream-semantic".to_owned(),
+                    tool_name: "shell.run".to_owned(),
+                    sequence: 0,
+                    terminal: true,
+                    columns: Some(80),
+                    rows: Some(24),
+                    started_at_ms: Some(10),
+                },
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::OutputDelta {
+                    tool_call_id: "call-stream-semantic".to_owned(),
+                    stream: ToolOutputStream::Pty,
+                    sequence: 1,
+                    text: "live\n".to_owned(),
+                    byte_len: 5,
+                },
+            },
+        ),
+        event(
+            session_id,
+            3,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "call-stream-semantic".to_owned(),
+                result: r#"{"mode":"terminal"}"#.to_owned(),
+                is_error: true,
+                output: None,
+                semantic_result: Some(ToolInvocationResult::ShellRun {
+                    result: ShellRunResult::Terminal {
+                        exit_code: Some(2),
+                        timed_out: true,
+                        cancelled: false,
+                        output_tail: "final tail\n".to_owned(),
+                        output_truncated: false,
+                        output_bytes: Some(11),
+                        retained_output_bytes: Some(11),
+                        columns: 80,
+                        rows: 24,
+                    },
+                }),
+            },
+        ),
+    ];
+
+    let transcript = transcript_items_from_events_with_reasoning(&events, true);
+    let terminal_items = transcript
+        .iter()
+        .filter(|item| matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. }))
+        .collect::<Vec<_>>();
+
+    assert_eq!(terminal_items.len(), 1);
+    assert_eq!(terminal_items[0].text(), "final tail\n");
+    assert!(!terminal_items[0].streaming());
+    let TranscriptItemKind::TerminalOutput {
+        exit_code,
+        timed_out,
+        is_error,
+        ..
+    } = terminal_items[0].kind()
+    else {
+        panic!("expected terminal output");
+    };
+    assert_eq!(*exit_code, Some(2));
+    assert_eq!(*timed_out, Some(true));
+    assert!(*is_error);
+    assert!(!transcript.iter().any(|item| {
+        matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
+            && item.text().contains(r#""mode":"terminal""#)
+    }));
+}
+
+#[test]
+fn semantic_captured_shell_result_renders_captured_text_not_terminal() {
+    let session_id = SessionId::new();
+    let events = vec![event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call-captured".to_owned(),
+            result: "legacy output should not be used".to_owned(),
+            is_error: false,
+            output: None,
+            semantic_result: Some(ToolInvocationResult::ShellRun {
+                result: ShellRunResult::Captured {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    cancelled: false,
+                    stdout: "captured stdout\n".to_owned(),
+                    stderr: "captured stderr\n".to_owned(),
+                    stdout_truncated: false,
+                    stderr_truncated: true,
+                    stdout_bytes: Some(16),
+                    stderr_bytes: Some(16),
+                },
+            }),
+        },
+    )];
+
+    let transcript = transcript_items_from_events_with_reasoning(&events, true);
+
+    assert!(
+        !transcript
+            .iter()
+            .any(|item| matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. }))
+    );
+    assert!(transcript.iter().any(|item| {
+        matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
+            && item.text().contains("captured stdout")
+            && item.text().contains("captured stderr")
+            && item.text().contains("[stderr truncated]")
+    }));
+    assert!(
+        !transcript
+            .iter()
+            .any(|item| item.text().contains("legacy output should not be used"))
+    );
 }
 
 fn session_summary(session_id: SessionId) -> SessionSummary {
