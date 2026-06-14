@@ -33,10 +33,10 @@ use bcode_model::{
 use bcode_plugin::PluginInvocationScope;
 use bcode_session::{CatalogLoadStatus, SessionManager, lease::SessionLeaseOwnerContext};
 use bcode_session_models::{
-    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, LiveFileEditPreview, LiveShellCommandPreview,
-    LiveToolArgumentPreview, ModelTurnOutcome, ProviderStreamEvent, ProviderToolCallProgress,
-    RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind, SessionId,
-    SessionLiveEventKind, SessionTokenUsage, SessionTraceEvent, SessionTracePayload,
+    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, LiveFileEditPreview, LiveQueryPreview,
+    LiveShellCommandPreview, LiveToolArgumentPreview, ModelTurnOutcome, ProviderStreamEvent,
+    ProviderToolCallProgress, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind,
+    SessionId, SessionLiveEventKind, SessionTokenUsage, SessionTraceEvent, SessionTracePayload,
     SessionTracePhase, ToolInvocationStreamEvent, ToolOutputStream as SessionToolOutputStream,
     TraceBlobRef, TraceRedaction,
 };
@@ -4454,6 +4454,9 @@ impl ModelStreamProgress {
             LiveToolArgumentPreview::ShellCommand(shell) => {
                 shell.truncated |= active.preview_arguments_truncated;
             }
+            LiveToolArgumentPreview::Query(query) => {
+                query.truncated |= active.preview_arguments_truncated;
+            }
         }
         if active
             .last_emitted_preview
@@ -4518,7 +4521,8 @@ fn live_tool_argument_preview_from_arguments(
         )
         .map(LiveToolArgumentPreview::ShellCommand);
     }
-    None
+    live_query_preview_from_arguments(tool_name, arguments, arguments_truncated, max_chars)
+        .map(LiveToolArgumentPreview::Query)
 }
 
 fn live_file_edit_preview_from_arguments(
@@ -4554,6 +4558,41 @@ fn live_shell_command_preview_from_arguments(
         cwd,
         argument_bytes: arguments.len(),
         truncated: arguments_truncated || command.truncated,
+    })
+}
+
+fn live_query_preview_from_arguments(
+    tool_name: &str,
+    arguments: &str,
+    arguments_truncated: bool,
+    max_chars: usize,
+) -> Option<LiveQueryPreview> {
+    let field_names: &[&str] = match tool_name
+        .replace(['-', '.'], "_")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "web_search" => &["query", "provider"],
+        "web_fetch" => &["url"],
+        "filesystem_grep" | "grep" => &["path", "pattern", "glob"],
+        "git_clone" | "github_clone" => &["url", "destination", "ref", "branch"],
+        _ => return None,
+    };
+    let mut fields = std::collections::BTreeMap::new();
+    let mut truncated = arguments_truncated;
+    for name in field_names {
+        if let Some(field) = partial_json_string_field(arguments, &[*name], max_chars) {
+            truncated |= field.truncated;
+            fields.insert((*name).to_owned(), field.value);
+        }
+    }
+    if fields.is_empty() {
+        return None;
+    }
+    Some(LiveQueryPreview {
+        fields,
+        argument_bytes: arguments.len(),
+        truncated,
     })
 }
 
@@ -6450,6 +6489,9 @@ const fn live_tool_argument_preview_with_bytes(
         }
         LiveToolArgumentPreview::ShellCommand(shell) => {
             shell.argument_bytes = argument_bytes;
+        }
+        LiveToolArgumentPreview::Query(query) => {
+            query.argument_bytes = argument_bytes;
         }
     }
     preview
@@ -10800,5 +10842,69 @@ mod tests {
 
         assert!(result.output.chars().count() <= 1_000);
         assert!(result.output.contains("tool output truncated"));
+    }
+    #[test]
+    fn live_preview_extraction_supports_shell_file_and_query_tools() {
+        let shell = live_tool_argument_preview_from_arguments(
+            "shell_run",
+            r#"{"command":"cargo test","cwd":"/repo"}"#,
+            false,
+            1024,
+        )
+        .expect("shell preview");
+        assert!(matches!(shell, LiveToolArgumentPreview::ShellCommand(_)));
+
+        let file = live_tool_argument_preview_from_arguments(
+            "filesystem_write",
+            r#"{"path":"src/lib.rs","contents":"pub fn demo() {}"}"#,
+            false,
+            1024,
+        )
+        .expect("file preview");
+        assert!(matches!(file, LiveToolArgumentPreview::FileEdit(_)));
+
+        let query = live_tool_argument_preview_from_arguments(
+            "web_search",
+            r#"{"query":"rust tui","provider":"brave"}"#,
+            false,
+            1024,
+        )
+        .expect("query preview");
+        let LiveToolArgumentPreview::Query(query) = query else {
+            panic!("expected query preview");
+        };
+        assert_eq!(query.fields.get("query"), Some(&"rust tui".to_owned()));
+        assert_eq!(query.fields.get("provider"), Some(&"brave".to_owned()));
+    }
+
+    #[test]
+    fn live_preview_suppresses_duplicate_preview_snapshots() {
+        let mut progress = ModelStreamProgress::default();
+        progress.start_tool_call("call-1".to_owned(), "shell_run".to_owned());
+        progress.record_tool_call_delta("call-1", r#"{"command":"cargo"}"#);
+        assert!(progress.take_tool_argument_preview().is_some());
+        assert!(progress.take_tool_argument_preview().is_none());
+    }
+
+    #[test]
+    fn live_preview_is_independent_from_coarse_progress_threshold() {
+        let mut progress = ModelStreamProgress::default();
+        progress.start_tool_call("call-1".to_owned(), "shell_run".to_owned());
+        progress.record_tool_call_delta("call-1", r#"{"command":"x"}"#);
+        assert!(progress.take_tool_progress_event().is_none());
+        assert!(progress.take_tool_argument_preview().is_some());
+    }
+
+    #[test]
+    fn partial_json_string_field_handles_partial_escape_and_unicode() {
+        let escaped =
+            partial_json_string_field(r#"{"command":"echo \"hi\" \u263A"#, &["command"], 1024)
+                .expect("partial command");
+        assert_eq!(escaped.value, "echo \"hi\" ☺");
+
+        let truncated = partial_json_string_field(r#"{"command":"abcdef"}"#, &["command"], 3)
+            .expect("truncated command");
+        assert_eq!(truncated.value, "abc");
+        assert!(truncated.truncated);
     }
 }

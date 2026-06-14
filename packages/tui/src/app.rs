@@ -10,6 +10,13 @@ use bcode_session_models::{
     SessionLiveEventKind, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
     ToolInvocationStreamEvent, ToolOutputStream,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveToolPreviewState {
+    tool_name: String,
+    argument_bytes: usize,
+    preview: LiveToolArgumentPreview,
+}
 use bcode_skill_models::SkillSource;
 use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
 use bmux_tui::diff::{DiffFileSummary, DiffLine};
@@ -36,9 +43,10 @@ use super::tool_present::{
 };
 use super::transcript::{
     FileEditPhase, TranscriptItem, TranscriptItemKind, live_file_edit_preview_item,
-    live_shell_command_preview_item, model_usage_item, permission_request_item,
-    permission_result_item, streaming_terminal_output_item, streaming_tool_output_item,
-    tool_request_item, tool_result_item, transcript_items_from_events_with_reasoning,
+    live_query_preview_item, live_shell_command_preview_item, model_usage_item,
+    permission_request_item, permission_result_item, streaming_terminal_output_item,
+    streaming_tool_output_item, tool_request_item, tool_result_item,
+    transcript_items_from_events_with_reasoning,
 };
 use super::transcript_document::TranscriptDocument;
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
@@ -131,6 +139,7 @@ pub struct BmuxApp {
     latest_history_sequence: Option<u64>,
     tool_call_contexts: BTreeMap<String, ToolCallContext>,
     streamed_tool_results: BTreeMap<String, StreamedToolResultContext>,
+    live_tool_previews: BTreeMap<String, LiveToolPreviewState>,
     runtime_work: RuntimeWorkViewState,
     diff_panel: DiffPanel,
     pending_submissions: PendingSubmissions,
@@ -284,6 +293,7 @@ impl BmuxApp {
             latest_history_sequence: None,
             tool_call_contexts: BTreeMap::new(),
             streamed_tool_results: BTreeMap::new(),
+            live_tool_previews: BTreeMap::new(),
             runtime_work: RuntimeWorkViewState::default(),
             diff_panel: DiffPanel::new(),
             pending_submissions: PendingSubmissions::default(),
@@ -1812,6 +1822,10 @@ impl BmuxApp {
                 arguments_json: arguments_json.to_owned(),
             },
         );
+        self.live_tool_previews.remove(tool_call_id);
+        let _ = self
+            .transcript
+            .remove_rev_find(|item| item.is_live_preview_for(tool_call_id));
         let item = tool_request_item(tool_call_id, tool_name, arguments_json);
         let replaced = self.transcript.mutate_rev_find(
             |existing| {
@@ -1824,6 +1838,9 @@ impl BmuxApp {
                         tool_call_id: item_tool_call_id,
                         ..
                     } | TranscriptItemKind::ShellPreview {
+                        tool_call_id: item_tool_call_id,
+                        ..
+                    } | TranscriptItemKind::QueryPreview {
                         tool_call_id: item_tool_call_id,
                         ..
                     } if item_tool_call_id == tool_call_id
@@ -2209,6 +2226,14 @@ impl BmuxApp {
         argument_bytes: usize,
         preview: &LiveToolArgumentPreview,
     ) {
+        self.live_tool_previews.insert(
+            tool_call_id.to_owned(),
+            LiveToolPreviewState {
+                tool_name: tool_name.to_owned(),
+                argument_bytes,
+                preview: preview.clone(),
+            },
+        );
         match preview {
             LiveToolArgumentPreview::FileEdit(file_preview) => self.apply_live_file_edit_preview(
                 tool_call_id,
@@ -2223,6 +2248,12 @@ impl BmuxApp {
                     argument_bytes,
                     shell_preview,
                 ),
+            LiveToolArgumentPreview::Query(query_preview) => self.apply_live_query_preview(
+                tool_call_id,
+                tool_name,
+                argument_bytes,
+                query_preview,
+            ),
         }
     }
 
@@ -2304,6 +2335,44 @@ impl BmuxApp {
         );
     }
 
+    fn apply_live_query_preview(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        argument_bytes: usize,
+        preview: &bcode_session_models::LiveQueryPreview,
+    ) {
+        let updated = self.transcript.mutate_rev_find(
+            |item| {
+                matches!(
+                    item.kind(),
+                    TranscriptItemKind::QueryPreview {
+                        tool_call_id: item_tool_call_id,
+                        ..
+                    } if item_tool_call_id == tool_call_id
+                )
+            },
+            |item| {
+                let _ = item.set_live_query_preview(tool_call_id, tool_name, preview);
+            },
+        );
+        if updated.is_none() {
+            self.transcript
+                .push(live_query_preview_item(tool_call_id, tool_name, preview));
+        }
+        self.set_activity(ActivityState::ProviderStream {
+            detail: format!(
+                "streaming {tool_name} arguments ({} received)",
+                format_provider_bytes(argument_bytes)
+            ),
+        });
+        self.mark_live_preview_dirty();
+        self.status = format!(
+            "streaming {tool_name} · {} received",
+            format_provider_bytes(argument_bytes)
+        );
+    }
+
     fn permission_tool_call_id(&self, permission_id: &str) -> Option<String> {
         self.transcript.iter().rev().find_map(|item| {
             let TranscriptItemKind::PermissionRequest {
@@ -2327,6 +2396,12 @@ impl BmuxApp {
                         tool_call_id: item_tool_call_id,
                         ..
                     } | TranscriptItemKind::FileEditPreview {
+                        tool_call_id: item_tool_call_id,
+                        ..
+                    } | TranscriptItemKind::ShellPreview {
+                        tool_call_id: item_tool_call_id,
+                        ..
+                    } | TranscriptItemKind::QueryPreview {
                         tool_call_id: item_tool_call_id,
                         ..
                     } if item_tool_call_id == tool_call_id

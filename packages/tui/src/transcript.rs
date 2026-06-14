@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use bcode_session_models::{
-    LiveFileEditPreview, LiveShellCommandPreview, SessionEvent, SessionEventKind,
+    LiveFileEditPreview, LiveQueryPreview, LiveShellCommandPreview, SessionEvent, SessionEventKind,
     SessionTokenUsage, ToolInvocationStreamEvent, ToolOutputStream,
 };
 
@@ -89,6 +89,19 @@ pub enum TranscriptItemKind {
         command_prefix: String,
         /// Best-effort working directory.
         cwd: Option<String>,
+        /// Total assembled argument bytes received so far.
+        argument_bytes: usize,
+        /// Whether preview text was truncated.
+        truncated: bool,
+    },
+    /// Live-only query-like tool preview with structured metadata.
+    QueryPreview {
+        /// Provider tool call identifier.
+        tool_call_id: String,
+        /// Tool name.
+        tool_name: String,
+        /// Extracted string fields for display.
+        fields: BTreeMap<String, String>,
         /// Total assembled argument bytes received so far.
         argument_bytes: usize,
         /// Whether preview text was truncated.
@@ -329,6 +342,24 @@ impl TranscriptItem {
         self.bump_revision();
     }
 
+    /// Return whether this item is a live preview for `tool_call_id`.
+    #[must_use]
+    pub fn is_live_preview_for(&self, tool_call_id: &str) -> bool {
+        matches!(
+            &self.kind,
+            TranscriptItemKind::FileEditPreview {
+                tool_call_id: item_tool_call_id,
+                ..
+            } | TranscriptItemKind::ShellPreview {
+                tool_call_id: item_tool_call_id,
+                ..
+            } | TranscriptItemKind::QueryPreview {
+                tool_call_id: item_tool_call_id,
+                ..
+            } if item_tool_call_id == tool_call_id
+        )
+    }
+
     /// Set file-edit phase for a tool request item.
     pub fn set_file_edit_phase(&mut self, tool_call_id: &str, phase: FileEditPhase) -> bool {
         let TranscriptItemKind::ToolRequest {
@@ -410,6 +441,40 @@ impl TranscriptItem {
         *argument_bytes = preview.argument_bytes;
         *truncated = preview.truncated;
         self.text.clone_from(&preview.command_prefix);
+        self.streaming = true;
+        self.bump_revision();
+        true
+    }
+
+    /// Update this item from a live-only query-like preview.
+    pub fn set_live_query_preview(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        preview: &LiveQueryPreview,
+    ) -> bool {
+        let TranscriptItemKind::QueryPreview {
+            tool_call_id: item_tool_call_id,
+            tool_name: item_tool_name,
+            fields,
+            argument_bytes,
+            truncated,
+        } = &mut self.kind
+        else {
+            return false;
+        };
+        if item_tool_call_id != tool_call_id {
+            return false;
+        }
+        tool_name.clone_into(item_tool_name);
+        fields.clone_from(&preview.fields);
+        *argument_bytes = preview.argument_bytes;
+        *truncated = preview.truncated;
+        self.text = fields
+            .iter()
+            .map(|(key, value)| format!("{key}: {value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         self.streaming = true;
         self.bump_revision();
         true
@@ -566,6 +631,32 @@ pub fn live_shell_command_preview_item(
             tool_name: tool_name.to_owned(),
             command_prefix: preview.command_prefix.clone(),
             cwd: preview.cwd.clone(),
+            argument_bytes: preview.argument_bytes,
+            truncated: preview.truncated,
+        },
+    )
+}
+
+/// Build a transcript item for a live-only query-like preview.
+#[must_use]
+pub fn live_query_preview_item(
+    tool_call_id: &str,
+    tool_name: &str,
+    preview: &LiveQueryPreview,
+) -> TranscriptItem {
+    TranscriptItem::with_kind(
+        "Tool",
+        preview
+            .fields
+            .iter()
+            .map(|(key, value)| format!("{key}: {value}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        true,
+        TranscriptItemKind::QueryPreview {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: tool_name.to_owned(),
+            fields: preview.fields.clone(),
             argument_bytes: preview.argument_bytes,
             truncated: preview.truncated,
         },

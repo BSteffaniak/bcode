@@ -301,6 +301,19 @@ pub enum LiveToolArgumentPreview {
     FileEdit(LiveFileEditPreview),
     /// Shell command preview.
     ShellCommand(LiveShellCommandPreview),
+    /// Query/search preview.
+    Query(LiveQueryPreview),
+}
+
+/// Live-only query-like tool preview derived from partial tool-call arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveQueryPreview {
+    /// Extracted string fields for display.
+    pub fields: BTreeMap<String, String>,
+    /// Total assembled argument bytes received so far.
+    pub argument_bytes: usize,
+    /// Whether the preview content was truncated by live-preview limits.
+    pub truncated: bool,
 }
 
 /// Live-only file edit/write preview derived from partial tool-call arguments.

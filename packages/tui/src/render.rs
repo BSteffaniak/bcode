@@ -717,6 +717,15 @@ fn push_transcript_item_rows(
                 width,
             );
         }
+        TranscriptItemKind::QueryPreview {
+            tool_name,
+            fields,
+            argument_bytes,
+            truncated,
+            ..
+        } => {
+            push_query_preview_rows(rows, tool_name, fields, *argument_bytes, *truncated, width);
+        }
         TranscriptItemKind::ToolResult {
             tool_call_id,
             tool_name,
@@ -1068,6 +1077,44 @@ fn push_shell_preview_rows(
     push_kv_row(rows, "command", command_prefix, width);
     if let Some(cwd) = cwd {
         push_kv_row(rows, "cwd", cwd, width);
+    }
+    push_kv_row(
+        rows,
+        "received",
+        &format_preview_bytes(argument_bytes),
+        width,
+    );
+    if truncated {
+        push_wrapped_styled_text(
+            rows,
+            vec![Span::styled("  ", muted_style())],
+            "preview truncated by live display limit",
+            width,
+            muted_style(),
+            muted_style(),
+        );
+    }
+    rows.push(Line::default());
+}
+
+fn push_query_preview_rows(
+    rows: &mut Vec<Line>,
+    tool_name: &str,
+    fields: &std::collections::BTreeMap<String, String>,
+    argument_bytes: usize,
+    truncated: bool,
+    width: u16,
+) {
+    push_wrapped_styled_text(
+        rows,
+        Vec::new(),
+        &format!("Tool call · {tool_name} · streaming preview"),
+        width,
+        Style::new().fg(Color::Cyan),
+        Style::new().fg(Color::Cyan),
+    );
+    for (key, value) in fields {
+        push_kv_row(rows, key, value, width);
     }
     push_kv_row(
         rows,
