@@ -3,6 +3,7 @@
 use bcode_session_models::{SessionEvent, SessionEventKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -480,6 +481,82 @@ const fn next_action_for_decision(decision: RalphStopDecision) -> &'static str {
     }
 }
 
+/// Ralph lifecycle event kind stored in audit history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RalphLifecycleEventKind {
+    /// Loop state was created.
+    Created,
+    /// Context pack was captured.
+    ContextCaptured,
+    /// Progress doc was generated or refreshed.
+    ProgressDocGenerated,
+    /// Isolated work area was created.
+    WorkAreaCreated,
+    /// Status was viewed.
+    StatusViewed,
+    /// Progress doc path was opened/viewed.
+    ProgressOpened,
+    /// Orchestration prompt was prepared.
+    PromptPrepared,
+}
+
+#[derive(Debug, Serialize)]
+struct RalphLifecycleEvent<'a> {
+    kind: RalphLifecycleEventKind,
+    message: &'a str,
+    occurred_at_ms: u128,
+}
+
+/// Append a Ralph lifecycle event to the loop audit history.
+///
+/// # Errors
+///
+/// Returns an error when the audit history file cannot be opened, encoded, or
+/// written.
+pub fn append_lifecycle_event(
+    state: &CreatedRalphLoopState,
+    kind: RalphLifecycleEventKind,
+    message: &str,
+) -> Result<(), RalphStateError> {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&state.audit_history_path)?;
+    let event = RalphLifecycleEvent {
+        kind,
+        message,
+        occurred_at_ms: now_ms(),
+    };
+    serde_json::to_writer(&mut file, &event).map_err(RalphStateError::Json)?;
+    file.write_all(b"\n")?;
+    Ok(())
+}
+
+/// Append a Ralph lifecycle event using a discovered loop summary.
+///
+/// # Errors
+///
+/// Returns an error when the audit history file cannot be opened, encoded, or
+/// written.
+pub fn append_lifecycle_event_for_summary(
+    summary: &RalphLoopSummary,
+    kind: RalphLifecycleEventKind,
+    message: &str,
+) -> Result<(), RalphStateError> {
+    append_lifecycle_event(
+        &CreatedRalphLoopState {
+            state_dir: summary.state_dir.clone(),
+            progress_doc_path: summary.progress_doc_path.clone(),
+            metadata_path: summary.state_dir.join(LOOP_METADATA_FILE_NAME),
+            context_pack_path: summary.state_dir.join(CONTEXT_PACK_FILE_NAME),
+            audit_history_path: summary.state_dir.join(AUDIT_HISTORY_FILE_NAME),
+        },
+        kind,
+        message,
+    )
+}
+
 /// Create initial local state for a Ralph loop.
 ///
 /// # Errors
@@ -507,6 +584,11 @@ pub fn create_initial_loop_state(
         initial_context_pack(loop_name, session_title)?,
     )?;
     std::fs::write(&paths.audit_history_path, [])?;
+    append_lifecycle_event(
+        &paths,
+        RalphLifecycleEventKind::Created,
+        "Ralph loop state created",
+    )?;
     Ok(paths)
 }
 
@@ -529,6 +611,11 @@ pub fn write_context_pack(
         state,
         "status",
         Value::String(RalphLoopStatus::Planning.as_str().to_owned()),
+    )?;
+    append_lifecycle_event(
+        state,
+        RalphLifecycleEventKind::ContextCaptured,
+        "Captured bounded context pack",
     )?;
     Ok(())
 }
@@ -555,6 +642,11 @@ pub fn generate_progress_doc_from_context(
         state,
         "status",
         Value::String(RalphLoopStatus::AwaitingApproval.as_str().to_owned()),
+    )?;
+    append_lifecycle_event(
+        state,
+        RalphLifecycleEventKind::ProgressDocGenerated,
+        "Generated progress doc from context pack",
     )?;
     Ok(())
 }
@@ -595,6 +687,11 @@ pub fn record_work_area(
         Value::from(now_ms().to_string()),
     );
     write_metadata(state, &metadata)?;
+    append_lifecycle_event(
+        state,
+        RalphLifecycleEventKind::WorkAreaCreated,
+        "Created isolated work area",
+    )?;
     Ok(())
 }
 

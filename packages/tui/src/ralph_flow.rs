@@ -24,6 +24,11 @@ pub fn show_status(chat: &mut ActiveChat) -> Result<(), TuiError> {
             .set_status("no Ralph loops for current repository".to_owned());
         return Ok(());
     };
+    ralph_state::append_lifecycle_event_for_summary(
+        &summary,
+        ralph_state::RalphLifecycleEventKind::StatusViewed,
+        "Viewed Ralph loop status",
+    )?;
     chat.app.push_system_note(format!(
         "Ralph loop status\n* Loop: {}\n* Status: {}\n* Iterations: {}\n* Checklist: {} checked, {} unchecked\n* Next: {}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}",
         summary.loop_name,
@@ -56,6 +61,11 @@ pub fn show_prompt(
         return Ok(());
     };
     let prompt = ralph_state::build_prompt(&summary, kind)?;
+    ralph_state::append_lifecycle_event_for_summary(
+        &summary,
+        ralph_state::RalphLifecycleEventKind::PromptPrepared,
+        "Prepared Ralph orchestration prompt",
+    )?;
     chat.app.push_system_note(format!(
         "Ralph prompt prepared\n* Loop: {}\n* Progress doc: {}\n\n{}",
         summary.loop_name,
@@ -75,6 +85,11 @@ pub fn open_progress(chat: &mut ActiveChat) -> Result<(), TuiError> {
             .set_status("no Ralph loops for current repository".to_owned());
         return Ok(());
     };
+    ralph_state::append_lifecycle_event_for_summary(
+        &summary,
+        ralph_state::RalphLifecycleEventKind::ProgressOpened,
+        "Viewed Ralph progress doc path",
+    )?;
     chat.app.push_system_note(format!(
         "Ralph progress doc\n* Loop: {}\n* Path: {}",
         summary.loop_name,
