@@ -1565,6 +1565,7 @@ dependencies = [
  "png",
  "serde",
  "serde_json",
+ "switchy",
  "thiserror 2.0.18",
  "tokio",
  "unicode-segmentation",
