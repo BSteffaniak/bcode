@@ -2,6 +2,7 @@
 
 use std::io::Write;
 
+use bcode_worktree_models::WorktreeCreateRequest;
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_text_edit::SelectionMode;
 use bmux_tui::event::{Event, FocusEvent, MouseEvent};
@@ -55,10 +56,38 @@ pub async fn start_loop<W: Write>(
                         &repo_root,
                         chat.app.session_title(),
                     )?;
+                    let work_area = services
+                        .client
+                        .create_worktree(WorktreeCreateRequest {
+                            name: format!("ralph-{loop_name}"),
+                            cwd: Some(repo_root.clone()),
+                            path: None,
+                            branch: None,
+                            new_branch: None,
+                            base_ref: Some(bcode_worktree_models::WorktreeBaseRef::Head),
+                            detach: false,
+                            force: false,
+                            attach_session_id: None,
+                            new_session: true,
+                            no_setup: false,
+                        })
+                        .await?;
+                    let work_area_session_id = work_area
+                        .session
+                        .as_ref()
+                        .map(|session| session.id.to_string());
+                    ralph_state::record_work_area(
+                        &state,
+                        &work_area.path,
+                        work_area.branch.as_deref(),
+                        work_area_session_id.as_deref(),
+                    )?;
                     chat.app.push_system_note(format!(
-                        "Ralph loop created\n* Loop: {loop_name}\n* Progress doc: {}\n* State: {}\n* Next: capture conversation context and create an isolated work area",
+                        "Ralph loop created\n* Loop: {loop_name}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}\n* Next: capture conversation context into the progress doc",
                         state.progress_doc_path.display(),
-                        state.state_dir.display()
+                        state.state_dir.display(),
+                        work_area.path.display(),
+                        work_area_session_id.as_deref().unwrap_or("<none>")
                     ));
                     chat.app.set_status("Ralph loop created".to_owned());
                     return Ok(());

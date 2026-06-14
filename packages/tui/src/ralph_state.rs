@@ -1,6 +1,7 @@
 //! Local Ralph loop state management for the TUI.
 
 use serde::Serialize;
+use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -42,6 +43,50 @@ pub fn create_initial_loop_state(
         initial_progress_doc(loop_name, repo_root, session_title, &paths),
     )?;
     Ok(paths)
+}
+
+/// Record the isolated work area created for a Ralph loop.
+///
+/// # Errors
+///
+/// Returns an error when the metadata file cannot be read, decoded, updated, or
+/// written.
+pub fn record_work_area(
+    state: &CreatedRalphLoopState,
+    work_area_path: &Path,
+    branch: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<(), RalphStateError> {
+    let bytes = std::fs::read(&state.metadata_path)?;
+    let mut metadata =
+        serde_json::from_slice::<Map<String, Value>>(&bytes).map_err(RalphStateError::Json)?;
+    metadata.insert(
+        "work_area_path".to_owned(),
+        Value::String(work_area_path.display().to_string()),
+    );
+    metadata.insert(
+        "branch".to_owned(),
+        branch.map_or(Value::Null, |branch| Value::String(branch.to_owned())),
+    );
+    metadata.insert(
+        "session_id".to_owned(),
+        session_id.map_or(Value::Null, |session_id| {
+            Value::String(session_id.to_owned())
+        }),
+    );
+    metadata.insert(
+        "status".to_owned(),
+        Value::String("work_area_created".to_owned()),
+    );
+    metadata.insert(
+        "updated_at_ms".to_owned(),
+        Value::from(now_ms().to_string()),
+    );
+    std::fs::write(
+        &state.metadata_path,
+        serde_json::to_vec_pretty(&metadata).map_err(RalphStateError::Json)?,
+    )?;
+    Ok(())
 }
 
 /// Return the default Ralph state root for a repository.
