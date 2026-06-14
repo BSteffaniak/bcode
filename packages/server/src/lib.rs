@@ -46,9 +46,10 @@ use bcode_skill_models::{
 };
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID,
-    ToolDefinition as ServiceToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent, ToolList, ToolOutputStream,
-    ToolResultContent,
+    ToolDefinition as ServiceToolDefinition,
+    ToolInvocationPresentation as ServiceToolInvocationPresentation, ToolInvocationRequest,
+    ToolInvocationResponse, ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent,
+    ToolList, ToolOutputStream, ToolResultContent,
 };
 use runtime_work::{CancellationHandle, RuntimeWorkManager, RuntimeWorkSpec};
 use serde::{Deserialize, Serialize};
@@ -7768,6 +7769,7 @@ async fn invoke_model_native_web_search_tool(
         is_error: false,
         content: Vec::new(),
         full_output: None,
+        presentation: None,
     })
 }
 
@@ -7813,9 +7815,15 @@ async fn execute_model_tool(
             is_error: true,
             content: Vec::new(),
             full_output: None,
+            presentation: None,
         });
-    let presentation =
-        tool_invocation_presentation_from_result(&call.name, &call.arguments, &result.output);
+    let presentation = result
+        .presentation
+        .as_ref()
+        .map(service_tool_presentation_to_session)
+        .or_else(|| {
+            tool_invocation_presentation_from_result(&call.name, &call.arguments, &result.output)
+        });
     let artifact_output = result.full_output.as_deref().unwrap_or(&result.output);
     let output_blob = (state.observability.persist_tool_io || state.observability.debug_enabled())
         .then(|| {
@@ -7881,6 +7889,7 @@ async fn invoke_model_tool(
             is_error: true,
             content: Vec::new(),
             full_output: None,
+            presentation: None,
         });
     }
     if call.name == "web.search"
@@ -7941,6 +7950,7 @@ async fn invoke_model_tool(
                 is_error: true,
                 content: Vec::new(),
                 full_output: None,
+                presentation: None,
             });
         }
         AgentDecision::Ask => {
@@ -7950,6 +7960,7 @@ async fn invoke_model_tool(
                     is_error: true,
                     content: Vec::new(),
                     full_output: None,
+                    presentation: None,
                 });
             }
         }
@@ -8015,6 +8026,7 @@ async fn invoke_model_tool(
                     is_error: true,
                     content: Vec::new(),
                     full_output: None,
+            presentation: None,
                 });
             }
             Some(payload) = invocation.events.recv() => {
@@ -8937,6 +8949,43 @@ fn file_change_tool_invocation_presentation(
 
 fn normalized_tool_name(tool_name: &str) -> String {
     tool_name.replace('.', "_")
+}
+
+fn service_tool_presentation_to_session(
+    presentation: &ServiceToolInvocationPresentation,
+) -> ToolInvocationPresentation {
+    match presentation {
+        ServiceToolInvocationPresentation::Terminal {
+            exit_code,
+            timed_out,
+            cancelled,
+            output,
+            output_truncated,
+            output_bytes,
+            retained_output_bytes,
+            columns,
+            rows,
+        } => ToolInvocationPresentation::Terminal {
+            exit_code: *exit_code,
+            timed_out: *timed_out,
+            cancelled: *cancelled,
+            output: output.clone(),
+            output_truncated: *output_truncated,
+            output_bytes: *output_bytes,
+            retained_output_bytes: *retained_output_bytes,
+            columns: (*columns).max(1),
+            rows: (*rows).max(1),
+        },
+        ServiceToolInvocationPresentation::FileChange {
+            tool_name,
+            summary,
+            path,
+        } => ToolInvocationPresentation::FileChange {
+            tool_name: tool_name.clone(),
+            summary: summary.clone(),
+            path: path.clone(),
+        },
+    }
 }
 
 async fn append_tool_finished_event(

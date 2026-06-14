@@ -121,6 +121,7 @@ impl WebSearchPlugin {
                 is_error: true,
                 content: Vec::new(),
                 full_output: None,
+                presentation: None,
             },
         };
         json_response(&response)
@@ -2239,6 +2240,7 @@ fn json_tool_response<T: Serialize>(value: &T) -> ToolInvocationResponse {
             is_error: false,
             content: Vec::new(),
             full_output: None,
+            presentation: None,
         },
         Err(error) => tool_error(error.to_string()),
     }
@@ -2250,6 +2252,7 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
         is_error: true,
         content: Vec::new(),
         full_output: None,
+        presentation: None,
     }
 }
 

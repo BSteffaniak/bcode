@@ -11,8 +11,8 @@ use bcode_config::{
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
-    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationStreamEvent, ToolList,
-    ToolOutputStream, ToolSideEffect,
+    ToolInvocationPresentation, ToolInvocationRequest, ToolInvocationResponse,
+    ToolInvocationStreamEvent, ToolList, ToolOutputStream, ToolSideEffect,
 };
 use bcode_tool_runtime::{ProcessExecutionRequest, ToolExecutionRuntime};
 use serde::{Deserialize, Serialize};
@@ -143,6 +143,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             is_error: true,
             content: Vec::new(),
             full_output: None,
+            presentation: None,
         },
     };
     json_response(&response)
@@ -165,6 +166,7 @@ fn run_shell_tool(
                 is_error: true,
                 content: Vec::new(),
                 full_output: None,
+                presentation: None,
             };
         }
     };
@@ -174,6 +176,7 @@ fn run_shell_tool(
             is_error: true,
             content: Vec::new(),
             full_output: None,
+            presentation: None,
         };
     }
     let now_ms = current_unix_millis();
@@ -218,6 +221,7 @@ fn run_shell_tool(
                 is_error: true,
                 content: Vec::new(),
                 full_output: None,
+                presentation: None,
             },
         }
     };
@@ -386,6 +390,7 @@ fn run_terminal_shell_command(
             is_error: true,
             content: Vec::new(),
             full_output: None,
+            presentation: None,
         },
     }
 }
@@ -541,11 +546,25 @@ fn run_terminal_shell_command_inner(
     drop(pair.master);
     let output = join_reader(reader_thread)?;
     let (encoded, full_encoded) = encode_terminal_output(status, &output, columns, rows)?;
+    let inline_output = limit_terminal_inline_output(&output);
     Ok(ToolInvocationResponse {
         output: encoded,
         is_error: status.timed_out || status.cancelled || !status.success,
         content: Vec::new(),
         full_output: Some(full_encoded),
+        presentation: Some(ToolInvocationPresentation::Terminal {
+            exit_code: Some(status.exit_code),
+            timed_out: status.timed_out,
+            cancelled: status.cancelled,
+            output: inline_output.text,
+            output_truncated: inline_output.truncated,
+            output_bytes: Some(u64::try_from(inline_output.original_bytes).unwrap_or(u64::MAX)),
+            retained_output_bytes: Some(
+                u64::try_from(inline_output.retained_bytes).unwrap_or(u64::MAX),
+            ),
+            columns,
+            rows,
+        }),
     })
 }
 
@@ -611,6 +630,7 @@ fn build_process_tool_response(
             || result.exit_code.is_none_or(|code| code != 0),
         content: Vec::new(),
         full_output: Some(full_output),
+        presentation: None,
     }
 }
 

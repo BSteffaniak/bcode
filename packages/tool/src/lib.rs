@@ -126,6 +126,32 @@ pub struct ToolInvocationResponse {
     pub content: Vec<ToolResultContent>,
     #[serde(default)]
     pub full_output: Option<String>,
+    #[serde(default)]
+    pub presentation: Option<ToolInvocationPresentation>,
+}
+
+/// Bounded UI presentation metadata returned by a tool invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolInvocationPresentation {
+    /// Pseudo-terminal execution result.
+    Terminal {
+        exit_code: Option<i32>,
+        timed_out: bool,
+        cancelled: bool,
+        output: String,
+        output_truncated: bool,
+        output_bytes: Option<u64>,
+        retained_output_bytes: Option<u64>,
+        columns: u16,
+        rows: u16,
+    },
+    /// Filesystem write/edit result.
+    FileChange {
+        tool_name: String,
+        summary: String,
+        path: Option<String>,
+    },
 }
 
 /// Structured model-visible tool result content.

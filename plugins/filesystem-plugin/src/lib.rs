@@ -7,8 +7,8 @@
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ImageMetadata, ImageRefContent, ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS,
-    TOOL_SERVICE_INTERFACE_ID, ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationStreamEvent, ToolList, ToolResultContent, ToolSideEffect,
+    TOOL_SERVICE_INTERFACE_ID, ToolDefinition, ToolInvocationPresentation, ToolInvocationRequest,
+    ToolInvocationResponse, ToolInvocationStreamEvent, ToolList, ToolResultContent, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -544,6 +544,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             is_error: true,
             content: Vec::new(),
             full_output: None,
+            presentation: None,
         });
     }
     let cwd = request.cwd.clone();
@@ -582,6 +583,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             is_error: true,
             content: Vec::new(),
             full_output: None,
+            presentation: None,
         },
     };
     json_response(&response)
@@ -616,6 +618,7 @@ fn text_tool_response(path: &Path, request: &ReadRequest, bytes: &[u8]) -> ToolI
             is_error: true,
             content: Vec::new(),
             full_output: None,
+            presentation: None,
         };
     };
     let lines = contents.lines().collect::<Vec<_>>();
@@ -653,6 +656,7 @@ fn text_tool_response(path: &Path, request: &ReadRequest, bytes: &[u8]) -> ToolI
         is_error: false,
         content: Vec::new(),
         full_output: None,
+        presentation: None,
     }
 }
 
@@ -713,6 +717,7 @@ fn tool_artifact_read(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolI
                 is_error: true,
                 content: Vec::new(),
                 full_output: None,
+                presentation: None,
             },
         },
         Err(error) => tool_json_error(&error),
@@ -758,6 +763,7 @@ fn tool_artifact_grep(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolI
                 is_error: true,
                 content: Vec::new(),
                 full_output: None,
+                presentation: None,
             },
         },
         Err(error) => tool_json_error(&error),
@@ -854,6 +860,7 @@ fn image_tool_response(path: &Path, image: ImageFileMetadata) -> ToolInvocationR
             },
         }],
         full_output: None,
+        presentation: None,
     }
 }
 
@@ -901,11 +908,19 @@ fn tool_write(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocatio
             request.path = resolve_session_path(cwd, &request.path);
             write_file_inner(&request.path, &request.contents).map_or_else(
                 |error| tool_io_error(&error),
-                |bytes_written| ToolInvocationResponse {
-                    output: format!("wrote {bytes_written} bytes"),
-                    is_error: false,
-                    content: Vec::new(),
-                    full_output: None,
+                |bytes_written| {
+                    let summary = format!("wrote {bytes_written} bytes");
+                    ToolInvocationResponse {
+                        output: summary.clone(),
+                        is_error: false,
+                        content: Vec::new(),
+                        full_output: None,
+                        presentation: Some(ToolInvocationPresentation::FileChange {
+                            tool_name: "filesystem.write".to_owned(),
+                            summary,
+                            path: Some(request.path.display().to_string()),
+                        }),
+                    }
                 },
             )
         }
@@ -923,12 +938,21 @@ fn tool_edit(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocation
                     is_error: true,
                     content: Vec::new(),
                     full_output: None,
+                    presentation: None,
                 },
-                |replacements| ToolInvocationResponse {
-                    output: format!("applied {replacements} replacement"),
-                    is_error: false,
-                    content: Vec::new(),
-                    full_output: None,
+                |replacements| {
+                    let summary = format!("applied {replacements} replacement");
+                    ToolInvocationResponse {
+                        output: summary.clone(),
+                        is_error: false,
+                        content: Vec::new(),
+                        full_output: None,
+                        presentation: Some(ToolInvocationPresentation::FileChange {
+                            tool_name: "filesystem.edit".to_owned(),
+                            summary,
+                            path: Some(request.path.display().to_string()),
+                        }),
+                    }
                 },
             )
         }
@@ -945,6 +969,7 @@ fn tool_exists(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocati
             is_error: false,
             content: Vec::new(),
             full_output: None,
+            presentation: None,
         },
         Err(error) => tool_json_error(&error),
     }
@@ -1912,6 +1937,7 @@ fn tool_io_error(error: &std::io::Error) -> ToolInvocationResponse {
         is_error: true,
         content: Vec::new(),
         full_output: None,
+        presentation: None,
     }
 }
 
@@ -1921,6 +1947,7 @@ fn tool_json_error(error: &serde_json::Error) -> ToolInvocationResponse {
         is_error: true,
         content: Vec::new(),
         full_output: None,
+        presentation: None,
     }
 }
 
@@ -1934,12 +1961,14 @@ where
             is_error: false,
             content: Vec::new(),
             full_output: None,
+            presentation: None,
         },
         Err(error) => ToolInvocationResponse {
             output: error.to_string(),
             is_error: true,
             content: Vec::new(),
             full_output: None,
+            presentation: None,
         },
     }
 }
