@@ -702,3 +702,59 @@ pub async fn execute(
         _ => Ok(SlashCommandOutcome::Unknown(message.to_owned())),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ralph_state::RalphPromptKind;
+
+    #[test]
+    fn ralph_start_routes_to_start_dialog() {
+        assert_eq!(
+            ralph_command(&["/ralph"]),
+            SlashCommandOutcome::OpenRalphStartDialog
+        );
+        assert_eq!(
+            ralph_command(&["/ralph", "start"]),
+            SlashCommandOutcome::OpenRalphStartDialog
+        );
+    }
+
+    #[test]
+    fn ralph_status_and_open_route_to_state_views() {
+        assert_eq!(
+            ralph_command(&["/ralph", "status"]),
+            SlashCommandOutcome::ShowRalphStatus
+        );
+        assert_eq!(
+            ralph_command(&["/ralph", "open"]),
+            SlashCommandOutcome::OpenRalphProgress
+        );
+    }
+
+    #[test]
+    fn ralph_run_audit_and_replan_route_to_prompt_builders() {
+        assert_eq!(
+            ralph_command(&["/ralph", "run"]),
+            SlashCommandOutcome::BuildRalphPrompt(RalphPromptKind::Work)
+        );
+        assert_eq!(
+            ralph_command(&["/ralph", "audit"]),
+            SlashCommandOutcome::BuildRalphPrompt(RalphPromptKind::Audit)
+        );
+        assert_eq!(
+            ralph_command(&["/ralph", "replan"]),
+            SlashCommandOutcome::BuildRalphPrompt(RalphPromptKind::Replan)
+        );
+    }
+
+    #[test]
+    fn ralph_unknown_subcommand_reports_usage() {
+        assert_eq!(
+            ralph_command(&["/ralph", "wat"]),
+            SlashCommandOutcome::Handled(
+                "usage: /ralph [start|run|stop|status|audit|replan|open]".to_owned()
+            )
+        );
+    }
+}
