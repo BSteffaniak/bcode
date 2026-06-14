@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use bcode_config::TuiInlineDiffConfig;
 use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
 use bcode_session_models::{LiveFileEditPreview, LiveToolArgumentPreview};
+use bcode_syntax_render::{SyntaxHighlighter, SyntaxStyle};
 use bmux_terminal_grid::{
     Color as GridColor, GridLimits, PhysicalRow, Style as GridStyle, TerminalGrid,
     TerminalGridStream,
@@ -1837,7 +1838,7 @@ fn push_file_edit_preview_rows(
     for row in preview {
         match row {
             InlineDiffPreviewRow::Line(line) => {
-                rows.extend(render_inline_diff_line(line, card_width));
+                rows.extend(render_inline_diff_line(line, card_width, edit.path()));
             }
             InlineDiffPreviewRow::Hidden(count) => {
                 rows.push(render_inline_diff_hidden_row(count, card_width));
@@ -1957,7 +1958,7 @@ fn inline_diff_hidden_text(count: usize) -> String {
     format!("… {count} diff rows hidden …")
 }
 
-fn render_inline_diff_line(line: &DiffLine, width: u16) -> Vec<Line> {
+fn render_inline_diff_line(line: &DiffLine, width: u16, syntax_hint: &str) -> Vec<Line> {
     let (sign, sign_style, body_style) = inline_diff_line_styles(line.kind);
     let row_style = inline_diff_row_style(line.kind);
     let emphasis_style = inline_diff_emphasis_style(line.kind);
@@ -1965,7 +1966,12 @@ fn render_inline_diff_line(line: &DiffLine, width: u16) -> Vec<Line> {
     let gutter_style = row_style.patch(muted_style());
     let body_width = inline_diff_body_width(width);
     let content_rows = wrap_inline_diff_content_spans(
-        inline_diff_content_spans(line, row_style.patch(body_style), emphasis_style),
+        inline_diff_content_spans(
+            line,
+            syntax_hint,
+            row_style.patch(body_style),
+            emphasis_style,
+        ),
         body_width,
     );
     let content_rows = if content_rows.is_empty() {
@@ -2022,11 +2028,12 @@ const fn inline_diff_body_width(width: u16) -> usize {
 
 fn inline_diff_content_spans(
     line: &DiffLine,
+    syntax_hint: &str,
     body_style: Style,
     emphasis_style: Style,
 ) -> Vec<Span> {
     let source_spans = if line.inline_spans.is_empty() {
-        vec![DiffInlineSpan::new(line.content.clone(), Style::new())]
+        syntax_inline_spans(syntax_hint, &line.content)
     } else {
         line.inline_spans.clone()
     };
@@ -2055,6 +2062,24 @@ fn inline_diff_content_spans(
     spans
 }
 
+const fn syntax_style_to_tui_style(style: SyntaxStyle) -> Style {
+    let mut output = Style::new().fg(Color::Rgb(
+        style.foreground_r,
+        style.foreground_g,
+        style.foreground_b,
+    ));
+    if style.bold {
+        output = output.add_modifier(Modifier::BOLD);
+    }
+    if style.italic {
+        output = output.add_modifier(Modifier::ITALIC);
+    }
+    if style.underline {
+        output = output.add_modifier(Modifier::UNDERLINE);
+    }
+    output
+}
+
 fn wrap_inline_diff_content_spans(spans: Vec<Span>, width: usize) -> Vec<Vec<Span>> {
     let width = width.max(1);
     let mut rows: Vec<Vec<Span>> = Vec::new();
@@ -2081,6 +2106,17 @@ struct InlineDiffSpanSegment<'content> {
     content: &'content str,
     style: Style,
     emphasized: bool,
+}
+
+fn syntax_inline_spans(syntax_hint: &str, content: &str) -> Vec<DiffInlineSpan> {
+    if syntax_hint.is_empty() || !SyntaxHighlighter::new().can_highlight(syntax_hint) {
+        return vec![DiffInlineSpan::new(content.to_owned(), Style::new())];
+    }
+    SyntaxHighlighter::new()
+        .highlight_line_tokens(syntax_hint, content)
+        .into_iter()
+        .map(|span| DiffInlineSpan::new(span.content, syntax_style_to_tui_style(span.style)))
+        .collect()
 }
 
 fn inline_diff_span_segments<'span>(

@@ -34,6 +34,12 @@ impl FileEditTranscript {
         self.old_text.is_empty()
     }
 
+    /// Return the edited file path.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
     /// Return a summary for this file edit.
     #[must_use]
     pub fn summary(&self) -> DiffFileSummary {
