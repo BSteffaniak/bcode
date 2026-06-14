@@ -244,7 +244,7 @@ impl SessionPickerApp {
 fn session_item(session: &SessionSummary) -> ListItem {
     let name = session.display_title();
     let display_name = session.import.as_ref().map_or_else(
-        || name.to_owned(),
+        || fork_display_name(session, name),
         |import| {
             if import.imported_at_ms == 0 {
                 format!("[{} import] {name}", import.source_id)
@@ -264,6 +264,22 @@ fn session_item(session: &SessionSummary) -> ListItem {
     ]))
 }
 
+fn fork_display_name(session: &SessionSummary, name: &str) -> String {
+    let Some(fork) = &session.fork else {
+        return name.to_owned();
+    };
+    let label = match fork.kind {
+        bcode_session_models::SessionForkKind::Fork => "fork",
+        bcode_session_models::SessionForkKind::Clone => "clone",
+    };
+    match fork.source_title.as_deref() {
+        Some(source_title) if !source_title.is_empty() => {
+            format!("[{label} of {source_title}] {name}")
+        }
+        _ => format!("[{label}] {name}"),
+    }
+}
+
 fn session_matches(session: &SessionSummary, query: &str) -> bool {
     if query.is_empty() {
         return true;
@@ -271,11 +287,28 @@ fn session_matches(session: &SessionSummary, query: &str) -> bool {
     session.display_title().to_ascii_lowercase().contains(query)
         || session.id.to_string().contains(query)
         || session
+            .fork
+            .as_ref()
+            .is_some_and(|fork| fork_matches_query(fork, query))
+        || session
             .working_directory
             .display()
             .to_string()
             .to_ascii_lowercase()
             .contains(query)
+}
+
+fn fork_matches_query(fork: &bcode_session_models::SessionForkSummary, query: &str) -> bool {
+    let kind = match fork.kind {
+        bcode_session_models::SessionForkKind::Fork => "fork",
+        bcode_session_models::SessionForkKind::Clone => "clone",
+    };
+    kind.contains(query)
+        || fork.source_session_id.to_string().contains(query)
+        || fork
+            .source_title
+            .as_deref()
+            .is_some_and(|title| title.to_ascii_lowercase().contains(query))
 }
 
 fn empty_item(message: &str) -> ListItem {
