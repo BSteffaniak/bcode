@@ -2786,6 +2786,112 @@ fn streamed_terminal_live_suppresses_final_tool_result_tail() {
 }
 
 #[test]
+fn file_change_presentation_history_suppresses_final_tool_result_without_request() {
+    let session_id = SessionId::new();
+    let events = file_change_presentation_events(session_id, false);
+
+    let transcript = transcript_items_from_events_with_reasoning(&events, true);
+
+    assert!(transcript.iter().any(|item| matches!(
+        item.kind(),
+        TranscriptItemKind::FileChangePresentation { summary, path, .. }
+            if summary == "wrote 2 bytes" && path.as_deref() == Some("file.txt")
+    )));
+    assert!(!transcript.iter().any(|item| {
+        matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
+            && item.text().contains("duplicate write result")
+    }));
+}
+
+#[test]
+fn file_change_presentation_history_uses_request_preview_when_present() {
+    let session_id = SessionId::new();
+    let events = file_change_presentation_events(session_id, true);
+
+    let transcript = transcript_items_from_events_with_reasoning(&events, true);
+
+    assert!(transcript.iter().any(|item| matches!(
+        item.kind(),
+        TranscriptItemKind::ToolRequest {
+            tool_call_id,
+            file_edit: Some(_),
+            file_edit_phase: Some(_),
+            ..
+        } if tool_call_id == "call-file"
+    )));
+    assert!(!transcript.iter().any(|item| {
+        matches!(
+            item.kind(),
+            TranscriptItemKind::FileChangePresentation { .. }
+        ) || (matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
+            && item.text().contains("duplicate write result"))
+    }));
+}
+
+#[test]
+fn file_change_presentation_live_suppresses_final_tool_result() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    for event in file_change_presentation_events(session_id, false) {
+        app.absorb_session_event(&event);
+    }
+
+    assert!(app.transcript().iter().any(|item| matches!(
+        item.kind(),
+        TranscriptItemKind::FileChangePresentation { summary, path, .. }
+            if summary == "wrote 2 bytes" && path.as_deref() == Some("file.txt")
+    )));
+    assert!(!app.transcript().iter().any(|item| {
+        matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
+            && item.text().contains("duplicate write result")
+    }));
+}
+
+fn file_change_presentation_events(
+    session_id: SessionId,
+    include_request: bool,
+) -> Vec<SessionEvent> {
+    let mut events = Vec::new();
+    if include_request {
+        events.push(event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-file".to_owned(),
+                tool_name: "filesystem.write".to_owned(),
+                arguments_json: r#"{"path":"file.txt","contents":"hi"}"#.to_owned(),
+            },
+        ));
+    }
+    events.push(event(
+        session_id,
+        2,
+        SessionEventKind::ToolInvocationPresentation {
+            tool_call_id: "call-file".to_owned(),
+            started_at_ms: Some(1),
+            finished_at_ms: Some(2),
+            is_error: false,
+            presentation: ToolInvocationPresentation::FileChange {
+                tool_name: "filesystem.write".to_owned(),
+                summary: "wrote 2 bytes".to_owned(),
+                path: Some("file.txt".to_owned()),
+            },
+        },
+    ));
+    events.push(event(
+        session_id,
+        3,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call-file".to_owned(),
+            result: "duplicate write result".to_owned(),
+            is_error: false,
+            output: None,
+        },
+    ));
+    events
+}
+
+#[test]
 fn streamed_tool_without_output_renders_final_result() {
     let session_id = SessionId::new();
     let events = vec![
