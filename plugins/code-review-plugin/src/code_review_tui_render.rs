@@ -86,9 +86,36 @@ fn render_header_actions(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>)
         frame,
         x,
         area.y,
+        "General",
+        ReviewMouseAction::SidebarMode(ReviewSidebarMode::General),
+        app.sidebar_mode == ReviewSidebarMode::General,
+    );
+    x = render_header_button(
+        app,
+        frame,
+        x,
+        area.y,
+        "Summary",
+        ReviewMouseAction::SidebarMode(ReviewSidebarMode::Summary),
+        app.sidebar_mode == ReviewSidebarMode::Summary,
+    );
+    x = render_header_button(
+        app,
+        frame,
+        x,
+        area.y,
         "Attention",
         ReviewMouseAction::SidebarMode(ReviewSidebarMode::NeedsAttention),
         app.sidebar_mode == ReviewSidebarMode::NeedsAttention,
+    );
+    x = render_header_button(
+        app,
+        frame,
+        x,
+        area.y,
+        "File note",
+        ReviewMouseAction::FileComment,
+        false,
     );
     let _ = render_header_button(
         app,
@@ -138,9 +165,12 @@ fn render_sidebar(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     match app.sidebar_mode {
         ReviewSidebarMode::Included => render_included(app, content, frame),
         ReviewSidebarMode::Repository => render_files(app, content, frame),
-        ReviewSidebarMode::Threads | ReviewSidebarMode::NeedsAttention => {
+        ReviewSidebarMode::Threads
+        | ReviewSidebarMode::General
+        | ReviewSidebarMode::NeedsAttention => {
             render_threads(app, content, frame);
         }
+        ReviewSidebarMode::Summary => render_review_summary(app, content, frame),
         ReviewSidebarMode::Sources => render_sources(app, content, frame),
     }
 }
@@ -333,6 +363,11 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                     " j/k thread  Enter jump  x publish  a ask/follow up  o open  e edit  D delete  t files  ? help ".to_string()
                 });
             }
+            if app.sidebar_mode == ReviewSidebarMode::General && app.sidebar_visible {
+                return app.selected_thread_preview().unwrap_or_else(|| {
+                    " general review comments  C new review note  j/k thread  Enter jump  a ask/follow up  e edit  D delete  t files  ? help ".to_string()
+                });
+            }
             if let Some(preview) = app.selected_draft_preview() {
                 let linked = app
                     .selected_draft_session_id()
@@ -344,16 +379,21 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                     " j/k thread  Enter jump  x publish  a ask/follow up  o open  e edit  D delete  t files  ? help ".to_string()
                 });
             }
+            if app.sidebar_mode == ReviewSidebarMode::General && app.sidebar_visible {
+                return app.selected_thread_preview().unwrap_or_else(|| {
+                    " general review comments  C new review note  j/k thread  Enter jump  a ask/follow up  e edit  D delete  t files  ? help ".to_string()
+                });
+            }
             if app.ux_mode == crate::code_review_tui::ReviewUxMode::Build {
                 return build_footer_hint(app);
             }
             if app.review.is_repository_review() {
                 return format!(
-                    " j/k move  enter open/toggle  ←/→ collapse/expand  f picker  : line  / search  n/N next/prev  M attention  u/i file-open  P/O global-open  ! attention-sidebar  c comment  C review-comment  w viewed  W/I unviewed  V/E all-viewed/unviewed  H hide-viewed  v range  x publish  a ask Bcode  t sidebar-tab:{sidebar}  b sidebar:{sidebar}  ? {help}  q exit "
+                    " j/k move  enter open/toggle  ←/→ collapse/expand  f picker  : line  / search  n/N next/prev  M attention  u/i file-open  P/O global-open  ! attention-sidebar  c comment  F file-comment  C review-comment  w viewed  W/I unviewed  V/E all-viewed/unviewed  H hide-viewed  v range  x publish  a ask Bcode  t sidebar-tab:{sidebar}  b sidebar:{sidebar}  ? {help}  q exit "
                 );
             }
             format!(
-                " j/k move  [/]/ thread  {{/}} draft  Enter fold/action  r resolve  R resolved  T filter  H hide-viewed  U expand  Z collapse  n/p file  J/K hunk  c comment/reply  C review-comment  v range  x publish  a ask Bcode  o open session  e edit  D delete draft  t sidebar-tab  b sidebar:{sidebar}  ? {help}  q exit "
+                " j/k move  [/]/ thread  {{/}} draft  Enter fold/action  r resolve  R resolved  T filter  H hide-viewed  U expand  Z collapse  n/p file  J/K hunk  c comment/reply  F file-comment  C review-comment  v range  x publish  a ask Bcode  o open session  e edit  D delete draft  t sidebar-tab  b sidebar:{sidebar}  ? {help}  q exit "
             )
         },
         |message| format!(" {message}"),
@@ -699,6 +739,52 @@ fn render_file_tree_file_row(row: &FileTreeFileRow<'_>, area: Rect, frame: &mut 
     );
 }
 
+fn render_review_summary(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+    if area.is_empty() {
+        return;
+    }
+    let (viewed, total_files) = app.viewed_file_counts();
+    let (open_threads, resolved_threads) = app.thread_status_counts();
+    let general_threads = app
+        .thread_summaries()
+        .into_iter()
+        .filter(|thread| thread.anchor.is_review_level())
+        .count();
+    let lines = [
+        " Summary".to_string(),
+        format!(" title: {}", app.review.title),
+        format!(" repo: {}", app.review.repo_root.display()),
+        format!(" files: {viewed}/{total_files} viewed"),
+        format!(" diff: +{} -{}", app.review.additions, app.review.deletions),
+        format!(" threads: {open_threads} open, {resolved_threads} resolved"),
+        format!(" general: {general_threads}"),
+        format!(" sources: {}", app.workspace.sources.len()),
+        format!(" surfaces: {}", app.review.surfaces().len()),
+        format!(" commits: {}", app.review.repository_commits.len()),
+    ];
+    for (row, line) in lines.into_iter().enumerate().take(usize::from(area.height)) {
+        let style = if row == 0 {
+            Style::new().fg(Color::Cyan).bg(Color::Black)
+        } else {
+            Style::new().fg(Color::White).bg(Color::Black)
+        };
+        frame.write_line_with_fallback_style(
+            Rect::new(
+                area.x,
+                area.y
+                    .saturating_add(u16::try_from(row).unwrap_or(u16::MAX)),
+                area.width,
+                1,
+            ),
+            &Line::from_spans(vec![Span::styled(
+                truncate_to_display_width(&line, usize::from(area.width)),
+                style,
+            )]),
+            style,
+        );
+    }
+}
+
 fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
@@ -721,10 +807,10 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     }
     let visible_rows = usize::from(list_area.height);
     if threads.is_empty() {
-        let label = if app.sidebar_mode == ReviewSidebarMode::NeedsAttention {
-            "open"
-        } else {
-            app.thread_filter.label()
+        let label = match app.sidebar_mode {
+            ReviewSidebarMode::NeedsAttention => "open".to_string(),
+            ReviewSidebarMode::General => "general".to_string(),
+            _ => app.thread_filter.label().to_string(),
         };
         frame.write_line(
             list_area,

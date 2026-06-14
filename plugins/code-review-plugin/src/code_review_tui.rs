@@ -1775,6 +1775,7 @@ fn handle_review_navigation_key(app: &mut ReviewApp, key: KeyCode) -> bool {
         KeyCode::Char('K') => app.select_previous_hunk(),
         KeyCode::Char('v') => app.toggle_range_selection(),
         KeyCode::Char('C') => app.open_review_comment_editor(),
+        KeyCode::Char('F') => app.open_file_comment_editor(),
         KeyCode::Char('c') => app.open_comment_editor(),
         KeyCode::Char('e') => app.open_latest_draft_editor(),
         KeyCode::Char('D') => app.delete_latest_draft_at_selection(),
@@ -1867,6 +1868,7 @@ pub enum ReviewMouseAction {
     ActivateTreeRow(usize),
     JumpSelectedThread,
     NewReviewComment,
+    FileComment,
     Publish,
     AskBcode,
     ReplyThread,
@@ -3013,6 +3015,10 @@ pub enum ReviewSidebarMode {
     Repository,
     /// Review thread list sidebar.
     Threads,
+    /// Whole-review/general discussion thread sidebar.
+    General,
+    /// Review summary/sidebar.
+    Summary,
     /// Review source list sidebar.
     Sources,
     /// Files with local review work remaining.
@@ -3027,6 +3033,8 @@ impl ReviewSidebarMode {
             Self::Included => "included",
             Self::Repository => "repo",
             Self::Threads => "threads",
+            Self::General => "general",
+            Self::Summary => "summary",
             Self::Sources => "sources",
             Self::NeedsAttention => "attention",
         }
@@ -3091,6 +3099,9 @@ impl ReviewThreadSummary {
     pub fn line_label(&self) -> String {
         if self.anchor.is_review_level() {
             return "review".to_string();
+        }
+        if self.anchor.kind() == ReviewAnchorKind::File {
+            return "file".to_string();
         }
         self.anchor.new_start.or(self.anchor.old_start).map_or_else(
             || format!("@{}", self.anchor.diff_row),
@@ -4591,6 +4602,7 @@ impl ReviewApp {
             ReviewMouseAction::ActivateTreeRow(index) => self.activate_tree_row(index),
             ReviewMouseAction::JumpSelectedThread => self.jump_to_selected_thread(),
             ReviewMouseAction::NewReviewComment => self.open_review_comment_editor(),
+            ReviewMouseAction::FileComment => self.open_file_comment_editor(),
             ReviewMouseAction::Publish => self.publish_review(),
             ReviewMouseAction::AskBcode => self.ask_bcode_about_selection(),
             ReviewMouseAction::ReplyThread => self.open_comment_editor(),
@@ -4720,7 +4732,9 @@ impl ReviewApp {
         self.sidebar_mode = match self.sidebar_mode {
             ReviewSidebarMode::Included => ReviewSidebarMode::Repository,
             ReviewSidebarMode::Repository => ReviewSidebarMode::Threads,
-            ReviewSidebarMode::Threads => ReviewSidebarMode::Sources,
+            ReviewSidebarMode::Threads => ReviewSidebarMode::General,
+            ReviewSidebarMode::General => ReviewSidebarMode::Summary,
+            ReviewSidebarMode::Summary => ReviewSidebarMode::Sources,
             ReviewSidebarMode::Sources => ReviewSidebarMode::NeedsAttention,
             ReviewSidebarMode::NeedsAttention => ReviewSidebarMode::Included,
         };
@@ -4735,7 +4749,9 @@ impl ReviewApp {
             self.select_next_build_row(rows)
         } else if matches!(
             self.sidebar_mode,
-            ReviewSidebarMode::Threads | ReviewSidebarMode::NeedsAttention
+            ReviewSidebarMode::Threads
+                | ReviewSidebarMode::General
+                | ReviewSidebarMode::NeedsAttention
         ) && self.sidebar_visible
         {
             self.select_next_thread(rows)
@@ -4755,7 +4771,9 @@ impl ReviewApp {
             self.select_previous_build_row(rows)
         } else if matches!(
             self.sidebar_mode,
-            ReviewSidebarMode::Threads | ReviewSidebarMode::NeedsAttention
+            ReviewSidebarMode::Threads
+                | ReviewSidebarMode::General
+                | ReviewSidebarMode::NeedsAttention
         ) && self.sidebar_visible
         {
             self.select_previous_thread(rows)
@@ -5531,10 +5549,13 @@ impl ReviewApp {
         }
         self.thread_summaries()
             .into_iter()
-            .filter(|thread| match self.thread_filter {
-                ReviewThreadFilter::All => true,
-                ReviewThreadFilter::Open => !thread.resolved,
-                ReviewThreadFilter::Resolved => thread.resolved,
+            .filter(|thread| match self.sidebar_mode {
+                ReviewSidebarMode::General => thread.anchor.is_review_level(),
+                _ => match self.thread_filter {
+                    ReviewThreadFilter::All => true,
+                    ReviewThreadFilter::Open => !thread.resolved,
+                    ReviewThreadFilter::Resolved => thread.resolved,
+                },
             })
             .collect()
     }
@@ -6678,6 +6699,41 @@ impl ReviewApp {
             surface_id: None,
             source_id: None,
         }
+    }
+
+    /// Open the draft comment editor for the selected file.
+    pub fn open_file_comment_editor(&mut self) -> bool {
+        let Some(anchor) = self.file_comment_anchor() else {
+            self.status_message = Some("select a review file to comment on".to_string());
+            return true;
+        };
+        let path = anchor.path.clone();
+        self.comment_editor = Some(ReviewCommentEditor::new(anchor));
+        self.status_message = Some(format!(
+            "editing file-level comment on {path}; enter/ctrl+s saves, esc cancels"
+        ));
+        true
+    }
+
+    fn file_comment_anchor(&self) -> Option<ReviewCommentAnchor> {
+        let path = self.selected_file_path()?;
+        let (surface_id, source_id) = self.selected_surface_ids();
+        Some(ReviewCommentAnchor {
+            file_index: self.selected_file,
+            path,
+            diff_row: 0,
+            end_diff_row: None,
+            old_line: None,
+            new_line: None,
+            old_start: None,
+            old_end: None,
+            new_start: None,
+            new_end: None,
+            line_kind: ReviewLineKind::Context,
+            is_file_anchor: true,
+            surface_id,
+            source_id,
+        })
     }
 
     /// Open the draft comment editor for the selected diff line.
