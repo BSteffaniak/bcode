@@ -1,0 +1,31 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Ralph loop persistence and orchestration primitives for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "ralph", "automation"]
+license     = { workspace = true }
+name        = "bcode_ralph"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_config = { workspace = true }
+bcode_session_models = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true }
+switchy = { workspace = true, features = [
+    "database",
+    "database-schema",
+    "database-connection",
+    "database-connection-turso",
+    "schema",
+] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time"] }
+uuid = { workspace = true, features = ["v4"] }
+
+[features]
+default          = []
+fail-on-warnings = []

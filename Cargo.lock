@@ -1396,6 +1396,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_ralph"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_config",
+ "bcode_session_models",
+ "serde",
+ "serde_json",
+ "switchy",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "bcode_server"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -1551,6 +1565,7 @@ dependencies = [
  "bcode_plugin",
  "bcode_plugin_sdk",
  "bcode_provider_auth",
+ "bcode_ralph",
  "bcode_session_models",
  "bcode_skill_models",
  "bcode_syntax_render",
@@ -1565,7 +1580,6 @@ dependencies = [
  "png",
  "serde",
  "serde_json",
- "switchy",
  "thiserror 2.0.18",
  "tokio",
  "unicode-segmentation",
