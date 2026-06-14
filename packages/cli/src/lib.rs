@@ -4752,6 +4752,7 @@ fn print_non_trace_session_event(event: &SessionEvent) {
             result,
             is_error,
             output,
+            ..
         } => {
             let status = if *is_error { "error" } else { "ok" };
             let artifact = output

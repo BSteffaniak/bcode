@@ -130,6 +130,61 @@ pub struct ToolInvocationResponse {
     pub full_output: Option<String>,
     #[serde(default)]
     pub presentation: Option<ToolInvocationPresentation>,
+    /// Optional typed semantic result for consumers to render in their own UI.
+    #[serde(default)]
+    pub result: Option<ToolInvocationResult>,
+}
+
+/// Typed semantic data returned by a tool invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolInvocationResult {
+    /// Plain textual result.
+    Text { text: String },
+    /// Structured JSON result encoded as a JSON string for transport stability.
+    Json { value: String },
+    /// Shell command execution result.
+    ShellRun { result: ShellRunResult },
+    /// Filesystem write/edit result.
+    FileChange { result: FileChangeResult },
+}
+
+/// Semantic shell command execution result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ShellRunResult {
+    /// Pseudo-terminal execution with ANSI-capable output.
+    Terminal {
+        exit_code: Option<i32>,
+        timed_out: bool,
+        cancelled: bool,
+        output_tail: String,
+        output_truncated: bool,
+        output_bytes: Option<u64>,
+        retained_output_bytes: Option<u64>,
+        columns: u16,
+        rows: u16,
+    },
+    /// Non-terminal execution with separately captured streams.
+    Captured {
+        exit_code: Option<i32>,
+        timed_out: bool,
+        cancelled: bool,
+        stdout: String,
+        stderr: String,
+        stdout_truncated: bool,
+        stderr_truncated: bool,
+        stdout_bytes: Option<u64>,
+        stderr_bytes: Option<u64>,
+    },
+}
+
+/// Semantic filesystem change result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChangeResult {
+    pub tool_name: String,
+    pub summary: String,
+    pub path: Option<String>,
 }
 
 /// Bounded UI presentation metadata returned by a tool invocation.

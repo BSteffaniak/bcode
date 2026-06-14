@@ -37,19 +37,21 @@ use bcode_session_models::{
     LiveShellCommandPreview, LiveToolArgumentPreview, ModelTurnOutcome, ProviderStreamEvent,
     ProviderToolCallProgress, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind,
     SessionId, SessionLiveEventKind, SessionTokenUsage, SessionTraceEvent, SessionTracePayload,
-    SessionTracePhase, ToolInvocationPresentation, ToolInvocationStreamEvent,
-    ToolOutputStream as SessionToolOutputStream, TraceBlobRef, TraceRedaction,
+    SessionTracePhase, ShellRunResult, ToolInvocationPresentation, ToolInvocationResult,
+    ToolInvocationStreamEvent, ToolOutputStream as SessionToolOutputStream, TraceBlobRef,
+    TraceRedaction,
 };
 use bcode_skill::{SkillRegistry, SkillRegistryOptions, SkillSourceRoot};
 use bcode_skill_models::{
     SkillActivationMode, SkillContextResponse, SkillId, SkillList, SkillSource, SkillSourceKind,
 };
 use bcode_tool::{
-    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID,
-    ToolDefinition as ServiceToolDefinition,
+    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, ShellRunResult as ServiceShellRunResult,
+    TOOL_SERVICE_INTERFACE_ID, ToolDefinition as ServiceToolDefinition,
     ToolInvocationPresentation as ServiceToolInvocationPresentation, ToolInvocationRequest,
-    ToolInvocationResponse, ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent,
-    ToolList, ToolOutputStream, ToolResultContent,
+    ToolInvocationResponse, ToolInvocationResult as ServiceToolInvocationResult,
+    ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent, ToolList, ToolOutputStream,
+    ToolResultContent,
 };
 use runtime_work::{CancellationHandle, RuntimeWorkManager, RuntimeWorkSpec};
 use serde::{Deserialize, Serialize};
@@ -5603,6 +5605,7 @@ fn session_event_compaction_line(
             result,
             is_error,
             output,
+            ..
         } => Some(format!(
             "#{} tool result {tool_call_id} (error={is_error}):\n{}",
             event.sequence,
@@ -7865,6 +7868,7 @@ async fn invoke_model_native_web_search_tool(
         content: Vec::new(),
         full_output: None,
         presentation: None,
+        result: None,
     })
 }
 
@@ -7898,6 +7902,7 @@ async fn execute_model_tool(
             true,
             Vec::new(),
             None,
+            None,
         )
         .await;
         return;
@@ -7911,6 +7916,7 @@ async fn execute_model_tool(
             content: Vec::new(),
             full_output: None,
             presentation: None,
+            result: None,
         });
     let presentation = result
         .presentation
@@ -7961,6 +7967,7 @@ async fn execute_model_tool(
         result.is_error,
         result.content,
         output_blob,
+        result.result.map(service_tool_result_to_session),
     )
     .await;
 }
@@ -7982,6 +7989,7 @@ async fn invoke_model_tool(
             content: Vec::new(),
             full_output: None,
             presentation: None,
+            result: None,
         });
     }
     if call.name == "web.search"
@@ -8043,6 +8051,7 @@ async fn invoke_model_tool(
                 content: Vec::new(),
                 full_output: None,
                 presentation: None,
+                result: None,
             });
         }
         AgentDecision::Ask => {
@@ -8053,6 +8062,7 @@ async fn invoke_model_tool(
                     content: Vec::new(),
                     full_output: None,
                     presentation: None,
+                    result: None,
                 });
             }
         }
@@ -8120,6 +8130,7 @@ async fn invoke_model_tool(
                     content: Vec::new(),
                     full_output: None,
                     presentation: None,
+            result: None,
                 });
             }
             event = invocation.next_event() => {
@@ -8687,6 +8698,7 @@ fn session_events_to_sanitized_model_messages(
                 result,
                 is_error,
                 output,
+                ..
             } => {
                 if pending_tool_call_ids
                     .iter()
@@ -9071,6 +9083,70 @@ fn service_tool_presentation_to_session(
     }
 }
 
+fn service_tool_result_to_session(result: ServiceToolInvocationResult) -> ToolInvocationResult {
+    match result {
+        ServiceToolInvocationResult::Text { text } => ToolInvocationResult::Text { text },
+        ServiceToolInvocationResult::Json { value } => ToolInvocationResult::Json { value },
+        ServiceToolInvocationResult::ShellRun { result } => ToolInvocationResult::ShellRun {
+            result: service_shell_result_to_session(result),
+        },
+        ServiceToolInvocationResult::FileChange { result } => ToolInvocationResult::FileChange {
+            result: bcode_session_models::FileChangeResult {
+                tool_name: result.tool_name,
+                summary: result.summary,
+                path: result.path,
+            },
+        },
+    }
+}
+
+fn service_shell_result_to_session(result: ServiceShellRunResult) -> ShellRunResult {
+    match result {
+        ServiceShellRunResult::Terminal {
+            exit_code,
+            timed_out,
+            cancelled,
+            output_tail,
+            output_truncated,
+            output_bytes,
+            retained_output_bytes,
+            columns,
+            rows,
+        } => ShellRunResult::Terminal {
+            exit_code,
+            timed_out,
+            cancelled,
+            output_tail,
+            output_truncated,
+            output_bytes,
+            retained_output_bytes,
+            columns: columns.max(1),
+            rows: rows.max(1),
+        },
+        ServiceShellRunResult::Captured {
+            exit_code,
+            timed_out,
+            cancelled,
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+            stdout_bytes,
+            stderr_bytes,
+        } => ShellRunResult::Captured {
+            exit_code,
+            timed_out,
+            cancelled,
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+            stdout_bytes,
+            stderr_bytes,
+        },
+    }
+}
+
 async fn append_tool_finished_event(
     state: &ServerState,
     session_id: SessionId,
@@ -9079,6 +9155,7 @@ async fn append_tool_finished_event(
     is_error: bool,
     content: Vec<ToolResultContent>,
     output: Option<TraceBlobRef>,
+    semantic_result: Option<ToolInvocationResult>,
 ) {
     if let Err(error) = append_tool_finished_event_inner(
         state,
@@ -9088,6 +9165,7 @@ async fn append_tool_finished_event(
         is_error,
         content,
         output,
+        semantic_result,
     )
     .await
     {
@@ -9103,6 +9181,7 @@ async fn append_tool_finished_event_inner(
     is_error: bool,
     content: Vec<ToolResultContent>,
     output: Option<TraceBlobRef>,
+    semantic_result: Option<ToolInvocationResult>,
 ) -> Result<bcode_session_models::SessionEvent, bcode_session::SessionError> {
     let runtime_work_id = RuntimeWorkId::new(format!("tool_{tool_call_id}"));
     let runtime_status = runtime_work_status_from_tool_result(&result, is_error);
@@ -9119,6 +9198,7 @@ async fn append_tool_finished_event_inner(
             format!("{result}{content_note}"),
             is_error,
             output,
+            semantic_result,
         )
         .await?;
     publish_session_event(state, &event).await;
@@ -10472,6 +10552,7 @@ mod tests {
                     result: "ok".to_string(),
                     is_error: false,
                     output: None,
+                    semantic_result: None,
                 },
             ),
         ];
@@ -10499,6 +10580,7 @@ mod tests {
                 result: "orphaned output".to_string(),
                 is_error: false,
                 output: None,
+                semantic_result: None,
             },
         )];
 
@@ -10567,6 +10649,7 @@ mod tests {
                     result: format!("{}middle{}", "x".repeat(2_000), "y".repeat(2_000)),
                     is_error: false,
                     output: None,
+                    semantic_result: None,
                 },
             )],
             1_000,
@@ -11311,6 +11394,7 @@ mod tests {
                     result: output,
                     is_error: false,
                     output: None,
+                    semantic_result: None,
                 },
             },
         ];

@@ -529,6 +529,98 @@ pub struct ProjectionWindow {
     pub scanned_events: usize,
 }
 
+/// Typed semantic data returned by a tool invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolInvocationResult {
+    /// Plain textual result.
+    Text { text: String },
+    /// Structured JSON result encoded as a JSON string for codec stability.
+    Json { value: String },
+    /// Shell command execution result.
+    ShellRun { result: ShellRunResult },
+    /// Filesystem write/edit result.
+    FileChange { result: FileChangeResult },
+}
+
+/// Semantic shell command execution result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ShellRunResult {
+    /// Pseudo-terminal execution with ANSI-capable output.
+    Terminal {
+        /// Process exit code, or `None` when unavailable.
+        #[serde(default)]
+        exit_code: Option<i32>,
+        /// Whether execution timed out.
+        #[serde(default)]
+        timed_out: bool,
+        /// Whether execution was cancelled.
+        #[serde(default)]
+        cancelled: bool,
+        /// Bounded tail of the PTY output stream.
+        #[serde(default)]
+        output_tail: String,
+        /// Whether the output was truncated.
+        #[serde(default)]
+        output_truncated: bool,
+        /// Original output byte count.
+        #[serde(default)]
+        output_bytes: Option<u64>,
+        /// Retained output byte count.
+        #[serde(default)]
+        retained_output_bytes: Option<u64>,
+        /// Terminal columns used for execution.
+        #[serde(default = "default_terminal_columns")]
+        columns: u16,
+        /// Terminal rows used for execution.
+        #[serde(default = "default_terminal_rows")]
+        rows: u16,
+    },
+    /// Non-terminal execution with separately captured streams.
+    Captured {
+        /// Process exit code, or `None` when unavailable.
+        #[serde(default)]
+        exit_code: Option<i32>,
+        /// Whether execution timed out.
+        #[serde(default)]
+        timed_out: bool,
+        /// Whether execution was cancelled.
+        #[serde(default)]
+        cancelled: bool,
+        /// Bounded stdout text.
+        #[serde(default)]
+        stdout: String,
+        /// Bounded stderr text.
+        #[serde(default)]
+        stderr: String,
+        /// Whether stdout was truncated.
+        #[serde(default)]
+        stdout_truncated: bool,
+        /// Whether stderr was truncated.
+        #[serde(default)]
+        stderr_truncated: bool,
+        /// Original stdout byte count.
+        #[serde(default)]
+        stdout_bytes: Option<u64>,
+        /// Original stderr byte count.
+        #[serde(default)]
+        stderr_bytes: Option<u64>,
+    },
+}
+
+/// Semantic filesystem change result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChangeResult {
+    /// Tool name that produced the change.
+    pub tool_name: String,
+    /// Human-readable summary of the change.
+    pub summary: String,
+    /// Best-effort target path.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
 /// Bounded durable presentation state for a completed tool invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -941,6 +1033,8 @@ pub enum SessionEventKind {
         is_error: bool,
         #[serde(default)]
         output: Option<TraceBlobRef>,
+        #[serde(default)]
+        semantic_result: Option<ToolInvocationResult>,
     },
     PermissionRequested {
         permission_id: String,

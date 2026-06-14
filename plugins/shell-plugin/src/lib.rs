@@ -10,9 +10,9 @@ use bcode_config::{
 };
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
-    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
-    ToolInvocationPresentation, ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationStreamEvent, ToolList, ToolOutputStream, ToolSideEffect,
+    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, ShellRunResult, TOOL_SERVICE_INTERFACE_ID,
+    ToolDefinition, ToolInvocationPresentation, ToolInvocationRequest, ToolInvocationResponse,
+    ToolInvocationResult, ToolInvocationStreamEvent, ToolList, ToolOutputStream, ToolSideEffect,
 };
 use bcode_tool_runtime::{ProcessExecutionRequest, ToolExecutionRuntime};
 use serde::{Deserialize, Serialize};
@@ -144,6 +144,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             content: Vec::new(),
             full_output: None,
             presentation: None,
+            result: None,
         },
     };
     json_response(&response)
@@ -167,6 +168,7 @@ fn run_shell_tool(
                 content: Vec::new(),
                 full_output: None,
                 presentation: None,
+                result: None,
             };
         }
     };
@@ -177,6 +179,7 @@ fn run_shell_tool(
             content: Vec::new(),
             full_output: None,
             presentation: None,
+            result: None,
         };
     }
     let now_ms = current_unix_millis();
@@ -223,6 +226,7 @@ fn run_shell_tool(
                 content: Vec::new(),
                 full_output: None,
                 presentation: None,
+                result: None,
             },
         }
     };
@@ -392,6 +396,7 @@ fn run_terminal_shell_command(
             content: Vec::new(),
             full_output: None,
             presentation: None,
+            result: None,
         },
     }
 }
@@ -456,14 +461,14 @@ fn encode_terminal_output(
     output: &LimitedOutput,
     columns: u16,
     rows: u16,
-) -> Result<(String, String), String> {
+) -> Result<(String, String, LimitedOutput), String> {
     let inline_output = limit_terminal_inline_output(output);
     let terminal_output = TerminalCommandOutput {
         mode: "terminal",
         exit_code: Some(status.exit_code),
         timed_out: status.timed_out,
         cancelled: status.cancelled,
-        output: inline_output.text,
+        output: inline_output.text.clone(),
         output_truncated: inline_output.truncated,
         output_bytes: u64::try_from(inline_output.original_bytes).unwrap_or(u64::MAX),
         retained_output_bytes: u64::try_from(inline_output.retained_bytes).unwrap_or(u64::MAX),
@@ -485,7 +490,7 @@ fn encode_terminal_output(
     let encoded = serde_json::to_string(&terminal_output).map_err(|error| error.to_string())?;
     let full_encoded =
         serde_json::to_string(&full_terminal_output).map_err(|error| error.to_string())?;
-    Ok((encoded, full_encoded))
+    Ok((encoded, full_encoded, inline_output))
 }
 
 fn run_terminal_shell_command_inner(
@@ -546,8 +551,8 @@ fn run_terminal_shell_command_inner(
     )?;
     drop(pair.master);
     let output = join_reader(reader_thread)?;
-    let (encoded, full_encoded) = encode_terminal_output(status, &output, columns, rows)?;
-    let inline_output = limit_terminal_inline_output(&output);
+    let (encoded, full_encoded, inline_output) =
+        encode_terminal_output(status, &output, columns, rows)?;
     Ok(ToolInvocationResponse {
         output: encoded,
         is_error: status.timed_out || status.cancelled || !status.success,
@@ -557,7 +562,7 @@ fn run_terminal_shell_command_inner(
             exit_code: Some(status.exit_code),
             timed_out: status.timed_out,
             cancelled: status.cancelled,
-            output: inline_output.text,
+            output: inline_output.text.clone(),
             output_truncated: inline_output.truncated,
             output_bytes: Some(u64::try_from(inline_output.original_bytes).unwrap_or(u64::MAX)),
             retained_output_bytes: Some(
@@ -565,6 +570,21 @@ fn run_terminal_shell_command_inner(
             ),
             columns,
             rows,
+        }),
+        result: Some(ToolInvocationResult::ShellRun {
+            result: ShellRunResult::Terminal {
+                exit_code: Some(status.exit_code),
+                timed_out: status.timed_out,
+                cancelled: status.cancelled,
+                output_tail: inline_output.text,
+                output_truncated: inline_output.truncated,
+                output_bytes: Some(u64::try_from(inline_output.original_bytes).unwrap_or(u64::MAX)),
+                retained_output_bytes: Some(
+                    u64::try_from(inline_output.retained_bytes).unwrap_or(u64::MAX),
+                ),
+                columns,
+                rows,
+            },
         }),
     })
 }
@@ -632,6 +652,19 @@ fn build_process_tool_response(
         content: Vec::new(),
         full_output: Some(full_output),
         presentation: None,
+        result: Some(ToolInvocationResult::ShellRun {
+            result: ShellRunResult::Captured {
+                exit_code: result.exit_code,
+                timed_out: result.timed_out,
+                cancelled: result.cancelled,
+                stdout: inline_stdout.text,
+                stderr: inline_stderr.text,
+                stdout_truncated: inline_stdout.truncated,
+                stderr_truncated: inline_stderr.truncated,
+                stdout_bytes: Some(stdout.original_bytes as u64),
+                stderr_bytes: Some(stderr.original_bytes as u64),
+            },
+        }),
     }
 }
 
@@ -1106,7 +1139,7 @@ mod tests {
             retained_bytes: 5,
             truncated: false,
         };
-        let (encoded, full_encoded) = encode_terminal_output(
+        let (encoded, full_encoded, inline_output) = encode_terminal_output(
             TerminalShellStatus {
                 exit_code: 0,
                 success: true,
@@ -1118,7 +1151,6 @@ mod tests {
             24,
         )
         .expect("terminal output encodes");
-        let inline_output = limit_terminal_inline_output(&output);
         let response = ToolInvocationResponse {
             output: encoded,
             is_error: false,
@@ -1137,6 +1169,7 @@ mod tests {
                 columns: 80,
                 rows: 24,
             }),
+            result: None,
         };
 
         assert!(matches!(

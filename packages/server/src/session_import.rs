@@ -153,6 +153,7 @@ pub async fn import_external_session(
                         result,
                         is_error,
                         output: None,
+                        semantic_result: None,
                     },
                     ImportableSessionEventKind::ModelUsage {
                         input_tokens,

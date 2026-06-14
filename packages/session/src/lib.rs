@@ -1864,6 +1864,7 @@ impl SessionManager {
         result: String,
         is_error: bool,
         output: Option<TraceBlobRef>,
+        semantic_result: Option<bcode_session_models::ToolInvocationResult>,
     ) -> Result<SessionEvent, SessionError> {
         self.append_event(
             session_id,
@@ -1872,6 +1873,7 @@ impl SessionManager {
                 result,
                 is_error,
                 output,
+                semantic_result,
             },
         )
         .await

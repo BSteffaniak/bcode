@@ -545,6 +545,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             content: Vec::new(),
             full_output: None,
             presentation: None,
+            result: None,
         });
     }
     let cwd = request.cwd.clone();
@@ -584,6 +585,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             content: Vec::new(),
             full_output: None,
             presentation: None,
+            result: None,
         },
     };
     json_response(&response)
@@ -619,6 +621,7 @@ fn text_tool_response(path: &Path, request: &ReadRequest, bytes: &[u8]) -> ToolI
             content: Vec::new(),
             full_output: None,
             presentation: None,
+            result: None,
         };
     };
     let lines = contents.lines().collect::<Vec<_>>();
@@ -657,6 +660,7 @@ fn text_tool_response(path: &Path, request: &ReadRequest, bytes: &[u8]) -> ToolI
         content: Vec::new(),
         full_output: None,
         presentation: None,
+        result: None,
     }
 }
 
@@ -718,6 +722,7 @@ fn tool_artifact_read(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolI
                 content: Vec::new(),
                 full_output: None,
                 presentation: None,
+                result: None,
             },
         },
         Err(error) => tool_json_error(&error),
@@ -764,6 +769,7 @@ fn tool_artifact_grep(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolI
                 content: Vec::new(),
                 full_output: None,
                 presentation: None,
+                result: None,
             },
         },
         Err(error) => tool_json_error(&error),
@@ -861,6 +867,7 @@ fn image_tool_response(path: &Path, image: ImageFileMetadata) -> ToolInvocationR
         }],
         full_output: None,
         presentation: None,
+        result: None,
     }
 }
 
@@ -920,6 +927,7 @@ fn tool_write(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocatio
                             summary,
                             path: Some(request.path.display().to_string()),
                         }),
+                        result: None,
                     }
                 },
             )
@@ -939,6 +947,7 @@ fn tool_edit(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocation
                     content: Vec::new(),
                     full_output: None,
                     presentation: None,
+                    result: None,
                 },
                 |replacements| {
                     let summary = format!("applied {replacements} replacement");
@@ -952,6 +961,7 @@ fn tool_edit(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocation
                             summary,
                             path: Some(request.path.display().to_string()),
                         }),
+                        result: None,
                     }
                 },
             )
@@ -970,6 +980,7 @@ fn tool_exists(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocati
             content: Vec::new(),
             full_output: None,
             presentation: None,
+            result: None,
         },
         Err(error) => tool_json_error(&error),
     }
@@ -1938,6 +1949,7 @@ fn tool_io_error(error: &std::io::Error) -> ToolInvocationResponse {
         content: Vec::new(),
         full_output: None,
         presentation: None,
+        result: None,
     }
 }
 
@@ -1948,6 +1960,7 @@ fn tool_json_error(error: &serde_json::Error) -> ToolInvocationResponse {
         content: Vec::new(),
         full_output: None,
         presentation: None,
+        result: None,
     }
 }
 
@@ -1962,6 +1975,7 @@ where
             content: Vec::new(),
             full_output: None,
             presentation: None,
+            result: None,
         },
         Err(error) => ToolInvocationResponse {
             output: error.to_string(),
@@ -1969,6 +1983,7 @@ where
             content: Vec::new(),
             full_output: None,
             presentation: None,
+            result: None,
         },
     }
 }
