@@ -30,7 +30,7 @@ use bcode_model::{
     OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse, ProviderTurnEvent,
     ReasoningEffort, StartTurnResponse, TokenUsage,
 };
-use bcode_plugin::PluginInvocationScope;
+use bcode_plugin::{PluginInvocationScope, StreamingServiceInvocationEvent};
 use bcode_session::{CatalogLoadStatus, SessionManager, lease::SessionLeaseOwnerContext};
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, LiveFileEditPreview, LiveQueryPreview,
@@ -8027,28 +8027,30 @@ async fn invoke_model_tool(
                     is_error: true,
                     content: Vec::new(),
                     full_output: None,
-            presentation: None,
+                    presentation: None,
                 });
             }
-            Some(payload) = invocation.events.recv() => {
-                if let Ok(event) = serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload) {
-                    push_tool_output_stream(
-                        state,
-                        session_id,
-                        &mut pending_tool_output,
-                        normalize_tool_stream_event_sequence(event, &mut stream_sequences),
-                    )
-                    .await;
+            event = invocation.next_event() => {
+                match event.map_err(|error| error.to_string())? {
+                    StreamingServiceInvocationEvent::Event(payload) => {
+                        if let Ok(event) = serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload) {
+                            push_tool_output_stream(
+                                state,
+                                session_id,
+                                &mut pending_tool_output,
+                                normalize_tool_stream_event_sequence(event, &mut stream_sequences),
+                            )
+                            .await;
+                        }
+                    }
+                    StreamingServiceInvocationEvent::Response(response) => {
+                        break response.map_err(|error| error.to_string())?;
+                    }
                 }
-            }
-            response = &mut invocation.response => {
-                break response
-                    .map_err(|error| error.to_string())?
-                    .map_err(|error| error.to_string())?;
             }
         }
     };
-    while let Ok(payload) = invocation.events.try_recv() {
+    while let Some(payload) = invocation.try_recv_event() {
         if let Ok(event) = serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload) {
             push_tool_output_stream(
                 state,

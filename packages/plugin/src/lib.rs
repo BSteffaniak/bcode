@@ -1143,6 +1143,15 @@ enum PluginExecutorMessage {
     Deactivate(oneshot::Sender<Result<(), PluginLoadError>>),
 }
 
+/// Event yielded by a running streaming service invocation.
+#[derive(Debug)]
+pub enum StreamingServiceInvocationEvent {
+    /// Plugin emitted an invocation event payload.
+    Event(Vec<u8>),
+    /// Plugin produced its final service response.
+    Response(Result<ServiceResponse, PluginLoadError>),
+}
+
 /// Running streaming plugin service invocation.
 #[derive(Debug)]
 pub struct StreamingServiceInvocation {
@@ -1150,6 +1159,47 @@ pub struct StreamingServiceInvocation {
     pub events: mpsc::UnboundedReceiver<Vec<u8>>,
     pub cancel: PluginInvocationCancelHandle,
     resource_permit: Option<Arc<PluginResourcePermit>>,
+}
+
+impl StreamingServiceInvocation {
+    /// Wait for the next invocation event or final response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response channel closes before a plugin response is produced.
+    pub async fn next_event(&mut self) -> Result<StreamingServiceInvocationEvent, PluginLoadError> {
+        tokio::select! {
+            event = self.events.recv() => {
+                match event {
+                    Some(payload) => Ok(StreamingServiceInvocationEvent::Event(payload)),
+                    None => (&mut self.response).await.map_or_else(
+                        |_| {
+                            Err(PluginLoadError::ServiceInvokeFailed {
+                                plugin_id: "streaming-service".to_owned(),
+                                code: -1,
+                            })
+                        },
+                        |response| Ok(StreamingServiceInvocationEvent::Response(response)),
+                    ),
+                }
+            }
+            response = &mut self.response => {
+                match response {
+                    Ok(response) => Ok(StreamingServiceInvocationEvent::Response(response)),
+                    Err(_error) => Err(PluginLoadError::ServiceInvokeFailed {
+                        plugin_id: "streaming-service".to_owned(),
+                        code: -1,
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Try to receive a queued invocation event without blocking.
+    #[must_use]
+    pub fn try_recv_event(&mut self) -> Option<Vec<u8>> {
+        self.events.try_recv().ok()
+    }
 }
 
 /// Handle to a plugin-local executor.
