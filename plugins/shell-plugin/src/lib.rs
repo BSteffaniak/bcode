@@ -185,6 +185,7 @@ fn run_shell_tool(
         &ToolInvocationStreamEvent::Started {
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.to_owned(),
+            sequence: 0,
             terminal: arguments.terminal,
             columns: arguments.terminal.then_some(arguments.terminal_columns()),
             rows: arguments.terminal.then_some(arguments.terminal_rows()),

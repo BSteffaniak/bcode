@@ -8009,6 +8009,7 @@ async fn invoke_model_tool(
         )
         .await;
     let mut pending_tool_output: Option<ToolOutputStreamAccumulator> = None;
+    let mut stream_sequences: BTreeMap<String, u64> = BTreeMap::new();
     let response = loop {
         tokio::select! {
             () = cancel_state.cancelled() => {
@@ -8035,7 +8036,7 @@ async fn invoke_model_tool(
                         state,
                         session_id,
                         &mut pending_tool_output,
-                        convert_tool_stream_event(event),
+                        normalize_tool_stream_event_sequence(event, &mut stream_sequences),
                     )
                     .await;
                 }
@@ -8053,7 +8054,7 @@ async fn invoke_model_tool(
                 state,
                 session_id,
                 &mut pending_tool_output,
-                convert_tool_stream_event(event),
+                normalize_tool_stream_event_sequence(event, &mut stream_sequences),
             )
             .await;
         }
@@ -8133,11 +8134,89 @@ fn runtime_work_progress_from_tool_stream_event(
     }
 }
 
+fn normalize_tool_stream_event_sequence(
+    event: ServiceToolInvocationStreamEvent,
+    stream_sequences: &mut BTreeMap<String, u64>,
+) -> ToolInvocationStreamEvent {
+    let event = convert_tool_stream_event(event);
+    let tool_call_id = match &event {
+        ToolInvocationStreamEvent::Started { tool_call_id, .. }
+        | ToolInvocationStreamEvent::OutputDelta { tool_call_id, .. }
+        | ToolInvocationStreamEvent::Status { tool_call_id, .. }
+        | ToolInvocationStreamEvent::Finished { tool_call_id, .. } => tool_call_id.clone(),
+    };
+    let next = stream_sequences
+        .entry(tool_call_id)
+        .and_modify(|sequence| *sequence = sequence.saturating_add(1))
+        .or_insert(1);
+    let sequence = *next;
+    set_tool_stream_event_sequence(event, sequence)
+}
+
+fn set_tool_stream_event_sequence(
+    event: ToolInvocationStreamEvent,
+    sequence: u64,
+) -> ToolInvocationStreamEvent {
+    match event {
+        ToolInvocationStreamEvent::Started {
+            tool_call_id,
+            tool_name,
+            terminal,
+            columns,
+            rows,
+            started_at_ms,
+            ..
+        } => ToolInvocationStreamEvent::Started {
+            tool_call_id,
+            tool_name,
+            sequence,
+            terminal,
+            columns,
+            rows,
+            started_at_ms,
+        },
+        ToolInvocationStreamEvent::OutputDelta {
+            tool_call_id,
+            stream,
+            text,
+            byte_len,
+            ..
+        } => ToolInvocationStreamEvent::OutputDelta {
+            tool_call_id,
+            stream,
+            sequence,
+            text,
+            byte_len,
+        },
+        ToolInvocationStreamEvent::Status {
+            tool_call_id,
+            message,
+            ..
+        } => ToolInvocationStreamEvent::Status {
+            tool_call_id,
+            sequence,
+            message,
+        },
+        ToolInvocationStreamEvent::Finished {
+            tool_call_id,
+            is_error,
+            finished_at_ms,
+            ..
+        } => ToolInvocationStreamEvent::Finished {
+            tool_call_id,
+            sequence,
+            is_error,
+            finished_at_ms,
+        },
+    }
+}
+
 fn convert_tool_stream_event(event: ServiceToolInvocationStreamEvent) -> ToolInvocationStreamEvent {
     match event {
         ServiceToolInvocationStreamEvent::Started {
             tool_call_id,
             tool_name,
+            sequence,
             terminal,
             columns,
             rows,
@@ -8145,6 +8224,7 @@ fn convert_tool_stream_event(event: ServiceToolInvocationStreamEvent) -> ToolInv
         } => ToolInvocationStreamEvent::Started {
             tool_call_id,
             tool_name,
+            sequence,
             terminal,
             columns,
             rows,

@@ -1310,6 +1310,7 @@ fn live_file_edit_card_shows_permission_and_applied_phases() {
             event: ToolInvocationStreamEvent::Started {
                 tool_call_id: "call_edit".to_owned(),
                 tool_name: "filesystem_edit".to_owned(),
+                sequence: 0,
                 terminal: false,
                 columns: None,
                 rows: None,
@@ -1676,6 +1677,7 @@ fn streamed_terminal_output_renders_running_until_final_result() {
             event: ToolInvocationStreamEvent::Started {
                 tool_call_id: "call-running".to_owned(),
                 tool_name: "shell.run".to_owned(),
+                sequence: 0,
                 terminal: true,
                 columns: Some(80),
                 rows: Some(24),
@@ -1729,6 +1731,7 @@ fn streamed_terminal_output_preserves_ansi_color() {
             event: ToolInvocationStreamEvent::Started {
                 tool_call_id: "call-color".to_owned(),
                 tool_name: "shell.run".to_owned(),
+                sequence: 0,
                 terminal: true,
                 columns: Some(80),
                 rows: Some(24),
@@ -1783,6 +1786,7 @@ fn streamed_terminal_output_updates_header_after_final_result() {
             event: ToolInvocationStreamEvent::Started {
                 tool_call_id: "call-final".to_owned(),
                 tool_name: "shell.run".to_owned(),
+                sequence: 0,
                 terminal: true,
                 columns: Some(80),
                 rows: Some(24),
@@ -2676,6 +2680,7 @@ fn streamed_tool_output_is_not_duplicated_by_final_result() {
             event: ToolInvocationStreamEvent::Started {
                 tool_call_id: "call-1".to_owned(),
                 tool_name: "filesystem.shell.run".to_owned(),
+                sequence: 0,
                 terminal: true,
                 columns: Some(80),
                 rows: Some(24),
@@ -2800,6 +2805,7 @@ fn streamed_tool_without_output_renders_final_result() {
                 event: ToolInvocationStreamEvent::Started {
                     tool_call_id: "call-empty".to_owned(),
                     tool_name: "shell.run".to_owned(),
+                    sequence: 0,
                     terminal: true,
                     columns: Some(120),
                     rows: Some(40),
@@ -2863,6 +2869,7 @@ fn streamed_terminal_tool_events(session_id: SessionId) -> Vec<SessionEvent> {
                 event: ToolInvocationStreamEvent::Started {
                     tool_call_id: "call-stream".to_owned(),
                     tool_name: "shell.run".to_owned(),
+                    sequence: 0,
                     terminal: true,
                     columns: Some(120),
                     rows: Some(40),
@@ -2958,6 +2965,7 @@ fn terminal_presentation_without_live_delta_renders_terminal_history() {
                 event: ToolInvocationStreamEvent::Started {
                     tool_call_id: "call-no-live".to_owned(),
                     tool_name: "shell.run".to_owned(),
+                    sequence: 0,
                     terminal: true,
                     columns: Some(80),
                     rows: Some(24),

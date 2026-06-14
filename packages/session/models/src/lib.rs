@@ -560,6 +560,8 @@ pub enum ToolInvocationStreamEvent {
         tool_call_id: String,
         tool_name: String,
         #[serde(default)]
+        sequence: u64,
+        #[serde(default)]
         terminal: bool,
         #[serde(default)]
         columns: Option<u16>,

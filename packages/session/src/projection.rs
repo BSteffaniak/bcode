@@ -811,6 +811,7 @@ mod tests {
                     event: ToolInvocationStreamEvent::Started {
                         tool_call_id: "tool".to_owned(),
                         tool_name: "shell".to_owned(),
+                        sequence: 0,
                         terminal: false,
                         columns: None,
                         rows: None,
