@@ -39,6 +39,10 @@ pub enum PaletteCommand {
     RenameSession,
     /// Open the session picker in delete mode.
     DeleteSession,
+    /// Fork the current session from a selected prompt.
+    ForkSession,
+    /// Clone the current session.
+    CloneSession,
     /// Request active turn cancellation.
     CancelTurn,
     /// Request context compaction.
@@ -64,6 +68,8 @@ impl PaletteCommand {
             Self::Help => "help",
             Self::RenameSession => "session.rename",
             Self::DeleteSession => "session.delete",
+            Self::ForkSession => "session.fork",
+            Self::CloneSession => "session.clone",
             Self::CancelTurn => "turn.cancel",
             Self::CompactContext => "context.compact",
         }
@@ -87,6 +93,8 @@ impl PaletteCommand {
             "help" => Some(Self::Help),
             "session.rename" => Some(Self::RenameSession),
             "session.delete" => Some(Self::DeleteSession),
+            "session.fork" => Some(Self::ForkSession),
+            "session.clone" => Some(Self::CloneSession),
             "turn.cancel" => Some(Self::CancelTurn),
             "context.compact" => Some(Self::CompactContext),
             _ => None,
@@ -145,6 +153,18 @@ fn palette_items() -> Vec<PaletteItem> {
             "Switch Session",
             "Open the session picker",
             "switch session picker open",
+        ),
+        item(
+            PaletteCommand::ForkSession,
+            "Fork Session",
+            "Create a new session from an earlier prompt",
+            "fork session conversation branch prompt",
+        ),
+        item(
+            PaletteCommand::CloneSession,
+            "Clone Session",
+            "Copy the full current conversation into a new session",
+            "clone session conversation copy duplicate",
         ),
         item(
             PaletteCommand::ListWorktrees,

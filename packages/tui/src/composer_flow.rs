@@ -31,6 +31,8 @@ fn is_slash_command_name(command: &str) -> bool {
             | "cwd"
             | "worktree"
             | "worktrees"
+            | "fork"
+            | "clone"
             | "skills"
             | "skill"
             | "thinking"
@@ -51,6 +53,8 @@ fn is_draft_safe_slash_command(command: &str) -> bool {
             | "diff"
             | "worktree"
             | "worktrees"
+            | "fork"
+            | "clone"
             | "skills"
             | "skill"
             | "thinking"
@@ -188,6 +192,17 @@ async fn handle_slash_command<W: Write>(
         slash_commands::SlashCommandOutcome::OpenWorktreeCreateDialog => {
             chat.app.clear_pending_submission(message);
             worktree_flow::create_for_current_session(io, services, chat).await?;
+        }
+        slash_commands::SlashCommandOutcome::OpenForkSessionWizard => {
+            chat.app.clear_pending_submission(message);
+            chat.app
+                .set_status("session fork wizard is not implemented yet".to_owned());
+        }
+        slash_commands::SlashCommandOutcome::SessionCloned { session_id } => {
+            chat.app.clear_pending_submission(message);
+            session_flow::switch_session(io.terminal, services.client, chat, session_id)?;
+            chat.app
+                .set_status("cloned session and switched".to_owned());
         }
         slash_commands::SlashCommandOutcome::ToggleDiff => {
             chat.app.clear_pending_submission(message);

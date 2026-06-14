@@ -88,7 +88,9 @@ async fn execute_palette_command<W: Write>(
         PaletteCommand::NewSession
         | PaletteCommand::SwitchSession
         | PaletteCommand::RenameSession
-        | PaletteCommand::DeleteSession => {
+        | PaletteCommand::DeleteSession
+        | PaletteCommand::ForkSession
+        | PaletteCommand::CloneSession => {
             execute_session_command(io, services, chat, command).await
         }
         PaletteCommand::ListWorktrees
@@ -149,6 +151,21 @@ async fn execute_session_command<W: Write>(
                 session_flow::SessionPickerStartMode::Delete,
             )
             .await?;
+        }
+        PaletteCommand::ForkSession => {
+            chat.app
+                .set_status("session fork wizard is not implemented yet".to_owned());
+        }
+        PaletteCommand::CloneSession => {
+            let Some(session_id) = chat.app.session_id() else {
+                chat.app.set_status("No active session".to_owned());
+                return Ok(());
+            };
+            let result = services.client.clone_session(session_id, None).await?;
+            let new_session_id = result.session.id;
+            session_flow::switch_session(io.terminal, services.client, chat, new_session_id)?;
+            chat.app
+                .set_status("cloned session and switched".to_owned());
         }
         _ => {}
     }

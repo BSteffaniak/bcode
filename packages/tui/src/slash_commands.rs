@@ -21,6 +21,10 @@ pub enum SlashCommandOutcome {
     PickModel,
     /// Open worktree create dialog.
     OpenWorktreeCreateDialog,
+    /// Open fork session wizard.
+    OpenForkSessionWizard,
+    /// Switch to a newly cloned session.
+    SessionCloned { session_id: SessionId },
     /// Open skill picker.
     PickSkill,
     /// Invoke a skill after creating an active session if needed.
@@ -573,6 +577,26 @@ pub async fn execute(
             cwd_command(client, session_id, &parts).await
         }
         "worktree" | "worktrees" => worktree_command(client, session_id, &parts).await,
+        "fork" => {
+            if session_id.is_none() {
+                return Ok(SlashCommandOutcome::Handled(
+                    "fork requires an active session".to_owned(),
+                ));
+            }
+            Ok(SlashCommandOutcome::OpenForkSessionWizard)
+        }
+        "clone" => {
+            let Some(session_id) = session_id else {
+                return Ok(SlashCommandOutcome::Handled(
+                    "clone requires an active session".to_owned(),
+                ));
+            };
+            let name = parts.get(1).map(|value| (*value).to_owned());
+            let result = client.clone_session(session_id, name).await?;
+            Ok(SlashCommandOutcome::SessionCloned {
+                session_id: result.session.id,
+            })
+        }
         "skills" => Ok(SlashCommandOutcome::PickSkill),
         "skill" => {
             if parts.get(1) == Some(&"describe") {
