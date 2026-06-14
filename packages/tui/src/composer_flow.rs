@@ -7,7 +7,7 @@ use bcode_session_models::SessionId;
 use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::ActiveChat;
 use super::{
-    TuiError, model_flow, session_flow, session_fork_flow, skill_flow, slash_commands,
+    TuiError, model_flow, ralph_flow, session_flow, session_fork_flow, skill_flow, slash_commands,
     thinking_dialog, worktree_flow,
 };
 
@@ -212,6 +212,10 @@ async fn handle_slash_command<W: Write>(
             session_flow::switch_session(io.terminal, services.client, chat, session_id)?;
             chat.app
                 .set_status("cloned session and switched".to_owned());
+        }
+        slash_commands::SlashCommandOutcome::OpenRalphStartDialog => {
+            chat.app.clear_pending_submission(message);
+            ralph_flow::start_loop(io, services, chat).await?;
         }
         slash_commands::SlashCommandOutcome::ToggleDiff => {
             chat.app.clear_pending_submission(message);

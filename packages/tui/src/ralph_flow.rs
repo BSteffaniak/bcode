@@ -1,0 +1,92 @@
+//! Ralph loop TUI flow.
+
+use std::io::Write;
+
+use bmux_keyboard::{KeyCode, KeyStroke};
+use bmux_text_edit::SelectionMode;
+use bmux_tui::event::{Event, FocusEvent, MouseEvent};
+use bmux_tui::geometry::Rect;
+use bmux_tui_components::text_input::TextInputControl;
+
+use super::helpers;
+use super::keymap::BmuxKeyMap;
+use super::runtime_context::{TuiIo, TuiServices};
+use super::session_flow::ActiveChat;
+use super::{TuiError, ralph_start_dialog, ralph_start_dialog_render};
+
+/// Start the Ralph loop setup flow.
+pub async fn start_loop<W: Write>(
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
+) -> Result<(), TuiError> {
+    let default_name = chat
+        .app
+        .session_title()
+        .map_or_else(|| "new-ralph-loop".to_owned(), ToString::to_string);
+    let mut dialog = ralph_start_dialog::RalphStartDialog::new(&default_name);
+    loop {
+        io.terminal.resize(helpers::terminal_area()?);
+        io.terminal
+            .draw(|frame| ralph_start_dialog_render::render_dialog(&mut dialog, frame))?;
+        let Some(event) = io.input.recv().await? else {
+            continue;
+        };
+        match event {
+            Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
+            Event::Paste(text) => {
+                let _ = TextInputControl::new(&ralph_start_dialog::loop_name_input_policy())
+                    .handle_paste(dialog.loop_name_mut(), &text);
+            }
+            Event::Key(stroke) => match stroke.key {
+                KeyCode::Escape => return Err(TuiError::Canceled),
+                KeyCode::Enter => {
+                    let loop_name = dialog.loop_name_text();
+                    if loop_name.is_empty() {
+                        dialog.set_status("Ralph loop name is required");
+                        continue;
+                    }
+                    chat.app.push_system_note(format!(
+                        "Ralph loop setup captured\n* Loop: {loop_name}\n* Next: create Ralph-owned progress-doc/work-area architecture"
+                    ));
+                    chat.app.set_status("Ralph loop setup captured".to_owned());
+                    return Ok(());
+                }
+                _ => handle_loop_name_key(&mut dialog, services.keymap, stroke),
+            },
+            Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick | Event::User(_) => {}
+            Event::Mouse(mouse) => handle_loop_name_mouse(&mut dialog, mouse),
+        }
+    }
+}
+
+fn handle_loop_name_key(
+    dialog: &mut ralph_start_dialog::RalphStartDialog,
+    keymap: &BmuxKeyMap,
+    stroke: KeyStroke,
+) {
+    if let Some(motion) = keymap.editor_selection_motion_for_key(stroke) {
+        dialog
+            .loop_name_mut()
+            .buffer_mut()
+            .move_cursor_with_selection(motion, SelectionMode::Extend);
+        dialog
+            .loop_name_mut()
+            .sync_scroll_to_cursor(&ralph_start_dialog::loop_name_input_policy());
+        return;
+    }
+    if let Some(command) = keymap.editor_command_for_key(stroke) {
+        dialog.loop_name_mut().buffer_mut().apply_command(command);
+        dialog
+            .loop_name_mut()
+            .sync_scroll_to_cursor(&ralph_start_dialog::loop_name_input_policy());
+        return;
+    }
+    let _ = TextInputControl::new(&ralph_start_dialog::loop_name_input_policy())
+        .handle_key(dialog.loop_name_mut(), stroke);
+}
+
+fn handle_loop_name_mouse(dialog: &mut ralph_start_dialog::RalphStartDialog, mouse: MouseEvent) {
+    let _ = TextInputControl::new(&ralph_start_dialog::loop_name_input_policy())
+        .handle_mouse(dialog.loop_name_mut(), mouse);
+}

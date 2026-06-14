@@ -26,6 +26,8 @@ pub enum SlashCommandOutcome {
     OpenForkSessionWizard,
     /// Switch to a newly cloned session.
     SessionCloned { session_id: SessionId },
+    /// Open Ralph loop start dialog.
+    OpenRalphStartDialog,
     /// Open skill picker.
     PickSkill,
     /// Invoke a skill after creating an active session if needed.
@@ -311,9 +313,7 @@ async fn cwd_command(
 
 async fn ralph_command(parts: &[&str]) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
     match parts.get(1).copied() {
-        Some("start") | None => Ok(SlashCommandOutcome::Handled(
-            "Ralph loop start wizard is not implemented yet".to_owned(),
-        )),
+        Some("start") | None => Ok(SlashCommandOutcome::OpenRalphStartDialog),
         Some("run" | "stop" | "status" | "audit" | "replan" | "open") => {
             Ok(SlashCommandOutcome::Handled(
                 "Ralph loop orchestration is not implemented yet".to_owned(),
