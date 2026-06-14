@@ -142,6 +142,7 @@ pub struct BmuxApp {
     latest_history_sequence: Option<u64>,
     tool_call_contexts: BTreeMap<String, ToolCallContext>,
     streamed_tool_results: BTreeMap<String, StreamedToolResultContext>,
+    presented_tool_results: BTreeSet<String>,
     live_tool_previews: BTreeMap<String, LiveToolPreviewState>,
     live_preview_revision: u64,
     live_preview_frames_requested: u64,
@@ -268,6 +269,19 @@ impl SessionEventApplication {
     }
 }
 
+#[derive(Clone, Copy)]
+struct TerminalInvocationPresentation<'a> {
+    tool_call_id: &'a str,
+    started_at_ms: Option<u64>,
+    finished_at_ms: Option<u64>,
+    is_error: bool,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    output: &'a str,
+    columns: u16,
+    rows: u16,
+}
+
 impl BmuxApp {
     /// Create TUI state with replayed session data.
     #[must_use]
@@ -300,6 +314,7 @@ impl BmuxApp {
             latest_history_sequence: None,
             tool_call_contexts: BTreeMap::new(),
             streamed_tool_results: BTreeMap::new(),
+            presented_tool_results: BTreeSet::new(),
             live_tool_previews: BTreeMap::new(),
             live_preview_revision: 0,
             live_preview_frames_requested: 0,
@@ -1953,14 +1968,17 @@ impl BmuxApp {
             self.finish_tool_request_preview(tool_call_id);
             return;
         }
-        let context = self.tool_call_contexts.get(tool_call_id);
-        self.transcript.push(tool_result_item(
-            tool_call_id,
-            context.map(|context| context.tool_name.as_str()),
-            context.map(|context| context.arguments_json.as_str()),
-            result,
-            is_error,
-        ));
+        let tool_context = self.tool_call_contexts.get(tool_call_id);
+        let presentation_known = self.presentation_known_for_tool_call(tool_call_id);
+        if !presentation_known {
+            self.transcript.push(tool_result_item(
+                tool_call_id,
+                tool_context.map(|context| context.tool_name.as_str()),
+                tool_context.map(|context| context.arguments_json.as_str()),
+                result,
+                is_error,
+            ));
+        }
         if is_error {
             if application.live_activity() {
                 "failed".clone_into(&mut self.status);
@@ -1980,6 +1998,11 @@ impl BmuxApp {
         self.finish_tool_request_preview(tool_call_id);
     }
 
+    fn presentation_known_for_tool_call(&self, tool_call_id: &str) -> bool {
+        self.presented_tool_results.contains(tool_call_id)
+            || self.streamed_tool_results.contains_key(tool_call_id)
+    }
+
     fn apply_tool_invocation_presentation(
         &mut self,
         tool_call_id: &str,
@@ -1988,56 +2011,76 @@ impl BmuxApp {
         is_error: bool,
         presentation: &ToolInvocationPresentation,
     ) {
-        let ToolInvocationPresentation::Terminal {
-            exit_code,
-            timed_out,
-            output,
-            columns,
-            rows,
-            ..
-        } = presentation;
-        if let Some(context) = self.streamed_tool_results.get(tool_call_id)
+        self.presented_tool_results.insert(tool_call_id.to_owned());
+        match presentation {
+            ToolInvocationPresentation::Terminal {
+                exit_code,
+                timed_out,
+                output,
+                columns,
+                rows,
+                ..
+            } => self.apply_terminal_invocation_presentation(TerminalInvocationPresentation {
+                tool_call_id,
+                started_at_ms,
+                finished_at_ms,
+                is_error,
+                exit_code: *exit_code,
+                timed_out: *timed_out,
+                output,
+                columns: (*columns).max(1),
+                rows: (*rows).max(1),
+            }),
+            ToolInvocationPresentation::FileChange { .. } => {}
+        }
+    }
+
+    fn apply_terminal_invocation_presentation(
+        &mut self,
+        event: TerminalInvocationPresentation<'_>,
+    ) {
+        if let Some(context) = self.streamed_tool_results.get(event.tool_call_id)
             && let Some(index) = context.index
             && let Some(item) = self.transcript.get_mut(index)
         {
             item.apply_terminal_presentation(
-                output.clone(),
-                *exit_code,
-                *timed_out,
-                is_error,
-                finished_at_ms,
+                event.output.to_owned(),
+                event.exit_code,
+                event.timed_out,
+                event.is_error,
+                event.finished_at_ms,
             );
-            if let Some(context) = self.streamed_tool_results.get_mut(tool_call_id) {
+            if let Some(context) = self.streamed_tool_results.get_mut(event.tool_call_id) {
                 context.saw_output = true;
             }
             return;
         }
-        let tool_context = self.tool_call_contexts.get(tool_call_id);
+        let tool_context = self.tool_call_contexts.get(event.tool_call_id);
         self.transcript.push(streaming_terminal_output_item(
-            tool_call_id,
+            event.tool_call_id,
             tool_context.map(|context| context.tool_name.as_str()),
-            output,
-            (*columns).max(1),
-            (*rows).max(1),
-            started_at_ms,
+            event.output,
+            event.columns,
+            event.rows,
+            event.started_at_ms,
         ));
         let index = self.transcript.len().saturating_sub(1);
         if let Some(item) = self.transcript.get_mut(index) {
             item.apply_terminal_presentation(
-                output.clone(),
-                *exit_code,
-                *timed_out,
-                is_error,
-                finished_at_ms,
+                event.output.to_owned(),
+                event.exit_code,
+                event.timed_out,
+                event.is_error,
+                event.finished_at_ms,
             );
         }
         self.streamed_tool_results.insert(
-            tool_call_id.to_owned(),
+            event.tool_call_id.to_owned(),
             StreamedToolResultContext {
                 index: Some(index),
-                columns: (*columns).max(1),
-                rows: (*rows).max(1),
-                started_at_ms,
+                columns: event.columns,
+                rows: event.rows,
+                started_at_ms: event.started_at_ms,
                 saw_output: true,
             },
         );

@@ -7814,7 +7814,8 @@ async fn execute_model_tool(
             content: Vec::new(),
             full_output: None,
         });
-    let presentation = tool_invocation_presentation_from_result(&call.name, &result.output);
+    let presentation =
+        tool_invocation_presentation_from_result(&call.name, &call.arguments, &result.output);
     let artifact_output = result.full_output.as_deref().unwrap_or(&result.output);
     let output_blob = (state.observability.persist_tool_io || state.observability.debug_enabled())
         .then(|| {
@@ -8849,6 +8850,17 @@ async fn append_tool_presentation_event(
 
 fn tool_invocation_presentation_from_result(
     tool_name: &str,
+    arguments: &serde_json::Value,
+    result: &str,
+) -> Option<ToolInvocationPresentation> {
+    if let Some(presentation) = terminal_tool_invocation_presentation(tool_name, result) {
+        return Some(presentation);
+    }
+    file_change_tool_invocation_presentation(tool_name, arguments, result)
+}
+
+fn terminal_tool_invocation_presentation(
+    tool_name: &str,
     result: &str,
 ) -> Option<ToolInvocationPresentation> {
     if tool_name != "shell.run" {
@@ -8899,6 +8911,32 @@ fn tool_invocation_presentation_from_result(
             .unwrap_or(24)
             .max(1),
     })
+}
+
+fn file_change_tool_invocation_presentation(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    result: &str,
+) -> Option<ToolInvocationPresentation> {
+    let normalized = normalized_tool_name(tool_name);
+    if !matches!(
+        normalized.as_str(),
+        "filesystem_write" | "write" | "filesystem_edit" | "edit"
+    ) {
+        return None;
+    }
+    Some(ToolInvocationPresentation::FileChange {
+        tool_name: tool_name.to_owned(),
+        summary: result.to_owned(),
+        path: arguments
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+    })
+}
+
+fn normalized_tool_name(tool_name: &str) -> String {
+    tool_name.replace('.', "_")
 }
 
 async fn append_tool_finished_event(

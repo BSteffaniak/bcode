@@ -527,6 +527,16 @@ pub enum ToolInvocationPresentation {
         #[serde(default = "default_terminal_rows")]
         rows: u16,
     },
+    /// Filesystem write/edit result.
+    FileChange {
+        /// Tool name that produced the change.
+        tool_name: String,
+        /// Human-readable plugin output.
+        summary: String,
+        /// Best-effort target path extracted from tool arguments.
+        #[serde(default)]
+        path: Option<String>,
+    },
 }
 
 const fn default_terminal_columns() -> u16 {

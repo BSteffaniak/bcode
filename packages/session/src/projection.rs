@@ -532,7 +532,10 @@ const fn tool_presentation_content_bytes(
     presentation: &bcode_session_models::ToolInvocationPresentation,
 ) -> usize {
     match presentation {
-        bcode_session_models::ToolInvocationPresentation::Terminal { output, .. } => output.len(),
+        bcode_session_models::ToolInvocationPresentation::Terminal { output, .. }
+        | bcode_session_models::ToolInvocationPresentation::FileChange {
+            summary: output, ..
+        } => output.len(),
     }
 }
 

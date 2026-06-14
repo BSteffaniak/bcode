@@ -1,6 +1,6 @@
 //! Transcript item projection for the TUI.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bcode_session_models::{
     SessionEvent, SessionEventKind, SessionTokenUsage, ToolInvocationPresentation,
@@ -406,6 +406,7 @@ struct TranscriptProjector {
     items: Vec<TranscriptItem>,
     tool_calls: BTreeMap<String, ToolCallContext>,
     streamed_tool_results: BTreeMap<String, StreamedToolReplayContext>,
+    presented_tool_results: BTreeSet<String>,
     include_reasoning: bool,
 }
 
@@ -415,6 +416,7 @@ impl TranscriptProjector {
             items: Vec::new(),
             tool_calls: BTreeMap::new(),
             streamed_tool_results: BTreeMap::new(),
+            presented_tool_results: BTreeSet::new(),
             include_reasoning,
         }
     }
@@ -424,6 +426,7 @@ impl TranscriptProjector {
             &mut self.items,
             &mut self.tool_calls,
             &mut self.streamed_tool_results,
+            &mut self.presented_tool_results,
             self.include_reasoning,
             event,
         );
@@ -661,6 +664,7 @@ fn push_transcript_item_from_event(
     items: &mut Vec<TranscriptItem>,
     tool_calls: &mut BTreeMap<String, ToolCallContext>,
     streamed_tool_results: &mut BTreeMap<String, StreamedToolReplayContext>,
+    presented_tool_results: &mut BTreeSet<String>,
     include_reasoning: bool,
     event: &SessionEvent,
 ) {
@@ -708,6 +712,7 @@ fn push_transcript_item_from_event(
                 true
             };
             if should_render_final
+                && !presented_tool_results.contains(tool_call_id)
                 && let Some(item) = non_streaming_transcript_item_from_event(
                     event,
                     tool_calls,
@@ -728,6 +733,7 @@ fn push_transcript_item_from_event(
                 items,
                 tool_calls,
                 streamed_tool_results,
+                presented_tool_results,
                 ToolPresentationEventRef {
                     tool_call_id,
                     started_at_ms: *started_at_ms,
@@ -931,16 +937,61 @@ fn apply_tool_invocation_presentation(
     items: &mut Vec<TranscriptItem>,
     tool_calls: &BTreeMap<String, ToolCallContext>,
     streamed_tool_results: &mut BTreeMap<String, StreamedToolReplayContext>,
+    presented_tool_results: &mut BTreeSet<String>,
     event: ToolPresentationEventRef<'_>,
 ) {
-    let ToolInvocationPresentation::Terminal {
-        exit_code,
-        timed_out,
-        output,
-        columns,
-        rows,
-        ..
-    } = event.presentation;
+    match event.presentation {
+        ToolInvocationPresentation::Terminal {
+            exit_code,
+            timed_out,
+            output,
+            columns,
+            rows,
+            ..
+        } => apply_terminal_invocation_presentation(
+            items,
+            tool_calls,
+            streamed_tool_results,
+            presented_tool_results,
+            TerminalPresentationEventRef {
+                tool_call_id: event.tool_call_id,
+                started_at_ms: event.started_at_ms,
+                finished_at_ms: event.finished_at_ms,
+                is_error: event.is_error,
+                exit_code: *exit_code,
+                timed_out: *timed_out,
+                output,
+                columns: (*columns).max(1),
+                rows: (*rows).max(1),
+            },
+        ),
+        ToolInvocationPresentation::FileChange { .. } => {
+            presented_tool_results.insert(event.tool_call_id.to_owned());
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TerminalPresentationEventRef<'a> {
+    tool_call_id: &'a str,
+    started_at_ms: Option<u64>,
+    finished_at_ms: Option<u64>,
+    is_error: bool,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    output: &'a str,
+    columns: u16,
+    rows: u16,
+}
+
+fn apply_terminal_invocation_presentation(
+    items: &mut Vec<TranscriptItem>,
+    tool_calls: &BTreeMap<String, ToolCallContext>,
+    streamed_tool_results: &mut BTreeMap<String, StreamedToolReplayContext>,
+    presented_tool_results: &mut BTreeSet<String>,
+    event: TerminalPresentationEventRef<'_>,
+) {
+    presented_tool_results.insert(event.tool_call_id.to_owned());
     let context = tool_calls.get(event.tool_call_id);
     let index = streamed_tool_results
         .get(event.tool_call_id)
@@ -949,9 +1000,9 @@ fn apply_tool_invocation_presentation(
         && let Some(item) = items.get_mut(index)
     {
         item.apply_terminal_presentation(
-            output.clone(),
-            *exit_code,
-            *timed_out,
+            event.output.to_owned(),
+            event.exit_code,
+            event.timed_out,
             event.is_error,
             event.finished_at_ms,
         );
@@ -964,17 +1015,17 @@ fn apply_tool_invocation_presentation(
     items.push(streaming_terminal_output_item(
         event.tool_call_id,
         context.map(|context| context.tool_name.as_str()),
-        output,
-        (*columns).max(1),
-        (*rows).max(1),
+        event.output,
+        event.columns,
+        event.rows,
         event.started_at_ms,
     ));
     let index = items.len().saturating_sub(1);
     if let Some(item) = items.get_mut(index) {
         item.apply_terminal_presentation(
-            output.clone(),
-            *exit_code,
-            *timed_out,
+            event.output.to_owned(),
+            event.exit_code,
+            event.timed_out,
             event.is_error,
             event.finished_at_ms,
         );
@@ -983,8 +1034,8 @@ fn apply_tool_invocation_presentation(
         event.tool_call_id.to_owned(),
         StreamedToolReplayContext {
             index: Some(index),
-            columns: (*columns).max(1),
-            rows: (*rows).max(1),
+            columns: event.columns,
+            rows: event.rows,
             started_at_ms: event.started_at_ms,
             finished_at_ms: event.finished_at_ms,
             saw_output: true,
