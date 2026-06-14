@@ -664,7 +664,7 @@ fn push_transcript_item_rows(
             arguments_json,
             file_edit,
             file_edit_phase,
-            ..
+            live_preview,
         } => {
             let context = ToolRequestRenderContext {
                 tool_call_id,
@@ -672,6 +672,7 @@ fn push_transcript_item_rows(
                 arguments_json,
                 file_edit: file_edit.as_ref(),
                 file_edit_phase: *file_edit_phase,
+                live_preview: *live_preview,
                 inline_diff_config,
             };
             push_tool_request_rows(rows, item, &context, width);
@@ -841,6 +842,7 @@ struct ToolRequestRenderContext<'a> {
     arguments_json: &'a str,
     file_edit: Option<&'a FileEditTranscript>,
     file_edit_phase: Option<FileEditPhase>,
+    live_preview: bool,
     inline_diff_config: TuiInlineDiffConfig,
 }
 
@@ -892,6 +894,7 @@ fn push_tool_request_rows(
             width,
             context.inline_diff_config,
             context.file_edit_phase,
+            context.live_preview,
             context.tool_name,
         );
     } else if let Some(presentation) =
@@ -1570,11 +1573,12 @@ fn push_file_edit_preview_rows(
     width: u16,
     inline_diff_config: TuiInlineDiffConfig,
     phase: Option<FileEditPhase>,
+    live_preview: bool,
     tool_name: &str,
 ) {
     let summary = edit.summary();
     let phase = phase.unwrap_or(FileEditPhase::Applied);
-    let phase_label = if phase == FileEditPhase::Pending && edit.old_text_is_empty() {
+    let phase_label = if live_preview {
         "Streaming preview"
     } else {
         phase.label()
