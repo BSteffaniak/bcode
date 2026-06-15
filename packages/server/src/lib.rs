@@ -7276,6 +7276,11 @@ async fn build_model_turn_request(
     let metadata_timer = state.metrics.timer();
     let mut metadata = projection.metadata();
     insert_reasoning_metadata(&mut metadata, &parameters);
+    if let Some(cache_info) =
+        resolve_model_cache_info(state, provider_plugin_id, selected_model_id).await
+    {
+        insert_model_cache_metadata(&mut metadata, &cache_info);
+    }
     state.metrics.record_histogram(
         "model.request_build.metadata_duration_ms",
         metadata_timer.elapsed_ms(),
@@ -7316,6 +7321,47 @@ fn insert_reasoning_metadata(
     if let Some(summary) = &parameters.reasoning_summary {
         metadata.insert("reasoning_summary".to_string(), summary.clone());
     }
+}
+
+fn insert_model_cache_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    cache_info: &bcode_model::ModelCacheInfo,
+) {
+    let capabilities = cache_info
+        .capabilities
+        .iter()
+        .map(|x| model_cache_capability_name(*x))
+        .collect::<Vec<_>>()
+        .join(",");
+    metadata.insert("model_cache_capabilities".to_string(), capabilities);
+}
+
+const fn model_cache_capability_name(
+    capability: bcode_model::ModelCacheCapability,
+) -> &'static str {
+    match capability {
+        bcode_model::ModelCacheCapability::PromptCacheKey => "prompt_cache_key",
+        bcode_model::ModelCacheCapability::AutomaticPrefixCache => "automatic_prefix_cache",
+        bcode_model::ModelCacheCapability::ExplicitCachePoints => "explicit_cache_points",
+        bcode_model::ModelCacheCapability::CacheUsageReporting => "cache_usage_reporting",
+        bcode_model::ModelCacheCapability::PreviousResponseId => "previous_response_id",
+    }
+}
+
+async fn resolve_model_cache_info(
+    state: &ServerState,
+    provider_plugin_id: Option<&str>,
+    selected_model_id: Option<&str>,
+) -> Option<bcode_model::ModelCacheInfo> {
+    let models = invoke_model_provider_json_blocking::<_, ModelList>(
+        state,
+        provider_plugin_id.map(ToOwned::to_owned),
+        OP_MODELS,
+        serde_json::Value::Null,
+    )
+    .await
+    .ok()?;
+    select_model_info(&models.models, selected_model_id).map(|model| model.cache)
 }
 
 async fn append_model_request_trace(
@@ -7439,17 +7485,19 @@ fn model_request_trace_metadata(
         "cache_conversation_prefix".to_string(),
         (prompt_cache_points > 0).to_string(),
     );
-    metadata.insert(
-        "cache_capability".to_string(),
-        cache_capability(provider_plugin_id),
-    );
+    let cache_capabilities = request
+        .metadata
+        .get("model_cache_capabilities")
+        .cloned()
+        .unwrap_or_else(|| cache_capability(provider_plugin_id));
+    metadata.insert("cache_capability".to_string(), cache_capabilities.clone());
     metadata.insert(
         "cache_point_projection".to_string(),
-        cache_point_projection(provider_plugin_id, prompt_cache_points),
+        cache_point_projection(&cache_capabilities, provider_plugin_id, prompt_cache_points),
     );
     metadata.insert(
         "provider_reuse_capability".to_string(),
-        provider_reuse_capability(provider_plugin_id),
+        provider_reuse_capability(&cache_capabilities, provider_plugin_id),
     );
     metadata
 }
@@ -7463,24 +7511,36 @@ fn cache_capability(provider_plugin_id: Option<&str>) -> String {
     }
 }
 
-fn cache_point_projection(provider_plugin_id: Option<&str>, prompt_cache_points: usize) -> String {
+fn cache_point_projection(
+    cache_capabilities: &str,
+    provider_plugin_id: Option<&str>,
+    prompt_cache_points: usize,
+) -> String {
     if prompt_cache_points == 0 {
         return "none".to_string();
     }
+    if cache_capabilities
+        .split(',')
+        .any(|capability| capability == "explicit_cache_points")
+    {
+        return "provider_declared_explicit_cache_points".to_string();
+    }
     match provider_plugin_id {
         Some("bcode.openai-compatible") => "unsupported_dropped".to_string(),
-        Some("bcode.bedrock") => "provider_specific".to_string(),
-        Some(_) => "unknown".to_string(),
+        Some(_) => "unsupported_or_unknown".to_string(),
         None => "auto_provider_unknown".to_string(),
     }
 }
 
-fn provider_reuse_capability(provider_plugin_id: Option<&str>) -> String {
+fn provider_reuse_capability(cache_capabilities: &str, provider_plugin_id: Option<&str>) -> String {
+    if cache_capabilities
+        .split(',')
+        .any(|capability| capability == "previous_response_id")
+    {
+        return "provider_declared_previous_response_id".to_string();
+    }
     match provider_plugin_id {
-        Some("bcode.openai-compatible") => {
-            "responses_previous_response_id_when_supported".to_string()
-        }
-        Some(_) => "unknown".to_string(),
+        Some(_) => "unsupported_or_unknown".to_string(),
         None => "auto_provider_unknown".to_string(),
     }
 }
@@ -7738,12 +7798,12 @@ fn build_repository_context_parts(cwd: &Path) -> (String, String) {
     if let Some(repo_root) = &repo_root {
         dynamic_lines.push(format!("* Git root: {}", repo_root.display()));
     }
-    if let Some(branch) = run_command(context_root, "git", &["branch", "--show-current"])
+    if let Some(branch) = run_command(context_root, "git", &["branch", "--show-current"][..])
         && !branch.is_empty()
     {
         dynamic_lines.push(format!("* Git branch: {branch}"));
     }
-    if let Some(status) = run_command(context_root, "git", &["status", "--short"]) {
+    if let Some(status) = run_command(context_root, "git", &["status", "--short"][..]) {
         dynamic_lines.push(format!(
             "* Git status:\n{}",
             format_block_or_placeholder(&status, "clean")
@@ -7754,7 +7814,7 @@ fn build_repository_context_parts(cwd: &Path) -> (String, String) {
 }
 
 fn discover_git_root(cwd: &Path) -> Option<PathBuf> {
-    run_command(cwd, "git", &["rev-parse", "--show-toplevel"])
+    run_command(cwd, "git", &["rev-parse", "--show-toplevel"][..])
         .filter(|root| !root.is_empty())
         .map(PathBuf::from)
 }
