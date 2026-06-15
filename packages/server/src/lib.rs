@@ -135,6 +135,7 @@ pub struct ServerState {
     session_runtimes: Mutex<BTreeMap<SessionId, SessionRuntimeHandle>>,
     active_session_turns: Mutex<BTreeMap<SessionId, ActiveSessionTurn>>,
     runtime_work: RuntimeWorkManager,
+    active_ralph_runs: Mutex<BTreeMap<PathBuf, JoinHandle<()>>>,
     active_turns: Mutex<BTreeMap<SessionId, ActiveModelTurn>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
     session_agent_selections: Mutex<BTreeMap<SessionId, String>>,
@@ -595,6 +596,7 @@ impl ServerState {
             session_runtimes: Mutex::default(),
             active_session_turns: Mutex::default(),
             runtime_work: RuntimeWorkManager::default(),
+            active_ralph_runs: Mutex::default(),
             active_turns: Mutex::default(),
             session_model_selections: Mutex::default(),
             session_agent_selections: Mutex::default(),
@@ -1588,7 +1590,9 @@ async fn handle_request(
             handle_remove_worktree(request_id, state, writer, request).await
         }
         Request::RalphStatus(request) => handle_ralph_status(request_id, writer, request).await,
-        Request::RunRalphLoop(request) => handle_run_ralph_loop(request_id, writer, request).await,
+        Request::RunRalphLoop(request) => {
+            handle_run_ralph_loop(request_id, state, writer, request).await
+        }
         Request::CancelRalphLoop(request) => {
             handle_cancel_ralph_loop(request_id, writer, request).await
         }
@@ -2210,35 +2214,11 @@ async fn handle_ralph_status(
 
 async fn handle_run_ralph_loop(
     request_id: u64,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
     request: RalphRunRequest,
 ) -> Result<(), ServerError> {
-    match resolve_ralph_loop(&request.repo_root, request.loop_state_dir.as_deref()).and_then(
-        |summary| {
-            if bcode_ralph::active_run_for_loop(&summary.state_dir)
-                .map_err(|error| error.to_string())?
-                .is_some()
-            {
-                return Err("Ralph loop already has an active run".to_owned());
-            }
-            let status = if request.require_approval {
-                "awaiting_approval"
-            } else {
-                "queued"
-            };
-            let run = bcode_ralph::create_run(bcode_ralph::RalphRunCreateRequest {
-                state_dir: summary.state_dir,
-                session_id: summary.session_id,
-                status: status.to_owned(),
-                requested_max_iterations: request.max_iterations,
-                requested_no_progress_limit: request.no_progress_limit,
-            })
-            .map_err(|error| error.to_string())?;
-            Ok(RalphRunResponse {
-                run: ralph_run_summary(run),
-            })
-        },
-    ) {
+    match start_ralph_runner(state, request).await {
         Ok(response) => {
             send_response(
                 writer,
@@ -2256,6 +2236,85 @@ async fn handle_run_ralph_loop(
             .await
         }
     }
+}
+
+async fn start_ralph_runner(
+    state: &Arc<ServerState>,
+    request: RalphRunRequest,
+) -> Result<RalphRunResponse, String> {
+    let summary = resolve_ralph_loop(&request.repo_root, request.loop_state_dir.as_deref())?;
+    if bcode_ralph::active_run_for_loop(&summary.state_dir)
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return Err("Ralph loop already has an active run".to_owned());
+    }
+
+    let mut active_ralph_runs = state.active_ralph_runs.lock().await;
+    if active_ralph_runs.contains_key(&summary.state_dir) {
+        return Err("Ralph loop already has an active runner task".to_owned());
+    }
+
+    let run = bcode_ralph::create_run(bcode_ralph::RalphRunCreateRequest {
+        state_dir: summary.state_dir.clone(),
+        session_id: summary.session_id.clone(),
+        status: if request.require_approval {
+            "awaiting_approval".to_owned()
+        } else {
+            "running".to_owned()
+        },
+        requested_max_iterations: request.max_iterations,
+        requested_no_progress_limit: request.no_progress_limit,
+    })
+    .map_err(|error| error.to_string())?;
+    let response = RalphRunResponse {
+        run: ralph_run_summary(run.clone()),
+    };
+    if request.require_approval {
+        return Ok(response);
+    }
+
+    let runner_state = Arc::clone(state);
+    let state_dir = run.state_dir.clone();
+    let handle = tokio::spawn(async move {
+        run_ralph_runner_skeleton(runner_state, run).await;
+    });
+    active_ralph_runs.insert(state_dir, handle);
+    drop(active_ralph_runs);
+    Ok(response)
+}
+
+async fn run_ralph_runner_skeleton(state: Arc<ServerState>, run: bcode_ralph::RalphRunRecord) {
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let active_run = bcode_ralph::active_run_for_loop(&run.state_dir)
+        .ok()
+        .flatten();
+    if active_run.as_ref().is_some_and(|run| run.cancel_requested) {
+        let _ = bcode_ralph::update_run_status(
+            &run.run_id,
+            "stopped",
+            Some(current_time_ms()),
+            Some("cancelled"),
+            None,
+        );
+    } else {
+        let _iteration = bcode_ralph::create_iteration(bcode_ralph::RalphIterationCreateRequest {
+            run_id: run.run_id.clone(),
+            state_dir: run.state_dir.clone(),
+            iteration_number: 1,
+            status: "skipped".to_owned(),
+            checklist_fingerprint_before: None,
+            work_prompt: None,
+        });
+        let _ = bcode_ralph::update_run_status(
+            &run.run_id,
+            "blocked",
+            Some(current_time_ms()),
+            Some("runner_skeleton"),
+            Some("Ralph runner skeleton is wired; model-turn execution is not implemented yet"),
+        );
+    }
+    state.active_ralph_runs.lock().await.remove(&run.state_dir);
 }
 
 async fn handle_cancel_ralph_loop(
