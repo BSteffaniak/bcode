@@ -317,6 +317,7 @@ pub enum Request {
     ListRalphRuns(Box<RalphListRunsRequest>),
     ListRalphIterations(Box<RalphListIterationsRequest>),
     ResumeRalphRun(RalphResumeRequest),
+    ApproveRalphRun(RalphApproveRequest),
     RalphRunStatus(RalphRunStatusRequest),
     RecordRalphLifecycle(RalphLifecycleRequest),
     ImportExternalSession {
@@ -661,6 +662,19 @@ pub struct RalphResumeRequest {
     pub interrupted_run_id: Option<String>,
 }
 
+/// Request to approve and start an approval-gated Ralph run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RalphApproveRequest {
+    /// Repository root used to discover the selected Ralph loop.
+    pub repo_root: PathBuf,
+    /// Specific Ralph loop state directory to inspect, when not using latest.
+    #[serde(default)]
+    pub loop_state_dir: Option<PathBuf>,
+    /// Specific run ID to approve, when not using the active approval-gated run.
+    #[serde(default)]
+    pub run_id: Option<String>,
+}
+
 /// Request to inspect Ralph autonomous run status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RalphRunStatusRequest {
@@ -918,6 +932,7 @@ pub enum ResponsePayload {
     RalphRunsListed(RalphListRunsResponse),
     RalphIterationsListed(RalphListIterationsResponse),
     RalphRunResumed(RalphResumeResponse),
+    RalphRunApproved(RalphRunResponse),
     RalphRunStatus(RalphRunStatusResponse),
     RalphLifecycleRecorded {
         event: SessionEvent,
@@ -3800,6 +3815,11 @@ mod tests {
                 max_iterations: Some(5),
                 no_progress_limit: Some(2),
                 require_approval: true,
+            }),
+            Request::ApproveRalphRun(RalphApproveRequest {
+                repo_root: PathBuf::from("/repo"),
+                loop_state_dir: None,
+                run_id: Some("run-1".to_owned()),
             }),
             Request::CancelRalphLoop(RalphCancelRequest {
                 repo_root: PathBuf::from("/repo"),

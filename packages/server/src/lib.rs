@@ -16,8 +16,8 @@ use bcode_agent_profile::{
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, DaemonStatus, EnvelopeKind, ErrorResponse, Event,
     IpcEndpoint, LocalIpcListener, LocalIpcStream, PermissionSummary, PluginServiceError,
-    PluginServiceResponse, PluginServiceSummary, RalphCancelRequest, RalphCancelResponse,
-    RalphIterationSummary, RalphLifecycleRequest, RalphListIterationsRequest,
+    PluginServiceResponse, PluginServiceSummary, RalphApproveRequest, RalphCancelRequest,
+    RalphCancelResponse, RalphIterationSummary, RalphLifecycleRequest, RalphListIterationsRequest,
     RalphListIterationsResponse, RalphListRunsRequest, RalphListRunsResponse, RalphResumeRequest,
     RalphResumeResponse, RalphRunRequest, RalphRunResponse, RalphRunStatusRequest,
     RalphRunStatusResponse, RalphRunSummary, RalphStatusRequest, RalphStatusResponse,
@@ -1621,6 +1621,9 @@ async fn handle_request(
         Request::RunRalphLoop(request) => {
             handle_run_ralph_loop(request_id, state, writer, request).await
         }
+        Request::ApproveRalphRun(request) => {
+            handle_approve_ralph_run(request_id, state, writer, request).await
+        }
         Request::CancelRalphLoop(request) => {
             Box::pin(handle_cancel_ralph_loop(request_id, state, writer, request)).await
         }
@@ -1934,6 +1937,7 @@ async fn handle_agent_permission_plugin_request(
         | Request::RemoveWorktree(_)
         | Request::RalphStatus(_)
         | Request::RunRalphLoop(_)
+        | Request::ApproveRalphRun(_)
         | Request::CancelRalphLoop(_)
         | Request::ListRalphRuns(_)
         | Request::ListRalphIterations(_)
@@ -2352,6 +2356,80 @@ async fn prepare_ralph_resume(
     })
 }
 
+async fn handle_approve_ralph_run(
+    request_id: u64,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: RalphApproveRequest,
+) -> Result<(), ServerError> {
+    match approve_ralph_run(state, request).await {
+        Ok(response) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::RalphRunApproved(response)),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("ralph_run_approval_failed", error)),
+            )
+            .await
+        }
+    }
+}
+
+async fn approve_ralph_run(
+    state: &Arc<ServerState>,
+    request: RalphApproveRequest,
+) -> Result<RalphRunResponse, String> {
+    let summary = resolve_ralph_loop(&request.repo_root, request.loop_state_dir.as_deref())?;
+    let active_run = bcode_ralph::active_run_for_loop(&summary.state_dir)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Ralph loop has no approval-gated run".to_owned())?;
+    if request
+        .run_id
+        .as_deref()
+        .is_some_and(|run_id| run_id != active_run.run_id)
+    {
+        return Err("requested Ralph run is not active for this loop".to_owned());
+    }
+    if active_run.status != "awaiting_approval" {
+        return Err("Ralph active run is not awaiting approval".to_owned());
+    }
+    bcode_ralph::update_run_status(&active_run.run_id, "running", None, None, None)
+        .map_err(|error| error.to_string())?;
+    let mut approved_run = active_run;
+    approved_run.status.clear();
+    approved_run.status.push_str("running");
+    spawn_ralph_runner_task(state, approved_run.clone(), summary).await?;
+    Ok(RalphRunResponse {
+        run: ralph_run_summary(approved_run),
+    })
+}
+
+async fn spawn_ralph_runner_task(
+    state: &Arc<ServerState>,
+    run: bcode_ralph::RalphRunRecord,
+    summary: bcode_ralph::RalphLoopSummary,
+) -> Result<(), String> {
+    let mut active_ralph_runs = state.active_ralph_runs.lock().await;
+    if active_ralph_runs.contains_key(&run.state_dir) {
+        return Err("Ralph loop already has an active runner task".to_owned());
+    }
+    let runner_state = Arc::clone(state);
+    let state_dir = run.state_dir.clone();
+    let handle = tokio::spawn(async move {
+        run_ralph_runner_skeleton(runner_state, run, summary).await;
+    });
+    active_ralph_runs.insert(state_dir, handle);
+    drop(active_ralph_runs);
+    Ok(())
+}
+
 fn effective_ralph_run_limits(
     summary_max_iterations: u64,
     summary_no_progress_limit: u64,
@@ -2376,7 +2454,7 @@ async fn start_ralph_runner(
         return Err("Ralph loop already has an active run".to_owned());
     }
 
-    let mut active_ralph_runs = state.active_ralph_runs.lock().await;
+    let active_ralph_runs = state.active_ralph_runs.lock().await;
     if active_ralph_runs.contains_key(&summary.state_dir) {
         return Err("Ralph loop already has an active runner task".to_owned());
     }
@@ -2420,14 +2498,8 @@ async fn start_ralph_runner(
         return Ok(response);
     }
 
-    let runner_state = Arc::clone(state);
-    let state_dir = run.state_dir.clone();
-    let summary_for_runner = summary.clone();
-    let handle = tokio::spawn(async move {
-        run_ralph_runner_skeleton(runner_state, run, summary_for_runner).await;
-    });
-    active_ralph_runs.insert(state_dir, handle);
     drop(active_ralph_runs);
+    spawn_ralph_runner_task(state, run, summary).await?;
     Ok(response)
 }
 

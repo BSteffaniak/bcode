@@ -32,6 +32,8 @@ pub enum SlashCommandOutcome {
     ShowRalphStatus,
     /// Start a Ralph autonomous run.
     RunRalphLoop,
+    /// Approve a prepared Ralph autonomous run.
+    ApproveRalphRun,
     /// Stop the active Ralph autonomous run.
     StopRalphLoop,
     /// List recent Ralph runs.
@@ -333,6 +335,7 @@ fn ralph_command(parts: &[&str]) -> SlashCommandOutcome {
         Some("status") => SlashCommandOutcome::ShowRalphStatus,
         Some("open") => SlashCommandOutcome::OpenRalphProgress,
         Some("run") => SlashCommandOutcome::RunRalphLoop,
+        Some("approve") => SlashCommandOutcome::ApproveRalphRun,
         Some("audit") => SlashCommandOutcome::BuildRalphPrompt(bcode_ralph::RalphPromptKind::Audit),
         Some("replan") => {
             SlashCommandOutcome::BuildRalphPrompt(bcode_ralph::RalphPromptKind::Replan)
@@ -342,7 +345,7 @@ fn ralph_command(parts: &[&str]) -> SlashCommandOutcome {
         Some("iterations") => SlashCommandOutcome::ListRalphIterations,
         Some("resume") => SlashCommandOutcome::ResumeRalphRun,
         Some(_) => SlashCommandOutcome::Handled(
-            "usage: /ralph [start|run|stop|status|runs|iterations|resume|audit|replan|open]"
+            "usage: /ralph [start|run|approve|stop|status|runs|iterations|resume|audit|replan|open]"
                 .to_owned(),
         ),
     }
@@ -747,6 +750,10 @@ mod tests {
             SlashCommandOutcome::RunRalphLoop
         );
         assert_eq!(
+            ralph_command(&["/ralph", "approve"]),
+            SlashCommandOutcome::ApproveRalphRun
+        );
+        assert_eq!(
             ralph_command(&["/ralph", "stop"]),
             SlashCommandOutcome::StopRalphLoop
         );
@@ -785,7 +792,7 @@ mod tests {
         assert_eq!(
             ralph_command(&["/ralph", "wat"]),
             SlashCommandOutcome::Handled(
-                "usage: /ralph [start|run|stop|status|runs|iterations|resume|audit|replan|open]"
+                "usage: /ralph [start|run|approve|stop|status|runs|iterations|resume|audit|replan|open]"
                     .to_owned()
             )
         );

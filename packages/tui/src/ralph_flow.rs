@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bcode_ipc::{
-    RalphCancelRequest, RalphLifecycleRequest, RalphListIterationsRequest, RalphListRunsRequest,
-    RalphResumeRequest, RalphRunRequest, RalphRunStatusRequest, RalphRunSummary,
-    RalphStatusSummary,
+    RalphApproveRequest, RalphCancelRequest, RalphLifecycleRequest, RalphListIterationsRequest,
+    RalphListRunsRequest, RalphResumeRequest, RalphRunRequest, RalphRunStatusRequest,
+    RalphRunSummary, RalphStatusSummary,
 };
 use bcode_ralph as ralph_state;
 use bcode_session_models::{SessionHistoryDirection, SessionHistoryQuery};
@@ -51,7 +51,7 @@ pub async fn show_status(
     Ok(())
 }
 
-/// Start the latest Ralph loop through the server-side runner API.
+/// Prepare the latest Ralph loop through the server-side runner API.
 pub async fn run_loop(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Result<(), TuiError> {
     let repo_root = current_repo_root(chat)?;
     let response = services
@@ -61,17 +61,43 @@ pub async fn run_loop(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Resu
             loop_state_dir: None,
             max_iterations: None,
             no_progress_limit: None,
-            require_approval: false,
+            require_approval: true,
         })
         .await?;
     chat.app.push_system_note(format!(
-        "Ralph run started\n* Run: {}\n* Status: {}\n* State: {}\n* Session: {}",
+        "Ralph run prepared\n* Run: {}\n* Status: {}\n* State: {}\n* Session: {}\n* Next: /ralph approve",
         response.run.run_id,
         response.run.status,
         response.run.state_dir.display(),
         response.run.session_id.as_deref().unwrap_or("<none>")
     ));
-    chat.app.set_status("Ralph run started".to_owned());
+    chat.app
+        .set_status("Ralph run prepared; approve to start".to_owned());
+    Ok(())
+}
+
+/// Approve and start the latest prepared Ralph run through the server-side runner API.
+pub async fn approve_run(
+    services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
+) -> Result<(), TuiError> {
+    let repo_root = current_repo_root(chat)?;
+    let response = services
+        .client
+        .approve_ralph_run(RalphApproveRequest {
+            repo_root,
+            loop_state_dir: None,
+            run_id: None,
+        })
+        .await?;
+    chat.app.push_system_note(format!(
+        "Ralph run approved\n* Run: {}\n* Status: {}\n* State: {}\n* Session: {}",
+        response.run.run_id,
+        response.run.status,
+        response.run.state_dir.display(),
+        response.run.session_id.as_deref().unwrap_or("<none>")
+    ));
+    chat.app.set_status("Ralph run approved".to_owned());
     Ok(())
 }
 
