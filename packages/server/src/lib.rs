@@ -17,11 +17,13 @@ use bcode_ipc::{
     ClientRuntimeContext, CodecError, DaemonStatus, EnvelopeKind, ErrorResponse, Event,
     IpcEndpoint, LocalIpcListener, LocalIpcStream, PermissionSummary, PluginServiceError,
     PluginServiceResponse, PluginServiceSummary, RalphCancelRequest, RalphCancelResponse,
-    RalphLifecycleRequest, RalphRunRequest, RalphRunResponse, RalphRunStatusRequest,
-    RalphRunStatusResponse, RalphRunSummary, RalphStatusRequest, RalphStatusResponse,
-    RalphStatusSummary, Request, Response, ResponsePayload, ServerStatus, ServerStopMode,
-    SessionCatalogSourceStatus, SessionCatalogStatus, WorktreeCreateRequest, WorktreeListRequest,
-    WorktreeRemoveRequest, decode, event_envelope, recv_envelope, response_envelope, send_envelope,
+    RalphIterationSummary, RalphLifecycleRequest, RalphListIterationsRequest,
+    RalphListIterationsResponse, RalphListRunsRequest, RalphListRunsResponse, RalphRunRequest,
+    RalphRunResponse, RalphRunStatusRequest, RalphRunStatusResponse, RalphRunSummary,
+    RalphStatusRequest, RalphStatusResponse, RalphStatusSummary, Request, Response,
+    ResponsePayload, ServerStatus, ServerStopMode, SessionCatalogSourceStatus,
+    SessionCatalogStatus, WorktreeCreateRequest, WorktreeListRequest, WorktreeRemoveRequest,
+    decode, event_envelope, recv_envelope, response_envelope, send_envelope,
 };
 use bcode_metrics::{MetricLabels, MetricsRegistry};
 use bcode_model::{
@@ -1544,7 +1546,7 @@ async fn handle_registered_client(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::large_stack_frames)]
 async fn handle_request(
     request: Request,
     request_id: u64,
@@ -1621,6 +1623,12 @@ async fn handle_request(
         }
         Request::CancelRalphLoop(request) => {
             Box::pin(handle_cancel_ralph_loop(request_id, state, writer, request)).await
+        }
+        Request::ListRalphRuns(request) => {
+            Box::pin(handle_list_ralph_runs(request_id, writer, *request)).await
+        }
+        Request::ListRalphIterations(request) => {
+            Box::pin(handle_list_ralph_iterations(request_id, writer, *request)).await
         }
         Request::RalphRunStatus(request) => {
             handle_ralph_run_status(request_id, writer, request).await
@@ -1924,6 +1932,8 @@ async fn handle_agent_permission_plugin_request(
         | Request::RalphStatus(_)
         | Request::RunRalphLoop(_)
         | Request::CancelRalphLoop(_)
+        | Request::ListRalphRuns(_)
+        | Request::ListRalphIterations(_)
         | Request::RalphRunStatus(_)
         | Request::RecordRalphLifecycle(_) => {
             unreachable!("primary request routed to primary handler")
@@ -3178,6 +3188,96 @@ async fn handle_cancel_ralph_loop(
     }
 }
 
+async fn handle_list_ralph_runs(
+    request_id: u64,
+    writer: &SharedWriter,
+    request: RalphListRunsRequest,
+) -> Result<(), ServerError> {
+    match resolve_ralph_loop(&request.repo_root, request.loop_state_dir.as_deref()).and_then(
+        |summary| {
+            let runs = bcode_ralph::list_runs_for_loop(&summary.state_dir)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(ralph_run_summary)
+                .collect();
+            Ok(RalphListRunsResponse {
+                loop_summary: Some(ralph_status_summary(summary)),
+                runs,
+            })
+        },
+    ) {
+        Ok(response) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::RalphRunsListed(response)),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("ralph_runs_list_failed", error)),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_list_ralph_iterations(
+    request_id: u64,
+    writer: &SharedWriter,
+    request: RalphListIterationsRequest,
+) -> Result<(), ServerError> {
+    match resolve_ralph_loop(&request.repo_root, request.loop_state_dir.as_deref()).and_then(
+        |summary| {
+            let runs = bcode_ralph::list_runs_for_loop(&summary.state_dir)
+                .map_err(|error| error.to_string())?;
+            let run = request
+                .run_id
+                .as_deref()
+                .and_then(|run_id| runs.iter().find(|run| run.run_id == run_id))
+                .or_else(|| runs.first());
+            let iterations = run
+                .map_or_else(
+                    || Ok(Vec::new()),
+                    |run| {
+                        bcode_ralph::list_iterations_for_run(&run.run_id).map(|iterations| {
+                            iterations
+                                .into_iter()
+                                .map(ralph_iteration_summary)
+                                .collect()
+                        })
+                    },
+                )
+                .map_err(|error: bcode_ralph::RalphStateError| error.to_string())?;
+            Ok(RalphListIterationsResponse {
+                loop_summary: Some(ralph_status_summary(summary)),
+                run: run.cloned().map(ralph_run_summary),
+                iterations,
+            })
+        },
+    ) {
+        Ok(response) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::RalphIterationsListed(response)),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("ralph_iterations_list_failed", error)),
+            )
+            .await
+        }
+    }
+}
+
 async fn handle_ralph_run_status(
     request_id: u64,
     writer: &SharedWriter,
@@ -3287,6 +3387,18 @@ fn ralph_run_summary(run: bcode_ralph::RalphRunRecord) -> RalphRunSummary {
         finished_at_ms: run.finished_at_ms,
         stop_reason: run.stop_reason,
         error_message: run.error_message,
+    }
+}
+
+fn ralph_iteration_summary(iteration: bcode_ralph::RalphIterationRecord) -> RalphIterationSummary {
+    RalphIterationSummary {
+        iteration_id: iteration.iteration_id,
+        run_id: iteration.run_id,
+        iteration_number: iteration.iteration_number,
+        status: iteration.status,
+        stop_reason: iteration.stop_reason,
+        error_message: iteration.error_message,
+        finished_at_ms: iteration.finished_at_ms,
     }
 }
 

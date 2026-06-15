@@ -9,7 +9,8 @@ use bcode_daemon_lifecycle::{DaemonStartError, EnsureDaemonOptions, ensure_daemo
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint,
     LocalIpcStream, PermissionSummary, PluginServiceResponse, PluginServiceSummary,
-    RalphCancelRequest, RalphCancelResponse, RalphLifecycleRequest, RalphRunRequest,
+    RalphCancelRequest, RalphCancelResponse, RalphLifecycleRequest, RalphListIterationsRequest,
+    RalphListIterationsResponse, RalphListRunsRequest, RalphListRunsResponse, RalphRunRequest,
     RalphRunResponse, RalphRunStatusRequest, RalphRunStatusResponse, RalphStatusRequest,
     RalphStatusResponse, Request, Response, ResponsePayload, ServerStopMode,
     SessionCatalogSourceStatus, SessionCatalogStatus, SessionImportWarning, WorktreeCreateRequest,
@@ -829,6 +830,42 @@ impl BcodeClient {
     ) -> Result<RalphCancelResponse, ClientError> {
         match self.send_request(Request::CancelRalphLoop(request)).await? {
             ResponsePayload::RalphRunCancelled(response) => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// List recent Ralph runs for a repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn list_ralph_runs(
+        &self,
+        request: RalphListRunsRequest,
+    ) -> Result<RalphListRunsResponse, ClientError> {
+        match self
+            .send_request(Request::ListRalphRuns(Box::new(request)))
+            .await?
+        {
+            ResponsePayload::RalphRunsListed(response) => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// List recent Ralph iterations for a repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn list_ralph_iterations(
+        &self,
+        request: RalphListIterationsRequest,
+    ) -> Result<RalphListIterationsResponse, ClientError> {
+        match self
+            .send_request(Request::ListRalphIterations(Box::new(request)))
+            .await?
+        {
+            ResponsePayload::RalphIterationsListed(response) => Ok(response),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

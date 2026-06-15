@@ -1089,6 +1089,34 @@ pub fn active_run_for_loop(state_dir: &Path) -> Result<Option<RalphRunRecord>, R
     })
 }
 
+/// List recent Ralph runs for a loop.
+///
+/// # Errors
+///
+/// Returns an error when the Ralph database cannot be opened, migrated, or queried.
+pub fn list_runs_for_loop(state_dir: &Path) -> Result<Vec<RalphRunRecord>, RalphStateError> {
+    let state_dir = state_dir.to_path_buf();
+    with_database(move |database| {
+        Box::pin(async move {
+            let rows = database
+                .select("ralph_runs")
+                .columns(&RALPH_RUN_COLUMNS)
+                .filter(Box::new(where_eq(
+                    "state_dir",
+                    state_dir.display().to_string(),
+                )))
+                .execute(database)
+                .await?;
+            let mut runs = rows
+                .iter()
+                .map(run_record_from_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            runs.sort_by(|left, right| right.started_at_ms.cmp(&left.started_at_ms));
+            Ok(runs)
+        })
+    })
+}
+
 /// Mark a Ralph run as cancellation-requested.
 ///
 /// # Errors

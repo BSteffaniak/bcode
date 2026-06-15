@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bcode_ipc::{
-    RalphCancelRequest, RalphLifecycleRequest, RalphRunRequest, RalphRunStatusRequest,
-    RalphRunSummary, RalphStatusSummary,
+    RalphCancelRequest, RalphLifecycleRequest, RalphListIterationsRequest, RalphListRunsRequest,
+    RalphRunRequest, RalphRunStatusRequest, RalphRunSummary, RalphStatusSummary,
 };
 use bcode_ralph as ralph_state;
 use bcode_session_models::{SessionHistoryDirection, SessionHistoryQuery};
@@ -71,6 +71,99 @@ pub async fn run_loop(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Resu
         response.run.session_id.as_deref().unwrap_or("<none>")
     ));
     chat.app.set_status("Ralph run started".to_owned());
+    Ok(())
+}
+
+/// List recent Ralph runs for the current repository.
+pub async fn list_runs(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Result<(), TuiError> {
+    let repo_root = current_repo_root(chat)?;
+    let response = services
+        .client
+        .list_ralph_runs(RalphListRunsRequest {
+            repo_root,
+            loop_state_dir: None,
+        })
+        .await?;
+    let Some(summary) = response.loop_summary else {
+        chat.app
+            .set_status("no Ralph loops for current repository".to_owned());
+        return Ok(());
+    };
+    let runs = if response.runs.is_empty() {
+        "* <none>".to_owned()
+    } else {
+        response
+            .runs
+            .iter()
+            .map(|run| {
+                format!(
+                    "* {} — {}{}",
+                    run.run_id,
+                    run.status,
+                    run.stop_reason
+                        .as_deref()
+                        .map_or_else(String::new, |reason| format!(" ({reason})"))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    chat.app.push_system_note(format!(
+        "Ralph runs\n* Loop: {}\n{}",
+        summary.loop_name, runs
+    ));
+    chat.app.set_status("Ralph runs shown".to_owned());
+    Ok(())
+}
+
+/// List iterations for the latest Ralph run in the current repository.
+pub async fn list_iterations(
+    services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
+) -> Result<(), TuiError> {
+    let repo_root = current_repo_root(chat)?;
+    let response = services
+        .client
+        .list_ralph_iterations(RalphListIterationsRequest {
+            repo_root,
+            loop_state_dir: None,
+            run_id: None,
+        })
+        .await?;
+    let Some(summary) = response.loop_summary else {
+        chat.app
+            .set_status("no Ralph loops for current repository".to_owned());
+        return Ok(());
+    };
+    let run_label = response
+        .run
+        .as_ref()
+        .map_or_else(|| "<none>".to_owned(), |run| run.run_id.clone());
+    let iterations = if response.iterations.is_empty() {
+        "* <none>".to_owned()
+    } else {
+        response
+            .iterations
+            .iter()
+            .map(|iteration| {
+                format!(
+                    "* #{} — {}{}",
+                    iteration.iteration_number,
+                    iteration.status,
+                    iteration
+                        .stop_reason
+                        .as_deref()
+                        .map_or_else(String::new, |reason| format!(" ({reason})"))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    chat.app.push_system_note(format!(
+        "Ralph iterations\n* Loop: {}\n* Run: {}\n{}",
+        summary.loop_name, run_label, iterations
+    ));
+    chat.app.set_status("Ralph iterations shown".to_owned());
     Ok(())
 }
 

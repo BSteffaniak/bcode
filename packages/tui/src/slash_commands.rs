@@ -34,6 +34,10 @@ pub enum SlashCommandOutcome {
     RunRalphLoop,
     /// Stop the active Ralph autonomous run.
     StopRalphLoop,
+    /// List recent Ralph runs.
+    ListRalphRuns,
+    /// List iterations for the latest Ralph run.
+    ListRalphIterations,
     /// Show the latest Ralph progress doc path.
     OpenRalphProgress,
     /// Build a Ralph work prompt.
@@ -332,8 +336,10 @@ fn ralph_command(parts: &[&str]) -> SlashCommandOutcome {
             SlashCommandOutcome::BuildRalphPrompt(bcode_ralph::RalphPromptKind::Replan)
         }
         Some("stop") => SlashCommandOutcome::StopRalphLoop,
+        Some("runs") => SlashCommandOutcome::ListRalphRuns,
+        Some("iterations") => SlashCommandOutcome::ListRalphIterations,
         Some(_) => SlashCommandOutcome::Handled(
-            "usage: /ralph [start|run|stop|status|audit|replan|open]".to_owned(),
+            "usage: /ralph [start|run|stop|status|runs|iterations|audit|replan|open]".to_owned(),
         ),
     }
 }
@@ -755,11 +761,24 @@ mod tests {
     }
 
     #[test]
+    fn ralph_runs_and_iterations_route_to_list_views() {
+        assert_eq!(
+            ralph_command(&["/ralph", "runs"]),
+            SlashCommandOutcome::ListRalphRuns
+        );
+        assert_eq!(
+            ralph_command(&["/ralph", "iterations"]),
+            SlashCommandOutcome::ListRalphIterations
+        );
+    }
+
+    #[test]
     fn ralph_unknown_subcommand_reports_usage() {
         assert_eq!(
             ralph_command(&["/ralph", "wat"]),
             SlashCommandOutcome::Handled(
-                "usage: /ralph [start|run|stop|status|audit|replan|open]".to_owned()
+                "usage: /ralph [start|run|stop|status|runs|iterations|audit|replan|open]"
+                    .to_owned()
             )
         );
     }

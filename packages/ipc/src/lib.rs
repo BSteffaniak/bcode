@@ -314,6 +314,8 @@ pub enum Request {
     RalphStatus(RalphStatusRequest),
     RunRalphLoop(RalphRunRequest),
     CancelRalphLoop(RalphCancelRequest),
+    ListRalphRuns(Box<RalphListRunsRequest>),
+    ListRalphIterations(Box<RalphListIterationsRequest>),
     RalphRunStatus(RalphRunStatusRequest),
     RecordRalphLifecycle(RalphLifecycleRequest),
     ImportExternalSession {
@@ -622,6 +624,29 @@ pub struct RalphCancelRequest {
     pub loop_state_dir: Option<PathBuf>,
 }
 
+/// Request to list recent Ralph runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RalphListRunsRequest {
+    /// Repository root used to discover the selected Ralph loop.
+    pub repo_root: PathBuf,
+    /// Specific Ralph loop state directory to inspect, when not using latest.
+    #[serde(default)]
+    pub loop_state_dir: Option<PathBuf>,
+}
+
+/// Request to list recent Ralph iterations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RalphListIterationsRequest {
+    /// Repository root used to discover the selected Ralph loop.
+    pub repo_root: PathBuf,
+    /// Specific Ralph loop state directory to inspect, when not using latest.
+    #[serde(default)]
+    pub loop_state_dir: Option<PathBuf>,
+    /// Specific run ID to inspect, when not using the latest run.
+    #[serde(default)]
+    pub run_id: Option<String>,
+}
+
 /// Request to inspect Ralph autonomous run status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RalphRunStatusRequest {
@@ -667,6 +692,28 @@ pub struct RalphRunSummary {
     pub error_message: Option<String>,
 }
 
+/// Ralph iteration summary for IPC clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RalphIterationSummary {
+    /// Iteration ID.
+    pub iteration_id: String,
+    /// Run ID this iteration belongs to.
+    pub run_id: String,
+    /// Iteration number.
+    pub iteration_number: u64,
+    /// Iteration status.
+    pub status: String,
+    /// Stop reason, when known.
+    #[serde(default)]
+    pub stop_reason: Option<String>,
+    /// Error message, when known.
+    #[serde(default)]
+    pub error_message: Option<String>,
+    /// Finish time in Unix epoch milliseconds.
+    #[serde(default)]
+    pub finished_at_ms: Option<u64>,
+}
+
 /// Response after starting a Ralph run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RalphRunResponse {
@@ -681,6 +728,31 @@ pub struct RalphCancelResponse {
     pub run: RalphRunSummary,
     /// Whether the cancel flag was requested by this call.
     pub cancel_requested: bool,
+}
+
+/// Response listing recent Ralph runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RalphListRunsResponse {
+    /// Latest or selected Ralph loop summary for the repository, when one exists.
+    #[serde(default)]
+    pub loop_summary: Option<RalphStatusSummary>,
+    /// Recent runs for the loop.
+    #[serde(default)]
+    pub runs: Vec<RalphRunSummary>,
+}
+
+/// Response listing recent Ralph iterations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RalphListIterationsResponse {
+    /// Latest or selected Ralph loop summary for the repository, when one exists.
+    #[serde(default)]
+    pub loop_summary: Option<RalphStatusSummary>,
+    /// Run whose iterations were listed, when one exists.
+    #[serde(default)]
+    pub run: Option<RalphRunSummary>,
+    /// Iterations for the run.
+    #[serde(default)]
+    pub iterations: Vec<RalphIterationSummary>,
 }
 
 /// Response describing Ralph autonomous run status.
@@ -820,6 +892,8 @@ pub enum ResponsePayload {
     RalphStatus(RalphStatusResponse),
     RalphRunStarted(RalphRunResponse),
     RalphRunCancelled(RalphCancelResponse),
+    RalphRunsListed(RalphListRunsResponse),
+    RalphIterationsListed(RalphListIterationsResponse),
     RalphRunStatus(RalphRunStatusResponse),
     RalphLifecycleRecorded {
         event: SessionEvent,
