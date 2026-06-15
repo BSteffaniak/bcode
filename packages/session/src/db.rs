@@ -8,7 +8,7 @@
 
 use std::{fs, path::Path, sync::Arc, time::Duration};
 
-use crate::persisted::decode_session_event_degraded;
+use crate::persisted::{decode_session_event_degraded, encode_session_event};
 
 use bcode_session_models::{
     RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
@@ -1249,7 +1249,7 @@ async fn insert_event(
                 .or_else(|| event_created_at_ms(event))
                 .map(seq_to_value),
         )
-        .value("payload", serde_json::to_string(event)?)
+        .value("payload", encode_session_event(event)?)
         .execute(db)
         .await?;
     Ok(())

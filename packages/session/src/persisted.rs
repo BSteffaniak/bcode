@@ -13,7 +13,7 @@ use bcode_session_models::{
     TraceBlobRef,
 };
 use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -28,6 +28,15 @@ pub fn decode_session_event(payload: &str) -> Result<SessionEvent, PersistedSess
     reject_unsupported_future_shape(&value)?;
     let persisted = serde_json::from_value::<PersistedSessionEvent>(value)?;
     persisted.into_domain()
+}
+
+/// Encode a session event into the durable JSON persistence DTO shape.
+///
+/// # Errors
+///
+/// Returns an error when the event cannot be serialized as JSON.
+pub fn encode_session_event(event: &SessionEvent) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&PersistedSessionEvent::from(event))
 }
 
 fn reject_unsupported_future_shape(
@@ -99,7 +108,7 @@ pub enum PersistedSessionEventError {
 }
 
 /// Persisted session event DTO.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct PersistedSessionEvent {
     schema_version: u16,
     sequence: u64,
@@ -107,6 +116,18 @@ struct PersistedSessionEvent {
     #[serde(default)]
     provenance: Option<SessionEventProvenance>,
     kind: PersistedSessionEventKind,
+}
+
+impl From<&SessionEvent> for PersistedSessionEvent {
+    fn from(value: &SessionEvent) -> Self {
+        Self {
+            schema_version: value.schema_version,
+            sequence: value.sequence,
+            session_id: value.session_id,
+            provenance: value.provenance.clone(),
+            kind: PersistedSessionEventKind::from(&value.kind),
+        }
+    }
 }
 
 impl PersistedSessionEvent {
@@ -129,7 +150,7 @@ impl PersistedSessionEvent {
 
 /// Persisted session event kind DTO.
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum PersistedSessionEventKind {
     SessionCreated {
@@ -348,6 +369,294 @@ enum PersistedSessionEventKind {
         forked_at_ms: u64,
         kind: SessionForkKind,
     },
+}
+
+impl From<&SessionEventKind> for PersistedSessionEventKind {
+    #[allow(clippy::too_many_lines, clippy::clone_on_copy)]
+    fn from(value: &SessionEventKind) -> Self {
+        match value {
+            SessionEventKind::SessionCreated {
+                name,
+                working_directory,
+            } => Self::SessionCreated {
+                name: name.clone(),
+                working_directory: working_directory.clone(),
+            },
+            SessionEventKind::ClientAttached { client_id } => Self::ClientAttached {
+                client_id: client_id.clone(),
+            },
+            SessionEventKind::ClientDetached { client_id } => Self::ClientDetached {
+                client_id: client_id.clone(),
+            },
+            SessionEventKind::UserMessage { client_id, text } => Self::UserMessage {
+                client_id: client_id.clone(),
+                text: text.clone(),
+            },
+            SessionEventKind::AssistantDelta { text } => {
+                Self::AssistantDelta { text: text.clone() }
+            }
+            SessionEventKind::AssistantMessage { text } => {
+                Self::AssistantMessage { text: text.clone() }
+            }
+            SessionEventKind::ToolCallRequested {
+                tool_call_id,
+                tool_name,
+                arguments_json,
+            } => Self::ToolCallRequested {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                arguments_json: arguments_json.clone(),
+            },
+            SessionEventKind::ToolCallFinished {
+                tool_call_id,
+                result,
+                is_error,
+                output,
+                semantic_result,
+            } => Self::ToolCallFinished {
+                tool_call_id: tool_call_id.clone(),
+                result: result.clone(),
+                is_error: is_error.clone(),
+                output: output.clone(),
+                semantic_result: semantic_result
+                    .as_ref()
+                    .map(PersistedToolInvocationResult::from),
+            },
+            SessionEventKind::PermissionRequested {
+                permission_id,
+                tool_call_id,
+                tool_name,
+                arguments_json,
+            } => Self::PermissionRequested {
+                permission_id: permission_id.clone(),
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                arguments_json: arguments_json.clone(),
+            },
+            SessionEventKind::PermissionResolved {
+                permission_id,
+                approved,
+            } => Self::PermissionResolved {
+                permission_id: permission_id.clone(),
+                approved: approved.clone(),
+            },
+            SessionEventKind::ModelChanged { provider, model } => Self::ModelChanged {
+                provider: provider.clone(),
+                model: model.clone(),
+            },
+            SessionEventKind::SystemMessage { text } => Self::SystemMessage { text: text.clone() },
+            SessionEventKind::AgentChanged { agent_id } => Self::AgentChanged {
+                agent_id: agent_id.clone(),
+            },
+            SessionEventKind::ModelTurnStarted { turn_id } => Self::ModelTurnStarted {
+                turn_id: turn_id.clone(),
+            },
+            SessionEventKind::ModelTurnFinished {
+                turn_id,
+                outcome,
+                message,
+            } => Self::ModelTurnFinished {
+                turn_id: turn_id.clone(),
+                outcome: outcome.clone(),
+                message: message.clone(),
+            },
+            SessionEventKind::ModelUsage { turn_id, usage } => Self::ModelUsage {
+                turn_id: turn_id.clone(),
+                usage: usage.clone(),
+            },
+            SessionEventKind::ContextCompacted {
+                summary,
+                compacted_through_sequence,
+            } => Self::ContextCompacted {
+                summary: summary.clone(),
+                compacted_through_sequence: compacted_through_sequence.clone(),
+            },
+            SessionEventKind::SessionRenamed { name } => {
+                Self::SessionRenamed { name: name.clone() }
+            }
+            SessionEventKind::TraceEvent { trace } => Self::TraceEvent {
+                trace: trace.clone(),
+            },
+            SessionEventKind::SkillInvoked {
+                skill_id,
+                arguments,
+                source,
+                invoked_at_ms,
+            } => Self::SkillInvoked {
+                skill_id: skill_id.clone(),
+                arguments: arguments.clone(),
+                source: source.clone(),
+                invoked_at_ms: invoked_at_ms.clone(),
+            },
+            SessionEventKind::SkillSuggested {
+                skill_id,
+                reason,
+                suggested_at_ms,
+            } => Self::SkillSuggested {
+                skill_id: skill_id.clone(),
+                reason: reason.clone(),
+                suggested_at_ms: suggested_at_ms.clone(),
+            },
+            SessionEventKind::SkillActivated {
+                skill_id,
+                source,
+                mode,
+                activated_at_ms,
+            } => Self::SkillActivated {
+                skill_id: skill_id.clone(),
+                source: source.clone(),
+                mode: mode.clone(),
+                activated_at_ms: activated_at_ms.clone(),
+            },
+            SessionEventKind::SkillDeactivated {
+                skill_id,
+                deactivated_at_ms,
+            } => Self::SkillDeactivated {
+                skill_id: skill_id.clone(),
+                deactivated_at_ms: deactivated_at_ms.clone(),
+            },
+            SessionEventKind::SkillContextLoaded {
+                skill_id,
+                bytes_loaded,
+                truncated,
+                loaded_at_ms,
+            } => Self::SkillContextLoaded {
+                skill_id: skill_id.clone(),
+                bytes_loaded: bytes_loaded.clone(),
+                truncated: truncated.clone(),
+                loaded_at_ms: loaded_at_ms.clone(),
+            },
+            SessionEventKind::SkillInvocationFailed {
+                skill_id,
+                error,
+                failed_at_ms,
+            } => Self::SkillInvocationFailed {
+                skill_id: skill_id.clone(),
+                error: error.clone(),
+                failed_at_ms: failed_at_ms.clone(),
+            },
+            SessionEventKind::AssistantReasoningDelta { text } => {
+                Self::AssistantReasoningDelta { text: text.clone() }
+            }
+            SessionEventKind::AssistantReasoningMessage { text } => {
+                Self::AssistantReasoningMessage { text: text.clone() }
+            }
+            SessionEventKind::RuntimeWorkStarted {
+                work_id,
+                kind,
+                label,
+                tool_call_id,
+                plugin_id,
+                service_interface,
+                operation,
+                parent_work_id,
+                started_at_ms,
+                cancellable,
+            } => Self::RuntimeWorkStarted {
+                work_id: work_id.clone(),
+                kind: kind.clone(),
+                label: label.clone(),
+                tool_call_id: tool_call_id.clone(),
+                plugin_id: plugin_id.clone(),
+                service_interface: service_interface.clone(),
+                operation: operation.clone(),
+                parent_work_id: parent_work_id.clone(),
+                started_at_ms: started_at_ms.clone(),
+                cancellable: cancellable.clone(),
+            },
+            SessionEventKind::RuntimeWorkCancelRequested {
+                work_id,
+                requested_at_ms,
+                client_id,
+            } => Self::RuntimeWorkCancelRequested {
+                work_id: work_id.clone(),
+                requested_at_ms: requested_at_ms.clone(),
+                client_id: client_id.clone(),
+            },
+            SessionEventKind::RuntimeWorkFinished {
+                work_id,
+                status,
+                finished_at_ms,
+                message,
+            } => Self::RuntimeWorkFinished {
+                work_id: work_id.clone(),
+                status: status.clone(),
+                finished_at_ms: finished_at_ms.clone(),
+                message: message.clone(),
+            },
+            SessionEventKind::RuntimeWorkProgress {
+                work_id,
+                message,
+                progress_at_ms,
+                completed_units,
+                total_units,
+            } => Self::RuntimeWorkProgress {
+                work_id: work_id.clone(),
+                message: message.clone(),
+                progress_at_ms: progress_at_ms.clone(),
+                completed_units: completed_units.clone(),
+                total_units: total_units.clone(),
+            },
+            SessionEventKind::ModelTurnCancelRequested {
+                turn_id,
+                requested_at_ms,
+                client_id,
+            } => Self::ModelTurnCancelRequested {
+                turn_id: turn_id.clone(),
+                requested_at_ms: requested_at_ms.clone(),
+                client_id: client_id.clone(),
+            },
+            SessionEventKind::ToolInvocationStream { event } => Self::ToolInvocationStream {
+                event: event.clone(),
+            },
+            SessionEventKind::WorkingDirectoryChanged {
+                old_working_directory,
+                new_working_directory,
+            } => Self::WorkingDirectoryChanged {
+                old_working_directory: old_working_directory.clone(),
+                new_working_directory: new_working_directory.clone(),
+            },
+            SessionEventKind::SessionImported {
+                source_id,
+                source_display_name,
+                external_session_id,
+                imported_at_ms,
+            } => Self::SessionImported {
+                source_id: source_id.clone(),
+                source_display_name: source_display_name.clone(),
+                external_session_id: external_session_id.clone(),
+                imported_at_ms: imported_at_ms.clone(),
+            },
+            SessionEventKind::ToolInvocationPresentation {
+                tool_call_id,
+                started_at_ms,
+                finished_at_ms,
+                is_error,
+                presentation,
+            } => Self::ToolInvocationPresentation {
+                tool_call_id: tool_call_id.clone(),
+                started_at_ms: started_at_ms.clone(),
+                finished_at_ms: finished_at_ms.clone(),
+                is_error: is_error.clone(),
+                presentation: presentation.clone(),
+            },
+            SessionEventKind::SessionForked {
+                source_session_id,
+                source_title,
+                source_cutoff_sequence,
+                source_prompt_sequence,
+                forked_at_ms,
+                kind,
+            } => Self::SessionForked {
+                source_session_id: source_session_id.clone(),
+                source_title: source_title.clone(),
+                source_cutoff_sequence: source_cutoff_sequence.clone(),
+                source_prompt_sequence: source_prompt_sequence.clone(),
+                forked_at_ms: forked_at_ms.clone(),
+                kind: kind.clone(),
+            },
+        }
+    }
 }
 
 impl PersistedSessionEventKind {
@@ -616,13 +925,30 @@ impl PersistedSessionEventKind {
 }
 
 /// Persisted semantic tool result DTO.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum PersistedToolInvocationResult {
     Text { text: String },
     Json { value: String },
     ShellRun { result: PersistedShellRunResult },
     FileChange { result: FileChangeResult },
+}
+
+impl From<&ToolInvocationResult> for PersistedToolInvocationResult {
+    fn from(value: &ToolInvocationResult) -> Self {
+        match value {
+            ToolInvocationResult::Text { text } => Self::Text { text: text.clone() },
+            ToolInvocationResult::Json { value } => Self::Json {
+                value: value.clone(),
+            },
+            ToolInvocationResult::ShellRun { result } => Self::ShellRun {
+                result: PersistedShellRunResult::from(result),
+            },
+            ToolInvocationResult::FileChange { result } => Self::FileChange {
+                result: result.clone(),
+            },
+        }
+    }
 }
 
 impl PersistedToolInvocationResult {
@@ -639,7 +965,7 @@ impl PersistedToolInvocationResult {
 }
 
 /// Persisted shell-run result DTO.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 enum PersistedShellRunResult {
     Terminal {
@@ -682,6 +1008,55 @@ enum PersistedShellRunResult {
         #[serde(default)]
         stderr_bytes: Option<u64>,
     },
+}
+
+impl From<&ShellRunResult> for PersistedShellRunResult {
+    fn from(value: &ShellRunResult) -> Self {
+        match value {
+            ShellRunResult::Terminal {
+                exit_code,
+                timed_out,
+                cancelled,
+                output_tail,
+                output_truncated,
+                output_bytes,
+                retained_output_bytes,
+                columns,
+                rows,
+            } => Self::Terminal {
+                exit_code: *exit_code,
+                timed_out: *timed_out,
+                cancelled: *cancelled,
+                output_tail: output_tail.clone(),
+                output_truncated: *output_truncated,
+                output_bytes: *output_bytes,
+                retained_output_bytes: *retained_output_bytes,
+                columns: *columns,
+                rows: *rows,
+            },
+            ShellRunResult::Captured {
+                exit_code,
+                timed_out,
+                cancelled,
+                stdout,
+                stderr,
+                stdout_truncated,
+                stderr_truncated,
+                stdout_bytes,
+                stderr_bytes,
+            } => Self::Captured {
+                exit_code: *exit_code,
+                timed_out: *timed_out,
+                cancelled: *cancelled,
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+                stdout_truncated: *stdout_truncated,
+                stderr_truncated: *stderr_truncated,
+                stdout_bytes: *stdout_bytes,
+                stderr_bytes: *stderr_bytes,
+            },
+        }
+    }
 }
 
 impl PersistedShellRunResult {
