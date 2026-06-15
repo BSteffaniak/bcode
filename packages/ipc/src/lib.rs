@@ -699,6 +699,166 @@ pub enum Event {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+enum IpcResponse {
+    Ok(IpcResponsePayload),
+    Err(ErrorResponse),
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IpcResponsePayload {
+    Domain(Box<ResponsePayload>),
+    SessionHistory {
+        session_id: SessionId,
+        history: Vec<IpcSessionEvent>,
+    },
+    SessionHistoryPage {
+        page: IpcSessionHistoryPage,
+    },
+    Attached {
+        session_id: SessionId,
+        session: SessionSummary,
+        history: Vec<IpcSessionEvent>,
+        input_history: Vec<SessionInputHistoryEntry>,
+        import_warnings: Vec<SessionImportWarning>,
+    },
+    RuntimeWorkHistory {
+        events: Vec<IpcSessionEvent>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct IpcSessionHistoryPage {
+    session_id: SessionId,
+    events: Vec<IpcSessionEvent>,
+    next_cursor: Option<bcode_session_models::SessionHistoryCursor>,
+    has_more: bool,
+}
+
+impl From<&Response> for IpcResponse {
+    fn from(value: &Response) -> Self {
+        match value {
+            Response::Ok(payload) => Self::Ok(IpcResponsePayload::from(payload)),
+            Response::Err(error) => Self::Err(error.clone()),
+        }
+    }
+}
+
+impl TryFrom<IpcResponse> for Response {
+    type Error = CodecError;
+
+    fn try_from(value: IpcResponse) -> Result<Self, Self::Error> {
+        match value {
+            IpcResponse::Ok(payload) => payload.try_into().map(Self::Ok),
+            IpcResponse::Err(error) => Ok(Self::Err(error)),
+        }
+    }
+}
+
+impl From<&ResponsePayload> for IpcResponsePayload {
+    fn from(value: &ResponsePayload) -> Self {
+        match value {
+            ResponsePayload::SessionHistory {
+                session_id,
+                history,
+            } => Self::SessionHistory {
+                session_id: *session_id,
+                history: history.iter().map(IpcSessionEvent::from).collect(),
+            },
+            ResponsePayload::SessionHistoryPage { page } => Self::SessionHistoryPage {
+                page: IpcSessionHistoryPage::from(page),
+            },
+            ResponsePayload::Attached {
+                session_id,
+                session,
+                history,
+                input_history,
+                import_warnings,
+            } => Self::Attached {
+                session_id: *session_id,
+                session: session.clone(),
+                history: history.iter().map(IpcSessionEvent::from).collect(),
+                input_history: input_history.clone(),
+                import_warnings: import_warnings.clone(),
+            },
+            ResponsePayload::RuntimeWorkHistory { events } => Self::RuntimeWorkHistory {
+                events: events.iter().map(IpcSessionEvent::from).collect(),
+            },
+            _ => Self::Domain(Box::new(value.clone())),
+        }
+    }
+}
+
+impl TryFrom<IpcResponsePayload> for ResponsePayload {
+    type Error = CodecError;
+
+    fn try_from(value: IpcResponsePayload) -> Result<Self, Self::Error> {
+        match value {
+            IpcResponsePayload::Domain(payload) => Ok(*payload),
+            IpcResponsePayload::SessionHistory {
+                session_id,
+                history,
+            } => Ok(Self::SessionHistory {
+                session_id,
+                history: ipc_events_to_session_events(history)?,
+            }),
+            IpcResponsePayload::SessionHistoryPage { page } => Ok(Self::SessionHistoryPage {
+                page: page.try_into()?,
+            }),
+            IpcResponsePayload::Attached {
+                session_id,
+                session,
+                history,
+                input_history,
+                import_warnings,
+            } => Ok(Self::Attached {
+                session_id,
+                session,
+                history: ipc_events_to_session_events(history)?,
+                input_history,
+                import_warnings,
+            }),
+            IpcResponsePayload::RuntimeWorkHistory { events } => Ok(Self::RuntimeWorkHistory {
+                events: ipc_events_to_session_events(events)?,
+            }),
+        }
+    }
+}
+
+impl From<&SessionHistoryPage> for IpcSessionHistoryPage {
+    fn from(value: &SessionHistoryPage) -> Self {
+        Self {
+            session_id: value.session_id,
+            events: value.events.iter().map(IpcSessionEvent::from).collect(),
+            next_cursor: value.next_cursor,
+            has_more: value.has_more,
+        }
+    }
+}
+
+impl TryFrom<IpcSessionHistoryPage> for SessionHistoryPage {
+    type Error = CodecError;
+
+    fn try_from(value: IpcSessionHistoryPage) -> Result<Self, Self::Error> {
+        Ok(Self {
+            session_id: value.session_id,
+            events: ipc_events_to_session_events(value.events)?,
+            next_cursor: value.next_cursor,
+            has_more: value.has_more,
+        })
+    }
+}
+
+fn ipc_events_to_session_events(
+    events: Vec<IpcSessionEvent>,
+) -> Result<Vec<SessionEvent>, CodecError> {
+    events.into_iter().map(TryInto::try_into).collect()
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum IpcEvent {
     Session(IpcSessionEvent),
     SessionLive(SessionLiveEvent),
@@ -1094,6 +1254,26 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
     bmux_codec::from_positional_bytes(bytes).map_err(CodecError::Deserialize)
 }
 
+/// Encode a response with the Bcode wire codec.
+///
+/// # Errors
+///
+/// Returns an error when serialization fails.
+pub fn encode_response(response: &Response) -> Result<Vec<u8>, CodecError> {
+    let response = IpcResponse::from(response);
+    encode(&response)
+}
+
+/// Decode a response with the Bcode wire codec.
+///
+/// # Errors
+///
+/// Returns an error when deserialization or domain conversion fails.
+pub fn decode_response(bytes: &[u8]) -> Result<Response, CodecError> {
+    let response = decode::<IpcResponse>(bytes)?;
+    response.try_into()
+}
+
 /// Decode a server event with the Bcode wire codec.
 ///
 /// # Errors
@@ -1359,7 +1539,7 @@ pub fn response_envelope(request_id: u64, response: &Response) -> Result<Envelop
     Ok(Envelope::new(
         request_id,
         EnvelopeKind::Response,
-        encode(response)?,
+        encode_response(response)?,
     ))
 }
 

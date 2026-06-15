@@ -12,7 +12,8 @@ use bcode_ipc::{
     Response, ResponsePayload, ServerStopMode, SessionCatalogSourceStatus, SessionCatalogStatus,
     SessionImportWarning, WorktreeCreateRequest, WorktreeCreateResponse, WorktreeListRequest,
     WorktreeListResponse, WorktreeRemoveRequest, WorktreeRemoveResponse, current_working_directory,
-    decode, decode_event, default_endpoint, recv_envelope, request_envelope, send_envelope,
+    decode_event, decode_response, default_endpoint, recv_envelope, request_envelope,
+    send_envelope,
 };
 use bcode_session_models::{
     ClientId, ProjectionWindowRequest, RuntimeWorkId, RuntimeWorkStatus, SessionEvent,
@@ -1770,7 +1771,7 @@ impl ClientConnection {
             if envelope.kind != EnvelopeKind::Response || envelope.request_id != request_id {
                 continue;
             }
-            let response: Response = decode(&envelope.payload)?;
+            let response: Response = decode_response(&envelope.payload)?;
             return match response {
                 Response::Ok(payload) => Ok(payload),
                 Response::Err(error) => Err(error.into()),
