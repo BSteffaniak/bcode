@@ -27,21 +27,45 @@ use super::{TuiError, ralph_start_dialog, ralph_start_dialog_render};
 /// Open the plugin-owned Ralph home UI.
 pub async fn open_home<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
     chat: &mut ActiveChat,
 ) -> Result<(), TuiError> {
     let repo_root = current_repo_root(chat)?;
     match super::ralph_launcher::run_home(io.terminal, repo_root).await? {
-        super::ralph_launcher::RalphHomeOutcome::RunCommand(command) => {
-            chat.app.replace_composer_with(&command);
-            chat.app.set_status(format!(
-                "selected {command}; press Enter to run it in this Bcode session"
-            ));
+        super::ralph_launcher::RalphHomeOutcome::Action(action) => {
+            dispatch_home_action(action, io, services, chat).await?;
         }
         super::ralph_launcher::RalphHomeOutcome::Exit => {
             chat.app.set_status("Ralph UI closed".to_owned());
         }
     }
     Ok(())
+}
+
+async fn dispatch_home_action<W: Write>(
+    action: super::ralph_launcher::RalphHomeAction,
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
+) -> Result<(), TuiError> {
+    match action {
+        super::ralph_launcher::RalphHomeAction::Start => start_loop(io, services, chat).await,
+        super::ralph_launcher::RalphHomeAction::Run
+        | super::ralph_launcher::RalphHomeAction::Goal => run_loop(services, chat).await,
+        super::ralph_launcher::RalphHomeAction::Approve => approve_run(services, chat).await,
+        super::ralph_launcher::RalphHomeAction::Stop => stop_loop(services, chat).await,
+        super::ralph_launcher::RalphHomeAction::Resume => resume_run(services, chat).await,
+        super::ralph_launcher::RalphHomeAction::Status => show_status(services, chat).await,
+        super::ralph_launcher::RalphHomeAction::Runs => list_runs(services, chat).await,
+        super::ralph_launcher::RalphHomeAction::Iterations => list_iterations(services, chat).await,
+        super::ralph_launcher::RalphHomeAction::Open => open_progress(chat),
+        super::ralph_launcher::RalphHomeAction::Audit => {
+            show_prompt(chat, ralph_state::RalphPromptKind::Audit)
+        }
+        super::ralph_launcher::RalphHomeAction::Replan => {
+            show_prompt(chat, ralph_state::RalphPromptKind::Replan)
+        }
+    }
 }
 
 /// Show latest Ralph loop status for the current repository.

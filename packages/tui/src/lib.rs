@@ -148,7 +148,9 @@ pub fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
 ///
 /// Returns I/O or plugin service errors.
 #[allow(clippy::future_not_send)]
-pub async fn run_ralph_home(repo_path: std::path::PathBuf) -> Result<Option<String>, TuiError> {
+pub async fn run_ralph_home(
+    repo_path: std::path::PathBuf,
+) -> Result<Option<ralph_launcher::RalphHomeAction>, TuiError> {
     let stdout = io::stdout();
     let mut guard = CrosstermTerminalGuard::enter(stdout)?;
     let result = {
@@ -162,9 +164,9 @@ pub async fn run_ralph_home(repo_path: std::path::PathBuf) -> Result<Option<Stri
     };
 
     match result {
-        Ok(ralph_launcher::RalphHomeOutcome::RunCommand(command)) => {
+        Ok(ralph_launcher::RalphHomeOutcome::Action(action)) => {
             let _writer = guard.leave()?;
-            Ok(Some(command))
+            Ok(Some(action))
         }
         Ok(ralph_launcher::RalphHomeOutcome::Exit) => {
             let _writer = guard.leave()?;

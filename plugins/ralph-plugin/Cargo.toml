@@ -18,6 +18,7 @@ bcode_plugin_sdk = { workspace = true }
 bcode_ralph      = { workspace = true }
 bmux_keyboard    = { workspace = true }
 bmux_tui         = { workspace = true, features = ["crossterm"] }
+serde            = { workspace = true, features = ["derive", "std"] }
 serde_json       = { workspace = true }
 
 [features]

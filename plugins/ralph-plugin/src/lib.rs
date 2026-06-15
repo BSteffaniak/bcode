@@ -30,29 +30,65 @@ pub fn tui_registry() -> PluginTuiRegistry {
 }
 
 const RALPH_ACTIONS: &[RalphAction] = &[
-    RalphAction::new("Start/setup loop", "/ralph start"),
-    RalphAction::new("Run autonomous loop", "/ralph run"),
-    RalphAction::new("Approve prepared run", "/ralph approve"),
-    RalphAction::new("Stop active run", "/ralph stop"),
-    RalphAction::new("Resume safely", "/ralph resume"),
-    RalphAction::new("Show status", "/ralph status"),
-    RalphAction::new("List runs", "/ralph runs"),
-    RalphAction::new("List iterations", "/ralph iterations"),
-    RalphAction::new("Open progress doc", "/ralph open"),
-    RalphAction::new("Build audit prompt", "/ralph audit"),
-    RalphAction::new("Build replan prompt", "/ralph replan"),
-    RalphAction::new("Goal workflow", "/goal"),
+    RalphAction::new("Start/setup loop", RalphActionKind::Start),
+    RalphAction::new("Run autonomous loop", RalphActionKind::Run),
+    RalphAction::new("Approve prepared run", RalphActionKind::Approve),
+    RalphAction::new("Stop active run", RalphActionKind::Stop),
+    RalphAction::new("Resume safely", RalphActionKind::Resume),
+    RalphAction::new("Show status", RalphActionKind::Status),
+    RalphAction::new("List runs", RalphActionKind::Runs),
+    RalphAction::new("List iterations", RalphActionKind::Iterations),
+    RalphAction::new("Open progress doc", RalphActionKind::Open),
+    RalphAction::new("Build audit prompt", RalphActionKind::Audit),
+    RalphAction::new("Build replan prompt", RalphActionKind::Replan),
+    RalphAction::new("Goal workflow", RalphActionKind::Goal),
 ];
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RalphActionKind {
+    Start,
+    Run,
+    Approve,
+    Stop,
+    Resume,
+    Status,
+    Runs,
+    Iterations,
+    Open,
+    Audit,
+    Replan,
+    Goal,
+}
+
+impl RalphActionKind {
+    const fn command_label(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Run => "run",
+            Self::Approve => "approve",
+            Self::Stop => "stop",
+            Self::Resume => "resume",
+            Self::Status => "status",
+            Self::Runs => "runs",
+            Self::Iterations => "iterations",
+            Self::Open => "open",
+            Self::Audit => "audit",
+            Self::Replan => "replan",
+            Self::Goal => "goal",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct RalphAction {
     label: &'static str,
-    command: &'static str,
+    kind: RalphActionKind,
 }
 
 impl RalphAction {
-    const fn new(label: &'static str, command: &'static str) -> Self {
-        Self { label, command }
+    const fn new(label: &'static str, kind: RalphActionKind) -> Self {
+        Self { label, kind }
     }
 }
 
@@ -160,7 +196,11 @@ impl RalphHomeSurface {
                 area,
                 y,
                 Line::from_spans(vec![Span::styled(
-                    format!("{marker} {:<24} {}", action.label, action.command),
+                    format!(
+                        "{marker} {:<24} {}",
+                        action.label,
+                        action.kind.command_label()
+                    ),
                     style,
                 )]),
             );
@@ -300,14 +340,16 @@ impl PluginTuiSurface for RalphHomeSurface {
                 self.selected_action = (self.selected_action + 1).min(RALPH_ACTIONS.len() - 1);
                 PluginTuiAction::Redraw
             }
-            KeyCode::Enter => PluginTuiAction::RunCommand {
-                command: RALPH_ACTIONS[self.selected_action].command.to_owned(),
+            KeyCode::Enter => PluginTuiAction::Close {
+                outcome: Some(serde_json::json!({
+                    "ralph_action": RALPH_ACTIONS[self.selected_action].kind,
+                })),
             },
-            KeyCode::Char('s') => PluginTuiAction::RunCommand {
-                command: "/ralph status".to_owned(),
+            KeyCode::Char('s') => PluginTuiAction::Close {
+                outcome: Some(serde_json::json!({ "ralph_action": RalphActionKind::Status })),
             },
-            KeyCode::Char('g') => PluginTuiAction::RunCommand {
-                command: "/goal".to_owned(),
+            KeyCode::Char('g') => PluginTuiAction::Close {
+                outcome: Some(serde_json::json!({ "ralph_action": RalphActionKind::Goal })),
             },
             _ => PluginTuiAction::None,
         }

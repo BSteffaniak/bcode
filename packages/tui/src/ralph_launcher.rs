@@ -4,15 +4,46 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use bmux_tui::terminal::Terminal;
+use serde::Deserialize;
 
 use crate::TuiError;
+
+/// Typed Ralph actions selected in the plugin surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RalphHomeAction {
+    /// Open setup flow.
+    Start,
+    /// Prepare/run autonomous loop.
+    Run,
+    /// Approve prepared run.
+    Approve,
+    /// Stop active run.
+    Stop,
+    /// Resume interrupted run.
+    Resume,
+    /// Show status.
+    Status,
+    /// List runs.
+    Runs,
+    /// List iterations.
+    Iterations,
+    /// Open progress document.
+    Open,
+    /// Build audit prompt.
+    Audit,
+    /// Build replan prompt.
+    Replan,
+    /// Open goal workflow.
+    Goal,
+}
 
 /// Ralph home outcome returned by the Ralph plugin surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RalphHomeOutcome {
-    /// Run a slash command selected in the plugin surface.
-    RunCommand(String),
-    /// Exit without running a command.
+    /// Dispatch a typed Ralph action selected in the plugin surface.
+    Action(RalphHomeAction),
+    /// Exit without running an action.
     Exit,
 }
 
@@ -61,7 +92,7 @@ fn load_ralph_tui_runtime() -> Result<bcode_plugin::PluginRuntimeHost, TuiError>
 
 fn parse_ralph_home_outcome(outcome: Option<serde_json::Value>) -> RalphHomeOutcome {
     outcome
-        .and_then(|value| value.get("run_command").cloned())
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .map_or(RalphHomeOutcome::Exit, RalphHomeOutcome::RunCommand)
+        .and_then(|value| value.get("ralph_action").cloned())
+        .and_then(|value| serde_json::from_value(value).ok())
+        .map_or(RalphHomeOutcome::Exit, RalphHomeOutcome::Action)
 }
