@@ -11,6 +11,7 @@
 mod actor;
 pub mod db;
 pub mod lease;
+pub mod persisted;
 pub mod projection;
 pub mod repair;
 mod store_executor;

@@ -8,6 +8,8 @@
 
 use std::{fs, path::Path, sync::Arc, time::Duration};
 
+use crate::persisted::decode_session_event;
+
 use bcode_session_models::{
     RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
     SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery,
@@ -724,7 +726,7 @@ impl SessionDb {
         rows.into_iter()
             .map(|row| {
                 let payload = required_string(&row, "payload")?;
-                Ok(serde_json::from_str(&payload)?)
+                Ok(decode_session_event(&payload)?)
             })
             .collect()
     }
@@ -771,7 +773,7 @@ impl SessionDb {
             .take(limit)
             .map(|row| {
                 let payload = required_string(row, "payload")?;
-                let event = serde_json::from_str::<SessionEvent>(&payload)?;
+                let event = decode_session_event(&payload)?;
                 Ok(event)
             })
             .collect::<SessionDbResult<Vec<_>>>()?;
@@ -821,7 +823,7 @@ impl SessionDb {
         events.push(compaction_event.clone());
         for row in rows {
             let payload = required_string(&row, "payload")?;
-            let event = serde_json::from_str::<SessionEvent>(&payload)?;
+            let event = decode_session_event(&payload)?;
             if event.sequence != compaction_event.sequence {
                 events.push(event);
             }
@@ -865,7 +867,7 @@ impl SessionDb {
                     continue;
                 }
                 let payload = required_string(row, "payload")?;
-                selected_newest_first.push(serde_json::from_str::<SessionEvent>(&payload)?);
+                selected_newest_first.push(decode_session_event(&payload)?);
                 if selected_newest_first.len() >= MODEL_CONTEXT_EVENT_LIMIT {
                     break;
                 }
@@ -897,7 +899,7 @@ impl SessionDb {
         row.as_ref()
             .map(|row| {
                 let payload = required_string(row, "payload")?;
-                Ok(serde_json::from_str(&payload)?)
+                Ok(decode_session_event(&payload)?)
             })
             .transpose()
     }
@@ -927,7 +929,7 @@ impl SessionDb {
         rows.into_iter()
             .map(|row| {
                 let payload = required_string(&row, "payload")?;
-                Ok(serde_json::from_str(&payload)?)
+                Ok(decode_session_event(&payload)?)
             })
             .collect()
     }
