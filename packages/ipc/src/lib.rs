@@ -7,9 +7,10 @@
 use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_metrics::MetricsSnapshot;
 use bcode_session_models::{
-    ClientId, ProjectionWindowRequest, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus,
-    SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId, SessionInputHistoryEntry,
-    SessionLiveEvent, SessionSummary,
+    ClientId, FileChangeResult, ProjectionWindowRequest, RuntimeWorkId, RuntimeWorkKind,
+    RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionHistoryPage, SessionHistoryQuery,
+    SessionId, SessionInputHistoryEntry, SessionLiveEvent, SessionSummary, ShellRunResult,
+    ToolInvocationResult,
 };
 use bcode_skill_models::{SkillContextResponse, SkillId, SkillList, SkillManifest};
 pub use bcode_worktree_models::{
@@ -695,6 +696,357 @@ pub enum Event {
     },
 }
 
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IpcEvent {
+    Session(IpcSessionEvent),
+    SessionLive(SessionLiveEvent),
+    RuntimeWork(IpcSessionEvent),
+    SessionCatalogUpdated { revision: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct IpcSessionEvent {
+    schema_version: u16,
+    sequence: u64,
+    session_id: SessionId,
+    provenance: Option<bcode_session_models::SessionEventProvenance>,
+    kind: IpcSessionEventKind,
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IpcSessionEventKind {
+    Domain(Box<SessionEventKind>),
+    ToolCallFinished {
+        tool_call_id: String,
+        result: String,
+        is_error: bool,
+        output: Option<bcode_session_models::TraceBlobRef>,
+        semantic_result: Option<IpcToolInvocationResult>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct IpcToolInvocationResult {
+    kind: IpcToolInvocationResultKind,
+    text: Option<String>,
+    json: Option<String>,
+    shell_run: Option<IpcShellRunResult>,
+    file_change: Option<FileChangeResult>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IpcToolInvocationResultKind {
+    Text,
+    Json,
+    ShellRun,
+    FileChange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct IpcShellRunResult {
+    kind: IpcShellRunResultKind,
+    terminal: Option<IpcShellRunTerminalResult>,
+    captured: Option<IpcShellRunCapturedResult>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IpcShellRunResultKind {
+    Terminal,
+    Captured,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct IpcShellRunTerminalResult {
+    exit_code: Option<i32>,
+    timed_out: bool,
+    cancelled: bool,
+    output_tail: String,
+    output_truncated: bool,
+    output_bytes: Option<u64>,
+    retained_output_bytes: Option<u64>,
+    columns: u16,
+    rows: u16,
+}
+
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct IpcShellRunCapturedResult {
+    exit_code: Option<i32>,
+    timed_out: bool,
+    cancelled: bool,
+    stdout: String,
+    stderr: String,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    stdout_bytes: Option<u64>,
+    stderr_bytes: Option<u64>,
+}
+
+impl From<&Event> for IpcEvent {
+    fn from(value: &Event) -> Self {
+        match value {
+            Event::Session(event) => Self::Session(IpcSessionEvent::from(event)),
+            Event::SessionLive(event) => Self::SessionLive(event.clone()),
+            Event::RuntimeWork(event) => Self::RuntimeWork(IpcSessionEvent::from(event)),
+            Event::SessionCatalogUpdated { revision } => Self::SessionCatalogUpdated {
+                revision: *revision,
+            },
+        }
+    }
+}
+
+impl TryFrom<IpcEvent> for Event {
+    type Error = CodecError;
+
+    fn try_from(value: IpcEvent) -> Result<Self, Self::Error> {
+        match value {
+            IpcEvent::Session(event) => event.try_into().map(Self::Session),
+            IpcEvent::SessionLive(event) => Ok(Self::SessionLive(event)),
+            IpcEvent::RuntimeWork(event) => event.try_into().map(Self::RuntimeWork),
+            IpcEvent::SessionCatalogUpdated { revision } => {
+                Ok(Self::SessionCatalogUpdated { revision })
+            }
+        }
+    }
+}
+
+impl From<&SessionEvent> for IpcSessionEvent {
+    fn from(value: &SessionEvent) -> Self {
+        Self {
+            schema_version: value.schema_version,
+            sequence: value.sequence,
+            session_id: value.session_id,
+            provenance: value.provenance.clone(),
+            kind: IpcSessionEventKind::from(&value.kind),
+        }
+    }
+}
+
+impl TryFrom<IpcSessionEvent> for SessionEvent {
+    type Error = CodecError;
+
+    fn try_from(value: IpcSessionEvent) -> Result<Self, Self::Error> {
+        Ok(Self {
+            schema_version: value.schema_version,
+            sequence: value.sequence,
+            session_id: value.session_id,
+            provenance: value.provenance,
+            kind: value.kind.try_into()?,
+        })
+    }
+}
+
+impl From<&SessionEventKind> for IpcSessionEventKind {
+    fn from(value: &SessionEventKind) -> Self {
+        match value {
+            SessionEventKind::ToolCallFinished {
+                tool_call_id,
+                result,
+                is_error,
+                output,
+                semantic_result,
+            } => Self::ToolCallFinished {
+                tool_call_id: tool_call_id.clone(),
+                result: result.clone(),
+                is_error: *is_error,
+                output: output.clone(),
+                semantic_result: semantic_result.as_ref().map(IpcToolInvocationResult::from),
+            },
+            _ => Self::Domain(Box::new(value.clone())),
+        }
+    }
+}
+
+impl TryFrom<IpcSessionEventKind> for SessionEventKind {
+    type Error = CodecError;
+
+    fn try_from(value: IpcSessionEventKind) -> Result<Self, Self::Error> {
+        match value {
+            IpcSessionEventKind::Domain(kind) => Ok(*kind),
+            IpcSessionEventKind::ToolCallFinished {
+                tool_call_id,
+                result,
+                is_error,
+                output,
+                semantic_result,
+            } => Ok(Self::ToolCallFinished {
+                tool_call_id,
+                result,
+                is_error,
+                output,
+                semantic_result: semantic_result.map(TryInto::try_into).transpose()?,
+            }),
+        }
+    }
+}
+
+impl From<&ToolInvocationResult> for IpcToolInvocationResult {
+    fn from(value: &ToolInvocationResult) -> Self {
+        match value {
+            ToolInvocationResult::Text { text } => Self {
+                kind: IpcToolInvocationResultKind::Text,
+                text: Some(text.clone()),
+                json: None,
+                shell_run: None,
+                file_change: None,
+            },
+            ToolInvocationResult::Json { value } => Self {
+                kind: IpcToolInvocationResultKind::Json,
+                text: None,
+                json: Some(value.clone()),
+                shell_run: None,
+                file_change: None,
+            },
+            ToolInvocationResult::ShellRun { result } => Self {
+                kind: IpcToolInvocationResultKind::ShellRun,
+                text: None,
+                json: None,
+                shell_run: Some(IpcShellRunResult::from(result)),
+                file_change: None,
+            },
+            ToolInvocationResult::FileChange { result } => Self {
+                kind: IpcToolInvocationResultKind::FileChange,
+                text: None,
+                json: None,
+                shell_run: None,
+                file_change: Some(result.clone()),
+            },
+        }
+    }
+}
+
+impl TryFrom<IpcToolInvocationResult> for ToolInvocationResult {
+    type Error = CodecError;
+
+    fn try_from(value: IpcToolInvocationResult) -> Result<Self, Self::Error> {
+        match value.kind {
+            IpcToolInvocationResultKind::Text => Ok(Self::Text {
+                text: value.text.unwrap_or_default(),
+            }),
+            IpcToolInvocationResultKind::Json => Ok(Self::Json {
+                value: value.json.unwrap_or_default(),
+            }),
+            IpcToolInvocationResultKind::ShellRun => Ok(Self::ShellRun {
+                result: value
+                    .shell_run
+                    .ok_or_else(|| {
+                        CodecError::EventConversion("missing shell_run payload".to_string())
+                    })?
+                    .try_into()?,
+            }),
+            IpcToolInvocationResultKind::FileChange => Ok(Self::FileChange {
+                result: value.file_change.ok_or_else(|| {
+                    CodecError::EventConversion("missing file_change payload".to_string())
+                })?,
+            }),
+        }
+    }
+}
+
+impl From<&ShellRunResult> for IpcShellRunResult {
+    fn from(value: &ShellRunResult) -> Self {
+        match value {
+            ShellRunResult::Terminal {
+                exit_code,
+                timed_out,
+                cancelled,
+                output_tail,
+                output_truncated,
+                output_bytes,
+                retained_output_bytes,
+                columns,
+                rows,
+            } => Self {
+                kind: IpcShellRunResultKind::Terminal,
+                terminal: Some(IpcShellRunTerminalResult {
+                    exit_code: *exit_code,
+                    timed_out: *timed_out,
+                    cancelled: *cancelled,
+                    output_tail: output_tail.clone(),
+                    output_truncated: *output_truncated,
+                    output_bytes: *output_bytes,
+                    retained_output_bytes: *retained_output_bytes,
+                    columns: *columns,
+                    rows: *rows,
+                }),
+                captured: None,
+            },
+            ShellRunResult::Captured {
+                exit_code,
+                timed_out,
+                cancelled,
+                stdout,
+                stderr,
+                stdout_truncated,
+                stderr_truncated,
+                stdout_bytes,
+                stderr_bytes,
+            } => Self {
+                kind: IpcShellRunResultKind::Captured,
+                terminal: None,
+                captured: Some(IpcShellRunCapturedResult {
+                    exit_code: *exit_code,
+                    timed_out: *timed_out,
+                    cancelled: *cancelled,
+                    stdout: stdout.clone(),
+                    stderr: stderr.clone(),
+                    stdout_truncated: *stdout_truncated,
+                    stderr_truncated: *stderr_truncated,
+                    stdout_bytes: *stdout_bytes,
+                    stderr_bytes: *stderr_bytes,
+                }),
+            },
+        }
+    }
+}
+
+impl TryFrom<IpcShellRunResult> for ShellRunResult {
+    type Error = CodecError;
+
+    fn try_from(value: IpcShellRunResult) -> Result<Self, Self::Error> {
+        match value.kind {
+            IpcShellRunResultKind::Terminal => {
+                let terminal = value.terminal.ok_or_else(|| {
+                    CodecError::EventConversion("missing terminal shell payload".to_string())
+                })?;
+                Ok(Self::Terminal {
+                    exit_code: terminal.exit_code,
+                    timed_out: terminal.timed_out,
+                    cancelled: terminal.cancelled,
+                    output_tail: terminal.output_tail,
+                    output_truncated: terminal.output_truncated,
+                    output_bytes: terminal.output_bytes,
+                    retained_output_bytes: terminal.retained_output_bytes,
+                    columns: terminal.columns,
+                    rows: terminal.rows,
+                })
+            }
+            IpcShellRunResultKind::Captured => {
+                let captured = value.captured.ok_or_else(|| {
+                    CodecError::EventConversion("missing captured shell payload".to_string())
+                })?;
+                Ok(Self::Captured {
+                    exit_code: captured.exit_code,
+                    timed_out: captured.timed_out,
+                    cancelled: captured.cancelled,
+                    stdout: captured.stdout,
+                    stderr: captured.stderr,
+                    stdout_truncated: captured.stdout_truncated,
+                    stderr_truncated: captured.stderr_truncated,
+                    stdout_bytes: captured.stdout_bytes,
+                    stderr_bytes: captured.stderr_bytes,
+                })
+            }
+        }
+    }
+}
+
 /// Errors returned by Bcode IPC encoding/decoding.
 #[derive(Debug, Error)]
 pub enum CodecError {
@@ -708,6 +1060,8 @@ pub enum CodecError {
     Serialize(#[source] bmux_codec::Error),
     #[error("deserialization failed: {0}")]
     Deserialize(#[source] bmux_codec::Error),
+    #[error("event conversion failed: {0}")]
+    EventConversion(String),
     #[error("unsupported protocol version {actual}; expected {expected}")]
     UnsupportedVersion { actual: u16, expected: u16 },
 }
@@ -721,6 +1075,16 @@ pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
     bmux_codec::to_positional_vec(value).map_err(CodecError::Serialize)
 }
 
+/// Encode a server event with the Bcode wire codec.
+///
+/// # Errors
+///
+/// Returns an error when serialization fails.
+pub fn encode_event(event: &Event) -> Result<Vec<u8>, CodecError> {
+    let event = IpcEvent::from(event);
+    encode(&event)
+}
+
 /// Decode a deserializable value with the Bcode wire codec.
 ///
 /// # Errors
@@ -728,6 +1092,16 @@ pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
 /// Returns an error when deserialization fails.
 pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
     bmux_codec::from_positional_bytes(bytes).map_err(CodecError::Deserialize)
+}
+
+/// Decode a server event with the Bcode wire codec.
+///
+/// # Errors
+///
+/// Returns an error when deserialization or domain conversion fails.
+pub fn decode_event(bytes: &[u8]) -> Result<Event, CodecError> {
+    let event = decode::<IpcEvent>(bytes)?;
+    event.try_into()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -995,7 +1369,7 @@ pub fn response_envelope(request_id: u64, response: &Response) -> Result<Envelop
 ///
 /// Returns an error when serialization fails.
 pub fn event_envelope(event: &Event) -> Result<Envelope, CodecError> {
-    Ok(Envelope::new(0, EnvelopeKind::Event, encode(event)?))
+    Ok(Envelope::new(0, EnvelopeKind::Event, encode_event(event)?))
 }
 
 /// Return the normalized current working directory for session scoping.
@@ -1494,7 +1868,7 @@ mod tests {
 
             let received = round_trip_envelope(envelope).await;
 
-            let decoded = decode::<Event>(&received.payload).expect("event should decode");
+            let decoded = decode_event(&received.payload).expect("event should decode");
             assert_eq!(decoded, event);
         }
     }
