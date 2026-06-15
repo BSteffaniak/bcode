@@ -3791,6 +3791,47 @@ mod tests {
         assert!(!source_without_comments.contains("impl Deserialize"));
     }
 
+    #[test]
+    fn ralph_runner_requests_round_trip() {
+        let requests = [
+            Request::RunRalphLoop(RalphRunRequest {
+                repo_root: PathBuf::from("/repo"),
+                loop_state_dir: Some(PathBuf::from("/repo/.bcode/ralph/state")),
+                max_iterations: Some(5),
+                no_progress_limit: Some(2),
+                require_approval: true,
+            }),
+            Request::CancelRalphLoop(RalphCancelRequest {
+                repo_root: PathBuf::from("/repo"),
+                run_id: Some("run-1".to_owned()),
+                loop_state_dir: None,
+            }),
+            Request::RalphRunStatus(RalphRunStatusRequest {
+                repo_root: PathBuf::from("/repo"),
+                loop_state_dir: None,
+            }),
+            Request::ListRalphRuns(Box::new(RalphListRunsRequest {
+                repo_root: PathBuf::from("/repo"),
+                loop_state_dir: None,
+            })),
+            Request::ListRalphIterations(Box::new(RalphListIterationsRequest {
+                repo_root: PathBuf::from("/repo"),
+                loop_state_dir: None,
+                run_id: Some("run-1".to_owned()),
+            })),
+            Request::ResumeRalphRun(RalphResumeRequest {
+                repo_root: PathBuf::from("/repo"),
+                loop_state_dir: None,
+                interrupted_run_id: Some("run-1".to_owned()),
+            }),
+        ];
+        for request in requests {
+            let encoded = encode(&request).expect("request should encode");
+            let decoded: Request = decode(&encoded).expect("request should decode");
+            assert_eq!(decoded, request);
+        }
+    }
+
     async fn round_trip_envelope(envelope: Envelope) -> Envelope {
         let (mut sender, mut receiver) = tokio::io::duplex(64 * 1024);
         let send = send_envelope(&mut sender, &envelope);
