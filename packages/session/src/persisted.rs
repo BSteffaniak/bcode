@@ -5,11 +5,10 @@
 //! compatibility and migration, while IPC DTOs must remain safe for the
 //! non-self-describing `bmux_codec` wire format.
 
-use bcode_session_models::{
-    CURRENT_SESSION_EVENT_SCHEMA_VERSION, FileChangeResult, SessionEvent, SessionEventKind,
-    SessionEventProvenance, SessionId, ShellRunResult, ToolInvocationResult, TraceBlobRef,
-};
+use bcode_session_models::*;
+use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
 use serde::Deserialize;
+use std::path::PathBuf;
 use thiserror::Error;
 
 /// Decode a persisted session event from durable JSON.
@@ -66,44 +65,255 @@ impl PersistedSessionEvent {
 }
 
 /// Persisted session event kind DTO.
-#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum PersistedSessionEventKind {
+    SessionCreated {
+        name: Option<String>,
+        #[serde(default)]
+        working_directory: PathBuf,
+    },
+    ClientAttached {
+        client_id: ClientId,
+    },
+    ClientDetached {
+        client_id: ClientId,
+    },
+    UserMessage {
+        client_id: ClientId,
+        text: String,
+    },
+    AssistantDelta {
+        text: String,
+    },
+    AssistantMessage {
+        text: String,
+    },
+    ToolCallRequested {
+        tool_call_id: String,
+        tool_name: String,
+        arguments_json: String,
+    },
     ToolCallFinished {
         tool_call_id: String,
         result: String,
+        #[serde(default)]
         is_error: bool,
+        #[serde(default)]
         output: Option<TraceBlobRef>,
+        #[serde(default)]
         semantic_result: Option<PersistedToolInvocationResult>,
     },
-    Domain(SessionEventKind),
-}
-
-impl<'de> Deserialize<'de> for PersistedSessionEventKind {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = serde_json::Value::deserialize(deserializer)?;
-        if let Some(payload) = value.get("tool_call_finished") {
-            return serde_json::from_value::<PersistedToolCallFinished>(payload.clone())
-                .map(|payload| Self::ToolCallFinished {
-                    tool_call_id: payload.tool_call_id,
-                    result: payload.result,
-                    is_error: payload.is_error,
-                    output: payload.output,
-                    semantic_result: payload.semantic_result,
-                })
-                .map_err(serde::de::Error::custom);
-        }
-        serde_json::from_value::<SessionEventKind>(value)
-            .map(Self::Domain)
-            .map_err(serde::de::Error::custom)
-    }
+    PermissionRequested {
+        permission_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        arguments_json: String,
+    },
+    PermissionResolved {
+        permission_id: String,
+        approved: bool,
+    },
+    ModelChanged {
+        provider: String,
+        model: String,
+    },
+    SystemMessage {
+        text: String,
+    },
+    AgentChanged {
+        agent_id: String,
+    },
+    ModelTurnStarted {
+        turn_id: String,
+    },
+    ModelTurnFinished {
+        turn_id: String,
+        outcome: ModelTurnOutcome,
+        #[serde(default)]
+        message: Option<String>,
+    },
+    ModelUsage {
+        turn_id: String,
+        usage: SessionTokenUsage,
+    },
+    ContextCompacted {
+        summary: String,
+        compacted_through_sequence: u64,
+    },
+    SessionRenamed {
+        name: Option<String>,
+    },
+    TraceEvent {
+        trace: Box<SessionTraceEvent>,
+    },
+    SkillInvoked {
+        skill_id: SkillId,
+        arguments: String,
+        #[serde(default)]
+        source: Option<SkillSource>,
+        invoked_at_ms: u64,
+    },
+    SkillSuggested {
+        skill_id: SkillId,
+        #[serde(default)]
+        reason: Option<String>,
+        suggested_at_ms: u64,
+    },
+    SkillActivated {
+        skill_id: SkillId,
+        #[serde(default)]
+        source: Option<SkillSource>,
+        mode: SkillActivationMode,
+        activated_at_ms: u64,
+    },
+    SkillDeactivated {
+        skill_id: SkillId,
+        deactivated_at_ms: u64,
+    },
+    SkillContextLoaded {
+        skill_id: SkillId,
+        bytes_loaded: usize,
+        truncated: bool,
+        loaded_at_ms: u64,
+    },
+    SkillInvocationFailed {
+        skill_id: SkillId,
+        error: String,
+        failed_at_ms: u64,
+    },
+    /// Provider-exposed reasoning text delta.
+    AssistantReasoningDelta {
+        text: String,
+    },
+    /// Completed provider-exposed reasoning text.
+    AssistantReasoningMessage {
+        text: String,
+    },
+    /// Durable runtime work start marker.
+    RuntimeWorkStarted {
+        work_id: RuntimeWorkId,
+        kind: RuntimeWorkKind,
+        label: String,
+        #[serde(default)]
+        tool_call_id: Option<String>,
+        #[serde(default)]
+        plugin_id: Option<String>,
+        #[serde(default)]
+        service_interface: Option<String>,
+        #[serde(default)]
+        operation: Option<String>,
+        #[serde(default)]
+        parent_work_id: Option<RuntimeWorkId>,
+        #[serde(default)]
+        started_at_ms: Option<u64>,
+        #[serde(default)]
+        cancellable: bool,
+    },
+    /// Durable runtime work cancellation request marker.
+    RuntimeWorkCancelRequested {
+        work_id: RuntimeWorkId,
+        #[serde(default)]
+        requested_at_ms: Option<u64>,
+        #[serde(default)]
+        client_id: Option<ClientId>,
+    },
+    /// Durable runtime work finish marker.
+    RuntimeWorkFinished {
+        work_id: RuntimeWorkId,
+        status: RuntimeWorkStatus,
+        #[serde(default)]
+        finished_at_ms: Option<u64>,
+        #[serde(default)]
+        message: Option<String>,
+    },
+    /// Durable runtime work progress marker.
+    RuntimeWorkProgress {
+        work_id: RuntimeWorkId,
+        message: String,
+        #[serde(default)]
+        progress_at_ms: Option<u64>,
+        #[serde(default)]
+        completed_units: Option<u64>,
+        #[serde(default)]
+        total_units: Option<u64>,
+    },
+    /// Durable marker that a model turn cancellation was requested.
+    ModelTurnCancelRequested {
+        turn_id: String,
+        #[serde(default)]
+        requested_at_ms: Option<u64>,
+        #[serde(default)]
+        client_id: Option<ClientId>,
+    },
+    /// Incremental tool invocation event emitted while a tool is running.
+    ToolInvocationStream {
+        event: ToolInvocationStreamEvent,
+    },
+    /// Durable marker that moves the session's canonical working directory.
+    WorkingDirectoryChanged {
+        old_working_directory: PathBuf,
+        new_working_directory: PathBuf,
+    },
+    /// Durable provenance marker for sessions imported from external agents.
+    SessionImported {
+        source_id: String,
+        source_display_name: String,
+        external_session_id: String,
+        imported_at_ms: u64,
+    },
+    /// Durable bounded presentation state for a completed tool invocation.
+    ToolInvocationPresentation {
+        tool_call_id: String,
+        #[serde(default)]
+        started_at_ms: Option<u64>,
+        #[serde(default)]
+        finished_at_ms: Option<u64>,
+        is_error: bool,
+        presentation: ToolInvocationPresentation,
+    },
+    /// Durable provenance marker for sessions forked or cloned from another session.
+    SessionForked {
+        source_session_id: SessionId,
+        #[serde(default)]
+        source_title: Option<String>,
+        #[serde(default)]
+        source_cutoff_sequence: Option<u64>,
+        #[serde(default)]
+        source_prompt_sequence: Option<u64>,
+        forked_at_ms: u64,
+        kind: SessionForkKind,
+    },
 }
 
 impl PersistedSessionEventKind {
+    #[allow(clippy::too_many_lines)]
     fn into_domain(self) -> SessionEventKind {
         match self {
+            Self::SessionCreated {
+                name,
+                working_directory,
+            } => SessionEventKind::SessionCreated {
+                name,
+                working_directory,
+            },
+            Self::ClientAttached { client_id } => SessionEventKind::ClientAttached { client_id },
+            Self::ClientDetached { client_id } => SessionEventKind::ClientDetached { client_id },
+            Self::UserMessage { client_id, text } => {
+                SessionEventKind::UserMessage { client_id, text }
+            }
+            Self::AssistantDelta { text } => SessionEventKind::AssistantDelta { text },
+            Self::AssistantMessage { text } => SessionEventKind::AssistantMessage { text },
+            Self::ToolCallRequested {
+                tool_call_id,
+                tool_name,
+                arguments_json,
+            } => SessionEventKind::ToolCallRequested {
+                tool_call_id,
+                tool_name,
+                arguments_json,
+            },
             Self::ToolCallFinished {
                 tool_call_id,
                 result,
@@ -117,21 +327,229 @@ impl PersistedSessionEventKind {
                 output,
                 semantic_result: semantic_result.map(PersistedToolInvocationResult::into_domain),
             },
-            Self::Domain(kind) => kind,
+            Self::PermissionRequested {
+                permission_id,
+                tool_call_id,
+                tool_name,
+                arguments_json,
+            } => SessionEventKind::PermissionRequested {
+                permission_id,
+                tool_call_id,
+                tool_name,
+                arguments_json,
+            },
+            Self::PermissionResolved {
+                permission_id,
+                approved,
+            } => SessionEventKind::PermissionResolved {
+                permission_id,
+                approved,
+            },
+            Self::ModelChanged { provider, model } => {
+                SessionEventKind::ModelChanged { provider, model }
+            }
+            Self::SystemMessage { text } => SessionEventKind::SystemMessage { text },
+            Self::AgentChanged { agent_id } => SessionEventKind::AgentChanged { agent_id },
+            Self::ModelTurnStarted { turn_id } => SessionEventKind::ModelTurnStarted { turn_id },
+            Self::ModelTurnFinished {
+                turn_id,
+                outcome,
+                message,
+            } => SessionEventKind::ModelTurnFinished {
+                turn_id,
+                outcome,
+                message,
+            },
+            Self::ModelUsage { turn_id, usage } => SessionEventKind::ModelUsage { turn_id, usage },
+            Self::ContextCompacted {
+                summary,
+                compacted_through_sequence,
+            } => SessionEventKind::ContextCompacted {
+                summary,
+                compacted_through_sequence,
+            },
+            Self::SessionRenamed { name } => SessionEventKind::SessionRenamed { name },
+            Self::TraceEvent { trace } => SessionEventKind::TraceEvent { trace },
+            Self::SkillInvoked {
+                skill_id,
+                arguments,
+                source,
+                invoked_at_ms,
+            } => SessionEventKind::SkillInvoked {
+                skill_id,
+                arguments,
+                source,
+                invoked_at_ms,
+            },
+            Self::SkillSuggested {
+                skill_id,
+                reason,
+                suggested_at_ms,
+            } => SessionEventKind::SkillSuggested {
+                skill_id,
+                reason,
+                suggested_at_ms,
+            },
+            Self::SkillActivated {
+                skill_id,
+                source,
+                mode,
+                activated_at_ms,
+            } => SessionEventKind::SkillActivated {
+                skill_id,
+                source,
+                mode,
+                activated_at_ms,
+            },
+            Self::SkillDeactivated {
+                skill_id,
+                deactivated_at_ms,
+            } => SessionEventKind::SkillDeactivated {
+                skill_id,
+                deactivated_at_ms,
+            },
+            Self::SkillContextLoaded {
+                skill_id,
+                bytes_loaded,
+                truncated,
+                loaded_at_ms,
+            } => SessionEventKind::SkillContextLoaded {
+                skill_id,
+                bytes_loaded,
+                truncated,
+                loaded_at_ms,
+            },
+            Self::SkillInvocationFailed {
+                skill_id,
+                error,
+                failed_at_ms,
+            } => SessionEventKind::SkillInvocationFailed {
+                skill_id,
+                error,
+                failed_at_ms,
+            },
+            Self::AssistantReasoningDelta { text } => {
+                SessionEventKind::AssistantReasoningDelta { text }
+            }
+            Self::AssistantReasoningMessage { text } => {
+                SessionEventKind::AssistantReasoningMessage { text }
+            }
+            Self::RuntimeWorkStarted {
+                work_id,
+                kind,
+                label,
+                tool_call_id,
+                plugin_id,
+                service_interface,
+                operation,
+                parent_work_id,
+                started_at_ms,
+                cancellable,
+            } => SessionEventKind::RuntimeWorkStarted {
+                work_id,
+                kind,
+                label,
+                tool_call_id,
+                plugin_id,
+                service_interface,
+                operation,
+                parent_work_id,
+                started_at_ms,
+                cancellable,
+            },
+            Self::RuntimeWorkCancelRequested {
+                work_id,
+                requested_at_ms,
+                client_id,
+            } => SessionEventKind::RuntimeWorkCancelRequested {
+                work_id,
+                requested_at_ms,
+                client_id,
+            },
+            Self::RuntimeWorkFinished {
+                work_id,
+                status,
+                finished_at_ms,
+                message,
+            } => SessionEventKind::RuntimeWorkFinished {
+                work_id,
+                status,
+                finished_at_ms,
+                message,
+            },
+            Self::RuntimeWorkProgress {
+                work_id,
+                message,
+                progress_at_ms,
+                completed_units,
+                total_units,
+            } => SessionEventKind::RuntimeWorkProgress {
+                work_id,
+                message,
+                progress_at_ms,
+                completed_units,
+                total_units,
+            },
+            Self::ModelTurnCancelRequested {
+                turn_id,
+                requested_at_ms,
+                client_id,
+            } => SessionEventKind::ModelTurnCancelRequested {
+                turn_id,
+                requested_at_ms,
+                client_id,
+            },
+            Self::ToolInvocationStream { event } => {
+                SessionEventKind::ToolInvocationStream { event }
+            }
+            Self::WorkingDirectoryChanged {
+                old_working_directory,
+                new_working_directory,
+            } => SessionEventKind::WorkingDirectoryChanged {
+                old_working_directory,
+                new_working_directory,
+            },
+            Self::SessionImported {
+                source_id,
+                source_display_name,
+                external_session_id,
+                imported_at_ms,
+            } => SessionEventKind::SessionImported {
+                source_id,
+                source_display_name,
+                external_session_id,
+                imported_at_ms,
+            },
+            Self::ToolInvocationPresentation {
+                tool_call_id,
+                started_at_ms,
+                finished_at_ms,
+                is_error,
+                presentation,
+            } => SessionEventKind::ToolInvocationPresentation {
+                tool_call_id,
+                started_at_ms,
+                finished_at_ms,
+                is_error,
+                presentation,
+            },
+            Self::SessionForked {
+                source_session_id,
+                source_title,
+                source_cutoff_sequence,
+                source_prompt_sequence,
+                forked_at_ms,
+                kind,
+            } => SessionEventKind::SessionForked {
+                source_session_id,
+                source_title,
+                source_cutoff_sequence,
+                source_prompt_sequence,
+                forked_at_ms,
+                kind,
+            },
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct PersistedToolCallFinished {
-    tool_call_id: String,
-    result: String,
-    #[serde(default)]
-    is_error: bool,
-    #[serde(default)]
-    output: Option<TraceBlobRef>,
-    #[serde(default)]
-    semantic_result: Option<PersistedToolInvocationResult>,
 }
 
 /// Persisted semantic tool result DTO.
