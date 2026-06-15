@@ -1220,6 +1220,35 @@ mod tests {
         assert!(!stderr_truncated);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn terminal_mode_preserves_ansi_output() {
+        let response = run_terminal_shell_command(
+            ServiceEventEmitter::default(),
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+            "test-terminal-ansi",
+            &ShellRunArguments {
+                command: "printf '\\033[31mred\\033[0m\\n'".to_string(),
+                cwd: None,
+                timeout_ms: Some(5_000),
+                terminal: true,
+                columns: Some(80),
+                rows: Some(24),
+            },
+            None,
+            None,
+        );
+
+        assert!(!response.is_error, "{}", response.output);
+        let Some(ToolInvocationResult::ShellRun {
+            result: ShellRunResult::Terminal { output_tail, .. },
+        }) = response.result
+        else {
+            panic!("expected semantic terminal shell result");
+        };
+        assert!(output_tail.contains("\u{1b}[31mred\u{1b}[0m"));
+    }
+
     #[test]
     fn process_response_includes_structured_terminal_presentation() {
         let output = LimitedOutput {
