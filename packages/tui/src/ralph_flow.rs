@@ -1,6 +1,7 @@
 //! Ralph loop TUI flow.
 
 use std::io::Write;
+use std::path::PathBuf;
 
 use bcode_ralph as ralph_state;
 use bcode_session_models::{SessionHistoryDirection, SessionHistoryQuery};
@@ -129,82 +130,16 @@ pub async fn start_loop<W: Write>(
         match event {
             Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
             Event::Paste(text) => {
-                let _ = TextInputControl::new(&ralph_start_dialog::loop_name_input_policy())
-                    .handle_paste(dialog.loop_name_mut(), &text);
+                let _ = TextInputControl::new(&ralph_start_dialog::input_policy())
+                    .handle_paste(dialog.focused_input_mut(), &text);
             }
             Event::Key(stroke) => match stroke.key {
                 KeyCode::Escape => return Err(TuiError::Canceled),
+                KeyCode::Tab => dialog.focus_next(),
                 KeyCode::Enter => {
-                    let loop_name = dialog.loop_name_text();
-                    if loop_name.is_empty() {
-                        dialog.set_status("Ralph loop name is required");
-                        continue;
+                    if confirm_start_loop(&mut dialog, services, chat).await? {
+                        return Ok(());
                     }
-                    let repo_root = chat
-                        .app
-                        .working_directory()
-                        .map_or_else(std::env::current_dir, |path| Ok(path.to_path_buf()))?;
-                    let state = ralph_state::create_initial_loop_state(
-                        &loop_name,
-                        &repo_root,
-                        chat.app.session_title(),
-                    )?;
-                    if let Some(session_id) = chat.app.session_id() {
-                        let history = services
-                            .client
-                            .session_history_page(
-                                session_id,
-                                SessionHistoryQuery {
-                                    cursor: None,
-                                    limit: 64,
-                                    direction: SessionHistoryDirection::Backward,
-                                },
-                            )
-                            .await?;
-                        ralph_state::write_context_pack(
-                            &state,
-                            chat.app.session_title(),
-                            &history.events,
-                        )?;
-                        ralph_state::generate_progress_doc_from_context(
-                            &state, &loop_name, &repo_root,
-                        )?;
-                    }
-                    let work_area = services
-                        .client
-                        .create_worktree(WorktreeCreateRequest {
-                            name: format!("ralph-{loop_name}"),
-                            cwd: Some(repo_root.clone()),
-                            path: None,
-                            branch: None,
-                            new_branch: None,
-                            base_ref: Some(bcode_worktree_models::WorktreeBaseRef::Head),
-                            detach: false,
-                            force: false,
-                            attach_session_id: None,
-                            new_session: true,
-                            no_setup: false,
-                        })
-                        .await?;
-                    let work_area_session_id = work_area
-                        .session
-                        .as_ref()
-                        .map(|session| session.id.to_string());
-                    ralph_state::record_work_area(
-                        &state,
-                        &work_area.path,
-                        work_area.branch.as_deref(),
-                        work_area_session_id.as_deref(),
-                    )?;
-                    chat.app.push_system_note(format!(
-                        "Ralph loop created\n* Loop: {loop_name}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}\n* Next: capture conversation context into the progress doc",
-                        state.progress_doc_path.display(),
-                        state.state_dir.display(),
-                        work_area.path.display(),
-                        work_area_session_id.as_deref().unwrap_or("<none>")
-                    ));
-                    chat.app.set_status("Ralph loop created".to_owned());
-                    return Ok(());
                 }
                 _ => handle_loop_name_key(&mut dialog, services.keymap, stroke),
             },
@@ -214,6 +149,74 @@ pub async fn start_loop<W: Write>(
     }
 }
 
+async fn confirm_start_loop(
+    dialog: &mut ralph_start_dialog::RalphStartDialog,
+    services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
+) -> Result<bool, TuiError> {
+    let loop_name = dialog.loop_name_text();
+    if loop_name.is_empty() {
+        dialog.set_status("Ralph loop name is required");
+        return Ok(false);
+    }
+    let repo_root = chat
+        .app
+        .working_directory()
+        .map_or_else(std::env::current_dir, |path| Ok(path.to_path_buf()))?;
+    let state =
+        ralph_state::create_initial_loop_state(&loop_name, &repo_root, chat.app.session_title())?;
+    if let Some(session_id) = chat.app.session_id() {
+        let history = services
+            .client
+            .session_history_page(
+                session_id,
+                SessionHistoryQuery {
+                    cursor: None,
+                    limit: 64,
+                    direction: SessionHistoryDirection::Backward,
+                },
+            )
+            .await?;
+        ralph_state::write_context_pack(&state, chat.app.session_title(), &history.events)?;
+        ralph_state::generate_progress_doc_from_context(&state, &loop_name, &repo_root)?;
+    }
+    let work_area = services
+        .client
+        .create_worktree(WorktreeCreateRequest {
+            name: format!("ralph-{loop_name}"),
+            cwd: Some(repo_root),
+            path: dialog.work_area_path_text().map(PathBuf::from),
+            branch: None,
+            new_branch: dialog.branch_text(),
+            base_ref: Some(bcode_worktree_models::WorktreeBaseRef::Head),
+            detach: false,
+            force: false,
+            attach_session_id: None,
+            new_session: true,
+            no_setup: false,
+        })
+        .await?;
+    let work_area_session_id = work_area
+        .session
+        .as_ref()
+        .map(|session| session.id.to_string());
+    ralph_state::record_work_area(
+        &state,
+        &work_area.path,
+        work_area.branch.as_deref(),
+        work_area_session_id.as_deref(),
+    )?;
+    chat.app.push_system_note(format!(
+        "Ralph loop created\n* Loop: {loop_name}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}\n* Next: capture conversation context into the progress doc",
+        state.progress_doc_path.display(),
+        state.state_dir.display(),
+        work_area.path.display(),
+        work_area_session_id.as_deref().unwrap_or("<none>")
+    ));
+    chat.app.set_status("Ralph loop created".to_owned());
+    Ok(true)
+}
+
 fn handle_loop_name_key(
     dialog: &mut ralph_start_dialog::RalphStartDialog,
     keymap: &BmuxKeyMap,
@@ -221,26 +224,29 @@ fn handle_loop_name_key(
 ) {
     if let Some(motion) = keymap.editor_selection_motion_for_key(stroke) {
         dialog
-            .loop_name_mut()
+            .focused_input_mut()
             .buffer_mut()
             .move_cursor_with_selection(motion, SelectionMode::Extend);
         dialog
-            .loop_name_mut()
-            .sync_scroll_to_cursor(&ralph_start_dialog::loop_name_input_policy());
+            .focused_input_mut()
+            .sync_scroll_to_cursor(&ralph_start_dialog::input_policy());
         return;
     }
     if let Some(command) = keymap.editor_command_for_key(stroke) {
-        dialog.loop_name_mut().buffer_mut().apply_command(command);
         dialog
-            .loop_name_mut()
-            .sync_scroll_to_cursor(&ralph_start_dialog::loop_name_input_policy());
+            .focused_input_mut()
+            .buffer_mut()
+            .apply_command(command);
+        dialog
+            .focused_input_mut()
+            .sync_scroll_to_cursor(&ralph_start_dialog::input_policy());
         return;
     }
-    let _ = TextInputControl::new(&ralph_start_dialog::loop_name_input_policy())
-        .handle_key(dialog.loop_name_mut(), stroke);
+    let _ = TextInputControl::new(&ralph_start_dialog::input_policy())
+        .handle_key(dialog.focused_input_mut(), stroke);
 }
 
 fn handle_loop_name_mouse(dialog: &mut ralph_start_dialog::RalphStartDialog, mouse: MouseEvent) {
-    let _ = TextInputControl::new(&ralph_start_dialog::loop_name_input_policy())
-        .handle_mouse(dialog.loop_name_mut(), mouse);
+    let _ = TextInputControl::new(&ralph_start_dialog::input_policy())
+        .handle_mouse(dialog.focused_input_mut(), mouse);
 }
