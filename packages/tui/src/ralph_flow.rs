@@ -24,6 +24,26 @@ use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::ActiveChat;
 use super::{TuiError, ralph_start_dialog, ralph_start_dialog_render};
 
+/// Open the plugin-owned Ralph home UI.
+pub async fn open_home<W: Write>(
+    io: &mut TuiIo<'_, '_, W>,
+    chat: &mut ActiveChat,
+) -> Result<(), TuiError> {
+    let repo_root = current_repo_root(chat)?;
+    match super::ralph_launcher::run_home(io.terminal, repo_root).await? {
+        super::ralph_launcher::RalphHomeOutcome::RunCommand(command) => {
+            chat.app.replace_composer_with(&command);
+            chat.app.set_status(format!(
+                "selected {command}; press Enter to run it in this Bcode session"
+            ));
+        }
+        super::ralph_launcher::RalphHomeOutcome::Exit => {
+            chat.app.set_status("Ralph UI closed".to_owned());
+        }
+    }
+    Ok(())
+}
+
 /// Show latest Ralph loop status for the current repository.
 pub async fn show_status(
     services: &TuiServices<'_>,

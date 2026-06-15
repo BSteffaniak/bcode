@@ -26,6 +26,8 @@ pub enum SlashCommandOutcome {
     OpenForkSessionWizard,
     /// Switch to a newly cloned session.
     SessionCloned { session_id: SessionId },
+    /// Open the plugin-owned Ralph home UI.
+    OpenRalphHome,
     /// Open Ralph loop start dialog.
     OpenRalphStartDialog,
     /// Show Ralph loop status.
@@ -342,6 +344,7 @@ async fn cwd_command(
 
 fn ralph_command(parts: &[&str]) -> SlashCommandOutcome {
     match parts.get(1).copied() {
+        Some("ui" | "home") => SlashCommandOutcome::OpenRalphHome,
         Some("start") | None => SlashCommandOutcome::OpenRalphStartDialog,
         Some("status") => SlashCommandOutcome::ShowRalphStatus,
         Some("open") => SlashCommandOutcome::OpenRalphProgress,
@@ -356,7 +359,7 @@ fn ralph_command(parts: &[&str]) -> SlashCommandOutcome {
         Some("iterations") => SlashCommandOutcome::ListRalphIterations,
         Some("resume") => SlashCommandOutcome::ResumeRalphRun,
         Some(_) => SlashCommandOutcome::Handled(
-            "usage: /ralph [start|run|approve|stop|status|runs|iterations|resume|audit|replan|open]"
+            "usage: /ralph [ui|start|run|approve|stop|status|runs|iterations|resume|audit|replan|open]"
                 .to_owned(),
         ),
     }
@@ -824,7 +827,7 @@ mod tests {
         assert_eq!(
             ralph_command(&["/ralph", "wat"]),
             SlashCommandOutcome::Handled(
-                "usage: /ralph [start|run|approve|stop|status|runs|iterations|resume|audit|replan|open]"
+                "usage: /ralph [ui|start|run|approve|stop|status|runs|iterations|resume|audit|replan|open]"
                     .to_owned()
             )
         );

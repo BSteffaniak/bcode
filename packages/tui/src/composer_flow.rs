@@ -215,6 +215,10 @@ async fn handle_slash_command<W: Write>(
             chat.app
                 .set_status("cloned session and switched".to_owned());
         }
+        slash_commands::SlashCommandOutcome::OpenRalphHome => {
+            chat.app.clear_pending_submission(message);
+            ralph_flow::open_home(io, chat).await?;
+        }
         slash_commands::SlashCommandOutcome::OpenRalphStartDialog => {
             chat.app.clear_pending_submission(message);
             ralph_flow::start_loop(io, services, chat).await?;
