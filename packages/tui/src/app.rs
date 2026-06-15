@@ -8,7 +8,7 @@ use bcode_session_models::{
     LiveToolArgumentPreview, ModelTurnOutcome, ProviderStreamEvent, SessionEvent, SessionEventKind,
     SessionHistoryCursor, SessionId, SessionInputHistoryEntry, SessionLiveEvent,
     SessionLiveEventKind, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
-    ToolInvocationPresentation, ToolInvocationStreamEvent, ToolOutputStream,
+    ToolInvocationPresentation, ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1453,13 +1453,20 @@ impl BmuxApp {
                 tool_call_id,
                 result,
                 is_error,
+                semantic_result,
                 ..
             } => {
                 if application.live_activity() {
                     self.set_activity(ActivityState::Thinking);
                 }
                 self.active_tool_calls.remove(tool_call_id);
-                self.push_tool_result(tool_call_id, result, *is_error, application);
+                self.push_tool_result(
+                    tool_call_id,
+                    result,
+                    *is_error,
+                    semantic_result.as_ref(),
+                    application,
+                );
             }
             SessionEventKind::ToolInvocationPresentation {
                 tool_call_id,
@@ -1918,6 +1925,7 @@ impl BmuxApp {
         tool_call_id: &str,
         is_error: Option<bool>,
         result: Option<&str>,
+        semantic_result: Option<&ToolInvocationResult>,
     ) -> bool {
         let Some(context) = self.streamed_tool_results.get(tool_call_id) else {
             return false;
@@ -1930,7 +1938,9 @@ impl BmuxApp {
                 exit_code,
                 timed_out,
                 ..
-            }) = result.and_then(terminal_shell_presentation)
+            }) = semantic_result
+                .and_then(semantic_terminal_presentation)
+                .or_else(|| result.and_then(terminal_shell_presentation))
             {
                 item.finish_terminal(exit_code, timed_out, is_error.unwrap_or(false), None);
             } else {
@@ -1948,9 +1958,11 @@ impl BmuxApp {
         tool_call_id: &str,
         result: &str,
         is_error: bool,
+        semantic_result: Option<&ToolInvocationResult>,
         application: SessionEventApplication,
     ) {
-        if self.finish_live_tool_output(tool_call_id, Some(is_error), Some(result)) {
+        if self.finish_live_tool_output(tool_call_id, Some(is_error), Some(result), semantic_result)
+        {
             if application.live_activity() {
                 if is_error {
                     "failed".clone_into(&mut self.status);
@@ -2931,6 +2943,38 @@ fn terminal_shell_presentation(result: &str) -> Option<ShellResultPresentation> 
         }
         _ => None,
     }
+}
+
+fn semantic_terminal_presentation(
+    result: &ToolInvocationResult,
+) -> Option<ShellResultPresentation> {
+    let ToolInvocationResult::ShellRun {
+        result:
+            bcode_session_models::ShellRunResult::Terminal {
+                exit_code,
+                timed_out,
+                cancelled: _,
+                output_tail,
+                output_truncated,
+                output_bytes,
+                retained_output_bytes,
+                columns,
+                rows,
+            },
+    } = result
+    else {
+        return None;
+    };
+    Some(ShellResultPresentation::Terminal {
+        exit_code: *exit_code,
+        timed_out: *timed_out,
+        output: output_tail.clone(),
+        output_truncated: *output_truncated,
+        output_bytes: *output_bytes,
+        retained_output_bytes: *retained_output_bytes,
+        columns: *columns,
+        rows: *rows,
+    })
 }
 
 fn working_directory_changed_message(

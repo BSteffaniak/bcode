@@ -3425,6 +3425,85 @@ fn semantic_text_result_renders_generic_tool_result() {
     );
 }
 
+#[test]
+fn live_semantic_terminal_result_finishes_stream_with_semantic_status_not_legacy_json() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolInvocationStream {
+            event: ToolInvocationStreamEvent::Started {
+                tool_call_id: "call-live-semantic".to_owned(),
+                tool_name: "shell.run".to_owned(),
+                sequence: 0,
+                terminal: true,
+                columns: Some(80),
+                rows: Some(24),
+                started_at_ms: Some(10),
+            },
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::ToolInvocationStream {
+            event: ToolInvocationStreamEvent::OutputDelta {
+                tool_call_id: "call-live-semantic".to_owned(),
+                stream: ToolOutputStream::Pty,
+                sequence: 1,
+                text: "live\n".to_owned(),
+                byte_len: 5,
+            },
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        3,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call-live-semantic".to_owned(),
+            result: r#"{"mode":"terminal","exit_code":0,"timed_out":false}"#.to_owned(),
+            is_error: true,
+            output: None,
+            semantic_result: Some(ToolInvocationResult::ShellRun {
+                result: ShellRunResult::Terminal {
+                    exit_code: Some(7),
+                    timed_out: true,
+                    cancelled: false,
+                    output_tail: "semantic final tail\n".to_owned(),
+                    output_truncated: false,
+                    output_bytes: Some(20),
+                    retained_output_bytes: Some(20),
+                    columns: 80,
+                    rows: 24,
+                },
+            }),
+        },
+    ));
+
+    let terminal_items = app
+        .transcript()
+        .iter()
+        .filter(|item| matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. }))
+        .collect::<Vec<_>>();
+
+    assert_eq!(terminal_items.len(), 1);
+    assert_eq!(terminal_items[0].text(), "live\n");
+    let TranscriptItemKind::TerminalOutput {
+        exit_code,
+        timed_out,
+        is_error,
+        ..
+    } = terminal_items[0].kind()
+    else {
+        panic!("expected terminal output");
+    };
+    assert_eq!(*exit_code, Some(7));
+    assert_eq!(*timed_out, Some(true));
+    assert!(*is_error);
+}
+
 fn session_summary(session_id: SessionId) -> SessionSummary {
     SessionSummary {
         id: session_id,
