@@ -7918,10 +7918,8 @@ async fn execute_model_tool(
             presentation: None,
             result: None,
         });
-    let presentation = result
-        .presentation
-        .as_ref()
-        .map(service_tool_presentation_to_session);
+    let semantic_result = result.result.clone().map(service_tool_result_to_session);
+    let presentation = legacy_tool_presentation_for_session(&result);
     let artifact_output = result.full_output.as_deref().unwrap_or(&result.output);
     let output_blob = (state.observability.persist_tool_io || state.observability.debug_enabled())
         .then(|| {
@@ -7967,7 +7965,7 @@ async fn execute_model_tool(
         result.is_error,
         result.content,
         output_blob,
-        result.result.map(service_tool_result_to_session),
+        semantic_result,
     )
     .await;
 }
@@ -9147,6 +9145,19 @@ fn service_shell_result_to_session(result: ServiceShellRunResult) -> ShellRunRes
     }
 }
 
+fn legacy_tool_presentation_for_session(
+    result: &ToolInvocationResponse,
+) -> Option<ToolInvocationPresentation> {
+    if result.result.is_some() {
+        None
+    } else {
+        result
+            .presentation
+            .as_ref()
+            .map(service_tool_presentation_to_session)
+    }
+}
+
 async fn append_tool_finished_event(
     state: &ServerState,
     session_id: SessionId,
@@ -10169,6 +10180,63 @@ mod tests {
             provenance: None,
             kind,
         }
+    }
+
+    #[test]
+    fn semantic_tool_response_does_not_emit_legacy_presentation() {
+        let response = ToolInvocationResponse {
+            output: "legacy".to_owned(),
+            is_error: false,
+            content: Vec::new(),
+            full_output: None,
+            presentation: Some(ServiceToolInvocationPresentation::Terminal {
+                exit_code: Some(0),
+                timed_out: false,
+                cancelled: false,
+                output: "terminal".to_owned(),
+                output_truncated: false,
+                output_bytes: Some(8),
+                retained_output_bytes: Some(8),
+                columns: 80,
+                rows: 24,
+            }),
+            result: Some(ServiceToolInvocationResult::ShellRun {
+                result: ServiceShellRunResult::Terminal {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    cancelled: false,
+                    output_tail: "terminal".to_owned(),
+                    output_truncated: false,
+                    output_bytes: Some(8),
+                    retained_output_bytes: Some(8),
+                    columns: 80,
+                    rows: 24,
+                },
+            }),
+        };
+
+        assert!(legacy_tool_presentation_for_session(&response).is_none());
+    }
+
+    #[test]
+    fn nonsemantic_tool_response_still_emits_legacy_presentation() {
+        let response = ToolInvocationResponse {
+            output: "legacy".to_owned(),
+            is_error: false,
+            content: Vec::new(),
+            full_output: None,
+            presentation: Some(ServiceToolInvocationPresentation::FileChange {
+                tool_name: "filesystem.write".to_owned(),
+                summary: "wrote 1 byte".to_owned(),
+                path: Some("file.txt".to_owned()),
+            }),
+            result: None,
+        };
+
+        assert!(matches!(
+            legacy_tool_presentation_for_session(&response),
+            Some(ToolInvocationPresentation::FileChange { .. })
+        ));
     }
 
     fn test_working_directory() -> PathBuf {
@@ -11356,6 +11424,7 @@ mod tests {
             canonical_result.clone(),
             false,
             Vec::new(),
+            None,
             None,
         )
         .await
