@@ -561,6 +561,136 @@ fn unix_time_millis() -> u64 {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn doctor_session_reports_future_and_corrupt_persisted_events_without_mutation() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let session_db = db::SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        session_db
+            .append_event(&session_event(
+                session_id,
+                0,
+                bcode_session_models::SessionEventKind::SessionCreated {
+                    name: Some("strict".to_string()),
+                    working_directory: temp_dir.path().to_path_buf(),
+                },
+            ))
+            .await
+            .expect("append valid event");
+        insert_raw_event(
+            &session_db,
+            session_id,
+            1,
+            "future_event_kind",
+            serde_json::json!({
+                "schema_version": bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                "sequence": 1,
+                "session_id": session_id,
+                "kind": { "future_event_kind": { "value": true } }
+            }),
+        )
+        .await;
+        insert_raw_event(
+            &session_db,
+            session_id,
+            2,
+            "tool_call_finished",
+            serde_json::json!({
+                "schema_version": bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                "sequence": 2,
+                "session_id": session_id,
+                "kind": { "tool_call_finished": { "result": "missing call id" } }
+            }),
+        )
+        .await;
+
+        let degraded_history = session_db
+            .all_events()
+            .await
+            .expect("normal history should degrade");
+        assert_eq!(degraded_history.len(), 1);
+
+        let report = doctor_session(temp_dir.path(), session_id)
+            .await
+            .expect("doctor should report");
+
+        assert_eq!(report.status, RepairStatus::ManualRequired);
+        let initial_error = report
+            .initial_error
+            .as_deref()
+            .expect("strict validation error should be reported");
+        assert!(
+            initial_error.contains("unsupported persisted session event kind future_event_kind"),
+            "unexpected initial error: {initial_error}"
+        );
+        assert_eq!(report.backup_path, None);
+        assert!(report.actions.is_empty());
+
+        let raw_rows = session_db
+            .database()
+            .select("events")
+            .columns(&["event_seq"])
+            .execute(session_db.database())
+            .await
+            .expect("raw rows remain queryable");
+        assert_eq!(raw_rows.len(), 3);
+    }
+
+    fn session_event(
+        session_id: SessionId,
+        sequence: u64,
+        kind: bcode_session_models::SessionEventKind,
+    ) -> bcode_session_models::SessionEvent {
+        bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            session_id,
+            provenance: None,
+            kind,
+        }
+    }
+
+    async fn insert_raw_event(
+        session_db: &db::SessionDb,
+        session_id: SessionId,
+        sequence: u64,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) {
+        session_db
+            .database()
+            .insert("events")
+            .value(
+                "event_seq",
+                switchy::database::DatabaseValue::Int64(
+                    i64::try_from(sequence).unwrap_or(i64::MAX),
+                ),
+            )
+            .value("event_type", event_type)
+            .value(
+                "schema_version",
+                switchy::database::DatabaseValue::Int32(i32::from(
+                    bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                )),
+            )
+            .value(
+                "created_at_ms",
+                switchy::database::DatabaseValue::Int64(
+                    i64::try_from(sequence).unwrap_or(i64::MAX),
+                ),
+            )
+            .value("payload", payload.to_string())
+            .execute(session_db.database())
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "insert raw event {sequence} for session {session_id} should succeed: {error}"
+                );
+            });
+    }
+
     #[test]
     fn plans_truncating_only_incomplete_final_wal_frame() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
