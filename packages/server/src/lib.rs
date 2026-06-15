@@ -7897,12 +7897,14 @@ async fn execute_model_tool(
         append_tool_finished_event(
             state,
             session_id,
-            call.id,
-            "tool skipped because model turn was cancelled".to_string(),
-            true,
-            Vec::new(),
-            None,
-            None,
+            ToolFinishedEventInput {
+                tool_call_id: call.id,
+                result: "tool skipped because model turn was cancelled".to_string(),
+                is_error: true,
+                content: Vec::new(),
+                output: None,
+                semantic_result: None,
+            },
         )
         .await;
         return;
@@ -7960,12 +7962,14 @@ async fn execute_model_tool(
     append_tool_finished_event(
         state,
         session_id,
-        call.id,
-        result.output,
-        result.is_error,
-        result.content,
-        output_blob,
-        semantic_result,
+        ToolFinishedEventInput {
+            tool_call_id: call.id,
+            result: result.output,
+            is_error: result.is_error,
+            content: result.content,
+            output: output_blob,
+            semantic_result,
+        },
     )
     .await;
 }
@@ -9158,28 +9162,21 @@ fn legacy_tool_presentation_for_session(
     }
 }
 
-async fn append_tool_finished_event(
-    state: &ServerState,
-    session_id: SessionId,
+struct ToolFinishedEventInput {
     tool_call_id: String,
     result: String,
     is_error: bool,
     content: Vec<ToolResultContent>,
     output: Option<TraceBlobRef>,
     semantic_result: Option<ToolInvocationResult>,
+}
+
+async fn append_tool_finished_event(
+    state: &ServerState,
+    session_id: SessionId,
+    input: ToolFinishedEventInput,
 ) {
-    if let Err(error) = append_tool_finished_event_inner(
-        state,
-        session_id,
-        tool_call_id,
-        result,
-        is_error,
-        content,
-        output,
-        semantic_result,
-    )
-    .await
-    {
+    if let Err(error) = append_tool_finished_event_inner(state, session_id, input).await {
         eprintln!("failed to append tool result: {error}");
     }
 }
@@ -9187,13 +9184,16 @@ async fn append_tool_finished_event(
 async fn append_tool_finished_event_inner(
     state: &ServerState,
     session_id: SessionId,
-    tool_call_id: String,
-    result: String,
-    is_error: bool,
-    content: Vec<ToolResultContent>,
-    output: Option<TraceBlobRef>,
-    semantic_result: Option<ToolInvocationResult>,
+    input: ToolFinishedEventInput,
 ) -> Result<bcode_session_models::SessionEvent, bcode_session::SessionError> {
+    let ToolFinishedEventInput {
+        tool_call_id,
+        result,
+        is_error,
+        content,
+        output,
+        semantic_result,
+    } = input;
     let runtime_work_id = RuntimeWorkId::new(format!("tool_{tool_call_id}"));
     let runtime_status = runtime_work_status_from_tool_result(&result, is_error);
     state
@@ -11420,12 +11420,14 @@ mod tests {
         let event = append_tool_finished_event_inner(
             &state,
             session_id,
-            "call-1".to_owned(),
-            canonical_result.clone(),
-            false,
-            Vec::new(),
-            None,
-            None,
+            ToolFinishedEventInput {
+                tool_call_id: "call-1".to_owned(),
+                result: canonical_result.clone(),
+                is_error: false,
+                content: Vec::new(),
+                output: None,
+                semantic_result: None,
+            },
         )
         .await
         .expect("tool result event should append");
@@ -11516,12 +11518,14 @@ mod tests {
         let event = append_tool_finished_event_inner(
             &state,
             session_id,
-            "call-semantic".to_owned(),
-            "legacy text".to_owned(),
-            false,
-            Vec::new(),
-            None,
-            Some(semantic_result.clone()),
+            ToolFinishedEventInput {
+                tool_call_id: "call-semantic".to_owned(),
+                result: "legacy text".to_owned(),
+                is_error: false,
+                content: Vec::new(),
+                output: None,
+                semantic_result: Some(semantic_result.clone()),
+            },
         )
         .await
         .expect("tool result event should append");

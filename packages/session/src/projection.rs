@@ -840,6 +840,7 @@ mod tests {
                     result: "final result".to_owned(),
                     is_error: false,
                     output: None,
+                    semantic_result: None,
                 },
             ),
         ];
@@ -874,6 +875,7 @@ mod tests {
                     result: "result".to_owned(),
                     is_error: false,
                     output: None,
+                    semantic_result: None,
                 },
             ),
         ];

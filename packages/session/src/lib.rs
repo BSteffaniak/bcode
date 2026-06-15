@@ -3163,6 +3163,7 @@ mod tests {
                 "ok".to_string(),
                 false,
                 None,
+                None,
             )
             .await
             .expect("tool result should append");
@@ -4197,6 +4198,7 @@ mod tests {
                     result: "ok".to_string(),
                     is_error: false,
                     output: None,
+                    semantic_result: None,
                 },
             ),
             (

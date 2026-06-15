@@ -5,7 +5,11 @@
 //! Shared session models for bcode.
 
 use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{self, SeqAccess, Visitor},
+    ser::SerializeTupleStruct,
+};
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
@@ -530,8 +534,7 @@ pub struct ProjectionWindow {
 }
 
 /// Typed semantic data returned by a tool invocation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolInvocationResult {
     /// Plain textual result.
     Text { text: String },
@@ -544,69 +547,465 @@ pub enum ToolInvocationResult {
 }
 
 /// Semantic shell command execution result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellRunResult {
     /// Pseudo-terminal execution with ANSI-capable output.
     Terminal {
         /// Process exit code, or `None` when unavailable.
-        #[serde(default)]
         exit_code: Option<i32>,
         /// Whether execution timed out.
-        #[serde(default)]
         timed_out: bool,
         /// Whether execution was cancelled.
-        #[serde(default)]
         cancelled: bool,
         /// Bounded tail of the PTY output stream.
-        #[serde(default)]
         output_tail: String,
         /// Whether the output was truncated.
-        #[serde(default)]
         output_truncated: bool,
         /// Original output byte count.
-        #[serde(default)]
         output_bytes: Option<u64>,
         /// Retained output byte count.
-        #[serde(default)]
         retained_output_bytes: Option<u64>,
         /// Terminal columns used for execution.
-        #[serde(default = "default_terminal_columns")]
         columns: u16,
         /// Terminal rows used for execution.
-        #[serde(default = "default_terminal_rows")]
         rows: u16,
     },
     /// Non-terminal execution with separately captured streams.
     Captured {
         /// Process exit code, or `None` when unavailable.
-        #[serde(default)]
         exit_code: Option<i32>,
         /// Whether execution timed out.
-        #[serde(default)]
         timed_out: bool,
         /// Whether execution was cancelled.
-        #[serde(default)]
         cancelled: bool,
         /// Bounded stdout text.
-        #[serde(default)]
         stdout: String,
         /// Bounded stderr text.
-        #[serde(default)]
         stderr: String,
         /// Whether stdout was truncated.
-        #[serde(default)]
         stdout_truncated: bool,
         /// Whether stderr was truncated.
-        #[serde(default)]
         stderr_truncated: bool,
         /// Original stdout byte count.
-        #[serde(default)]
         stdout_bytes: Option<u64>,
         /// Original stderr byte count.
-        #[serde(default)]
         stderr_bytes: Option<u64>,
     },
+}
+
+impl Serialize for ToolInvocationResult {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        ToolInvocationResultWire::from(self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolInvocationResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        ToolInvocationResultWire::deserialize(deserializer).map(Into::into)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolInvocationResultWire {
+    kind: ToolInvocationResultKind,
+    text: Option<String>,
+    json: Option<String>,
+    shell_run: Option<ShellRunResult>,
+    file_change: Option<FileChangeResult>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ToolInvocationResultKind {
+    Text,
+    Json,
+    ShellRun,
+    FileChange,
+}
+
+impl Serialize for ToolInvocationResultWire {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut tuple = serializer.serialize_tuple_struct("ToolInvocationResultWire", 5)?;
+        tuple.serialize_field(&self.kind)?;
+        tuple.serialize_field(&self.text)?;
+        tuple.serialize_field(&self.json)?;
+        tuple.serialize_field(&self.shell_run)?;
+        tuple.serialize_field(&self.file_change)?;
+        tuple.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolInvocationResultWire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_tuple(5, ToolInvocationResultWireVisitor)
+    }
+}
+
+struct ToolInvocationResultWireVisitor;
+
+impl<'de> Visitor<'de> for ToolInvocationResultWireVisitor {
+    type Value = ToolInvocationResultWire;
+
+    fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a positional tool invocation result")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        Ok(ToolInvocationResultWire {
+            kind: seq
+                .next_element()?
+                .ok_or_else(|| de::Error::invalid_length(0, &self))?,
+            text: seq
+                .next_element()?
+                .ok_or_else(|| de::Error::invalid_length(1, &self))?,
+            json: seq
+                .next_element()?
+                .ok_or_else(|| de::Error::invalid_length(2, &self))?,
+            shell_run: seq
+                .next_element()?
+                .ok_or_else(|| de::Error::invalid_length(3, &self))?,
+            file_change: seq
+                .next_element()?
+                .ok_or_else(|| de::Error::invalid_length(4, &self))?,
+        })
+    }
+}
+
+impl From<&ToolInvocationResult> for ToolInvocationResultWire {
+    fn from(value: &ToolInvocationResult) -> Self {
+        match value {
+            ToolInvocationResult::Text { text } => Self {
+                kind: ToolInvocationResultKind::Text,
+                text: Some(text.clone()),
+                json: None,
+                shell_run: None,
+                file_change: None,
+            },
+            ToolInvocationResult::Json { value } => Self {
+                kind: ToolInvocationResultKind::Json,
+                text: None,
+                json: Some(value.clone()),
+                shell_run: None,
+                file_change: None,
+            },
+            ToolInvocationResult::ShellRun { result } => Self {
+                kind: ToolInvocationResultKind::ShellRun,
+                text: None,
+                json: None,
+                shell_run: Some(result.clone()),
+                file_change: None,
+            },
+            ToolInvocationResult::FileChange { result } => Self {
+                kind: ToolInvocationResultKind::FileChange,
+                text: None,
+                json: None,
+                shell_run: None,
+                file_change: Some(result.clone()),
+            },
+        }
+    }
+}
+
+impl From<ToolInvocationResultWire> for ToolInvocationResult {
+    fn from(value: ToolInvocationResultWire) -> Self {
+        match value.kind {
+            ToolInvocationResultKind::Text => Self::Text {
+                text: value.text.unwrap_or_default(),
+            },
+            ToolInvocationResultKind::Json => Self::Json {
+                value: value.json.unwrap_or_default(),
+            },
+            ToolInvocationResultKind::ShellRun => Self::ShellRun {
+                result: value
+                    .shell_run
+                    .unwrap_or_else(ShellRunResult::default_captured),
+            },
+            ToolInvocationResultKind::FileChange => Self::FileChange {
+                result: value.file_change.unwrap_or_else(FileChangeResult::empty),
+            },
+        }
+    }
+}
+
+impl Serialize for ShellRunResult {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        ShellRunResultWire::from(self).serialize(serializer)
+    }
+}
+
+impl ShellRunResult {
+    const fn default_captured() -> Self {
+        Self::Captured {
+            exit_code: None,
+            timed_out: false,
+            cancelled: false,
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            stdout_bytes: None,
+            stderr_bytes: None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ShellRunResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        ShellRunResultWire::deserialize(deserializer).map(Into::into)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellRunResultWire {
+    kind: ShellRunResultKind,
+    terminal: Option<ShellRunTerminalFields>,
+    captured: Option<ShellRunCapturedFields>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ShellRunResultKind {
+    Terminal,
+    Captured,
+}
+
+impl Serialize for ShellRunResultWire {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut tuple = serializer.serialize_tuple_struct("ShellRunResultWire", 3)?;
+        tuple.serialize_field(&self.kind)?;
+        tuple.serialize_field(&self.terminal)?;
+        tuple.serialize_field(&self.captured)?;
+        tuple.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ShellRunResultWire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_tuple(3, ShellRunResultWireVisitor)
+    }
+}
+
+struct ShellRunResultWireVisitor;
+
+impl<'de> Visitor<'de> for ShellRunResultWireVisitor {
+    type Value = ShellRunResultWire;
+
+    fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a positional shell run result")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        Ok(ShellRunResultWire {
+            kind: seq
+                .next_element()?
+                .ok_or_else(|| de::Error::invalid_length(0, &self))?,
+            terminal: seq
+                .next_element()?
+                .ok_or_else(|| de::Error::invalid_length(1, &self))?,
+            captured: seq
+                .next_element()?
+                .ok_or_else(|| de::Error::invalid_length(2, &self))?,
+        })
+    }
+}
+
+impl From<&ShellRunResult> for ShellRunResultWire {
+    fn from(value: &ShellRunResult) -> Self {
+        match value {
+            ShellRunResult::Terminal { .. } => Self {
+                kind: ShellRunResultKind::Terminal,
+                terminal: Some(ShellRunTerminalFields::from(value)),
+                captured: None,
+            },
+            ShellRunResult::Captured { .. } => Self {
+                kind: ShellRunResultKind::Captured,
+                terminal: None,
+                captured: Some(ShellRunCapturedFields::from(value)),
+            },
+        }
+    }
+}
+
+impl From<ShellRunResultWire> for ShellRunResult {
+    fn from(value: ShellRunResultWire) -> Self {
+        match value.kind {
+            ShellRunResultKind::Terminal => value.terminal.map_or_else(
+                Self::default_captured,
+                ShellRunTerminalFields::into_terminal,
+            ),
+            ShellRunResultKind::Captured => value.captured.map_or_else(
+                Self::default_captured,
+                ShellRunCapturedFields::into_captured,
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ShellRunTerminalFields {
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    timed_out: bool,
+    #[serde(default)]
+    cancelled: bool,
+    #[serde(default)]
+    output_tail: String,
+    #[serde(default)]
+    output_truncated: bool,
+    #[serde(default)]
+    output_bytes: Option<u64>,
+    #[serde(default)]
+    retained_output_bytes: Option<u64>,
+    #[serde(default = "default_terminal_columns")]
+    columns: u16,
+    #[serde(default = "default_terminal_rows")]
+    rows: u16,
+}
+
+impl ShellRunTerminalFields {
+    fn into_terminal(self) -> ShellRunResult {
+        ShellRunResult::Terminal {
+            exit_code: self.exit_code,
+            timed_out: self.timed_out,
+            cancelled: self.cancelled,
+            output_tail: self.output_tail,
+            output_truncated: self.output_truncated,
+            output_bytes: self.output_bytes,
+            retained_output_bytes: self.retained_output_bytes,
+            columns: self.columns,
+            rows: self.rows,
+        }
+    }
+}
+
+impl From<&ShellRunResult> for ShellRunTerminalFields {
+    fn from(value: &ShellRunResult) -> Self {
+        let ShellRunResult::Terminal {
+            exit_code,
+            timed_out,
+            cancelled,
+            output_tail,
+            output_truncated,
+            output_bytes,
+            retained_output_bytes,
+            columns,
+            rows,
+        } = value
+        else {
+            unreachable!("terminal fields only constructed from terminal results")
+        };
+        Self {
+            exit_code: *exit_code,
+            timed_out: *timed_out,
+            cancelled: *cancelled,
+            output_tail: output_tail.clone(),
+            output_truncated: *output_truncated,
+            output_bytes: *output_bytes,
+            retained_output_bytes: *retained_output_bytes,
+            columns: *columns,
+            rows: *rows,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+struct ShellRunCapturedFields {
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    timed_out: bool,
+    #[serde(default)]
+    cancelled: bool,
+    #[serde(default)]
+    stdout: String,
+    #[serde(default)]
+    stderr: String,
+    #[serde(default)]
+    stdout_truncated: bool,
+    #[serde(default)]
+    stderr_truncated: bool,
+    #[serde(default)]
+    stdout_bytes: Option<u64>,
+    #[serde(default)]
+    stderr_bytes: Option<u64>,
+}
+
+impl ShellRunCapturedFields {
+    fn into_captured(self) -> ShellRunResult {
+        ShellRunResult::Captured {
+            exit_code: self.exit_code,
+            timed_out: self.timed_out,
+            cancelled: self.cancelled,
+            stdout: self.stdout,
+            stderr: self.stderr,
+            stdout_truncated: self.stdout_truncated,
+            stderr_truncated: self.stderr_truncated,
+            stdout_bytes: self.stdout_bytes,
+            stderr_bytes: self.stderr_bytes,
+        }
+    }
+}
+
+impl From<&ShellRunResult> for ShellRunCapturedFields {
+    fn from(value: &ShellRunResult) -> Self {
+        let ShellRunResult::Captured {
+            exit_code,
+            timed_out,
+            cancelled,
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+            stdout_bytes,
+            stderr_bytes,
+        } = value
+        else {
+            unreachable!("captured fields only constructed from captured results")
+        };
+        Self {
+            exit_code: *exit_code,
+            timed_out: *timed_out,
+            cancelled: *cancelled,
+            stdout: stdout.clone(),
+            stderr: stderr.clone(),
+            stdout_truncated: *stdout_truncated,
+            stderr_truncated: *stderr_truncated,
+            stdout_bytes: *stdout_bytes,
+            stderr_bytes: *stderr_bytes,
+        }
+    }
 }
 
 /// Semantic filesystem change result.
@@ -619,6 +1018,16 @@ pub struct FileChangeResult {
     /// Best-effort target path.
     #[serde(default)]
     pub path: Option<String>,
+}
+
+impl FileChangeResult {
+    const fn empty() -> Self {
+        Self {
+            tool_name: String::new(),
+            summary: String::new(),
+            path: None,
+        }
+    }
 }
 
 /// Bounded durable presentation state for a completed tool invocation.

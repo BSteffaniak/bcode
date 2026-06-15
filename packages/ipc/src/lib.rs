@@ -1090,8 +1090,8 @@ fn default_socket_path() -> PathBuf {
 mod tests {
     use super::*;
     use bcode_session_models::{
-        CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEventKind, SessionForkResult, SessionId,
-        SessionSummary,
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, FileChangeResult, SessionEventKind,
+        SessionForkResult, SessionId, SessionSummary, ShellRunResult, ToolInvocationResult,
     };
 
     #[test]
@@ -1425,8 +1425,10 @@ mod tests {
                 result: "z".repeat(MAX_FRAME_PAYLOAD_SIZE + 100_000),
                 is_error: false,
                 output: None,
+                semantic_result: None,
             },
         });
+
         let envelope = event_envelope(&event).expect("event should encode");
         assert!(encode(&envelope).expect("envelope should encode").len() > MAX_FRAME_PAYLOAD_SIZE);
 
@@ -1435,6 +1437,66 @@ mod tests {
         assert_eq!(received, envelope);
         let decoded = decode::<Event>(&received.payload).expect("event should decode");
         assert_eq!(decoded, event);
+    }
+
+    #[tokio::test]
+    async fn semantic_tool_result_events_round_trip_across_ipc_frames() {
+        let session_id = SessionId::new();
+        for semantic_result in [
+            ToolInvocationResult::FileChange {
+                result: FileChangeResult {
+                    tool_name: "filesystem.write".to_string(),
+                    summary: "wrote 171 bytes".to_string(),
+                    path: Some("/tmp/hello_world.rs".to_string()),
+                },
+            },
+            ToolInvocationResult::ShellRun {
+                result: ShellRunResult::Terminal {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    cancelled: false,
+                    output_tail: "hello\n".to_string(),
+                    output_truncated: false,
+                    output_bytes: Some(6),
+                    retained_output_bytes: Some(6),
+                    columns: 120,
+                    rows: 30,
+                },
+            },
+            ToolInvocationResult::ShellRun {
+                result: ShellRunResult::Captured {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    cancelled: false,
+                    stdout: "hello\n".to_string(),
+                    stderr: String::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                    stdout_bytes: Some(6),
+                    stderr_bytes: Some(0),
+                },
+            },
+        ] {
+            let event = Event::Session(SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 77,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::ToolCallFinished {
+                    tool_call_id: "call-1".to_string(),
+                    result: "tool result".to_string(),
+                    is_error: false,
+                    output: None,
+                    semantic_result: Some(semantic_result),
+                },
+            });
+            let envelope = event_envelope(&event).expect("event should encode");
+
+            let received = round_trip_envelope(envelope).await;
+
+            let decoded = decode::<Event>(&received.payload).expect("event should decode");
+            assert_eq!(decoded, event);
+        }
     }
 
     async fn round_trip_envelope(envelope: Envelope) -> Envelope {

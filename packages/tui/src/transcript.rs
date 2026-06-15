@@ -333,7 +333,7 @@ impl TranscriptItem {
             ..
         } = &mut self.kind
         {
-            self.text = output.clone();
+            self.text.clone_from(&output);
             *terminal_output = output;
             if finished_at_ms.is_some() {
                 *terminal_finished_at_ms = finished_at_ms;
@@ -702,6 +702,7 @@ pub fn truncate_block(value: &str, max_chars: usize) -> String {
     output
 }
 
+#[allow(clippy::too_many_lines)]
 fn push_transcript_item_from_event(
     items: &mut Vec<TranscriptItem>,
     tool_calls: &mut BTreeMap<String, ToolCallContext>,
@@ -737,7 +738,7 @@ fn push_transcript_item_from_event(
                     items,
                     tool_call_id,
                     tool_calls.get(tool_call_id),
-                    streamed_tool_results.get_mut(tool_call_id),
+                    &mut streamed_tool_results.get_mut(tool_call_id),
                     semantic_result,
                     *is_error,
                 );
@@ -754,7 +755,7 @@ fn push_transcript_item_from_event(
                     items,
                     tool_call_id,
                     tool_calls.get(tool_call_id),
-                    streamed_tool_results.get_mut(tool_call_id),
+                    &mut streamed_tool_results.get_mut(tool_call_id),
                     &legacy_result,
                     *is_error,
                 );
@@ -873,6 +874,7 @@ fn latest_streaming_item_mut<'items>(
         .find(|item| item.role == role && item.streaming)
 }
 
+#[allow(clippy::too_many_lines)]
 fn non_streaming_transcript_item_from_event(
     event: &SessionEvent,
     tool_calls: &mut BTreeMap<String, ToolCallContext>,
@@ -914,10 +916,11 @@ fn non_streaming_transcript_item_from_event(
             ..
         } => {
             if let Some(semantic_result) = semantic_result {
+                let mut replay = None;
                 return semantic_tool_result_item(
                     tool_call_id,
                     tool_calls.get(tool_call_id),
-                    None,
+                    &mut replay,
                     semantic_result,
                     *is_error,
                 );
@@ -928,10 +931,11 @@ fn non_streaming_transcript_item_from_event(
                     .map(|context| context.tool_name.as_str()),
                 result,
             ) {
+                let mut replay = None;
                 return semantic_tool_result_item(
                     tool_call_id,
                     tool_calls.get(tool_call_id),
-                    None,
+                    &mut replay,
                     &legacy_result,
                     *is_error,
                 );
@@ -1166,11 +1170,12 @@ fn apply_tool_invocation_presentation_event(
     }
 }
 
+#[allow(clippy::single_match_else, clippy::needless_pass_by_ref_mut)]
 fn apply_semantic_tool_result(
     items: &mut Vec<TranscriptItem>,
     tool_call_id: &str,
     context: Option<&ToolCallContext>,
-    replay: Option<&mut StreamedToolReplayContext>,
+    replay: &mut Option<&mut StreamedToolReplayContext>,
     result: &ToolInvocationResult,
     is_error: bool,
 ) {
@@ -1218,8 +1223,9 @@ fn apply_semantic_tool_result(
             items.push(item);
         }
         _ => {
+            let mut replay = None;
             if let Some(item) =
-                semantic_tool_result_item(tool_call_id, context, None, result, is_error)
+                semantic_tool_result_item(tool_call_id, context, &mut replay, result, is_error)
             {
                 items.push(item);
             }
@@ -1227,10 +1233,11 @@ fn apply_semantic_tool_result(
     }
 }
 
+#[allow(clippy::needless_pass_by_ref_mut)]
 fn semantic_tool_result_item(
     tool_call_id: &str,
     context: Option<&ToolCallContext>,
-    replay: Option<&mut StreamedToolReplayContext>,
+    replay: &mut Option<&mut StreamedToolReplayContext>,
     result: &ToolInvocationResult,
     is_error: bool,
 ) -> Option<TranscriptItem> {
@@ -1264,10 +1271,11 @@ fn semantic_tool_result_item(
     }
 }
 
+#[allow(clippy::needless_pass_by_ref_mut)]
 fn semantic_shell_result_item(
     tool_call_id: &str,
     context: Option<&ToolCallContext>,
-    replay: Option<&mut StreamedToolReplayContext>,
+    replay: &mut Option<&mut StreamedToolReplayContext>,
     result: &ShellRunResult,
     is_error: bool,
 ) -> Option<TranscriptItem> {

@@ -1955,6 +1955,7 @@ mod tests {
                 result: "done".to_string(),
                 is_error: false,
                 output: None,
+                semantic_result: None,
             },
         ))
         .await

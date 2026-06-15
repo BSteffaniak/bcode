@@ -4,8 +4,8 @@ use bcode_client::BcodeClient;
 use bcode_ipc::Event as BcodeEvent;
 use bcode_session_models::{
     ProjectionWindowAnchor, ProjectionWindowDirection, ProjectionWindowLimits,
-    ProjectionWindowRequest, ProjectionWindowTarget, SessionHistoryDirection, SessionHistoryQuery,
-    SessionId, SessionProjectionKind,
+    ProjectionWindowRequest, ProjectionWindowTarget, SessionHistoryCursor, SessionHistoryDirection,
+    SessionHistoryQuery, SessionId, SessionProjectionKind,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -235,9 +235,11 @@ async fn reconnecting_event_stream<F>(
         + 'static,
 {
     let mut reconnect_delay = EVENT_STREAM_RECONNECT_INITIAL_DELAY;
+    let mut latest_sequence = 0;
     loop {
         while let Ok(event) = connection.recv_event().await {
             reconnect_delay = EVENT_STREAM_RECONNECT_INITIAL_DELAY;
+            latest_sequence = latest_sequence.max(event_sequence(&event));
             if event_sender.send(event).is_err() {
                 return;
             }
@@ -255,10 +257,52 @@ async fn reconnecting_event_stream<F>(
                 continue;
             };
             if attach(&mut next_connection, session_id).await.is_ok() {
+                if let Ok(replayed_latest_sequence) =
+                    replay_gap(&client, session_id, latest_sequence, &event_sender).await
+                {
+                    latest_sequence = latest_sequence.max(replayed_latest_sequence);
+                }
                 connection = next_connection;
                 reconnect_delay = EVENT_STREAM_RECONNECT_INITIAL_DELAY;
                 break;
             }
         }
     }
+}
+
+const fn event_sequence(event: &BcodeEvent) -> u64 {
+    match event {
+        BcodeEvent::Session(event) | BcodeEvent::RuntimeWork(event) => event.sequence,
+        BcodeEvent::SessionLive(_) | BcodeEvent::SessionCatalogUpdated { .. } => 0,
+    }
+}
+
+async fn replay_gap(
+    client: &BcodeClient,
+    session_id: SessionId,
+    latest_sequence: u64,
+    event_sender: &mpsc::UnboundedSender<BcodeEvent>,
+) -> Result<u64, bcode_client::ClientError> {
+    let page = client
+        .session_history_page(
+            session_id,
+            SessionHistoryQuery {
+                cursor: Some(SessionHistoryCursor {
+                    sequence: latest_sequence.saturating_add(1),
+                }),
+                limit: 512,
+                direction: SessionHistoryDirection::Forward,
+            },
+        )
+        .await?;
+    let mut replayed_latest_sequence = latest_sequence;
+    for event in page.events {
+        if event.sequence > latest_sequence {
+            replayed_latest_sequence = replayed_latest_sequence.max(event.sequence);
+            if event_sender.send(BcodeEvent::Session(event)).is_err() {
+                break;
+            }
+        }
+    }
+    Ok(replayed_latest_sequence)
 }
