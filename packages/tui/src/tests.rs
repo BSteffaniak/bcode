@@ -3259,7 +3259,7 @@ fn semantic_terminal_result_finishes_existing_stream_item() {
         .collect::<Vec<_>>();
 
     assert_eq!(terminal_items.len(), 1);
-    assert_eq!(terminal_items[0].text(), "final tail\n");
+    assert_eq!(terminal_items[0].text(), "live\n");
     assert!(!terminal_items[0].streaming());
     let TranscriptItemKind::TerminalOutput {
         exit_code,

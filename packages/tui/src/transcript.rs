@@ -1139,6 +1139,22 @@ fn apply_tool_invocation_presentation_event(
         .map(|context| TerminalInvocationItemContext {
             index: context.index,
         });
+    if let ToolInvocationPresentation::Terminal {
+        exit_code,
+        timed_out,
+        ..
+    } = event.presentation
+        && let Some(streamed) = streamed_tool_results.get(event.tool_call_id)
+        && streamed.saw_output
+    {
+        if let Some(index) = streamed.index
+            && let Some(item) = items.get_mut(index)
+        {
+            item.finish_terminal(*exit_code, *timed_out, event.is_error, event.finished_at_ms);
+        }
+        presented_tool_results.insert(event.tool_call_id.to_owned());
+        return;
+    }
     let effects = apply_tool_invocation_presentation(
         items,
         ToolInvocationPresentationInput {
@@ -1179,6 +1195,25 @@ fn apply_semantic_tool_result(
     result: &ToolInvocationResult,
     is_error: bool,
 ) {
+    if let ToolInvocationResult::ShellRun {
+        result:
+            ShellRunResult::Terminal {
+                exit_code,
+                timed_out,
+                ..
+            },
+    } = result
+        && let Some(replay) = replay.as_deref_mut()
+        && replay.saw_output
+    {
+        if let Some(index) = replay.index
+            && let Some(item) = items.get_mut(index)
+        {
+            item.finish_terminal(*exit_code, *timed_out, is_error, replay.finished_at_ms);
+        }
+        return;
+    }
+
     match result {
         ToolInvocationResult::ShellRun {
             result:

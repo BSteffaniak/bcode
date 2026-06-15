@@ -2649,7 +2649,7 @@ mod tests {
         let received = round_trip_envelope(envelope.clone()).await;
 
         assert_eq!(received, envelope);
-        let decoded = decode::<Response>(&received.payload).expect("response should decode");
+        let decoded = decode_response(&received.payload).expect("response should decode");
         assert_eq!(decoded, response);
     }
 
@@ -2676,7 +2676,7 @@ mod tests {
         let received = round_trip_envelope(envelope.clone()).await;
 
         assert_eq!(received, envelope);
-        let decoded = decode::<Event>(&received.payload).expect("event should decode");
+        let decoded = decode_event(&received.payload).expect("event should decode");
         assert_eq!(decoded, event);
     }
 

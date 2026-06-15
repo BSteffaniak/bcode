@@ -2022,6 +2022,22 @@ impl BmuxApp {
                 index: context.index,
             }
         });
+        if let ToolInvocationPresentation::Terminal {
+            exit_code,
+            timed_out,
+            ..
+        } = presentation
+            && let Some(streamed) = self.streamed_tool_results.get(tool_call_id)
+            && streamed.saw_output
+        {
+            if let Some(index) = streamed.index
+                && let Some(item) = self.transcript.get_mut(index)
+            {
+                item.finish_terminal(*exit_code, *timed_out, is_error, finished_at_ms);
+            }
+            self.presented_tool_results.insert(tool_call_id.to_owned());
+            return;
+        }
         let effects = apply_tool_invocation_presentation(
             &mut self.transcript,
             ToolInvocationPresentationInput {
