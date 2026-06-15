@@ -2558,6 +2558,16 @@ fn progress_doc_checklist_summary(
     std::fs::read_to_string(path).map(|text| bcode_ralph::analyze_progress_doc_text(&text))
 }
 
+fn progress_doc_is_coherent_and_writable(path: &Path) -> bool {
+    let Ok(summary) = progress_doc_checklist_summary(path) else {
+        return false;
+    };
+    if summary.checked_count == 0 && summary.unchecked_count == 0 {
+        return false;
+    }
+    std::fs::OpenOptions::new().write(true).open(path).is_ok()
+}
+
 fn progress_doc_checklist_fingerprint(path: &Path) -> Option<String> {
     progress_doc_checklist_summary(path)
         .ok()
@@ -2908,11 +2918,11 @@ async fn apply_ralph_post_audit_decision(
             "Ralph replan turn did not complete successfully",
         );
     }
-    if progress_doc_checklist_summary(&summary.progress_doc_path).is_err() {
+    if !progress_doc_is_coherent_and_writable(&summary.progress_doc_path) {
         return (
             "blocked",
-            "progress_doc_unreadable",
-            "Ralph progress doc could not be read after replan",
+            "progress_doc_invalid",
+            "Ralph progress doc was not coherent and writable after replan",
         );
     }
     (
