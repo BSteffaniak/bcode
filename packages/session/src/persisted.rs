@@ -11,6 +11,46 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use thiserror::Error;
 
+const KNOWN_PERSISTED_EVENT_KINDS: &[&str] = &[
+    "session_created",
+    "client_attached",
+    "client_detached",
+    "user_message",
+    "assistant_delta",
+    "assistant_message",
+    "tool_call_requested",
+    "tool_call_finished",
+    "permission_requested",
+    "permission_resolved",
+    "model_changed",
+    "system_message",
+    "agent_changed",
+    "model_turn_started",
+    "model_turn_finished",
+    "model_usage",
+    "context_compacted",
+    "session_renamed",
+    "trace_event",
+    "skill_invoked",
+    "skill_suggested",
+    "skill_activated",
+    "skill_deactivated",
+    "skill_context_loaded",
+    "skill_invocation_failed",
+    "assistant_reasoning_delta",
+    "assistant_reasoning_message",
+    "runtime_work_started",
+    "runtime_work_cancel_requested",
+    "runtime_work_finished",
+    "runtime_work_progress",
+    "model_turn_cancel_requested",
+    "tool_invocation_stream",
+    "working_directory_changed",
+    "session_imported",
+    "tool_invocation_presentation",
+    "session_forked",
+];
+
 /// Decode a persisted session event from durable JSON.
 ///
 /// # Errors
@@ -18,8 +58,40 @@ use thiserror::Error;
 /// Returns an error when the event is not a supported persisted session-event
 /// shape or cannot be converted into the current domain model.
 pub fn decode_session_event(payload: &str) -> Result<SessionEvent, PersistedSessionEventError> {
-    let persisted = serde_json::from_str::<PersistedSessionEvent>(payload)?;
+    let value = serde_json::from_str::<serde_json::Value>(payload)?;
+    reject_unsupported_future_shape(&value)?;
+    let persisted = serde_json::from_value::<PersistedSessionEvent>(value)?;
     persisted.into_domain()
+}
+
+fn reject_unsupported_future_shape(
+    value: &serde_json::Value,
+) -> Result<(), PersistedSessionEventError> {
+    if let Some(schema_version) = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+    {
+        let schema_version = u16::try_from(schema_version).unwrap_or(u16::MAX);
+        if schema_version > CURRENT_SESSION_EVENT_SCHEMA_VERSION {
+            return Err(PersistedSessionEventError::UnsupportedSchemaVersion {
+                actual: schema_version,
+                current: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            });
+        }
+    }
+
+    let Some(kind) = value.get("kind").and_then(serde_json::Value::as_object) else {
+        return Ok(());
+    };
+    let Some(kind_name) = kind.keys().next() else {
+        return Ok(());
+    };
+    if !KNOWN_PERSISTED_EVENT_KINDS.contains(&kind_name.as_str()) {
+        return Err(PersistedSessionEventError::UnsupportedEventKind {
+            kind: kind_name.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// Errors returned when decoding persisted session events.
@@ -33,6 +105,9 @@ pub enum PersistedSessionEventError {
         "unsupported persisted session event schema version {actual}; current version is {current}"
     )]
     UnsupportedSchemaVersion { actual: u16, current: u16 },
+    /// Persisted event uses an unknown future event kind not supported by this build.
+    #[error("unsupported persisted session event kind {kind}")]
+    UnsupportedEventKind { kind: String },
 }
 
 /// Persisted session event DTO.
@@ -707,6 +782,24 @@ mod tests {
         assert!(matches!(
             error,
             PersistedSessionEventError::UnsupportedSchemaVersion { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_future_event_kind() {
+        let payload = serde_json::json!({
+            "schema_version": CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            "sequence": 1,
+            "session_id": SessionId::new(),
+            "kind": { "future_event_kind": { "value": true } }
+        })
+        .to_string();
+
+        let error = decode_session_event(&payload).expect_err("future event kind should fail");
+
+        assert!(matches!(
+            error,
+            PersistedSessionEventError::UnsupportedEventKind { .. }
         ));
     }
 
