@@ -8,7 +8,7 @@
 
 use bcode_session_models::{SessionEvent, SessionEventKind};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -21,9 +21,6 @@ use switchy::schema::runner::MigrationRunner;
 
 const RALPH_STATE_SUBDIR: &str = "ralph";
 const PROGRESS_DOC_FILE_NAME: &str = "progress.md";
-// Legacy compatibility snapshot. `ralph.db` is the canonical loop metadata store;
-// this file is maintained temporarily for backfill/older-state compatibility.
-const LOOP_METADATA_FILE_NAME: &str = "loop.json";
 const CONTEXT_PACK_FILE_NAME: &str = "context-pack.json";
 const DATABASE_FILE_NAME: &str = "ralph.db";
 const MIGRATIONS_TABLE: &str = "ralph_schema_migrations";
@@ -91,8 +88,6 @@ pub struct CreatedRalphLoopState {
     pub state_dir: PathBuf,
     /// Canonical progress document path.
     pub progress_doc_path: PathBuf,
-    /// Loop metadata path.
-    pub metadata_path: PathBuf,
     /// Context pack sidecar path.
     pub context_pack_path: PathBuf,
 }
@@ -353,11 +348,9 @@ pub struct RalphLoopSummary {
 ///
 /// # Errors
 ///
-/// Returns an error when state directory entries or metadata files cannot be
-/// read. Missing repository state is treated as an empty result.
+/// Returns an error when the Ralph database cannot be opened, migrated, or queried.
 pub fn latest_loop(repo_root: &Path) -> Result<Option<RalphLoopSummary>, RalphStateError> {
     let repo_root = repo_root.to_path_buf();
-    let db_repo_root = repo_root.clone();
     let db_summary = with_database(move |database| {
         Box::pin(async move {
             let rows = database
@@ -377,7 +370,7 @@ pub fn latest_loop(repo_root: &Path) -> Result<Option<RalphLoopSummary>, RalphSt
                 ])
                 .filter(Box::new(where_eq(
                     "repo_root",
-                    db_repo_root.display().to_string(),
+                    repo_root.display().to_string(),
                 )))
                 .execute(database)
                 .await?;
@@ -390,49 +383,7 @@ pub fn latest_loop(repo_root: &Path) -> Result<Option<RalphLoopSummary>, RalphSt
                 })
         })
     })?;
-    if db_summary.is_some() {
-        return Ok(db_summary);
-    }
-    latest_loop_from_legacy_files(repo_root.as_path())
-}
-
-fn latest_loop_from_legacy_files(
-    repo_root: &Path,
-) -> Result<Option<RalphLoopSummary>, RalphStateError> {
-    let root = repo_state_root(repo_root);
-    if !root.exists() {
-        return Ok(None);
-    }
-    let mut latest = None;
-    for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let metadata_path = entry.path().join(LOOP_METADATA_FILE_NAME);
-        if !metadata_path.exists() {
-            continue;
-        }
-        let Some(summary) = read_loop_summary(&metadata_path)? else {
-            continue;
-        };
-        if latest
-            .as_ref()
-            .is_none_or(|current: &RalphLoopSummary| summary.updated_at_ms > current.updated_at_ms)
-        {
-            latest = Some(summary);
-        }
-    }
-    if let Some(summary) = &latest {
-        let legacy_state = CreatedRalphLoopState {
-            state_dir: summary.state_dir.clone(),
-            progress_doc_path: summary.progress_doc_path.clone(),
-            metadata_path: summary.state_dir.join(LOOP_METADATA_FILE_NAME),
-            context_pack_path: summary.state_dir.join(CONTEXT_PACK_FILE_NAME),
-        };
-        upsert_loop_row(&legacy_state)?;
-    }
-    Ok(latest)
+    Ok(db_summary)
 }
 
 fn summary_from_loop_row(row: &Row) -> Result<RalphLoopSummary, RalphStateError> {
@@ -476,70 +427,6 @@ fn summary_from_loop_row(row: &Row) -> Result<RalphLoopSummary, RalphStateError>
     })
 }
 
-fn read_loop_summary(metadata_path: &Path) -> Result<Option<RalphLoopSummary>, RalphStateError> {
-    let bytes = std::fs::read(metadata_path)?;
-    let metadata =
-        serde_json::from_slice::<Map<String, Value>>(&bytes).map_err(RalphStateError::Json)?;
-    let Some(state_dir) = metadata_path.parent().map(Path::to_path_buf) else {
-        return Ok(None);
-    };
-    let progress_doc_path = metadata
-        .get("progress_doc_path")
-        .and_then(Value::as_str)
-        .map_or_else(|| state_dir.join(PROGRESS_DOC_FILE_NAME), PathBuf::from);
-    let checklist_summary = if progress_doc_path.exists() {
-        analyze_progress_doc_text(&std::fs::read_to_string(&progress_doc_path)?)
-    } else {
-        ProgressDocChecklistSummary {
-            checked_count: 0,
-            unchecked_count: 0,
-            checklist_fingerprint: FNV_OFFSET_BASIS,
-        }
-    };
-    Ok(Some(RalphLoopSummary {
-        loop_name: metadata
-            .get("loop_name")
-            .and_then(Value::as_str)
-            .unwrap_or("Ralph loop")
-            .to_owned(),
-        status: metadata
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_owned(),
-        state_dir,
-        progress_doc_path,
-        work_area_path: metadata
-            .get("work_area_path")
-            .and_then(Value::as_str)
-            .map(PathBuf::from),
-        session_id: metadata
-            .get("session_id")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        iteration_count: metadata_u64(&metadata, "iteration_count"),
-        next_action: next_action_for_decision(decide_stop(RalphStopDecisionInput {
-            status: status_from_str(
-                metadata
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown"),
-            ),
-            iteration_count: metadata_u64(&metadata, "iteration_count"),
-            max_iterations: metadata_u64(&metadata, "max_iterations"),
-            no_progress_count: metadata_u64(&metadata, "no_progress_count"),
-            no_progress_limit: metadata_u64(&metadata, "no_progress_limit"),
-            checklist_summary,
-            permission_denied: false,
-            validation_blocked: false,
-            user_question: false,
-        }))
-        .to_owned(),
-        checklist_summary,
-        updated_at_ms: metadata_u128(&metadata, "updated_at_ms"),
-    }))
-}
-
 fn required_text(row: &Row, column: &'static str) -> Result<String, RalphStateError> {
     row.get(column)
         .and_then(|value| value.as_str().map(ToOwned::to_owned))
@@ -561,26 +448,15 @@ fn i64_to_u64(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
 }
 
-fn metadata_u128(metadata: &Map<String, Value>, key: &str) -> u128 {
-    metadata
-        .get(key)
-        .and_then(|value| match value {
-            Value::Number(number) => number.as_u64().map(u128::from),
-            Value::String(text) => text.parse::<u128>().ok(),
-            _ => None,
-        })
-        .unwrap_or(0)
-}
-
-fn metadata_u64(metadata: &Map<String, Value>, key: &str) -> u64 {
-    metadata
-        .get(key)
-        .and_then(|value| match value {
-            Value::Number(number) => number.as_u64(),
-            Value::String(text) => text.parse::<u64>().ok(),
-            _ => None,
-        })
-        .unwrap_or(0)
+fn event_record_from_row(row: &Row) -> Result<RalphLifecycleEventRecord, RalphStateError> {
+    Ok(RalphLifecycleEventRecord {
+        event_id: required_text(row, "event_id")?,
+        state_dir: PathBuf::from(required_text(row, "state_dir")?),
+        kind: required_text(row, "kind")?,
+        message: required_text(row, "message")?,
+        payload_json: optional_text(row, "payload_json"),
+        occurred_at_ms: i64_to_u64(required_i64(row, "occurred_at_ms")?),
+    })
 }
 
 fn status_from_str(status: &str) -> RalphLoopStatus {
@@ -688,6 +564,60 @@ pub fn append_lifecycle_event_for_summary(
     })
 }
 
+/// Persisted Ralph lifecycle event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RalphLifecycleEventRecord {
+    /// Event ID.
+    pub event_id: String,
+    /// Loop state directory this event belongs to.
+    pub state_dir: PathBuf,
+    /// Event kind.
+    pub kind: String,
+    /// Human-readable event message.
+    pub message: String,
+    /// Optional serialized event payload.
+    pub payload_json: Option<String>,
+    /// Event time in Unix epoch milliseconds.
+    pub occurred_at_ms: u64,
+}
+
+/// List lifecycle events for a Ralph loop summary.
+///
+/// # Errors
+///
+/// Returns an error when the Ralph database cannot be opened, migrated, or queried.
+pub fn list_lifecycle_events(
+    summary: &RalphLoopSummary,
+) -> Result<Vec<RalphLifecycleEventRecord>, RalphStateError> {
+    let state_dir = summary.state_dir.clone();
+    with_database(move |database| {
+        Box::pin(async move {
+            let rows = database
+                .select("ralph_events")
+                .columns(&[
+                    "event_id",
+                    "state_dir",
+                    "kind",
+                    "message",
+                    "payload_json",
+                    "occurred_at_ms",
+                ])
+                .filter(Box::new(where_eq(
+                    "state_dir",
+                    state_dir.display().to_string(),
+                )))
+                .execute(database)
+                .await?;
+            let mut events = rows
+                .iter()
+                .map(event_record_from_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            events.sort_by(|left, right| left.occurred_at_ms.cmp(&right.occurred_at_ms));
+            Ok(events)
+        })
+    })
+}
+
 /// Create initial local state for a Ralph loop.
 ///
 /// # Errors
@@ -703,10 +633,6 @@ pub fn create_initial_loop_state(
     std::fs::create_dir_all(&paths.state_dir)?;
     let metadata = LoopMetadata::new(loop_name, repo_root, &paths);
     std::fs::write(
-        &paths.metadata_path,
-        serde_json::to_vec_pretty(&metadata).map_err(RalphStateError::Json)?,
-    )?;
-    std::fs::write(
         &paths.progress_doc_path,
         initial_progress_doc(loop_name, repo_root, session_title, &paths),
     )?;
@@ -714,7 +640,7 @@ pub fn create_initial_loop_state(
         &paths.context_pack_path,
         initial_context_pack(loop_name, session_title)?,
     )?;
-    upsert_loop_row(&paths)?;
+    upsert_loop_metadata(&metadata)?;
     append_lifecycle_event(
         &paths,
         RalphLifecycleEventKind::Created,
@@ -794,30 +720,7 @@ pub fn record_work_area(
     branch: Option<&str>,
     session_id: Option<&str>,
 ) -> Result<(), RalphStateError> {
-    let mut metadata = read_metadata(state)?;
-    metadata.insert(
-        "work_area_path".to_owned(),
-        Value::String(work_area_path.display().to_string()),
-    );
-    metadata.insert(
-        "branch".to_owned(),
-        branch.map_or(Value::Null, |branch| Value::String(branch.to_owned())),
-    );
-    metadata.insert(
-        "session_id".to_owned(),
-        session_id.map_or(Value::Null, |session_id| {
-            Value::String(session_id.to_owned())
-        }),
-    );
-    metadata.insert(
-        "status".to_owned(),
-        Value::String(RalphLoopStatus::Running.as_str().to_owned()),
-    );
-    metadata.insert(
-        "updated_at_ms".to_owned(),
-        Value::from(now_ms().to_string()),
-    );
-    write_metadata(state, &metadata)?;
+    update_loop_work_area(state, work_area_path, branch, session_id)?;
     append_lifecycle_event(
         state,
         RalphLifecycleEventKind::WorkAreaCreated,
@@ -826,35 +729,12 @@ pub fn record_work_area(
     Ok(())
 }
 
-fn read_metadata(state: &CreatedRalphLoopState) -> Result<Map<String, Value>, RalphStateError> {
-    let bytes = std::fs::read(&state.metadata_path)?;
-    serde_json::from_slice::<Map<String, Value>>(&bytes).map_err(RalphStateError::Json)
-}
-
-fn write_metadata(
-    state: &CreatedRalphLoopState,
-    metadata: &Map<String, Value>,
-) -> Result<(), RalphStateError> {
-    std::fs::write(
-        &state.metadata_path,
-        serde_json::to_vec_pretty(metadata).map_err(RalphStateError::Json)?,
-    )?;
-    upsert_loop_row(state)?;
-    Ok(())
-}
-
 fn update_metadata_field(
     state: &CreatedRalphLoopState,
     key: &str,
     value: Value,
 ) -> Result<(), RalphStateError> {
-    let mut metadata = read_metadata(state)?;
-    metadata.insert(key.to_owned(), value);
-    metadata.insert(
-        "updated_at_ms".to_owned(),
-        Value::from(now_ms().to_string()),
-    );
-    write_metadata(state, &metadata)
+    update_loop_metadata_field(state, key, value)
 }
 
 /// Return the default Ralph state root for a repository.
@@ -881,7 +761,6 @@ fn allocate_loop_paths(
         if !state_dir.exists() {
             return Ok(CreatedRalphLoopState {
                 progress_doc_path: state_dir.join(PROGRESS_DOC_FILE_NAME),
-                metadata_path: state_dir.join(LOOP_METADATA_FILE_NAME),
                 context_pack_path: state_dir.join(CONTEXT_PACK_FILE_NAME),
                 state_dir,
             });
@@ -967,6 +846,7 @@ struct LoopMetadata<'a> {
     loop_slug: String,
     repo_root: &'a Path,
     repo_id: String,
+    state_dir: &'a Path,
     progress_doc_path: &'a Path,
     status: RalphLoopStatus,
     stop_reason: Option<&'static str>,
@@ -992,6 +872,7 @@ impl<'a> LoopMetadata<'a> {
                 .to_owned(),
             repo_root,
             repo_id: repo_state_id(repo_root),
+            state_dir: &paths.state_dir,
             progress_doc_path: &paths.progress_doc_path,
             status: RalphLoopStatus::Created,
             stop_reason: None,
@@ -1176,9 +1057,20 @@ fn now_ms() -> u128 {
         .map_or(0, |duration| duration.as_millis())
 }
 
-fn upsert_loop_row(state: &CreatedRalphLoopState) -> Result<(), RalphStateError> {
-    let metadata = read_metadata(state)?;
-    let state_dir = state.state_dir.clone();
+fn upsert_loop_metadata(metadata: &LoopMetadata<'_>) -> Result<(), RalphStateError> {
+    let state_dir = metadata.state_dir.to_path_buf();
+    let loop_name = metadata.loop_name.to_owned();
+    let repo_id = metadata.repo_id.clone();
+    let repo_root = metadata.repo_root.display().to_string();
+    let progress_doc_path = metadata.progress_doc_path.display().to_string();
+    let context_pack_path = metadata.context_pack_path.display().to_string();
+    let status = metadata.status.as_str().to_owned();
+    let iteration_count = u128_to_i64(u128::from(metadata.iteration_count));
+    let max_iterations = u128_to_i64(u128::from(metadata.max_iterations));
+    let no_progress_count = u128_to_i64(u128::from(metadata.no_progress_count));
+    let no_progress_limit = u128_to_i64(u128::from(metadata.no_progress_limit));
+    let created_at_ms = u128_to_i64(metadata.created_at_ms);
+    let updated_at_ms = u128_to_i64(metadata.updated_at_ms);
     with_database(move |database| {
         Box::pin(async move {
             let state_dir_text = state_dir.display().to_string();
@@ -1192,67 +1084,21 @@ fn upsert_loop_row(state: &CreatedRalphLoopState) -> Result<(), RalphStateError>
                 database
                     .insert("ralph_loops")
                     .value("state_dir", state_dir_text)
-                    .value("loop_name", metadata_text(&metadata, "loop_name"))
-                    .value("repo_id", metadata_text(&metadata, "repo_id"))
-                    .value("repo_root", metadata_text(&metadata, "repo_root"))
-                    .value(
-                        "progress_doc_path",
-                        metadata_text(&metadata, "progress_doc_path"),
-                    )
-                    .value(
-                        "context_pack_path",
-                        metadata_text(&metadata, "context_pack_path"),
-                    )
-                    .value(
-                        "work_area_path",
-                        optional_metadata_text(&metadata, "work_area_path"),
-                    )
-                    .value("branch", optional_metadata_text(&metadata, "branch"))
-                    .value(
-                        "session_id",
-                        optional_metadata_text(&metadata, "session_id"),
-                    )
-                    .value("status", metadata_text(&metadata, "status"))
-                    .value(
-                        "iteration_count",
-                        metadata_i64(&metadata, "iteration_count"),
-                    )
-                    .value("max_iterations", metadata_i64(&metadata, "max_iterations"))
-                    .value(
-                        "no_progress_count",
-                        metadata_i64(&metadata, "no_progress_count"),
-                    )
-                    .value(
-                        "no_progress_limit",
-                        metadata_i64(&metadata, "no_progress_limit"),
-                    )
-                    .value("created_at_ms", metadata_i64(&metadata, "created_at_ms"))
-                    .value("updated_at_ms", metadata_i64(&metadata, "updated_at_ms"))
-                    .execute(database)
-                    .await?;
-            } else {
-                database
-                    .update("ralph_loops")
-                    .value(
-                        "work_area_path",
-                        optional_metadata_text(&metadata, "work_area_path"),
-                    )
-                    .value("branch", optional_metadata_text(&metadata, "branch"))
-                    .value(
-                        "session_id",
-                        optional_metadata_text(&metadata, "session_id"),
-                    )
-                    .value("status", metadata_text(&metadata, "status"))
-                    .value(
-                        "iteration_count",
-                        metadata_i64(&metadata, "iteration_count"),
-                    )
-                    .value(
-                        "no_progress_count",
-                        metadata_i64(&metadata, "no_progress_count"),
-                    )
-                    .value("updated_at_ms", metadata_i64(&metadata, "updated_at_ms"))
-                    .filter(Box::new(where_eq("state_dir", state_dir_text)))
+                    .value("loop_name", loop_name)
+                    .value("repo_id", repo_id)
+                    .value("repo_root", repo_root)
+                    .value("progress_doc_path", progress_doc_path)
+                    .value("context_pack_path", context_pack_path)
+                    .value("work_area_path", Option::<String>::None)
+                    .value("branch", Option::<String>::None)
+                    .value("session_id", Option::<String>::None)
+                    .value("status", status)
+                    .value("iteration_count", iteration_count)
+                    .value("max_iterations", max_iterations)
+                    .value("no_progress_count", no_progress_count)
+                    .value("no_progress_limit", no_progress_limit)
+                    .value("created_at_ms", created_at_ms)
+                    .value("updated_at_ms", updated_at_ms)
                     .execute(database)
                     .await?;
             }
@@ -1261,19 +1107,79 @@ fn upsert_loop_row(state: &CreatedRalphLoopState) -> Result<(), RalphStateError>
     })
 }
 
-fn metadata_text(metadata: &Map<String, Value>, key: &str) -> String {
-    optional_metadata_text(metadata, key).unwrap_or_default()
+fn update_loop_metadata_field(
+    state: &CreatedRalphLoopState,
+    key: &str,
+    value: Value,
+) -> Result<(), RalphStateError> {
+    let state_dir = state.state_dir.clone();
+    let key = key.to_owned();
+    let value = match value {
+        Value::String(text) => Some(text),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    };
+    with_database(move |database| {
+        Box::pin(async move {
+            let mut update = database
+                .update("ralph_loops")
+                .value("updated_at_ms", u128_to_i64(now_ms()));
+            match key.as_str() {
+                "status" => update = update.value("status", value.unwrap_or_default()),
+                "iteration_count" => {
+                    update = update.value(
+                        "iteration_count",
+                        value.and_then(|v| v.parse::<i64>().ok()).unwrap_or(0),
+                    );
+                }
+                "no_progress_count" => {
+                    update = update.value(
+                        "no_progress_count",
+                        value.and_then(|v| v.parse::<i64>().ok()).unwrap_or(0),
+                    );
+                }
+                _ => return Ok(()),
+            }
+            update
+                .filter(Box::new(where_eq(
+                    "state_dir",
+                    state_dir.display().to_string(),
+                )))
+                .execute(database)
+                .await?;
+            Ok(())
+        })
+    })
 }
 
-fn optional_metadata_text(metadata: &Map<String, Value>, key: &str) -> Option<String> {
-    metadata
-        .get(key)
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-}
-
-fn metadata_i64(metadata: &Map<String, Value>, key: &str) -> i64 {
-    i64::try_from(metadata_u128(metadata, key)).unwrap_or(i64::MAX)
+fn update_loop_work_area(
+    state: &CreatedRalphLoopState,
+    work_area_path: &Path,
+    branch: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<(), RalphStateError> {
+    let state_dir = state.state_dir.clone();
+    let work_area_path = work_area_path.display().to_string();
+    let branch = branch.map(ToOwned::to_owned);
+    let session_id = session_id.map(ToOwned::to_owned);
+    with_database(move |database| {
+        Box::pin(async move {
+            database
+                .update("ralph_loops")
+                .value("work_area_path", work_area_path)
+                .value("branch", branch)
+                .value("session_id", session_id)
+                .value("status", RalphLoopStatus::Running.as_str())
+                .value("updated_at_ms", u128_to_i64(now_ms()))
+                .filter(Box::new(where_eq(
+                    "state_dir",
+                    state_dir.display().to_string(),
+                )))
+                .execute(database)
+                .await?;
+            Ok(())
+        })
+    })
 }
 
 fn with_database<T>(
@@ -1609,36 +1515,9 @@ mod tests {
             .expect("latest loop should query")
             .expect("latest loop should exist");
         assert_eq!(summary.state_dir, state.state_dir);
-        assert_eq!(summary.loop_name, state_loop_name(&state));
+        assert!(summary.loop_name.starts_with("db-backed-"));
         assert_eq!(summary.progress_doc_path, state.progress_doc_path);
-        let event_count = event_count_for_state(&state.state_dir).expect("events should query");
-        assert!(event_count >= 2);
-    }
-
-    fn event_count_for_state(state_dir: &Path) -> Result<usize, RalphStateError> {
-        let state_dir = state_dir.to_path_buf();
-        with_database(move |database| {
-            Box::pin(async move {
-                let rows = database
-                    .select("ralph_events")
-                    .columns(&["event_id"])
-                    .filter(Box::new(where_eq(
-                        "state_dir",
-                        state_dir.display().to_string(),
-                    )))
-                    .execute(database)
-                    .await?;
-                Ok(rows.len())
-            })
-        })
-    }
-
-    fn state_loop_name(state: &CreatedRalphLoopState) -> String {
-        read_metadata(state)
-            .expect("metadata should read")
-            .get("loop_name")
-            .and_then(Value::as_str)
-            .expect("loop name should exist")
-            .to_owned()
+        let events = list_lifecycle_events(&summary).expect("events should query");
+        assert!(events.len() >= 2);
     }
 }
