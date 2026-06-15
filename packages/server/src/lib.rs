@@ -2436,12 +2436,27 @@ async fn submit_ralph_skeleton_work_turn(
     )
 }
 
+const fn ralph_iteration_status_from_model_outcome(
+    outcome: Option<ModelTurnOutcome>,
+) -> &'static str {
+    match outcome {
+        Some(ModelTurnOutcome::Completed) => "work_completed",
+        Some(ModelTurnOutcome::Cancelled) => "work_cancelled",
+        Some(ModelTurnOutcome::ProviderUnavailable) => "work_blocked",
+        Some(ModelTurnOutcome::IdleTimeout) => "work_timed_out",
+        Some(ModelTurnOutcome::ToolRoundLimitReached) => "work_tool_round_limit",
+        Some(ModelTurnOutcome::Error) => "work_failed",
+        None => "skipped",
+    }
+}
+
 async fn record_ralph_skeleton_noop_iteration(
     state: &ServerState,
     runtime_session_id: Option<SessionId>,
     parent_work_id: &RuntimeWorkId,
     run: &bcode_ralph::RalphRunRecord,
     work_prompt: String,
+    work_completion: Option<ModelTurnCompletion>,
 ) {
     let iteration_work_id = RuntimeWorkId::new(format!("ralph:{}:iteration:1", run.run_id));
     register_ralph_runtime_work(
@@ -2461,13 +2476,19 @@ async fn record_ralph_skeleton_noop_iteration(
         1,
     )
     .await;
+    let outcome = work_completion
+        .as_ref()
+        .map(|completion| completion.outcome);
     let _iteration = bcode_ralph::create_iteration(bcode_ralph::RalphIterationCreateRequest {
         run_id: run.run_id.clone(),
         state_dir: run.state_dir.clone(),
         iteration_number: 1,
-        status: "skipped".to_owned(),
+        status: ralph_iteration_status_from_model_outcome(outcome).to_owned(),
         checklist_fingerprint_before: None,
         work_prompt: Some(work_prompt),
+        finished_at_ms: Some(current_time_ms()),
+        stop_reason: outcome.map(|outcome| format!("model_turn_{outcome:?}").to_lowercase()),
+        error_message: work_completion.and_then(|completion| completion.message),
     });
     finish_ralph_runtime_work(
         state,
@@ -2570,7 +2591,7 @@ async fn run_ralph_runner_skeleton(
         )
     } else {
         let work_prompt = build_ralph_work_prompt(&summary);
-        let _work_completion = submit_ralph_skeleton_work_turn(
+        let work_completion = submit_ralph_skeleton_work_turn(
             &state,
             runtime_session_id,
             &runtime_work_id,
@@ -2583,6 +2604,7 @@ async fn run_ralph_runner_skeleton(
             &runtime_work_id,
             &run,
             work_prompt,
+            work_completion,
         )
         .await;
         let _ = bcode_ralph::update_run_status(

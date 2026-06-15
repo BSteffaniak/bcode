@@ -827,6 +827,12 @@ pub struct RalphIterationCreateRequest {
     pub checklist_fingerprint_before: Option<String>,
     /// Work prompt submitted for this iteration.
     pub work_prompt: Option<String>,
+    /// Iteration finish time, when creating a terminal iteration record.
+    pub finished_at_ms: Option<u64>,
+    /// Terminal stop reason, when known at creation time.
+    pub stop_reason: Option<String>,
+    /// Terminal error message, when known at creation time.
+    pub error_message: Option<String>,
 }
 
 /// Persisted Ralph iteration record.
@@ -1149,9 +1155,9 @@ pub fn create_iteration(
         validation_status: None,
         validation_summary: None,
         started_at_ms: u64::try_from(now).unwrap_or(u64::MAX),
-        finished_at_ms: None,
-        stop_reason: None,
-        error_message: None,
+        finished_at_ms: request.finished_at_ms,
+        stop_reason: request.stop_reason,
+        error_message: request.error_message,
     };
     let persisted = record.clone();
     with_database(move |database| {
@@ -2329,6 +2335,9 @@ mod tests {
             status: "working".to_owned(),
             checklist_fingerprint_before: Some("before".to_owned()),
             work_prompt: Some("do work".to_owned()),
+            finished_at_ms: None,
+            stop_reason: None,
+            error_message: None,
         })
         .expect("iteration should persist");
         let iterations = list_iterations_for_run(&run.run_id).expect("iterations should query");
