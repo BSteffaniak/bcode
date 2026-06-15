@@ -61,8 +61,12 @@ pub async fn run_plugin_surface<W: Write>(
                         close_outcome = outcome;
                         should_exit = true;
                     }
-                    PluginTuiAction::OpenSurface { .. } | PluginTuiAction::RunCommand { .. } => {
+                    PluginTuiAction::OpenSurface { .. } => {
                         needs_redraw = true;
+                    }
+                    PluginTuiAction::RunCommand { command } => {
+                        close_outcome = Some(serde_json::json!({ "run_command": command }));
+                        should_exit = true;
                     }
                 }
             }

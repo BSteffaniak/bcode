@@ -29,6 +29,33 @@ pub fn tui_registry() -> PluginTuiRegistry {
     registry
 }
 
+const RALPH_ACTIONS: &[RalphAction] = &[
+    RalphAction::new("Start/setup loop", "/ralph start"),
+    RalphAction::new("Run autonomous loop", "/ralph run"),
+    RalphAction::new("Approve prepared run", "/ralph approve"),
+    RalphAction::new("Stop active run", "/ralph stop"),
+    RalphAction::new("Resume safely", "/ralph resume"),
+    RalphAction::new("Show status", "/ralph status"),
+    RalphAction::new("List runs", "/ralph runs"),
+    RalphAction::new("List iterations", "/ralph iterations"),
+    RalphAction::new("Open progress doc", "/ralph open"),
+    RalphAction::new("Build audit prompt", "/ralph audit"),
+    RalphAction::new("Build replan prompt", "/ralph replan"),
+    RalphAction::new("Goal workflow", "/goal"),
+];
+
+#[derive(Debug, Clone, Copy)]
+struct RalphAction {
+    label: &'static str,
+    command: &'static str,
+}
+
+impl RalphAction {
+    const fn new(label: &'static str, command: &'static str) -> Self {
+        Self { label, command }
+    }
+}
+
 /// Ralph plugin implementation.
 #[derive(Debug, Default)]
 pub struct RalphPlugin;
@@ -67,6 +94,7 @@ struct RalphHomeSurface {
     repo_path: PathBuf,
     loop_summary: Option<bcode_ralph::RalphLoopSummary>,
     runs: Vec<bcode_ralph::RalphRunRecord>,
+    selected_action: usize,
     status_message: Option<String>,
 }
 
@@ -76,6 +104,7 @@ impl RalphHomeSurface {
             repo_path,
             loop_summary: None,
             runs: Vec::new(),
+            selected_action: 0,
             status_message: None,
         };
         surface.refresh();
@@ -106,6 +135,38 @@ impl RalphHomeSurface {
                 self.status_message = Some(format!("failed to load Ralph status: {error}"));
             }
         }
+    }
+    fn render_actions(&self, frame: &mut Frame<'_>, area: Rect, mut y: u16) -> u16 {
+        write_line(
+            frame,
+            area,
+            y,
+            Line::from_spans(vec![Span::styled(
+                "Actions",
+                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+            )]),
+        );
+        y = y.saturating_add(1);
+        for (index, action) in RALPH_ACTIONS.iter().enumerate() {
+            let selected = index == self.selected_action;
+            let marker = if selected { "›" } else { " " };
+            let style = if selected {
+                Style::new().fg(Color::Black).bg(Color::White)
+            } else {
+                Style::new().fg(Color::White).bg(Color::Black)
+            };
+            write_line(
+                frame,
+                area,
+                y,
+                Line::from_spans(vec![Span::styled(
+                    format!("{marker} {:<24} {}", action.label, action.command),
+                    style,
+                )]),
+            );
+            y = y.saturating_add(1);
+        }
+        y.saturating_add(1)
     }
 }
 
@@ -138,6 +199,7 @@ impl PluginTuiSurface for RalphHomeSurface {
             Line::from(format!("Repo: {}", self.repo_path.display())),
         );
         y = y.saturating_add(2);
+        y = self.render_actions(frame, area, y);
 
         if let Some(summary) = &self.loop_summary {
             write_line(
@@ -208,7 +270,7 @@ impl PluginTuiSurface for RalphHomeSurface {
             frame,
             area,
             status_y,
-            Line::from("Keys: r refresh · s /ralph status · g /goal · q close"),
+            Line::from("Keys: ↑/↓ select · Enter run · r refresh · q close"),
         );
         if let Some(message) = &self.status_message {
             write_line(
@@ -230,6 +292,17 @@ impl PluginTuiSurface for RalphHomeSurface {
                 self.refresh();
                 PluginTuiAction::Redraw
             }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.selected_action = self.selected_action.saturating_sub(1);
+                PluginTuiAction::Redraw
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.selected_action = (self.selected_action + 1).min(RALPH_ACTIONS.len() - 1);
+                PluginTuiAction::Redraw
+            }
+            KeyCode::Enter => PluginTuiAction::RunCommand {
+                command: RALPH_ACTIONS[self.selected_action].command.to_owned(),
+            },
             KeyCode::Char('s') => PluginTuiAction::RunCommand {
                 command: "/ralph status".to_owned(),
             },
