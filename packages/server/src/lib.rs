@@ -2496,6 +2496,48 @@ async fn submit_ralph_skeleton_audit_turn(
     Some(completion)
 }
 
+async fn submit_ralph_skeleton_replan_turn(
+    state: &Arc<ServerState>,
+    runtime_session_id: Option<SessionId>,
+    parent_work_id: &RuntimeWorkId,
+    run_id: &str,
+    replan_prompt: String,
+) -> Option<ModelTurnCompletion> {
+    let session_id = runtime_session_id?;
+    let replan_turn_id = RuntimeWorkId::new(format!("ralph:{run_id}:replan:1"));
+    register_ralph_runtime_work(
+        state,
+        runtime_session_id,
+        replan_turn_id.clone(),
+        "Ralph replan 1".to_owned(),
+        run_id.to_owned(),
+        Some(parent_work_id.clone()),
+    )
+    .await;
+    append_ralph_runner_progress(
+        state,
+        runtime_session_id,
+        parent_work_id,
+        "Ralph runner skeleton submitting replan turn",
+        1,
+    )
+    .await;
+    let completion = submit_session_model_turn_and_wait(state, session_id, replan_prompt)
+        .await
+        .unwrap_or_else(|error| {
+            ModelTurnCompletion::with_message(ModelTurnOutcome::Error, error.to_string())
+        });
+    finish_ralph_runtime_work(
+        state,
+        runtime_session_id,
+        replan_turn_id,
+        runtime_work_status_from_model_outcome(completion.outcome),
+        completion.message.clone(),
+    )
+    .await;
+    Some(completion)
+}
+
 const fn ralph_iteration_status_from_model_outcome(
     outcome: Option<ModelTurnOutcome>,
 ) -> &'static str {
@@ -2809,6 +2851,77 @@ async fn submit_ralph_audit_after_validation(
     .await
 }
 
+async fn submit_ralph_replan_after_audit(
+    state: &Arc<ServerState>,
+    runtime_session_id: Option<SessionId>,
+    parent_work_id: &RuntimeWorkId,
+    summary: &bcode_ralph::RalphLoopSummary,
+    run: &bcode_ralph::RalphRunRecord,
+) -> Option<ModelTurnCompletion> {
+    let prompt = bcode_ralph::build_prompt(summary, bcode_ralph::RalphPromptKind::Replan)
+        .unwrap_or_else(|error| {
+            format!(
+                "Ralph replan prompt could not read the progress doc; report this blocker and stop safely. Error: {error}"
+            )
+        });
+    submit_ralph_skeleton_replan_turn(
+        state,
+        runtime_session_id,
+        parent_work_id,
+        &run.run_id,
+        prompt,
+    )
+    .await
+}
+
+async fn apply_ralph_post_audit_decision(
+    state: &Arc<ServerState>,
+    runtime_session_id: Option<SessionId>,
+    parent_work_id: &RuntimeWorkId,
+    summary: &bcode_ralph::RalphLoopSummary,
+    run: &bcode_ralph::RalphRunRecord,
+    iteration: Option<&bcode_ralph::RalphIterationRecord>,
+) -> (&'static str, &'static str, &'static str) {
+    let Some(decision) = iteration
+        .and_then(|iteration| ralph_stop_decision_after_audit(summary, run, iteration).ok())
+    else {
+        return (
+            "blocked",
+            "progress_doc_unreadable",
+            "Ralph progress doc could not be read after audit",
+        );
+    };
+    if decision != bcode_ralph::RalphStopDecision::Continue {
+        return ralph_run_terminal_from_decision(decision);
+    }
+    let replan_completion =
+        submit_ralph_replan_after_audit(state, runtime_session_id, parent_work_id, summary, run)
+            .await;
+    if replan_completion
+        .as_ref()
+        .map(|completion| completion.outcome)
+        != Some(ModelTurnOutcome::Completed)
+    {
+        return (
+            "blocked",
+            "replan_failed",
+            "Ralph replan turn did not complete successfully",
+        );
+    }
+    if progress_doc_checklist_summary(&summary.progress_doc_path).is_err() {
+        return (
+            "blocked",
+            "progress_doc_unreadable",
+            "Ralph progress doc could not be read after replan",
+        );
+    }
+    (
+        "blocked",
+        "runner_skeleton",
+        "Ralph runner skeleton completed work, validation, audit, and replan; loop continuation is not implemented yet",
+    )
+}
+
 async fn complete_ralph_skeleton_after_iteration(
     state: &Arc<ServerState>,
     runtime_session_id: Option<SessionId>,
@@ -2853,16 +2966,15 @@ async fn complete_ralph_skeleton_after_iteration(
         .map(|completion| completion.outcome);
     let (run_status, stop_reason, error_message) =
         if audit_outcome == Some(ModelTurnOutcome::Completed) {
-            iteration
-                .and_then(|iteration| ralph_stop_decision_after_audit(summary, run, iteration).ok())
-                .map_or(
-                    (
-                        "blocked",
-                        "progress_doc_unreadable",
-                        "Ralph progress doc could not be read after audit",
-                    ),
-                    ralph_run_terminal_from_decision,
-                )
+            apply_ralph_post_audit_decision(
+                state,
+                runtime_session_id,
+                parent_work_id,
+                summary,
+                run,
+                iteration,
+            )
+            .await
         } else {
             (
                 "blocked",
