@@ -38,6 +38,8 @@ pub enum SlashCommandOutcome {
     ListRalphRuns,
     /// List iterations for the latest Ralph run.
     ListRalphIterations,
+    /// Prepare an approval-gated resume run.
+    ResumeRalphRun,
     /// Show the latest Ralph progress doc path.
     OpenRalphProgress,
     /// Build a Ralph work prompt.
@@ -338,8 +340,10 @@ fn ralph_command(parts: &[&str]) -> SlashCommandOutcome {
         Some("stop") => SlashCommandOutcome::StopRalphLoop,
         Some("runs") => SlashCommandOutcome::ListRalphRuns,
         Some("iterations") => SlashCommandOutcome::ListRalphIterations,
+        Some("resume") => SlashCommandOutcome::ResumeRalphRun,
         Some(_) => SlashCommandOutcome::Handled(
-            "usage: /ralph [start|run|stop|status|runs|iterations|audit|replan|open]".to_owned(),
+            "usage: /ralph [start|run|stop|status|runs|iterations|resume|audit|replan|open]"
+                .to_owned(),
         ),
     }
 }
@@ -770,6 +774,10 @@ mod tests {
             ralph_command(&["/ralph", "iterations"]),
             SlashCommandOutcome::ListRalphIterations
         );
+        assert_eq!(
+            ralph_command(&["/ralph", "resume"]),
+            SlashCommandOutcome::ResumeRalphRun
+        );
     }
 
     #[test]
@@ -777,7 +785,7 @@ mod tests {
         assert_eq!(
             ralph_command(&["/ralph", "wat"]),
             SlashCommandOutcome::Handled(
-                "usage: /ralph [start|run|stop|status|runs|iterations|audit|replan|open]"
+                "usage: /ralph [start|run|stop|status|runs|iterations|resume|audit|replan|open]"
                     .to_owned()
             )
         );

@@ -316,6 +316,7 @@ pub enum Request {
     CancelRalphLoop(RalphCancelRequest),
     ListRalphRuns(Box<RalphListRunsRequest>),
     ListRalphIterations(Box<RalphListIterationsRequest>),
+    ResumeRalphRun(RalphResumeRequest),
     RalphRunStatus(RalphRunStatusRequest),
     RecordRalphLifecycle(RalphLifecycleRequest),
     ImportExternalSession {
@@ -647,6 +648,19 @@ pub struct RalphListIterationsRequest {
     pub run_id: Option<String>,
 }
 
+/// Request to prepare resuming an interrupted Ralph run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RalphResumeRequest {
+    /// Repository root used to discover the selected Ralph loop.
+    pub repo_root: PathBuf,
+    /// Specific Ralph loop state directory to inspect, when not using latest.
+    #[serde(default)]
+    pub loop_state_dir: Option<PathBuf>,
+    /// Specific interrupted run ID to resume, when not using the latest interrupted run.
+    #[serde(default)]
+    pub interrupted_run_id: Option<String>,
+}
+
 /// Request to inspect Ralph autonomous run status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RalphRunStatusRequest {
@@ -753,6 +767,15 @@ pub struct RalphListIterationsResponse {
     /// Iterations for the run.
     #[serde(default)]
     pub iterations: Vec<RalphIterationSummary>,
+}
+
+/// Response after preparing a Ralph resume run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RalphResumeResponse {
+    /// Interrupted run selected for resume.
+    pub interrupted_run: RalphRunSummary,
+    /// Newly created approval-gated run.
+    pub resumed_run: RalphRunSummary,
 }
 
 /// Response describing Ralph autonomous run status.
@@ -894,6 +917,7 @@ pub enum ResponsePayload {
     RalphRunCancelled(RalphCancelResponse),
     RalphRunsListed(RalphListRunsResponse),
     RalphIterationsListed(RalphListIterationsResponse),
+    RalphRunResumed(RalphResumeResponse),
     RalphRunStatus(RalphRunStatusResponse),
     RalphLifecycleRecorded {
         event: SessionEvent,

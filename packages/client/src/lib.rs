@@ -10,13 +10,14 @@ use bcode_ipc::{
     ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint,
     LocalIpcStream, PermissionSummary, PluginServiceResponse, PluginServiceSummary,
     RalphCancelRequest, RalphCancelResponse, RalphLifecycleRequest, RalphListIterationsRequest,
-    RalphListIterationsResponse, RalphListRunsRequest, RalphListRunsResponse, RalphRunRequest,
-    RalphRunResponse, RalphRunStatusRequest, RalphRunStatusResponse, RalphStatusRequest,
-    RalphStatusResponse, Request, Response, ResponsePayload, ServerStopMode,
-    SessionCatalogSourceStatus, SessionCatalogStatus, SessionImportWarning, WorktreeCreateRequest,
-    WorktreeCreateResponse, WorktreeListRequest, WorktreeListResponse, WorktreeRemoveRequest,
-    WorktreeRemoveResponse, current_working_directory, decode_event, decode_response,
-    default_endpoint, recv_envelope, request_envelope, send_envelope,
+    RalphListIterationsResponse, RalphListRunsRequest, RalphListRunsResponse, RalphResumeRequest,
+    RalphResumeResponse, RalphRunRequest, RalphRunResponse, RalphRunStatusRequest,
+    RalphRunStatusResponse, RalphStatusRequest, RalphStatusResponse, Request, Response,
+    ResponsePayload, ServerStopMode, SessionCatalogSourceStatus, SessionCatalogStatus,
+    SessionImportWarning, WorktreeCreateRequest, WorktreeCreateResponse, WorktreeListRequest,
+    WorktreeListResponse, WorktreeRemoveRequest, WorktreeRemoveResponse, current_working_directory,
+    decode_event, decode_response, default_endpoint, recv_envelope, request_envelope,
+    send_envelope,
 };
 use bcode_session_models::{
     ClientId, ProjectionWindowRequest, RuntimeWorkId, RuntimeWorkStatus, SessionEvent,
@@ -866,6 +867,21 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::RalphIterationsListed(response) => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Prepare a Ralph resume run for an interrupted run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn resume_ralph_run(
+        &self,
+        request: RalphResumeRequest,
+    ) -> Result<RalphResumeResponse, ClientError> {
+        match self.send_request(Request::ResumeRalphRun(request)).await? {
+            ResponsePayload::RalphRunResumed(response) => Ok(response),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

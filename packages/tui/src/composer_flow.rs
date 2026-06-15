@@ -237,6 +237,10 @@ async fn handle_slash_command<W: Write>(
             chat.app.clear_pending_submission(message);
             ralph_flow::list_iterations(services, chat).await?;
         }
+        slash_commands::SlashCommandOutcome::ResumeRalphRun => {
+            chat.app.clear_pending_submission(message);
+            ralph_flow::resume_run(services, chat).await?;
+        }
         slash_commands::SlashCommandOutcome::OpenRalphProgress => {
             chat.app.clear_pending_submission(message);
             ralph_flow::open_progress(chat)?;

@@ -6,7 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bcode_ipc::{
     RalphCancelRequest, RalphLifecycleRequest, RalphListIterationsRequest, RalphListRunsRequest,
-    RalphRunRequest, RalphRunStatusRequest, RalphRunSummary, RalphStatusSummary,
+    RalphResumeRequest, RalphRunRequest, RalphRunStatusRequest, RalphRunSummary,
+    RalphStatusSummary,
 };
 use bcode_ralph as ralph_state;
 use bcode_session_models::{SessionHistoryDirection, SessionHistoryQuery};
@@ -164,6 +165,28 @@ pub async fn list_iterations(
         summary.loop_name, run_label, iterations
     ));
     chat.app.set_status("Ralph iterations shown".to_owned());
+    Ok(())
+}
+
+/// Prepare an approval-gated resume run for the latest interrupted Ralph run.
+pub async fn resume_run(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Result<(), TuiError> {
+    let repo_root = current_repo_root(chat)?;
+    let response = services
+        .client
+        .resume_ralph_run(RalphResumeRequest {
+            repo_root,
+            loop_state_dir: None,
+            interrupted_run_id: None,
+        })
+        .await?;
+    chat.app.push_system_note(format!(
+        "Ralph resume prepared\n* Interrupted run: {}\n* New run: {}\n* Status: {}\n* Next: approve before autonomous execution continues",
+        response.interrupted_run.run_id,
+        response.resumed_run.run_id,
+        response.resumed_run.status
+    ));
+    chat.app
+        .set_status("Ralph resume prepared; approval required".to_owned());
     Ok(())
 }
 

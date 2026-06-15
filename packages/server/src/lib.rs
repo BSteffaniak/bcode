@@ -18,12 +18,12 @@ use bcode_ipc::{
     IpcEndpoint, LocalIpcListener, LocalIpcStream, PermissionSummary, PluginServiceError,
     PluginServiceResponse, PluginServiceSummary, RalphCancelRequest, RalphCancelResponse,
     RalphIterationSummary, RalphLifecycleRequest, RalphListIterationsRequest,
-    RalphListIterationsResponse, RalphListRunsRequest, RalphListRunsResponse, RalphRunRequest,
-    RalphRunResponse, RalphRunStatusRequest, RalphRunStatusResponse, RalphRunSummary,
-    RalphStatusRequest, RalphStatusResponse, RalphStatusSummary, Request, Response,
-    ResponsePayload, ServerStatus, ServerStopMode, SessionCatalogSourceStatus,
-    SessionCatalogStatus, WorktreeCreateRequest, WorktreeListRequest, WorktreeRemoveRequest,
-    decode, event_envelope, recv_envelope, response_envelope, send_envelope,
+    RalphListIterationsResponse, RalphListRunsRequest, RalphListRunsResponse, RalphResumeRequest,
+    RalphResumeResponse, RalphRunRequest, RalphRunResponse, RalphRunStatusRequest,
+    RalphRunStatusResponse, RalphRunSummary, RalphStatusRequest, RalphStatusResponse,
+    RalphStatusSummary, Request, Response, ResponsePayload, ServerStatus, ServerStopMode,
+    SessionCatalogSourceStatus, SessionCatalogStatus, WorktreeCreateRequest, WorktreeListRequest,
+    WorktreeRemoveRequest, decode, event_envelope, recv_envelope, response_envelope, send_envelope,
 };
 use bcode_metrics::{MetricLabels, MetricsRegistry};
 use bcode_model::{
@@ -1630,6 +1630,9 @@ async fn handle_request(
         Request::ListRalphIterations(request) => {
             Box::pin(handle_list_ralph_iterations(request_id, writer, *request)).await
         }
+        Request::ResumeRalphRun(request) => {
+            handle_resume_ralph_run(request_id, state, writer, request).await
+        }
         Request::RalphRunStatus(request) => {
             handle_ralph_run_status(request_id, writer, request).await
         }
@@ -1934,6 +1937,7 @@ async fn handle_agent_permission_plugin_request(
         | Request::CancelRalphLoop(_)
         | Request::ListRalphRuns(_)
         | Request::ListRalphIterations(_)
+        | Request::ResumeRalphRun(_)
         | Request::RalphRunStatus(_)
         | Request::RecordRalphLifecycle(_) => {
             unreachable!("primary request routed to primary handler")
@@ -2272,6 +2276,80 @@ async fn handle_run_ralph_loop(
             .await
         }
     }
+}
+
+async fn handle_resume_ralph_run(
+    request_id: u64,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: RalphResumeRequest,
+) -> Result<(), ServerError> {
+    match prepare_ralph_resume(state, request).await {
+        Ok(response) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::RalphRunResumed(response)),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("ralph_resume_failed", error)),
+            )
+            .await
+        }
+    }
+}
+
+async fn prepare_ralph_resume(
+    state: &Arc<ServerState>,
+    request: RalphResumeRequest,
+) -> Result<RalphResumeResponse, String> {
+    let summary = resolve_ralph_loop(&request.repo_root, request.loop_state_dir.as_deref())?;
+    if bcode_ralph::active_run_for_loop(&summary.state_dir)
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return Err("Ralph loop already has an active run".to_owned());
+    }
+    let interrupted_runs = bcode_ralph::interrupted_runs_for_loop(&summary.state_dir)
+        .map_err(|error| error.to_string())?;
+    let interrupted_run = request
+        .interrupted_run_id
+        .as_deref()
+        .and_then(|run_id| interrupted_runs.iter().find(|run| run.run_id == run_id))
+        .or_else(|| interrupted_runs.first())
+        .cloned()
+        .ok_or_else(|| "Ralph loop has no interrupted runs to resume".to_owned())?;
+    let resumed_run = bcode_ralph::create_run(bcode_ralph::RalphRunCreateRequest {
+        state_dir: summary.state_dir.clone(),
+        session_id: summary.session_id.clone(),
+        status: "awaiting_approval".to_owned(),
+        requested_max_iterations: interrupted_run.requested_max_iterations,
+        requested_no_progress_limit: interrupted_run.requested_no_progress_limit,
+    })
+    .map_err(|error| error.to_string())?;
+    let _ = bcode_ralph::append_lifecycle_event_for_summary(
+        &summary,
+        bcode_ralph::RalphLifecycleEventKind::RunStarted,
+        "Prepared approval-gated Ralph resume run",
+    );
+    append_ralph_session_lifecycle(
+        state,
+        resumed_run.session_id.as_deref(),
+        summary.loop_name,
+        resumed_run.state_dir.clone(),
+        "resume_prepared",
+        "Prepared approval-gated Ralph resume run",
+    )
+    .await;
+    Ok(RalphResumeResponse {
+        interrupted_run: ralph_run_summary(interrupted_run),
+        resumed_run: ralph_run_summary(resumed_run),
+    })
 }
 
 async fn start_ralph_runner(
