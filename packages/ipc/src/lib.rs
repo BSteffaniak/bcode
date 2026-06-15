@@ -7,12 +7,15 @@
 use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_metrics::MetricsSnapshot;
 use bcode_session_models::{
-    ClientId, FileChangeResult, ProjectionWindowRequest, RuntimeWorkId, RuntimeWorkKind,
-    RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionHistoryPage, SessionHistoryQuery,
-    SessionId, SessionInputHistoryEntry, SessionLiveEvent, SessionSummary, ShellRunResult,
-    ToolInvocationResult,
+    ClientId, FileChangeResult, ModelTurnOutcome, ProjectionWindowRequest, RuntimeWorkId,
+    RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionForkKind,
+    SessionHistoryPage, SessionHistoryQuery, SessionId, SessionInputHistoryEntry, SessionLiveEvent,
+    SessionSummary, SessionTokenUsage, SessionTraceEvent, ShellRunResult,
+    ToolInvocationPresentation, ToolInvocationResult, ToolInvocationStreamEvent, TraceBlobRef,
 };
-use bcode_skill_models::{SkillContextResponse, SkillId, SkillList, SkillManifest};
+use bcode_skill_models::{
+    SkillActivationMode, SkillContextResponse, SkillId, SkillList, SkillManifest, SkillSource,
+};
 pub use bcode_worktree_models::{
     WorktreeCreateRequest, WorktreeCreateResponse, WorktreeListRequest, WorktreeListResponse,
     WorktreeRemoveRequest, WorktreeRemoveResponse,
@@ -879,13 +882,180 @@ struct IpcSessionEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum IpcSessionEventKind {
-    Domain(Box<SessionEventKind>),
+    SessionCreated {
+        name: Option<String>,
+        working_directory: PathBuf,
+    },
+    ClientAttached {
+        client_id: ClientId,
+    },
+    ClientDetached {
+        client_id: ClientId,
+    },
+    UserMessage {
+        client_id: ClientId,
+        text: String,
+    },
+    AssistantDelta {
+        text: String,
+    },
+    AssistantMessage {
+        text: String,
+    },
+    ToolCallRequested {
+        tool_call_id: String,
+        tool_name: String,
+        arguments_json: String,
+    },
     ToolCallFinished {
         tool_call_id: String,
         result: String,
         is_error: bool,
-        output: Option<bcode_session_models::TraceBlobRef>,
+        output: Option<TraceBlobRef>,
         semantic_result: Option<IpcToolInvocationResult>,
+    },
+    PermissionRequested {
+        permission_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        arguments_json: String,
+    },
+    PermissionResolved {
+        permission_id: String,
+        approved: bool,
+    },
+    ModelChanged {
+        provider: String,
+        model: String,
+    },
+    SystemMessage {
+        text: String,
+    },
+    AgentChanged {
+        agent_id: String,
+    },
+    ModelTurnStarted {
+        turn_id: String,
+    },
+    ModelTurnFinished {
+        turn_id: String,
+        outcome: ModelTurnOutcome,
+        message: Option<String>,
+    },
+    ModelUsage {
+        turn_id: String,
+        usage: SessionTokenUsage,
+    },
+    ContextCompacted {
+        summary: String,
+        compacted_through_sequence: u64,
+    },
+    SessionRenamed {
+        name: Option<String>,
+    },
+    TraceEvent {
+        trace: Box<SessionTraceEvent>,
+    },
+    SkillInvoked {
+        skill_id: SkillId,
+        arguments: String,
+        source: Option<SkillSource>,
+        invoked_at_ms: u64,
+    },
+    SkillSuggested {
+        skill_id: SkillId,
+        reason: Option<String>,
+        suggested_at_ms: u64,
+    },
+    SkillActivated {
+        skill_id: SkillId,
+        source: Option<SkillSource>,
+        mode: SkillActivationMode,
+        activated_at_ms: u64,
+    },
+    SkillDeactivated {
+        skill_id: SkillId,
+        deactivated_at_ms: u64,
+    },
+    SkillContextLoaded {
+        skill_id: SkillId,
+        bytes_loaded: usize,
+        truncated: bool,
+        loaded_at_ms: u64,
+    },
+    SkillInvocationFailed {
+        skill_id: SkillId,
+        error: String,
+        failed_at_ms: u64,
+    },
+    AssistantReasoningDelta {
+        text: String,
+    },
+    AssistantReasoningMessage {
+        text: String,
+    },
+    RuntimeWorkStarted {
+        work_id: RuntimeWorkId,
+        kind: RuntimeWorkKind,
+        label: String,
+        tool_call_id: Option<String>,
+        plugin_id: Option<String>,
+        service_interface: Option<String>,
+        operation: Option<String>,
+        parent_work_id: Option<RuntimeWorkId>,
+        started_at_ms: Option<u64>,
+        cancellable: bool,
+    },
+    RuntimeWorkCancelRequested {
+        work_id: RuntimeWorkId,
+        requested_at_ms: Option<u64>,
+        client_id: Option<ClientId>,
+    },
+    RuntimeWorkFinished {
+        work_id: RuntimeWorkId,
+        status: RuntimeWorkStatus,
+        finished_at_ms: Option<u64>,
+        message: Option<String>,
+    },
+    RuntimeWorkProgress {
+        work_id: RuntimeWorkId,
+        message: String,
+        progress_at_ms: Option<u64>,
+        completed_units: Option<u64>,
+        total_units: Option<u64>,
+    },
+    ModelTurnCancelRequested {
+        turn_id: String,
+        requested_at_ms: Option<u64>,
+        client_id: Option<ClientId>,
+    },
+    ToolInvocationStream {
+        event: ToolInvocationStreamEvent,
+    },
+    WorkingDirectoryChanged {
+        old_working_directory: PathBuf,
+        new_working_directory: PathBuf,
+    },
+    SessionImported {
+        source_id: String,
+        source_display_name: String,
+        external_session_id: String,
+        imported_at_ms: u64,
+    },
+    ToolInvocationPresentation {
+        tool_call_id: String,
+        started_at_ms: Option<u64>,
+        finished_at_ms: Option<u64>,
+        is_error: bool,
+        presentation: ToolInvocationPresentation,
+    },
+    SessionForked {
+        source_session_id: SessionId,
+        source_title: Option<String>,
+        source_cutoff_sequence: Option<u64>,
+        source_prompt_sequence: Option<u64>,
+        forked_at_ms: u64,
+        kind: SessionForkKind,
     },
 }
 
@@ -1003,8 +1173,41 @@ impl TryFrom<IpcSessionEvent> for SessionEvent {
 }
 
 impl From<&SessionEventKind> for IpcSessionEventKind {
+    #[allow(clippy::clone_on_copy, clippy::too_many_lines)]
     fn from(value: &SessionEventKind) -> Self {
         match value {
+            SessionEventKind::SessionCreated {
+                name,
+                working_directory,
+            } => Self::SessionCreated {
+                name: name.clone(),
+                working_directory: working_directory.clone(),
+            },
+            SessionEventKind::ClientAttached { client_id } => Self::ClientAttached {
+                client_id: client_id.clone(),
+            },
+            SessionEventKind::ClientDetached { client_id } => Self::ClientDetached {
+                client_id: client_id.clone(),
+            },
+            SessionEventKind::UserMessage { client_id, text } => Self::UserMessage {
+                client_id: client_id.clone(),
+                text: text.clone(),
+            },
+            SessionEventKind::AssistantDelta { text } => {
+                Self::AssistantDelta { text: text.clone() }
+            }
+            SessionEventKind::AssistantMessage { text } => {
+                Self::AssistantMessage { text: text.clone() }
+            }
+            SessionEventKind::ToolCallRequested {
+                tool_call_id,
+                tool_name,
+                arguments_json,
+            } => Self::ToolCallRequested {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                arguments_json: arguments_json.clone(),
+            },
             SessionEventKind::ToolCallFinished {
                 tool_call_id,
                 result,
@@ -1014,11 +1217,243 @@ impl From<&SessionEventKind> for IpcSessionEventKind {
             } => Self::ToolCallFinished {
                 tool_call_id: tool_call_id.clone(),
                 result: result.clone(),
-                is_error: *is_error,
+                is_error: is_error.clone(),
                 output: output.clone(),
                 semantic_result: semantic_result.as_ref().map(IpcToolInvocationResult::from),
             },
-            _ => Self::Domain(Box::new(value.clone())),
+            SessionEventKind::PermissionRequested {
+                permission_id,
+                tool_call_id,
+                tool_name,
+                arguments_json,
+            } => Self::PermissionRequested {
+                permission_id: permission_id.clone(),
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                arguments_json: arguments_json.clone(),
+            },
+            SessionEventKind::PermissionResolved {
+                permission_id,
+                approved,
+            } => Self::PermissionResolved {
+                permission_id: permission_id.clone(),
+                approved: approved.clone(),
+            },
+            SessionEventKind::ModelChanged { provider, model } => Self::ModelChanged {
+                provider: provider.clone(),
+                model: model.clone(),
+            },
+            SessionEventKind::SystemMessage { text } => Self::SystemMessage { text: text.clone() },
+            SessionEventKind::AgentChanged { agent_id } => Self::AgentChanged {
+                agent_id: agent_id.clone(),
+            },
+            SessionEventKind::ModelTurnStarted { turn_id } => Self::ModelTurnStarted {
+                turn_id: turn_id.clone(),
+            },
+            SessionEventKind::ModelTurnFinished {
+                turn_id,
+                outcome,
+                message,
+            } => Self::ModelTurnFinished {
+                turn_id: turn_id.clone(),
+                outcome: outcome.clone(),
+                message: message.clone(),
+            },
+            SessionEventKind::ModelUsage { turn_id, usage } => Self::ModelUsage {
+                turn_id: turn_id.clone(),
+                usage: usage.clone(),
+            },
+            SessionEventKind::ContextCompacted {
+                summary,
+                compacted_through_sequence,
+            } => Self::ContextCompacted {
+                summary: summary.clone(),
+                compacted_through_sequence: compacted_through_sequence.clone(),
+            },
+            SessionEventKind::SessionRenamed { name } => {
+                Self::SessionRenamed { name: name.clone() }
+            }
+            SessionEventKind::TraceEvent { trace } => Self::TraceEvent {
+                trace: trace.clone(),
+            },
+            SessionEventKind::SkillInvoked {
+                skill_id,
+                arguments,
+                source,
+                invoked_at_ms,
+            } => Self::SkillInvoked {
+                skill_id: skill_id.clone(),
+                arguments: arguments.clone(),
+                source: source.clone(),
+                invoked_at_ms: invoked_at_ms.clone(),
+            },
+            SessionEventKind::SkillSuggested {
+                skill_id,
+                reason,
+                suggested_at_ms,
+            } => Self::SkillSuggested {
+                skill_id: skill_id.clone(),
+                reason: reason.clone(),
+                suggested_at_ms: suggested_at_ms.clone(),
+            },
+            SessionEventKind::SkillActivated {
+                skill_id,
+                source,
+                mode,
+                activated_at_ms,
+            } => Self::SkillActivated {
+                skill_id: skill_id.clone(),
+                source: source.clone(),
+                mode: mode.clone(),
+                activated_at_ms: activated_at_ms.clone(),
+            },
+            SessionEventKind::SkillDeactivated {
+                skill_id,
+                deactivated_at_ms,
+            } => Self::SkillDeactivated {
+                skill_id: skill_id.clone(),
+                deactivated_at_ms: deactivated_at_ms.clone(),
+            },
+            SessionEventKind::SkillContextLoaded {
+                skill_id,
+                bytes_loaded,
+                truncated,
+                loaded_at_ms,
+            } => Self::SkillContextLoaded {
+                skill_id: skill_id.clone(),
+                bytes_loaded: bytes_loaded.clone(),
+                truncated: truncated.clone(),
+                loaded_at_ms: loaded_at_ms.clone(),
+            },
+            SessionEventKind::SkillInvocationFailed {
+                skill_id,
+                error,
+                failed_at_ms,
+            } => Self::SkillInvocationFailed {
+                skill_id: skill_id.clone(),
+                error: error.clone(),
+                failed_at_ms: failed_at_ms.clone(),
+            },
+            SessionEventKind::AssistantReasoningDelta { text } => {
+                Self::AssistantReasoningDelta { text: text.clone() }
+            }
+            SessionEventKind::AssistantReasoningMessage { text } => {
+                Self::AssistantReasoningMessage { text: text.clone() }
+            }
+            SessionEventKind::RuntimeWorkStarted {
+                work_id,
+                kind,
+                label,
+                tool_call_id,
+                plugin_id,
+                service_interface,
+                operation,
+                parent_work_id,
+                started_at_ms,
+                cancellable,
+            } => Self::RuntimeWorkStarted {
+                work_id: work_id.clone(),
+                kind: kind.clone(),
+                label: label.clone(),
+                tool_call_id: tool_call_id.clone(),
+                plugin_id: plugin_id.clone(),
+                service_interface: service_interface.clone(),
+                operation: operation.clone(),
+                parent_work_id: parent_work_id.clone(),
+                started_at_ms: started_at_ms.clone(),
+                cancellable: cancellable.clone(),
+            },
+            SessionEventKind::RuntimeWorkCancelRequested {
+                work_id,
+                requested_at_ms,
+                client_id,
+            } => Self::RuntimeWorkCancelRequested {
+                work_id: work_id.clone(),
+                requested_at_ms: requested_at_ms.clone(),
+                client_id: client_id.clone(),
+            },
+            SessionEventKind::RuntimeWorkFinished {
+                work_id,
+                status,
+                finished_at_ms,
+                message,
+            } => Self::RuntimeWorkFinished {
+                work_id: work_id.clone(),
+                status: status.clone(),
+                finished_at_ms: finished_at_ms.clone(),
+                message: message.clone(),
+            },
+            SessionEventKind::RuntimeWorkProgress {
+                work_id,
+                message,
+                progress_at_ms,
+                completed_units,
+                total_units,
+            } => Self::RuntimeWorkProgress {
+                work_id: work_id.clone(),
+                message: message.clone(),
+                progress_at_ms: progress_at_ms.clone(),
+                completed_units: completed_units.clone(),
+                total_units: total_units.clone(),
+            },
+            SessionEventKind::ModelTurnCancelRequested {
+                turn_id,
+                requested_at_ms,
+                client_id,
+            } => Self::ModelTurnCancelRequested {
+                turn_id: turn_id.clone(),
+                requested_at_ms: requested_at_ms.clone(),
+                client_id: client_id.clone(),
+            },
+            SessionEventKind::ToolInvocationStream { event } => Self::ToolInvocationStream {
+                event: event.clone(),
+            },
+            SessionEventKind::WorkingDirectoryChanged {
+                old_working_directory,
+                new_working_directory,
+            } => Self::WorkingDirectoryChanged {
+                old_working_directory: old_working_directory.clone(),
+                new_working_directory: new_working_directory.clone(),
+            },
+            SessionEventKind::SessionImported {
+                source_id,
+                source_display_name,
+                external_session_id,
+                imported_at_ms,
+            } => Self::SessionImported {
+                source_id: source_id.clone(),
+                source_display_name: source_display_name.clone(),
+                external_session_id: external_session_id.clone(),
+                imported_at_ms: imported_at_ms.clone(),
+            },
+            SessionEventKind::ToolInvocationPresentation {
+                tool_call_id,
+                started_at_ms,
+                finished_at_ms,
+                is_error,
+                presentation,
+            } => Self::ToolInvocationPresentation {
+                tool_call_id: tool_call_id.clone(),
+                started_at_ms: started_at_ms.clone(),
+                finished_at_ms: finished_at_ms.clone(),
+                is_error: is_error.clone(),
+                presentation: presentation.clone(),
+            },
+            SessionEventKind::SessionForked {
+                source_session_id,
+                source_title,
+                source_cutoff_sequence,
+                source_prompt_sequence,
+                forked_at_ms,
+                kind,
+            } => Self::SessionForked {
+                source_session_id: source_session_id.clone(),
+                source_title: source_title.clone(),
+                source_cutoff_sequence: source_cutoff_sequence.clone(),
+                source_prompt_sequence: source_prompt_sequence.clone(),
+                forked_at_ms: forked_at_ms.clone(),
+                kind: kind.clone(),
+            },
         }
     }
 }
@@ -1026,9 +1461,36 @@ impl From<&SessionEventKind> for IpcSessionEventKind {
 impl TryFrom<IpcSessionEventKind> for SessionEventKind {
     type Error = CodecError;
 
+    #[allow(clippy::too_many_lines)]
     fn try_from(value: IpcSessionEventKind) -> Result<Self, Self::Error> {
         match value {
-            IpcSessionEventKind::Domain(kind) => Ok(*kind),
+            IpcSessionEventKind::SessionCreated {
+                name,
+                working_directory,
+            } => Ok(Self::SessionCreated {
+                name,
+                working_directory,
+            }),
+            IpcSessionEventKind::ClientAttached { client_id } => {
+                Ok(Self::ClientAttached { client_id })
+            }
+            IpcSessionEventKind::ClientDetached { client_id } => {
+                Ok(Self::ClientDetached { client_id })
+            }
+            IpcSessionEventKind::UserMessage { client_id, text } => {
+                Ok(Self::UserMessage { client_id, text })
+            }
+            IpcSessionEventKind::AssistantDelta { text } => Ok(Self::AssistantDelta { text }),
+            IpcSessionEventKind::AssistantMessage { text } => Ok(Self::AssistantMessage { text }),
+            IpcSessionEventKind::ToolCallRequested {
+                tool_call_id,
+                tool_name,
+                arguments_json,
+            } => Ok(Self::ToolCallRequested {
+                tool_call_id,
+                tool_name,
+                arguments_json,
+            }),
             IpcSessionEventKind::ToolCallFinished {
                 tool_call_id,
                 result,
@@ -1041,6 +1503,231 @@ impl TryFrom<IpcSessionEventKind> for SessionEventKind {
                 is_error,
                 output,
                 semantic_result: semantic_result.map(TryInto::try_into).transpose()?,
+            }),
+            IpcSessionEventKind::PermissionRequested {
+                permission_id,
+                tool_call_id,
+                tool_name,
+                arguments_json,
+            } => Ok(Self::PermissionRequested {
+                permission_id,
+                tool_call_id,
+                tool_name,
+                arguments_json,
+            }),
+            IpcSessionEventKind::PermissionResolved {
+                permission_id,
+                approved,
+            } => Ok(Self::PermissionResolved {
+                permission_id,
+                approved,
+            }),
+            IpcSessionEventKind::ModelChanged { provider, model } => {
+                Ok(Self::ModelChanged { provider, model })
+            }
+            IpcSessionEventKind::SystemMessage { text } => Ok(Self::SystemMessage { text }),
+            IpcSessionEventKind::AgentChanged { agent_id } => Ok(Self::AgentChanged { agent_id }),
+            IpcSessionEventKind::ModelTurnStarted { turn_id } => {
+                Ok(Self::ModelTurnStarted { turn_id })
+            }
+            IpcSessionEventKind::ModelTurnFinished {
+                turn_id,
+                outcome,
+                message,
+            } => Ok(Self::ModelTurnFinished {
+                turn_id,
+                outcome,
+                message,
+            }),
+            IpcSessionEventKind::ModelUsage { turn_id, usage } => {
+                Ok(Self::ModelUsage { turn_id, usage })
+            }
+            IpcSessionEventKind::ContextCompacted {
+                summary,
+                compacted_through_sequence,
+            } => Ok(Self::ContextCompacted {
+                summary,
+                compacted_through_sequence,
+            }),
+            IpcSessionEventKind::SessionRenamed { name } => Ok(Self::SessionRenamed { name }),
+            IpcSessionEventKind::TraceEvent { trace } => Ok(Self::TraceEvent { trace }),
+            IpcSessionEventKind::SkillInvoked {
+                skill_id,
+                arguments,
+                source,
+                invoked_at_ms,
+            } => Ok(Self::SkillInvoked {
+                skill_id,
+                arguments,
+                source,
+                invoked_at_ms,
+            }),
+            IpcSessionEventKind::SkillSuggested {
+                skill_id,
+                reason,
+                suggested_at_ms,
+            } => Ok(Self::SkillSuggested {
+                skill_id,
+                reason,
+                suggested_at_ms,
+            }),
+            IpcSessionEventKind::SkillActivated {
+                skill_id,
+                source,
+                mode,
+                activated_at_ms,
+            } => Ok(Self::SkillActivated {
+                skill_id,
+                source,
+                mode,
+                activated_at_ms,
+            }),
+            IpcSessionEventKind::SkillDeactivated {
+                skill_id,
+                deactivated_at_ms,
+            } => Ok(Self::SkillDeactivated {
+                skill_id,
+                deactivated_at_ms,
+            }),
+            IpcSessionEventKind::SkillContextLoaded {
+                skill_id,
+                bytes_loaded,
+                truncated,
+                loaded_at_ms,
+            } => Ok(Self::SkillContextLoaded {
+                skill_id,
+                bytes_loaded,
+                truncated,
+                loaded_at_ms,
+            }),
+            IpcSessionEventKind::SkillInvocationFailed {
+                skill_id,
+                error,
+                failed_at_ms,
+            } => Ok(Self::SkillInvocationFailed {
+                skill_id,
+                error,
+                failed_at_ms,
+            }),
+            IpcSessionEventKind::AssistantReasoningDelta { text } => {
+                Ok(Self::AssistantReasoningDelta { text })
+            }
+            IpcSessionEventKind::AssistantReasoningMessage { text } => {
+                Ok(Self::AssistantReasoningMessage { text })
+            }
+            IpcSessionEventKind::RuntimeWorkStarted {
+                work_id,
+                kind,
+                label,
+                tool_call_id,
+                plugin_id,
+                service_interface,
+                operation,
+                parent_work_id,
+                started_at_ms,
+                cancellable,
+            } => Ok(Self::RuntimeWorkStarted {
+                work_id,
+                kind,
+                label,
+                tool_call_id,
+                plugin_id,
+                service_interface,
+                operation,
+                parent_work_id,
+                started_at_ms,
+                cancellable,
+            }),
+            IpcSessionEventKind::RuntimeWorkCancelRequested {
+                work_id,
+                requested_at_ms,
+                client_id,
+            } => Ok(Self::RuntimeWorkCancelRequested {
+                work_id,
+                requested_at_ms,
+                client_id,
+            }),
+            IpcSessionEventKind::RuntimeWorkFinished {
+                work_id,
+                status,
+                finished_at_ms,
+                message,
+            } => Ok(Self::RuntimeWorkFinished {
+                work_id,
+                status,
+                finished_at_ms,
+                message,
+            }),
+            IpcSessionEventKind::RuntimeWorkProgress {
+                work_id,
+                message,
+                progress_at_ms,
+                completed_units,
+                total_units,
+            } => Ok(Self::RuntimeWorkProgress {
+                work_id,
+                message,
+                progress_at_ms,
+                completed_units,
+                total_units,
+            }),
+            IpcSessionEventKind::ModelTurnCancelRequested {
+                turn_id,
+                requested_at_ms,
+                client_id,
+            } => Ok(Self::ModelTurnCancelRequested {
+                turn_id,
+                requested_at_ms,
+                client_id,
+            }),
+            IpcSessionEventKind::ToolInvocationStream { event } => {
+                Ok(Self::ToolInvocationStream { event })
+            }
+            IpcSessionEventKind::WorkingDirectoryChanged {
+                old_working_directory,
+                new_working_directory,
+            } => Ok(Self::WorkingDirectoryChanged {
+                old_working_directory,
+                new_working_directory,
+            }),
+            IpcSessionEventKind::SessionImported {
+                source_id,
+                source_display_name,
+                external_session_id,
+                imported_at_ms,
+            } => Ok(Self::SessionImported {
+                source_id,
+                source_display_name,
+                external_session_id,
+                imported_at_ms,
+            }),
+            IpcSessionEventKind::ToolInvocationPresentation {
+                tool_call_id,
+                started_at_ms,
+                finished_at_ms,
+                is_error,
+                presentation,
+            } => Ok(Self::ToolInvocationPresentation {
+                tool_call_id,
+                started_at_ms,
+                finished_at_ms,
+                is_error,
+                presentation,
+            }),
+            IpcSessionEventKind::SessionForked {
+                source_session_id,
+                source_title,
+                source_cutoff_sequence,
+                source_prompt_sequence,
+                forked_at_ms,
+                kind,
+            } => Ok(Self::SessionForked {
+                source_session_id,
+                source_title,
+                source_cutoff_sequence,
+                source_prompt_sequence,
+                forked_at_ms,
+                kind,
             }),
         }
     }
