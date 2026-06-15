@@ -2683,7 +2683,79 @@ mod tests {
     #[tokio::test]
     async fn semantic_tool_result_events_round_trip_across_ipc_frames() {
         let session_id = SessionId::new();
-        for semantic_result in [
+        for semantic_result in semantic_tool_results() {
+            let event = Event::Session(semantic_tool_result_event(session_id, semantic_result));
+            let envelope = event_envelope(&event).expect("event should encode");
+
+            let received = round_trip_envelope(envelope).await;
+
+            let decoded = decode_event(&received.payload).expect("event should decode");
+            assert_eq!(decoded, event);
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_tool_result_response_histories_round_trip_across_ipc_frames() {
+        let session_id = SessionId::new();
+        let session = test_session_summary("semantic history");
+
+        for semantic_result in semantic_tool_results() {
+            let event = semantic_tool_result_event(session_id, semantic_result);
+            for response in [
+                Response::Ok(ResponsePayload::Attached {
+                    session_id,
+                    session: session.clone(),
+                    history: vec![event.clone()],
+                    input_history: Vec::new(),
+                    import_warnings: Vec::new(),
+                }),
+                Response::Ok(ResponsePayload::SessionHistory {
+                    session_id,
+                    history: vec![event.clone()],
+                }),
+                Response::Ok(ResponsePayload::SessionHistoryPage {
+                    page: bcode_session_models::SessionHistoryPage {
+                        session_id,
+                        events: vec![event.clone()],
+                        next_cursor: None,
+                        has_more: false,
+                    },
+                }),
+                Response::Ok(ResponsePayload::RuntimeWorkHistory {
+                    events: vec![event.clone()],
+                }),
+            ] {
+                let envelope = response_envelope(42, &response).expect("response should encode");
+
+                let received = round_trip_envelope(envelope).await;
+
+                let decoded = decode_response(&received.payload).expect("response should decode");
+                assert_eq!(decoded, response);
+            }
+        }
+    }
+
+    fn semantic_tool_result_event(
+        session_id: SessionId,
+        semantic_result: ToolInvocationResult,
+    ) -> SessionEvent {
+        SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 77,
+            session_id,
+            provenance: None,
+            kind: SessionEventKind::ToolCallFinished {
+                tool_call_id: "call-1".to_string(),
+                result: "tool result".to_string(),
+                is_error: false,
+                output: None,
+                semantic_result: Some(semantic_result),
+            },
+        }
+    }
+
+    fn semantic_tool_results() -> Vec<ToolInvocationResult> {
+        vec![
             ToolInvocationResult::FileChange {
                 result: FileChangeResult {
                     tool_name: "filesystem.write".to_string(),
@@ -2717,27 +2789,13 @@ mod tests {
                     stderr_bytes: Some(0),
                 },
             },
-        ] {
-            let event = Event::Session(SessionEvent {
-                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                sequence: 77,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::ToolCallFinished {
-                    tool_call_id: "call-1".to_string(),
-                    result: "tool result".to_string(),
-                    is_error: false,
-                    output: None,
-                    semantic_result: Some(semantic_result),
-                },
-            });
-            let envelope = event_envelope(&event).expect("event should encode");
-
-            let received = round_trip_envelope(envelope).await;
-
-            let decoded = decode_event(&received.payload).expect("event should decode");
-            assert_eq!(decoded, event);
-        }
+            ToolInvocationResult::Text {
+                text: "plain text".to_string(),
+            },
+            ToolInvocationResult::Json {
+                value: r#"{"ok":true}"#.to_string(),
+            },
+        ]
     }
 
     async fn round_trip_envelope(envelope: Envelope) -> Envelope {
