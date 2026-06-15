@@ -6,9 +6,10 @@
 
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
-    ImageMetadata, ImageRefContent, ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS,
-    TOOL_SERVICE_INTERFACE_ID, ToolDefinition, ToolInvocationPresentation, ToolInvocationRequest,
-    ToolInvocationResponse, ToolInvocationStreamEvent, ToolList, ToolResultContent, ToolSideEffect,
+    FileChangeResult, ImageMetadata, ImageRefContent, ListToolsRequest, OP_INVOKE_TOOL,
+    OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition, ToolInvocationPresentation,
+    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolInvocationStreamEvent,
+    ToolList, ToolResultContent, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -924,10 +925,16 @@ fn tool_write(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocatio
                         full_output: None,
                         presentation: Some(ToolInvocationPresentation::FileChange {
                             tool_name: "filesystem.write".to_owned(),
-                            summary,
+                            summary: summary.clone(),
                             path: Some(request.path.display().to_string()),
                         }),
-                        result: None,
+                        result: Some(ToolInvocationResult::FileChange {
+                            result: FileChangeResult {
+                                tool_name: "filesystem.write".to_owned(),
+                                summary,
+                                path: Some(request.path.display().to_string()),
+                            },
+                        }),
                     }
                 },
             )
@@ -958,10 +965,16 @@ fn tool_edit(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocation
                         full_output: None,
                         presentation: Some(ToolInvocationPresentation::FileChange {
                             tool_name: "filesystem.edit".to_owned(),
-                            summary,
+                            summary: summary.clone(),
                             path: Some(request.path.display().to_string()),
                         }),
-                        result: None,
+                        result: Some(ToolInvocationResult::FileChange {
+                            result: FileChangeResult {
+                                tool_name: "filesystem.edit".to_owned(),
+                                summary,
+                                path: Some(request.path.display().to_string()),
+                            },
+                        }),
                     }
                 },
             )
@@ -2028,6 +2041,16 @@ mod tests {
                 path: Some(_),
             }) if tool_name == "filesystem.write" && summary == "wrote 5 bytes"
         ));
+        assert!(matches!(
+            write_response.result,
+            Some(ToolInvocationResult::FileChange {
+                result: FileChangeResult {
+                    tool_name,
+                    summary,
+                    path: Some(_),
+                },
+            }) if tool_name == "filesystem.write" && summary == "wrote 5 bytes"
+        ));
 
         let edit_response = tool_edit(
             serde_json::json!({
@@ -2043,6 +2066,16 @@ mod tests {
                 tool_name,
                 summary,
                 path: Some(_),
+            }) if tool_name == "filesystem.edit" && summary == "applied 1 replacement"
+        ));
+        assert!(matches!(
+            edit_response.result,
+            Some(ToolInvocationResult::FileChange {
+                result: FileChangeResult {
+                    tool_name,
+                    summary,
+                    path: Some(_),
+                },
             }) if tool_name == "filesystem.edit" && summary == "applied 1 replacement"
         ));
         let _ = std::fs::remove_dir_all(root);
