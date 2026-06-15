@@ -41,6 +41,7 @@ fn is_slash_command_name(command: &str) -> bool {
             | "runtime"
             | "status"
             | "ralph"
+            | "goal"
     )
 }
 
@@ -62,6 +63,7 @@ fn is_draft_safe_slash_command(command: &str) -> bool {
             | "thinking"
             | "rescan-imports"
             | "ralph"
+            | "goal"
     )
 }
 

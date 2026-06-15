@@ -116,6 +116,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Worktree { command } => handle_worktree_command(command).await?,
         Commands::Blims { command } => blims::handle_blims_command(command).await?,
         Commands::Review { command } => handle_review_command(command).await?,
+        Commands::Ralph { repo } => handle_ralph_command(repo).await?,
         Commands::Plugin { command } => match command {
             PluginCommand::List { root } => list_plugins(&root)?,
             PluginCommand::Services { root, daemon } => {
@@ -185,6 +186,7 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
         | Commands::Worktree { .. }
         | Commands::Blims { .. }
         | Commands::Review { .. }
+        | Commands::Ralph { .. }
         | Commands::Plugin { .. }
         | Commands::Model { .. }
         | Commands::Auth { .. }
@@ -277,6 +279,11 @@ enum Commands {
     Review {
         #[command(subcommand)]
         command: Option<ReviewCommand>,
+    },
+    Ralph {
+        /// Repository path.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
     },
     Plugin {
         #[command(subcommand)]
@@ -842,6 +849,15 @@ enum PluginCommand {
         topic: String,
         payload: Option<String>,
     },
+}
+
+async fn handle_ralph_command(repo: PathBuf) -> Result<(), CliError> {
+    ensure_server_running().await?;
+    if let Some(command) = bcode_tui::run_ralph_home(repo).await? {
+        println!("selected Ralph command: {command}");
+        println!("Open bcode TUI and run this slash command to execute it.");
+    }
+    Ok(())
 }
 
 async fn handle_review_command(command: Option<ReviewCommand>) -> Result<(), CliError> {

@@ -84,9 +84,14 @@ static-bundled-plugins = [
     "static-bundled-openai-compatible-provider-plugin",
     "static-bundled-opencode-session-import-plugin",
     "static-bundled-pi-session-import-plugin",
+    "static-bundled-ralph-plugin",
     "static-bundled-shell-plugin",
     "static-bundled-web-search-plugin",
     "static-bundled-worktree-plugin",
+]
+static-bundled-ralph-plugin = [
+    "_static-bundled",
+    "bcode_cli/static-bundled-ralph-plugin",
 ]
 static-bundled-shell-plugin = [
     "_static-bundled",

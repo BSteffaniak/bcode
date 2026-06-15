@@ -42,6 +42,7 @@ pub mod plugin_tui;
 pub(crate) mod provider_picker;
 pub(crate) mod provider_picker_render;
 pub(crate) mod ralph_flow;
+pub mod ralph_launcher;
 pub(crate) mod ralph_start_dialog;
 pub(crate) mod ralph_start_dialog_render;
 pub(crate) mod render;
@@ -139,6 +140,38 @@ pub fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
             bcode_ralph_plugin::static_plugin(),
         ),
     ]
+}
+
+/// Run the Ralph plugin home/status interface.
+///
+/// # Errors
+///
+/// Returns I/O or plugin service errors.
+#[allow(clippy::future_not_send)]
+pub async fn run_ralph_home(repo_path: std::path::PathBuf) -> Result<Option<String>, TuiError> {
+    let stdout = io::stdout();
+    let mut guard = CrosstermTerminalGuard::enter(stdout)?;
+    let result = {
+        let mut terminal = Terminal::new(
+            guard.writer_mut().ok_or_else(|| {
+                std::io::Error::other("terminal guard writer unavailable after entering terminal")
+            })?,
+            helpers::terminal_area()?,
+        );
+        ralph_launcher::run_home(&mut terminal, repo_path).await
+    };
+
+    match result {
+        Ok(ralph_launcher::RalphHomeOutcome::RunCommand(command)) => {
+            let _writer = guard.leave()?;
+            Ok(Some(command))
+        }
+        Ok(ralph_launcher::RalphHomeOutcome::Exit) => {
+            let _writer = guard.leave()?;
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Run the terminal user interface.
