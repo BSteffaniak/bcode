@@ -2468,10 +2468,20 @@ const fn ralph_iteration_status_from_model_outcome(
     }
 }
 
+fn progress_doc_checklist_fingerprint(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    Some(
+        bcode_ralph::analyze_progress_doc_text(&text)
+            .checklist_fingerprint
+            .to_string(),
+    )
+}
+
 async fn record_ralph_skeleton_noop_iteration(
     state: &ServerState,
     runtime_session_id: Option<SessionId>,
     parent_work_id: &RuntimeWorkId,
+    summary: &bcode_ralph::RalphLoopSummary,
     run: &bcode_ralph::RalphRunRecord,
     work_prompt: String,
     work_completion: Option<ModelTurnCompletion>,
@@ -2502,7 +2512,10 @@ async fn record_ralph_skeleton_noop_iteration(
         state_dir: run.state_dir.clone(),
         iteration_number: 1,
         status: ralph_iteration_status_from_model_outcome(outcome).to_owned(),
-        checklist_fingerprint_before: None,
+        checklist_fingerprint_before: Some(
+            summary.checklist_summary.checklist_fingerprint.to_string(),
+        ),
+        checklist_fingerprint_after: progress_doc_checklist_fingerprint(&summary.progress_doc_path),
         work_prompt: Some(work_prompt),
         finished_at_ms: Some(current_time_ms()),
         stop_reason: outcome.map(|outcome| format!("model_turn_{outcome:?}").to_lowercase()),
@@ -2775,6 +2788,7 @@ async fn run_ralph_runner_skeleton(
             &state,
             runtime_session_id,
             &runtime_work_id,
+            &summary,
             &run,
             work_prompt,
             work_completion,

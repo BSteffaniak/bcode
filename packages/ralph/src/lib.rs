@@ -825,6 +825,8 @@ pub struct RalphIterationCreateRequest {
     pub status: String,
     /// Checklist fingerprint before the work turn.
     pub checklist_fingerprint_before: Option<String>,
+    /// Checklist fingerprint after the work turn.
+    pub checklist_fingerprint_after: Option<String>,
     /// Work prompt submitted for this iteration.
     pub work_prompt: Option<String>,
     /// Iteration finish time, when creating a terminal iteration record.
@@ -1268,7 +1270,7 @@ pub fn create_iteration(
         iteration_number: request.iteration_number,
         status: request.status,
         checklist_fingerprint_before: request.checklist_fingerprint_before,
-        checklist_fingerprint_after: None,
+        checklist_fingerprint_after: request.checklist_fingerprint_after,
         work_prompt: request.work_prompt,
         audit_prompt: None,
         replan_prompt: None,
@@ -2477,6 +2479,7 @@ mod tests {
             iteration_number: 1,
             status: "working".to_owned(),
             checklist_fingerprint_before: Some("before".to_owned()),
+            checklist_fingerprint_after: Some("after".to_owned()),
             work_prompt: Some("do work".to_owned()),
             finished_at_ms: None,
             stop_reason: None,
