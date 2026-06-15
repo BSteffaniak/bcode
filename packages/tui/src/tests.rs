@@ -3326,6 +3326,105 @@ fn semantic_captured_shell_result_renders_captured_text_not_terminal() {
     );
 }
 
+#[test]
+fn old_out_of_order_result_then_presentation_does_not_leave_raw_terminal_json() {
+    let session_id = SessionId::new();
+    let events = vec![
+        event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-old-order".to_owned(),
+                tool_name: "shell.run".to_owned(),
+                arguments_json: "{}".to_owned(),
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "call-old-order".to_owned(),
+                result: serde_json::json!({
+                    "mode": "terminal",
+                    "exit_code": 0,
+                    "timed_out": false,
+                    "output": "legacy tail\n",
+                    "columns": 80,
+                    "rows": 24,
+                })
+                .to_string(),
+                is_error: false,
+                output: None,
+                semantic_result: None,
+            },
+        ),
+        event(
+            session_id,
+            3,
+            SessionEventKind::ToolInvocationPresentation {
+                tool_call_id: "call-old-order".to_owned(),
+                started_at_ms: None,
+                finished_at_ms: None,
+                is_error: false,
+                presentation: ToolInvocationPresentation::Terminal {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    cancelled: false,
+                    output: "presentation tail\n".to_owned(),
+                    output_truncated: false,
+                    output_bytes: Some(18),
+                    retained_output_bytes: Some(18),
+                    columns: 80,
+                    rows: 24,
+                },
+            },
+        ),
+    ];
+
+    let transcript = transcript_items_from_events_with_reasoning(&events, true);
+    let terminal_count = transcript
+        .iter()
+        .filter(|item| matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. }))
+        .count();
+    let raw_json_count = transcript
+        .iter()
+        .filter(|item| item.text().contains(r#""mode":"terminal""#))
+        .count();
+
+    assert_eq!(terminal_count, 1);
+    assert_eq!(raw_json_count, 0);
+}
+
+#[test]
+fn semantic_text_result_renders_generic_tool_result() {
+    let session_id = SessionId::new();
+    let events = vec![event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call-text".to_owned(),
+            result: "legacy text".to_owned(),
+            is_error: false,
+            output: None,
+            semantic_result: Some(ToolInvocationResult::Text {
+                text: "semantic text".to_owned(),
+            }),
+        },
+    )];
+
+    let transcript = transcript_items_from_events_with_reasoning(&events, true);
+
+    assert!(transcript.iter().any(|item| matches!(
+        item.kind(),
+        TranscriptItemKind::ToolResult { result, .. } if result == "semantic text"
+    )));
+    assert!(
+        !transcript
+            .iter()
+            .any(|item| item.text().contains("legacy text"))
+    );
+}
+
 fn session_summary(session_id: SessionId) -> SessionSummary {
     SessionSummary {
         id: session_id,

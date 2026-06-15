@@ -801,6 +801,9 @@ fn push_transcript_item_from_event(
             is_error,
             presentation,
         } => {
+            if presented_tool_results.contains(tool_call_id) {
+                return;
+            }
             apply_tool_invocation_presentation_event(
                 items,
                 tool_calls,
