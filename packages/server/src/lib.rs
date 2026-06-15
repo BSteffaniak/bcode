@@ -2377,8 +2377,10 @@ async fn start_ralph_runner(
         } else {
             "running".to_owned()
         },
-        requested_max_iterations: request.max_iterations,
-        requested_no_progress_limit: request.no_progress_limit,
+        requested_max_iterations: request.max_iterations.or(Some(summary.max_iterations)),
+        requested_no_progress_limit: request
+            .no_progress_limit
+            .or(Some(summary.no_progress_limit)),
     })
     .map_err(|error| error.to_string())?;
     let response = RalphRunResponse {
@@ -2662,21 +2664,28 @@ fn progress_doc_checklist_fingerprint(path: &Path) -> Option<String> {
         .map(|summary| summary.checklist_fingerprint.to_string())
 }
 
+struct RalphRunnerIterationInput {
+    iteration_number: u64,
+    work_prompt: String,
+    work_completion: Option<ModelTurnCompletion>,
+}
+
 async fn record_ralph_skeleton_noop_iteration(
     state: &ServerState,
     runtime_session_id: Option<SessionId>,
     parent_work_id: &RuntimeWorkId,
     summary: &bcode_ralph::RalphLoopSummary,
     run: &bcode_ralph::RalphRunRecord,
-    work_prompt: String,
-    work_completion: Option<ModelTurnCompletion>,
+    input: RalphRunnerIterationInput,
 ) -> Option<bcode_ralph::RalphIterationRecord> {
-    let iteration_work_id = RuntimeWorkId::new(format!("ralph:{}:iteration:1", run.run_id));
+    let iteration_number = input.iteration_number;
+    let iteration_work_id =
+        RuntimeWorkId::new(format!("ralph:{}:iteration:{iteration_number}", run.run_id));
     register_ralph_runtime_work(
         state,
         runtime_session_id,
         iteration_work_id.clone(),
-        "Ralph iteration 1".to_owned(),
+        format!("Ralph iteration {iteration_number}"),
         run.run_id.clone(),
         Some(parent_work_id.clone()),
     )
@@ -2685,33 +2694,36 @@ async fn record_ralph_skeleton_noop_iteration(
         state,
         runtime_session_id,
         parent_work_id,
-        "Ralph runner skeleton creating no-op iteration",
+        &format!("Ralph runner recording iteration {iteration_number}"),
         1,
     )
     .await;
-    let outcome = work_completion
+    let outcome = input
+        .work_completion
         .as_ref()
         .map(|completion| completion.outcome);
     let iteration = bcode_ralph::create_iteration(bcode_ralph::RalphIterationCreateRequest {
         run_id: run.run_id.clone(),
         state_dir: run.state_dir.clone(),
-        iteration_number: 1,
+        iteration_number,
         status: ralph_iteration_status_from_model_outcome(outcome).to_owned(),
         checklist_fingerprint_before: Some(
             summary.checklist_summary.checklist_fingerprint.to_string(),
         ),
         checklist_fingerprint_after: progress_doc_checklist_fingerprint(&summary.progress_doc_path),
-        work_prompt: Some(work_prompt),
+        work_prompt: Some(input.work_prompt),
         finished_at_ms: Some(current_time_ms()),
         stop_reason: outcome.map(|outcome| format!("model_turn_{outcome:?}").to_lowercase()),
-        error_message: work_completion.and_then(|completion| completion.message),
+        error_message: input
+            .work_completion
+            .and_then(|completion| completion.message),
     });
     finish_ralph_runtime_work(
         state,
         runtime_session_id,
         iteration_work_id,
         RuntimeWorkStatus::Completed,
-        Some("Ralph skeleton no-op iteration recorded".to_owned()),
+        Some(format!("Ralph iteration {iteration_number} recorded")),
     )
     .await;
     iteration.ok()
@@ -2866,12 +2878,13 @@ fn ralph_stop_decision_after_audit(
     iteration: &bcode_ralph::RalphIterationRecord,
 ) -> Result<bcode_ralph::RalphStopDecision, std::io::Error> {
     let checklist_summary = progress_doc_checklist_summary(&summary.progress_doc_path)?;
-    let no_progress_count =
-        u64::from(iteration.checklist_fingerprint_before == iteration.checklist_fingerprint_after);
+    let iterations = bcode_ralph::list_iterations_for_run(&run.run_id).unwrap_or_default();
+    let iteration_count = u64::try_from(iterations.len()).unwrap_or(u64::MAX);
+    let no_progress_count = consecutive_no_progress_iterations(&iterations, iteration);
     Ok(bcode_ralph::decide_stop(
         bcode_ralph::RalphStopDecisionInput {
             status: bcode_ralph::RalphLoopStatus::Running,
-            iteration_count: summary.iteration_count.saturating_add(1),
+            iteration_count,
             max_iterations: run.requested_max_iterations.unwrap_or(0),
             no_progress_count,
             no_progress_limit: run.requested_no_progress_limit.unwrap_or(0),
@@ -2883,14 +2896,36 @@ fn ralph_stop_decision_after_audit(
     ))
 }
 
+fn consecutive_no_progress_iterations(
+    iterations: &[bcode_ralph::RalphIterationRecord],
+    fallback_iteration: &bcode_ralph::RalphIterationRecord,
+) -> u64 {
+    let mut count = 0_u64;
+    let source = if iterations.is_empty() {
+        std::slice::from_ref(fallback_iteration)
+    } else {
+        iterations
+    };
+    for iteration in source.iter().rev() {
+        if iteration.checklist_fingerprint_before.is_some()
+            && iteration.checklist_fingerprint_before == iteration.checklist_fingerprint_after
+        {
+            count = count.saturating_add(1);
+        } else {
+            break;
+        }
+    }
+    count
+}
+
 const fn ralph_run_terminal_from_decision(
     decision: bcode_ralph::RalphStopDecision,
 ) -> (&'static str, &'static str, &'static str) {
     match decision {
         bcode_ralph::RalphStopDecision::Continue => (
-            "blocked",
-            "runner_skeleton",
-            "Ralph runner skeleton would continue; loop continuation is not implemented yet",
+            "running",
+            "continue",
+            "Ralph iteration completed and loop will continue",
         ),
         bcode_ralph::RalphStopDecision::CompletionCandidate => (
             "done",
@@ -3036,10 +3071,16 @@ async fn apply_ralph_post_audit_decision(
         );
     }
     (
-        "blocked",
-        "runner_skeleton",
-        "Ralph runner skeleton completed work, validation, audit, and replan; loop continuation is not implemented yet",
+        "running",
+        "continue",
+        "Ralph replan completed and loop will continue",
     )
+}
+
+struct RalphIterationCompletion {
+    continue_loop: bool,
+    runtime_status: RuntimeWorkStatus,
+    message: String,
 }
 
 async fn complete_ralph_skeleton_after_iteration(
@@ -3049,7 +3090,7 @@ async fn complete_ralph_skeleton_after_iteration(
     summary: &bcode_ralph::RalphLoopSummary,
     run: &bcode_ralph::RalphRunRecord,
     iteration: Option<&bcode_ralph::RalphIterationRecord>,
-) -> String {
+) -> RalphIterationCompletion {
     let validation_passed = if let Some(iteration) = iteration {
         run_ralph_iteration_validations(
             state,
@@ -3071,7 +3112,11 @@ async fn complete_ralph_skeleton_after_iteration(
             Some("validation_failed"),
             Some("Ralph validation command failed"),
         );
-        return "Ralph validation command failed".to_owned();
+        return RalphIterationCompletion {
+            continue_loop: false,
+            runtime_status: RuntimeWorkStatus::Failed,
+            message: "Ralph validation command failed".to_owned(),
+        };
     }
     let audit_completion = submit_ralph_audit_after_validation(
         state,
@@ -3103,16 +3148,29 @@ async fn complete_ralph_skeleton_after_iteration(
                 "Ralph audit turn did not complete successfully",
             )
         };
+    let finished_at_ms = (run_status != "running").then(current_time_ms);
+    let stop_reason_value = (run_status != "running").then_some(stop_reason);
+    let error_message_value = (run_status != "running").then_some(error_message);
     let _ = bcode_ralph::update_run_status(
         &run.run_id,
         run_status,
-        Some(current_time_ms()),
-        Some(stop_reason),
-        Some(error_message),
+        finished_at_ms,
+        stop_reason_value,
+        error_message_value,
     );
-    error_message.to_owned()
+    let runtime_status = match run_status {
+        "done" | "stopped" => RuntimeWorkStatus::Completed,
+        "running" => RuntimeWorkStatus::Running,
+        _ => RuntimeWorkStatus::Failed,
+    };
+    RalphIterationCompletion {
+        continue_loop: run_status == "running",
+        runtime_status,
+        message: error_message.to_owned(),
+    }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_ralph_runner_skeleton(
     state: Arc<ServerState>,
     run: bcode_ralph::RalphRunRecord,
@@ -3142,38 +3200,46 @@ async fn run_ralph_runner_skeleton(
     .await;
 
     tokio::time::sleep(Duration::from_millis(250)).await;
-    let active_run = bcode_ralph::active_run_for_loop(&run.state_dir)
-        .ok()
-        .flatten();
-    append_ralph_runner_progress(
-        &state,
-        runtime_session_id,
-        &runtime_work_id,
-        "Ralph runner skeleton checking cancellation",
-        0,
-    )
-    .await;
-    let (status, message) = if active_run.as_ref().is_some_and(|run| run.cancel_requested) {
+    let (final_status, final_message) = loop {
+        let next_iteration_number = bcode_ralph::list_iterations_for_run(&run.run_id)
+            .map(|iterations| {
+                u64::try_from(iterations.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1)
+            })
+            .unwrap_or(1);
+        let active_run = bcode_ralph::active_run_for_loop(&run.state_dir)
+            .ok()
+            .flatten();
         append_ralph_runner_progress(
             &state,
             runtime_session_id,
             &runtime_work_id,
-            "Ralph runner skeleton observed cancellation",
-            1,
+            &format!("Ralph runner checking cancellation before iteration {next_iteration_number}"),
+            next_iteration_number.saturating_sub(1),
         )
         .await;
-        let _ = bcode_ralph::update_run_status(
-            &run.run_id,
-            "stopped",
-            Some(current_time_ms()),
-            Some("cancelled"),
-            None,
-        );
-        (
-            RuntimeWorkStatus::Cancelled,
-            Some("Ralph run cancelled".to_owned()),
-        )
-    } else {
+        if active_run.as_ref().is_some_and(|run| run.cancel_requested) {
+            append_ralph_runner_progress(
+                &state,
+                runtime_session_id,
+                &runtime_work_id,
+                "Ralph runner observed cancellation",
+                next_iteration_number.saturating_sub(1),
+            )
+            .await;
+            let _ = bcode_ralph::update_run_status(
+                &run.run_id,
+                "stopped",
+                Some(current_time_ms()),
+                Some("cancelled"),
+                None,
+            );
+            break (
+                RuntimeWorkStatus::Cancelled,
+                Some("Ralph run cancelled".to_owned()),
+            );
+        }
         let work_prompt = build_ralph_work_prompt(&summary);
         let work_completion = submit_ralph_skeleton_work_turn(
             &state,
@@ -3189,11 +3255,14 @@ async fn run_ralph_runner_skeleton(
             &runtime_work_id,
             &summary,
             &run,
-            work_prompt,
-            work_completion,
+            RalphRunnerIterationInput {
+                iteration_number: next_iteration_number,
+                work_prompt,
+                work_completion,
+            },
         )
         .await;
-        let error_message = complete_ralph_skeleton_after_iteration(
+        let completion = complete_ralph_skeleton_after_iteration(
             &state,
             runtime_session_id,
             &runtime_work_id,
@@ -3202,10 +3271,28 @@ async fn run_ralph_runner_skeleton(
             iteration.as_ref(),
         )
         .await;
-        (RuntimeWorkStatus::Failed, Some(error_message))
+        if completion.continue_loop {
+            append_ralph_runner_progress(
+                &state,
+                runtime_session_id,
+                &runtime_work_id,
+                &format!("Ralph iteration {next_iteration_number} complete; continuing"),
+                next_iteration_number,
+            )
+            .await;
+            continue;
+        }
+        break (completion.runtime_status, Some(completion.message));
     };
     finish_ralph_runner_lifecycle(&state, &run, summary.loop_name).await;
-    finish_ralph_runtime_work(&state, runtime_session_id, runtime_work_id, status, message).await;
+    finish_ralph_runtime_work(
+        &state,
+        runtime_session_id,
+        runtime_work_id,
+        final_status,
+        final_message,
+    )
+    .await;
     state.active_ralph_runs.lock().await.remove(&run.state_dir);
 }
 

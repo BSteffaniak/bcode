@@ -337,6 +337,12 @@ pub struct RalphLoopSummary {
     pub session_id: Option<String>,
     /// Completed iteration count.
     pub iteration_count: u64,
+    /// Configured maximum iterations; zero means no configured limit.
+    pub max_iterations: u64,
+    /// Current consecutive no-progress count.
+    pub no_progress_count: u64,
+    /// Configured no-progress limit; zero means no configured limit.
+    pub no_progress_limit: u64,
     /// Suggested next action.
     pub next_action: String,
     /// Progress doc checklist summary.
@@ -456,6 +462,9 @@ fn summary_from_loop_row(row: &Row) -> Result<RalphLoopSummary, RalphStateError>
         work_area_path: optional_text(row, "work_area_path").map(PathBuf::from),
         session_id: optional_text(row, "session_id"),
         iteration_count,
+        max_iterations,
+        no_progress_count,
+        no_progress_limit,
         next_action: next_action_for_decision(decide_stop(RalphStopDecisionInput {
             status: status_from_str(&status),
             iteration_count,
