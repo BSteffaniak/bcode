@@ -13,6 +13,8 @@ pub enum RalphStartDialogField {
     WorkAreaPath,
     /// Optional explicit branch name.
     Branch,
+    /// Optional validation commands separated by semicolons.
+    ValidationCommands,
 }
 
 /// Ralph loop start dialog state.
@@ -21,6 +23,7 @@ pub struct RalphStartDialog {
     loop_name: TextInputState,
     work_area_path: TextInputState,
     branch: TextInputState,
+    validation_commands: TextInputState,
     focused_field: RalphStartDialogField,
     status: String,
 }
@@ -28,13 +31,17 @@ pub struct RalphStartDialog {
 impl RalphStartDialog {
     /// Create a Ralph loop start dialog.
     #[must_use]
-    pub fn new(default_loop_name: &str) -> Self {
+    pub fn new(default_loop_name: &str, default_validation_commands: &[String]) -> Self {
         let mut loop_name = TextEditBuffer::from_text(default_loop_name);
         loop_name.move_cursor_with_selection(TextMotion::Start, SelectionMode::Extend);
+        let validation_commands = default_validation_commands.join("; ");
         Self {
             loop_name: TextInputState::new(loop_name),
             work_area_path: TextInputState::new(TextEditBuffer::default()),
             branch: TextInputState::new(TextEditBuffer::default()),
+            validation_commands: TextInputState::new(TextEditBuffer::from_text(
+                &validation_commands,
+            )),
             focused_field: RalphStartDialogField::LoopName,
             status: "Enter starts, Tab switches optional fields, Esc cancels".to_owned(),
         }
@@ -58,6 +65,12 @@ impl RalphStartDialog {
         &self.branch
     }
 
+    /// Return validation commands input state.
+    #[must_use]
+    pub const fn validation_commands(&self) -> &TextInputState {
+        &self.validation_commands
+    }
+
     /// Return currently focused field.
     #[must_use]
     pub const fn focused_field(&self) -> RalphStartDialogField {
@@ -70,6 +83,7 @@ impl RalphStartDialog {
             RalphStartDialogField::LoopName => &mut self.loop_name,
             RalphStartDialogField::WorkAreaPath => &mut self.work_area_path,
             RalphStartDialogField::Branch => &mut self.branch,
+            RalphStartDialogField::ValidationCommands => &mut self.validation_commands,
         }
     }
 
@@ -78,7 +92,8 @@ impl RalphStartDialog {
         self.focused_field = match self.focused_field {
             RalphStartDialogField::LoopName => RalphStartDialogField::WorkAreaPath,
             RalphStartDialogField::WorkAreaPath => RalphStartDialogField::Branch,
-            RalphStartDialogField::Branch => RalphStartDialogField::LoopName,
+            RalphStartDialogField::Branch => RalphStartDialogField::ValidationCommands,
+            RalphStartDialogField::ValidationCommands => RalphStartDialogField::LoopName,
         };
     }
 
@@ -95,6 +110,12 @@ impl RalphStartDialog {
     /// Update the branch input content area.
     pub fn set_branch_content_area(&mut self, area: Rect) {
         self.branch.set_content_area(area, &input_policy());
+    }
+
+    /// Update the validation commands input content area.
+    pub fn set_validation_commands_content_area(&mut self, area: Rect) {
+        self.validation_commands
+            .set_content_area(area, &input_policy());
     }
 
     /// Return the requested Ralph loop name.
@@ -115,6 +136,19 @@ impl RalphStartDialog {
     pub fn branch_text(&self) -> Option<String> {
         let text = self.branch.buffer().text().trim().to_owned();
         (!text.is_empty()).then_some(text)
+    }
+
+    /// Return validation commands separated in the setup dialog.
+    #[must_use]
+    pub fn validation_command_texts(&self) -> Vec<String> {
+        self.validation_commands
+            .buffer()
+            .text()
+            .split(';')
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
     }
 
     /// Return status text.

@@ -352,7 +352,13 @@ pub async fn start_loop<W: Write>(
         .app
         .session_title()
         .map_or_else(|| "new-ralph-loop".to_owned(), ToString::to_string);
-    let mut dialog = ralph_start_dialog::RalphStartDialog::new(&default_name);
+    let repo_root = chat
+        .app
+        .working_directory()
+        .map_or_else(std::env::current_dir, |path| Ok(path.to_path_buf()))?;
+    let default_validation_commands = ralph_state::default_validation_commands(&repo_root);
+    let mut dialog =
+        ralph_start_dialog::RalphStartDialog::new(&default_name, &default_validation_commands);
     loop {
         io.terminal.resize(helpers::terminal_area()?);
         io.terminal
@@ -398,6 +404,8 @@ async fn confirm_start_loop(
         .map_or_else(std::env::current_dir, |path| Ok(path.to_path_buf()))?;
     let state =
         ralph_state::create_initial_loop_state(&loop_name, &repo_root, chat.app.session_title())?;
+    let validation_commands = dialog.validation_command_texts();
+    ralph_state::set_validation_commands(&state.state_dir, &validation_commands, "setup")?;
     if let Some(session_id) = chat.app.session_id() {
         let history = services
             .client
@@ -452,12 +460,18 @@ async fn confirm_start_loop(
             })
             .await?;
     }
+    let validation_summary = if validation_commands.is_empty() {
+        "<none>".to_owned()
+    } else {
+        validation_commands.join("; ")
+    };
     chat.app.push_system_note(format!(
-        "Ralph loop created\n* Loop: {loop_name}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}\n* Next: capture conversation context into the progress doc",
+        "Ralph loop created\n* Loop: {loop_name}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}\n* Validation: {}\n* Next: capture conversation context into the progress doc",
         state.progress_doc_path.display(),
         state.state_dir.display(),
         work_area.path.display(),
-        work_area_session_id.as_deref().unwrap_or("<none>")
+        work_area_session_id.as_deref().unwrap_or("<none>"),
+        validation_summary
     ));
     chat.app.set_status("Ralph loop created".to_owned());
     Ok(true)

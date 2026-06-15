@@ -44,6 +44,15 @@ pub fn render_dialog(dialog: &mut RalphStartDialog, frame: &mut Frame<'_>) {
         RalphStartDialogField::Branch,
         "Branch",
     );
+    render_input_field(
+        dialog,
+        &modal,
+        content,
+        &mut row,
+        frame,
+        RalphStartDialogField::ValidationCommands,
+        "Validation",
+    );
     render_line(&help_line(), &modal, content, &mut row, frame);
     let status = Line::from_spans(vec![Span::styled(
         dialog.status().to_owned(),
@@ -54,7 +63,7 @@ pub fn render_dialog(dialog: &mut RalphStartDialog, frame: &mut Frame<'_>) {
 
 fn modal_frame() -> ModalFrame {
     ModalFrame::new(
-        ModalSizing::new(Size::new(70, 10), Size::new(96, 12), Insets::all(4)),
+        ModalSizing::new(Size::new(76, 11), Size::new(104, 13), Insets::all(4)),
         ModalTheme::dark(Color::Cyan),
     )
     .title(" Start Ralph loop ")
@@ -105,6 +114,10 @@ fn render_input_field(
         RalphStartDialogField::Branch => {
             dialog.set_branch_content_area(input_area);
             dialog.branch()
+        }
+        RalphStartDialogField::ValidationCommands => {
+            dialog.set_validation_commands_content_area(input_area);
+            dialog.validation_commands()
         }
     };
     TextInput::new(input.buffer())
