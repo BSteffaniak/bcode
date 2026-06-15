@@ -2573,17 +2573,42 @@ async fn execute_ralph_validation_command(
 }
 
 async fn run_ralph_iteration_validations(
+    state: &ServerState,
+    runtime_session_id: Option<SessionId>,
+    parent_work_id: &RuntimeWorkId,
     summary: &bcode_ralph::RalphLoopSummary,
+    run: &bcode_ralph::RalphRunRecord,
     iteration: &bcode_ralph::RalphIterationRecord,
 ) -> bool {
     let Some(work_area) = summary.work_area_path.clone() else {
         return true;
     };
     let commands = bcode_ralph::list_validation_commands(&summary.state_dir).unwrap_or_default();
-    for command in commands {
+    for (index, command) in commands.into_iter().enumerate() {
+        let validation_work_id =
+            RuntimeWorkId::new(format!("ralph:{}:validation:{}", run.run_id, index + 1));
+        register_ralph_runtime_work(
+            state,
+            runtime_session_id,
+            validation_work_id.clone(),
+            format!("Ralph validation {}", index + 1),
+            run.run_id.clone(),
+            Some(parent_work_id.clone()),
+        )
+        .await;
         let execution =
             execute_ralph_validation_command(work_area.clone(), command.command.clone()).await;
         let passed = execution.status == "passed";
+        let runtime_status = if passed {
+            RuntimeWorkStatus::Completed
+        } else {
+            RuntimeWorkStatus::Failed
+        };
+        let validation_message = if passed {
+            Some(format!("validation passed: {}", command.command))
+        } else {
+            Some(format!("validation failed: {}", command.command))
+        };
         let _ = bcode_ralph::create_validation(bcode_ralph::RalphValidationCreateRequest {
             iteration_id: iteration.iteration_id.clone(),
             command: command.command,
@@ -2593,6 +2618,14 @@ async fn run_ralph_iteration_validations(
             finished_at_ms: Some(current_time_ms()),
             error_message: execution.error_message,
         });
+        finish_ralph_runtime_work(
+            state,
+            runtime_session_id,
+            validation_work_id,
+            runtime_status,
+            validation_message,
+        )
+        .await;
         if !passed {
             return false;
         }
@@ -2630,12 +2663,23 @@ fn build_ralph_work_prompt(summary: &bcode_ralph::RalphLoopSummary) -> String {
 }
 
 async fn complete_ralph_skeleton_after_iteration(
+    state: &ServerState,
+    runtime_session_id: Option<SessionId>,
+    parent_work_id: &RuntimeWorkId,
     summary: &bcode_ralph::RalphLoopSummary,
     run: &bcode_ralph::RalphRunRecord,
     iteration: Option<&bcode_ralph::RalphIterationRecord>,
 ) -> String {
     let validation_passed = if let Some(iteration) = iteration {
-        run_ralph_iteration_validations(summary, iteration).await
+        run_ralph_iteration_validations(
+            state,
+            runtime_session_id,
+            parent_work_id,
+            summary,
+            run,
+            iteration,
+        )
+        .await
     } else {
         true
     };
@@ -2736,8 +2780,15 @@ async fn run_ralph_runner_skeleton(
             work_completion,
         )
         .await;
-        let error_message =
-            complete_ralph_skeleton_after_iteration(&summary, &run, iteration.as_ref()).await;
+        let error_message = complete_ralph_skeleton_after_iteration(
+            &state,
+            runtime_session_id,
+            &runtime_work_id,
+            &summary,
+            &run,
+            iteration.as_ref(),
+        )
+        .await;
         (RuntimeWorkStatus::Failed, Some(error_message))
     };
     finish_ralph_runner_lifecycle(&state, &run, summary.loop_name).await;
