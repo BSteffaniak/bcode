@@ -2988,6 +2988,71 @@ mod tests {
         assert_eq!(decoded, request);
     }
 
+    #[test]
+    fn representative_non_history_responses_round_trip_through_ipc_dtos() {
+        let responses = vec![
+            Response::Ok(ResponsePayload::Hello {
+                protocol_version: ProtocolVersion::current(),
+                client_id: ClientId::new(),
+            }),
+            Response::Ok(ResponsePayload::ServerStatus {
+                status: ServerStatus {
+                    connected_client_count: 1,
+                    sessions: vec![test_session_summary("status")],
+                    session_catalog_loaded: true,
+                    session_catalog_status: SessionCatalogStatus::Loaded,
+                    session_catalog_sources: Vec::new(),
+                    session_catalog_revision: 7,
+                    selected_provider_plugin_id: Some("provider".to_string()),
+                    selected_model_id: Some("model".to_string()),
+                    plugin_runtime: Vec::new(),
+                    daemon: DaemonStatus {
+                        namespace: daemon_namespace(),
+                        protocol_version: u32::from(ProtocolVersion::current().0),
+                        build_fingerprint: "test-build".to_string(),
+                        pid: Some(123),
+                        instance_id: "instance".to_string(),
+                        started_at_unix_ms: 456,
+                    },
+                    metrics: MetricsSnapshot::default(),
+                    metrics_report: Box::default(),
+                },
+            }),
+            Response::Ok(ResponsePayload::SessionList {
+                sessions: vec![test_session_summary("listed")],
+                catalog_status: SessionCatalogStatus::Loaded,
+                catalog_sources: Vec::new(),
+                catalog_revision: 7,
+            }),
+            Response::Ok(ResponsePayload::PluginServiceResult {
+                response: PluginServiceResponse {
+                    payload: b"payload".to_vec(),
+                    error: None,
+                },
+            }),
+            Response::Ok(ResponsePayload::WorktreeList(WorktreeListResponse {
+                repo_root: "/tmp/repo".into(),
+                current_worktree: "/tmp/repo".into(),
+                worktrees: Vec::new(),
+            })),
+            Response::Ok(ResponsePayload::SessionCatalogRefreshed {
+                sessions: vec![test_session_summary("refreshed")],
+                catalog_status: SessionCatalogStatus::Loaded,
+                catalog_sources: Vec::new(),
+                catalog_revision: 8,
+            }),
+            Response::Ok(ResponsePayload::RuntimeWorkCancellationRequested { cancelled: true }),
+            Response::Err(ErrorResponse::new("test_error", "something failed")),
+        ];
+
+        for response in responses {
+            let encoded = encode_response(&response).expect("response should encode");
+            let decoded = decode_response(&encoded).expect("response should decode");
+
+            assert_eq!(decoded, response);
+        }
+    }
+
     #[tokio::test]
     async fn oversized_response_envelope_round_trips_across_chunked_frames() {
         let payload = vec![b'x'; MAX_FRAME_PAYLOAD_SIZE + 100_000];
@@ -3418,6 +3483,12 @@ mod tests {
         assert!(
             !source_without_comments
                 .contains(&format!("{}({})", "Domain", "Box<SessionEventKind>"))
+        );
+        assert!(
+            !source_without_comments.contains(&format!("{}::{}", "IpcResponsePayload", "Domain"))
+        );
+        assert!(
+            !source_without_comments.contains(&format!("{}({})", "Domain", "Box<ResponsePayload>"))
         );
         assert!(!source_without_comments.contains("serde_json::Value"));
         assert!(!source_without_comments.contains("#[serde(flatten)]"));
