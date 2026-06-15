@@ -699,6 +699,11 @@ pub enum Event {
     },
 }
 
+// IPC DTOs intentionally do not reuse session-event domain enums directly.
+// `bmux_codec` is non-self-describing, so DTOs that carry session events must
+// stay positional-codec-safe and avoid JSON-only serde patterns such as
+// tagged/untagged enum assumptions, flattened fields, custom visitors, and
+// `serde_json::Value` payloads.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2796,6 +2801,32 @@ mod tests {
                 value: r#"{"ok":true}"#.to_string(),
             },
         ]
+    }
+
+    #[test]
+    fn ipc_session_dtos_do_not_use_unsafe_escape_hatches() {
+        let source = include_str!("lib.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("source should contain production code before tests");
+        let source_without_comments = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !source_without_comments.contains(&format!("{}::{}", "IpcSessionEventKind", "Domain"))
+        );
+        assert!(
+            !source_without_comments
+                .contains(&format!("{}({})", "Domain", "Box<SessionEventKind>"))
+        );
+        assert!(!source_without_comments.contains("serde_json::Value"));
+        assert!(!source_without_comments.contains("#[serde(flatten)]"));
+        assert!(!source_without_comments.contains("#[serde(untagged)]"));
+        assert!(!source_without_comments.contains("impl<'de> Deserialize"));
+        assert!(!source_without_comments.contains("impl Deserialize"));
     }
 
     async fn round_trip_envelope(envelope: Envelope) -> Envelope {
