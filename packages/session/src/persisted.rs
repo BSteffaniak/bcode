@@ -64,6 +64,19 @@ fn first_persisted_event_kind_name(kind: &serde_json::Value) -> String {
         .unwrap_or_else(|| "<invalid>".to_string())
 }
 
+/// Decode a persisted session event from durable JSON, returning `None` for
+/// unsupported or corrupt records that should not block normal catalog/open/
+/// attach/history paths.
+///
+/// This is intentionally lossy and must not be used by repair, doctor, reindex,
+/// or migration code that needs to report exact damage. Normal user-facing reads
+/// use it to degrade safely without implicitly repairing or mutating damaged
+/// logs.
+#[must_use]
+pub fn decode_session_event_degraded(payload: &str) -> Option<SessionEvent> {
+    decode_session_event(payload).ok()
+}
+
 /// Errors returned when decoding persisted session events.
 #[derive(Debug, Error)]
 pub enum PersistedSessionEventError {
