@@ -2416,9 +2416,20 @@ async fn submit_ralph_skeleton_work_turn(
     state: &Arc<ServerState>,
     runtime_session_id: Option<SessionId>,
     parent_work_id: &RuntimeWorkId,
+    run_id: &str,
     work_prompt: String,
 ) -> Option<ModelTurnCompletion> {
     let session_id = runtime_session_id?;
+    let work_turn_id = RuntimeWorkId::new(format!("ralph:{run_id}:work:1"));
+    register_ralph_runtime_work(
+        state,
+        runtime_session_id,
+        work_turn_id.clone(),
+        "Ralph work turn 1".to_owned(),
+        run_id.to_owned(),
+        Some(parent_work_id.clone()),
+    )
+    .await;
     append_ralph_runner_progress(
         state,
         runtime_session_id,
@@ -2427,13 +2438,20 @@ async fn submit_ralph_skeleton_work_turn(
         1,
     )
     .await;
-    Some(
-        submit_session_model_turn_and_wait(state, session_id, work_prompt)
-            .await
-            .unwrap_or_else(|error| {
-                ModelTurnCompletion::with_message(ModelTurnOutcome::Error, error.to_string())
-            }),
+    let completion = submit_session_model_turn_and_wait(state, session_id, work_prompt)
+        .await
+        .unwrap_or_else(|error| {
+            ModelTurnCompletion::with_message(ModelTurnOutcome::Error, error.to_string())
+        });
+    finish_ralph_runtime_work(
+        state,
+        runtime_session_id,
+        work_turn_id,
+        runtime_work_status_from_model_outcome(completion.outcome),
+        completion.message.clone(),
     )
+    .await;
+    Some(completion)
 }
 
 const fn ralph_iteration_status_from_model_outcome(
@@ -2595,6 +2613,7 @@ async fn run_ralph_runner_skeleton(
             &state,
             runtime_session_id,
             &runtime_work_id,
+            &run.run_id,
             work_prompt.clone(),
         )
         .await;
