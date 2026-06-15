@@ -8,7 +8,7 @@
 
 use std::{fs, path::Path, sync::Arc, time::Duration};
 
-use crate::persisted::decode_session_event;
+use crate::persisted::decode_session_event_degraded;
 
 use bcode_session_models::{
     RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
@@ -726,12 +726,14 @@ impl SessionDb {
             .execute(&**self.db)
             .await?;
 
-        rows.into_iter()
-            .map(|row| {
-                let payload = required_string(&row, "payload")?;
-                Ok(decode_session_event(&payload)?)
-            })
-            .collect()
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            let payload = required_string(&row, "payload")?;
+            if let Some(event) = decode_session_event_degraded(&payload) {
+                events.push(event);
+            }
+        }
+        Ok(events)
     }
 
     /// Return a bounded history page from canonical DB events.
@@ -771,15 +773,13 @@ impl SessionDb {
 
         let rows = select.execute(&**self.db).await?;
         let has_more = rows.len() > limit;
-        let mut events = rows
-            .iter()
-            .take(limit)
-            .map(|row| {
-                let payload = required_string(row, "payload")?;
-                let event = decode_session_event(&payload)?;
-                Ok(event)
-            })
-            .collect::<SessionDbResult<Vec<_>>>()?;
+        let mut events = Vec::with_capacity(limit.min(rows.len()));
+        for row in rows.iter().take(limit) {
+            let payload = required_string(row, "payload")?;
+            if let Some(event) = decode_session_event_degraded(&payload) {
+                events.push(event);
+            }
+        }
         if matches!(query.direction, SessionHistoryDirection::Backward) {
             events.reverse();
         }
@@ -826,9 +826,10 @@ impl SessionDb {
         events.push(compaction_event.clone());
         for row in rows {
             let payload = required_string(&row, "payload")?;
-            let event = decode_session_event(&payload)?;
-            if event.sequence != compaction_event.sequence {
-                events.push(event);
+            if let Some(event) = decode_session_event_degraded(&payload) {
+                if event.sequence != compaction_event.sequence {
+                    events.push(event);
+                }
             }
         }
         Ok(events)
@@ -870,7 +871,9 @@ impl SessionDb {
                     continue;
                 }
                 let payload = required_string(row, "payload")?;
-                selected_newest_first.push(decode_session_event(&payload)?);
+                if let Some(event) = decode_session_event_degraded(&payload) {
+                    selected_newest_first.push(event);
+                }
                 if selected_newest_first.len() >= MODEL_CONTEXT_EVENT_LIMIT {
                     break;
                 }
@@ -899,12 +902,11 @@ impl SessionDb {
             .limit(1)
             .execute_first(&**self.db)
             .await?;
-        row.as_ref()
-            .map(|row| {
-                let payload = required_string(row, "payload")?;
-                Ok(decode_session_event(&payload)?)
-            })
-            .transpose()
+        let Some(row) = row.as_ref() else {
+            return Ok(None);
+        };
+        let payload = required_string(row, "payload")?;
+        Ok(decode_session_event_degraded(&payload))
     }
 
     /// Return events from the canonical event table for the inclusive sequence range.
@@ -929,12 +931,14 @@ impl SessionDb {
             .execute(&**self.db)
             .await?;
 
-        rows.into_iter()
-            .map(|row| {
-                let payload = required_string(&row, "payload")?;
-                Ok(decode_session_event(&payload)?)
-            })
-            .collect()
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            let payload = required_string(&row, "payload")?;
+            if let Some(event) = decode_session_event_degraded(&payload) {
+                events.push(event);
+            }
+        }
+        Ok(events)
     }
 
     /// Return latest transcript projection items in chronological order.
