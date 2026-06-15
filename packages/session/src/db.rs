@@ -1844,6 +1844,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn normal_history_reads_skip_corrupt_and_future_persisted_events_without_repair() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: Some("test".to_string()),
+                working_directory: temp_dir.path().to_path_buf(),
+            },
+        ))
+        .await
+        .expect("append valid event");
+
+        db.database()
+            .insert("events")
+            .value("event_seq", seq_to_value(1))
+            .value("event_type", "future_event_kind")
+            .value(
+                "schema_version",
+                DatabaseValue::Int32(i32::from(CURRENT_SESSION_EVENT_SCHEMA_VERSION)),
+            )
+            .value("created_at_ms", seq_to_value(1))
+            .value(
+                "payload",
+                serde_json::json!({
+                    "schema_version": CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                    "sequence": 1,
+                    "session_id": session_id,
+                    "kind": { "future_event_kind": { "value": true } }
+                })
+                .to_string(),
+            )
+            .execute(db.database())
+            .await
+            .expect("insert future event");
+        db.database()
+            .insert("events")
+            .value("event_seq", seq_to_value(2))
+            .value("event_type", "tool_call_finished")
+            .value(
+                "schema_version",
+                DatabaseValue::Int32(i32::from(CURRENT_SESSION_EVENT_SCHEMA_VERSION)),
+            )
+            .value("created_at_ms", seq_to_value(2))
+            .value(
+                "payload",
+                serde_json::json!({
+                    "schema_version": CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                    "sequence": 2,
+                    "session_id": session_id,
+                    "kind": { "tool_call_finished": { "result": "missing call id" } }
+                })
+                .to_string(),
+            )
+            .execute(db.database())
+            .await
+            .expect("insert corrupt event");
+        db.append_event(&event(
+            session_id,
+            3,
+            SessionEventKind::AssistantMessage {
+                text: "still readable".to_string(),
+            },
+        ))
+        .await
+        .expect("append second valid event");
+
+        let history = db.all_events().await.expect("history should degrade");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].sequence, 0);
+        assert_eq!(history[1].sequence, 3);
+
+        let page = db
+            .history_page(SessionHistoryQuery {
+                cursor: None,
+                direction: SessionHistoryDirection::Forward,
+                limit: 8,
+            })
+            .await
+            .expect("page should degrade");
+        assert_eq!(page.events.len(), 2);
+        assert_eq!(page.events[0].sequence, 0);
+        assert_eq!(page.events[1].sequence, 3);
+
+        let raw_rows = db
+            .database()
+            .select("events")
+            .columns(&["event_seq"])
+            .sort("event_seq", SortDirection::Asc)
+            .execute(db.database())
+            .await
+            .expect("raw rows should remain");
+        assert_eq!(raw_rows.len(), 4);
+    }
+
+    #[tokio::test]
     async fn append_event_updates_input_history_and_transcript_projections() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
