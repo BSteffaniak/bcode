@@ -1131,6 +1131,247 @@ mod tests {
     }
 
     #[test]
+    fn encodes_and_decodes_persisted_tool_results_through_dto_layer() {
+        for (semantic_result, assertion) in semantic_result_cases() {
+            let mut original = decode_session_event(&event_payload(&semantic_result))
+                .expect("fixture should decode through persisted DTOs");
+            original.sequence = 42;
+
+            let encoded = encode_session_event(&original).expect("event should encode");
+            let decoded = decode_session_event(&encoded).expect("event should decode");
+
+            assert_eq!(decoded.sequence, 42);
+            assertion(decoded);
+        }
+    }
+
+    #[test]
+    fn persisted_event_kind_dto_covers_all_current_domain_event_kinds() {
+        let session_id = SessionId::new();
+        for kind in all_event_kind_samples(session_id) {
+            let original = SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 1,
+                session_id,
+                provenance: None,
+                kind: kind.clone(),
+            };
+
+            let encoded = encode_session_event(&original).expect("event should encode");
+            let decoded = decode_session_event(&encoded).expect("event should decode");
+
+            assert_eq!(decoded.kind, kind);
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn all_event_kind_samples(session_id: SessionId) -> Vec<SessionEventKind> {
+        vec![
+            SessionEventKind::SessionCreated {
+                name: Some("session".to_string()),
+                working_directory: PathBuf::from("/tmp/session"),
+            },
+            SessionEventKind::ClientAttached {
+                client_id: ClientId::new(),
+            },
+            SessionEventKind::ClientDetached {
+                client_id: ClientId::new(),
+            },
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "hello".to_string(),
+            },
+            SessionEventKind::AssistantDelta {
+                text: "delta".to_string(),
+            },
+            SessionEventKind::AssistantMessage {
+                text: "message".to_string(),
+            },
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call".to_string(),
+                tool_name: "tool".to_string(),
+                arguments_json: "{}".to_string(),
+            },
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "call".to_string(),
+                result: "done".to_string(),
+                is_error: false,
+                output: None,
+                semantic_result: Some(ToolInvocationResult::Text {
+                    text: "semantic".to_string(),
+                }),
+            },
+            SessionEventKind::PermissionRequested {
+                permission_id: "perm".to_string(),
+                tool_call_id: "call".to_string(),
+                tool_name: "tool".to_string(),
+                arguments_json: "{}".to_string(),
+            },
+            SessionEventKind::PermissionResolved {
+                permission_id: "perm".to_string(),
+                approved: true,
+            },
+            SessionEventKind::ModelChanged {
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+            },
+            SessionEventKind::SystemMessage {
+                text: "system".to_string(),
+            },
+            SessionEventKind::AgentChanged {
+                agent_id: "agent".to_string(),
+            },
+            SessionEventKind::ModelTurnStarted {
+                turn_id: "turn".to_string(),
+            },
+            SessionEventKind::ModelTurnFinished {
+                turn_id: "turn".to_string(),
+                outcome: ModelTurnOutcome::Completed,
+                message: Some("done".to_string()),
+            },
+            SessionEventKind::ModelUsage {
+                turn_id: "turn".to_string(),
+                usage: SessionTokenUsage {
+                    input_tokens: Some(1),
+                    cached_input_tokens: Some(2),
+                    cache_write_input_tokens: Some(3),
+                    output_tokens: Some(4),
+                    reasoning_tokens: Some(5),
+                    total_tokens: Some(6),
+                },
+            },
+            SessionEventKind::ContextCompacted {
+                summary: "summary".to_string(),
+                compacted_through_sequence: 1,
+            },
+            SessionEventKind::SessionRenamed {
+                name: Some("renamed".to_string()),
+            },
+            SessionEventKind::TraceEvent {
+                trace: Box::new(SessionTraceEvent {
+                    timestamp_ms: 1,
+                    turn_id: Some("turn".to_string()),
+                    phase: bcode_session_models::SessionTracePhase::ModelProviderEvent,
+                    payload: bcode_session_models::SessionTracePayload::ProviderEvent {
+                        event_type: "event".to_string(),
+                        detail: Some("detail".to_string()),
+                    },
+                }),
+            },
+            SessionEventKind::SkillInvoked {
+                skill_id: SkillId::new("skill"),
+                arguments: "{}".to_string(),
+                source: None,
+                invoked_at_ms: 1,
+            },
+            SessionEventKind::SkillSuggested {
+                skill_id: SkillId::new("skill"),
+                reason: Some("reason".to_string()),
+                suggested_at_ms: 2,
+            },
+            SessionEventKind::SkillActivated {
+                skill_id: SkillId::new("skill"),
+                source: None,
+                mode: SkillActivationMode::Automatic,
+                activated_at_ms: 3,
+            },
+            SessionEventKind::SkillDeactivated {
+                skill_id: SkillId::new("skill"),
+                deactivated_at_ms: 4,
+            },
+            SessionEventKind::SkillContextLoaded {
+                skill_id: SkillId::new("skill"),
+                bytes_loaded: 12,
+                truncated: false,
+                loaded_at_ms: 5,
+            },
+            SessionEventKind::SkillInvocationFailed {
+                skill_id: SkillId::new("skill"),
+                error: "error".to_string(),
+                failed_at_ms: 6,
+            },
+            SessionEventKind::AssistantReasoningDelta {
+                text: "reasoning delta".to_string(),
+            },
+            SessionEventKind::AssistantReasoningMessage {
+                text: "reasoning".to_string(),
+            },
+            SessionEventKind::RuntimeWorkStarted {
+                work_id: RuntimeWorkId::new("work-started"),
+                kind: RuntimeWorkKind::Tool,
+                label: "work".to_string(),
+                tool_call_id: Some("call".to_string()),
+                plugin_id: None,
+                service_interface: None,
+                operation: None,
+                parent_work_id: None,
+                started_at_ms: Some(7),
+                cancellable: true,
+            },
+            SessionEventKind::RuntimeWorkCancelRequested {
+                work_id: RuntimeWorkId::new("work-cancel"),
+                requested_at_ms: Some(8),
+                client_id: None,
+            },
+            SessionEventKind::RuntimeWorkFinished {
+                work_id: RuntimeWorkId::new("work-finished"),
+                status: RuntimeWorkStatus::Completed,
+                finished_at_ms: Some(9),
+                message: Some("finished".to_string()),
+            },
+            SessionEventKind::RuntimeWorkProgress {
+                work_id: RuntimeWorkId::new("work-progress"),
+                message: "progress".to_string(),
+                progress_at_ms: Some(10),
+                completed_units: Some(1),
+                total_units: Some(2),
+            },
+            SessionEventKind::ModelTurnCancelRequested {
+                turn_id: "turn".to_string(),
+                requested_at_ms: Some(11),
+                client_id: None,
+            },
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Finished {
+                    tool_call_id: "call".to_string(),
+                    sequence: 1,
+                    is_error: false,
+                    finished_at_ms: Some(14),
+                },
+            },
+            SessionEventKind::WorkingDirectoryChanged {
+                old_working_directory: PathBuf::from("/tmp/old"),
+                new_working_directory: PathBuf::from("/tmp/new"),
+            },
+            SessionEventKind::SessionImported {
+                source_id: "source".to_string(),
+                source_display_name: "Source".to_string(),
+                external_session_id: "external".to_string(),
+                imported_at_ms: 12,
+            },
+            SessionEventKind::ToolInvocationPresentation {
+                tool_call_id: "call".to_string(),
+                started_at_ms: Some(13),
+                finished_at_ms: Some(14),
+                is_error: false,
+                presentation: ToolInvocationPresentation::FileChange {
+                    tool_name: "filesystem.write".to_string(),
+                    summary: "present".to_string(),
+                    path: Some("present.txt".to_string()),
+                },
+            },
+            SessionEventKind::SessionForked {
+                source_session_id: session_id,
+                source_title: Some("source".to_string()),
+                source_cutoff_sequence: Some(1),
+                source_prompt_sequence: Some(0),
+                forked_at_ms: 15,
+                kind: SessionForkKind::Fork,
+            },
+        ]
+    }
+
+    #[test]
     fn rejects_future_schema_version() {
         let payload = serde_json::json!({
             "schema_version": CURRENT_SESSION_EVENT_SCHEMA_VERSION + 1,
