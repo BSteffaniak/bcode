@@ -559,7 +559,7 @@ pub enum ShellRunResult {
         #[serde(default)]
         cancelled: bool,
         /// Bounded tail of the PTY output stream.
-        #[serde(default, alias = "output")]
+        #[serde(default)]
         output_tail: String,
         /// Whether the output was truncated.
         #[serde(default)]
@@ -1280,31 +1280,6 @@ mod tests {
                 retained_output_bytes: Some(6),
                 columns: 120,
                 rows: 30,
-            }
-        );
-    }
-
-    #[test]
-    fn semantic_tool_result_json_decodes_legacy_terminal_output_alias() {
-        let decoded: ToolInvocationResult = serde_json::from_str(
-            r#"{"type":"shell_run","result":{"mode":"terminal","exit_code":7,"timed_out":true,"cancelled":false,"output":"legacy tail","output_truncated":false,"columns":120,"rows":30}}"#,
-        )
-        .expect("legacy terminal semantic result should decode");
-
-        assert_eq!(
-            decoded,
-            ToolInvocationResult::ShellRun {
-                result: ShellRunResult::Terminal {
-                    exit_code: Some(7),
-                    timed_out: true,
-                    cancelled: false,
-                    output_tail: "legacy tail".to_string(),
-                    output_truncated: false,
-                    output_bytes: None,
-                    retained_output_bytes: None,
-                    columns: 120,
-                    rows: 30,
-                },
             }
         );
     }
