@@ -2716,6 +2716,35 @@ async fn submit_ralph_skeleton_replan_turn(
     Some(completion)
 }
 
+fn ralph_run_failure_from_model_completion(
+    phase: &'static str,
+    completion: &ModelTurnCompletion,
+) -> Option<(&'static str, &'static str, String)> {
+    if completion.outcome == ModelTurnOutcome::Completed {
+        return None;
+    }
+    let message = completion
+        .message
+        .clone()
+        .unwrap_or_else(|| format!("Ralph {phase} turn ended with {:?}", completion.outcome));
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("permission") && (lower.contains("denied") || lower.contains("rejected")) {
+        return Some(("stopped", "permission_denied", message));
+    }
+    if lower.contains("question") || lower.contains("needs user") || lower.contains("ask the user")
+    {
+        return Some(("blocked", "user_question", message));
+    }
+    match completion.outcome {
+        ModelTurnOutcome::Cancelled => Some(("stopped", "cancelled", message)),
+        ModelTurnOutcome::ProviderUnavailable => Some(("blocked", "provider_unavailable", message)),
+        ModelTurnOutcome::IdleTimeout => Some(("blocked", "model_idle_timeout", message)),
+        ModelTurnOutcome::ToolRoundLimitReached => Some(("blocked", "tool_round_limit", message)),
+        ModelTurnOutcome::Error => Some(("blocked", "model_turn_failed", message)),
+        ModelTurnOutcome::Completed => None,
+    }
+}
+
 const fn ralph_iteration_status_from_model_outcome(
     outcome: Option<ModelTurnOutcome>,
 ) -> &'static str {
@@ -2744,6 +2773,29 @@ fn progress_doc_is_coherent_and_writable(path: &Path) -> bool {
         return false;
     }
     std::fs::OpenOptions::new().write(true).open(path).is_ok()
+}
+
+fn validate_ralph_runner_inputs(
+    summary: &bcode_ralph::RalphLoopSummary,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    let Some(work_area_path) = summary.work_area_path.as_ref() else {
+        return Some(("blocked", "work_area_missing", "Ralph work area is missing"));
+    };
+    if !work_area_path.is_dir() {
+        return Some((
+            "blocked",
+            "work_area_invalid",
+            "Ralph work area does not exist or is not a directory",
+        ));
+    }
+    if !progress_doc_is_coherent_and_writable(&summary.progress_doc_path) {
+        return Some((
+            "blocked",
+            "progress_doc_invalid",
+            "Ralph progress doc is missing, corrupt, or not writable",
+        ));
+    }
+    None
 }
 
 fn progress_doc_checklist_fingerprint(path: &Path) -> Option<String> {
@@ -3218,9 +3270,9 @@ async fn complete_ralph_skeleton_after_iteration(
     let audit_outcome = audit_completion
         .as_ref()
         .map(|completion| completion.outcome);
-    let (run_status, stop_reason, error_message) =
+    let (run_status, stop_reason, error_message): (&str, &str, String) =
         if audit_outcome == Some(ModelTurnOutcome::Completed) {
-            apply_ralph_post_audit_decision(
+            let (run_status, stop_reason, error_message) = apply_ralph_post_audit_decision(
                 state,
                 runtime_session_id,
                 parent_work_id,
@@ -3228,17 +3280,23 @@ async fn complete_ralph_skeleton_after_iteration(
                 run,
                 iteration,
             )
-            .await
+            .await;
+            (run_status, stop_reason, error_message.to_owned())
+        } else if let Some((run_status, stop_reason, error_message)) = audit_completion
+            .as_ref()
+            .and_then(|completion| ralph_run_failure_from_model_completion("audit", completion))
+        {
+            (run_status, stop_reason, error_message)
         } else {
             (
                 "blocked",
                 "audit_failed",
-                "Ralph audit turn did not complete successfully",
+                "Ralph audit turn did not complete successfully".to_owned(),
             )
         };
     let finished_at_ms = (run_status != "running").then(current_time_ms);
     let stop_reason_value = (run_status != "running").then_some(stop_reason);
-    let error_message_value = (run_status != "running").then_some(error_message);
+    let error_message_value = (run_status != "running").then_some(error_message.as_str());
     let _ = bcode_ralph::update_run_status(
         &run.run_id,
         run_status,
@@ -3254,7 +3312,7 @@ async fn complete_ralph_skeleton_after_iteration(
     RalphIterationCompletion {
         continue_loop: run_status == "running",
         runtime_status,
-        message: error_message.to_owned(),
+        message: error_message.clone(),
     }
 }
 
@@ -3307,6 +3365,18 @@ async fn run_ralph_runner_skeleton(
             next_iteration_number.saturating_sub(1),
         )
         .await;
+        if let Some((run_status, stop_reason, error_message)) =
+            validate_ralph_runner_inputs(&summary)
+        {
+            let _ = bcode_ralph::update_run_status(
+                &run.run_id,
+                run_status,
+                Some(current_time_ms()),
+                Some(stop_reason),
+                Some(error_message),
+            );
+            break (RuntimeWorkStatus::Failed, Some(error_message.to_owned()));
+        }
         if active_run.as_ref().is_some_and(|run| run.cancel_requested) {
             append_ralph_runner_progress(
                 &state,
@@ -3337,6 +3407,9 @@ async fn run_ralph_runner_skeleton(
             work_prompt.clone(),
         )
         .await;
+        let work_failure = work_completion
+            .as_ref()
+            .and_then(|completion| ralph_run_failure_from_model_completion("work", completion));
         let iteration = record_ralph_skeleton_noop_iteration(
             &state,
             runtime_session_id,
@@ -3350,6 +3423,21 @@ async fn run_ralph_runner_skeleton(
             },
         )
         .await;
+        if let Some((run_status, stop_reason, error_message)) = work_failure {
+            let _ = bcode_ralph::update_run_status(
+                &run.run_id,
+                run_status,
+                Some(current_time_ms()),
+                Some(stop_reason),
+                Some(error_message.as_str()),
+            );
+            let runtime_status = if run_status == "stopped" {
+                RuntimeWorkStatus::Completed
+            } else {
+                RuntimeWorkStatus::Failed
+            };
+            break (runtime_status, Some(error_message));
+        }
         let completion = complete_ralph_skeleton_after_iteration(
             &state,
             runtime_session_id,
@@ -12290,6 +12378,53 @@ mod tests {
         assert_eq!(
             consecutive_no_progress_iterations(&iterations, &iterations[1]),
             0
+        );
+    }
+
+    #[test]
+    fn ralph_model_completion_failures_map_to_terminal_run_reasons() {
+        assert_eq!(
+            ralph_run_failure_from_model_completion(
+                "work",
+                &ModelTurnCompletion::with_message(ModelTurnOutcome::Cancelled, "cancelled")
+            ),
+            Some(("stopped", "cancelled", "cancelled".to_owned()))
+        );
+        assert_eq!(
+            ralph_run_failure_from_model_completion(
+                "work",
+                &ModelTurnCompletion::with_message(
+                    ModelTurnOutcome::ProviderUnavailable,
+                    "provider unavailable"
+                )
+            ),
+            Some((
+                "blocked",
+                "provider_unavailable",
+                "provider unavailable".to_owned()
+            ))
+        );
+        assert_eq!(
+            ralph_run_failure_from_model_completion(
+                "work",
+                &ModelTurnCompletion::with_message(ModelTurnOutcome::Error, "permission denied")
+            ),
+            Some((
+                "stopped",
+                "permission_denied",
+                "permission denied".to_owned()
+            ))
+        );
+        assert_eq!(
+            ralph_run_failure_from_model_completion(
+                "work",
+                &ModelTurnCompletion::with_message(ModelTurnOutcome::Error, "needs user question")
+            ),
+            Some(("blocked", "user_question", "needs user question".to_owned()))
+        );
+        assert_eq!(
+            ralph_run_failure_from_model_completion("work", &ModelTurnCompletion::completed()),
+            None
         );
     }
 
