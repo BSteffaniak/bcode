@@ -107,6 +107,8 @@ pub enum ServerError {
     DaemonLifecycle(#[from] bcode_daemon_lifecycle::DaemonLifecycleError),
     #[error("blocking task join error: {0}")]
     BlockingTask(#[from] tokio::task::JoinError),
+    #[error("model turn completion channel closed: {0}")]
+    ModelTurnCompletionClosed(#[from] oneshot::error::RecvError),
 }
 
 #[derive(Debug)]
@@ -2410,6 +2412,31 @@ async fn append_ralph_runner_progress(
     }
 }
 
+async fn submit_ralph_skeleton_work_turn(
+    state: &Arc<ServerState>,
+    runtime_session_id: Option<SessionId>,
+    parent_work_id: &RuntimeWorkId,
+) -> Option<ModelTurnCompletion> {
+    let session_id = runtime_session_id?;
+    append_ralph_runner_progress(
+        state,
+        runtime_session_id,
+        parent_work_id,
+        "Ralph runner skeleton submitting work turn",
+        1,
+    )
+    .await;
+    Some(
+        submit_session_model_turn_and_wait(
+            state,
+            session_id,
+            "Ralph runner skeleton work turn: review the progress document and make one safe, minimal change if possible. If blocked, explain the blocker.".to_owned(),
+        )
+        .await
+        .unwrap_or_else(|error| ModelTurnCompletion::with_message(ModelTurnOutcome::Error, error.to_string())),
+    )
+}
+
 async fn record_ralph_skeleton_noop_iteration(
     state: &ServerState,
     runtime_session_id: Option<SessionId>,
@@ -2513,6 +2540,8 @@ async fn run_ralph_runner_skeleton(
             Some("Ralph run cancelled".to_owned()),
         )
     } else {
+        let _work_completion =
+            submit_ralph_skeleton_work_turn(&state, runtime_session_id, &runtime_work_id).await;
         record_ralph_skeleton_noop_iteration(&state, runtime_session_id, &runtime_work_id, &run)
             .await;
         let _ = bcode_ralph::update_run_status(
@@ -3852,6 +3881,26 @@ async fn handle_invoke_skill(
             .await
         }
     }
+}
+
+async fn submit_session_model_turn_and_wait(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    text: String,
+) -> Result<ModelTurnCompletion, ServerError> {
+    let (sender, receiver) = oneshot::channel();
+    enqueue_session_command(
+        state,
+        session_id,
+        SessionCommand::UserMessage {
+            client_id: ClientId::new(),
+            runtime_context: None,
+            text,
+            completion: Some(sender),
+        },
+    )
+    .await?;
+    receiver.await.map_err(ServerError::from)
 }
 
 async fn handle_user_message(
