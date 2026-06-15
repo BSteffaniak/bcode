@@ -2352,6 +2352,18 @@ async fn prepare_ralph_resume(
     })
 }
 
+fn effective_ralph_run_limits(
+    summary_max_iterations: u64,
+    summary_no_progress_limit: u64,
+    max_iterations: Option<u64>,
+    no_progress_limit: Option<u64>,
+) -> (Option<u64>, Option<u64>) {
+    (
+        max_iterations.or(Some(summary_max_iterations)),
+        no_progress_limit.or(Some(summary_no_progress_limit)),
+    )
+}
+
 async fn start_ralph_runner(
     state: &Arc<ServerState>,
     request: RalphRunRequest,
@@ -2369,6 +2381,12 @@ async fn start_ralph_runner(
         return Err("Ralph loop already has an active runner task".to_owned());
     }
 
+    let (requested_max_iterations, requested_no_progress_limit) = effective_ralph_run_limits(
+        summary.max_iterations,
+        summary.no_progress_limit,
+        request.max_iterations,
+        request.no_progress_limit,
+    );
     let run = bcode_ralph::create_run(bcode_ralph::RalphRunCreateRequest {
         state_dir: summary.state_dir.clone(),
         session_id: summary.session_id.clone(),
@@ -2377,10 +2395,8 @@ async fn start_ralph_runner(
         } else {
             "running".to_owned()
         },
-        requested_max_iterations: request.max_iterations.or(Some(summary.max_iterations)),
-        requested_no_progress_limit: request
-            .no_progress_limit
-            .or(Some(summary.no_progress_limit)),
+        requested_max_iterations,
+        requested_no_progress_limit,
     })
     .map_err(|error| error.to_string())?;
     let response = RalphRunResponse {
@@ -12121,6 +12137,104 @@ mod tests {
             name: "filesystem.read".to_string(),
             arguments: serde_json::json!({ "path": "Cargo.toml" }),
         }
+    }
+
+    fn ralph_iteration_with_fingerprints(
+        iteration_number: u64,
+        before: Option<String>,
+        after: Option<String>,
+    ) -> bcode_ralph::RalphIterationRecord {
+        bcode_ralph::RalphIterationRecord {
+            iteration_id: format!("iteration-{iteration_number}"),
+            run_id: "run-test".to_owned(),
+            state_dir: PathBuf::from("/tmp/bcode-ralph-server-test"),
+            iteration_number,
+            status: "work_completed".to_owned(),
+            checklist_fingerprint_before: before,
+            checklist_fingerprint_after: after,
+            work_prompt: None,
+            audit_prompt: None,
+            replan_prompt: None,
+            validation_status: None,
+            validation_summary: None,
+            started_at_ms: iteration_number,
+            finished_at_ms: Some(iteration_number),
+            stop_reason: None,
+            error_message: None,
+        }
+    }
+
+    #[test]
+    fn ralph_run_limits_default_from_loop_summary() {
+        assert_eq!(
+            effective_ralph_run_limits(7, 3, None, None),
+            (Some(7), Some(3))
+        );
+        assert_eq!(
+            effective_ralph_run_limits(7, 3, Some(2), Some(1)),
+            (Some(2), Some(1))
+        );
+    }
+
+    #[test]
+    fn ralph_terminal_mapping_keeps_continue_running() {
+        assert_eq!(
+            ralph_run_terminal_from_decision(bcode_ralph::RalphStopDecision::Continue),
+            (
+                "running",
+                "continue",
+                "Ralph iteration completed and loop will continue"
+            )
+        );
+        assert_eq!(
+            ralph_run_terminal_from_decision(bcode_ralph::RalphStopDecision::MaxIterations).0,
+            "stopped"
+        );
+        assert_eq!(
+            ralph_run_terminal_from_decision(bcode_ralph::RalphStopDecision::CompletionCandidate).0,
+            "done"
+        );
+    }
+
+    #[test]
+    fn ralph_no_progress_counts_trailing_noop_iterations() {
+        let iterations = vec![
+            ralph_iteration_with_fingerprints(1, Some("a".to_owned()), Some("b".to_owned())),
+            ralph_iteration_with_fingerprints(2, Some("b".to_owned()), Some("b".to_owned())),
+            ralph_iteration_with_fingerprints(3, Some("b".to_owned()), Some("b".to_owned())),
+        ];
+        assert_eq!(
+            consecutive_no_progress_iterations(&iterations, &iterations[2]),
+            2
+        );
+    }
+
+    #[test]
+    fn ralph_no_progress_resets_after_progress() {
+        let iterations = vec![
+            ralph_iteration_with_fingerprints(1, Some("a".to_owned()), Some("a".to_owned())),
+            ralph_iteration_with_fingerprints(2, Some("a".to_owned()), Some("b".to_owned())),
+        ];
+        assert_eq!(
+            consecutive_no_progress_iterations(&iterations, &iterations[1]),
+            0
+        );
+    }
+
+    #[test]
+    fn ralph_iteration_status_tracks_model_outcomes() {
+        assert_eq!(
+            ralph_iteration_status_from_model_outcome(Some(ModelTurnOutcome::Completed)),
+            "work_completed"
+        );
+        assert_eq!(
+            ralph_iteration_status_from_model_outcome(Some(ModelTurnOutcome::Cancelled)),
+            "work_cancelled"
+        );
+        assert_eq!(
+            ralph_iteration_status_from_model_outcome(Some(ModelTurnOutcome::Error)),
+            "work_failed"
+        );
     }
 
     #[test]
