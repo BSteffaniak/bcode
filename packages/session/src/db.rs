@@ -826,10 +826,10 @@ impl SessionDb {
         events.push(compaction_event.clone());
         for row in rows {
             let payload = required_string(&row, "payload")?;
-            if let Some(event) = decode_session_event_degraded(&payload) {
-                if event.sequence != compaction_event.sequence {
-                    events.push(event);
-                }
+            if let Some(event) = decode_session_event_degraded(&payload)
+                && event.sequence != compaction_event.sequence
+            {
+                events.push(event);
             }
         }
         Ok(events)

@@ -5,7 +5,13 @@
 //! compatibility and migration, while IPC DTOs must remain safe for the
 //! non-self-describing `bmux_codec` wire format.
 
-use bcode_session_models::*;
+use bcode_session_models::{
+    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, FileChangeResult, ModelTurnOutcome,
+    RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
+    SessionEventProvenance, SessionForkKind, SessionId, SessionTokenUsage, SessionTraceEvent,
+    ShellRunResult, ToolInvocationPresentation, ToolInvocationResult, ToolInvocationStreamEvent,
+    TraceBlobRef,
+};
 use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -44,13 +50,12 @@ fn reject_unsupported_future_shape(
         return Ok(());
     };
     match serde_json::from_value::<PersistedSessionEventKind>(kind.clone()) {
-        Ok(_) => Ok(()),
         Err(error) if is_unknown_variant_error(&error) => {
             Err(PersistedSessionEventError::UnsupportedEventKind {
                 kind: first_persisted_event_kind_name(kind),
             })
         }
-        Err(_) => Ok(()),
+        Ok(_) | Err(_) => Ok(()),
     }
 }
 
