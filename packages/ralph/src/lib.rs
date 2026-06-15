@@ -955,6 +955,113 @@ pub fn request_run_cancel(run_id: &str) -> Result<(), RalphStateError> {
     })
 }
 
+/// Update the terminal or in-flight status fields for a Ralph run.
+///
+/// # Errors
+///
+/// Returns an error when the Ralph database cannot be opened, migrated, or written.
+pub fn update_run_status(
+    run_id: &str,
+    status: &str,
+    finished_at_ms: Option<u64>,
+    stop_reason: Option<&str>,
+    error_message: Option<&str>,
+) -> Result<(), RalphStateError> {
+    let run_id = run_id.to_owned();
+    let status = status.to_owned();
+    let stop_reason = stop_reason.map(ToOwned::to_owned);
+    let error_message = error_message.map(ToOwned::to_owned);
+    with_database(move |database| {
+        Box::pin(async move {
+            database
+                .update("ralph_runs")
+                .value("status", status)
+                .value("updated_at_ms", u128_to_i64(now_ms()))
+                .value("finished_at_ms", finished_at_ms.map(u64_to_i64))
+                .value("stop_reason", stop_reason)
+                .value("error_message", error_message)
+                .filter(Box::new(where_eq("run_id", run_id)))
+                .execute(database)
+                .await?;
+            Ok(())
+        })
+    })
+}
+
+/// List interrupted Ralph runs for a loop.
+///
+/// # Errors
+///
+/// Returns an error when the Ralph database cannot be opened, migrated, or queried.
+pub fn interrupted_runs_for_loop(state_dir: &Path) -> Result<Vec<RalphRunRecord>, RalphStateError> {
+    let state_dir = state_dir.to_path_buf();
+    with_database(move |database| {
+        Box::pin(async move {
+            let rows = database
+                .select("ralph_runs")
+                .columns(&RALPH_RUN_COLUMNS)
+                .filter(Box::new(where_eq(
+                    "state_dir",
+                    state_dir.display().to_string(),
+                )))
+                .execute(database)
+                .await?;
+            let mut runs = rows
+                .iter()
+                .map(run_record_from_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            runs.retain(|run| run.status == "interrupted");
+            runs.sort_by(|left, right| right.started_at_ms.cmp(&left.started_at_ms));
+            Ok(runs)
+        })
+    })
+}
+
+/// Mark all active Ralph runs for a loop as interrupted.
+///
+/// # Errors
+///
+/// Returns an error when the Ralph database cannot be opened, migrated, queried, or written.
+pub fn mark_active_runs_interrupted(
+    state_dir: &Path,
+    reason: &str,
+) -> Result<usize, RalphStateError> {
+    let state_dir = state_dir.to_path_buf();
+    let reason = reason.to_owned();
+    with_database(move |database| {
+        Box::pin(async move {
+            let rows = database
+                .select("ralph_runs")
+                .columns(&RALPH_RUN_COLUMNS)
+                .filter(Box::new(where_eq(
+                    "state_dir",
+                    state_dir.display().to_string(),
+                )))
+                .execute(database)
+                .await?;
+            let active_runs = rows
+                .iter()
+                .map(run_record_from_row)
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|run| is_active_run_status(&run.status))
+                .collect::<Vec<_>>();
+            for run in &active_runs {
+                database
+                    .update("ralph_runs")
+                    .value("status", "interrupted")
+                    .value("updated_at_ms", u128_to_i64(now_ms()))
+                    .value("finished_at_ms", u128_to_i64(now_ms()))
+                    .value("stop_reason", reason.clone())
+                    .filter(Box::new(where_eq("run_id", run.run_id.clone())))
+                    .execute(database)
+                    .await?;
+            }
+            Ok(active_runs.len())
+        })
+    })
+}
+
 /// Create a persisted Ralph iteration record.
 ///
 /// # Errors
@@ -2123,6 +2230,92 @@ mod tests {
             user_question: false,
         });
         assert_eq!(decision, RalphStopDecision::RepeatedNoProgress);
+    }
+
+    #[test]
+    fn run_iteration_and_validation_records_round_trip() {
+        let state_dir = PathBuf::from(format!("/tmp/bcode-ralph-test-{}", uuid::Uuid::new_v4()));
+        let run = create_run(RalphRunCreateRequest {
+            state_dir: state_dir.clone(),
+            session_id: Some("session-1".to_owned()),
+            status: "running".to_owned(),
+            requested_max_iterations: Some(3),
+            requested_no_progress_limit: Some(2),
+        })
+        .expect("run should persist");
+        assert_eq!(run.state_dir, state_dir);
+        assert_eq!(run.session_id.as_deref(), Some("session-1"));
+
+        let active = active_run_for_loop(&state_dir)
+            .expect("active run should query")
+            .expect("active run should exist");
+        assert_eq!(active.run_id, run.run_id);
+        assert!(!active.cancel_requested);
+
+        request_run_cancel(&run.run_id).expect("cancel should persist");
+        let cancelled = active_run_for_loop(&state_dir)
+            .expect("cancelled active run should query")
+            .expect("cancelled active run should still be active");
+        assert!(cancelled.cancel_requested);
+
+        let iteration = create_iteration(RalphIterationCreateRequest {
+            run_id: run.run_id.clone(),
+            state_dir,
+            iteration_number: 1,
+            status: "working".to_owned(),
+            checklist_fingerprint_before: Some("before".to_owned()),
+            work_prompt: Some("do work".to_owned()),
+        })
+        .expect("iteration should persist");
+        let iterations = list_iterations_for_run(&run.run_id).expect("iterations should query");
+        assert_eq!(iterations.len(), 1);
+        assert_eq!(iterations[0].iteration_id, iteration.iteration_id);
+        assert_eq!(iterations[0].work_prompt.as_deref(), Some("do work"));
+
+        let validation = create_validation(RalphValidationCreateRequest {
+            iteration_id: iteration.iteration_id.clone(),
+            command: "cargo check -p bcode_ralph".to_owned(),
+            status: "queued".to_owned(),
+        })
+        .expect("validation should persist");
+        let validations = list_validations_for_iteration(&iteration.iteration_id)
+            .expect("validations should query");
+        assert_eq!(validations.len(), 1);
+        assert_eq!(validations[0].validation_id, validation.validation_id);
+        assert_eq!(validations[0].command, "cargo check -p bcode_ralph");
+    }
+
+    #[test]
+    fn active_runs_can_be_marked_interrupted() {
+        let state_dir = PathBuf::from(format!(
+            "/tmp/bcode-ralph-interrupted-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let run = create_run(RalphRunCreateRequest {
+            state_dir: state_dir.clone(),
+            session_id: None,
+            status: "running".to_owned(),
+            requested_max_iterations: None,
+            requested_no_progress_limit: None,
+        })
+        .expect("run should persist");
+
+        let marked = mark_active_runs_interrupted(&state_dir, "daemon restart")
+            .expect("active runs should mark interrupted");
+        assert_eq!(marked, 1);
+        assert!(
+            active_run_for_loop(&state_dir)
+                .expect("active run query should work")
+                .is_none()
+        );
+        let interrupted =
+            interrupted_runs_for_loop(&state_dir).expect("interrupted runs should query");
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(interrupted[0].run_id, run.run_id);
+        assert_eq!(
+            interrupted[0].stop_reason.as_deref(),
+            Some("daemon restart")
+        );
     }
 
     #[test]
