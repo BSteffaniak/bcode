@@ -2480,8 +2480,20 @@ fn model_infos_from_items(
             max_output_tokens: None,
             capabilities: model_capabilities_for(&model),
             reasoning: reasoning_info_for_model(&model, default_reasoning_request_shape()),
+            cache: openai_model_cache_info(),
         })
         .collect()
+}
+
+fn openai_model_cache_info() -> bcode_model::ModelCacheInfo {
+    bcode_model::ModelCacheInfo {
+        capabilities: BTreeSet::from([
+            bcode_model::ModelCacheCapability::PromptCacheKey,
+            bcode_model::ModelCacheCapability::AutomaticPrefixCache,
+            bcode_model::ModelCacheCapability::CacheUsageReporting,
+            bcode_model::ModelCacheCapability::PreviousResponseId,
+        ]),
+    }
 }
 
 fn model_capabilities_for(model: &ModelResponseItem) -> BTreeSet<ModelCapability> {

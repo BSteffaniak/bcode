@@ -3470,6 +3470,7 @@ async fn handle_session_model_status(
     let model = models
         .as_ref()
         .and_then(|models| select_model_info(&models.models, selection.model_id.as_deref()));
+    let cache_info = model.as_ref().map(|model| model.cache.clone());
     let model_id = selection
         .model_id
         .clone()
@@ -3495,6 +3496,7 @@ async fn handle_session_model_status(
                     conversation_reuse_mode_name(state.conversation_reuse_mode).to_string(),
                 ),
                 compaction_mode: Some(compaction_mode_name(state.auto_compaction.mode).to_string()),
+                cache: cache_info,
             },
         }),
     )
@@ -11180,6 +11182,7 @@ mod tests {
                 max_output_tokens: Some(1_000),
                 capabilities: BTreeSet::new(),
                 reasoning: None,
+                cache: bcode_model::ModelCacheInfo::default(),
             },
             bcode_model::ModelInfo {
                 model_id: "selected".to_string(),
@@ -11189,6 +11192,7 @@ mod tests {
                 max_output_tokens: Some(2_000),
                 capabilities: BTreeSet::new(),
                 reasoning: None,
+                cache: bcode_model::ModelCacheInfo::default(),
             },
         ];
 

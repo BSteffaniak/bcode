@@ -270,6 +270,7 @@ fn models() -> ModelList {
                 .into_iter()
                 .collect(),
             reasoning: None,
+            cache: bcode_model::ModelCacheInfo::default(),
         }],
     }
 }

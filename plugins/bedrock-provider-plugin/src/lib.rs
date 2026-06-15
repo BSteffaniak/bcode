@@ -1188,8 +1188,18 @@ fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Ve
             .into_iter()
             .collect(),
             reasoning: None,
+            cache: bedrock_model_cache_info(),
         })
         .collect()
+}
+
+fn bedrock_model_cache_info() -> bcode_model::ModelCacheInfo {
+    bcode_model::ModelCacheInfo {
+        capabilities: std::collections::BTreeSet::from([
+            bcode_model::ModelCacheCapability::ExplicitCachePoints,
+            bcode_model::ModelCacheCapability::CacheUsageReporting,
+        ]),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1779,6 +1789,7 @@ async fn discover_models(settings: &Settings) -> Result<ModelDiscovery, Provider
             .into_iter()
             .collect(),
             reasoning: None,
+            cache: bedrock_model_cache_info(),
         })
         .collect();
     Ok(ModelDiscovery {

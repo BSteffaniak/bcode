@@ -84,6 +84,26 @@ pub struct ModelInfo {
     pub capabilities: BTreeSet<ModelCapability>,
     #[serde(default)]
     pub reasoning: Option<ModelReasoningInfo>,
+    #[serde(default)]
+    pub cache: ModelCacheInfo,
+}
+
+/// Per-model/provider cache and continuation capabilities.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCacheInfo {
+    #[serde(default)]
+    pub capabilities: BTreeSet<ModelCacheCapability>,
+}
+
+/// Provider cache/continuation capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCacheCapability {
+    PromptCacheKey,
+    AutomaticPrefixCache,
+    ExplicitCachePoints,
+    CacheUsageReporting,
+    PreviousResponseId,
 }
 
 /// Source of model reasoning capability metadata.

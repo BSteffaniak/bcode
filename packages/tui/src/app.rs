@@ -671,6 +671,7 @@ impl BmuxApp {
                 max_output_tokens: status.max_output_tokens,
                 capabilities: std::collections::BTreeSet::new(),
                 reasoning: status.reasoning.clone(),
+                cache: bcode_model::ModelCacheInfo::default(),
             });
         self.token_usage.apply_model_info(model.as_ref());
     }

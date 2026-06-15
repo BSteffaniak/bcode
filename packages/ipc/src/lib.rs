@@ -474,6 +474,8 @@ pub struct SessionModelStatus {
     pub conversation_reuse_mode: Option<String>,
     #[serde(default)]
     pub compaction_mode: Option<String>,
+    #[serde(default)]
+    pub cache: Option<bcode_model::ModelCacheInfo>,
 }
 
 /// Service interface provided by a loaded plugin.
