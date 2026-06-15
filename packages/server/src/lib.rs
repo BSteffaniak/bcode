@@ -12643,6 +12643,61 @@ mod tests {
         )));
     }
 
+    #[tokio::test]
+    async fn ralph_successful_work_iteration_reaches_audit_prompt() {
+        let sessions = SessionManager::default();
+        let state = Arc::new(test_server_state(sessions));
+        let (repo_root, summary) = create_test_ralph_loop("audit");
+        let run = bcode_ralph::create_run(bcode_ralph::RalphRunCreateRequest {
+            state_dir: summary.state_dir.clone(),
+            session_id: None,
+            status: "running".to_owned(),
+            requested_max_iterations: Some(1),
+            requested_no_progress_limit: Some(1),
+        })
+        .expect("run should persist");
+        let work_prompt = build_ralph_work_prompt(&summary);
+        let iteration = bcode_ralph::create_iteration(bcode_ralph::RalphIterationCreateRequest {
+            run_id: run.run_id.clone(),
+            state_dir: summary.state_dir.clone(),
+            iteration_number: 1,
+            status: "work_completed".to_owned(),
+            checklist_fingerprint_before: None,
+            checklist_fingerprint_after: None,
+            work_prompt: Some(work_prompt),
+            finished_at_ms: Some(current_time_ms()),
+            stop_reason: None,
+            error_message: None,
+        })
+        .expect("iteration should persist");
+
+        let completion = submit_ralph_audit_after_validation(
+            &state,
+            None,
+            &RuntimeWorkId::new("ralph:test-run"),
+            &summary,
+            &run,
+            Some(&iteration),
+        )
+        .await;
+        let refreshed = bcode_ralph::list_iterations_for_run(&run.run_id)
+            .expect("iterations should list")
+            .into_iter()
+            .find(|record| record.iteration_id == iteration.iteration_id)
+            .expect("iteration should exist");
+
+        assert!(completion.is_none());
+        assert!(refreshed.audit_prompt.is_some());
+        assert!(
+            refreshed
+                .audit_prompt
+                .as_deref()
+                .is_some_and(|prompt| prompt.contains("audit")),
+            "audit prompt should be persisted for post-work review"
+        );
+        let _ = std::fs::remove_dir_all(repo_root);
+    }
+
     fn ralph_iteration_with_fingerprints(
         iteration_number: u64,
         before: Option<String>,
