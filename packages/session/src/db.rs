@@ -8,7 +8,10 @@
 
 use std::{fs, path::Path, sync::Arc, time::Duration};
 
-use crate::persisted::{decode_session_event_degraded, encode_session_event};
+use crate::persisted::{
+    PersistedSessionEventError, decode_session_event, decode_session_event_degraded,
+    encode_session_event,
+};
 
 use bcode_session_models::{
     RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
@@ -59,9 +62,9 @@ pub enum SessionDbError {
     /// Event serialization failed.
     #[error(transparent)]
     Serialize(#[from] serde_json::Error),
-    /// Persisted event decode failed.
+    /// Strict persisted event decode failed.
     #[error(transparent)]
-    PersistedEvent(#[from] crate::persisted::PersistedSessionEventError),
+    PersistedEvent(#[from] PersistedSessionEventError),
     /// A database row did not contain the expected column/type.
     #[error("invalid session database row: missing or invalid column {column}")]
     InvalidRow { column: String },
@@ -712,7 +715,8 @@ impl SessionDb {
         Ok(first.zip(last))
     }
 
-    /// Return all canonical events in sequence order.
+    /// Return all canonical events in sequence order, skipping unsupported or
+    /// corrupt persisted records for normal user-facing history reads.
     ///
     /// # Errors
     ///
@@ -734,6 +738,32 @@ impl SessionDb {
             }
         }
         Ok(events)
+    }
+
+    /// Return all canonical events in sequence order using strict persisted DTO
+    /// decoding.
+    ///
+    /// Repair, doctor, reindex, and migration flows should use this instead of
+    /// [`Self::all_events`] so damaged records are surfaced rather than skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query or event deserialization fails.
+    pub async fn all_events_strict(&self) -> SessionDbResult<Vec<SessionEvent>> {
+        let rows = self
+            .db
+            .select("events")
+            .columns(&["payload"])
+            .sort("event_seq", SortDirection::Asc)
+            .execute(&**self.db)
+            .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let payload = required_string(&row, "payload")?;
+                Ok(decode_session_event(&payload)?)
+            })
+            .collect()
     }
 
     /// Return a bounded history page from canonical DB events.
