@@ -1620,7 +1620,7 @@ async fn handle_request(
             handle_run_ralph_loop(request_id, state, writer, request).await
         }
         Request::CancelRalphLoop(request) => {
-            handle_cancel_ralph_loop(request_id, writer, request).await
+            Box::pin(handle_cancel_ralph_loop(request_id, state, writer, request)).await
         }
         Request::RalphRunStatus(request) => {
             handle_ralph_run_status(request_id, writer, request).await
@@ -2645,30 +2645,50 @@ async fn run_ralph_runner_skeleton(
 
 async fn handle_cancel_ralph_loop(
     request_id: u64,
+    state: &ServerState,
     writer: &SharedWriter,
     request: RalphCancelRequest,
 ) -> Result<(), ServerError> {
     match resolve_ralph_loop(&request.repo_root, request.loop_state_dir.as_deref())
         .and_then(|summary| resolve_ralph_cancel_target(&summary.state_dir, request.run_id))
-        .and_then(|run| {
-            bcode_ralph::request_run_cancel(&run.run_id).map_err(|error| error.to_string())?;
-            Ok(RalphCancelResponse {
-                run: RalphRunSummary {
+    {
+        Ok(run) => match bcode_ralph::request_run_cancel(&run.run_id) {
+            Ok(()) => {
+                if let Some(session_id) = run
+                    .session_id
+                    .as_deref()
+                    .and_then(|session_id| session_id.parse::<SessionId>().ok())
+                {
+                    let _cancelled =
+                        request_session_turn_cancellation(state, session_id, true, None).await;
+                }
+                let response = RalphCancelResponse {
+                    run: RalphRunSummary {
+                        cancel_requested: true,
+                        updated_at_ms: current_time_ms(),
+                        ..ralph_run_summary(run)
+                    },
                     cancel_requested: true,
-                    updated_at_ms: current_time_ms(),
-                    ..ralph_run_summary(run)
-                },
-                cancel_requested: true,
-            })
-        }) {
-        Ok(response) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::RalphRunCancelled(response)),
-            )
-            .await
-        }
+                };
+                send_response(
+                    writer,
+                    request_id,
+                    Response::Ok(ResponsePayload::RalphRunCancelled(response)),
+                )
+                .await
+            }
+            Err(error) => {
+                send_response(
+                    writer,
+                    request_id,
+                    Response::Err(ErrorResponse::new(
+                        "ralph_run_cancel_failed",
+                        error.to_string(),
+                    )),
+                )
+                .await
+            }
+        },
         Err(error) => {
             send_response(
                 writer,
@@ -4553,14 +4573,12 @@ async fn handle_set_session_agent(
     }
 }
 
-async fn handle_cancel_session_turn(
-    request_id: u64,
+async fn request_session_turn_cancellation(
     state: &ServerState,
-    writer: &SharedWriter,
     session_id: SessionId,
-    client_id: ClientId,
     clear_queue: bool,
-) -> Result<(), ServerError> {
+    requested_by: Option<ClientId>,
+) -> bool {
     let Some(active_session_turn) = state
         .active_session_turns
         .lock()
@@ -4568,12 +4586,7 @@ async fn handle_cancel_session_turn(
         .get(&session_id)
         .cloned()
     else {
-        return send_response(
-            writer,
-            request_id,
-            Response::Ok(ResponsePayload::TurnCancellationRequested { cancelled: false }),
-        )
-        .await;
+        return false;
     };
 
     active_session_turn.cancel_state.cancel();
@@ -4584,25 +4597,20 @@ async fn handle_cancel_session_turn(
         state,
         session_id,
         active_session_turn.turn_id.clone(),
-        Some(client_id),
+        requested_by,
     )
     .await;
     cancel_registered_runtime_work(
         state,
         session_id,
         RuntimeWorkId::new(format!("model_{}", active_session_turn.turn_id)),
-        Some(client_id),
+        requested_by,
     )
     .await;
 
     let active_turn = state.active_turns.lock().await.get(&session_id).cloned();
     let Some(active_turn) = active_turn else {
-        return send_response(
-            writer,
-            request_id,
-            Response::Ok(ResponsePayload::TurnCancellationRequested { cancelled: true }),
-        )
-        .await;
+        return true;
     };
     let request = CancelTurnRequest {
         provider_turn_id: active_turn.provider_turn_id,
@@ -4614,30 +4622,33 @@ async fn handle_cancel_session_turn(
         request,
     )
     .await;
-    match cancel_result {
-        Ok(_) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::TurnCancellationRequested { cancelled: true }),
-            )
-            .await
-        }
-        Err(error) => {
-            append_system_event(
-                state,
-                session_id,
-                format!("provider turn cancellation failed: {error}"),
-            )
-            .await;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::TurnCancellationRequested { cancelled: true }),
-            )
-            .await
-        }
+    if let Err(error) = cancel_result {
+        append_system_event(
+            state,
+            session_id,
+            format!("provider turn cancellation failed: {error}"),
+        )
+        .await;
     }
+    true
+}
+
+async fn handle_cancel_session_turn(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+    client_id: ClientId,
+    clear_queue: bool,
+) -> Result<(), ServerError> {
+    let cancelled =
+        request_session_turn_cancellation(state, session_id, clear_queue, Some(client_id)).await;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::TurnCancellationRequested { cancelled }),
+    )
+    .await
 }
 
 async fn clear_session_command_queue(state: &ServerState, session_id: SessionId) {
