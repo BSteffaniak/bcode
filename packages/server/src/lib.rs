@@ -2284,6 +2284,26 @@ async fn start_ralph_runner(
     Ok(response)
 }
 
+async fn append_ralph_runner_progress(
+    state: &ServerState,
+    session_id: Option<SessionId>,
+    runtime_work_id: &RuntimeWorkId,
+    message: &str,
+    completed_units: u64,
+) {
+    if let Some(session_id) = session_id {
+        append_runtime_work_progress_event(
+            state,
+            session_id,
+            runtime_work_id.clone(),
+            message.to_owned(),
+            Some(completed_units),
+            Some(1),
+        )
+        .await;
+    }
+}
+
 async fn run_ralph_runner_skeleton(state: Arc<ServerState>, run: bcode_ralph::RalphRunRecord) {
     let runtime_session_id = run
         .session_id
@@ -2302,13 +2322,37 @@ async fn run_ralph_runner_skeleton(state: Arc<ServerState>, run: bcode_ralph::Ra
             ),
         )
         .await;
+        append_ralph_runner_progress(
+            &state,
+            runtime_session_id,
+            &runtime_work_id,
+            "Ralph runner skeleton started",
+            0,
+        )
+        .await;
     }
 
     tokio::time::sleep(Duration::from_millis(250)).await;
     let active_run = bcode_ralph::active_run_for_loop(&run.state_dir)
         .ok()
         .flatten();
+    append_ralph_runner_progress(
+        &state,
+        runtime_session_id,
+        &runtime_work_id,
+        "Ralph runner skeleton checking cancellation",
+        0,
+    )
+    .await;
     let (status, message) = if active_run.as_ref().is_some_and(|run| run.cancel_requested) {
+        append_ralph_runner_progress(
+            &state,
+            runtime_session_id,
+            &runtime_work_id,
+            "Ralph runner skeleton observed cancellation",
+            1,
+        )
+        .await;
         let _ = bcode_ralph::update_run_status(
             &run.run_id,
             "stopped",
@@ -2321,6 +2365,14 @@ async fn run_ralph_runner_skeleton(state: Arc<ServerState>, run: bcode_ralph::Ra
             Some("Ralph run cancelled".to_owned()),
         )
     } else {
+        append_ralph_runner_progress(
+            &state,
+            runtime_session_id,
+            &runtime_work_id,
+            "Ralph runner skeleton creating no-op iteration",
+            1,
+        )
+        .await;
         let _iteration = bcode_ralph::create_iteration(bcode_ralph::RalphIterationCreateRequest {
             run_id: run.run_id.clone(),
             state_dir: run.state_dir.clone(),
