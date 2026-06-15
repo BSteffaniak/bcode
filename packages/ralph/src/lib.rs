@@ -993,6 +993,14 @@ pub struct RalphValidationCreateRequest {
     pub command: String,
     /// Initial validation status.
     pub status: String,
+    /// Process exit code, when completed.
+    pub exit_code: Option<i64>,
+    /// Bounded output reference, when retained.
+    pub output_ref: Option<String>,
+    /// Validation finish time, when terminal at creation time.
+    pub finished_at_ms: Option<u64>,
+    /// Error message, when validation failed to run.
+    pub error_message: Option<String>,
 }
 
 /// Persisted Ralph validation command record.
@@ -1320,11 +1328,11 @@ pub fn create_validation(
         iteration_id: request.iteration_id,
         command: request.command,
         status: request.status,
-        exit_code: None,
-        output_ref: None,
+        exit_code: request.exit_code,
+        output_ref: request.output_ref,
         started_at_ms: u64::try_from(now).unwrap_or(u64::MAX),
-        finished_at_ms: None,
-        error_message: None,
+        finished_at_ms: request.finished_at_ms,
+        error_message: request.error_message,
     };
     let persisted = record.clone();
     with_database(move |database| {
@@ -2484,6 +2492,10 @@ mod tests {
             iteration_id: iteration.iteration_id.clone(),
             command: "cargo check -p bcode_ralph".to_owned(),
             status: "queued".to_owned(),
+            exit_code: None,
+            output_ref: None,
+            finished_at_ms: None,
+            error_message: None,
         })
         .expect("validation should persist");
         let validations = list_validations_for_iteration(&iteration.iteration_id)

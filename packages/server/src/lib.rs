@@ -2475,7 +2475,7 @@ async fn record_ralph_skeleton_noop_iteration(
     run: &bcode_ralph::RalphRunRecord,
     work_prompt: String,
     work_completion: Option<ModelTurnCompletion>,
-) {
+) -> Option<bcode_ralph::RalphIterationRecord> {
     let iteration_work_id = RuntimeWorkId::new(format!("ralph:{}:iteration:1", run.run_id));
     register_ralph_runtime_work(
         state,
@@ -2497,7 +2497,7 @@ async fn record_ralph_skeleton_noop_iteration(
     let outcome = work_completion
         .as_ref()
         .map(|completion| completion.outcome);
-    let _iteration = bcode_ralph::create_iteration(bcode_ralph::RalphIterationCreateRequest {
+    let iteration = bcode_ralph::create_iteration(bcode_ralph::RalphIterationCreateRequest {
         run_id: run.run_id.clone(),
         state_dir: run.state_dir.clone(),
         iteration_number: 1,
@@ -2516,6 +2516,88 @@ async fn record_ralph_skeleton_noop_iteration(
         Some("Ralph skeleton no-op iteration recorded".to_owned()),
     )
     .await;
+    iteration.ok()
+}
+struct RalphValidationExecution {
+    status: String,
+    exit_code: Option<i64>,
+    output_ref: Option<String>,
+    error_message: Option<String>,
+}
+
+async fn execute_ralph_validation_command(
+    work_area: PathBuf,
+    command: String,
+) -> RalphValidationExecution {
+    tokio::task::spawn_blocking(move || {
+        let output = Command::new("sh")
+            .arg("-lc")
+            .arg(&command)
+            .current_dir(work_area)
+            .output();
+        match output {
+            Ok(output) => {
+                let exit_code = output.status.code().map(i64::from);
+                let mut combined = String::new();
+                combined.push_str(&String::from_utf8_lossy(&output.stdout));
+                combined.push_str(&String::from_utf8_lossy(&output.stderr));
+                if combined.len() > 8_192 {
+                    combined.truncate(8_192);
+                }
+                RalphValidationExecution {
+                    status: if output.status.success() {
+                        "passed".to_owned()
+                    } else {
+                        "failed".to_owned()
+                    },
+                    exit_code,
+                    output_ref: (!combined.trim().is_empty()).then_some(combined),
+                    error_message: None,
+                }
+            }
+            Err(error) => RalphValidationExecution {
+                status: "error".to_owned(),
+                exit_code: None,
+                output_ref: None,
+                error_message: Some(error.to_string()),
+            },
+        }
+    })
+    .await
+    .unwrap_or_else(|error| RalphValidationExecution {
+        status: "error".to_owned(),
+        exit_code: None,
+        output_ref: None,
+        error_message: Some(error.to_string()),
+    })
+}
+
+async fn run_ralph_iteration_validations(
+    summary: &bcode_ralph::RalphLoopSummary,
+    iteration: &bcode_ralph::RalphIterationRecord,
+) -> bool {
+    let Some(work_area) = summary.work_area_path.clone() else {
+        return true;
+    };
+    let commands = bcode_ralph::list_validation_commands(&summary.state_dir).unwrap_or_default();
+    for command in commands {
+        let execution =
+            execute_ralph_validation_command(work_area.clone(), command.command.clone()).await;
+        let passed = execution.status == "passed";
+        let _ = bcode_ralph::create_validation(bcode_ralph::RalphValidationCreateRequest {
+            iteration_id: iteration.iteration_id.clone(),
+            command: command.command,
+            status: execution.status,
+            exit_code: execution.exit_code,
+            output_ref: execution.output_ref,
+            finished_at_ms: Some(current_time_ms()),
+            error_message: execution.error_message,
+        });
+        if !passed {
+            return false;
+        }
+    }
+    true
 }
 
 async fn finish_ralph_runner_lifecycle(
@@ -2545,6 +2627,34 @@ fn build_ralph_work_prompt(summary: &bcode_ralph::RalphLoopSummary) -> String {
             "Ralph work prompt could not read the progress doc; report this blocker and stop safely. Error: {error}"
         )
     })
+}
+
+async fn complete_ralph_skeleton_after_iteration(
+    summary: &bcode_ralph::RalphLoopSummary,
+    run: &bcode_ralph::RalphRunRecord,
+    iteration: Option<&bcode_ralph::RalphIterationRecord>,
+) -> String {
+    let validation_passed = if let Some(iteration) = iteration {
+        run_ralph_iteration_validations(summary, iteration).await
+    } else {
+        true
+    };
+    let (stop_reason, error_message) = if validation_passed {
+        (
+            "runner_skeleton",
+            "Ralph runner skeleton completed one work turn; loop continuation is not implemented yet",
+        )
+    } else {
+        ("validation_failed", "Ralph validation command failed")
+    };
+    let _ = bcode_ralph::update_run_status(
+        &run.run_id,
+        "blocked",
+        Some(current_time_ms()),
+        Some(stop_reason),
+        Some(error_message),
+    );
+    error_message.to_owned()
 }
 
 async fn run_ralph_runner_skeleton(
@@ -2617,7 +2727,7 @@ async fn run_ralph_runner_skeleton(
             work_prompt.clone(),
         )
         .await;
-        record_ralph_skeleton_noop_iteration(
+        let iteration = record_ralph_skeleton_noop_iteration(
             &state,
             runtime_session_id,
             &runtime_work_id,
@@ -2626,17 +2736,9 @@ async fn run_ralph_runner_skeleton(
             work_completion,
         )
         .await;
-        let _ = bcode_ralph::update_run_status(
-            &run.run_id,
-            "blocked",
-            Some(current_time_ms()),
-            Some("runner_skeleton"),
-            Some("Ralph runner skeleton is wired; model-turn execution is not implemented yet"),
-        );
-        (
-            RuntimeWorkStatus::Failed,
-            Some("Ralph runner skeleton stopped before model-turn execution".to_owned()),
-        )
+        let error_message =
+            complete_ralph_skeleton_after_iteration(&summary, &run, iteration.as_ref()).await;
+        (RuntimeWorkStatus::Failed, Some(error_message))
     };
     finish_ralph_runner_lifecycle(&state, &run, summary.loop_name).await;
     finish_ralph_runtime_work(&state, runtime_session_id, runtime_work_id, status, message).await;
