@@ -2987,11 +2987,26 @@ async fn finish_ralph_runner_lifecycle(
     state: &ServerState,
     run: &bcode_ralph::RalphRunRecord,
     loop_name: String,
+    final_status: RuntimeWorkStatus,
+    final_message: Option<&str>,
 ) {
+    let status_label = match final_status {
+        RuntimeWorkStatus::Completed => "completed",
+        RuntimeWorkStatus::Cancelled => "cancelled",
+        RuntimeWorkStatus::Failed => "blocked",
+        RuntimeWorkStatus::TimedOut => "timed out",
+        RuntimeWorkStatus::Running | RuntimeWorkStatus::Queued | RuntimeWorkStatus::Cancelling => {
+            "stopped"
+        }
+    };
+    let message = final_message.map_or_else(
+        || format!("Ralph autonomous runner {status_label}"),
+        |message| format!("Ralph autonomous runner {status_label}: {message}"),
+    );
     let _ = bcode_ralph::append_lifecycle_event_for_state_dir(
         &run.state_dir,
         bcode_ralph::RalphLifecycleEventKind::RunFinished,
-        "Finished Ralph autonomous runner skeleton",
+        &message,
     );
     append_ralph_session_lifecycle(
         state,
@@ -2999,7 +3014,7 @@ async fn finish_ralph_runner_lifecycle(
         loop_name,
         run.state_dir.clone(),
         "run_finished",
-        "Finished Ralph autonomous runner skeleton",
+        &message,
     )
     .await;
 }
@@ -3500,7 +3515,14 @@ async fn run_ralph_runner_skeleton(
         }
         break (completion.runtime_status, Some(completion.message));
     };
-    finish_ralph_runner_lifecycle(&state, &run, summary.loop_name).await;
+    finish_ralph_runner_lifecycle(
+        &state,
+        &run,
+        summary.loop_name,
+        final_status,
+        final_message.as_deref(),
+    )
+    .await;
     finish_ralph_runtime_work(
         &state,
         runtime_session_id,
