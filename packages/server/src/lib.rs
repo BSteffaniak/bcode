@@ -2454,6 +2454,48 @@ async fn submit_ralph_skeleton_work_turn(
     Some(completion)
 }
 
+async fn submit_ralph_skeleton_audit_turn(
+    state: &Arc<ServerState>,
+    runtime_session_id: Option<SessionId>,
+    parent_work_id: &RuntimeWorkId,
+    run_id: &str,
+    audit_prompt: String,
+) -> Option<ModelTurnCompletion> {
+    let session_id = runtime_session_id?;
+    let audit_turn_id = RuntimeWorkId::new(format!("ralph:{run_id}:audit:1"));
+    register_ralph_runtime_work(
+        state,
+        runtime_session_id,
+        audit_turn_id.clone(),
+        "Ralph audit 1".to_owned(),
+        run_id.to_owned(),
+        Some(parent_work_id.clone()),
+    )
+    .await;
+    append_ralph_runner_progress(
+        state,
+        runtime_session_id,
+        parent_work_id,
+        "Ralph runner skeleton submitting audit turn",
+        1,
+    )
+    .await;
+    let completion = submit_session_model_turn_and_wait(state, session_id, audit_prompt)
+        .await
+        .unwrap_or_else(|error| {
+            ModelTurnCompletion::with_message(ModelTurnOutcome::Error, error.to_string())
+        });
+    finish_ralph_runtime_work(
+        state,
+        runtime_session_id,
+        audit_turn_id,
+        runtime_work_status_from_model_outcome(completion.outcome),
+        completion.message.clone(),
+    )
+    .await;
+    Some(completion)
+}
+
 const fn ralph_iteration_status_from_model_outcome(
     outcome: Option<ModelTurnOutcome>,
 ) -> &'static str {
@@ -2675,8 +2717,31 @@ fn build_ralph_work_prompt(summary: &bcode_ralph::RalphLoopSummary) -> String {
     })
 }
 
+async fn submit_ralph_audit_after_validation(
+    state: &Arc<ServerState>,
+    runtime_session_id: Option<SessionId>,
+    parent_work_id: &RuntimeWorkId,
+    summary: &bcode_ralph::RalphLoopSummary,
+    run: &bcode_ralph::RalphRunRecord,
+) -> Option<ModelTurnCompletion> {
+    let prompt = bcode_ralph::build_prompt(summary, bcode_ralph::RalphPromptKind::Audit)
+        .unwrap_or_else(|error| {
+            format!(
+                "Ralph audit prompt could not read the progress doc; report this blocker and stop safely. Error: {error}"
+            )
+        });
+    submit_ralph_skeleton_audit_turn(
+        state,
+        runtime_session_id,
+        parent_work_id,
+        &run.run_id,
+        prompt,
+    )
+    .await
+}
+
 async fn complete_ralph_skeleton_after_iteration(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     runtime_session_id: Option<SessionId>,
     parent_work_id: &RuntimeWorkId,
     summary: &bcode_ralph::RalphLoopSummary,
@@ -2696,13 +2761,37 @@ async fn complete_ralph_skeleton_after_iteration(
     } else {
         true
     };
-    let (stop_reason, error_message) = if validation_passed {
+    if !validation_passed {
+        let _ = bcode_ralph::update_run_status(
+            &run.run_id,
+            "blocked",
+            Some(current_time_ms()),
+            Some("validation_failed"),
+            Some("Ralph validation command failed"),
+        );
+        return "Ralph validation command failed".to_owned();
+    }
+    let audit_completion = submit_ralph_audit_after_validation(
+        state,
+        runtime_session_id,
+        parent_work_id,
+        summary,
+        run,
+    )
+    .await;
+    let audit_outcome = audit_completion
+        .as_ref()
+        .map(|completion| completion.outcome);
+    let (stop_reason, error_message) = if audit_outcome == Some(ModelTurnOutcome::Completed) {
         (
             "runner_skeleton",
-            "Ralph runner skeleton completed one work turn; loop continuation is not implemented yet",
+            "Ralph runner skeleton completed work, validation, and audit; loop continuation is not implemented yet",
         )
     } else {
-        ("validation_failed", "Ralph validation command failed")
+        (
+            "audit_failed",
+            "Ralph audit turn did not complete successfully",
+        )
     };
     let _ = bcode_ralph::update_run_status(
         &run.run_id,
