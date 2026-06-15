@@ -20,7 +20,7 @@ use bcode_session_models::{
     SessionInputHistoryEntry, SessionSummary,
 };
 use bcode_skill_models::{SkillId, SkillList, SkillManifest};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use thiserror::Error;
 
 /// Grouped runtime-work lifecycle span.
@@ -1465,6 +1465,7 @@ impl BcodeClient {
             stream,
             next_request_id: 1,
             client_id: None,
+            pending_events: VecDeque::new(),
         };
         match connection
             .send_request(Request::Hello {
@@ -1489,6 +1490,7 @@ pub struct ClientConnection {
     stream: LocalIpcStream,
     next_request_id: u64,
     client_id: Option<ClientId>,
+    pending_events: VecDeque<Event>,
 }
 
 impl ClientConnection {
@@ -1740,6 +1742,9 @@ impl ClientConnection {
     ///
     /// Returns an error when the connection closes or the event cannot be decoded.
     pub async fn recv_event(&mut self) -> Result<Event, ClientError> {
+        if let Some(event) = self.pending_events.pop_front() {
+            return Ok(event);
+        }
         loop {
             let envelope = recv_envelope(&mut self.stream).await?;
             if envelope.kind != EnvelopeKind::Event {
@@ -1757,6 +1762,11 @@ impl ClientConnection {
 
         loop {
             let envelope = recv_envelope(&mut self.stream).await?;
+            if envelope.kind == EnvelopeKind::Event {
+                self.pending_events
+                    .push_back(decode(&envelope.payload).map_err(ClientError::from)?);
+                continue;
+            }
             if envelope.kind != EnvelopeKind::Response || envelope.request_id != request_id {
                 continue;
             }
