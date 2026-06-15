@@ -3183,6 +3183,9 @@ async fn apply_ralph_post_audit_decision(
     if decision != bcode_ralph::RalphStopDecision::Continue {
         return ralph_run_terminal_from_decision(decision);
     }
+    if ralph_run_cancel_requested(run) {
+        return ("stopped", "cancelled", "Ralph run cancelled");
+    }
     let replan_completion = submit_ralph_replan_after_audit(
         state,
         runtime_session_id,
@@ -3203,6 +3206,9 @@ async fn apply_ralph_post_audit_decision(
             "Ralph replan turn did not complete successfully",
         );
     }
+    if ralph_run_cancel_requested(run) {
+        return ("stopped", "cancelled", "Ralph run cancelled");
+    }
     if !progress_doc_is_coherent_and_writable(&summary.progress_doc_path) {
         return (
             "blocked",
@@ -3221,6 +3227,30 @@ struct RalphIterationCompletion {
     continue_loop: bool,
     runtime_status: RuntimeWorkStatus,
     message: String,
+}
+
+fn ralph_run_cancel_requested(run: &bcode_ralph::RalphRunRecord) -> bool {
+    bcode_ralph::active_run_for_loop(&run.state_dir)
+        .ok()
+        .flatten()
+        .is_some_and(|active_run| active_run.cancel_requested)
+}
+
+fn ralph_cancelled_iteration_completion(
+    run: &bcode_ralph::RalphRunRecord,
+) -> RalphIterationCompletion {
+    let _ = bcode_ralph::update_run_status(
+        &run.run_id,
+        "stopped",
+        Some(current_time_ms()),
+        Some("cancelled"),
+        None,
+    );
+    RalphIterationCompletion {
+        continue_loop: false,
+        runtime_status: RuntimeWorkStatus::Cancelled,
+        message: "Ralph run cancelled".to_owned(),
+    }
 }
 
 async fn complete_ralph_skeleton_after_iteration(
@@ -3258,6 +3288,9 @@ async fn complete_ralph_skeleton_after_iteration(
             message: "Ralph validation command failed".to_owned(),
         };
     }
+    if ralph_run_cancel_requested(run) {
+        return ralph_cancelled_iteration_completion(run);
+    }
     let audit_completion = submit_ralph_audit_after_validation(
         state,
         runtime_session_id,
@@ -3270,6 +3303,9 @@ async fn complete_ralph_skeleton_after_iteration(
     let audit_outcome = audit_completion
         .as_ref()
         .map(|completion| completion.outcome);
+    if ralph_run_cancel_requested(run) {
+        return ralph_cancelled_iteration_completion(run);
+    }
     let (run_status, stop_reason, error_message): (&str, &str, String) =
         if audit_outcome == Some(ModelTurnOutcome::Completed) {
             let (run_status, stop_reason, error_message) = apply_ralph_post_audit_decision(
@@ -3437,6 +3473,10 @@ async fn run_ralph_runner_skeleton(
                 RuntimeWorkStatus::Failed
             };
             break (runtime_status, Some(error_message));
+        }
+        if ralph_run_cancel_requested(&run) {
+            let completion = ralph_cancelled_iteration_completion(&run);
+            break (completion.runtime_status, Some(completion.message));
         }
         let completion = complete_ralph_skeleton_after_iteration(
             &state,
@@ -12425,6 +12465,34 @@ mod tests {
         assert_eq!(
             ralph_run_failure_from_model_completion("work", &ModelTurnCompletion::completed()),
             None
+        );
+    }
+
+    #[test]
+    fn ralph_cancelled_iteration_completion_persists_stopped_run() {
+        let state_dir = PathBuf::from(format!(
+            "/tmp/bcode-server-ralph-cancel-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let run = bcode_ralph::create_run(bcode_ralph::RalphRunCreateRequest {
+            state_dir: state_dir.clone(),
+            session_id: None,
+            status: "running".to_owned(),
+            requested_max_iterations: Some(1),
+            requested_no_progress_limit: Some(1),
+        })
+        .expect("run should persist");
+        bcode_ralph::request_run_cancel(&run.run_id).expect("cancel should persist");
+        assert!(ralph_run_cancel_requested(&run));
+
+        let completion = ralph_cancelled_iteration_completion(&run);
+
+        assert!(!completion.continue_loop);
+        assert_eq!(completion.runtime_status, RuntimeWorkStatus::Cancelled);
+        assert!(
+            bcode_ralph::active_run_for_loop(&state_dir)
+                .expect("active run query should work")
+                .is_none()
         );
     }
 
