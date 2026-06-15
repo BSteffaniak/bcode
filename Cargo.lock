@@ -1473,6 +1473,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_skill_models",
  "serde",
+ "serde_json",
  "uuid",
 ]
 

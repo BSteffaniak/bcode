@@ -1217,3 +1217,129 @@ pub enum SessionEventKind {
         kind: SessionForkKind,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn semantic_tool_result_json_decodes_current_shapes() {
+        for (payload, expected) in semantic_tool_result_fixtures() {
+            let decoded: ToolInvocationResult =
+                serde_json::from_str(payload).expect("semantic result should decode");
+
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
+    fn tool_call_finished_semantic_result_json_decodes_current_shape() {
+        let payload = serde_json::json!({
+            "tool_call_finished": {
+                "tool_call_id": "call-1",
+                "result": "tool result",
+                "is_error": false,
+                "semantic_result": {
+                    "type": "shell_run",
+                    "result": {
+                        "mode": "terminal",
+                        "exit_code": 0,
+                        "timed_out": false,
+                        "cancelled": false,
+                        "output_tail": "hello\n",
+                        "output_truncated": false,
+                        "output_bytes": 6,
+                        "retained_output_bytes": 6,
+                        "columns": 120,
+                        "rows": 30
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let decoded: SessionEventKind =
+            serde_json::from_str(&payload).expect("tool call finished event kind should decode");
+
+        let SessionEventKind::ToolCallFinished {
+            semantic_result: Some(ToolInvocationResult::ShellRun { result }),
+            ..
+        } = decoded
+        else {
+            panic!("expected shell semantic result");
+        };
+        assert_eq!(
+            result,
+            ShellRunResult::Terminal {
+                exit_code: Some(0),
+                timed_out: false,
+                cancelled: false,
+                output_tail: "hello\n".to_string(),
+                output_truncated: false,
+                output_bytes: Some(6),
+                retained_output_bytes: Some(6),
+                columns: 120,
+                rows: 30,
+            }
+        );
+    }
+
+    fn semantic_tool_result_fixtures() -> Vec<(&'static str, ToolInvocationResult)> {
+        vec![
+            (
+                r#"{"type":"text","text":"plain text"}"#,
+                ToolInvocationResult::Text {
+                    text: "plain text".to_string(),
+                },
+            ),
+            (
+                r#"{"type":"json","value":"{\"ok\":true}"}"#,
+                ToolInvocationResult::Json {
+                    value: r#"{"ok":true}"#.to_string(),
+                },
+            ),
+            (
+                r#"{"type":"file_change","result":{"tool_name":"filesystem.write","summary":"wrote 171 bytes","path":"/tmp/hello.txt"}}"#,
+                ToolInvocationResult::FileChange {
+                    result: FileChangeResult {
+                        tool_name: "filesystem.write".to_string(),
+                        summary: "wrote 171 bytes".to_string(),
+                        path: Some("/tmp/hello.txt".to_string()),
+                    },
+                },
+            ),
+            (
+                r#"{"type":"shell_run","result":{"mode":"terminal","exit_code":0,"timed_out":false,"cancelled":false,"output_tail":"hello\n","output_truncated":false,"output_bytes":6,"retained_output_bytes":6,"columns":120,"rows":30}}"#,
+                ToolInvocationResult::ShellRun {
+                    result: ShellRunResult::Terminal {
+                        exit_code: Some(0),
+                        timed_out: false,
+                        cancelled: false,
+                        output_tail: "hello\n".to_string(),
+                        output_truncated: false,
+                        output_bytes: Some(6),
+                        retained_output_bytes: Some(6),
+                        columns: 120,
+                        rows: 30,
+                    },
+                },
+            ),
+            (
+                r#"{"type":"shell_run","result":{"mode":"captured","exit_code":0,"timed_out":false,"cancelled":false,"stdout":"hello\n","stderr":"","stdout_truncated":false,"stderr_truncated":false,"stdout_bytes":6,"stderr_bytes":0}}"#,
+                ToolInvocationResult::ShellRun {
+                    result: ShellRunResult::Captured {
+                        exit_code: Some(0),
+                        timed_out: false,
+                        cancelled: false,
+                        stdout: "hello\n".to_string(),
+                        stderr: String::new(),
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        stdout_bytes: Some(6),
+                        stderr_bytes: Some(0),
+                    },
+                },
+            ),
+        ]
+    }
+}
