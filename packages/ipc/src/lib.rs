@@ -695,6 +695,9 @@ pub struct RalphRunSummary {
     /// Work-area session used by the runner, when known.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Parent runtime-work ID emitted for this run.
+    #[serde(default)]
+    pub runtime_work_id: Option<String>,
     /// Current run status.
     pub status: String,
     /// Requested max iteration override.

@@ -3805,10 +3805,12 @@ fn ralph_status_summary(summary: bcode_ralph::RalphLoopSummary) -> RalphStatusSu
 }
 
 fn ralph_run_summary(run: bcode_ralph::RalphRunRecord) -> RalphRunSummary {
+    let runtime_work_id = Some(format!("ralph:{}", run.run_id));
     RalphRunSummary {
         run_id: run.run_id,
         state_dir: run.state_dir,
         session_id: run.session_id,
+        runtime_work_id,
         status: run.status,
         requested_max_iterations: run.requested_max_iterations,
         requested_no_progress_limit: run.requested_no_progress_limit,

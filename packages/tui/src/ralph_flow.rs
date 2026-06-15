@@ -263,9 +263,12 @@ fn format_status_note(
         || "none".to_owned(),
         |run| {
             format!(
-                "{} ({}){}{}",
+                "{} ({}){}{}{}",
                 run.run_id,
                 run.status,
+                run.runtime_work_id
+                    .as_deref()
+                    .map_or_else(String::new, |work_id| format!(", work: {work_id}")),
                 run.stop_reason
                     .as_deref()
                     .map_or_else(String::new, |reason| format!(", stop: {reason}")),
