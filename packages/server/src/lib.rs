@@ -12549,6 +12549,100 @@ mod tests {
         assert_eq!(failure.1, "permission_denied");
     }
 
+    #[tokio::test]
+    async fn ralph_runtime_work_events_are_appended_to_session_history() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("test".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        let _attachment = sessions
+            .attach_session(session_id, ClientId::new())
+            .await
+            .expect("session should attach");
+        let state = test_server_state(sessions);
+        let work_id = RuntimeWorkId::new("ralph:test-run");
+
+        register_ralph_runtime_work(
+            &state,
+            Some(session_id),
+            work_id.clone(),
+            "Ralph loop: test".to_owned(),
+            "test-run".to_owned(),
+            None,
+        )
+        .await;
+        finish_ralph_runtime_work(
+            &state,
+            Some(session_id),
+            work_id.clone(),
+            RuntimeWorkStatus::Completed,
+            Some("done".to_owned()),
+        )
+        .await;
+
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::RuntimeWorkStarted { work_id: id, label, .. }
+                if id == &work_id && label == "Ralph loop: test"
+        )));
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::RuntimeWorkFinished { work_id: id, status, message, .. }
+                if id == &work_id
+                    && *status == RuntimeWorkStatus::Completed
+                    && message.as_deref() == Some("done")
+        )));
+    }
+
+    #[tokio::test]
+    async fn ralph_session_lifecycle_markers_are_appended() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("test".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        let state = test_server_state(sessions);
+        let state_dir = PathBuf::from("/tmp/bcode-server-ralph-lifecycle");
+        let session_id_text = session_id.to_string();
+
+        append_ralph_session_lifecycle(
+            &state,
+            Some(session_id_text.as_str()),
+            "test-loop".to_owned(),
+            state_dir.clone(),
+            "run_finished",
+            "Ralph autonomous runner completed",
+        )
+        .await;
+
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::RalphLifecycle {
+                loop_name,
+                state_dir: event_state_dir,
+                kind,
+                message,
+                ..
+            } if loop_name == "test-loop"
+                && event_state_dir == &state_dir
+                && kind == "run_finished"
+                && message == "Ralph autonomous runner completed"
+        )));
+    }
+
     fn ralph_iteration_with_fingerprints(
         iteration_number: u64,
         before: Option<String>,
