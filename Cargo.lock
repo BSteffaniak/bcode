@@ -1411,6 +1411,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_ralph_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_plugin_sdk",
+ "bcode_ralph",
+ "bmux_keyboard",
+ "bmux_tui",
+ "serde_json",
+]
+
+[[package]]
 name = "bcode_server"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -1568,6 +1579,7 @@ dependencies = [
  "bcode_plugin_sdk",
  "bcode_provider_auth",
  "bcode_ralph",
+ "bcode_ralph_plugin",
  "bcode_session_models",
  "bcode_skill_models",
  "bcode_syntax_render",

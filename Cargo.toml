@@ -4,6 +4,7 @@ members = [
     "plugins/filesystem-plugin",
     "plugins/git-plugin",
     "plugins/code-review-plugin",
+    "plugins/ralph-plugin",
     "plugins/github-review-publisher-plugin",
     "plugins/document-plugin",
     "plugins/bedrock-provider-plugin",
@@ -90,6 +91,7 @@ bcode_plugin                            = { version = "0.0.1-alpha.0", default-f
 bcode_plugin_sdk                        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-sdk" }
 bcode_provider_auth                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/provider-auth" }
 bcode_ralph                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ralph" }
+bcode_ralph_plugin                      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/ralph-plugin" }
 bcode_server                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/server" }
 bcode_session                           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session" }
 bcode_session_import                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-import" }

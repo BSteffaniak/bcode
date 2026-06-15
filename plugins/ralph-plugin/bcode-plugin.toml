@@ -1,0 +1,21 @@
+id      = "bcode.ralph"
+name    = "Bcode Ralph Plugin"
+version = "0.0.1"
+
+[config]
+section = "ralph"
+
+[[tui_surfaces]]
+description = "Full-screen Ralph loop status and command home UI"
+kind        = "ralph-home"
+title       = "Ralph"
+
+[concurrency]
+max  = 1
+type = "limited"
+
+[runtime]
+abi_version  = 1
+event_symbol = "bcode_plugin_handle_event_v1"
+library      = "libbcode_ralph_plugin.dylib"
+type         = "native"

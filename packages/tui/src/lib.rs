@@ -133,6 +133,11 @@ pub fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
             include_str!("../../../plugins/code-review-plugin/bcode-plugin.toml"),
             bcode_code_review_plugin::static_plugin(),
         ),
+        #[cfg(feature = "static-bundled-ralph-plugin")]
+        bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/ralph-plugin/bcode-plugin.toml"),
+            bcode_ralph_plugin::static_plugin(),
+        ),
     ]
 }
 

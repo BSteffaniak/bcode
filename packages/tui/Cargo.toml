@@ -25,6 +25,7 @@ bcode_plugin             = { workspace = true }
 bcode_plugin_sdk         = { workspace = true }
 bcode_provider_auth      = { workspace = true }
 bcode_ralph              = { workspace = true }
+bcode_ralph_plugin       = { workspace = true }
 bcode_session_models     = { workspace = true }
 bcode_skill_models       = { workspace = true }
 bcode_syntax_render      = { workspace = true }
@@ -48,3 +49,4 @@ uuid                     = { workspace = true, features = ["v4"] }
 default                           = []
 fail-on-warnings                  = []
 static-bundled-code-review-plugin = ["bcode_code_review_plugin/static-bundled"]
+static-bundled-ralph-plugin       = ["bcode_ralph_plugin/static-bundled"]

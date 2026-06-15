@@ -1,0 +1,26 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Bundled Ralph TUI plugin for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "ralph", "tui", "plugin"]
+license     = { workspace = true }
+name        = "bcode_ralph_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bcode_plugin_sdk = { workspace = true }
+bcode_ralph      = { workspace = true }
+bmux_keyboard    = { workspace = true }
+bmux_tui         = { workspace = true, features = ["crossterm"] }
+serde_json       = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
+static-bundled   = []
