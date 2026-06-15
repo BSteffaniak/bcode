@@ -79,7 +79,12 @@ pub const MAX_FRAME_PAYLOAD_SIZE: usize = 1_048_576;
 const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 
 /// Current Bcode IPC protocol version.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 2;
+///
+/// Same-build client/server compatibility is expected. Bump this when IPC DTO
+/// enum layouts or envelope payload shapes change incompatibly so stale
+/// client/daemon pairs fail explicitly during envelope decode instead of
+/// interpreting payloads with mismatched positional layouts.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 3;
 
 /// Build-scoped daemon fingerprint generated at compile time.
 pub const BUILD_FINGERPRINT: &str = env!("BCODE_BUILD_FINGERPRINT");
@@ -2864,7 +2869,7 @@ mod tests {
             .expect("response envelope should encode");
 
         assert_eq!(envelope.version, ProtocolVersion::current());
-        assert_eq!(ProtocolVersion::current().0, 2);
+        assert_eq!(ProtocolVersion::current().0, 3);
     }
 
     #[tokio::test]
@@ -2894,7 +2899,7 @@ mod tests {
             error,
             CodecError::UnsupportedVersion {
                 actual: 1,
-                expected: 2
+                expected: 3
             }
         ));
     }
