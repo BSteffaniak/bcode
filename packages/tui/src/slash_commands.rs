@@ -309,6 +309,17 @@ fn list_or_default(values: &[String]) -> String {
     }
 }
 
+fn goal_command(parts: &[&str]) -> SlashCommandOutcome {
+    let mut ralph_parts = Vec::with_capacity(parts.len().max(2));
+    ralph_parts.push("/ralph");
+    if parts.len() == 1 {
+        ralph_parts.push("start");
+    } else {
+        ralph_parts.extend(parts.iter().skip(1).copied());
+    }
+    ralph_command(&ralph_parts)
+}
+
 async fn cwd_command(
     client: &BcodeClient,
     session_id: SessionId,
@@ -659,6 +670,7 @@ pub async fn execute(
             })
         }
         "ralph" => Ok(ralph_command(&parts)),
+        "goal" => Ok(goal_command(&parts)),
         "skills" => Ok(SlashCommandOutcome::PickSkill),
         "skill" => {
             if parts.get(1) == Some(&"describe") {
@@ -784,6 +796,26 @@ mod tests {
         assert_eq!(
             ralph_command(&["/ralph", "resume"]),
             SlashCommandOutcome::ResumeRalphRun
+        );
+    }
+
+    #[test]
+    fn goal_alias_routes_to_ralph_workflow() {
+        assert_eq!(
+            goal_command(&["/goal"]),
+            SlashCommandOutcome::OpenRalphStartDialog
+        );
+        assert_eq!(
+            goal_command(&["/goal", "run"]),
+            SlashCommandOutcome::RunRalphLoop
+        );
+        assert_eq!(
+            goal_command(&["/goal", "approve"]),
+            SlashCommandOutcome::ApproveRalphRun
+        );
+        assert_eq!(
+            goal_command(&["/goal", "status"]),
+            SlashCommandOutcome::ShowRalphStatus
         );
     }
 
