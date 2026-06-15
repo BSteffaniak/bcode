@@ -372,7 +372,7 @@ enum PersistedSessionEventKind {
 }
 
 impl From<&SessionEventKind> for PersistedSessionEventKind {
-    #[allow(clippy::too_many_lines, clippy::clone_on_copy)]
+    #[allow(clippy::too_many_lines)]
     fn from(value: &SessionEventKind) -> Self {
         match value {
             SessionEventKind::SessionCreated {
@@ -383,13 +383,13 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 working_directory: working_directory.clone(),
             },
             SessionEventKind::ClientAttached { client_id } => Self::ClientAttached {
-                client_id: client_id.clone(),
+                client_id: *client_id,
             },
             SessionEventKind::ClientDetached { client_id } => Self::ClientDetached {
-                client_id: client_id.clone(),
+                client_id: *client_id,
             },
             SessionEventKind::UserMessage { client_id, text } => Self::UserMessage {
-                client_id: client_id.clone(),
+                client_id: *client_id,
                 text: text.clone(),
             },
             SessionEventKind::AssistantDelta { text } => {
@@ -416,7 +416,7 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
             } => Self::ToolCallFinished {
                 tool_call_id: tool_call_id.clone(),
                 result: result.clone(),
-                is_error: is_error.clone(),
+                is_error: *is_error,
                 output: output.clone(),
                 semantic_result: semantic_result
                     .as_ref()
@@ -438,7 +438,7 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 approved,
             } => Self::PermissionResolved {
                 permission_id: permission_id.clone(),
-                approved: approved.clone(),
+                approved: *approved,
             },
             SessionEventKind::ModelChanged { provider, model } => Self::ModelChanged {
                 provider: provider.clone(),
@@ -457,7 +457,7 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 message,
             } => Self::ModelTurnFinished {
                 turn_id: turn_id.clone(),
-                outcome: outcome.clone(),
+                outcome: *outcome,
                 message: message.clone(),
             },
             SessionEventKind::ModelUsage { turn_id, usage } => Self::ModelUsage {
@@ -469,7 +469,7 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 compacted_through_sequence,
             } => Self::ContextCompacted {
                 summary: summary.clone(),
-                compacted_through_sequence: compacted_through_sequence.clone(),
+                compacted_through_sequence: *compacted_through_sequence,
             },
             SessionEventKind::SessionRenamed { name } => {
                 Self::SessionRenamed { name: name.clone() }
@@ -486,7 +486,7 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 skill_id: skill_id.clone(),
                 arguments: arguments.clone(),
                 source: source.clone(),
-                invoked_at_ms: invoked_at_ms.clone(),
+                invoked_at_ms: *invoked_at_ms,
             },
             SessionEventKind::SkillSuggested {
                 skill_id,
@@ -495,7 +495,7 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
             } => Self::SkillSuggested {
                 skill_id: skill_id.clone(),
                 reason: reason.clone(),
-                suggested_at_ms: suggested_at_ms.clone(),
+                suggested_at_ms: *suggested_at_ms,
             },
             SessionEventKind::SkillActivated {
                 skill_id,
@@ -505,15 +505,15 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
             } => Self::SkillActivated {
                 skill_id: skill_id.clone(),
                 source: source.clone(),
-                mode: mode.clone(),
-                activated_at_ms: activated_at_ms.clone(),
+                mode: *mode,
+                activated_at_ms: *activated_at_ms,
             },
             SessionEventKind::SkillDeactivated {
                 skill_id,
                 deactivated_at_ms,
             } => Self::SkillDeactivated {
                 skill_id: skill_id.clone(),
-                deactivated_at_ms: deactivated_at_ms.clone(),
+                deactivated_at_ms: *deactivated_at_ms,
             },
             SessionEventKind::SkillContextLoaded {
                 skill_id,
@@ -522,9 +522,9 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 loaded_at_ms,
             } => Self::SkillContextLoaded {
                 skill_id: skill_id.clone(),
-                bytes_loaded: bytes_loaded.clone(),
-                truncated: truncated.clone(),
-                loaded_at_ms: loaded_at_ms.clone(),
+                bytes_loaded: *bytes_loaded,
+                truncated: *truncated,
+                loaded_at_ms: *loaded_at_ms,
             },
             SessionEventKind::SkillInvocationFailed {
                 skill_id,
@@ -533,7 +533,7 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
             } => Self::SkillInvocationFailed {
                 skill_id: skill_id.clone(),
                 error: error.clone(),
-                failed_at_ms: failed_at_ms.clone(),
+                failed_at_ms: *failed_at_ms,
             },
             SessionEventKind::AssistantReasoningDelta { text } => {
                 Self::AssistantReasoningDelta { text: text.clone() }
@@ -554,15 +554,15 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 cancellable,
             } => Self::RuntimeWorkStarted {
                 work_id: work_id.clone(),
-                kind: kind.clone(),
+                kind: *kind,
                 label: label.clone(),
                 tool_call_id: tool_call_id.clone(),
                 plugin_id: plugin_id.clone(),
                 service_interface: service_interface.clone(),
                 operation: operation.clone(),
                 parent_work_id: parent_work_id.clone(),
-                started_at_ms: started_at_ms.clone(),
-                cancellable: cancellable.clone(),
+                started_at_ms: *started_at_ms,
+                cancellable: *cancellable,
             },
             SessionEventKind::RuntimeWorkCancelRequested {
                 work_id,
@@ -570,8 +570,8 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 client_id,
             } => Self::RuntimeWorkCancelRequested {
                 work_id: work_id.clone(),
-                requested_at_ms: requested_at_ms.clone(),
-                client_id: client_id.clone(),
+                requested_at_ms: *requested_at_ms,
+                client_id: *client_id,
             },
             SessionEventKind::RuntimeWorkFinished {
                 work_id,
@@ -580,8 +580,8 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 message,
             } => Self::RuntimeWorkFinished {
                 work_id: work_id.clone(),
-                status: status.clone(),
-                finished_at_ms: finished_at_ms.clone(),
+                status: *status,
+                finished_at_ms: *finished_at_ms,
                 message: message.clone(),
             },
             SessionEventKind::RuntimeWorkProgress {
@@ -593,9 +593,9 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
             } => Self::RuntimeWorkProgress {
                 work_id: work_id.clone(),
                 message: message.clone(),
-                progress_at_ms: progress_at_ms.clone(),
-                completed_units: completed_units.clone(),
-                total_units: total_units.clone(),
+                progress_at_ms: *progress_at_ms,
+                completed_units: *completed_units,
+                total_units: *total_units,
             },
             SessionEventKind::ModelTurnCancelRequested {
                 turn_id,
@@ -603,8 +603,8 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 client_id,
             } => Self::ModelTurnCancelRequested {
                 turn_id: turn_id.clone(),
-                requested_at_ms: requested_at_ms.clone(),
-                client_id: client_id.clone(),
+                requested_at_ms: *requested_at_ms,
+                client_id: *client_id,
             },
             SessionEventKind::ToolInvocationStream { event } => Self::ToolInvocationStream {
                 event: event.clone(),
@@ -625,7 +625,7 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 source_id: source_id.clone(),
                 source_display_name: source_display_name.clone(),
                 external_session_id: external_session_id.clone(),
-                imported_at_ms: imported_at_ms.clone(),
+                imported_at_ms: *imported_at_ms,
             },
             SessionEventKind::ToolInvocationPresentation {
                 tool_call_id,
@@ -635,9 +635,9 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 presentation,
             } => Self::ToolInvocationPresentation {
                 tool_call_id: tool_call_id.clone(),
-                started_at_ms: started_at_ms.clone(),
-                finished_at_ms: finished_at_ms.clone(),
-                is_error: is_error.clone(),
+                started_at_ms: *started_at_ms,
+                finished_at_ms: *finished_at_ms,
+                is_error: *is_error,
                 presentation: presentation.clone(),
             },
             SessionEventKind::SessionForked {
@@ -648,12 +648,12 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 forked_at_ms,
                 kind,
             } => Self::SessionForked {
-                source_session_id: source_session_id.clone(),
+                source_session_id: *source_session_id,
                 source_title: source_title.clone(),
-                source_cutoff_sequence: source_cutoff_sequence.clone(),
-                source_prompt_sequence: source_prompt_sequence.clone(),
-                forked_at_ms: forked_at_ms.clone(),
-                kind: kind.clone(),
+                source_cutoff_sequence: *source_cutoff_sequence,
+                source_prompt_sequence: *source_prompt_sequence,
+                forked_at_ms: *forked_at_ms,
+                kind: *kind,
             },
         }
     }
