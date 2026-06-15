@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn decodes_current_and_legacy_persisted_tool_results() {
         for (semantic_result, assertion) in semantic_result_cases() {
-            let event = decode_session_event(&event_payload(semantic_result))
+            let event = decode_session_event(&event_payload(&semantic_result))
                 .expect("persisted event should decode");
 
             assertion(event);
@@ -356,7 +356,7 @@ mod tests {
         ]
     }
 
-    fn event_payload(semantic_result: serde_json::Value) -> String {
+    fn event_payload(semantic_result: &serde_json::Value) -> String {
         serde_json::json!({
             "schema_version": CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             "sequence": 1,
@@ -366,7 +366,7 @@ mod tests {
                 "tool_call_finished": {
                     "tool_call_id": "call-1",
                     "result": "legacy",
-                    "semantic_result": semantic_result
+                    "semantic_result": semantic_result.clone()
                 }
             }
         })
