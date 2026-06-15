@@ -386,6 +386,52 @@ pub fn latest_loop(repo_root: &Path) -> Result<Option<RalphLoopSummary>, RalphSt
     Ok(db_summary)
 }
 
+const RALPH_RUN_COLUMNS: [&str; 12] = [
+    "run_id",
+    "state_dir",
+    "session_id",
+    "status",
+    "requested_max_iterations",
+    "requested_no_progress_limit",
+    "cancel_requested",
+    "started_at_ms",
+    "updated_at_ms",
+    "finished_at_ms",
+    "stop_reason",
+    "error_message",
+];
+
+const RALPH_ITERATION_COLUMNS: [&str; 16] = [
+    "iteration_id",
+    "run_id",
+    "state_dir",
+    "iteration_number",
+    "status",
+    "checklist_fingerprint_before",
+    "checklist_fingerprint_after",
+    "work_prompt",
+    "audit_prompt",
+    "replan_prompt",
+    "validation_status",
+    "validation_summary",
+    "started_at_ms",
+    "finished_at_ms",
+    "stop_reason",
+    "error_message",
+];
+
+const RALPH_VALIDATION_COLUMNS: [&str; 9] = [
+    "validation_id",
+    "iteration_id",
+    "command",
+    "status",
+    "exit_code",
+    "output_ref",
+    "started_at_ms",
+    "finished_at_ms",
+    "error_message",
+];
+
 fn summary_from_loop_row(row: &Row) -> Result<RalphLoopSummary, RalphStateError> {
     let progress_doc_path = PathBuf::from(required_text(row, "progress_doc_path")?);
     let checklist_summary = if progress_doc_path.exists() {
@@ -442,6 +488,83 @@ fn required_i64(row: &Row, column: &'static str) -> Result<i64, RalphStateError>
     row.get(column)
         .and_then(|value| value.as_i64())
         .ok_or(RalphStateError::MissingColumn(column))
+}
+
+fn optional_i64(row: &Row, column: &'static str) -> Option<i64> {
+    row.get(column).and_then(|value| value.as_i64())
+}
+
+fn required_bool(row: &Row, column: &'static str) -> Result<bool, RalphStateError> {
+    Ok(required_i64(row, column)? != 0)
+}
+
+fn optional_u64(row: &Row, column: &'static str) -> Option<u64> {
+    optional_i64(row, column).map(i64_to_u64)
+}
+
+fn is_active_run_status(status: &str) -> bool {
+    matches!(
+        status,
+        "awaiting_approval"
+            | "queued"
+            | "running"
+            | "working"
+            | "validating"
+            | "auditing"
+            | "replanning"
+    )
+}
+
+fn run_record_from_row(row: &Row) -> Result<RalphRunRecord, RalphStateError> {
+    Ok(RalphRunRecord {
+        run_id: required_text(row, "run_id")?,
+        state_dir: PathBuf::from(required_text(row, "state_dir")?),
+        session_id: optional_text(row, "session_id"),
+        status: required_text(row, "status")?,
+        requested_max_iterations: optional_u64(row, "requested_max_iterations"),
+        requested_no_progress_limit: optional_u64(row, "requested_no_progress_limit"),
+        cancel_requested: required_bool(row, "cancel_requested")?,
+        started_at_ms: i64_to_u64(required_i64(row, "started_at_ms")?),
+        updated_at_ms: i64_to_u64(required_i64(row, "updated_at_ms")?),
+        finished_at_ms: optional_u64(row, "finished_at_ms"),
+        stop_reason: optional_text(row, "stop_reason"),
+        error_message: optional_text(row, "error_message"),
+    })
+}
+
+fn iteration_record_from_row(row: &Row) -> Result<RalphIterationRecord, RalphStateError> {
+    Ok(RalphIterationRecord {
+        iteration_id: required_text(row, "iteration_id")?,
+        run_id: required_text(row, "run_id")?,
+        state_dir: PathBuf::from(required_text(row, "state_dir")?),
+        iteration_number: i64_to_u64(required_i64(row, "iteration_number")?),
+        status: required_text(row, "status")?,
+        checklist_fingerprint_before: optional_text(row, "checklist_fingerprint_before"),
+        checklist_fingerprint_after: optional_text(row, "checklist_fingerprint_after"),
+        work_prompt: optional_text(row, "work_prompt"),
+        audit_prompt: optional_text(row, "audit_prompt"),
+        replan_prompt: optional_text(row, "replan_prompt"),
+        validation_status: optional_text(row, "validation_status"),
+        validation_summary: optional_text(row, "validation_summary"),
+        started_at_ms: i64_to_u64(required_i64(row, "started_at_ms")?),
+        finished_at_ms: optional_u64(row, "finished_at_ms"),
+        stop_reason: optional_text(row, "stop_reason"),
+        error_message: optional_text(row, "error_message"),
+    })
+}
+
+fn validation_record_from_row(row: &Row) -> Result<RalphValidationRecord, RalphStateError> {
+    Ok(RalphValidationRecord {
+        validation_id: required_text(row, "validation_id")?,
+        iteration_id: required_text(row, "iteration_id")?,
+        command: required_text(row, "command")?,
+        status: required_text(row, "status")?,
+        exit_code: optional_i64(row, "exit_code"),
+        output_ref: optional_text(row, "output_ref"),
+        started_at_ms: i64_to_u64(required_i64(row, "started_at_ms")?),
+        finished_at_ms: optional_u64(row, "finished_at_ms"),
+        error_message: optional_text(row, "error_message"),
+    })
 }
 
 fn i64_to_u64(value: i64) -> u64 {
@@ -614,6 +737,339 @@ pub fn list_lifecycle_events(
                 .collect::<Result<Vec<_>, _>>()?;
             events.sort_by(|left, right| left.occurred_at_ms.cmp(&right.occurred_at_ms));
             Ok(events)
+        })
+    })
+}
+
+/// Request used to create a persisted Ralph autonomous run record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RalphRunCreateRequest {
+    /// Loop state directory this run belongs to.
+    pub state_dir: PathBuf,
+    /// Work-area session used by the runner, when known.
+    pub session_id: Option<String>,
+    /// Initial run status.
+    pub status: String,
+    /// Requested max iteration override.
+    pub requested_max_iterations: Option<u64>,
+    /// Requested no-progress limit override.
+    pub requested_no_progress_limit: Option<u64>,
+}
+
+/// Persisted Ralph autonomous run record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RalphRunRecord {
+    /// Run ID.
+    pub run_id: String,
+    /// Loop state directory this run belongs to.
+    pub state_dir: PathBuf,
+    /// Work-area session used by the runner, when known.
+    pub session_id: Option<String>,
+    /// Current run status.
+    pub status: String,
+    /// Requested max iteration override.
+    pub requested_max_iterations: Option<u64>,
+    /// Requested no-progress limit override.
+    pub requested_no_progress_limit: Option<u64>,
+    /// Whether cancellation was requested.
+    pub cancel_requested: bool,
+    /// Run start time in Unix epoch milliseconds.
+    pub started_at_ms: u64,
+    /// Last update time in Unix epoch milliseconds.
+    pub updated_at_ms: u64,
+    /// Run finish time in Unix epoch milliseconds.
+    pub finished_at_ms: Option<u64>,
+    /// Terminal stop reason, when known.
+    pub stop_reason: Option<String>,
+    /// Terminal error message, when known.
+    pub error_message: Option<String>,
+}
+
+/// Request used to create a persisted Ralph iteration record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RalphIterationCreateRequest {
+    /// Parent run ID.
+    pub run_id: String,
+    /// Loop state directory this iteration belongs to.
+    pub state_dir: PathBuf,
+    /// One-based iteration number.
+    pub iteration_number: u64,
+    /// Initial iteration status.
+    pub status: String,
+    /// Checklist fingerprint before the work turn.
+    pub checklist_fingerprint_before: Option<String>,
+    /// Work prompt submitted for this iteration.
+    pub work_prompt: Option<String>,
+}
+
+/// Persisted Ralph iteration record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RalphIterationRecord {
+    /// Iteration ID.
+    pub iteration_id: String,
+    /// Parent run ID.
+    pub run_id: String,
+    /// Loop state directory this iteration belongs to.
+    pub state_dir: PathBuf,
+    /// One-based iteration number.
+    pub iteration_number: u64,
+    /// Current iteration status.
+    pub status: String,
+    /// Checklist fingerprint before the work turn.
+    pub checklist_fingerprint_before: Option<String>,
+    /// Checklist fingerprint after the work turn/audit.
+    pub checklist_fingerprint_after: Option<String>,
+    /// Work prompt submitted for this iteration.
+    pub work_prompt: Option<String>,
+    /// Audit prompt submitted for this iteration.
+    pub audit_prompt: Option<String>,
+    /// Replan prompt submitted for this iteration.
+    pub replan_prompt: Option<String>,
+    /// Validation status summary for this iteration.
+    pub validation_status: Option<String>,
+    /// Human-readable validation summary.
+    pub validation_summary: Option<String>,
+    /// Iteration start time in Unix epoch milliseconds.
+    pub started_at_ms: u64,
+    /// Iteration finish time in Unix epoch milliseconds.
+    pub finished_at_ms: Option<u64>,
+    /// Terminal stop reason, when known.
+    pub stop_reason: Option<String>,
+    /// Terminal error message, when known.
+    pub error_message: Option<String>,
+}
+
+/// Request used to create a persisted Ralph validation command record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RalphValidationCreateRequest {
+    /// Parent iteration ID.
+    pub iteration_id: String,
+    /// Validation command.
+    pub command: String,
+    /// Initial validation status.
+    pub status: String,
+}
+
+/// Persisted Ralph validation command record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RalphValidationRecord {
+    /// Validation ID.
+    pub validation_id: String,
+    /// Parent iteration ID.
+    pub iteration_id: String,
+    /// Validation command.
+    pub command: String,
+    /// Current validation status.
+    pub status: String,
+    /// Process exit code, when completed.
+    pub exit_code: Option<i64>,
+    /// Bounded output reference, when retained.
+    pub output_ref: Option<String>,
+    /// Validation start time in Unix epoch milliseconds.
+    pub started_at_ms: u64,
+    /// Validation finish time in Unix epoch milliseconds.
+    pub finished_at_ms: Option<u64>,
+    /// Error message, when validation failed to run.
+    pub error_message: Option<String>,
+}
+
+/// Create a persisted Ralph run record.
+///
+/// # Errors
+///
+/// Returns an error when the Ralph database cannot be opened, migrated, or written.
+pub fn create_run(request: RalphRunCreateRequest) -> Result<RalphRunRecord, RalphStateError> {
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let now = now_ms();
+    let record = RalphRunRecord {
+        run_id,
+        state_dir: request.state_dir,
+        session_id: request.session_id,
+        status: request.status,
+        requested_max_iterations: request.requested_max_iterations,
+        requested_no_progress_limit: request.requested_no_progress_limit,
+        cancel_requested: false,
+        started_at_ms: u64::try_from(now).unwrap_or(u64::MAX),
+        updated_at_ms: u64::try_from(now).unwrap_or(u64::MAX),
+        finished_at_ms: None,
+        stop_reason: None,
+        error_message: None,
+    };
+    let persisted = record.clone();
+    with_database(move |database| {
+        Box::pin(async move {
+            insert_run_record(database, &persisted).await?;
+            Ok(())
+        })
+    })?;
+    Ok(record)
+}
+
+/// Return the active Ralph run for a loop, if one exists.
+///
+/// # Errors
+///
+/// Returns an error when the Ralph database cannot be opened, migrated, or queried.
+pub fn active_run_for_loop(state_dir: &Path) -> Result<Option<RalphRunRecord>, RalphStateError> {
+    let state_dir = state_dir.to_path_buf();
+    with_database(move |database| {
+        Box::pin(async move {
+            let rows = database
+                .select("ralph_runs")
+                .columns(&RALPH_RUN_COLUMNS)
+                .filter(Box::new(where_eq(
+                    "state_dir",
+                    state_dir.display().to_string(),
+                )))
+                .execute(database)
+                .await?;
+            let mut runs = rows
+                .iter()
+                .map(run_record_from_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            runs.retain(|run| is_active_run_status(&run.status));
+            runs.sort_by(|left, right| right.started_at_ms.cmp(&left.started_at_ms));
+            Ok(runs.into_iter().next())
+        })
+    })
+}
+
+/// Mark a Ralph run as cancellation-requested.
+///
+/// # Errors
+///
+/// Returns an error when the Ralph database cannot be opened, migrated, or written.
+pub fn request_run_cancel(run_id: &str) -> Result<(), RalphStateError> {
+    let run_id = run_id.to_owned();
+    with_database(move |database| {
+        Box::pin(async move {
+            database
+                .update("ralph_runs")
+                .value("cancel_requested", 1_i64)
+                .value("updated_at_ms", u128_to_i64(now_ms()))
+                .filter(Box::new(where_eq("run_id", run_id)))
+                .execute(database)
+                .await?;
+            Ok(())
+        })
+    })
+}
+
+/// Create a persisted Ralph iteration record.
+///
+/// # Errors
+///
+/// Returns an error when the Ralph database cannot be opened, migrated, or written.
+pub fn create_iteration(
+    request: RalphIterationCreateRequest,
+) -> Result<RalphIterationRecord, RalphStateError> {
+    let now = now_ms();
+    let record = RalphIterationRecord {
+        iteration_id: uuid::Uuid::new_v4().to_string(),
+        run_id: request.run_id,
+        state_dir: request.state_dir,
+        iteration_number: request.iteration_number,
+        status: request.status,
+        checklist_fingerprint_before: request.checklist_fingerprint_before,
+        checklist_fingerprint_after: None,
+        work_prompt: request.work_prompt,
+        audit_prompt: None,
+        replan_prompt: None,
+        validation_status: None,
+        validation_summary: None,
+        started_at_ms: u64::try_from(now).unwrap_or(u64::MAX),
+        finished_at_ms: None,
+        stop_reason: None,
+        error_message: None,
+    };
+    let persisted = record.clone();
+    with_database(move |database| {
+        Box::pin(async move {
+            insert_iteration_record(database, &persisted).await?;
+            Ok(())
+        })
+    })?;
+    Ok(record)
+}
+
+/// List iterations for a Ralph run.
+///
+/// # Errors
+///
+/// Returns an error when the Ralph database cannot be opened, migrated, or queried.
+pub fn list_iterations_for_run(run_id: &str) -> Result<Vec<RalphIterationRecord>, RalphStateError> {
+    let run_id = run_id.to_owned();
+    with_database(move |database| {
+        Box::pin(async move {
+            let rows = database
+                .select("ralph_iterations")
+                .columns(&RALPH_ITERATION_COLUMNS)
+                .filter(Box::new(where_eq("run_id", run_id)))
+                .execute(database)
+                .await?;
+            let mut iterations = rows
+                .iter()
+                .map(iteration_record_from_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            iterations.sort_by(|left, right| left.iteration_number.cmp(&right.iteration_number));
+            Ok(iterations)
+        })
+    })
+}
+
+/// Create a persisted Ralph validation command record.
+///
+/// # Errors
+///
+/// Returns an error when the Ralph database cannot be opened, migrated, or written.
+pub fn create_validation(
+    request: RalphValidationCreateRequest,
+) -> Result<RalphValidationRecord, RalphStateError> {
+    let now = now_ms();
+    let record = RalphValidationRecord {
+        validation_id: uuid::Uuid::new_v4().to_string(),
+        iteration_id: request.iteration_id,
+        command: request.command,
+        status: request.status,
+        exit_code: None,
+        output_ref: None,
+        started_at_ms: u64::try_from(now).unwrap_or(u64::MAX),
+        finished_at_ms: None,
+        error_message: None,
+    };
+    let persisted = record.clone();
+    with_database(move |database| {
+        Box::pin(async move {
+            insert_validation_record(database, &persisted).await?;
+            Ok(())
+        })
+    })?;
+    Ok(record)
+}
+
+/// List validation commands for a Ralph iteration.
+///
+/// # Errors
+///
+/// Returns an error when the Ralph database cannot be opened, migrated, or queried.
+pub fn list_validations_for_iteration(
+    iteration_id: &str,
+) -> Result<Vec<RalphValidationRecord>, RalphStateError> {
+    let iteration_id = iteration_id.to_owned();
+    with_database(move |database| {
+        Box::pin(async move {
+            let rows = database
+                .select("ralph_validation_runs")
+                .columns(&RALPH_VALIDATION_COLUMNS)
+                .filter(Box::new(where_eq("iteration_id", iteration_id)))
+                .execute(database)
+                .await?;
+            let mut validations = rows
+                .iter()
+                .map(validation_record_from_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            validations.sort_by(|left, right| left.started_at_ms.cmp(&right.started_at_ms));
+            Ok(validations)
         })
     })
 }
@@ -1255,6 +1711,9 @@ fn ralph_migrations() -> CodeMigrationSource<'static> {
     let mut source = CodeMigrationSource::new();
     source.add_migration(loops_table_migration());
     source.add_migration(events_table_migration());
+    source.add_migration(runs_table_migration());
+    source.add_migration(iterations_table_migration());
+    source.add_migration(validation_runs_table_migration());
     source
 }
 
@@ -1304,6 +1763,79 @@ fn events_table_migration() -> CodeMigration<'static> {
     )
 }
 
+fn runs_table_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "003_ralph_runs".to_owned(),
+        Box::new(
+            create_table("ralph_runs")
+                .if_not_exists(true)
+                .column(text_column("run_id"))
+                .column(text_column("state_dir"))
+                .column(nullable_text_column("session_id"))
+                .column(text_column("status"))
+                .column(nullable_int_column("requested_max_iterations"))
+                .column(nullable_int_column("requested_no_progress_limit"))
+                .column(int_column("cancel_requested"))
+                .column(int_column("started_at_ms"))
+                .column(int_column("updated_at_ms"))
+                .column(nullable_int_column("finished_at_ms"))
+                .column(nullable_text_column("stop_reason"))
+                .column(nullable_text_column("error_message"))
+                .primary_key("run_id"),
+        ),
+        None,
+    )
+}
+
+fn iterations_table_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "004_ralph_iterations".to_owned(),
+        Box::new(
+            create_table("ralph_iterations")
+                .if_not_exists(true)
+                .column(text_column("iteration_id"))
+                .column(text_column("run_id"))
+                .column(text_column("state_dir"))
+                .column(int_column("iteration_number"))
+                .column(text_column("status"))
+                .column(nullable_text_column("checklist_fingerprint_before"))
+                .column(nullable_text_column("checklist_fingerprint_after"))
+                .column(nullable_text_column("work_prompt"))
+                .column(nullable_text_column("audit_prompt"))
+                .column(nullable_text_column("replan_prompt"))
+                .column(nullable_text_column("validation_status"))
+                .column(nullable_text_column("validation_summary"))
+                .column(int_column("started_at_ms"))
+                .column(nullable_int_column("finished_at_ms"))
+                .column(nullable_text_column("stop_reason"))
+                .column(nullable_text_column("error_message"))
+                .primary_key("iteration_id"),
+        ),
+        None,
+    )
+}
+
+fn validation_runs_table_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "005_ralph_validation_runs".to_owned(),
+        Box::new(
+            create_table("ralph_validation_runs")
+                .if_not_exists(true)
+                .column(text_column("validation_id"))
+                .column(text_column("iteration_id"))
+                .column(text_column("command"))
+                .column(text_column("status"))
+                .column(nullable_int_column("exit_code"))
+                .column(nullable_text_column("output_ref"))
+                .column(int_column("started_at_ms"))
+                .column(nullable_int_column("finished_at_ms"))
+                .column(nullable_text_column("error_message"))
+                .primary_key("validation_id"),
+        ),
+        None,
+    )
+}
+
 fn text_column(name: &str) -> Column {
     Column {
         name: name.to_owned(),
@@ -1334,6 +1866,16 @@ fn int_column(name: &str) -> Column {
     }
 }
 
+fn nullable_int_column(name: &str) -> Column {
+    Column {
+        name: name.to_owned(),
+        nullable: true,
+        auto_increment: false,
+        data_type: DataType::BigInt,
+        default: None,
+    }
+}
+
 async fn insert_lifecycle_event(
     database: &dyn Database,
     state_dir: &Path,
@@ -1354,7 +1896,97 @@ async fn insert_lifecycle_event(
     Ok(())
 }
 
+async fn insert_run_record(
+    database: &dyn Database,
+    record: &RalphRunRecord,
+) -> Result<(), RalphStateError> {
+    database
+        .insert("ralph_runs")
+        .value("run_id", record.run_id.clone())
+        .value("state_dir", record.state_dir.display().to_string())
+        .value("session_id", record.session_id.clone())
+        .value("status", record.status.clone())
+        .value(
+            "requested_max_iterations",
+            record
+                .requested_max_iterations
+                .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
+        )
+        .value(
+            "requested_no_progress_limit",
+            record
+                .requested_no_progress_limit
+                .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
+        )
+        .value("cancel_requested", i64::from(record.cancel_requested))
+        .value("started_at_ms", u64_to_i64(record.started_at_ms))
+        .value("updated_at_ms", u64_to_i64(record.updated_at_ms))
+        .value("finished_at_ms", record.finished_at_ms.map(u64_to_i64))
+        .value("stop_reason", record.stop_reason.clone())
+        .value("error_message", record.error_message.clone())
+        .execute(database)
+        .await?;
+    Ok(())
+}
+
+async fn insert_iteration_record(
+    database: &dyn Database,
+    record: &RalphIterationRecord,
+) -> Result<(), RalphStateError> {
+    database
+        .insert("ralph_iterations")
+        .value("iteration_id", record.iteration_id.clone())
+        .value("run_id", record.run_id.clone())
+        .value("state_dir", record.state_dir.display().to_string())
+        .value("iteration_number", u64_to_i64(record.iteration_number))
+        .value("status", record.status.clone())
+        .value(
+            "checklist_fingerprint_before",
+            record.checklist_fingerprint_before.clone(),
+        )
+        .value(
+            "checklist_fingerprint_after",
+            record.checklist_fingerprint_after.clone(),
+        )
+        .value("work_prompt", record.work_prompt.clone())
+        .value("audit_prompt", record.audit_prompt.clone())
+        .value("replan_prompt", record.replan_prompt.clone())
+        .value("validation_status", record.validation_status.clone())
+        .value("validation_summary", record.validation_summary.clone())
+        .value("started_at_ms", u64_to_i64(record.started_at_ms))
+        .value("finished_at_ms", record.finished_at_ms.map(u64_to_i64))
+        .value("stop_reason", record.stop_reason.clone())
+        .value("error_message", record.error_message.clone())
+        .execute(database)
+        .await?;
+    Ok(())
+}
+
+async fn insert_validation_record(
+    database: &dyn Database,
+    record: &RalphValidationRecord,
+) -> Result<(), RalphStateError> {
+    database
+        .insert("ralph_validation_runs")
+        .value("validation_id", record.validation_id.clone())
+        .value("iteration_id", record.iteration_id.clone())
+        .value("command", record.command.clone())
+        .value("status", record.status.clone())
+        .value("exit_code", record.exit_code)
+        .value("output_ref", record.output_ref.clone())
+        .value("started_at_ms", u64_to_i64(record.started_at_ms))
+        .value("finished_at_ms", record.finished_at_ms.map(u64_to_i64))
+        .value("error_message", record.error_message.clone())
+        .execute(database)
+        .await?;
+    Ok(())
+}
+
 fn u128_to_i64(value: u128) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn u64_to_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
