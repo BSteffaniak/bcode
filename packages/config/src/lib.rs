@@ -1378,6 +1378,8 @@ pub struct ModelConfig {
     #[serde(default)]
     pub max_tool_rounds: Option<u32>,
     #[serde(default)]
+    pub context_strategy: ContextStrategyConfig,
+    #[serde(default)]
     pub prompt_cache: PromptCacheConfig,
     #[serde(default)]
     pub conversation_reuse: ConversationReuseConfig,
@@ -1400,6 +1402,53 @@ impl ModelConfig {
     pub fn effective_max_tool_rounds(&self) -> Option<u32> {
         self.max_tool_rounds.filter(|rounds| *rounds > 0)
     }
+
+    #[must_use]
+    pub const fn effective_prompt_cache_mode(&self) -> bcode_model::PromptCacheMode {
+        match self.context_strategy.mode {
+            ContextStrategyMode::ProviderReuse => self.prompt_cache.mode,
+            ContextStrategyMode::ExplicitCachedTranscript => {
+                bcode_model::PromptCacheMode::Aggressive
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn effective_conversation_reuse_mode(&self) -> bcode_model::ConversationReuseMode {
+        match self.context_strategy.mode {
+            ContextStrategyMode::ProviderReuse => self.conversation_reuse.mode,
+            ContextStrategyMode::ExplicitCachedTranscript => {
+                bcode_model::ConversationReuseMode::Off
+            }
+        }
+    }
+}
+
+/// High-level model context management strategy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextStrategyConfig {
+    /// Context strategy mode. Defaults to provider-native continuation where available.
+    #[serde(default)]
+    pub mode: ContextStrategyMode,
+}
+
+impl Default for ContextStrategyConfig {
+    fn default() -> Self {
+        Self {
+            mode: ContextStrategyMode::ProviderReuse,
+        }
+    }
+}
+
+/// High-level context strategy mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextStrategyMode {
+    /// Prefer provider-native continuation/state reuse when supported.
+    #[default]
+    ProviderReuse,
+    /// Resend explicit transcript context, using prompt cache hints aggressively.
+    ExplicitCachedTranscript,
 }
 
 /// Reasoning / thinking request configuration.
@@ -2277,6 +2326,7 @@ fn write_model_toml(output: &mut String, model: &ModelConfig) {
         || model.max_tool_rounds.is_some()
         || model.profile.is_some()
         || !model.aliases.is_empty()
+        || model.context_strategy != ContextStrategyConfig::default()
         || model.prompt_cache != PromptCacheConfig::default()
         || model.conversation_reuse != ConversationReuseConfig::default()
         || model.tool_output != ToolOutputConfig::default()
@@ -2309,6 +2359,16 @@ fn write_model_toml(output: &mut String, model: &ModelConfig) {
             writeln!(output, "max_tool_rounds = {max_tool_rounds}")
                 .expect("writing to string should not fail");
         }
+        output.push('\n');
+    }
+    if model.context_strategy != ContextStrategyConfig::default() {
+        output.push_str("[model.context_strategy]\n");
+        writeln!(
+            output,
+            "mode = {}",
+            toml_string(context_strategy_mode_name(model.context_strategy.mode))
+        )
+        .expect("writing to string should not fail");
         output.push('\n');
     }
     if model.prompt_cache != PromptCacheConfig::default() {
@@ -2614,6 +2674,13 @@ fn write_action_map(
         .expect("writing to string should not fail");
     }
     output.push_str(" }\n");
+}
+
+const fn context_strategy_mode_name(mode: ContextStrategyMode) -> &'static str {
+    match mode {
+        ContextStrategyMode::ProviderReuse => "provider_reuse",
+        ContextStrategyMode::ExplicitCachedTranscript => "explicit_cached_transcript",
+    }
 }
 
 const fn prompt_cache_mode_name(mode: bcode_model::PromptCacheMode) -> &'static str {
@@ -3207,11 +3274,11 @@ fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BcodeConfig, CompactionMode, ConfigLoadOverrides, DEFAULT_AGENT_PROFILE_PLUGIN_ID,
-        DEFAULT_CODE_REVIEW_PLUGIN_ID, DEFAULT_DOCUMENT_PLUGIN_ID, DEFAULT_FILESYSTEM_PLUGIN_ID,
-        DEFAULT_GIT_PLUGIN_ID, DEFAULT_PI_SESSION_IMPORT_PLUGIN_ID, DEFAULT_SHELL_PLUGIN_ID,
-        DEFAULT_WEB_SEARCH_PLUGIN_ID, PluginSelection, TuiMouseConfig, default_config_paths_from,
-        default_permissions_state_path, load_config_from_paths,
+        BcodeConfig, CompactionMode, ConfigLoadOverrides, ContextStrategyMode,
+        DEFAULT_AGENT_PROFILE_PLUGIN_ID, DEFAULT_CODE_REVIEW_PLUGIN_ID, DEFAULT_DOCUMENT_PLUGIN_ID,
+        DEFAULT_FILESYSTEM_PLUGIN_ID, DEFAULT_GIT_PLUGIN_ID, DEFAULT_PI_SESSION_IMPORT_PLUGIN_ID,
+        DEFAULT_SHELL_PLUGIN_ID, DEFAULT_WEB_SEARCH_PLUGIN_ID, PluginSelection, TuiMouseConfig,
+        default_config_paths_from, default_permissions_state_path, load_config_from_paths,
         load_config_from_paths_with_overrides, load_permissions_state_from, merge_agent_configs,
         upsert_agent_permission_rule,
     };
@@ -3496,6 +3563,30 @@ custom_boolean = false
         );
 
         restore_provider_env(previous_env);
+    }
+
+    #[test]
+    fn parses_context_strategy_mode() {
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[model.context_strategy]
+mode = "explicit_cached_transcript"
+"#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(
+            config.model.context_strategy.mode,
+            ContextStrategyMode::ExplicitCachedTranscript
+        );
+        assert_eq!(
+            config.model.effective_prompt_cache_mode(),
+            bcode_model::PromptCacheMode::Aggressive
+        );
+        assert_eq!(
+            config.model.effective_conversation_reuse_mode(),
+            bcode_model::ConversationReuseMode::Off
+        );
     }
 
     #[test]

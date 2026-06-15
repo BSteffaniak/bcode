@@ -2573,8 +2573,13 @@ impl BmuxApp {
                 message,
                 ..
             } => self.apply_compaction_trace(trace.phase, reason, *compacted, message.as_deref()),
-            SessionTracePayload::ModelRequestBuilt { .. }
-            | SessionTracePayload::ProviderRound { .. }
+            SessionTracePayload::ModelRequestBuilt {
+                uses_previous_provider_response,
+                ..
+            } => self
+                .token_usage
+                .apply_model_request(*uses_previous_provider_response),
+            SessionTracePayload::ProviderRound { .. }
             | SessionTracePayload::ToolInvocationStarted { .. }
             | SessionTracePayload::ToolPolicyEvaluated { .. }
             | SessionTracePayload::ToolPermissionWait { .. }
@@ -2820,6 +2825,7 @@ struct TokenUsageMeter {
     latest_context_input_tokens: Option<u32>,
     latest_cached_input_tokens: Option<u32>,
     latest_cache_write_input_tokens: Option<u32>,
+    provider_reuse_active: bool,
     context_window: Option<u32>,
 }
 
@@ -2831,12 +2837,8 @@ impl TokenUsageMeter {
         if let Some(input_tokens) = usage.context_input_tokens() {
             self.latest_context_input_tokens = Some(input_tokens);
         }
-        if usage.cached_input_tokens.is_some() {
-            self.latest_cached_input_tokens = usage.cached_input_tokens;
-        }
-        if usage.cache_write_input_tokens.is_some() {
-            self.latest_cache_write_input_tokens = usage.cache_write_input_tokens;
-        }
+        self.latest_cached_input_tokens = usage.cached_input_tokens;
+        self.latest_cache_write_input_tokens = usage.cache_write_input_tokens;
     }
 
     const fn apply_model_info(&mut self, model: Option<&bcode_model::ModelInfo>) {
@@ -2849,12 +2851,22 @@ impl TokenUsageMeter {
         self.context_window = None;
     }
 
+    const fn apply_model_request(&mut self, uses_previous_provider_response: bool) {
+        self.provider_reuse_active = uses_previous_provider_response;
+    }
+
     fn footer_summary(&self) -> String {
         let mut parts = vec![self.context_summary()];
+        if self.provider_reuse_active {
+            parts.push("reuse on".to_string());
+        }
         if let Some(cached) = self.latest_cached_input_tokens
             && cached > 0
         {
-            parts.push(format!("cached {} tok", compact_u64(u64::from(cached))));
+            parts.push(format!(
+                "cached prefix {} tok",
+                compact_u64(u64::from(cached))
+            ));
         }
         if let Some(written) = self.latest_cache_write_input_tokens
             && written > 0

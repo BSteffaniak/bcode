@@ -1338,8 +1338,8 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
                 request: resolved_model.request,
                 env: BTreeMap::new(),
             },
-            prompt_cache_mode: config.model.prompt_cache.mode,
-            conversation_reuse_mode: config.model.conversation_reuse.mode,
+            prompt_cache_mode: config.model.effective_prompt_cache_mode(),
+            conversation_reuse_mode: config.model.effective_conversation_reuse_mode(),
             selected_reasoning: resolved_model.reasoning.clone(),
             selected_reasoning_capabilities: reasoning_capabilities_from_config(
                 &resolved_model.reasoning,
@@ -7354,6 +7354,26 @@ async fn append_model_request_trace(
         )
     })
     .flatten();
+    let mut metadata = request.metadata.clone();
+    metadata.insert(
+        "message_count".to_string(),
+        request.messages.len().to_string(),
+    );
+    metadata.insert(
+        "new_messages_start_index".to_string(),
+        request
+            .conversation_reuse
+            .new_messages_start_index
+            .map_or_else(|| "none".to_string(), |index| index.to_string()),
+    );
+    metadata.insert(
+        "sent_message_count".to_string(),
+        sent_message_count(request).to_string(),
+    );
+    metadata.insert(
+        "prompt_cache_points".to_string(),
+        prompt_cache_point_count(request).to_string(),
+    );
     append_trace_event(
         state,
         session_id,
@@ -7377,11 +7397,38 @@ async fn append_model_request_trace(
                 .conversation_reuse
                 .previous_provider_response_id
                 .is_some(),
-            metadata: request.metadata.clone(),
+            metadata,
             request: request_blob,
         },
     )
     .await;
+}
+
+fn sent_message_count(request: &ModelTurnRequest) -> usize {
+    request
+        .conversation_reuse
+        .new_messages_start_index
+        .filter(|_| {
+            request
+                .conversation_reuse
+                .previous_provider_response_id
+                .is_some()
+        })
+        .map_or(request.messages.len(), |start| {
+            request
+                .messages
+                .len()
+                .saturating_sub(start.min(request.messages.len()))
+        })
+}
+
+fn prompt_cache_point_count(request: &ModelTurnRequest) -> usize {
+    request
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter(|block| matches!(block, ContentBlock::CachePoint { .. }))
+        .count()
 }
 
 fn model_round_from_turn_id(turn_id: &str) -> Option<u32> {
