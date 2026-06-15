@@ -2575,6 +2575,135 @@ mod tests {
     }
 
     #[test]
+    fn active_run_query_returns_latest_active_run_only() {
+        let state_dir = PathBuf::from(format!(
+            "/tmp/bcode-ralph-active-lock-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let first = create_run(RalphRunCreateRequest {
+            state_dir: state_dir.clone(),
+            session_id: None,
+            status: "running".to_owned(),
+            requested_max_iterations: None,
+            requested_no_progress_limit: None,
+        })
+        .expect("first run should persist");
+        update_run_status(
+            &first.run_id,
+            "blocked",
+            Some(first.started_at_ms + 1),
+            Some("test"),
+            Some("blocked by test"),
+        )
+        .expect("first run should update");
+        let second = create_run(RalphRunCreateRequest {
+            state_dir: state_dir.clone(),
+            session_id: None,
+            status: "awaiting_approval".to_owned(),
+            requested_max_iterations: Some(3),
+            requested_no_progress_limit: Some(1),
+        })
+        .expect("second run should persist");
+
+        let active = active_run_for_loop(&state_dir)
+            .expect("active run query should work")
+            .expect("active run should exist");
+        assert_eq!(active.run_id, second.run_id);
+        assert_eq!(active.status, "awaiting_approval");
+    }
+
+    #[test]
+    fn recent_runs_are_listed_newest_first() {
+        let state_dir = PathBuf::from(format!(
+            "/tmp/bcode-ralph-runs-list-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let first = create_run(RalphRunCreateRequest {
+            state_dir: state_dir.clone(),
+            session_id: None,
+            status: "blocked".to_owned(),
+            requested_max_iterations: None,
+            requested_no_progress_limit: None,
+        })
+        .expect("first run should persist");
+        let second = create_run(RalphRunCreateRequest {
+            state_dir: state_dir.clone(),
+            session_id: None,
+            status: "running".to_owned(),
+            requested_max_iterations: Some(2),
+            requested_no_progress_limit: Some(1),
+        })
+        .expect("second run should persist");
+
+        let runs = list_runs_for_loop(&state_dir).expect("runs should list");
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].run_id, second.run_id);
+        assert_eq!(runs[1].run_id, first.run_id);
+    }
+
+    #[test]
+    fn validation_records_capture_failure_details() {
+        let state_dir = PathBuf::from(format!(
+            "/tmp/bcode-ralph-validation-parse-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let run = create_run(RalphRunCreateRequest {
+            state_dir,
+            session_id: None,
+            status: "running".to_owned(),
+            requested_max_iterations: None,
+            requested_no_progress_limit: None,
+        })
+        .expect("run should persist");
+        let iteration = create_iteration(RalphIterationCreateRequest {
+            run_id: run.run_id,
+            state_dir: PathBuf::from("/tmp/bcode-ralph-validation-parse-loop"),
+            iteration_number: 1,
+            work_prompt: Some("work".to_owned()),
+            checklist_fingerprint_before: None,
+            checklist_fingerprint_after: None,
+            status: "blocked".to_owned(),
+            stop_reason: Some("validation_failed".to_owned()),
+            error_message: Some("cargo test failed".to_owned()),
+            finished_at_ms: Some(42),
+        })
+        .expect("iteration should persist");
+        create_validation(RalphValidationCreateRequest {
+            iteration_id: iteration.iteration_id.clone(),
+            command: "cargo test".to_owned(),
+            status: "failed".to_owned(),
+            exit_code: Some(101),
+            output_ref: Some("target/ralph-validation.log".to_owned()),
+            finished_at_ms: Some(43),
+            error_message: Some("test failed".to_owned()),
+        })
+        .expect("validation should persist");
+
+        let validations = list_validations_for_iteration(&iteration.iteration_id)
+            .expect("validations should query");
+        assert_eq!(validations.len(), 1);
+        assert_eq!(validations[0].status, "failed");
+        assert_eq!(validations[0].exit_code, Some(101));
+        assert_eq!(validations[0].error_message.as_deref(), Some("test failed"));
+    }
+
+    #[test]
+    fn stop_decision_integration_prefers_completion_over_continue() {
+        let decision = decide_stop(RalphStopDecisionInput {
+            status: RalphLoopStatus::Running,
+            iteration_count: 1,
+            max_iterations: 5,
+            no_progress_count: 0,
+            no_progress_limit: 2,
+            checklist_summary: analyze_progress_doc_text("- [x] done\n"),
+            permission_denied: false,
+            validation_blocked: false,
+            user_question: false,
+        });
+        assert_eq!(decision, RalphStopDecision::CompletionCandidate);
+    }
+
+    #[test]
     fn active_runs_can_be_marked_interrupted() {
         let state_dir = PathBuf::from(format!(
             "/tmp/bcode-ralph-interrupted-test-{}",
