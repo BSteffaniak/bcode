@@ -685,6 +685,10 @@ pub enum ProviderTurnEvent {
     Usage {
         usage: TokenUsage,
     },
+    /// Provider reported actual request projection/sending metadata.
+    RequestProjection {
+        projection: ProviderRequestProjection,
+    },
     /// Provider-specific metadata that the host may use for invisible optimization state.
     ProviderMetadata {
         key: String,
@@ -700,6 +704,35 @@ pub enum ProviderTurnEvent {
         stop_reason: StopReason,
     },
     Cancelled,
+}
+
+/// Provider-reported request projection metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRequestProjection {
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub api_shape: Option<String>,
+    #[serde(default)]
+    pub input_item_count: Option<usize>,
+    #[serde(default)]
+    pub message_count: Option<usize>,
+    #[serde(default)]
+    pub original_message_count: Option<usize>,
+    #[serde(default)]
+    pub sent_message_count: Option<usize>,
+    #[serde(default)]
+    pub omitted_message_count: Option<usize>,
+    #[serde(default)]
+    pub cache_point_count: Option<usize>,
+    #[serde(default)]
+    pub emitted_cache_point_count: Option<usize>,
+    #[serde(default)]
+    pub dropped_cache_point_count: Option<usize>,
+    #[serde(default)]
+    pub used_previous_response_id: bool,
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 /// Provider-neutral token usage metadata.

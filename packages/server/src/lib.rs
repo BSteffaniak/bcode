@@ -5487,6 +5487,7 @@ async fn handle_compaction_events(
             }
             ProviderTurnEvent::TurnStarted
             | ProviderTurnEvent::ReasoningDelta { .. }
+            | ProviderTurnEvent::RequestProjection { .. }
             | ProviderTurnEvent::ProviderMetadata { .. } => {}
         }
     }
@@ -6313,7 +6314,8 @@ const fn model_event_is_progress(event: &ProviderTurnEvent) -> bool {
             true
         }
         ProviderTurnEvent::ToolCallDelta { delta, .. } => !delta.is_empty(),
-        ProviderTurnEvent::TurnStarted
+        ProviderTurnEvent::RequestProjection { .. }
+        | ProviderTurnEvent::TurnStarted
         | ProviderTurnEvent::Usage { .. }
         | ProviderTurnEvent::Warning { .. }
         | ProviderTurnEvent::ProviderMetadata { .. }
@@ -6466,6 +6468,9 @@ async fn handle_provider_turn_event(
             update_provider_usage_state(state, session_id, &usage).await;
             append_model_usage_event(state, session_id, turn_id.to_string(), usage).await;
         }
+        ProviderTurnEvent::RequestProjection { projection } => {
+            handle_provider_request_projection_event(state, session_id, turn_id, projection).await;
+        }
         ProviderTurnEvent::ProviderMetadata { key, value } => {
             handle_provider_metadata_event(state, session_id, turn_id, key, value).await;
         }
@@ -6527,6 +6532,59 @@ async fn handle_provider_turn_event(
             }
         }
     }
+}
+
+async fn handle_provider_request_projection_event(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+    projection: bcode_model::ProviderRequestProjection,
+) {
+    append_provider_event_trace(
+        state,
+        session_id,
+        turn_id,
+        "request_projection",
+        Some(provider_request_projection_detail(&projection)),
+    )
+    .await;
+}
+
+fn provider_request_projection_detail(
+    projection: &bcode_model::ProviderRequestProjection,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(provider) = &projection.provider {
+        parts.push(format!("provider={provider}"));
+    }
+    if let Some(api_shape) = &projection.api_shape {
+        parts.push(format!("api_shape={api_shape}"));
+    }
+    if let Some(sent) = projection.sent_message_count {
+        parts.push(format!("sent_messages={sent}"));
+    }
+    if let Some(original) = projection.original_message_count {
+        parts.push(format!("original_messages={original}"));
+    }
+    if let Some(omitted) = projection.omitted_message_count {
+        parts.push(format!("omitted_messages={omitted}"));
+    }
+    if let Some(input_items) = projection.input_item_count {
+        parts.push(format!("input_items={input_items}"));
+    }
+    if let Some(emitted) = projection.emitted_cache_point_count {
+        parts.push(format!("emitted_cache_points={emitted}"));
+    }
+    if let Some(dropped) = projection.dropped_cache_point_count {
+        parts.push(format!("dropped_cache_points={dropped}"));
+    }
+    if projection.used_previous_response_id {
+        parts.push("used_previous_response_id=true".to_string());
+    }
+    if let Some(detail) = &projection.detail {
+        parts.push(format!("detail={detail}"));
+    }
+    parts.join(",")
 }
 
 async fn handle_provider_error_event(

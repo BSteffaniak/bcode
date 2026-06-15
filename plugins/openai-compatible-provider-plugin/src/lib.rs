@@ -15,7 +15,8 @@ use bcode_model::{
     OP_FINISH_TURN, OP_MODELS, OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS, OP_START_TURN,
     OP_VALIDATE_CONFIG, PollTurnEventsRequest, PollTurnEventsResponse, ProviderCapabilities,
     ProviderCapability, ProviderError, ProviderErrorCategory, ProviderRequestContext,
-    ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage, ToolCall, ValidateConfigResponse,
+    ProviderRequestProjection, ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage,
+    ToolCall, ValidateConfigResponse,
 };
 use bcode_model_provider_runtime::ProviderRuntime;
 use bcode_plugin_sdk::prelude::*;
@@ -104,6 +105,87 @@ impl RustPlugin for OpenAiCompatibleProviderPlugin {
     }
 }
 
+fn openai_request_projection(request: &ModelTurnRequest) -> ProviderRequestProjection {
+    let settings = settings_for_context(&request.provider_context);
+    match settings.dialect {
+        OpenAiCompatibleDialect::ChatCompletions => {
+            let messages = model_messages_to_chat_messages(request);
+            ProviderRequestProjection {
+                provider: Some("bcode.openai-compatible".to_string()),
+                api_shape: Some("chat_completions".to_string()),
+                message_count: Some(messages.len()),
+                original_message_count: Some(request.messages.len()),
+                sent_message_count: Some(request.messages.len()),
+                omitted_message_count: Some(0),
+                cache_point_count: Some(prompt_cache_point_count(request)),
+                emitted_cache_point_count: Some(0),
+                dropped_cache_point_count: Some(prompt_cache_point_count(request)),
+                detail: Some(
+                    "explicit cache points are not supported by this API shape".to_string(),
+                ),
+                ..ProviderRequestProjection::default()
+            }
+        }
+        dialect => {
+            let previous_response_id = responses_previous_response_id(&settings, request);
+            let project_reused_history =
+                dialect.projects_reused_history() && previous_response_id.is_some();
+            let projection = responses_projection(
+                request,
+                responses_instruction_strategy(&settings),
+                project_reused_history,
+                dialect,
+            );
+            let sent = responses_projected_message_count(request, project_reused_history);
+            ProviderRequestProjection {
+                provider: Some("bcode.openai-compatible".to_string()),
+                api_shape: Some("responses".to_string()),
+                input_item_count: Some(projection.input.len()),
+                original_message_count: Some(request.messages.len()),
+                sent_message_count: Some(sent),
+                omitted_message_count: Some(request.messages.len().saturating_sub(sent)),
+                cache_point_count: Some(prompt_cache_point_count(request)),
+                emitted_cache_point_count: Some(0),
+                dropped_cache_point_count: Some(prompt_cache_point_count(request)),
+                used_previous_response_id: previous_response_id.is_some(),
+                detail: Some(
+                    "explicit cache points are not supported by this API shape".to_string(),
+                ),
+                ..ProviderRequestProjection::default()
+            }
+        }
+    }
+}
+
+fn responses_projected_message_count(
+    request: &ModelTurnRequest,
+    project_reused_history: bool,
+) -> usize {
+    let start = project_reused_history
+        .then(|| {
+            request
+                .conversation_reuse
+                .previous_provider_response_id
+                .as_ref()
+                .and(request.conversation_reuse.new_messages_start_index)
+        })
+        .flatten()
+        .unwrap_or_default();
+    request
+        .messages
+        .len()
+        .saturating_sub(start.min(request.messages.len()))
+}
+
+fn prompt_cache_point_count(request: &ModelTurnRequest) -> usize {
+    request
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter(|block| matches!(block, ContentBlock::CachePoint { .. }))
+        .count()
+}
+
 impl OpenAiCompatibleProviderPlugin {
     fn invoke_provider_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         if context.request.interface_id != MODEL_PROVIDER_INTERFACE_ID {
@@ -157,6 +239,9 @@ impl OpenAiCompatibleProviderPlugin {
         let provider_turn_id = format!("openai-compatible-turn-{}", state.next_turn);
         let turn = TurnState::default();
         turn.push(ProviderTurnEvent::TurnStarted);
+        turn.push(ProviderTurnEvent::RequestProjection {
+            projection: openai_request_projection(&request),
+        });
         state.turns.insert(provider_turn_id.clone(), turn.clone());
         drop(state);
         match &self.runtime {

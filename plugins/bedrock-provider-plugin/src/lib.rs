@@ -24,8 +24,9 @@ use bcode_model::{
     MessageRole, ModelCapability, ModelInfo, ModelList, ModelMessage, ModelTurnRequest,
     OP_CANCEL_TURN, OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS, OP_POLL_TURN_EVENTS, OP_START_TURN,
     OP_VALIDATE_CONFIG, PollTurnEventsRequest, PollTurnEventsResponse, ProviderCapabilities,
-    ProviderCapability, ProviderError, ProviderErrorCategory, ProviderTurnEvent, StartTurnResponse,
-    StopReason, TokenUsage, ToolCall, ToolDefinition, ValidateConfigResponse,
+    ProviderCapability, ProviderError, ProviderErrorCategory, ProviderRequestProjection,
+    ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage, ToolCall, ToolDefinition,
+    ValidateConfigResponse,
 };
 use bcode_model_provider_runtime::{
     ProviderRuntime, StreamOutcome, TurnState, TurnStore, provider_error,
@@ -137,6 +138,9 @@ impl BedrockProviderPlugin {
             .lock()
             .expect("bedrock turn store lock should not be poisoned")
             .insert_started("bedrock-turn");
+        turn.push(ProviderTurnEvent::RequestProjection {
+            projection: bedrock_request_projection(&request),
+        });
         match &self.runtime {
             Ok(runtime) => {
                 let discovery = self.discovery.clone();
@@ -600,6 +604,50 @@ struct BedrockConverseRequest {
     system: Vec<SystemContentBlock>,
     tool_config: Option<ToolConfiguration>,
     inference_config: Option<InferenceConfiguration>,
+}
+
+fn bedrock_request_projection(request: &ModelTurnRequest) -> ProviderRequestProjection {
+    let emitted_cache_points = bedrock_emitted_cache_point_count(request);
+    let sent_messages = request
+        .messages
+        .iter()
+        .filter(|message| message.role != MessageRole::System)
+        .count();
+    ProviderRequestProjection {
+        provider: Some("bcode.bedrock".to_string()),
+        api_shape: Some("bedrock_converse".to_string()),
+        message_count: Some(sent_messages),
+        original_message_count: Some(request.messages.len()),
+        sent_message_count: Some(sent_messages),
+        omitted_message_count: Some(request.messages.len().saturating_sub(sent_messages)),
+        cache_point_count: Some(prompt_cache_point_count(request)),
+        emitted_cache_point_count: Some(emitted_cache_points),
+        dropped_cache_point_count: Some(0),
+        used_previous_response_id: false,
+        ..ProviderRequestProjection::default()
+    }
+}
+
+fn bedrock_emitted_cache_point_count(request: &ModelTurnRequest) -> usize {
+    let system_prompt_cache_point = usize::from(
+        request.prompt_cache.cache_system_prompt
+            && request
+                .system_prompt
+                .as_ref()
+                .is_some_and(|prompt| !prompt.trim().is_empty()),
+    );
+    let tool_cache_point =
+        usize::from(request.prompt_cache.cache_tools && !request.tools.is_empty());
+    system_prompt_cache_point + tool_cache_point + prompt_cache_point_count(request)
+}
+
+fn prompt_cache_point_count(request: &ModelTurnRequest) -> usize {
+    request
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter(|block| matches!(block, ContentBlock::CachePoint { .. }))
+        .count()
 }
 
 fn build_converse_request(
