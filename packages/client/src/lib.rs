@@ -8,12 +8,12 @@ use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_daemon_lifecycle::{DaemonStartError, EnsureDaemonOptions, ensure_daemon_running};
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint,
-    LocalIpcStream, PermissionSummary, PluginServiceResponse, PluginServiceSummary, Request,
-    Response, ResponsePayload, ServerStopMode, SessionCatalogSourceStatus, SessionCatalogStatus,
-    SessionImportWarning, WorktreeCreateRequest, WorktreeCreateResponse, WorktreeListRequest,
-    WorktreeListResponse, WorktreeRemoveRequest, WorktreeRemoveResponse, current_working_directory,
-    decode_event, decode_response, default_endpoint, recv_envelope, request_envelope,
-    send_envelope,
+    LocalIpcStream, PermissionSummary, PluginServiceResponse, PluginServiceSummary,
+    RalphStatusRequest, RalphStatusResponse, Request, Response, ResponsePayload, ServerStopMode,
+    SessionCatalogSourceStatus, SessionCatalogStatus, SessionImportWarning, WorktreeCreateRequest,
+    WorktreeCreateResponse, WorktreeListRequest, WorktreeListResponse, WorktreeRemoveRequest,
+    WorktreeRemoveResponse, current_working_directory, decode_event, decode_response,
+    default_endpoint, recv_envelope, request_envelope, send_envelope,
 };
 use bcode_session_models::{
     ClientId, ProjectionWindowRequest, RuntimeWorkId, RuntimeWorkStatus, SessionEvent,
@@ -782,6 +782,21 @@ impl BcodeClient {
     ) -> Result<WorktreeRemoveResponse, ClientError> {
         match self.send_request(Request::RemoveWorktree(request)).await? {
             ResponsePayload::WorktreeRemoved(response) => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Return Ralph loop status for a repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn ralph_status(
+        &self,
+        request: RalphStatusRequest,
+    ) -> Result<RalphStatusResponse, ClientError> {
+        match self.send_request(Request::RalphStatus(request)).await? {
+            ResponsePayload::RalphStatus(response) => Ok(response),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

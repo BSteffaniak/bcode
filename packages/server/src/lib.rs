@@ -16,10 +16,10 @@ use bcode_agent_profile::{
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, DaemonStatus, EnvelopeKind, ErrorResponse, Event,
     IpcEndpoint, LocalIpcListener, LocalIpcStream, PermissionSummary, PluginServiceError,
-    PluginServiceResponse, PluginServiceSummary, Request, Response, ResponsePayload, ServerStatus,
-    ServerStopMode, SessionCatalogSourceStatus, SessionCatalogStatus, WorktreeCreateRequest,
-    WorktreeListRequest, WorktreeRemoveRequest, decode, event_envelope, recv_envelope,
-    response_envelope, send_envelope,
+    PluginServiceResponse, PluginServiceSummary, RalphStatusRequest, RalphStatusResponse,
+    RalphStatusSummary, Request, Response, ResponsePayload, ServerStatus, ServerStopMode,
+    SessionCatalogSourceStatus, SessionCatalogStatus, WorktreeCreateRequest, WorktreeListRequest,
+    WorktreeRemoveRequest, decode, event_envelope, recv_envelope, response_envelope, send_envelope,
 };
 use bcode_metrics::{MetricLabels, MetricsRegistry};
 use bcode_model::{
@@ -1585,6 +1585,7 @@ async fn handle_request(
         Request::RemoveWorktree(request) => {
             handle_remove_worktree(request_id, state, writer, request).await
         }
+        Request::RalphStatus(request) => handle_ralph_status(request_id, writer, request).await,
         Request::RenameSession { session_id, name } => {
             handle_rename_session(request_id, state, writer, session_id, name).await
         }
@@ -1875,9 +1876,10 @@ async fn handle_agent_permission_plugin_request(
         Request::PublishPluginEvent { topic, payload } => {
             handle_publish_plugin_event(request_id, state, writer, &topic, &payload).await
         }
-        Request::ListWorktrees(_) | Request::CreateWorktree(_) | Request::RemoveWorktree(_) => {
-            unreachable!("worktree request routed to primary handler")
-        }
+        Request::ListWorktrees(_)
+        | Request::CreateWorktree(_)
+        | Request::RemoveWorktree(_)
+        | Request::RalphStatus(_) => unreachable!("primary request routed to primary handler"),
         _ => unreachable!("primary request routed to agent/permission/plugin handler"),
     }
 }
@@ -2154,6 +2156,45 @@ async fn handle_list_worktrees(
                     "worktree_list_failed",
                     error.to_string(),
                 )),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_ralph_status(
+    request_id: u64,
+    writer: &SharedWriter,
+    request: RalphStatusRequest,
+) -> Result<(), ServerError> {
+    match bcode_ralph::latest_loop(&request.repo_root) {
+        Ok(loop_summary) => {
+            let response = RalphStatusResponse {
+                loop_summary: loop_summary.map(|summary| RalphStatusSummary {
+                    loop_name: summary.loop_name,
+                    status: summary.status,
+                    state_dir: summary.state_dir,
+                    progress_doc_path: summary.progress_doc_path,
+                    work_area_path: summary.work_area_path,
+                    session_id: summary.session_id,
+                    iteration_count: summary.iteration_count,
+                    next_action: summary.next_action,
+                    checked_count: summary.checklist_summary.checked_count,
+                    unchecked_count: summary.checklist_summary.unchecked_count,
+                }),
+            };
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::RalphStatus(response)),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("ralph_status_failed", error.to_string())),
             )
             .await
         }

@@ -32,6 +32,7 @@ bcode_openai_compatible_provider_plugin = { workspace = true, optional = true }
 bcode_opencode_session_import_plugin = { workspace = true, optional = true }
 bcode_pi_session_import_plugin = { workspace = true, optional = true }
 bcode_plugin = { workspace = true }
+bcode_ralph = { workspace = true }
 bcode_session = { workspace = true }
 bcode_session_import = { workspace = true }
 bcode_session_models = { workspace = true }

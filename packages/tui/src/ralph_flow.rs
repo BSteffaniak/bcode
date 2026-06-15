@@ -3,6 +3,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
+use bcode_ipc::{RalphStatusRequest, RalphStatusSummary};
 use bcode_ralph as ralph_state;
 use bcode_session_models::{SessionHistoryDirection, SessionHistoryQuery};
 use bcode_worktree_models::WorktreeCreateRequest;
@@ -19,25 +20,33 @@ use super::session_flow::ActiveChat;
 use super::{TuiError, ralph_start_dialog, ralph_start_dialog_render};
 
 /// Show latest Ralph loop status for the current repository.
-pub fn show_status(chat: &mut ActiveChat) -> Result<(), TuiError> {
+pub async fn show_status(
+    services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
+) -> Result<(), TuiError> {
     let repo_root = current_repo_root(chat)?;
-    let Some(summary) = ralph_state::latest_loop(&repo_root)? else {
+    let response = services
+        .client
+        .ralph_status(RalphStatusRequest { repo_root })
+        .await?;
+    let Some(summary) = response.loop_summary else {
         chat.app
             .set_status("no Ralph loops for current repository".to_owned());
         return Ok(());
     };
-    ralph_state::append_lifecycle_event_for_summary(
-        &summary,
-        ralph_state::RalphLifecycleEventKind::StatusViewed,
-        "Viewed Ralph loop status",
-    )?;
-    chat.app.push_system_note(format!(
+    chat.app.push_system_note(format_status_note(&summary));
+    chat.app.set_status("Ralph status shown".to_owned());
+    Ok(())
+}
+
+fn format_status_note(summary: &RalphStatusSummary) -> String {
+    format!(
         "Ralph loop status\n* Loop: {}\n* Status: {}\n* Iterations: {}\n* Checklist: {} checked, {} unchecked\n* Next: {}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}",
         summary.loop_name,
         summary.status,
         summary.iteration_count,
-        summary.checklist_summary.checked_count,
-        summary.checklist_summary.unchecked_count,
+        summary.checked_count,
+        summary.unchecked_count,
         summary.next_action,
         summary.progress_doc_path.display(),
         summary.state_dir.display(),
@@ -46,9 +55,7 @@ pub fn show_status(chat: &mut ActiveChat) -> Result<(), TuiError> {
             .as_ref()
             .map_or_else(|| "<none>".to_owned(), |path| path.display().to_string()),
         summary.session_id.as_deref().unwrap_or("<none>")
-    ));
-    chat.app.set_status("Ralph status shown".to_owned());
-    Ok(())
+    )
 }
 
 /// Build and show a Ralph orchestration prompt for the current repository.

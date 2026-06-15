@@ -311,6 +311,7 @@ pub enum Request {
     ListWorktrees(WorktreeListRequest),
     CreateWorktree(WorktreeCreateRequest),
     RemoveWorktree(WorktreeRemoveRequest),
+    RalphStatus(RalphStatusRequest),
     ImportExternalSession {
         source_id: String,
         external_session_id: String,
@@ -523,6 +524,48 @@ pub struct SessionImportWarning {
     pub count: Option<u64>,
 }
 
+/// Ralph loop status request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RalphStatusRequest {
+    /// Repository root used to discover the active/latest Ralph loop.
+    pub repo_root: PathBuf,
+}
+
+/// Ralph loop status summary for IPC clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RalphStatusSummary {
+    /// User-facing loop name.
+    pub loop_name: String,
+    /// Current lifecycle status.
+    pub status: String,
+    /// Loop state directory.
+    pub state_dir: PathBuf,
+    /// Canonical progress document path.
+    pub progress_doc_path: PathBuf,
+    /// Isolated work area path, when created.
+    #[serde(default)]
+    pub work_area_path: Option<PathBuf>,
+    /// Session ID rooted at the isolated work area, when created.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Completed iteration count.
+    pub iteration_count: u64,
+    /// Suggested next action.
+    pub next_action: String,
+    /// Checked progress-doc checklist items.
+    pub checked_count: usize,
+    /// Unchecked progress-doc checklist items.
+    pub unchecked_count: usize,
+}
+
+/// Ralph loop status response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RalphStatusResponse {
+    /// Latest Ralph loop summary for the repository, when one exists.
+    #[serde(default)]
+    pub loop_summary: Option<RalphStatusSummary>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeWorkSnapshot {
     pub work_id: RuntimeWorkId,
@@ -643,6 +686,7 @@ pub enum ResponsePayload {
     WorktreeList(WorktreeListResponse),
     WorktreeCreated(WorktreeCreateResponse),
     WorktreeRemoved(WorktreeRemoveResponse),
+    RalphStatus(RalphStatusResponse),
     ExternalSessionImported {
         session: SessionSummary,
         warnings: Vec<SessionImportWarning>,

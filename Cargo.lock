@@ -1435,6 +1435,7 @@ dependencies = [
  "bcode_opencode_session_import_plugin",
  "bcode_pi_session_import_plugin",
  "bcode_plugin",
+ "bcode_ralph",
  "bcode_session",
  "bcode_session_import",
  "bcode_session_models",
