@@ -2510,13 +2510,16 @@ const fn ralph_iteration_status_from_model_outcome(
     }
 }
 
+fn progress_doc_checklist_summary(
+    path: &Path,
+) -> Result<bcode_ralph::ProgressDocChecklistSummary, std::io::Error> {
+    std::fs::read_to_string(path).map(|text| bcode_ralph::analyze_progress_doc_text(&text))
+}
+
 fn progress_doc_checklist_fingerprint(path: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    Some(
-        bcode_ralph::analyze_progress_doc_text(&text)
-            .checklist_fingerprint
-            .to_string(),
-    )
+    progress_doc_checklist_summary(path)
+        .ok()
+        .map(|summary| summary.checklist_fingerprint.to_string())
 }
 
 async fn record_ralph_skeleton_noop_iteration(
@@ -2717,6 +2720,72 @@ fn build_ralph_work_prompt(summary: &bcode_ralph::RalphLoopSummary) -> String {
     })
 }
 
+fn ralph_stop_decision_after_audit(
+    summary: &bcode_ralph::RalphLoopSummary,
+    run: &bcode_ralph::RalphRunRecord,
+    iteration: &bcode_ralph::RalphIterationRecord,
+) -> Result<bcode_ralph::RalphStopDecision, std::io::Error> {
+    let checklist_summary = progress_doc_checklist_summary(&summary.progress_doc_path)?;
+    let no_progress_count =
+        u64::from(iteration.checklist_fingerprint_before == iteration.checklist_fingerprint_after);
+    Ok(bcode_ralph::decide_stop(
+        bcode_ralph::RalphStopDecisionInput {
+            status: bcode_ralph::RalphLoopStatus::Running,
+            iteration_count: summary.iteration_count.saturating_add(1),
+            max_iterations: run.requested_max_iterations.unwrap_or(0),
+            no_progress_count,
+            no_progress_limit: run.requested_no_progress_limit.unwrap_or(0),
+            checklist_summary,
+            permission_denied: false,
+            validation_blocked: false,
+            user_question: false,
+        },
+    ))
+}
+
+const fn ralph_run_terminal_from_decision(
+    decision: bcode_ralph::RalphStopDecision,
+) -> (&'static str, &'static str, &'static str) {
+    match decision {
+        bcode_ralph::RalphStopDecision::Continue => (
+            "blocked",
+            "runner_skeleton",
+            "Ralph runner skeleton would continue; loop continuation is not implemented yet",
+        ),
+        bcode_ralph::RalphStopDecision::CompletionCandidate => (
+            "done",
+            "progress_doc_complete",
+            "Ralph progress doc appears complete after audit",
+        ),
+        bcode_ralph::RalphStopDecision::MaxIterations => (
+            "stopped",
+            "max_iterations",
+            "Ralph maximum iteration count reached",
+        ),
+        bcode_ralph::RalphStopDecision::RepeatedNoProgress => (
+            "blocked",
+            "no_progress",
+            "Ralph repeated no-progress threshold reached",
+        ),
+        bcode_ralph::RalphStopDecision::PermissionDenied => {
+            ("blocked", "permission_denied", "Ralph permission denied")
+        }
+        bcode_ralph::RalphStopDecision::ValidationBlocked => (
+            "blocked",
+            "validation_blocked",
+            "Ralph validation blocked the loop",
+        ),
+        bcode_ralph::RalphStopDecision::UserQuestion => {
+            ("blocked", "user_question", "Ralph needs a user answer")
+        }
+        bcode_ralph::RalphStopDecision::TerminalStatus => (
+            "stopped",
+            "terminal_status",
+            "Ralph loop was already terminal",
+        ),
+    }
+}
+
 async fn submit_ralph_audit_after_validation(
     state: &Arc<ServerState>,
     runtime_session_id: Option<SessionId>,
@@ -2782,20 +2851,28 @@ async fn complete_ralph_skeleton_after_iteration(
     let audit_outcome = audit_completion
         .as_ref()
         .map(|completion| completion.outcome);
-    let (stop_reason, error_message) = if audit_outcome == Some(ModelTurnOutcome::Completed) {
-        (
-            "runner_skeleton",
-            "Ralph runner skeleton completed work, validation, and audit; loop continuation is not implemented yet",
-        )
-    } else {
-        (
-            "audit_failed",
-            "Ralph audit turn did not complete successfully",
-        )
-    };
+    let (run_status, stop_reason, error_message) =
+        if audit_outcome == Some(ModelTurnOutcome::Completed) {
+            iteration
+                .and_then(|iteration| ralph_stop_decision_after_audit(summary, run, iteration).ok())
+                .map_or(
+                    (
+                        "blocked",
+                        "progress_doc_unreadable",
+                        "Ralph progress doc could not be read after audit",
+                    ),
+                    ralph_run_terminal_from_decision,
+                )
+        } else {
+            (
+                "blocked",
+                "audit_failed",
+                "Ralph audit turn did not complete successfully",
+            )
+        };
     let _ = bcode_ralph::update_run_status(
         &run.run_id,
-        "blocked",
+        run_status,
         Some(current_time_ms()),
         Some(stop_reason),
         Some(error_message),
