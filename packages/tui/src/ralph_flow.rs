@@ -186,9 +186,28 @@ pub async fn list_iterations(
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let validations = if response.validations.is_empty() {
+        "* <none>".to_owned()
+    } else {
+        response
+            .validations
+            .iter()
+            .map(|validation| {
+                format!(
+                    "* {} — {}{}",
+                    validation.command,
+                    validation.status,
+                    validation
+                        .exit_code
+                        .map_or_else(String::new, |code| format!(" (exit {code})"))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     chat.app.push_system_note(format!(
-        "Ralph iterations\n* Loop: {}\n* Run: {}\n{}",
-        summary.loop_name, run_label, iterations
+        "Ralph iterations\n* Loop: {}\n* Run: {}\nIterations:\n{}\nValidations:\n{}",
+        summary.loop_name, run_label, iterations, validations
     ));
     chat.app.set_status("Ralph iterations shown".to_owned());
     Ok(())

@@ -21,9 +21,10 @@ use bcode_ipc::{
     RalphListIterationsResponse, RalphListRunsRequest, RalphListRunsResponse, RalphResumeRequest,
     RalphResumeResponse, RalphRunRequest, RalphRunResponse, RalphRunStatusRequest,
     RalphRunStatusResponse, RalphRunSummary, RalphStatusRequest, RalphStatusResponse,
-    RalphStatusSummary, Request, Response, ResponsePayload, ServerStatus, ServerStopMode,
-    SessionCatalogSourceStatus, SessionCatalogStatus, WorktreeCreateRequest, WorktreeListRequest,
-    WorktreeRemoveRequest, decode, event_envelope, recv_envelope, response_envelope, send_envelope,
+    RalphStatusSummary, RalphValidationSummary, Request, Response, ResponsePayload, ServerStatus,
+    ServerStopMode, SessionCatalogSourceStatus, SessionCatalogStatus, WorktreeCreateRequest,
+    WorktreeListRequest, WorktreeRemoveRequest, decode, event_envelope, recv_envelope,
+    response_envelope, send_envelope,
 };
 use bcode_metrics::{MetricLabels, MetricsRegistry};
 use bcode_model::{
@@ -3642,16 +3643,27 @@ async fn handle_list_ralph_iterations(
                 .as_deref()
                 .and_then(|run_id| runs.iter().find(|run| run.run_id == run_id))
                 .or_else(|| runs.first());
-            let iterations = run
+            let (iterations, validations) = run
                 .map_or_else(
-                    || Ok(Vec::new()),
+                    || Ok((Vec::new(), Vec::new())),
                     |run| {
-                        bcode_ralph::list_iterations_for_run(&run.run_id).map(|iterations| {
-                            iterations
+                        let iteration_records = bcode_ralph::list_iterations_for_run(&run.run_id)?;
+                        let mut validation_records = Vec::new();
+                        for iteration in &iteration_records {
+                            validation_records.extend(bcode_ralph::list_validations_for_iteration(
+                                &iteration.iteration_id,
+                            )?);
+                        }
+                        Ok((
+                            iteration_records
                                 .into_iter()
                                 .map(ralph_iteration_summary)
-                                .collect()
-                        })
+                                .collect(),
+                            validation_records
+                                .into_iter()
+                                .map(ralph_validation_summary)
+                                .collect(),
+                        ))
                     },
                 )
                 .map_err(|error: bcode_ralph::RalphStateError| error.to_string())?;
@@ -3659,6 +3671,7 @@ async fn handle_list_ralph_iterations(
                 loop_summary: Some(ralph_status_summary(summary)),
                 run: run.cloned().map(ralph_run_summary),
                 iterations,
+                validations,
             })
         },
     ) {
@@ -3749,6 +3762,21 @@ fn resolve_ralph_cancel_target(
         (Some(_), None) => Err("requested Ralph run is not active".to_owned()),
         (None, Some(run)) => Ok(run),
         (None, None) => Err("Ralph loop has no active run".to_owned()),
+    }
+}
+
+fn ralph_validation_summary(
+    validation: bcode_ralph::RalphValidationRecord,
+) -> RalphValidationSummary {
+    RalphValidationSummary {
+        validation_id: validation.validation_id,
+        iteration_id: validation.iteration_id,
+        command: validation.command,
+        status: validation.status,
+        exit_code: validation.exit_code,
+        output_ref: validation.output_ref,
+        finished_at_ms: validation.finished_at_ms,
+        error_message: validation.error_message,
     }
 }
 

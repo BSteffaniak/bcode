@@ -742,6 +742,31 @@ pub struct RalphIterationSummary {
     pub finished_at_ms: Option<u64>,
 }
 
+/// Ralph validation summary for IPC clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RalphValidationSummary {
+    /// Validation ID.
+    pub validation_id: String,
+    /// Parent iteration ID.
+    pub iteration_id: String,
+    /// Validation command.
+    pub command: String,
+    /// Validation status.
+    pub status: String,
+    /// Process exit code, when available.
+    #[serde(default)]
+    pub exit_code: Option<i64>,
+    /// Bounded output reference, when retained.
+    #[serde(default)]
+    pub output_ref: Option<String>,
+    /// Validation finish time in Unix epoch milliseconds.
+    #[serde(default)]
+    pub finished_at_ms: Option<u64>,
+    /// Error message, when validation failed to run.
+    #[serde(default)]
+    pub error_message: Option<String>,
+}
+
 /// Response after starting a Ralph run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RalphRunResponse {
@@ -781,6 +806,9 @@ pub struct RalphListIterationsResponse {
     /// Iterations for the run.
     #[serde(default)]
     pub iterations: Vec<RalphIterationSummary>,
+    /// Validation records grouped with the listed iterations.
+    #[serde(default)]
+    pub validations: Vec<RalphValidationSummary>,
 }
 
 /// Response after preparing a Ralph resume run.
