@@ -11,46 +11,6 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use thiserror::Error;
 
-const KNOWN_PERSISTED_EVENT_KINDS: &[&str] = &[
-    "session_created",
-    "client_attached",
-    "client_detached",
-    "user_message",
-    "assistant_delta",
-    "assistant_message",
-    "tool_call_requested",
-    "tool_call_finished",
-    "permission_requested",
-    "permission_resolved",
-    "model_changed",
-    "system_message",
-    "agent_changed",
-    "model_turn_started",
-    "model_turn_finished",
-    "model_usage",
-    "context_compacted",
-    "session_renamed",
-    "trace_event",
-    "skill_invoked",
-    "skill_suggested",
-    "skill_activated",
-    "skill_deactivated",
-    "skill_context_loaded",
-    "skill_invocation_failed",
-    "assistant_reasoning_delta",
-    "assistant_reasoning_message",
-    "runtime_work_started",
-    "runtime_work_cancel_requested",
-    "runtime_work_finished",
-    "runtime_work_progress",
-    "model_turn_cancel_requested",
-    "tool_invocation_stream",
-    "working_directory_changed",
-    "session_imported",
-    "tool_invocation_presentation",
-    "session_forked",
-];
-
 /// Decode a persisted session event from durable JSON.
 ///
 /// # Errors
@@ -80,18 +40,28 @@ fn reject_unsupported_future_shape(
         }
     }
 
-    let Some(kind) = value.get("kind").and_then(serde_json::Value::as_object) else {
+    let Some(kind) = value.get("kind") else {
         return Ok(());
     };
-    let Some(kind_name) = kind.keys().next() else {
-        return Ok(());
-    };
-    if !KNOWN_PERSISTED_EVENT_KINDS.contains(&kind_name.as_str()) {
-        return Err(PersistedSessionEventError::UnsupportedEventKind {
-            kind: kind_name.clone(),
-        });
+    match serde_json::from_value::<PersistedSessionEventKind>(kind.clone()) {
+        Ok(_) => Ok(()),
+        Err(error) if is_unknown_variant_error(&error) => {
+            Err(PersistedSessionEventError::UnsupportedEventKind {
+                kind: first_persisted_event_kind_name(kind),
+            })
+        }
+        Err(_) => Ok(()),
     }
-    Ok(())
+}
+
+fn is_unknown_variant_error(error: &serde_json::Error) -> bool {
+    error.to_string().starts_with("unknown variant `")
+}
+
+fn first_persisted_event_kind_name(kind: &serde_json::Value) -> String {
+    kind.as_object()
+        .and_then(|object| object.keys().next().cloned())
+        .unwrap_or_else(|| "<invalid>".to_string())
 }
 
 /// Errors returned when decoding persisted session events.
