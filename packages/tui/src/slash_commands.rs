@@ -33,7 +33,7 @@ pub enum SlashCommandOutcome {
     /// Show the latest Ralph progress doc path.
     OpenRalphProgress,
     /// Build a Ralph work prompt.
-    BuildRalphPrompt(super::ralph_state::RalphPromptKind),
+    BuildRalphPrompt(bcode_ralph::RalphPromptKind),
     /// Open skill picker.
     PickSkill,
     /// Invoke a skill after creating an active session if needed.
@@ -322,14 +322,10 @@ fn ralph_command(parts: &[&str]) -> SlashCommandOutcome {
         Some("start") | None => SlashCommandOutcome::OpenRalphStartDialog,
         Some("status") => SlashCommandOutcome::ShowRalphStatus,
         Some("open") => SlashCommandOutcome::OpenRalphProgress,
-        Some("run") => {
-            SlashCommandOutcome::BuildRalphPrompt(super::ralph_state::RalphPromptKind::Work)
-        }
-        Some("audit") => {
-            SlashCommandOutcome::BuildRalphPrompt(super::ralph_state::RalphPromptKind::Audit)
-        }
+        Some("run") => SlashCommandOutcome::BuildRalphPrompt(bcode_ralph::RalphPromptKind::Work),
+        Some("audit") => SlashCommandOutcome::BuildRalphPrompt(bcode_ralph::RalphPromptKind::Audit),
         Some("replan") => {
-            SlashCommandOutcome::BuildRalphPrompt(super::ralph_state::RalphPromptKind::Replan)
+            SlashCommandOutcome::BuildRalphPrompt(bcode_ralph::RalphPromptKind::Replan)
         }
         Some("stop") => {
             SlashCommandOutcome::Handled("Ralph stop is not implemented yet".to_owned())
@@ -706,7 +702,7 @@ pub async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ralph_state::RalphPromptKind;
+    use bcode_ralph::RalphPromptKind;
 
     #[test]
     fn ralph_start_routes_to_start_dialog() {

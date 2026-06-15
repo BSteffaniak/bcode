@@ -23,8 +23,11 @@ switchy = { workspace = true, features = [
     "schema",
 ] }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
 uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [features]
 default          = []

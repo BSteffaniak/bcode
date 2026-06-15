@@ -2,6 +2,7 @@
 
 use std::io::Write;
 
+use bcode_ralph as ralph_state;
 use bcode_session_models::{SessionHistoryDirection, SessionHistoryQuery};
 use bcode_worktree_models::WorktreeCreateRequest;
 use bmux_keyboard::{KeyCode, KeyStroke};
@@ -14,7 +15,7 @@ use super::helpers;
 use super::keymap::BmuxKeyMap;
 use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::ActiveChat;
-use super::{TuiError, ralph_start_dialog, ralph_start_dialog_render, ralph_state};
+use super::{TuiError, ralph_start_dialog, ralph_start_dialog_render};
 
 /// Show latest Ralph loop status for the current repository.
 pub fn show_status(chat: &mut ActiveChat) -> Result<(), TuiError> {
