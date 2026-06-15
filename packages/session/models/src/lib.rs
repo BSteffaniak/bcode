@@ -1216,6 +1216,14 @@ pub enum SessionEventKind {
         forked_at_ms: u64,
         kind: SessionForkKind,
     },
+    /// Durable marker for Ralph loop lifecycle events relevant to this session.
+    RalphLifecycle {
+        loop_name: String,
+        state_dir: PathBuf,
+        kind: String,
+        message: String,
+        occurred_at_ms: u64,
+    },
 }
 
 #[cfg(test)]

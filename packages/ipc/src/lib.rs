@@ -312,6 +312,7 @@ pub enum Request {
     CreateWorktree(WorktreeCreateRequest),
     RemoveWorktree(WorktreeRemoveRequest),
     RalphStatus(RalphStatusRequest),
+    RecordRalphLifecycle(RalphLifecycleRequest),
     ImportExternalSession {
         source_id: String,
         external_session_id: String,
@@ -524,6 +525,23 @@ pub struct SessionImportWarning {
     pub count: Option<u64>,
 }
 
+/// Ralph lifecycle session-history append request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RalphLifecycleRequest {
+    /// Session that should receive the durable lifecycle marker.
+    pub session_id: SessionId,
+    /// User-facing loop name.
+    pub loop_name: String,
+    /// Ralph loop state directory.
+    pub state_dir: PathBuf,
+    /// Lifecycle kind.
+    pub kind: String,
+    /// Human-readable lifecycle message.
+    pub message: String,
+    /// Lifecycle time in Unix epoch milliseconds.
+    pub occurred_at_ms: u64,
+}
+
 /// Ralph loop status request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RalphStatusRequest {
@@ -687,6 +705,9 @@ pub enum ResponsePayload {
     WorktreeCreated(WorktreeCreateResponse),
     WorktreeRemoved(WorktreeRemoveResponse),
     RalphStatus(RalphStatusResponse),
+    RalphLifecycleRecorded {
+        event: SessionEvent,
+    },
     ExternalSessionImported {
         session: SessionSummary,
         warnings: Vec<SessionImportWarning>,

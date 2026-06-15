@@ -16,10 +16,11 @@ use bcode_agent_profile::{
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, DaemonStatus, EnvelopeKind, ErrorResponse, Event,
     IpcEndpoint, LocalIpcListener, LocalIpcStream, PermissionSummary, PluginServiceError,
-    PluginServiceResponse, PluginServiceSummary, RalphStatusRequest, RalphStatusResponse,
-    RalphStatusSummary, Request, Response, ResponsePayload, ServerStatus, ServerStopMode,
-    SessionCatalogSourceStatus, SessionCatalogStatus, WorktreeCreateRequest, WorktreeListRequest,
-    WorktreeRemoveRequest, decode, event_envelope, recv_envelope, response_envelope, send_envelope,
+    PluginServiceResponse, PluginServiceSummary, RalphLifecycleRequest, RalphStatusRequest,
+    RalphStatusResponse, RalphStatusSummary, Request, Response, ResponsePayload, ServerStatus,
+    ServerStopMode, SessionCatalogSourceStatus, SessionCatalogStatus, WorktreeCreateRequest,
+    WorktreeListRequest, WorktreeRemoveRequest, decode, event_envelope, recv_envelope,
+    response_envelope, send_envelope,
 };
 use bcode_metrics::{MetricLabels, MetricsRegistry};
 use bcode_model::{
@@ -1586,6 +1587,9 @@ async fn handle_request(
             handle_remove_worktree(request_id, state, writer, request).await
         }
         Request::RalphStatus(request) => handle_ralph_status(request_id, writer, request).await,
+        Request::RecordRalphLifecycle(request) => {
+            handle_record_ralph_lifecycle(request_id, state, writer, request).await
+        }
         Request::RenameSession { session_id, name } => {
             handle_rename_session(request_id, state, writer, session_id, name).await
         }
@@ -1879,7 +1883,10 @@ async fn handle_agent_permission_plugin_request(
         Request::ListWorktrees(_)
         | Request::CreateWorktree(_)
         | Request::RemoveWorktree(_)
-        | Request::RalphStatus(_) => unreachable!("primary request routed to primary handler"),
+        | Request::RalphStatus(_)
+        | Request::RecordRalphLifecycle(_) => {
+            unreachable!("primary request routed to primary handler")
+        }
         _ => unreachable!("primary request routed to agent/permission/plugin handler"),
     }
 }
@@ -2195,6 +2202,49 @@ async fn handle_ralph_status(
                 writer,
                 request_id,
                 Response::Err(ErrorResponse::new("ralph_status_failed", error.to_string())),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_record_ralph_lifecycle(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    request: RalphLifecycleRequest,
+) -> Result<(), ServerError> {
+    match state
+        .sessions
+        .append_event(
+            request.session_id,
+            SessionEventKind::RalphLifecycle {
+                loop_name: request.loop_name,
+                state_dir: request.state_dir,
+                kind: request.kind,
+                message: request.message,
+                occurred_at_ms: request.occurred_at_ms,
+            },
+        )
+        .await
+    {
+        Ok(event) => {
+            publish_session_event(state, &event).await;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::RalphLifecycleRecorded { event }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "ralph_lifecycle_record_failed",
+                    error.to_string(),
+                )),
             )
             .await
         }
@@ -10054,6 +10104,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::ToolInvocationPresentation { .. } => "tool_invocation_presentation",
         SessionEventKind::SessionForked { .. } => "session_forked",
+        SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
     }
 }
 

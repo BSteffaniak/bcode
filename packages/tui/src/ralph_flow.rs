@@ -2,8 +2,9 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use bcode_ipc::{RalphStatusRequest, RalphStatusSummary};
+use bcode_ipc::{RalphLifecycleRequest, RalphStatusRequest, RalphStatusSummary};
 use bcode_ralph as ralph_state;
 use bcode_session_models::{SessionHistoryDirection, SessionHistoryQuery};
 use bcode_worktree_models::WorktreeCreateRequest;
@@ -213,6 +214,19 @@ async fn confirm_start_loop(
         work_area.branch.as_deref(),
         work_area_session_id.as_deref(),
     )?;
+    if let Some(session) = &work_area.session {
+        let _event = services
+            .client
+            .record_ralph_lifecycle(RalphLifecycleRequest {
+                session_id: session.id,
+                loop_name: loop_name.clone(),
+                state_dir: state.state_dir.clone(),
+                kind: "work_area_created".to_owned(),
+                message: "Created Ralph isolated work area".to_owned(),
+                occurred_at_ms: now_ms(),
+            })
+            .await?;
+    }
     chat.app.push_system_note(format!(
         "Ralph loop created\n* Loop: {loop_name}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}\n* Next: capture conversation context into the progress doc",
         state.progress_doc_path.display(),
@@ -222,6 +236,14 @@ async fn confirm_start_loop(
     ));
     chat.app.set_status("Ralph loop created".to_owned());
     Ok(true)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 fn handle_loop_name_key(

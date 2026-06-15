@@ -1561,6 +1561,7 @@ const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::ToolInvocationPresentation { .. } => "tool_invocation_presentation",
         SessionEventKind::SessionForked { .. } => "session_forked",
+        SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
     }
 }
 

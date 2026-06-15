@@ -4458,6 +4458,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::ToolInvocationPresentation { .. } => "tool_invocation_presentation",
         SessionEventKind::SessionForked { .. } => "session_forked",
+        SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
     }
 }
 
@@ -4930,6 +4931,15 @@ fn print_non_trace_session_event(event: &SessionEvent) {
                 event.sequence, kind
             );
         }
+        SessionEventKind::RalphLifecycle {
+            loop_name,
+            kind,
+            message,
+            ..
+        } => println!(
+            "#{} Ralph {kind} for {loop_name}: {message}",
+            event.sequence
+        ),
         SessionEventKind::TraceEvent { .. } => {}
     }
 }

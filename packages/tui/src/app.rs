@@ -3086,6 +3086,7 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::RuntimeWorkFinished { .. }
         | SessionEventKind::ToolInvocationStream { .. }
         | SessionEventKind::ToolInvocationPresentation { .. }
+        | SessionEventKind::RalphLifecycle { .. }
         | SessionEventKind::AssistantReasoningDelta { .. }
         | SessionEventKind::AssistantReasoningMessage { .. } => true,
         SessionEventKind::SkillSuggested { reason, .. } => reason.is_some(),

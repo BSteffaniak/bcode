@@ -9,11 +9,12 @@ use bcode_daemon_lifecycle::{DaemonStartError, EnsureDaemonOptions, ensure_daemo
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint,
     LocalIpcStream, PermissionSummary, PluginServiceResponse, PluginServiceSummary,
-    RalphStatusRequest, RalphStatusResponse, Request, Response, ResponsePayload, ServerStopMode,
-    SessionCatalogSourceStatus, SessionCatalogStatus, SessionImportWarning, WorktreeCreateRequest,
-    WorktreeCreateResponse, WorktreeListRequest, WorktreeListResponse, WorktreeRemoveRequest,
-    WorktreeRemoveResponse, current_working_directory, decode_event, decode_response,
-    default_endpoint, recv_envelope, request_envelope, send_envelope,
+    RalphLifecycleRequest, RalphStatusRequest, RalphStatusResponse, Request, Response,
+    ResponsePayload, ServerStopMode, SessionCatalogSourceStatus, SessionCatalogStatus,
+    SessionImportWarning, WorktreeCreateRequest, WorktreeCreateResponse, WorktreeListRequest,
+    WorktreeListResponse, WorktreeRemoveRequest, WorktreeRemoveResponse, current_working_directory,
+    decode_event, decode_response, default_endpoint, recv_envelope, request_envelope,
+    send_envelope,
 };
 use bcode_session_models::{
     ClientId, ProjectionWindowRequest, RuntimeWorkId, RuntimeWorkStatus, SessionEvent,
@@ -797,6 +798,24 @@ impl BcodeClient {
     ) -> Result<RalphStatusResponse, ClientError> {
         match self.send_request(Request::RalphStatus(request)).await? {
             ResponsePayload::RalphStatus(response) => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Record a Ralph lifecycle marker in session history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn record_ralph_lifecycle(
+        &self,
+        request: RalphLifecycleRequest,
+    ) -> Result<SessionEvent, ClientError> {
+        match self
+            .send_request(Request::RecordRalphLifecycle(request))
+            .await?
+        {
+            ResponsePayload::RalphLifecycleRecorded { event } => Ok(event),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
