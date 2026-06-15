@@ -71,7 +71,7 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::io::{WriteHalf, split};
-use tokio::sync::{Mutex, Notify, broadcast, mpsc};
+use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 
 const CLIENT_EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -255,6 +255,7 @@ enum SessionCommand {
         client_id: ClientId,
         runtime_context: Option<ClientRuntimeContext>,
         text: String,
+        completion: Option<oneshot::Sender<ModelTurnCompletion>>,
     },
     SkillInvocation {
         client_id: ClientId,
@@ -3621,9 +3622,17 @@ async fn run_session_runtime(
                 client_id,
                 runtime_context,
                 text,
+                completion,
             } => {
-                process_user_message_command(&state, &mut permit, client_id, runtime_context, text)
-                    .await;
+                process_user_message_command(
+                    &state,
+                    &mut permit,
+                    client_id,
+                    runtime_context,
+                    text,
+                    completion,
+                )
+                .await;
             }
             SessionCommand::SkillInvocation {
                 client_id,
@@ -3656,28 +3665,26 @@ async fn process_user_message_command(
     client_id: ClientId,
     runtime_context: Option<ClientRuntimeContext>,
     text: String,
+    completion_sender: Option<oneshot::Sender<ModelTurnCompletion>>,
 ) {
-    match append_turn_user_message(state, permit, client_id, text).await {
+    let completion = match append_turn_user_message(state, permit, client_id, text).await {
         Ok(Some(user_event)) => {
             suggest_skills_for_prompt(state, permit.session_id(), &user_event).await;
-            run_model_turn(state, permit, &user_event, client_id, runtime_context).await;
+            run_model_turn(state, permit, &user_event, client_id, runtime_context).await
         }
         Ok(None) => {
-            append_system_event(
-                state,
-                permit.session_id(),
-                "no user message event was appended".to_string(),
-            )
-            .await;
+            let message = "no user message event was appended".to_string();
+            append_system_event(state, permit.session_id(), message.clone()).await;
+            ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message)
         }
         Err(error) => {
-            append_system_event(
-                state,
-                permit.session_id(),
-                format!("failed to append user message: {error}"),
-            )
-            .await;
+            let message = format!("failed to append user message: {error}");
+            append_system_event(state, permit.session_id(), message.clone()).await;
+            ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message)
         }
+    };
+    if let Some(sender) = completion_sender {
+        let _sent = sender.send(completion);
     }
 }
 
@@ -3897,6 +3904,7 @@ async fn handle_user_message(
             client_id,
             runtime_context: state.client_runtime_context(client_id).await,
             text,
+            completion: None,
         },
     )
     .await
@@ -6263,7 +6271,7 @@ async fn run_model_turn(
     trigger_event: &bcode_session_models::SessionEvent,
     client_id: ClientId,
     runtime_context: Option<ClientRuntimeContext>,
-) {
+) -> ModelTurnCompletion {
     let session_id = permit.enter_turn();
     let turn_id = format!("{}-{}", session_id, trigger_event.sequence);
     let model_work_id = RuntimeWorkId::new(format!("model_{turn_id}"));
@@ -6308,9 +6316,10 @@ async fn run_model_turn(
         session_id,
         model_work_id,
         runtime_work_status_from_model_outcome(completion.outcome),
-        completion.message,
+        completion.message.clone(),
     )
     .await;
+    completion
 }
 
 #[allow(clippy::too_many_lines)]
