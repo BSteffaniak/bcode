@@ -567,6 +567,23 @@ pub async fn execute(
                 status.provider_plugin_id.as_deref().unwrap_or("auto")
             )))
         }
+        "context-strategy" | "context" => {
+            let Some(session_id) = session_id else {
+                return Ok(SlashCommandOutcome::Handled(
+                    "context-strategy requires an active session".to_owned(),
+                ));
+            };
+            let status = client.session_model_status(session_id).await?;
+            Ok(SlashCommandOutcome::Handled(format!(
+                "context strategy: prompt_cache={}, conversation_reuse={}, compaction={}",
+                status.prompt_cache_mode.as_deref().unwrap_or("unknown"),
+                status
+                    .conversation_reuse_mode
+                    .as_deref()
+                    .unwrap_or("unknown"),
+                status.compaction_mode.as_deref().unwrap_or("unknown")
+            )))
+        }
         "diff" => Ok(SlashCommandOutcome::ToggleDiff),
         "cwd" => {
             let Some(session_id) = session_id else {

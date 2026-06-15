@@ -791,6 +791,9 @@ fn header_and_footer_include_model_agent_and_token_context() {
         reasoning: None,
         reasoning_effort: None,
         reasoning_summary: None,
+        prompt_cache_mode: None,
+        conversation_reuse_mode: None,
+        compaction_mode: None,
     });
     let mut buffer = Buffer::empty(Rect::new(0, 0, 180, 12));
     let mut frame = Frame::new(&mut buffer);
@@ -808,7 +811,7 @@ fn header_and_footer_include_model_agent_and_token_context() {
     assert!(output.contains("model-example"));
     assert!(buffer.row_symbols(0).unwrap().contains("agent: plan"));
     assert!(output.contains("ctx 512/1.0k 50%"));
-    assert!(output.contains("cached 256 tok"));
+    assert!(output.contains("cache read 256 tok"));
     assert!(output.contains("cache write 128 tok"));
     assert!(output.contains("spent 640 tok"));
 }
@@ -3623,6 +3626,9 @@ fn thinking_label_uses_effective_values() {
         }),
         reasoning_effort: None,
         reasoning_summary: Some("detailed".to_owned()),
+        prompt_cache_mode: None,
+        conversation_reuse_mode: None,
+        compaction_mode: None,
     });
     app.set_reasoning_visible(true);
 
@@ -3650,6 +3656,9 @@ fn thinking_dialog_cycles_supported_values() {
         }),
         reasoning_effort: Some("low".to_owned()),
         reasoning_summary: Some("auto".to_owned()),
+        prompt_cache_mode: None,
+        conversation_reuse_mode: None,
+        compaction_mode: None,
     };
     let mut dialog = super::thinking_dialog::ThinkingDialogState::new(false, &status);
 
@@ -3681,6 +3690,9 @@ fn thinking_dialog_can_start_focused_on_effort_or_summary() {
         }),
         reasoning_effort: Some("low".to_owned()),
         reasoning_summary: Some("auto".to_owned()),
+        prompt_cache_mode: None,
+        conversation_reuse_mode: None,
+        compaction_mode: None,
     };
 
     let effort = super::thinking_dialog::ThinkingDialogState::new_focused(
@@ -3708,6 +3720,9 @@ fn thinking_dialog_cycles_fallback_values_when_provider_values_are_unknown() {
         reasoning: None,
         reasoning_effort: None,
         reasoning_summary: None,
+        prompt_cache_mode: None,
+        conversation_reuse_mode: None,
+        compaction_mode: None,
     };
     let mut dialog = super::thinking_dialog::ThinkingDialogState::new(false, &status);
 

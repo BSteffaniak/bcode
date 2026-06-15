@@ -2575,10 +2575,19 @@ impl BmuxApp {
             } => self.apply_compaction_trace(trace.phase, reason, *compacted, message.as_deref()),
             SessionTracePayload::ModelRequestBuilt {
                 uses_previous_provider_response,
+                message_count,
+                metadata,
                 ..
-            } => self
-                .token_usage
-                .apply_model_request(*uses_previous_provider_response),
+            } => self.token_usage.apply_model_request(
+                *uses_previous_provider_response,
+                *message_count,
+                metadata
+                    .get("sent_message_count")
+                    .and_then(|value| value.parse().ok()),
+                metadata
+                    .get("prompt_cache_points")
+                    .and_then(|value| value.parse().ok()),
+            ),
             SessionTracePayload::ProviderRound { .. }
             | SessionTracePayload::ToolInvocationStarted { .. }
             | SessionTracePayload::ToolPolicyEvaluated { .. }
@@ -2826,6 +2835,9 @@ struct TokenUsageMeter {
     latest_cached_input_tokens: Option<u32>,
     latest_cache_write_input_tokens: Option<u32>,
     provider_reuse_active: bool,
+    latest_sent_message_count: Option<usize>,
+    latest_total_message_count: Option<usize>,
+    latest_prompt_cache_points: Option<usize>,
     context_window: Option<u32>,
 }
 
@@ -2851,8 +2863,17 @@ impl TokenUsageMeter {
         self.context_window = None;
     }
 
-    const fn apply_model_request(&mut self, uses_previous_provider_response: bool) {
+    const fn apply_model_request(
+        &mut self,
+        uses_previous_provider_response: bool,
+        message_count: usize,
+        metadata_sent_message_count: Option<usize>,
+        metadata_prompt_cache_points: Option<usize>,
+    ) {
         self.provider_reuse_active = uses_previous_provider_response;
+        self.latest_total_message_count = Some(message_count);
+        self.latest_sent_message_count = metadata_sent_message_count;
+        self.latest_prompt_cache_points = metadata_prompt_cache_points;
     }
 
     fn footer_summary(&self) -> String {
@@ -2863,10 +2884,7 @@ impl TokenUsageMeter {
         if let Some(cached) = self.latest_cached_input_tokens
             && cached > 0
         {
-            parts.push(format!(
-                "cached prefix {} tok",
-                compact_u64(u64::from(cached))
-            ));
+            parts.push(format!("cache read {} tok", compact_u64(u64::from(cached))));
         }
         if let Some(written) = self.latest_cache_write_input_tokens
             && written > 0
@@ -2875,6 +2893,18 @@ impl TokenUsageMeter {
                 "cache write {} tok",
                 compact_u64(u64::from(written))
             ));
+        }
+        if let (Some(sent), Some(total)) = (
+            self.latest_sent_message_count,
+            self.latest_total_message_count,
+        ) && sent < total
+        {
+            parts.push(format!("sent {sent}/{total} msgs"));
+        }
+        if let Some(points) = self.latest_prompt_cache_points
+            && points > 0
+        {
+            parts.push(format!("cache points {points}"));
         }
         parts.push(format!("spent {} tok", compact_u64(self.session_tokens)));
         parts.join(" · ")

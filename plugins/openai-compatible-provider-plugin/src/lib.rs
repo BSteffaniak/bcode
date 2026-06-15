@@ -2269,7 +2269,6 @@ fn joined_text_content(message: &ModelMessage) -> String {
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.as_str()),
-            ContentBlock::CachePoint { .. } => Some("[Bcode prompt cache point]"),
             _ => None,
         })
         .collect::<Vec<_>>()

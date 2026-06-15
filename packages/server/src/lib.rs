@@ -3488,6 +3488,13 @@ async fn handle_session_model_status(
                     .or_else(|| model.as_ref().and_then(|model| model.reasoning.clone())),
                 reasoning_effort: selection.reasoning_effort,
                 reasoning_summary: selection.reasoning_summary,
+                prompt_cache_mode: Some(
+                    prompt_cache_mode_name(state.prompt_cache_mode).to_string(),
+                ),
+                conversation_reuse_mode: Some(
+                    conversation_reuse_mode_name(state.conversation_reuse_mode).to_string(),
+                ),
+                compaction_mode: Some(compaction_mode_name(state.auto_compaction.mode).to_string()),
             },
         }),
     )
@@ -7319,61 +7326,8 @@ async fn append_model_request_trace(
     if !state.observability.enabled() {
         return;
     }
-    let request_blob = (state.observability.persist_model_requests
-        || state.observability.debug_enabled())
-    .then(|| {
-        let mut redacted_request = request.clone();
-        redacted_request.provider_context.env = redacted_request
-            .provider_context
-            .env
-            .keys()
-            .cloned()
-            .map(|key| (key, "<redacted>".to_string()))
-            .collect();
-        if let Some(auth) = &mut redacted_request.provider_context.auth {
-            auth.credentials = auth
-                .credentials
-                .keys()
-                .cloned()
-                .map(|key| {
-                    (
-                        key,
-                        bcode_model::ProviderAuthCredential {
-                            value: "<redacted>".to_string(),
-                            source: None,
-                        },
-                    )
-                })
-                .collect();
-        }
-        state.trace_store.write_json_blob(
-            session_id,
-            &format!("model-request-round-{round}"),
-            &redacted_request,
-            state.observability.max_blob_bytes,
-        )
-    })
-    .flatten();
-    let mut metadata = request.metadata.clone();
-    metadata.insert(
-        "message_count".to_string(),
-        request.messages.len().to_string(),
-    );
-    metadata.insert(
-        "new_messages_start_index".to_string(),
-        request
-            .conversation_reuse
-            .new_messages_start_index
-            .map_or_else(|| "none".to_string(), |index| index.to_string()),
-    );
-    metadata.insert(
-        "sent_message_count".to_string(),
-        sent_message_count(request).to_string(),
-    );
-    metadata.insert(
-        "prompt_cache_points".to_string(),
-        prompt_cache_point_count(request).to_string(),
-    );
+    let request_blob = model_request_trace_blob(state, session_id, request, round);
+    let metadata = model_request_trace_metadata(request, provider_plugin_id);
     append_trace_event(
         state,
         session_id,
@@ -7402,6 +7356,131 @@ async fn append_model_request_trace(
         },
     )
     .await;
+}
+
+fn model_request_trace_blob(
+    state: &ServerState,
+    session_id: SessionId,
+    request: &ModelTurnRequest,
+    round: u32,
+) -> Option<bcode_session_models::TraceBlobRef> {
+    (state.observability.persist_model_requests || state.observability.debug_enabled())
+        .then(|| {
+            let mut redacted_request = request.clone();
+            redacted_request.provider_context.env = redacted_request
+                .provider_context
+                .env
+                .keys()
+                .cloned()
+                .map(|key| (key, "<redacted>".to_string()))
+                .collect();
+            if let Some(auth) = &mut redacted_request.provider_context.auth {
+                auth.credentials = auth
+                    .credentials
+                    .keys()
+                    .cloned()
+                    .map(|key| {
+                        (
+                            key,
+                            bcode_model::ProviderAuthCredential {
+                                value: "<redacted>".to_string(),
+                                source: None,
+                            },
+                        )
+                    })
+                    .collect();
+            }
+            state.trace_store.write_json_blob(
+                session_id,
+                &format!("model-request-round-{round}"),
+                &redacted_request,
+                state.observability.max_blob_bytes,
+            )
+        })
+        .flatten()
+}
+
+fn model_request_trace_metadata(
+    request: &ModelTurnRequest,
+    provider_plugin_id: Option<&str>,
+) -> BTreeMap<String, String> {
+    let prompt_cache_points = prompt_cache_point_count(request);
+    let mut metadata = request.metadata.clone();
+    metadata.insert(
+        "message_count".to_string(),
+        request.messages.len().to_string(),
+    );
+    metadata.insert(
+        "new_messages_start_index".to_string(),
+        request
+            .conversation_reuse
+            .new_messages_start_index
+            .map_or_else(|| "none".to_string(), |index| index.to_string()),
+    );
+    metadata.insert(
+        "sent_message_count".to_string(),
+        sent_message_count(request).to_string(),
+    );
+    metadata.insert(
+        "prompt_cache_points".to_string(),
+        prompt_cache_points.to_string(),
+    );
+    metadata.insert(
+        "cache_system_prompt".to_string(),
+        request.prompt_cache.cache_system_prompt.to_string(),
+    );
+    metadata.insert(
+        "cache_tools".to_string(),
+        request.prompt_cache.cache_tools.to_string(),
+    );
+    metadata.insert(
+        "cache_conversation_prefix".to_string(),
+        (prompt_cache_points > 0).to_string(),
+    );
+    metadata.insert(
+        "cache_capability".to_string(),
+        cache_capability(provider_plugin_id),
+    );
+    metadata.insert(
+        "cache_point_projection".to_string(),
+        cache_point_projection(provider_plugin_id, prompt_cache_points),
+    );
+    metadata.insert(
+        "provider_reuse_capability".to_string(),
+        provider_reuse_capability(provider_plugin_id),
+    );
+    metadata
+}
+
+fn cache_capability(provider_plugin_id: Option<&str>) -> String {
+    match provider_plugin_id {
+        Some("bcode.openai-compatible") => "prompt_cache_key_automatic_prefix".to_string(),
+        Some("bcode.bedrock") => "provider_specific_cache_control".to_string(),
+        Some(_) => "unknown".to_string(),
+        None => "auto_provider_unknown".to_string(),
+    }
+}
+
+fn cache_point_projection(provider_plugin_id: Option<&str>, prompt_cache_points: usize) -> String {
+    if prompt_cache_points == 0 {
+        return "none".to_string();
+    }
+    match provider_plugin_id {
+        Some("bcode.openai-compatible") => "unsupported_dropped".to_string(),
+        Some("bcode.bedrock") => "provider_specific".to_string(),
+        Some(_) => "unknown".to_string(),
+        None => "auto_provider_unknown".to_string(),
+    }
+}
+
+fn provider_reuse_capability(provider_plugin_id: Option<&str>) -> String {
+    match provider_plugin_id {
+        Some("bcode.openai-compatible") => {
+            "responses_previous_response_id_when_supported".to_string()
+        }
+        Some(_) => "unknown".to_string(),
+        None => "auto_provider_unknown".to_string(),
+    }
 }
 
 fn sent_message_count(request: &ModelTurnRequest) -> usize {
@@ -8983,6 +9062,16 @@ const fn conversation_reuse_mode_name(mode: bcode_model::ConversationReuseMode) 
     }
 }
 
+const fn compaction_mode_name(mode: bcode_config::CompactionMode) -> &'static str {
+    match mode {
+        bcode_config::CompactionMode::Off => "off",
+        bcode_config::CompactionMode::OnOverflow => "on_overflow",
+        bcode_config::CompactionMode::Proactive => "proactive",
+        bcode_config::CompactionMode::ProactiveAndOverflow => "proactive_and_overflow",
+        bcode_config::CompactionMode::Auto => "auto",
+    }
+}
+
 async fn append_assistant_message_event(state: &ServerState, session_id: SessionId, text: String) {
     match state
         .sessions
@@ -10227,6 +10316,92 @@ mod tests {
             provenance: None,
             kind,
         }
+    }
+
+    #[test]
+    fn aggressive_prompt_cache_adds_conversation_cache_point() {
+        let mut messages = (0..6)
+            .map(|index| ModelMessage {
+                role: if index % 2 == 0 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Assistant
+                },
+                content: vec![ContentBlock::Text {
+                    text: format!("message {index}"),
+                }],
+            })
+            .collect::<Vec<_>>();
+
+        let hints = plan_prompt_cache(&mut messages, bcode_model::PromptCacheMode::Aggressive);
+
+        assert_eq!(hints.mode, bcode_model::PromptCacheMode::Aggressive);
+        assert_eq!(prompt_cache_point_count_in_messages(&messages), 1);
+    }
+
+    #[test]
+    fn auto_prompt_cache_does_not_add_conversation_cache_point() {
+        let mut messages = (0..6)
+            .map(|index| ModelMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Text {
+                    text: format!("message {index}"),
+                }],
+            })
+            .collect::<Vec<_>>();
+
+        let hints = plan_prompt_cache(&mut messages, bcode_model::PromptCacheMode::Auto);
+
+        assert_eq!(hints.mode, bcode_model::PromptCacheMode::Auto);
+        assert_eq!(prompt_cache_point_count_in_messages(&messages), 0);
+    }
+
+    #[test]
+    fn sent_message_count_skips_only_when_reusing_provider_response() {
+        let messages = vec![
+            test_model_message(MessageRole::User, "one"),
+            test_model_message(MessageRole::Assistant, "two"),
+            test_model_message(MessageRole::User, "three"),
+        ];
+        let mut request = test_model_turn_request(messages);
+        request.conversation_reuse.new_messages_start_index = Some(2);
+        assert_eq!(sent_message_count(&request), 3);
+
+        request.conversation_reuse.previous_provider_response_id = Some("resp_1".to_string());
+        assert_eq!(sent_message_count(&request), 1);
+    }
+
+    fn test_model_message(role: MessageRole, text: &str) -> ModelMessage {
+        ModelMessage {
+            role,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    fn test_model_turn_request(messages: Vec<ModelMessage>) -> ModelTurnRequest {
+        ModelTurnRequest {
+            session_id: SessionId::new(),
+            turn_id: "turn-test".to_string(),
+            model_id: "model-test".to_string(),
+            provider_context: bcode_model::ProviderRequestContext::default(),
+            system_prompt: None,
+            messages,
+            tools: Vec::new(),
+            parameters: ModelParameters::default(),
+            prompt_cache: bcode_model::PromptCacheHints::default(),
+            conversation_reuse: bcode_model::ConversationReuseHints::default(),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    fn prompt_cache_point_count_in_messages(messages: &[ModelMessage]) -> usize {
+        messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter(|block| matches!(block, ContentBlock::CachePoint { .. }))
+            .count()
     }
 
     #[test]

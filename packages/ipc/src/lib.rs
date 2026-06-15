@@ -468,6 +468,12 @@ pub struct SessionModelStatus {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub reasoning_summary: Option<String>,
+    #[serde(default)]
+    pub prompt_cache_mode: Option<String>,
+    #[serde(default)]
+    pub conversation_reuse_mode: Option<String>,
+    #[serde(default)]
+    pub compaction_mode: Option<String>,
 }
 
 /// Service interface provided by a loaded plugin.
