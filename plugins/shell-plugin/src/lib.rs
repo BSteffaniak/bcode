@@ -1131,6 +1131,95 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn terminal_mode_returns_semantic_terminal_result() {
+        let response = run_terminal_shell_command(
+            ServiceEventEmitter::default(),
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+            "test-terminal-semantic",
+            &ShellRunArguments {
+                command: "printf 'semantic terminal\\n'".to_string(),
+                cwd: None,
+                timeout_ms: Some(5_000),
+                terminal: true,
+                columns: Some(80),
+                rows: Some(24),
+            },
+            None,
+            None,
+        );
+
+        assert!(!response.is_error, "{}", response.output);
+        let Some(ToolInvocationResult::ShellRun {
+            result:
+                ShellRunResult::Terminal {
+                    exit_code,
+                    timed_out,
+                    cancelled,
+                    output_tail,
+                    columns,
+                    rows,
+                    ..
+                },
+        }) = response.result
+        else {
+            panic!("expected semantic terminal shell result");
+        };
+        assert_eq!(exit_code, Some(0));
+        assert!(!timed_out);
+        assert!(!cancelled);
+        assert!(output_tail.contains("semantic terminal"));
+        assert_eq!(columns, 80);
+        assert_eq!(rows, 24);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_mode_returns_semantic_captured_result() {
+        let response = run_shell_command(
+            ServiceEventEmitter::default(),
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+            "test-captured-semantic",
+            &ShellRunArguments {
+                command: "printf 'semantic stdout'; printf 'semantic stderr' >&2".to_string(),
+                cwd: None,
+                timeout_ms: Some(5_000),
+                terminal: false,
+                columns: None,
+                rows: None,
+            },
+            None,
+            None,
+        )
+        .expect("shell command should complete");
+
+        assert!(!response.is_error, "{}", response.output);
+        let Some(ToolInvocationResult::ShellRun {
+            result:
+                ShellRunResult::Captured {
+                    exit_code,
+                    timed_out,
+                    cancelled,
+                    stdout,
+                    stderr,
+                    stdout_truncated,
+                    stderr_truncated,
+                    ..
+                },
+        }) = response.result
+        else {
+            panic!("expected semantic captured shell result");
+        };
+        assert_eq!(exit_code, Some(0));
+        assert!(!timed_out);
+        assert!(!cancelled);
+        assert_eq!(stdout, "semantic stdout");
+        assert_eq!(stderr, "semantic stderr");
+        assert!(!stdout_truncated);
+        assert!(!stderr_truncated);
+    }
+
     #[test]
     fn process_response_includes_structured_terminal_presentation() {
         let output = LimitedOutput {
