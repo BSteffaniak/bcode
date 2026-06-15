@@ -872,6 +872,118 @@ pub struct RalphIterationRecord {
     pub error_message: Option<String>,
 }
 
+/// Persisted Ralph validation command configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RalphValidationCommandRecord {
+    /// Command ID.
+    pub command_id: String,
+    /// Loop state directory.
+    pub state_dir: PathBuf,
+    /// Sort position.
+    pub position: u64,
+    /// Shell command to execute from the work area.
+    pub command: String,
+    /// Source that supplied the command.
+    pub source: String,
+    /// Creation time in Unix epoch milliseconds.
+    pub created_at_ms: u64,
+}
+
+/// Return conservative default validation commands for a repository.
+#[must_use]
+pub fn default_validation_commands(repo_root: &Path) -> Vec<String> {
+    if repo_root.join("Cargo.toml").exists() {
+        return vec!["cargo check --workspace".to_owned()];
+    }
+    Vec::new()
+}
+
+/// Replace validation commands for a Ralph loop.
+///
+/// # Errors
+///
+/// Returns an error when the Ralph database cannot be opened, migrated, or written.
+pub fn set_validation_commands(
+    state_dir: &Path,
+    commands: &[String],
+    source: &str,
+) -> Result<(), RalphStateError> {
+    let state_dir = state_dir.to_path_buf();
+    let commands = commands.to_owned();
+    let source = source.to_owned();
+    with_database(move |database| {
+        Box::pin(async move {
+            database
+                .delete("ralph_validation_commands")
+                .filter(Box::new(where_eq(
+                    "state_dir",
+                    state_dir.display().to_string(),
+                )))
+                .execute(database)
+                .await?;
+            for (index, command) in commands.iter().enumerate() {
+                database
+                    .insert("ralph_validation_commands")
+                    .value("command_id", uuid::Uuid::new_v4().to_string())
+                    .value("state_dir", state_dir.display().to_string())
+                    .value("position", u128_to_i64(index as u128))
+                    .value("command", command.clone())
+                    .value("source", source.clone())
+                    .value("created_at_ms", u128_to_i64(now_ms()))
+                    .execute(database)
+                    .await?;
+            }
+            Ok(())
+        })
+    })
+}
+
+/// List configured validation commands for a Ralph loop.
+///
+/// # Errors
+///
+/// Returns an error when the Ralph database cannot be opened, migrated, or queried.
+pub fn list_validation_commands(
+    state_dir: &Path,
+) -> Result<Vec<RalphValidationCommandRecord>, RalphStateError> {
+    let state_dir = state_dir.to_path_buf();
+    with_database(move |database| {
+        Box::pin(async move {
+            let rows = database
+                .select("ralph_validation_commands")
+                .columns(&[
+                    "command_id",
+                    "state_dir",
+                    "position",
+                    "command",
+                    "source",
+                    "created_at_ms",
+                ])
+                .filter(Box::new(where_eq(
+                    "state_dir",
+                    state_dir.display().to_string(),
+                )))
+                .execute(database)
+                .await?;
+            let mut commands = rows
+                .iter()
+                .map(|row| {
+                    Ok(RalphValidationCommandRecord {
+                        command_id: required_text(row, "command_id")?,
+                        state_dir: PathBuf::from(required_text(row, "state_dir")?),
+                        position: i64_to_u64(required_i64(row, "position")?),
+                        command: required_text(row, "command")?,
+                        source: required_text(row, "source")?,
+                        created_at_ms: i64_to_u64(required_i64(row, "created_at_ms")?),
+                    })
+                })
+                .collect::<Result<Vec<_>, RalphStateError>>()?;
+            commands.sort_by(|left, right| left.position.cmp(&right.position));
+            Ok(commands)
+        })
+    })
+}
+
 /// Request used to create a persisted Ralph validation command record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RalphValidationCreateRequest {
@@ -1274,6 +1386,10 @@ pub fn create_initial_loop_state(
         initial_context_pack(loop_name, session_title)?,
     )?;
     upsert_loop_metadata(&metadata)?;
+    let validation_commands = default_validation_commands(repo_root);
+    if !validation_commands.is_empty() {
+        set_validation_commands(&paths.state_dir, &validation_commands, "default")?;
+    }
     append_lifecycle_event(
         &paths,
         RalphLifecycleEventKind::Created,
@@ -1891,6 +2007,7 @@ fn ralph_migrations() -> CodeMigrationSource<'static> {
     source.add_migration(runs_table_migration());
     source.add_migration(iterations_table_migration());
     source.add_migration(validation_runs_table_migration());
+    source.add_migration(validation_commands_table_migration());
     source
 }
 
@@ -2008,6 +2125,24 @@ fn validation_runs_table_migration() -> CodeMigration<'static> {
                 .column(nullable_int_column("finished_at_ms"))
                 .column(nullable_text_column("error_message"))
                 .primary_key("validation_id"),
+        ),
+        None,
+    )
+}
+
+fn validation_commands_table_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "006_ralph_validation_commands".to_owned(),
+        Box::new(
+            create_table("ralph_validation_commands")
+                .if_not_exists(true)
+                .column(text_column("command_id"))
+                .column(text_column("state_dir"))
+                .column(int_column("position"))
+                .column(text_column("command"))
+                .column(text_column("source"))
+                .column(int_column("created_at_ms"))
+                .primary_key("command_id"),
         ),
         None,
     )
@@ -2396,6 +2531,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir should create");
         let repo_root = temp.path().join("repo");
         std::fs::create_dir_all(&repo_root).expect("repo should create");
+        std::fs::write(repo_root.join("Cargo.toml"), "[workspace]\n")
+            .expect("manifest should write");
         let state = create_initial_loop_state(
             &format!("db-backed-{}", uuid::Uuid::new_v4()),
             &repo_root,
@@ -2417,5 +2554,9 @@ mod tests {
         assert_eq!(summary.progress_doc_path, state.progress_doc_path);
         let events = list_lifecycle_events(&summary).expect("events should query");
         assert!(events.len() >= 2);
+        let validation_commands =
+            list_validation_commands(&summary.state_dir).expect("validation commands should query");
+        assert_eq!(validation_commands.len(), 1);
+        assert_eq!(validation_commands[0].command, "cargo check --workspace");
     }
 }
