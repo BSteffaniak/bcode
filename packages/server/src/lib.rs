@@ -2285,11 +2285,30 @@ async fn start_ralph_runner(
 }
 
 async fn run_ralph_runner_skeleton(state: Arc<ServerState>, run: bcode_ralph::RalphRunRecord) {
+    let runtime_session_id = run
+        .session_id
+        .as_deref()
+        .and_then(|session_id| session_id.parse::<SessionId>().ok());
+    let runtime_work_id = RuntimeWorkId::new(format!("ralph:{}", run.run_id));
+    if let Some(session_id) = runtime_session_id {
+        register_runtime_work(
+            &state,
+            session_id,
+            RuntimeWorkSpec::new(
+                runtime_work_id.clone(),
+                RuntimeWorkKind::EventDelivery,
+                "Ralph autonomous runner".to_owned(),
+                CancellationHandle::RalphRun(run.run_id.clone()),
+            ),
+        )
+        .await;
+    }
+
     tokio::time::sleep(Duration::from_millis(250)).await;
     let active_run = bcode_ralph::active_run_for_loop(&run.state_dir)
         .ok()
         .flatten();
-    if active_run.as_ref().is_some_and(|run| run.cancel_requested) {
+    let (status, message) = if active_run.as_ref().is_some_and(|run| run.cancel_requested) {
         let _ = bcode_ralph::update_run_status(
             &run.run_id,
             "stopped",
@@ -2297,6 +2316,10 @@ async fn run_ralph_runner_skeleton(state: Arc<ServerState>, run: bcode_ralph::Ra
             Some("cancelled"),
             None,
         );
+        (
+            RuntimeWorkStatus::Cancelled,
+            Some("Ralph run cancelled".to_owned()),
+        )
     } else {
         let _iteration = bcode_ralph::create_iteration(bcode_ralph::RalphIterationCreateRequest {
             run_id: run.run_id.clone(),
@@ -2313,6 +2336,13 @@ async fn run_ralph_runner_skeleton(state: Arc<ServerState>, run: bcode_ralph::Ra
             Some("runner_skeleton"),
             Some("Ralph runner skeleton is wired; model-turn execution is not implemented yet"),
         );
+        (
+            RuntimeWorkStatus::Failed,
+            Some("Ralph runner skeleton stopped before model-turn execution".to_owned()),
+        )
+    };
+    if let Some(session_id) = runtime_session_id {
+        finish_registered_runtime_work(&state, session_id, runtime_work_id, status, message).await;
     }
     state.active_ralph_runs.lock().await.remove(&run.state_dir);
 }

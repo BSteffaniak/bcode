@@ -14,6 +14,8 @@ pub enum CancellationHandle {
     SessionTurn(Arc<TurnCancelState>),
     /// Cancel an in-flight plugin invocation.
     PluginInvocation(PluginInvocationCancelHandle),
+    /// Cancel a Ralph autonomous runner.
+    RalphRun(String),
     /// Test/no-op cancellation hook.
     #[cfg(test)]
     Test(Arc<std::sync::atomic::AtomicUsize>),
@@ -25,6 +27,9 @@ impl CancellationHandle {
         match self {
             Self::SessionTurn(cancel_state) => cancel_state.cancel(),
             Self::PluginInvocation(cancel) => cancel.cancel(),
+            Self::RalphRun(run_id) => {
+                let _ = bcode_ralph::request_run_cancel(run_id);
+            }
             #[cfg(test)]
             Self::Test(count) => {
                 count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -35,7 +40,7 @@ impl CancellationHandle {
     /// Runtime work with a handle is cancellable.
     pub const fn is_cancellable(&self) -> bool {
         match self {
-            Self::SessionTurn(_) | Self::PluginInvocation(_) => true,
+            Self::SessionTurn(_) | Self::PluginInvocation(_) | Self::RalphRun(_) => true,
             #[cfg(test)]
             Self::Test(_) => true,
         }
