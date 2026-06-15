@@ -11476,6 +11476,68 @@ mod tests {
         assert!(result.output.chars().count() <= 1_000);
         assert!(result.output.contains("tool output truncated"));
     }
+    #[tokio::test]
+    async fn append_tool_finished_event_inner_persists_semantic_result() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("test".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        let state = ServerState::new(
+            sessions,
+            bcode_plugin::PluginHost::default().into(),
+            ServerStateInit {
+                selected_provider_plugin_id: None,
+                selected_model_id: None,
+                selected_provider_context: bcode_model::ProviderRequestContext::default(),
+                prompt_cache_mode: bcode_model::PromptCacheMode::default(),
+                conversation_reuse_mode: bcode_model::ConversationReuseMode::default(),
+                selected_reasoning: bcode_config::ReasoningConfig::default(),
+                selected_reasoning_capabilities: None,
+                provider_state: ProviderStateStore::load(PathBuf::new()),
+                observability: bcode_config::ObservabilityConfig::default(),
+                trace_store: TraceStore::new(PathBuf::new()),
+                max_tool_rounds: None,
+                tool_output_context_chars: 1_000,
+                model_streaming: bcode_config::StreamingConfig::default(),
+                auto_compaction: bcode_config::CompactionConfig::default(),
+                skills: None,
+                skill_context_bytes: 0,
+                daemon_status: DaemonStatus::default(),
+                daemon_record_path: None,
+                metrics: MetricsRegistry::default(),
+            },
+        );
+        let semantic_result = ToolInvocationResult::Text {
+            text: "semantic text".to_owned(),
+        };
+
+        let event = append_tool_finished_event_inner(
+            &state,
+            session_id,
+            "call-semantic".to_owned(),
+            "legacy text".to_owned(),
+            false,
+            Vec::new(),
+            None,
+            Some(semantic_result.clone()),
+        )
+        .await
+        .expect("tool result event should append");
+
+        let SessionEventKind::ToolCallFinished {
+            result,
+            semantic_result: persisted_semantic_result,
+            ..
+        } = event.kind
+        else {
+            panic!("expected tool result event");
+        };
+        assert_eq!(result, "legacy text");
+        assert_eq!(persisted_semantic_result, Some(semantic_result));
+    }
+
     #[test]
     fn live_preview_extraction_supports_shell_file_and_query_tools() {
         let mut shell_fields = StreamingJsonStringFields::default();
