@@ -2270,18 +2270,64 @@ async fn start_ralph_runner(
     let response = RalphRunResponse {
         run: ralph_run_summary(run.clone()),
     };
+    let _ = bcode_ralph::append_lifecycle_event_for_summary(
+        &summary,
+        bcode_ralph::RalphLifecycleEventKind::RunStarted,
+        "Started Ralph autonomous runner",
+    );
+    append_ralph_session_lifecycle(
+        state,
+        run.session_id.as_deref(),
+        summary.loop_name.clone(),
+        run.state_dir.clone(),
+        "run_started",
+        "Started Ralph autonomous runner",
+    )
+    .await;
     if request.require_approval {
         return Ok(response);
     }
 
     let runner_state = Arc::clone(state);
     let state_dir = run.state_dir.clone();
+    let loop_name = summary.loop_name;
     let handle = tokio::spawn(async move {
-        run_ralph_runner_skeleton(runner_state, run).await;
+        run_ralph_runner_skeleton(runner_state, run, loop_name).await;
     });
     active_ralph_runs.insert(state_dir, handle);
     drop(active_ralph_runs);
     Ok(response)
+}
+
+async fn append_ralph_session_lifecycle(
+    state: &ServerState,
+    session_id: Option<&str>,
+    loop_name: String,
+    state_dir: PathBuf,
+    kind: &str,
+    message: &str,
+) {
+    let Some(session_id) = session_id.and_then(|session_id| session_id.parse::<SessionId>().ok())
+    else {
+        return;
+    };
+    match state
+        .sessions
+        .append_event(
+            session_id,
+            SessionEventKind::RalphLifecycle {
+                loop_name,
+                state_dir,
+                kind: kind.to_owned(),
+                message: message.to_owned(),
+                occurred_at_ms: current_time_ms(),
+            },
+        )
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => eprintln!("failed to append Ralph session lifecycle: {error}"),
+    }
 }
 
 async fn register_ralph_runtime_work(
@@ -2382,7 +2428,11 @@ async fn record_ralph_skeleton_noop_iteration(
     .await;
 }
 
-async fn run_ralph_runner_skeleton(state: Arc<ServerState>, run: bcode_ralph::RalphRunRecord) {
+async fn run_ralph_runner_skeleton(
+    state: Arc<ServerState>,
+    run: bcode_ralph::RalphRunRecord,
+    loop_name: String,
+) {
     let runtime_session_id = run
         .session_id
         .as_deref()
@@ -2453,6 +2503,20 @@ async fn run_ralph_runner_skeleton(state: Arc<ServerState>, run: bcode_ralph::Ra
             Some("Ralph runner skeleton stopped before model-turn execution".to_owned()),
         )
     };
+    let _ = bcode_ralph::append_lifecycle_event_for_state_dir(
+        &run.state_dir,
+        bcode_ralph::RalphLifecycleEventKind::RunFinished,
+        "Finished Ralph autonomous runner skeleton",
+    );
+    append_ralph_session_lifecycle(
+        &state,
+        run.session_id.as_deref(),
+        loop_name,
+        run.state_dir.clone(),
+        "run_finished",
+        "Finished Ralph autonomous runner skeleton",
+    )
+    .await;
     finish_ralph_runtime_work(&state, runtime_session_id, runtime_work_id, status, message).await;
     state.active_ralph_runs.lock().await.remove(&run.state_dir);
 }

@@ -629,6 +629,10 @@ pub enum RalphLifecycleEventKind {
     ProgressOpened,
     /// Orchestration prompt was prepared.
     PromptPrepared,
+    /// Autonomous runner started.
+    RunStarted,
+    /// Autonomous runner finished.
+    RunFinished,
 }
 
 impl RalphLifecycleEventKind {
@@ -641,6 +645,8 @@ impl RalphLifecycleEventKind {
             Self::StatusViewed => "status_viewed",
             Self::ProgressOpened => "progress_opened",
             Self::PromptPrepared => "prompt_prepared",
+            Self::RunStarted => "run_started",
+            Self::RunFinished => "run_finished",
         }
     }
 }
@@ -678,6 +684,27 @@ pub fn append_lifecycle_event_for_summary(
     message: &str,
 ) -> Result<(), RalphStateError> {
     let state_dir = summary.state_dir.clone();
+    let message = message.to_owned();
+    with_database(move |database| {
+        Box::pin(async move {
+            insert_lifecycle_event(database, &state_dir, kind, &message, None).await?;
+            Ok(())
+        })
+    })
+}
+
+/// Append a Ralph lifecycle event using a loop state directory.
+///
+/// # Errors
+///
+/// Returns an error when the Ralph database cannot be opened, migrated, or
+/// written.
+pub fn append_lifecycle_event_for_state_dir(
+    state_dir: &Path,
+    kind: RalphLifecycleEventKind,
+    message: &str,
+) -> Result<(), RalphStateError> {
+    let state_dir = state_dir.to_path_buf();
     let message = message.to_owned();
     with_database(move |database| {
         Box::pin(async move {
