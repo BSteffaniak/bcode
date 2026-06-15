@@ -1309,6 +1309,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tool_call_finished_without_semantic_result_json_decodes() {
+        let decoded: SessionEventKind = serde_json::from_str(
+            r#"{"tool_call_finished":{"tool_call_id":"call-1","result":"legacy result"}}"#,
+        )
+        .expect("legacy tool call finished event kind should decode");
+
+        assert_eq!(
+            decoded,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "call-1".to_string(),
+                result: "legacy result".to_string(),
+                is_error: false,
+                output: None,
+                semantic_result: None,
+            }
+        );
+    }
+
+    #[test]
+    fn semantic_tool_result_json_decodes_missing_optional_fields() {
+        let decoded: ToolInvocationResult = serde_json::from_str(
+            r#"{"type":"shell_run","result":{"mode":"terminal","output_tail":"minimal"}}"#,
+        )
+        .expect("minimal terminal semantic result should decode");
+
+        assert_eq!(
+            decoded,
+            ToolInvocationResult::ShellRun {
+                result: ShellRunResult::Terminal {
+                    exit_code: None,
+                    timed_out: false,
+                    cancelled: false,
+                    output_tail: "minimal".to_string(),
+                    output_truncated: false,
+                    output_bytes: None,
+                    retained_output_bytes: None,
+                    columns: 80,
+                    rows: 24,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn semantic_tool_result_json_ignores_unknown_extra_fields() {
+        let decoded: ToolInvocationResult = serde_json::from_str(
+            r#"{"type":"file_change","result":{"tool_name":"filesystem.write","summary":"wrote bytes","path":"file.txt","future_field":"ignored"},"future_top_level":"ignored"}"#,
+        )
+        .expect("semantic result with future fields should decode");
+
+        assert_eq!(
+            decoded,
+            ToolInvocationResult::FileChange {
+                result: FileChangeResult {
+                    tool_name: "filesystem.write".to_string(),
+                    summary: "wrote bytes".to_string(),
+                    path: Some("file.txt".to_string()),
+                },
+            }
+        );
+    }
+
     fn semantic_tool_result_fixtures() -> Vec<(&'static str, ToolInvocationResult)> {
         vec![
             (
