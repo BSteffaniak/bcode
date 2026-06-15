@@ -1291,6 +1291,34 @@ pub fn create_iteration(
     Ok(record)
 }
 
+/// Update audit/replan prompt text for a Ralph iteration.
+///
+/// # Errors
+///
+/// Returns an error when the Ralph database cannot be opened, migrated, or written.
+pub fn update_iteration_prompts(
+    iteration_id: &str,
+    audit_prompt: Option<String>,
+    replan_prompt: Option<String>,
+) -> Result<(), RalphStateError> {
+    let iteration_id = iteration_id.to_owned();
+    with_database(move |database| {
+        Box::pin(async move {
+            let mut update = database
+                .update("ralph_iterations")
+                .filter(Box::new(where_eq("iteration_id", iteration_id)));
+            if let Some(audit_prompt) = audit_prompt {
+                update = update.value("audit_prompt", audit_prompt);
+            }
+            if let Some(replan_prompt) = replan_prompt {
+                update = update.value("replan_prompt", replan_prompt);
+            }
+            update.execute(database).await?;
+            Ok(())
+        })
+    })
+}
+
 /// List iterations for a Ralph run.
 ///
 /// # Errors
@@ -2490,6 +2518,16 @@ mod tests {
         assert_eq!(iterations.len(), 1);
         assert_eq!(iterations[0].iteration_id, iteration.iteration_id);
         assert_eq!(iterations[0].work_prompt.as_deref(), Some("do work"));
+
+        update_iteration_prompts(
+            &iteration.iteration_id,
+            Some("audit".to_owned()),
+            Some("replan".to_owned()),
+        )
+        .expect("iteration prompts should update");
+        let iterations = list_iterations_for_run(&run.run_id).expect("iterations should query");
+        assert_eq!(iterations[0].audit_prompt.as_deref(), Some("audit"));
+        assert_eq!(iterations[0].replan_prompt.as_deref(), Some("replan"));
 
         let validation = create_validation(RalphValidationCreateRequest {
             iteration_id: iteration.iteration_id.clone(),

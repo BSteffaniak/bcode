@@ -2844,6 +2844,7 @@ async fn submit_ralph_audit_after_validation(
     parent_work_id: &RuntimeWorkId,
     summary: &bcode_ralph::RalphLoopSummary,
     run: &bcode_ralph::RalphRunRecord,
+    iteration: Option<&bcode_ralph::RalphIterationRecord>,
 ) -> Option<ModelTurnCompletion> {
     let prompt = bcode_ralph::build_prompt(summary, bcode_ralph::RalphPromptKind::Audit)
         .unwrap_or_else(|error| {
@@ -2851,6 +2852,13 @@ async fn submit_ralph_audit_after_validation(
                 "Ralph audit prompt could not read the progress doc; report this blocker and stop safely. Error: {error}"
             )
         });
+    if let Some(iteration) = iteration {
+        let _ = bcode_ralph::update_iteration_prompts(
+            &iteration.iteration_id,
+            Some(prompt.clone()),
+            None,
+        );
+    }
     submit_ralph_skeleton_audit_turn(
         state,
         runtime_session_id,
@@ -2867,6 +2875,7 @@ async fn submit_ralph_replan_after_audit(
     parent_work_id: &RuntimeWorkId,
     summary: &bcode_ralph::RalphLoopSummary,
     run: &bcode_ralph::RalphRunRecord,
+    iteration: Option<&bcode_ralph::RalphIterationRecord>,
 ) -> Option<ModelTurnCompletion> {
     let prompt = bcode_ralph::build_prompt(summary, bcode_ralph::RalphPromptKind::Replan)
         .unwrap_or_else(|error| {
@@ -2874,6 +2883,13 @@ async fn submit_ralph_replan_after_audit(
                 "Ralph replan prompt could not read the progress doc; report this blocker and stop safely. Error: {error}"
             )
         });
+    if let Some(iteration) = iteration {
+        let _ = bcode_ralph::update_iteration_prompts(
+            &iteration.iteration_id,
+            None,
+            Some(prompt.clone()),
+        );
+    }
     submit_ralph_skeleton_replan_turn(
         state,
         runtime_session_id,
@@ -2904,9 +2920,15 @@ async fn apply_ralph_post_audit_decision(
     if decision != bcode_ralph::RalphStopDecision::Continue {
         return ralph_run_terminal_from_decision(decision);
     }
-    let replan_completion =
-        submit_ralph_replan_after_audit(state, runtime_session_id, parent_work_id, summary, run)
-            .await;
+    let replan_completion = submit_ralph_replan_after_audit(
+        state,
+        runtime_session_id,
+        parent_work_id,
+        summary,
+        run,
+        iteration,
+    )
+    .await;
     if replan_completion
         .as_ref()
         .map(|completion| completion.outcome)
@@ -2969,6 +2991,7 @@ async fn complete_ralph_skeleton_after_iteration(
         parent_work_id,
         summary,
         run,
+        iteration,
     )
     .await;
     let audit_outcome = audit_completion
