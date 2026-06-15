@@ -6,10 +6,11 @@
 //! non-self-describing `bmux_codec` wire format.
 
 use bcode_session_models::{
-    FileChangeResult, SessionEvent, SessionEventKind, SessionEventProvenance, SessionId,
-    ShellRunResult, ToolInvocationResult, TraceBlobRef,
+    CURRENT_SESSION_EVENT_SCHEMA_VERSION, FileChangeResult, SessionEvent, SessionEventKind,
+    SessionEventProvenance, SessionId, ShellRunResult, ToolInvocationResult, TraceBlobRef,
 };
 use serde::Deserialize;
+use thiserror::Error;
 
 /// Decode a persisted session event from durable JSON.
 ///
@@ -17,8 +18,22 @@ use serde::Deserialize;
 ///
 /// Returns an error when the event is not a supported persisted session-event
 /// shape or cannot be converted into the current domain model.
-pub fn decode_session_event(payload: &str) -> Result<SessionEvent, serde_json::Error> {
-    serde_json::from_str::<PersistedSessionEvent>(payload).map(PersistedSessionEvent::into_domain)
+pub fn decode_session_event(payload: &str) -> Result<SessionEvent, PersistedSessionEventError> {
+    let persisted = serde_json::from_str::<PersistedSessionEvent>(payload)?;
+    persisted.into_domain()
+}
+
+/// Errors returned when decoding persisted session events.
+#[derive(Debug, Error)]
+pub enum PersistedSessionEventError {
+    /// Persisted JSON was malformed or incompatible with known DTOs.
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    /// Persisted event uses a future schema version not supported by this build.
+    #[error(
+        "unsupported persisted session event schema version {actual}; current version is {current}"
+    )]
+    UnsupportedSchemaVersion { actual: u16, current: u16 },
 }
 
 /// Persisted session event DTO.
@@ -33,14 +48,20 @@ struct PersistedSessionEvent {
 }
 
 impl PersistedSessionEvent {
-    fn into_domain(self) -> SessionEvent {
-        SessionEvent {
+    fn into_domain(self) -> Result<SessionEvent, PersistedSessionEventError> {
+        if self.schema_version > CURRENT_SESSION_EVENT_SCHEMA_VERSION {
+            return Err(PersistedSessionEventError::UnsupportedSchemaVersion {
+                actual: self.schema_version,
+                current: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            });
+        }
+        Ok(SessionEvent {
             schema_version: self.schema_version,
             sequence: self.sequence,
             session_id: self.session_id,
             provenance: self.provenance,
             kind: self.kind.into_domain(),
-        }
+        })
     }
 }
 
@@ -242,42 +263,193 @@ const fn default_terminal_rows() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION;
 
     #[test]
-    fn decodes_legacy_terminal_output_alias() {
-        let session_id = SessionId::new();
+    fn decodes_current_and_legacy_persisted_tool_results() {
+        for (semantic_result, assertion) in semantic_result_cases() {
+            let event = decode_session_event(&event_payload(semantic_result))
+                .expect("persisted event should decode");
+
+            assertion(event);
+        }
+    }
+
+    #[test]
+    fn rejects_future_schema_version() {
+        let payload = serde_json::json!({
+            "schema_version": CURRENT_SESSION_EVENT_SCHEMA_VERSION + 1,
+            "sequence": 1,
+            "session_id": SessionId::new(),
+            "kind": { "assistant_message": { "text": "future" } }
+        })
+        .to_string();
+
+        let error = decode_session_event(&payload).expect_err("future schema should fail");
+
+        assert!(matches!(
+            error,
+            PersistedSessionEventError::UnsupportedSchemaVersion { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_corrupt_event_payload() {
         let payload = serde_json::json!({
             "schema_version": CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             "sequence": 1,
-            "session_id": session_id,
+            "session_id": SessionId::new(),
+            "kind": { "tool_call_finished": { "result": "missing id" } }
+        })
+        .to_string();
+
+        let error = decode_session_event(&payload).expect_err("corrupt event should fail");
+
+        assert!(matches!(error, PersistedSessionEventError::Json(_)));
+    }
+
+    type PersistedAssertion = fn(SessionEvent);
+
+    fn semantic_result_cases() -> Vec<(serde_json::Value, PersistedAssertion)> {
+        vec![
+            (
+                serde_json::json!({ "type": "text", "text": "plain" }),
+                assert_text_result,
+            ),
+            (
+                serde_json::json!({ "type": "json", "value": "{\"ok\":true}" }),
+                assert_json_result,
+            ),
+            (
+                serde_json::json!({
+                    "type": "file_change",
+                    "result": {
+                        "tool_name": "filesystem.write",
+                        "summary": "wrote bytes",
+                        "path": "file.txt",
+                        "future_field": "ignored"
+                    },
+                    "future_top_level": "ignored"
+                }),
+                assert_file_change_result,
+            ),
+            (
+                serde_json::json!({
+                    "type": "shell_run",
+                    "result": {
+                        "mode": "terminal",
+                        "output": "legacy tail"
+                    }
+                }),
+                assert_legacy_terminal_result,
+            ),
+            (
+                serde_json::json!({
+                    "type": "shell_run",
+                    "result": {
+                        "mode": "captured",
+                        "stdout": "hello\n",
+                        "stderr": ""
+                    }
+                }),
+                assert_captured_result,
+            ),
+        ]
+    }
+
+    fn event_payload(semantic_result: serde_json::Value) -> String {
+        serde_json::json!({
+            "schema_version": CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            "sequence": 1,
+            "session_id": SessionId::new(),
             "provenance": null,
             "kind": {
                 "tool_call_finished": {
                     "tool_call_id": "call-1",
                     "result": "legacy",
-                    "semantic_result": {
-                        "type": "shell_run",
-                        "result": {
-                            "mode": "terminal",
-                            "output": "legacy tail"
-                        }
-                    }
+                    "semantic_result": semantic_result
                 }
             }
         })
-        .to_string();
+        .to_string()
+    }
 
-        let event = decode_session_event(&payload).expect("persisted event should decode");
+    fn tool_result(event: SessionEvent) -> ToolInvocationResult {
+        let SessionEventKind::ToolCallFinished {
+            semantic_result: Some(result),
+            ..
+        } = event.kind
+        else {
+            panic!("expected semantic tool result");
+        };
+        result
+    }
 
-        assert!(matches!(
-            event.kind,
-            SessionEventKind::ToolCallFinished {
-                semantic_result: Some(ToolInvocationResult::ShellRun {
-                    result: ShellRunResult::Terminal { output_tail, .. },
-                }),
-                ..
-            } if output_tail == "legacy tail"
-        ));
+    fn assert_text_result(event: SessionEvent) {
+        assert_eq!(
+            tool_result(event),
+            ToolInvocationResult::Text {
+                text: "plain".to_string(),
+            }
+        );
+    }
+
+    fn assert_json_result(event: SessionEvent) {
+        assert_eq!(
+            tool_result(event),
+            ToolInvocationResult::Json {
+                value: r#"{"ok":true}"#.to_string(),
+            }
+        );
+    }
+
+    fn assert_file_change_result(event: SessionEvent) {
+        assert_eq!(
+            tool_result(event),
+            ToolInvocationResult::FileChange {
+                result: FileChangeResult {
+                    tool_name: "filesystem.write".to_string(),
+                    summary: "wrote bytes".to_string(),
+                    path: Some("file.txt".to_string()),
+                },
+            }
+        );
+    }
+
+    fn assert_legacy_terminal_result(event: SessionEvent) {
+        assert_eq!(
+            tool_result(event),
+            ToolInvocationResult::ShellRun {
+                result: ShellRunResult::Terminal {
+                    exit_code: None,
+                    timed_out: false,
+                    cancelled: false,
+                    output_tail: "legacy tail".to_string(),
+                    output_truncated: false,
+                    output_bytes: None,
+                    retained_output_bytes: None,
+                    columns: 80,
+                    rows: 24,
+                },
+            }
+        );
+    }
+
+    fn assert_captured_result(event: SessionEvent) {
+        assert_eq!(
+            tool_result(event),
+            ToolInvocationResult::ShellRun {
+                result: ShellRunResult::Captured {
+                    exit_code: None,
+                    timed_out: false,
+                    cancelled: false,
+                    stdout: "hello\n".to_string(),
+                    stderr: String::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                    stdout_bytes: None,
+                    stderr_bytes: None,
+                },
+            }
+        );
     }
 }

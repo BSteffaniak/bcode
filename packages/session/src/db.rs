@@ -59,6 +59,9 @@ pub enum SessionDbError {
     /// Event serialization failed.
     #[error(transparent)]
     Serialize(#[from] serde_json::Error),
+    /// Persisted event decode failed.
+    #[error(transparent)]
+    PersistedEvent(#[from] crate::persisted::PersistedSessionEventError),
     /// A database row did not contain the expected column/type.
     #[error("invalid session database row: missing or invalid column {column}")]
     InvalidRow { column: String },
