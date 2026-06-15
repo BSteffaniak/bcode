@@ -4,7 +4,10 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bcode_ipc::{RalphLifecycleRequest, RalphStatusRequest, RalphStatusSummary};
+use bcode_ipc::{
+    RalphCancelRequest, RalphLifecycleRequest, RalphRunRequest, RalphRunStatusRequest,
+    RalphRunSummary, RalphStatusSummary,
+};
 use bcode_ralph as ralph_state;
 use bcode_session_models::{SessionHistoryDirection, SessionHistoryQuery};
 use bcode_worktree_models::WorktreeCreateRequest;
@@ -28,23 +31,94 @@ pub async fn show_status(
     let repo_root = current_repo_root(chat)?;
     let response = services
         .client
-        .ralph_status(RalphStatusRequest { repo_root })
+        .ralph_run_status(RalphRunStatusRequest {
+            repo_root,
+            loop_state_dir: None,
+        })
         .await?;
     let Some(summary) = response.loop_summary else {
         chat.app
             .set_status("no Ralph loops for current repository".to_owned());
         return Ok(());
     };
-    chat.app.push_system_note(format_status_note(&summary));
+    chat.app.push_system_note(format_status_note(
+        &summary,
+        response.active_run.as_ref(),
+        response.interrupted_runs.len(),
+    ));
     chat.app.set_status("Ralph status shown".to_owned());
     Ok(())
 }
 
-fn format_status_note(summary: &RalphStatusSummary) -> String {
+/// Start the latest Ralph loop through the server-side runner API.
+pub async fn run_loop(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Result<(), TuiError> {
+    let repo_root = current_repo_root(chat)?;
+    let response = services
+        .client
+        .run_ralph_loop(RalphRunRequest {
+            repo_root,
+            loop_state_dir: None,
+            max_iterations: None,
+            no_progress_limit: None,
+            require_approval: false,
+        })
+        .await?;
+    chat.app.push_system_note(format!(
+        "Ralph run started\n* Run: {}\n* Status: {}\n* State: {}\n* Session: {}",
+        response.run.run_id,
+        response.run.status,
+        response.run.state_dir.display(),
+        response.run.session_id.as_deref().unwrap_or("<none>")
+    ));
+    chat.app.set_status("Ralph run started".to_owned());
+    Ok(())
+}
+
+/// Request cancellation for the active Ralph loop run.
+pub async fn stop_loop(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Result<(), TuiError> {
+    let repo_root = current_repo_root(chat)?;
+    let response = services
+        .client
+        .cancel_ralph_loop(RalphCancelRequest {
+            repo_root,
+            run_id: None,
+            loop_state_dir: None,
+        })
+        .await?;
+    chat.app.push_system_note(format!(
+        "Ralph stop requested\n* Run: {}\n* Status: {}\n* Cancel requested: {}",
+        response.run.run_id, response.run.status, response.cancel_requested
+    ));
+    chat.app.set_status("Ralph stop requested".to_owned());
+    Ok(())
+}
+
+fn format_status_note(
+    summary: &RalphStatusSummary,
+    active_run: Option<&RalphRunSummary>,
+    interrupted_run_count: usize,
+) -> String {
+    let run_status = active_run.map_or_else(
+        || "none".to_owned(),
+        |run| {
+            format!(
+                "{} ({}){}",
+                run.run_id,
+                run.status,
+                if run.cancel_requested {
+                    ", cancel requested"
+                } else {
+                    ""
+                }
+            )
+        },
+    );
     format!(
-        "Ralph loop status\n* Loop: {}\n* Status: {}\n* Iterations: {}\n* Checklist: {} checked, {} unchecked\n* Next: {}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}",
+        "Ralph loop status\n* Loop: {}\n* Status: {}\n* Active run: {}\n* Interrupted runs: {}\n* Iterations: {}\n* Checklist: {} checked, {} unchecked\n* Next: {}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}",
         summary.loop_name,
         summary.status,
+        run_status,
+        interrupted_run_count,
         summary.iteration_count,
         summary.checked_count,
         summary.unchecked_count,

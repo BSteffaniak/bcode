@@ -30,6 +30,10 @@ pub enum SlashCommandOutcome {
     OpenRalphStartDialog,
     /// Show Ralph loop status.
     ShowRalphStatus,
+    /// Start a Ralph autonomous run.
+    RunRalphLoop,
+    /// Stop the active Ralph autonomous run.
+    StopRalphLoop,
     /// Show the latest Ralph progress doc path.
     OpenRalphProgress,
     /// Build a Ralph work prompt.
@@ -322,14 +326,12 @@ fn ralph_command(parts: &[&str]) -> SlashCommandOutcome {
         Some("start") | None => SlashCommandOutcome::OpenRalphStartDialog,
         Some("status") => SlashCommandOutcome::ShowRalphStatus,
         Some("open") => SlashCommandOutcome::OpenRalphProgress,
-        Some("run") => SlashCommandOutcome::BuildRalphPrompt(bcode_ralph::RalphPromptKind::Work),
+        Some("run") => SlashCommandOutcome::RunRalphLoop,
         Some("audit") => SlashCommandOutcome::BuildRalphPrompt(bcode_ralph::RalphPromptKind::Audit),
         Some("replan") => {
             SlashCommandOutcome::BuildRalphPrompt(bcode_ralph::RalphPromptKind::Replan)
         }
-        Some("stop") => {
-            SlashCommandOutcome::Handled("Ralph stop is not implemented yet".to_owned())
-        }
+        Some("stop") => SlashCommandOutcome::StopRalphLoop,
         Some(_) => SlashCommandOutcome::Handled(
             "usage: /ralph [start|run|stop|status|audit|replan|open]".to_owned(),
         ),
@@ -729,11 +731,19 @@ mod tests {
     }
 
     #[test]
-    fn ralph_run_audit_and_replan_route_to_prompt_builders() {
+    fn ralph_run_and_stop_route_to_runner_actions() {
         assert_eq!(
             ralph_command(&["/ralph", "run"]),
-            SlashCommandOutcome::BuildRalphPrompt(RalphPromptKind::Work)
+            SlashCommandOutcome::RunRalphLoop
         );
+        assert_eq!(
+            ralph_command(&["/ralph", "stop"]),
+            SlashCommandOutcome::StopRalphLoop
+        );
+    }
+
+    #[test]
+    fn ralph_audit_and_replan_route_to_prompt_builders() {
         assert_eq!(
             ralph_command(&["/ralph", "audit"]),
             SlashCommandOutcome::BuildRalphPrompt(RalphPromptKind::Audit)
