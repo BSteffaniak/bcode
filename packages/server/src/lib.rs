@@ -1392,6 +1392,7 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
         },
     ));
     state.start_catalog_event_forwarder();
+    interrupt_stale_ralph_runs_best_effort(&state);
     if config.daemon.idle_shutdown {
         state.start_idle_shutdown_watcher(Duration::from_secs(
             config.daemon.idle_shutdown_after_secs,
@@ -1421,6 +1422,28 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
     }
     tracing::debug!(target: "bcode_server::startup", "shutdown complete");
     Ok(())
+}
+
+fn interrupt_stale_ralph_runs_best_effort(state: &ServerState) {
+    match bcode_ralph::mark_all_active_runs_interrupted("daemon restart") {
+        Ok(marked) if marked > 0 => {
+            state
+                .metrics
+                .increment_counter("server.ralph_runs.interrupted_on_startup_total");
+            tracing::warn!(
+                target: "bcode_server::ralph",
+                marked,
+                "marked stale active Ralph runs interrupted on daemon startup"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            state
+                .metrics
+                .increment_counter("server.ralph_runs.interrupt_startup_error_total");
+            eprintln!("failed to interrupt stale Ralph runs on startup: {error}");
+        }
+    }
 }
 
 async fn recover_abandoned_session_runtime_work_best_effort(

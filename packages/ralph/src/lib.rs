@@ -1089,6 +1089,43 @@ pub fn mark_active_runs_interrupted(
     })
 }
 
+/// Mark every active Ralph run as interrupted.
+///
+/// # Errors
+///
+/// Returns an error when the Ralph database cannot be opened, migrated, queried, or written.
+pub fn mark_all_active_runs_interrupted(reason: &str) -> Result<usize, RalphStateError> {
+    let reason = reason.to_owned();
+    with_database(move |database| {
+        Box::pin(async move {
+            let rows = database
+                .select("ralph_runs")
+                .columns(&RALPH_RUN_COLUMNS)
+                .execute(database)
+                .await?;
+            let active_runs = rows
+                .iter()
+                .map(run_record_from_row)
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|run| is_active_run_status(&run.status))
+                .collect::<Vec<_>>();
+            for run in &active_runs {
+                database
+                    .update("ralph_runs")
+                    .value("status", "interrupted")
+                    .value("updated_at_ms", u128_to_i64(now_ms()))
+                    .value("finished_at_ms", u128_to_i64(now_ms()))
+                    .value("stop_reason", reason.clone())
+                    .filter(Box::new(where_eq("run_id", run.run_id.clone())))
+                    .execute(database)
+                    .await?;
+            }
+            Ok(active_runs.len())
+        })
+    })
+}
+
 /// Create a persisted Ralph iteration record.
 ///
 /// # Errors
