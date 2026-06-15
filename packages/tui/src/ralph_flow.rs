@@ -102,9 +102,12 @@ fn format_status_note(
         || "none".to_owned(),
         |run| {
             format!(
-                "{} ({}){}",
+                "{} ({}){}{}",
                 run.run_id,
                 run.status,
+                run.stop_reason
+                    .as_deref()
+                    .map_or_else(String::new, |reason| format!(", stop: {reason}")),
                 if run.cancel_requested {
                     ", cancel requested"
                 } else {
@@ -113,8 +116,13 @@ fn format_status_note(
             )
         },
     );
+    let validation_commands = if summary.validation_commands.is_empty() {
+        "<none>".to_owned()
+    } else {
+        summary.validation_commands.join("; ")
+    };
     format!(
-        "Ralph loop status\n* Loop: {}\n* Status: {}\n* Active run: {}\n* Interrupted runs: {}\n* Iterations: {}\n* Checklist: {} checked, {} unchecked\n* Next: {}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}",
+        "Ralph loop status\n* Loop: {}\n* Status: {}\n* Active run: {}\n* Interrupted runs: {}\n* Iterations: {}\n* Checklist: {} checked, {} unchecked\n* Validation: {}\n* Next: {}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}",
         summary.loop_name,
         summary.status,
         run_status,
@@ -122,6 +130,7 @@ fn format_status_note(
         summary.iteration_count,
         summary.checked_count,
         summary.unchecked_count,
+        validation_commands,
         summary.next_action,
         summary.progress_doc_path.display(),
         summary.state_dir.display(),

@@ -3250,6 +3250,14 @@ fn resolve_ralph_cancel_target(
 }
 
 fn ralph_status_summary(summary: bcode_ralph::RalphLoopSummary) -> RalphStatusSummary {
+    let validation_commands = bcode_ralph::list_validation_commands(&summary.state_dir)
+        .map(|commands| {
+            commands
+                .into_iter()
+                .map(|command| command.command)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     RalphStatusSummary {
         loop_name: summary.loop_name,
         status: summary.status,
@@ -3261,6 +3269,7 @@ fn ralph_status_summary(summary: bcode_ralph::RalphLoopSummary) -> RalphStatusSu
         next_action: summary.next_action,
         checked_count: summary.checklist_summary.checked_count,
         unchecked_count: summary.checklist_summary.unchecked_count,
+        validation_commands,
     }
 }
 

@@ -577,6 +577,9 @@ pub struct RalphStatusSummary {
     pub checked_count: usize,
     /// Unchecked progress-doc checklist items.
     pub unchecked_count: usize,
+    /// Validation commands configured for the loop.
+    #[serde(default)]
+    pub validation_commands: Vec<String>,
 }
 
 /// Ralph loop status response.
