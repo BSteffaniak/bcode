@@ -9,12 +9,13 @@ use bcode_daemon_lifecycle::{DaemonStartError, EnsureDaemonOptions, ensure_daemo
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint,
     LocalIpcStream, PermissionSummary, PluginServiceResponse, PluginServiceSummary,
-    RalphLifecycleRequest, RalphStatusRequest, RalphStatusResponse, Request, Response,
-    ResponsePayload, ServerStopMode, SessionCatalogSourceStatus, SessionCatalogStatus,
-    SessionImportWarning, WorktreeCreateRequest, WorktreeCreateResponse, WorktreeListRequest,
-    WorktreeListResponse, WorktreeRemoveRequest, WorktreeRemoveResponse, current_working_directory,
-    decode_event, decode_response, default_endpoint, recv_envelope, request_envelope,
-    send_envelope,
+    RalphCancelRequest, RalphCancelResponse, RalphLifecycleRequest, RalphRunRequest,
+    RalphRunResponse, RalphRunStatusRequest, RalphRunStatusResponse, RalphStatusRequest,
+    RalphStatusResponse, Request, Response, ResponsePayload, ServerStopMode,
+    SessionCatalogSourceStatus, SessionCatalogStatus, SessionImportWarning, WorktreeCreateRequest,
+    WorktreeCreateResponse, WorktreeListRequest, WorktreeListResponse, WorktreeRemoveRequest,
+    WorktreeRemoveResponse, current_working_directory, decode_event, decode_response,
+    default_endpoint, recv_envelope, request_envelope, send_envelope,
 };
 use bcode_session_models::{
     ClientId, ProjectionWindowRequest, RuntimeWorkId, RuntimeWorkStatus, SessionEvent,
@@ -798,6 +799,51 @@ impl BcodeClient {
     ) -> Result<RalphStatusResponse, ClientError> {
         match self.send_request(Request::RalphStatus(request)).await? {
             ResponsePayload::RalphStatus(response) => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Start a bounded Ralph autonomous run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn run_ralph_loop(
+        &self,
+        request: RalphRunRequest,
+    ) -> Result<RalphRunResponse, ClientError> {
+        match self.send_request(Request::RunRalphLoop(request)).await? {
+            ResponsePayload::RalphRunStarted(response) => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Cancel a Ralph autonomous run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn cancel_ralph_loop(
+        &self,
+        request: RalphCancelRequest,
+    ) -> Result<RalphCancelResponse, ClientError> {
+        match self.send_request(Request::CancelRalphLoop(request)).await? {
+            ResponsePayload::RalphRunCancelled(response) => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Return Ralph autonomous run status for a repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn ralph_run_status(
+        &self,
+        request: RalphRunStatusRequest,
+    ) -> Result<RalphRunStatusResponse, ClientError> {
+        match self.send_request(Request::RalphRunStatus(request)).await? {
+            ResponsePayload::RalphRunStatus(response) => Ok(response),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

@@ -312,6 +312,9 @@ pub enum Request {
     CreateWorktree(WorktreeCreateRequest),
     RemoveWorktree(WorktreeRemoveRequest),
     RalphStatus(RalphStatusRequest),
+    RunRalphLoop(RalphRunRequest),
+    CancelRalphLoop(RalphCancelRequest),
+    RalphRunStatus(RalphRunStatusRequest),
     RecordRalphLifecycle(RalphLifecycleRequest),
     ImportExternalSession {
         source_id: String,
@@ -584,6 +587,113 @@ pub struct RalphStatusResponse {
     pub loop_summary: Option<RalphStatusSummary>,
 }
 
+/// Request to start a bounded Ralph autonomous run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RalphRunRequest {
+    /// Repository root used to discover the selected Ralph loop.
+    pub repo_root: PathBuf,
+    /// Specific Ralph loop state directory to run, when not using latest.
+    #[serde(default)]
+    pub loop_state_dir: Option<PathBuf>,
+    /// Requested max iteration override.
+    #[serde(default)]
+    pub max_iterations: Option<u64>,
+    /// Requested no-progress limit override.
+    #[serde(default)]
+    pub no_progress_limit: Option<u64>,
+    /// Whether this run should begin in an approval-gated state.
+    #[serde(default)]
+    pub require_approval: bool,
+}
+
+/// Request to cancel an active Ralph run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RalphCancelRequest {
+    /// Repository root used to discover the selected Ralph loop.
+    pub repo_root: PathBuf,
+    /// Specific run ID to cancel. Defaults to the active run for the loop.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Specific Ralph loop state directory to cancel, when not using latest.
+    #[serde(default)]
+    pub loop_state_dir: Option<PathBuf>,
+}
+
+/// Request to inspect Ralph autonomous run status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RalphRunStatusRequest {
+    /// Repository root used to discover the selected Ralph loop.
+    pub repo_root: PathBuf,
+    /// Specific Ralph loop state directory to inspect, when not using latest.
+    #[serde(default)]
+    pub loop_state_dir: Option<PathBuf>,
+}
+
+/// Ralph autonomous run summary for IPC clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RalphRunSummary {
+    /// Run ID.
+    pub run_id: String,
+    /// Loop state directory this run belongs to.
+    pub state_dir: PathBuf,
+    /// Work-area session used by the runner, when known.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Current run status.
+    pub status: String,
+    /// Requested max iteration override.
+    #[serde(default)]
+    pub requested_max_iterations: Option<u64>,
+    /// Requested no-progress limit override.
+    #[serde(default)]
+    pub requested_no_progress_limit: Option<u64>,
+    /// Whether cancellation was requested.
+    pub cancel_requested: bool,
+    /// Run start time in Unix epoch milliseconds.
+    pub started_at_ms: u64,
+    /// Last update time in Unix epoch milliseconds.
+    pub updated_at_ms: u64,
+    /// Run finish time in Unix epoch milliseconds.
+    #[serde(default)]
+    pub finished_at_ms: Option<u64>,
+    /// Terminal stop reason, when known.
+    #[serde(default)]
+    pub stop_reason: Option<String>,
+    /// Terminal error message, when known.
+    #[serde(default)]
+    pub error_message: Option<String>,
+}
+
+/// Response after starting a Ralph run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RalphRunResponse {
+    /// Persisted run summary.
+    pub run: RalphRunSummary,
+}
+
+/// Response after requesting Ralph run cancellation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RalphCancelResponse {
+    /// Run summary after cancellation was requested.
+    pub run: RalphRunSummary,
+    /// Whether the cancel flag was requested by this call.
+    pub cancel_requested: bool,
+}
+
+/// Response describing Ralph autonomous run status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RalphRunStatusResponse {
+    /// Latest or selected Ralph loop summary for the repository, when one exists.
+    #[serde(default)]
+    pub loop_summary: Option<RalphStatusSummary>,
+    /// Active run for the loop, when one exists.
+    #[serde(default)]
+    pub active_run: Option<RalphRunSummary>,
+    /// Interrupted runs for the loop.
+    #[serde(default)]
+    pub interrupted_runs: Vec<RalphRunSummary>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeWorkSnapshot {
     pub work_id: RuntimeWorkId,
@@ -705,6 +815,9 @@ pub enum ResponsePayload {
     WorktreeCreated(WorktreeCreateResponse),
     WorktreeRemoved(WorktreeRemoveResponse),
     RalphStatus(RalphStatusResponse),
+    RalphRunStarted(RalphRunResponse),
+    RalphRunCancelled(RalphCancelResponse),
+    RalphRunStatus(RalphRunStatusResponse),
     RalphLifecycleRecorded {
         event: SessionEvent,
     },

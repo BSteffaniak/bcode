@@ -16,11 +16,12 @@ use bcode_agent_profile::{
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, DaemonStatus, EnvelopeKind, ErrorResponse, Event,
     IpcEndpoint, LocalIpcListener, LocalIpcStream, PermissionSummary, PluginServiceError,
-    PluginServiceResponse, PluginServiceSummary, RalphLifecycleRequest, RalphStatusRequest,
-    RalphStatusResponse, RalphStatusSummary, Request, Response, ResponsePayload, ServerStatus,
-    ServerStopMode, SessionCatalogSourceStatus, SessionCatalogStatus, WorktreeCreateRequest,
-    WorktreeListRequest, WorktreeRemoveRequest, decode, event_envelope, recv_envelope,
-    response_envelope, send_envelope,
+    PluginServiceResponse, PluginServiceSummary, RalphCancelRequest, RalphCancelResponse,
+    RalphLifecycleRequest, RalphRunRequest, RalphRunResponse, RalphRunStatusRequest,
+    RalphRunStatusResponse, RalphRunSummary, RalphStatusRequest, RalphStatusResponse,
+    RalphStatusSummary, Request, Response, ResponsePayload, ServerStatus, ServerStopMode,
+    SessionCatalogSourceStatus, SessionCatalogStatus, WorktreeCreateRequest, WorktreeListRequest,
+    WorktreeRemoveRequest, decode, event_envelope, recv_envelope, response_envelope, send_envelope,
 };
 use bcode_metrics::{MetricLabels, MetricsRegistry};
 use bcode_model::{
@@ -1587,6 +1588,13 @@ async fn handle_request(
             handle_remove_worktree(request_id, state, writer, request).await
         }
         Request::RalphStatus(request) => handle_ralph_status(request_id, writer, request).await,
+        Request::RunRalphLoop(request) => handle_run_ralph_loop(request_id, writer, request).await,
+        Request::CancelRalphLoop(request) => {
+            handle_cancel_ralph_loop(request_id, writer, request).await
+        }
+        Request::RalphRunStatus(request) => {
+            handle_ralph_run_status(request_id, writer, request).await
+        }
         Request::RecordRalphLifecycle(request) => {
             handle_record_ralph_lifecycle(request_id, state, writer, request).await
         }
@@ -1884,6 +1892,9 @@ async fn handle_agent_permission_plugin_request(
         | Request::CreateWorktree(_)
         | Request::RemoveWorktree(_)
         | Request::RalphStatus(_)
+        | Request::RunRalphLoop(_)
+        | Request::CancelRalphLoop(_)
+        | Request::RalphRunStatus(_)
         | Request::RecordRalphLifecycle(_) => {
             unreachable!("primary request routed to primary handler")
         }
@@ -2177,18 +2188,7 @@ async fn handle_ralph_status(
     match bcode_ralph::latest_loop(&request.repo_root) {
         Ok(loop_summary) => {
             let response = RalphStatusResponse {
-                loop_summary: loop_summary.map(|summary| RalphStatusSummary {
-                    loop_name: summary.loop_name,
-                    status: summary.status,
-                    state_dir: summary.state_dir,
-                    progress_doc_path: summary.progress_doc_path,
-                    work_area_path: summary.work_area_path,
-                    session_id: summary.session_id,
-                    iteration_count: summary.iteration_count,
-                    next_action: summary.next_action,
-                    checked_count: summary.checklist_summary.checked_count,
-                    unchecked_count: summary.checklist_summary.unchecked_count,
-                }),
+                loop_summary: loop_summary.map(ralph_status_summary),
             };
             send_response(
                 writer,
@@ -2205,6 +2205,196 @@ async fn handle_ralph_status(
             )
             .await
         }
+    }
+}
+
+async fn handle_run_ralph_loop(
+    request_id: u64,
+    writer: &SharedWriter,
+    request: RalphRunRequest,
+) -> Result<(), ServerError> {
+    match resolve_ralph_loop(&request.repo_root, request.loop_state_dir.as_deref()).and_then(
+        |summary| {
+            if bcode_ralph::active_run_for_loop(&summary.state_dir)
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                return Err("Ralph loop already has an active run".to_owned());
+            }
+            let status = if request.require_approval {
+                "awaiting_approval"
+            } else {
+                "queued"
+            };
+            let run = bcode_ralph::create_run(bcode_ralph::RalphRunCreateRequest {
+                state_dir: summary.state_dir,
+                session_id: summary.session_id,
+                status: status.to_owned(),
+                requested_max_iterations: request.max_iterations,
+                requested_no_progress_limit: request.no_progress_limit,
+            })
+            .map_err(|error| error.to_string())?;
+            Ok(RalphRunResponse {
+                run: ralph_run_summary(run),
+            })
+        },
+    ) {
+        Ok(response) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::RalphRunStarted(response)),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("ralph_run_start_failed", error)),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_cancel_ralph_loop(
+    request_id: u64,
+    writer: &SharedWriter,
+    request: RalphCancelRequest,
+) -> Result<(), ServerError> {
+    match resolve_ralph_loop(&request.repo_root, request.loop_state_dir.as_deref())
+        .and_then(|summary| resolve_ralph_cancel_target(&summary.state_dir, request.run_id))
+        .and_then(|run| {
+            bcode_ralph::request_run_cancel(&run.run_id).map_err(|error| error.to_string())?;
+            Ok(RalphCancelResponse {
+                run: RalphRunSummary {
+                    cancel_requested: true,
+                    updated_at_ms: current_time_ms(),
+                    ..ralph_run_summary(run)
+                },
+                cancel_requested: true,
+            })
+        }) {
+        Ok(response) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::RalphRunCancelled(response)),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("ralph_run_cancel_failed", error)),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_ralph_run_status(
+    request_id: u64,
+    writer: &SharedWriter,
+    request: RalphRunStatusRequest,
+) -> Result<(), ServerError> {
+    match resolve_ralph_loop(&request.repo_root, request.loop_state_dir.as_deref()).and_then(
+        |summary| {
+            let active_run = bcode_ralph::active_run_for_loop(&summary.state_dir)
+                .map_err(|error| error.to_string())?
+                .map(ralph_run_summary);
+            let interrupted_runs = bcode_ralph::interrupted_runs_for_loop(&summary.state_dir)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(ralph_run_summary)
+                .collect();
+            Ok(RalphRunStatusResponse {
+                loop_summary: Some(ralph_status_summary(summary)),
+                active_run,
+                interrupted_runs,
+            })
+        },
+    ) {
+        Ok(response) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::RalphRunStatus(response)),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("ralph_run_status_failed", error)),
+            )
+            .await
+        }
+    }
+}
+
+fn resolve_ralph_loop(
+    repo_root: &Path,
+    loop_state_dir: Option<&Path>,
+) -> Result<bcode_ralph::RalphLoopSummary, String> {
+    let summary = bcode_ralph::latest_loop(repo_root)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "no Ralph loop exists for repository".to_owned())?;
+    if let Some(loop_state_dir) = loop_state_dir
+        && summary.state_dir != loop_state_dir
+    {
+        return Err("requested Ralph loop is not the latest loop for repository".to_owned());
+    }
+    Ok(summary)
+}
+
+fn resolve_ralph_cancel_target(
+    state_dir: &Path,
+    run_id: Option<String>,
+) -> Result<bcode_ralph::RalphRunRecord, String> {
+    let active_run =
+        bcode_ralph::active_run_for_loop(state_dir).map_err(|error| error.to_string())?;
+    match (run_id, active_run) {
+        (Some(run_id), Some(run)) if run.run_id == run_id => Ok(run),
+        (Some(_), Some(_)) => Err("requested Ralph run is not active for loop".to_owned()),
+        (Some(_), None) => Err("requested Ralph run is not active".to_owned()),
+        (None, Some(run)) => Ok(run),
+        (None, None) => Err("Ralph loop has no active run".to_owned()),
+    }
+}
+
+fn ralph_status_summary(summary: bcode_ralph::RalphLoopSummary) -> RalphStatusSummary {
+    RalphStatusSummary {
+        loop_name: summary.loop_name,
+        status: summary.status,
+        state_dir: summary.state_dir,
+        progress_doc_path: summary.progress_doc_path,
+        work_area_path: summary.work_area_path,
+        session_id: summary.session_id,
+        iteration_count: summary.iteration_count,
+        next_action: summary.next_action,
+        checked_count: summary.checklist_summary.checked_count,
+        unchecked_count: summary.checklist_summary.unchecked_count,
+    }
+}
+
+fn ralph_run_summary(run: bcode_ralph::RalphRunRecord) -> RalphRunSummary {
+    RalphRunSummary {
+        run_id: run.run_id,
+        state_dir: run.state_dir,
+        session_id: run.session_id,
+        status: run.status,
+        requested_max_iterations: run.requested_max_iterations,
+        requested_no_progress_limit: run.requested_no_progress_limit,
+        cancel_requested: run.cancel_requested,
+        started_at_ms: run.started_at_ms,
+        updated_at_ms: run.updated_at_ms,
+        finished_at_ms: run.finished_at_ms,
+        stop_reason: run.stop_reason,
+        error_message: run.error_message,
     }
 }
 
