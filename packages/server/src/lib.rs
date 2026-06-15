@@ -12391,6 +12391,164 @@ mod tests {
         }
     }
 
+    fn unique_ralph_repo_root(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "bcode-server-ralph-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&path).expect("test repo root should be created");
+        path
+    }
+
+    fn create_test_ralph_loop(label: &str) -> (PathBuf, bcode_ralph::RalphLoopSummary) {
+        let repo_root = unique_ralph_repo_root(label);
+        bcode_ralph::create_initial_loop_state("test-loop", &repo_root, Some("test"))
+            .expect("Ralph loop should be created");
+        let summary = bcode_ralph::latest_loop(&repo_root)
+            .expect("latest loop should query")
+            .expect("latest loop should exist");
+        (repo_root, summary)
+    }
+
+    #[tokio::test]
+    async fn ralph_start_rejects_duplicate_active_run() {
+        let sessions = SessionManager::default();
+        let state = Arc::new(test_server_state(sessions));
+        let (repo_root, _summary) = create_test_ralph_loop("duplicate");
+        let request = RalphRunRequest {
+            repo_root: repo_root.clone(),
+            loop_state_dir: None,
+            max_iterations: Some(1),
+            no_progress_limit: Some(1),
+            require_approval: true,
+        };
+
+        start_ralph_runner(&state, request.clone())
+            .await
+            .expect("first run should prepare");
+        let error = start_ralph_runner(&state, request)
+            .await
+            .expect_err("second active run should be rejected");
+
+        assert!(error.contains("already has an active run"));
+    }
+
+    #[tokio::test]
+    async fn ralph_cancel_marks_active_run_cancel_requested() {
+        let sessions = SessionManager::default();
+        let state = Arc::new(test_server_state(sessions));
+        let (repo_root, summary) = create_test_ralph_loop("cancel");
+        let response = start_ralph_runner(
+            &state,
+            RalphRunRequest {
+                repo_root,
+                loop_state_dir: None,
+                max_iterations: Some(1),
+                no_progress_limit: Some(1),
+                require_approval: true,
+            },
+        )
+        .await
+        .expect("run should prepare");
+
+        bcode_ralph::request_run_cancel(&response.run.run_id).expect("cancel should persist");
+        let active = bcode_ralph::active_run_for_loop(&summary.state_dir)
+            .expect("active run query should work")
+            .expect("run should remain active while awaiting runner observation");
+
+        assert!(active.cancel_requested);
+    }
+
+    #[test]
+    fn ralph_run_summary_reports_active_runtime_work_identity() {
+        let state_dir = PathBuf::from(format!(
+            "/tmp/bcode-server-ralph-summary-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let run = bcode_ralph::create_run(bcode_ralph::RalphRunCreateRequest {
+            state_dir,
+            session_id: Some("session-test".to_owned()),
+            status: "running".to_owned(),
+            requested_max_iterations: Some(3),
+            requested_no_progress_limit: Some(2),
+        })
+        .expect("run should persist");
+
+        let summary = ralph_run_summary(run.clone());
+
+        assert_eq!(summary.run_id, run.run_id);
+        assert_eq!(summary.session_id.as_deref(), Some("session-test"));
+        let expected_runtime_work_id = format!("ralph:{}", run.run_id);
+        assert_eq!(
+            summary.runtime_work_id.as_deref(),
+            Some(expected_runtime_work_id.as_str())
+        );
+        assert_eq!(summary.status, "running");
+    }
+
+    #[test]
+    fn ralph_validation_failure_completion_blocks_run() {
+        let state_dir = PathBuf::from(format!(
+            "/tmp/bcode-server-ralph-validation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let run = bcode_ralph::create_run(bcode_ralph::RalphRunCreateRequest {
+            state_dir: state_dir.clone(),
+            session_id: None,
+            status: "running".to_owned(),
+            requested_max_iterations: Some(1),
+            requested_no_progress_limit: Some(1),
+        })
+        .expect("run should persist");
+
+        let _ = bcode_ralph::update_run_status(
+            &run.run_id,
+            "blocked",
+            Some(current_time_ms()),
+            Some("validation_failed"),
+            Some("Ralph validation command failed"),
+        );
+        let active =
+            bcode_ralph::active_run_for_loop(&state_dir).expect("active run query should work");
+
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn ralph_permission_denial_completion_stops_run() {
+        let state_dir = PathBuf::from(format!(
+            "/tmp/bcode-server-ralph-permission-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let run = bcode_ralph::create_run(bcode_ralph::RalphRunCreateRequest {
+            state_dir: state_dir.clone(),
+            session_id: None,
+            status: "running".to_owned(),
+            requested_max_iterations: Some(1),
+            requested_no_progress_limit: Some(1),
+        })
+        .expect("run should persist");
+        let failure = ralph_run_failure_from_model_completion(
+            "work",
+            &ModelTurnCompletion::with_message(ModelTurnOutcome::Error, "permission denied"),
+        )
+        .expect("permission denial should classify");
+
+        let _ = bcode_ralph::update_run_status(
+            &run.run_id,
+            failure.0,
+            Some(current_time_ms()),
+            Some(failure.1),
+            Some(failure.2.as_str()),
+        );
+        let active =
+            bcode_ralph::active_run_for_loop(&state_dir).expect("active run query should work");
+
+        assert!(active.is_none());
+        assert_eq!(failure.0, "stopped");
+        assert_eq!(failure.1, "permission_denied");
+    }
+
     fn ralph_iteration_with_fingerprints(
         iteration_number: u64,
         before: Option<String>,
