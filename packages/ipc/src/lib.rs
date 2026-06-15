@@ -716,7 +716,30 @@ enum IpcResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum IpcResponsePayload {
-    Domain(Box<ResponsePayload>),
+    Hello {
+        protocol_version: ProtocolVersion,
+        client_id: ClientId,
+    },
+    Pong,
+    ServerStatus {
+        status: ServerStatus,
+    },
+    ServerStopping,
+    SessionCreated {
+        session: SessionSummary,
+    },
+    SessionList {
+        sessions: Vec<SessionSummary>,
+        catalog_status: SessionCatalogStatus,
+        catalog_sources: Vec<SessionCatalogSourceStatus>,
+        catalog_revision: u64,
+    },
+    SessionRenamed {
+        session: SessionSummary,
+    },
+    SessionDeleted {
+        session: SessionSummary,
+    },
     SessionHistory {
         session_id: SessionId,
         history: Vec<IpcSessionEvent>,
@@ -731,9 +754,93 @@ enum IpcResponsePayload {
         input_history: Vec<SessionInputHistoryEntry>,
         import_warnings: Vec<SessionImportWarning>,
     },
+    MessageSent,
+    TurnCancellationRequested {
+        cancelled: bool,
+    },
+    SessionCompacted {
+        compacted: bool,
+        message: String,
+    },
+    SessionModelSet,
+    SessionModelStatus {
+        status: SessionModelStatus,
+    },
+    AgentList {
+        agents: Vec<AgentInfo>,
+    },
+    SkillList {
+        skills: Box<SkillList>,
+    },
+    SkillManifest {
+        skill: Box<SkillManifest>,
+    },
+    ActiveSkills {
+        skills: Vec<SkillContextResponse>,
+    },
+    AgentPolicyStatus {
+        status: PolicyStatusResponse,
+    },
+    SessionAgentSet,
+    PermissionList {
+        permissions: Vec<PermissionSummary>,
+    },
+    PermissionResolved {
+        resolved: bool,
+    },
+    PermissionRuleAdded {
+        config_path: String,
+    },
+    PluginServices {
+        services: Vec<PluginServiceSummary>,
+    },
+    PluginServiceResult {
+        response: PluginServiceResponse,
+    },
+    PluginEventPublished {
+        delivered: usize,
+    },
+    MessageAccepted {
+        queued: bool,
+        queue_position: Option<u32>,
+    },
+    SessionModelList {
+        provider_plugin_id: Option<String>,
+        models: bcode_model::ModelList,
+    },
+    ClientRuntimeContextUpdated,
+    SessionWorkingDirectoryChanged {
+        session: SessionSummary,
+        changed: bool,
+    },
+    WorktreeList(WorktreeListResponse),
+    WorktreeCreated(WorktreeCreateResponse),
+    WorktreeRemoved(WorktreeRemoveResponse),
+    ExternalSessionImported {
+        session: SessionSummary,
+        warnings: Vec<SessionImportWarning>,
+    },
+    SessionForked {
+        session: SessionSummary,
+        draft: Option<String>,
+    },
+    SessionCatalogRefreshed {
+        sessions: Vec<SessionSummary>,
+        catalog_status: SessionCatalogStatus,
+        catalog_sources: Vec<SessionCatalogSourceStatus>,
+        catalog_revision: u64,
+    },
+    CatalogUpdatesSubscribed,
+    RuntimeWorkList {
+        work: Vec<RuntimeWorkSnapshot>,
+    },
+    RuntimeWorkCancellationRequested {
+        cancelled: bool,
+    },
     RuntimeWorkHistory {
         events: Vec<IpcSessionEvent>,
     },
+    RuntimeWorkSubscribed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -758,20 +865,53 @@ impl TryFrom<IpcResponse> for Response {
 
     fn try_from(value: IpcResponse) -> Result<Self, Self::Error> {
         match value {
-            IpcResponse::Ok(payload) => payload.try_into().map(Self::Ok),
+            IpcResponse::Ok(payload) => Ok(Self::Ok(payload.try_into()?)),
             IpcResponse::Err(error) => Ok(Self::Err(error)),
         }
     }
 }
 
 impl From<&ResponsePayload> for IpcResponsePayload {
+    #[allow(clippy::too_many_lines, clippy::clone_on_copy)]
     fn from(value: &ResponsePayload) -> Self {
         match value {
+            ResponsePayload::Hello {
+                protocol_version,
+                client_id,
+            } => Self::Hello {
+                protocol_version: protocol_version.clone(),
+                client_id: client_id.clone(),
+            },
+            ResponsePayload::Pong => Self::Pong,
+            ResponsePayload::ServerStatus { status } => Self::ServerStatus {
+                status: status.clone(),
+            },
+            ResponsePayload::ServerStopping => Self::ServerStopping,
+            ResponsePayload::SessionCreated { session } => Self::SessionCreated {
+                session: session.clone(),
+            },
+            ResponsePayload::SessionList {
+                sessions,
+                catalog_status,
+                catalog_sources,
+                catalog_revision,
+            } => Self::SessionList {
+                sessions: sessions.clone(),
+                catalog_status: catalog_status.clone(),
+                catalog_sources: catalog_sources.clone(),
+                catalog_revision: catalog_revision.clone(),
+            },
+            ResponsePayload::SessionRenamed { session } => Self::SessionRenamed {
+                session: session.clone(),
+            },
+            ResponsePayload::SessionDeleted { session } => Self::SessionDeleted {
+                session: session.clone(),
+            },
             ResponsePayload::SessionHistory {
                 session_id,
                 history,
             } => Self::SessionHistory {
-                session_id: *session_id,
+                session_id: session_id.clone(),
                 history: history.iter().map(IpcSessionEvent::from).collect(),
             },
             ResponsePayload::SessionHistoryPage { page } => Self::SessionHistoryPage {
@@ -784,16 +924,118 @@ impl From<&ResponsePayload> for IpcResponsePayload {
                 input_history,
                 import_warnings,
             } => Self::Attached {
-                session_id: *session_id,
+                session_id: session_id.clone(),
                 session: session.clone(),
                 history: history.iter().map(IpcSessionEvent::from).collect(),
                 input_history: input_history.clone(),
                 import_warnings: import_warnings.clone(),
             },
+            ResponsePayload::MessageSent => Self::MessageSent,
+            ResponsePayload::TurnCancellationRequested { cancelled } => {
+                Self::TurnCancellationRequested {
+                    cancelled: cancelled.clone(),
+                }
+            }
+            ResponsePayload::SessionCompacted { compacted, message } => Self::SessionCompacted {
+                compacted: compacted.clone(),
+                message: message.clone(),
+            },
+            ResponsePayload::SessionModelSet => Self::SessionModelSet,
+            ResponsePayload::SessionModelStatus { status } => Self::SessionModelStatus {
+                status: status.clone(),
+            },
+            ResponsePayload::AgentList { agents } => Self::AgentList {
+                agents: agents.clone(),
+            },
+            ResponsePayload::SkillList { skills } => Self::SkillList {
+                skills: skills.clone(),
+            },
+            ResponsePayload::SkillManifest { skill } => Self::SkillManifest {
+                skill: skill.clone(),
+            },
+            ResponsePayload::ActiveSkills { skills } => Self::ActiveSkills {
+                skills: skills.clone(),
+            },
+            ResponsePayload::AgentPolicyStatus { status } => Self::AgentPolicyStatus {
+                status: status.clone(),
+            },
+            ResponsePayload::SessionAgentSet => Self::SessionAgentSet,
+            ResponsePayload::PermissionList { permissions } => Self::PermissionList {
+                permissions: permissions.clone(),
+            },
+            ResponsePayload::PermissionResolved { resolved } => Self::PermissionResolved {
+                resolved: resolved.clone(),
+            },
+            ResponsePayload::PermissionRuleAdded { config_path } => Self::PermissionRuleAdded {
+                config_path: config_path.clone(),
+            },
+            ResponsePayload::PluginServices { services } => Self::PluginServices {
+                services: services.clone(),
+            },
+            ResponsePayload::PluginServiceResult { response } => Self::PluginServiceResult {
+                response: response.clone(),
+            },
+            ResponsePayload::PluginEventPublished { delivered } => Self::PluginEventPublished {
+                delivered: delivered.clone(),
+            },
+            ResponsePayload::MessageAccepted {
+                queued,
+                queue_position,
+            } => Self::MessageAccepted {
+                queued: queued.clone(),
+                queue_position: queue_position.clone(),
+            },
+            ResponsePayload::SessionModelList {
+                provider_plugin_id,
+                models,
+            } => Self::SessionModelList {
+                provider_plugin_id: provider_plugin_id.clone(),
+                models: models.clone(),
+            },
+            ResponsePayload::ClientRuntimeContextUpdated => Self::ClientRuntimeContextUpdated,
+            ResponsePayload::SessionWorkingDirectoryChanged { session, changed } => {
+                Self::SessionWorkingDirectoryChanged {
+                    session: session.clone(),
+                    changed: changed.clone(),
+                }
+            }
+            ResponsePayload::WorktreeList(value) => Self::WorktreeList(value.clone()),
+            ResponsePayload::WorktreeCreated(value) => Self::WorktreeCreated(value.clone()),
+            ResponsePayload::WorktreeRemoved(value) => Self::WorktreeRemoved(value.clone()),
+            ResponsePayload::ExternalSessionImported { session, warnings } => {
+                Self::ExternalSessionImported {
+                    session: session.clone(),
+                    warnings: warnings.clone(),
+                }
+            }
+            ResponsePayload::SessionForked { session, draft } => Self::SessionForked {
+                session: session.clone(),
+                draft: draft.clone(),
+            },
+            ResponsePayload::SessionCatalogRefreshed {
+                sessions,
+                catalog_status,
+                catalog_sources,
+                catalog_revision,
+            } => Self::SessionCatalogRefreshed {
+                sessions: sessions.clone(),
+                catalog_status: catalog_status.clone(),
+                catalog_sources: catalog_sources.clone(),
+                catalog_revision: catalog_revision.clone(),
+            },
+            ResponsePayload::CatalogUpdatesSubscribed => Self::CatalogUpdatesSubscribed,
+            ResponsePayload::RuntimeWorkList { work } => {
+                Self::RuntimeWorkList { work: work.clone() }
+            }
+            ResponsePayload::RuntimeWorkCancellationRequested { cancelled } => {
+                Self::RuntimeWorkCancellationRequested {
+                    cancelled: cancelled.clone(),
+                }
+            }
             ResponsePayload::RuntimeWorkHistory { events } => Self::RuntimeWorkHistory {
                 events: events.iter().map(IpcSessionEvent::from).collect(),
             },
-            _ => Self::Domain(Box::new(value.clone())),
+            ResponsePayload::RuntimeWorkSubscribed => Self::RuntimeWorkSubscribed,
         }
     }
 }
@@ -801,9 +1043,33 @@ impl From<&ResponsePayload> for IpcResponsePayload {
 impl TryFrom<IpcResponsePayload> for ResponsePayload {
     type Error = CodecError;
 
+    #[allow(clippy::too_many_lines)]
     fn try_from(value: IpcResponsePayload) -> Result<Self, Self::Error> {
         match value {
-            IpcResponsePayload::Domain(payload) => Ok(*payload),
+            IpcResponsePayload::Hello {
+                protocol_version,
+                client_id,
+            } => Ok(Self::Hello {
+                protocol_version,
+                client_id,
+            }),
+            IpcResponsePayload::Pong => Ok(Self::Pong),
+            IpcResponsePayload::ServerStatus { status } => Ok(Self::ServerStatus { status }),
+            IpcResponsePayload::ServerStopping => Ok(Self::ServerStopping),
+            IpcResponsePayload::SessionCreated { session } => Ok(Self::SessionCreated { session }),
+            IpcResponsePayload::SessionList {
+                sessions,
+                catalog_status,
+                catalog_sources,
+                catalog_revision,
+            } => Ok(Self::SessionList {
+                sessions,
+                catalog_status,
+                catalog_sources,
+                catalog_revision,
+            }),
+            IpcResponsePayload::SessionRenamed { session } => Ok(Self::SessionRenamed { session }),
+            IpcResponsePayload::SessionDeleted { session } => Ok(Self::SessionDeleted { session }),
             IpcResponsePayload::SessionHistory {
                 session_id,
                 history,
@@ -827,9 +1093,92 @@ impl TryFrom<IpcResponsePayload> for ResponsePayload {
                 input_history,
                 import_warnings,
             }),
+            IpcResponsePayload::MessageSent => Ok(Self::MessageSent),
+            IpcResponsePayload::TurnCancellationRequested { cancelled } => {
+                Ok(Self::TurnCancellationRequested { cancelled })
+            }
+            IpcResponsePayload::SessionCompacted { compacted, message } => {
+                Ok(Self::SessionCompacted { compacted, message })
+            }
+            IpcResponsePayload::SessionModelSet => Ok(Self::SessionModelSet),
+            IpcResponsePayload::SessionModelStatus { status } => {
+                Ok(Self::SessionModelStatus { status })
+            }
+            IpcResponsePayload::AgentList { agents } => Ok(Self::AgentList { agents }),
+            IpcResponsePayload::SkillList { skills } => Ok(Self::SkillList { skills }),
+            IpcResponsePayload::SkillManifest { skill } => Ok(Self::SkillManifest { skill }),
+            IpcResponsePayload::ActiveSkills { skills } => Ok(Self::ActiveSkills { skills }),
+            IpcResponsePayload::AgentPolicyStatus { status } => {
+                Ok(Self::AgentPolicyStatus { status })
+            }
+            IpcResponsePayload::SessionAgentSet => Ok(Self::SessionAgentSet),
+            IpcResponsePayload::PermissionList { permissions } => {
+                Ok(Self::PermissionList { permissions })
+            }
+            IpcResponsePayload::PermissionResolved { resolved } => {
+                Ok(Self::PermissionResolved { resolved })
+            }
+            IpcResponsePayload::PermissionRuleAdded { config_path } => {
+                Ok(Self::PermissionRuleAdded { config_path })
+            }
+            IpcResponsePayload::PluginServices { services } => {
+                Ok(Self::PluginServices { services })
+            }
+            IpcResponsePayload::PluginServiceResult { response } => {
+                Ok(Self::PluginServiceResult { response })
+            }
+            IpcResponsePayload::PluginEventPublished { delivered } => {
+                Ok(Self::PluginEventPublished { delivered })
+            }
+            IpcResponsePayload::MessageAccepted {
+                queued,
+                queue_position,
+            } => Ok(Self::MessageAccepted {
+                queued,
+                queue_position,
+            }),
+            IpcResponsePayload::SessionModelList {
+                provider_plugin_id,
+                models,
+            } => Ok(Self::SessionModelList {
+                provider_plugin_id,
+                models,
+            }),
+            IpcResponsePayload::ClientRuntimeContextUpdated => {
+                Ok(Self::ClientRuntimeContextUpdated)
+            }
+            IpcResponsePayload::SessionWorkingDirectoryChanged { session, changed } => {
+                Ok(Self::SessionWorkingDirectoryChanged { session, changed })
+            }
+            IpcResponsePayload::WorktreeList(value) => Ok(Self::WorktreeList(value)),
+            IpcResponsePayload::WorktreeCreated(value) => Ok(Self::WorktreeCreated(value)),
+            IpcResponsePayload::WorktreeRemoved(value) => Ok(Self::WorktreeRemoved(value)),
+            IpcResponsePayload::ExternalSessionImported { session, warnings } => {
+                Ok(Self::ExternalSessionImported { session, warnings })
+            }
+            IpcResponsePayload::SessionForked { session, draft } => {
+                Ok(Self::SessionForked { session, draft })
+            }
+            IpcResponsePayload::SessionCatalogRefreshed {
+                sessions,
+                catalog_status,
+                catalog_sources,
+                catalog_revision,
+            } => Ok(Self::SessionCatalogRefreshed {
+                sessions,
+                catalog_status,
+                catalog_sources,
+                catalog_revision,
+            }),
+            IpcResponsePayload::CatalogUpdatesSubscribed => Ok(Self::CatalogUpdatesSubscribed),
+            IpcResponsePayload::RuntimeWorkList { work } => Ok(Self::RuntimeWorkList { work }),
+            IpcResponsePayload::RuntimeWorkCancellationRequested { cancelled } => {
+                Ok(Self::RuntimeWorkCancellationRequested { cancelled })
+            }
             IpcResponsePayload::RuntimeWorkHistory { events } => Ok(Self::RuntimeWorkHistory {
                 events: ipc_events_to_session_events(events)?,
             }),
+            IpcResponsePayload::RuntimeWorkSubscribed => Ok(Self::RuntimeWorkSubscribed),
         }
     }
 }
