@@ -2667,8 +2667,8 @@ mod tests {
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProviderStreamEvent, RuntimeWorkId,
         RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance,
         SessionForkKind, SessionId, SessionLiveEvent, SessionLiveEventKind, SessionTraceEvent,
-        SessionTracePayload, SessionTracePhase, ToolInvocationPresentation,
-        ToolInvocationStreamEvent, ToolOutputStream, TraceBlobRef,
+        SessionTracePayload, SessionTracePhase, ShellRunResult, ToolInvocationPresentation,
+        ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream, TraceBlobRef,
     };
     use bcode_skill_models::{SkillActivationMode, SkillId};
     use serde::Serialize;
@@ -2824,6 +2824,112 @@ mod tests {
             SessionEventKind::ToolInvocationStream {
                 event: ToolInvocationStreamEvent::OutputDelta { .. }
             }
+        )));
+        std::fs::remove_dir_all(root).expect("temp session dir should be removed");
+    }
+
+    #[tokio::test]
+    async fn persisted_semantic_result_session_reopens_and_attaches() {
+        let root = unique_temp_dir();
+        let session_id = {
+            let manager = SessionManager::persistent(&root).expect("manager should create");
+            let session = manager
+                .create_session(
+                    Some("semantic reopen".to_string()),
+                    test_working_directory(),
+                )
+                .await
+                .expect("session should create");
+            manager
+                .append_tool_call_requested(
+                    session.id,
+                    "call-1".to_string(),
+                    "shell.run".to_string(),
+                    "{}".to_string(),
+                )
+                .await
+                .expect("request should append");
+            manager
+                .append_tool_call_finished(
+                    session.id,
+                    "call-1".to_string(),
+                    "legacy fallback".to_string(),
+                    false,
+                    None,
+                    Some(ToolInvocationResult::ShellRun {
+                        result: ShellRunResult::Terminal {
+                            exit_code: Some(0),
+                            timed_out: false,
+                            cancelled: false,
+                            output_tail: "hello\n".to_string(),
+                            output_truncated: false,
+                            output_bytes: Some(6),
+                            retained_output_bytes: Some(6),
+                            columns: 120,
+                            rows: 30,
+                        },
+                    }),
+                )
+                .await
+                .expect("finish should append");
+            session.id
+        };
+
+        let reopened = SessionManager::persistent(&root).expect("manager should reopen");
+        let attachment = reopened
+            .attach_session(session_id, ClientId::new())
+            .await
+            .expect("session should attach after reopen");
+
+        assert!(attachment.history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ToolCallFinished {
+                semantic_result: Some(ToolInvocationResult::ShellRun {
+                    result: ShellRunResult::Terminal { output_tail, .. },
+                }),
+                ..
+            } if output_tail == "hello\n"
+        )));
+        std::fs::remove_dir_all(root).expect("temp session dir should be removed");
+    }
+
+    #[tokio::test]
+    async fn old_persisted_session_without_semantic_result_reopens_and_attaches() {
+        let root = unique_temp_dir();
+        let session_id = {
+            let manager = SessionManager::persistent(&root).expect("manager should create");
+            let session = manager
+                .create_session(Some("legacy reopen".to_string()), test_working_directory())
+                .await
+                .expect("session should create");
+            manager
+                .append_tool_call_finished(
+                    session.id,
+                    "call-legacy".to_string(),
+                    "legacy result".to_string(),
+                    false,
+                    None,
+                    None,
+                )
+                .await
+                .expect("legacy finish should append");
+            session.id
+        };
+
+        let reopened = SessionManager::persistent(&root).expect("manager should reopen");
+        let attachment = reopened
+            .attach_session(session_id, ClientId::new())
+            .await
+            .expect("legacy session should attach after reopen");
+
+        assert!(attachment.history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id,
+                result,
+                semantic_result: None,
+                ..
+            } if tool_call_id == "call-legacy" && result == "legacy result"
         )));
         std::fs::remove_dir_all(root).expect("temp session dir should be removed");
     }
