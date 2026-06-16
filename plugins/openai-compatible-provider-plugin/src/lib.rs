@@ -214,7 +214,7 @@ impl OpenAiCompatibleProviderPlugin {
     }
 
     fn models_response(&self, request: &ServiceRequest) -> ServiceResponse {
-        json_response(&self.models(model_list_request(request)))
+        json_response(&self.models(&model_list_request(request)))
     }
 
     fn native_web_search(&self, request: &ServiceRequest) -> ServiceResponse {
@@ -2505,7 +2505,7 @@ fn capabilities() -> ProviderCapabilities {
 }
 
 impl OpenAiCompatibleProviderPlugin {
-    fn models(&self, request: ModelListRequest) -> ModelList {
+    fn models(&self, request: &ModelListRequest) -> ModelList {
         let settings = settings_for_context(&request.provider_context);
         if !settings.model_ids_are_explicit
             && settings.default_model.is_none()
