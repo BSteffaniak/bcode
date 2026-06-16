@@ -61,6 +61,8 @@ pub enum CliError {
     SessionStore(#[from] bcode_session::SessionStoreError),
     #[error("session repair error: {0}")]
     SessionRepair(#[from] bcode_session::repair::SessionRepairError),
+    #[error("semantic migration audit error: {0}")]
+    SemanticMigrationAudit(#[from] bcode_session::semantic_migration::SemanticMigrationAuditError),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("TUI error: {0}")]
@@ -610,6 +612,15 @@ enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Audit local sessions for semantic-result migration readiness without writing changes.
+    MigrateSemanticResults {
+        /// Session store root to audit. Defaults to Bcode's local session store.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Emit the full JSON audit report.
+        #[arg(long)]
+        json: bool,
+    },
     Import {
         #[command(subcommand)]
         command: SessionImportCommand,
@@ -1124,6 +1135,9 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
                 output: repair_cli_output(json),
             })
             .await?;
+        }
+        SessionCommand::MigrateSemanticResults { root, json } => {
+            audit_semantic_result_migration(root, json).await?;
         }
         SessionCommand::Import { command } => handle_session_import_command(command).await?,
     }
@@ -4181,6 +4195,86 @@ async fn session_diagnose(session_id: SessionId, json: bool) -> Result<(), CliEr
         print_session_diagnosis(&diagnosis);
     }
     Ok(())
+}
+
+async fn audit_semantic_result_migration(
+    root: Option<PathBuf>,
+    json: bool,
+) -> Result<(), CliError> {
+    let root = root.unwrap_or_else(|| bcode_config::default_state_dir().join("sessions"));
+    let report = bcode_session::semantic_migration::audit_semantic_result_migration(&root).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_semantic_migration_audit(&report);
+    }
+    Ok(())
+}
+
+fn print_semantic_migration_audit(
+    report: &bcode_session::semantic_migration::SemanticMigrationAuditReport,
+) {
+    println!("semantic migration audit");
+    println!("root: {}", report.root.display());
+    println!("sessions scanned: {}", report.sessions_scanned);
+    println!("sessions decoded: {}", report.sessions_decoded);
+    println!("events scanned: {}", report.events_scanned);
+    println!("tool completions: {}", report.tool_call_finished.total);
+    println!(
+        "  with semantic_result: {}",
+        report.tool_call_finished.with_semantic_result
+    );
+    println!(
+        "  without semantic_result: {}",
+        report.tool_call_finished.without_semantic_result
+    );
+    println!(
+        "  legacy terminal JSON: {}",
+        report.tool_call_finished.legacy_terminal_json
+    );
+    println!(
+        "  non-terminal JSON: {}",
+        report.tool_call_finished.non_terminal_json
+    );
+    println!("  plain text: {}", report.tool_call_finished.plain_text);
+    println!("presentations: {}", report.presentations.total);
+    println!("  terminal: {}", report.presentations.terminal);
+    println!("  file_change: {}", report.presentations.file_change);
+    println!(
+        "  matched to completion: {}",
+        report.presentations.matched_to_completion
+    );
+    println!("  orphan: {}", report.presentations.orphan);
+    println!("  duplicate: {}", report.presentations.duplicate);
+    println!("  conflict: {}", report.presentations.conflict);
+    println!("migration readiness:");
+    println!(
+        "  removable presentations: {}",
+        report.readiness.removable_presentations
+    );
+    println!(
+        "  addable terminal results: {}",
+        report.readiness.addable_terminal_results
+    );
+    println!(
+        "  addable file-change results: {}",
+        report.readiness.addable_file_change_results
+    );
+    println!(
+        "  sessions requiring review: {}",
+        report.readiness.sessions_requiring_review
+    );
+    if !report.issues.is_empty() {
+        println!("issues:");
+        for issue in &report.issues {
+            println!(
+                "  {:?}: {} ({})",
+                issue.issue,
+                issue.detail,
+                issue.path.display()
+            );
+        }
+    }
 }
 
 struct SessionRepairCliOptions {

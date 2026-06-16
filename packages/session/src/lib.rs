@@ -14,6 +14,7 @@ pub mod lease;
 pub mod persisted;
 pub mod projection;
 pub mod repair;
+pub mod semantic_migration;
 mod store_executor;
 
 use actor::{AttachMode, SessionHandle};
