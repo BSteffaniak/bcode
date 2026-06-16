@@ -518,6 +518,14 @@ fn canonical_profile_id(profile_id: &str) -> String {
     profile_id.trim().to_ascii_lowercase()
 }
 
+/// Recursively merge TOML config values.
+///
+/// Tables are merged key-by-key. Non-table overlay values replace the base
+/// value at the same path.
+pub fn merge_config_values(base: &mut toml::Value, overlay: toml::Value) {
+    merge_toml_value(base, overlay);
+}
+
 fn merge_toml_value(base: &mut toml::Value, overlay: toml::Value) {
     match (base, overlay) {
         (toml::Value::Table(base_table), toml::Value::Table(overlay_table)) => {
@@ -2133,6 +2141,31 @@ pub fn load_permissions_state()
     load_permissions_state_from(&default_permissions_state_path())
 }
 
+/// Load runtime permissions state as a raw TOML config value.
+///
+/// Missing state files are represented as `None`. Existing files keep their raw
+/// shape so composition can recursively merge future agent config fields without
+/// typed field-by-field merge logic.
+///
+/// # Errors
+///
+/// Returns an error when the file exists but cannot be read or parsed.
+pub fn load_permissions_state_value() -> Result<Option<toml::Value>, ConfigError> {
+    load_permissions_state_value_from(&default_permissions_state_path())
+}
+
+/// Load runtime permissions state from an explicit path as a raw TOML config value.
+///
+/// # Errors
+///
+/// Returns an error when the file exists but cannot be read or parsed.
+pub fn load_permissions_state_value_from(path: &Path) -> Result<Option<toml::Value>, ConfigError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(load_toml_file(path)?))
+}
+
 /// Load the runtime permissions state file from an explicit path.
 ///
 /// # Errors
@@ -2157,45 +2190,6 @@ pub fn load_permissions_state_from(
             ),
         })?;
     Ok(config.agent)
-}
-
-/// Merge a state-file agent map over a declarative agent map.
-///
-/// State entries win per `(agent, category, pattern)`: a rule appearing in the
-/// state map replaces the same-pattern rule in the declarative map. Patterns
-/// present only in the declarative map survive untouched. Tool enablement
-/// (`[agent.<id>.tools]`) and `external_directory` fields also take the state
-/// value when set in the state map.
-pub fn merge_agent_configs(
-    base: &mut BTreeMap<String, bcode_agent_policy_models::AgentConfig>,
-    overlay: BTreeMap<String, bcode_agent_policy_models::AgentConfig>,
-) {
-    for (agent_id, overlay_agent) in overlay {
-        let entry = base.entry(agent_id).or_default();
-        for (tool, enabled) in overlay_agent.tools {
-            entry.tools.insert(tool, enabled);
-        }
-        // External directory: treat a non-default state value as an override.
-        let overlay_external = overlay_agent.permission.external_directory;
-        if overlay_external != bcode_agent_policy_models::default_external_directory_action() {
-            entry.permission.external_directory = overlay_external;
-        }
-        for (pattern, action) in overlay_agent.permission.bash {
-            entry.permission.bash.insert(pattern, action);
-        }
-        for (pattern, action) in overlay_agent.permission.read {
-            entry.permission.read.insert(pattern, action);
-        }
-        for (pattern, action) in overlay_agent.permission.write {
-            entry.permission.write.insert(pattern, action);
-        }
-        for (pattern, action) in overlay_agent.permission.edit {
-            entry.permission.edit.insert(pattern, action);
-        }
-        for (pattern, action) in overlay_agent.permission.web {
-            entry.permission.web.insert(pattern, action);
-        }
-    }
 }
 
 fn update_permissions_state(
@@ -3229,6 +3223,28 @@ pub fn load_config_from_paths(paths: &[PathBuf]) -> Result<BcodeConfig, ConfigEr
     )
 }
 
+/// Load composed raw configuration from default paths.
+///
+/// # Errors
+///
+/// Returns an error if an existing config layer cannot be read, parsed, or composed.
+pub fn load_composed_config_value() -> Result<toml::Value, ConfigError> {
+    load_composed_config_value_with_overrides(&ConfigLoadOverrides::from_env_with_cli(None, None))
+}
+
+/// Load composed raw configuration from default paths with explicit overrides.
+///
+/// # Errors
+///
+/// Returns an error if an existing config layer cannot be read, parsed, or composed.
+pub fn load_composed_config_value_with_overrides(
+    overrides: &ConfigLoadOverrides,
+) -> Result<toml::Value, ConfigError> {
+    let raw = merged_raw_config_value_with_overrides(&default_config_paths(), overrides)?;
+    let (resolved, _resolution) = resolve_composed_config_value(&raw)?;
+    Ok(resolved)
+}
+
 /// Load and merge configuration from paths with explicit override layers.
 ///
 /// Precedence is: base config, provided paths, env config file, env raw TOML,
@@ -3348,11 +3364,10 @@ mod tests {
         DEFAULT_FILESYSTEM_PLUGIN_ID, DEFAULT_GIT_PLUGIN_ID, DEFAULT_PI_SESSION_IMPORT_PLUGIN_ID,
         DEFAULT_SHELL_PLUGIN_ID, DEFAULT_WEB_SEARCH_PLUGIN_ID, PluginSelection, TuiMouseConfig,
         default_config_paths_from, default_permissions_state_path, load_config_from_paths,
-        load_config_from_paths_with_overrides, load_permissions_state_from, merge_agent_configs,
+        load_config_from_paths_with_overrides, load_permissions_state_from, merge_config_values,
         upsert_agent_permission_rule,
     };
-    use bcode_agent_policy_models::{Action, AgentConfig, PermissionConfig};
-    use std::collections::BTreeMap;
+    use bcode_agent_policy_models::Action;
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -4149,77 +4164,133 @@ bash = { "cargo *" = "allow" }
     }
 
     #[test]
-    fn merge_agent_configs_state_wins_on_same_pattern() {
-        let mut base = BTreeMap::from([(
-            "build".to_string(),
-            AgentConfig {
-                accent: None,
-                tools: BTreeMap::new(),
-                permission: PermissionConfig {
-                    bash: BTreeMap::from([
-                        ("cargo *".to_string(), Action::Allow),
-                        ("git push *".to_string(), Action::Deny),
-                    ]),
-                    ..PermissionConfig::default()
-                },
-            },
-        )]);
-        let overlay = BTreeMap::from([(
-            "build".to_string(),
-            AgentConfig {
-                accent: None,
-                tools: BTreeMap::new(),
-                permission: PermissionConfig {
-                    bash: BTreeMap::from([
-                        // Flip the declarative allow to deny; that is the
-                        // "state wins" contract the user signed up for.
-                        ("cargo *".to_string(), Action::Deny),
-                        // Add a brand-new pattern.
-                        ("echo *".to_string(), Action::Allow),
-                    ]),
-                    ..PermissionConfig::default()
-                },
-            },
-        )]);
+    fn raw_agent_config_merge_recurses_key_by_key() {
+        let mut base: toml::Value = toml::from_str(
+            r##"
+[agent.build]
+accent = "#22d3ee"
 
-        merge_agent_configs(&mut base, overlay);
+[agent.build.tools]
+"filesystem.read" = true
+"filesystem.write" = true
 
-        let build = base.get("build").expect("build agent should exist");
+[agent.build.permission.bash]
+"cargo *" = "allow"
+"git push *" = "deny"
+"##,
+        )
+        .expect("base TOML should parse");
+        let overlay: toml::Value = toml::from_str(
+            r##"
+[agent.build]
+accent = "#6b7280"
+
+[agent.build.tools]
+"filesystem.write" = false
+"shell.run" = true
+
+[agent.build.permission.bash]
+"cargo *" = "deny"
+"echo *" = "allow"
+"##,
+        )
+        .expect("overlay TOML should parse");
+
+        merge_config_values(&mut base, overlay);
+        let build = base
+            .get("agent")
+            .and_then(toml::Value::as_table)
+            .and_then(|agents| agents.get("build"))
+            .and_then(toml::Value::as_table)
+            .expect("build agent table should exist");
+        let tools = build
+            .get("tools")
+            .and_then(toml::Value::as_table)
+            .expect("tools table should exist");
+        let bash_rules = build
+            .get("permission")
+            .and_then(toml::Value::as_table)
+            .and_then(|permission| permission.get("bash"))
+            .and_then(toml::Value::as_table)
+            .expect("bash permission table should exist");
+
         assert_eq!(
-            build.permission.bash.get("cargo *").copied(),
-            Some(Action::Deny)
+            build.get("accent").and_then(toml::Value::as_str),
+            Some("#6b7280")
         );
         assert_eq!(
-            build.permission.bash.get("git push *").copied(),
-            Some(Action::Deny),
-            "declarative-only rules survive the merge"
+            tools.get("filesystem.read").and_then(toml::Value::as_bool),
+            Some(true)
         );
         assert_eq!(
-            build.permission.bash.get("echo *").copied(),
-            Some(Action::Allow)
+            tools.get("filesystem.write").and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            tools.get("shell.run").and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            bash_rules.get("cargo *").and_then(toml::Value::as_str),
+            Some("deny")
+        );
+        assert_eq!(
+            bash_rules.get("git push *").and_then(toml::Value::as_str),
+            Some("deny")
+        );
+        assert_eq!(
+            bash_rules.get("echo *").and_then(toml::Value::as_str),
+            Some("allow")
         );
     }
 
     #[test]
-    fn merge_agent_configs_state_only_agent_is_added() {
-        let mut base: BTreeMap<String, AgentConfig> = BTreeMap::new();
-        let overlay = BTreeMap::from([(
-            "scratch".to_string(),
-            AgentConfig {
-                accent: None,
-                tools: BTreeMap::from([("shell.run".to_string(), true)]),
-                permission: PermissionConfig {
-                    bash: BTreeMap::from([("*".to_string(), Action::Ask)]),
-                    ..PermissionConfig::default()
-                },
-            },
-        )]);
+    fn raw_agent_config_merge_adds_state_only_agent() {
+        let mut base = toml::Value::Table(toml::Table::new());
+        let overlay: toml::Value = toml::from_str(
+            r##"
+[agent.scratch]
+accent = "#abcdef"
 
-        merge_agent_configs(&mut base, overlay);
+[agent.scratch.tools]
+"shell.run" = true
 
-        let scratch = base.get("scratch").expect("scratch agent should be added");
-        assert_eq!(scratch.tools.get("shell.run").copied(), Some(true));
-        assert_eq!(scratch.permission.bash.get("*").copied(), Some(Action::Ask));
+[agent.scratch.permission.bash]
+"*" = "ask"
+"##,
+        )
+        .expect("overlay TOML should parse");
+
+        merge_config_values(&mut base, overlay);
+
+        let scratch = base
+            .get("agent")
+            .and_then(toml::Value::as_table)
+            .and_then(|agents| agents.get("scratch"))
+            .and_then(toml::Value::as_table)
+            .expect("scratch agent should be added");
+        assert_eq!(
+            scratch.get("accent").and_then(toml::Value::as_str),
+            Some("#abcdef")
+        );
+        assert_eq!(
+            scratch
+                .get("tools")
+                .and_then(toml::Value::as_table)
+                .and_then(|tools| tools.get("shell.run"))
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            scratch
+                .get("permission")
+                .and_then(toml::Value::as_table)
+                .and_then(|permission| permission.get("bash"))
+                .and_then(toml::Value::as_table)
+                .and_then(|bash| bash.get("*"))
+                .and_then(toml::Value::as_str),
+            Some("ask")
+        );
     }
 
     #[test]

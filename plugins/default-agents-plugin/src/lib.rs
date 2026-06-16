@@ -15,6 +15,7 @@ use bcode_agent_profile::{
 };
 use bcode_plugin_sdk::prelude::*;
 use std::path::PathBuf;
+use toml::{Table, Value};
 
 const MANIFEST: &str = include_str!("../bcode-plugin.toml");
 
@@ -122,8 +123,8 @@ struct PolicySource {
 }
 
 fn load_config() -> (AgentPermissionConfig, PolicySource) {
-    let declarative = match bcode_config::load_config() {
-        Ok(cfg) => cfg,
+    let declarative = match bcode_config::load_composed_config_value() {
+        Ok(value) => value,
         Err(error) => {
             eprintln!(
                 "bcode.default-agents: failed to load declarative config ({error}); using built-in defaults"
@@ -138,18 +139,18 @@ fn load_config() -> (AgentPermissionConfig, PolicySource) {
         }
     };
 
-    let state = match bcode_config::load_permissions_state() {
+    let state = match bcode_config::load_permissions_state_value() {
         Ok(state) => state,
         Err(error) => {
             eprintln!(
                 "bcode.default-agents: failed to load runtime permissions state ({error}); using declarative config only"
             );
-            std::collections::BTreeMap::new()
+            None
         }
     };
 
-    let declarative_empty = declarative.agent.is_empty();
-    let state_empty = state.is_empty();
+    let declarative_empty = agent_table_is_empty(&declarative);
+    let state_empty = state.as_ref().is_none_or(agent_table_is_empty);
 
     if declarative_empty && state_empty {
         return (
@@ -161,13 +162,41 @@ fn load_config() -> (AgentPermissionConfig, PolicySource) {
         );
     }
 
-    let mut agents = default_config().agent;
-    if !declarative_empty {
-        bcode_config::merge_agent_configs(&mut agents, declarative.agent);
+    let mut merged = match Value::try_from(default_config()) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!(
+                "bcode.default-agents: failed to encode built-in agent policy ({error}); using built-in defaults"
+            );
+            return (
+                default_config(),
+                PolicySource {
+                    label: "built-in default agent policy".to_string(),
+                    using_default: true,
+                },
+            );
+        }
+    };
+    bcode_config::merge_config_values(&mut merged, agent_only_config_value(&declarative));
+    if let Some(state) = state.as_ref() {
+        bcode_config::merge_config_values(&mut merged, agent_only_config_value(state));
     }
-    if !state_empty {
-        bcode_config::merge_agent_configs(&mut agents, state);
-    }
+
+    let config = match merged.try_into() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!(
+                "bcode.default-agents: failed to decode composed agent policy ({error}); using built-in defaults"
+            );
+            return (
+                default_config(),
+                PolicySource {
+                    label: "built-in default agent policy".to_string(),
+                    using_default: true,
+                },
+            );
+        }
+    };
 
     let label = match (declarative_empty, state_empty) {
         (false, false) => {
@@ -180,12 +209,28 @@ fn load_config() -> (AgentPermissionConfig, PolicySource) {
     };
 
     (
-        AgentPermissionConfig { agent: agents },
+        config,
         PolicySource {
             label,
             using_default: false,
         },
     )
+}
+
+fn agent_table_is_empty(value: &Value) -> bool {
+    value
+        .get("agent")
+        .and_then(Value::as_table)
+        .is_none_or(Table::is_empty)
+}
+
+fn agent_only_config_value(value: &Value) -> Value {
+    let Some(agent) = value.get("agent").cloned() else {
+        return Value::Table(Table::new());
+    };
+    let mut root = Table::new();
+    root.insert("agent".to_string(), agent);
+    Value::Table(root)
 }
 
 fn json_response<T: serde::Serialize>(value: &T) -> ServiceResponse {
@@ -249,13 +294,20 @@ mod tests {
     }
 
     #[test]
-    fn runtime_permission_state_preserves_build_default_tools() {
+    fn runtime_permission_state_preserves_build_default_tools_and_merges_agent_metadata() {
         let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
         let root = unique_temp_dir();
         std::fs::create_dir_all(&root).expect("temp root should be created");
         let config_path = root.join("bcode.toml");
         let state_path = root.join("permissions.toml");
-        std::fs::write(&config_path, "").expect("config should be written");
+        std::fs::write(
+            &config_path,
+            r##"
+[agent.build]
+accent = "#22d3ee"
+"##,
+        )
+        .expect("config should be written");
         std::fs::write(
             &state_path,
             r#"
@@ -278,6 +330,7 @@ bash = { "python3 *" = "allow" }
         assert!(tools.contains(&"filesystem.write".to_string()));
         assert!(tools.contains(&"filesystem.edit".to_string()));
         assert!(tools.contains(&"shell.run".to_string()));
+        assert_eq!(build.accent.as_deref(), Some("#22d3ee"));
         assert_eq!(build.permission.bash.get("python3 *"), Some(&Action::Allow));
         assert!(matches!(
             source.label.as_str(),
