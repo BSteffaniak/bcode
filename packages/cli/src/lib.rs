@@ -851,13 +851,9 @@ enum PluginCommand {
     },
 }
 
-async fn handle_ralph_command(repo: PathBuf) -> Result<(), CliError> {
+async fn handle_ralph_command(_repo: PathBuf) -> Result<(), CliError> {
     ensure_server_running().await?;
-    if let Some(action) = bcode_tui::run_ralph_home(repo).await? {
-        println!(
-            "selected Ralph action: {action:?}. Open Bcode and run /ralph ui to execute actions in-session."
-        );
-    }
+    bcode_tui::run_ralph_home().await?;
     Ok(())
 }
 

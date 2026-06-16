@@ -31,7 +31,7 @@ pub async fn open_home<W: Write>(
     chat: &mut ActiveChat,
 ) -> Result<(), TuiError> {
     let repo_root = current_repo_root(chat)?;
-    match super::ralph_launcher::run_home(io.terminal, repo_root).await? {
+    match super::ralph_launcher::run_home_with_input(io.terminal, io.input, repo_root).await? {
         super::ralph_launcher::RalphHomeOutcome::Action(action) => {
             dispatch_home_action(action, io, services, chat).await?;
         }

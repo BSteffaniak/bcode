@@ -9,8 +9,10 @@ use tokio::sync::mpsc;
 
 use super::app::BmuxApp;
 use super::keymap::BmuxKeyMap;
+use super::runtime_context::{TuiIo, TuiServices};
+use super::startup_action::StartupTuiAction;
 use super::terminal_events::TuiInput;
-use super::{TuiError, chat_loop, session_flow};
+use super::{TuiError, chat_loop, ralph_flow, session_flow};
 
 fn auth_security_status(config: &bcode_config::BcodeConfig) -> Option<String> {
     let selection = config.resolved_model_selection();
@@ -61,6 +63,15 @@ pub async fn run_event_loop<W: Write>(
     terminal: &mut Terminal<&mut W>,
     session_id: Option<SessionId>,
 ) -> Result<(), TuiError> {
+    run_event_loop_with_startup(terminal, session_id, StartupTuiAction::None).await
+}
+
+/// Attach to a session, run an optional startup action, and run the active chat loop.
+pub async fn run_event_loop_with_startup<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    session_id: Option<SessionId>,
+    startup_action: StartupTuiAction,
+) -> Result<(), TuiError> {
     let client = BcodeClient::default_endpoint();
     let config = bcode_config::load_config()?;
     let auth_security_status = auth_security_status(&config);
@@ -96,6 +107,17 @@ pub async fn run_event_loop<W: Write>(
     } else {
         chat.app
             .set_status("New draft session; send a message to save it".to_owned());
+    }
+    if startup_action == StartupTuiAction::OpenRalphHome {
+        let mut io = TuiIo {
+            terminal,
+            input: &mut terminal_events,
+        };
+        let services = TuiServices {
+            client: &client,
+            keymap: &keymap,
+        };
+        ralph_flow::open_home(&mut io, &services, &mut chat).await?;
     }
     let result = {
         chat_loop::run_with_client(

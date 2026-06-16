@@ -7,6 +7,7 @@ use bmux_tui::terminal::Terminal;
 use serde::Deserialize;
 
 use crate::TuiError;
+use crate::terminal_events::TuiInput;
 
 /// Typed Ralph actions selected in the plugin surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -57,8 +58,38 @@ pub async fn run_home<W: Write>(
     terminal: &mut Terminal<&mut W>,
     repo_path: PathBuf,
 ) -> Result<RalphHomeOutcome, TuiError> {
+    let mut surface = open_ralph_home_surface(repo_path).await?;
+    let close_outcome =
+        crate::plugin_surface_host::run_plugin_surface(terminal, surface.as_mut()).await?;
+    Ok(parse_ralph_home_outcome(close_outcome))
+}
+
+/// Run the Ralph plugin home surface with the caller-owned input stream.
+///
+/// # Errors
+///
+/// Returns an error when the Ralph plugin cannot be loaded/opened or terminal I/O fails.
+#[allow(clippy::future_not_send)]
+pub async fn run_home_with_input<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    input: &mut TuiInput,
+    repo_path: PathBuf,
+) -> Result<RalphHomeOutcome, TuiError> {
+    let mut surface = open_ralph_home_surface(repo_path).await?;
+    let close_outcome = crate::plugin_surface_host::run_plugin_surface_with_input(
+        terminal,
+        input,
+        surface.as_mut(),
+    )
+    .await?;
+    Ok(parse_ralph_home_outcome(close_outcome))
+}
+
+async fn open_ralph_home_surface(
+    repo_path: PathBuf,
+) -> Result<bcode_plugin_sdk::tui::BoxedPluginTuiSurface, TuiError> {
     let runtime = load_ralph_tui_runtime()?;
-    let mut surface = crate::plugin_tui::open_plugin_tui_surface(
+    let surface = crate::plugin_tui::open_plugin_tui_surface(
         &runtime,
         "bcode.ralph",
         "ralph-home",
@@ -74,9 +105,7 @@ pub async fn run_home<W: Write>(
         code: "tui_surface_open_failed".to_string(),
         message: error.to_string(),
     })?;
-    let close_outcome =
-        crate::plugin_surface_host::run_plugin_surface(terminal, surface.as_mut()).await?;
-    Ok(parse_ralph_home_outcome(close_outcome))
+    Ok(surface)
 }
 
 fn load_ralph_tui_runtime() -> Result<bcode_plugin::PluginRuntimeHost, TuiError> {

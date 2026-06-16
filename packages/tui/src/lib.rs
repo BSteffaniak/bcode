@@ -62,6 +62,7 @@ pub(crate) mod slash_commands;
 pub(crate) mod slash_flow;
 pub(crate) mod slash_palette;
 pub(crate) mod slash_palette_render;
+pub(crate) mod startup_action;
 pub(crate) mod temporal;
 pub(crate) mod terminal_events;
 #[cfg(test)]
@@ -142,15 +143,13 @@ pub fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
     ]
 }
 
-/// Run the Ralph plugin home/status interface.
+/// Run the main terminal user interface and open Ralph on startup.
 ///
 /// # Errors
 ///
 /// Returns I/O or plugin service errors.
 #[allow(clippy::future_not_send)]
-pub async fn run_ralph_home(
-    repo_path: std::path::PathBuf,
-) -> Result<Option<ralph_launcher::RalphHomeAction>, TuiError> {
+pub async fn run_ralph_home() -> Result<(), TuiError> {
     let stdout = io::stdout();
     let mut guard = CrosstermTerminalGuard::enter(stdout)?;
     let result = {
@@ -160,20 +159,15 @@ pub async fn run_ralph_home(
             })?,
             helpers::terminal_area()?,
         );
-        ralph_launcher::run_home(&mut terminal, repo_path).await
+        runtime::run_event_loop_with_startup(
+            &mut terminal,
+            None,
+            startup_action::StartupTuiAction::OpenRalphHome,
+        )
+        .await
     };
-
-    match result {
-        Ok(ralph_launcher::RalphHomeOutcome::Action(action)) => {
-            let _writer = guard.leave()?;
-            Ok(Some(action))
-        }
-        Ok(ralph_launcher::RalphHomeOutcome::Exit) => {
-            let _writer = guard.leave()?;
-            Ok(None)
-        }
-        Err(error) => Err(error),
-    }
+    let _writer = guard.leave()?;
+    result
 }
 
 /// Run the terminal user interface.

@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use super::terminal_events::TuiInput;
 use super::{TuiError, helpers};
 
-/// Run one plugin-owned native TUI surface in the Bcode TUI host and return its close outcome.
+/// Run one plugin-owned native TUI surface with a fresh terminal input stream and return its close outcome.
 ///
 /// # Errors
 ///
@@ -22,6 +22,23 @@ pub async fn run_plugin_surface<W: Write>(
     surface: &mut dyn PluginTuiSurface,
 ) -> Result<Option<serde_json::Value>, TuiError> {
     let mut input = TuiInput::start();
+    run_plugin_surface_with_input(terminal, &mut input, surface).await
+}
+
+/// Run one plugin-owned native TUI surface with the caller-owned terminal input stream.
+///
+/// Use this when a plugin surface is nested inside the main TUI runtime so there is only one
+/// terminal event reader.
+///
+/// # Errors
+///
+/// Returns an error when terminal I/O or terminal input fails.
+#[allow(clippy::future_not_send)]
+pub async fn run_plugin_surface_with_input<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    input: &mut TuiInput,
+    surface: &mut dyn PluginTuiSurface,
+) -> Result<Option<serde_json::Value>, TuiError> {
     let (redraw_sender, mut redraw_receiver) = mpsc::unbounded_channel();
     let host = TokioPluginTuiHost::current(redraw_sender);
     let mut needs_redraw = true;
