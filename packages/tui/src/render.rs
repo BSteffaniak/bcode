@@ -2929,7 +2929,7 @@ impl ChromeLine {
 
     fn fit(&mut self, width: usize) {
         while self.width() > width {
-            if let Some(index) = self.lowest_priority_optional_index(false) {
+            if let Some(index) = self.lowest_priority_optional_index(true) {
                 self.segments.remove(index);
             } else {
                 break;
@@ -3031,6 +3031,11 @@ fn statusline_spans(app: &BmuxApp, width: usize) -> Vec<Span> {
         true,
     );
 
+    for (token_segment, priority) in compact_statusline_token_segments(&app.token_summary()) {
+        let truncatable = token_segment.starts_with("ctx ");
+        line = line.optional(token_segment, muted, priority, truncatable);
+    }
+
     let status_text = statusline_status_text(app);
     if !status_text.is_empty() {
         line = line.optional(status_text, muted, 90, true);
@@ -3051,11 +3056,6 @@ fn statusline_spans(app: &BmuxApp, width: usize) -> Vec<Span> {
         );
     }
 
-    let token_summary = compact_statusline_token_summary(&app.token_summary());
-    if !token_summary.is_empty() {
-        line = line.optional(token_summary, muted, 60, false);
-    }
-
     let key_hints = compact_key_hints(app.key_hints());
     if !key_hints.is_empty() {
         line = line.optional(key_hints, muted, 10, false);
@@ -3068,39 +3068,39 @@ fn statusline_status_text(app: &BmuxApp) -> String {
     app.status().to_owned()
 }
 
-fn compact_statusline_token_summary(summary: &str) -> String {
+fn compact_statusline_token_segments(summary: &str) -> Vec<(String, u8)> {
     summary
         .split(" · ")
         .filter_map(|part| match part {
             "ctx limit unknown" => None,
-            "reuse on" => Some("reuse".to_owned()),
+            "reuse on" => Some(("reuse".to_owned(), 50)),
+            _ if part.starts_with("ctx ") => Some((part.to_owned(), 95)),
             _ => part
                 .strip_prefix("spent ")
                 .and_then(|value| value.strip_suffix(" tok"))
-                .map(|value| format!("spent {value}"))
+                .map(|value| (format!("spent {value}"), 30))
                 .or_else(|| {
                     part.strip_prefix("cache read ")
                         .and_then(|value| value.strip_suffix(" tok"))
-                        .map(|value| format!("read {value}"))
+                        .map(|value| (format!("read {value}"), 45))
                 })
                 .or_else(|| {
                     part.strip_prefix("cache write ")
                         .and_then(|value| value.strip_suffix(" tok"))
-                        .map(|value| format!("write {value}"))
+                        .map(|value| (format!("write {value}"), 45))
                 })
                 .or_else(|| {
                     part.strip_prefix("sent ")
                         .and_then(|value| value.strip_suffix(" msgs"))
-                        .map(|value| format!("sent {value}"))
+                        .map(|value| (format!("sent {value}"), 40))
                 })
                 .or_else(|| {
                     part.strip_prefix("cache points ")
-                        .map(|value| format!("pts {value}"))
+                        .map(|value| (format!("pts {value}"), 40))
                 })
-                .or_else(|| Some(part.to_owned())),
+                .or_else(|| Some((part.to_owned(), 35))),
         })
-        .collect::<Vec<_>>()
-        .join(" · ")
+        .collect()
 }
 
 fn compact_key_hints(hints: &str) -> String {

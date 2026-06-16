@@ -876,6 +876,49 @@ fn header_and_footer_include_model_agent_and_token_context() {
 }
 
 #[test]
+fn status_line_prioritizes_context_over_spent_tokens() {
+    let session_id = SessionId::new();
+    let history = [event(
+        session_id,
+        1,
+        SessionEventKind::ModelUsage {
+            turn_id: "turn-1".to_owned(),
+            usage: SessionTokenUsage {
+                input_tokens: Some(512),
+                output_tokens: Some(128),
+                total_tokens: Some(640),
+                cached_input_tokens: None,
+                cache_write_input_tokens: None,
+                reasoning_tokens: None,
+            },
+        },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.apply_model_status(bcode_ipc::SessionModelStatus {
+        provider_plugin_id: Some("provider.example".to_owned()),
+        model_id: Some("model-example".to_owned()),
+        context_window: Some(128_000),
+        max_output_tokens: None,
+        reasoning: None,
+        reasoning_effort: None,
+        reasoning_summary: None,
+        prompt_cache_mode: None,
+        conversation_reuse_mode: None,
+        compaction_mode: None,
+        cache: None,
+        metadata_source: None,
+    });
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 52, 8));
+    let mut frame = Frame::new(&mut buffer);
+
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+
+    assert!(output.contains("ctx 512/128.0k 0%"), "{output}");
+    assert!(!output.contains("spent 640"), "{output}");
+}
+
+#[test]
 fn status_line_drops_low_priority_segments_in_narrow_panes() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
