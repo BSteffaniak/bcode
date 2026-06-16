@@ -412,6 +412,32 @@ struct SessionModelSelection {
     provider_context: bcode_model::ProviderRequestContext,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ModelMetadataOverride {
+    context_window: Option<u32>,
+    max_output_tokens: Option<u32>,
+}
+
+fn model_metadata_override(
+    context: &bcode_model::ProviderRequestContext,
+    model_id: &str,
+) -> ModelMetadataOverride {
+    let context_window = context
+        .settings
+        .get(&format!("model_metadata.{model_id}.context_window"))
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0);
+    let max_output_tokens = context
+        .settings
+        .get(&format!("model_metadata.{model_id}.max_output_tokens"))
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0);
+    ModelMetadataOverride {
+        context_window,
+        max_output_tokens,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TraceStore {
     root: PathBuf,
@@ -3475,6 +3501,17 @@ async fn handle_session_model_status(
         .model_id
         .clone()
         .or_else(|| model.as_ref().map(|model| model.model_id.clone()));
+    let override_metadata = model_id
+        .as_deref()
+        .map(|model_id| model_metadata_override(&selection.provider_context, model_id));
+    let context_window = override_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.context_window)
+        .or_else(|| model.as_ref().and_then(|model| model.context_window));
+    let max_output_tokens = override_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.max_output_tokens)
+        .or_else(|| model.as_ref().and_then(|model| model.max_output_tokens));
     send_response(
         writer,
         request_id,
@@ -3482,8 +3519,8 @@ async fn handle_session_model_status(
             status: bcode_ipc::SessionModelStatus {
                 provider_plugin_id: selection.provider_plugin_id,
                 model_id,
-                context_window: model.as_ref().and_then(|model| model.context_window),
-                max_output_tokens: model.as_ref().and_then(|model| model.max_output_tokens),
+                context_window,
+                max_output_tokens,
                 reasoning: selection
                     .reasoning_capabilities
                     .or_else(|| model.as_ref().and_then(|model| model.reasoning.clone())),

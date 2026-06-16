@@ -2923,7 +2923,7 @@ impl TokenUsageMeter {
                 context_window_percentage(input, window)
             );
         }
-        "ctx unknown".to_owned()
+        "ctx limit unknown".to_owned()
     }
 }
 

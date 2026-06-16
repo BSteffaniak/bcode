@@ -2557,17 +2557,49 @@ fn model_infos_from_items(
         .or_else(|| models.first().map(|model| model.id.clone()));
     models
         .into_iter()
-        .map(|model| ModelInfo {
-            is_default: selected_default.as_deref() == Some(model.id.as_str()),
-            model_id: model.id.clone(),
-            display_name: model.id.clone(),
-            context_window: None,
-            max_output_tokens: None,
-            capabilities: model_capabilities_for(&model),
-            reasoning: reasoning_info_for_model(&model, default_reasoning_request_shape()),
-            cache: openai_model_cache_info(),
+        .map(|model| {
+            let metadata = model_metadata_for(&model.id);
+            ModelInfo {
+                is_default: selected_default.as_deref() == Some(model.id.as_str()),
+                model_id: model.id.clone(),
+                display_name: model.id.clone(),
+                context_window: metadata.context_window,
+                max_output_tokens: metadata.max_output_tokens,
+                capabilities: model_capabilities_for(&model),
+                reasoning: reasoning_info_for_model(&model, default_reasoning_request_shape()),
+                cache: openai_model_cache_info(),
+            }
         })
         .collect()
+}
+
+struct ModelMetadata {
+    context_window: Option<u32>,
+    max_output_tokens: Option<u32>,
+}
+
+fn model_metadata_for(model_id: &str) -> ModelMetadata {
+    let normalized = model_id.to_ascii_lowercase();
+    let context_window = if normalized.contains("gpt-4.1")
+        || normalized.contains("gpt-4o")
+        || normalized.contains("gpt-5")
+        || normalized.contains("o3")
+        || normalized.contains("o4")
+    {
+        Some(1_000_000)
+    } else if normalized.contains("o1") {
+        Some(200_000)
+    } else if normalized.contains("grok-4") {
+        Some(256_000)
+    } else if normalized.contains("grok-3") {
+        Some(131_072)
+    } else {
+        None
+    };
+    ModelMetadata {
+        context_window,
+        max_output_tokens: None,
+    }
 }
 
 fn openai_model_cache_info() -> bcode_model::ModelCacheInfo {
@@ -4331,6 +4363,26 @@ mod tests {
                 .capabilities
                 .contains(&ModelCapability::ToolCalls)
         );
+    }
+
+    #[test]
+    fn known_openai_model_context_windows_are_populated() {
+        assert_eq!(
+            model_metadata_for("gpt-4.1-mini").context_window,
+            Some(1_000_000)
+        );
+        assert_eq!(
+            model_metadata_for("o1-preview").context_window,
+            Some(200_000)
+        );
+        assert_eq!(model_metadata_for("grok-4.3").context_window, Some(256_000));
+    }
+
+    #[test]
+    fn model_infos_include_known_context_windows() {
+        let model_infos = model_infos_from_ids(&["gpt-4.1-mini".to_string()], None);
+
+        assert_eq!(model_infos[0].context_window, Some(1_000_000));
     }
 
     #[test]

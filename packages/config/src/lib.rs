@@ -231,7 +231,34 @@ impl BcodeConfig {
         {
             selection.model_id = Some(model_id);
         }
+        self.apply_model_metadata_override(&mut selection);
         selection
+    }
+
+    fn apply_model_metadata_override(&self, selection: &mut ResolvedModelSelection) {
+        let Some(model_id) = selection.model_id.as_deref() else {
+            return;
+        };
+        let Some(metadata) = self.model.metadata.get(model_id) else {
+            return;
+        };
+        if let Some(provider_plugin_id) = metadata.provider_plugin_id.as_deref()
+            && selection.provider_plugin_id.as_deref() != Some(provider_plugin_id)
+        {
+            return;
+        }
+        if let Some(context_window) = metadata.context_window {
+            selection.settings.insert(
+                format!("model_metadata.{model_id}.context_window"),
+                context_window.to_string(),
+            );
+        }
+        if let Some(max_output_tokens) = metadata.max_output_tokens {
+            selection.settings.insert(
+                format!("model_metadata.{model_id}.max_output_tokens"),
+                max_output_tokens.to_string(),
+            );
+        }
     }
 
     fn apply_model_alias(&self, selection: &mut ResolvedModelSelection) {
@@ -1395,6 +1422,8 @@ pub struct ModelConfig {
     pub profiles: BTreeMap<String, ModelProfileConfig>,
     #[serde(default)]
     pub aliases: BTreeMap<String, ModelAliasConfig>,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, ModelMetadataConfig>,
 }
 
 impl ModelConfig {
@@ -1641,6 +1670,17 @@ pub struct ModelAliasConfig {
     pub model_id: String,
     #[serde(default)]
     pub request: BTreeMap<String, serde_json::Value>,
+}
+
+/// User-provided model metadata override.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelMetadataConfig {
+    #[serde(default)]
+    pub provider_plugin_id: Option<String>,
+    #[serde(default)]
+    pub context_window: Option<u32>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
 }
 
 /// Resolved model selection after applying the active model profile, if any.
@@ -2326,6 +2366,7 @@ fn write_model_toml(output: &mut String, model: &ModelConfig) {
         || model.max_tool_rounds.is_some()
         || model.profile.is_some()
         || !model.aliases.is_empty()
+        || !model.metadata.is_empty()
         || model.context_strategy != ContextStrategyConfig::default()
         || model.prompt_cache != PromptCacheConfig::default()
         || model.conversation_reuse != ConversationReuseConfig::default()
@@ -2398,6 +2439,7 @@ fn write_model_toml(output: &mut String, model: &ModelConfig) {
     }
     write_model_profiles_toml(output, &model.profiles);
     write_model_aliases_toml(output, &model.aliases);
+    write_model_metadata_toml(output, &model.metadata);
 }
 
 fn write_reasoning_inline_toml(output: &mut String, reasoning: &ReasoningConfig) {
@@ -2507,6 +2549,33 @@ fn write_model_aliases_toml(output: &mut String, aliases: &BTreeMap<String, Mode
             &format!("model.aliases.{}.request", toml_key(alias_name)),
             &alias.request,
         );
+    }
+}
+
+fn write_model_metadata_toml(
+    output: &mut String,
+    metadata: &BTreeMap<String, ModelMetadataConfig>,
+) {
+    for (model_id, metadata) in metadata {
+        writeln!(output, "[model.metadata.{}]", toml_key(model_id))
+            .expect("writing to string should not fail");
+        if let Some(provider_plugin_id) = &metadata.provider_plugin_id {
+            writeln!(
+                output,
+                "provider_plugin_id = {}",
+                toml_string(provider_plugin_id)
+            )
+            .expect("writing to string should not fail");
+        }
+        if let Some(context_window) = metadata.context_window {
+            writeln!(output, "context_window = {context_window}")
+                .expect("writing to string should not fail");
+        }
+        if let Some(max_output_tokens) = metadata.max_output_tokens {
+            writeln!(output, "max_output_tokens = {max_output_tokens}")
+                .expect("writing to string should not fail");
+        }
+        output.push('\n');
     }
 }
 

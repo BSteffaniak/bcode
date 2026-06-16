@@ -1222,23 +1222,82 @@ impl BedrockProviderPlugin {
 fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Vec<ModelInfo> {
     model_ids
         .iter()
-        .map(|model_id| ModelInfo {
-            model_id: model_id.clone(),
-            display_name: model_id.clone(),
-            is_default: default_model == Some(model_id.as_str()),
-            context_window: None,
-            max_output_tokens: None,
-            capabilities: [
-                ModelCapability::StreamingText,
-                ModelCapability::ToolCalls,
-                ModelCapability::PromptCaching,
-            ]
-            .into_iter()
-            .collect(),
-            reasoning: None,
-            cache: bedrock_model_cache_info(),
+        .map(|model_id| {
+            let metadata = bedrock_model_metadata_for(model_id);
+            ModelInfo {
+                model_id: model_id.clone(),
+                display_name: model_id.clone(),
+                is_default: default_model == Some(model_id.as_str()),
+                context_window: metadata.context_window,
+                max_output_tokens: metadata.max_output_tokens,
+                capabilities: [
+                    ModelCapability::StreamingText,
+                    ModelCapability::ToolCalls,
+                    ModelCapability::PromptCaching,
+                ]
+                .into_iter()
+                .collect(),
+                reasoning: None,
+                cache: bedrock_model_cache_info(),
+            }
         })
         .collect()
+}
+
+struct BedrockModelMetadata {
+    context_window: Option<u32>,
+    max_output_tokens: Option<u32>,
+}
+
+fn bedrock_model_metadata_for(model_id: &str) -> BedrockModelMetadata {
+    let normalized = normalized_bedrock_model_id(model_id);
+    let context_window = if normalized.contains("claude-4")
+        || normalized.contains("claude-sonnet-4")
+        || normalized.contains("claude-opus-4")
+        || normalized.contains("claude-3-7")
+        || normalized.contains("claude-3-5")
+        || normalized.contains("claude-3-haiku")
+        || normalized.contains("claude-3-opus")
+        || normalized.contains("claude-3-sonnet")
+    {
+        Some(200_000)
+    } else if normalized.contains("nova") {
+        Some(300_000)
+    } else if normalized.contains("llama3")
+        || normalized.contains("llama-3")
+        || normalized.contains("mistral-large")
+        || normalized.contains("command-r")
+    {
+        Some(128_000)
+    } else if normalized.contains("mixtral") || normalized.contains("mistral") {
+        Some(32_000)
+    } else if normalized.contains("titan") {
+        Some(8_000)
+    } else if normalized.contains("command-r") {
+        Some(128_000)
+    } else if normalized.contains("command") {
+        Some(4_000)
+    } else {
+        None
+    };
+    BedrockModelMetadata {
+        context_window,
+        max_output_tokens: None,
+    }
+}
+
+fn normalized_bedrock_model_id(model_id: &str) -> String {
+    let mut id = model_id.to_ascii_lowercase();
+    for prefix in ["us.", "eu.", "apac.", "us-gov."] {
+        if let Some(stripped) = id.strip_prefix(prefix) {
+            id = stripped.to_string();
+            break;
+        }
+    }
+    if let Some((base, _version)) = id.rsplit_once(':') {
+        id = base.to_string();
+    }
+    id
 }
 
 fn bedrock_model_cache_info() -> bcode_model::ModelCacheInfo {
@@ -1823,21 +1882,24 @@ async fn discover_models(settings: &Settings) -> Result<ModelDiscovery, Provider
         .map(|candidate| candidate.model_id.clone());
     let models = candidates
         .into_iter()
-        .map(|candidate| ModelInfo {
-            is_default: default_model_id.as_deref() == Some(candidate.model_id.as_str()),
-            model_id: candidate.model_id,
-            display_name: candidate.display_name,
-            context_window: None,
-            max_output_tokens: None,
-            capabilities: [
-                ModelCapability::StreamingText,
-                ModelCapability::ToolCalls,
-                ModelCapability::PromptCaching,
-            ]
-            .into_iter()
-            .collect(),
-            reasoning: None,
-            cache: bedrock_model_cache_info(),
+        .map(|candidate| {
+            let metadata = bedrock_model_metadata_for(&candidate.model_id);
+            ModelInfo {
+                is_default: default_model_id.as_deref() == Some(candidate.model_id.as_str()),
+                model_id: candidate.model_id,
+                display_name: candidate.display_name,
+                context_window: metadata.context_window,
+                max_output_tokens: metadata.max_output_tokens,
+                capabilities: [
+                    ModelCapability::StreamingText,
+                    ModelCapability::ToolCalls,
+                    ModelCapability::PromptCaching,
+                ]
+                .into_iter()
+                .collect(),
+                reasoning: None,
+                cache: bedrock_model_cache_info(),
+            }
         })
         .collect();
     Ok(ModelDiscovery {
@@ -2206,6 +2268,33 @@ mod tests {
     #[test]
     fn bedrock_tool_names_are_sanitized() {
         assert_eq!(bedrock_tool_name("filesystem.read"), "filesystem_read");
+    }
+
+    #[test]
+    fn known_bedrock_model_context_windows_are_populated() {
+        assert_eq!(
+            bedrock_model_metadata_for("us.anthropic.claude-3-5-sonnet-20241022-v2:0")
+                .context_window,
+            Some(200_000)
+        );
+        assert_eq!(
+            bedrock_model_metadata_for("amazon.nova-pro-v1:0").context_window,
+            Some(300_000)
+        );
+        assert_eq!(
+            bedrock_model_metadata_for("meta.llama3-1-70b-instruct-v1:0").context_window,
+            Some(128_000)
+        );
+    }
+
+    #[test]
+    fn explicit_bedrock_model_infos_include_context_windows() {
+        let models = model_infos_from_ids(
+            &["anthropic.claude-3-5-sonnet-20241022-v2:0".to_string()],
+            None,
+        );
+
+        assert_eq!(models[0].context_window, Some(200_000));
     }
 
     #[test]
