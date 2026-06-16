@@ -30,16 +30,24 @@ pub async fn open_home<W: Write>(
     services: &TuiServices<'_>,
     chat: &mut ActiveChat,
 ) -> Result<(), TuiError> {
-    let repo_root = current_repo_root(chat)?;
-    match super::ralph_launcher::run_home_with_input(io.terminal, io.input, repo_root).await? {
-        super::ralph_launcher::RalphHomeOutcome::Action(action) => {
-            dispatch_home_action(action, io, services, chat).await?;
-        }
-        super::ralph_launcher::RalphHomeOutcome::Exit => {
-            chat.app.set_status("Ralph UI closed".to_owned());
+    loop {
+        let repo_root = current_repo_root(chat)?;
+        match super::ralph_launcher::run_home_with_input(io.terminal, io.input, repo_root).await? {
+            super::ralph_launcher::RalphHomeOutcome::Action(action) => {
+                match dispatch_home_action(action, io, services, chat).await {
+                    Ok(()) => {}
+                    Err(TuiError::Canceled) => {
+                        chat.app.set_status("Ralph action canceled".to_owned());
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            super::ralph_launcher::RalphHomeOutcome::Exit => {
+                chat.app.set_status("Ralph UI closed".to_owned());
+                return Ok(());
+            }
         }
     }
-    Ok(())
 }
 
 async fn dispatch_home_action<W: Write>(
