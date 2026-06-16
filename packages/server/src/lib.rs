@@ -3489,7 +3489,10 @@ async fn handle_session_model_status(
         state,
         selection.provider_plugin_id.clone(),
         OP_MODELS,
-        serde_json::Value::Null,
+        bcode_model::ModelListRequest {
+            provider_context: selection.provider_context.clone(),
+            selected_model_id: selection.model_id.clone(),
+        },
     )
     .await
     .ok();
@@ -3555,19 +3558,27 @@ async fn handle_session_model_list(
     writer: &SharedWriter,
     provider_plugin_id: Option<String>,
 ) -> Result<(), ServerError> {
+    let runtime_context = state
+        .client_runtime_contexts
+        .try_lock()
+        .ok()
+        .and_then(|contexts| contexts.get(&client_id).cloned());
     let selected_provider_plugin_id = provider_plugin_id.or_else(|| {
-        state
-            .client_runtime_contexts
-            .try_lock()
-            .ok()
-            .and_then(|contexts| contexts.get(&client_id).cloned())
-            .and_then(|context| context.selected_provider_plugin_id)
+        runtime_context
+            .as_ref()
+            .and_then(|context| context.selected_provider_plugin_id.clone())
     });
     match invoke_model_provider_json_blocking::<_, ModelList>(
         state,
         selected_provider_plugin_id.clone(),
         OP_MODELS,
-        serde_json::Value::Null,
+        bcode_model::ModelListRequest {
+            provider_context: runtime_context
+                .map_or_else(bcode_model::ProviderRequestContext::default, |context| {
+                    context.provider_context
+                }),
+            selected_model_id: None,
+        },
     )
     .await
     {
@@ -7460,7 +7471,10 @@ async fn resolve_model_cache_info(
         state,
         provider_plugin_id.map(ToOwned::to_owned),
         OP_MODELS,
-        serde_json::Value::Null,
+        bcode_model::ModelListRequest {
+            provider_context: bcode_model::ProviderRequestContext::default(),
+            selected_model_id: selected_model_id.map(ToOwned::to_owned),
+        },
     )
     .await
     .ok()?;

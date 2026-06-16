@@ -11,7 +11,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bcode_config::AuthMode;
 use bcode_model::{
     AckResponse, CancelTurnRequest, ContentBlock, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID,
-    MessageRole, ModelCapability, ModelInfo, ModelList, ModelMessage,
+    MessageRole, ModelCapability, ModelInfo, ModelList, ModelListRequest, ModelMessage,
     ModelReasoningCapabilitySource, ModelTurnRequest, NativeWebSearchRequest,
     NativeWebSearchResponse, NativeWebSearchResult, OP_CANCEL_TURN, OP_CAPABILITIES,
     OP_FINISH_TURN, OP_MODELS, OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS, OP_START_TURN,
@@ -199,7 +199,7 @@ impl OpenAiCompatibleProviderPlugin {
 
         match context.request.operation.as_str() {
             OP_CAPABILITIES => json_response(&capabilities()),
-            OP_MODELS => json_response(&self.models()),
+            OP_MODELS => self.models_response(&context.request),
             OP_VALIDATE_CONFIG => json_response(&self.validate_config()),
             OP_NATIVE_WEB_SEARCH => self.native_web_search(&context.request),
             OP_START_TURN => self.start_turn(&context.request),
@@ -211,6 +211,10 @@ impl OpenAiCompatibleProviderPlugin {
                 "unsupported model provider operation",
             ),
         }
+    }
+
+    fn models_response(&self, request: &ServiceRequest) -> ServiceResponse {
+        json_response(&self.models(model_list_request(request)))
     }
 
     fn native_web_search(&self, request: &ServiceRequest) -> ServiceResponse {
@@ -2501,20 +2505,52 @@ fn capabilities() -> ProviderCapabilities {
 }
 
 impl OpenAiCompatibleProviderPlugin {
-    fn models(&self) -> ModelList {
-        let settings = settings();
+    fn models(&self, request: ModelListRequest) -> ModelList {
+        let settings = settings_for_context(&request.provider_context);
         if !settings.model_ids_are_explicit
             && settings.default_model.is_none()
             && let Some(discovered_models) = self.discover_models(&settings)
         {
             return ModelList {
-                models: discovered_models,
+                models: ensure_selected_model_info(
+                    discovered_models,
+                    request.selected_model_id.as_deref(),
+                ),
             };
         }
         ModelList {
-            models: model_infos_from_ids(&settings.model_ids, settings.default_model.as_deref()),
+            models: ensure_selected_model_info(
+                model_infos_from_ids(&settings.model_ids, settings.default_model.as_deref()),
+                request.selected_model_id.as_deref(),
+            ),
         }
     }
+}
+
+fn model_list_request(request: &ServiceRequest) -> ModelListRequest {
+    request
+        .payload_json::<ModelListRequest>()
+        .unwrap_or_default()
+}
+
+fn ensure_selected_model_info(
+    mut models: Vec<ModelInfo>,
+    selected_model_id: Option<&str>,
+) -> Vec<ModelInfo> {
+    let Some(selected_model_id) = selected_model_id.filter(|model_id| !model_id.trim().is_empty())
+    else {
+        return models;
+    };
+    if models
+        .iter()
+        .any(|model| model.model_id == selected_model_id)
+    {
+        return models;
+    }
+    let mut selected =
+        model_infos_from_ids(&[selected_model_id.to_string()], Some(selected_model_id));
+    models.append(&mut selected);
+    models
 }
 
 fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Vec<ModelInfo> {

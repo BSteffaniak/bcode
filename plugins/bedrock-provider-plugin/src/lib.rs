@@ -23,12 +23,12 @@ use aws_smithy_types::{Document, Number};
 use base64::Engine as _;
 use bcode_model::{
     AckResponse, CancelTurnRequest, ContentBlock, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID,
-    MessageRole, ModelCapability, ModelInfo, ModelList, ModelMessage, ModelMetadataSource,
-    ModelTurnRequest, OP_CANCEL_TURN, OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS,
-    OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG, PollTurnEventsRequest,
+    MessageRole, ModelCapability, ModelInfo, ModelList, ModelListRequest, ModelMessage,
+    ModelMetadataSource, ModelTurnRequest, OP_CANCEL_TURN, OP_CAPABILITIES, OP_FINISH_TURN,
+    OP_MODELS, OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG, PollTurnEventsRequest,
     PollTurnEventsResponse, ProviderCapabilities, ProviderCapability, ProviderError,
-    ProviderErrorCategory, ProviderRequestProjection, ProviderTurnEvent, StartTurnResponse,
-    StopReason, TokenUsage, ToolCall, ToolDefinition, ValidateConfigResponse,
+    ProviderErrorCategory, ProviderRequestContext, ProviderRequestProjection, ProviderTurnEvent,
+    StartTurnResponse, StopReason, TokenUsage, ToolCall, ToolDefinition, ValidateConfigResponse,
 };
 use bcode_model_provider_runtime::{
     ProviderRuntime, StreamOutcome, TurnState, TurnStore, provider_error,
@@ -117,7 +117,7 @@ impl BedrockProviderPlugin {
         }
         match context.request.operation.as_str() {
             OP_CAPABILITIES => json_response(&capabilities()),
-            OP_MODELS => json_response(&self.models()),
+            OP_MODELS => self.models_response(&context.request),
             OP_VALIDATE_CONFIG => json_response(&self.validate_config()),
             OP_START_TURN => self.start_turn(&context.request),
             OP_POLL_TURN_EVENTS => self.poll_turn_events(&context.request),
@@ -128,6 +128,10 @@ impl BedrockProviderPlugin {
                 "unsupported model provider operation",
             ),
         }
+    }
+
+    fn models_response(&self, request: &ServiceRequest) -> ServiceResponse {
+        json_response(&self.models(model_list_request(request)))
     }
 
     fn start_turn(&self, request: &ServiceRequest) -> ServiceResponse {
@@ -977,18 +981,26 @@ impl RegionSource {
 }
 
 impl Settings {
+    fn resolve_from_context(context: &ProviderRequestContext) -> Self {
+        Self::resolve_context(Some(context))
+    }
+
     fn resolve(request: Option<&ModelTurnRequest>) -> Self {
+        Self::resolve_context(request.map(|request| &request.provider_context))
+    }
+
+    fn resolve_context(request_context: Option<&ProviderRequestContext>) -> Self {
         let config = bcode_config::load_config().ok();
         let resolved = config
             .as_ref()
             .map(bcode_config::BcodeConfig::resolved_model_selection);
-        let request_settings = request
-            .map(|request| request.provider_context.settings.clone())
+        let request_settings = request_context
+            .map(|context| context.settings.clone())
             .unwrap_or_default();
-        let request_env = request
-            .map(|request| request.provider_context.env.clone())
+        let request_env = request_context
+            .map(|context| context.env.clone())
             .unwrap_or_default();
-        let request_auth = request.and_then(|request| request.provider_context.auth.as_ref());
+        let request_auth = request_context.and_then(|context| context.auth.as_ref());
         let request_auth_attributes = request_auth
             .map(|auth| auth.attributes.clone())
             .unwrap_or_default();
@@ -1071,7 +1083,7 @@ impl Settings {
             .or_else(|| value(&["endpoint_url"])),
             auth_credentials: request_auth_credentials,
             env: request_env,
-            config_source: if request.is_some() {
+            config_source: if request_context.is_some() {
                 "request/config/environment".to_string()
             } else {
                 "config/environment".to_string()
@@ -1120,13 +1132,13 @@ fn capabilities() -> ProviderCapabilities {
 }
 
 impl BedrockProviderPlugin {
-    fn models(&self) -> ModelList {
-        let settings = Settings::resolve(None);
+    fn models(&self, request: ModelListRequest) -> ModelList {
+        let settings = Settings::resolve_from_context(&request.provider_context);
         if settings.model_ids_are_explicit || settings.default_model.is_some() {
             return ModelList {
-                models: model_infos_from_ids(
-                    &settings.model_ids,
-                    settings.default_model.as_deref(),
+                models: ensure_selected_model_info(
+                    model_infos_from_ids(&settings.model_ids, settings.default_model.as_deref()),
+                    request.selected_model_id.as_deref(),
                 ),
             };
         }
@@ -1150,7 +1162,10 @@ impl BedrockProviderPlugin {
                 ModelDiscovery::default()
             });
         ModelList {
-            models: discovered.models,
+            models: ensure_selected_model_info(
+                discovered.models,
+                request.selected_model_id.as_deref(),
+            ),
         }
     }
 
@@ -1219,6 +1234,32 @@ impl BedrockProviderPlugin {
             metadata,
         }
     }
+}
+
+fn model_list_request(request: &ServiceRequest) -> ModelListRequest {
+    request
+        .payload_json::<ModelListRequest>()
+        .unwrap_or_default()
+}
+
+fn ensure_selected_model_info(
+    mut models: Vec<ModelInfo>,
+    selected_model_id: Option<&str>,
+) -> Vec<ModelInfo> {
+    let Some(selected_model_id) = selected_model_id.filter(|model_id| !model_id.trim().is_empty())
+    else {
+        return models;
+    };
+    if models
+        .iter()
+        .any(|model| model.model_id == selected_model_id)
+    {
+        return models;
+    }
+    let mut selected =
+        model_infos_from_ids(&[selected_model_id.to_string()], Some(selected_model_id));
+    models.append(&mut selected);
+    models
 }
 
 fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Vec<ModelInfo> {

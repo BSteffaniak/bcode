@@ -63,6 +63,15 @@ pub enum ProviderCapability {
     CodeSearch,
 }
 
+/// Model listing request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelListRequest {
+    #[serde(default)]
+    pub provider_context: ProviderRequestContext,
+    #[serde(default)]
+    pub selected_model_id: Option<String>,
+}
+
 /// Model listing response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelList {
