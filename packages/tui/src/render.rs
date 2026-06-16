@@ -399,44 +399,59 @@ fn composer_panel() -> Panel {
 }
 
 fn render_header(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
-    let session_id = app
-        .session_id()
-        .map_or_else(|| "new".to_owned(), |id| id.to_string());
+    if area.is_empty() {
+        return;
+    }
+
+    let line = Line::from_spans(header_spans(app, usize::from(area.width)));
+    frame.write_line(area, &line);
+}
+
+fn header_spans(app: &BmuxApp, width: usize) -> Vec<Span> {
+    let muted = Style::new().fg(Color::BrightBlack);
+    let cyan = Style::new().fg(Color::Cyan);
     let session_title = app
         .session_title()
         .map_or_else(|| "Untitled session".to_owned(), ToOwned::to_owned);
-    let provider = app.selected_provider_plugin_id().unwrap_or("auto");
-    let model = app.selected_model_id().unwrap_or("default");
-    let agent = app.current_agent_id();
-    let line = Line::from_spans(vec![
-        Span::styled(
-            "bcode",
+    let mut line = ChromeLine::new(" · ", muted)
+        .required(
+            "bcode".to_owned(),
             Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::styled("session ", Style::new().fg(Color::BrightBlack)),
-        Span::raw(session_title),
-        Span::styled(
-            format!(" ({session_id})"),
-            Style::new().fg(Color::BrightBlack),
-        ),
-        Span::raw("  "),
-        Span::styled("provider: ", Style::new().fg(Color::BrightBlack)),
-        Span::styled(provider, Style::new().fg(Color::Cyan)),
-        Span::raw("  "),
-        Span::styled("model: ", Style::new().fg(Color::BrightBlack)),
-        Span::raw(model),
-        Span::raw("  "),
-        Span::styled("agent: ", Style::new().fg(Color::BrightBlack)),
-        Span::styled(agent, Style::new().fg(Color::Cyan)),
-        Span::raw("  "),
-        Span::styled("thinking: ", Style::new().fg(Color::BrightBlack)),
-        Span::styled(
-            app.thinking_label().to_owned(),
-            Style::new().fg(Color::BrightBlack),
-        ),
-    ]);
-    frame.write_line(area, &line);
+            false,
+        )
+        .required(session_title, Style::new(), true)
+        .optional(
+            format!("model {}", app.selected_model_id().unwrap_or("default")),
+            Style::new(),
+            80,
+            false,
+        )
+        .optional(format!("agent {}", app.current_agent_id()), cyan, 70, false)
+        .optional(
+            format!(
+                "provider {}",
+                app.selected_provider_plugin_id().unwrap_or("auto")
+            ),
+            cyan,
+            50,
+            false,
+        )
+        .optional(
+            format!("thinking {}", app.thinking_label()),
+            muted,
+            30,
+            false,
+        );
+
+    if let Some(session_id) = app.session_id() {
+        line = line.optional(short_session_id(&session_id.to_string()), muted, 10, false);
+    }
+
+    line.spans(width)
+}
+
+fn short_session_id(session_id: &str) -> String {
+    format!("#{}", session_id.chars().take(8).collect::<String>())
 }
 
 fn render_body(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
@@ -2851,20 +2866,20 @@ fn render_status(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
 }
 
 #[derive(Clone)]
-struct StatuslineSegment {
+struct ChromeSegment {
     text: String,
     style: Style,
     priority: u8,
     truncatable: bool,
 }
 
-impl StatuslineSegment {
-    const fn required(text: String, style: Style) -> Self {
+impl ChromeSegment {
+    const fn required(text: String, style: Style, truncatable: bool) -> Self {
         Self {
             text,
             style,
             priority: u8::MAX,
-            truncatable: true,
+            truncatable,
         }
     }
 
@@ -2878,127 +2893,175 @@ impl StatuslineSegment {
     }
 }
 
+struct ChromeLine {
+    separator: String,
+    separator_style: Style,
+    segments: Vec<ChromeSegment>,
+}
+
+impl ChromeLine {
+    fn new(separator: impl Into<String>, separator_style: Style) -> Self {
+        Self {
+            separator: separator.into(),
+            separator_style,
+            segments: Vec::new(),
+        }
+    }
+
+    fn required(mut self, text: String, style: Style, truncatable: bool) -> Self {
+        self.segments
+            .push(ChromeSegment::required(text, style, truncatable));
+        self
+    }
+
+    fn optional(mut self, text: String, style: Style, priority: u8, truncatable: bool) -> Self {
+        if !text.is_empty() {
+            self.segments
+                .push(ChromeSegment::optional(text, style, priority, truncatable));
+        }
+        self
+    }
+
+    fn spans(mut self, width: usize) -> Vec<Span> {
+        self.fit(width);
+        self.into_spans()
+    }
+
+    fn fit(&mut self, width: usize) {
+        while self.width() > width {
+            if let Some(index) = self.lowest_priority_optional_index(false) {
+                self.segments.remove(index);
+            } else {
+                break;
+            }
+        }
+
+        if self.width() <= width {
+            return;
+        }
+
+        self.truncate_segments(width);
+
+        while self.width() > width {
+            if let Some(index) = self.lowest_priority_optional_index(true) {
+                self.segments.remove(index);
+            } else {
+                break;
+            }
+        }
+
+        if self.width() > width
+            && let Some(segment) = self.segments.first_mut()
+        {
+            segment.text = truncate_chrome_part(&segment.text, width);
+        }
+    }
+
+    fn truncate_segments(&mut self, width: usize) {
+        let separators = self.separator_width();
+        let fixed_width = self
+            .segments
+            .iter()
+            .filter(|segment| !segment.truncatable)
+            .map(|segment| text_display_width(&segment.text))
+            .sum::<usize>()
+            .saturating_add(separators);
+        let truncatable_count = self
+            .segments
+            .iter()
+            .filter(|segment| segment.truncatable)
+            .count();
+        if truncatable_count == 0 {
+            return;
+        }
+        let truncatable_width = width.saturating_sub(fixed_width) / truncatable_count;
+
+        for segment in self
+            .segments
+            .iter_mut()
+            .filter(|segment| segment.truncatable)
+        {
+            segment.text = truncate_chrome_part(&segment.text, truncatable_width);
+        }
+    }
+
+    fn lowest_priority_optional_index(&self, include_truncatable: bool) -> Option<usize> {
+        self.segments
+            .iter()
+            .enumerate()
+            .filter(|(_, segment)| segment.priority < u8::MAX)
+            .filter(|(_, segment)| include_truncatable || !segment.truncatable)
+            .min_by_key(|(_, segment)| segment.priority)
+            .map(|(index, _)| index)
+    }
+
+    fn into_spans(self) -> Vec<Span> {
+        let mut spans = Vec::new();
+        for (index, segment) in self.segments.into_iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::styled(self.separator.clone(), self.separator_style));
+            }
+            spans.push(Span::styled(segment.text, segment.style));
+        }
+        spans
+    }
+
+    fn width(&self) -> usize {
+        let text_width = self
+            .segments
+            .iter()
+            .map(|segment| text_display_width(&segment.text))
+            .sum::<usize>();
+        text_width.saturating_add(self.separator_width())
+    }
+
+    fn separator_width(&self) -> usize {
+        self.segments
+            .len()
+            .saturating_sub(1)
+            .saturating_mul(text_display_width(&self.separator))
+    }
+}
+
 fn statusline_spans(app: &BmuxApp, width: usize) -> Vec<Span> {
     let muted = Style::new().fg(Color::BrightBlack);
-    let mut segments = vec![StatuslineSegment::required(
+    let mut line = ChromeLine::new(" · ", muted).required(
         activity_label(app.activity()),
         Style::new().fg(Color::Cyan),
-    )];
+        true,
+    );
 
     let status_text = statusline_status_text(app);
     if !status_text.is_empty() {
-        segments.push(StatuslineSegment::optional(status_text, muted, 90, true));
+        line = line.optional(status_text, muted, 90, true);
     }
     if app.scroll_offset() > 0 {
-        segments.push(StatuslineSegment::optional(
+        line = line.optional(
             format!("{} rows from bottom", app.scroll_offset()),
             muted,
             80,
             false,
-        ));
+        );
     } else if app.bottom_overscroll() > 0 {
-        segments.push(StatuslineSegment::optional(
+        line = line.optional(
             format!("{} rows below latest", app.bottom_overscroll()),
             muted,
             80,
             false,
-        ));
+        );
     }
 
     let token_summary = compact_statusline_token_summary(&app.token_summary());
     if !token_summary.is_empty() {
-        segments.push(StatuslineSegment::optional(token_summary, muted, 60, false));
+        line = line.optional(token_summary, muted, 60, false);
     }
 
     let key_hints = compact_key_hints(app.key_hints());
     if !key_hints.is_empty() {
-        segments.push(StatuslineSegment::optional(key_hints, muted, 10, false));
+        line = line.optional(key_hints, muted, 10, false);
     }
 
-    fit_statusline_segments(&mut segments, width);
-    statusline_segments_to_spans(&segments)
-}
-
-fn fit_statusline_segments(segments: &mut Vec<StatuslineSegment>, width: usize) {
-    while statusline_width(segments) > width {
-        if let Some(index) = segments
-            .iter()
-            .enumerate()
-            .filter(|(_, segment)| !segment.truncatable && segment.priority < u8::MAX)
-            .min_by_key(|(_, segment)| segment.priority)
-            .map(|(index, _)| index)
-        {
-            segments.remove(index);
-        } else {
-            break;
-        }
-    }
-
-    if statusline_width(segments) <= width {
-        return;
-    }
-
-    let separators = segments.len().saturating_sub(1) * 3;
-    let fixed_width = segments
-        .iter()
-        .filter(|segment| !segment.truncatable)
-        .map(|segment| text_display_width(&segment.text))
-        .sum::<usize>()
-        .saturating_add(separators);
-    let truncatable_count = segments
-        .iter()
-        .filter(|segment| segment.truncatable)
-        .count();
-    if truncatable_count == 0 {
-        return;
-    }
-    let truncatable_width = width.saturating_sub(fixed_width) / truncatable_count;
-
-    for segment in segments.iter_mut().filter(|segment| segment.truncatable) {
-        segment.text = truncate_status_part(&segment.text, truncatable_width);
-    }
-
-    while statusline_width(segments) > width {
-        if let Some(index) = segments
-            .iter()
-            .enumerate()
-            .filter(|(_, segment)| segment.priority < u8::MAX)
-            .min_by_key(|(_, segment)| segment.priority)
-            .map(|(index, _)| index)
-        {
-            segments.remove(index);
-        } else {
-            break;
-        }
-    }
-
-    if statusline_width(segments) > width
-        && let Some(segment) = segments.first_mut()
-    {
-        segment.text = truncate_status_part(&segment.text, width);
-    }
-}
-
-fn statusline_segments_to_spans(segments: &[StatuslineSegment]) -> Vec<Span> {
-    let mut spans = Vec::new();
-    for (index, segment) in segments.iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::styled(
-                " · ".to_owned(),
-                Style::new().fg(Color::BrightBlack),
-            ));
-        }
-        spans.push(Span::styled(segment.text.clone(), segment.style));
-    }
-    spans
-}
-
-fn statusline_width(segments: &[StatuslineSegment]) -> usize {
-    let text_width = segments
-        .iter()
-        .map(|segment| text_display_width(&segment.text))
-        .sum::<usize>();
-    text_width.saturating_add(segments.len().saturating_sub(1) * 3)
+    line.spans(width)
 }
 
 fn statusline_status_text(app: &BmuxApp) -> String {
@@ -3047,7 +3110,7 @@ fn compact_key_hints(hints: &str) -> String {
         .replace("palette", "pal")
 }
 
-fn truncate_status_part(part: &str, max_width: usize) -> String {
+fn truncate_chrome_part(part: &str, max_width: usize) -> String {
     if text_display_width(part) <= max_width {
         return part.to_owned();
     }

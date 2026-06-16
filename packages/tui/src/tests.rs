@@ -719,6 +719,63 @@ fn header_uses_attach_summary_title_when_recent_history_lacks_title_events() {
 }
 
 #[test]
+fn header_drops_low_priority_segments_in_narrow_panes() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.apply_session_summary(&SessionSummary {
+        id: session_id,
+        name: Some("A readable session title".to_owned()),
+        explicit_name: Some("A readable session title".to_owned()),
+        derived_title: None,
+        title_source: SessionTitleSource::Explicit,
+        client_count: 1,
+        created_at_ms: 1,
+        updated_at_ms: 2,
+        working_directory: "/tmp/bcode-tui-test".into(),
+        import: None,
+        fork: None,
+    });
+    app.apply_model_status(bcode_ipc::SessionModelStatus {
+        provider_plugin_id: Some("very-long-provider-plugin-id".to_owned()),
+        model_id: Some("very-long-model-id".to_owned()),
+        context_window: None,
+        max_output_tokens: None,
+        reasoning: None,
+        reasoning_effort: None,
+        reasoning_summary: None,
+        prompt_cache_mode: None,
+        conversation_reuse_mode: None,
+        compaction_mode: None,
+        cache: None,
+        metadata_source: None,
+    });
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 36, 8));
+    let mut frame = Frame::new(&mut buffer);
+
+    render::render(&mut app, &mut frame);
+    let header = buffer.row_symbols(0).unwrap();
+
+    assert!(header.contains("bcode"));
+    assert!(header.contains("readable session title"));
+    assert!(!header.contains("provider"));
+    assert!(!header.contains("thinking"));
+}
+
+#[test]
+fn header_shortens_session_id_on_wide_panes() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 240, 8));
+    let mut frame = Frame::new(&mut buffer);
+
+    render::render(&mut app, &mut frame);
+    let header = buffer.row_symbols(0).unwrap();
+
+    assert!(header.contains(&format!("#{}", &session_id.to_string()[..8])));
+    assert!(!header.contains(&session_id.to_string()[9..]));
+}
+
+#[test]
 fn live_session_rename_overrides_attach_summary_title() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
@@ -811,7 +868,7 @@ fn header_and_footer_include_model_agent_and_token_context() {
     );
     assert!(buffer.row_symbols(0).unwrap().contains("provider.example"));
     assert!(output.contains("model-example"));
-    assert!(buffer.row_symbols(0).unwrap().contains("agent: plan"));
+    assert!(output.contains("agent plan"));
     assert!(output.contains("ctx 512/1.0k 50%"));
     assert!(output.contains("read 256"));
     assert!(output.contains("write 128"));
@@ -845,7 +902,7 @@ fn draft_agent_selection_updates_header() {
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
 
-    assert!(buffer.row_symbols(0).unwrap().contains("agent: plan"));
+    assert!(buffer.row_symbols(0).unwrap().contains("agent plan"));
 }
 
 #[test]
