@@ -3009,7 +3009,7 @@ fn compact_statusline_token_summary(summary: &str) -> String {
     summary
         .split(" · ")
         .filter_map(|part| match part {
-            "ctx limit unknown" => Some("ctx unknown".to_owned()),
+            "ctx limit unknown" => None,
             "reuse on" => Some("reuse".to_owned()),
             _ => part
                 .strip_prefix("spent ")

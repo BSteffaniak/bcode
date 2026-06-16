@@ -672,6 +672,7 @@ impl BmuxApp {
                 capabilities: std::collections::BTreeSet::new(),
                 reasoning: status.reasoning.clone(),
                 cache: bcode_model::ModelCacheInfo::default(),
+                metadata_source: None,
             });
         self.token_usage.apply_model_info(model.as_ref());
     }

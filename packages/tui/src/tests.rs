@@ -795,6 +795,7 @@ fn header_and_footer_include_model_agent_and_token_context() {
         conversation_reuse_mode: None,
         compaction_mode: None,
         cache: None,
+        metadata_source: None,
     });
     let mut buffer = Buffer::empty(Rect::new(0, 0, 180, 12));
     let mut frame = Frame::new(&mut buffer);
@@ -3648,6 +3649,7 @@ fn thinking_label_uses_effective_values() {
         conversation_reuse_mode: None,
         compaction_mode: None,
         cache: None,
+        metadata_source: None,
     });
     app.set_reasoning_visible(true);
 
@@ -3679,6 +3681,7 @@ fn thinking_dialog_cycles_supported_values() {
         conversation_reuse_mode: None,
         compaction_mode: None,
         cache: None,
+        metadata_source: None,
     };
     let mut dialog = super::thinking_dialog::ThinkingDialogState::new(false, &status);
 
@@ -3714,6 +3717,7 @@ fn thinking_dialog_can_start_focused_on_effort_or_summary() {
         conversation_reuse_mode: None,
         compaction_mode: None,
         cache: None,
+        metadata_source: None,
     };
 
     let effort = super::thinking_dialog::ThinkingDialogState::new_focused(
@@ -3745,6 +3749,7 @@ fn thinking_dialog_cycles_fallback_values_when_provider_values_are_unknown() {
         conversation_reuse_mode: None,
         compaction_mode: None,
         cache: None,
+        metadata_source: None,
     };
     let mut dialog = super::thinking_dialog::ThinkingDialogState::new(false, &status);
 

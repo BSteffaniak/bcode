@@ -86,6 +86,20 @@ pub struct ModelInfo {
     pub reasoning: Option<ModelReasoningInfo>,
     #[serde(default)]
     pub cache: ModelCacheInfo,
+    #[serde(default)]
+    pub metadata_source: Option<ModelMetadataSource>,
+}
+
+/// Source used by a provider to resolve model metadata such as token limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelMetadataSource {
+    ConfigOverride,
+    ProviderApi,
+    BundledCatalog,
+    PatternMatch,
+    ProviderDefault,
+    Unknown,
 }
 
 /// Per-model/provider cache and continuation capabilities.

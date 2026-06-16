@@ -3512,6 +3512,13 @@ async fn handle_session_model_status(
         .as_ref()
         .and_then(|metadata| metadata.max_output_tokens)
         .or_else(|| model.as_ref().and_then(|model| model.max_output_tokens));
+    let metadata_source = if override_metadata.as_ref().is_some_and(|metadata| {
+        metadata.context_window.is_some() || metadata.max_output_tokens.is_some()
+    }) {
+        Some(bcode_model::ModelMetadataSource::ConfigOverride)
+    } else {
+        model.as_ref().and_then(|model| model.metadata_source)
+    };
     send_response(
         writer,
         request_id,
@@ -3534,6 +3541,7 @@ async fn handle_session_model_status(
                 ),
                 compaction_mode: Some(compaction_mode_name(state.auto_compaction.mode).to_string()),
                 cache: cache_info,
+                metadata_source,
             },
         }),
     )
@@ -11338,6 +11346,7 @@ mod tests {
                 capabilities: BTreeSet::new(),
                 reasoning: None,
                 cache: bcode_model::ModelCacheInfo::default(),
+                metadata_source: None,
             },
             bcode_model::ModelInfo {
                 model_id: "selected".to_string(),
@@ -11348,6 +11357,7 @@ mod tests {
                 capabilities: BTreeSet::new(),
                 reasoning: None,
                 cache: bcode_model::ModelCacheInfo::default(),
+                metadata_source: None,
             },
         ];
 

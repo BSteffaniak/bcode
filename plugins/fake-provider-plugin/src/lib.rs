@@ -271,6 +271,7 @@ fn models() -> ModelList {
                 .collect(),
             reasoning: None,
             cache: bcode_model::ModelCacheInfo::default(),
+            metadata_source: Some(bcode_model::ModelMetadataSource::BundledCatalog),
         }],
     }
 }

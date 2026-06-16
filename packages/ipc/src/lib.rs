@@ -476,6 +476,8 @@ pub struct SessionModelStatus {
     pub compaction_mode: Option<String>,
     #[serde(default)]
     pub cache: Option<bcode_model::ModelCacheInfo>,
+    #[serde(default)]
+    pub metadata_source: Option<bcode_model::ModelMetadataSource>,
 }
 
 /// Service interface provided by a loaded plugin.
