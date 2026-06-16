@@ -3032,8 +3032,7 @@ fn statusline_spans(app: &BmuxApp, width: usize) -> Vec<Span> {
     );
 
     for (token_segment, priority) in compact_statusline_token_segments(&app.token_summary()) {
-        let truncatable = token_segment.starts_with("ctx ");
-        line = line.optional(token_segment, muted, priority, truncatable);
+        line = line.optional(token_segment, muted, priority, false);
     }
 
     let status_text = statusline_status_text(app);
@@ -3072,7 +3071,7 @@ fn compact_statusline_token_segments(summary: &str) -> Vec<(String, u8)> {
     summary
         .split(" · ")
         .filter_map(|part| match part {
-            "ctx limit unknown" => None,
+            "ctx limit unknown" => Some(("ctx unknown".to_owned(), 85)),
             "reuse on" => Some(("reuse".to_owned(), 50)),
             _ if part.starts_with("ctx ") => Some((part.to_owned(), 95)),
             _ => part

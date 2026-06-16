@@ -908,7 +908,7 @@ fn status_line_prioritizes_context_over_spent_tokens() {
         cache: None,
         metadata_source: None,
     });
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 52, 8));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 68, 8));
     let mut frame = Frame::new(&mut buffer);
 
     render::render(&mut app, &mut frame);
@@ -916,6 +916,36 @@ fn status_line_prioritizes_context_over_spent_tokens() {
 
     assert!(output.contains("ctx 512/128.0k 0%"), "{output}");
     assert!(!output.contains("spent 640"), "{output}");
+}
+
+#[test]
+fn status_line_includes_unknown_context_before_spent_tokens() {
+    let session_id = SessionId::new();
+    let history = [event(
+        session_id,
+        1,
+        SessionEventKind::ModelUsage {
+            turn_id: "turn-1".to_owned(),
+            usage: SessionTokenUsage {
+                input_tokens: Some(75_700),
+                output_tokens: Some(1_524_300),
+                total_tokens: Some(1_600_000),
+                cached_input_tokens: Some(75_700),
+                cache_write_input_tokens: None,
+                reasoning_tokens: None,
+            },
+        },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_status("model: bcode.openai-compatible/gpt-5.5; active skills: 0".to_owned());
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
+    let mut frame = Frame::new(&mut buffer);
+
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+
+    assert!(output.contains("ctx unknown"), "{output}");
+    assert!(!output.contains("spent 1.6m"), "{output}");
 }
 
 #[test]
@@ -932,7 +962,7 @@ fn status_line_drops_low_priority_segments_in_narrow_panes() {
     assert!(output.contains("ready"));
     assert!(output.contains("important status message"));
     assert!(!output.contains("enter send"));
-    assert!(!output.contains("ctx"));
+    assert!(!output.contains("spent"));
 }
 
 #[test]
