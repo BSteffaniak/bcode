@@ -3096,14 +3096,14 @@ fn statusline_spans(app: &BmuxApp, width: usize, theme: RenderTheme) -> Vec<Span
         line = line.optional(
             format!("{} rows from bottom", app.scroll_offset()),
             muted,
-            80,
+            100,
             false,
         );
     } else if app.bottom_overscroll() > 0 {
         line = line.optional(
             format!("{} rows below latest", app.bottom_overscroll()),
             muted,
-            80,
+            100,
             false,
         );
     }
