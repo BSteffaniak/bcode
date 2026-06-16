@@ -27,7 +27,7 @@ const MIGRATIONS_TABLE: &str = "ralph_schema_migrations";
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DATABASE_OPEN_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(20);
 const DATABASE_OPEN_MAX_RETRY_DELAY: Duration = Duration::from_millis(250);
-const DATABASE_OPEN_RETRY_ATTEMPTS: u32 = 5;
+const DATABASE_OPEN_RETRY_ATTEMPTS: u32 = 80;
 
 /// Ralph loop lifecycle status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -2062,7 +2062,11 @@ async fn open_database(path: &Path) -> Result<Box<dyn Database>, RalphStateError
 
 fn is_database_lock_error(error: &impl std::fmt::Display) -> bool {
     let message = error.to_string().to_ascii_lowercase();
-    message.contains("database is locked") || message.contains("busy")
+    message.contains("database is locked")
+        || message.contains("busy")
+        || message.contains("locking error")
+        || message.contains("file is locked")
+        || message.contains("locked by another process")
 }
 
 async fn run_migrations(database: &dyn Database) -> Result<(), RalphStateError> {
