@@ -2845,54 +2845,219 @@ fn render_status(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
     }
-    let mut spans = vec![Span::styled(
-        activity_label(app.activity()),
-        Style::new().fg(Color::Cyan),
-    )];
-    let status_text = statusline_status_text(app);
-    if !status_text.is_empty() {
-        spans.extend([
-            Span::styled(" · ", Style::new().fg(Color::BrightBlack)),
-            Span::styled(status_text, Style::new().fg(Color::BrightBlack)),
-        ]);
-    }
-    if app.scroll_offset() > 0 {
-        spans.push(Span::styled(
-            format!(" · {} rows from bottom", app.scroll_offset()),
-            Style::new().fg(Color::BrightBlack),
-        ));
-    } else if app.bottom_overscroll() > 0 {
-        spans.push(Span::styled(
-            format!(" · {} rows below latest", app.bottom_overscroll()),
-            Style::new().fg(Color::BrightBlack),
-        ));
-    }
-    spans.extend([
-        Span::styled(" · ", Style::new().fg(Color::BrightBlack)),
-        Span::styled(app.token_summary(), Style::new().fg(Color::BrightBlack)),
-        Span::styled(" · ", Style::new().fg(Color::BrightBlack)),
-        Span::styled(
-            app.key_hints().to_owned(),
-            Style::new().fg(Color::BrightBlack),
-        ),
-    ]);
+
+    let spans = statusline_spans(app, usize::from(area.width));
     frame.write_line(area, &Line::from_spans(spans));
 }
 
+#[derive(Clone)]
+struct StatuslineSegment {
+    text: String,
+    style: Style,
+    priority: u8,
+    truncatable: bool,
+}
+
+impl StatuslineSegment {
+    const fn required(text: String, style: Style) -> Self {
+        Self {
+            text,
+            style,
+            priority: u8::MAX,
+            truncatable: true,
+        }
+    }
+
+    const fn optional(text: String, style: Style, priority: u8, truncatable: bool) -> Self {
+        Self {
+            text,
+            style,
+            priority,
+            truncatable,
+        }
+    }
+}
+
+fn statusline_spans(app: &BmuxApp, width: usize) -> Vec<Span> {
+    let muted = Style::new().fg(Color::BrightBlack);
+    let mut segments = vec![StatuslineSegment::required(
+        activity_label(app.activity()),
+        Style::new().fg(Color::Cyan),
+    )];
+
+    let status_text = statusline_status_text(app);
+    if !status_text.is_empty() {
+        segments.push(StatuslineSegment::optional(status_text, muted, 90, true));
+    }
+    if app.scroll_offset() > 0 {
+        segments.push(StatuslineSegment::optional(
+            format!("{} rows from bottom", app.scroll_offset()),
+            muted,
+            80,
+            false,
+        ));
+    } else if app.bottom_overscroll() > 0 {
+        segments.push(StatuslineSegment::optional(
+            format!("{} rows below latest", app.bottom_overscroll()),
+            muted,
+            80,
+            false,
+        ));
+    }
+
+    let token_summary = compact_statusline_token_summary(&app.token_summary());
+    if !token_summary.is_empty() {
+        segments.push(StatuslineSegment::optional(token_summary, muted, 60, false));
+    }
+
+    let key_hints = compact_key_hints(app.key_hints());
+    if !key_hints.is_empty() {
+        segments.push(StatuslineSegment::optional(key_hints, muted, 10, false));
+    }
+
+    fit_statusline_segments(&mut segments, width);
+    statusline_segments_to_spans(&segments)
+}
+
+fn fit_statusline_segments(segments: &mut Vec<StatuslineSegment>, width: usize) {
+    while statusline_width(segments) > width {
+        if let Some(index) = segments
+            .iter()
+            .enumerate()
+            .filter(|(_, segment)| !segment.truncatable && segment.priority < u8::MAX)
+            .min_by_key(|(_, segment)| segment.priority)
+            .map(|(index, _)| index)
+        {
+            segments.remove(index);
+        } else {
+            break;
+        }
+    }
+
+    if statusline_width(segments) <= width {
+        return;
+    }
+
+    let separators = segments.len().saturating_sub(1) * 3;
+    let fixed_width = segments
+        .iter()
+        .filter(|segment| !segment.truncatable)
+        .map(|segment| text_display_width(&segment.text))
+        .sum::<usize>()
+        .saturating_add(separators);
+    let truncatable_count = segments
+        .iter()
+        .filter(|segment| segment.truncatable)
+        .count();
+    if truncatable_count == 0 {
+        return;
+    }
+    let truncatable_width = width.saturating_sub(fixed_width) / truncatable_count;
+
+    for segment in segments.iter_mut().filter(|segment| segment.truncatable) {
+        segment.text = truncate_status_part(&segment.text, truncatable_width);
+    }
+
+    while statusline_width(segments) > width {
+        if let Some(index) = segments
+            .iter()
+            .enumerate()
+            .filter(|(_, segment)| segment.priority < u8::MAX)
+            .min_by_key(|(_, segment)| segment.priority)
+            .map(|(index, _)| index)
+        {
+            segments.remove(index);
+        } else {
+            break;
+        }
+    }
+
+    if statusline_width(segments) > width
+        && let Some(segment) = segments.first_mut()
+    {
+        segment.text = truncate_status_part(&segment.text, width);
+    }
+}
+
+fn statusline_segments_to_spans(segments: &[StatuslineSegment]) -> Vec<Span> {
+    let mut spans = Vec::new();
+    for (index, segment) in segments.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(
+                " · ".to_owned(),
+                Style::new().fg(Color::BrightBlack),
+            ));
+        }
+        spans.push(Span::styled(segment.text.clone(), segment.style));
+    }
+    spans
+}
+
+fn statusline_width(segments: &[StatuslineSegment]) -> usize {
+    let text_width = segments
+        .iter()
+        .map(|segment| text_display_width(&segment.text))
+        .sum::<usize>();
+    text_width.saturating_add(segments.len().saturating_sub(1) * 3)
+}
+
 fn statusline_status_text(app: &BmuxApp) -> String {
-    let max_width = 48;
-    let status = app.status();
-    status
+    app.status().to_owned()
+}
+
+fn compact_statusline_token_summary(summary: &str) -> String {
+    summary
         .split(" · ")
-        .map(|part| truncate_status_part(part, max_width))
+        .filter_map(|part| match part {
+            "ctx limit unknown" => Some("ctx unknown".to_owned()),
+            "reuse on" => Some("reuse".to_owned()),
+            _ => part
+                .strip_prefix("spent ")
+                .and_then(|value| value.strip_suffix(" tok"))
+                .map(|value| format!("spent {value}"))
+                .or_else(|| {
+                    part.strip_prefix("cache read ")
+                        .and_then(|value| value.strip_suffix(" tok"))
+                        .map(|value| format!("read {value}"))
+                })
+                .or_else(|| {
+                    part.strip_prefix("cache write ")
+                        .and_then(|value| value.strip_suffix(" tok"))
+                        .map(|value| format!("write {value}"))
+                })
+                .or_else(|| {
+                    part.strip_prefix("sent ")
+                        .and_then(|value| value.strip_suffix(" msgs"))
+                        .map(|value| format!("sent {value}"))
+                })
+                .or_else(|| {
+                    part.strip_prefix("cache points ")
+                        .map(|value| format!("pts {value}"))
+                })
+                .or_else(|| Some(part.to_owned())),
+        })
         .collect::<Vec<_>>()
         .join(" · ")
+}
+
+fn compact_key_hints(hints: &str) -> String {
+    hints
+        .replace("escape", "esc")
+        .replace("ctrl+", "^")
+        .replace("palette", "pal")
 }
 
 fn truncate_status_part(part: &str, max_width: usize) -> String {
     if text_display_width(part) <= max_width {
         return part.to_owned();
     }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return "…".to_owned();
+    }
+
     let mut suffix = String::new();
     let mut width: usize = 1;
     for grapheme in part.graphemes(true).rev() {

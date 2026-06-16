@@ -812,9 +812,26 @@ fn header_and_footer_include_model_agent_and_token_context() {
     assert!(output.contains("model-example"));
     assert!(buffer.row_symbols(0).unwrap().contains("agent: plan"));
     assert!(output.contains("ctx 512/1.0k 50%"));
-    assert!(output.contains("cache read 256 tok"));
-    assert!(output.contains("cache write 128 tok"));
-    assert!(output.contains("spent 640 tok"));
+    assert!(output.contains("read 256"));
+    assert!(output.contains("write 128"));
+    assert!(output.contains("spent 640"));
+}
+
+#[test]
+fn status_line_drops_low_priority_segments_in_narrow_panes() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_status("important status message".to_owned());
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 36, 8));
+    let mut frame = Frame::new(&mut buffer);
+
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+
+    assert!(output.contains("ready"));
+    assert!(output.contains("important status message"));
+    assert!(!output.contains("enter send"));
+    assert!(!output.contains("ctx"));
 }
 
 #[test]
