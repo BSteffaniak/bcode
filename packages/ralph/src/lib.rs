@@ -27,7 +27,390 @@ const MIGRATIONS_TABLE: &str = "ralph_schema_migrations";
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DATABASE_OPEN_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(20);
 const DATABASE_OPEN_MAX_RETRY_DELAY: Duration = Duration::from_millis(250);
-const DATABASE_OPEN_RETRY_ATTEMPTS: u32 = 80;
+const DATABASE_OPEN_RETRY_ATTEMPTS: u32 = 5;
+
+/// Durable Ralph filesystem and database state location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RalphStateStore {
+    ralph_state_root: PathBuf,
+}
+
+impl Default for RalphStateStore {
+    fn default() -> Self {
+        Self::from_ralph_state_root(bcode_config::default_state_dir().join(RALPH_STATE_SUBDIR))
+    }
+}
+
+impl RalphStateStore {
+    /// Create a Ralph state store rooted at `ralph_state_root`.
+    #[must_use]
+    pub fn from_ralph_state_root(ralph_state_root: impl Into<PathBuf>) -> Self {
+        Self {
+            ralph_state_root: ralph_state_root.into(),
+        }
+    }
+
+    /// Return this store's Ralph state root.
+    #[must_use]
+    pub fn ralph_state_root(&self) -> &Path {
+        &self.ralph_state_root
+    }
+
+    /// Return the Ralph state root for a repository within this store.
+    #[must_use]
+    pub fn repo_state_root(&self, repo_root: &Path) -> PathBuf {
+        repo_state_root_in_store(self, repo_root)
+    }
+
+    /// Return the most recently updated Ralph loop for a repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Ralph database cannot be opened, migrated, or queried.
+    pub fn latest_loop(
+        &self,
+        repo_root: &Path,
+    ) -> Result<Option<RalphLoopSummary>, RalphStateError> {
+        latest_loop_in_store(self, repo_root)
+    }
+
+    /// Append a Ralph lifecycle event to the loop database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Ralph database cannot be opened, migrated, or written.
+    pub fn append_lifecycle_event(
+        &self,
+        state: &CreatedRalphLoopState,
+        kind: RalphLifecycleEventKind,
+        message: &str,
+    ) -> Result<(), RalphStateError> {
+        append_lifecycle_event_in_store(self, state, kind, message)
+    }
+
+    /// Append a Ralph lifecycle event using a discovered loop summary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Ralph database cannot be opened, migrated, or written.
+    pub fn append_lifecycle_event_for_summary(
+        &self,
+        summary: &RalphLoopSummary,
+        kind: RalphLifecycleEventKind,
+        message: &str,
+    ) -> Result<(), RalphStateError> {
+        append_lifecycle_event_for_summary_in_store(self, summary, kind, message)
+    }
+
+    /// Append a Ralph lifecycle event using a loop state directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Ralph database cannot be opened, migrated, or written.
+    pub fn append_lifecycle_event_for_state_dir(
+        &self,
+        state_dir: &Path,
+        kind: RalphLifecycleEventKind,
+        message: &str,
+    ) -> Result<(), RalphStateError> {
+        append_lifecycle_event_for_state_dir_in_store(self, state_dir, kind, message)
+    }
+
+    /// List lifecycle events for a Ralph loop summary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Ralph database cannot be opened, migrated, or queried.
+    pub fn list_lifecycle_events(
+        &self,
+        summary: &RalphLoopSummary,
+    ) -> Result<Vec<RalphLifecycleEventRecord>, RalphStateError> {
+        list_lifecycle_events_in_store(self, summary)
+    }
+
+    /// Replace validation commands for a Ralph loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Ralph database cannot be opened, migrated, or written.
+    pub fn set_validation_commands(
+        &self,
+        state_dir: &Path,
+        commands: &[String],
+        source: &str,
+    ) -> Result<(), RalphStateError> {
+        set_validation_commands_in_store(self, state_dir, commands, source)
+    }
+
+    /// List configured validation commands for a Ralph loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Ralph database cannot be opened, migrated, or queried.
+    pub fn list_validation_commands(
+        &self,
+        state_dir: &Path,
+    ) -> Result<Vec<RalphValidationCommandRecord>, RalphStateError> {
+        list_validation_commands_in_store(self, state_dir)
+    }
+
+    /// Create a persisted Ralph run record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Ralph database cannot be opened, migrated, or written.
+    pub fn create_run(
+        &self,
+        request: RalphRunCreateRequest,
+    ) -> Result<RalphRunRecord, RalphStateError> {
+        create_run_in_store(self, request)
+    }
+
+    /// Return the active Ralph run for a loop, if one exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Ralph database cannot be opened, migrated, or queried.
+    pub fn active_run_for_loop(
+        &self,
+        state_dir: &Path,
+    ) -> Result<Option<RalphRunRecord>, RalphStateError> {
+        active_run_for_loop_in_store(self, state_dir)
+    }
+
+    /// List recent Ralph runs for a loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Ralph database cannot be opened, migrated, or queried.
+    pub fn list_runs_for_loop(
+        &self,
+        state_dir: &Path,
+    ) -> Result<Vec<RalphRunRecord>, RalphStateError> {
+        list_runs_for_loop_in_store(self, state_dir)
+    }
+
+    /// Mark a Ralph run as cancellation-requested.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Ralph database cannot be opened, migrated, or written.
+    pub fn request_run_cancel(&self, run_id: &str) -> Result<(), RalphStateError> {
+        request_run_cancel_in_store(self, run_id)
+    }
+
+    /// Update the terminal or in-flight status fields for a Ralph run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Ralph database cannot be opened, migrated, or written.
+    pub fn update_run_status(
+        &self,
+        run_id: &str,
+        status: &str,
+        finished_at_ms: Option<u64>,
+        stop_reason: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Result<(), RalphStateError> {
+        update_run_status_in_store(
+            self,
+            run_id,
+            status,
+            finished_at_ms,
+            stop_reason,
+            error_message,
+        )
+    }
+
+    /// List interrupted Ralph runs for a loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Ralph database cannot be opened, migrated, or queried.
+    pub fn interrupted_runs_for_loop(
+        &self,
+        state_dir: &Path,
+    ) -> Result<Vec<RalphRunRecord>, RalphStateError> {
+        interrupted_runs_for_loop_in_store(self, state_dir)
+    }
+
+    /// Mark all active Ralph runs for a loop as interrupted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Ralph database cannot be opened, migrated, queried, or written.
+    pub fn mark_active_runs_interrupted(
+        &self,
+        state_dir: &Path,
+        reason: &str,
+    ) -> Result<usize, RalphStateError> {
+        mark_active_runs_interrupted_in_store(self, state_dir, reason)
+    }
+
+    /// Mark every active Ralph run as interrupted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Ralph database cannot be opened, migrated, queried, or written.
+    pub fn mark_all_active_runs_interrupted(&self, reason: &str) -> Result<usize, RalphStateError> {
+        mark_all_active_runs_interrupted_in_store(self, reason)
+    }
+
+    /// Create a persisted Ralph iteration record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Ralph database cannot be opened, migrated, or written.
+    pub fn create_iteration(
+        &self,
+        request: RalphIterationCreateRequest,
+    ) -> Result<RalphIterationRecord, RalphStateError> {
+        create_iteration_in_store(self, request)
+    }
+
+    /// Update audit/replan prompt text for a Ralph iteration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Ralph database cannot be opened, migrated, or written.
+    pub fn update_iteration_prompts(
+        &self,
+        iteration_id: &str,
+        audit_prompt: Option<String>,
+        replan_prompt: Option<String>,
+    ) -> Result<(), RalphStateError> {
+        update_iteration_prompts_in_store(self, iteration_id, audit_prompt, replan_prompt)
+    }
+
+    /// List iterations for a Ralph run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Ralph database cannot be opened, migrated, or queried.
+    pub fn list_iterations_for_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<RalphIterationRecord>, RalphStateError> {
+        list_iterations_for_run_in_store(self, run_id)
+    }
+
+    /// Create a persisted Ralph validation command record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Ralph database cannot be opened, migrated, or written.
+    pub fn create_validation(
+        &self,
+        request: RalphValidationCreateRequest,
+    ) -> Result<RalphValidationRecord, RalphStateError> {
+        create_validation_in_store(self, request)
+    }
+
+    /// List validation commands for a Ralph iteration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Ralph database cannot be opened, migrated, or queried.
+    pub fn list_validations_for_iteration(
+        &self,
+        iteration_id: &str,
+    ) -> Result<Vec<RalphValidationRecord>, RalphStateError> {
+        list_validations_for_iteration_in_store(self, iteration_id)
+    }
+
+    /// Create initial local state for a Ralph loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the local state directory or files cannot be written,
+    /// or when loop metadata cannot be encoded.
+    pub fn create_initial_loop_state(
+        &self,
+        loop_name: &str,
+        repo_root: &Path,
+        session_title: Option<&str>,
+    ) -> Result<CreatedRalphLoopState, RalphStateError> {
+        create_initial_loop_state_in_store(self, loop_name, repo_root, session_title)
+    }
+
+    /// Write a bounded conversation context pack for a Ralph loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the context pack cannot be encoded or written.
+    pub fn write_context_pack(
+        &self,
+        state: &CreatedRalphLoopState,
+        session_title: Option<&str>,
+        events: &[SessionEvent],
+    ) -> Result<(), RalphStateError> {
+        write_context_pack_in_store(self, state, session_title, events)
+    }
+
+    /// Generate the local progress doc from the current context pack.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the context pack cannot be read or decoded, or when
+    /// the progress doc cannot be written.
+    pub fn generate_progress_doc_from_context(
+        &self,
+        state: &CreatedRalphLoopState,
+        loop_name: &str,
+        repo_root: &Path,
+    ) -> Result<(), RalphStateError> {
+        generate_progress_doc_from_context_in_store(self, state, loop_name, repo_root)
+    }
+
+    /// Record the isolated work area created for a Ralph loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the metadata file cannot be read, decoded, updated, or written.
+    pub fn record_work_area(
+        &self,
+        state: &CreatedRalphLoopState,
+        work_area_path: &Path,
+        branch: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<(), RalphStateError> {
+        record_work_area_in_store(self, state, work_area_path, branch, session_id)
+    }
+
+    fn database_path(&self) -> PathBuf {
+        self.ralph_state_root.join(DATABASE_FILE_NAME)
+    }
+
+    fn with_database<T>(
+        &self,
+        operation: impl for<'a> FnOnce(
+            &'a dyn Database,
+        )
+            -> Pin<Box<dyn Future<Output = Result<T, RalphStateError>> + 'a>>
+        + Send
+        + 'static,
+    ) -> Result<T, RalphStateError>
+    where
+        T: Send + 'static,
+    {
+        let state_root = self.ralph_state_root.clone();
+        let database_path = self.database_path();
+        std::fs::create_dir_all(&state_root)?;
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread Tokio runtime should build");
+            runtime.block_on(async {
+                let database = open_database(&database_path).await?;
+                run_migrations(database.as_ref()).await?;
+                operation(database.as_ref()).await
+            })
+        })
+        .join()
+        .map_err(|_| RalphStateError::DatabaseWorkerPanicked)?
+    }
+}
 
 /// Ralph loop lifecycle status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -355,9 +738,298 @@ pub struct RalphLoopSummary {
 /// # Errors
 ///
 /// Returns an error when the Ralph database cannot be opened, migrated, or queried.
+/// Return the most recently updated Ralph loop for a repository.
+///
+/// # Errors
+///
+/// Returns an error when the default Ralph database cannot be opened, migrated, or queried.
 pub fn latest_loop(repo_root: &Path) -> Result<Option<RalphLoopSummary>, RalphStateError> {
+    RalphStateStore::default().latest_loop(repo_root)
+}
+
+/// Append a Ralph lifecycle event to the loop database.
+///
+/// # Errors
+///
+/// Returns an error when the default Ralph database cannot be opened, migrated, or written.
+pub fn append_lifecycle_event(
+    state: &CreatedRalphLoopState,
+    kind: RalphLifecycleEventKind,
+    message: &str,
+) -> Result<(), RalphStateError> {
+    RalphStateStore::default().append_lifecycle_event(state, kind, message)
+}
+
+/// Append a Ralph lifecycle event using a discovered loop summary.
+///
+/// # Errors
+///
+/// Returns an error when the default Ralph database cannot be opened, migrated, or written.
+pub fn append_lifecycle_event_for_summary(
+    summary: &RalphLoopSummary,
+    kind: RalphLifecycleEventKind,
+    message: &str,
+) -> Result<(), RalphStateError> {
+    RalphStateStore::default().append_lifecycle_event_for_summary(summary, kind, message)
+}
+
+/// Append a Ralph lifecycle event using a loop state directory.
+///
+/// # Errors
+///
+/// Returns an error when the default Ralph database cannot be opened, migrated, or written.
+pub fn append_lifecycle_event_for_state_dir(
+    state_dir: &Path,
+    kind: RalphLifecycleEventKind,
+    message: &str,
+) -> Result<(), RalphStateError> {
+    RalphStateStore::default().append_lifecycle_event_for_state_dir(state_dir, kind, message)
+}
+
+/// List lifecycle events for a Ralph loop summary.
+///
+/// # Errors
+///
+/// Returns an error when the default Ralph database cannot be opened, migrated, or queried.
+pub fn list_lifecycle_events(
+    summary: &RalphLoopSummary,
+) -> Result<Vec<RalphLifecycleEventRecord>, RalphStateError> {
+    RalphStateStore::default().list_lifecycle_events(summary)
+}
+
+/// Replace validation commands for a Ralph loop.
+///
+/// # Errors
+///
+/// Returns an error when the default Ralph database cannot be opened, migrated, or written.
+pub fn set_validation_commands(
+    state_dir: &Path,
+    commands: &[String],
+    source: &str,
+) -> Result<(), RalphStateError> {
+    RalphStateStore::default().set_validation_commands(state_dir, commands, source)
+}
+
+/// List configured validation commands for a Ralph loop.
+///
+/// # Errors
+///
+/// Returns an error when the default Ralph database cannot be opened, migrated, or queried.
+pub fn list_validation_commands(
+    state_dir: &Path,
+) -> Result<Vec<RalphValidationCommandRecord>, RalphStateError> {
+    RalphStateStore::default().list_validation_commands(state_dir)
+}
+
+/// Create a persisted Ralph run record.
+///
+/// # Errors
+///
+/// Returns an error when the default Ralph database cannot be opened, migrated, or written.
+pub fn create_run(request: RalphRunCreateRequest) -> Result<RalphRunRecord, RalphStateError> {
+    RalphStateStore::default().create_run(request)
+}
+
+/// Return the active Ralph run for a loop, if one exists.
+///
+/// # Errors
+///
+/// Returns an error when the default Ralph database cannot be opened, migrated, or queried.
+pub fn active_run_for_loop(state_dir: &Path) -> Result<Option<RalphRunRecord>, RalphStateError> {
+    RalphStateStore::default().active_run_for_loop(state_dir)
+}
+
+/// List recent Ralph runs for a loop.
+///
+/// # Errors
+///
+/// Returns an error when the default Ralph database cannot be opened, migrated, or queried.
+pub fn list_runs_for_loop(state_dir: &Path) -> Result<Vec<RalphRunRecord>, RalphStateError> {
+    RalphStateStore::default().list_runs_for_loop(state_dir)
+}
+
+/// Mark a Ralph run as cancellation-requested.
+///
+/// # Errors
+///
+/// Returns an error when the default Ralph database cannot be opened, migrated, or written.
+pub fn request_run_cancel(run_id: &str) -> Result<(), RalphStateError> {
+    RalphStateStore::default().request_run_cancel(run_id)
+}
+
+/// Update the terminal or in-flight status fields for a Ralph run.
+///
+/// # Errors
+///
+/// Returns an error when the default Ralph database cannot be opened, migrated, or written.
+pub fn update_run_status(
+    run_id: &str,
+    status: &str,
+    finished_at_ms: Option<u64>,
+    stop_reason: Option<&str>,
+    error_message: Option<&str>,
+) -> Result<(), RalphStateError> {
+    RalphStateStore::default().update_run_status(
+        run_id,
+        status,
+        finished_at_ms,
+        stop_reason,
+        error_message,
+    )
+}
+
+/// List interrupted Ralph runs for a loop.
+///
+/// # Errors
+///
+/// Returns an error when the default Ralph database cannot be opened, migrated, or queried.
+pub fn interrupted_runs_for_loop(state_dir: &Path) -> Result<Vec<RalphRunRecord>, RalphStateError> {
+    RalphStateStore::default().interrupted_runs_for_loop(state_dir)
+}
+
+/// Mark all active Ralph runs for a loop as interrupted.
+///
+/// # Errors
+///
+/// Returns an error when the default Ralph database cannot be opened, migrated, queried, or written.
+pub fn mark_active_runs_interrupted(
+    state_dir: &Path,
+    reason: &str,
+) -> Result<usize, RalphStateError> {
+    RalphStateStore::default().mark_active_runs_interrupted(state_dir, reason)
+}
+
+/// Mark every active Ralph run as interrupted.
+///
+/// # Errors
+///
+/// Returns an error when the default Ralph database cannot be opened, migrated, queried, or written.
+pub fn mark_all_active_runs_interrupted(reason: &str) -> Result<usize, RalphStateError> {
+    RalphStateStore::default().mark_all_active_runs_interrupted(reason)
+}
+
+/// Create a persisted Ralph iteration record.
+///
+/// # Errors
+///
+/// Returns an error when the default Ralph database cannot be opened, migrated, or written.
+pub fn create_iteration(
+    request: RalphIterationCreateRequest,
+) -> Result<RalphIterationRecord, RalphStateError> {
+    RalphStateStore::default().create_iteration(request)
+}
+
+/// Update audit/replan prompt text for a Ralph iteration.
+///
+/// # Errors
+///
+/// Returns an error when the default Ralph database cannot be opened, migrated, or written.
+pub fn update_iteration_prompts(
+    iteration_id: &str,
+    audit_prompt: Option<String>,
+    replan_prompt: Option<String>,
+) -> Result<(), RalphStateError> {
+    RalphStateStore::default().update_iteration_prompts(iteration_id, audit_prompt, replan_prompt)
+}
+
+/// List iterations for a Ralph run.
+///
+/// # Errors
+///
+/// Returns an error when the default Ralph database cannot be opened, migrated, or queried.
+pub fn list_iterations_for_run(run_id: &str) -> Result<Vec<RalphIterationRecord>, RalphStateError> {
+    RalphStateStore::default().list_iterations_for_run(run_id)
+}
+
+/// Create a persisted Ralph validation command record.
+///
+/// # Errors
+///
+/// Returns an error when the default Ralph database cannot be opened, migrated, or written.
+pub fn create_validation(
+    request: RalphValidationCreateRequest,
+) -> Result<RalphValidationRecord, RalphStateError> {
+    RalphStateStore::default().create_validation(request)
+}
+
+/// List validation commands for a Ralph iteration.
+///
+/// # Errors
+///
+/// Returns an error when the default Ralph database cannot be opened, migrated, or queried.
+pub fn list_validations_for_iteration(
+    iteration_id: &str,
+) -> Result<Vec<RalphValidationRecord>, RalphStateError> {
+    RalphStateStore::default().list_validations_for_iteration(iteration_id)
+}
+
+/// Create initial local state for a Ralph loop.
+///
+/// # Errors
+///
+/// Returns an error when the local state directory or files cannot be written,
+/// or when loop metadata cannot be encoded by the default Ralph store.
+pub fn create_initial_loop_state(
+    loop_name: &str,
+    repo_root: &Path,
+    session_title: Option<&str>,
+) -> Result<CreatedRalphLoopState, RalphStateError> {
+    RalphStateStore::default().create_initial_loop_state(loop_name, repo_root, session_title)
+}
+
+/// Write a bounded conversation context pack for a Ralph loop.
+///
+/// # Errors
+///
+/// Returns an error when the context pack cannot be encoded or written by the default Ralph store.
+pub fn write_context_pack(
+    state: &CreatedRalphLoopState,
+    session_title: Option<&str>,
+    events: &[SessionEvent],
+) -> Result<(), RalphStateError> {
+    RalphStateStore::default().write_context_pack(state, session_title, events)
+}
+
+/// Generate the local progress doc from the current context pack.
+///
+/// # Errors
+///
+/// Returns an error when the context pack cannot be read or decoded, or when
+/// the progress doc cannot be written by the default Ralph store.
+pub fn generate_progress_doc_from_context(
+    state: &CreatedRalphLoopState,
+    loop_name: &str,
+    repo_root: &Path,
+) -> Result<(), RalphStateError> {
+    RalphStateStore::default().generate_progress_doc_from_context(state, loop_name, repo_root)
+}
+
+/// Record the isolated work area created for a Ralph loop.
+///
+/// # Errors
+///
+/// Returns an error when the metadata cannot be updated by the default Ralph store.
+pub fn record_work_area(
+    state: &CreatedRalphLoopState,
+    work_area_path: &Path,
+    branch: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<(), RalphStateError> {
+    RalphStateStore::default().record_work_area(state, work_area_path, branch, session_id)
+}
+
+/// Return the default Ralph state root for a repository.
+#[must_use]
+pub fn repo_state_root(repo_root: &Path) -> PathBuf {
+    RalphStateStore::default().repo_state_root(repo_root)
+}
+
+fn latest_loop_in_store(
+    store: &RalphStateStore,
+    repo_root: &Path,
+) -> Result<Option<RalphLoopSummary>, RalphStateError> {
     let repo_root = repo_root.to_path_buf();
-    let db_summary = with_database(move |database| {
+    let db_summary = store.with_database(move |database| {
         Box::pin(async move {
             let rows = database
                 .select("ralph_loops")
@@ -666,14 +1338,15 @@ impl RalphLifecycleEventKind {
 ///
 /// Returns an error when the Ralph database cannot be opened, migrated, or
 /// written.
-pub fn append_lifecycle_event(
+fn append_lifecycle_event_in_store(
+    store: &RalphStateStore,
     state: &CreatedRalphLoopState,
     kind: RalphLifecycleEventKind,
     message: &str,
 ) -> Result<(), RalphStateError> {
     let state_dir = state.state_dir.clone();
     let message = message.to_owned();
-    with_database(move |database| {
+    store.with_database(move |database| {
         Box::pin(async move {
             insert_lifecycle_event(database, &state_dir, kind, &message, None).await?;
             Ok(())
@@ -687,14 +1360,15 @@ pub fn append_lifecycle_event(
 ///
 /// Returns an error when the Ralph database cannot be opened, migrated, or
 /// written.
-pub fn append_lifecycle_event_for_summary(
+fn append_lifecycle_event_for_summary_in_store(
+    store: &RalphStateStore,
     summary: &RalphLoopSummary,
     kind: RalphLifecycleEventKind,
     message: &str,
 ) -> Result<(), RalphStateError> {
     let state_dir = summary.state_dir.clone();
     let message = message.to_owned();
-    with_database(move |database| {
+    store.with_database(move |database| {
         Box::pin(async move {
             insert_lifecycle_event(database, &state_dir, kind, &message, None).await?;
             Ok(())
@@ -708,14 +1382,15 @@ pub fn append_lifecycle_event_for_summary(
 ///
 /// Returns an error when the Ralph database cannot be opened, migrated, or
 /// written.
-pub fn append_lifecycle_event_for_state_dir(
+fn append_lifecycle_event_for_state_dir_in_store(
+    store: &RalphStateStore,
     state_dir: &Path,
     kind: RalphLifecycleEventKind,
     message: &str,
 ) -> Result<(), RalphStateError> {
     let state_dir = state_dir.to_path_buf();
     let message = message.to_owned();
-    with_database(move |database| {
+    store.with_database(move |database| {
         Box::pin(async move {
             insert_lifecycle_event(database, &state_dir, kind, &message, None).await?;
             Ok(())
@@ -745,11 +1420,12 @@ pub struct RalphLifecycleEventRecord {
 /// # Errors
 ///
 /// Returns an error when the Ralph database cannot be opened, migrated, or queried.
-pub fn list_lifecycle_events(
+fn list_lifecycle_events_in_store(
+    store: &RalphStateStore,
     summary: &RalphLoopSummary,
 ) -> Result<Vec<RalphLifecycleEventRecord>, RalphStateError> {
     let state_dir = summary.state_dir.clone();
-    with_database(move |database| {
+    store.with_database(move |database| {
         Box::pin(async move {
             let rows = database
                 .select("ralph_events")
@@ -914,7 +1590,8 @@ pub fn default_validation_commands(repo_root: &Path) -> Vec<String> {
 /// # Errors
 ///
 /// Returns an error when the Ralph database cannot be opened, migrated, or written.
-pub fn set_validation_commands(
+fn set_validation_commands_in_store(
+    store: &RalphStateStore,
     state_dir: &Path,
     commands: &[String],
     source: &str,
@@ -922,7 +1599,7 @@ pub fn set_validation_commands(
     let state_dir = state_dir.to_path_buf();
     let commands = commands.to_owned();
     let source = source.to_owned();
-    with_database(move |database| {
+    store.with_database(move |database| {
         Box::pin(async move {
             database
                 .delete("ralph_validation_commands")
@@ -954,11 +1631,12 @@ pub fn set_validation_commands(
 /// # Errors
 ///
 /// Returns an error when the Ralph database cannot be opened, migrated, or queried.
-pub fn list_validation_commands(
+fn list_validation_commands_in_store(
+    store: &RalphStateStore,
     state_dir: &Path,
 ) -> Result<Vec<RalphValidationCommandRecord>, RalphStateError> {
     let state_dir = state_dir.to_path_buf();
-    with_database(move |database| {
+    store.with_database(move |database| {
         Box::pin(async move {
             let rows = database
                 .select("ralph_validation_commands")
@@ -1042,7 +1720,10 @@ pub struct RalphValidationRecord {
 /// # Errors
 ///
 /// Returns an error when the Ralph database cannot be opened, migrated, or written.
-pub fn create_run(request: RalphRunCreateRequest) -> Result<RalphRunRecord, RalphStateError> {
+fn create_run_in_store(
+    store: &RalphStateStore,
+    request: RalphRunCreateRequest,
+) -> Result<RalphRunRecord, RalphStateError> {
     let run_id = uuid::Uuid::new_v4().to_string();
     let now = now_ms();
     let record = RalphRunRecord {
@@ -1060,7 +1741,7 @@ pub fn create_run(request: RalphRunCreateRequest) -> Result<RalphRunRecord, Ralp
         error_message: None,
     };
     let persisted = record.clone();
-    with_database(move |database| {
+    store.with_database(move |database| {
         Box::pin(async move {
             insert_run_record(database, &persisted).await?;
             Ok(())
@@ -1074,9 +1755,12 @@ pub fn create_run(request: RalphRunCreateRequest) -> Result<RalphRunRecord, Ralp
 /// # Errors
 ///
 /// Returns an error when the Ralph database cannot be opened, migrated, or queried.
-pub fn active_run_for_loop(state_dir: &Path) -> Result<Option<RalphRunRecord>, RalphStateError> {
+fn active_run_for_loop_in_store(
+    store: &RalphStateStore,
+    state_dir: &Path,
+) -> Result<Option<RalphRunRecord>, RalphStateError> {
     let state_dir = state_dir.to_path_buf();
-    with_database(move |database| {
+    store.with_database(move |database| {
         Box::pin(async move {
             let rows = database
                 .select("ralph_runs")
@@ -1103,9 +1787,12 @@ pub fn active_run_for_loop(state_dir: &Path) -> Result<Option<RalphRunRecord>, R
 /// # Errors
 ///
 /// Returns an error when the Ralph database cannot be opened, migrated, or queried.
-pub fn list_runs_for_loop(state_dir: &Path) -> Result<Vec<RalphRunRecord>, RalphStateError> {
+fn list_runs_for_loop_in_store(
+    store: &RalphStateStore,
+    state_dir: &Path,
+) -> Result<Vec<RalphRunRecord>, RalphStateError> {
     let state_dir = state_dir.to_path_buf();
-    with_database(move |database| {
+    store.with_database(move |database| {
         Box::pin(async move {
             let rows = database
                 .select("ralph_runs")
@@ -1131,9 +1818,12 @@ pub fn list_runs_for_loop(state_dir: &Path) -> Result<Vec<RalphRunRecord>, Ralph
 /// # Errors
 ///
 /// Returns an error when the Ralph database cannot be opened, migrated, or written.
-pub fn request_run_cancel(run_id: &str) -> Result<(), RalphStateError> {
+fn request_run_cancel_in_store(
+    store: &RalphStateStore,
+    run_id: &str,
+) -> Result<(), RalphStateError> {
     let run_id = run_id.to_owned();
-    with_database(move |database| {
+    store.with_database(move |database| {
         Box::pin(async move {
             database
                 .update("ralph_runs")
@@ -1152,7 +1842,8 @@ pub fn request_run_cancel(run_id: &str) -> Result<(), RalphStateError> {
 /// # Errors
 ///
 /// Returns an error when the Ralph database cannot be opened, migrated, or written.
-pub fn update_run_status(
+fn update_run_status_in_store(
+    store: &RalphStateStore,
     run_id: &str,
     status: &str,
     finished_at_ms: Option<u64>,
@@ -1163,7 +1854,7 @@ pub fn update_run_status(
     let status = status.to_owned();
     let stop_reason = stop_reason.map(ToOwned::to_owned);
     let error_message = error_message.map(ToOwned::to_owned);
-    with_database(move |database| {
+    store.with_database(move |database| {
         Box::pin(async move {
             database
                 .update("ralph_runs")
@@ -1185,9 +1876,12 @@ pub fn update_run_status(
 /// # Errors
 ///
 /// Returns an error when the Ralph database cannot be opened, migrated, or queried.
-pub fn interrupted_runs_for_loop(state_dir: &Path) -> Result<Vec<RalphRunRecord>, RalphStateError> {
+fn interrupted_runs_for_loop_in_store(
+    store: &RalphStateStore,
+    state_dir: &Path,
+) -> Result<Vec<RalphRunRecord>, RalphStateError> {
     let state_dir = state_dir.to_path_buf();
-    with_database(move |database| {
+    store.with_database(move |database| {
         Box::pin(async move {
             let rows = database
                 .select("ralph_runs")
@@ -1214,13 +1908,14 @@ pub fn interrupted_runs_for_loop(state_dir: &Path) -> Result<Vec<RalphRunRecord>
 /// # Errors
 ///
 /// Returns an error when the Ralph database cannot be opened, migrated, queried, or written.
-pub fn mark_active_runs_interrupted(
+fn mark_active_runs_interrupted_in_store(
+    store: &RalphStateStore,
     state_dir: &Path,
     reason: &str,
 ) -> Result<usize, RalphStateError> {
     let state_dir = state_dir.to_path_buf();
     let reason = reason.to_owned();
-    with_database(move |database| {
+    store.with_database(move |database| {
         Box::pin(async move {
             let rows = database
                 .select("ralph_runs")
@@ -1259,9 +1954,12 @@ pub fn mark_active_runs_interrupted(
 /// # Errors
 ///
 /// Returns an error when the Ralph database cannot be opened, migrated, queried, or written.
-pub fn mark_all_active_runs_interrupted(reason: &str) -> Result<usize, RalphStateError> {
+fn mark_all_active_runs_interrupted_in_store(
+    store: &RalphStateStore,
+    reason: &str,
+) -> Result<usize, RalphStateError> {
     let reason = reason.to_owned();
-    with_database(move |database| {
+    store.with_database(move |database| {
         Box::pin(async move {
             let rows = database
                 .select("ralph_runs")
@@ -1296,7 +1994,8 @@ pub fn mark_all_active_runs_interrupted(reason: &str) -> Result<usize, RalphStat
 /// # Errors
 ///
 /// Returns an error when the Ralph database cannot be opened, migrated, or written.
-pub fn create_iteration(
+fn create_iteration_in_store(
+    store: &RalphStateStore,
     request: RalphIterationCreateRequest,
 ) -> Result<RalphIterationRecord, RalphStateError> {
     let now = now_ms();
@@ -1319,7 +2018,7 @@ pub fn create_iteration(
         error_message: request.error_message,
     };
     let persisted = record.clone();
-    with_database(move |database| {
+    store.with_database(move |database| {
         Box::pin(async move {
             insert_iteration_record(database, &persisted).await?;
             Ok(())
@@ -1333,13 +2032,14 @@ pub fn create_iteration(
 /// # Errors
 ///
 /// Returns an error when the Ralph database cannot be opened, migrated, or written.
-pub fn update_iteration_prompts(
+fn update_iteration_prompts_in_store(
+    store: &RalphStateStore,
     iteration_id: &str,
     audit_prompt: Option<String>,
     replan_prompt: Option<String>,
 ) -> Result<(), RalphStateError> {
     let iteration_id = iteration_id.to_owned();
-    with_database(move |database| {
+    store.with_database(move |database| {
         Box::pin(async move {
             let mut update = database
                 .update("ralph_iterations")
@@ -1361,9 +2061,12 @@ pub fn update_iteration_prompts(
 /// # Errors
 ///
 /// Returns an error when the Ralph database cannot be opened, migrated, or queried.
-pub fn list_iterations_for_run(run_id: &str) -> Result<Vec<RalphIterationRecord>, RalphStateError> {
+fn list_iterations_for_run_in_store(
+    store: &RalphStateStore,
+    run_id: &str,
+) -> Result<Vec<RalphIterationRecord>, RalphStateError> {
     let run_id = run_id.to_owned();
-    with_database(move |database| {
+    store.with_database(move |database| {
         Box::pin(async move {
             let rows = database
                 .select("ralph_iterations")
@@ -1386,7 +2089,8 @@ pub fn list_iterations_for_run(run_id: &str) -> Result<Vec<RalphIterationRecord>
 /// # Errors
 ///
 /// Returns an error when the Ralph database cannot be opened, migrated, or written.
-pub fn create_validation(
+fn create_validation_in_store(
+    store: &RalphStateStore,
     request: RalphValidationCreateRequest,
 ) -> Result<RalphValidationRecord, RalphStateError> {
     let now = now_ms();
@@ -1402,7 +2106,7 @@ pub fn create_validation(
         error_message: request.error_message,
     };
     let persisted = record.clone();
-    with_database(move |database| {
+    store.with_database(move |database| {
         Box::pin(async move {
             insert_validation_record(database, &persisted).await?;
             Ok(())
@@ -1416,11 +2120,12 @@ pub fn create_validation(
 /// # Errors
 ///
 /// Returns an error when the Ralph database cannot be opened, migrated, or queried.
-pub fn list_validations_for_iteration(
+fn list_validations_for_iteration_in_store(
+    store: &RalphStateStore,
     iteration_id: &str,
 ) -> Result<Vec<RalphValidationRecord>, RalphStateError> {
     let iteration_id = iteration_id.to_owned();
-    with_database(move |database| {
+    store.with_database(move |database| {
         Box::pin(async move {
             let rows = database
                 .select("ralph_validation_runs")
@@ -1444,12 +2149,13 @@ pub fn list_validations_for_iteration(
 ///
 /// Returns an error when the local state directory or files cannot be written,
 /// or when loop metadata cannot be encoded.
-pub fn create_initial_loop_state(
+fn create_initial_loop_state_in_store(
+    store: &RalphStateStore,
     loop_name: &str,
     repo_root: &Path,
     session_title: Option<&str>,
 ) -> Result<CreatedRalphLoopState, RalphStateError> {
-    let paths = allocate_loop_paths(loop_name, repo_root)?;
+    let paths = allocate_loop_paths_in_store(store, loop_name, repo_root)?;
     std::fs::create_dir_all(&paths.state_dir)?;
     let metadata = LoopMetadata::new(loop_name, repo_root, &paths);
     std::fs::write(
@@ -1460,12 +2166,13 @@ pub fn create_initial_loop_state(
         &paths.context_pack_path,
         initial_context_pack(loop_name, session_title)?,
     )?;
-    upsert_loop_metadata(&metadata)?;
+    upsert_loop_metadata_in_store(store, &metadata)?;
     let validation_commands = default_validation_commands(repo_root);
     if !validation_commands.is_empty() {
-        set_validation_commands(&paths.state_dir, &validation_commands, "default")?;
+        set_validation_commands_in_store(store, &paths.state_dir, &validation_commands, "default")?;
     }
-    append_lifecycle_event(
+    append_lifecycle_event_in_store(
+        store,
         &paths,
         RalphLifecycleEventKind::Created,
         "Ralph loop state created",
@@ -1478,7 +2185,8 @@ pub fn create_initial_loop_state(
 /// # Errors
 ///
 /// Returns an error when the context pack cannot be encoded or written.
-pub fn write_context_pack(
+fn write_context_pack_in_store(
+    store: &RalphStateStore,
     state: &CreatedRalphLoopState,
     session_title: Option<&str>,
     events: &[SessionEvent],
@@ -1488,12 +2196,14 @@ pub fn write_context_pack(
         &state.context_pack_path,
         serde_json::to_vec_pretty(&pack).map_err(RalphStateError::Json)?,
     )?;
-    update_metadata_field(
+    update_metadata_field_in_store(
+        store,
         state,
         "status",
         Value::String(RalphLoopStatus::Planning.as_str().to_owned()),
     )?;
-    append_lifecycle_event(
+    append_lifecycle_event_in_store(
+        store,
         state,
         RalphLifecycleEventKind::ContextCaptured,
         "Captured bounded context pack",
@@ -1507,7 +2217,8 @@ pub fn write_context_pack(
 ///
 /// Returns an error when the context pack cannot be read or decoded, or when
 /// the progress doc cannot be written.
-pub fn generate_progress_doc_from_context(
+fn generate_progress_doc_from_context_in_store(
+    store: &RalphStateStore,
     state: &CreatedRalphLoopState,
     loop_name: &str,
     repo_root: &Path,
@@ -1519,12 +2230,14 @@ pub fn generate_progress_doc_from_context(
         &state.progress_doc_path,
         progress_doc_from_context(loop_name, repo_root, state, &context_pack),
     )?;
-    update_metadata_field(
+    update_metadata_field_in_store(
+        store,
         state,
         "status",
         Value::String(RalphLoopStatus::AwaitingApproval.as_str().to_owned()),
     )?;
-    append_lifecycle_event(
+    append_lifecycle_event_in_store(
+        store,
         state,
         RalphLifecycleEventKind::ProgressDocGenerated,
         "Generated progress doc from context pack",
@@ -1538,14 +2251,16 @@ pub fn generate_progress_doc_from_context(
 ///
 /// Returns an error when the metadata file cannot be read, decoded, updated, or
 /// written.
-pub fn record_work_area(
+fn record_work_area_in_store(
+    store: &RalphStateStore,
     state: &CreatedRalphLoopState,
     work_area_path: &Path,
     branch: Option<&str>,
     session_id: Option<&str>,
 ) -> Result<(), RalphStateError> {
-    update_loop_work_area(state, work_area_path, branch, session_id)?;
-    append_lifecycle_event(
+    update_loop_work_area_in_store(store, state, work_area_path, branch, session_id)?;
+    append_lifecycle_event_in_store(
+        store,
         state,
         RalphLifecycleEventKind::WorkAreaCreated,
         "Created isolated work area",
@@ -1553,27 +2268,27 @@ pub fn record_work_area(
     Ok(())
 }
 
-fn update_metadata_field(
+fn update_metadata_field_in_store(
+    store: &RalphStateStore,
     state: &CreatedRalphLoopState,
     key: &str,
     value: Value,
 ) -> Result<(), RalphStateError> {
-    update_loop_metadata_field(state, key, value)
+    update_loop_metadata_field_in_store(store, state, key, value)
 }
 
 /// Return the default Ralph state root for a repository.
 #[must_use]
-pub fn repo_state_root(repo_root: &Path) -> PathBuf {
-    bcode_config::default_state_dir()
-        .join(RALPH_STATE_SUBDIR)
-        .join(repo_state_id(repo_root))
+fn repo_state_root_in_store(store: &RalphStateStore, repo_root: &Path) -> PathBuf {
+    store.ralph_state_root().join(repo_state_id(repo_root))
 }
 
-fn allocate_loop_paths(
+fn allocate_loop_paths_in_store(
+    store: &RalphStateStore,
     loop_name: &str,
     repo_root: &Path,
 ) -> Result<CreatedRalphLoopState, RalphStateError> {
-    let root = repo_state_root(repo_root);
+    let root = repo_state_root_in_store(store, repo_root);
     let loop_slug = slugify(loop_name);
     for suffix in 0..100_u8 {
         let candidate_slug = if suffix == 0 {
@@ -1881,7 +2596,10 @@ fn now_ms() -> u128 {
         .map_or(0, |duration| duration.as_millis())
 }
 
-fn upsert_loop_metadata(metadata: &LoopMetadata<'_>) -> Result<(), RalphStateError> {
+fn upsert_loop_metadata_in_store(
+    store: &RalphStateStore,
+    metadata: &LoopMetadata<'_>,
+) -> Result<(), RalphStateError> {
     let state_dir = metadata.state_dir.to_path_buf();
     let loop_name = metadata.loop_name.to_owned();
     let repo_id = metadata.repo_id.clone();
@@ -1895,7 +2613,7 @@ fn upsert_loop_metadata(metadata: &LoopMetadata<'_>) -> Result<(), RalphStateErr
     let no_progress_limit = u128_to_i64(u128::from(metadata.no_progress_limit));
     let created_at_ms = u128_to_i64(metadata.created_at_ms);
     let updated_at_ms = u128_to_i64(metadata.updated_at_ms);
-    with_database(move |database| {
+    store.with_database(move |database| {
         Box::pin(async move {
             let state_dir_text = state_dir.display().to_string();
             let existing = database
@@ -1931,7 +2649,8 @@ fn upsert_loop_metadata(metadata: &LoopMetadata<'_>) -> Result<(), RalphStateErr
     })
 }
 
-fn update_loop_metadata_field(
+fn update_loop_metadata_field_in_store(
+    store: &RalphStateStore,
     state: &CreatedRalphLoopState,
     key: &str,
     value: Value,
@@ -1943,7 +2662,7 @@ fn update_loop_metadata_field(
         Value::Number(number) => Some(number.to_string()),
         _ => None,
     };
-    with_database(move |database| {
+    store.with_database(move |database| {
         Box::pin(async move {
             let mut update = database
                 .update("ralph_loops")
@@ -1976,7 +2695,8 @@ fn update_loop_metadata_field(
     })
 }
 
-fn update_loop_work_area(
+fn update_loop_work_area_in_store(
+    store: &RalphStateStore,
     state: &CreatedRalphLoopState,
     work_area_path: &Path,
     branch: Option<&str>,
@@ -1986,7 +2706,7 @@ fn update_loop_work_area(
     let work_area_path = work_area_path.display().to_string();
     let branch = branch.map(ToOwned::to_owned);
     let session_id = session_id.map(ToOwned::to_owned);
-    with_database(move |database| {
+    store.with_database(move |database| {
         Box::pin(async move {
             database
                 .update("ralph_loops")
@@ -2004,35 +2724,6 @@ fn update_loop_work_area(
             Ok(())
         })
     })
-}
-
-fn with_database<T>(
-    operation: impl for<'a> FnOnce(
-        &'a dyn Database,
-    )
-        -> Pin<Box<dyn Future<Output = Result<T, RalphStateError>> + 'a>>
-    + Send
-    + 'static,
-) -> Result<T, RalphStateError>
-where
-    T: Send + 'static,
-{
-    let state_root = bcode_config::default_state_dir().join(RALPH_STATE_SUBDIR);
-    let database_path = state_root.join(DATABASE_FILE_NAME);
-    std::fs::create_dir_all(&state_root)?;
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("current-thread Tokio runtime should build");
-        runtime.block_on(async {
-            let database = open_database(&database_path).await?;
-            run_migrations(database.as_ref()).await?;
-            operation(database.as_ref()).await
-        })
-    })
-    .join()
-    .map_err(|_| RalphStateError::DatabaseWorkerPanicked)?
 }
 
 async fn open_database(path: &Path) -> Result<Box<dyn Database>, RalphStateError> {
@@ -2062,11 +2753,7 @@ async fn open_database(path: &Path) -> Result<Box<dyn Database>, RalphStateError
 
 fn is_database_lock_error(error: &impl std::fmt::Display) -> bool {
     let message = error.to_string().to_ascii_lowercase();
-    message.contains("database is locked")
-        || message.contains("busy")
-        || message.contains("locking error")
-        || message.contains("file is locked")
-        || message.contains("locked by another process")
+    message.contains("database is locked") || message.contains("busy")
 }
 
 async fn run_migrations(database: &dyn Database) -> Result<(), RalphStateError> {
@@ -2414,6 +3101,12 @@ pub enum RalphStateError {
 mod tests {
     use super::*;
 
+    fn test_store() -> (tempfile::TempDir, RalphStateStore) {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let store = RalphStateStore::from_ralph_state_root(temp.path().join("ralph"));
+        (temp, store)
+    }
+
     #[test]
     fn slugify_normalizes_loop_names() {
         assert_eq!(slugify("Session Import Cleanup"), "session-import-cleanup");
@@ -2518,69 +3211,83 @@ mod tests {
 
     #[test]
     fn run_iteration_and_validation_records_round_trip() {
+        let (_temp, store) = test_store();
         let state_dir = PathBuf::from(format!("/tmp/bcode-ralph-test-{}", uuid::Uuid::new_v4()));
-        let run = create_run(RalphRunCreateRequest {
-            state_dir: state_dir.clone(),
-            session_id: Some("session-1".to_owned()),
-            status: "running".to_owned(),
-            requested_max_iterations: Some(3),
-            requested_no_progress_limit: Some(2),
-        })
-        .expect("run should persist");
+        let run = store
+            .create_run(RalphRunCreateRequest {
+                state_dir: state_dir.clone(),
+                session_id: Some("session-1".to_owned()),
+                status: "running".to_owned(),
+                requested_max_iterations: Some(3),
+                requested_no_progress_limit: Some(2),
+            })
+            .expect("run should persist");
         assert_eq!(run.state_dir, state_dir);
         assert_eq!(run.session_id.as_deref(), Some("session-1"));
 
-        let active = active_run_for_loop(&state_dir)
+        let active = store
+            .active_run_for_loop(&state_dir)
             .expect("active run should query")
             .expect("active run should exist");
         assert_eq!(active.run_id, run.run_id);
         assert!(!active.cancel_requested);
 
-        request_run_cancel(&run.run_id).expect("cancel should persist");
-        let cancelled = active_run_for_loop(&state_dir)
+        store
+            .request_run_cancel(&run.run_id)
+            .expect("cancel should persist");
+        let cancelled = store
+            .active_run_for_loop(&state_dir)
             .expect("cancelled active run should query")
             .expect("cancelled active run should still be active");
         assert!(cancelled.cancel_requested);
 
-        let iteration = create_iteration(RalphIterationCreateRequest {
-            run_id: run.run_id.clone(),
-            state_dir,
-            iteration_number: 1,
-            status: "working".to_owned(),
-            checklist_fingerprint_before: Some("before".to_owned()),
-            checklist_fingerprint_after: Some("after".to_owned()),
-            work_prompt: Some("do work".to_owned()),
-            finished_at_ms: None,
-            stop_reason: None,
-            error_message: None,
-        })
-        .expect("iteration should persist");
-        let iterations = list_iterations_for_run(&run.run_id).expect("iterations should query");
+        let iteration = store
+            .create_iteration(RalphIterationCreateRequest {
+                run_id: run.run_id.clone(),
+                state_dir,
+                iteration_number: 1,
+                status: "working".to_owned(),
+                checklist_fingerprint_before: Some("before".to_owned()),
+                checklist_fingerprint_after: Some("after".to_owned()),
+                work_prompt: Some("do work".to_owned()),
+                finished_at_ms: None,
+                stop_reason: None,
+                error_message: None,
+            })
+            .expect("iteration should persist");
+        let iterations = store
+            .list_iterations_for_run(&run.run_id)
+            .expect("iterations should query");
         assert_eq!(iterations.len(), 1);
         assert_eq!(iterations[0].iteration_id, iteration.iteration_id);
         assert_eq!(iterations[0].work_prompt.as_deref(), Some("do work"));
 
-        update_iteration_prompts(
-            &iteration.iteration_id,
-            Some("audit".to_owned()),
-            Some("replan".to_owned()),
-        )
-        .expect("iteration prompts should update");
-        let iterations = list_iterations_for_run(&run.run_id).expect("iterations should query");
+        store
+            .update_iteration_prompts(
+                &iteration.iteration_id,
+                Some("audit".to_owned()),
+                Some("replan".to_owned()),
+            )
+            .expect("iteration prompts should update");
+        let iterations = store
+            .list_iterations_for_run(&run.run_id)
+            .expect("iterations should query");
         assert_eq!(iterations[0].audit_prompt.as_deref(), Some("audit"));
         assert_eq!(iterations[0].replan_prompt.as_deref(), Some("replan"));
 
-        let validation = create_validation(RalphValidationCreateRequest {
-            iteration_id: iteration.iteration_id.clone(),
-            command: "cargo check -p bcode_ralph".to_owned(),
-            status: "queued".to_owned(),
-            exit_code: None,
-            output_ref: None,
-            finished_at_ms: None,
-            error_message: None,
-        })
-        .expect("validation should persist");
-        let validations = list_validations_for_iteration(&iteration.iteration_id)
+        let validation = store
+            .create_validation(RalphValidationCreateRequest {
+                iteration_id: iteration.iteration_id.clone(),
+                command: "cargo check -p bcode_ralph".to_owned(),
+                status: "queued".to_owned(),
+                exit_code: None,
+                output_ref: None,
+                finished_at_ms: None,
+                error_message: None,
+            })
+            .expect("validation should persist");
+        let validations = store
+            .list_validations_for_iteration(&iteration.iteration_id)
             .expect("validations should query");
         assert_eq!(validations.len(), 1);
         assert_eq!(validations[0].validation_id, validation.validation_id);
@@ -2589,36 +3296,41 @@ mod tests {
 
     #[test]
     fn active_run_query_returns_latest_active_run_only() {
+        let (_temp, store) = test_store();
         let state_dir = PathBuf::from(format!(
             "/tmp/bcode-ralph-active-lock-test-{}",
             uuid::Uuid::new_v4()
         ));
-        let first = create_run(RalphRunCreateRequest {
-            state_dir: state_dir.clone(),
-            session_id: None,
-            status: "running".to_owned(),
-            requested_max_iterations: None,
-            requested_no_progress_limit: None,
-        })
-        .expect("first run should persist");
-        update_run_status(
-            &first.run_id,
-            "blocked",
-            Some(first.started_at_ms + 1),
-            Some("test"),
-            Some("blocked by test"),
-        )
-        .expect("first run should update");
-        let second = create_run(RalphRunCreateRequest {
-            state_dir: state_dir.clone(),
-            session_id: None,
-            status: "awaiting_approval".to_owned(),
-            requested_max_iterations: Some(3),
-            requested_no_progress_limit: Some(1),
-        })
-        .expect("second run should persist");
+        let first = store
+            .create_run(RalphRunCreateRequest {
+                state_dir: state_dir.clone(),
+                session_id: None,
+                status: "running".to_owned(),
+                requested_max_iterations: None,
+                requested_no_progress_limit: None,
+            })
+            .expect("first run should persist");
+        store
+            .update_run_status(
+                &first.run_id,
+                "blocked",
+                Some(first.started_at_ms + 1),
+                Some("test"),
+                Some("blocked by test"),
+            )
+            .expect("first run should update");
+        let second = store
+            .create_run(RalphRunCreateRequest {
+                state_dir: state_dir.clone(),
+                session_id: None,
+                status: "awaiting_approval".to_owned(),
+                requested_max_iterations: Some(3),
+                requested_no_progress_limit: Some(1),
+            })
+            .expect("second run should persist");
 
-        let active = active_run_for_loop(&state_dir)
+        let active = store
+            .active_run_for_loop(&state_dir)
             .expect("active run query should work")
             .expect("active run should exist");
         assert_eq!(active.run_id, second.run_id);
@@ -2627,28 +3339,33 @@ mod tests {
 
     #[test]
     fn recent_runs_are_listed_newest_first() {
+        let (_temp, store) = test_store();
         let state_dir = PathBuf::from(format!(
             "/tmp/bcode-ralph-runs-list-test-{}",
             uuid::Uuid::new_v4()
         ));
-        let first = create_run(RalphRunCreateRequest {
-            state_dir: state_dir.clone(),
-            session_id: None,
-            status: "blocked".to_owned(),
-            requested_max_iterations: None,
-            requested_no_progress_limit: None,
-        })
-        .expect("first run should persist");
-        let second = create_run(RalphRunCreateRequest {
-            state_dir: state_dir.clone(),
-            session_id: None,
-            status: "running".to_owned(),
-            requested_max_iterations: Some(2),
-            requested_no_progress_limit: Some(1),
-        })
-        .expect("second run should persist");
+        let first = store
+            .create_run(RalphRunCreateRequest {
+                state_dir: state_dir.clone(),
+                session_id: None,
+                status: "blocked".to_owned(),
+                requested_max_iterations: None,
+                requested_no_progress_limit: None,
+            })
+            .expect("first run should persist");
+        let second = store
+            .create_run(RalphRunCreateRequest {
+                state_dir: state_dir.clone(),
+                session_id: None,
+                status: "running".to_owned(),
+                requested_max_iterations: Some(2),
+                requested_no_progress_limit: Some(1),
+            })
+            .expect("second run should persist");
 
-        let runs = list_runs_for_loop(&state_dir).expect("runs should list");
+        let runs = store
+            .list_runs_for_loop(&state_dir)
+            .expect("runs should list");
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].run_id, second.run_id);
         assert_eq!(runs[1].run_id, first.run_id);
@@ -2656,43 +3373,48 @@ mod tests {
 
     #[test]
     fn validation_records_capture_failure_details() {
+        let (_temp, store) = test_store();
         let state_dir = PathBuf::from(format!(
             "/tmp/bcode-ralph-validation-parse-test-{}",
             uuid::Uuid::new_v4()
         ));
-        let run = create_run(RalphRunCreateRequest {
-            state_dir,
-            session_id: None,
-            status: "running".to_owned(),
-            requested_max_iterations: None,
-            requested_no_progress_limit: None,
-        })
-        .expect("run should persist");
-        let iteration = create_iteration(RalphIterationCreateRequest {
-            run_id: run.run_id,
-            state_dir: PathBuf::from("/tmp/bcode-ralph-validation-parse-loop"),
-            iteration_number: 1,
-            work_prompt: Some("work".to_owned()),
-            checklist_fingerprint_before: None,
-            checklist_fingerprint_after: None,
-            status: "blocked".to_owned(),
-            stop_reason: Some("validation_failed".to_owned()),
-            error_message: Some("cargo test failed".to_owned()),
-            finished_at_ms: Some(42),
-        })
-        .expect("iteration should persist");
-        create_validation(RalphValidationCreateRequest {
-            iteration_id: iteration.iteration_id.clone(),
-            command: "cargo test".to_owned(),
-            status: "failed".to_owned(),
-            exit_code: Some(101),
-            output_ref: Some("target/ralph-validation.log".to_owned()),
-            finished_at_ms: Some(43),
-            error_message: Some("test failed".to_owned()),
-        })
-        .expect("validation should persist");
+        let run = store
+            .create_run(RalphRunCreateRequest {
+                state_dir,
+                session_id: None,
+                status: "running".to_owned(),
+                requested_max_iterations: None,
+                requested_no_progress_limit: None,
+            })
+            .expect("run should persist");
+        let iteration = store
+            .create_iteration(RalphIterationCreateRequest {
+                run_id: run.run_id,
+                state_dir: PathBuf::from("/tmp/bcode-ralph-validation-parse-loop"),
+                iteration_number: 1,
+                work_prompt: Some("work".to_owned()),
+                checklist_fingerprint_before: None,
+                checklist_fingerprint_after: None,
+                status: "blocked".to_owned(),
+                stop_reason: Some("validation_failed".to_owned()),
+                error_message: Some("cargo test failed".to_owned()),
+                finished_at_ms: Some(42),
+            })
+            .expect("iteration should persist");
+        store
+            .create_validation(RalphValidationCreateRequest {
+                iteration_id: iteration.iteration_id.clone(),
+                command: "cargo test".to_owned(),
+                status: "failed".to_owned(),
+                exit_code: Some(101),
+                output_ref: Some("target/ralph-validation.log".to_owned()),
+                finished_at_ms: Some(43),
+                error_message: Some("test failed".to_owned()),
+            })
+            .expect("validation should persist");
 
-        let validations = list_validations_for_iteration(&iteration.iteration_id)
+        let validations = store
+            .list_validations_for_iteration(&iteration.iteration_id)
             .expect("validations should query");
         assert_eq!(validations.len(), 1);
         assert_eq!(validations[0].status, "failed");
@@ -2718,29 +3440,34 @@ mod tests {
 
     #[test]
     fn active_runs_can_be_marked_interrupted() {
+        let (_temp, store) = test_store();
         let state_dir = PathBuf::from(format!(
             "/tmp/bcode-ralph-interrupted-test-{}",
             uuid::Uuid::new_v4()
         ));
-        let run = create_run(RalphRunCreateRequest {
-            state_dir: state_dir.clone(),
-            session_id: None,
-            status: "running".to_owned(),
-            requested_max_iterations: None,
-            requested_no_progress_limit: None,
-        })
-        .expect("run should persist");
+        let run = store
+            .create_run(RalphRunCreateRequest {
+                state_dir: state_dir.clone(),
+                session_id: None,
+                status: "running".to_owned(),
+                requested_max_iterations: None,
+                requested_no_progress_limit: None,
+            })
+            .expect("run should persist");
 
-        let marked = mark_active_runs_interrupted(&state_dir, "daemon restart")
+        let marked = store
+            .mark_active_runs_interrupted(&state_dir, "daemon restart")
             .expect("active runs should mark interrupted");
         assert_eq!(marked, 1);
         assert!(
-            active_run_for_loop(&state_dir)
+            store
+                .active_run_for_loop(&state_dir)
                 .expect("active run query should work")
                 .is_none()
         );
-        let interrupted =
-            interrupted_runs_for_loop(&state_dir).expect("interrupted runs should query");
+        let interrupted = store
+            .interrupted_runs_for_loop(&state_dir)
+            .expect("interrupted runs should query");
         assert_eq!(interrupted.len(), 1);
         assert_eq!(interrupted[0].run_id, run.run_id);
         assert_eq!(
@@ -2751,34 +3478,40 @@ mod tests {
 
     #[test]
     fn latest_loop_reads_database_rows_and_records_events() {
-        let temp = tempfile::tempdir().expect("tempdir should create");
+        let (temp, store) = test_store();
         let repo_root = temp.path().join("repo");
         std::fs::create_dir_all(&repo_root).expect("repo should create");
         std::fs::write(repo_root.join("Cargo.toml"), "[workspace]\n")
             .expect("manifest should write");
-        let state = create_initial_loop_state(
-            &format!("db-backed-{}", uuid::Uuid::new_v4()),
-            &repo_root,
-            Some("DB backed test"),
-        )
-        .expect("loop state should create");
-        append_lifecycle_event(
-            &state,
-            RalphLifecycleEventKind::StatusViewed,
-            "status viewed in test",
-        )
-        .expect("event should append");
+        let state = store
+            .create_initial_loop_state(
+                &format!("db-backed-{}", uuid::Uuid::new_v4()),
+                &repo_root,
+                Some("DB backed test"),
+            )
+            .expect("loop state should create");
+        store
+            .append_lifecycle_event(
+                &state,
+                RalphLifecycleEventKind::StatusViewed,
+                "status viewed in test",
+            )
+            .expect("event should append");
 
-        let summary = latest_loop(&repo_root)
+        let summary = store
+            .latest_loop(&repo_root)
             .expect("latest loop should query")
             .expect("latest loop should exist");
         assert_eq!(summary.state_dir, state.state_dir);
         assert!(summary.loop_name.starts_with("db-backed-"));
         assert_eq!(summary.progress_doc_path, state.progress_doc_path);
-        let events = list_lifecycle_events(&summary).expect("events should query");
+        let events = store
+            .list_lifecycle_events(&summary)
+            .expect("events should query");
         assert!(events.len() >= 2);
-        let validation_commands =
-            list_validation_commands(&summary.state_dir).expect("validation commands should query");
+        let validation_commands = store
+            .list_validation_commands(&summary.state_dir)
+            .expect("validation commands should query");
         assert_eq!(validation_commands.len(), 1);
         assert_eq!(validation_commands[0].command, "cargo check --workspace");
     }

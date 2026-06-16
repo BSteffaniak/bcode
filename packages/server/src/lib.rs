@@ -140,6 +140,7 @@ pub struct ServerState {
     session_runtimes: Mutex<BTreeMap<SessionId, SessionRuntimeHandle>>,
     active_session_turns: Mutex<BTreeMap<SessionId, ActiveSessionTurn>>,
     runtime_work: RuntimeWorkManager,
+    ralph_store: bcode_ralph::RalphStateStore,
     active_ralph_runs: Mutex<BTreeMap<PathBuf, JoinHandle<()>>>,
     active_turns: Mutex<BTreeMap<SessionId, ActiveModelTurn>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
@@ -568,6 +569,7 @@ struct ServerStateInit {
     daemon_status: DaemonStatus,
     daemon_record_path: Option<PathBuf>,
     metrics: MetricsRegistry,
+    ralph_store: bcode_ralph::RalphStateStore,
 }
 
 impl ServerState {
@@ -602,6 +604,7 @@ impl ServerState {
             session_runtimes: Mutex::default(),
             active_session_turns: Mutex::default(),
             runtime_work: RuntimeWorkManager::default(),
+            ralph_store: init.ralph_store,
             active_ralph_runs: Mutex::default(),
             active_turns: Mutex::default(),
             session_model_selections: Mutex::default(),
@@ -1395,6 +1398,7 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
                 &daemon_record.namespace,
             )),
             metrics,
+            ralph_store: bcode_ralph::RalphStateStore::default(),
         },
     ));
     state.start_catalog_event_forwarder();
@@ -1431,7 +1435,10 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
 }
 
 fn interrupt_stale_ralph_runs_best_effort(state: &ServerState) {
-    match bcode_ralph::mark_all_active_runs_interrupted("daemon restart") {
+    match state
+        .ralph_store
+        .mark_all_active_runs_interrupted("daemon restart")
+    {
         Ok(marked) if marked > 0 => {
             state
                 .metrics
@@ -1618,7 +1625,9 @@ async fn handle_request(
         Request::RemoveWorktree(request) => {
             handle_remove_worktree(request_id, state, writer, request).await
         }
-        Request::RalphStatus(request) => handle_ralph_status(request_id, writer, request).await,
+        Request::RalphStatus(request) => {
+            handle_ralph_status(request_id, state, writer, request).await
+        }
         Request::RunRalphLoop(request) => {
             handle_run_ralph_loop(request_id, state, writer, request).await
         }
@@ -1629,16 +1638,19 @@ async fn handle_request(
             Box::pin(handle_cancel_ralph_loop(request_id, state, writer, request)).await
         }
         Request::ListRalphRuns(request) => {
-            Box::pin(handle_list_ralph_runs(request_id, writer, *request)).await
+            Box::pin(handle_list_ralph_runs(request_id, state, writer, *request)).await
         }
         Request::ListRalphIterations(request) => {
-            Box::pin(handle_list_ralph_iterations(request_id, writer, *request)).await
+            Box::pin(handle_list_ralph_iterations(
+                request_id, state, writer, *request,
+            ))
+            .await
         }
         Request::ResumeRalphRun(request) => {
             handle_resume_ralph_run(request_id, state, writer, request).await
         }
         Request::RalphRunStatus(request) => {
-            handle_ralph_run_status(request_id, writer, request).await
+            handle_ralph_run_status(request_id, state, writer, request).await
         }
         Request::RecordRalphLifecycle(request) => {
             handle_record_ralph_lifecycle(request_id, state, writer, request).await
@@ -2231,13 +2243,15 @@ async fn handle_list_worktrees(
 
 async fn handle_ralph_status(
     request_id: u64,
+    state: &ServerState,
     writer: &SharedWriter,
     request: RalphStatusRequest,
 ) -> Result<(), ServerError> {
-    match bcode_ralph::latest_loop(&request.repo_root) {
+    match state.ralph_store.latest_loop(&request.repo_root) {
         Ok(loop_summary) => {
             let response = RalphStatusResponse {
-                loop_summary: loop_summary.map(ralph_status_summary),
+                loop_summary: loop_summary
+                    .map(|summary| ralph_status_summary(&state.ralph_store, summary)),
             };
             send_response(
                 writer,
@@ -2313,14 +2327,22 @@ async fn prepare_ralph_resume(
     state: &Arc<ServerState>,
     request: RalphResumeRequest,
 ) -> Result<RalphResumeResponse, String> {
-    let summary = resolve_ralph_loop(&request.repo_root, request.loop_state_dir.as_deref())?;
-    if bcode_ralph::active_run_for_loop(&summary.state_dir)
+    let summary = resolve_ralph_loop(
+        &state.ralph_store,
+        &request.repo_root,
+        request.loop_state_dir.as_deref(),
+    )?;
+    if state
+        .ralph_store
+        .active_run_for_loop(&summary.state_dir)
         .map_err(|error| error.to_string())?
         .is_some()
     {
         return Err("Ralph loop already has an active run".to_owned());
     }
-    let interrupted_runs = bcode_ralph::interrupted_runs_for_loop(&summary.state_dir)
+    let interrupted_runs = state
+        .ralph_store
+        .interrupted_runs_for_loop(&summary.state_dir)
         .map_err(|error| error.to_string())?;
     let interrupted_run = request
         .interrupted_run_id
@@ -2329,15 +2351,17 @@ async fn prepare_ralph_resume(
         .or_else(|| interrupted_runs.first())
         .cloned()
         .ok_or_else(|| "Ralph loop has no interrupted runs to resume".to_owned())?;
-    let resumed_run = bcode_ralph::create_run(bcode_ralph::RalphRunCreateRequest {
-        state_dir: summary.state_dir.clone(),
-        session_id: summary.session_id.clone(),
-        status: "awaiting_approval".to_owned(),
-        requested_max_iterations: interrupted_run.requested_max_iterations,
-        requested_no_progress_limit: interrupted_run.requested_no_progress_limit,
-    })
-    .map_err(|error| error.to_string())?;
-    let _ = bcode_ralph::append_lifecycle_event_for_summary(
+    let resumed_run = state
+        .ralph_store
+        .create_run(bcode_ralph::RalphRunCreateRequest {
+            state_dir: summary.state_dir.clone(),
+            session_id: summary.session_id.clone(),
+            status: "awaiting_approval".to_owned(),
+            requested_max_iterations: interrupted_run.requested_max_iterations,
+            requested_no_progress_limit: interrupted_run.requested_no_progress_limit,
+        })
+        .map_err(|error| error.to_string())?;
+    let _ = state.ralph_store.append_lifecycle_event_for_summary(
         &summary,
         bcode_ralph::RalphLifecycleEventKind::RunStarted,
         "Prepared approval-gated Ralph resume run",
@@ -2387,8 +2411,14 @@ async fn approve_ralph_run(
     state: &Arc<ServerState>,
     request: RalphApproveRequest,
 ) -> Result<RalphRunResponse, String> {
-    let summary = resolve_ralph_loop(&request.repo_root, request.loop_state_dir.as_deref())?;
-    let active_run = bcode_ralph::active_run_for_loop(&summary.state_dir)
+    let summary = resolve_ralph_loop(
+        &state.ralph_store,
+        &request.repo_root,
+        request.loop_state_dir.as_deref(),
+    )?;
+    let active_run = state
+        .ralph_store
+        .active_run_for_loop(&summary.state_dir)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "Ralph loop has no approval-gated run".to_owned())?;
     if request
@@ -2401,7 +2431,9 @@ async fn approve_ralph_run(
     if active_run.status != "awaiting_approval" {
         return Err("Ralph active run is not awaiting approval".to_owned());
     }
-    bcode_ralph::update_run_status(&active_run.run_id, "running", None, None, None)
+    state
+        .ralph_store
+        .update_run_status(&active_run.run_id, "running", None, None, None)
         .map_err(|error| error.to_string())?;
     let mut approved_run = active_run;
     approved_run.status.clear();
@@ -2447,8 +2479,14 @@ async fn start_ralph_runner(
     state: &Arc<ServerState>,
     request: RalphRunRequest,
 ) -> Result<RalphRunResponse, String> {
-    let summary = resolve_ralph_loop(&request.repo_root, request.loop_state_dir.as_deref())?;
-    if bcode_ralph::active_run_for_loop(&summary.state_dir)
+    let summary = resolve_ralph_loop(
+        &state.ralph_store,
+        &request.repo_root,
+        request.loop_state_dir.as_deref(),
+    )?;
+    if state
+        .ralph_store
+        .active_run_for_loop(&summary.state_dir)
         .map_err(|error| error.to_string())?
         .is_some()
     {
@@ -2466,22 +2504,24 @@ async fn start_ralph_runner(
         request.max_iterations,
         request.no_progress_limit,
     );
-    let run = bcode_ralph::create_run(bcode_ralph::RalphRunCreateRequest {
-        state_dir: summary.state_dir.clone(),
-        session_id: summary.session_id.clone(),
-        status: if request.require_approval {
-            "awaiting_approval".to_owned()
-        } else {
-            "running".to_owned()
-        },
-        requested_max_iterations,
-        requested_no_progress_limit,
-    })
-    .map_err(|error| error.to_string())?;
+    let run = state
+        .ralph_store
+        .create_run(bcode_ralph::RalphRunCreateRequest {
+            state_dir: summary.state_dir.clone(),
+            session_id: summary.session_id.clone(),
+            status: if request.require_approval {
+                "awaiting_approval".to_owned()
+            } else {
+                "running".to_owned()
+            },
+            requested_max_iterations,
+            requested_no_progress_limit,
+        })
+        .map_err(|error| error.to_string())?;
     let response = RalphRunResponse {
         run: ralph_run_summary(run.clone()),
     };
-    let _ = bcode_ralph::append_lifecycle_event_for_summary(
+    let _ = state.ralph_store.append_lifecycle_event_for_summary(
         &summary,
         bcode_ralph::RalphLifecycleEventKind::RunStarted,
         "Started Ralph autonomous runner",
@@ -2551,7 +2591,10 @@ async fn register_ralph_runtime_work(
                 work_id,
                 RuntimeWorkKind::EventDelivery,
                 label,
-                CancellationHandle::RalphRun(run_id),
+                CancellationHandle::RalphRun {
+                    store: state.ralph_store.clone(),
+                    run_id,
+                },
             )
             .with_parent_work_id(parent_work_id),
         )
@@ -2843,22 +2886,26 @@ async fn record_ralph_skeleton_noop_iteration(
         .work_completion
         .as_ref()
         .map(|completion| completion.outcome);
-    let iteration = bcode_ralph::create_iteration(bcode_ralph::RalphIterationCreateRequest {
-        run_id: run.run_id.clone(),
-        state_dir: run.state_dir.clone(),
-        iteration_number,
-        status: ralph_iteration_status_from_model_outcome(outcome).to_owned(),
-        checklist_fingerprint_before: Some(
-            summary.checklist_summary.checklist_fingerprint.to_string(),
-        ),
-        checklist_fingerprint_after: progress_doc_checklist_fingerprint(&summary.progress_doc_path),
-        work_prompt: Some(input.work_prompt),
-        finished_at_ms: Some(current_time_ms()),
-        stop_reason: outcome.map(|outcome| format!("model_turn_{outcome:?}").to_lowercase()),
-        error_message: input
-            .work_completion
-            .and_then(|completion| completion.message),
-    });
+    let iteration = state
+        .ralph_store
+        .create_iteration(bcode_ralph::RalphIterationCreateRequest {
+            run_id: run.run_id.clone(),
+            state_dir: run.state_dir.clone(),
+            iteration_number,
+            status: ralph_iteration_status_from_model_outcome(outcome).to_owned(),
+            checklist_fingerprint_before: Some(
+                summary.checklist_summary.checklist_fingerprint.to_string(),
+            ),
+            checklist_fingerprint_after: progress_doc_checklist_fingerprint(
+                &summary.progress_doc_path,
+            ),
+            work_prompt: Some(input.work_prompt),
+            finished_at_ms: Some(current_time_ms()),
+            stop_reason: outcome.map(|outcome| format!("model_turn_{outcome:?}").to_lowercase()),
+            error_message: input
+                .work_completion
+                .and_then(|completion| completion.message),
+        });
     finish_ralph_runtime_work(
         state,
         runtime_session_id,
@@ -2934,7 +2981,10 @@ async fn run_ralph_iteration_validations(
     let Some(work_area) = summary.work_area_path.clone() else {
         return true;
     };
-    let commands = bcode_ralph::list_validation_commands(&summary.state_dir).unwrap_or_default();
+    let commands = state
+        .ralph_store
+        .list_validation_commands(&summary.state_dir)
+        .unwrap_or_default();
     for (index, command) in commands.into_iter().enumerate() {
         let validation_work_id =
             RuntimeWorkId::new(format!("ralph:{}:validation:{}", run.run_id, index + 1));
@@ -2960,15 +3010,17 @@ async fn run_ralph_iteration_validations(
         } else {
             Some(format!("validation failed: {}", command.command))
         };
-        let _ = bcode_ralph::create_validation(bcode_ralph::RalphValidationCreateRequest {
-            iteration_id: iteration.iteration_id.clone(),
-            command: command.command,
-            status: execution.status,
-            exit_code: execution.exit_code,
-            output_ref: execution.output_ref,
-            finished_at_ms: Some(current_time_ms()),
-            error_message: execution.error_message,
-        });
+        let _ = state
+            .ralph_store
+            .create_validation(bcode_ralph::RalphValidationCreateRequest {
+                iteration_id: iteration.iteration_id.clone(),
+                command: command.command,
+                status: execution.status,
+                exit_code: execution.exit_code,
+                output_ref: execution.output_ref,
+                finished_at_ms: Some(current_time_ms()),
+                error_message: execution.error_message,
+            });
         finish_ralph_runtime_work(
             state,
             runtime_session_id,
@@ -3004,7 +3056,7 @@ async fn finish_ralph_runner_lifecycle(
         || format!("Ralph autonomous runner {status_label}"),
         |message| format!("Ralph autonomous runner {status_label}: {message}"),
     );
-    let _ = bcode_ralph::append_lifecycle_event_for_state_dir(
+    let _ = state.ralph_store.append_lifecycle_event_for_state_dir(
         &run.state_dir,
         bcode_ralph::RalphLifecycleEventKind::RunFinished,
         &message,
@@ -3029,12 +3081,15 @@ fn build_ralph_work_prompt(summary: &bcode_ralph::RalphLoopSummary) -> String {
 }
 
 fn ralph_stop_decision_after_audit(
+    store: &bcode_ralph::RalphStateStore,
     summary: &bcode_ralph::RalphLoopSummary,
     run: &bcode_ralph::RalphRunRecord,
     iteration: &bcode_ralph::RalphIterationRecord,
 ) -> Result<bcode_ralph::RalphStopDecision, std::io::Error> {
     let checklist_summary = progress_doc_checklist_summary(&summary.progress_doc_path)?;
-    let iterations = bcode_ralph::list_iterations_for_run(&run.run_id).unwrap_or_default();
+    let iterations = store
+        .list_iterations_for_run(&run.run_id)
+        .unwrap_or_default();
     let iteration_count = u64::try_from(iterations.len()).unwrap_or(u64::MAX);
     let no_progress_count = consecutive_no_progress_iterations(&iterations, iteration);
     Ok(bcode_ralph::decide_stop(
@@ -3132,7 +3187,7 @@ async fn submit_ralph_audit_after_validation(
             )
         });
     if let Some(iteration) = iteration {
-        let _ = bcode_ralph::update_iteration_prompts(
+        let _ = state.ralph_store.update_iteration_prompts(
             &iteration.iteration_id,
             Some(prompt.clone()),
             None,
@@ -3163,7 +3218,7 @@ async fn submit_ralph_replan_after_audit(
             )
         });
     if let Some(iteration) = iteration {
-        let _ = bcode_ralph::update_iteration_prompts(
+        let _ = state.ralph_store.update_iteration_prompts(
             &iteration.iteration_id,
             None,
             Some(prompt.clone()),
@@ -3187,9 +3242,9 @@ async fn apply_ralph_post_audit_decision(
     run: &bcode_ralph::RalphRunRecord,
     iteration: Option<&bcode_ralph::RalphIterationRecord>,
 ) -> (&'static str, &'static str, &'static str) {
-    let Some(decision) = iteration
-        .and_then(|iteration| ralph_stop_decision_after_audit(summary, run, iteration).ok())
-    else {
+    let Some(decision) = iteration.and_then(|iteration| {
+        ralph_stop_decision_after_audit(&state.ralph_store, summary, run, iteration).ok()
+    }) else {
         return (
             "blocked",
             "progress_doc_unreadable",
@@ -3199,7 +3254,7 @@ async fn apply_ralph_post_audit_decision(
     if decision != bcode_ralph::RalphStopDecision::Continue {
         return ralph_run_terminal_from_decision(decision);
     }
-    if ralph_run_cancel_requested(run) {
+    if ralph_run_cancel_requested(&state.ralph_store, run) {
         return ("stopped", "cancelled", "Ralph run cancelled");
     }
     let replan_completion = submit_ralph_replan_after_audit(
@@ -3222,7 +3277,7 @@ async fn apply_ralph_post_audit_decision(
             "Ralph replan turn did not complete successfully",
         );
     }
-    if ralph_run_cancel_requested(run) {
+    if ralph_run_cancel_requested(&state.ralph_store, run) {
         return ("stopped", "cancelled", "Ralph run cancelled");
     }
     if !progress_doc_is_coherent_and_writable(&summary.progress_doc_path) {
@@ -3245,17 +3300,22 @@ struct RalphIterationCompletion {
     message: String,
 }
 
-fn ralph_run_cancel_requested(run: &bcode_ralph::RalphRunRecord) -> bool {
-    bcode_ralph::active_run_for_loop(&run.state_dir)
+fn ralph_run_cancel_requested(
+    store: &bcode_ralph::RalphStateStore,
+    run: &bcode_ralph::RalphRunRecord,
+) -> bool {
+    store
+        .active_run_for_loop(&run.state_dir)
         .ok()
         .flatten()
         .is_some_and(|active_run| active_run.cancel_requested)
 }
 
 fn ralph_cancelled_iteration_completion(
+    store: &bcode_ralph::RalphStateStore,
     run: &bcode_ralph::RalphRunRecord,
 ) -> RalphIterationCompletion {
-    let _ = bcode_ralph::update_run_status(
+    let _ = store.update_run_status(
         &run.run_id,
         "stopped",
         Some(current_time_ms()),
@@ -3291,7 +3351,7 @@ async fn complete_ralph_skeleton_after_iteration(
         true
     };
     if !validation_passed {
-        let _ = bcode_ralph::update_run_status(
+        let _ = state.ralph_store.update_run_status(
             &run.run_id,
             "blocked",
             Some(current_time_ms()),
@@ -3304,8 +3364,8 @@ async fn complete_ralph_skeleton_after_iteration(
             message: "Ralph validation command failed".to_owned(),
         };
     }
-    if ralph_run_cancel_requested(run) {
-        return ralph_cancelled_iteration_completion(run);
+    if ralph_run_cancel_requested(&state.ralph_store, run) {
+        return ralph_cancelled_iteration_completion(&state.ralph_store, run);
     }
     let audit_completion = submit_ralph_audit_after_validation(
         state,
@@ -3319,8 +3379,8 @@ async fn complete_ralph_skeleton_after_iteration(
     let audit_outcome = audit_completion
         .as_ref()
         .map(|completion| completion.outcome);
-    if ralph_run_cancel_requested(run) {
-        return ralph_cancelled_iteration_completion(run);
+    if ralph_run_cancel_requested(&state.ralph_store, run) {
+        return ralph_cancelled_iteration_completion(&state.ralph_store, run);
     }
     let (run_status, stop_reason, error_message): (&str, &str, String) =
         if audit_outcome == Some(ModelTurnOutcome::Completed) {
@@ -3349,7 +3409,7 @@ async fn complete_ralph_skeleton_after_iteration(
     let finished_at_ms = (run_status != "running").then(current_time_ms);
     let stop_reason_value = (run_status != "running").then_some(stop_reason);
     let error_message_value = (run_status != "running").then_some(error_message.as_str());
-    let _ = bcode_ralph::update_run_status(
+    let _ = state.ralph_store.update_run_status(
         &run.run_id,
         run_status,
         finished_at_ms,
@@ -3399,14 +3459,18 @@ async fn run_ralph_runner_skeleton(
 
     tokio::time::sleep(Duration::from_millis(250)).await;
     let (final_status, final_message) = loop {
-        let next_iteration_number = bcode_ralph::list_iterations_for_run(&run.run_id)
+        let next_iteration_number = state
+            .ralph_store
+            .list_iterations_for_run(&run.run_id)
             .map(|iterations| {
                 u64::try_from(iterations.len())
                     .unwrap_or(u64::MAX)
                     .saturating_add(1)
             })
             .unwrap_or(1);
-        let active_run = bcode_ralph::active_run_for_loop(&run.state_dir)
+        let active_run = state
+            .ralph_store
+            .active_run_for_loop(&run.state_dir)
             .ok()
             .flatten();
         append_ralph_runner_progress(
@@ -3420,7 +3484,7 @@ async fn run_ralph_runner_skeleton(
         if let Some((run_status, stop_reason, error_message)) =
             validate_ralph_runner_inputs(&summary)
         {
-            let _ = bcode_ralph::update_run_status(
+            let _ = state.ralph_store.update_run_status(
                 &run.run_id,
                 run_status,
                 Some(current_time_ms()),
@@ -3438,7 +3502,7 @@ async fn run_ralph_runner_skeleton(
                 next_iteration_number.saturating_sub(1),
             )
             .await;
-            let _ = bcode_ralph::update_run_status(
+            let _ = state.ralph_store.update_run_status(
                 &run.run_id,
                 "stopped",
                 Some(current_time_ms()),
@@ -3476,7 +3540,7 @@ async fn run_ralph_runner_skeleton(
         )
         .await;
         if let Some((run_status, stop_reason, error_message)) = work_failure {
-            let _ = bcode_ralph::update_run_status(
+            let _ = state.ralph_store.update_run_status(
                 &run.run_id,
                 run_status,
                 Some(current_time_ms()),
@@ -3490,8 +3554,8 @@ async fn run_ralph_runner_skeleton(
             };
             break (runtime_status, Some(error_message));
         }
-        if ralph_run_cancel_requested(&run) {
-            let completion = ralph_cancelled_iteration_completion(&run);
+        if ralph_run_cancel_requested(&state.ralph_store, &run) {
+            let completion = ralph_cancelled_iteration_completion(&state.ralph_store, &run);
             break (completion.runtime_status, Some(completion.message));
         }
         let completion = complete_ralph_skeleton_after_iteration(
@@ -3541,10 +3605,15 @@ async fn handle_cancel_ralph_loop(
     writer: &SharedWriter,
     request: RalphCancelRequest,
 ) -> Result<(), ServerError> {
-    match resolve_ralph_loop(&request.repo_root, request.loop_state_dir.as_deref())
-        .and_then(|summary| resolve_ralph_cancel_target(&summary.state_dir, request.run_id))
-    {
-        Ok(run) => match bcode_ralph::request_run_cancel(&run.run_id) {
+    match resolve_ralph_loop(
+        &state.ralph_store,
+        &request.repo_root,
+        request.loop_state_dir.as_deref(),
+    )
+    .and_then(|summary| {
+        resolve_ralph_cancel_target(&state.ralph_store, &summary.state_dir, request.run_id)
+    }) {
+        Ok(run) => match state.ralph_store.request_run_cancel(&run.run_id) {
             Ok(()) => {
                 if let Some(session_id) = run
                     .session_id
@@ -3594,22 +3663,28 @@ async fn handle_cancel_ralph_loop(
 
 async fn handle_list_ralph_runs(
     request_id: u64,
+    state: &ServerState,
     writer: &SharedWriter,
     request: RalphListRunsRequest,
 ) -> Result<(), ServerError> {
-    match resolve_ralph_loop(&request.repo_root, request.loop_state_dir.as_deref()).and_then(
-        |summary| {
-            let runs = bcode_ralph::list_runs_for_loop(&summary.state_dir)
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .map(ralph_run_summary)
-                .collect();
-            Ok(RalphListRunsResponse {
-                loop_summary: Some(ralph_status_summary(summary)),
-                runs,
-            })
-        },
-    ) {
+    match resolve_ralph_loop(
+        &state.ralph_store,
+        &request.repo_root,
+        request.loop_state_dir.as_deref(),
+    )
+    .and_then(|summary| {
+        let runs = state
+            .ralph_store
+            .list_runs_for_loop(&summary.state_dir)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(ralph_run_summary)
+            .collect();
+        Ok(RalphListRunsResponse {
+            loop_summary: Some(ralph_status_summary(&state.ralph_store, summary)),
+            runs,
+        })
+    }) {
         Ok(response) => {
             send_response(
                 writer,
@@ -3631,50 +3706,59 @@ async fn handle_list_ralph_runs(
 
 async fn handle_list_ralph_iterations(
     request_id: u64,
+    state: &ServerState,
     writer: &SharedWriter,
     request: RalphListIterationsRequest,
 ) -> Result<(), ServerError> {
-    match resolve_ralph_loop(&request.repo_root, request.loop_state_dir.as_deref()).and_then(
-        |summary| {
-            let runs = bcode_ralph::list_runs_for_loop(&summary.state_dir)
-                .map_err(|error| error.to_string())?;
-            let run = request
-                .run_id
-                .as_deref()
-                .and_then(|run_id| runs.iter().find(|run| run.run_id == run_id))
-                .or_else(|| runs.first());
-            let (iterations, validations) = run
-                .map_or_else(
-                    || Ok((Vec::new(), Vec::new())),
-                    |run| {
-                        let iteration_records = bcode_ralph::list_iterations_for_run(&run.run_id)?;
-                        let mut validation_records = Vec::new();
-                        for iteration in &iteration_records {
-                            validation_records.extend(bcode_ralph::list_validations_for_iteration(
-                                &iteration.iteration_id,
-                            )?);
-                        }
-                        Ok((
-                            iteration_records
-                                .into_iter()
-                                .map(ralph_iteration_summary)
-                                .collect(),
-                            validation_records
-                                .into_iter()
-                                .map(ralph_validation_summary)
-                                .collect(),
-                        ))
-                    },
-                )
-                .map_err(|error: bcode_ralph::RalphStateError| error.to_string())?;
-            Ok(RalphListIterationsResponse {
-                loop_summary: Some(ralph_status_summary(summary)),
-                run: run.cloned().map(ralph_run_summary),
-                iterations,
-                validations,
-            })
-        },
-    ) {
+    match resolve_ralph_loop(
+        &state.ralph_store,
+        &request.repo_root,
+        request.loop_state_dir.as_deref(),
+    )
+    .and_then(|summary| {
+        let runs = state
+            .ralph_store
+            .list_runs_for_loop(&summary.state_dir)
+            .map_err(|error| error.to_string())?;
+        let run = request
+            .run_id
+            .as_deref()
+            .and_then(|run_id| runs.iter().find(|run| run.run_id == run_id))
+            .or_else(|| runs.first());
+        let (iterations, validations) = run
+            .map_or_else(
+                || Ok((Vec::new(), Vec::new())),
+                |run| {
+                    let iteration_records =
+                        state.ralph_store.list_iterations_for_run(&run.run_id)?;
+                    let mut validation_records = Vec::new();
+                    for iteration in &iteration_records {
+                        validation_records.extend(
+                            state
+                                .ralph_store
+                                .list_validations_for_iteration(&iteration.iteration_id)?,
+                        );
+                    }
+                    Ok((
+                        iteration_records
+                            .into_iter()
+                            .map(ralph_iteration_summary)
+                            .collect(),
+                        validation_records
+                            .into_iter()
+                            .map(ralph_validation_summary)
+                            .collect(),
+                    ))
+                },
+            )
+            .map_err(|error: bcode_ralph::RalphStateError| error.to_string())?;
+        Ok(RalphListIterationsResponse {
+            loop_summary: Some(ralph_status_summary(&state.ralph_store, summary)),
+            run: run.cloned().map(ralph_run_summary),
+            iterations,
+            validations,
+        })
+    }) {
         Ok(response) => {
             send_response(
                 writer,
@@ -3696,26 +3780,34 @@ async fn handle_list_ralph_iterations(
 
 async fn handle_ralph_run_status(
     request_id: u64,
+    state: &ServerState,
     writer: &SharedWriter,
     request: RalphRunStatusRequest,
 ) -> Result<(), ServerError> {
-    match resolve_ralph_loop(&request.repo_root, request.loop_state_dir.as_deref()).and_then(
-        |summary| {
-            let active_run = bcode_ralph::active_run_for_loop(&summary.state_dir)
-                .map_err(|error| error.to_string())?
-                .map(ralph_run_summary);
-            let interrupted_runs = bcode_ralph::interrupted_runs_for_loop(&summary.state_dir)
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .map(ralph_run_summary)
-                .collect();
-            Ok(RalphRunStatusResponse {
-                loop_summary: Some(ralph_status_summary(summary)),
-                active_run,
-                interrupted_runs,
-            })
-        },
-    ) {
+    match resolve_ralph_loop(
+        &state.ralph_store,
+        &request.repo_root,
+        request.loop_state_dir.as_deref(),
+    )
+    .and_then(|summary| {
+        let active_run = state
+            .ralph_store
+            .active_run_for_loop(&summary.state_dir)
+            .map_err(|error| error.to_string())?
+            .map(ralph_run_summary);
+        let interrupted_runs = state
+            .ralph_store
+            .interrupted_runs_for_loop(&summary.state_dir)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(ralph_run_summary)
+            .collect();
+        Ok(RalphRunStatusResponse {
+            loop_summary: Some(ralph_status_summary(&state.ralph_store, summary)),
+            active_run,
+            interrupted_runs,
+        })
+    }) {
         Ok(response) => {
             send_response(
                 writer,
@@ -3736,10 +3828,12 @@ async fn handle_ralph_run_status(
 }
 
 fn resolve_ralph_loop(
+    store: &bcode_ralph::RalphStateStore,
     repo_root: &Path,
     loop_state_dir: Option<&Path>,
 ) -> Result<bcode_ralph::RalphLoopSummary, String> {
-    let summary = bcode_ralph::latest_loop(repo_root)
+    let summary = store
+        .latest_loop(repo_root)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "no Ralph loop exists for repository".to_owned())?;
     if let Some(loop_state_dir) = loop_state_dir
@@ -3751,11 +3845,13 @@ fn resolve_ralph_loop(
 }
 
 fn resolve_ralph_cancel_target(
+    store: &bcode_ralph::RalphStateStore,
     state_dir: &Path,
     run_id: Option<String>,
 ) -> Result<bcode_ralph::RalphRunRecord, String> {
-    let active_run =
-        bcode_ralph::active_run_for_loop(state_dir).map_err(|error| error.to_string())?;
+    let active_run = store
+        .active_run_for_loop(state_dir)
+        .map_err(|error| error.to_string())?;
     match (run_id, active_run) {
         (Some(run_id), Some(run)) if run.run_id == run_id => Ok(run),
         (Some(_), Some(_)) => Err("requested Ralph run is not active for loop".to_owned()),
@@ -3780,8 +3876,12 @@ fn ralph_validation_summary(
     }
 }
 
-fn ralph_status_summary(summary: bcode_ralph::RalphLoopSummary) -> RalphStatusSummary {
-    let validation_commands = bcode_ralph::list_validation_commands(&summary.state_dir)
+fn ralph_status_summary(
+    store: &bcode_ralph::RalphStateStore,
+    summary: bcode_ralph::RalphLoopSummary,
+) -> RalphStatusSummary {
+    let validation_commands = store
+        .list_validation_commands(&summary.state_dir)
         .map(|commands| {
             commands
                 .into_iter()
@@ -12391,6 +12491,17 @@ mod tests {
         }
     }
 
+    struct TestRalphStore {
+        _temp: tempfile::TempDir,
+        store: bcode_ralph::RalphStateStore,
+    }
+
+    fn test_ralph_store() -> TestRalphStore {
+        let temp = tempfile::tempdir().expect("temp Ralph store should create");
+        let store = bcode_ralph::RalphStateStore::from_ralph_state_root(temp.path().join("ralph"));
+        TestRalphStore { _temp: temp, store }
+    }
+
     fn unique_ralph_repo_root(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "bcode-server-ralph-{label}-{}",
@@ -12400,11 +12511,16 @@ mod tests {
         path
     }
 
-    fn create_test_ralph_loop(label: &str) -> (PathBuf, bcode_ralph::RalphLoopSummary) {
+    fn create_test_ralph_loop(
+        store: &bcode_ralph::RalphStateStore,
+        label: &str,
+    ) -> (PathBuf, bcode_ralph::RalphLoopSummary) {
         let repo_root = unique_ralph_repo_root(label);
-        bcode_ralph::create_initial_loop_state("test-loop", &repo_root, Some("test"))
+        store
+            .create_initial_loop_state("test-loop", &repo_root, Some("test"))
             .expect("Ralph loop should be created");
-        let summary = bcode_ralph::latest_loop(&repo_root)
+        let summary = store
+            .latest_loop(&repo_root)
             .expect("latest loop should query")
             .expect("latest loop should exist");
         (repo_root, summary)
@@ -12412,9 +12528,13 @@ mod tests {
 
     #[tokio::test]
     async fn ralph_start_rejects_duplicate_active_run() {
+        let ralph = test_ralph_store();
         let sessions = SessionManager::default();
-        let state = Arc::new(test_server_state(sessions));
-        let (repo_root, _summary) = create_test_ralph_loop("duplicate");
+        let state = Arc::new(test_server_state_with_ralph_store(
+            sessions,
+            ralph.store.clone(),
+        ));
+        let (repo_root, _summary) = create_test_ralph_loop(&ralph.store, "duplicate");
         let request = RalphRunRequest {
             repo_root: repo_root.clone(),
             loop_state_dir: None,
@@ -12435,9 +12555,13 @@ mod tests {
 
     #[tokio::test]
     async fn ralph_cancel_marks_active_run_cancel_requested() {
+        let ralph = test_ralph_store();
         let sessions = SessionManager::default();
-        let state = Arc::new(test_server_state(sessions));
-        let (repo_root, summary) = create_test_ralph_loop("cancel");
+        let state = Arc::new(test_server_state_with_ralph_store(
+            sessions,
+            ralph.store.clone(),
+        ));
+        let (repo_root, summary) = create_test_ralph_loop(&ralph.store, "cancel");
         let response = start_ralph_runner(
             &state,
             RalphRunRequest {
@@ -12451,8 +12575,13 @@ mod tests {
         .await
         .expect("run should prepare");
 
-        bcode_ralph::request_run_cancel(&response.run.run_id).expect("cancel should persist");
-        let active = bcode_ralph::active_run_for_loop(&summary.state_dir)
+        ralph
+            .store
+            .request_run_cancel(&response.run.run_id)
+            .expect("cancel should persist");
+        let active = ralph
+            .store
+            .active_run_for_loop(&summary.state_dir)
             .expect("active run query should work")
             .expect("run should remain active while awaiting runner observation");
 
@@ -12461,18 +12590,21 @@ mod tests {
 
     #[test]
     fn ralph_run_summary_reports_active_runtime_work_identity() {
+        let ralph = test_ralph_store();
         let state_dir = PathBuf::from(format!(
             "/tmp/bcode-server-ralph-summary-{}",
             uuid::Uuid::new_v4()
         ));
-        let run = bcode_ralph::create_run(bcode_ralph::RalphRunCreateRequest {
-            state_dir,
-            session_id: Some("session-test".to_owned()),
-            status: "running".to_owned(),
-            requested_max_iterations: Some(3),
-            requested_no_progress_limit: Some(2),
-        })
-        .expect("run should persist");
+        let run = ralph
+            .store
+            .create_run(bcode_ralph::RalphRunCreateRequest {
+                state_dir,
+                session_id: Some("session-test".to_owned()),
+                status: "running".to_owned(),
+                requested_max_iterations: Some(3),
+                requested_no_progress_limit: Some(2),
+            })
+            .expect("run should persist");
 
         let summary = ralph_run_summary(run.clone());
 
@@ -12488,61 +12620,71 @@ mod tests {
 
     #[test]
     fn ralph_validation_failure_completion_blocks_run() {
+        let ralph = test_ralph_store();
         let state_dir = PathBuf::from(format!(
             "/tmp/bcode-server-ralph-validation-{}",
             uuid::Uuid::new_v4()
         ));
-        let run = bcode_ralph::create_run(bcode_ralph::RalphRunCreateRequest {
-            state_dir: state_dir.clone(),
-            session_id: None,
-            status: "running".to_owned(),
-            requested_max_iterations: Some(1),
-            requested_no_progress_limit: Some(1),
-        })
-        .expect("run should persist");
+        let run = ralph
+            .store
+            .create_run(bcode_ralph::RalphRunCreateRequest {
+                state_dir: state_dir.clone(),
+                session_id: None,
+                status: "running".to_owned(),
+                requested_max_iterations: Some(1),
+                requested_no_progress_limit: Some(1),
+            })
+            .expect("run should persist");
 
-        let _ = bcode_ralph::update_run_status(
+        let _ = ralph.store.update_run_status(
             &run.run_id,
             "blocked",
             Some(current_time_ms()),
             Some("validation_failed"),
             Some("Ralph validation command failed"),
         );
-        let active =
-            bcode_ralph::active_run_for_loop(&state_dir).expect("active run query should work");
+        let active = ralph
+            .store
+            .active_run_for_loop(&state_dir)
+            .expect("active run query should work");
 
         assert!(active.is_none());
     }
 
     #[test]
     fn ralph_permission_denial_completion_stops_run() {
+        let ralph = test_ralph_store();
         let state_dir = PathBuf::from(format!(
             "/tmp/bcode-server-ralph-permission-{}",
             uuid::Uuid::new_v4()
         ));
-        let run = bcode_ralph::create_run(bcode_ralph::RalphRunCreateRequest {
-            state_dir: state_dir.clone(),
-            session_id: None,
-            status: "running".to_owned(),
-            requested_max_iterations: Some(1),
-            requested_no_progress_limit: Some(1),
-        })
-        .expect("run should persist");
+        let run = ralph
+            .store
+            .create_run(bcode_ralph::RalphRunCreateRequest {
+                state_dir: state_dir.clone(),
+                session_id: None,
+                status: "running".to_owned(),
+                requested_max_iterations: Some(1),
+                requested_no_progress_limit: Some(1),
+            })
+            .expect("run should persist");
         let failure = ralph_run_failure_from_model_completion(
             "work",
             &ModelTurnCompletion::with_message(ModelTurnOutcome::Error, "permission denied"),
         )
         .expect("permission denial should classify");
 
-        let _ = bcode_ralph::update_run_status(
+        let _ = ralph.store.update_run_status(
             &run.run_id,
             failure.0,
             Some(current_time_ms()),
             Some(failure.1),
             Some(failure.2.as_str()),
         );
-        let active =
-            bcode_ralph::active_run_for_loop(&state_dir).expect("active run query should work");
+        let active = ralph
+            .store
+            .active_run_for_loop(&state_dir)
+            .expect("active run query should work");
 
         assert!(active.is_none());
         assert_eq!(failure.0, "stopped");
@@ -12645,31 +12787,39 @@ mod tests {
 
     #[tokio::test]
     async fn ralph_successful_work_iteration_reaches_audit_prompt() {
+        let ralph = test_ralph_store();
         let sessions = SessionManager::default();
-        let state = Arc::new(test_server_state(sessions));
-        let (repo_root, summary) = create_test_ralph_loop("audit");
-        let run = bcode_ralph::create_run(bcode_ralph::RalphRunCreateRequest {
-            state_dir: summary.state_dir.clone(),
-            session_id: None,
-            status: "running".to_owned(),
-            requested_max_iterations: Some(1),
-            requested_no_progress_limit: Some(1),
-        })
-        .expect("run should persist");
+        let state = Arc::new(test_server_state_with_ralph_store(
+            sessions,
+            ralph.store.clone(),
+        ));
+        let (repo_root, summary) = create_test_ralph_loop(&ralph.store, "audit");
+        let run = ralph
+            .store
+            .create_run(bcode_ralph::RalphRunCreateRequest {
+                state_dir: summary.state_dir.clone(),
+                session_id: None,
+                status: "running".to_owned(),
+                requested_max_iterations: Some(1),
+                requested_no_progress_limit: Some(1),
+            })
+            .expect("run should persist");
         let work_prompt = build_ralph_work_prompt(&summary);
-        let iteration = bcode_ralph::create_iteration(bcode_ralph::RalphIterationCreateRequest {
-            run_id: run.run_id.clone(),
-            state_dir: summary.state_dir.clone(),
-            iteration_number: 1,
-            status: "work_completed".to_owned(),
-            checklist_fingerprint_before: None,
-            checklist_fingerprint_after: None,
-            work_prompt: Some(work_prompt),
-            finished_at_ms: Some(current_time_ms()),
-            stop_reason: None,
-            error_message: None,
-        })
-        .expect("iteration should persist");
+        let iteration = ralph
+            .store
+            .create_iteration(bcode_ralph::RalphIterationCreateRequest {
+                run_id: run.run_id.clone(),
+                state_dir: summary.state_dir.clone(),
+                iteration_number: 1,
+                status: "work_completed".to_owned(),
+                checklist_fingerprint_before: None,
+                checklist_fingerprint_after: None,
+                work_prompt: Some(work_prompt),
+                finished_at_ms: Some(current_time_ms()),
+                stop_reason: None,
+                error_message: None,
+            })
+            .expect("iteration should persist");
 
         let completion = submit_ralph_audit_after_validation(
             &state,
@@ -12680,7 +12830,9 @@ mod tests {
             Some(&iteration),
         )
         .await;
-        let refreshed = bcode_ralph::list_iterations_for_run(&run.run_id)
+        let refreshed = ralph
+            .store
+            .list_iterations_for_run(&run.run_id)
             .expect("iterations should list")
             .into_iter()
             .find(|record| record.iteration_id == iteration.iteration_id)
@@ -12829,27 +12981,35 @@ mod tests {
 
     #[test]
     fn ralph_cancelled_iteration_completion_persists_stopped_run() {
+        let ralph = test_ralph_store();
         let state_dir = PathBuf::from(format!(
             "/tmp/bcode-server-ralph-cancel-{}",
             uuid::Uuid::new_v4()
         ));
-        let run = bcode_ralph::create_run(bcode_ralph::RalphRunCreateRequest {
-            state_dir: state_dir.clone(),
-            session_id: None,
-            status: "running".to_owned(),
-            requested_max_iterations: Some(1),
-            requested_no_progress_limit: Some(1),
-        })
-        .expect("run should persist");
-        bcode_ralph::request_run_cancel(&run.run_id).expect("cancel should persist");
-        assert!(ralph_run_cancel_requested(&run));
+        let run = ralph
+            .store
+            .create_run(bcode_ralph::RalphRunCreateRequest {
+                state_dir: state_dir.clone(),
+                session_id: None,
+                status: "running".to_owned(),
+                requested_max_iterations: Some(1),
+                requested_no_progress_limit: Some(1),
+            })
+            .expect("run should persist");
+        ralph
+            .store
+            .request_run_cancel(&run.run_id)
+            .expect("cancel should persist");
+        assert!(ralph_run_cancel_requested(&ralph.store, &run));
 
-        let completion = ralph_cancelled_iteration_completion(&run);
+        let completion = ralph_cancelled_iteration_completion(&ralph.store, &run);
 
         assert!(!completion.continue_loop);
         assert_eq!(completion.runtime_status, RuntimeWorkStatus::Cancelled);
         assert!(
-            bcode_ralph::active_run_for_loop(&state_dir)
+            ralph
+                .store
+                .active_run_for_loop(&state_dir)
                 .expect("active run query should work")
                 .is_none()
         );
@@ -13700,6 +13860,13 @@ mod tests {
     }
 
     fn test_server_state(sessions: SessionManager) -> ServerState {
+        test_server_state_with_ralph_store(sessions, bcode_ralph::RalphStateStore::default())
+    }
+
+    fn test_server_state_with_ralph_store(
+        sessions: SessionManager,
+        ralph_store: bcode_ralph::RalphStateStore,
+    ) -> ServerState {
         ServerState::new(
             sessions,
             bcode_plugin::PluginHost::default().into(),
@@ -13723,6 +13890,7 @@ mod tests {
                 daemon_status: DaemonStatus::default(),
                 daemon_record_path: None,
                 metrics: MetricsRegistry::default(),
+                ralph_store,
             },
         )
     }
@@ -14038,6 +14206,7 @@ mod tests {
                 daemon_status: DaemonStatus::default(),
                 daemon_record_path: None,
                 metrics: MetricsRegistry::default(),
+                ralph_store: bcode_ralph::RalphStateStore::default(),
             },
         );
 
@@ -14133,6 +14302,7 @@ mod tests {
                 daemon_status: DaemonStatus::default(),
                 daemon_record_path: None,
                 metrics: MetricsRegistry::default(),
+                ralph_store: bcode_ralph::RalphStateStore::default(),
             },
         );
         let semantic_result = ToolInvocationResult::Text {

@@ -61,6 +61,9 @@ toml = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [features]
 _static-bundled = []
 default = ["static-bundled-plugins"]
