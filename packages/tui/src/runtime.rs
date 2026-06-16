@@ -71,8 +71,11 @@ pub async fn run_event_loop<W: Write>(
     let (async_event_sender, async_event_receiver) = mpsc::unbounded_channel();
     let mut app = BmuxApp::new_with_history(session_id, &[], &[], false);
     app.apply_tui_config(config.tui);
+    let agents = session_flow::AgentCatalog::load(&client).await?;
+    agents.refresh_app_agent_metadata(&mut app);
     let mut chat = session_flow::ActiveChat {
         app,
+        agents,
         session_id: None,
         event_sender,
         event_receiver,

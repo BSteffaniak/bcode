@@ -3,9 +3,9 @@
 use std::io::Write;
 use std::time::{Duration, Instant, SystemTime};
 
-use bcode_agent_profile::AgentInfo;
 use bcode_client::BcodeClient;
 use bcode_ipc::Event as BcodeEvent;
+use bcode_session_models::SessionEventKind;
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
@@ -214,7 +214,12 @@ fn drain_bcode_events(chat: &mut ActiveChat) -> bool {
 fn absorb_bcode_event(chat: &mut ActiveChat, event: BcodeEvent) -> bool {
     match event {
         BcodeEvent::Session(event) if Some(event.session_id) == chat.session_id => {
-            chat.app.absorb_session_event(&event);
+            if let SessionEventKind::AgentChanged { agent_id } = &event.kind {
+                chat.agents
+                    .apply_agent_to_app(&mut chat.app, agent_id.clone());
+            } else {
+                chat.app.absorb_session_event(&event);
+            }
             true
         }
         BcodeEvent::SessionLive(event) if Some(event.session_id) == chat.session_id => {
@@ -507,46 +512,24 @@ async fn request_turn_cancellation(client: &BcodeClient, chat: &mut ActiveChat) 
 }
 
 async fn cycle_session_agent(client: &BcodeClient, chat: &mut ActiveChat) {
-    let agents = match client.list_agents().await {
-        Ok(agents) => agents,
-        Err(error) => {
-            chat.app.set_status(format!("agent cycle failed: {error}"));
-            return;
-        }
-    };
-    let Some(agent) = next_agent(&agents, chat.app.current_agent_id()) else {
+    let Some(agent) = chat.agents.next_agent(chat.app.current_agent_id()) else {
         chat.app.set_status("no agents available".to_owned());
         return;
     };
     let agent_id = agent.id.clone();
     let agent_name = agent.name.clone();
-    let agent_accent = agent.accent.clone();
     let Some(session_id) = chat.app.session_id() else {
-        chat.app.set_current_agent(agent_id, agent_accent);
+        chat.agents.apply_agent_to_app(&mut chat.app, agent_id);
         chat.app.set_status(format!("agent set to {agent_name}"));
         return;
     };
     match client.set_session_agent(session_id, agent_id.clone()).await {
         Ok(()) => {
-            chat.app.set_current_agent(agent_id, agent_accent);
+            chat.agents.apply_agent_to_app(&mut chat.app, agent_id);
             chat.app.set_status(format!("agent set to {agent_name}"));
         }
         Err(error) => chat.app.set_status(format!("agent switch failed: {error}")),
     }
-}
-
-#[must_use]
-pub fn next_agent<'a>(agents: &'a [AgentInfo], current_agent_id: &str) -> Option<&'a AgentInfo> {
-    if agents.is_empty() {
-        return None;
-    }
-    if let Some(index) = agents.iter().position(|agent| agent.id == current_agent_id) {
-        return agents.get((index + 1) % agents.len());
-    }
-    agents
-        .iter()
-        .find(|agent| agent.is_default)
-        .or_else(|| agents.first())
 }
 
 fn is_palette_open_key(keymap: &BmuxKeyMap, stroke: KeyStroke) -> bool {

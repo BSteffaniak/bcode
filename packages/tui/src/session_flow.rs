@@ -1,7 +1,9 @@
 //! Session picker event flow for the TUI.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 
+use bcode_agent_profile::AgentInfo;
 use bcode_client::{AttachedSessionHistory, BcodeClient, SessionList};
 use bcode_ipc::{
     Event as BcodeEvent, RuntimeWorkSnapshot, SessionCatalogSourceStatus, SessionCatalogStatus,
@@ -26,6 +28,7 @@ use super::{session_picker, session_picker_render};
 /// Active chat session state shared by TUI flows.
 pub struct ActiveChat {
     pub app: BmuxApp,
+    pub agents: AgentCatalog,
     pub session_id: Option<SessionId>,
     pub event_sender: mpsc::UnboundedSender<BcodeEvent>,
     pub event_receiver: mpsc::UnboundedReceiver<BcodeEvent>,
@@ -35,6 +38,70 @@ pub struct ActiveChat {
     pub session_open_task: Option<JoinHandle<()>>,
     pub status_hydration_task: Option<JoinHandle<()>>,
     pub opening_session_id: Option<SessionId>,
+}
+
+/// TUI-side catalog of agent profile metadata.
+#[derive(Debug, Clone, Default)]
+pub struct AgentCatalog {
+    agents: Vec<AgentInfo>,
+    by_id: BTreeMap<String, AgentInfo>,
+}
+
+impl AgentCatalog {
+    /// Load agent metadata from the daemon.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the client cannot fetch agent profiles.
+    pub async fn load(client: &BcodeClient) -> Result<Self, TuiError> {
+        Ok(Self::from_agents(client.list_agents().await?))
+    }
+
+    /// Build a catalog from ordered agent metadata.
+    #[must_use]
+    pub fn from_agents(agents: Vec<AgentInfo>) -> Self {
+        let by_id = agents
+            .iter()
+            .map(|agent| (agent.id.clone(), agent.clone()))
+            .collect();
+        Self { agents, by_id }
+    }
+
+    /// Apply an agent id plus any known metadata to app state.
+    pub fn apply_agent_to_app(&self, app: &mut BmuxApp, agent_id: impl Into<String>) {
+        let agent_id = agent_id.into();
+        let accent = self
+            .by_id
+            .get(&agent_id)
+            .and_then(|agent| agent.accent.clone());
+        app.set_current_agent(agent_id, accent);
+    }
+
+    /// Apply metadata for the app's current agent id without changing the id.
+    pub fn refresh_app_agent_metadata(&self, app: &mut BmuxApp) {
+        let agent_id = app.current_agent_id().to_owned();
+        self.apply_agent_to_app(app, agent_id);
+    }
+
+    /// Return the next agent after the current one in catalog order.
+    #[must_use]
+    pub fn next_agent(&self, current_agent_id: &str) -> Option<&AgentInfo> {
+        next_agent(&self.agents, current_agent_id)
+    }
+}
+
+#[must_use]
+pub fn next_agent<'a>(agents: &'a [AgentInfo], current_agent_id: &str) -> Option<&'a AgentInfo> {
+    if agents.is_empty() {
+        return None;
+    }
+    if let Some(index) = agents.iter().position(|agent| agent.id == current_agent_id) {
+        return agents.get((index + 1) % agents.len());
+    }
+    agents
+        .iter()
+        .find(|agent| agent.is_default)
+        .or_else(|| agents.first())
 }
 
 /// Async TUI work completion event.
@@ -89,6 +156,7 @@ pub fn start_switch_session(
     chat.session_id = None;
     chat.app = BmuxApp::new_with_history(Some(next_session_id), &[], &[], false);
     chat.app.apply_tui_config(tui_config);
+    chat.agents.refresh_app_agent_metadata(&mut chat.app);
     if !draft_text.is_empty() {
         chat.app.replace_composer_with(&draft_text);
     }
@@ -139,6 +207,7 @@ pub fn complete_switch_session(
                 has_older_history,
             );
             chat.app.apply_tui_config(tui_config);
+            chat.agents.refresh_app_agent_metadata(&mut chat.app);
             if !draft_text.is_empty() {
                 chat.app.replace_composer_with(&draft_text);
             }
@@ -268,11 +337,10 @@ pub fn switch_to_draft_session(chat: &mut ActiveChat) {
     chat.session_id = None;
     let tui_config = chat.app.tui_config().clone();
     let current_agent_id = chat.app.current_agent_id().to_owned();
-    let current_agent_accent = chat.app.current_agent_accent().map(ToOwned::to_owned);
     chat.app = BmuxApp::new_with_history(None, &[], &[], false);
     chat.app.apply_tui_config(tui_config);
-    chat.app
-        .set_current_agent(current_agent_id, current_agent_accent);
+    chat.agents
+        .apply_agent_to_app(&mut chat.app, current_agent_id);
     chat.app
         .set_status("New draft session; send a message to save it".to_owned());
 }
@@ -289,14 +357,13 @@ pub async fn persist_draft_session<W: Write>(
     chat.app.set_status("Creating session…".to_owned());
     terminal.draw(|frame| super::render::render(&mut chat.app, frame))?;
     let draft_agent_id = chat.app.current_agent_id().to_owned();
-    let draft_agent_accent = chat.app.current_agent_accent().map(ToOwned::to_owned);
     let session = client.create_session(None).await?;
     if draft_agent_id != "build" {
         client
             .set_session_agent(session.id, draft_agent_id.clone())
             .await?;
-        chat.app
-            .set_current_agent(draft_agent_id, draft_agent_accent);
+        chat.agents
+            .apply_agent_to_app(&mut chat.app, draft_agent_id);
     }
     let (attached, event_task) =
         history_flow::attach_session_event_stream(client, session.id, chat.event_sender.clone())

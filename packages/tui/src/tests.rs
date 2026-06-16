@@ -315,19 +315,32 @@ fn configured_agent_cycle_binding_can_be_changed() {
 }
 
 #[test]
+fn agent_catalog_applies_configured_accent() {
+    let agents =
+        agent_infos_with_accents(&[("plan", false, Some("#6b7280")), ("build", true, None)]);
+    let catalog = super::session_flow::AgentCatalog::from_agents(agents);
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+
+    catalog.apply_agent_to_app(&mut app, "plan");
+
+    assert_eq!(app.current_agent_id(), "plan");
+    assert_eq!(app.current_agent_accent(), Some("#6b7280"));
+}
+
+#[test]
 fn next_agent_preserves_list_order_and_wraps() {
     let agents = agent_infos(&[("plan", false), ("review", false), ("build", true)]);
 
     assert_eq!(
-        super::chat_loop::next_agent(&agents, "plan").map(|agent| agent.id.as_str()),
+        super::session_flow::next_agent(&agents, "plan").map(|agent| agent.id.as_str()),
         Some("review")
     );
     assert_eq!(
-        super::chat_loop::next_agent(&agents, "review").map(|agent| agent.id.as_str()),
+        super::session_flow::next_agent(&agents, "review").map(|agent| agent.id.as_str()),
         Some("build")
     );
     assert_eq!(
-        super::chat_loop::next_agent(&agents, "build").map(|agent| agent.id.as_str()),
+        super::session_flow::next_agent(&agents, "build").map(|agent| agent.id.as_str()),
         Some("plan")
     );
 }
@@ -338,14 +351,14 @@ fn next_agent_uses_default_or_first_when_current_is_unknown() {
     let no_default = agent_infos(&[("plan", false), ("build", false)]);
 
     assert_eq!(
-        super::chat_loop::next_agent(&agents, "custom").map(|agent| agent.id.as_str()),
+        super::session_flow::next_agent(&agents, "custom").map(|agent| agent.id.as_str()),
         Some("build")
     );
     assert_eq!(
-        super::chat_loop::next_agent(&no_default, "custom").map(|agent| agent.id.as_str()),
+        super::session_flow::next_agent(&no_default, "custom").map(|agent| agent.id.as_str()),
         Some("plan")
     );
-    assert!(super::chat_loop::next_agent(&[], "custom").is_none());
+    assert!(super::session_flow::next_agent(&[], "custom").is_none());
 }
 
 #[test]
@@ -1074,6 +1087,7 @@ fn new_draft_preserves_selected_agent() {
     let (async_sender, async_receiver) = tokio::sync::mpsc::unbounded_channel();
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(None, &[], &[], false),
+        agents: super::session_flow::AgentCatalog::default(),
         session_id: None,
         event_sender: sender,
         event_receiver: receiver,
@@ -1098,6 +1112,7 @@ async fn async_session_open_preserves_typed_draft() {
     let session_id = SessionId::new();
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(Some(session_id), &[], &[], false),
+        agents: super::session_flow::AgentCatalog::default(),
         session_id: None,
         event_sender: sender,
         event_receiver: receiver,
@@ -1151,6 +1166,7 @@ async fn async_session_open_initial_state_preserves_existing_draft() {
     let session_id = SessionId::new();
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(None, &[], &[], false),
+        agents: super::session_flow::AgentCatalog::default(),
         session_id: None,
         event_sender: sender,
         event_receiver: receiver,
@@ -3833,14 +3849,23 @@ fn rendered_text(buffer: &Buffer) -> String {
 }
 
 fn agent_infos(items: &[(&str, bool)]) -> Vec<AgentInfo> {
+    agent_infos_with_accents(
+        &items
+            .iter()
+            .map(|(id, is_default)| (*id, *is_default, None))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn agent_infos_with_accents(items: &[(&str, bool, Option<&str>)]) -> Vec<AgentInfo> {
     items
         .iter()
-        .map(|(id, is_default)| AgentInfo {
+        .map(|(id, is_default, accent)| AgentInfo {
             id: (*id).to_owned(),
             name: (*id).to_owned(),
             description: String::new(),
             badge: None,
-            accent: None,
+            accent: accent.map(ToOwned::to_owned),
             aliases: Vec::new(),
             is_default: *is_default,
         })
