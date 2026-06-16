@@ -1156,6 +1156,17 @@ enum IpcResponsePayload {
     WorktreeList(WorktreeListResponse),
     WorktreeCreated(WorktreeCreateResponse),
     WorktreeRemoved(WorktreeRemoveResponse),
+    RalphStatus(RalphStatusResponse),
+    RalphRunStarted(RalphRunResponse),
+    RalphRunCancelled(RalphCancelResponse),
+    RalphRunsListed(RalphListRunsResponse),
+    RalphIterationsListed(RalphListIterationsResponse),
+    RalphRunResumed(RalphResumeResponse),
+    RalphRunApproved(RalphRunResponse),
+    RalphRunStatus(RalphRunStatusResponse),
+    RalphLifecycleRecorded {
+        event: IpcSessionEvent,
+    },
     ExternalSessionImported {
         session: SessionSummary,
         warnings: Vec<SessionImportWarning>,
@@ -1342,6 +1353,19 @@ impl From<&ResponsePayload> for IpcResponsePayload {
             ResponsePayload::WorktreeList(value) => Self::WorktreeList(value.clone()),
             ResponsePayload::WorktreeCreated(value) => Self::WorktreeCreated(value.clone()),
             ResponsePayload::WorktreeRemoved(value) => Self::WorktreeRemoved(value.clone()),
+            ResponsePayload::RalphStatus(value) => Self::RalphStatus(value.clone()),
+            ResponsePayload::RalphRunStarted(value) => Self::RalphRunStarted(value.clone()),
+            ResponsePayload::RalphRunCancelled(value) => Self::RalphRunCancelled(value.clone()),
+            ResponsePayload::RalphRunsListed(value) => Self::RalphRunsListed(value.clone()),
+            ResponsePayload::RalphIterationsListed(value) => {
+                Self::RalphIterationsListed(value.clone())
+            }
+            ResponsePayload::RalphRunResumed(value) => Self::RalphRunResumed(value.clone()),
+            ResponsePayload::RalphRunApproved(value) => Self::RalphRunApproved(value.clone()),
+            ResponsePayload::RalphRunStatus(value) => Self::RalphRunStatus(value.clone()),
+            ResponsePayload::RalphLifecycleRecorded { event } => Self::RalphLifecycleRecorded {
+                event: IpcSessionEvent::from(event),
+            },
             ResponsePayload::ExternalSessionImported { session, warnings } => {
                 Self::ExternalSessionImported {
                     session: session.clone(),
@@ -1493,6 +1517,21 @@ impl TryFrom<IpcResponsePayload> for ResponsePayload {
             IpcResponsePayload::WorktreeList(value) => Ok(Self::WorktreeList(value)),
             IpcResponsePayload::WorktreeCreated(value) => Ok(Self::WorktreeCreated(value)),
             IpcResponsePayload::WorktreeRemoved(value) => Ok(Self::WorktreeRemoved(value)),
+            IpcResponsePayload::RalphStatus(value) => Ok(Self::RalphStatus(value)),
+            IpcResponsePayload::RalphRunStarted(value) => Ok(Self::RalphRunStarted(value)),
+            IpcResponsePayload::RalphRunCancelled(value) => Ok(Self::RalphRunCancelled(value)),
+            IpcResponsePayload::RalphRunsListed(value) => Ok(Self::RalphRunsListed(value)),
+            IpcResponsePayload::RalphIterationsListed(value) => {
+                Ok(Self::RalphIterationsListed(value))
+            }
+            IpcResponsePayload::RalphRunResumed(value) => Ok(Self::RalphRunResumed(value)),
+            IpcResponsePayload::RalphRunApproved(value) => Ok(Self::RalphRunApproved(value)),
+            IpcResponsePayload::RalphRunStatus(value) => Ok(Self::RalphRunStatus(value)),
+            IpcResponsePayload::RalphLifecycleRecorded { event } => {
+                Ok(Self::RalphLifecycleRecorded {
+                    event: event.try_into()?,
+                })
+            }
             IpcResponsePayload::ExternalSessionImported { session, warnings } => {
                 Ok(Self::ExternalSessionImported { session, warnings })
             }
@@ -1750,6 +1789,13 @@ enum IpcSessionEventKind {
         source_prompt_sequence: Option<u64>,
         forked_at_ms: u64,
         kind: SessionForkKind,
+    },
+    RalphLifecycle {
+        loop_name: String,
+        state_dir: PathBuf,
+        kind: String,
+        message: String,
+        occurred_at_ms: u64,
     },
 }
 
@@ -2148,6 +2194,19 @@ impl From<&SessionEventKind> for IpcSessionEventKind {
                 forked_at_ms: forked_at_ms.clone(),
                 kind: kind.clone(),
             },
+            SessionEventKind::RalphLifecycle {
+                loop_name,
+                state_dir,
+                kind,
+                message,
+                occurred_at_ms,
+            } => Self::RalphLifecycle {
+                loop_name: loop_name.clone(),
+                state_dir: state_dir.clone(),
+                kind: kind.clone(),
+                message: message.clone(),
+                occurred_at_ms: occurred_at_ms.clone(),
+            },
         }
     }
 }
@@ -2422,6 +2481,19 @@ impl TryFrom<IpcSessionEventKind> for SessionEventKind {
                 source_prompt_sequence,
                 forked_at_ms,
                 kind,
+            }),
+            IpcSessionEventKind::RalphLifecycle {
+                loop_name,
+                state_dir,
+                kind,
+                message,
+                occurred_at_ms,
+            } => Ok(Self::RalphLifecycle {
+                loop_name,
+                state_dir,
+                kind,
+                message,
+                occurred_at_ms,
             }),
         }
     }

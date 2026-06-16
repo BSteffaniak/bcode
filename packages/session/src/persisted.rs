@@ -369,6 +369,14 @@ enum PersistedSessionEventKind {
         forked_at_ms: u64,
         kind: SessionForkKind,
     },
+    /// Durable marker for Ralph loop lifecycle events relevant to this session.
+    RalphLifecycle {
+        loop_name: String,
+        state_dir: PathBuf,
+        kind: String,
+        message: String,
+        occurred_at_ms: u64,
+    },
 }
 
 impl From<&SessionEventKind> for PersistedSessionEventKind {
@@ -655,6 +663,19 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 forked_at_ms: *forked_at_ms,
                 kind: *kind,
             },
+            SessionEventKind::RalphLifecycle {
+                loop_name,
+                state_dir,
+                kind,
+                message,
+                occurred_at_ms,
+            } => Self::RalphLifecycle {
+                loop_name: loop_name.clone(),
+                state_dir: state_dir.clone(),
+                kind: kind.clone(),
+                message: message.clone(),
+                occurred_at_ms: *occurred_at_ms,
+            },
         }
     }
 }
@@ -919,6 +940,19 @@ impl PersistedSessionEventKind {
                 source_prompt_sequence,
                 forked_at_ms,
                 kind,
+            },
+            Self::RalphLifecycle {
+                loop_name,
+                state_dir,
+                kind,
+                message,
+                occurred_at_ms,
+            } => SessionEventKind::RalphLifecycle {
+                loop_name,
+                state_dir,
+                kind,
+                message,
+                occurred_at_ms,
             },
         }
     }
