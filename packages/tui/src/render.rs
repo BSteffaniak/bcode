@@ -419,6 +419,7 @@ fn header_spans(app: &BmuxApp, width: usize) -> Vec<Span> {
             Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             false,
         )
+        .required(app.current_agent_id().to_owned(), cyan, false)
         .required(session_title, Style::new(), true)
         .optional(
             format!("model {}", app.selected_model_id().unwrap_or("default")),
@@ -426,7 +427,6 @@ fn header_spans(app: &BmuxApp, width: usize) -> Vec<Span> {
             80,
             false,
         )
-        .optional(format!("agent {}", app.current_agent_id()), cyan, 70, false)
         .optional(
             format!(
                 "provider {}",

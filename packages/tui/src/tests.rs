@@ -756,7 +756,7 @@ fn header_drops_low_priority_segments_in_narrow_panes() {
     let header = buffer.row_symbols(0).unwrap();
 
     assert!(header.contains("bcode"));
-    assert!(header.contains("readable session title"));
+    assert!(header.contains("build"));
     assert!(!header.contains("provider"));
     assert!(!header.contains("thinking"));
 }
@@ -868,7 +868,8 @@ fn header_and_footer_include_model_agent_and_token_context() {
     );
     assert!(buffer.row_symbols(0).unwrap().contains("provider.example"));
     assert!(output.contains("model-example"));
-    assert!(output.contains("agent plan"));
+    assert!(output.contains("plan"));
+    assert!(!output.contains("agent plan"));
     assert!(output.contains("ctx 512/1.0k 50%"));
     assert!(output.contains("read 256"));
     assert!(output.contains("write 128"));
@@ -975,7 +976,8 @@ fn draft_agent_selection_updates_header() {
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
 
-    assert!(buffer.row_symbols(0).unwrap().contains("agent plan"));
+    assert!(buffer.row_symbols(0).unwrap().contains("plan"));
+    assert!(!buffer.row_symbols(0).unwrap().contains("agent plan"));
 }
 
 #[test]
