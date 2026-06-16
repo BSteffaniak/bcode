@@ -49,6 +49,38 @@ const MAX_INLINE_STDOUT_ROWS: usize = 24;
 const MAX_INLINE_STDERR_ROWS: usize = 24;
 const MAX_INLINE_TOOL_TEXT_ROWS: usize = 28;
 const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(420);
+#[derive(Debug, Clone, Copy)]
+struct RenderTheme {
+    accent: Color,
+}
+
+impl RenderTheme {
+    fn for_agent(agent_id: &str) -> Self {
+        Self {
+            accent: agent_accent_color(agent_id),
+        }
+    }
+}
+
+fn agent_accent_color(agent_id: &str) -> Color {
+    fallback_agent_accent_color(agent_id)
+}
+
+fn fallback_agent_accent_color(agent_id: &str) -> Color {
+    const PALETTE: [Color; 6] = [
+        Color::Cyan,
+        Color::Rgb(167, 139, 250),
+        Color::Rgb(52, 211, 153),
+        Color::Rgb(245, 158, 11),
+        Color::Rgb(96, 165, 250),
+        Color::Rgb(244, 114, 182),
+    ];
+    let hash = agent_id.bytes().fold(0_usize, |hash, byte| {
+        hash.wrapping_mul(33).wrapping_add(usize::from(byte))
+    });
+    PALETTE[hash % PALETTE.len()]
+}
+
 /// Prepared geometry for one TUI frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameLayout {
@@ -95,13 +127,14 @@ pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>, layout: FrameLa
         return;
     }
 
-    render_header(app, layout.header, frame);
-    render_composer(app, layout.composer, frame);
+    let theme = RenderTheme::for_agent(app.current_agent_id());
+    render_header(app, layout.header, frame, theme);
+    render_composer(app, layout.composer, frame, theme);
     render_body(app, layout.body, frame);
     if let Some(latest_bar) = layout.latest_bar {
         render_latest_bar(app, latest_bar, frame, Instant::now());
     }
-    render_status(app, layout.status, frame);
+    render_status(app, layout.status, frame, theme);
 }
 
 impl FrameLayout {
@@ -148,7 +181,7 @@ fn frame_layout(app: &BmuxApp, area: Rect) -> Option<FrameLayout> {
         latest_bar,
         status,
         composer,
-        composer_content: composer_panel().inner_area(composer),
+        composer_content: composer_panel(Color::Cyan).inner_area(composer),
     })
 }
 
@@ -391,35 +424,35 @@ const fn composer_area(area: Rect, composer_height: u16) -> Rect {
     )
 }
 
-fn composer_panel() -> Panel {
+fn composer_panel(accent: Color) -> Panel {
     Panel::new()
-        .border(Border::single().style(Style::new().fg(Color::Cyan)))
+        .border(Border::single().style(Style::new().fg(accent)))
         .title(" Message ")
         .padding(Insets::new(0, 1, 0, 1))
 }
 
-fn render_header(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_header(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: RenderTheme) {
     if area.is_empty() {
         return;
     }
 
-    let line = Line::from_spans(header_spans(app, usize::from(area.width)));
+    let line = Line::from_spans(header_spans(app, usize::from(area.width), theme));
     frame.write_line(area, &line);
 }
 
-fn header_spans(app: &BmuxApp, width: usize) -> Vec<Span> {
+fn header_spans(app: &BmuxApp, width: usize, theme: RenderTheme) -> Vec<Span> {
     let muted = Style::new().fg(Color::BrightBlack);
-    let cyan = Style::new().fg(Color::Cyan);
+    let accent = Style::new().fg(theme.accent);
     let session_title = app
         .session_title()
         .map_or_else(|| "Untitled session".to_owned(), ToOwned::to_owned);
     let mut line = ChromeLine::new(" · ", muted)
         .required(
             "bcode".to_owned(),
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
             false,
         )
-        .required(app.current_agent_id().to_owned(), cyan, false)
+        .required(app.current_agent_id().to_owned(), accent, false)
         .required(session_title, Style::new(), true)
         .optional(
             format!("model {}", app.selected_model_id().unwrap_or("default")),
@@ -432,7 +465,7 @@ fn header_spans(app: &BmuxApp, width: usize) -> Vec<Span> {
                 "provider {}",
                 app.selected_provider_plugin_id().unwrap_or("auto")
             ),
-            cyan,
+            accent,
             50,
             false,
         )
@@ -2856,12 +2889,12 @@ fn pending_label(state: PendingSubmissionState) -> String {
     }
 }
 
-fn render_status(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_status(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: RenderTheme) {
     if area.is_empty() {
         return;
     }
 
-    let spans = statusline_spans(app, usize::from(area.width));
+    let spans = statusline_spans(app, usize::from(area.width), theme);
     frame.write_line(area, &Line::from_spans(spans));
 }
 
@@ -3023,11 +3056,11 @@ impl ChromeLine {
     }
 }
 
-fn statusline_spans(app: &BmuxApp, width: usize) -> Vec<Span> {
+fn statusline_spans(app: &BmuxApp, width: usize, theme: RenderTheme) -> Vec<Span> {
     let muted = Style::new().fg(Color::BrightBlack);
     let mut line = ChromeLine::new(" · ", muted).required(
         activity_label(app.activity()),
-        Style::new().fg(Color::Cyan),
+        Style::new().fg(theme.accent),
         true,
     );
 
@@ -3185,11 +3218,11 @@ fn spinner_frame() -> &'static str {
     SPINNER_FRAMES[index]
 }
 
-fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: RenderTheme) {
     if area.is_empty() {
         return;
     }
-    let panel = composer_panel();
+    let panel = composer_panel(theme.accent);
     panel.render(area, frame);
     let inner = panel.inner_area(area);
     app.set_composer_content_area(inner);

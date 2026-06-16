@@ -776,6 +776,56 @@ fn header_shortens_session_id_on_wide_panes() {
 }
 
 #[test]
+fn header_accent_color_tracks_arbitrary_selected_agent() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.set_current_agent_id("one");
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
+    let mut frame = Frame::new(&mut buffer);
+
+    render::render(&mut app, &mut frame);
+
+    assert_eq!(
+        buffer.get(Point::new(0, 0)).and_then(|cell| cell.style.fg),
+        Some(bmux_tui::style::Color::Rgb(52, 211, 153))
+    );
+}
+
+#[test]
+fn composer_border_accent_color_tracks_arbitrary_selected_agent() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.set_current_agent_id("two");
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
+    let mut frame = Frame::new(&mut buffer);
+
+    render::render(&mut app, &mut frame);
+    let border_y = app.composer_content_area().y.saturating_sub(1);
+
+    assert_eq!(
+        buffer
+            .get(Point::new(0, border_y))
+            .and_then(|cell| cell.style.fg),
+        Some(bmux_tui::style::Color::Cyan)
+    );
+}
+
+#[test]
+fn same_agent_gets_same_accent_across_chrome() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.set_current_agent_id("custom-agent");
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
+    let mut frame = Frame::new(&mut buffer);
+
+    render::render(&mut app, &mut frame);
+    let header_accent = buffer.get(Point::new(0, 0)).and_then(|cell| cell.style.fg);
+    let border_y = app.composer_content_area().y.saturating_sub(1);
+    let composer_accent = buffer
+        .get(Point::new(0, border_y))
+        .and_then(|cell| cell.style.fg);
+
+    assert_eq!(header_accent, composer_accent);
+}
+
+#[test]
 fn live_session_rename_overrides_attach_summary_title() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
