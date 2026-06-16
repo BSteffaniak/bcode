@@ -44,6 +44,9 @@ impl RustPlugin for DefaultAgentsPlugin {
 }
 
 fn agent_list() -> AgentList {
+    let (config, _) = load_config();
+    let plan = agent_config(&config, PLAN_AGENT);
+    let build = agent_config(&config, BUILD_AGENT);
     AgentList {
         agents: vec![
             AgentInfo {
@@ -52,6 +55,7 @@ fn agent_list() -> AgentList {
                 description: "Read-only analysis agent with Pi/OpenCode-style command policy"
                     .to_string(),
                 badge: Some("plan".to_string()),
+                accent: plan.accent,
                 aliases: vec!["plan".to_string()],
                 is_default: false,
             },
@@ -61,6 +65,7 @@ fn agent_list() -> AgentList {
                 description: "Implementation agent with normal Bcode permission checkpoints"
                     .to_string(),
                 badge: Some("build".to_string()),
+                accent: build.accent,
                 aliases: vec!["build".to_string()],
                 is_default: true,
             },

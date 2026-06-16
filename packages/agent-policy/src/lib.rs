@@ -41,6 +41,7 @@ pub fn default_config() -> AgentPermissionConfig {
     agent.insert(
         BUILD_AGENT.to_string(),
         AgentConfig {
+            accent: None,
             tools: BTreeMap::from([
                 ("bash".to_string(), true),
                 ("read".to_string(), true),
@@ -72,6 +73,7 @@ pub fn default_config() -> AgentPermissionConfig {
     agent.insert(
         PLAN_AGENT.to_string(),
         AgentConfig {
+            accent: None,
             tools: BTreeMap::from([
                 ("bash".to_string(), true),
                 ("read".to_string(), true),
@@ -924,6 +926,7 @@ mod tests {
             agent: BTreeMap::from([(
                 PLAN_AGENT.to_string(),
                 AgentConfig {
+                    accent: None,
                     tools: BTreeMap::from([
                         ("bash".to_string(), true),
                         ("write".to_string(), false),
@@ -978,6 +981,7 @@ mod tests {
             agent: BTreeMap::from([(
                 BUILD_AGENT.to_string(),
                 AgentConfig {
+                    accent: None,
                     tools: BTreeMap::from([("bash".to_string(), true)]),
                     permission: PermissionConfig {
                         bash: BTreeMap::from([
@@ -1017,6 +1021,7 @@ mod tests {
     #[test]
     fn external_directory_policy_blocks_outside_paths() {
         let config = AgentConfig {
+            accent: None,
             tools: BTreeMap::from([("write".to_string(), true)]),
             permission: PermissionConfig {
                 bash: BTreeMap::new(),
@@ -1054,6 +1059,7 @@ mod tests {
 
     fn build_with_permission(permission: PermissionConfig) -> AgentConfig {
         AgentConfig {
+            accent: None,
             tools: BTreeMap::from([
                 ("filesystem.read".to_string(), true),
                 ("filesystem.write".to_string(), true),
@@ -1163,6 +1169,7 @@ mod tests {
     #[test]
     fn filesystem_write_falls_back_to_deny_when_tool_disabled() {
         let config = AgentConfig {
+            accent: None,
             tools: BTreeMap::from([("filesystem.write".to_string(), false)]),
             permission: PermissionConfig::default(),
         };
@@ -1179,6 +1186,7 @@ mod tests {
     #[test]
     fn external_directory_short_circuits_before_path_rules() {
         let config = AgentConfig {
+            accent: None,
             tools: BTreeMap::from([("filesystem.write".to_string(), true)]),
             permission: PermissionConfig {
                 external_directory: Action::Deny,

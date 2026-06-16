@@ -268,9 +268,11 @@ pub fn switch_to_draft_session(chat: &mut ActiveChat) {
     chat.session_id = None;
     let tui_config = chat.app.tui_config().clone();
     let current_agent_id = chat.app.current_agent_id().to_owned();
+    let current_agent_accent = chat.app.current_agent_accent().map(ToOwned::to_owned);
     chat.app = BmuxApp::new_with_history(None, &[], &[], false);
     chat.app.apply_tui_config(tui_config);
-    chat.app.set_current_agent_id(current_agent_id);
+    chat.app
+        .set_current_agent(current_agent_id, current_agent_accent);
     chat.app
         .set_status("New draft session; send a message to save it".to_owned());
 }
@@ -287,12 +289,14 @@ pub async fn persist_draft_session<W: Write>(
     chat.app.set_status("Creating session…".to_owned());
     terminal.draw(|frame| super::render::render(&mut chat.app, frame))?;
     let draft_agent_id = chat.app.current_agent_id().to_owned();
+    let draft_agent_accent = chat.app.current_agent_accent().map(ToOwned::to_owned);
     let session = client.create_session(None).await?;
     if draft_agent_id != "build" {
         client
             .set_session_agent(session.id, draft_agent_id.clone())
             .await?;
-        chat.app.set_current_agent_id(draft_agent_id);
+        chat.app
+            .set_current_agent(draft_agent_id, draft_agent_accent);
     }
     let (attached, event_task) =
         history_flow::attach_session_event_stream(client, session.id, chat.event_sender.clone())

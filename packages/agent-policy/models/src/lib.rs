@@ -23,6 +23,9 @@ pub enum Action {
 /// Agent mode/profile configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentConfig {
+    /// Optional UI accent color, encoded as `#RRGGBB`.
+    #[serde(default)]
+    pub accent: Option<String>,
     /// Per-tool enablement map. Missing entries inherit the host default.
     #[serde(default)]
     pub tools: BTreeMap<String, bool>,

@@ -4153,6 +4153,7 @@ bash = { "cargo *" = "allow" }
         let mut base = BTreeMap::from([(
             "build".to_string(),
             AgentConfig {
+                accent: None,
                 tools: BTreeMap::new(),
                 permission: PermissionConfig {
                     bash: BTreeMap::from([
@@ -4166,6 +4167,7 @@ bash = { "cargo *" = "allow" }
         let overlay = BTreeMap::from([(
             "build".to_string(),
             AgentConfig {
+                accent: None,
                 tools: BTreeMap::new(),
                 permission: PermissionConfig {
                     bash: BTreeMap::from([
@@ -4204,6 +4206,7 @@ bash = { "cargo *" = "allow" }
         let overlay = BTreeMap::from([(
             "scratch".to_string(),
             AgentConfig {
+                accent: None,
                 tools: BTreeMap::from([("shell.run".to_string(), true)]),
                 permission: PermissionConfig {
                     bash: BTreeMap::from([("*".to_string(), Action::Ask)]),

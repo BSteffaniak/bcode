@@ -6996,6 +6996,7 @@ fn default_agent_profiles() -> Vec<AgentInfo> {
         name: "Build".to_string(),
         description: "Default implementation agent".to_string(),
         badge: Some("build".to_string()),
+        accent: None,
         aliases: vec!["build".to_string()],
         is_default: true,
     }]

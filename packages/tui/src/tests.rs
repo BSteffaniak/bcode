@@ -826,6 +826,44 @@ fn same_agent_gets_same_accent_across_chrome() {
 }
 
 #[test]
+fn configured_agent_accent_overrides_fallback_color() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.set_current_agent("quiet-plan", Some("#6b7280".to_owned()));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
+    let mut frame = Frame::new(&mut buffer);
+
+    render::render(&mut app, &mut frame);
+
+    assert_eq!(
+        buffer.get(Point::new(0, 0)).and_then(|cell| cell.style.fg),
+        Some(bmux_tui::style::Color::Rgb(107, 114, 128))
+    );
+}
+
+#[test]
+fn invalid_configured_agent_accent_falls_back_to_agent_color() {
+    let mut fallback_app = BmuxApp::new_with_history(None, &[], &[], false);
+    fallback_app.set_current_agent_id("quiet-plan");
+    let mut fallback_buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
+    let mut fallback_frame = Frame::new(&mut fallback_buffer);
+    render::render(&mut fallback_app, &mut fallback_frame);
+    let fallback_accent = fallback_buffer
+        .get(Point::new(0, 0))
+        .and_then(|cell| cell.style.fg);
+
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.set_current_agent("quiet-plan", Some("not-a-color".to_owned()));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+
+    assert_eq!(
+        buffer.get(Point::new(0, 0)).and_then(|cell| cell.style.fg),
+        fallback_accent
+    );
+}
+
+#[test]
 fn live_session_rename_overrides_attach_summary_title() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
@@ -3802,6 +3840,7 @@ fn agent_infos(items: &[(&str, bool)]) -> Vec<AgentInfo> {
             name: (*id).to_owned(),
             description: String::new(),
             badge: None,
+            accent: None,
             aliases: Vec::new(),
             is_default: *is_default,
         })

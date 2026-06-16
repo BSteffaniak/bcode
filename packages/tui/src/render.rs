@@ -37,6 +37,7 @@ use super::transcript::{FileEditPhase, TranscriptItem, TranscriptItemKind};
 use super::transcript_layout::TranscriptLayoutSignature;
 use crate::time_format::{format_elapsed_millis, format_millis};
 use bmux_tui::text_width::{display_width as text_display_width, truncate_to_display_width};
+use std::num::ParseIntError;
 use unicode_segmentation::UnicodeSegmentation;
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -55,11 +56,30 @@ struct RenderTheme {
 }
 
 impl RenderTheme {
-    fn for_agent(agent_id: &str) -> Self {
+    fn for_agent(agent_id: &str, configured_accent: Option<&str>) -> Self {
         Self {
-            accent: agent_accent_color(agent_id),
+            accent: configured_accent
+                .and_then(parse_agent_accent_color)
+                .unwrap_or_else(|| agent_accent_color(agent_id)),
         }
     }
+}
+
+fn parse_agent_accent_color(accent: &str) -> Option<Color> {
+    let hex = accent.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let [red, green, blue] = parse_hex_rgb(hex).ok()?;
+    Some(Color::Rgb(red, green, blue))
+}
+
+fn parse_hex_rgb(hex: &str) -> Result<[u8; 3], ParseIntError> {
+    Ok([
+        u8::from_str_radix(&hex[0..2], 16)?,
+        u8::from_str_radix(&hex[2..4], 16)?,
+        u8::from_str_radix(&hex[4..6], 16)?,
+    ])
 }
 
 fn agent_accent_color(agent_id: &str) -> Color {
@@ -127,7 +147,7 @@ pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>, layout: FrameLa
         return;
     }
 
-    let theme = RenderTheme::for_agent(app.current_agent_id());
+    let theme = RenderTheme::for_agent(app.current_agent_id(), app.current_agent_accent());
     render_header(app, layout.header, frame, theme);
     render_composer(app, layout.composer, frame, theme);
     render_body(app, layout.body, frame);

@@ -73,8 +73,13 @@ fn has_known_slash_command(message: &str) -> bool {
     slash_command_name(message).is_some_and(is_slash_command_name)
 }
 
-fn apply_draft_agent_selection(chat: &mut ActiveChat, agent_id: String, agent_name: &str) {
-    chat.app.set_current_agent_id(agent_id);
+fn apply_draft_agent_selection(
+    chat: &mut ActiveChat,
+    agent_id: String,
+    agent_name: &str,
+    agent_accent: Option<String>,
+) {
+    chat.app.set_current_agent(agent_id, agent_accent);
     chat.app.set_status(format!("agent set to {agent_name}"));
 }
 
@@ -156,9 +161,10 @@ async fn handle_slash_command<W: Write>(
         slash_commands::SlashCommandOutcome::DraftAgentSelected {
             agent_id,
             agent_name,
+            agent_accent,
         } => {
             chat.app.clear_pending_submission(message);
-            apply_draft_agent_selection(chat, agent_id, &agent_name);
+            apply_draft_agent_selection(chat, agent_id, &agent_name, agent_accent);
         }
         slash_commands::SlashCommandOutcome::PickSession => {
             chat.app.clear_pending_submission(message);

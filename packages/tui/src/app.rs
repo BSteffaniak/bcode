@@ -132,6 +132,7 @@ pub struct BmuxApp {
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
     current_agent_id: String,
+    current_agent_accent: Option<String>,
     reasoning_visible: bool,
     thinking_label: String,
     reasoning_effort: Option<String>,
@@ -299,6 +300,7 @@ impl BmuxApp {
             selected_provider_plugin_id: None,
             selected_model_id: None,
             current_agent_id: "build".to_owned(),
+            current_agent_accent: None,
             reasoning_visible: true,
             thinking_label: "shown · effort: provider default · summary: provider default"
                 .to_owned(),
@@ -412,9 +414,22 @@ impl BmuxApp {
         &self.current_agent_id
     }
 
+    /// Return the configured current agent accent, if known.
+    #[must_use]
+    pub fn current_agent_accent(&self) -> Option<&str> {
+        self.current_agent_accent.as_deref()
+    }
+
     /// Set the current agent id.
     pub fn set_current_agent_id(&mut self, agent_id: impl Into<String>) {
         self.current_agent_id = agent_id.into();
+        self.current_agent_accent = None;
+    }
+
+    /// Set the current agent id and optional configured accent.
+    pub fn set_current_agent(&mut self, agent_id: impl Into<String>, accent: Option<String>) {
+        self.current_agent_id = agent_id.into();
+        self.current_agent_accent = accent;
     }
 
     /// Return the current thinking display label.
@@ -1577,7 +1592,7 @@ impl BmuxApp {
                 }
             }
             SessionEventKind::AgentChanged { agent_id } => {
-                self.current_agent_id.clone_from(agent_id);
+                self.set_current_agent_id(agent_id.clone());
             }
             SessionEventKind::TraceEvent { trace } => {
                 if application.live_activity() {

@@ -39,6 +39,9 @@ pub struct AgentInfo {
     /// Optional compact UI badge.
     #[serde(default)]
     pub badge: Option<String>,
+    /// Optional UI accent color, encoded as `#RRGGBB`.
+    #[serde(default)]
+    pub accent: Option<String>,
     /// Optional slash-command aliases.
     #[serde(default)]
     pub aliases: Vec<String>,

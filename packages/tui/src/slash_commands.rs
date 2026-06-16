@@ -14,6 +14,7 @@ pub enum SlashCommandOutcome {
     DraftAgentSelected {
         agent_id: String,
         agent_name: String,
+        agent_accent: Option<String>,
     },
     /// Open the session picker.
     PickSession,
@@ -480,6 +481,7 @@ async fn handle_agent_command(
     Ok(SlashCommandOutcome::DraftAgentSelected {
         agent_id: agent.id.clone(),
         agent_name: agent.name.clone(),
+        agent_accent: agent.accent.clone(),
     })
 }
 
