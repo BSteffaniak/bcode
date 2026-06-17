@@ -31,6 +31,8 @@ pub fn tui_registry() -> PluginTuiRegistry {
 
 const RALPH_ACTIONS: &[RalphAction] = &[
     RalphAction::new("Plan/setup loop", RalphActionKind::Plan),
+    RalphAction::new("Save setup draft", RalphActionKind::SaveDraft),
+    RalphAction::new("Create loop from draft", RalphActionKind::CreateFromDraft),
     RalphAction::new("Quick create loop", RalphActionKind::Start),
     RalphAction::new("Prepare run", RalphActionKind::Run),
     RalphAction::new("Approve/start run", RalphActionKind::Approve),
@@ -53,6 +55,8 @@ fn action_for_kind(kind: RalphActionKind) -> Option<&'static RalphAction> {
 #[serde(rename_all = "snake_case")]
 enum RalphActionKind {
     Plan,
+    SaveDraft,
+    CreateFromDraft,
     Start,
     Run,
     Approve,
@@ -71,6 +75,8 @@ impl RalphActionKind {
     const fn command_label(self) -> &'static str {
         match self {
             Self::Plan => "plan",
+            Self::SaveDraft => "save-draft",
+            Self::CreateFromDraft => "create-from-draft",
             Self::Start => "start",
             Self::Run => "run",
             Self::Approve => "approve",
@@ -91,6 +97,10 @@ impl RalphActionKind {
             Self::Plan => {
                 "start guided LLM setup: clarify goal, draft charter/progress, then approve"
             }
+            Self::SaveDraft => {
+                "capture latest assistant charter/progress draft for review/approval"
+            }
+            Self::CreateFromDraft => "create loop files/worktree from the reviewed setup draft",
             Self::Start => {
                 "quick-create starter docs/worktree from recent context; advanced fallback"
             }
@@ -279,6 +289,8 @@ impl RalphHomeSurface {
         let kinds: &[RalphActionKind] = if no_loop && has_draft {
             &[
                 RalphActionKind::Plan,
+                RalphActionKind::SaveDraft,
+                RalphActionKind::CreateFromDraft,
                 RalphActionKind::Status,
                 RalphActionKind::Start,
             ]

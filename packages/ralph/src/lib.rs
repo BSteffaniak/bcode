@@ -103,6 +103,18 @@ impl RalphStateStore {
         mark_setup_draft_converted_in_store(self, draft_id, repo_root, state_dir)
     }
 
+    /// Update setup draft content after assistant planning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the draft cannot be read or written.
+    pub fn update_setup_draft(
+        &self,
+        request: RalphSetupDraftUpdateRequest,
+    ) -> Result<RalphSetupDraft, RalphStateError> {
+        update_setup_draft_in_store(self, request)
+    }
+
     /// Return the most recently updated Ralph loop for a repository.
     ///
     /// # Errors
@@ -372,6 +384,20 @@ impl RalphStateStore {
         session_title: Option<&str>,
     ) -> Result<CreatedRalphLoopState, RalphStateError> {
         create_initial_loop_state_in_store(self, loop_name, repo_root, session_title)
+    }
+
+    /// Create initial local state for a Ralph loop from an approved setup draft.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the draft cannot be read, or when loop state files cannot be written.
+    pub fn create_loop_from_setup_draft(
+        &self,
+        draft_id: &str,
+        repo_root: &Path,
+        session_title: Option<&str>,
+    ) -> Result<CreatedRalphLoopState, RalphStateError> {
+        create_loop_from_setup_draft_in_store(self, draft_id, repo_root, session_title)
     }
 
     /// Write a bounded conversation context pack for a Ralph loop.
@@ -849,6 +875,23 @@ pub struct RalphSetupDraftCreateRequest {
     pub validation_commands: Vec<String>,
 }
 
+/// Request used to update setup draft content after assistant planning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RalphSetupDraftUpdateRequest {
+    /// Draft ID to update.
+    pub draft_id: String,
+    /// Repository root the draft belongs to.
+    pub repo_root: PathBuf,
+    /// Updated draft status.
+    pub status: RalphSetupDraftStatus,
+    /// Draft charter content.
+    pub charter_draft: Option<String>,
+    /// Draft progress content.
+    pub progress_draft: Option<String>,
+    /// Updated validation commands.
+    pub validation_commands: Vec<String>,
+}
+
 /// Persistent setup draft used before a Ralph loop is created.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RalphSetupDraft {
@@ -925,6 +968,17 @@ pub fn mark_setup_draft_converted(
     state_dir: &Path,
 ) -> Result<RalphSetupDraft, RalphStateError> {
     RalphStateStore::default().mark_setup_draft_converted(draft_id, repo_root, state_dir)
+}
+
+/// Update setup draft content after assistant planning.
+///
+/// # Errors
+///
+/// Returns an error when the draft cannot be read or written.
+pub fn update_setup_draft(
+    request: RalphSetupDraftUpdateRequest,
+) -> Result<RalphSetupDraft, RalphStateError> {
+    RalphStateStore::default().update_setup_draft(request)
 }
 
 /// Append a Ralph lifecycle event to the loop database.
@@ -1155,6 +1209,19 @@ pub fn create_initial_loop_state(
     session_title: Option<&str>,
 ) -> Result<CreatedRalphLoopState, RalphStateError> {
     RalphStateStore::default().create_initial_loop_state(loop_name, repo_root, session_title)
+}
+
+/// Create initial local state for a Ralph loop from an approved setup draft.
+///
+/// # Errors
+///
+/// Returns an error when the draft cannot be read, or when loop state files cannot be written.
+pub fn create_loop_from_setup_draft(
+    draft_id: &str,
+    repo_root: &Path,
+    session_title: Option<&str>,
+) -> Result<CreatedRalphLoopState, RalphStateError> {
+    RalphStateStore::default().create_loop_from_setup_draft(draft_id, repo_root, session_title)
 }
 
 /// Write a bounded conversation context pack for a Ralph loop.
@@ -2546,6 +2613,66 @@ fn mark_setup_draft_converted_in_store(
     draft.draft_path = draft_path;
     write_setup_draft(&draft)?;
     Ok(draft)
+}
+
+fn update_setup_draft_in_store(
+    store: &RalphStateStore,
+    request: RalphSetupDraftUpdateRequest,
+) -> Result<RalphSetupDraft, RalphStateError> {
+    let draft_path = repo_state_root_in_store(store, &request.repo_root)
+        .join(SETUP_DRAFTS_DIR_NAME)
+        .join(&request.draft_id)
+        .join(SETUP_DRAFT_FILE_NAME);
+    let mut draft = read_setup_draft(&draft_path)?;
+    draft.status = request.status;
+    draft.charter_draft = request.charter_draft;
+    draft.progress_draft = request.progress_draft;
+    draft.validation_commands = request.validation_commands;
+    draft.updated_at_ms = unix_epoch_ms();
+    draft.draft_path = draft_path;
+    write_setup_draft(&draft)?;
+    Ok(draft)
+}
+
+fn create_loop_from_setup_draft_in_store(
+    store: &RalphStateStore,
+    draft_id: &str,
+    repo_root: &Path,
+    session_title: Option<&str>,
+) -> Result<CreatedRalphLoopState, RalphStateError> {
+    let draft_path = repo_state_root_in_store(store, repo_root)
+        .join(SETUP_DRAFTS_DIR_NAME)
+        .join(draft_id)
+        .join(SETUP_DRAFT_FILE_NAME);
+    let draft = read_setup_draft(&draft_path)?;
+    let state = create_initial_loop_state_in_store(
+        store,
+        &draft.loop_name,
+        repo_root,
+        session_title.or(draft.session_title.as_deref()),
+    )?;
+    if let Some(charter) = draft
+        .charter_draft
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
+        std::fs::write(&state.charter_doc_path, charter)?;
+    }
+    if let Some(progress) = draft
+        .progress_draft
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
+        std::fs::write(&state.progress_doc_path, progress)?;
+    }
+    set_validation_commands_in_store(
+        store,
+        &state.state_dir,
+        &draft.validation_commands,
+        "setup_draft",
+    )?;
+    mark_setup_draft_converted_in_store(store, draft_id, repo_root, &state.state_dir)?;
+    Ok(state)
 }
 
 fn read_setup_draft(path: &Path) -> Result<RalphSetupDraft, RalphStateError> {

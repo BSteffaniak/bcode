@@ -15,6 +15,10 @@ use crate::terminal_events::TuiInput;
 pub enum RalphHomeAction {
     /// Open guided setup flow.
     Plan,
+    /// Save latest assistant planning output into the setup draft.
+    SaveDraft,
+    /// Create loop from approved setup draft.
+    CreateFromDraft,
     /// Open quick setup flow.
     Start,
     /// Prepare/run autonomous loop.

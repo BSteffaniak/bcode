@@ -69,6 +69,12 @@ fn flash_message_for_action(action: super::ralph_launcher::RalphHomeAction) -> S
             "Guided setup started. Next: answer the assistant's clarifying questions in chat."
                 .to_owned()
         }
+        super::ralph_launcher::RalphHomeAction::SaveDraft => {
+            "Setup draft saved. Next: review it, then create the loop from the draft.".to_owned()
+        }
+        super::ralph_launcher::RalphHomeAction::CreateFromDraft => {
+            "Loop created from setup draft. Next: prepare a run.".to_owned()
+        }
         super::ralph_launcher::RalphHomeAction::Start => {
             "Setup complete. Next: review the docs if desired, then prepare a run.".to_owned()
         }
@@ -106,6 +112,116 @@ fn flash_message_for_action(action: super::ralph_launcher::RalphHomeAction) -> S
             "Replan prompt written to chat. Next: apply the replan, then prepare a run.".to_owned()
         }
     }
+}
+
+async fn create_loop_from_draft(
+    services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
+) -> Result<(), TuiError> {
+    let repo_root = current_repo_root(chat)?;
+    let Some(draft) = ralph_state::latest_setup_draft(&repo_root)? else {
+        chat.app.set_status("no Ralph setup draft found".to_owned());
+        return Ok(());
+    };
+    let state = ralph_state::create_loop_from_setup_draft(
+        &draft.draft_id,
+        &repo_root,
+        chat.app.session_title(),
+    )?;
+    let work_area = services
+        .client
+        .create_worktree(WorktreeCreateRequest {
+            name: format!("ralph-{}", draft.loop_name),
+            cwd: Some(repo_root),
+            path: None,
+            branch: None,
+            new_branch: None,
+            base_ref: Some(bcode_worktree_models::WorktreeBaseRef::Head),
+            detach: false,
+            force: false,
+            attach_session_id: None,
+            new_session: true,
+            no_setup: false,
+        })
+        .await?;
+    let work_area_session_id = work_area
+        .session
+        .as_ref()
+        .map(|session| session.id.to_string());
+    ralph_state::record_work_area(
+        &state,
+        &work_area.path,
+        work_area.branch.as_deref(),
+        work_area_session_id.as_deref(),
+    )?;
+    chat.app.push_system_note(format!(
+        "Ralph loop created from setup draft\n* Draft: {}\n* Loop: {}\n* Charter: {}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}\n* Next: prepare a run, then approve/start it",
+        draft.draft_id,
+        draft.loop_name,
+        state.charter_doc_path.display(),
+        state.progress_doc_path.display(),
+        state.state_dir.display(),
+        work_area.path.display(),
+        work_area_session_id.as_deref().unwrap_or("<none>")
+    ));
+    chat.app
+        .set_status("Ralph loop created from setup draft".to_owned());
+    Ok(())
+}
+
+fn latest_assistant_message(chat: &ActiveChat) -> Option<String> {
+    chat.app
+        .transcript()
+        .iter()
+        .rev()
+        .find(|item| item.role == "assistant" && !item.text.trim().is_empty())
+        .map(|item| item.text.clone())
+}
+
+fn extract_markdown_section(text: &str, marker: &str) -> Option<String> {
+    let start = text.find(marker)?;
+    let after_marker = &text[start + marker.len()..];
+    let content = after_marker
+        .split("```")
+        .nth(1)
+        .map_or(after_marker, |fenced| fenced)
+        .trim();
+    (!content.is_empty()).then(|| content.to_owned())
+}
+
+fn save_setup_draft(chat: &mut ActiveChat) -> Result<(), TuiError> {
+    let repo_root = current_repo_root(chat)?;
+    let Some(draft) = ralph_state::latest_setup_draft(&repo_root)? else {
+        chat.app.set_status("no Ralph setup draft found".to_owned());
+        return Ok(());
+    };
+    let Some(message) = latest_assistant_message(chat) else {
+        chat.app
+            .set_status("no assistant draft found to save".to_owned());
+        return Ok(());
+    };
+    let charter = extract_markdown_section(&message, "charter.md")
+        .or_else(|| draft.charter_draft.clone())
+        .or_else(|| Some(message.clone()));
+    let progress = extract_markdown_section(&message, "progress.md")
+        .or_else(|| draft.progress_draft.clone())
+        .or_else(|| Some(message.clone()));
+    let updated = ralph_state::update_setup_draft(ralph_state::RalphSetupDraftUpdateRequest {
+        draft_id: draft.draft_id,
+        repo_root,
+        status: ralph_state::RalphSetupDraftStatus::DraftReady,
+        charter_draft: charter,
+        progress_draft: progress,
+        validation_commands: draft.validation_commands,
+    })?;
+    chat.app.push_system_note(format!(
+        "Ralph setup draft saved\n* Draft: {}\n* Status: {}\n* Path: {}\n* Next: review the draft path, then create the loop from draft when approved",
+        updated.draft_id,
+        updated.status,
+        updated.draft_path.display()
+    ));
+    chat.app.set_status("Ralph setup draft saved".to_owned());
+    Ok(())
 }
 
 /// Start an LLM-guided Ralph setup draft instead of immediately creating loop files.
@@ -206,6 +322,10 @@ async fn dispatch_home_action<W: Write>(
 ) -> Result<(), TuiError> {
     match action {
         super::ralph_launcher::RalphHomeAction::Plan => plan_loop(services, chat).await,
+        super::ralph_launcher::RalphHomeAction::SaveDraft => save_setup_draft(chat),
+        super::ralph_launcher::RalphHomeAction::CreateFromDraft => {
+            create_loop_from_draft(services, chat).await
+        }
         super::ralph_launcher::RalphHomeAction::Start => start_loop(io, services, chat).await,
         super::ralph_launcher::RalphHomeAction::Run
         | super::ralph_launcher::RalphHomeAction::Goal => run_loop(services, chat).await,
