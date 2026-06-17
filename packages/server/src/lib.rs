@@ -5377,7 +5377,12 @@ async fn begin_current_turn(
     turn_id: String,
     cancel_state: Arc<TurnCancelState>,
 ) {
-    *context.current_turn.lock().await = Some(RuntimeCurrentTurn {
+    let mut current_turn = context.current_turn.lock().await;
+    debug_assert!(
+        current_turn.is_none(),
+        "begin_current_turn requires no active current turn"
+    );
+    *current_turn = Some(RuntimeCurrentTurn {
         client_id,
         turn_id,
         cancel_state,
@@ -5386,22 +5391,46 @@ async fn begin_current_turn(
 }
 
 async fn finish_current_turn(context: &RuntimeCommandContext<'_>) {
-    *context.current_turn.lock().await = None;
+    let mut current_turn = context.current_turn.lock().await;
+    debug_assert!(
+        current_turn.is_some(),
+        "finish_current_turn requires an active current turn"
+    );
+    *current_turn = None;
 }
 
 async fn begin_provider_round(context: &RuntimeCommandContext<'_>, model_turn: ActiveModelTurn) {
-    if let Some(current_turn) = context.current_turn.lock().await.as_mut() {
-        current_turn.model = Some(model_turn);
-    }
+    let mut current_turn_guard = context.current_turn.lock().await;
+    let Some(current_turn) = current_turn_guard.as_mut() else {
+        debug_assert!(
+            false,
+            "begin_provider_round requires an active current turn"
+        );
+        return;
+    };
+    debug_assert!(
+        current_turn.model.is_none(),
+        "begin_provider_round requires no active provider round"
+    );
+    current_turn.model = Some(model_turn);
+    drop(current_turn_guard);
 }
 
 async fn finish_provider_round(context: &RuntimeCommandContext<'_>) -> Option<ActiveModelTurn> {
-    let mut current_turn = context.current_turn.lock().await;
-    let active_turn = current_turn.as_ref().and_then(|turn| turn.model.clone());
-    if let Some(current_turn) = current_turn.as_mut() {
-        current_turn.model = None;
-    }
-    drop(current_turn);
+    let mut current_turn_guard = context.current_turn.lock().await;
+    let Some(current_turn) = current_turn_guard.as_mut() else {
+        debug_assert!(
+            false,
+            "finish_provider_round requires an active current turn"
+        );
+        return None;
+    };
+    let active_turn = current_turn.model.take();
+    debug_assert!(
+        active_turn.is_some(),
+        "finish_provider_round requires an active provider round"
+    );
+    drop(current_turn_guard);
     active_turn
 }
 
