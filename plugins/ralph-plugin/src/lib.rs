@@ -310,28 +310,32 @@ impl RalphHomeSurface {
         let no_loop = self.loop_summary.is_none();
         let has_draft = self.setup_draft.is_some();
         let latest_status = self.latest_run().map(|run| run.status.as_str());
-        let kinds: &[RalphActionKind] = if no_loop && has_draft {
-            &[
-                RalphActionKind::Plan,
+        let mut kinds = Vec::new();
+
+        if has_draft {
+            kinds.extend([
                 RalphActionKind::SaveDraft,
                 RalphActionKind::ViewDraft,
                 RalphActionKind::ReviseDraft,
                 RalphActionKind::ApproveDraft,
-                RalphActionKind::CreateFromDraft,
-                RalphActionKind::RebuildLoopContext,
-                RalphActionKind::ApplyDraftToLoop,
-                RalphActionKind::Status,
-                RalphActionKind::Start,
-            ]
-        } else if no_loop {
-            &[
+            ]);
+            if no_loop {
+                kinds.push(RalphActionKind::CreateFromDraft);
+            } else {
+                kinds.push(RalphActionKind::ApplyDraftToLoop);
+            }
+        }
+
+        if no_loop {
+            kinds.extend([
                 RalphActionKind::Plan,
                 RalphActionKind::Start,
                 RalphActionKind::Status,
-            ]
+            ]);
         } else {
+            kinds.push(RalphActionKind::RebuildLoopContext);
             match latest_status {
-                None => &[
+                None => kinds.extend([
                     RalphActionKind::Run,
                     RalphActionKind::Open,
                     RalphActionKind::Status,
@@ -340,8 +344,8 @@ impl RalphHomeSurface {
                     RalphActionKind::Runs,
                     RalphActionKind::Iterations,
                     RalphActionKind::Start,
-                ],
-                Some("awaiting_approval" | "prepared" | "queued") => &[
+                ]),
+                Some("awaiting_approval" | "prepared" | "queued") => kinds.extend([
                     RalphActionKind::Approve,
                     RalphActionKind::Open,
                     RalphActionKind::Status,
@@ -350,16 +354,16 @@ impl RalphHomeSurface {
                     RalphActionKind::Stop,
                     RalphActionKind::Audit,
                     RalphActionKind::Replan,
-                ],
-                Some("running") => &[
+                ]),
+                Some("running") => kinds.extend([
                     RalphActionKind::Status,
                     RalphActionKind::Iterations,
                     RalphActionKind::Stop,
                     RalphActionKind::Open,
                     RalphActionKind::Runs,
                     RalphActionKind::Audit,
-                ],
-                Some("interrupted" | "blocked" | "failed" | "stopped") => &[
+                ]),
+                Some("interrupted" | "blocked" | "failed" | "stopped") => kinds.extend([
                     RalphActionKind::Resume,
                     RalphActionKind::Audit,
                     RalphActionKind::Replan,
@@ -367,16 +371,16 @@ impl RalphHomeSurface {
                     RalphActionKind::Iterations,
                     RalphActionKind::Open,
                     RalphActionKind::Run,
-                ],
-                Some("completed" | "done") => &[
+                ]),
+                Some("completed" | "done") => kinds.extend([
                     RalphActionKind::Audit,
                     RalphActionKind::Open,
                     RalphActionKind::Status,
                     RalphActionKind::Iterations,
                     RalphActionKind::Replan,
                     RalphActionKind::Run,
-                ],
-                Some(_) => &[
+                ]),
+                Some(_) => kinds.extend([
                     RalphActionKind::Status,
                     RalphActionKind::Runs,
                     RalphActionKind::Iterations,
@@ -384,10 +388,11 @@ impl RalphHomeSurface {
                     RalphActionKind::Run,
                     RalphActionKind::Audit,
                     RalphActionKind::Replan,
-                ],
+                ]),
             }
-        };
-        kinds.iter().copied().filter_map(action_for_kind).collect()
+        }
+
+        kinds.into_iter().filter_map(action_for_kind).collect()
     }
 
     fn render_current_draft(&self, frame: &mut Frame<'_>, area: Rect, mut y: u16) -> u16 {
