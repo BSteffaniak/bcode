@@ -756,6 +756,57 @@ impl ServerState {
         Ok(())
     }
 
+    async fn session_current_turn(&self, session_id: SessionId) -> Option<RuntimeCurrentTurn> {
+        let handle = self
+            .session_runtimes
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()?;
+        handle.current_turn.lock().await.clone()
+    }
+
+    async fn session_has_active_turn(&self, session_id: SessionId) -> bool {
+        self.session_current_turn(session_id).await.is_some()
+            || self
+                .active_session_turns
+                .lock()
+                .await
+                .contains_key(&session_id)
+            || self.active_turns.lock().await.contains_key(&session_id)
+    }
+
+    async fn active_model_turn_snapshot(&self, session_id: SessionId) -> Option<ActiveModelTurn> {
+        self.session_current_turn(session_id)
+            .await
+            .and_then(|turn| turn.model)
+            .or_else(|| {
+                self.active_turns
+                    .try_lock()
+                    .ok()
+                    .and_then(|turns| turns.get(&session_id).cloned())
+            })
+    }
+
+    async fn active_runtime_turn_count(&self) -> usize {
+        let handles = self
+            .session_runtimes
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut count = 0_usize;
+        for handle in handles {
+            if handle.current_turn.lock().await.is_some() {
+                count = count.saturating_add(1);
+            }
+        }
+        count
+            .max(self.active_session_turns.lock().await.len())
+            .max(self.active_turns.lock().await.len())
+    }
+
     async fn release_session_resources_if_idle(&self, session_id: SessionId) {
         if self
             .attached_client_sessions
@@ -766,12 +817,7 @@ impl ServerState {
         {
             return;
         }
-        if self
-            .active_session_turns
-            .lock()
-            .await
-            .contains_key(&session_id)
-            || self.active_turns.lock().await.contains_key(&session_id)
+        if self.session_has_active_turn(session_id).await
             || !self
                 .runtime_work
                 .active_for_session(session_id)
@@ -913,7 +959,7 @@ impl ServerState {
                 "daemon has {connected_clients} connected clients; refusing idle-only stop"
             ));
         }
-        let active_model_turns = self.active_turns.lock().await.len();
+        let active_model_turns = self.active_runtime_turn_count().await;
         if active_model_turns > 0 {
             return Some(format!(
                 "daemon has {active_model_turns} active model turns; refusing idle-only stop"
@@ -2247,7 +2293,7 @@ async fn handle_change_session_working_directory(
     session_id: SessionId,
     working_directory: PathBuf,
 ) -> Result<(), ServerError> {
-    if state.active_turns.lock().await.contains_key(&session_id) {
+    if state.session_has_active_turn(session_id).await {
         return send_response(
             writer,
             request_id,
@@ -4070,7 +4116,7 @@ async fn handle_create_worktree(
     request: WorktreeCreateRequest,
 ) -> Result<(), ServerError> {
     if let Some(session_id) = request.attach_session_id
-        && state.active_turns.lock().await.contains_key(&session_id)
+        && state.session_has_active_turn(session_id).await
     {
         return send_response(
             writer,
@@ -4239,7 +4285,7 @@ async fn handle_delete_session(
     writer: &SharedWriter,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
-    if state.active_turns.lock().await.contains_key(&session_id) {
+    if state.session_has_active_turn(session_id).await {
         return send_response(
             writer,
             request_id,
@@ -6133,11 +6179,16 @@ async fn request_session_turn_cancellation(
     requested_by: Option<ClientId>,
 ) -> bool {
     let Some(active_session_turn) = state
-        .active_session_turns
-        .lock()
+        .session_current_turn(session_id)
         .await
-        .get(&session_id)
-        .cloned()
+        .map(|turn| turn.active_session_turn())
+        .or_else(|| {
+            state
+                .active_session_turns
+                .try_lock()
+                .ok()
+                .and_then(|turns| turns.get(&session_id).cloned())
+        })
     else {
         return false;
     };
@@ -6158,29 +6209,7 @@ async fn request_session_turn_cancellation(
     )
     .await;
 
-    let runtime_handle = state
-        .session_runtimes
-        .lock()
-        .await
-        .get(&session_id)
-        .cloned();
-    let active_turn = if let Some(handle) = runtime_handle {
-        handle
-            .current_turn
-            .lock()
-            .await
-            .as_ref()
-            .and_then(|turn| turn.model.clone())
-    } else {
-        None
-    }
-    .or_else(|| {
-        state
-            .active_turns
-            .try_lock()
-            .ok()
-            .and_then(|turns| turns.get(&session_id).cloned())
-    });
+    let active_turn = state.active_model_turn_snapshot(session_id).await;
     let Some(active_turn) = active_turn else {
         return true;
     };
@@ -7331,7 +7360,7 @@ async fn compact_session_context_with_limit(
     selection: &SessionModelSelection,
     first_kept_sequence: Option<u64>,
 ) -> Result<String, CompactionError> {
-    if state.active_turns.lock().await.contains_key(&session_id) {
+    if state.session_has_active_turn(session_id).await {
         return Err(CompactionError::Busy);
     }
 
@@ -7388,7 +7417,7 @@ async fn maybe_auto_compact_session_context(
     {
         return Ok(());
     }
-    if state.active_turns.lock().await.contains_key(&session_id) {
+    if state.session_has_active_turn(session_id).await {
         return Ok(());
     }
 
@@ -8302,12 +8331,10 @@ async fn active_plugin_scope_for_session(
     session_id: SessionId,
 ) -> PluginInvocationScope {
     state
-        .active_session_turns
-        .lock()
+        .session_current_turn(session_id)
         .await
-        .get(&session_id)
         .map_or_else(PluginInvocationScope::default, |active_turn| {
-            plugin_scope_for_session_turn(session_id, active_turn)
+            plugin_scope_for_session_turn(session_id, &active_turn.active_session_turn())
         })
 }
 
@@ -8327,14 +8354,12 @@ async fn active_plugin_scope_for_tool_call(
     session_id: SessionId,
     tool_call_id: &str,
 ) -> PluginInvocationScope {
-    state
-        .active_session_turns
-        .lock()
-        .await
-        .get(&session_id)
-        .map_or_else(PluginInvocationScope::default, |active_turn| {
-            plugin_scope_for_tool_call(session_id, active_turn, tool_call_id)
-        })
+    state.session_current_turn(session_id).await.map_or_else(
+        PluginInvocationScope::default,
+        |active_turn| {
+            plugin_scope_for_tool_call(session_id, &active_turn.active_session_turn(), tool_call_id)
+        },
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -8521,10 +8546,8 @@ async fn ensure_terminal_poll_outcome(
         return;
     }
     if state
-        .active_session_turns
-        .lock()
+        .session_current_turn(session_id)
         .await
-        .get(&session_id)
         .is_some_and(|turn| turn.cancel_state.is_cancelled())
     {
         outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
@@ -8824,10 +8847,8 @@ async fn handle_provider_turn_event(
     command_context: &mut RuntimeCommandContext<'_>,
 ) {
     if state
-        .active_session_turns
-        .lock()
+        .session_current_turn(session_id)
         .await
-        .get(&session_id)
         .is_some_and(|turn| turn.cancel_state.is_cancelled())
     {
         outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
@@ -9150,10 +9171,8 @@ async fn active_turn_cancel_state(
     session_id: SessionId,
 ) -> Option<Arc<TurnCancelState>> {
     state
-        .active_session_turns
-        .lock()
+        .session_current_turn(session_id)
         .await
-        .get(&session_id)
         .map(|turn| Arc::clone(&turn.cancel_state))
 }
 
@@ -9261,11 +9280,9 @@ async fn update_provider_usage_state(
     usage: &TokenUsage,
 ) {
     let reuse_key = state
-        .active_turns
-        .lock()
+        .active_model_turn_snapshot(session_id)
         .await
-        .get(&session_id)
-        .and_then(|turn| turn.reuse_key.clone());
+        .and_then(|turn| turn.reuse_key);
     let Some(reuse_key) = reuse_key else {
         return;
     };
@@ -9291,19 +9308,15 @@ async fn update_provider_metadata_state(
         return;
     }
     let reuse_key = state
-        .active_turns
-        .lock()
+        .active_model_turn_snapshot(session_id)
         .await
-        .get(&session_id)
-        .and_then(|turn| turn.reuse_key.clone());
+        .and_then(|turn| turn.reuse_key);
     let Some(reuse_key) = reuse_key else {
         return;
     };
     let reusable_message_count = state
-        .active_turns
-        .lock()
+        .active_model_turn_snapshot(session_id)
         .await
-        .get(&session_id)
         .map_or(0, |turn| turn.request_message_count.saturating_add(1));
 
     let mut provider_state = state.provider_state.lock().await;
@@ -11709,10 +11722,8 @@ async fn append_tool_request_event(
         .with_tool_call_id(Some(runtime_tool_call_id))
         .with_parent_work_id(
             state
-                .active_session_turns
-                .lock()
+                .session_current_turn(session_id)
                 .await
-                .get(&session_id)
                 .map(|turn| RuntimeWorkId::new(format!("model_{}", turn.turn_id))),
         ),
     )
