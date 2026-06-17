@@ -179,6 +179,7 @@ pub struct TranscriptItem {
     pub role: &'static str,
     pub text: String,
     pub streaming: bool,
+    event_sequence: Option<u64>,
     timestamp_ms: Option<u64>,
     kind: TranscriptItemKind,
 }
@@ -214,16 +215,24 @@ impl TranscriptItem {
             role,
             text,
             streaming,
+            event_sequence: None,
             timestamp_ms: None,
             kind,
         }
     }
 
-    /// Return a copy annotated with an event timestamp.
+    /// Return a copy annotated with event metadata.
     #[must_use]
-    pub const fn with_timestamp_ms(mut self, timestamp_ms: u64) -> Self {
+    pub const fn with_event_metadata(mut self, sequence: u64, timestamp_ms: u64) -> Self {
+        self.event_sequence = Some(sequence);
         self.timestamp_ms = Some(timestamp_ms);
         self
+    }
+
+    /// Return the source event sequence associated with this item, when known.
+    #[must_use]
+    pub const fn event_sequence(&self) -> Option<u64> {
+        self.event_sequence
     }
 
     /// Return the event timestamp associated with this item, when known.
@@ -896,9 +905,10 @@ fn non_streaming_transcript_item_from_event(
     streamed_tool_results: &BTreeMap<String, StreamedToolReplayContext>,
 ) -> Option<TranscriptItem> {
     match &event.kind {
-        SessionEventKind::UserMessage { text, .. } => {
-            Some(TranscriptItem::new("You", text.clone()))
-        }
+        SessionEventKind::UserMessage { text, .. } => Some(
+            TranscriptItem::new("You", text.clone())
+                .with_event_metadata(event.sequence, event.timestamp_ms),
+        ),
         SessionEventKind::SystemMessage { text } => {
             Some(TranscriptItem::new("System", text.clone()))
         }

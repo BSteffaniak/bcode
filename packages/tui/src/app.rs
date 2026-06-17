@@ -370,7 +370,8 @@ impl BmuxApp {
             .filter_map(|(index, item)| {
                 if item.role() == "You" {
                     Some(TimelineEntry::new(
-                        index,
+                        Some(index),
+                        item.event_sequence().unwrap_or(0),
                         item.timestamp_ms().unwrap_or(0),
                         item.text().to_owned(),
                     ))
@@ -1995,15 +1996,15 @@ impl BmuxApp {
     ) {
         self.input_history.push_committed(sequence, text);
         if application.live_activity() {
-            self.push_live_user_message(text, timestamp_ms);
+            self.push_live_user_message(sequence, text, timestamp_ms);
         } else {
-            self.push_user_message(text, timestamp_ms);
+            self.push_user_message(sequence, text, timestamp_ms);
         }
     }
 
-    fn push_live_user_message(&mut self, text: &str, timestamp_ms: u64) {
+    fn push_live_user_message(&mut self, sequence: u64, text: &str, timestamp_ms: u64) {
         self.set_activity(ActivityState::Thinking);
-        self.push_user_message(text, timestamp_ms);
+        self.push_user_message(sequence, text, timestamp_ms);
     }
 
     fn push_live_assistant_delta(&mut self, text: &str, application: SessionEventApplication) {
@@ -2011,10 +2012,11 @@ impl BmuxApp {
         self.push_streaming_item("Assistant", text);
     }
 
-    fn push_user_message(&mut self, text: &str, timestamp_ms: u64) {
+    fn push_user_message(&mut self, sequence: u64, text: &str, timestamp_ms: u64) {
         self.remove_pending_submission(text);
-        self.transcript
-            .push(TranscriptItem::new("You", text.to_owned()).with_timestamp_ms(timestamp_ms));
+        self.transcript.push(
+            TranscriptItem::new("You", text.to_owned()).with_event_metadata(sequence, timestamp_ms),
+        );
     }
 
     fn push_system_message(&mut self, text: &str) {

@@ -3,26 +3,39 @@
 /// One selectable user-message timeline row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimelineEntry {
-    transcript_index: usize,
+    transcript_index: Option<usize>,
+    sequence: u64,
     timestamp_ms: u64,
     text: String,
 }
 
 impl TimelineEntry {
-    /// Create a timeline entry.
+    /// Create a timeline entry for a loaded transcript item.
     #[must_use]
-    pub fn new(transcript_index: usize, timestamp_ms: u64, text: impl Into<String>) -> Self {
+    pub fn new(
+        transcript_index: Option<usize>,
+        sequence: u64,
+        timestamp_ms: u64,
+        text: impl Into<String>,
+    ) -> Self {
         Self {
             transcript_index,
+            sequence,
             timestamp_ms,
             text: text.into(),
         }
     }
 
-    /// Return the committed transcript item index to jump to.
+    /// Return the committed transcript item index to jump to, when loaded.
     #[must_use]
-    pub const fn transcript_index(&self) -> usize {
+    pub const fn transcript_index(&self) -> Option<usize> {
         self.transcript_index
+    }
+
+    /// Return the source event sequence.
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
     }
 
     /// Return the event timestamp in Unix milliseconds.

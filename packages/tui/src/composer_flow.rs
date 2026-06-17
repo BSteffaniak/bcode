@@ -8,6 +8,7 @@ use bcode_session_models::SessionId;
 use super::activity::ActivityState;
 use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::ActiveChat;
+use super::timeline_dialog::TimelineEntry;
 use super::{
     TuiError, model_flow, ralph_flow, session_flow, session_fork_flow, skill_flow, slash_commands,
     slash_registry, thinking_dialog, worktree_flow,
@@ -125,7 +126,14 @@ async fn handle_slash_command<W: Write>(
         }
         slash_commands::SlashCommandOutcome::OpenTimeline => {
             chat.app.clear_pending_submission(message);
-            let entries = chat.app.timeline_entries();
+            let entries = if let Some(session_id) = session_id {
+                timeline_entries_from_history(
+                    &services.client.session_history(session_id).await?,
+                    &chat.app.timeline_entries(),
+                )
+            } else {
+                chat.app.timeline_entries()
+            };
             chat.app.set_status(if entries.is_empty() {
                 "timeline: no user messages".to_owned()
             } else {
@@ -260,6 +268,35 @@ async fn commit_pending_agent(
     client.set_session_agent(session_id, agent_id).await?;
     let _committed = chat.app.take_pending_agent();
     Ok(())
+}
+
+fn timeline_entries_from_history(
+    history: &[bcode_session_models::SessionEvent],
+    loaded_entries: &[TimelineEntry],
+) -> Vec<TimelineEntry> {
+    let loaded_by_sequence = loaded_entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .transcript_index()
+                .map(|index| (entry.sequence(), index))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    history
+        .iter()
+        .filter_map(|event| {
+            let bcode_session_models::SessionEventKind::UserMessage { text, .. } = &event.kind
+            else {
+                return None;
+            };
+            Some(TimelineEntry::new(
+                loaded_by_sequence.get(&event.sequence).copied(),
+                event.sequence,
+                event.timestamp_ms,
+                text.clone(),
+            ))
+        })
+        .collect()
 }
 
 /// Submit the staged composer text.

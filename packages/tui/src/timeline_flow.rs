@@ -46,16 +46,21 @@ pub fn handle_timeline_key(
             true
         }
         KeyCode::Enter => {
-            let selected = dialog
-                .selected_entry()
-                .map(super::timeline_dialog::TimelineEntry::transcript_index);
+            let selected = dialog.selected_entry().cloned();
             *timeline_dialog = None;
-            if let Some(index) = selected {
-                if chat.app.jump_to_transcript_index(index) {
-                    chat.app.set_status("jumped to timeline message".to_owned());
+            if let Some(entry) = selected {
+                if let Some(index) = entry.transcript_index() {
+                    if chat.app.jump_to_transcript_index(index) {
+                        chat.app.set_status("jumped to timeline message".to_owned());
+                    } else {
+                        chat.app
+                            .set_status("timeline message is not currently visible".to_owned());
+                    }
                 } else {
-                    chat.app
-                        .set_status("timeline message is not currently visible".to_owned());
+                    chat.app.set_status(format!(
+                        "timeline message seq {} is outside the loaded transcript window",
+                        entry.sequence()
+                    ));
                 }
             }
             true
