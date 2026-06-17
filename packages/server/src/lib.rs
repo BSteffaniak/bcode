@@ -269,6 +269,26 @@ struct MessageQueueStatus {
     disposition: bcode_ipc::MessageAcceptanceDisposition,
 }
 
+struct RuntimeCommandContext<'a> {
+    commands: &'a mut mpsc::Receiver<SessionCommand>,
+    deferred_commands: &'a mut VecDeque<SessionCommand>,
+    queued_commands: &'a AtomicUsize,
+}
+
+impl<'a> RuntimeCommandContext<'a> {
+    const fn new(
+        commands: &'a mut mpsc::Receiver<SessionCommand>,
+        deferred_commands: &'a mut VecDeque<SessionCommand>,
+        queued_commands: &'a AtomicUsize,
+    ) -> Self {
+        Self {
+            commands,
+            deferred_commands,
+            queued_commands,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum SessionCommand {
     UserMessage {
@@ -5058,6 +5078,9 @@ async fn run_session_runtime(
                 process_skill_invocation_command(
                     &state,
                     &mut permit,
+                    &mut commands,
+                    &mut deferred_commands,
+                    queued_commands.as_ref(),
                     client_id,
                     runtime_context,
                     skill_id,
@@ -5085,24 +5108,6 @@ async fn next_session_command(
         queued_commands.fetch_sub(1, Ordering::AcqRel);
     }
     Some(command)
-}
-
-fn drain_steering_commands(
-    commands: &mut mpsc::Receiver<SessionCommand>,
-    deferred_commands: &mut VecDeque<SessionCommand>,
-    queued_commands: &AtomicUsize,
-) -> Vec<SessionCommand> {
-    let mut steering_commands = Vec::new();
-    while let Ok(command) = commands.try_recv() {
-        if !matches!(command, SessionCommand::CancelTurn { .. }) {
-            queued_commands.fetch_sub(1, Ordering::AcqRel);
-        }
-        match command {
-            SessionCommand::SteeringMessage { .. } => steering_commands.push(command),
-            other => deferred_commands.push_back(other),
-        }
-    }
-    steering_commands
 }
 
 fn clear_deferred_session_commands(deferred_commands: &mut VecDeque<SessionCommand>) -> usize {
@@ -5174,22 +5179,47 @@ async fn process_steering_message_command(
     }
 }
 
-async fn append_drained_steering_commands(
+async fn service_runtime_priority_commands(
     state: &ServerState,
     session_id: SessionId,
-    commands: &mut mpsc::Receiver<SessionCommand>,
-    deferred_commands: &mut VecDeque<SessionCommand>,
-    queued_commands: &AtomicUsize,
+    context: &mut RuntimeCommandContext<'_>,
 ) {
-    for command in drain_steering_commands(commands, deferred_commands, queued_commands) {
-        if let SessionCommand::SteeringMessage {
-            client_id,
-            text,
-            completion,
-        } = command
-        {
-            process_steering_message_command(state, session_id, client_id, text, completion).await;
+    let mut retained_commands = VecDeque::new();
+    while let Ok(command) = context.commands.try_recv() {
+        if !matches!(command, SessionCommand::CancelTurn { .. }) {
+            context.queued_commands.fetch_sub(1, Ordering::AcqRel);
         }
+        match command {
+            SessionCommand::SteeringMessage {
+                client_id,
+                text,
+                completion,
+            } => {
+                process_steering_message_command(state, session_id, client_id, text, completion)
+                    .await;
+            }
+            SessionCommand::CancelTurn {
+                clear_queue,
+                requested_by,
+                response,
+            } => {
+                let cancelled = process_cancel_turn_command(
+                    state,
+                    session_id,
+                    context.commands,
+                    context.deferred_commands,
+                    context.queued_commands,
+                    clear_queue,
+                    requested_by,
+                )
+                .await;
+                let _sent = response.send(cancelled);
+            }
+            other => retained_commands.push_back(other),
+        }
+    }
+    while let Some(command) = retained_commands.pop_front() {
+        context.deferred_commands.push_back(command);
     }
 }
 
@@ -5223,17 +5253,17 @@ async fn process_user_message_command(
     let completion = match append_turn_user_message(state, permit, client_id, text).await {
         Ok(Some(user_event)) => {
             suggest_skills_for_prompt(state, permit.session_id(), &user_event).await;
-            let completion =
-                run_model_turn(state, permit, &user_event, client_id, runtime_context).await;
-            append_drained_steering_commands(
+            let mut command_context =
+                RuntimeCommandContext::new(commands, deferred_commands, queued_commands);
+            run_model_turn(
                 state,
-                permit.session_id(),
-                commands,
-                deferred_commands,
-                queued_commands,
+                permit,
+                &user_event,
+                client_id,
+                runtime_context,
+                &mut command_context,
             )
-            .await;
-            completion
+            .await
         }
         Ok(None) => {
             let message = "no user message event was appended".to_string();
@@ -5256,6 +5286,9 @@ async fn process_user_message_command(
 async fn process_skill_invocation_command(
     state: &ServerState,
     permit: &mut SessionTurnPermit,
+    commands: &mut mpsc::Receiver<SessionCommand>,
+    deferred_commands: &mut VecDeque<SessionCommand>,
+    queued_commands: &AtomicUsize,
     client_id: ClientId,
     runtime_context: Option<ClientRuntimeContext>,
     skill_id: SkillId,
@@ -5297,7 +5330,17 @@ async fn process_skill_invocation_command(
                     arguments,
                 },
             );
-            run_model_turn(state, permit, &user_event, client_id, runtime_context).await;
+            let mut command_context =
+                RuntimeCommandContext::new(commands, deferred_commands, queued_commands);
+            run_model_turn(
+                state,
+                permit,
+                &user_event,
+                client_id,
+                runtime_context,
+                &mut command_context,
+            )
+            .await;
         }
         Ok(None) => {
             append_system_event(
@@ -7794,6 +7837,7 @@ async fn run_model_turn(
     trigger_event: &bcode_session_models::SessionEvent,
     client_id: ClientId,
     runtime_context: Option<ClientRuntimeContext>,
+    command_context: &mut RuntimeCommandContext<'_>,
 ) -> ModelTurnCompletion {
     let session_id = permit.enter_turn();
     let turn_id = format!("{}-{}", session_id, trigger_event.sequence);
@@ -7816,6 +7860,7 @@ async fn run_model_turn(
         },
     );
     append_model_turn_started_event(state, session_id, turn_id.clone()).await;
+    service_runtime_priority_commands(state, session_id, command_context).await;
     let completion = run_model_turn_inner(
         state,
         session_id,
@@ -7824,6 +7869,7 @@ async fn run_model_turn(
         Arc::clone(&cancel_state),
     )
     .await;
+    service_runtime_priority_commands(state, session_id, command_context).await;
     state.active_session_turns.lock().await.remove(&session_id);
     state.active_turns.lock().await.remove(&session_id);
     append_model_turn_finished_event(
@@ -7834,6 +7880,7 @@ async fn run_model_turn(
         completion.message.clone(),
     )
     .await;
+    service_runtime_priority_commands(state, session_id, command_context).await;
     finish_registered_runtime_work(
         state,
         session_id,
@@ -7842,6 +7889,7 @@ async fn run_model_turn(
         completion.message.clone(),
     )
     .await;
+    service_runtime_priority_commands(state, session_id, command_context).await;
     completion
 }
 
