@@ -3998,7 +3998,8 @@ async fn handle_create_worktree(
         .await;
     }
     let cwd = request.cwd.clone().unwrap_or_else(current_request_cwd);
-    let config = bcode_config::load_config()?;
+    let config_paths = bcode_config::default_config_paths_from(&cwd);
+    let config = bcode_config::load_config_from_paths(&config_paths)?;
     match bcode_worktree::create_worktree(&config, &request, &cwd) {
         Ok(mut response) => {
             if let Some(session_id) = request.attach_session_id {

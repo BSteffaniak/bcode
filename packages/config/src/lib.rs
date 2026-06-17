@@ -971,7 +971,8 @@ pub enum SessionImportPathMode {
 /// Worktree configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorktreeConfig {
-    /// Root directory for Bcode-created worktrees. Relative paths resolve from the repo root.
+    /// Root directory for Bcode-created worktrees. Relative paths resolve from the repository's
+    /// main worktree root.
     #[serde(default = "default_worktree_root")]
     pub root: PathBuf,
     /// Prefix used when deriving new branch names.

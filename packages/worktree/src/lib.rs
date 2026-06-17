@@ -45,7 +45,6 @@ pub enum WorktreeError {
 /// Returns an error when repository discovery or worktree listing fails.
 pub fn list_worktrees(cwd: &Path) -> Result<WorktreeListResponse, WorktreeError> {
     let repo = discover_repo(cwd)?;
-    let repo_root = get_repo_root(&repo)?;
     let current_worktree = get_workdir(&repo)?;
     let worktrees = get_worktrees(&repo)?
         .into_iter()
@@ -55,7 +54,14 @@ pub fn list_worktrees(cwd: &Path) -> Result<WorktreeListResponse, WorktreeError>
             branch: worktree.branch,
             commit: worktree.commit,
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let repo_root = worktrees
+        .iter()
+        .find(|worktree| worktree.is_main)
+        .map_or_else(
+            || current_worktree.clone(),
+            |worktree| worktree.path.clone(),
+        );
     Ok(WorktreeListResponse {
         repo_root,
         current_worktree,
@@ -76,7 +82,11 @@ pub fn create_worktree(
 ) -> Result<WorktreeCreateResponse, WorktreeError> {
     validate_create_request(request)?;
     let repo = discover_repo(cwd)?;
-    let repo_root = get_repo_root(&repo)?;
+    let current_repo_root = get_repo_root(&repo)?;
+    let repo_root = get_worktrees(&repo)?
+        .into_iter()
+        .find(|worktree| worktree.is_main)
+        .map_or_else(|| current_repo_root.clone(), |worktree| worktree.path);
     let slug = slugify(&request.name);
     let path = request.path.clone().map_or_else(
         || configured_worktree_root(config, &repo_root).join(&slug),
@@ -87,7 +97,13 @@ pub fn create_worktree(
     let base_ref = request
         .base_ref
         .unwrap_or_else(|| base_ref_from_config(config.worktree.base_ref));
-    let branch_ref = branch_ref_for_create(request, branch.as_deref(), base_ref, cwd, &repo_root)?;
+    let branch_ref = branch_ref_for_create(
+        request,
+        branch.as_deref(),
+        base_ref,
+        cwd,
+        &current_repo_root,
+    )?;
     setup_create_worktree(
         &repo,
         &path,
@@ -430,6 +446,107 @@ mod tests {
             repo.root.canonicalize().expect("temp root canonical")
         );
         assert!(response.worktrees.iter().any(|worktree| worktree.is_main));
+    }
+
+    #[test]
+    fn create_worktree_from_linked_worktree_resolves_paths_from_main_worktree() {
+        let repo = TempRepo::init();
+        let sibling_root = repo
+            .root
+            .parent()
+            .expect("repo should have parent")
+            .join(format!(
+                "wt-{}",
+                repo.root
+                    .file_name()
+                    .expect("repo should have file name")
+                    .to_string_lossy()
+            ));
+        let leaf = sibling_root.join("leaf");
+        run(
+            &repo.root,
+            &[
+                "worktree",
+                "add",
+                leaf.to_str().expect("leaf path should be utf-8"),
+                "-b",
+                "leaf",
+            ],
+        );
+        let mut config = bcode_config::BcodeConfig::default();
+        config.worktree.root = std::path::PathBuf::from(format!(
+            "../{}",
+            sibling_root
+                .file_name()
+                .expect("sibling root should have file name")
+                .to_string_lossy()
+        ));
+        let request = create_request("From Leaf");
+
+        let response =
+            create_worktree(&config, &request, &leaf).expect("worktree should be created");
+
+        assert_eq!(
+            response
+                .path
+                .canonicalize()
+                .expect("response path canonical"),
+            sibling_root
+                .join("from-leaf")
+                .canonicalize()
+                .expect("expected path canonical")
+        );
+        assert_eq!(
+            response
+                .repo_root
+                .canonicalize()
+                .expect("repo root canonical"),
+            repo.root.canonicalize().expect("temp root canonical")
+        );
+    }
+
+    #[test]
+    fn list_worktrees_from_linked_worktree_reports_main_repo_root() {
+        let repo = TempRepo::init();
+        let sibling_root = repo
+            .root
+            .parent()
+            .expect("repo should have parent")
+            .join(format!(
+                "wt-{}",
+                repo.root
+                    .file_name()
+                    .expect("repo should have file name")
+                    .to_string_lossy()
+            ));
+        let leaf = sibling_root.join("list-leaf");
+        run(
+            &repo.root,
+            &[
+                "worktree",
+                "add",
+                leaf.to_str().expect("leaf path should be utf-8"),
+                "-b",
+                "list-leaf",
+            ],
+        );
+
+        let response = list_worktrees(&leaf).expect("worktrees should list");
+
+        assert_eq!(
+            response
+                .repo_root
+                .canonicalize()
+                .expect("repo root canonical"),
+            repo.root.canonicalize().expect("temp root canonical")
+        );
+        assert_eq!(
+            response
+                .current_worktree
+                .canonicalize()
+                .expect("current worktree canonical"),
+            leaf.canonicalize().expect("leaf canonical")
+        );
     }
 
     #[test]
