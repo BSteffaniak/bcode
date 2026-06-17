@@ -400,6 +400,19 @@ impl RalphStateStore {
         create_loop_from_setup_draft_in_store(self, draft_id, repo_root, session_title)
     }
 
+    /// Apply an approved setup draft to an existing Ralph loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the draft cannot be read or loop files cannot be backed up/written.
+    pub fn apply_setup_draft_to_existing_loop(
+        &self,
+        draft_id: &str,
+        repo_root: &Path,
+    ) -> Result<RalphLoopContextRebuildResult, RalphStateError> {
+        apply_setup_draft_to_existing_loop_in_store(self, draft_id, repo_root)
+    }
+
     /// Write a bounded conversation context pack for a Ralph loop.
     ///
     /// # Errors
@@ -860,6 +873,26 @@ impl std::fmt::Display for RalphSetupDraftStatus {
     }
 }
 
+/// User-visible setup draft mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RalphSetupDraftMode {
+    /// Draft will create a brand-new Ralph loop.
+    #[default]
+    NewLoop,
+    /// Draft will replace context/docs for an existing Ralph loop.
+    RebuildExistingLoop,
+}
+
+impl std::fmt::Display for RalphSetupDraftMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::NewLoop => "new_loop",
+            Self::RebuildExistingLoop => "rebuild_existing_loop",
+        })
+    }
+}
+
 /// Request used to create a persistent setup draft.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RalphSetupDraftCreateRequest {
@@ -873,6 +906,10 @@ pub struct RalphSetupDraftCreateRequest {
     pub source_context: String,
     /// Proposed validation commands.
     pub validation_commands: Vec<String>,
+    /// Setup draft mode.
+    pub mode: RalphSetupDraftMode,
+    /// Existing loop state dir targeted by rebuild drafts.
+    pub target_state_dir: Option<PathBuf>,
 }
 
 /// Request used to update setup draft content after assistant planning.
@@ -898,6 +935,19 @@ pub struct RalphSetupDraftUpdateRequest {
     pub work_area_path: Option<PathBuf>,
 }
 
+/// Result of applying a setup draft to an existing Ralph loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RalphLoopContextRebuildResult {
+    /// Target loop state dir.
+    pub state_dir: PathBuf,
+    /// Backup directory containing previous artifacts.
+    pub backup_dir: PathBuf,
+    /// Rewritten charter path.
+    pub charter_doc_path: PathBuf,
+    /// Rewritten progress path.
+    pub progress_doc_path: PathBuf,
+}
+
 /// Persistent setup draft used before a Ralph loop is created.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RalphSetupDraft {
@@ -907,6 +957,12 @@ pub struct RalphSetupDraft {
     pub repo_root: PathBuf,
     /// Current setup status.
     pub status: RalphSetupDraftStatus,
+    /// Setup draft mode.
+    #[serde(default)]
+    pub mode: RalphSetupDraftMode,
+    /// Existing loop state dir targeted by rebuild drafts.
+    #[serde(default)]
+    pub target_state_dir: Option<PathBuf>,
     /// Proposed loop name.
     pub loop_name: String,
     /// Source session title, when available.
@@ -1045,6 +1101,18 @@ pub fn update_setup_draft(
     request: RalphSetupDraftUpdateRequest,
 ) -> Result<RalphSetupDraft, RalphStateError> {
     RalphStateStore::default().update_setup_draft(request)
+}
+
+/// Apply an approved setup draft to an existing Ralph loop.
+///
+/// # Errors
+///
+/// Returns an error when the draft is incomplete, not approved, not a rebuild draft, or files cannot be backed up/written.
+pub fn apply_setup_draft_to_existing_loop(
+    draft_id: &str,
+    repo_root: &Path,
+) -> Result<RalphLoopContextRebuildResult, RalphStateError> {
+    RalphStateStore::default().apply_setup_draft_to_existing_loop(draft_id, repo_root)
 }
 
 /// Append a Ralph lifecycle event to the loop database.
@@ -2623,6 +2691,8 @@ fn create_setup_draft_in_store(
         draft_id,
         repo_root: request.repo_root,
         status: RalphSetupDraftStatus::Clarifying,
+        mode: request.mode,
+        target_state_dir: request.target_state_dir,
         loop_name: request.loop_name,
         session_title: request.session_title,
         source_context: request.source_context,
@@ -2722,6 +2792,9 @@ fn create_loop_from_setup_draft_in_store(
         .join(draft_id)
         .join(SETUP_DRAFT_FILE_NAME);
     let draft = read_setup_draft(&draft_path)?;
+    if draft.mode != RalphSetupDraftMode::NewLoop {
+        return Err(RalphStateError::SetupDraftWrongMode(draft.draft_id));
+    }
     if !draft.readiness().ready() {
         return Err(RalphStateError::SetupDraftNotReady(draft.draft_id));
     }
@@ -2753,6 +2826,72 @@ fn create_loop_from_setup_draft_in_store(
     )?;
     mark_setup_draft_converted_in_store(store, draft_id, repo_root, &state.state_dir)?;
     Ok(state)
+}
+
+fn apply_setup_draft_to_existing_loop_in_store(
+    store: &RalphStateStore,
+    draft_id: &str,
+    repo_root: &Path,
+) -> Result<RalphLoopContextRebuildResult, RalphStateError> {
+    let draft_path = repo_state_root_in_store(store, repo_root)
+        .join(SETUP_DRAFTS_DIR_NAME)
+        .join(draft_id)
+        .join(SETUP_DRAFT_FILE_NAME);
+    let mut draft = read_setup_draft(&draft_path)?;
+    if draft.mode != RalphSetupDraftMode::RebuildExistingLoop {
+        return Err(RalphStateError::SetupDraftWrongMode(draft.draft_id));
+    }
+    if !draft.readiness().ready() {
+        return Err(RalphStateError::SetupDraftNotReady(draft.draft_id));
+    }
+    let state_dir = draft
+        .target_state_dir
+        .clone()
+        .ok_or_else(|| RalphStateError::SetupDraftMissingTarget(draft.draft_id.clone()))?;
+    let charter_doc_path = state_dir.join(CHARTER_DOC_FILE_NAME);
+    let progress_doc_path = state_dir.join(PROGRESS_DOC_FILE_NAME);
+    let backup_dir = state_dir
+        .join("backups")
+        .join(format!("rebuild-{}", unix_epoch_ms()));
+    std::fs::create_dir_all(&backup_dir)?;
+    for path in [&charter_doc_path, &progress_doc_path] {
+        if path.exists() {
+            let Some(file_name) = path.file_name() else {
+                continue;
+            };
+            std::fs::copy(path, backup_dir.join(file_name))?;
+        }
+    }
+    std::fs::write(
+        &charter_doc_path,
+        draft.charter_draft.as_deref().unwrap_or_default(),
+    )?;
+    std::fs::write(
+        &progress_doc_path,
+        draft.progress_draft.as_deref().unwrap_or_default(),
+    )?;
+    set_validation_commands_in_store(
+        store,
+        &state_dir,
+        &draft.validation_commands,
+        "setup_draft_rebuild",
+    )?;
+    append_lifecycle_event_for_state_dir_in_store(
+        store,
+        &state_dir,
+        RalphLifecycleEventKind::ContextCaptured,
+        "Rebuilt Ralph loop context from approved setup draft",
+    )?;
+    draft.status = RalphSetupDraftStatus::ConvertedToLoop;
+    draft.converted_state_dir = Some(state_dir.clone());
+    draft.updated_at_ms = unix_epoch_ms();
+    write_setup_draft(&draft)?;
+    Ok(RalphLoopContextRebuildResult {
+        state_dir,
+        backup_dir,
+        charter_doc_path,
+        progress_doc_path,
+    })
 }
 
 fn read_setup_draft(path: &Path) -> Result<RalphSetupDraft, RalphStateError> {
@@ -3708,6 +3847,12 @@ pub enum RalphStateError {
     /// Setup draft is missing required content or approval.
     #[error("Ralph setup draft is not ready for loop creation: {0}")]
     SetupDraftNotReady(String),
+    /// Setup draft mode does not match the requested operation.
+    #[error("Ralph setup draft has the wrong mode for this operation: {0}")]
+    SetupDraftWrongMode(String),
+    /// Setup draft is missing a rebuild target.
+    #[error("Ralph setup draft is missing rebuild target: {0}")]
+    SetupDraftMissingTarget(String),
     /// Could not allocate a unique loop state directory.
     #[error("could not allocate a unique Ralph loop state directory for {0}")]
     LoopNameExhausted(String),

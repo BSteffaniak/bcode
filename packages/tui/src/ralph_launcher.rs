@@ -25,12 +25,18 @@ pub enum RalphHomeAction {
     /// Build a focused revision prompt for the saved setup draft.
     #[serde(alias = "revise-draft")]
     ReviseDraft,
+    /// Start guided setup to rebuild the latest existing loop context.
+    #[serde(alias = "rebuild-loop-context")]
+    RebuildLoopContext,
     /// Approve the saved setup draft.
     #[serde(alias = "approve-draft")]
     ApproveDraft,
     /// Create loop from approved setup draft.
     #[serde(alias = "create-from-draft")]
     CreateFromDraft,
+    /// Apply approved setup draft to existing loop.
+    #[serde(alias = "apply-draft-to-loop")]
+    ApplyDraftToLoop,
     /// Open quick setup flow.
     #[serde(alias = "start")]
     Start,

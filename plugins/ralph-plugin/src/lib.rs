@@ -34,7 +34,9 @@ const RALPH_ACTIONS: &[RalphAction] = &[
     RalphAction::new("Save setup draft", RalphActionKind::SaveDraft),
     RalphAction::new("View setup draft", RalphActionKind::ViewDraft),
     RalphAction::new("Revise setup draft", RalphActionKind::ReviseDraft),
+    RalphAction::new("Rebuild loop context", RalphActionKind::RebuildLoopContext),
     RalphAction::new("Approve setup draft", RalphActionKind::ApproveDraft),
+    RalphAction::new("Apply draft to loop", RalphActionKind::ApplyDraftToLoop),
     RalphAction::new("Create loop from draft", RalphActionKind::CreateFromDraft),
     RalphAction::new("Quick create loop", RalphActionKind::Start),
     RalphAction::new("Prepare run", RalphActionKind::Run),
@@ -61,7 +63,9 @@ enum RalphActionKind {
     SaveDraft,
     ViewDraft,
     ReviseDraft,
+    RebuildLoopContext,
     ApproveDraft,
+    ApplyDraftToLoop,
     CreateFromDraft,
     Start,
     Run,
@@ -84,7 +88,9 @@ impl RalphActionKind {
             Self::SaveDraft => "save-draft",
             Self::ViewDraft => "view-draft",
             Self::ReviseDraft => "revise-draft",
+            Self::RebuildLoopContext => "rebuild-loop-context",
             Self::ApproveDraft => "approve-draft",
+            Self::ApplyDraftToLoop => "apply-draft-to-loop",
             Self::CreateFromDraft => "create-from-draft",
             Self::Start => "start",
             Self::Run => "run",
@@ -111,7 +117,11 @@ impl RalphActionKind {
             }
             Self::ViewDraft => "show saved setup draft paths and content previews",
             Self::ReviseDraft => "ask the assistant to revise the saved setup draft",
+            Self::RebuildLoopContext => "restart guided context building for the existing loop",
             Self::ApproveDraft => "approve saved charter/progress as ready for loop creation",
+            Self::ApplyDraftToLoop => {
+                "replace existing loop charter/progress from approved rebuild draft"
+            }
             Self::CreateFromDraft => "create loop files/worktree from the approved setup draft",
             Self::Start => {
                 "quick-create starter docs/worktree from recent context; advanced fallback"
@@ -308,6 +318,8 @@ impl RalphHomeSurface {
                 RalphActionKind::ReviseDraft,
                 RalphActionKind::ApproveDraft,
                 RalphActionKind::CreateFromDraft,
+                RalphActionKind::RebuildLoopContext,
+                RalphActionKind::ApplyDraftToLoop,
                 RalphActionKind::Status,
                 RalphActionKind::Start,
             ]
@@ -396,6 +408,7 @@ impl RalphHomeSurface {
         for line in [
             format!("  Draft: {}", draft.draft_id),
             format!("  Status: {}", draft.status),
+            format!("  Mode: {}", draft.mode),
             format!("  Proposed loop: {}", draft.loop_name),
             format!(
                 "  Branch: {}",

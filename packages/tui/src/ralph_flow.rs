@@ -78,11 +78,18 @@ fn flash_message_for_action(action: super::ralph_launcher::RalphHomeAction) -> S
         super::ralph_launcher::RalphHomeAction::ReviseDraft => {
             "Revision prompt prepared. Submit it, then save setup draft again.".to_owned()
         }
+        super::ralph_launcher::RalphHomeAction::RebuildLoopContext => {
+            "Rebuild setup started. Answer questions, then save/approve/apply the draft.".to_owned()
+        }
         super::ralph_launcher::RalphHomeAction::ApproveDraft => {
             "Setup draft approved. Next: create the loop from the approved draft.".to_owned()
         }
         super::ralph_launcher::RalphHomeAction::CreateFromDraft => {
             "Loop created from setup draft. Next: prepare a run.".to_owned()
+        }
+        super::ralph_launcher::RalphHomeAction::ApplyDraftToLoop => {
+            "Existing loop context rebuilt from draft. Next: review status or prepare run."
+                .to_owned()
         }
         super::ralph_launcher::RalphHomeAction::Start => {
             "Setup complete. Next: review the docs if desired, then prepare a run.".to_owned()
@@ -145,9 +152,14 @@ fn view_setup_draft(chat: &mut ActiveChat) -> Result<(), TuiError> {
     };
     let readiness = draft.readiness();
     chat.app.push_system_note(format!(
-        "Ralph setup draft review\n* Draft: {}\n* Status: {}\n* Loop: {}\n* Branch: {}\n* Worktree: {}\n* Validation: {}\n* Ready: charter={} progress={} approved={}\n* Draft JSON: {}\n* Setup transcript: {}\n\nCharter preview:\n{}\n\nProgress preview:\n{}",
+        "Ralph setup draft review\n* Draft: {}\n* Status: {}\n* Mode: {}\n* Target state: {}\n* Loop: {}\n* Branch: {}\n* Worktree: {}\n* Validation: {}\n* Ready: charter={} progress={} approved={}\n* Draft JSON: {}\n* Setup transcript: {}\n\nCharter preview:\n{}\n\nProgress preview:\n{}",
         draft.draft_id,
         draft.status,
+        draft.mode,
+        draft
+            .target_state_dir
+            .as_ref()
+            .map_or_else(|| "<none>".to_owned(), |path| path.display().to_string()),
         draft.loop_name,
         draft.branch.as_deref().unwrap_or("<default>"),
         draft
@@ -284,9 +296,14 @@ fn approve_setup_draft(chat: &mut ActiveChat) -> Result<(), TuiError> {
         ),
     )?;
     chat.app.push_system_note(format!(
-        "Ralph setup draft approved\n* Draft: {}\n* Path: {}\n* Next: create loop from draft",
+        "Ralph setup draft approved\n* Draft: {}\n* Path: {}\n* Next: {}",
         updated.draft_id,
-        updated.draft_path.display()
+        updated.draft_path.display(),
+        if updated.mode == ralph_state::RalphSetupDraftMode::RebuildExistingLoop {
+            "apply draft to loop"
+        } else {
+            "create loop from draft"
+        }
     ));
     chat.app.set_status("Ralph setup draft approved".to_owned());
     Ok(())
@@ -301,6 +318,15 @@ async fn create_loop_from_draft(
         chat.app.set_status("no Ralph setup draft found".to_owned());
         return Ok(());
     };
+    if draft.mode != ralph_state::RalphSetupDraftMode::NewLoop {
+        chat.app.push_system_note(format!(
+            "Ralph setup draft is not a new-loop draft\n* Draft: {}\n* Mode: {}\n* Next: use Apply draft to loop for rebuild drafts",
+            draft.draft_id, draft.mode
+        ));
+        chat.app
+            .set_status("Ralph setup draft is not a new-loop draft".to_owned());
+        return Ok(());
+    }
     let readiness = draft.readiness();
     if !readiness.ready() {
         chat.app.push_system_note(format!(
@@ -511,6 +537,132 @@ fn save_setup_draft(chat: &mut ActiveChat) -> Result<(), TuiError> {
     Ok(())
 }
 
+fn rebuild_setup_prompt(
+    draft: &ralph_state::RalphSetupDraft,
+    loop_summary: &ralph_state::RalphLoopSummary,
+) -> String {
+    format!(
+        "We are rebuilding context for an existing Ralph loop because its current charter/progress may be nonsense or stubbed.\n\n\
+         Existing loop:\n\
+         * Name: {loop_name}\n\
+         * State dir: {state_dir}\n\
+         * Charter path: {charter_path}\n\
+         * Progress path: {progress_path}\n\n\
+         Treat this as a fresh setup pass for the existing loop. Do not preserve meaningless existing charter/progress text. Preserve only real constraints from the repo/session and ask clarifying questions if essential.\n\n\
+         Produce the replacement artifact in this exact shape when ready:\n\n\
+         RALPH_SETUP_DRAFT_START\n\
+         loop_name: {draft_loop_name}\n\
+         branch: <optional branch name or <none>>\n\
+         worktree_path: <optional absolute path or <none>>\n\
+         validation:\n\
+         - <command>\n\n\
+         --- charter.md ---\n\
+         <complete replacement charter markdown>\n\n\
+         --- progress.md ---\n\
+         <complete replacement progress markdown with actionable checklist items>\n\
+         RALPH_SETUP_DRAFT_END\n\n\
+         Initial context pack:\n\n{source_context}",
+        loop_name = loop_summary.loop_name,
+        state_dir = loop_summary.state_dir.display(),
+        charter_path = loop_summary.charter_doc_path.display(),
+        progress_path = loop_summary.progress_doc_path.display(),
+        draft_loop_name = draft.loop_name,
+        source_context = draft.source_context
+    )
+}
+
+/// Start an LLM-guided rebuild setup draft for the latest existing loop.
+pub async fn rebuild_loop_context(
+    services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
+) -> Result<(), TuiError> {
+    let repo_root = current_repo_root(chat)?;
+    let Some(loop_summary) = ralph_state::latest_loop(&repo_root)? else {
+        chat.app
+            .set_status("no Ralph loop found to rebuild".to_owned());
+        return Ok(());
+    };
+    let mut source_context = setup_source_context(services, chat).await?;
+    source_context.push_str("\n\nExisting Ralph loop files:\n* charter: ");
+    source_context.push_str(&loop_summary.charter_doc_path.display().to_string());
+    source_context.push_str("\n* progress: ");
+    source_context.push_str(&loop_summary.progress_doc_path.display().to_string());
+    source_context.push_str("\n* state dir: ");
+    source_context.push_str(&loop_summary.state_dir.display().to_string());
+    source_context.push('\n');
+    let draft = ralph_state::create_setup_draft(ralph_state::RalphSetupDraftCreateRequest {
+        repo_root: repo_root.clone(),
+        loop_name: loop_summary.loop_name.clone(),
+        session_title: chat.app.session_title().map(ToOwned::to_owned),
+        source_context,
+        validation_commands: ralph_state::default_validation_commands(&repo_root),
+        mode: ralph_state::RalphSetupDraftMode::RebuildExistingLoop,
+        target_state_dir: Some(loop_summary.state_dir.clone()),
+    })?;
+    let prompt = rebuild_setup_prompt(&draft, &loop_summary);
+    append_setup_transcript(
+        &draft,
+        &format!(
+            "## Created rebuild setup draft\n\nTarget state dir: {}\n\n{}",
+            loop_summary.state_dir.display(),
+            prompt
+        ),
+    )?;
+    chat.app.push_system_note(format!(
+        "Ralph rebuild setup draft created\n* Draft: {}\n* Target loop: {}\n* Target state: {}\n* Transcript: {}\n* Next: submit the prepared prompt, then Save setup draft when the assistant returns the replacement artifact",
+        draft.draft_id,
+        loop_summary.loop_name,
+        loop_summary.state_dir.display(),
+        draft
+            .setup_transcript_path
+            .as_ref()
+            .map_or_else(|| "<none>".to_owned(), |path| path.display().to_string())
+    ));
+    chat.app.composer_mut().clear();
+    chat.app.composer_mut().insert_str(&prompt);
+    chat.app
+        .set_status("Ralph rebuild setup prompt prepared".to_owned());
+    Ok(())
+}
+
+fn apply_draft_to_existing_loop(chat: &mut ActiveChat) -> Result<(), TuiError> {
+    let repo_root = current_repo_root(chat)?;
+    let Some(draft) = ralph_state::latest_setup_draft(&repo_root)? else {
+        chat.app.set_status("no Ralph setup draft found".to_owned());
+        return Ok(());
+    };
+    if draft.mode != ralph_state::RalphSetupDraftMode::RebuildExistingLoop {
+        chat.app.push_system_note(format!(
+            "Ralph setup draft is not a rebuild draft\n* Draft: {}\n* Mode: {}\n* Next: use Create loop from draft for new-loop drafts, or start Rebuild loop context",
+            draft.draft_id, draft.mode
+        ));
+        chat.app
+            .set_status("Ralph setup draft is not a rebuild draft".to_owned());
+        return Ok(());
+    }
+    let readiness = draft.readiness();
+    if !readiness.ready() {
+        chat.app.push_system_note(format!(
+            "Ralph rebuild draft is not ready to apply\n* Draft: {}\n* Has charter: {}\n* Has progress: {}\n* Approved: {}\n* Next: save and approve the rebuild draft before applying it",
+            draft.draft_id, readiness.has_charter, readiness.has_progress, readiness.approved
+        ));
+        chat.app
+            .set_status("Ralph rebuild draft is not ready".to_owned());
+        return Ok(());
+    }
+    let result = ralph_state::apply_setup_draft_to_existing_loop(&draft.draft_id, &repo_root)?;
+    chat.app.push_system_note(format!(
+        "Ralph loop context rebuilt\n* State dir: {}\n* Backups: {}\n* Charter: {}\n* Progress: {}\n* Run history was preserved",
+        result.state_dir.display(),
+        result.backup_dir.display(),
+        result.charter_doc_path.display(),
+        result.progress_doc_path.display()
+    ));
+    chat.app
+        .set_status("Ralph loop context rebuilt from draft".to_owned());
+    Ok(())
+}
+
 /// Start an LLM-guided Ralph setup draft instead of immediately creating loop files.
 pub async fn plan_loop(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Result<(), TuiError> {
     let repo_root = current_repo_root(chat)?;
@@ -526,6 +678,8 @@ pub async fn plan_loop(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Res
         session_title: chat.app.session_title().map(ToOwned::to_owned),
         source_context,
         validation_commands,
+        mode: ralph_state::RalphSetupDraftMode::NewLoop,
+        target_state_dir: None,
     })?;
     let prompt = guided_setup_prompt(&draft);
     append_setup_transcript(
@@ -631,9 +785,15 @@ async fn dispatch_home_action<W: Write>(
         super::ralph_launcher::RalphHomeAction::SaveDraft => save_setup_draft(chat),
         super::ralph_launcher::RalphHomeAction::ViewDraft => view_setup_draft(chat),
         super::ralph_launcher::RalphHomeAction::ReviseDraft => revise_setup_draft(chat),
+        super::ralph_launcher::RalphHomeAction::RebuildLoopContext => {
+            rebuild_loop_context(services, chat).await
+        }
         super::ralph_launcher::RalphHomeAction::ApproveDraft => approve_setup_draft(chat),
         super::ralph_launcher::RalphHomeAction::CreateFromDraft => {
             create_loop_from_draft(services, chat).await
+        }
+        super::ralph_launcher::RalphHomeAction::ApplyDraftToLoop => {
+            apply_draft_to_existing_loop(chat)
         }
         super::ralph_launcher::RalphHomeAction::Start => start_loop(io, services, chat).await,
         super::ralph_launcher::RalphHomeAction::Run
