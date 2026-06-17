@@ -65,6 +65,10 @@ pub async fn open_home<W: Write>(
 
 fn flash_message_for_action(action: super::ralph_launcher::RalphHomeAction) -> String {
     match action {
+        super::ralph_launcher::RalphHomeAction::Plan => {
+            "Guided setup started. Next: answer the assistant's clarifying questions in chat."
+                .to_owned()
+        }
         super::ralph_launcher::RalphHomeAction::Start => {
             "Setup complete. Next: review the docs if desired, then prepare a run.".to_owned()
         }
@@ -104,6 +108,96 @@ fn flash_message_for_action(action: super::ralph_launcher::RalphHomeAction) -> S
     }
 }
 
+/// Start an LLM-guided Ralph setup draft instead of immediately creating loop files.
+pub async fn plan_loop(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Result<(), TuiError> {
+    let repo_root = current_repo_root(chat)?;
+    let default_name = chat
+        .app
+        .session_title()
+        .map_or_else(|| "new-ralph-loop".to_owned(), ToString::to_string);
+    let validation_commands = ralph_state::default_validation_commands(&repo_root);
+    let source_context = setup_source_context(services, chat).await?;
+    let draft = ralph_state::create_setup_draft(ralph_state::RalphSetupDraftCreateRequest {
+        repo_root: repo_root.clone(),
+        loop_name: default_name,
+        session_title: chat.app.session_title().map(ToOwned::to_owned),
+        source_context,
+        validation_commands,
+    })?;
+    let prompt = guided_setup_prompt(&draft);
+    chat.app.push_system_note(format!(
+        "Ralph guided setup draft created\n* Draft: {}\n* Status: {}\n* Repo: {}\n* Next: answer the assistant's clarifying questions; approve only after charter/progress are meaningful",
+        draft.draft_id,
+        draft.status,
+        repo_root.display()
+    ));
+    chat.app.composer_mut().clear();
+    chat.app.composer_mut().insert_str(&prompt);
+    chat.app.set_status(
+        "Ralph setup draft created; submit the guided setup prompt to start planning".to_owned(),
+    );
+    Ok(())
+}
+
+async fn setup_source_context(
+    services: &TuiServices<'_>,
+    chat: &ActiveChat,
+) -> Result<String, TuiError> {
+    let Some(session_id) = chat.app.session_id() else {
+        return Ok("No active session history was available. Ask the user for the loop goal, constraints, non-goals, validation expectations, and definition of done.".to_owned());
+    };
+    let history = services
+        .client
+        .session_history_page(
+            session_id,
+            SessionHistoryQuery {
+                cursor: None,
+                limit: 64,
+                direction: SessionHistoryDirection::Backward,
+            },
+        )
+        .await?;
+    Ok(history
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            bcode_session_models::SessionEventKind::UserMessage { text, .. } => {
+                Some(format!("User: {text}"))
+            }
+            bcode_session_models::SessionEventKind::AssistantMessage { text, .. } => {
+                Some(format!("Assistant: {text}"))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n"))
+}
+
+fn guided_setup_prompt(draft: &ralph_state::RalphSetupDraft) -> String {
+    format!(
+        "Start Ralph guided setup for draft `{draft_id}`.\n\n\
+         Goal: do not create loop files yet. First help me clarify the goal, constraints, non-goals, validation, and definition of done. Ask focused clarifying questions until the loop is well specified. Then draft a meaningful `charter.md` and `progress.md` for review.\n\n\
+         Required process:\n\
+         1. Summarize what you understand from the context.\n\
+         2. Ask the minimum necessary clarifying questions.\n\
+         3. After answers, produce draft `charter.md`, draft `progress.md`, proposed validation commands, loop name, branch/worktree, and approval checklist.\n\
+         4. Do not claim setup is complete until I explicitly approve creating the loop from the draft.\n\n\
+         Current draft status: {status}\n\
+         Proposed loop name: {loop_name}\n\
+         Validation commands: {validation}\n\n\
+         Captured context:\n{context}",
+        draft_id = draft.draft_id,
+        status = draft.status,
+        loop_name = draft.loop_name,
+        validation = if draft.validation_commands.is_empty() {
+            "<none>".to_owned()
+        } else {
+            draft.validation_commands.join("; ")
+        },
+        context = draft.source_context
+    )
+}
+
 async fn dispatch_home_action<W: Write>(
     action: super::ralph_launcher::RalphHomeAction,
     io: &mut TuiIo<'_, '_, W>,
@@ -111,6 +205,7 @@ async fn dispatch_home_action<W: Write>(
     chat: &mut ActiveChat,
 ) -> Result<(), TuiError> {
     match action {
+        super::ralph_launcher::RalphHomeAction::Plan => plan_loop(services, chat).await,
         super::ralph_launcher::RalphHomeAction::Start => start_loop(io, services, chat).await,
         super::ralph_launcher::RalphHomeAction::Run
         | super::ralph_launcher::RalphHomeAction::Goal => run_loop(services, chat).await,

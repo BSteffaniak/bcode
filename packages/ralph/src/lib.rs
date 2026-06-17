@@ -29,6 +29,8 @@ const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DATABASE_OPEN_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(20);
 const DATABASE_OPEN_MAX_RETRY_DELAY: Duration = Duration::from_millis(250);
 const DATABASE_OPEN_RETRY_ATTEMPTS: u32 = 5;
+const SETUP_DRAFTS_DIR_NAME: &str = "setup-drafts";
+const SETUP_DRAFT_FILE_NAME: &str = "draft.json";
 
 /// Durable Ralph filesystem and database state location.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +63,44 @@ impl RalphStateStore {
     #[must_use]
     pub fn repo_state_root(&self, repo_root: &Path) -> PathBuf {
         repo_state_root_in_store(self, repo_root)
+    }
+
+    /// Create a setup draft for an LLM-guided Ralph planning flow.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the draft directory or draft JSON cannot be written.
+    pub fn create_setup_draft(
+        &self,
+        request: RalphSetupDraftCreateRequest,
+    ) -> Result<RalphSetupDraft, RalphStateError> {
+        create_setup_draft_in_store(self, request)
+    }
+
+    /// Return the most recently updated setup draft for a repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when draft JSON cannot be read or decoded.
+    pub fn latest_setup_draft(
+        &self,
+        repo_root: &Path,
+    ) -> Result<Option<RalphSetupDraft>, RalphStateError> {
+        latest_setup_draft_in_store(self, repo_root)
+    }
+
+    /// Mark a setup draft as converted to a durable Ralph loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the draft cannot be read or written.
+    pub fn mark_setup_draft_converted(
+        &self,
+        draft_id: &str,
+        repo_root: &Path,
+        state_dir: &Path,
+    ) -> Result<RalphSetupDraft, RalphStateError> {
+        mark_setup_draft_converted_in_store(self, draft_id, repo_root, state_dir)
     }
 
     /// Return the most recently updated Ralph loop for a repository.
@@ -752,6 +792,94 @@ pub struct RalphLoopSummary {
     updated_at_ms: u128,
 }
 
+/// User-visible status for an LLM-guided Ralph setup draft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RalphSetupDraftStatus {
+    /// Context is being collected before questions are asked.
+    CollectingContext,
+    /// The assistant is asking clarifying questions.
+    Clarifying,
+    /// The assistant is drafting charter/progress content.
+    Drafting,
+    /// Draft charter/progress are ready for review.
+    DraftReady,
+    /// The user approved the draft for loop creation.
+    Approved,
+    /// The user canceled the draft.
+    Canceled,
+    /// The draft was converted into a durable Ralph loop.
+    ConvertedToLoop,
+}
+
+impl RalphSetupDraftStatus {
+    /// Return the stable status label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CollectingContext => "collecting_context",
+            Self::Clarifying => "clarifying",
+            Self::Drafting => "drafting",
+            Self::DraftReady => "draft_ready",
+            Self::Approved => "approved",
+            Self::Canceled => "canceled",
+            Self::ConvertedToLoop => "converted_to_loop",
+        }
+    }
+}
+
+impl std::fmt::Display for RalphSetupDraftStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Request used to create a persistent setup draft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RalphSetupDraftCreateRequest {
+    /// Repository root the draft belongs to.
+    pub repo_root: PathBuf,
+    /// Proposed loop name.
+    pub loop_name: String,
+    /// Source session title, when available.
+    pub session_title: Option<String>,
+    /// Initial context summary or prompt seed.
+    pub source_context: String,
+    /// Proposed validation commands.
+    pub validation_commands: Vec<String>,
+}
+
+/// Persistent setup draft used before a Ralph loop is created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RalphSetupDraft {
+    /// Stable draft ID.
+    pub draft_id: String,
+    /// Repository root the draft belongs to.
+    pub repo_root: PathBuf,
+    /// Current setup status.
+    pub status: RalphSetupDraftStatus,
+    /// Proposed loop name.
+    pub loop_name: String,
+    /// Source session title, when available.
+    pub session_title: Option<String>,
+    /// Captured context seed for the planning conversation.
+    pub source_context: String,
+    /// Proposed validation commands.
+    pub validation_commands: Vec<String>,
+    /// Draft charter content, once produced by the assistant.
+    pub charter_draft: Option<String>,
+    /// Draft progress content, once produced by the assistant.
+    pub progress_draft: Option<String>,
+    /// Created timestamp in Unix epoch milliseconds.
+    pub created_at_ms: u64,
+    /// Updated timestamp in Unix epoch milliseconds.
+    pub updated_at_ms: u64,
+    /// Loop state directory after conversion.
+    pub converted_state_dir: Option<PathBuf>,
+    /// Draft JSON path.
+    pub draft_path: PathBuf,
+}
+
 /// Return the most recently updated Ralph loop for a repository.
 ///
 /// # Errors
@@ -764,6 +892,39 @@ pub struct RalphLoopSummary {
 /// Returns an error when the default Ralph database cannot be opened, migrated, or queried.
 pub fn latest_loop(repo_root: &Path) -> Result<Option<RalphLoopSummary>, RalphStateError> {
     RalphStateStore::default().latest_loop(repo_root)
+}
+
+/// Return the most recently updated setup draft for a repository.
+///
+/// # Errors
+///
+/// Returns an error when draft JSON cannot be read or decoded.
+pub fn latest_setup_draft(repo_root: &Path) -> Result<Option<RalphSetupDraft>, RalphStateError> {
+    RalphStateStore::default().latest_setup_draft(repo_root)
+}
+
+/// Create a setup draft for an LLM-guided Ralph planning flow.
+///
+/// # Errors
+///
+/// Returns an error when draft JSON cannot be written.
+pub fn create_setup_draft(
+    request: RalphSetupDraftCreateRequest,
+) -> Result<RalphSetupDraft, RalphStateError> {
+    RalphStateStore::default().create_setup_draft(request)
+}
+
+/// Mark a setup draft as converted to a durable Ralph loop.
+///
+/// # Errors
+///
+/// Returns an error when the draft cannot be read or written.
+pub fn mark_setup_draft_converted(
+    draft_id: &str,
+    repo_root: &Path,
+    state_dir: &Path,
+) -> Result<RalphSetupDraft, RalphStateError> {
+    RalphStateStore::default().mark_setup_draft_converted(draft_id, repo_root, state_dir)
 }
 
 /// Append a Ralph lifecycle event to the loop database.
@@ -2312,6 +2473,94 @@ fn repo_state_root_in_store(store: &RalphStateStore, repo_root: &Path) -> PathBu
     store.ralph_state_root().join(repo_state_id(repo_root))
 }
 
+fn create_setup_draft_in_store(
+    store: &RalphStateStore,
+    request: RalphSetupDraftCreateRequest,
+) -> Result<RalphSetupDraft, RalphStateError> {
+    let drafts_root =
+        repo_state_root_in_store(store, &request.repo_root).join(SETUP_DRAFTS_DIR_NAME);
+    std::fs::create_dir_all(&drafts_root)?;
+    let now = unix_epoch_ms();
+    let draft_id = format!("draft-{}", uuid::Uuid::new_v4());
+    let draft_path = drafts_root.join(&draft_id).join(SETUP_DRAFT_FILE_NAME);
+    let draft = RalphSetupDraft {
+        draft_id,
+        repo_root: request.repo_root,
+        status: RalphSetupDraftStatus::Clarifying,
+        loop_name: request.loop_name,
+        session_title: request.session_title,
+        source_context: request.source_context,
+        validation_commands: request.validation_commands,
+        charter_draft: None,
+        progress_draft: None,
+        created_at_ms: now,
+        updated_at_ms: now,
+        converted_state_dir: None,
+        draft_path,
+    };
+    write_setup_draft(&draft)?;
+    Ok(draft)
+}
+
+fn latest_setup_draft_in_store(
+    store: &RalphStateStore,
+    repo_root: &Path,
+) -> Result<Option<RalphSetupDraft>, RalphStateError> {
+    let drafts_root = repo_state_root_in_store(store, repo_root).join(SETUP_DRAFTS_DIR_NAME);
+    if !drafts_root.exists() {
+        return Ok(None);
+    }
+    let mut latest: Option<RalphSetupDraft> = None;
+    for entry in std::fs::read_dir(drafts_root)? {
+        let entry = entry?;
+        let draft_path = entry.path().join(SETUP_DRAFT_FILE_NAME);
+        if !draft_path.is_file() {
+            continue;
+        }
+        let mut draft = read_setup_draft(&draft_path)?;
+        draft.draft_path = draft_path;
+        if latest
+            .as_ref()
+            .is_none_or(|current| draft.updated_at_ms > current.updated_at_ms)
+        {
+            latest = Some(draft);
+        }
+    }
+    Ok(latest)
+}
+
+fn mark_setup_draft_converted_in_store(
+    store: &RalphStateStore,
+    draft_id: &str,
+    repo_root: &Path,
+    state_dir: &Path,
+) -> Result<RalphSetupDraft, RalphStateError> {
+    let draft_path = repo_state_root_in_store(store, repo_root)
+        .join(SETUP_DRAFTS_DIR_NAME)
+        .join(draft_id)
+        .join(SETUP_DRAFT_FILE_NAME);
+    let mut draft = read_setup_draft(&draft_path)?;
+    draft.status = RalphSetupDraftStatus::ConvertedToLoop;
+    draft.updated_at_ms = unix_epoch_ms();
+    draft.converted_state_dir = Some(state_dir.to_path_buf());
+    draft.draft_path = draft_path;
+    write_setup_draft(&draft)?;
+    Ok(draft)
+}
+
+fn read_setup_draft(path: &Path) -> Result<RalphSetupDraft, RalphStateError> {
+    serde_json::from_str(&std::fs::read_to_string(path)?).map_err(RalphStateError::Json)
+}
+
+fn write_setup_draft(draft: &RalphSetupDraft) -> Result<(), RalphStateError> {
+    if let Some(parent) = draft.draft_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(draft).map_err(RalphStateError::Json)?;
+    std::fs::write(&draft.draft_path, json)?;
+    Ok(())
+}
+
 fn allocate_loop_paths_in_store(
     store: &RalphStateStore,
     loop_name: &str,
@@ -2747,6 +2996,10 @@ fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis())
+}
+
+fn unix_epoch_ms() -> u64 {
+    u64::try_from(now_ms()).unwrap_or(u64::MAX)
 }
 
 fn upsert_loop_metadata_in_store(

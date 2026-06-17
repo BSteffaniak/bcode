@@ -30,7 +30,8 @@ pub fn tui_registry() -> PluginTuiRegistry {
 }
 
 const RALPH_ACTIONS: &[RalphAction] = &[
-    RalphAction::new("Start/setup loop", RalphActionKind::Start),
+    RalphAction::new("Plan/setup loop", RalphActionKind::Plan),
+    RalphAction::new("Quick create loop", RalphActionKind::Start),
     RalphAction::new("Prepare run", RalphActionKind::Run),
     RalphAction::new("Approve/start run", RalphActionKind::Approve),
     RalphAction::new("Stop active run", RalphActionKind::Stop),
@@ -51,6 +52,7 @@ fn action_for_kind(kind: RalphActionKind) -> Option<&'static RalphAction> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum RalphActionKind {
+    Plan,
     Start,
     Run,
     Approve,
@@ -68,6 +70,7 @@ enum RalphActionKind {
 impl RalphActionKind {
     const fn command_label(self) -> &'static str {
         match self {
+            Self::Plan => "plan",
             Self::Start => "start",
             Self::Run => "run",
             Self::Approve => "approve",
@@ -85,7 +88,12 @@ impl RalphActionKind {
 
     const fn description(self) -> &'static str {
         match self {
-            Self::Start => "create loop docs, worktree, branch/session, and validation config",
+            Self::Plan => {
+                "start guided LLM setup: clarify goal, draft charter/progress, then approve"
+            }
+            Self::Start => {
+                "quick-create starter docs/worktree from recent context; advanced fallback"
+            }
             Self::Run => "prepare an approval-gated autonomous run; does not start work yet",
             Self::Approve => "approve/start the prepared run",
             Self::Stop => "request cancellation for an active run",
@@ -155,6 +163,7 @@ impl PluginTuiSurfaceFactory for RalphHomeSurfaceFactory {
 struct RalphHomeSurface {
     repo_path: PathBuf,
     loop_summary: Option<bcode_ralph::RalphLoopSummary>,
+    setup_draft: Option<bcode_ralph::RalphSetupDraft>,
     runs: Vec<bcode_ralph::RalphRunRecord>,
     selected_action: usize,
     status_message: Option<String>,
@@ -165,6 +174,7 @@ impl RalphHomeSurface {
         let mut surface = Self {
             repo_path,
             loop_summary: None,
+            setup_draft: None,
             runs: Vec::new(),
             selected_action: 0,
             status_message: flash_message,
@@ -174,6 +184,16 @@ impl RalphHomeSurface {
     }
 
     fn refresh(&mut self) {
+        self.setup_draft = bcode_ralph::latest_setup_draft(&self.repo_path)
+            .ok()
+            .flatten()
+            .filter(|draft| {
+                !matches!(
+                    draft.status,
+                    bcode_ralph::RalphSetupDraftStatus::Canceled
+                        | bcode_ralph::RalphSetupDraftStatus::ConvertedToLoop
+                )
+            });
         match bcode_ralph::latest_loop(&self.repo_path) {
             Ok(Some(summary)) => {
                 self.runs =
@@ -209,8 +229,27 @@ impl RalphHomeSurface {
     }
 
     fn next_step(&self) -> &'static str {
+        if let Some(draft) = &self.setup_draft {
+            return match draft.status {
+                bcode_ralph::RalphSetupDraftStatus::CollectingContext
+                | bcode_ralph::RalphSetupDraftStatus::Clarifying => {
+                    "Guided setup draft exists. Next: answer the assistant's clarifying questions in chat."
+                }
+                bcode_ralph::RalphSetupDraftStatus::Drafting => {
+                    "Guided setup is drafting. Next: review the generated charter/progress draft."
+                }
+                bcode_ralph::RalphSetupDraftStatus::DraftReady
+                | bcode_ralph::RalphSetupDraftStatus::Approved => {
+                    "Setup draft is ready. Next: review and create the loop from the approved draft."
+                }
+                bcode_ralph::RalphSetupDraftStatus::Canceled
+                | bcode_ralph::RalphSetupDraftStatus::ConvertedToLoop => {
+                    "Start a new guided setup draft or use the existing loop below."
+                }
+            };
+        }
         let Some(_summary) = &self.loop_summary else {
-            return "Start/setup a loop to create docs, worktree, branch/session, and validation config.";
+            return "Plan/setup a loop with the assistant; quick-create is only an advanced fallback.";
         };
         let Some(run) = self.latest_run() else {
             return "Setup is complete. Next: prepare a run. Preparing does not start work until you approve it.";
@@ -235,9 +274,20 @@ impl RalphHomeSurface {
 
     fn action_order(&self) -> Vec<&'static RalphAction> {
         let no_loop = self.loop_summary.is_none();
+        let has_draft = self.setup_draft.is_some();
         let latest_status = self.latest_run().map(|run| run.status.as_str());
-        let kinds: &[RalphActionKind] = if no_loop {
-            &[RalphActionKind::Start, RalphActionKind::Status]
+        let kinds: &[RalphActionKind] = if no_loop && has_draft {
+            &[
+                RalphActionKind::Plan,
+                RalphActionKind::Status,
+                RalphActionKind::Start,
+            ]
+        } else if no_loop {
+            &[
+                RalphActionKind::Plan,
+                RalphActionKind::Start,
+                RalphActionKind::Status,
+            ]
         } else {
             match latest_status {
                 None => &[
@@ -297,6 +347,32 @@ impl RalphHomeSurface {
             }
         };
         kinds.iter().copied().filter_map(action_for_kind).collect()
+    }
+
+    fn render_current_draft(&self, frame: &mut Frame<'_>, area: Rect, mut y: u16) -> u16 {
+        let Some(draft) = &self.setup_draft else {
+            return y;
+        };
+        write_line(
+            frame,
+            area,
+            y,
+            Line::from_spans(vec![Span::styled(
+                "Setup draft",
+                Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            )]),
+        );
+        y = y.saturating_add(1);
+        for line in [
+            format!("  Draft: {}", draft.draft_id),
+            format!("  Status: {}", draft.status),
+            format!("  Proposed loop: {}", draft.loop_name),
+            format!("  Path: {}", draft.draft_path.display()),
+        ] {
+            write_line(frame, area, y, Line::from(line));
+            y = y.saturating_add(1);
+        }
+        y
     }
 
     fn render_runs(&self, frame: &mut Frame<'_>, area: Rect, mut y: u16) -> u16 {
@@ -463,6 +539,10 @@ impl PluginTuiSurface for RalphHomeSurface {
             ]),
         );
         y = y.saturating_add(2);
+        y = self.render_current_draft(frame, area, y);
+        if self.setup_draft.is_some() {
+            y = y.saturating_add(1);
+        }
         y = self.render_current_loop(frame, area, y);
         y = y.saturating_add(1);
         y = self.render_runs(frame, area, y);
