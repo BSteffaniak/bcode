@@ -249,6 +249,7 @@ struct SessionRuntimeHandle {
     commands: mpsc::Sender<SessionCommand>,
     queued_commands: Arc<AtomicUsize>,
     phase: Arc<Mutex<SessionRuntimePhase>>,
+    current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -291,6 +292,7 @@ struct RuntimeCommandContext<'a> {
     commands: &'a mut mpsc::Receiver<SessionCommand>,
     deferred_commands: &'a mut VecDeque<SessionCommand>,
     queued_commands: &'a AtomicUsize,
+    current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
 }
 
 impl<'a> RuntimeCommandContext<'a> {
@@ -298,11 +300,13 @@ impl<'a> RuntimeCommandContext<'a> {
         commands: &'a mut mpsc::Receiver<SessionCommand>,
         deferred_commands: &'a mut VecDeque<SessionCommand>,
         queued_commands: &'a AtomicUsize,
+        current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
     ) -> Self {
         Self {
             commands,
             deferred_commands,
             queued_commands,
+            current_turn,
         }
     }
 }
@@ -401,6 +405,24 @@ struct ActiveModelTurn {
     provider_turn_id: String,
     reuse_key: Option<String>,
     request_message_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeCurrentTurn {
+    client_id: ClientId,
+    turn_id: String,
+    cancel_state: Arc<TurnCancelState>,
+    model: Option<ActiveModelTurn>,
+}
+
+impl RuntimeCurrentTurn {
+    fn active_session_turn(&self) -> ActiveSessionTurn {
+        ActiveSessionTurn {
+            client_id: self.client_id,
+            turn_id: self.turn_id.clone(),
+            cancel_state: Arc::clone(&self.cancel_state),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4990,10 +5012,12 @@ async fn session_runtime_handle(
     let queued_commands = Arc::new(AtomicUsize::new(0));
     let receiver = Arc::new(Mutex::new(Some(receiver)));
     let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
+    let current_turn = Arc::new(Mutex::new(None));
     let handle = SessionRuntimeHandle {
         commands,
         queued_commands: Arc::clone(&queued_commands),
         phase: Arc::clone(&phase),
+        current_turn: Arc::clone(&current_turn),
     };
     runtimes.insert(session_id, handle.clone());
     drop(runtimes);
@@ -5005,6 +5029,7 @@ async fn session_runtime_handle(
             receiver,
             queued_commands,
             phase,
+            current_turn,
         ))
         .await;
     });
@@ -5017,6 +5042,7 @@ async fn run_session_runtime(
     commands: Arc<Mutex<Option<mpsc::Receiver<SessionCommand>>>>,
     queued_commands: Arc<AtomicUsize>,
     phase: Arc<Mutex<SessionRuntimePhase>>,
+    current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
 ) {
     let mut permit = SessionTurnPermit::new(session_id);
     let mut commands = commands
@@ -5046,6 +5072,7 @@ async fn run_session_runtime(
                     &mut commands,
                     &mut deferred_commands,
                     queued_commands.as_ref(),
+                    Arc::clone(&current_turn),
                     client_id,
                     runtime_context,
                     text,
@@ -5100,6 +5127,7 @@ async fn run_session_runtime(
                     &mut commands,
                     &mut deferred_commands,
                     queued_commands.as_ref(),
+                    Arc::clone(&current_turn),
                     client_id,
                     runtime_context,
                     skill_id,
@@ -5280,6 +5308,7 @@ async fn process_user_message_command(
     commands: &mut mpsc::Receiver<SessionCommand>,
     deferred_commands: &mut VecDeque<SessionCommand>,
     queued_commands: &AtomicUsize,
+    current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
     client_id: ClientId,
     runtime_context: Option<ClientRuntimeContext>,
     text: String,
@@ -5303,8 +5332,12 @@ async fn process_user_message_command(
         Ok(Some(user_event)) => {
             suggest_skills_for_prompt(state, permit.session_id(), &user_event).await;
             *phase.lock().await = SessionRuntimePhase::PreparingModelRequest;
-            let mut command_context =
-                RuntimeCommandContext::new(commands, deferred_commands, queued_commands);
+            let mut command_context = RuntimeCommandContext::new(
+                commands,
+                deferred_commands,
+                queued_commands,
+                Arc::clone(&current_turn),
+            );
             run_model_turn(
                 state,
                 permit,
@@ -5341,6 +5374,7 @@ async fn process_skill_invocation_command(
     commands: &mut mpsc::Receiver<SessionCommand>,
     deferred_commands: &mut VecDeque<SessionCommand>,
     queued_commands: &AtomicUsize,
+    current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
     client_id: ClientId,
     runtime_context: Option<ClientRuntimeContext>,
     skill_id: SkillId,
@@ -5383,8 +5417,12 @@ async fn process_skill_invocation_command(
                 },
             );
             *phase.lock().await = SessionRuntimePhase::PreparingModelRequest;
-            let mut command_context =
-                RuntimeCommandContext::new(commands, deferred_commands, queued_commands);
+            let mut command_context = RuntimeCommandContext::new(
+                commands,
+                deferred_commands,
+                queued_commands,
+                Arc::clone(&current_turn),
+            );
             run_model_turn(
                 state,
                 permit,
@@ -6120,7 +6158,29 @@ async fn request_session_turn_cancellation(
     )
     .await;
 
-    let active_turn = state.active_turns.lock().await.get(&session_id).cloned();
+    let runtime_handle = state
+        .session_runtimes
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned();
+    let active_turn = if let Some(handle) = runtime_handle {
+        handle
+            .current_turn
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|turn| turn.model.clone())
+    } else {
+        None
+    }
+    .or_else(|| {
+        state
+            .active_turns
+            .try_lock()
+            .ok()
+            .and_then(|turns| turns.get(&session_id).cloned())
+    });
     let Some(active_turn) = active_turn else {
         return true;
     };
@@ -7906,13 +7966,21 @@ async fn run_model_turn(
         Arc::clone(&cancel_state),
     )
     .await;
+    *command_context.current_turn.lock().await = Some(RuntimeCurrentTurn {
+        client_id,
+        turn_id: turn_id.clone(),
+        cancel_state: Arc::clone(&cancel_state),
+        model: None,
+    });
     state.active_session_turns.lock().await.insert(
         session_id,
-        ActiveSessionTurn {
-            client_id,
-            turn_id: turn_id.clone(),
-            cancel_state: Arc::clone(&cancel_state),
-        },
+        command_context
+            .current_turn
+            .lock()
+            .await
+            .as_ref()
+            .expect("current turn was just initialized")
+            .active_session_turn(),
     );
     append_model_turn_started_event(state, session_id, turn_id.clone()).await;
     *phase.lock().await = SessionRuntimePhase::ProviderActive;
@@ -7930,6 +7998,7 @@ async fn run_model_turn(
     *phase.lock().await = SessionRuntimePhase::FinishingTurn;
     state.active_session_turns.lock().await.remove(&session_id);
     state.active_turns.lock().await.remove(&session_id);
+    *command_context.current_turn.lock().await = None;
     append_model_turn_finished_event(
         state,
         session_id,
@@ -8342,15 +8411,20 @@ async fn run_model_turn_round(
         }
     };
 
-    state.active_turns.lock().await.insert(
-        session_id,
-        ActiveModelTurn {
-            provider_plugin_id: provider_plugin_id.map(ToString::to_string),
-            provider_turn_id: start.provider_turn_id.clone(),
-            reuse_key: request.conversation_reuse.key.clone(),
-            request_message_count: request.messages.len(),
-        },
-    );
+    let active_model_turn = ActiveModelTurn {
+        provider_plugin_id: provider_plugin_id.map(ToString::to_string),
+        provider_turn_id: start.provider_turn_id.clone(),
+        reuse_key: request.conversation_reuse.key.clone(),
+        request_message_count: request.messages.len(),
+    };
+    if let Some(current_turn) = command_context.current_turn.lock().await.as_mut() {
+        current_turn.model = Some(active_model_turn.clone());
+    }
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(session_id, active_model_turn);
 
     append_trace_event(
         state,
@@ -8388,6 +8462,9 @@ async fn run_model_turn_round(
 
     service_runtime_priority_commands(state, session_id, command_context).await;
     let active_turn = state.active_turns.lock().await.remove(&session_id);
+    if let Some(current_turn) = command_context.current_turn.lock().await.as_mut() {
+        current_turn.model = None;
+    }
     if cancel_state.is_cancelled() && outcome.completion.is_none() {
         outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
         outcome.completion = Some(ModelTurnCompletion::with_message(
