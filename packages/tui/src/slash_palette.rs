@@ -323,6 +323,8 @@ fn static_items() -> Vec<SlashItem> {
             "Open thinking settings focused on summary",
         ),
         ("/diff", "Toggle diff panel"),
+        ("/fork", "Fork current session"),
+        ("/clone", "Clone current session"),
         ("/worktree", "Create worktree"),
         ("/worktrees", "Create worktree"),
         ("/worktree list", "List Git worktrees"),
@@ -379,6 +381,17 @@ mod tests {
 
         assert_eq!(items[0].command(), "/thinking");
         assert_eq!(items[1].command(), "/agent");
+    }
+
+    #[test]
+    fn includes_session_fork_commands() {
+        let commands = static_items()
+            .into_iter()
+            .map(|item| item.command().to_owned())
+            .collect::<Vec<_>>();
+
+        assert!(commands.iter().any(|command| command == "/fork"));
+        assert!(commands.iter().any(|command| command == "/clone"));
     }
 
     #[test]
