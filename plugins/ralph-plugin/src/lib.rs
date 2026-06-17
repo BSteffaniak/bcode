@@ -32,6 +32,7 @@ pub fn tui_registry() -> PluginTuiRegistry {
 const RALPH_ACTIONS: &[RalphAction] = &[
     RalphAction::new("Plan/setup loop", RalphActionKind::Plan),
     RalphAction::new("Save setup draft", RalphActionKind::SaveDraft),
+    RalphAction::new("Approve setup draft", RalphActionKind::ApproveDraft),
     RalphAction::new("Create loop from draft", RalphActionKind::CreateFromDraft),
     RalphAction::new("Quick create loop", RalphActionKind::Start),
     RalphAction::new("Prepare run", RalphActionKind::Run),
@@ -56,6 +57,7 @@ fn action_for_kind(kind: RalphActionKind) -> Option<&'static RalphAction> {
 enum RalphActionKind {
     Plan,
     SaveDraft,
+    ApproveDraft,
     CreateFromDraft,
     Start,
     Run,
@@ -76,6 +78,7 @@ impl RalphActionKind {
         match self {
             Self::Plan => "plan",
             Self::SaveDraft => "save-draft",
+            Self::ApproveDraft => "approve-draft",
             Self::CreateFromDraft => "create-from-draft",
             Self::Start => "start",
             Self::Run => "run",
@@ -100,7 +103,8 @@ impl RalphActionKind {
             Self::SaveDraft => {
                 "capture latest assistant charter/progress draft for review/approval"
             }
-            Self::CreateFromDraft => "create loop files/worktree from the reviewed setup draft",
+            Self::ApproveDraft => "approve saved charter/progress as ready for loop creation",
+            Self::CreateFromDraft => "create loop files/worktree from the approved setup draft",
             Self::Start => {
                 "quick-create starter docs/worktree from recent context; advanced fallback"
             }
@@ -248,9 +252,11 @@ impl RalphHomeSurface {
                 bcode_ralph::RalphSetupDraftStatus::Drafting => {
                     "Guided setup is drafting. Next: review the generated charter/progress draft."
                 }
-                bcode_ralph::RalphSetupDraftStatus::DraftReady
-                | bcode_ralph::RalphSetupDraftStatus::Approved => {
-                    "Setup draft is ready. Next: review and create the loop from the approved draft."
+                bcode_ralph::RalphSetupDraftStatus::DraftReady => {
+                    "Setup draft is saved. Next: review it, then approve setup draft."
+                }
+                bcode_ralph::RalphSetupDraftStatus::Approved => {
+                    "Setup draft is approved. Next: create the loop from the approved draft."
                 }
                 bcode_ralph::RalphSetupDraftStatus::Canceled
                 | bcode_ralph::RalphSetupDraftStatus::ConvertedToLoop => {
@@ -290,6 +296,7 @@ impl RalphHomeSurface {
             &[
                 RalphActionKind::Plan,
                 RalphActionKind::SaveDraft,
+                RalphActionKind::ApproveDraft,
                 RalphActionKind::CreateFromDraft,
                 RalphActionKind::Status,
                 RalphActionKind::Start,
@@ -365,6 +372,7 @@ impl RalphHomeSurface {
         let Some(draft) = &self.setup_draft else {
             return y;
         };
+        let readiness = draft.readiness();
         write_line(
             frame,
             area,
@@ -379,6 +387,10 @@ impl RalphHomeSurface {
             format!("  Draft: {}", draft.draft_id),
             format!("  Status: {}", draft.status),
             format!("  Proposed loop: {}", draft.loop_name),
+            format!(
+                "  Ready: charter={} progress={} approved={}",
+                readiness.has_charter, readiness.has_progress, readiness.approved
+            ),
             format!("  Path: {}", draft.draft_path.display()),
         ] {
             write_line(frame, area, y, Line::from(line));

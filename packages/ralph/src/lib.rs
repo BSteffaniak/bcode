@@ -923,6 +923,55 @@ pub struct RalphSetupDraft {
     pub draft_path: PathBuf,
 }
 
+impl RalphSetupDraft {
+    /// Return whether the draft has enough approved content to create a useful loop.
+    #[must_use]
+    pub fn readiness(&self) -> RalphSetupDraftReadiness {
+        let has_charter = self
+            .charter_draft
+            .as_deref()
+            .is_some_and(|text| has_meaningful_markdown(text, "charter"));
+        let has_progress = self
+            .progress_draft
+            .as_deref()
+            .is_some_and(|text| has_meaningful_markdown(text, "progress"));
+        let approved = self.status == RalphSetupDraftStatus::Approved;
+        RalphSetupDraftReadiness {
+            has_charter,
+            has_progress,
+            approved,
+        }
+    }
+}
+
+/// Readiness summary for turning a setup draft into a loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RalphSetupDraftReadiness {
+    /// Whether a meaningful charter draft exists.
+    pub has_charter: bool,
+    /// Whether a meaningful progress draft exists.
+    pub has_progress: bool,
+    /// Whether the user approved the setup draft.
+    pub approved: bool,
+}
+
+impl RalphSetupDraftReadiness {
+    /// Return whether all required gates pass.
+    #[must_use]
+    pub const fn ready(self) -> bool {
+        self.has_charter && self.has_progress && self.approved
+    }
+}
+
+fn has_meaningful_markdown(text: &str, domain: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let trimmed = text.trim();
+    trimmed.len() >= 80
+        && !trimmed.contains("TODO")
+        && !lower.contains("template")
+        && lower.contains(domain)
+}
+
 /// Return the most recently updated Ralph loop for a repository.
 ///
 /// # Errors
@@ -2645,6 +2694,9 @@ fn create_loop_from_setup_draft_in_store(
         .join(draft_id)
         .join(SETUP_DRAFT_FILE_NAME);
     let draft = read_setup_draft(&draft_path)?;
+    if !draft.readiness().ready() {
+        return Err(RalphStateError::SetupDraftNotReady(draft.draft_id));
+    }
     let state = create_initial_loop_state_in_store(
         store,
         &draft.loop_name,
@@ -3625,6 +3677,9 @@ pub enum RalphStateError {
     /// State database worker panicked.
     #[error("Ralph state database worker panicked")]
     DatabaseWorkerPanicked,
+    /// Setup draft is missing required content or approval.
+    #[error("Ralph setup draft is not ready for loop creation: {0}")]
+    SetupDraftNotReady(String),
     /// Could not allocate a unique loop state directory.
     #[error("could not allocate a unique Ralph loop state directory for {0}")]
     LoopNameExhausted(String),

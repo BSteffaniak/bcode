@@ -14,12 +14,19 @@ use crate::terminal_events::TuiInput;
 #[serde(rename_all = "snake_case")]
 pub enum RalphHomeAction {
     /// Open guided setup flow.
+    #[serde(alias = "plan")]
     Plan,
     /// Save latest assistant planning output into the setup draft.
+    #[serde(alias = "save-draft")]
     SaveDraft,
+    /// Approve the saved setup draft.
+    #[serde(alias = "approve-draft")]
+    ApproveDraft,
     /// Create loop from approved setup draft.
+    #[serde(alias = "create-from-draft")]
     CreateFromDraft,
     /// Open quick setup flow.
+    #[serde(alias = "start")]
     Start,
     /// Prepare/run autonomous loop.
     Run,
