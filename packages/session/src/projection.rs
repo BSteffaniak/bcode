@@ -41,7 +41,6 @@ fn projection_window_from_transcript_projection_items(
     request: &ProjectionWindowRequest,
 ) -> Option<ProjectionWindow> {
     if request.projection != SessionProjectionKind::Transcript
-        || request.anchor != ProjectionWindowAnchor::Latest
         || request.direction != ProjectionWindowDirection::Backward
     {
         return None;
@@ -53,7 +52,13 @@ fn projection_window_from_transcript_projection_items(
             item.source_range.end_sequence,
         )
     });
-    let selected_items = select_latest_items(spans, request);
+    let selected_items = match request.anchor {
+        ProjectionWindowAnchor::Latest => select_latest_items(spans, request),
+        ProjectionWindowAnchor::AroundSequence(sequence) => {
+            select_around_sequence_items(spans, sequence, request)
+        }
+        _ => return None,
+    };
     let source_range = source_range_for_items(&selected_items);
     let scanned_events = source_range.map_or(0, |range| {
         usize::try_from(range.end_sequence - range.start_sequence + 1).unwrap_or(usize::MAX)
@@ -94,19 +99,35 @@ pub fn projection_window_from_events(
     request: &ProjectionWindowRequest,
 ) -> Option<ProjectionWindow> {
     if request.projection != SessionProjectionKind::Transcript
-        || request.anchor != ProjectionWindowAnchor::Latest
         || request.direction != ProjectionWindowDirection::Backward
     {
         return None;
     }
 
-    let scan_start = events
-        .len()
-        .saturating_sub(request.limits.max_events_scanned);
-    let scanned_events = events.len().saturating_sub(scan_start);
-    let scanned = &events[scan_start..];
-    let items = build_transcript_projection(scanned, request.target.width_columns);
-    let selected_items = select_latest_items(&items, request);
+    let (items, scanned_events) = match request.anchor {
+        ProjectionWindowAnchor::Latest => {
+            let scan_start = events
+                .len()
+                .saturating_sub(request.limits.max_events_scanned);
+            let scanned = &events[scan_start..];
+            (
+                build_transcript_projection(scanned, request.target.width_columns),
+                events.len().saturating_sub(scan_start),
+            )
+        }
+        ProjectionWindowAnchor::AroundSequence(_) => (
+            build_transcript_projection(events, request.target.width_columns),
+            events.len(),
+        ),
+        _ => return None,
+    };
+    let selected_items = match request.anchor {
+        ProjectionWindowAnchor::Latest => select_latest_items(&items, request),
+        ProjectionWindowAnchor::AroundSequence(sequence) => {
+            select_around_sequence_items(&items, sequence, request)
+        }
+        _ => return None,
+    };
     let source_range = source_range_for_items(&selected_items);
     let has_older = source_range.is_some_and(|range| {
         events
@@ -174,6 +195,59 @@ fn select_latest_items(
 
     selected.reverse();
     selected
+}
+
+fn select_around_sequence_items(
+    items: &[TranscriptProjectionItem],
+    sequence: u64,
+    request: &ProjectionWindowRequest,
+) -> Vec<TranscriptProjectionItem> {
+    let Some(anchor_index) = items.iter().position(|item| {
+        item.source_range.start_sequence <= sequence && sequence <= item.source_range.end_sequence
+    }) else {
+        return Vec::new();
+    };
+    let mut start = anchor_index;
+    let mut end = anchor_index + 1;
+    let mut selected_rows = items[anchor_index].estimated_rows.unwrap_or(1);
+    let mut selected_bytes = items[anchor_index].content_bytes;
+
+    while end.saturating_sub(start) < request.limits.max_items
+        && selected_bytes <= request.limits.max_bytes
+        && !target_satisfied(
+            end.saturating_sub(start),
+            selected_rows,
+            selected_bytes,
+            request.target.min_items,
+            request.target.min_estimated_rows,
+            request.target.min_bytes,
+        )
+    {
+        let can_prepend = start > 0;
+        let can_append = end < items.len();
+        if !can_prepend && !can_append {
+            break;
+        }
+        let use_prepend = can_prepend
+            && (!can_append
+                || anchor_index.saturating_sub(start) <= end.saturating_sub(anchor_index + 1));
+        let candidate = if use_prepend {
+            &items[start - 1]
+        } else {
+            &items[end]
+        };
+        if selected_bytes.saturating_add(candidate.content_bytes) > request.limits.max_bytes {
+            break;
+        }
+        selected_rows = selected_rows.saturating_add(candidate.estimated_rows.unwrap_or(1));
+        selected_bytes = selected_bytes.saturating_add(candidate.content_bytes);
+        if use_prepend {
+            start -= 1;
+        } else {
+            end += 1;
+        }
+    }
+    items[start..end].to_vec()
 }
 
 fn target_satisfied(

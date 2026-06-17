@@ -505,10 +505,12 @@ fn composer_double_click_selects_word_and_triple_click_selects_all() {
 fn input_history_updates_status_and_restores_draft() {
     let history = [
         SessionInputHistoryEntry {
+            timestamp_ms: 1,
             sequence: 1,
             text: "first prompt".to_owned(),
         },
         SessionInputHistoryEntry {
+            timestamp_ms: 1,
             sequence: 2,
             text: "second prompt".to_owned(),
         },
@@ -547,6 +549,7 @@ fn input_history_empty_and_not_browsing_update_status() {
 #[test]
 fn composer_edit_after_history_resets_navigation() {
     let history = [SessionInputHistoryEntry {
+        timestamp_ms: 1,
         sequence: 1,
         text: "history prompt".to_owned(),
     }];
@@ -565,10 +568,12 @@ fn composer_edit_after_history_resets_navigation() {
 fn input_history_moves_within_multiline_entry_before_cycling() {
     let history = [
         SessionInputHistoryEntry {
+            timestamp_ms: 1,
             sequence: 1,
             text: "older prompt\nolder second line".to_owned(),
         },
         SessionInputHistoryEntry {
+            timestamp_ms: 1,
             sequence: 2,
             text: "newest prompt\nnewest second line".to_owned(),
         },
@@ -609,6 +614,7 @@ fn input_history_moves_within_multiline_entry_before_cycling() {
 #[test]
 fn input_history_restores_empty_draft_from_newest_entry_bottom() {
     let history = [SessionInputHistoryEntry {
+        timestamp_ms: 1,
         sequence: 1,
         text: "history prompt".to_owned(),
     }];
@@ -629,6 +635,7 @@ fn input_history_restores_empty_draft_from_newest_entry_bottom() {
 fn live_user_message_does_not_overwrite_saved_history_draft() {
     let session_id = SessionId::new();
     let history = [SessionInputHistoryEntry {
+        timestamp_ms: 1,
         sequence: 1,
         text: "older prompt".to_owned(),
     }];
@@ -654,6 +661,7 @@ fn live_user_message_does_not_overwrite_saved_history_draft() {
 #[test]
 fn empty_and_slash_submissions_do_not_enter_input_history() {
     let history = [SessionInputHistoryEntry {
+        timestamp_ms: 1,
         sequence: 1,
         text: "real prompt".to_owned(),
     }];
@@ -1137,6 +1145,7 @@ async fn async_session_open_preserves_typed_draft() {
             },
         )],
         input_history: vec![SessionInputHistoryEntry {
+            timestamp_ms: 1,
             sequence: 1,
             text: "previous prompt".to_owned(),
         }],

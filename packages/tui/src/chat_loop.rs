@@ -496,11 +496,13 @@ async fn handle_chat_key<W: Write>(
     stroke: KeyStroke,
 ) -> Result<bool, TuiError> {
     if modals.timeline_dialog.is_some() {
-        return Ok(timeline_flow::handle_timeline_key(
+        return timeline_flow::handle_timeline_key(
+            context.services.client,
             chat,
             &mut modals.timeline_dialog,
             stroke,
-        ));
+        )
+        .await;
     }
     if modals.thinking_dialog.is_some() {
         return thinking_flow::handle_thinking_key(

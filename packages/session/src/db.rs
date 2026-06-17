@@ -817,7 +817,7 @@ impl SessionDb {
         let rows = self
             .db
             .select("input_messages")
-            .columns(&["event_seq", "text"])
+            .columns(&["event_seq", "created_at_ms", "text"])
             .sort("input_seq", SortDirection::Asc)
             .execute(&**self.db)
             .await?;
@@ -1815,6 +1815,7 @@ fn input_history_entry_from_row(
 ) -> SessionDbResult<SessionInputHistoryEntry> {
     Ok(SessionInputHistoryEntry {
         sequence: required_i64(row, "event_seq").map(i64_to_u64)?,
+        timestamp_ms: optional_i64(row, "created_at_ms").map_or(0, i64_to_u64),
         text: required_string(row, "text")?,
     })
 }
@@ -2098,6 +2099,7 @@ mod tests {
             input_history,
             vec![SessionInputHistoryEntry {
                 sequence: 1,
+                timestamp_ms: 1,
                 text: "hello".to_string(),
             }]
         );

@@ -235,12 +235,6 @@ impl TranscriptItem {
         self.event_sequence
     }
 
-    /// Return the event timestamp associated with this item, when known.
-    #[must_use]
-    pub const fn timestamp_ms(&self) -> Option<u64> {
-        self.timestamp_ms
-    }
-
     const fn with_streaming(mut self, streaming: bool) -> Self {
         self.streaming = streaming;
         self.bump_revision();

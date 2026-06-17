@@ -364,22 +364,33 @@ impl BmuxApp {
     /// Return timeline entries for committed user messages.
     #[must_use]
     pub fn timeline_entries(&self) -> Vec<TimelineEntry> {
-        self.transcript
+        self.input_history
+            .entries()
             .iter()
-            .enumerate()
-            .filter_map(|(index, item)| {
-                if item.role() == "You" {
-                    Some(TimelineEntry::new(
-                        Some(index),
-                        item.event_sequence().unwrap_or(0),
-                        item.timestamp_ms().unwrap_or(0),
-                        item.text().to_owned(),
-                    ))
-                } else {
-                    None
-                }
+            .map(|entry| {
+                TimelineEntry::new(
+                    self.transcript_index_for_sequence(entry.sequence),
+                    entry.sequence,
+                    entry.timestamp_ms,
+                    entry.text.clone(),
+                )
             })
             .collect()
+    }
+
+    pub fn transcript_index_for_sequence(&self, sequence: u64) -> Option<usize> {
+        self.transcript
+            .iter()
+            .position(|item| item.event_sequence() == Some(sequence))
+    }
+
+    /// Replace the resident transcript with a bounded replay window.
+    pub fn replace_transcript_window(&mut self, events: &[SessionEvent]) {
+        self.latest_history_sequence = events.last().map(|event| event.sequence);
+        self.transcript_window.replace_window(events);
+        self.rebuild_transcript_from_history();
+        self.reconcile_tool_state_with_resident_transcript();
+        self.pending_visual_overflow_bottom = None;
     }
 
     /// Jump to a committed transcript item and top-anchor it in the viewport.
@@ -1489,7 +1500,11 @@ impl BmuxApp {
         }
 
         let input_messages = events.iter().filter_map(|event| match &event.kind {
-            SessionEventKind::UserMessage { text, .. } => Some((event.sequence, text.clone())),
+            SessionEventKind::UserMessage { text, .. } => Some(SessionInputHistoryEntry {
+                sequence: event.sequence,
+                timestamp_ms: event.timestamp_ms,
+                text: text.clone(),
+            }),
             _ => None,
         });
         self.input_history.prepend_committed(input_messages);
@@ -1994,7 +2009,8 @@ impl BmuxApp {
         timestamp_ms: u64,
         application: SessionEventApplication,
     ) {
-        self.input_history.push_committed(sequence, text);
+        self.input_history
+            .push_committed(sequence, timestamp_ms, text);
         if application.live_activity() {
             self.push_live_user_message(sequence, text, timestamp_ms);
         } else {

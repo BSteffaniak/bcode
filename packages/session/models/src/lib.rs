@@ -213,6 +213,8 @@ pub struct SessionHistoryPage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInputHistoryEntry {
     pub sequence: u64,
+    #[serde(default)]
+    pub timestamp_ms: u64,
     pub text: String,
 }
 

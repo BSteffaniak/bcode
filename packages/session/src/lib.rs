@@ -2632,6 +2632,7 @@ fn input_history_from_events(history: &[SessionEvent]) -> Vec<SessionInputHistor
             if let SessionEventKind::UserMessage { text, .. } = &event.kind {
                 Some(SessionInputHistoryEntry {
                     sequence: event.sequence,
+                    timestamp_ms: event.timestamp_ms,
                     text: text.clone(),
                 })
             } else {
@@ -3697,6 +3698,7 @@ mod tests {
             attachment.input_history,
             vec![bcode_session_models::SessionInputHistoryEntry {
                 sequence: 1,
+                timestamp_ms: 1,
                 text: "hello".to_owned(),
             }]
         );

@@ -27,7 +27,7 @@ pub enum InputHistoryOutcome {
 /// Input history plus draft restoration state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputHistory {
-    entries: Vec<String>,
+    entries: Vec<SessionInputHistoryEntry>,
     sequences: BTreeSet<u64>,
     index: Option<usize>,
     browse_len: Option<usize>,
@@ -38,33 +38,46 @@ impl InputHistory {
     /// Create input history from session entries.
     #[must_use]
     pub fn from_entries(entries: &[SessionInputHistoryEntry]) -> Self {
+        let entries = entries
+            .iter()
+            .filter(|entry| !entry.text.trim().is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
         Self {
-            entries: entries
-                .iter()
-                .filter(|entry| !entry.text.trim().is_empty())
-                .map(|entry| entry.text.clone())
-                .collect(),
             sequences: entries.iter().map(|entry| entry.sequence).collect(),
+            entries,
             index: None,
             browse_len: None,
             draft: None,
         }
     }
 
+    /// Return all committed input-history entries.
+    #[must_use]
+    pub fn entries(&self) -> &[SessionInputHistoryEntry] {
+        &self.entries
+    }
+
     /// Push a committed user message and reset navigation state.
-    pub fn push_committed(&mut self, sequence: u64, text: &str) {
+    pub fn push_committed(&mut self, sequence: u64, timestamp_ms: u64, text: &str) {
         if text.trim().is_empty() || !self.sequences.insert(sequence) {
             return;
         }
-        self.entries.push(text.to_owned());
+        self.entries.push(SessionInputHistoryEntry {
+            sequence,
+            timestamp_ms,
+            text: text.to_owned(),
+        });
     }
 
     /// Prepend older committed user messages in chronological order.
-    pub fn prepend_committed(&mut self, messages: impl IntoIterator<Item = (u64, String)>) {
+    pub fn prepend_committed(
+        &mut self,
+        messages: impl IntoIterator<Item = SessionInputHistoryEntry>,
+    ) {
         let messages = messages
             .into_iter()
-            .filter(|(sequence, text)| !text.trim().is_empty() && self.sequences.insert(*sequence))
-            .map(|(_, text)| text)
+            .filter(|entry| !entry.text.trim().is_empty() && self.sequences.insert(entry.sequence))
             .collect::<Vec<_>>();
         if messages.is_empty() {
             return;
@@ -131,7 +144,7 @@ impl InputHistory {
         InputHistoryOutcome::Entry {
             index: index.saturating_add(1),
             total: self.entries.len(),
-            text: self.entries[index].clone(),
+            text: self.entries[index].text.clone(),
         }
     }
 }

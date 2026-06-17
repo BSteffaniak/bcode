@@ -63,6 +63,13 @@ impl TranscriptResidentWindow {
         self.events.len()
     }
 
+    /// Replace resident events with a bounded transcript window.
+    pub fn replace_window(&mut self, events: &[SessionEvent]) {
+        self.events.clear();
+        self.events.extend_from_slice(events);
+        self.dropped_before_sequence = events.first().map(|event| event.sequence);
+    }
+
     /// Append one live event to the resident window.
     pub fn append_live_event(&mut self, event: &SessionEvent) {
         self.events.push(event.clone());

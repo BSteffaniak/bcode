@@ -18,6 +18,7 @@ const INITIAL_TRANSCRIPT_MIN_ITEMS: usize = 12;
 const INITIAL_TRANSCRIPT_MAX_ITEMS: usize = 64;
 const INITIAL_TRANSCRIPT_MAX_EVENTS_SCANNED: usize = 2_048;
 const INITIAL_TRANSCRIPT_MAX_BYTES: usize = 512 * 1024;
+const TIMELINE_JUMP_MAX_EVENTS_SCANNED: usize = 1_024;
 const EVENT_STREAM_RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(100);
 const EVENT_STREAM_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(2);
 
@@ -45,6 +46,47 @@ pub fn initial_transcript_window_request(
             max_bytes: INITIAL_TRANSCRIPT_MAX_BYTES,
         },
     }
+}
+
+/// Load a bounded transcript event window around an event sequence.
+pub async fn load_timeline_jump_events(
+    client: &BcodeClient,
+    session_id: SessionId,
+    sequence: u64,
+) -> Result<Vec<bcode_session_models::SessionEvent>, TuiError> {
+    let half_limit = TIMELINE_JUMP_MAX_EVENTS_SCANNED / 2;
+    let older = client
+        .session_history_page(
+            session_id,
+            SessionHistoryQuery {
+                cursor: Some(SessionHistoryCursor { sequence }),
+                limit: half_limit.max(1),
+                direction: SessionHistoryDirection::Backward,
+            },
+        )
+        .await?;
+    let newer = client
+        .session_history_page(
+            session_id,
+            SessionHistoryQuery {
+                cursor: Some(SessionHistoryCursor {
+                    sequence: sequence.saturating_add(1),
+                }),
+                limit: half_limit.max(1),
+                direction: SessionHistoryDirection::Forward,
+            },
+        )
+        .await?;
+    let mut events = older.events;
+    events.extend(
+        newer
+            .events
+            .into_iter()
+            .filter(|event| event.sequence != sequence),
+    );
+    events.sort_by_key(|event| event.sequence);
+    events.dedup_by_key(|event| event.sequence);
+    Ok(events)
 }
 
 /// Load the next older page of transcript history when available.

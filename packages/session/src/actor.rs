@@ -9,6 +9,7 @@ use super::{
     title_from_first_prompt, usize_to_u64,
 };
 use crate::db::{MaterializedProjection, SessionDb};
+use bcode_session_models::ProjectionWindowAnchor;
 use std::sync::RwLock;
 use tokio::sync::{mpsc, oneshot};
 
@@ -775,6 +776,9 @@ impl SessionActor {
                     expected: expected_last_sequence,
                 });
             }
+            if matches!(request.anchor, ProjectionWindowAnchor::AroundSequence(_)) {
+                return self.projection_window_from_bounded_events(&request).await;
+            }
             let transcript_items = db
                 .transcript_items_for_latest_window(
                     request.target.min_items.unwrap_or(1),
@@ -795,6 +799,28 @@ impl SessionActor {
             return Err(SessionError::NotFound(self.state.summary.id));
         }
         Err(SessionError::UnsupportedProjectionWindow)
+    }
+
+    async fn projection_window_from_bounded_events(
+        &mut self,
+        request: &ProjectionWindowRequest,
+    ) -> Result<ProjectionWindow, SessionError> {
+        let ProjectionWindowAnchor::AroundSequence(sequence) = request.anchor else {
+            return Err(SessionError::UnsupportedProjectionWindow);
+        };
+        let half_scan =
+            u64::try_from(request.limits.max_events_scanned.max(1) / 2).unwrap_or(u64::MAX);
+        let start_sequence = sequence.saturating_sub(half_scan).max(1);
+        let end_sequence = sequence.saturating_add(half_scan);
+        let events = self
+            .events_range(
+                start_sequence,
+                end_sequence,
+                request.limits.max_events_scanned.max(1),
+            )
+            .await?;
+        crate::projection::projection_window_from_events(&events, request)
+            .ok_or(SessionError::UnsupportedProjectionWindow)
     }
 
     async fn events_range(
