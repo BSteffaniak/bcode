@@ -15364,4 +15364,104 @@ mod tests {
         assert_eq!(command.value, "abcdef");
         assert!(!command.truncated);
     }
+
+    #[tokio::test]
+    async fn split_runtime_queues_clear_only_drains_followups() {
+        let (followup_tx, mut followup_rx) = mpsc::channel(8);
+        let (cancel_tx, mut cancel_rx) = mpsc::channel(8);
+        let queued_followups = AtomicUsize::new(0);
+
+        queued_followups.fetch_add(1, Ordering::AcqRel);
+        followup_tx
+            .send(FollowupCommand::UserMessage {
+                client_id: ClientId::new(),
+                runtime_context: None,
+                text: "queued followup".to_owned(),
+                placement: bcode_ipc::PromptPlacement::FollowUp,
+                completion: None,
+            })
+            .await
+            .expect("followup send should succeed");
+        let (response, _completion) = oneshot::channel();
+        cancel_tx
+            .send(CancelCommand {
+                clear_queue: true,
+                requested_by: None,
+                response,
+            })
+            .await
+            .expect("cancel send should succeed");
+
+        let cleared = drain_followup_commands(&mut followup_rx);
+        queued_followups.fetch_sub(cleared, Ordering::AcqRel);
+
+        assert_eq!(cleared, 1);
+        assert_eq!(queued_followups.load(Ordering::Acquire), 0);
+        assert!(followup_rx.try_recv().is_err());
+        assert!(matches!(
+            cancel_rx.try_recv(),
+            Ok(CancelCommand {
+                clear_queue: true,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn current_turn_transition_helpers_manage_provider_round_state() {
+        let (_followup_tx, mut followup_rx) = mpsc::channel(1);
+        let (_steering_tx, mut steering_rx) = mpsc::channel(1);
+        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let queued_followups = AtomicUsize::new(0);
+        let current_turn = Arc::new(Mutex::new(None));
+        let context = RuntimeCommandContext::new(
+            &mut followup_rx,
+            &mut steering_rx,
+            &mut cancel_rx,
+            &queued_followups,
+            Arc::clone(&current_turn),
+        );
+        let cancel_state = Arc::new(TurnCancelState::default());
+
+        begin_current_turn(
+            &context,
+            ClientId::new(),
+            "turn-test".to_owned(),
+            Arc::clone(&cancel_state),
+        )
+        .await;
+        assert!(current_turn.lock().await.is_some());
+
+        let model_turn = ActiveModelTurn {
+            provider_plugin_id: Some("provider-test".to_owned()),
+            provider_turn_id: "provider-turn-test".to_owned(),
+            reuse_key: None,
+            request_message_count: 1,
+        };
+        begin_provider_round(&context, model_turn.clone()).await;
+        assert_eq!(
+            current_turn
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|turn| turn.model.as_ref())
+                .map(|turn| turn.provider_turn_id.as_str()),
+            Some("provider-turn-test")
+        );
+
+        let finished = finish_provider_round(&context)
+            .await
+            .expect("provider round should finish");
+        assert_eq!(finished.provider_turn_id, model_turn.provider_turn_id);
+        assert!(
+            current_turn
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|turn| turn.model.is_none())
+        );
+
+        finish_current_turn(&context).await;
+        assert!(current_turn.lock().await.is_none());
+    }
 }
