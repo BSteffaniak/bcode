@@ -646,6 +646,7 @@ mod tests {
         bcode_session_models::SessionEvent {
             schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence,
+            timestamp_ms: unix_time_millis(),
             session_id,
             provenance: None,
             kind,

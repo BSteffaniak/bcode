@@ -179,6 +179,7 @@ pub struct TranscriptItem {
     pub role: &'static str,
     pub text: String,
     pub streaming: bool,
+    timestamp_ms: Option<u64>,
     kind: TranscriptItemKind,
 }
 
@@ -213,8 +214,22 @@ impl TranscriptItem {
             role,
             text,
             streaming,
+            timestamp_ms: None,
             kind,
         }
+    }
+
+    /// Return a copy annotated with an event timestamp.
+    #[must_use]
+    pub const fn with_timestamp_ms(mut self, timestamp_ms: u64) -> Self {
+        self.timestamp_ms = Some(timestamp_ms);
+        self
+    }
+
+    /// Return the event timestamp associated with this item, when known.
+    #[must_use]
+    pub const fn timestamp_ms(&self) -> Option<u64> {
+        self.timestamp_ms
     }
 
     const fn with_streaming(mut self, streaming: bool) -> Self {

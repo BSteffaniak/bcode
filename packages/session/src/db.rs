@@ -1426,9 +1426,7 @@ async fn insert_event(
         )
         .value(
             "created_at_ms",
-            activity_timestamp_ms
-                .or_else(|| event_created_at_ms(event))
-                .map(seq_to_value),
+            seq_to_value(activity_timestamp_ms.unwrap_or_else(|| event_created_at_ms(event))),
         )
         .value("payload", encode_session_event(event)?)
         .execute(db)
@@ -1452,10 +1450,7 @@ async fn project_event(db: &dyn Database, event: &SessionEvent) -> SessionDbResu
                     "working_directory",
                     working_directory.to_string_lossy().to_string(),
                 )
-                .value(
-                    "updated_at_ms",
-                    event_created_at_ms(event).map(seq_to_value),
-                )
+                .value("updated_at_ms", seq_to_value(event_created_at_ms(event)))
                 .execute(db)
                 .await?;
         }
@@ -1478,10 +1473,7 @@ async fn project_event(db: &dyn Database, event: &SessionEvent) -> SessionDbResu
             db.insert("input_messages")
                 .value("input_seq", seq_to_value(event.sequence))
                 .value("event_seq", seq_to_value(event.sequence))
-                .value(
-                    "created_at_ms",
-                    event_created_at_ms(event).map(seq_to_value),
-                )
+                .value("created_at_ms", seq_to_value(event_created_at_ms(event)))
                 .value("text", text.clone())
                 .execute(db)
                 .await?;
@@ -1635,10 +1627,7 @@ async fn update_session_state(db: &dyn Database, event: &SessionEvent) -> Sessio
     db.upsert("session_state")
         .value("session_id", event.session_id.to_string())
         .value("last_event_seq", seq_to_value(event.sequence))
-        .value(
-            "updated_at_ms",
-            event_created_at_ms(event).map(seq_to_value),
-        )
+        .value("updated_at_ms", seq_to_value(event_created_at_ms(event)))
         .execute(db)
         .await?;
     Ok(())
@@ -1660,10 +1649,7 @@ async fn insert_transcript_item(
         .value("role", role)
         .value("kind", kind)
         .value("status", status)
-        .value(
-            "created_at_ms",
-            event_created_at_ms(event).map(seq_to_value),
-        );
+        .value("created_at_ms", seq_to_value(event_created_at_ms(event)));
 
     if let Some(content) = content {
         statement = statement.value("content", content);
@@ -1742,10 +1728,7 @@ async fn update_projection_checkpoint(
         db.update("projection_checkpoints")
             .value("last_event_seq", seq_to_value(event.sequence))
             .value("projection_version", DatabaseValue::Int32(1))
-            .value(
-                "updated_at_ms",
-                event_created_at_ms(event).map(seq_to_value),
-            )
+            .value("updated_at_ms", seq_to_value(event_created_at_ms(event)))
             .where_eq("projection_name", projection_name)
             .execute(db)
             .await?;
@@ -1754,10 +1737,7 @@ async fn update_projection_checkpoint(
             .value("projection_name", projection_name)
             .value("last_event_seq", seq_to_value(event.sequence))
             .value("projection_version", DatabaseValue::Int32(1))
-            .value(
-                "updated_at_ms",
-                event_created_at_ms(event).map(seq_to_value),
-            )
+            .value("updated_at_ms", seq_to_value(event_created_at_ms(event)))
             .execute(db)
             .await?;
     }
@@ -1927,60 +1907,8 @@ fn parse_runtime_work_status(value: &str) -> RuntimeWorkStatus {
     }
 }
 
-const fn event_created_at_ms(event: &SessionEvent) -> Option<u64> {
-    match &event.kind {
-        SessionEventKind::SkillInvoked { invoked_at_ms, .. }
-        | SessionEventKind::SkillSuggested {
-            suggested_at_ms: invoked_at_ms,
-            ..
-        }
-        | SessionEventKind::SkillActivated {
-            activated_at_ms: invoked_at_ms,
-            ..
-        }
-        | SessionEventKind::SkillDeactivated {
-            deactivated_at_ms: invoked_at_ms,
-            ..
-        }
-        | SessionEventKind::SkillContextLoaded {
-            loaded_at_ms: invoked_at_ms,
-            ..
-        }
-        | SessionEventKind::SkillInvocationFailed {
-            failed_at_ms: invoked_at_ms,
-            ..
-        }
-        | SessionEventKind::SessionImported {
-            imported_at_ms: invoked_at_ms,
-            ..
-        }
-        | SessionEventKind::SessionForked {
-            forked_at_ms: invoked_at_ms,
-            ..
-        } => Some(*invoked_at_ms),
-        SessionEventKind::RuntimeWorkStarted { started_at_ms, .. }
-        | SessionEventKind::RuntimeWorkCancelRequested {
-            requested_at_ms: started_at_ms,
-            ..
-        }
-        | SessionEventKind::RuntimeWorkFinished {
-            finished_at_ms: started_at_ms,
-            ..
-        }
-        | SessionEventKind::RuntimeWorkProgress {
-            progress_at_ms: started_at_ms,
-            ..
-        }
-        | SessionEventKind::ModelTurnCancelRequested {
-            requested_at_ms: started_at_ms,
-            ..
-        }
-        | SessionEventKind::ToolInvocationPresentation {
-            finished_at_ms: started_at_ms,
-            ..
-        } => *started_at_ms,
-        _ => None,
-    }
+const fn event_created_at_ms(event: &SessionEvent) -> u64 {
+    event.timestamp_ms
 }
 
 fn seq_to_value(sequence: u64) -> DatabaseValue {
@@ -2005,6 +1933,7 @@ mod tests {
         SessionEvent {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence,
+            timestamp_ms: 1,
             session_id,
             provenance: None,
             kind,

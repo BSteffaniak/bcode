@@ -9,6 +9,8 @@ use bcode_worktree_models::WorktreeListRequest;
 pub enum SlashCommandOutcome {
     /// Command was handled in-place.
     Handled(String),
+    /// Open timeline message browser.
+    OpenTimeline,
     /// Switch to a new unpersisted draft session.
     NewDraftSession,
     /// Set the draft session agent locally.
@@ -728,6 +730,7 @@ async fn execute_builtin(
             };
             thinking_command(client, session_id, parts).await
         }
+        "timeline" => Ok(SlashCommandOutcome::OpenTimeline),
         "stop" => {
             let Some(session_id) = session_id else {
                 return Ok(SlashCommandOutcome::Handled(

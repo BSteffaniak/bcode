@@ -10,7 +10,7 @@ use bcode_session_models::{
     RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
     SessionEventProvenance, SessionForkKind, SessionId, SessionTokenUsage, SessionTraceEvent,
     ShellRunResult, ToolInvocationPresentation, ToolInvocationResult, ToolInvocationStreamEvent,
-    TraceBlobRef,
+    TraceBlobRef, current_unix_timestamp_ms,
 };
 use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
 use serde::{Deserialize, Serialize};
@@ -112,6 +112,8 @@ pub enum PersistedSessionEventError {
 struct PersistedSessionEvent {
     schema_version: u16,
     sequence: u64,
+    #[serde(default = "current_unix_timestamp_ms")]
+    timestamp_ms: u64,
     session_id: SessionId,
     #[serde(default)]
     provenance: Option<SessionEventProvenance>,
@@ -123,6 +125,7 @@ impl From<&SessionEvent> for PersistedSessionEvent {
         Self {
             schema_version: value.schema_version,
             sequence: value.sequence,
+            timestamp_ms: value.timestamp_ms,
             session_id: value.session_id,
             provenance: value.provenance.clone(),
             kind: PersistedSessionEventKind::from(&value.kind),
@@ -141,6 +144,7 @@ impl PersistedSessionEvent {
         Ok(SessionEvent {
             schema_version: self.schema_version,
             sequence: self.sequence,
+            timestamp_ms: self.timestamp_ms,
             session_id: self.session_id,
             provenance: self.provenance,
             kind: self.kind.into_domain(),
@@ -1186,6 +1190,7 @@ mod tests {
             let original = SessionEvent {
                 schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
                 sequence: 1,
+                timestamp_ms: 1,
                 session_id,
                 provenance: None,
                 kind: kind.clone(),

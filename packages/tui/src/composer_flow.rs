@@ -14,7 +14,15 @@ use super::{
 };
 
 /// Result of submitting staged composer text.
-pub type SubmitComposerOutcome = Option<thinking_dialog::ThinkingDialogState>;
+pub type SubmitComposerOutcome = Option<ComposerModalRequest>;
+
+/// Modal requested by a composer submission.
+pub enum ComposerModalRequest {
+    /// Open thinking settings.
+    Thinking(thinking_dialog::ThinkingDialogState),
+    /// Open timeline browser.
+    Timeline(super::timeline_dialog::TimelineDialogState),
+}
 
 fn agent_selection_status(chat: &ActiveChat, agent_name: &str) -> String {
     if matches!(chat.app.activity(), ActivityState::Idle) {
@@ -55,10 +63,12 @@ async fn open_thinking_settings(
     chat.app.apply_model_status(status.clone());
     chat.app
         .set_status("thinking settings: enter apply, esc cancel".to_owned());
-    Ok(Some(thinking_dialog::ThinkingDialogState::new_focused(
-        chat.app.reasoning_visible(),
-        &status,
-        focus,
+    Ok(Some(ComposerModalRequest::Thinking(
+        thinking_dialog::ThinkingDialogState::new_focused(
+            chat.app.reasoning_visible(),
+            &status,
+            focus,
+        ),
     )))
 }
 
@@ -112,6 +122,18 @@ async fn handle_slash_command<W: Write>(
         slash_commands::SlashCommandOutcome::OpenThinkingSettings(focus) => {
             chat.app.clear_pending_submission(message);
             return open_thinking_settings(services, chat, session_id, focus).await;
+        }
+        slash_commands::SlashCommandOutcome::OpenTimeline => {
+            chat.app.clear_pending_submission(message);
+            let entries = chat.app.timeline_entries();
+            chat.app.set_status(if entries.is_empty() {
+                "timeline: no user messages".to_owned()
+            } else {
+                "timeline: select a user message".to_owned()
+            });
+            return Ok(Some(ComposerModalRequest::Timeline(
+                super::timeline_dialog::TimelineDialogState::new(entries),
+            )));
         }
         slash_commands::SlashCommandOutcome::NewDraftSession => {
             chat.app.clear_pending_submission(message);

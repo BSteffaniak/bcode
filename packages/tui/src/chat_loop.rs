@@ -25,6 +25,7 @@ use super::{
     TuiError, command_palette_render, composer_flow, history_flow, input, input::KeyRequest,
     mouse_flow, palette_flow, permission_dialog_render, permission_flow, render, slash_flow,
     slash_palette, slash_palette_render, thinking_dialog_render, thinking_flow,
+    timeline_dialog_render, timeline_flow,
 };
 
 const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -95,6 +96,7 @@ struct ModalState {
     slash_palette: Option<slash_palette::SlashPalette>,
     permission_dialog: Option<PermissionDialogState>,
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
+    timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
 }
 
 struct ChatEventContext<'a, 'b, W: Write> {
@@ -131,6 +133,7 @@ pub async fn run_with_client<W: Write>(
         slash_palette: None,
         permission_dialog: None,
         thinking_dialog: None,
+        timeline_dialog: None,
     };
     sync_chat_key_labels(chat, keymap);
     let mut draft_autosave = DraftAutosave::new(
@@ -287,6 +290,9 @@ fn draw_chat_frame<W: Write>(
         }
         if let Some(dialog) = &modals.thinking_dialog {
             thinking_dialog_render::render_thinking_dialog(dialog, frame, theme);
+        }
+        if let Some(dialog) = &mut modals.timeline_dialog {
+            timeline_dialog_render::render_timeline_dialog(dialog, frame, theme);
         }
     })?;
     Ok(())
@@ -489,6 +495,13 @@ async fn handle_chat_key<W: Write>(
     modals: &mut ModalState,
     stroke: KeyStroke,
 ) -> Result<bool, TuiError> {
+    if modals.timeline_dialog.is_some() {
+        return Ok(timeline_flow::handle_timeline_key(
+            chat,
+            &mut modals.timeline_dialog,
+            stroke,
+        ));
+    }
     if modals.thinking_dialog.is_some() {
         return thinking_flow::handle_thinking_key(
             context.services.client,
@@ -511,7 +524,7 @@ async fn handle_chat_key<W: Write>(
             .await?
             .flatten()
         } {
-            modals.thinking_dialog = Some(dialog);
+            apply_composer_modal_request(modals, dialog);
         }
         return Ok(true);
     }
@@ -566,8 +579,8 @@ async fn handle_chat_key<W: Write>(
         KeyRequest::Submit { placement } => {
             let (mut io, services) = context.flow_context();
             match composer_flow::submit_composer(&mut io, &services, chat, placement).await {
-                Ok(Some(dialog)) => {
-                    modals.thinking_dialog = Some(dialog);
+                Ok(Some(request)) => {
+                    apply_composer_modal_request(modals, request);
                 }
                 Ok(None) => {}
                 Err(error) => helpers::report_client_error(&mut chat.app, "send failed", &error),
@@ -626,6 +639,20 @@ fn cycle_session_agent(chat: &mut ActiveChat) {
     } else {
         chat.agents.apply_agent_to_app(&mut chat.app, agent_id);
         chat.app.set_status(format!("agent set to {agent_name}"));
+    }
+}
+
+fn apply_composer_modal_request(
+    modals: &mut ModalState,
+    request: composer_flow::ComposerModalRequest,
+) {
+    match request {
+        composer_flow::ComposerModalRequest::Thinking(dialog) => {
+            modals.thinking_dialog = Some(dialog);
+        }
+        composer_flow::ComposerModalRequest::Timeline(dialog) => {
+            modals.timeline_dialog = Some(dialog);
+        }
     }
 }
 

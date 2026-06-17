@@ -43,6 +43,7 @@ fn provider_tool_call_delta_trace_does_not_replace_status() {
     app.absorb_session_event(&SessionEvent {
         schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
         sequence: 1,
+        timestamp_ms: 1,
         session_id,
         provenance: None,
         kind: SessionEventKind::TraceEvent {
@@ -68,6 +69,7 @@ fn provider_tool_call_progress_status_formats_bytes() {
     app.absorb_session_event(&SessionEvent {
         schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
         sequence: 1,
+        timestamp_ms: 1,
         session_id,
         provenance: None,
         kind: SessionEventKind::TraceEvent {
@@ -3920,6 +3922,7 @@ fn event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> Sessio
     SessionEvent {
         schema_version: 1,
         sequence,
+        timestamp_ms: 1,
         session_id,
         provenance: None,
         kind,

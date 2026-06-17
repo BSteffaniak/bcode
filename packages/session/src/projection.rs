@@ -1230,6 +1230,7 @@ mod tests {
         SessionEvent {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence,
+            timestamp_ms: 1,
             session_id,
             provenance: None,
             kind,

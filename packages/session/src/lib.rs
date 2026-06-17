@@ -2430,10 +2430,11 @@ impl SessionState {
         summary
     }
 
-    const fn build_next_event(&self, kind: SessionEventKind) -> SessionEvent {
+    const fn build_next_event(&self, kind: SessionEventKind, timestamp_ms: u64) -> SessionEvent {
         SessionEvent {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence: self.next_sequence,
+            timestamp_ms,
             session_id: self.summary.id,
             provenance: None,
             kind,
@@ -3109,6 +3110,7 @@ mod tests {
         let event = SessionEvent {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence: 0,
+            timestamp_ms: 1,
             session_id,
             provenance: None,
             kind: SessionEventKind::ToolInvocationStream {
@@ -3155,6 +3157,7 @@ mod tests {
         let event = SessionEvent {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence: 0,
+            timestamp_ms: 1,
             session_id: bcode_session_models::SessionId::new(),
             provenance: None,
             kind: SessionEventKind::TraceEvent {

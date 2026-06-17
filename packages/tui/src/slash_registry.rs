@@ -151,6 +151,10 @@ const BUILTIN_COMMANDS: &[BuiltinSlashCommand] = &[
         draft_safe: true,
     },
     BuiltinSlashCommand {
+        name: "timeline",
+        draft_safe: true,
+    },
+    BuiltinSlashCommand {
         name: "stop",
         draft_safe: false,
     },
@@ -212,6 +216,10 @@ const STATIC_COMPLETIONS: &[SlashCompletion] = &[
     SlashCompletion {
         command: "/thinking",
         description: "Open thinking settings",
+    },
+    SlashCompletion {
+        command: "/timeline",
+        description: "Browse user messages",
     },
     SlashCompletion {
         command: "/thinking status",

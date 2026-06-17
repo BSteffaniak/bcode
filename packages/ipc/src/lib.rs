@@ -1695,6 +1695,8 @@ enum IpcEvent {
 struct IpcSessionEvent {
     schema_version: u16,
     sequence: u64,
+    #[serde(default = "bcode_session_models::current_unix_timestamp_ms")]
+    timestamp_ms: u64,
     session_id: SessionId,
     provenance: Option<bcode_session_models::SessionEventProvenance>,
     kind: IpcSessionEventKind,
@@ -1980,6 +1982,7 @@ impl From<&SessionEvent> for IpcSessionEvent {
         Self {
             schema_version: value.schema_version,
             sequence: value.sequence,
+            timestamp_ms: value.timestamp_ms,
             session_id: value.session_id,
             provenance: value.provenance.clone(),
             kind: IpcSessionEventKind::from(&value.kind),
@@ -1994,6 +1997,7 @@ impl TryFrom<IpcSessionEvent> for SessionEvent {
         Ok(Self {
             schema_version: value.schema_version,
             sequence: value.sequence,
+            timestamp_ms: value.timestamp_ms,
             session_id: value.session_id,
             provenance: value.provenance,
             kind: value.kind.try_into()?,
@@ -3580,6 +3584,7 @@ mod tests {
         let event = Event::Session(SessionEvent {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence: 7,
+            timestamp_ms: 1,
             session_id,
             provenance: None,
             kind: SessionEventKind::ToolCallFinished {
@@ -3836,6 +3841,7 @@ mod tests {
             let event = Event::Session(SessionEvent {
                 schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
                 sequence: u64::try_from(index).expect("index should fit u64"),
+                timestamp_ms: 1,
                 session_id,
                 provenance: None,
                 kind,
@@ -3912,6 +3918,7 @@ mod tests {
         SessionEvent {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence: 77,
+            timestamp_ms: 1,
             session_id,
             provenance: None,
             kind: SessionEventKind::ToolCallFinished {

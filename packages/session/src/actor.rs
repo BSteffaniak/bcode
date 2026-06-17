@@ -4,9 +4,9 @@ use super::{
     Arc, CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, Instant, PathBuf, ProjectionWindow,
     ProjectionWindowRequest, SessionAttachment, SessionError, SessionEvent, SessionEventKind,
     SessionEventProvenance, SessionInputHistoryEntry, SessionLiveEvent, SessionLiveEventKind,
-    SessionLoadStatusKind, SessionState, SessionStoreExecutor, SessionSummary, elapsed_ms,
-    input_history_from_events, model_context_events_from_history, title_from_first_prompt,
-    usize_to_u64,
+    SessionLoadStatusKind, SessionState, SessionStoreExecutor, SessionSummary, current_unix_millis,
+    elapsed_ms, input_history_from_events, model_context_events_from_history,
+    title_from_first_prompt, usize_to_u64,
 };
 use crate::db::{MaterializedProjection, SessionDb};
 use std::sync::RwLock;
@@ -532,6 +532,10 @@ impl SessionActor {
         provenance: Option<SessionEventProvenance>,
         activity_timestamp_ms: u64,
     ) -> Result<SessionEvent, SessionError> {
+        let event_timestamp_ms = provenance
+            .as_ref()
+            .and_then(|provenance| provenance.source_timestamp_ms)
+            .unwrap_or(activity_timestamp_ms);
         let event = if let Some(store) = self.store.clone() {
             let _write_guard = crate::lease::acquire_session_write_lock(
                 &store.root_path(),
@@ -539,10 +543,10 @@ impl SessionActor {
             )?;
             let db = self.session_db_for_write().await?;
             self.refresh_state_from_db_for_write(&db).await?;
-            let mut event = self.state.build_next_event(kind);
+            let mut event = self.state.build_next_event(kind, event_timestamp_ms);
             event.provenance = provenance;
             let db_append_started_at = Instant::now();
-            db.append_event_with_activity_timestamp(&event, Some(activity_timestamp_ms))
+            db.append_event_with_activity_timestamp(&event, Some(event_timestamp_ms))
                 .await?;
             store.metrics().record_histogram(
                 "session.actor.append_event.db_append_duration_ms",
@@ -550,7 +554,7 @@ impl SessionActor {
             );
             event
         } else {
-            let mut event = self.state.build_next_event(kind);
+            let mut event = self.state.build_next_event(kind, event_timestamp_ms);
             event.provenance = provenance;
             event
         };
@@ -963,6 +967,7 @@ impl SessionActor {
         let event = SessionEvent {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence: self.state.next_sequence,
+            timestamp_ms: current_unix_millis(),
             session_id: self.state.summary.id,
             provenance: None,
             kind,

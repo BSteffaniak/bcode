@@ -6544,6 +6544,7 @@ fn runtime_work_projection_to_events(
     let start = bcode_session_models::SessionEvent {
         schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
         sequence: work.event_seq_start,
+        timestamp_ms: work.started_at_ms.unwrap_or(0),
         session_id,
         provenance: None,
         kind: SessionEventKind::RuntimeWorkStarted {
@@ -6565,6 +6566,7 @@ fn runtime_work_projection_to_events(
     let finish = bcode_session_models::SessionEvent {
         schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
         sequence: work.event_seq_end.unwrap_or(work.event_seq_start),
+        timestamp_ms: work.finished_at_ms.or(work.started_at_ms).unwrap_or(0),
         session_id,
         provenance: None,
         kind: SessionEventKind::RuntimeWorkFinished {
@@ -13338,6 +13340,7 @@ mod tests {
         SessionEvent {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence,
+            timestamp_ms: 1,
             session_id,
             provenance: None,
             kind,
@@ -15248,6 +15251,7 @@ mod tests {
             SessionEvent {
                 schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
                 sequence: 0,
+                timestamp_ms: 1,
                 session_id,
                 provenance: None,
                 kind: SessionEventKind::ToolCallRequested {
@@ -15259,6 +15263,7 @@ mod tests {
             SessionEvent {
                 schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
                 sequence: 1,
+                timestamp_ms: 1,
                 session_id,
                 provenance: None,
                 kind: SessionEventKind::ToolCallFinished {

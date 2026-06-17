@@ -10,10 +10,21 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 23;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 24;
+
+/// Return the current Unix timestamp in milliseconds.
+#[must_use]
+pub fn current_unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
 
 /// Unique session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -279,6 +290,9 @@ pub struct SessionEventProvenance {
 pub struct SessionEvent {
     pub schema_version: u16,
     pub sequence: u64,
+    /// Unix timestamp in milliseconds when the event was created or emitted.
+    #[serde(default = "current_unix_timestamp_ms")]
+    pub timestamp_ms: u64,
     pub session_id: SessionId,
     #[serde(default)]
     pub provenance: Option<SessionEventProvenance>,

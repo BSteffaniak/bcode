@@ -42,6 +42,7 @@ use super::pending_submission::PendingSubmission;
 use super::pending_submissions::PendingSubmissions;
 use super::runtime_work_view::RuntimeWorkViewState;
 use super::temporal::next_elapsed_invalidation_capped;
+use super::timeline_dialog::TimelineEntry;
 use super::tool_invocation_view::{
     TerminalInvocationItemContext, ToolInvocationPresentationInput, ToolInvocationRequestContext,
     apply_tool_invocation_presentation,
@@ -358,6 +359,40 @@ impl BmuxApp {
         };
         app.absorb_history(history);
         app
+    }
+
+    /// Return timeline entries for committed user messages.
+    #[must_use]
+    pub fn timeline_entries(&self) -> Vec<TimelineEntry> {
+        self.transcript
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                if item.role() == "You" {
+                    Some(TimelineEntry::new(
+                        index,
+                        item.timestamp_ms().unwrap_or(0),
+                        item.text().to_owned(),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Jump to a committed transcript item and top-anchor it in the viewport.
+    pub fn jump_to_transcript_index(&mut self, index: usize) -> bool {
+        let Some(top_row) = self
+            .transcript_layout
+            .entry_start_row(VisibleTranscriptSource::Transcript, index)
+        else {
+            return false;
+        };
+        self.transcript_scroll_animation = None;
+        self.scroll_mode = TranscriptScrollMode::ManualDetached;
+        self.viewport.follow_anchor(top_row);
+        true
     }
 
     /// Return the active session id, if one was provided.
@@ -1569,7 +1604,12 @@ impl BmuxApp {
                 self.tool_activity_seen = false;
                 self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
                 self.pending_assistant_stream_anchor = false;
-                self.push_committed_user_message(event.sequence, text, application);
+                self.push_committed_user_message(
+                    event.sequence,
+                    text,
+                    event.timestamp_ms,
+                    application,
+                );
             }
             SessionEventKind::AssistantDelta { text } => {
                 self.push_live_assistant_delta(text, application);
@@ -1950,19 +1990,20 @@ impl BmuxApp {
         &mut self,
         sequence: u64,
         text: &str,
+        timestamp_ms: u64,
         application: SessionEventApplication,
     ) {
         self.input_history.push_committed(sequence, text);
         if application.live_activity() {
-            self.push_live_user_message(text);
+            self.push_live_user_message(text, timestamp_ms);
         } else {
-            self.push_user_message(text);
+            self.push_user_message(text, timestamp_ms);
         }
     }
 
-    fn push_live_user_message(&mut self, text: &str) {
+    fn push_live_user_message(&mut self, text: &str, timestamp_ms: u64) {
         self.set_activity(ActivityState::Thinking);
-        self.push_user_message(text);
+        self.push_user_message(text, timestamp_ms);
     }
 
     fn push_live_assistant_delta(&mut self, text: &str, application: SessionEventApplication) {
@@ -1970,10 +2011,10 @@ impl BmuxApp {
         self.push_streaming_item("Assistant", text);
     }
 
-    fn push_user_message(&mut self, text: &str) {
+    fn push_user_message(&mut self, text: &str, timestamp_ms: u64) {
         self.remove_pending_submission(text);
         self.transcript
-            .push(TranscriptItem::new("You", text.to_owned()));
+            .push(TranscriptItem::new("You", text.to_owned()).with_timestamp_ms(timestamp_ms));
     }
 
     fn push_system_message(&mut self, text: &str) {
