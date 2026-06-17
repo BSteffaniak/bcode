@@ -5356,6 +5356,51 @@ async fn service_runtime_priority_commands(
     }
 }
 
+async fn runtime_accepts_steering(phase: &Arc<Mutex<SessionRuntimePhase>>) -> bool {
+    phase.lock().await.accepts_steering()
+}
+
+async fn set_runtime_phase(
+    phase: &Arc<Mutex<SessionRuntimePhase>>,
+    next_phase: SessionRuntimePhase,
+) {
+    *phase.lock().await = next_phase;
+}
+
+async fn begin_current_turn(
+    context: &RuntimeCommandContext<'_>,
+    client_id: ClientId,
+    turn_id: String,
+    cancel_state: Arc<TurnCancelState>,
+) {
+    *context.current_turn.lock().await = Some(RuntimeCurrentTurn {
+        client_id,
+        turn_id,
+        cancel_state,
+        model: None,
+    });
+}
+
+async fn finish_current_turn(context: &RuntimeCommandContext<'_>) {
+    *context.current_turn.lock().await = None;
+}
+
+async fn begin_provider_round(context: &RuntimeCommandContext<'_>, model_turn: ActiveModelTurn) {
+    if let Some(current_turn) = context.current_turn.lock().await.as_mut() {
+        current_turn.model = Some(model_turn);
+    }
+}
+
+async fn finish_provider_round(context: &RuntimeCommandContext<'_>) -> Option<ActiveModelTurn> {
+    let mut current_turn = context.current_turn.lock().await;
+    let active_turn = current_turn.as_ref().and_then(|turn| turn.model.clone());
+    if let Some(current_turn) = current_turn.as_mut() {
+        current_turn.model = None;
+    }
+    drop(current_turn);
+    active_turn
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_user_message_command(
     state: &ServerState,
@@ -5372,7 +5417,7 @@ async fn process_user_message_command(
     placement: bcode_ipc::PromptPlacement,
     completion_sender: Option<oneshot::Sender<ModelTurnCompletion>>,
 ) {
-    if placement == bcode_ipc::PromptPlacement::Steering && phase.lock().await.accepts_steering() {
+    if placement == bcode_ipc::PromptPlacement::Steering && runtime_accepts_steering(&phase).await {
         process_steering_message_command(
             state,
             permit.session_id(),
@@ -5384,11 +5429,11 @@ async fn process_user_message_command(
         return;
     }
 
-    *phase.lock().await = SessionRuntimePhase::AppendingUser;
+    set_runtime_phase(&phase, SessionRuntimePhase::AppendingUser).await;
     let completion = match append_turn_user_message(state, permit, client_id, text).await {
         Ok(Some(user_event)) => {
             suggest_skills_for_prompt(state, permit.session_id(), &user_event).await;
-            *phase.lock().await = SessionRuntimePhase::PreparingModelRequest;
+            set_runtime_phase(&phase, SessionRuntimePhase::PreparingModelRequest).await;
             let mut command_context = RuntimeCommandContext::new(
                 followup_commands,
                 steering_commands,
@@ -5418,7 +5463,7 @@ async fn process_user_message_command(
             ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message)
         }
     };
-    *phase.lock().await = SessionRuntimePhase::Idle;
+    set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
     if let Some(sender) = completion_sender {
         let _sent = sender.send(completion);
     }
@@ -5466,6 +5511,7 @@ async fn process_skill_invocation_command(
         }
     }
 
+    set_runtime_phase(&phase, SessionRuntimePhase::AppendingUser).await;
     match append_turn_user_message(state, permit, client_id, display_text).await {
         Ok(Some(user_event)) => {
             state.turn_skills.lock().await.insert(
@@ -5475,7 +5521,7 @@ async fn process_skill_invocation_command(
                     arguments,
                 },
             );
-            *phase.lock().await = SessionRuntimePhase::PreparingModelRequest;
+            set_runtime_phase(&phase, SessionRuntimePhase::PreparingModelRequest).await;
             let mut command_context = RuntimeCommandContext::new(
                 followup_commands,
                 steering_commands,
@@ -5511,6 +5557,7 @@ async fn process_skill_invocation_command(
             .await;
         }
     }
+    set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
 }
 
 async fn append_turn_user_message(
@@ -7998,14 +8045,15 @@ async fn run_model_turn(
         Arc::clone(&cancel_state),
     )
     .await;
-    *command_context.current_turn.lock().await = Some(RuntimeCurrentTurn {
+    begin_current_turn(
+        command_context,
         client_id,
-        turn_id: turn_id.clone(),
-        cancel_state: Arc::clone(&cancel_state),
-        model: None,
-    });
+        turn_id.clone(),
+        Arc::clone(&cancel_state),
+    )
+    .await;
     append_model_turn_started_event(state, session_id, turn_id.clone()).await;
-    *phase.lock().await = SessionRuntimePhase::ProviderActive;
+    set_runtime_phase(phase, SessionRuntimePhase::ProviderActive).await;
     service_runtime_priority_commands(state, session_id, command_context).await;
     let completion = run_model_turn_inner(
         state,
@@ -8017,8 +8065,8 @@ async fn run_model_turn(
     )
     .await;
     service_runtime_priority_commands(state, session_id, command_context).await;
-    *phase.lock().await = SessionRuntimePhase::FinishingTurn;
-    *command_context.current_turn.lock().await = None;
+    set_runtime_phase(phase, SessionRuntimePhase::FinishingTurn).await;
+    finish_current_turn(command_context).await;
     append_model_turn_finished_event(
         state,
         session_id,
@@ -8412,9 +8460,7 @@ async fn run_model_turn_round(
         reuse_key: request.conversation_reuse.key.clone(),
         request_message_count: request.messages.len(),
     };
-    if let Some(current_turn) = command_context.current_turn.lock().await.as_mut() {
-        current_turn.model = Some(active_model_turn);
-    }
+    begin_provider_round(command_context, active_model_turn).await;
 
     append_trace_event(
         state,
@@ -8451,15 +8497,7 @@ async fn run_model_turn_round(
     }
 
     service_runtime_priority_commands(state, session_id, command_context).await;
-    let active_turn = command_context
-        .current_turn
-        .lock()
-        .await
-        .as_ref()
-        .and_then(|turn| turn.model.clone());
-    if let Some(current_turn) = command_context.current_turn.lock().await.as_mut() {
-        current_turn.model = None;
-    }
+    let active_turn = finish_provider_round(command_context).await;
     if cancel_state.is_cancelled() && outcome.completion.is_none() {
         outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
         outcome.completion = Some(ModelTurnCompletion::with_message(
