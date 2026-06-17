@@ -5189,47 +5189,51 @@ async fn process_steering_message_command(
     }
 }
 
+async fn process_runtime_command(
+    state: &ServerState,
+    session_id: SessionId,
+    context: &mut RuntimeCommandContext<'_>,
+    command: SessionCommand,
+) {
+    if !matches!(command, SessionCommand::CancelTurn { .. }) {
+        context.queued_commands.fetch_sub(1, Ordering::AcqRel);
+    }
+    match command {
+        SessionCommand::SteeringMessage {
+            client_id,
+            text,
+            completion,
+        } => {
+            process_steering_message_command(state, session_id, client_id, text, completion).await;
+        }
+        SessionCommand::CancelTurn {
+            clear_queue,
+            requested_by,
+            response,
+        } => {
+            let cancelled = process_cancel_turn_command(
+                state,
+                session_id,
+                context.commands,
+                context.deferred_commands,
+                context.queued_commands,
+                clear_queue,
+                requested_by,
+            )
+            .await;
+            let _sent = response.send(cancelled);
+        }
+        other => context.deferred_commands.push_back(other),
+    }
+}
+
 async fn service_runtime_priority_commands(
     state: &ServerState,
     session_id: SessionId,
     context: &mut RuntimeCommandContext<'_>,
 ) {
-    let mut retained_commands = VecDeque::new();
     while let Ok(command) = context.commands.try_recv() {
-        if !matches!(command, SessionCommand::CancelTurn { .. }) {
-            context.queued_commands.fetch_sub(1, Ordering::AcqRel);
-        }
-        match command {
-            SessionCommand::SteeringMessage {
-                client_id,
-                text,
-                completion,
-            } => {
-                process_steering_message_command(state, session_id, client_id, text, completion)
-                    .await;
-            }
-            SessionCommand::CancelTurn {
-                clear_queue,
-                requested_by,
-                response,
-            } => {
-                let cancelled = process_cancel_turn_command(
-                    state,
-                    session_id,
-                    context.commands,
-                    context.deferred_commands,
-                    context.queued_commands,
-                    clear_queue,
-                    requested_by,
-                )
-                .await;
-                let _sent = response.send(cancelled);
-            }
-            other => retained_commands.push_back(other),
-        }
-    }
-    while let Some(command) = retained_commands.pop_front() {
-        context.deferred_commands.push_back(command);
+        process_runtime_command(state, session_id, context, command).await;
     }
 }
 
@@ -7884,6 +7888,7 @@ async fn run_model_turn(
         trigger_event,
         runtime_context,
         Arc::clone(&cancel_state),
+        command_context,
     )
     .await;
     service_runtime_priority_commands(state, session_id, command_context).await;
@@ -7918,6 +7923,7 @@ async fn run_model_turn_inner(
     trigger_event: &bcode_session_models::SessionEvent,
     runtime_context: Option<ClientRuntimeContext>,
     cancel_state: Arc<TurnCancelState>,
+    command_context: &mut RuntimeCommandContext<'_>,
 ) -> ModelTurnCompletion {
     let selection =
         session_model_selection_with_runtime_context(state, session_id, runtime_context).await;
@@ -7976,6 +7982,7 @@ async fn run_model_turn_inner(
             provider_plugin_id.as_deref(),
             &request,
             Arc::clone(&cancel_state),
+            command_context,
         )
         .await
         {
@@ -8233,6 +8240,7 @@ async fn run_model_turn_round(
     provider_plugin_id: Option<&str>,
     request: &ModelTurnRequest,
     cancel_state: Arc<TurnCancelState>,
+    command_context: &mut RuntimeCommandContext<'_>,
 ) -> Result<ModelPollOutcome, ModelTurnCompletion> {
     let round_start = Instant::now();
     let provider_label = provider_plugin_id.unwrap_or("<auto>").to_string();
@@ -8242,6 +8250,7 @@ async fn run_model_turn_round(
             "model turn cancelled",
         ));
     }
+    service_runtime_priority_commands(state, session_id, command_context).await;
     let start_timer = state.metrics.timer();
     let scope = active_plugin_scope_for_session(state, session_id).await;
     let start = invoke_model_provider_json_blocking_scoped::<_, StartTurnResponse>(
@@ -8316,15 +8325,18 @@ async fn run_model_turn_round(
         &start.provider_turn_id,
         &request.turn_id,
         Arc::clone(&cancel_state),
+        command_context,
     )
     .await;
 
+    service_runtime_priority_commands(state, session_id, command_context).await;
     ensure_terminal_poll_outcome(state, session_id, &mut outcome).await;
 
     if !assistant_text.is_empty() {
         append_assistant_message_event(state, session_id, assistant_text).await;
     }
 
+    service_runtime_priority_commands(state, session_id, command_context).await;
     let active_turn = state.active_turns.lock().await.remove(&session_id);
     if cancel_state.is_cancelled() && outcome.completion.is_none() {
         outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
@@ -8415,6 +8427,7 @@ async fn append_model_provider_round_finished_trace(
     .await;
 }
 
+#[allow(clippy::too_many_lines)]
 async fn poll_model_turn_events(
     state: &ServerState,
     session_id: SessionId,
@@ -8422,6 +8435,7 @@ async fn poll_model_turn_events(
     provider_turn_id: &str,
     turn_id: &str,
     cancel_state: Arc<TurnCancelState>,
+    command_context: &mut RuntimeCommandContext<'_>,
 ) -> (String, ModelPollOutcome) {
     let mut stream = ModelStreamAccumulator::new(session_id, turn_id);
     let mut outcome = ModelPollOutcome::default();
@@ -8429,6 +8443,7 @@ async fn poll_model_turn_events(
     let mut idle_for = Duration::ZERO;
     let mut no_progress_warned = false;
     loop {
+        service_runtime_priority_commands(state, session_id, command_context).await;
         if cancel_state.is_cancelled() {
             outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
             outcome.completion = Some(ModelTurnCompletion::with_message(
@@ -8470,6 +8485,7 @@ async fn poll_model_turn_events(
                 cancel_state.as_ref(),
                 stream_progress.tool_progress_snapshot(),
                 &mut outcome,
+                command_context,
             )
             .await
             else {
@@ -8510,6 +8526,7 @@ async fn poll_model_turn_events(
                 cancel_state.as_ref(),
                 stream_progress.tool_progress_snapshot(),
                 &mut outcome,
+                command_context,
             )
             .await
             else {
@@ -8546,6 +8563,7 @@ const fn model_event_is_progress(event: &ProviderTurnEvent) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_model_progress_or_timeout(
     state: &ServerState,
     session_id: SessionId,
@@ -8554,6 +8572,7 @@ async fn wait_for_model_progress_or_timeout(
     cancel_state: &TurnCancelState,
     active_tool_call: Option<ProviderToolCallProgress>,
     outcome: &mut ModelPollOutcome,
+    command_context: &mut RuntimeCommandContext<'_>,
 ) -> Option<Duration> {
     let idle_for = idle_for.saturating_add(MODEL_POLL_INTERVAL);
     let warning_after = Duration::from_secs(state.model_streaming.no_progress_warning_secs);
@@ -8594,6 +8613,12 @@ async fn wait_for_model_progress_or_timeout(
     }
     tokio::select! {
         () = tokio::time::sleep(MODEL_POLL_INTERVAL) => Some(idle_for),
+        command = command_context.commands.recv() => {
+            if let Some(command) = command {
+                process_runtime_command(state, session_id, command_context, command).await;
+            }
+            Some(idle_for)
+        }
         () = cancel_state.cancelled() => {
             outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
             outcome.completion = Some(ModelTurnCompletion::with_message(
