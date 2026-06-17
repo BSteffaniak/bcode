@@ -43,8 +43,6 @@ pub fn resolve_auth_profile(
                 .map_or(auth_profile_name, String::as_str);
             storage_profile = profile.to_string();
             storage_vault = Some(vault.display().to_string());
-            let store =
-                sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(vault.clone()));
             let policy = security::device_seal_policy_for_auth_profile(auth_profile);
             let report = security::reconcile_auth_vault_security_report(
                 &vault,
@@ -56,10 +54,22 @@ pub fn resolve_auth_profile(
                     .map(String::as_str),
             );
             diagnostics.extend(report.diagnostics);
-            if let Ok(Some(profile_env)) = store.get_profile(profile) {
-                for (key, value) in profile_env {
-                    env.entry(key).or_insert_with(|| value.to_string());
+            match security::read_auth_vault_profile(&vault, profile) {
+                Ok(Some(profile_env)) => {
+                    for (key, value) in profile_env {
+                        env.entry(key).or_insert(value);
+                    }
                 }
+                Ok(None) => {}
+                Err(error) => diagnostics.push(security::AuthSecurityDiagnostic {
+                    severity: security::AuthSecurityDiagnosticSeverity::Warning,
+                    code: "auth_vault_profile_unavailable".to_string(),
+                    message: error,
+                    remediation: Some(
+                        "Restore this device's seal secret or run provider login to reset the auth profile."
+                            .to_string(),
+                    ),
+                }),
             }
             merge_metadata_env(auth_profile, profile, &vault, &mut env);
             merge_mapped_process_env(auth_profile, &mut env);

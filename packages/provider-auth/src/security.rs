@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -139,13 +139,17 @@ pub fn inspect_auth_vault_security(
         return status;
     }
 
-    let store = sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(
-        vault_path.to_path_buf(),
-    ));
-    let Ok((vault, _data_key)) = store.load_and_unlock() else {
+    if let Ok(ciphertext) = sshenv_vault::Vault::load_ciphertext(vault_path) {
+        status.vault_version = Some(ciphertext.header.version);
+    }
+
+    let Ok((mut vault, data_key)) = load_auth_vault_metadata(vault_path) else {
         status.diagnostics.push(AuthSecurityDiagnostic::warning(
             "auth_vault_unlock_failed",
-            format!("Auth vault could not be unlocked: {}", vault_path.display()),
+            format!(
+                "Auth vault metadata could not be unlocked: {}",
+                vault_path.display()
+            ),
             "Ensure the SSH identity used for this vault is available, then retry.",
         ));
         return status;
@@ -156,9 +160,27 @@ pub fn inspect_auth_vault_security(
     status.profile_exists = vault.profiles.profiles.contains_key(profile)
         || vault.profiles.profile_entries.contains_key(profile);
     status.profile_device_sealed = profile_has_device_seal(&vault, profile);
+    let profile_unlockable = if status.profile_exists
+        && vault.profiles.get(profile).is_none()
+        && vault.profiles.profile_entries.contains_key(profile)
+    {
+        match vault.unlock_profile_with_passphrase(profile, &data_key, None) {
+            Ok(()) => true,
+            Err(error) => {
+                status.diagnostics.push(AuthSecurityDiagnostic::warning(
+                    "auth_vault_profile_unlock_failed",
+                    format!("Auth vault profile {profile} could not be unlocked: {error}"),
+                    "Restore this device's seal secret, re-login to reset the auth profile, or remove/rebind the profile seal from a device that can unlock it.",
+                ));
+                false
+            }
+        }
+    } else {
+        true
+    };
     status.policy_satisfied = match policy {
         AuthDeviceSealPolicy::Off | AuthDeviceSealPolicy::Preferred => true,
-        AuthDeviceSealPolicy::Required => status.profile_device_sealed,
+        AuthDeviceSealPolicy::Required => status.profile_device_sealed && profile_unlockable,
     };
 
     if !status.profile_exists {
@@ -191,6 +213,48 @@ pub fn inspect_auth_vault_security(
     }
 
     status
+}
+
+pub(crate) fn read_auth_vault_profile(
+    vault_path: &Path,
+    profile: &str,
+) -> Result<Option<BTreeMap<String, String>>, String> {
+    let (mut vault, data_key) = load_auth_vault_metadata(vault_path).map_err(|error| {
+        format!(
+            "failed to unlock auth vault metadata at {}: {error}",
+            vault_path.display()
+        )
+    })?;
+    if vault.profiles.get(profile).is_none() && vault.profiles.profile_entries.contains_key(profile)
+    {
+        vault
+            .unlock_profile_with_passphrase(profile, &data_key, None)
+            .map_err(|error| format!("failed to unlock auth vault profile {profile}: {error}"))?;
+    }
+    Ok(vault.profiles.get(profile).cloned())
+}
+
+fn load_auth_vault_metadata(
+    vault_path: &Path,
+) -> Result<(sshenv_vault::Vault, sshenv_vault::DataKey), String> {
+    let ciphertext = sshenv_vault::Vault::load_ciphertext(vault_path)
+        .map_err(|error| format!("failed to load auth vault: {error}"))?;
+    let fingerprints: HashSet<String> = ciphertext
+        .recipients
+        .iter()
+        .map(|recipient| recipient.fingerprint.clone())
+        .collect();
+    let private_key_paths = sshenv_vault::identity::discover_private_key_paths();
+    let identities = sshenv_vault::identity::load_identities_for_vault_from_paths(
+        &private_key_paths,
+        &fingerprints,
+    )
+    .map_err(|error| format!("failed to load auth vault SSH identities: {error}"))?;
+    if identities.is_empty() {
+        return Err("no local SSH private key matches an auth vault recipient".to_string());
+    }
+    sshenv_vault::Vault::unlock_metadata_with_passphrase(ciphertext, &identities, None)
+        .map_err(|error| format!("failed to unlock auth vault metadata: {error}"))
 }
 
 /// Desired device-seal policy for an sshenv-backed auth profile.
@@ -288,12 +352,8 @@ pub fn reconcile_auth_vault_security(
         return Ok(Vec::new());
     }
 
-    let store = sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(
-        vault_path.to_path_buf(),
-    ));
-    let (mut vault, data_key) = store
-        .load_and_unlock()
-        .map_err(|error| format!("failed to unlock auth vault: {error}"))?;
+    let (mut vault, data_key) = load_auth_vault_metadata(vault_path)
+        .map_err(|error| format!("failed to unlock auth vault metadata: {error}"))?;
 
     let mut actions = Vec::new();
     if matches!(policy, AuthDeviceSealPolicy::Off) {
@@ -313,6 +373,13 @@ pub fn reconcile_auth_vault_security(
 
     if profile_has_device_seal(&vault, profile) {
         return Ok(actions);
+    }
+
+    if vault.profiles.get(profile).is_none() && vault.profiles.profile_entries.contains_key(profile)
+    {
+        vault
+            .unlock_profile_with_passphrase(profile, &data_key, None)
+            .map_err(|error| format!("failed to unlock auth profile {profile}: {error}"))?;
     }
 
     if vault.header.version != VERSION_V2 {

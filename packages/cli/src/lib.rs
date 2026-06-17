@@ -32,6 +32,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rand::TryRngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{IsTerminal as _, Read as _, Write as _};
@@ -42,7 +43,6 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing_subscriber::util::SubscriberInitExt as _;
-use zeroize::Zeroizing;
 
 const SESSION_CLI_PAGE_LIMIT: usize = 500;
 
@@ -1416,15 +1416,24 @@ fn auth_login(
             .get("recipient_key")
             .map(String::to_string)
     });
-    let store = open_auth_store(&vault_path, recipient_key)?;
+    let _store = open_auth_store(&vault_path, recipient_key)?;
     let device_seal_policy =
         bcode_provider_auth::security::device_seal_policy_for_auth_profile(auth_profile);
     let api_key = rpassword::prompt_password(format!("{api_key_env}: "))?;
-    store
-        .set_secret(&storage_profile, &api_key_env, Zeroizing::new(api_key))
-        .map_err(|error| {
-            CliError::BundledPluginInstallFailed(format!("failed to store API key: {error}"))
-        })?;
+    let target = LoginTarget {
+        auth_profile: auth_profile_name.clone(),
+        storage_profile: storage_profile.clone(),
+        vault_path: vault_path.clone(),
+        api_key_env: Some(api_key_env.clone()),
+        config_update: LoginConfigUpdate::Declarative,
+        device_seal_policy,
+        recipient_key: recipient_key_hint.clone(),
+    };
+    upsert_auth_profile_secrets(
+        &target,
+        BTreeMap::from([(api_key_env.clone(), api_key)]),
+        &[],
+    )?;
     apply_auth_device_seal_policy(
         &vault_path,
         &storage_profile,
@@ -1800,10 +1809,96 @@ fn open_auth_store(
     Ok(store)
 }
 
+fn upsert_auth_profile_secrets(
+    target: &LoginTarget,
+    values: BTreeMap<String, String>,
+    remove_keys: &[String],
+) -> Result<(), CliError> {
+    let ciphertext = sshenv_vault::Vault::load_ciphertext(&target.vault_path).map_err(|error| {
+        CliError::BundledPluginInstallFailed(format!("failed to load auth vault: {error}"))
+    })?;
+    let fingerprints: HashSet<String> = ciphertext
+        .recipients
+        .iter()
+        .map(|recipient| recipient.fingerprint.clone())
+        .collect();
+    let private_key_paths = sshenv_vault::identity::discover_private_key_paths();
+    let identities = sshenv_vault::identity::load_identities_for_vault_from_paths(
+        &private_key_paths,
+        &fingerprints,
+    )
+    .map_err(|error| {
+        CliError::BundledPluginInstallFailed(format!(
+            "failed to load auth vault SSH identities: {error}"
+        ))
+    })?;
+    if identities.is_empty() {
+        return Err(CliError::BundledPluginInstallFailed(
+            "failed to unlock auth vault: no local SSH private key matches a vault recipient"
+                .to_string(),
+        ));
+    }
+    let (mut vault, data_key) =
+        sshenv_vault::Vault::unlock_metadata_with_passphrase(ciphertext, &identities, None)
+            .map_err(|error| {
+                CliError::BundledPluginInstallFailed(format!(
+                    "failed to unlock auth vault metadata: {error}"
+                ))
+            })?;
+
+    let mut profile_values = if vault.profiles.get(&target.storage_profile).is_none()
+        && vault
+            .profiles
+            .profile_entries
+            .contains_key(&target.storage_profile)
+    {
+        match vault.unlock_profile_with_passphrase(&target.storage_profile, &data_key, None) {
+            Ok(()) => vault
+                .profiles
+                .get(&target.storage_profile)
+                .cloned()
+                .unwrap_or_default(),
+            Err(error) => {
+                println!(
+                    "Auth vault profile {} could not be unlocked ({error}); resetting it with fresh login credentials.",
+                    target.storage_profile
+                );
+                vault
+                    .profiles
+                    .profile_entries
+                    .remove(&target.storage_profile);
+                vault
+                    .profiles
+                    .profile_policies
+                    .remove(&target.storage_profile);
+                BTreeMap::new()
+            }
+        }
+    } else {
+        vault
+            .profiles
+            .get(&target.storage_profile)
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    for key in remove_keys {
+        profile_values.remove(key);
+    }
+    profile_values.extend(values);
+    vault
+        .profiles
+        .profiles
+        .insert(target.storage_profile.clone(), profile_values);
+    vault.save(&target.vault_path, &data_key).map_err(|error| {
+        CliError::BundledPluginInstallFailed(format!("failed to save auth vault: {error}"))
+    })
+}
+
 /// Generic helper for storing API-key auth for any OpenAI-compatible provider (`OpenAI`, xAI, etc.).
 /// `prefix` is "OPENAI" or "XAI" (used for env-style secret keys stored in the vault).
 fn login_compatible_api_key(
-    store: &sshenv_vault::SshenvStore,
+    _store: &sshenv_vault::SshenvStore,
     target: &LoginTarget,
     api_key: Option<String>,
     base_url: Option<String>,
@@ -1823,40 +1918,25 @@ fn login_compatible_api_key(
         .unwrap_or_else(|| format!("BCODE_{prefix}_API_KEY"));
     let base_url_key = format!("BCODE_{prefix}_BASE_URL");
 
-    store
-        .set_secret(
-            &target.storage_profile,
-            &auth_mode_key,
-            Zeroizing::new("api_key".to_string()),
-        )
-        .map_err(|error| {
-            CliError::BundledPluginInstallFailed(format!("failed to store auth mode: {error}"))
-        })?;
-    store
-        .set_secret(
-            &target.storage_profile,
-            &api_key_key,
-            Zeroizing::new(api_key),
-        )
-        .map_err(|error| {
-            CliError::BundledPluginInstallFailed(format!(
-                "failed to store {prefix} API key: {error}"
-            ))
-        })?;
     let config_base_url = base_url.clone();
+    let mut values = BTreeMap::from([
+        (auth_mode_key, "api_key".to_string()),
+        (api_key_key, api_key),
+    ]);
+    let mut remove_keys = Vec::new();
     if let Some(base_url) = base_url {
-        store
-            .set_secret(
-                &target.storage_profile,
-                &base_url_key,
-                Zeroizing::new(base_url),
-            )
-            .map_err(|error| {
-                CliError::BundledPluginInstallFailed(format!(
-                    "failed to store {prefix} base URL: {error}"
-                ))
-            })?;
+        values.insert(base_url_key, base_url);
+    } else {
+        remove_keys.push(base_url_key);
     }
+    remove_keys.extend([
+        format!("BCODE_{prefix}_CODEX_ACCESS_TOKEN"),
+        format!("BCODE_{prefix}_CODEX_ID_TOKEN"),
+        format!("BCODE_{prefix}_CODEX_REFRESH_TOKEN"),
+        format!("BCODE_{prefix}_CODEX_EXPIRES_AT"),
+        format!("BCODE_{prefix}_CODEX_ACCOUNT_ID"),
+    ]);
+    upsert_auth_profile_secrets(target, values, &remove_keys)?;
     apply_auth_device_seal_policy(
         &target.vault_path,
         &target.storage_profile,
@@ -1930,7 +2010,7 @@ fn login_xai(options: XaiLoginOptions) -> Result<(), CliError> {
 }
 
 async fn login_openai_chatgpt(
-    store: &sshenv_vault::SshenvStore,
+    _store: &sshenv_vault::SshenvStore,
     target: LoginTarget,
     model: Option<String>,
     flow: OpenAiLoginFlow,
@@ -1942,70 +2022,43 @@ async fn login_openai_chatgpt(
         .as_deref()
         .and_then(chatgpt_account_id_from_access_token)
         .or_else(|| chatgpt_account_id_from_access_token(&oauth.access_token));
-    store
-        .set_secret(
-            &target.storage_profile,
-            "BCODE_OPENAI_AUTH_MODE",
-            Zeroizing::new("chatgpt".to_string()),
-        )
-        .map_err(|error| {
-            CliError::BundledPluginInstallFailed(format!("failed to store auth mode: {error}"))
-        })?;
-    store
-        .set_secret(
-            &target.storage_profile,
-            "BCODE_OPENAI_CODEX_ACCESS_TOKEN",
-            Zeroizing::new(oauth.access_token),
-        )
-        .map_err(|error| {
-            CliError::BundledPluginInstallFailed(format!("failed to store access token: {error}"))
-        })?;
+    let mut values = BTreeMap::from([
+        ("BCODE_OPENAI_AUTH_MODE".to_string(), "chatgpt".to_string()),
+        (
+            "BCODE_OPENAI_CODEX_ACCESS_TOKEN".to_string(),
+            oauth.access_token,
+        ),
+        (
+            "BCODE_OPENAI_CODEX_EXPIRES_AT".to_string(),
+            expires_at.to_string(),
+        ),
+    ]);
+    let mut remove_keys = vec![
+        target
+            .api_key_env
+            .clone()
+            .unwrap_or_else(|| "BCODE_OPENAI_API_KEY".to_string()),
+        "BCODE_OPENAI_BASE_URL".to_string(),
+        "BCODE_OPENAI_CODEX_ID_TOKEN".to_string(),
+        "BCODE_OPENAI_CODEX_REFRESH_TOKEN".to_string(),
+        "BCODE_OPENAI_CODEX_ACCOUNT_ID".to_string(),
+    ];
     if let Some(id_token) = oauth.id_token {
-        store
-            .set_secret(
-                &target.storage_profile,
-                "BCODE_OPENAI_CODEX_ID_TOKEN",
-                Zeroizing::new(id_token),
-            )
-            .map_err(|error| {
-                CliError::BundledPluginInstallFailed(format!("failed to store ID token: {error}"))
-            })?;
+        values.insert("BCODE_OPENAI_CODEX_ID_TOKEN".to_string(), id_token);
+        remove_keys.retain(|key| key != "BCODE_OPENAI_CODEX_ID_TOKEN");
     }
     if let Some(refresh_token) = oauth.refresh_token {
-        store
-            .set_secret(
-                &target.storage_profile,
-                "BCODE_OPENAI_CODEX_REFRESH_TOKEN",
-                Zeroizing::new(refresh_token),
-            )
-            .map_err(|error| {
-                CliError::BundledPluginInstallFailed(format!(
-                    "failed to store refresh token: {error}"
-                ))
-            })?;
+        values.insert(
+            "BCODE_OPENAI_CODEX_REFRESH_TOKEN".to_string(),
+            refresh_token,
+        );
+        remove_keys.retain(|key| key != "BCODE_OPENAI_CODEX_REFRESH_TOKEN");
     }
-    store
-        .set_secret(
-            &target.storage_profile,
-            "BCODE_OPENAI_CODEX_EXPIRES_AT",
-            Zeroizing::new(expires_at.to_string()),
-        )
-        .map_err(|error| {
-            CliError::BundledPluginInstallFailed(format!("failed to store token expiry: {error}"))
-        })?;
     if let Some(account_id) = account_id {
-        store
-            .set_secret(
-                &target.storage_profile,
-                "BCODE_OPENAI_CODEX_ACCOUNT_ID",
-                Zeroizing::new(account_id),
-            )
-            .map_err(|error| {
-                CliError::BundledPluginInstallFailed(format!(
-                    "failed to store ChatGPT account id: {error}"
-                ))
-            })?;
+        values.insert("BCODE_OPENAI_CODEX_ACCOUNT_ID".to_string(), account_id);
+        remove_keys.retain(|key| key != "BCODE_OPENAI_CODEX_ACCOUNT_ID");
     }
+    upsert_auth_profile_secrets(&target, values, &remove_keys)?;
     apply_auth_device_seal_policy(
         &target.vault_path,
         &target.storage_profile,
