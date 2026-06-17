@@ -267,6 +267,7 @@ impl SessionRuntimePhase {
 struct MessageQueueStatus {
     queued: bool,
     queue_position: Option<u32>,
+    disposition: bcode_ipc::MessageAcceptanceDisposition,
 }
 
 #[derive(Debug)]
@@ -4849,10 +4850,20 @@ async fn enqueue_user_message_command(
     };
     let queued = !steering_now && (pending_before > 0 || phase.accepts_steering());
     let queue_position = queued.then(|| usize_to_u32_saturating(pending_before.saturating_add(1)));
+    let disposition = if steering_now {
+        bcode_ipc::MessageAcceptanceDisposition::AppliedSteering
+    } else if queued && placement == bcode_ipc::PromptPlacement::FollowUp {
+        bcode_ipc::MessageAcceptanceDisposition::QueuedFollowUp
+    } else if queued {
+        bcode_ipc::MessageAcceptanceDisposition::QueuedTurn
+    } else {
+        bcode_ipc::MessageAcceptanceDisposition::StartedTurn
+    };
     if handle.commands.send(command).await.is_ok() {
         return Ok(MessageQueueStatus {
             queued,
             queue_position,
+            disposition,
         });
     }
     handle.queued_commands.fetch_sub(1, Ordering::AcqRel);
@@ -4873,10 +4884,16 @@ async fn enqueue_session_command(
     let pending_before = handle.queued_commands.fetch_add(1, Ordering::AcqRel);
     let queued = pending_before > 0 || handle.phase.lock().await.accepts_steering();
     let queue_position = queued.then(|| usize_to_u32_saturating(pending_before.saturating_add(1)));
+    let disposition = if queued {
+        bcode_ipc::MessageAcceptanceDisposition::QueuedTurn
+    } else {
+        bcode_ipc::MessageAcceptanceDisposition::StartedTurn
+    };
     if handle.commands.send(command).await.is_ok() {
         return Ok(MessageQueueStatus {
             queued,
             queue_position,
+            disposition,
         });
     }
     handle.queued_commands.fetch_sub(1, Ordering::AcqRel);
@@ -5233,9 +5250,10 @@ async fn send_message_acceptance_response(
     status: MessageQueueStatus,
 ) -> Result<(), ServerError> {
     let payload = if state.client_supports_message_accepted(client_id).await {
-        ResponsePayload::MessageAccepted {
+        ResponsePayload::MessageAcceptedWithDisposition {
             queued: status.queued,
             queue_position: status.queue_position,
+            disposition: status.disposition,
         }
     } else {
         ResponsePayload::MessageSent

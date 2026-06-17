@@ -118,6 +118,29 @@ pub enum PromptPlacement {
     FollowUp,
 }
 
+/// Server-side disposition for an accepted user prompt or skill invocation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageAcceptanceDisposition {
+    /// Accepted as a new turn that can start immediately.
+    #[default]
+    StartedTurn,
+    /// Accepted as steering for the active turn.
+    AppliedSteering,
+    /// Accepted as a follow-up requested for after the active turn.
+    QueuedFollowUp,
+    /// Accepted behind already queued session work.
+    QueuedTurn,
+}
+
+impl MessageAcceptanceDisposition {
+    /// Return whether the disposition is the wire-compatible default.
+    #[must_use]
+    pub const fn is_default(disposition: &Self) -> bool {
+        matches!(disposition, Self::StartedTurn)
+    }
+}
+
 impl PromptPlacement {
     /// Return whether this placement is the wire-compatible default.
     #[must_use]
@@ -945,6 +968,11 @@ pub enum ResponsePayload {
         queued: bool,
         queue_position: Option<u32>,
     },
+    MessageAcceptedWithDisposition {
+        queued: bool,
+        queue_position: Option<u32>,
+        disposition: MessageAcceptanceDisposition,
+    },
     SessionModelList {
         provider_plugin_id: Option<String>,
         models: bcode_model::ModelList,
@@ -1144,6 +1172,11 @@ enum IpcResponsePayload {
         queued: bool,
         queue_position: Option<u32>,
     },
+    MessageAcceptedWithDisposition {
+        queued: bool,
+        queue_position: Option<u32>,
+        disposition: MessageAcceptanceDisposition,
+    },
     SessionModelList {
         provider_plugin_id: Option<String>,
         models: bcode_model::ModelList,
@@ -1336,6 +1369,15 @@ impl From<&ResponsePayload> for IpcResponsePayload {
                 queued: queued.clone(),
                 queue_position: queue_position.clone(),
             },
+            ResponsePayload::MessageAcceptedWithDisposition {
+                queued,
+                queue_position,
+                disposition,
+            } => Self::MessageAcceptedWithDisposition {
+                queued: queued.clone(),
+                queue_position: queue_position.clone(),
+                disposition: *disposition,
+            },
             ResponsePayload::SessionModelList {
                 provider_plugin_id,
                 models,
@@ -1500,6 +1542,15 @@ impl TryFrom<IpcResponsePayload> for ResponsePayload {
             } => Ok(Self::MessageAccepted {
                 queued,
                 queue_position,
+            }),
+            IpcResponsePayload::MessageAcceptedWithDisposition {
+                queued,
+                queue_position,
+                disposition,
+            } => Ok(Self::MessageAcceptedWithDisposition {
+                queued,
+                queue_position,
+                disposition,
             }),
             IpcResponsePayload::SessionModelList {
                 provider_plugin_id,

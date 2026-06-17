@@ -318,6 +318,7 @@ impl From<ErrorResponse> for ClientError {
 pub struct MessageAcceptance {
     pub queued: bool,
     pub queue_position: Option<u32>,
+    pub disposition: bcode_ipc::MessageAcceptanceDisposition,
 }
 
 impl MessageAcceptance {
@@ -327,6 +328,7 @@ impl MessageAcceptance {
         Self {
             queued: false,
             queue_position: None,
+            disposition: bcode_ipc::MessageAcceptanceDisposition::StartedTurn,
         }
     }
 }
@@ -1037,6 +1039,16 @@ impl BcodeClient {
             } => Ok(MessageAcceptance {
                 queued,
                 queue_position,
+                disposition: bcode_ipc::MessageAcceptanceDisposition::StartedTurn,
+            }),
+            ResponsePayload::MessageAcceptedWithDisposition {
+                queued,
+                queue_position,
+                disposition,
+            } => Ok(MessageAcceptance {
+                queued,
+                queue_position,
+                disposition,
             }),
             ResponsePayload::MessageSent => Ok(MessageAcceptance::sent()),
             _ => Err(ClientError::UnexpectedResponse),
@@ -1314,6 +1326,16 @@ impl BcodeClient {
             } => Ok(MessageAcceptance {
                 queued,
                 queue_position,
+                disposition: bcode_ipc::MessageAcceptanceDisposition::StartedTurn,
+            }),
+            ResponsePayload::MessageAcceptedWithDisposition {
+                queued,
+                queue_position,
+                disposition,
+            } => Ok(MessageAcceptance {
+                queued,
+                queue_position,
+                disposition,
             }),
             ResponsePayload::MessageSent => Ok(MessageAcceptance::sent()),
             _ => Err(ClientError::UnexpectedResponse),
@@ -1879,6 +1901,16 @@ impl ClientConnection {
             } => Ok(MessageAcceptance {
                 queued,
                 queue_position,
+                disposition: bcode_ipc::MessageAcceptanceDisposition::StartedTurn,
+            }),
+            ResponsePayload::MessageAcceptedWithDisposition {
+                queued,
+                queue_position,
+                disposition,
+            } => Ok(MessageAcceptance {
+                queued,
+                queue_position,
+                disposition,
             }),
             ResponsePayload::MessageSent => Ok(MessageAcceptance::sent()),
             _ => Err(ClientError::UnexpectedResponse),

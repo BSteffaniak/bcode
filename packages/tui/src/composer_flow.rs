@@ -304,19 +304,27 @@ pub async fn submit_composer<W: Write>(
         .await
     {
         Ok(acceptance) => {
-            if acceptance.queued {
-                chat.app.set_idle();
-                chat.app
-                    .mark_pending_submission_queued(acceptance.queue_position);
-                chat.app.set_status(format!(
-                    "Message queued{}",
-                    acceptance
-                        .queue_position
-                        .map_or_else(String::new, |position| format!(" at #{position}"))
-                ));
-            } else {
-                chat.app.mark_pending_submission_sent();
-                chat.app.set_status("Message sent".to_owned());
+            match acceptance.disposition {
+                bcode_ipc::MessageAcceptanceDisposition::AppliedSteering => {
+                    chat.app.mark_pending_submission_sent();
+                    chat.app.set_status("Steering sent".to_owned());
+                }
+                bcode_ipc::MessageAcceptanceDisposition::QueuedFollowUp
+                | bcode_ipc::MessageAcceptanceDisposition::QueuedTurn => {
+                    chat.app.set_idle();
+                    chat.app
+                        .mark_pending_submission_queued(acceptance.queue_position);
+                    chat.app.set_status(format!(
+                        "Message queued{}",
+                        acceptance
+                            .queue_position
+                            .map_or_else(String::new, |position| format!(" at #{position}"))
+                    ));
+                }
+                bcode_ipc::MessageAcceptanceDisposition::StartedTurn => {
+                    chat.app.mark_pending_submission_sent();
+                    chat.app.set_status("Message sent".to_owned());
+                }
             }
             Ok(None)
         }
