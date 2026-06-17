@@ -295,7 +295,11 @@ fn merge_legacy_openai_auth_profile_env(
         policy,
         None,
     );
-    let store = sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(vault));
+    let store = sshenv_vault::SshenvStore::new(
+        sshenv_vault::SshenvStoreConfig::new(vault.clone()).with_private_key_paths(
+            bcode_provider_auth::security::vault_private_key_paths(&vault),
+        ),
+    );
     let Ok(Some(profile)) = store.get_profile(&auth.profile) else {
         return;
     };

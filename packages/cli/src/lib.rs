@@ -1777,38 +1777,46 @@ fn open_auth_store(
     vault_path: &Path,
     recipient_key: Option<String>,
 ) -> Result<sshenv_vault::SshenvStore, CliError> {
-    let store = sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(
-        vault_path.to_path_buf(),
-    ));
+    let store = sshenv_vault::SshenvStore::new(
+        sshenv_vault::SshenvStoreConfig::new(vault_path.to_path_buf()).with_private_key_paths(
+            bcode_provider_auth::security::vault_private_key_paths(vault_path),
+        ),
+    );
     if !vault_path.exists() {
-        let recipient_key = resolve_recipient_key(recipient_key)?;
-        store.init(&recipient_key).map_err(|error| {
-            CliError::BundledPluginInstallFailed(format!(
-                "failed to initialize auth vault: {error}"
-            ))
-        })?;
-        let (mut vault, data_key) = store.load_and_unlock().map_err(|error| {
-            CliError::BundledPluginInstallFailed(format!(
-                "failed to unlock initialized auth vault: {error}"
-            ))
-        })?;
-        vault.migrate_to_v2(&[recipient_key]).map_err(|error| {
+        let recipient_key = resolve_recipient_key(vault_path, recipient_key)?;
+        initialize_auth_vault(vault_path, &store, &recipient_key)?;
+    }
+    Ok(store)
+}
+
+fn initialize_auth_vault(
+    vault_path: &Path,
+    store: &sshenv_vault::SshenvStore,
+    recipient_key: &str,
+) -> Result<(), CliError> {
+    store.init(recipient_key).map_err(|error| {
+        CliError::BundledPluginInstallFailed(format!("failed to initialize auth vault: {error}"))
+    })?;
+    let (mut vault, data_key) = store.load_and_unlock().map_err(|error| {
+        CliError::BundledPluginInstallFailed(format!(
+            "failed to unlock initialized auth vault: {error}"
+        ))
+    })?;
+    vault
+        .migrate_to_v2(&[recipient_key.to_string()])
+        .map_err(|error| {
             CliError::BundledPluginInstallFailed(format!(
                 "failed to migrate auth vault to v2: {error}"
             ))
         })?;
-        vault.enable_profile_keys().map_err(|error| {
-            CliError::BundledPluginInstallFailed(format!(
-                "failed to enable auth profile keys: {error}"
-            ))
-        })?;
-        vault.save(vault_path, &data_key).map_err(|error| {
-            CliError::BundledPluginInstallFailed(format!(
-                "failed to save initialized auth vault: {error}"
-            ))
-        })?;
-    }
-    Ok(store)
+    vault.enable_profile_keys().map_err(|error| {
+        CliError::BundledPluginInstallFailed(format!("failed to enable auth profile keys: {error}"))
+    })?;
+    vault.save(vault_path, &data_key).map_err(|error| {
+        CliError::BundledPluginInstallFailed(format!(
+            "failed to save initialized auth vault: {error}"
+        ))
+    })
 }
 
 fn upsert_auth_profile_secrets(
@@ -1822,7 +1830,7 @@ fn upsert_auth_profile_secrets(
         Ok(None) => BTreeMap::new(),
         Err(error) => {
             println!(
-                "Auth vault profile {} could not be unlocked ({error}); resetting it with fresh login credentials.",
+                "Auth vault profile {} could not be unlocked with the Bcode-managed vault key ({error}); resetting it with fresh login credentials.",
                 target.storage_profile
             );
             BTreeMap::new()
@@ -2556,19 +2564,18 @@ fn open_browser(url: &str) {
         .spawn();
 }
 
-fn resolve_recipient_key(recipient_key: Option<String>) -> Result<String, CliError> {
+fn resolve_recipient_key(
+    vault_path: &Path,
+    recipient_key: Option<String>,
+) -> Result<String, CliError> {
     if let Some(recipient_key) = recipient_key {
         return public_key_line_from_path_or_literal(&recipient_key);
     }
-    let Some(path) = sshenv_vault::identity::discover_public_key_paths()
-        .into_iter()
-        .next()
-    else {
-        return Err(CliError::BundledPluginInstallFailed(
-            "no SSH public key found; pass --recipient-key <path-or-public-key>".to_string(),
-        ));
-    };
-    public_key_line_from_path_or_literal(&path.display().to_string())
+    bcode_provider_auth::security::ensure_vault_recipient_key(vault_path).map_err(|error| {
+        CliError::BundledPluginInstallFailed(format!(
+            "failed to prepare Bcode-managed auth vault key: {error}"
+        ))
+    })
 }
 
 fn public_key_line_from_path_or_literal(value: &str) -> Result<String, CliError> {

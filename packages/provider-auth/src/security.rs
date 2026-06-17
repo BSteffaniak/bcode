@@ -1,11 +1,237 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use ssh_key::{Algorithm, LineEnding, PrivateKey, rand_core::OsRng};
 use sshenv_vault::models::{ProfileFactorRequirement, VERSION_V2};
+
+const BCODE_VAULT_KEY_DIR_SUFFIX: &str = "keys";
+const BCODE_VAULT_PRIVATE_KEY_FILE_NAME: &str = "bcode_sshenv_ed25519";
+const BCODE_VAULT_PUBLIC_KEY_FILE_NAME: &str = "bcode_sshenv_ed25519.pub";
+const BCODE_VAULT_KEY_COMMENT: &str = "bcode sshenv vault key";
+
+/// Error returned when Bcode-managed auth vault identity material cannot be used.
+#[derive(Debug)]
+pub enum AuthIdentityError {
+    /// Identity material exists only partially and must be repaired manually.
+    IncompleteIdentity {
+        private_key: PathBuf,
+        public_key: PathBuf,
+    },
+    /// Filesystem or SSH key operation failed.
+    OperationFailed { message: String },
+}
+
+impl fmt::Display for AuthIdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IncompleteIdentity {
+                private_key,
+                public_key,
+            } => write!(
+                formatter,
+                "Bcode-managed auth vault identity is incomplete; expected both {} and {}. Remove the incomplete key files and run `bcode login` again.",
+                private_key.display(),
+                public_key.display()
+            ),
+            Self::OperationFailed { message } => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for AuthIdentityError {}
+
+/// Return the Bcode-managed key directory for an sshenv vault path.
+#[must_use]
+pub fn vault_identity_dir(vault_path: &Path) -> PathBuf {
+    let mut dir = vault_path.as_os_str().to_os_string();
+    dir.push(".");
+    dir.push(BCODE_VAULT_KEY_DIR_SUFFIX);
+    PathBuf::from(dir)
+}
+
+/// Return the Bcode-managed private key path for an sshenv vault path.
+#[must_use]
+pub fn vault_private_key_path(vault_path: &Path) -> PathBuf {
+    vault_identity_dir(vault_path).join(BCODE_VAULT_PRIVATE_KEY_FILE_NAME)
+}
+
+/// Return the Bcode-managed public key path for an sshenv vault path.
+#[must_use]
+pub fn vault_public_key_path(vault_path: &Path) -> PathBuf {
+    vault_identity_dir(vault_path).join(BCODE_VAULT_PUBLIC_KEY_FILE_NAME)
+}
+
+/// Return private-key paths Bcode may use to unlock an auth vault.
+#[must_use]
+pub fn vault_private_key_paths(vault_path: &Path) -> Vec<PathBuf> {
+    vec![vault_private_key_path(vault_path)]
+}
+
+/// Read the Bcode-managed auth vault recipient key if the complete keypair exists.
+///
+/// # Errors
+///
+/// Returns an error when only part of the managed keypair exists or the public
+/// key cannot be read.
+pub fn read_vault_recipient_key(vault_path: &Path) -> Result<Option<String>, AuthIdentityError> {
+    let private_key = vault_private_key_path(vault_path);
+    let public_key = vault_public_key_path(vault_path);
+    match (private_key.exists(), public_key.exists()) {
+        (true, true) => read_public_key_file(&public_key).map(Some),
+        (false, false) => Ok(None),
+        _ => Err(AuthIdentityError::IncompleteIdentity {
+            private_key,
+            public_key,
+        }),
+    }
+}
+
+/// Create or reuse the Bcode-managed auth vault recipient key for a vault.
+///
+/// # Errors
+///
+/// Returns an error when key generation, filesystem writes, or reading the
+/// resulting public key fails.
+pub fn ensure_vault_recipient_key(vault_path: &Path) -> Result<String, AuthIdentityError> {
+    if let Some(key) = read_vault_recipient_key(vault_path)? {
+        return Ok(key);
+    }
+
+    let identity_dir = vault_identity_dir(vault_path);
+    fs::create_dir_all(&identity_dir).map_err(|error| AuthIdentityError::OperationFailed {
+        message: format!(
+            "failed to create Bcode auth vault key directory {}: {error}",
+            identity_dir.display()
+        ),
+    })?;
+    restrict_dir_permissions(&identity_dir)?;
+
+    let private_key_path = vault_private_key_path(vault_path);
+    let public_key_path = vault_public_key_path(vault_path);
+    let mut private_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).map_err(|error| {
+        AuthIdentityError::OperationFailed {
+            message: format!("failed to generate Bcode auth vault key: {error}"),
+        }
+    })?;
+    private_key.set_comment(BCODE_VAULT_KEY_COMMENT);
+
+    let private_key_text = private_key.to_openssh(LineEnding::LF).map_err(|error| {
+        AuthIdentityError::OperationFailed {
+            message: format!("failed to encode Bcode auth vault private key: {error}"),
+        }
+    })?;
+    let public_key_text = private_key.public_key().to_openssh().map_err(|error| {
+        AuthIdentityError::OperationFailed {
+            message: format!("failed to encode Bcode auth vault public key: {error}"),
+        }
+    })?;
+
+    write_private_key_file(&private_key_path, private_key_text.as_str())?;
+    write_public_key_file(&public_key_path, &public_key_text)?;
+    read_public_key_file(&public_key_path)
+}
+
+fn read_public_key_file(path: &Path) -> Result<String, AuthIdentityError> {
+    let contents =
+        fs::read_to_string(path).map_err(|error| AuthIdentityError::OperationFailed {
+            message: format!(
+                "failed to read Bcode auth vault public key {}: {error}",
+                path.display()
+            ),
+        })?;
+    contents
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| AuthIdentityError::OperationFailed {
+            message: format!(
+                "Bcode auth vault public key {} does not contain a public key line",
+                path.display()
+            ),
+        })
+}
+
+fn write_private_key_file(path: &Path, contents: &str) -> Result<(), AuthIdentityError> {
+    fs::write(path, contents).map_err(|error| AuthIdentityError::OperationFailed {
+        message: format!(
+            "failed to write Bcode auth vault private key {}: {error}",
+            path.display()
+        ),
+    })?;
+    restrict_private_key_permissions(path)
+}
+
+fn write_public_key_file(path: &Path, contents: &str) -> Result<(), AuthIdentityError> {
+    fs::write(path, format!("{contents}\n")).map_err(|error| {
+        AuthIdentityError::OperationFailed {
+            message: format!(
+                "failed to write Bcode auth vault public key {}: {error}",
+                path.display()
+            ),
+        }
+    })?;
+    restrict_public_key_permissions(path)
+}
+
+#[cfg(unix)]
+fn restrict_dir_permissions(path: &Path) -> Result<(), AuthIdentityError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
+        AuthIdentityError::OperationFailed {
+            message: format!(
+                "failed to restrict Bcode auth vault key directory permissions {}: {error}",
+                path.display()
+            ),
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn restrict_dir_permissions(_path: &Path) -> Result<(), AuthIdentityError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_private_key_permissions(path: &Path) -> Result<(), AuthIdentityError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+        AuthIdentityError::OperationFailed {
+            message: format!(
+                "failed to restrict Bcode auth vault private key permissions {}: {error}",
+                path.display()
+            ),
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn restrict_private_key_permissions(_path: &Path) -> Result<(), AuthIdentityError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_public_key_permissions(path: &Path) -> Result<(), AuthIdentityError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o644)).map_err(|error| {
+        AuthIdentityError::OperationFailed {
+            message: format!(
+                "failed to set Bcode auth vault public key permissions {}: {error}",
+                path.display()
+            ),
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn restrict_public_key_permissions(_path: &Path) -> Result<(), AuthIdentityError> {
+    Ok(())
+}
 
 /// Severity for auth vault security diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,14 +470,17 @@ fn load_auth_vault_metadata(
         .iter()
         .map(|recipient| recipient.fingerprint.clone())
         .collect();
-    let private_key_paths = sshenv_vault::identity::discover_private_key_paths();
+    let private_key_paths = vault_private_key_paths(vault_path);
     let identities = sshenv_vault::identity::load_identities_for_vault_from_paths(
         &private_key_paths,
         &fingerprints,
     )
-    .map_err(|error| format!("failed to load auth vault SSH identities: {error}"))?;
+    .map_err(|error| format!("failed to load Bcode auth vault SSH identity: {error}"))?;
     if identities.is_empty() {
-        return Err("no local SSH private key matches an auth vault recipient".to_string());
+        return Err(
+            "no Bcode-managed auth vault private key matches an auth vault recipient; run `bcode login` to recreate this profile"
+                .to_string(),
+        );
     }
     sshenv_vault::Vault::unlock_metadata_with_passphrase(ciphertext, &identities, None)
         .map_err(|error| format!("failed to unlock auth vault metadata: {error}"))
@@ -315,14 +544,14 @@ pub fn reconcile_auth_vault_security_report(
                     format!(
                         "Auth vault security refresh skipped for profile {profile}; device seal is preferred but not active: {error}"
                     ),
-                    "Add settings.recipient_key for the auth profile or run `bcode auth status` for details.",
+                    "Run `bcode login` to recreate credentials with the Bcode-managed per-vault key.",
                 ),
                 AuthSecurityDiagnosticSeverity::Error => AuthSecurityDiagnostic::error(
                     "auth_vault_security_required_unsatisfied",
                     format!(
                         "Auth vault security requirement is not satisfied for profile {profile}: {error}"
                     ),
-                    "Add settings.recipient_key for the auth profile, ensure local secure storage is available, then retry.",
+                    "Run `bcode login` to recreate credentials with the Bcode-managed per-vault key.",
                 ),
             };
             AuthSecurityReconcileReport {
@@ -383,7 +612,7 @@ pub fn reconcile_auth_vault_security(
     }
 
     if vault.header.version != VERSION_V2 {
-        let recipient_keys = recipient_keys_for_vault(&vault, explicit_recipient_key)?;
+        let recipient_keys = recipient_keys_for_vault(vault_path, &vault, explicit_recipient_key)?;
         vault
             .migrate_to_v2(&recipient_keys)
             .map_err(|error| format!("failed to migrate auth vault to v2: {error}"))?;
@@ -422,6 +651,7 @@ fn profile_has_device_seal(vault: &sshenv_vault::Vault, profile: &str) -> bool {
 }
 
 fn recipient_keys_for_vault(
+    vault_path: &Path,
     vault: &sshenv_vault::Vault,
     explicit_recipient_key: Option<&str>,
 ) -> Result<Vec<String>, String> {
@@ -430,7 +660,7 @@ fn recipient_keys_for_vault(
         .iter()
         .map(|recipient| recipient.fingerprint.clone())
         .collect();
-    let candidates = recipient_key_candidates(explicit_recipient_key);
+    let candidates = recipient_key_candidates(vault_path, explicit_recipient_key);
     let by_fingerprint: BTreeMap<_, _> = candidates
         .into_iter()
         .filter_map(|line| {
@@ -451,29 +681,21 @@ fn recipient_keys_for_vault(
         Ok(keys)
     } else {
         Err(format!(
-            "cannot migrate existing auth vault to v2 because recipient public keys were not found for: {}. Re-run login with --recipient-key PATH_TO_PUBLIC_KEY or add settings.recipient_key to the auth profile.",
+            "cannot migrate existing auth vault to v2 because recipient public keys were not found for: {}. Run `bcode login` to recreate credentials with the Bcode-managed per-vault key, or pass --recipient-key if this vault intentionally uses a custom key.",
             missing.join(", ")
         ))
     }
 }
 
-fn recipient_key_candidates(explicit_recipient_key: Option<&str>) -> Vec<String> {
+fn recipient_key_candidates(
+    vault_path: &Path,
+    explicit_recipient_key: Option<&str>,
+) -> Vec<String> {
     let mut candidates = Vec::new();
     if let Some(key) = explicit_recipient_key.and_then(read_public_key_arg) {
         candidates.push(key);
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        let ssh_dir = PathBuf::from(home).join(".ssh");
-        if let Ok(entries) = fs::read_dir(ssh_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|extension| extension == "pub")
-                    && let Ok(line) = fs::read_to_string(path)
-                {
-                    candidates.push(line);
-                }
-            }
-        }
+    } else if let Ok(Some(key)) = read_vault_recipient_key(vault_path) {
+        candidates.push(key);
     }
     candidates
 }

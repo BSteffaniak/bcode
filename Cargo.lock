@@ -1327,6 +1327,7 @@ dependencies = [
  "bcode_model",
  "bcode_model_provider_runtime",
  "bcode_plugin_sdk",
+ "bcode_provider_auth",
  "reqwest",
  "serde",
  "serde_json",
@@ -1392,6 +1393,7 @@ dependencies = [
  "bcode_model",
  "serde",
  "sha2 0.10.9",
+ "ssh-key",
  "sshenv_vault",
 ]
 
@@ -1447,6 +1449,7 @@ dependencies = [
  "bcode_opencode_session_import_plugin",
  "bcode_pi_session_import_plugin",
  "bcode_plugin",
+ "bcode_provider_auth",
  "bcode_ralph",
  "bcode_session",
  "bcode_session_import",

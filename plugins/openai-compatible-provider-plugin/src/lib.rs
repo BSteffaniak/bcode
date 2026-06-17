@@ -3196,7 +3196,11 @@ fn saved_openai_auth() -> SavedOpenAiAuth {
         .vault
         .clone()
         .unwrap_or_else(bcode_config::default_auth_vault_path);
-    let store = sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(vault.clone()));
+    let store = sshenv_vault::SshenvStore::new(
+        sshenv_vault::SshenvStoreConfig::new(vault.clone()).with_private_key_paths(
+            bcode_provider_auth::security::vault_private_key_paths(&vault),
+        ),
+    );
     let Ok(Some(profile)) = store.get_profile(&auth.profile) else {
         return SavedOpenAiAuth {
             values: BTreeMap::new(),
@@ -3778,7 +3782,11 @@ fn store_refreshed_chatgpt_auth(
     next_expires_at: u64,
     account_id: Option<&str>,
 ) -> Result<(), ProviderError> {
-    let store = sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(vault));
+    let store = sshenv_vault::SshenvStore::new(
+        sshenv_vault::SshenvStoreConfig::new(vault).with_private_key_paths(
+            bcode_provider_auth::security::vault_private_key_paths(vault),
+        ),
+    );
     set_codex_secret(
         &store,
         profile,

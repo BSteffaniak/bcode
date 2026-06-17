@@ -44,14 +44,19 @@ pub fn resolve_auth_profile(
             storage_profile = profile.to_string();
             storage_vault = Some(vault.display().to_string());
             let policy = security::device_seal_policy_for_auth_profile(auth_profile);
+            let recipient_key = auth_profile
+                .settings
+                .get("recipient_key")
+                .map(String::as_str)
+                .map_or_else(
+                    || security::ensure_vault_recipient_key(&vault).ok(),
+                    |key| Some(key.to_string()),
+                );
             let report = security::reconcile_auth_vault_security_report(
                 &vault,
                 profile,
                 policy,
-                auth_profile
-                    .settings
-                    .get("recipient_key")
-                    .map(String::as_str),
+                recipient_key.as_deref(),
             );
             diagnostics.extend(report.diagnostics);
             match security::read_auth_vault_profile(&vault, profile) {
@@ -66,7 +71,7 @@ pub fn resolve_auth_profile(
                     code: "auth_vault_profile_unavailable".to_string(),
                     message: error,
                     remediation: Some(
-                        "Restore this device's seal secret or run provider login to reset the auth profile."
+                        "Run `bcode login` to recreate this profile using the Bcode-managed per-vault key."
                             .to_string(),
                     ),
                 }),

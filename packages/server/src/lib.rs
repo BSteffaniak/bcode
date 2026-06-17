@@ -1380,7 +1380,11 @@ fn resolve_sshenv_secret_ref(map: &serde_json::Map<String, serde_json::Value>) -
             bcode_config::default_auth_vault_path,
             std::path::PathBuf::from,
         );
-    let store = sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(vault));
+    let store = sshenv_vault::SshenvStore::new(
+        sshenv_vault::SshenvStoreConfig::new(vault.clone()).with_private_key_paths(
+            bcode_provider_auth::security::vault_private_key_paths(&vault),
+        ),
+    );
     store
         .get_profile(profile)
         .ok()
