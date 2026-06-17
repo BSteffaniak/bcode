@@ -75,6 +75,9 @@ fn flash_message_for_action(action: super::ralph_launcher::RalphHomeAction) -> S
         super::ralph_launcher::RalphHomeAction::ViewDraft => {
             "Setup draft shown. Next: approve it or ask Ralph to revise it.".to_owned()
         }
+        super::ralph_launcher::RalphHomeAction::ReviseDraft => {
+            "Revision prompt prepared. Submit it, then save setup draft again.".to_owned()
+        }
         super::ralph_launcher::RalphHomeAction::ApproveDraft => {
             "Setup draft approved. Next: create the loop from the approved draft.".to_owned()
         }
@@ -168,6 +171,81 @@ fn view_setup_draft(chat: &mut ActiveChat) -> Result<(), TuiError> {
         markdown_preview(draft.progress_draft.as_deref())
     ));
     chat.app.set_status("Ralph setup draft shown".to_owned());
+    Ok(())
+}
+
+fn revision_prompt(draft: &ralph_state::RalphSetupDraft) -> String {
+    format!(
+        "Revise Ralph setup draft `{draft_id}`.\n\n\
+         Goal: improve the saved setup draft, not create files yet. Preserve correct constraints and decisions, fix weak/missing sections, and ask focused questions only if essential.\n\n\
+         Required output shape:\n\n\
+         RALPH_SETUP_DRAFT_START\n\
+         loop_name: <name>\n\
+         branch: <optional branch name or <none>>\n\
+         worktree_path: <optional absolute path or <none>>\n\
+         validation:\n\
+         - <command>\n\n\
+         --- charter.md ---\n\
+         <complete revised charter markdown>\n\n\
+         --- progress.md ---\n\
+         <complete revised progress markdown with actionable checklist items>\n\
+         RALPH_SETUP_DRAFT_END\n\n\
+         Current draft metadata:\n\
+         * Status: {status}\n\
+         * Loop: {loop_name}\n\
+         * Branch: {branch}\n\
+         * Worktree: {worktree}\n\
+         * Validation: {validation}\n\n\
+         Current charter draft:\n\n{charter}\n\n\
+         Current progress draft:\n\n{progress}",
+        draft_id = draft.draft_id,
+        status = draft.status,
+        loop_name = draft.loop_name,
+        branch = draft.branch.as_deref().unwrap_or("<default>"),
+        worktree = draft
+            .work_area_path
+            .as_ref()
+            .map_or_else(|| "<default>".to_owned(), |path| path.display().to_string()),
+        validation = if draft.validation_commands.is_empty() {
+            "<none>".to_owned()
+        } else {
+            draft.validation_commands.join("; ")
+        },
+        charter = draft.charter_draft.as_deref().unwrap_or("<missing>"),
+        progress = draft.progress_draft.as_deref().unwrap_or("<missing>")
+    )
+}
+
+fn revise_setup_draft(chat: &mut ActiveChat) -> Result<(), TuiError> {
+    let repo_root = current_repo_root(chat)?;
+    let Some(draft) = ralph_state::latest_setup_draft(&repo_root)? else {
+        chat.app.set_status("no Ralph setup draft found".to_owned());
+        return Ok(());
+    };
+    let updated = ralph_state::update_setup_draft(ralph_state::RalphSetupDraftUpdateRequest {
+        draft_id: draft.draft_id,
+        repo_root,
+        status: ralph_state::RalphSetupDraftStatus::Drafting,
+        loop_name: None,
+        charter_draft: draft.charter_draft,
+        progress_draft: draft.progress_draft,
+        validation_commands: draft.validation_commands,
+        branch: draft.branch,
+        work_area_path: draft.work_area_path,
+    })?;
+    let prompt = revision_prompt(&updated);
+    append_setup_transcript(
+        &updated,
+        &format!("## Requested setup draft revision\n\n{prompt}"),
+    )?;
+    chat.app.composer_mut().clear();
+    chat.app.composer_mut().insert_str(&prompt);
+    chat.app.push_system_note(format!(
+        "Ralph setup draft revision prompt prepared\n* Draft: {}\n* Status: {}\n* Next: submit the prompt, then use Save setup draft on the assistant's revised artifact",
+        updated.draft_id, updated.status
+    ));
+    chat.app
+        .set_status("Ralph setup draft revision prompt prepared".to_owned());
     Ok(())
 }
 
@@ -552,6 +630,7 @@ async fn dispatch_home_action<W: Write>(
         super::ralph_launcher::RalphHomeAction::Plan => plan_loop(services, chat).await,
         super::ralph_launcher::RalphHomeAction::SaveDraft => save_setup_draft(chat),
         super::ralph_launcher::RalphHomeAction::ViewDraft => view_setup_draft(chat),
+        super::ralph_launcher::RalphHomeAction::ReviseDraft => revise_setup_draft(chat),
         super::ralph_launcher::RalphHomeAction::ApproveDraft => approve_setup_draft(chat),
         super::ralph_launcher::RalphHomeAction::CreateFromDraft => {
             create_loop_from_draft(services, chat).await

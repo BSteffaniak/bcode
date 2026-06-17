@@ -33,6 +33,7 @@ const RALPH_ACTIONS: &[RalphAction] = &[
     RalphAction::new("Plan/setup loop", RalphActionKind::Plan),
     RalphAction::new("Save setup draft", RalphActionKind::SaveDraft),
     RalphAction::new("View setup draft", RalphActionKind::ViewDraft),
+    RalphAction::new("Revise setup draft", RalphActionKind::ReviseDraft),
     RalphAction::new("Approve setup draft", RalphActionKind::ApproveDraft),
     RalphAction::new("Create loop from draft", RalphActionKind::CreateFromDraft),
     RalphAction::new("Quick create loop", RalphActionKind::Start),
@@ -59,6 +60,7 @@ enum RalphActionKind {
     Plan,
     SaveDraft,
     ViewDraft,
+    ReviseDraft,
     ApproveDraft,
     CreateFromDraft,
     Start,
@@ -81,6 +83,7 @@ impl RalphActionKind {
             Self::Plan => "plan",
             Self::SaveDraft => "save-draft",
             Self::ViewDraft => "view-draft",
+            Self::ReviseDraft => "revise-draft",
             Self::ApproveDraft => "approve-draft",
             Self::CreateFromDraft => "create-from-draft",
             Self::Start => "start",
@@ -107,6 +110,7 @@ impl RalphActionKind {
                 "capture latest assistant charter/progress draft for review/approval"
             }
             Self::ViewDraft => "show saved setup draft paths and content previews",
+            Self::ReviseDraft => "ask the assistant to revise the saved setup draft",
             Self::ApproveDraft => "approve saved charter/progress as ready for loop creation",
             Self::CreateFromDraft => "create loop files/worktree from the approved setup draft",
             Self::Start => {
@@ -301,6 +305,7 @@ impl RalphHomeSurface {
                 RalphActionKind::Plan,
                 RalphActionKind::SaveDraft,
                 RalphActionKind::ViewDraft,
+                RalphActionKind::ReviseDraft,
                 RalphActionKind::ApproveDraft,
                 RalphActionKind::CreateFromDraft,
                 RalphActionKind::Status,

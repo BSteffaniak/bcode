@@ -22,6 +22,9 @@ pub enum RalphHomeAction {
     /// View saved setup draft contents.
     #[serde(alias = "view-draft")]
     ViewDraft,
+    /// Build a focused revision prompt for the saved setup draft.
+    #[serde(alias = "revise-draft")]
+    ReviseDraft,
     /// Approve the saved setup draft.
     #[serde(alias = "approve-draft")]
     ApproveDraft,
