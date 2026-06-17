@@ -191,6 +191,12 @@ impl PluginTuiSurfaceFactory for RalphHomeSurfaceFactory {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RalphHomeScreen {
+    Dashboard,
+    RebuildIntro,
+}
+
 #[derive(Debug, Clone)]
 struct RalphHomeSurface {
     repo_path: PathBuf,
@@ -199,6 +205,7 @@ struct RalphHomeSurface {
     runs: Vec<bcode_ralph::RalphRunRecord>,
     selected_action: usize,
     status_message: Option<String>,
+    screen: RalphHomeScreen,
 }
 
 impl RalphHomeSurface {
@@ -210,6 +217,7 @@ impl RalphHomeSurface {
             runs: Vec::new(),
             selected_action: 0,
             status_message: flash_message,
+            screen: RalphHomeScreen::Dashboard,
         };
         surface.refresh();
         surface
@@ -558,6 +566,86 @@ impl RalphHomeSurface {
         }
         y.saturating_add(1)
     }
+    fn render_rebuild_intro(&self, frame: &mut Frame<'_>, area: Rect) {
+        let mut y = area.y;
+        write_line(
+            frame,
+            area,
+            y,
+            Line::from_spans(vec![Span::styled(
+                "Rebuild Ralph loop context",
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )]),
+        );
+        y = y.saturating_add(2);
+        write_line(
+            frame,
+            area,
+            y,
+            Line::from("Create a fresh replacement charter/progress draft for the existing loop."),
+        );
+        y = y.saturating_add(1);
+        write_line(
+            frame,
+            area,
+            y,
+            Line::from("Nothing is overwritten until you review, approve, and apply the draft."),
+        );
+        y = y.saturating_add(2);
+
+        if let Some(summary) = &self.loop_summary {
+            for line in [
+                format!("Loop: {}", summary.loop_name),
+                format!("State: {}", summary.state_dir.display()),
+                format!("Charter: {}", summary.charter_doc_path.display()),
+                format!("Progress: {}", summary.progress_doc_path.display()),
+            ] {
+                write_line(frame, area, y, Line::from(line));
+                y = y.saturating_add(1);
+            }
+        } else {
+            write_line(
+                frame,
+                area,
+                y,
+                Line::from("No existing Ralph loop was found."),
+            );
+            y = y.saturating_add(1);
+        }
+
+        y = y.saturating_add(1);
+        for line in [
+            "Flow:",
+            "  1. Bcode will open a focused rebuild prompt in the composer.",
+            "  2. Add any extra context/goals/constraints before submitting it.",
+            "  3. Ralph will ask clarifying questions or output a replacement draft.",
+            "  4. Use Save/View/Revise/Approve setup draft.",
+            "  5. Use Apply draft to loop to overwrite files with backups.",
+            "",
+            "Affected on apply: charter.md, progress.md, validation commands.",
+            "Preserved: loop state dir, run history, iteration history.",
+            "Backups: <loop-state>/backups/rebuild-<timestamp>/",
+        ] {
+            write_line(frame, area, y, Line::from(line));
+            y = y.saturating_add(1);
+        }
+
+        let status_y = area.y.saturating_add(area.height.saturating_sub(2));
+        write_line(
+            frame,
+            area,
+            status_y,
+            Line::from("Keys: Enter prepare rebuild prompt · Esc back · q close"),
+        );
+        if let Some(message) = &self.status_message {
+            write_line(
+                frame,
+                area,
+                status_y.saturating_add(1),
+                Line::from(message.clone()),
+            );
+        }
+    }
 }
 
 impl PluginTuiSurface for RalphHomeSurface {
@@ -571,6 +659,10 @@ impl PluginTuiSurface for RalphHomeSurface {
 
     fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
         frame.fill(area, " ", Style::new().fg(Color::White).bg(Color::Black));
+        if self.screen == RalphHomeScreen::RebuildIntro {
+            self.render_rebuild_intro(frame, area);
+            return;
+        }
         let mut y = area.y;
         write_line(
             frame,
@@ -633,6 +725,21 @@ impl PluginTuiSurface for RalphHomeSurface {
         let Event::Key(key) = event else {
             return PluginTuiAction::None;
         };
+        if self.screen == RalphHomeScreen::RebuildIntro {
+            return match key.key {
+                KeyCode::Char('q') => PluginTuiAction::Close { outcome: None },
+                KeyCode::Escape => {
+                    self.screen = RalphHomeScreen::Dashboard;
+                    PluginTuiAction::Redraw
+                }
+                KeyCode::Enter => PluginTuiAction::Close {
+                    outcome: Some(serde_json::json!({
+                        "ralph_action": RalphActionKind::RebuildLoopContext,
+                    })),
+                },
+                _ => PluginTuiAction::None,
+            };
+        }
         match key.key {
             KeyCode::Char('q') | KeyCode::Escape => PluginTuiAction::Close { outcome: None },
             KeyCode::Char('r') => {
@@ -650,6 +757,14 @@ impl PluginTuiSurface for RalphHomeSurface {
             }
             KeyCode::Enter => {
                 let action = self.action_order()[self.selected_action].kind;
+                if action == RalphActionKind::RebuildLoopContext && self.loop_summary.is_some() {
+                    self.screen = RalphHomeScreen::RebuildIntro;
+                    self.status_message = Some(
+                        "Review the rebuild flow, then press Enter to prepare the prompt."
+                            .to_owned(),
+                    );
+                    return PluginTuiAction::Redraw;
+                }
                 PluginTuiAction::Close {
                     outcome: Some(serde_json::json!({
                         "ralph_action": action,
