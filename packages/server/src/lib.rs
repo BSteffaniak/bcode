@@ -60,7 +60,7 @@ use bcode_tool::{
 };
 use runtime_work::{CancellationHandle, RuntimeWorkManager, RuntimeWorkSpec};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::future::Future;
@@ -244,8 +244,10 @@ const fn client_event_kind(event: &Event) -> &'static str {
 
 #[derive(Debug, Clone)]
 struct SessionRuntimeHandle {
-    commands: mpsc::Sender<SessionCommand>,
-    queued_commands: Arc<AtomicUsize>,
+    followup_commands: mpsc::Sender<FollowupCommand>,
+    steering_commands: mpsc::Sender<SteeringCommand>,
+    cancel_commands: mpsc::Sender<CancelCommand>,
+    queued_followups: Arc<AtomicUsize>,
     phase: Arc<Mutex<SessionRuntimePhase>>,
     current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
 }
@@ -287,46 +289,39 @@ enum ProviderCallWait<T> {
 }
 
 struct RuntimeCommandContext<'a> {
-    commands: &'a mut mpsc::Receiver<SessionCommand>,
-    deferred_commands: &'a mut VecDeque<SessionCommand>,
-    queued_commands: &'a AtomicUsize,
+    followup_commands: &'a mut mpsc::Receiver<FollowupCommand>,
+    steering_commands: &'a mut mpsc::Receiver<SteeringCommand>,
+    cancel_commands: &'a mut mpsc::Receiver<CancelCommand>,
+    queued_followups: &'a AtomicUsize,
     current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
 }
 
 impl<'a> RuntimeCommandContext<'a> {
     const fn new(
-        commands: &'a mut mpsc::Receiver<SessionCommand>,
-        deferred_commands: &'a mut VecDeque<SessionCommand>,
-        queued_commands: &'a AtomicUsize,
+        followup_commands: &'a mut mpsc::Receiver<FollowupCommand>,
+        steering_commands: &'a mut mpsc::Receiver<SteeringCommand>,
+        cancel_commands: &'a mut mpsc::Receiver<CancelCommand>,
+        queued_followups: &'a AtomicUsize,
         current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
     ) -> Self {
         Self {
-            commands,
-            deferred_commands,
-            queued_commands,
+            followup_commands,
+            steering_commands,
+            cancel_commands,
+            queued_followups,
             current_turn,
         }
     }
 }
 
 #[derive(Debug)]
-enum SessionCommand {
+enum FollowupCommand {
     UserMessage {
         client_id: ClientId,
         runtime_context: Option<ClientRuntimeContext>,
         text: String,
         placement: bcode_ipc::PromptPlacement,
         completion: Option<oneshot::Sender<ModelTurnCompletion>>,
-    },
-    SteeringMessage {
-        client_id: ClientId,
-        text: String,
-        completion: Option<oneshot::Sender<ModelTurnCompletion>>,
-    },
-    CancelTurn {
-        clear_queue: bool,
-        requested_by: Option<ClientId>,
-        response: oneshot::Sender<bool>,
     },
     SkillInvocation {
         client_id: ClientId,
@@ -336,6 +331,20 @@ enum SessionCommand {
         source: Option<SkillSource>,
         display_text: String,
     },
+}
+
+#[derive(Debug)]
+struct SteeringCommand {
+    client_id: ClientId,
+    text: String,
+    completion: Option<oneshot::Sender<ModelTurnCompletion>>,
+}
+
+#[derive(Debug)]
+struct CancelCommand {
+    clear_queue: bool,
+    requested_by: Option<ClientId>,
+    response: oneshot::Sender<bool>,
 }
 
 #[derive(Debug)]
@@ -955,7 +964,7 @@ impl ServerState {
             .lock()
             .await
             .values()
-            .map(|handle| handle.queued_commands.load(Ordering::Acquire))
+            .map(|handle| handle.queued_followups.load(Ordering::Acquire))
             .sum::<usize>();
         if queued_session_commands > 0 {
             return Some(format!(
@@ -4927,21 +4936,10 @@ async fn enqueue_user_message_command(
     let mut phase = handle.phase.lock().await;
     let steering_now =
         placement == bcode_ipc::PromptPlacement::Steering && phase.accepts_steering();
-    let pending_before = handle.queued_commands.fetch_add(1, Ordering::AcqRel);
-    let command = if steering_now {
-        SessionCommand::SteeringMessage {
-            client_id,
-            text,
-            completion: None,
-        }
+    let pending_before = if steering_now {
+        0
     } else {
-        SessionCommand::UserMessage {
-            client_id,
-            runtime_context,
-            text,
-            placement,
-            completion: None,
-        }
+        handle.queued_followups.fetch_add(1, Ordering::AcqRel)
     };
     let queued = !steering_now && (pending_before > 0 || phase.accepts_steering());
     let queue_position = queued.then(|| usize_to_u32_saturating(pending_before.saturating_add(1)));
@@ -4954,14 +4952,39 @@ async fn enqueue_user_message_command(
     } else {
         bcode_ipc::MessageAcceptanceDisposition::StartedTurn
     };
-    if handle.commands.send(command).await.is_ok() {
+    let send_result = if steering_now {
+        handle
+            .steering_commands
+            .send(SteeringCommand {
+                client_id,
+                text,
+                completion: None,
+            })
+            .await
+            .map_err(|error| error.to_string())
+    } else {
+        handle
+            .followup_commands
+            .send(FollowupCommand::UserMessage {
+                client_id,
+                runtime_context,
+                text,
+                placement,
+                completion: None,
+            })
+            .await
+            .map_err(|error| error.to_string())
+    };
+    if send_result.is_ok() {
         return Ok(MessageQueueStatus {
             queued,
             queue_position,
             disposition,
         });
     }
-    handle.queued_commands.fetch_sub(1, Ordering::AcqRel);
+    if !steering_now {
+        handle.queued_followups.fetch_sub(1, Ordering::AcqRel);
+    }
     *phase = SessionRuntimePhase::Idle;
     drop(phase);
 
@@ -4979,8 +5002,8 @@ async fn enqueue_cancel_turn_command(
     let handle = session_runtime_handle(state, session_id).await;
     let (response, completion) = oneshot::channel();
     if handle
-        .commands
-        .send(SessionCommand::CancelTurn {
+        .cancel_commands
+        .send(CancelCommand {
             clear_queue,
             requested_by,
             response,
@@ -4994,14 +5017,14 @@ async fn enqueue_cancel_turn_command(
     completion.await.map_err(ServerError::from)
 }
 
-async fn enqueue_session_command(
+async fn enqueue_followup_command(
     state: &Arc<ServerState>,
     session_id: SessionId,
-    command: SessionCommand,
+    command: FollowupCommand,
 ) -> Result<MessageQueueStatus, ServerError> {
     state.sessions.session_summary(session_id).await?;
     let handle = session_runtime_handle(state, session_id).await;
-    let pending_before = handle.queued_commands.fetch_add(1, Ordering::AcqRel);
+    let pending_before = handle.queued_followups.fetch_add(1, Ordering::AcqRel);
     let queued = pending_before > 0 || handle.phase.lock().await.accepts_steering();
     let queue_position = queued.then(|| usize_to_u32_saturating(pending_before.saturating_add(1)));
     let disposition = if queued {
@@ -5009,14 +5032,14 @@ async fn enqueue_session_command(
     } else {
         bcode_ipc::MessageAcceptanceDisposition::StartedTurn
     };
-    if handle.commands.send(command).await.is_ok() {
+    if handle.followup_commands.send(command).await.is_ok() {
         return Ok(MessageQueueStatus {
             queued,
             queue_position,
             disposition,
         });
     }
-    handle.queued_commands.fetch_sub(1, Ordering::AcqRel);
+    handle.queued_followups.fetch_sub(1, Ordering::AcqRel);
 
     state.session_runtimes.lock().await.remove(&session_id);
     Err(bcode_session::SessionError::NotFound(session_id).into())
@@ -5039,14 +5062,20 @@ async fn session_runtime_handle(
         return handle.clone();
     }
 
-    let (commands, receiver) = mpsc::channel(128);
-    let queued_commands = Arc::new(AtomicUsize::new(0));
-    let receiver = Arc::new(Mutex::new(Some(receiver)));
+    let (followup_commands, followup_receiver) = mpsc::channel(128);
+    let (steering_commands, steering_receiver) = mpsc::channel(128);
+    let (cancel_commands, cancel_receiver) = mpsc::channel(32);
+    let queued_followups = Arc::new(AtomicUsize::new(0));
+    let followup_receiver = Arc::new(Mutex::new(Some(followup_receiver)));
+    let steering_receiver = Arc::new(Mutex::new(Some(steering_receiver)));
+    let cancel_receiver = Arc::new(Mutex::new(Some(cancel_receiver)));
     let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
     let current_turn = Arc::new(Mutex::new(None));
     let handle = SessionRuntimeHandle {
-        commands,
-        queued_commands: Arc::clone(&queued_commands),
+        followup_commands,
+        steering_commands,
+        cancel_commands,
+        queued_followups: Arc::clone(&queued_followups),
         phase: Arc::clone(&phase),
         current_turn: Arc::clone(&current_turn),
     };
@@ -5057,8 +5086,10 @@ async fn session_runtime_handle(
         Box::pin(run_session_runtime(
             state_for_runtime,
             session_id,
-            receiver,
-            queued_commands,
+            followup_receiver,
+            steering_receiver,
+            cancel_receiver,
+            queued_followups,
             phase,
             current_turn,
         ))
@@ -5067,29 +5098,59 @@ async fn session_runtime_handle(
     handle
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_session_runtime(
     state: Arc<ServerState>,
     session_id: SessionId,
-    commands: Arc<Mutex<Option<mpsc::Receiver<SessionCommand>>>>,
-    queued_commands: Arc<AtomicUsize>,
+    followup_commands: Arc<Mutex<Option<mpsc::Receiver<FollowupCommand>>>>,
+    steering_commands: Arc<Mutex<Option<mpsc::Receiver<SteeringCommand>>>>,
+    cancel_commands: Arc<Mutex<Option<mpsc::Receiver<CancelCommand>>>>,
+    queued_followups: Arc<AtomicUsize>,
     phase: Arc<Mutex<SessionRuntimePhase>>,
     current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
 ) {
     let mut permit = SessionTurnPermit::new(session_id);
-    let mut commands = commands
+    let mut followup_commands = followup_commands
         .lock()
         .await
         .take()
-        .expect("session runtime receiver should be present");
-    let mut deferred_commands = VecDeque::new();
+        .expect("session runtime followup receiver should be present");
+    let mut steering_commands = steering_commands
+        .lock()
+        .await
+        .take()
+        .expect("session runtime steering receiver should be present");
+    let mut cancel_commands = cancel_commands
+        .lock()
+        .await
+        .take()
+        .expect("session runtime cancel receiver should be present");
     loop {
+        service_cancel_commands(
+            &state,
+            session_id,
+            &mut cancel_commands,
+            &mut followup_commands,
+            queued_followups.as_ref(),
+        )
+        .await;
+        while let Ok(command) = steering_commands.try_recv() {
+            process_steering_message_command(
+                &state,
+                permit.session_id(),
+                command.client_id,
+                command.text,
+                command.completion,
+            )
+            .await;
+        }
         let Some(command) =
-            next_session_command(&mut commands, &mut deferred_commands, &queued_commands).await
+            next_followup_command(&mut followup_commands, queued_followups.as_ref()).await
         else {
             break;
         };
         match command {
-            SessionCommand::UserMessage {
+            FollowupCommand::UserMessage {
                 client_id,
                 runtime_context,
                 text,
@@ -5100,9 +5161,10 @@ async fn run_session_runtime(
                     &state,
                     &mut permit,
                     Arc::clone(&phase),
-                    &mut commands,
-                    &mut deferred_commands,
-                    queued_commands.as_ref(),
+                    &mut followup_commands,
+                    &mut steering_commands,
+                    &mut cancel_commands,
+                    queued_followups.as_ref(),
                     Arc::clone(&current_turn),
                     client_id,
                     runtime_context,
@@ -5112,38 +5174,7 @@ async fn run_session_runtime(
                 ))
                 .await;
             }
-            SessionCommand::SteeringMessage {
-                client_id,
-                text,
-                completion,
-            } => {
-                process_steering_message_command(
-                    &state,
-                    permit.session_id(),
-                    client_id,
-                    text,
-                    completion,
-                )
-                .await;
-            }
-            SessionCommand::CancelTurn {
-                clear_queue,
-                requested_by,
-                response,
-            } => {
-                let cancelled = process_cancel_turn_command(
-                    &state,
-                    permit.session_id(),
-                    &mut commands,
-                    &mut deferred_commands,
-                    queued_commands.as_ref(),
-                    clear_queue,
-                    requested_by,
-                )
-                .await;
-                let _sent = response.send(cancelled);
-            }
-            SessionCommand::SkillInvocation {
+            FollowupCommand::SkillInvocation {
                 client_id,
                 runtime_context,
                 skill_id,
@@ -5155,9 +5186,10 @@ async fn run_session_runtime(
                     &state,
                     &mut permit,
                     Arc::clone(&phase),
-                    &mut commands,
-                    &mut deferred_commands,
-                    queued_commands.as_ref(),
+                    &mut followup_commands,
+                    &mut steering_commands,
+                    &mut cancel_commands,
+                    queued_followups.as_ref(),
                     Arc::clone(&current_turn),
                     client_id,
                     runtime_context,
@@ -5173,65 +5205,57 @@ async fn run_session_runtime(
     state.session_runtimes.lock().await.remove(&session_id);
 }
 
-async fn next_session_command(
-    commands: &mut mpsc::Receiver<SessionCommand>,
-    deferred_commands: &mut VecDeque<SessionCommand>,
-    queued_commands: &AtomicUsize,
-) -> Option<SessionCommand> {
-    if let Some(command) = deferred_commands.pop_front() {
-        return Some(command);
-    }
-    let command = commands.recv().await?;
-    if !matches!(command, SessionCommand::CancelTurn { .. }) {
-        queued_commands.fetch_sub(1, Ordering::AcqRel);
-    }
+async fn next_followup_command(
+    followup_commands: &mut mpsc::Receiver<FollowupCommand>,
+    queued_followups: &AtomicUsize,
+) -> Option<FollowupCommand> {
+    let command = followup_commands.recv().await?;
+    queued_followups.fetch_sub(1, Ordering::AcqRel);
     Some(command)
 }
 
-fn clear_deferred_session_commands(deferred_commands: &mut VecDeque<SessionCommand>) -> usize {
+fn drain_followup_commands(followup_commands: &mut mpsc::Receiver<FollowupCommand>) -> usize {
     let mut cleared = 0_usize;
-    let mut retained = VecDeque::new();
-    while let Some(command) = deferred_commands.pop_front() {
-        if matches!(command, SessionCommand::CancelTurn { .. }) {
-            retained.push_back(command);
-        } else {
-            cleared = cleared.saturating_add(1);
-        }
+    while followup_commands.try_recv().is_ok() {
+        cleared = cleared.saturating_add(1);
     }
-    *deferred_commands = retained;
     cleared
 }
 
-fn drain_queued_session_commands(
-    commands: &mut mpsc::Receiver<SessionCommand>,
-    deferred_commands: &mut VecDeque<SessionCommand>,
-) -> usize {
-    let mut cleared = 0_usize;
-    while let Ok(command) = commands.try_recv() {
-        if matches!(command, SessionCommand::CancelTurn { .. }) {
-            deferred_commands.push_back(command);
-        } else {
-            cleared = cleared.saturating_add(1);
-        }
+async fn service_cancel_commands(
+    state: &ServerState,
+    session_id: SessionId,
+    cancel_commands: &mut mpsc::Receiver<CancelCommand>,
+    followup_commands: &mut mpsc::Receiver<FollowupCommand>,
+    queued_followups: &AtomicUsize,
+) {
+    while let Ok(command) = cancel_commands.try_recv() {
+        let cancelled = process_cancel_turn_command(
+            state,
+            session_id,
+            followup_commands,
+            queued_followups,
+            command.clear_queue,
+            command.requested_by,
+        )
+        .await;
+        let _sent = command.response.send(cancelled);
     }
-    cleared
 }
 
 async fn process_cancel_turn_command(
     state: &ServerState,
     session_id: SessionId,
-    commands: &mut mpsc::Receiver<SessionCommand>,
-    deferred_commands: &mut VecDeque<SessionCommand>,
-    queued_commands: &AtomicUsize,
+    followup_commands: &mut mpsc::Receiver<FollowupCommand>,
+    queued_followups: &AtomicUsize,
     clear_queue: bool,
     requested_by: Option<ClientId>,
 ) -> bool {
     let cancelled = request_session_turn_cancellation(state, session_id, requested_by).await;
     if clear_queue {
-        let cleared = clear_deferred_session_commands(deferred_commands)
-            + drain_queued_session_commands(commands, deferred_commands);
+        let cleared = drain_followup_commands(followup_commands);
         if cleared > 0 {
-            queued_commands.fetch_sub(cleared, Ordering::AcqRel);
+            queued_followups.fetch_sub(cleared, Ordering::AcqRel);
         }
     }
     cancelled
@@ -5270,9 +5294,33 @@ where
     loop {
         tokio::select! {
             result = &mut provider_call => return ProviderCallWait::Completed(result),
-            command = context.commands.recv() => {
-                if let Some(command) = command {
-                    process_runtime_command(state, session_id, context, command).await;
+            cancel_command = context.cancel_commands.recv() => {
+                if let Some(command) = cancel_command {
+                    let cancelled = process_cancel_turn_command(
+                        state,
+                        session_id,
+                        context.followup_commands,
+                        context.queued_followups,
+                        command.clear_queue,
+                        command.requested_by,
+                    )
+                    .await;
+                    let _sent = command.response.send(cancelled);
+                }
+                if cancel_state.is_cancelled() {
+                    return ProviderCallWait::Cancelled;
+                }
+            }
+            steering_command = context.steering_commands.recv() => {
+                if let Some(command) = steering_command {
+                    process_steering_message_command(
+                        state,
+                        session_id,
+                        command.client_id,
+                        command.text,
+                        command.completion,
+                    )
+                    .await;
                 }
                 if cancel_state.is_cancelled() {
                     return ProviderCallWait::Cancelled;
@@ -5283,51 +5331,28 @@ where
     }
 }
 
-async fn process_runtime_command(
-    state: &ServerState,
-    session_id: SessionId,
-    context: &mut RuntimeCommandContext<'_>,
-    command: SessionCommand,
-) {
-    if !matches!(command, SessionCommand::CancelTurn { .. }) {
-        context.queued_commands.fetch_sub(1, Ordering::AcqRel);
-    }
-    match command {
-        SessionCommand::SteeringMessage {
-            client_id,
-            text,
-            completion,
-        } => {
-            process_steering_message_command(state, session_id, client_id, text, completion).await;
-        }
-        SessionCommand::CancelTurn {
-            clear_queue,
-            requested_by,
-            response,
-        } => {
-            let cancelled = process_cancel_turn_command(
-                state,
-                session_id,
-                context.commands,
-                context.deferred_commands,
-                context.queued_commands,
-                clear_queue,
-                requested_by,
-            )
-            .await;
-            let _sent = response.send(cancelled);
-        }
-        other => context.deferred_commands.push_back(other),
-    }
-}
-
 async fn service_runtime_priority_commands(
     state: &ServerState,
     session_id: SessionId,
     context: &mut RuntimeCommandContext<'_>,
 ) {
-    while let Ok(command) = context.commands.try_recv() {
-        process_runtime_command(state, session_id, context, command).await;
+    service_cancel_commands(
+        state,
+        session_id,
+        context.cancel_commands,
+        context.followup_commands,
+        context.queued_followups,
+    )
+    .await;
+    while let Ok(command) = context.steering_commands.try_recv() {
+        process_steering_message_command(
+            state,
+            session_id,
+            command.client_id,
+            command.text,
+            command.completion,
+        )
+        .await;
     }
 }
 
@@ -5336,9 +5361,10 @@ async fn process_user_message_command(
     state: &ServerState,
     permit: &mut SessionTurnPermit,
     phase: Arc<Mutex<SessionRuntimePhase>>,
-    commands: &mut mpsc::Receiver<SessionCommand>,
-    deferred_commands: &mut VecDeque<SessionCommand>,
-    queued_commands: &AtomicUsize,
+    followup_commands: &mut mpsc::Receiver<FollowupCommand>,
+    steering_commands: &mut mpsc::Receiver<SteeringCommand>,
+    cancel_commands: &mut mpsc::Receiver<CancelCommand>,
+    queued_followups: &AtomicUsize,
     current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
     client_id: ClientId,
     runtime_context: Option<ClientRuntimeContext>,
@@ -5364,9 +5390,10 @@ async fn process_user_message_command(
             suggest_skills_for_prompt(state, permit.session_id(), &user_event).await;
             *phase.lock().await = SessionRuntimePhase::PreparingModelRequest;
             let mut command_context = RuntimeCommandContext::new(
-                commands,
-                deferred_commands,
-                queued_commands,
+                followup_commands,
+                steering_commands,
+                cancel_commands,
+                queued_followups,
                 Arc::clone(&current_turn),
             );
             run_model_turn(
@@ -5402,9 +5429,10 @@ async fn process_skill_invocation_command(
     state: &ServerState,
     permit: &mut SessionTurnPermit,
     phase: Arc<Mutex<SessionRuntimePhase>>,
-    commands: &mut mpsc::Receiver<SessionCommand>,
-    deferred_commands: &mut VecDeque<SessionCommand>,
-    queued_commands: &AtomicUsize,
+    followup_commands: &mut mpsc::Receiver<FollowupCommand>,
+    steering_commands: &mut mpsc::Receiver<SteeringCommand>,
+    cancel_commands: &mut mpsc::Receiver<CancelCommand>,
+    queued_followups: &AtomicUsize,
     current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
     client_id: ClientId,
     runtime_context: Option<ClientRuntimeContext>,
@@ -5449,9 +5477,10 @@ async fn process_skill_invocation_command(
             );
             *phase.lock().await = SessionRuntimePhase::PreparingModelRequest;
             let mut command_context = RuntimeCommandContext::new(
-                commands,
-                deferred_commands,
-                queued_commands,
+                followup_commands,
+                steering_commands,
+                cancel_commands,
+                queued_followups,
                 Arc::clone(&current_turn),
             );
             run_model_turn(
@@ -5562,7 +5591,7 @@ async fn handle_invoke_skill(
         )
         .await;
     };
-    let command = SessionCommand::SkillInvocation {
+    let command = FollowupCommand::SkillInvocation {
         client_id,
         runtime_context: state.client_runtime_context(client_id).await,
         skill_id,
@@ -5570,7 +5599,7 @@ async fn handle_invoke_skill(
         source: Some(summary.source),
         display_text,
     };
-    match enqueue_session_command(state, session_id, command).await {
+    match enqueue_followup_command(state, session_id, command).await {
         Ok(status) => {
             send_message_acceptance_response(state, writer, request_id, client_id, status).await
         }
@@ -5591,10 +5620,10 @@ async fn submit_session_model_turn_and_wait(
     text: String,
 ) -> Result<ModelTurnCompletion, ServerError> {
     let (sender, receiver) = oneshot::channel();
-    enqueue_session_command(
+    enqueue_followup_command(
         state,
         session_id,
-        SessionCommand::UserMessage {
+        FollowupCommand::UserMessage {
             client_id: ClientId::new(),
             runtime_context: None,
             text,
@@ -8742,9 +8771,31 @@ async fn wait_for_model_progress_or_timeout(
     }
     tokio::select! {
         () = tokio::time::sleep(MODEL_POLL_INTERVAL) => Some(idle_for),
-        command = command_context.commands.recv() => {
-            if let Some(command) = command {
-                process_runtime_command(state, session_id, command_context, command).await;
+        cancel_command = command_context.cancel_commands.recv() => {
+            if let Some(command) = cancel_command {
+                let cancelled = process_cancel_turn_command(
+                    state,
+                    session_id,
+                    command_context.followup_commands,
+                    command_context.queued_followups,
+                    command.clear_queue,
+                    command.requested_by,
+                )
+                .await;
+                let _sent = command.response.send(cancelled);
+            }
+            Some(idle_for)
+        }
+        steering_command = command_context.steering_commands.recv() => {
+            if let Some(command) = steering_command {
+                process_steering_message_command(
+                    state,
+                    session_id,
+                    command.client_id,
+                    command.text,
+                    command.completion,
+                )
+                .await;
             }
             Some(idle_for)
         }
@@ -10756,9 +10807,49 @@ async fn invoke_model_tool(
     let mut stream_sequences: BTreeMap<String, u64> = BTreeMap::new();
     let response = loop {
         tokio::select! {
-            command = command_context.commands.recv() => {
-                if let Some(command) = command {
-                    process_runtime_command(state, session_id, command_context, command).await;
+            cancel_command = command_context.cancel_commands.recv() => {
+                if let Some(command) = cancel_command {
+                    let cancelled = process_cancel_turn_command(
+                        state,
+                        session_id,
+                        command_context.followup_commands,
+                        command_context.queued_followups,
+                        command.clear_queue,
+                        command.requested_by,
+                    )
+                    .await;
+                    let _sent = command.response.send(cancelled);
+                }
+                if cancel_state.is_cancelled() {
+                    invocation.cancel.cancel();
+                    let _ = std::fs::write(&cancellation_path, b"cancelled\n");
+                    cancel_registered_runtime_work(
+                        state,
+                        session_id,
+                        RuntimeWorkId::new(format!("tool_{}", call.id)),
+                        None,
+                    )
+                    .await;
+                    return Ok(ToolInvocationResponse {
+                        output: "tool invocation cancelled".to_string(),
+                        is_error: true,
+                        content: Vec::new(),
+                        full_output: None,
+                        presentation: None,
+                        result: None,
+                    });
+                }
+            }
+            steering_command = command_context.steering_commands.recv() => {
+                if let Some(command) = steering_command {
+                    process_steering_message_command(
+                        state,
+                        session_id,
+                        command.client_id,
+                        command.text,
+                        command.completion,
+                    )
+                    .await;
                 }
                 if cancel_state.is_cancelled() {
                     invocation.cancel.cancel();
