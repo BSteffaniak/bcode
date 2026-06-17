@@ -63,9 +63,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Command;
 use std::sync::{
     Arc,
@@ -276,6 +278,13 @@ struct MessageQueueStatus {
     queued: bool,
     queue_position: Option<u32>,
     disposition: bcode_ipc::MessageAcceptanceDisposition,
+}
+
+type ProviderCallFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+enum ProviderCallWait<T> {
+    Completed(T),
+    Cancelled,
 }
 
 struct RuntimeCommandContext<'a> {
@@ -5189,6 +5198,32 @@ async fn process_steering_message_command(
     }
 }
 
+async fn wait_for_provider_call<'a, T>(
+    state: &ServerState,
+    session_id: SessionId,
+    context: &mut RuntimeCommandContext<'_>,
+    cancel_state: &TurnCancelState,
+    mut provider_call: ProviderCallFuture<'a, T>,
+) -> ProviderCallWait<T>
+where
+    T: Send + 'a,
+{
+    loop {
+        tokio::select! {
+            result = &mut provider_call => return ProviderCallWait::Completed(result),
+            command = context.commands.recv() => {
+                if let Some(command) = command {
+                    process_runtime_command(state, session_id, context, command).await;
+                }
+                if cancel_state.is_cancelled() {
+                    return ProviderCallWait::Cancelled;
+                }
+            }
+            () = cancel_state.cancelled() => return ProviderCallWait::Cancelled,
+        }
+    }
+}
+
 async fn process_runtime_command(
     state: &ServerState,
     session_id: SessionId,
@@ -8253,12 +8288,21 @@ async fn run_model_turn_round(
     service_runtime_priority_commands(state, session_id, command_context).await;
     let start_timer = state.metrics.timer();
     let scope = active_plugin_scope_for_session(state, session_id).await;
-    let start = invoke_model_provider_json_blocking_scoped::<_, StartTurnResponse>(
+    let start = wait_for_provider_call(
         state,
-        provider_plugin_id.map(ToString::to_string),
-        OP_START_TURN,
-        request.clone(),
-        scope,
+        session_id,
+        command_context,
+        cancel_state.as_ref(),
+        Box::pin(invoke_model_provider_json_blocking_scoped::<
+            _,
+            StartTurnResponse,
+        >(
+            state,
+            provider_plugin_id.map(ToString::to_string),
+            OP_START_TURN,
+            request.clone(),
+            scope,
+        )),
     )
     .await;
     state.metrics.record_histogram(
@@ -8266,8 +8310,8 @@ async fn run_model_turn_round(
         start_timer.elapsed_ms(),
     );
     let start = match start {
-        Ok(start) => start,
-        Err(error) => {
+        ProviderCallWait::Completed(Ok(start)) => start,
+        ProviderCallWait::Completed(Err(error)) => {
             let message = format!("model provider error: {error}");
             append_trace_event(
                 state,
@@ -8288,6 +8332,12 @@ async fn run_model_turn_round(
             return Err(ModelTurnCompletion::with_message(
                 ModelTurnOutcome::Error,
                 message,
+            ));
+        }
+        ProviderCallWait::Cancelled => {
+            return Err(ModelTurnCompletion::with_message(
+                ModelTurnOutcome::Cancelled,
+                "model turn cancelled",
             ));
         }
     };
@@ -8358,13 +8408,30 @@ async fn run_model_turn_round(
         &outcome,
     )
     .await;
-    let _ = invoke_model_provider_json_blocking::<_, bcode_model::AckResponse>(
+    let finish_result = wait_for_provider_call(
         state,
-        active_turn.and_then(|turn| turn.provider_plugin_id),
-        OP_FINISH_TURN,
-        finish,
+        session_id,
+        command_context,
+        cancel_state.as_ref(),
+        Box::pin(invoke_model_provider_json_blocking::<
+            _,
+            bcode_model::AckResponse,
+        >(
+            state,
+            active_turn.and_then(|turn| turn.provider_plugin_id),
+            OP_FINISH_TURN,
+            finish,
+        )),
     )
     .await;
+    if let ProviderCallWait::Completed(Err(error)) = finish_result {
+        append_system_event(
+            state,
+            session_id,
+            format!("model provider finish turn failed: {error}"),
+        )
+        .await;
+    }
     Ok(outcome)
 }
 
@@ -8456,19 +8523,39 @@ async fn poll_model_turn_events(
             provider_turn_id: provider_turn_id.to_string(),
         };
         let poll_timer = state.metrics.timer();
-        let response = poll_model_turn(state, session_id, provider_plugin_id, &poll).await;
+        let response = wait_for_provider_call(
+            state,
+            session_id,
+            command_context,
+            cancel_state.as_ref(),
+            Box::pin(poll_model_turn(
+                state,
+                session_id,
+                provider_plugin_id,
+                &poll,
+            )),
+        )
+        .await;
         state.metrics.record_histogram(
             "model.provider.poll_turn_events_duration_ms",
             poll_timer.elapsed_ms(),
         );
         let response = match response {
-            Ok(response) => response,
-            Err(error) => {
+            ProviderCallWait::Completed(Ok(response)) => response,
+            ProviderCallWait::Completed(Err(error)) => {
                 let message = format!("model provider error: {error}");
                 append_system_event(state, session_id, message.clone()).await;
                 outcome.completion = Some(ModelTurnCompletion::with_message(
                     ModelTurnOutcome::Error,
                     message,
+                ));
+                break;
+            }
+            ProviderCallWait::Cancelled => {
+                outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
+                outcome.completion = Some(ModelTurnCompletion::with_message(
+                    ModelTurnOutcome::Cancelled,
+                    "model turn cancelled",
                 ));
                 break;
             }
