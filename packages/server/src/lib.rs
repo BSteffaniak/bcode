@@ -259,6 +259,7 @@ enum SessionRuntimePhase {
     AppendingUser,
     PreparingModelRequest,
     ProviderActive,
+    Compacting,
     FinishingTurn,
 }
 
@@ -269,6 +270,7 @@ impl SessionRuntimePhase {
             Self::AppendingUser
                 | Self::PreparingModelRequest
                 | Self::ProviderActive
+                | Self::Compacting
                 | Self::FinishingTurn
         )
     }
@@ -330,6 +332,10 @@ enum FollowupCommand {
         arguments: String,
         source: Option<SkillSource>,
         display_text: String,
+    },
+    CompactSession {
+        selection: SessionModelSelection,
+        response: oneshot::Sender<Result<String, CompactionError>>,
     },
 }
 
@@ -5049,6 +5055,24 @@ async fn enqueue_followup_command(
     Err(bcode_session::SessionError::NotFound(session_id).into())
 }
 
+async fn enqueue_compact_session_command(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    selection: SessionModelSelection,
+) -> Result<Result<String, CompactionError>, ServerError> {
+    let (response, completion) = oneshot::channel();
+    enqueue_followup_command(
+        state,
+        session_id,
+        FollowupCommand::CompactSession {
+            selection,
+            response,
+        },
+    )
+    .await?;
+    completion.await.map_err(ServerError::from)
+}
+
 fn usize_to_u32_saturating(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
@@ -5102,7 +5126,7 @@ async fn session_runtime_handle(
     handle
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_session_runtime(
     state: Arc<ServerState>,
     session_id: SessionId,
@@ -5203,6 +5227,19 @@ async fn run_session_runtime(
                     display_text,
                 ))
                 .await;
+            }
+            FollowupCommand::CompactSession {
+                selection,
+                response,
+            } => {
+                let result = process_compact_session_command(
+                    &state,
+                    permit.session_id(),
+                    Arc::clone(&phase),
+                    selection,
+                )
+                .await;
+                let _sent = response.send(result);
             }
         }
     }
@@ -5591,6 +5628,18 @@ async fn process_skill_invocation_command(
         }
     }
     set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
+}
+
+async fn process_compact_session_command(
+    state: &ServerState,
+    session_id: SessionId,
+    phase: Arc<Mutex<SessionRuntimePhase>>,
+    selection: SessionModelSelection,
+) -> Result<String, CompactionError> {
+    set_runtime_phase(&phase, SessionRuntimePhase::Compacting).await;
+    let result = compact_session_context(state, session_id, &selection).await;
+    set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
+    result
 }
 
 async fn append_turn_user_message(
@@ -6460,7 +6509,7 @@ async fn handle_subscribe_runtime_work(
 async fn handle_compact_session(
     request_id: u64,
     client_id: ClientId,
-    state: &ServerState,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
@@ -6477,7 +6526,7 @@ async fn handle_compact_session(
         state.client_runtime_context(client_id).await,
     )
     .await;
-    match compact_session_context(state, session_id, &selection).await {
+    match enqueue_compact_session_command(state, session_id, selection).await? {
         Ok(message) => {
             send_response(
                 writer,
@@ -7501,6 +7550,15 @@ async fn maybe_auto_compact_session_context(
         return Ok(());
     }
     if state.session_has_active_turn(session_id).await {
+        append_context_compaction_trace(
+            state,
+            session_id,
+            "active_turn",
+            0,
+            false,
+            Some("skipping auto compaction while a turn is active".to_string()),
+        )
+        .await;
         return Ok(());
     }
 
