@@ -253,12 +253,21 @@ struct SessionRuntimeHandle {
 enum SessionRuntimePhase {
     #[default]
     Idle,
-    TurnInProgress,
+    AppendingUser,
+    PreparingModelRequest,
+    ProviderActive,
+    FinishingTurn,
 }
 
 impl SessionRuntimePhase {
     const fn accepts_steering(self) -> bool {
-        matches!(self, Self::TurnInProgress)
+        matches!(
+            self,
+            Self::AppendingUser
+                | Self::PreparingModelRequest
+                | Self::ProviderActive
+                | Self::FinishingTurn
+        )
     }
 }
 
@@ -3646,7 +3655,7 @@ async fn run_ralph_runner_skeleton(
 
 async fn handle_cancel_ralph_loop(
     request_id: u64,
-    state: &ServerState,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
     request: RalphCancelRequest,
 ) -> Result<(), ServerError> {
@@ -3666,7 +3675,7 @@ async fn handle_cancel_ralph_loop(
                     .and_then(|session_id| session_id.parse::<SessionId>().ok())
                 {
                     let _cancelled =
-                        request_session_turn_cancellation(state, session_id, None).await;
+                        enqueue_cancel_turn_command(state, session_id, true, None).await?;
                 }
                 let response = RalphCancelResponse {
                     run: RalphRunSummary {
@@ -5078,6 +5087,7 @@ async fn run_session_runtime(
                 process_skill_invocation_command(
                     &state,
                     &mut permit,
+                    Arc::clone(&phase),
                     &mut commands,
                     &mut deferred_commands,
                     queued_commands.as_ref(),
@@ -5249,10 +5259,11 @@ async fn process_user_message_command(
         return;
     }
 
-    *phase.lock().await = SessionRuntimePhase::TurnInProgress;
+    *phase.lock().await = SessionRuntimePhase::AppendingUser;
     let completion = match append_turn_user_message(state, permit, client_id, text).await {
         Ok(Some(user_event)) => {
             suggest_skills_for_prompt(state, permit.session_id(), &user_event).await;
+            *phase.lock().await = SessionRuntimePhase::PreparingModelRequest;
             let mut command_context =
                 RuntimeCommandContext::new(commands, deferred_commands, queued_commands);
             run_model_turn(
@@ -5262,6 +5273,7 @@ async fn process_user_message_command(
                 client_id,
                 runtime_context,
                 &mut command_context,
+                &phase,
             )
             .await
         }
@@ -5286,6 +5298,7 @@ async fn process_user_message_command(
 async fn process_skill_invocation_command(
     state: &ServerState,
     permit: &mut SessionTurnPermit,
+    phase: Arc<Mutex<SessionRuntimePhase>>,
     commands: &mut mpsc::Receiver<SessionCommand>,
     deferred_commands: &mut VecDeque<SessionCommand>,
     queued_commands: &AtomicUsize,
@@ -5330,6 +5343,7 @@ async fn process_skill_invocation_command(
                     arguments,
                 },
             );
+            *phase.lock().await = SessionRuntimePhase::PreparingModelRequest;
             let mut command_context =
                 RuntimeCommandContext::new(commands, deferred_commands, queued_commands);
             run_model_turn(
@@ -5339,6 +5353,7 @@ async fn process_skill_invocation_command(
                 client_id,
                 runtime_context,
                 &mut command_context,
+                &phase,
             )
             .await;
         }
@@ -7838,6 +7853,7 @@ async fn run_model_turn(
     client_id: ClientId,
     runtime_context: Option<ClientRuntimeContext>,
     command_context: &mut RuntimeCommandContext<'_>,
+    phase: &Arc<Mutex<SessionRuntimePhase>>,
 ) -> ModelTurnCompletion {
     let session_id = permit.enter_turn();
     let turn_id = format!("{}-{}", session_id, trigger_event.sequence);
@@ -7860,6 +7876,7 @@ async fn run_model_turn(
         },
     );
     append_model_turn_started_event(state, session_id, turn_id.clone()).await;
+    *phase.lock().await = SessionRuntimePhase::ProviderActive;
     service_runtime_priority_commands(state, session_id, command_context).await;
     let completion = run_model_turn_inner(
         state,
@@ -7870,6 +7887,7 @@ async fn run_model_turn(
     )
     .await;
     service_runtime_priority_commands(state, session_id, command_context).await;
+    *phase.lock().await = SessionRuntimePhase::FinishingTurn;
     state.active_session_turns.lock().await.remove(&session_id);
     state.active_turns.lock().await.remove(&session_id);
     append_model_turn_finished_event(
