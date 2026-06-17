@@ -1411,13 +1411,13 @@ fn auth_login(
     let vault_path = vault
         .or_else(|| auth_profile.settings.get("vault").map(PathBuf::from))
         .unwrap_or_else(bcode_config::default_auth_vault_path);
-    let recipient_key_hint = recipient_key.clone().or_else(|| {
+    let recipient_key_hint = recipient_key.or_else(|| {
         auth_profile
             .settings
             .get("recipient_key")
             .map(String::to_string)
     });
-    let store = open_auth_store(&vault_path, recipient_key)?;
+    let store = open_auth_store(&vault_path)?;
     let device_seal_policy =
         bcode_provider_auth::security::device_seal_policy_for_auth_profile(auth_profile);
     let api_key = rpassword::prompt_password(format!("{api_key_env}: "))?;
@@ -1525,7 +1525,7 @@ async fn login_openai(options: OpenAiLoginOptions) -> Result<(), CliError> {
         options.vault,
         options.recipient_key.as_deref(),
     )?;
-    let store = open_auth_store(&target.vault_path, options.recipient_key)?;
+    let store = open_auth_store(&target.vault_path)?;
     if options.api_key.is_some() || (options.base_url.is_some() && !options.chatgpt) {
         login_openai_api_key(
             &store,
@@ -1773,20 +1773,68 @@ fn apply_auth_device_seal_policy(
     }
 }
 
-fn open_auth_store(
-    vault_path: &Path,
-    recipient_key: Option<String>,
-) -> Result<sshenv_vault::SshenvStore, CliError> {
+fn open_auth_store(vault_path: &Path) -> Result<sshenv_vault::SshenvStore, CliError> {
+    let managed_recipient_key =
+        bcode_provider_auth::security::ensure_vault_recipient_key(vault_path).map_err(|error| {
+            CliError::BundledPluginInstallFailed(format!(
+                "failed to prepare Bcode-managed auth vault key: {error}"
+            ))
+        })?;
+    let private_key_paths = bcode_provider_auth::security::vault_private_key_paths(vault_path);
     let store = sshenv_vault::SshenvStore::new(
-        sshenv_vault::SshenvStoreConfig::new(vault_path.to_path_buf()).with_private_key_paths(
-            bcode_provider_auth::security::vault_private_key_paths(vault_path),
-        ),
+        sshenv_vault::SshenvStoreConfig::new(vault_path.to_path_buf())
+            .with_private_key_paths(private_key_paths.clone()),
     );
     if !vault_path.exists() {
-        let recipient_key = resolve_recipient_key(vault_path, recipient_key)?;
-        initialize_auth_vault(vault_path, &store, &recipient_key)?;
+        initialize_auth_vault(vault_path, &store, &managed_recipient_key)?;
+    } else if let Err(error) = sshenv_vault::load_and_unlock_metadata_with_private_key_paths(
+        vault_path,
+        &private_key_paths,
+    ) {
+        let archive_path = archive_incompatible_auth_vault(vault_path, &error)?;
+        println!(
+            "Archived incompatible auth vault to {}; initialized a fresh Bcode-managed auth vault.",
+            archive_path.display()
+        );
+        initialize_auth_vault(vault_path, &store, &managed_recipient_key)?;
     }
     Ok(store)
+}
+
+fn archive_incompatible_auth_vault(
+    vault_path: &Path,
+    unlock_error: &dyn std::fmt::Display,
+) -> Result<PathBuf, CliError> {
+    let file_name = vault_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("vault");
+    let parent = vault_path.parent().unwrap_or_else(|| Path::new("."));
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    for attempt in 0_u16..1000 {
+        let archive_name = if attempt == 0 {
+            format!("{file_name}.legacy-{timestamp}")
+        } else {
+            format!("{file_name}.legacy-{timestamp}-{attempt}")
+        };
+        let archive_path = parent.join(archive_name);
+        if archive_path.exists() {
+            continue;
+        }
+        fs::rename(vault_path, &archive_path).map_err(|error| {
+            CliError::BundledPluginInstallFailed(format!(
+                "failed to archive incompatible auth vault {} after Bcode-managed unlock failed ({unlock_error}): {error}",
+                vault_path.display()
+            ))
+        })?;
+        return Ok(archive_path);
+    }
+    Err(CliError::BundledPluginInstallFailed(format!(
+        "failed to choose archive path for incompatible auth vault {} after Bcode-managed unlock failed ({unlock_error})",
+        vault_path.display()
+    )))
 }
 
 fn initialize_auth_vault(
@@ -1950,7 +1998,7 @@ fn login_xai(options: XaiLoginOptions) -> Result<(), CliError> {
         options.vault,
         options.recipient_key.as_deref(),
     )?;
-    let store = open_auth_store(&target.vault_path, options.recipient_key)?;
+    let store = open_auth_store(&target.vault_path)?;
     login_compatible_api_key(
         &store,
         &target,
@@ -2562,35 +2610,6 @@ fn open_browser(url: &str) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
-}
-
-fn resolve_recipient_key(
-    vault_path: &Path,
-    recipient_key: Option<String>,
-) -> Result<String, CliError> {
-    if let Some(recipient_key) = recipient_key {
-        return public_key_line_from_path_or_literal(&recipient_key);
-    }
-    bcode_provider_auth::security::ensure_vault_recipient_key(vault_path).map_err(|error| {
-        CliError::BundledPluginInstallFailed(format!(
-            "failed to prepare Bcode-managed auth vault key: {error}"
-        ))
-    })
-}
-
-fn public_key_line_from_path_or_literal(value: &str) -> Result<String, CliError> {
-    if value.starts_with("ssh-") {
-        return Ok(value.to_string());
-    }
-    let contents = std::fs::read_to_string(value)?;
-    contents
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(ToString::to_string)
-        .ok_or_else(|| {
-            CliError::BundledPluginInstallFailed(format!("no public key line found in {value}"))
-        })
 }
 
 fn list_plugins(roots: &[std::path::PathBuf]) -> Result<(), CliError> {
