@@ -31,20 +31,24 @@ pub fn tui_registry() -> PluginTuiRegistry {
 
 const RALPH_ACTIONS: &[RalphAction] = &[
     RalphAction::new("Start/setup loop", RalphActionKind::Start),
-    RalphAction::new("Run autonomous loop", RalphActionKind::Run),
-    RalphAction::new("Approve prepared run", RalphActionKind::Approve),
+    RalphAction::new("Prepare run", RalphActionKind::Run),
+    RalphAction::new("Approve/start run", RalphActionKind::Approve),
     RalphAction::new("Stop active run", RalphActionKind::Stop),
     RalphAction::new("Resume safely", RalphActionKind::Resume),
     RalphAction::new("Show status", RalphActionKind::Status),
     RalphAction::new("List runs", RalphActionKind::Runs),
     RalphAction::new("List iterations", RalphActionKind::Iterations),
     RalphAction::new("Open progress doc", RalphActionKind::Open),
-    RalphAction::new("Build audit prompt", RalphActionKind::Audit),
-    RalphAction::new("Build replan prompt", RalphActionKind::Replan),
+    RalphAction::new("Audit alignment", RalphActionKind::Audit),
+    RalphAction::new("Replan from charter", RalphActionKind::Replan),
     RalphAction::new("Goal workflow", RalphActionKind::Goal),
 ];
 
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+fn action_for_kind(kind: RalphActionKind) -> Option<&'static RalphAction> {
+    RALPH_ACTIONS.iter().find(|action| action.kind == kind)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum RalphActionKind {
     Start,
@@ -76,6 +80,23 @@ impl RalphActionKind {
             Self::Audit => "audit",
             Self::Replan => "replan",
             Self::Goal => "goal",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Start => "create loop docs, worktree, branch/session, and validation config",
+            Self::Run => "prepare an approval-gated autonomous run; does not start work yet",
+            Self::Approve => "approve/start the prepared run",
+            Self::Stop => "request cancellation for an active run",
+            Self::Resume => "resume an interrupted run safely",
+            Self::Status => "show the latest loop and active-run status in chat",
+            Self::Runs => "list recent runs and their states",
+            Self::Iterations => "list iterations, validation, and stop reasons",
+            Self::Open => "open/copy the mutable progress doc path",
+            Self::Audit => "check repo/progress alignment against the immutable charter",
+            Self::Replan => "recalibrate the progress doc against the immutable charter",
+            Self::Goal => "prepare a run from the current goal workflow",
         }
     }
 }
@@ -119,7 +140,12 @@ impl PluginTuiSurfaceFactory for RalphHomeSurfaceFactory {
             let repo_path = request
                 .repo_path
                 .ok_or("Ralph home surface requires repo_path")?;
-            Ok(Box::new(RalphHomeSurface::load(repo_path))
+            let flash_message = request
+                .options
+                .get("flash_message")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned);
+            Ok(Box::new(RalphHomeSurface::load(repo_path, flash_message))
                 as bcode_plugin_sdk::tui::BoxedPluginTuiSurface)
         })
     }
@@ -135,13 +161,13 @@ struct RalphHomeSurface {
 }
 
 impl RalphHomeSurface {
-    fn load(repo_path: PathBuf) -> Self {
+    fn load(repo_path: PathBuf, flash_message: Option<String>) -> Self {
         let mut surface = Self {
             repo_path,
             loop_summary: None,
             runs: Vec::new(),
             selected_action: 0,
-            status_message: None,
+            status_message: flash_message,
         };
         surface.refresh();
         surface
@@ -156,6 +182,7 @@ impl RalphHomeSurface {
                         Vec::new()
                     });
                 self.loop_summary = Some(summary);
+                self.selected_action = self.selected_action.min(self.action_order().len() - 1);
                 if self.status_message.is_none() {
                     self.status_message = Some("Ralph status refreshed".to_owned());
                 }
@@ -163,15 +190,198 @@ impl RalphHomeSurface {
             Ok(None) => {
                 self.loop_summary = None;
                 self.runs.clear();
+                self.selected_action = 0;
                 self.status_message = Some("No Ralph loop found for this repository".to_owned());
             }
             Err(error) => {
                 self.loop_summary = None;
                 self.runs.clear();
+                self.selected_action = 0;
                 self.status_message = Some(format!("failed to load Ralph status: {error}"));
             }
         }
     }
+
+    fn latest_run(&self) -> Option<&bcode_ralph::RalphRunRecord> {
+        self.runs
+            .iter()
+            .max_by_key(|run| (run.updated_at_ms, run.started_at_ms))
+    }
+
+    fn next_step(&self) -> &'static str {
+        let Some(_summary) = &self.loop_summary else {
+            return "Start/setup a loop to create docs, worktree, branch/session, and validation config.";
+        };
+        let Some(run) = self.latest_run() else {
+            return "Setup is complete. Next: prepare a run. Preparing does not start work until you approve it.";
+        };
+        if run.cancel_requested {
+            return "Cancellation is requested. Next: refresh status, then resume, audit, or replan.";
+        }
+        match run.status.as_str() {
+            "awaiting_approval" | "prepared" | "queued" => {
+                "A run is prepared. Next: approve/start the prepared run."
+            }
+            "running" => "A run is active. Next: watch status/iterations, or stop if needed.",
+            "interrupted" | "blocked" | "failed" | "stopped" => {
+                "The latest run is not running. Next: resume safely, audit alignment, or replan from the charter."
+            }
+            "completed" | "done" => {
+                "Latest run is complete. Next: audit alignment before considering the loop done."
+            }
+            _ => "Review the latest run status, then choose the safest available action below.",
+        }
+    }
+
+    fn action_order(&self) -> Vec<&'static RalphAction> {
+        let no_loop = self.loop_summary.is_none();
+        let latest_status = self.latest_run().map(|run| run.status.as_str());
+        let kinds: &[RalphActionKind] = if no_loop {
+            &[RalphActionKind::Start, RalphActionKind::Status]
+        } else {
+            match latest_status {
+                None => &[
+                    RalphActionKind::Run,
+                    RalphActionKind::Open,
+                    RalphActionKind::Status,
+                    RalphActionKind::Audit,
+                    RalphActionKind::Replan,
+                    RalphActionKind::Runs,
+                    RalphActionKind::Iterations,
+                    RalphActionKind::Start,
+                ],
+                Some("awaiting_approval" | "prepared" | "queued") => &[
+                    RalphActionKind::Approve,
+                    RalphActionKind::Open,
+                    RalphActionKind::Status,
+                    RalphActionKind::Runs,
+                    RalphActionKind::Iterations,
+                    RalphActionKind::Stop,
+                    RalphActionKind::Audit,
+                    RalphActionKind::Replan,
+                ],
+                Some("running") => &[
+                    RalphActionKind::Status,
+                    RalphActionKind::Iterations,
+                    RalphActionKind::Stop,
+                    RalphActionKind::Open,
+                    RalphActionKind::Runs,
+                    RalphActionKind::Audit,
+                ],
+                Some("interrupted" | "blocked" | "failed" | "stopped") => &[
+                    RalphActionKind::Resume,
+                    RalphActionKind::Audit,
+                    RalphActionKind::Replan,
+                    RalphActionKind::Status,
+                    RalphActionKind::Iterations,
+                    RalphActionKind::Open,
+                    RalphActionKind::Run,
+                ],
+                Some("completed" | "done") => &[
+                    RalphActionKind::Audit,
+                    RalphActionKind::Open,
+                    RalphActionKind::Status,
+                    RalphActionKind::Iterations,
+                    RalphActionKind::Replan,
+                    RalphActionKind::Run,
+                ],
+                Some(_) => &[
+                    RalphActionKind::Status,
+                    RalphActionKind::Runs,
+                    RalphActionKind::Iterations,
+                    RalphActionKind::Open,
+                    RalphActionKind::Run,
+                    RalphActionKind::Audit,
+                    RalphActionKind::Replan,
+                ],
+            }
+        };
+        kinds.iter().copied().filter_map(action_for_kind).collect()
+    }
+
+    fn render_runs(&self, frame: &mut Frame<'_>, area: Rect, mut y: u16) -> u16 {
+        write_line(
+            frame,
+            area,
+            y,
+            Line::from_spans(vec![Span::styled(
+                "Runs",
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )]),
+        );
+        y = y.saturating_add(1);
+        if self.runs.is_empty() {
+            write_line(frame, area, y, Line::from("  <none yet>"));
+            return y.saturating_add(1);
+        }
+        for run in self.runs.iter().take(6) {
+            write_line(
+                frame,
+                area,
+                y,
+                Line::from(format!(
+                    "  {}  {}{}{}  session {}",
+                    run.run_id,
+                    run.status,
+                    run.stop_reason
+                        .as_deref()
+                        .map_or_else(String::new, |reason| format!(" ({reason})")),
+                    if run.cancel_requested {
+                        " [cancel requested]"
+                    } else {
+                        ""
+                    },
+                    run.session_id.as_deref().unwrap_or("<none>")
+                )),
+            );
+            y = y.saturating_add(1);
+        }
+        y
+    }
+
+    fn render_current_loop(&self, frame: &mut Frame<'_>, area: Rect, mut y: u16) -> u16 {
+        write_line(
+            frame,
+            area,
+            y,
+            Line::from_spans(vec![Span::styled(
+                "Current loop",
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )]),
+        );
+        y = y.saturating_add(1);
+        let Some(summary) = &self.loop_summary else {
+            write_line(frame, area, y, Line::from("  <none configured>"));
+            return y.saturating_add(1);
+        };
+        for line in [
+            format!("  Name: {}", summary.loop_name),
+            format!("  Lifecycle: {}", summary.status),
+            format!("  State dir: {}", summary.state_dir.display()),
+            format!("  Charter: {}", summary.charter_doc_path.display()),
+            format!("  Progress: {}", summary.progress_doc_path.display()),
+            format!(
+                "  Work area: {}",
+                summary.work_area_path.as_ref().map_or_else(
+                    || "<not created>".to_owned(),
+                    |path| path.display().to_string()
+                )
+            ),
+            format!(
+                "  Session: {}",
+                summary.session_id.as_deref().unwrap_or("<none>")
+            ),
+            format!(
+                "  Limits: max iterations {}, no-progress {}",
+                summary.max_iterations, summary.no_progress_limit
+            ),
+        ] {
+            write_line(frame, area, y, Line::from(line));
+            y = y.saturating_add(1);
+        }
+        y
+    }
+
     fn render_actions(&self, frame: &mut Frame<'_>, area: Rect, mut y: u16) -> u16 {
         write_line(
             frame,
@@ -183,7 +393,7 @@ impl RalphHomeSurface {
             )]),
         );
         y = y.saturating_add(1);
-        for (index, action) in RALPH_ACTIONS.iter().enumerate() {
+        for (index, action) in self.action_order().iter().enumerate() {
             let selected = index == self.selected_action;
             let marker = if selected { "›" } else { " " };
             let style = if selected {
@@ -197,9 +407,10 @@ impl RalphHomeSurface {
                 y,
                 Line::from_spans(vec![Span::styled(
                     format!(
-                        "{marker} {:<24} {}",
+                        "{marker} {:<22} /ralph {:<10} — {}",
                         action.label,
-                        action.kind.command_label()
+                        action.kind.command_label(),
+                        action.kind.description()
                     ),
                     style,
                 )]),
@@ -238,72 +449,25 @@ impl PluginTuiSurface for RalphHomeSurface {
             y,
             Line::from(format!("Repo: {}", self.repo_path.display())),
         );
-        y = y.saturating_add(2);
-        y = self.render_actions(frame, area, y);
-
-        if let Some(summary) = &self.loop_summary {
-            write_line(
-                frame,
-                area,
-                y,
-                Line::from(format!("Loop: {}", summary.loop_name)),
-            );
-            y = y.saturating_add(1);
-            write_line(
-                frame,
-                area,
-                y,
-                Line::from(format!("State: {}", summary.state_dir.display())),
-            );
-            y = y.saturating_add(1);
-            write_line(
-                frame,
-                area,
-                y,
-                Line::from(format!(
-                    "Limits: max iterations {}, no-progress {}",
-                    summary.max_iterations, summary.no_progress_limit
-                )),
-            );
-            y = y.saturating_add(2);
-            write_line(
-                frame,
-                area,
-                y,
-                Line::from_spans(vec![Span::styled(
-                    "Recent runs",
+        y = y.saturating_add(1);
+        write_line(
+            frame,
+            area,
+            y,
+            Line::from_spans(vec![
+                Span::styled(
+                    "Next: ",
                     Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                )]),
-            );
-            y = y.saturating_add(1);
-            if self.runs.is_empty() {
-                write_line(frame, area, y, Line::from("  <none>"));
-            } else {
-                for run in self.runs.iter().take(8) {
-                    write_line(
-                        frame,
-                        area,
-                        y,
-                        Line::from(format!(
-                            "  {}  {}{}{}",
-                            run.run_id,
-                            run.status,
-                            run.stop_reason
-                                .as_deref()
-                                .map_or_else(String::new, |reason| format!(" ({reason})")),
-                            if run.cancel_requested {
-                                " [cancel requested]"
-                            } else {
-                                ""
-                            }
-                        )),
-                    );
-                    y = y.saturating_add(1);
-                }
-            }
-        } else {
-            write_line(frame, area, y, Line::from("No Ralph loop configured."));
-        }
+                ),
+                Span::raw(self.next_step()),
+            ]),
+        );
+        y = y.saturating_add(2);
+        y = self.render_current_loop(frame, area, y);
+        y = y.saturating_add(1);
+        y = self.render_runs(frame, area, y);
+        y = y.saturating_add(1);
+        let _ = self.render_actions(frame, area, y);
 
         let status_y = area.y.saturating_add(area.height.saturating_sub(2));
         write_line(
@@ -337,14 +501,18 @@ impl PluginTuiSurface for RalphHomeSurface {
                 PluginTuiAction::Redraw
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                self.selected_action = (self.selected_action + 1).min(RALPH_ACTIONS.len() - 1);
+                self.selected_action =
+                    (self.selected_action + 1).min(self.action_order().len() - 1);
                 PluginTuiAction::Redraw
             }
-            KeyCode::Enter => PluginTuiAction::Close {
-                outcome: Some(serde_json::json!({
-                    "ralph_action": RALPH_ACTIONS[self.selected_action].kind,
-                })),
-            },
+            KeyCode::Enter => {
+                let action = self.action_order()[self.selected_action].kind;
+                PluginTuiAction::Close {
+                    outcome: Some(serde_json::json!({
+                        "ralph_action": action,
+                    })),
+                }
+            }
             KeyCode::Char('s') => PluginTuiAction::Close {
                 outcome: Some(serde_json::json!({ "ralph_action": RalphActionKind::Status })),
             },

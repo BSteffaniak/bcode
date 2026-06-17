@@ -30,14 +30,27 @@ pub async fn open_home<W: Write>(
     services: &TuiServices<'_>,
     chat: &mut ActiveChat,
 ) -> Result<(), TuiError> {
+    let mut flash_message: Option<String> = None;
     loop {
         let repo_root = current_repo_root(chat)?;
-        match super::ralph_launcher::run_home_with_input(io.terminal, io.input, repo_root).await? {
+        match super::ralph_launcher::run_home_with_input(
+            io.terminal,
+            io.input,
+            repo_root,
+            flash_message.as_deref(),
+        )
+        .await?
+        {
             super::ralph_launcher::RalphHomeOutcome::Action(action) => {
                 match dispatch_home_action(action, io, services, chat).await {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        flash_message = Some(flash_message_for_action(action));
+                    }
                     Err(TuiError::Canceled) => {
                         chat.app.set_status("Ralph action canceled".to_owned());
+                        flash_message = Some(
+                            "Action canceled. Choose the next Ralph action when ready.".to_owned(),
+                        );
                     }
                     Err(error) => return Err(error),
                 }
@@ -46,6 +59,47 @@ pub async fn open_home<W: Write>(
                 chat.app.set_status("Ralph UI closed".to_owned());
                 return Ok(());
             }
+        }
+    }
+}
+
+fn flash_message_for_action(action: super::ralph_launcher::RalphHomeAction) -> String {
+    match action {
+        super::ralph_launcher::RalphHomeAction::Start => {
+            "Setup complete. Next: review the docs if desired, then prepare a run.".to_owned()
+        }
+        super::ralph_launcher::RalphHomeAction::Run
+        | super::ralph_launcher::RalphHomeAction::Goal => {
+            "Run prepared. Next: approve/start the prepared run.".to_owned()
+        }
+        super::ralph_launcher::RalphHomeAction::Approve => {
+            "Run approved. Next: watch status/iterations, or stop if needed.".to_owned()
+        }
+        super::ralph_launcher::RalphHomeAction::Stop => {
+            "Stop requested. Next: refresh status, then resume, audit, or replan.".to_owned()
+        }
+        super::ralph_launcher::RalphHomeAction::Resume => {
+            "Resume requested. Next: watch status/iterations.".to_owned()
+        }
+        super::ralph_launcher::RalphHomeAction::Status => {
+            "Status written to chat. Next: choose the recommended Ralph action below.".to_owned()
+        }
+        super::ralph_launcher::RalphHomeAction::Runs => {
+            "Runs written to chat. Next: choose an available action for the latest run.".to_owned()
+        }
+        super::ralph_launcher::RalphHomeAction::Iterations => {
+            "Iterations written to chat. Next: continue, audit, replan, or resume as appropriate."
+                .to_owned()
+        }
+        super::ralph_launcher::RalphHomeAction::Open => {
+            "Progress doc path written to chat. Next: prepare/run or recalibrate as needed."
+                .to_owned()
+        }
+        super::ralph_launcher::RalphHomeAction::Audit => {
+            "Audit prompt written to chat. Next: run the audit or replan from findings.".to_owned()
+        }
+        super::ralph_launcher::RalphHomeAction::Replan => {
+            "Replan prompt written to chat. Next: apply the replan, then prepare a run.".to_owned()
         }
     }
 }
@@ -541,7 +595,7 @@ async fn confirm_start_loop(
         validation_commands.join("; ")
     };
     chat.app.push_system_note(format!(
-        "Ralph loop created\n* Loop: {loop_name}\n* Charter: {}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}\n* Validation: {}\n* Next: capture conversation context into the progress doc",
+        "Ralph loop created\n* Loop: {loop_name}\n* Charter: {}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}\n* Validation: {}\n* Next: review docs if desired, then prepare a run and approve/start it",
         state.charter_doc_path.display(),
         state.progress_doc_path.display(),
         state.state_dir.display(),

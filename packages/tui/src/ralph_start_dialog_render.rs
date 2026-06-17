@@ -55,6 +55,7 @@ pub fn render_dialog(dialog: &mut RalphStartDialog, frame: &mut Frame<'_>, theme
         "Validation",
     );
     render_line(&help_line(), &modal, content, &mut row, frame);
+    render_line(&setup_explanation_line(), &modal, content, &mut row, frame);
     let status = Line::from_spans(vec![Span::styled(
         dialog.status().to_owned(),
         Style::new().fg(Color::BrightBlack).bg(MODAL_BG),
@@ -64,7 +65,7 @@ pub fn render_dialog(dialog: &mut RalphStartDialog, frame: &mut Frame<'_>, theme
 
 fn modal_frame(theme: TuiTheme) -> ModalFrame {
     ModalFrame::new(
-        ModalSizing::new(Size::new(76, 11), Size::new(104, 13), Insets::all(4)),
+        ModalSizing::new(Size::new(76, 12), Size::new(112, 14), Insets::all(4)),
         ModalTheme::dark(theme.accent),
     )
     .title(" Start Ralph loop ")
@@ -142,6 +143,13 @@ fn render_line(
     }
     modal.render_line(Rect::new(content.x, *row, content.width, 1), line, frame);
     *row = row.saturating_add(1);
+}
+
+fn setup_explanation_line() -> Line {
+    Line::from_spans(vec![Span::styled(
+        "Creates docs/worktree/session/validation. After setup: review docs → prepare run → approve/start.",
+        Style::new().fg(Color::BrightBlack).bg(MODAL_BG),
+    )])
 }
 
 fn help_line() -> Line {

@@ -58,7 +58,7 @@ pub async fn run_home<W: Write>(
     terminal: &mut Terminal<&mut W>,
     repo_path: PathBuf,
 ) -> Result<RalphHomeOutcome, TuiError> {
-    let mut surface = open_ralph_home_surface(repo_path).await?;
+    let mut surface = open_ralph_home_surface(repo_path, None).await?;
     let close_outcome =
         crate::plugin_surface_host::run_plugin_surface(terminal, surface.as_mut()).await?;
     Ok(parse_ralph_home_outcome(close_outcome))
@@ -74,8 +74,9 @@ pub async fn run_home_with_input<W: Write>(
     terminal: &mut Terminal<&mut W>,
     input: &mut TuiInput,
     repo_path: PathBuf,
+    flash_message: Option<&str>,
 ) -> Result<RalphHomeOutcome, TuiError> {
-    let mut surface = open_ralph_home_surface(repo_path).await?;
+    let mut surface = open_ralph_home_surface(repo_path, flash_message).await?;
     let close_outcome = crate::plugin_surface_host::run_plugin_surface_with_input(
         terminal,
         input,
@@ -87,8 +88,13 @@ pub async fn run_home_with_input<W: Write>(
 
 async fn open_ralph_home_surface(
     repo_path: PathBuf,
+    flash_message: Option<&str>,
 ) -> Result<bcode_plugin_sdk::tui::BoxedPluginTuiSurface, TuiError> {
     let runtime = load_ralph_tui_runtime()?;
+    let options = flash_message.map_or(
+        serde_json::Value::Null,
+        |message| serde_json::json!({ "flash_message": message }),
+    );
     let surface = crate::plugin_tui::open_plugin_tui_surface(
         &runtime,
         "bcode.ralph",
@@ -97,7 +103,7 @@ async fn open_ralph_home_surface(
             instance_id: "ralph-home".to_string(),
             repo_path: Some(repo_path),
             target: None,
-            options: serde_json::Value::Null,
+            options,
         },
     )
     .await
