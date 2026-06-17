@@ -32,7 +32,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rand::TryRngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{IsTerminal as _, Read as _, Write as _};
@@ -43,6 +43,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing_subscriber::util::SubscriberInitExt as _;
+use zeroize::Zeroizing;
 
 const SESSION_CLI_PAGE_LIMIT: usize = 500;
 
@@ -1416,7 +1417,7 @@ fn auth_login(
             .get("recipient_key")
             .map(String::to_string)
     });
-    let _store = open_auth_store(&vault_path, recipient_key)?;
+    let store = open_auth_store(&vault_path, recipient_key)?;
     let device_seal_policy =
         bcode_provider_auth::security::device_seal_policy_for_auth_profile(auth_profile);
     let api_key = rpassword::prompt_password(format!("{api_key_env}: "))?;
@@ -1430,6 +1431,7 @@ fn auth_login(
         recipient_key: recipient_key_hint.clone(),
     };
     upsert_auth_profile_secrets(
+        &store,
         &target,
         BTreeMap::from([(api_key_env.clone(), api_key)]),
         &[],
@@ -1810,95 +1812,41 @@ fn open_auth_store(
 }
 
 fn upsert_auth_profile_secrets(
+    store: &sshenv_vault::SshenvStore,
     target: &LoginTarget,
     values: BTreeMap<String, String>,
     remove_keys: &[String],
 ) -> Result<(), CliError> {
-    let ciphertext = sshenv_vault::Vault::load_ciphertext(&target.vault_path).map_err(|error| {
-        CliError::BundledPluginInstallFailed(format!("failed to load auth vault: {error}"))
-    })?;
-    let fingerprints: HashSet<String> = ciphertext
-        .recipients
-        .iter()
-        .map(|recipient| recipient.fingerprint.clone())
-        .collect();
-    let private_key_paths = sshenv_vault::identity::discover_private_key_paths();
-    let identities = sshenv_vault::identity::load_identities_for_vault_from_paths(
-        &private_key_paths,
-        &fingerprints,
-    )
-    .map_err(|error| {
-        CliError::BundledPluginInstallFailed(format!(
-            "failed to load auth vault SSH identities: {error}"
-        ))
-    })?;
-    if identities.is_empty() {
-        return Err(CliError::BundledPluginInstallFailed(
-            "failed to unlock auth vault: no local SSH private key matches a vault recipient"
-                .to_string(),
-        ));
-    }
-    let (mut vault, data_key) =
-        sshenv_vault::Vault::unlock_metadata_with_passphrase(ciphertext, &identities, None)
-            .map_err(|error| {
-                CliError::BundledPluginInstallFailed(format!(
-                    "failed to unlock auth vault metadata: {error}"
-                ))
-            })?;
-
-    let mut profile_values = if vault.profiles.get(&target.storage_profile).is_none()
-        && vault
-            .profiles
-            .profile_entries
-            .contains_key(&target.storage_profile)
-    {
-        match vault.unlock_profile_with_passphrase(&target.storage_profile, &data_key, None) {
-            Ok(()) => vault
-                .profiles
-                .get(&target.storage_profile)
-                .cloned()
-                .unwrap_or_default(),
-            Err(error) => {
-                println!(
-                    "Auth vault profile {} could not be unlocked ({error}); resetting it with fresh login credentials.",
-                    target.storage_profile
-                );
-                vault
-                    .profiles
-                    .profile_entries
-                    .remove(&target.storage_profile);
-                vault
-                    .profiles
-                    .profile_policies
-                    .remove(&target.storage_profile);
-                BTreeMap::new()
-            }
+    let mut profile_values = match store.get_profile(&target.storage_profile) {
+        Ok(Some(values)) => values,
+        Ok(None) => BTreeMap::new(),
+        Err(error) => {
+            println!(
+                "Auth vault profile {} could not be unlocked ({error}); resetting it with fresh login credentials.",
+                target.storage_profile
+            );
+            BTreeMap::new()
         }
-    } else {
-        vault
-            .profiles
-            .get(&target.storage_profile)
-            .cloned()
-            .unwrap_or_default()
     };
 
     for key in remove_keys {
         profile_values.remove(key);
     }
-    profile_values.extend(values);
-    vault
-        .profiles
-        .profiles
-        .insert(target.storage_profile.clone(), profile_values);
-    vault.save(&target.vault_path, &data_key).map_err(|error| {
-        CliError::BundledPluginInstallFailed(format!("failed to save auth vault: {error}"))
-    })
+    for (key, value) in values {
+        profile_values.insert(key, Zeroizing::new(value));
+    }
+
+    store
+        .replace_profile(&target.storage_profile, profile_values)
+        .map_err(|error| {
+            CliError::BundledPluginInstallFailed(format!("failed to save auth profile: {error}"))
+        })
 }
 
 /// Generic helper for storing API-key auth for any OpenAI-compatible provider (`OpenAI`, xAI, etc.).
 /// `prefix` is "OPENAI" or "XAI" (used for env-style secret keys stored in the vault).
 fn login_compatible_api_key(
-    _store: &sshenv_vault::SshenvStore,
+    store: &sshenv_vault::SshenvStore,
     target: &LoginTarget,
     api_key: Option<String>,
     base_url: Option<String>,
@@ -1936,7 +1884,7 @@ fn login_compatible_api_key(
         format!("BCODE_{prefix}_CODEX_EXPIRES_AT"),
         format!("BCODE_{prefix}_CODEX_ACCOUNT_ID"),
     ]);
-    upsert_auth_profile_secrets(target, values, &remove_keys)?;
+    upsert_auth_profile_secrets(store, target, values, &remove_keys)?;
     apply_auth_device_seal_policy(
         &target.vault_path,
         &target.storage_profile,
@@ -2010,7 +1958,7 @@ fn login_xai(options: XaiLoginOptions) -> Result<(), CliError> {
 }
 
 async fn login_openai_chatgpt(
-    _store: &sshenv_vault::SshenvStore,
+    store: &sshenv_vault::SshenvStore,
     target: LoginTarget,
     model: Option<String>,
     flow: OpenAiLoginFlow,
@@ -2058,7 +2006,7 @@ async fn login_openai_chatgpt(
         values.insert("BCODE_OPENAI_CODEX_ACCOUNT_ID".to_string(), account_id);
         remove_keys.retain(|key| key != "BCODE_OPENAI_CODEX_ACCOUNT_ID");
     }
-    upsert_auth_profile_secrets(&target, values, &remove_keys)?;
+    upsert_auth_profile_secrets(store, &target, values, &remove_keys)?;
     apply_auth_device_seal_policy(
         &target.vault_path,
         &target.storage_profile,
