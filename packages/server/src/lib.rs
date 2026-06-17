@@ -140,11 +140,9 @@ pub struct ServerState {
     active_skills: Mutex<BTreeMap<SessionId, BTreeSet<SkillId>>>,
     turn_skills: Mutex<BTreeMap<(SessionId, u64), SkillTurnInvocation>>,
     session_runtimes: Mutex<BTreeMap<SessionId, SessionRuntimeHandle>>,
-    active_session_turns: Mutex<BTreeMap<SessionId, ActiveSessionTurn>>,
     runtime_work: RuntimeWorkManager,
     ralph_store: bcode_ralph::RalphStateStore,
     active_ralph_runs: Mutex<BTreeMap<PathBuf, JoinHandle<()>>>,
-    active_turns: Mutex<BTreeMap<SessionId, ActiveModelTurn>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
     session_agent_selections: Mutex<BTreeMap<SessionId, String>>,
     pending_permissions: Mutex<BTreeMap<String, PendingPermission>>,
@@ -368,13 +366,6 @@ impl SessionTurnPermit {
     }
 }
 
-#[derive(Debug, Clone)]
-struct ActiveSessionTurn {
-    client_id: ClientId,
-    turn_id: String,
-    cancel_state: Arc<TurnCancelState>,
-}
-
 #[derive(Debug, Default)]
 struct TurnCancelState {
     cancelled: std::sync::atomic::AtomicBool,
@@ -416,12 +407,22 @@ struct RuntimeCurrentTurn {
 }
 
 impl RuntimeCurrentTurn {
-    fn active_session_turn(&self) -> ActiveSessionTurn {
-        ActiveSessionTurn {
-            client_id: self.client_id,
-            turn_id: self.turn_id.clone(),
-            cancel_state: Arc::clone(&self.cancel_state),
-        }
+    fn plugin_scope_for_model(&self, session_id: SessionId) -> PluginInvocationScope {
+        PluginInvocationScope::session(session_id.to_string())
+            .with_client_id(self.client_id.to_string())
+            .with_turn_id(self.turn_id.clone())
+            .with_work_id(format!("model_{}", self.turn_id))
+    }
+
+    fn plugin_scope_for_tool_call(
+        &self,
+        session_id: SessionId,
+        tool_call_id: &str,
+    ) -> PluginInvocationScope {
+        PluginInvocationScope::session(session_id.to_string())
+            .with_client_id(self.client_id.to_string())
+            .with_turn_id(self.turn_id.clone())
+            .with_work_id(format!("tool_{tool_call_id}"))
     }
 }
 
@@ -687,11 +688,9 @@ impl ServerState {
             active_skills: Mutex::default(),
             turn_skills: Mutex::default(),
             session_runtimes: Mutex::default(),
-            active_session_turns: Mutex::default(),
             runtime_work: RuntimeWorkManager::default(),
             ralph_store: init.ralph_store,
             active_ralph_runs: Mutex::default(),
-            active_turns: Mutex::default(),
             session_model_selections: Mutex::default(),
             session_agent_selections: Mutex::default(),
             pending_permissions: Mutex::default(),
@@ -768,24 +767,12 @@ impl ServerState {
 
     async fn session_has_active_turn(&self, session_id: SessionId) -> bool {
         self.session_current_turn(session_id).await.is_some()
-            || self
-                .active_session_turns
-                .lock()
-                .await
-                .contains_key(&session_id)
-            || self.active_turns.lock().await.contains_key(&session_id)
     }
 
     async fn active_model_turn_snapshot(&self, session_id: SessionId) -> Option<ActiveModelTurn> {
         self.session_current_turn(session_id)
             .await
             .and_then(|turn| turn.model)
-            .or_else(|| {
-                self.active_turns
-                    .try_lock()
-                    .ok()
-                    .and_then(|turns| turns.get(&session_id).cloned())
-            })
     }
 
     async fn active_runtime_turn_count(&self) -> usize {
@@ -803,8 +790,6 @@ impl ServerState {
             }
         }
         count
-            .max(self.active_session_turns.lock().await.len())
-            .max(self.active_turns.lock().await.len())
     }
 
     async fn release_session_resources_if_idle(&self, session_id: SessionId) {
@@ -6178,33 +6163,22 @@ async fn request_session_turn_cancellation(
     session_id: SessionId,
     requested_by: Option<ClientId>,
 ) -> bool {
-    let Some(active_session_turn) = state
-        .session_current_turn(session_id)
-        .await
-        .map(|turn| turn.active_session_turn())
-        .or_else(|| {
-            state
-                .active_session_turns
-                .try_lock()
-                .ok()
-                .and_then(|turns| turns.get(&session_id).cloned())
-        })
-    else {
+    let Some(current_turn) = state.session_current_turn(session_id).await else {
         return false;
     };
 
-    active_session_turn.cancel_state.cancel();
+    current_turn.cancel_state.cancel();
     append_model_turn_cancel_requested_event(
         state,
         session_id,
-        active_session_turn.turn_id.clone(),
+        current_turn.turn_id.clone(),
         requested_by,
     )
     .await;
     cancel_registered_runtime_work(
         state,
         session_id,
-        RuntimeWorkId::new(format!("model_{}", active_session_turn.turn_id)),
+        RuntimeWorkId::new(format!("model_{}", current_turn.turn_id)),
         requested_by,
     )
     .await;
@@ -8001,16 +7975,6 @@ async fn run_model_turn(
         cancel_state: Arc::clone(&cancel_state),
         model: None,
     });
-    state.active_session_turns.lock().await.insert(
-        session_id,
-        command_context
-            .current_turn
-            .lock()
-            .await
-            .as_ref()
-            .expect("current turn was just initialized")
-            .active_session_turn(),
-    );
     append_model_turn_started_event(state, session_id, turn_id.clone()).await;
     *phase.lock().await = SessionRuntimePhase::ProviderActive;
     service_runtime_priority_commands(state, session_id, command_context).await;
@@ -8025,8 +7989,6 @@ async fn run_model_turn(
     .await;
     service_runtime_priority_commands(state, session_id, command_context).await;
     *phase.lock().await = SessionRuntimePhase::FinishingTurn;
-    state.active_session_turns.lock().await.remove(&session_id);
-    state.active_turns.lock().await.remove(&session_id);
     *command_context.current_turn.lock().await = None;
     append_model_turn_finished_event(
         state,
@@ -8316,16 +8278,6 @@ fn provider_error_message(error: &bcode_model::ProviderError) -> String {
     format!("model error {}: {}", error.code, error.message)
 }
 
-fn plugin_scope_for_session_turn(
-    session_id: SessionId,
-    active_turn: &ActiveSessionTurn,
-) -> PluginInvocationScope {
-    PluginInvocationScope::session(session_id.to_string())
-        .with_client_id(active_turn.client_id.to_string())
-        .with_turn_id(active_turn.turn_id.clone())
-        .with_work_id(format!("model_{}", active_turn.turn_id))
-}
-
 async fn active_plugin_scope_for_session(
     state: &ServerState,
     session_id: SessionId,
@@ -8333,20 +8285,9 @@ async fn active_plugin_scope_for_session(
     state
         .session_current_turn(session_id)
         .await
-        .map_or_else(PluginInvocationScope::default, |active_turn| {
-            plugin_scope_for_session_turn(session_id, &active_turn.active_session_turn())
+        .map_or_else(PluginInvocationScope::default, |turn| {
+            turn.plugin_scope_for_model(session_id)
         })
-}
-
-fn plugin_scope_for_tool_call(
-    session_id: SessionId,
-    active_turn: &ActiveSessionTurn,
-    tool_call_id: &str,
-) -> PluginInvocationScope {
-    PluginInvocationScope::session(session_id.to_string())
-        .with_client_id(active_turn.client_id.to_string())
-        .with_turn_id(active_turn.turn_id.clone())
-        .with_work_id(format!("tool_{tool_call_id}"))
 }
 
 async fn active_plugin_scope_for_tool_call(
@@ -8354,12 +8295,12 @@ async fn active_plugin_scope_for_tool_call(
     session_id: SessionId,
     tool_call_id: &str,
 ) -> PluginInvocationScope {
-    state.session_current_turn(session_id).await.map_or_else(
-        PluginInvocationScope::default,
-        |active_turn| {
-            plugin_scope_for_tool_call(session_id, &active_turn.active_session_turn(), tool_call_id)
-        },
-    )
+    state
+        .session_current_turn(session_id)
+        .await
+        .map_or_else(PluginInvocationScope::default, |turn| {
+            turn.plugin_scope_for_tool_call(session_id, tool_call_id)
+        })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -8443,13 +8384,8 @@ async fn run_model_turn_round(
         request_message_count: request.messages.len(),
     };
     if let Some(current_turn) = command_context.current_turn.lock().await.as_mut() {
-        current_turn.model = Some(active_model_turn.clone());
+        current_turn.model = Some(active_model_turn);
     }
-    state
-        .active_turns
-        .lock()
-        .await
-        .insert(session_id, active_model_turn);
 
     append_trace_event(
         state,
@@ -8486,7 +8422,12 @@ async fn run_model_turn_round(
     }
 
     service_runtime_priority_commands(state, session_id, command_context).await;
-    let active_turn = state.active_turns.lock().await.remove(&session_id);
+    let active_turn = command_context
+        .current_turn
+        .lock()
+        .await
+        .as_ref()
+        .and_then(|turn| turn.model.clone());
     if let Some(current_turn) = command_context.current_turn.lock().await.as_mut() {
         current_turn.model = None;
     }
