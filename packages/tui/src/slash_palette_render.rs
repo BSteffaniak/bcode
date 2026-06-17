@@ -6,6 +6,7 @@ use bmux_tui::geometry::{Insets, Rect};
 use bmux_tui::prelude::{Line, Span, Style, Widget};
 use bmux_tui::style::{Color, Modifier};
 
+use super::render::TuiTheme;
 use super::slash_palette::{SlashItem, SlashPalette};
 
 const POPUP_MAX_HEIGHT: u16 = 8;
@@ -13,7 +14,12 @@ const POPUP_MAX_WIDTH: u16 = 88;
 const POPUP_SIDE_MARGIN: u16 = 2;
 
 /// Render slash completions above the composer.
-pub fn render_palette(palette: &SlashPalette, composer_content_area: Rect, frame: &mut Frame<'_>) {
+pub fn render_palette(
+    palette: &SlashPalette,
+    composer_content_area: Rect,
+    frame: &mut Frame<'_>,
+    theme: TuiTheme,
+) {
     let frame_area = frame.area();
     let composer = composer_panel_area(composer_content_area);
     let Some(area) = slash_palette_area(frame_area, composer, palette.item_count()) else {
@@ -22,7 +28,7 @@ pub fn render_palette(palette: &SlashPalette, composer_content_area: Rect, frame
 
     frame.fill(area, " ", Style::new());
     let panel = Panel::new()
-        .border(Border::single().style(Style::new().fg(Color::Cyan)))
+        .border(Border::single().style(Style::new().fg(theme.accent)))
         .title(" Slash Commands  tab/enter accept · ↑/↓ select · esc hide ")
         .padding(Insets::new(0, 1, 0, 1));
     panel.render(area, frame);
@@ -39,7 +45,7 @@ pub fn render_palette(palette: &SlashPalette, composer_content_area: Rect, frame
         let selected = item.source_index == palette.selected_index();
         frame.write_line(
             Rect::new(inner.x, y, inner.width, 1),
-            &slash_item_line(item.item, selected, inner.width),
+            &slash_item_line(item.item, selected, inner.width, theme),
         );
     }
 }
@@ -99,7 +105,7 @@ pub const fn composer_panel_area(content_area: Rect) -> Rect {
     )
 }
 
-fn slash_item_line(item: &SlashItem, selected: bool, width: u16) -> Line {
+fn slash_item_line(item: &SlashItem, selected: bool, width: u16, theme: TuiTheme) -> Line {
     let base = if selected {
         Style::new()
             .fg(Color::White)
@@ -110,7 +116,7 @@ fn slash_item_line(item: &SlashItem, selected: bool, width: u16) -> Line {
     };
     let badge_style = Style::new()
         .fg(Color::Black)
-        .bg(Color::Cyan)
+        .bg(theme.accent)
         .add_modifier(Modifier::BOLD);
     let available = usize::from(width.saturating_sub(15));
     Line::from_spans(vec![

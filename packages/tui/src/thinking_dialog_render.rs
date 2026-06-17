@@ -6,6 +6,7 @@ use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
 
+use super::render::TuiTheme;
 use super::thinking_dialog::ThinkingDialogState;
 
 const MODAL_BG: Color = Color::Black;
@@ -16,12 +17,12 @@ const MIN_DIALOG_HEIGHT: u16 = 15;
 const MAX_DIALOG_HEIGHT: u16 = 22;
 
 /// Render a thinking settings dialog.
-pub fn render_thinking_dialog(state: &ThinkingDialogState, frame: &mut Frame<'_>) {
-    let modal = modal_frame();
+pub fn render_thinking_dialog(state: &ThinkingDialogState, frame: &mut Frame<'_>, theme: TuiTheme) {
+    let modal = modal_frame(theme);
     modal.render(frame.area(), frame);
 
     let content = modal.content_area(frame.area());
-    let rows = rows(state);
+    let rows = rows(state, theme);
     for (row_index, line) in rows.iter().take(usize::from(content.height)).enumerate() {
         let Ok(row_offset) = u16::try_from(row_index) else {
             return;
@@ -39,21 +40,21 @@ pub fn render_thinking_dialog(state: &ThinkingDialogState, frame: &mut Frame<'_>
     }
 }
 
-fn modal_frame() -> ModalFrame {
+fn modal_frame(theme: TuiTheme) -> ModalFrame {
     ModalFrame::new(
         ModalSizing::new(
             Size::new(MIN_DIALOG_WIDTH, MIN_DIALOG_HEIGHT),
             Size::new(MAX_DIALOG_WIDTH, MAX_DIALOG_HEIGHT),
             Insets::all(4),
         ),
-        ModalTheme::dark(Color::Cyan),
+        ModalTheme::dark(theme.accent),
     )
     .title(" Thinking settings ")
     .padding(Insets::new(1, 2, 1, 2))
     .placement(ModalPlacement::UpperThird)
 }
 
-fn rows(state: &ThinkingDialogState) -> Vec<Line> {
+fn rows(state: &ThinkingDialogState, theme: TuiTheme) -> Vec<Line> {
     let mut rows = Vec::new();
     rows.push(Line::from_spans(vec![Span::styled(
         "Control what reasoning is requested and whether provider-visible reasoning is shown.",
@@ -65,6 +66,7 @@ fn rows(state: &ThinkingDialogState) -> Vec<Line> {
         "Display reasoning",
         if state.visible() { "shown" } else { "hidden" },
         Some("local TUI display only"),
+        theme,
     ));
     rows.push(setting_row(
         state.focused_row() == 1,
@@ -74,6 +76,7 @@ fn rows(state: &ThinkingDialogState) -> Vec<Line> {
             state.effort_values(),
             state.effort_values_source(),
         )),
+        theme,
     ));
     rows.push(setting_row(
         state.focused_row() == 2,
@@ -83,6 +86,7 @@ fn rows(state: &ThinkingDialogState) -> Vec<Line> {
             state.summary_values(),
             state.summary_values_source(),
         )),
+        theme,
     ));
     rows.push(modal_blank_line());
     rows.push(Line::from_spans(vec![
@@ -105,7 +109,7 @@ fn rows(state: &ThinkingDialogState) -> Vec<Line> {
         Span::styled(
             "↑/↓",
             Style::new()
-                .fg(Color::Cyan)
+                .fg(theme.accent)
                 .bg(MODAL_BG)
                 .add_modifier(Modifier::BOLD),
         ),
@@ -113,7 +117,7 @@ fn rows(state: &ThinkingDialogState) -> Vec<Line> {
         Span::styled(
             "Space",
             Style::new()
-                .fg(Color::Cyan)
+                .fg(theme.accent)
                 .bg(MODAL_BG)
                 .add_modifier(Modifier::BOLD),
         ),
@@ -126,11 +130,17 @@ fn modal_blank_line() -> Line {
     Line::from_spans(vec![Span::styled("", Style::new().bg(MODAL_BG))])
 }
 
-fn setting_row(focused: bool, label: &str, value: &str, help: Option<&str>) -> Line {
+fn setting_row(
+    focused: bool,
+    label: &str,
+    value: &str,
+    help: Option<&str>,
+    theme: TuiTheme,
+) -> Line {
     let marker = if focused { "›" } else { " " };
     let marker_style = if focused {
         Style::new()
-            .fg(Color::Cyan)
+            .fg(theme.accent)
             .bg(MODAL_BG)
             .add_modifier(Modifier::BOLD)
     } else {
@@ -143,7 +153,7 @@ fn setting_row(focused: bool, label: &str, value: &str, help: Option<&str>) -> L
             format!("{label}: "),
             Style::new().fg(Color::BrightBlack).bg(MODAL_BG),
         ),
-        Span::styled(value.to_owned(), Style::new().fg(Color::Cyan).bg(MODAL_BG)),
+        Span::styled(value.to_owned(), Style::new().fg(theme.accent).bg(MODAL_BG)),
     ];
     if let Some(help) = help {
         spans.push(Span::styled("  ", Style::new().bg(MODAL_BG)));

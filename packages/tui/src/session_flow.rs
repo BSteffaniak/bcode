@@ -489,9 +489,10 @@ const fn catalog_still_loading(status: &SessionCatalogStatus) -> bool {
 fn draw_session_picker<W: Write>(
     terminal: &mut Terminal<&mut W>,
     picker: &mut session_picker::SessionPickerApp,
+    theme: super::render::TuiTheme,
 ) -> Result<(), TuiError> {
     terminal.resize(helpers::terminal_area()?);
-    terminal.draw(|frame| session_picker_render::render_picker(picker, frame))?;
+    terminal.draw(|frame| session_picker_render::render_picker(picker, frame, theme))?;
     Ok(())
 }
 
@@ -499,6 +500,7 @@ async fn import_selected_session<W: Write>(
     terminal: &mut Terminal<&mut W>,
     client: &BcodeClient,
     picker: &mut session_picker::SessionPickerApp,
+    theme: super::render::TuiTheme,
 ) -> Result<Option<SessionId>, TuiError> {
     let selected_import = picker
         .selected_import()
@@ -507,7 +509,7 @@ async fn import_selected_session<W: Write>(
     if let Some(import) = selected_import {
         picker.set_status(format!("Importing [{}] session...", import.source_id));
         terminal.draw(|frame| {
-            session_picker_render::render_picker(picker, frame);
+            session_picker_render::render_picker(picker, frame, theme);
         })?;
         match client
             .import_external_session(import.source_id.clone(), import.external_session_id)
@@ -535,7 +537,7 @@ async fn import_selected_session<W: Write>(
     } else if let Some(session_id) = picker.selected_session_id() {
         picker.set_status("Opening session…".to_owned());
         terminal.draw(|frame| {
-            session_picker_render::render_picker(picker, frame);
+            session_picker_render::render_picker(picker, frame, theme);
         })?;
         Ok(Some(session_id))
     } else {
@@ -563,15 +565,15 @@ pub async fn pick_session<W: Write>(
     picker.set_loading_status(
         "Loading sessions: connecting to catalog; press Ctrl-N to create one".to_owned(),
     );
-    draw_session_picker(io.terminal, &mut picker)?;
+    draw_session_picker(io.terminal, &mut picker, services.theme)?;
     let mut watcher = services.client.watch_session_catalog().await?;
     picker.set_loading_status(
         "Loading sessions: discovering sources; press Ctrl-N to create one".to_owned(),
     );
-    draw_session_picker(io.terminal, &mut picker)?;
+    draw_session_picker(io.terminal, &mut picker, services.theme)?;
     apply_session_list(&mut picker, watcher.initial_snapshot().await?);
     loop {
-        draw_session_picker(io.terminal, &mut picker)?;
+        draw_session_picker(io.terminal, &mut picker, services.theme)?;
         let event = tokio::select! {
             snapshot = watcher.next_snapshot() => {
                 apply_session_list(&mut picker, snapshot?);
@@ -602,8 +604,13 @@ pub async fn pick_session<W: Write>(
                     delete_picker_session(services.client, &mut picker).await?;
                 }
                 PickerKeyOutcome::Selected => {
-                    if let Some(session_id) =
-                        import_selected_session(io.terminal, services.client, &mut picker).await?
+                    if let Some(session_id) = import_selected_session(
+                        io.terminal,
+                        services.client,
+                        &mut picker,
+                        services.theme,
+                    )
+                    .await?
                     {
                         return Ok(PickSessionOutcome::Existing(session_id));
                     }
@@ -615,8 +622,13 @@ pub async fn pick_session<W: Write>(
             Event::Mouse(mouse) => {
                 if let Some(row) = picker_row_from_mouse(mouse)
                     && picker.select_visible(row)
-                    && let Some(session_id) =
-                        import_selected_session(io.terminal, services.client, &mut picker).await?
+                    && let Some(session_id) = import_selected_session(
+                        io.terminal,
+                        services.client,
+                        &mut picker,
+                        services.theme,
+                    )
+                    .await?
                 {
                     return Ok(PickSessionOutcome::Existing(session_id));
                 }
@@ -634,10 +646,10 @@ pub async fn pick_session_for_mutation<W: Write>(
 ) -> Result<(), TuiError> {
     let mut picker = session_picker::SessionPickerApp::new(Vec::new());
     picker.set_loading_status("Loading sessions: connecting to catalog".to_owned());
-    draw_session_picker(io.terminal, &mut picker)?;
+    draw_session_picker(io.terminal, &mut picker, services.theme)?;
     let mut watcher = services.client.watch_session_catalog().await?;
     picker.set_loading_status("Loading sessions: discovering sources".to_owned());
-    draw_session_picker(io.terminal, &mut picker)?;
+    draw_session_picker(io.terminal, &mut picker, services.theme)?;
     apply_session_list(&mut picker, watcher.initial_snapshot().await?);
     let mut pending_start_mode = Some(start_mode);
     loop {
@@ -651,7 +663,7 @@ pub async fn pick_session_for_mutation<W: Write>(
                 }
             }
         }
-        draw_session_picker(io.terminal, &mut picker)?;
+        draw_session_picker(io.terminal, &mut picker, services.theme)?;
         let event = tokio::select! {
             snapshot = watcher.next_snapshot() => {
                 apply_session_list(&mut picker, snapshot?);

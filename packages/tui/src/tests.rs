@@ -1237,7 +1237,12 @@ fn slash_palette_renders_above_composer() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
     let mut frame = Frame::new(&mut buffer);
 
-    slash_palette_render::render_palette(&palette, Rect::new(2, 18, 76, 1), &mut frame);
+    slash_palette_render::render_palette(
+        &palette,
+        Rect::new(2, 18, 76, 1),
+        &mut frame,
+        render::TuiTheme::for_agent("build", None),
+    );
     let output = rendered_text(&buffer);
 
     assert!(output.contains("Slash Commands"));

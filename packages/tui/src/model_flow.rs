@@ -128,8 +128,9 @@ pub async fn pick_model_for_session<W: Write>(
     let mut picker = model_picker::ModelPickerApp::new_with_status(models, status);
     loop {
         io.terminal.resize(helpers::terminal_area()?);
-        io.terminal
-            .draw(|frame| model_picker_render::render_model_picker(&mut picker, frame))?;
+        io.terminal.draw(|frame| {
+            model_picker_render::render_model_picker(&mut picker, frame, services.theme);
+        })?;
         let Some(event) = io.input.recv().await? else {
             continue;
         };
@@ -202,8 +203,9 @@ async fn pick_model_provider<W: Write>(
     let mut picker = provider_picker::ProviderPickerApp::new(providers);
     loop {
         io.terminal.resize(helpers::terminal_area()?);
-        io.terminal
-            .draw(|frame| provider_picker_render::render_provider_picker(&mut picker, frame))?;
+        io.terminal.draw(|frame| {
+            provider_picker_render::render_provider_picker(&mut picker, frame, services.theme);
+        })?;
         let Some(event) = io.input.recv().await? else {
             continue;
         };

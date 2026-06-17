@@ -57,8 +57,9 @@ async fn create_with_dialog<W: Write>(
     );
     loop {
         io.terminal.resize(helpers::terminal_area()?);
-        io.terminal
-            .draw(|frame| worktree_create_dialog_render::render_dialog(&mut dialog, frame))?;
+        io.terminal.draw(|frame| {
+            worktree_create_dialog_render::render_dialog(&mut dialog, frame, services.theme);
+        })?;
         let Some(event) = io.input.recv().await? else {
             continue;
         };
@@ -228,8 +229,9 @@ pub async fn attach_current_session<W: Write>(
     let mut picker = worktree_picker::WorktreePickerApp::new(response.worktrees);
     loop {
         io.terminal.resize(helpers::terminal_area()?);
-        io.terminal
-            .draw(|frame| worktree_picker_render::render_picker(&mut picker, frame))?;
+        io.terminal.draw(|frame| {
+            worktree_picker_render::render_picker(&mut picker, frame, services.theme);
+        })?;
         let Some(event) = io.input.recv().await? else {
             continue;
         };
@@ -295,8 +297,9 @@ pub async fn remove_worktree<W: Write>(
     );
     loop {
         io.terminal.resize(helpers::terminal_area()?);
-        io.terminal
-            .draw(|frame| worktree_picker_render::render_picker(&mut picker, frame))?;
+        io.terminal.draw(|frame| {
+            worktree_picker_render::render_picker(&mut picker, frame, services.theme);
+        })?;
         let Some(event) = io.input.recv().await? else {
             continue;
         };

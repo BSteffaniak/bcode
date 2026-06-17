@@ -7,10 +7,11 @@ use bmux_tui::style::{Color, Modifier};
 use super::picker_render::{
     picker_list_area, render_picker_chrome, render_picker_list, render_picker_status,
 };
+use super::render::TuiTheme;
 use super::session_picker::{SessionPickerApp, SessionPickerMode};
 
 /// Render the session picker.
-pub fn render_picker(app: &mut SessionPickerApp, frame: &mut Frame<'_>) {
+pub fn render_picker(app: &mut SessionPickerApp, frame: &mut Frame<'_>, theme: TuiTheme) {
     let mode = app.mode();
     let Some((inner, list_y)) = render_picker_chrome(
         " Sessions ",
@@ -18,6 +19,7 @@ pub fn render_picker(app: &mut SessionPickerApp, frame: &mut Frame<'_>) {
         app.active_input_mut(),
         input_placeholder(mode),
         frame,
+        theme,
     ) else {
         return;
     };

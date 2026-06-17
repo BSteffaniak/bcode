@@ -125,7 +125,11 @@ pub async fn run_with_client<W: Write>(
                     super::invalidation::UiInvalidation::Layout
                 };
                 let mut context = ChatEventContext {
-                    services: TuiServices { client, keymap },
+                    services: TuiServices {
+                        client,
+                        keymap,
+                        theme: render::TuiTheme::for_app(&chat.app),
+                    },
                     terminal,
                     terminal_events,
                     mouse_scroll_rows,
@@ -179,6 +183,7 @@ fn draw_chat_frame<W: Write>(
     modals: &mut ModalState,
 ) -> Result<(), TuiError> {
     let layout = render::prepare_frame(&mut chat.app, terminal.area());
+    let theme = render::TuiTheme::for_app(&chat.app);
     terminal.draw(|frame| {
         if let Some(layout) = layout {
             render::render_prepared(&mut chat.app, frame, layout);
@@ -188,16 +193,17 @@ fn draw_chat_frame<W: Write>(
                 slash_palette,
                 chat.app.composer_content_area(),
                 frame,
+                theme,
             );
         }
         if let Some(palette) = &mut modals.palette {
-            command_palette_render::render_palette(palette, frame);
+            command_palette_render::render_palette(palette, frame, theme);
         }
         if let Some(dialog) = &modals.permission_dialog {
             permission_dialog_render::render_permission_dialog(dialog, frame);
         }
         if let Some(dialog) = &modals.thinking_dialog {
-            thinking_dialog_render::render_thinking_dialog(dialog, frame);
+            thinking_dialog_render::render_thinking_dialog(dialog, frame, theme);
         }
     })?;
     Ok(())

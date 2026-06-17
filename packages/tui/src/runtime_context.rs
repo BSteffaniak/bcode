@@ -10,6 +10,7 @@ use bcode_client::BcodeClient;
 use bmux_tui::terminal::Terminal;
 
 use super::keymap::BmuxKeyMap;
+use super::render::TuiTheme;
 use super::terminal_events::TuiInput;
 
 /// Mutable terminal I/O resources shared by TUI flows.
@@ -23,4 +24,5 @@ pub struct TuiIo<'a, 'b, W: Write> {
 pub struct TuiServices<'a> {
     pub client: &'a BcodeClient,
     pub keymap: &'a BmuxKeyMap,
+    pub theme: TuiTheme,
 }

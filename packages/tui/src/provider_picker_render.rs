@@ -6,9 +6,10 @@ use bmux_tui::style::Modifier;
 
 use super::picker_render::{picker_list_area, render_picker_chrome, render_picker_list};
 use super::provider_picker::ProviderPickerApp;
+use super::render::TuiTheme;
 
 /// Render the provider picker.
-pub fn render_provider_picker(app: &mut ProviderPickerApp, frame: &mut Frame<'_>) {
+pub fn render_provider_picker(app: &mut ProviderPickerApp, frame: &mut Frame<'_>, theme: TuiTheme) {
     let Some((inner, list_y)) = render_picker_chrome(
         " Providers ",
         &Line::from_spans(vec![
@@ -21,6 +22,7 @@ pub fn render_provider_picker(app: &mut ProviderPickerApp, frame: &mut Frame<'_>
         app.filter_mut(),
         "Filter providers",
         frame,
+        theme,
     ) else {
         return;
     };

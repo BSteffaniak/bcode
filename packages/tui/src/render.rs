@@ -51,12 +51,18 @@ const MAX_INLINE_STDERR_ROWS: usize = 24;
 const MAX_INLINE_TOOL_TEXT_ROWS: usize = 28;
 const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(420);
 #[derive(Debug, Clone, Copy)]
-struct RenderTheme {
-    accent: Color,
+pub struct TuiTheme {
+    pub accent: Color,
 }
 
-impl RenderTheme {
-    fn for_agent(agent_id: &str, configured_accent: Option<&str>) -> Self {
+impl TuiTheme {
+    #[must_use]
+    pub fn for_app(app: &BmuxApp) -> Self {
+        Self::for_agent(app.current_agent_id(), app.current_agent_accent())
+    }
+
+    #[must_use]
+    pub fn for_agent(agent_id: &str, configured_accent: Option<&str>) -> Self {
         Self {
             accent: configured_accent
                 .and_then(parse_agent_accent_color)
@@ -147,7 +153,7 @@ pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>, layout: FrameLa
         return;
     }
 
-    let theme = RenderTheme::for_agent(app.current_agent_id(), app.current_agent_accent());
+    let theme = TuiTheme::for_app(app);
     render_header(app, layout.header, frame, theme);
     render_composer(app, layout.composer, frame, theme);
     render_body(app, layout.body, frame);
@@ -201,7 +207,7 @@ fn frame_layout(app: &BmuxApp, area: Rect) -> Option<FrameLayout> {
         latest_bar,
         status,
         composer,
-        composer_content: composer_panel(Color::Cyan).inner_area(composer),
+        composer_content: composer_panel(TuiTheme::for_app(app).accent).inner_area(composer),
     })
 }
 
@@ -451,7 +457,7 @@ fn composer_panel(accent: Color) -> Panel {
         .padding(Insets::new(0, 1, 0, 1))
 }
 
-fn render_header(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: RenderTheme) {
+fn render_header(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: TuiTheme) {
     if area.is_empty() {
         return;
     }
@@ -460,7 +466,7 @@ fn render_header(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: Render
     frame.write_line(area, &line);
 }
 
-fn header_spans(app: &BmuxApp, width: usize, theme: RenderTheme) -> Vec<Span> {
+fn header_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
     let muted = Style::new().fg(Color::BrightBlack);
     let accent = Style::new().fg(theme.accent);
     let session_title = app
@@ -2909,7 +2915,7 @@ fn pending_label(state: PendingSubmissionState) -> String {
     }
 }
 
-fn render_status(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: RenderTheme) {
+fn render_status(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: TuiTheme) {
     if area.is_empty() {
         return;
     }
@@ -3076,7 +3082,7 @@ impl ChromeLine {
     }
 }
 
-fn statusline_spans(app: &BmuxApp, width: usize, theme: RenderTheme) -> Vec<Span> {
+fn statusline_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
     let muted = Style::new().fg(Color::BrightBlack);
     let mut line = ChromeLine::new(" · ", muted).required(
         activity_label(app.activity()),
@@ -3238,7 +3244,7 @@ fn spinner_frame() -> &'static str {
     SPINNER_FRAMES[index]
 }
 
-fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: RenderTheme) {
+fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: TuiTheme) {
     if area.is_empty() {
         return;
     }

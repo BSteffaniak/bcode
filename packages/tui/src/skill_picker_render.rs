@@ -9,11 +9,12 @@ use bmux_tui::style::{Color, Modifier};
 use super::picker_render::{
     picker_base_style, picker_list_area, render_picker_chrome, render_picker_list,
 };
+use super::render::TuiTheme;
 use super::skill_picker::{SkillPickerApp, SkillPickerMode};
 use super::text_input_flow;
 
 /// Render the skill picker.
-pub fn render_skill_picker(app: &mut SkillPickerApp, frame: &mut Frame<'_>) {
+pub fn render_skill_picker(app: &mut SkillPickerApp, frame: &mut Frame<'_>, theme: TuiTheme) {
     let Some((inner, list_y)) = render_picker_chrome(
         " Skills ",
         &Line::from_spans(vec![
@@ -23,6 +24,7 @@ pub fn render_skill_picker(app: &mut SkillPickerApp, frame: &mut Frame<'_>) {
         app.filter_mut(),
         "Filter skills",
         frame,
+        theme,
     ) else {
         return;
     };

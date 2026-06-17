@@ -435,8 +435,9 @@ pub async fn start_loop<W: Write>(
         ralph_start_dialog::RalphStartDialog::new(&default_name, &default_validation_commands);
     loop {
         io.terminal.resize(helpers::terminal_area()?);
-        io.terminal
-            .draw(|frame| ralph_start_dialog_render::render_dialog(&mut dialog, frame))?;
+        io.terminal.draw(|frame| {
+            ralph_start_dialog_render::render_dialog(&mut dialog, frame, services.theme);
+        })?;
         let Some(event) = io.input.recv().await? else {
             continue;
         };

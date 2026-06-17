@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 
 use super::app::BmuxApp;
 use super::keymap::BmuxKeyMap;
+use super::render::TuiTheme;
 use super::runtime_context::{TuiIo, TuiServices};
 use super::startup_action::StartupTuiAction;
 use super::terminal_events::TuiInput;
@@ -116,6 +117,7 @@ pub async fn run_event_loop_with_startup<W: Write>(
         let services = TuiServices {
             client: &client,
             keymap: &keymap,
+            theme: TuiTheme::for_app(&chat.app),
         };
         ralph_flow::open_home(&mut io, &services, &mut chat).await?;
     }

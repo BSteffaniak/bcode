@@ -9,6 +9,7 @@ use bmux_tui::prelude::{Line, Span, StatefulWidget, Style, Widget};
 use bmux_tui::style::{Color, Modifier};
 use bmux_tui_components::text_input::TextInputState;
 
+use super::render::TuiTheme;
 use super::text_input_flow;
 
 const PICKER_BG: Color = Color::Black;
@@ -29,13 +30,14 @@ pub fn render_picker_chrome(
     input: &mut TextInputState,
     placeholder: &'static str,
     frame: &mut Frame<'_>,
+    theme: TuiTheme,
 ) -> Option<(Rect, u16)> {
     let area = frame.area();
     if area.is_empty() {
         return None;
     }
 
-    let inner = render_picker_panel(title, area, frame);
+    let inner = render_picker_panel(title, area, frame, theme);
     frame.write_line_with_fallback_style(
         Rect::new(inner.x, inner.y, inner.width, 1),
         header,
@@ -70,9 +72,14 @@ pub fn picker_list_area(inner: Rect, list_y: u16, bottom_y: u16) -> Option<Rect>
 }
 
 /// Render a standard picker panel and return its inner area.
-pub fn render_picker_panel(title: &'static str, area: Rect, frame: &mut Frame<'_>) -> Rect {
+pub fn render_picker_panel(
+    title: &'static str,
+    area: Rect,
+    frame: &mut Frame<'_>,
+    theme: TuiTheme,
+) -> Rect {
     let panel = Panel::new()
-        .border(Border::single().style(Style::new().fg(Color::Cyan).bg(PICKER_BG)))
+        .border(Border::single().style(Style::new().fg(theme.accent).bg(PICKER_BG)))
         .title(title)
         .padding(Insets::new(1, 1, 1, 1))
         .background(picker_style());

@@ -8,12 +8,13 @@ use bmux_tui::style::{Color, Modifier};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
 
 use super::ralph_start_dialog::{RalphStartDialog, RalphStartDialogField};
+use super::render::TuiTheme;
 
 const MODAL_BG: Color = Color::Black;
 
 /// Render the Ralph loop start dialog.
-pub fn render_dialog(dialog: &mut RalphStartDialog, frame: &mut Frame<'_>) {
-    let modal = modal_frame();
+pub fn render_dialog(dialog: &mut RalphStartDialog, frame: &mut Frame<'_>, theme: TuiTheme) {
+    let modal = modal_frame(theme);
     modal.render(frame.area(), frame);
     let content = modal.content_area(frame.area());
     let mut row = content.y;
@@ -61,10 +62,10 @@ pub fn render_dialog(dialog: &mut RalphStartDialog, frame: &mut Frame<'_>) {
     render_line(&status, &modal, content, &mut row, frame);
 }
 
-fn modal_frame() -> ModalFrame {
+fn modal_frame(theme: TuiTheme) -> ModalFrame {
     ModalFrame::new(
         ModalSizing::new(Size::new(76, 11), Size::new(104, 13), Insets::all(4)),
-        ModalTheme::dark(Color::Cyan),
+        ModalTheme::dark(theme.accent),
     )
     .title(" Start Ralph loop ")
     .padding(Insets::new(1, 2, 1, 2))

@@ -33,8 +33,9 @@ pub async fn pick_skill_for_session<W: Write>(
     let mut picker = skill_picker::SkillPickerApp::new(skills.skills);
     loop {
         io.terminal.resize(helpers::terminal_area()?);
-        io.terminal
-            .draw(|frame| skill_picker_render::render_skill_picker(&mut picker, frame))?;
+        io.terminal.draw(|frame| {
+            skill_picker_render::render_skill_picker(&mut picker, frame, services.theme);
+        })?;
         let Some(event) = io.input.recv().await? else {
             continue;
         };

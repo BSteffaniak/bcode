@@ -38,7 +38,7 @@ pub async fn fork_current_session<W: Write>(
         session_fork_dialog::SessionForkDialogMode::Fork,
         &format!("[fork] {source_title}"),
     );
-    let submission = run_dialog(io, &mut dialog).await?;
+    let submission = run_dialog(io, &mut dialog, services.theme).await?;
     let Some(prompt) = select_prompt_for_fork(io, services, session_id).await? else {
         chat.app.set_status("fork canceled".to_owned());
         return Ok(());
@@ -93,7 +93,7 @@ async fn select_prompt_for_fork<W: Write>(
     loop {
         io.terminal.resize(helpers::terminal_area()?);
         io.terminal
-            .draw(|frame| render_prompt_picker(frame, &prompts, selected))?;
+            .draw(|frame| render_prompt_picker(frame, &prompts, selected, services.theme))?;
         let Some(event) = io.input.recv().await? else {
             continue;
         };
@@ -147,8 +147,13 @@ fn user_prompt_candidate_from_event(event: &SessionEvent) -> Option<ForkPromptCa
     })
 }
 
-fn render_prompt_picker(frame: &mut Frame<'_>, prompts: &[ForkPromptCandidate], selected: usize) {
-    let modal = prompt_picker_modal();
+fn render_prompt_picker(
+    frame: &mut Frame<'_>,
+    prompts: &[ForkPromptCandidate],
+    selected: usize,
+    theme: super::render::TuiTheme,
+) {
+    let modal = prompt_picker_modal(theme);
     modal.render(frame.area(), frame);
     let content = modal.content_area(frame.area());
     let mut row = content.y;
@@ -168,10 +173,10 @@ fn render_prompt_picker(frame: &mut Frame<'_>, prompts: &[ForkPromptCandidate], 
     render_picker_help(frame, &modal, content, &mut row);
 }
 
-fn prompt_picker_modal() -> ModalFrame {
+fn prompt_picker_modal(theme: super::render::TuiTheme) -> ModalFrame {
     ModalFrame::new(
         ModalSizing::new(Size::new(72, 12), Size::new(96, 18), Insets::all(4)),
-        ModalTheme::dark(Color::Cyan),
+        ModalTheme::dark(theme.accent),
     )
     .title(" Select fork prompt ")
     .padding(Insets::new(1, 2, 1, 2))
@@ -274,7 +279,7 @@ pub async fn clone_current_session<W: Write>(
         session_fork_dialog::SessionForkDialogMode::Clone,
         &format!("[clone] {source_title}"),
     );
-    let submission = run_dialog(io, &mut dialog).await?;
+    let submission = run_dialog(io, &mut dialog, services.theme).await?;
     if !submission.install_draft {
         chat.app.replace_composer_with("");
     }
@@ -298,11 +303,12 @@ pub async fn clone_current_session<W: Write>(
 async fn run_dialog<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     dialog: &mut session_fork_dialog::SessionForkDialog,
+    theme: super::render::TuiTheme,
 ) -> Result<session_fork_dialog::SessionForkDialogSubmission, TuiError> {
     loop {
         io.terminal.resize(helpers::terminal_area()?);
         io.terminal
-            .draw(|frame| session_fork_dialog_render::render_dialog(dialog, frame))?;
+            .draw(|frame| session_fork_dialog_render::render_dialog(dialog, frame, theme))?;
         let Some(event) = io.input.recv().await? else {
             continue;
         };
