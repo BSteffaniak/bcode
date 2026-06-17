@@ -32,6 +32,7 @@ pub fn tui_registry() -> PluginTuiRegistry {
 const RALPH_ACTIONS: &[RalphAction] = &[
     RalphAction::new("Plan/setup loop", RalphActionKind::Plan),
     RalphAction::new("Save setup draft", RalphActionKind::SaveDraft),
+    RalphAction::new("View setup draft", RalphActionKind::ViewDraft),
     RalphAction::new("Approve setup draft", RalphActionKind::ApproveDraft),
     RalphAction::new("Create loop from draft", RalphActionKind::CreateFromDraft),
     RalphAction::new("Quick create loop", RalphActionKind::Start),
@@ -57,6 +58,7 @@ fn action_for_kind(kind: RalphActionKind) -> Option<&'static RalphAction> {
 enum RalphActionKind {
     Plan,
     SaveDraft,
+    ViewDraft,
     ApproveDraft,
     CreateFromDraft,
     Start,
@@ -78,6 +80,7 @@ impl RalphActionKind {
         match self {
             Self::Plan => "plan",
             Self::SaveDraft => "save-draft",
+            Self::ViewDraft => "view-draft",
             Self::ApproveDraft => "approve-draft",
             Self::CreateFromDraft => "create-from-draft",
             Self::Start => "start",
@@ -103,6 +106,7 @@ impl RalphActionKind {
             Self::SaveDraft => {
                 "capture latest assistant charter/progress draft for review/approval"
             }
+            Self::ViewDraft => "show saved setup draft paths and content previews",
             Self::ApproveDraft => "approve saved charter/progress as ready for loop creation",
             Self::CreateFromDraft => "create loop files/worktree from the approved setup draft",
             Self::Start => {
@@ -296,6 +300,7 @@ impl RalphHomeSurface {
             &[
                 RalphActionKind::Plan,
                 RalphActionKind::SaveDraft,
+                RalphActionKind::ViewDraft,
                 RalphActionKind::ApproveDraft,
                 RalphActionKind::CreateFromDraft,
                 RalphActionKind::Status,
@@ -387,6 +392,17 @@ impl RalphHomeSurface {
             format!("  Draft: {}", draft.draft_id),
             format!("  Status: {}", draft.status),
             format!("  Proposed loop: {}", draft.loop_name),
+            format!(
+                "  Branch: {}",
+                draft.branch.as_deref().unwrap_or("<default>")
+            ),
+            format!(
+                "  Worktree: {}",
+                draft
+                    .work_area_path
+                    .as_ref()
+                    .map_or_else(|| "<default>".to_owned(), |path| path.display().to_string())
+            ),
             format!(
                 "  Ready: charter={} progress={} approved={}",
                 readiness.has_charter, readiness.has_progress, readiness.approved

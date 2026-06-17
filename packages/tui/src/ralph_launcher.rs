@@ -19,6 +19,9 @@ pub enum RalphHomeAction {
     /// Save latest assistant planning output into the setup draft.
     #[serde(alias = "save-draft")]
     SaveDraft,
+    /// View saved setup draft contents.
+    #[serde(alias = "view-draft")]
+    ViewDraft,
     /// Approve the saved setup draft.
     #[serde(alias = "approve-draft")]
     ApproveDraft,

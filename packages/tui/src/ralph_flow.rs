@@ -72,6 +72,9 @@ fn flash_message_for_action(action: super::ralph_launcher::RalphHomeAction) -> S
         super::ralph_launcher::RalphHomeAction::SaveDraft => {
             "Setup draft saved. Next: review it, then approve setup draft.".to_owned()
         }
+        super::ralph_launcher::RalphHomeAction::ViewDraft => {
+            "Setup draft shown. Next: approve it or ask Ralph to revise it.".to_owned()
+        }
         super::ralph_launcher::RalphHomeAction::ApproveDraft => {
             "Setup draft approved. Next: create the loop from the approved draft.".to_owned()
         }
@@ -117,6 +120,57 @@ fn flash_message_for_action(action: super::ralph_launcher::RalphHomeAction) -> S
     }
 }
 
+fn markdown_preview(text: Option<&str>) -> String {
+    text.map_or_else(
+        || "<missing>".to_owned(),
+        |value| {
+            let preview = value.lines().take(12).collect::<Vec<_>>().join("\n");
+            if value.lines().count() > 12 {
+                format!("{preview}\n...")
+            } else {
+                preview
+            }
+        },
+    )
+}
+
+fn view_setup_draft(chat: &mut ActiveChat) -> Result<(), TuiError> {
+    let repo_root = current_repo_root(chat)?;
+    let Some(draft) = ralph_state::latest_setup_draft(&repo_root)? else {
+        chat.app.set_status("no Ralph setup draft found".to_owned());
+        return Ok(());
+    };
+    let readiness = draft.readiness();
+    chat.app.push_system_note(format!(
+        "Ralph setup draft review\n* Draft: {}\n* Status: {}\n* Loop: {}\n* Branch: {}\n* Worktree: {}\n* Validation: {}\n* Ready: charter={} progress={} approved={}\n* Draft JSON: {}\n* Setup transcript: {}\n\nCharter preview:\n{}\n\nProgress preview:\n{}",
+        draft.draft_id,
+        draft.status,
+        draft.loop_name,
+        draft.branch.as_deref().unwrap_or("<default>"),
+        draft
+            .work_area_path
+            .as_ref()
+            .map_or_else(|| "<default>".to_owned(), |path| path.display().to_string()),
+        if draft.validation_commands.is_empty() {
+            "<none>".to_owned()
+        } else {
+            draft.validation_commands.join("; ")
+        },
+        readiness.has_charter,
+        readiness.has_progress,
+        readiness.approved,
+        draft.draft_path.display(),
+        draft
+            .setup_transcript_path
+            .as_ref()
+            .map_or_else(|| "<none>".to_owned(), |path| path.display().to_string()),
+        markdown_preview(draft.charter_draft.as_deref()),
+        markdown_preview(draft.progress_draft.as_deref())
+    ));
+    chat.app.set_status("Ralph setup draft shown".to_owned());
+    Ok(())
+}
+
 fn approve_setup_draft(chat: &mut ActiveChat) -> Result<(), TuiError> {
     let repo_root = current_repo_root(chat)?;
     let Some(draft) = ralph_state::latest_setup_draft(&repo_root)? else {
@@ -137,10 +191,20 @@ fn approve_setup_draft(chat: &mut ActiveChat) -> Result<(), TuiError> {
         draft_id: draft.draft_id,
         repo_root,
         status: ralph_state::RalphSetupDraftStatus::Approved,
+        loop_name: None,
         charter_draft: draft.charter_draft,
         progress_draft: draft.progress_draft,
         validation_commands: draft.validation_commands,
+        branch: draft.branch,
+        work_area_path: draft.work_area_path,
     })?;
+    append_setup_transcript(
+        &updated,
+        &format!(
+            "## Approved setup draft\n\nDraft `{}` approved.",
+            updated.draft_id
+        ),
+    )?;
     chat.app.push_system_note(format!(
         "Ralph setup draft approved\n* Draft: {}\n* Path: {}\n* Next: create loop from draft",
         updated.draft_id,
@@ -179,9 +243,9 @@ async fn create_loop_from_draft(
         .create_worktree(WorktreeCreateRequest {
             name: format!("ralph-{}", draft.loop_name),
             cwd: Some(repo_root),
-            path: None,
+            path: draft.work_area_path.clone(),
             branch: None,
-            new_branch: None,
+            new_branch: draft.branch.clone(),
             base_ref: Some(bcode_worktree_models::WorktreeBaseRef::Head),
             detach: false,
             force: false,
@@ -222,6 +286,53 @@ fn latest_assistant_message(chat: &ActiveChat) -> Option<String> {
         .rev()
         .find(|item| item.role == "assistant" && !item.text.trim().is_empty())
         .map(|item| item.text.clone())
+}
+
+fn append_setup_transcript(
+    draft: &ralph_state::RalphSetupDraft,
+    entry: &str,
+) -> Result<(), TuiError> {
+    let Some(path) = &draft.setup_transcript_path else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut existing = if path.exists() {
+        std::fs::read_to_string(path)?
+    } else {
+        String::new()
+    };
+    if !existing.is_empty() {
+        existing.push_str("\n\n");
+    }
+    existing.push_str(entry);
+    existing.push('\n');
+    std::fs::write(path, existing)?;
+    Ok(())
+}
+
+fn extract_scalar_field(text: &str, field: &str) -> Option<String> {
+    let prefix = format!("{field}:");
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix(&prefix).map(str::trim))
+        .filter(|value| !value.is_empty() && *value != "<none>")
+        .map(ToOwned::to_owned)
+}
+
+fn extract_validation_commands(text: &str) -> Vec<String> {
+    let Some(start) = text.find("validation:") else {
+        return Vec::new();
+    };
+    let after_start = &text[start + "validation:".len()..];
+    after_start
+        .lines()
+        .map(str::trim)
+        .take_while(|line| !line.starts_with("--- ") && !line.ends_with(':'))
+        .filter_map(|line| line.strip_prefix("- ").map(str::trim))
+        .filter(|command| !command.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn extract_between(text: &str, start_marker: &str, end_marker: &str) -> Option<String> {
@@ -271,19 +382,44 @@ fn save_setup_draft(chat: &mut ActiveChat) -> Result<(), TuiError> {
         extract_markdown_section(&message, "charter.md").or_else(|| draft.charter_draft.clone());
     let progress =
         extract_markdown_section(&message, "progress.md").or_else(|| draft.progress_draft.clone());
+    let parsed_validation_commands = extract_validation_commands(&message);
+    let validation_commands = if parsed_validation_commands.is_empty() {
+        draft.validation_commands
+    } else {
+        parsed_validation_commands
+    };
     let updated = ralph_state::update_setup_draft(ralph_state::RalphSetupDraftUpdateRequest {
         draft_id: draft.draft_id,
         repo_root,
         status: ralph_state::RalphSetupDraftStatus::DraftReady,
+        loop_name: extract_scalar_field(&message, "loop_name"),
         charter_draft: charter,
         progress_draft: progress,
-        validation_commands: draft.validation_commands,
+        validation_commands,
+        branch: extract_scalar_field(&message, "branch").or(draft.branch),
+        work_area_path: extract_scalar_field(&message, "worktree_path")
+            .or_else(|| extract_scalar_field(&message, "work_area_path"))
+            .map(PathBuf::from)
+            .or(draft.work_area_path),
     })?;
+    append_setup_transcript(
+        &updated,
+        &format!(
+            "## Saved setup draft\n\nStatus: {}\n\n{}",
+            updated.status, message
+        ),
+    )?;
     let readiness = updated.readiness();
     chat.app.push_system_note(format!(
-        "Ralph setup draft saved\n* Draft: {}\n* Status: {}\n* Has charter: {}\n* Has progress: {}\n* Path: {}\n* Next: {}",
+        "Ralph setup draft saved\n* Draft: {}\n* Status: {}\n* Loop: {}\n* Branch: {}\n* Worktree: {}\n* Has charter: {}\n* Has progress: {}\n* Path: {}\n* Next: {}",
         updated.draft_id,
         updated.status,
+        updated.loop_name,
+        updated.branch.as_deref().unwrap_or("<default>"),
+        updated
+            .work_area_path
+            .as_ref()
+            .map_or_else(|| "<default>".to_owned(), |path| path.display().to_string()),
         readiness.has_charter,
         readiness.has_progress,
         updated.draft_path.display(),
@@ -314,6 +450,14 @@ pub async fn plan_loop(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Res
         validation_commands,
     })?;
     let prompt = guided_setup_prompt(&draft);
+    append_setup_transcript(
+        &draft,
+        &format!(
+            "## Created setup draft\n\nRepo: {}\n\nInitial context:\n\n{}",
+            repo_root.display(),
+            draft.source_context
+        ),
+    )?;
     chat.app.push_system_note(format!(
         "Ralph guided setup draft created\n* Draft: {}\n* Status: {}\n* Repo: {}\n* Next: answer the assistant's clarifying questions; approve only after charter/progress are meaningful",
         draft.draft_id,
@@ -372,6 +516,8 @@ fn guided_setup_prompt(draft: &ralph_state::RalphSetupDraft) -> String {
          3. After answers, produce a final setup artifact in this exact shape so Ralph can save it reliably:\n\n\
          RALPH_SETUP_DRAFT_START\n\
          loop_name: <name>\n\
+         branch: <optional branch name or <none>>\n\
+         worktree_path: <optional absolute path or <none>>\n\
          validation:\n\
          - <command>\n\n\
          --- charter.md ---\n\
@@ -405,6 +551,7 @@ async fn dispatch_home_action<W: Write>(
     match action {
         super::ralph_launcher::RalphHomeAction::Plan => plan_loop(services, chat).await,
         super::ralph_launcher::RalphHomeAction::SaveDraft => save_setup_draft(chat),
+        super::ralph_launcher::RalphHomeAction::ViewDraft => view_setup_draft(chat),
         super::ralph_launcher::RalphHomeAction::ApproveDraft => approve_setup_draft(chat),
         super::ralph_launcher::RalphHomeAction::CreateFromDraft => {
             create_loop_from_draft(services, chat).await

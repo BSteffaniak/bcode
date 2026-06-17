@@ -884,12 +884,18 @@ pub struct RalphSetupDraftUpdateRequest {
     pub repo_root: PathBuf,
     /// Updated draft status.
     pub status: RalphSetupDraftStatus,
+    /// Updated proposed loop name.
+    pub loop_name: Option<String>,
     /// Draft charter content.
     pub charter_draft: Option<String>,
     /// Draft progress content.
     pub progress_draft: Option<String>,
     /// Updated validation commands.
     pub validation_commands: Vec<String>,
+    /// Proposed branch name.
+    pub branch: Option<String>,
+    /// Proposed isolated work area path.
+    pub work_area_path: Option<PathBuf>,
 }
 
 /// Persistent setup draft used before a Ralph loop is created.
@@ -908,7 +914,14 @@ pub struct RalphSetupDraft {
     /// Captured context seed for the planning conversation.
     pub source_context: String,
     /// Proposed validation commands.
+    #[serde(default)]
     pub validation_commands: Vec<String>,
+    /// Proposed branch name.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Proposed isolated work area path.
+    #[serde(default)]
+    pub work_area_path: Option<PathBuf>,
     /// Draft charter content, once produced by the assistant.
     pub charter_draft: Option<String>,
     /// Draft progress content, once produced by the assistant.
@@ -918,7 +931,11 @@ pub struct RalphSetupDraft {
     /// Updated timestamp in Unix epoch milliseconds.
     pub updated_at_ms: u64,
     /// Loop state directory after conversion.
+    #[serde(default)]
     pub converted_state_dir: Option<PathBuf>,
+    /// Setup transcript markdown path.
+    #[serde(default)]
+    pub setup_transcript_path: Option<PathBuf>,
     /// Draft JSON path.
     pub draft_path: PathBuf,
 }
@@ -2599,6 +2616,9 @@ fn create_setup_draft_in_store(
     let now = unix_epoch_ms();
     let draft_id = format!("draft-{}", uuid::Uuid::new_v4());
     let draft_path = drafts_root.join(&draft_id).join(SETUP_DRAFT_FILE_NAME);
+    let setup_transcript_path = draft_path
+        .parent()
+        .map(|parent| parent.join("setup-transcript.md"));
     let draft = RalphSetupDraft {
         draft_id,
         repo_root: request.repo_root,
@@ -2607,11 +2627,14 @@ fn create_setup_draft_in_store(
         session_title: request.session_title,
         source_context: request.source_context,
         validation_commands: request.validation_commands,
+        branch: None,
+        work_area_path: None,
         charter_draft: None,
         progress_draft: None,
         created_at_ms: now,
         updated_at_ms: now,
         converted_state_dir: None,
+        setup_transcript_path,
         draft_path,
     };
     write_setup_draft(&draft)?;
@@ -2674,9 +2697,14 @@ fn update_setup_draft_in_store(
         .join(SETUP_DRAFT_FILE_NAME);
     let mut draft = read_setup_draft(&draft_path)?;
     draft.status = request.status;
+    if let Some(loop_name) = request.loop_name.filter(|name| !name.trim().is_empty()) {
+        draft.loop_name = loop_name;
+    }
     draft.charter_draft = request.charter_draft;
     draft.progress_draft = request.progress_draft;
     draft.validation_commands = request.validation_commands;
+    draft.branch = request.branch;
+    draft.work_area_path = request.work_area_path;
     draft.updated_at_ms = unix_epoch_ms();
     draft.draft_path = draft_path;
     write_setup_draft(&draft)?;
