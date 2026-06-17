@@ -5236,6 +5236,11 @@ async fn run_session_runtime(
                     &state,
                     permit.session_id(),
                     Arc::clone(&phase),
+                    &mut followup_commands,
+                    &mut steering_commands,
+                    &mut cancel_commands,
+                    queued_followups.as_ref(),
+                    Arc::clone(&current_turn),
                     selection,
                 )
                 .await;
@@ -5630,14 +5635,34 @@ async fn process_skill_invocation_command(
     set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_compact_session_command(
     state: &ServerState,
     session_id: SessionId,
     phase: Arc<Mutex<SessionRuntimePhase>>,
+    followup_commands: &mut mpsc::Receiver<FollowupCommand>,
+    steering_commands: &mut mpsc::Receiver<SteeringCommand>,
+    cancel_commands: &mut mpsc::Receiver<CancelCommand>,
+    queued_followups: &AtomicUsize,
+    current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
     selection: SessionModelSelection,
 ) -> Result<String, CompactionError> {
     set_runtime_phase(&phase, SessionRuntimePhase::Compacting).await;
-    let result = compact_session_context(state, session_id, &selection).await;
+    let mut command_context = RuntimeCommandContext::new(
+        followup_commands,
+        steering_commands,
+        cancel_commands,
+        queued_followups,
+        current_turn,
+    );
+    let result = compact_session_context_with_limit(
+        state,
+        session_id,
+        &selection,
+        None,
+        Some(&mut command_context),
+    )
+    .await;
     set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
     result
 }
@@ -7473,7 +7498,7 @@ async fn compact_session_context(
     session_id: SessionId,
     selection: &SessionModelSelection,
 ) -> Result<String, CompactionError> {
-    compact_session_context_with_limit(state, session_id, selection, None).await
+    compact_session_context_with_limit(state, session_id, selection, None, None).await
 }
 
 async fn compact_session_context_before_sequence(
@@ -7482,8 +7507,14 @@ async fn compact_session_context_before_sequence(
     selection: &SessionModelSelection,
     first_kept_sequence: u64,
 ) -> Result<String, CompactionError> {
-    compact_session_context_with_limit(state, session_id, selection, Some(first_kept_sequence))
-        .await
+    compact_session_context_with_limit(
+        state,
+        session_id,
+        selection,
+        Some(first_kept_sequence),
+        None,
+    )
+    .await
 }
 
 async fn compact_session_context_with_limit(
@@ -7491,6 +7522,7 @@ async fn compact_session_context_with_limit(
     session_id: SessionId,
     selection: &SessionModelSelection,
     first_kept_sequence: Option<u64>,
+    command_context: Option<&mut RuntimeCommandContext<'_>>,
 ) -> Result<String, CompactionError> {
     if state.session_has_active_turn(session_id).await {
         return Err(CompactionError::Busy);
@@ -7519,7 +7551,9 @@ async fn compact_session_context_with_limit(
         return Err(CompactionError::ProviderUnavailable);
     }
 
-    let summary = collect_compaction_summary(state, session_id, selection, &transcript).await?;
+    let summary =
+        collect_compaction_summary(state, session_id, selection, &transcript, command_context)
+            .await?;
     let summary = summary.trim().to_string();
     if summary.is_empty() {
         return Err(CompactionError::Provider(
@@ -7664,6 +7698,7 @@ async fn collect_compaction_summary(
     session_id: SessionId,
     selection: &SessionModelSelection,
     transcript: &CompactionTranscript,
+    command_context: Option<&mut RuntimeCommandContext<'_>>,
 ) -> Result<String, CompactionError> {
     append_context_compaction_trace(
         state,
@@ -7676,8 +7711,15 @@ async fn collect_compaction_summary(
     .await;
 
     let prompt_text = compaction_prompt_text(transcript);
-    match collect_compaction_summary_once(state, session_id, selection, transcript, &prompt_text)
-        .await
+    match collect_compaction_summary_once(
+        state,
+        session_id,
+        selection,
+        transcript,
+        &prompt_text,
+        command_context,
+    )
+    .await
     {
         Ok(summary) if !summary.trim().is_empty() => Ok(truncate_text(
             summary.trim(),
@@ -7711,24 +7753,58 @@ async fn collect_compaction_summary_once(
     selection: &SessionModelSelection,
     transcript: &CompactionTranscript,
     prompt_text: &str,
+    mut command_context: Option<&mut RuntimeCommandContext<'_>>,
 ) -> Result<String, String> {
     let turn_id = format!(
         "{session_id}-compact-{}",
         transcript.compacted_through_sequence
     );
     let request = build_compaction_request(session_id, selection, prompt_text, turn_id.clone());
-    let start = invoke_model_provider_json_blocking::<_, StartTurnResponse>(
-        state,
-        selection.provider_plugin_id.clone(),
-        OP_START_TURN,
-        request,
-    )
-    .await?;
-
-    let provider_turn_id = start.provider_turn_id;
-    let result = poll_compaction_summary(state, session_id, selection, &provider_turn_id, &turn_id)
+    let compaction_cancel_state = TurnCancelState::default();
+    let provider_turn_id = if let Some(context) = &mut command_context {
+        match wait_for_provider_call(
+            state,
+            session_id,
+            context,
+            &compaction_cancel_state,
+            Box::pin(invoke_model_provider_json_blocking::<_, StartTurnResponse>(
+                state,
+                selection.provider_plugin_id.clone(),
+                OP_START_TURN,
+                request,
+            )),
+        )
         .await
-        .map_err(compaction_error_detail);
+        {
+            ProviderCallWait::Completed(result) => result?.provider_turn_id,
+            ProviderCallWait::Cancelled => return Err("compaction cancelled".to_string()),
+        }
+    } else {
+        invoke_model_provider_json_blocking::<_, StartTurnResponse>(
+            state,
+            selection.provider_plugin_id.clone(),
+            OP_START_TURN,
+            request,
+        )
+        .await?
+        .provider_turn_id
+    };
+
+    let result = if let Some(context) = command_context {
+        poll_compaction_summary_actor_aware(
+            state,
+            session_id,
+            selection,
+            &provider_turn_id,
+            &turn_id,
+            context,
+            &compaction_cancel_state,
+        )
+        .await
+    } else {
+        poll_compaction_summary(state, session_id, selection, &provider_turn_id, &turn_id).await
+    }
+    .map_err(compaction_error_detail);
     finish_provider_turn(
         state,
         selection.provider_plugin_id.clone(),
@@ -7844,6 +7920,129 @@ fn compaction_error_detail(error: CompactionError) -> String {
     match error {
         CompactionError::Provider(message) => message,
         error => error.to_string(),
+    }
+}
+
+async fn poll_compaction_summary_actor_aware(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+    provider_turn_id: &str,
+    turn_id: &str,
+    command_context: &mut RuntimeCommandContext<'_>,
+    cancel_state: &TurnCancelState,
+) -> Result<String, CompactionError> {
+    let mut summary = String::new();
+    let mut idle_for = Duration::ZERO;
+    loop {
+        let poll = PollTurnEventsRequest {
+            provider_turn_id: provider_turn_id.to_string(),
+        };
+        let response = match wait_for_provider_call(
+            state,
+            session_id,
+            command_context,
+            cancel_state,
+            Box::pin(poll_model_turn(
+                state,
+                session_id,
+                selection.provider_plugin_id.as_deref(),
+                &poll,
+            )),
+        )
+        .await
+        {
+            ProviderCallWait::Completed(result) => result.map_err(CompactionError::Provider)?,
+            ProviderCallWait::Cancelled => {
+                return Err(CompactionError::Provider(
+                    "compaction cancelled".to_string(),
+                ));
+            }
+        };
+        if response.events.is_empty() {
+            idle_for = wait_for_compaction_progress_actor_aware(
+                state,
+                session_id,
+                command_context,
+                cancel_state,
+                idle_for,
+            )
+            .await?;
+            continue;
+        }
+        let saw_progress = compaction_events_include_progress(&response.events);
+        match handle_compaction_events(state, session_id, turn_id, &mut summary, response.events)
+            .await
+        {
+            CompactionPollStatus::Continue => {
+                if saw_progress {
+                    idle_for = Duration::ZERO;
+                } else {
+                    idle_for = wait_for_compaction_progress_actor_aware(
+                        state,
+                        session_id,
+                        command_context,
+                        cancel_state,
+                        idle_for,
+                    )
+                    .await?;
+                }
+            }
+            CompactionPollStatus::Finished => return Ok(summary),
+            CompactionPollStatus::Failed(error) => return Err(CompactionError::Provider(error)),
+        }
+    }
+}
+
+async fn wait_for_compaction_progress_actor_aware(
+    state: &ServerState,
+    session_id: SessionId,
+    command_context: &mut RuntimeCommandContext<'_>,
+    cancel_state: &TurnCancelState,
+    idle_for: Duration,
+) -> Result<Duration, CompactionError> {
+    let idle_for = idle_for.saturating_add(MODEL_POLL_INTERVAL);
+    let timeout = Duration::from_secs(state.model_streaming.no_progress_timeout_secs);
+    if idle_for > timeout {
+        return Err(CompactionError::Provider(format!(
+            "model provider made no compaction progress for {} seconds before timeout",
+            timeout.as_secs()
+        )));
+    }
+    tokio::select! {
+        () = tokio::time::sleep(MODEL_POLL_INTERVAL) => Ok(idle_for),
+        cancel_command = command_context.cancel_commands.recv() => {
+            if let Some(command) = cancel_command {
+                let cancelled = process_cancel_turn_command(
+                    state,
+                    session_id,
+                    command_context.followup_commands,
+                    command_context.queued_followups,
+                    command.clear_queue,
+                    command.requested_by,
+                )
+                .await;
+                let _sent = command.response.send(cancelled);
+            }
+            if cancel_state.is_cancelled() {
+                Err(CompactionError::Provider("compaction cancelled".to_string()))
+            } else {
+                Ok(idle_for)
+            }
+        }
+        steering_command = command_context.steering_commands.recv() => {
+            if let Some(command) = steering_command {
+                process_steering_message_command(
+                    state,
+                    session_id,
+                    command.client_id,
+                    command.text,
+                    command.completion,
+                )
+                .await;
+            }
+            Ok(idle_for)
+        }
     }
 }
 
