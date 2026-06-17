@@ -13,10 +13,15 @@ use bcode_ralph as ralph_state;
 use bcode_session_models::{SessionHistoryDirection, SessionHistoryQuery};
 use bcode_worktree_models::WorktreeCreateRequest;
 use bmux_keyboard::{KeyCode, KeyStroke};
-use bmux_text_edit::SelectionMode;
+use bmux_text_edit::{SelectionMode, TextEditBuffer};
 use bmux_tui::event::{Event, FocusEvent, MouseEvent};
-use bmux_tui::geometry::Rect;
-use bmux_tui_components::text_input::TextInputControl;
+use bmux_tui::frame::Frame;
+use bmux_tui::geometry::{Insets, Rect, Size};
+use bmux_tui::input::TextInput;
+use bmux_tui::prelude::{Line, Style, Widget};
+use bmux_tui::style::Color;
+use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
+use bmux_tui_components::text_input::{TextInputControl, TextInputState};
 
 use super::helpers;
 use super::keymap::BmuxKeyMap;
@@ -571,8 +576,300 @@ fn rebuild_setup_prompt(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RalphRebuildField {
+    Intent,
+    Problem,
+    Constraints,
+    Validation,
+}
+
+struct RalphRebuildDialog {
+    intent: TextInputState,
+    problem: TextInputState,
+    constraints: TextInputState,
+    validation: TextInputState,
+    focused_field: RalphRebuildField,
+    status: String,
+}
+
+impl RalphRebuildDialog {
+    fn new(loop_summary: &ralph_state::RalphLoopSummary, validation_commands: &[String]) -> Self {
+        Self {
+            intent: TextInputState::new(TextEditBuffer::from_text(format!(
+                "Rebuild this Ralph loop so it has accurate charter/progress context for {}.",
+                loop_summary.loop_name
+            ))),
+            problem: TextInputState::new(TextEditBuffer::from_text(
+                "The current charter/progress may be stubbed, nonsense, stale, or not grounded in the actual repository/session state.",
+            )),
+            constraints: TextInputState::new(TextEditBuffer::from_text(
+                "Preserve run history. Do not overwrite files until I approve/apply the draft. Ignore meaningless existing context.",
+            )),
+            validation: TextInputState::new(TextEditBuffer::from_text(
+                validation_commands.join("; "),
+            )),
+            focused_field: RalphRebuildField::Intent,
+            status:
+                "Fill in context, Tab between fields, Enter starts the guided Ralph conversation."
+                    .to_owned(),
+        }
+    }
+
+    const fn focused_input_mut(&mut self) -> &mut TextInputState {
+        match self.focused_field {
+            RalphRebuildField::Intent => &mut self.intent,
+            RalphRebuildField::Problem => &mut self.problem,
+            RalphRebuildField::Constraints => &mut self.constraints,
+            RalphRebuildField::Validation => &mut self.validation,
+        }
+    }
+
+    const fn focus_next(&mut self) {
+        self.focused_field = match self.focused_field {
+            RalphRebuildField::Intent => RalphRebuildField::Problem,
+            RalphRebuildField::Problem => RalphRebuildField::Constraints,
+            RalphRebuildField::Constraints => RalphRebuildField::Validation,
+            RalphRebuildField::Validation => RalphRebuildField::Intent,
+        };
+    }
+
+    fn validation_commands(&self) -> Vec<String> {
+        self.validation
+            .buffer()
+            .text()
+            .split(';')
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    fn user_context(&self) -> String {
+        format!(
+            "User-provided rebuild context:\n\nIntent:\n{}\n\nCurrent problem:\n{}\n\nConstraints / non-goals:\n{}\n",
+            self.intent.buffer().text().trim(),
+            self.problem.buffer().text().trim(),
+            self.constraints.buffer().text().trim()
+        )
+    }
+}
+
+fn render_rebuild_dialog(
+    dialog: &mut RalphRebuildDialog,
+    loop_summary: &ralph_state::RalphLoopSummary,
+    frame: &mut Frame<'_>,
+    theme: super::render::TuiTheme,
+) {
+    let modal = ModalFrame::new(
+        ModalSizing::new(Size::new(96, 30), Size::new(118, 34), Insets::all(4)),
+        ModalTheme::dark(theme.accent),
+    )
+    .title(" Ralph rebuild setup ")
+    .padding(Insets::new(1, 2, 1, 2))
+    .placement(ModalPlacement::UpperThird);
+    modal.render(frame.area(), frame);
+    let content = modal.content_area(frame.area());
+    let mut row = content.y;
+    render_rebuild_line(
+        &modal,
+        content,
+        &mut row,
+        frame,
+        "Guided rebuild conversation for existing loop context. Nothing is overwritten here.",
+    );
+    render_rebuild_line(
+        &modal,
+        content,
+        &mut row,
+        frame,
+        &format!("Loop: {}", loop_summary.loop_name),
+    );
+    render_rebuild_line(
+        &modal,
+        content,
+        &mut row,
+        frame,
+        &format!("State: {}", loop_summary.state_dir.display()),
+    );
+    row = row.saturating_add(1);
+    render_rebuild_input(
+        dialog,
+        &modal,
+        content,
+        &mut row,
+        frame,
+        RalphRebuildField::Intent,
+        "Intent / goal",
+    );
+    render_rebuild_input(
+        dialog,
+        &modal,
+        content,
+        &mut row,
+        frame,
+        RalphRebuildField::Problem,
+        "What is wrong now?",
+    );
+    render_rebuild_input(
+        dialog,
+        &modal,
+        content,
+        &mut row,
+        frame,
+        RalphRebuildField::Constraints,
+        "Constraints / non-goals",
+    );
+    render_rebuild_input(
+        dialog,
+        &modal,
+        content,
+        &mut row,
+        frame,
+        RalphRebuildField::Validation,
+        "Validation commands (; separated)",
+    );
+    row = row.saturating_add(1);
+    render_rebuild_line(
+        &modal,
+        content,
+        &mut row,
+        frame,
+        "After Enter, Bcode sends this scoped Ralph rebuild turn automatically; no composer handoff.",
+    );
+    render_rebuild_line(
+        &modal,
+        content,
+        &mut row,
+        frame,
+        "Next response stays in the chat transcript, then use Save/View/Approve/Apply in Ralph.",
+    );
+    row = content.bottom().saturating_sub(2);
+    render_rebuild_line(
+        &modal,
+        content,
+        &mut row,
+        frame,
+        "Enter start conversation · Tab field · Esc cancel",
+    );
+    render_rebuild_line(&modal, content, &mut row, frame, &dialog.status);
+}
+
+fn render_rebuild_line(
+    modal: &ModalFrame,
+    content: Rect,
+    row: &mut u16,
+    frame: &mut Frame<'_>,
+    text: &str,
+) {
+    if *row >= content.bottom() {
+        return;
+    }
+    modal.render_line(
+        Rect::new(content.x, *row, content.width, 1),
+        &Line::from(text.to_owned()),
+        frame,
+    );
+    *row = row.saturating_add(1);
+}
+
+fn render_rebuild_input(
+    dialog: &mut RalphRebuildDialog,
+    modal: &ModalFrame,
+    content: Rect,
+    row: &mut u16,
+    frame: &mut Frame<'_>,
+    field: RalphRebuildField,
+    label: &str,
+) {
+    render_rebuild_line(modal, content, row, frame, label);
+    if *row >= content.bottom() {
+        return;
+    }
+    let input_area = Rect::new(content.x, *row, content.width, 1);
+    let focused = dialog.focused_field == field;
+    let input = match field {
+        RalphRebuildField::Intent => &mut dialog.intent,
+        RalphRebuildField::Problem => &mut dialog.problem,
+        RalphRebuildField::Constraints => &mut dialog.constraints,
+        RalphRebuildField::Validation => &mut dialog.validation,
+    };
+    input.set_content_area(input_area, &ralph_start_dialog::input_policy());
+    TextInput::new(input.buffer())
+        .style(Style::new().fg(Color::Yellow).bg(Color::Black))
+        .selection_style(Style::new().fg(Color::Black).bg(Color::Yellow))
+        .vertical_scroll(input.vertical_scroll())
+        .cursor_visible(focused)
+        .render(input_area, frame);
+    *row = row.saturating_add(2);
+}
+
+async fn collect_rebuild_context<W: Write>(
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
+    loop_summary: &ralph_state::RalphLoopSummary,
+    default_validation_commands: &[String],
+) -> Result<Option<RalphRebuildDialog>, TuiError> {
+    let mut dialog = RalphRebuildDialog::new(loop_summary, default_validation_commands);
+    loop {
+        io.terminal.resize(helpers::terminal_area()?);
+        io.terminal.draw(|frame| {
+            render_rebuild_dialog(&mut dialog, loop_summary, frame, services.theme);
+        })?;
+        let Some(event) = io.input.recv().await? else {
+            continue;
+        };
+        match event {
+            Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
+            Event::Paste(text) => {
+                dialog.focused_input_mut().buffer_mut().insert_str(&text);
+                dialog
+                    .focused_input_mut()
+                    .sync_scroll_to_cursor(&ralph_start_dialog::input_policy());
+            }
+            Event::Key(key) => match key.key {
+                KeyCode::Escape => return Ok(None),
+                KeyCode::Tab => dialog.focus_next(),
+                KeyCode::Enter => return Ok(Some(dialog)),
+                _ => handle_rebuild_dialog_key(&mut dialog, services.keymap, key),
+            },
+            Event::Mouse(_) | Event::Focus(_) | Event::Tick | Event::User(_) => {}
+        }
+    }
+}
+
+fn handle_rebuild_dialog_key(
+    dialog: &mut RalphRebuildDialog,
+    keymap: &BmuxKeyMap,
+    stroke: KeyStroke,
+) {
+    if let Some(motion) = keymap.editor_selection_motion_for_key(stroke) {
+        dialog
+            .focused_input_mut()
+            .buffer_mut()
+            .move_cursor_with_selection(motion, SelectionMode::Extend);
+        dialog
+            .focused_input_mut()
+            .sync_scroll_to_cursor(&ralph_start_dialog::input_policy());
+        return;
+    }
+    if let Some(command) = keymap.editor_command_for_key(stroke) {
+        dialog
+            .focused_input_mut()
+            .buffer_mut()
+            .apply_command(command);
+        dialog
+            .focused_input_mut()
+            .sync_scroll_to_cursor(&ralph_start_dialog::input_policy());
+        return;
+    }
+    let _ = TextInputControl::new(&ralph_start_dialog::input_policy())
+        .handle_key(dialog.focused_input_mut(), stroke);
+}
+
 /// Start an LLM-guided rebuild setup draft for the latest existing loop.
-pub async fn rebuild_loop_context(
+pub async fn rebuild_loop_context<W: Write>(
+    io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
     chat: &mut ActiveChat,
 ) -> Result<(), TuiError> {
@@ -582,8 +879,17 @@ pub async fn rebuild_loop_context(
             .set_status("no Ralph loop found to rebuild".to_owned());
         return Ok(());
     };
+    let default_validation_commands = ralph_state::default_validation_commands(&repo_root);
+    let Some(dialog) =
+        collect_rebuild_context(io, services, &loop_summary, &default_validation_commands).await?
+    else {
+        chat.app.set_status("Ralph rebuild canceled".to_owned());
+        return Ok(());
+    };
     let mut source_context = setup_source_context(services, chat).await?;
-    source_context.push_str("\n\nExisting Ralph loop files:\n* charter: ");
+    source_context.push_str("\n\n");
+    source_context.push_str(&dialog.user_context());
+    source_context.push_str("\nExisting Ralph loop files:\n* charter: ");
     source_context.push_str(&loop_summary.charter_doc_path.display().to_string());
     source_context.push_str("\n* progress: ");
     source_context.push_str(&loop_summary.progress_doc_path.display().to_string());
@@ -595,7 +901,7 @@ pub async fn rebuild_loop_context(
         loop_name: loop_summary.loop_name.clone(),
         session_title: chat.app.session_title().map(ToOwned::to_owned),
         source_context,
-        validation_commands: ralph_state::default_validation_commands(&repo_root),
+        validation_commands: dialog.validation_commands(),
         mode: ralph_state::RalphSetupDraftMode::RebuildExistingLoop,
         target_state_dir: Some(loop_summary.state_dir.clone()),
     })?;
@@ -608,8 +914,18 @@ pub async fn rebuild_loop_context(
             prompt
         ),
     )?;
+    let session_id =
+        super::session_flow::persist_draft_session(io.terminal, services.client, chat).await?;
+    services
+        .client
+        .send_user_message(
+            session_id,
+            prompt.clone(),
+            bcode_ipc::PromptPlacement::FollowUp,
+        )
+        .await?;
     chat.app.push_system_note(format!(
-        "Ralph rebuild setup draft created\n* Draft: {}\n* Target loop: {}\n* Target state: {}\n* Transcript: {}\n* Next: submit the prepared prompt, then Save setup draft when the assistant returns the replacement artifact",
+        "Ralph rebuild conversation started\n* Draft: {}\n* Target loop: {}\n* Target state: {}\n* Transcript: {}\n* Assistant turn: started automatically from the guided rebuild context\n* Next: answer Ralph's questions here, then Save/View/Approve/Apply the setup draft from Ralph UI",
         draft.draft_id,
         loop_summary.loop_name,
         loop_summary.state_dir.display(),
@@ -618,10 +934,9 @@ pub async fn rebuild_loop_context(
             .as_ref()
             .map_or_else(|| "<none>".to_owned(), |path| path.display().to_string())
     ));
-    chat.app.composer_mut().clear();
-    chat.app.composer_mut().insert_str(&prompt);
+    chat.app.set_idle();
     chat.app
-        .set_status("Ralph rebuild setup prompt prepared".to_owned());
+        .set_status("Ralph rebuild conversation started".to_owned());
     Ok(())
 }
 
@@ -786,7 +1101,7 @@ async fn dispatch_home_action<W: Write>(
         super::ralph_launcher::RalphHomeAction::ViewDraft => view_setup_draft(chat),
         super::ralph_launcher::RalphHomeAction::ReviseDraft => revise_setup_draft(chat),
         super::ralph_launcher::RalphHomeAction::RebuildLoopContext => {
-            rebuild_loop_context(services, chat).await
+            rebuild_loop_context(io, services, chat).await
         }
         super::ralph_launcher::RalphHomeAction::ApproveDraft => approve_setup_draft(chat),
         super::ralph_launcher::RalphHomeAction::CreateFromDraft => {
