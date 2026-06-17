@@ -57,6 +57,7 @@ use super::transcript::{
 };
 use super::transcript_document::TranscriptDocument;
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
+use super::transcript_resident_window::{TranscriptResidentWindow, TranscriptWindowPolicy};
 use super::transcript_viewport::TranscriptViewport;
 
 const MANUAL_TRANSCRIPT_SCROLL_GRACE: Duration = Duration::from_millis(450);
@@ -67,6 +68,8 @@ const TRANSCRIPT_SCROLL_ANIMATION_FRAME: Duration = Duration::from_millis(16);
 const TRANSCRIPT_SCROLL_ANIMATION_INVALIDATION_KEY: &str = "transcript-scroll-animation";
 const LATEST_BAR_ANIMATION_INVALIDATION_KEY: &str = "latest-bar-animation";
 const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(420);
+const RESIDENT_TRANSCRIPT_MAX_EVENTS: usize = 1_024;
+const RESIDENT_TRANSCRIPT_TARGET_EVENTS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LivePreviewFrameState {
@@ -143,7 +146,7 @@ pub struct BmuxApp {
     composer: TextInputState,
     input_history: InputHistory,
     transcript: TranscriptDocument,
-    transcript_history: Vec<SessionEvent>,
+    transcript_window: TranscriptResidentWindow,
     latest_history_sequence: Option<u64>,
     tool_call_contexts: BTreeMap<String, ToolCallContext>,
     streamed_tool_results: BTreeMap<String, StreamedToolResultContext>,
@@ -312,7 +315,7 @@ impl BmuxApp {
             composer: TextInputState::new(TextEditBuffer::new()),
             input_history: InputHistory::from_entries(input_history),
             transcript: TranscriptDocument::default(),
-            transcript_history: Vec::new(),
+            transcript_window: TranscriptResidentWindow::default(),
             latest_history_sequence: None,
             tool_call_contexts: BTreeMap::new(),
             streamed_tool_results: BTreeMap::new(),
@@ -770,6 +773,30 @@ impl BmuxApp {
         }
         self.viewport
             .top_row(self.transcript_layout.total_rows(), viewport_height)
+    }
+
+    /// Return resident transcript-affecting event count.
+    #[cfg(test)]
+    pub const fn resident_transcript_event_count(&self) -> usize {
+        self.transcript_window.len()
+    }
+
+    /// Return oldest resident transcript-affecting event sequence.
+    #[cfg(test)]
+    pub fn resident_transcript_oldest_sequence(&self) -> Option<u64> {
+        self.transcript_window.oldest_sequence()
+    }
+
+    /// Return resident tool-call context count.
+    #[cfg(test)]
+    pub fn resident_tool_call_context_count(&self) -> usize {
+        self.tool_call_contexts.keys().count()
+    }
+
+    /// Return resident streamed tool result context count.
+    #[cfg(test)]
+    pub fn resident_streamed_tool_result_count(&self) -> usize {
+        self.streamed_tool_results.keys().count()
     }
 
     /// Return whether older history may be available.
@@ -1307,18 +1334,65 @@ impl BmuxApp {
     /// Absorb replayed history events.
     pub fn absorb_history(&mut self, events: &[SessionEvent]) {
         self.latest_history_sequence = events.last().map(|event| event.sequence);
-        self.transcript_history.extend_from_slice(events);
+        self.transcript_window.append_history(events);
         for event in events {
             self.apply_session_event(event, SessionEventApplication::Replay);
         }
+        self.trim_resident_transcript_window_if_needed();
     }
 
     fn rebuild_transcript_from_history(&mut self) {
         self.transcript
             .replace(transcript_items_from_events_with_reasoning(
-                &self.transcript_history,
+                self.transcript_window.events(),
                 self.reasoning_visible(),
             ));
+    }
+
+    fn trim_resident_transcript_window_if_needed(&mut self) {
+        let trim = self
+            .transcript_window
+            .trim_if_allowed(self.resident_transcript_window_policy());
+        if !trim.trimmed() {
+            return;
+        }
+        if let Some(new_oldest_sequence) = trim.new_oldest_sequence {
+            self.older_history
+                .mark_dropped_history_before(new_oldest_sequence);
+        }
+        self.rebuild_transcript_from_history();
+        self.reconcile_tool_state_with_resident_transcript();
+        self.viewport.scroll_to_bottom(&mut self.older_history);
+        self.pending_visual_overflow_bottom = None;
+    }
+
+    fn resident_transcript_window_policy(&self) -> TranscriptWindowPolicy {
+        TranscriptWindowPolicy {
+            max_events: RESIDENT_TRANSCRIPT_MAX_EVENTS,
+            target_events: RESIDENT_TRANSCRIPT_TARGET_EVENTS,
+            allow_trim: self.can_trim_resident_transcript_window(),
+        }
+    }
+
+    fn can_trim_resident_transcript_window(&self) -> bool {
+        matches!(self.scroll_mode, TranscriptScrollMode::BottomFollow)
+            && self.viewport.at_bottom_threshold()
+            && self.transcript_scroll_animation.is_none()
+            && !self.manual_transcript_scroll_active()
+            && self.active_tool_calls.is_empty()
+            && !self.pending_assistant_stream_anchor
+            && !self.older_history.loading()
+    }
+
+    fn reconcile_tool_state_with_resident_transcript(&mut self) {
+        let referenced = referenced_tool_call_ids(self.transcript.items());
+        self.tool_call_contexts
+            .retain(|tool_call_id, _| referenced.contains(tool_call_id));
+        self.presented_tool_results
+            .retain(|tool_call_id| referenced.contains(tool_call_id));
+        self.live_tool_previews
+            .retain(|tool_call_id, _| referenced.contains(tool_call_id));
+        self.streamed_tool_results.clear();
     }
 
     /// Prepend older history and preserve the current viewport.
@@ -1336,7 +1410,7 @@ impl BmuxApp {
         });
         self.input_history.prepend_committed(input_messages);
 
-        self.transcript_history.splice(0..0, events.iter().cloned());
+        self.transcript_window.prepend_older_history(events);
         if self.latest_history_sequence.is_none() {
             self.latest_history_sequence = events.last().map(|event| event.sequence);
         }
@@ -1363,9 +1437,10 @@ impl BmuxApp {
             return;
         }
         if event_affects_transcript_rows(event) {
-            self.transcript_history.push(event.clone());
+            self.transcript_window.append_live_event(event);
         }
         self.apply_session_event(event, SessionEventApplication::Live);
+        self.trim_resident_transcript_window_if_needed();
     }
 
     /// Absorb one live-only session event.
@@ -3063,6 +3138,33 @@ const fn event_breaks_sticky_entry_anchor(event: &SessionEvent) -> bool {
             | SessionEventKind::ToolInvocationPresentation { .. }
             | SessionEventKind::PermissionRequested { .. }
     )
+}
+
+fn referenced_tool_call_ids(items: &[TranscriptItem]) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    for item in items {
+        match item.kind() {
+            TranscriptItemKind::ToolRequest { tool_call_id, .. }
+            | TranscriptItemKind::LiveToolPreviewAnchor { tool_call_id, .. }
+            | TranscriptItemKind::ToolResult { tool_call_id, .. }
+            | TranscriptItemKind::FileChangePresentation { tool_call_id, .. }
+            | TranscriptItemKind::TerminalOutput { tool_call_id, .. }
+            | TranscriptItemKind::PermissionRequest { tool_call_id, .. } => {
+                ids.insert(tool_call_id.clone());
+            }
+            TranscriptItemKind::UserMessage
+            | TranscriptItemKind::AssistantMessage
+            | TranscriptItemKind::ReasoningMessage
+            | TranscriptItemKind::Usage { .. }
+            | TranscriptItemKind::PermissionResult { .. }
+            | TranscriptItemKind::System
+            | TranscriptItemKind::Meta
+            | TranscriptItemKind::Skill
+            | TranscriptItemKind::SkillError
+            | TranscriptItemKind::Generic => {}
+        }
+    }
+    ids
 }
 
 const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {

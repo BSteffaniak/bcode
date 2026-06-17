@@ -58,6 +58,17 @@ impl OlderHistoryState {
         self.cursor = oldest_history_cursor(events, has_more);
     }
 
+    /// Mark previously resident events before `oldest_resident_sequence` as reloadable older history.
+    pub const fn mark_dropped_history_before(&mut self, oldest_resident_sequence: u64) {
+        self.cursor = if oldest_resident_sequence == 0 {
+            None
+        } else {
+            Some(SessionHistoryCursor {
+                sequence: oldest_resident_sequence.saturating_sub(1),
+            })
+        };
+    }
+
     /// Request loading older history and reveal this many rows afterward.
     pub const fn request_load(&mut self, reveal_rows: usize) {
         self.reveal_request = Some(reveal_rows);

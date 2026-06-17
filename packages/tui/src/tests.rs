@@ -3778,6 +3778,138 @@ fn session_summary(session_id: SessionId) -> SessionSummary {
     }
 }
 
+#[test]
+fn transcript_resident_window_trims_live_bottom_following_turns() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+
+    for turn in 0..600_u64 {
+        let user_sequence = turn.saturating_mul(2).saturating_add(1);
+        app.absorb_session_event(&event(
+            session_id,
+            user_sequence,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: format!("user {turn}"),
+            },
+        ));
+        app.absorb_session_event(&event(
+            session_id,
+            user_sequence.saturating_add(1),
+            SessionEventKind::AssistantMessage {
+                text: format!("assistant {turn}"),
+            },
+        ));
+    }
+
+    assert!(app.resident_transcript_event_count() <= 700);
+    assert!(
+        app.resident_transcript_oldest_sequence()
+            .is_some_and(|sequence| sequence > 1)
+    );
+    assert!(app.has_older_history());
+    let cursor = app.older_history_cursor().expect("dropped history cursor");
+    assert_eq!(
+        cursor.sequence,
+        app.resident_transcript_oldest_sequence()
+            .expect("oldest resident sequence")
+            .saturating_sub(1)
+    );
+    assert!(
+        app.transcript()
+            .iter()
+            .any(|item| item.text().contains("assistant 599"))
+    );
+}
+
+#[test]
+fn transcript_resident_window_does_not_trim_with_active_tool() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+
+    for turn in 0..500_u64 {
+        let user_sequence = turn.saturating_mul(2).saturating_add(1);
+        app.absorb_session_event(&event(
+            session_id,
+            user_sequence,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: format!("user {turn}"),
+            },
+        ));
+        app.absorb_session_event(&event(
+            session_id,
+            user_sequence.saturating_add(1),
+            SessionEventKind::AssistantMessage {
+                text: format!("assistant {turn}"),
+            },
+        ));
+    }
+    app.absorb_session_event(&event(
+        session_id,
+        1_001,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "active-tool".to_owned(),
+            tool_name: "shell.run".to_owned(),
+            arguments_json: "{}".to_owned(),
+        },
+    ));
+    for index in 0..50_u64 {
+        app.absorb_session_event(&event(
+            session_id,
+            1_002_u64.saturating_add(index),
+            SessionEventKind::AssistantDelta {
+                text: format!("still active {index}"),
+            },
+        ));
+    }
+
+    assert!(app.resident_transcript_event_count() > 1_024);
+}
+
+#[test]
+fn transcript_resident_window_prunes_old_tool_state_after_trim() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+
+    for turn in 0..360_u64 {
+        let base = turn.saturating_mul(3).saturating_add(1);
+        let tool_call_id = format!("tool-{turn}");
+        app.absorb_session_event(&event(
+            session_id,
+            base,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: format!("user {turn}"),
+            },
+        ));
+        app.absorb_session_event(&event(
+            session_id,
+            base.saturating_add(1),
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: "shell.run".to_owned(),
+                arguments_json: "{}".to_owned(),
+            },
+        ));
+        app.absorb_session_event(&event(
+            session_id,
+            base.saturating_add(2),
+            SessionEventKind::ToolCallFinished {
+                tool_call_id,
+                result: "ok".to_owned(),
+                is_error: false,
+                output: None,
+                semantic_result: None,
+            },
+        ));
+    }
+
+    assert!(app.resident_transcript_event_count() <= 600);
+    assert!(app.resident_tool_call_context_count() < 360);
+    assert_eq!(app.resident_streamed_tool_result_count(), 0);
+}
+
 fn event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> SessionEvent {
     SessionEvent {
         schema_version: 1,
