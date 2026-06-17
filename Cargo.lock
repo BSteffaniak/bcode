@@ -342,9 +342,9 @@ checksum = "cc7bb162ec39d46ab1ca8c77bf72e890535becd1751bb45f64c597edb4c8c6b3"
 
 [[package]]
 name = "alloc-stdlib"
-version = "0.2.2"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94fb8275041c72129eb51b7d0322c29b8387a0386127718b096429201a5d6ece"
+checksum = "0e76a019e91224d279006ff972f1e984179a6e9feb050adba6ce8274aef23195"
 dependencies = [
  "alloc-no-stdlib",
 ]
@@ -591,9 +591,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-bedrockruntime"
-version = "1.134.0"
+version = "1.135.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09525553211416fd3c18ead2dd6a29908dcdeb1a032809a23417e7ab848dc23e"
+checksum = "e74b780f2f36912bae71b4f4f8ed9a0a88832b4681a1add3caf5ca25dbc8ab2d"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -770,7 +770,7 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "h2 0.3.27",
- "h2 0.4.14",
+ "h2 0.4.15",
  "http 0.2.12",
  "http 1.4.2",
  "http-body 0.4.6",
@@ -1786,7 +1786,7 @@ dependencies = [
 [[package]]
 name = "bmux_attach_image_protocol"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#fe94fd0a5fa60b8c2e2682cb5b4228bee0798963"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#0fefe5646101ea37388e3e8bdf15fd49017910d3"
 dependencies = [
  "bmux_codec",
  "serde",
@@ -1796,7 +1796,7 @@ dependencies = [
 [[package]]
 name = "bmux_codec"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#fe94fd0a5fa60b8c2e2682cb5b4228bee0798963"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#0fefe5646101ea37388e3e8bdf15fd49017910d3"
 dependencies = [
  "serde",
 ]
@@ -1804,7 +1804,7 @@ dependencies = [
 [[package]]
 name = "bmux_ipc"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#fe94fd0a5fa60b8c2e2682cb5b4228bee0798963"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#0fefe5646101ea37388e3e8bdf15fd49017910d3"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_codec",
@@ -1818,7 +1818,7 @@ dependencies = [
 [[package]]
 name = "bmux_keyboard"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#fe94fd0a5fa60b8c2e2682cb5b4228bee0798963"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#0fefe5646101ea37388e3e8bdf15fd49017910d3"
 dependencies = [
  "crossterm",
 ]
@@ -1826,7 +1826,7 @@ dependencies = [
 [[package]]
 name = "bmux_terminal_grid"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#fe94fd0a5fa60b8c2e2682cb5b4228bee0798963"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#0fefe5646101ea37388e3e8bdf15fd49017910d3"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -1837,7 +1837,7 @@ dependencies = [
 [[package]]
 name = "bmux_text_edit"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#fe94fd0a5fa60b8c2e2682cb5b4228bee0798963"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#0fefe5646101ea37388e3e8bdf15fd49017910d3"
 dependencies = [
  "bmux_keyboard",
  "unicode-segmentation",
@@ -1847,7 +1847,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#fe94fd0a5fa60b8c2e2682cb5b4228bee0798963"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#0fefe5646101ea37388e3e8bdf15fd49017910d3"
 dependencies = [
  "bmux_keyboard",
  "bmux_text_edit",
@@ -1859,7 +1859,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui_components"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#fe94fd0a5fa60b8c2e2682cb5b4228bee0798963"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#0fefe5646101ea37388e3e8bdf15fd49017910d3"
 dependencies = [
  "bmux_keyboard",
  "bmux_text_edit",
@@ -1878,9 +1878,9 @@ dependencies = [
 
 [[package]]
 name = "brotli"
-version = "8.0.3"
+version = "8.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8119e4516436f5708bbc474a9d395bf12f1b5395e93a92a56e647ac3388c8610"
+checksum = "5cc91aac060a7a1e25823bdccbfb6af1875b88f17c6daac97894eed8207166b3"
 dependencies = [
  "alloc-no-stdlib",
  "alloc-stdlib",
@@ -1889,9 +1889,9 @@ dependencies = [
 
 [[package]]
 name = "brotli-decompressor"
-version = "5.0.1"
+version = "5.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5962523e1b92ce1b5e793d9169b9943eece10d39f62550bc04bb605d75b94924"
+checksum = "3a32acac15fe1967bc3986b2a6347dffc965602354ea6f450ad07e8bfd253583"
 dependencies = [
  "alloc-no-stdlib",
  "alloc-stdlib",
@@ -2220,7 +2220,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2542,9 +2542,6 @@ name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
-dependencies = [
- "powerfmt",
-]
 
 [[package]]
 name = "derive_more"
@@ -2611,7 +2608,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2772,7 +2769,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3192,16 +3189,14 @@ dependencies = [
 
 [[package]]
 name = "getrandom"
-version = "0.4.2"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0de51e6874e94e7bf76d726fc5d13ba782deca734ff60d5bb2fb2607c7406555"
+checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
 dependencies = [
  "cfg-if",
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.1",
- "wasip2",
- "wasip3",
 ]
 
 [[package]]
@@ -3287,9 +3282,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.14"
+version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "171fefbc92fe4a4de27e0698d6a5b392d6a0e333506bc49133760b3bcf948733"
+checksum = "6cb093c84e8bd9b188d4c4a8cb6579fc016968d14c99882163cd3ff402a4f155"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3323,15 +3318,6 @@ checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 dependencies = [
  "ahash",
  "allocator-api2",
-]
-
-[[package]]
-name = "hashbrown"
-version = "0.15.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
-dependencies = [
- "foldhash 0.1.5",
 ]
 
 [[package]]
@@ -3547,7 +3533,7 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-core",
- "h2 0.4.14",
+ "h2 0.4.15",
  "http 1.4.2",
  "http-body 1.0.1",
  "httparse",
@@ -3616,7 +3602,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_actions"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
  "hyperchad_color",
  "hyperchad_transformer_models",
@@ -3631,7 +3617,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_color"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
  "color-hex",
  "log",
@@ -3643,7 +3629,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_markdown"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
  "hyperchad_color",
  "hyperchad_transformer",
@@ -3658,7 +3644,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_transformer"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
  "html-escape",
  "hyperchad_actions",
@@ -3679,7 +3665,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_transformer_models"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
  "log",
  "moosicbox_assert",
@@ -3860,12 +3846,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "id-arena"
-version = "2.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
-
-[[package]]
 name = "idna"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3935,8 +3915,6 @@ checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
- "serde",
- "serde_core",
 ]
 
 [[package]]
@@ -4087,12 +4065,6 @@ name = "lazycell"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "830d08ce1d1d941e6b30645f1a0eb5643013d835ce3779a5fc208261dbe10f55"
-
-[[package]]
-name = "leb128fmt"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "libc"
@@ -4410,7 +4382,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_arb"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
  "log",
  "moosicbox_assert",
@@ -4421,7 +4393,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_assert"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
  "colored",
  "moosicbox_env_utils",
@@ -4430,12 +4402,12 @@ dependencies = [
 [[package]]
 name = "moosicbox_env_utils"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 
 [[package]]
 name = "moosicbox_json_utils"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4447,7 +4419,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_logging"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
  "free_log_client",
  "log",
@@ -4457,7 +4429,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_profiles"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
  "actix-web",
  "futures",
@@ -4530,7 +4502,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5330,7 +5302,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2e8e8bcc7961af1fdac401278c6a831614941f6164ee3bf4ce61b7edb162207"
 dependencies = [
  "chacha20 0.10.0",
- "getrandom 0.4.2",
+ "getrandom 0.4.3",
  "rand_core 0.10.1",
 ]
 
@@ -5739,7 +5711,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5752,7 +5724,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6274,7 +6246,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6347,7 +6319,7 @@ dependencies = [
 [[package]]
 name = "sshenv_vault"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/sshenv.git?branch=master#48282597ef4c6fe3c2ff67cbd19408ebeb320824"
+source = "git+https://github.com/BSteffaniak/sshenv.git?branch=master#66c2e1f1f3dbd8474309a722e39d0d1cf6a3d3a0"
 dependencies = [
  "aes-siv",
  "age",
@@ -6372,7 +6344,7 @@ dependencies = [
 [[package]]
 name = "sshenv_vault_models"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/sshenv.git?branch=master#48282597ef4c6fe3c2ff67cbd19408ebeb320824"
+source = "git+https://github.com/BSteffaniak/sshenv.git?branch=master#66c2e1f1f3dbd8474309a722e39d0d1cf6a3d3a0"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -6800,7 +6772,7 @@ dependencies = [
 [[package]]
 name = "switchy"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
  "switchy_database",
  "switchy_database_connection",
@@ -6810,7 +6782,7 @@ dependencies = [
 [[package]]
 name = "switchy_async"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
  "flume",
  "futures",
@@ -6825,7 +6797,7 @@ dependencies = [
 [[package]]
 name = "switchy_database"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6844,7 +6816,7 @@ dependencies = [
 [[package]]
 name = "switchy_database_connection"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
  "log",
  "rusqlite",
@@ -6857,7 +6829,7 @@ dependencies = [
 [[package]]
 name = "switchy_env"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
  "log",
  "thiserror 2.0.18",
@@ -6866,7 +6838,7 @@ dependencies = [
 [[package]]
 name = "switchy_schema"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6883,7 +6855,7 @@ dependencies = [
 [[package]]
 name = "switchy_time"
 version = "0.3.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#d234b7fc1dc2ab3cedc8173bf8dc595e7b3ca755"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
  "chrono",
  "log",
@@ -6897,9 +6869,9 @@ checksum = "a7973cce6668464ea31f176d85b13c7ab3bba2cb3b77a2ed26abd7801688010a"
 
 [[package]]
 name = "syn"
-version = "2.0.117"
+version = "2.0.118"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e665b8803e7b1d2a727f4023456bbbbe74da67099c585258af0ad9c5013b9b99"
+checksum = "1b9ae57f904213ebb649ce6895b8a66c66f0203b9319718f69a5612a065b1422"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6960,10 +6932,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7061,12 +7033,11 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.47"
+version = "0.3.49"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "743bd48c283afc0388f9b8827b976905fb217ad9e647fae3a379a9283c4def2c"
+checksum = "711a53c2d47bbd818258c498c8dbfe186a2526c631495cfe7e078567f86b8469"
 dependencies = [
  "deranged",
- "itoa",
  "num-conv",
  "powerfmt",
  "serde_core",
@@ -7076,15 +7047,15 @@ dependencies = [
 
 [[package]]
 name = "time-core"
-version = "0.1.8"
+version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7694e1cfe791f8d31026952abf09c69ca6f6fa4e1a1229e18988f06a04a12dca"
+checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
 
 [[package]]
 name = "time-macros"
-version = "0.2.27"
+version = "0.2.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e70e4c5a0e0a8a4823ad65dfe1a6930e4f4d756dcd9dd7939022b5e8c501215"
+checksum = "71c652a3727a9cbb9a02f707f530b618ce00d0ccd762009c8c23bd191df3c17d"
 dependencies = [
  "num-conv",
  "time-core",
@@ -7488,7 +7459,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9a47927d766b9ae7e3adf092d5e150dce80533615edc502641797878f190080"
 dependencies = [
  "chrono",
- "getrandom 0.4.2",
+ "getrandom 0.4.3",
  "turso_macros",
 ]
 
@@ -7768,7 +7739,7 @@ version = "1.23.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "144d6b123cef80b301b8f72a9e2ca4370ddec21950d0a103dd22c437006d2db7"
 dependencies = [
- "getrandom 0.4.2",
+ "getrandom 0.4.3",
  "js-sys",
  "serde_core",
  "sha1_smol",
@@ -7840,16 +7811,7 @@ version = "1.0.4+wasi-0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
 dependencies = [
- "wit-bindgen 0.57.1",
-]
-
-[[package]]
-name = "wasip3"
-version = "0.4.0+wasi-0.3.0-rc-2026-01-06"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5428f8bf88ea5ddc08faddef2ac4a67e390b88186c703ce6dbd955e1c145aca5"
-dependencies = [
- "wit-bindgen 0.51.0",
+ "wit-bindgen",
 ]
 
 [[package]]
@@ -7908,40 +7870,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wasm-encoder"
-version = "0.244.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "990065f2fe63003fe337b932cfb5e3b80e0b4d0f5ff650e6985b1048f62c8319"
-dependencies = [
- "leb128fmt",
- "wasmparser",
-]
-
-[[package]]
-name = "wasm-metadata"
-version = "0.244.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb0e353e6a2fbdc176932bbaab493762eb1255a7900fe0fea1a2f96c296cc909"
-dependencies = [
- "anyhow",
- "indexmap",
- "wasm-encoder",
- "wasmparser",
-]
-
-[[package]]
-name = "wasmparser"
-version = "0.244.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47b807c72e1bac69382b3a6fb3dbe8ea4c0ed87ff5629b8685ae6b9a611028fe"
-dependencies = [
- "bitflags 2.13.0",
- "hashbrown 0.15.5",
- "indexmap",
- "semver",
-]
-
-[[package]]
 name = "web-sys"
 version = "0.3.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7963,9 +7891,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.7"
+version = "1.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52f5ee44c96cf55f1b349600768e3ece3a8f26010c05265ab73f945bb1a2eb9d"
+checksum = "bf85cb06032201fa7c6f829d7db5a7e5aa45bcc0655327713065f6f0576731bf"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -8010,7 +7938,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8320,97 +8248,9 @@ dependencies = [
 
 [[package]]
 name = "wit-bindgen"
-version = "0.51.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7249219f66ced02969388cf2bb044a09756a083d0fab1e566056b04d9fbcaa5"
-dependencies = [
- "wit-bindgen-rust-macro",
-]
-
-[[package]]
-name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
-
-[[package]]
-name = "wit-bindgen-core"
-version = "0.51.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea61de684c3ea68cb082b7a88508a8b27fcc8b797d738bfc99a82facf1d752dc"
-dependencies = [
- "anyhow",
- "heck",
- "wit-parser",
-]
-
-[[package]]
-name = "wit-bindgen-rust"
-version = "0.51.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7c566e0f4b284dd6561c786d9cb0142da491f46a9fbed79ea69cdad5db17f21"
-dependencies = [
- "anyhow",
- "heck",
- "indexmap",
- "prettyplease",
- "syn",
- "wasm-metadata",
- "wit-bindgen-core",
- "wit-component",
-]
-
-[[package]]
-name = "wit-bindgen-rust-macro"
-version = "0.51.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c0f9bfd77e6a48eccf51359e3ae77140a7f50b1e2ebfe62422d8afdaffab17a"
-dependencies = [
- "anyhow",
- "prettyplease",
- "proc-macro2",
- "quote",
- "syn",
- "wit-bindgen-core",
- "wit-bindgen-rust",
-]
-
-[[package]]
-name = "wit-component"
-version = "0.244.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d66ea20e9553b30172b5e831994e35fbde2d165325bec84fc43dbf6f4eb9cb2"
-dependencies = [
- "anyhow",
- "bitflags 2.13.0",
- "indexmap",
- "log",
- "serde",
- "serde_derive",
- "serde_json",
- "wasm-encoder",
- "wasm-metadata",
- "wasmparser",
- "wit-parser",
-]
-
-[[package]]
-name = "wit-parser"
-version = "0.244.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ecc8ac4bc1dc3381b7f59c34f00b67e18f910c2c0f50015669dde7def656a736"
-dependencies = [
- "anyhow",
- "id-arena",
- "indexmap",
- "log",
- "semver",
- "serde",
- "serde_derive",
- "serde_json",
- "unicode-xid",
- "wasmparser",
-]
 
 [[package]]
 name = "worktree_setup_config"
