@@ -541,7 +541,8 @@ async fn confirm_start_loop(
         validation_commands.join("; ")
     };
     chat.app.push_system_note(format!(
-        "Ralph loop created\n* Loop: {loop_name}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}\n* Validation: {}\n* Next: capture conversation context into the progress doc",
+        "Ralph loop created\n* Loop: {loop_name}\n* Charter: {}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}\n* Validation: {}\n* Next: capture conversation context into the progress doc",
+        state.charter_doc_path.display(),
         state.progress_doc_path.display(),
         state.state_dir.display(),
         work_area.path.display(),

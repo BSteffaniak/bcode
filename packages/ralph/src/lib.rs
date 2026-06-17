@@ -21,6 +21,7 @@ use switchy::schema::runner::MigrationRunner;
 
 const RALPH_STATE_SUBDIR: &str = "ralph";
 const PROGRESS_DOC_FILE_NAME: &str = "progress.md";
+const CHARTER_DOC_FILE_NAME: &str = "charter.md";
 const CONTEXT_PACK_FILE_NAME: &str = "context-pack.json";
 const DATABASE_FILE_NAME: &str = "ralph.db";
 const MIGRATIONS_TABLE: &str = "ralph_schema_migrations";
@@ -471,6 +472,8 @@ pub struct CreatedRalphLoopState {
     pub state_dir: PathBuf,
     /// Canonical progress document path.
     pub progress_doc_path: PathBuf,
+    /// Immutable high-level charter document path.
+    pub charter_doc_path: PathBuf,
     /// Context pack sidecar path.
     pub context_pack_path: PathBuf,
 }
@@ -574,58 +577,72 @@ pub enum RalphPromptKind {
 ///
 /// # Errors
 ///
-/// Returns an error when the progress doc cannot be read.
+/// Returns an error when the progress doc or immutable charter cannot be read.
 pub fn build_prompt(
     summary: &RalphLoopSummary,
     kind: RalphPromptKind,
 ) -> Result<String, RalphStateError> {
     let progress_doc = std::fs::read_to_string(&summary.progress_doc_path)?;
+    let charter_doc = std::fs::read_to_string(&summary.charter_doc_path)?;
     Ok(match kind {
-        RalphPromptKind::Work => work_prompt(summary, &progress_doc),
-        RalphPromptKind::Audit => audit_prompt(summary, &progress_doc),
-        RalphPromptKind::Replan => replan_prompt(summary, &progress_doc),
+        RalphPromptKind::Work => work_prompt(summary, &charter_doc, &progress_doc),
+        RalphPromptKind::Audit => audit_prompt(summary, &charter_doc, &progress_doc),
+        RalphPromptKind::Replan => replan_prompt(summary, &charter_doc, &progress_doc),
     })
 }
 
-fn work_prompt(summary: &RalphLoopSummary, progress_doc: &str) -> String {
+fn work_prompt(summary: &RalphLoopSummary, charter_doc: &str, progress_doc: &str) -> String {
     format!(
         "Read the Ralph progress doc below, complete exactly one meaningful bounded chunk, update the doc honestly, and run relevant validation if practical.\n\n\
          Constraints:\n\
          * Do not mark checklist items complete unless verified.\n\
          * Preserve completed work and decisions.\n\
          * Stop and ask if permission, validation, or product intent is unclear.\n\
-         * Keep changes focused on the progress doc goal.\n\n\
+         * Keep changes focused on the charter-backed progress doc goal.\n\
+         * Treat the charter as immutable. Do not rewrite it during normal work.\n\n\
          Ralph loop: {loop_name}\n\
+         Charter path: {charter_doc_path}\n\
          Progress doc path: {progress_doc_path}\n\
          Checked items: {checked}\n\
          Unchecked items: {unchecked}\n\n\
+         Immutable charter:\n\n{charter_doc}\n\n\
          Progress doc:\n\n{progress_doc}",
         loop_name = summary.loop_name,
+        charter_doc_path = summary.charter_doc_path.display(),
         progress_doc_path = summary.progress_doc_path.display(),
         checked = summary.checklist_summary.checked_count,
-        unchecked = summary.checklist_summary.unchecked_count
+        unchecked = summary.checklist_summary.unchecked_count,
+        charter_doc = charter_doc
     )
 }
 
-fn audit_prompt(summary: &RalphLoopSummary, progress_doc: &str) -> String {
+fn audit_prompt(summary: &RalphLoopSummary, charter_doc: &str, progress_doc: &str) -> String {
     format!(
-        "Audit the repository state against this Ralph progress doc. Verify completed checklist items, validation claims, decisions, and handoff notes. Do not implement new work except minimal inspection needed for the audit. Convert unverified completed items back to unchecked items and record blockers/questions.\n\n\
+        "Audit the repository state against this Ralph loop's immutable charter and mutable progress doc. Verify completed checklist items, validation claims, decisions, and handoff notes. Do not implement new work except minimal inspection needed for the audit. Convert unverified completed items back to unchecked items and record blockers/questions. Explicitly call out any drift between the progress doc and the charter; preserve important progress-doc context while recommending realignment. Do not rewrite the charter.\n\n\
          Ralph loop: {loop_name}\n\
+         Charter path: {charter_doc_path}\n\
          Progress doc path: {progress_doc_path}\n\n\
+         Immutable charter:\n\n{charter_doc}\n\n\
          Progress doc:\n\n{progress_doc}",
         loop_name = summary.loop_name,
-        progress_doc_path = summary.progress_doc_path.display()
+        charter_doc_path = summary.charter_doc_path.display(),
+        progress_doc_path = summary.progress_doc_path.display(),
+        charter_doc = charter_doc
     )
 }
 
-fn replan_prompt(summary: &RalphLoopSummary, progress_doc: &str) -> String {
+fn replan_prompt(summary: &RalphLoopSummary, charter_doc: &str, progress_doc: &str) -> String {
     format!(
-        "Replan this Ralph progress doc. Preserve verified completed work, decisions, and validation results. Convert incomplete or unverified work into clear unchecked checklist items. Keep the plan bounded and actionable for the next single work iteration.\n\n\
+        "Replan this Ralph progress doc against the immutable charter. Preserve verified completed work, important discovered context, decisions, and validation results. Convert incomplete or unverified work into clear unchecked checklist items. If the progress doc has drifted, recalibrate it toward the charter without deleting useful context/tasks casually; regroup, reprioritize, clarify, or add workstreams with rationale. Keep the plan bounded and actionable for the next single work iteration. Do not rewrite the charter.\n\n\
          Ralph loop: {loop_name}\n\
+         Charter path: {charter_doc_path}\n\
          Progress doc path: {progress_doc_path}\n\n\
+         Immutable charter:\n\n{charter_doc}\n\n\
          Progress doc:\n\n{progress_doc}",
         loop_name = summary.loop_name,
-        progress_doc_path = summary.progress_doc_path.display()
+        charter_doc_path = summary.charter_doc_path.display(),
+        progress_doc_path = summary.progress_doc_path.display(),
+        charter_doc = charter_doc
     )
 }
 
@@ -714,6 +731,8 @@ pub struct RalphLoopSummary {
     pub state_dir: PathBuf,
     /// Canonical progress document path.
     pub progress_doc_path: PathBuf,
+    /// Immutable high-level charter document path.
+    pub charter_doc_path: PathBuf,
     /// Isolated work area path, when created.
     pub work_area_path: Option<PathBuf>,
     /// Session ID rooted at the isolated work area, when created.
@@ -1131,6 +1150,8 @@ fn summary_from_loop_row(row: &Row) -> Result<RalphLoopSummary, RalphStateError>
         status: status.clone(),
         state_dir: PathBuf::from(required_text(row, "state_dir")?),
         progress_doc_path,
+        charter_doc_path: PathBuf::from(required_text(row, "state_dir")?)
+            .join(CHARTER_DOC_FILE_NAME),
         work_area_path: optional_text(row, "work_area_path").map(PathBuf::from),
         session_id: optional_text(row, "session_id"),
         iteration_count,
@@ -2159,6 +2180,10 @@ fn create_initial_loop_state_in_store(
     std::fs::create_dir_all(&paths.state_dir)?;
     let metadata = LoopMetadata::new(loop_name, repo_root, &paths);
     std::fs::write(
+        &paths.charter_doc_path,
+        initial_charter_doc(loop_name, repo_root, session_title, &paths),
+    )?;
+    std::fs::write(
         &paths.progress_doc_path,
         initial_progress_doc(loop_name, repo_root, session_title, &paths),
     )?;
@@ -2226,6 +2251,10 @@ fn generate_progress_doc_from_context_in_store(
     let bytes = std::fs::read(&state.context_pack_path)?;
     let context_pack =
         serde_json::from_slice::<ContextPack>(&bytes).map_err(RalphStateError::Json)?;
+    std::fs::write(
+        &state.charter_doc_path,
+        charter_doc_from_context(loop_name, repo_root, state, &context_pack),
+    )?;
     std::fs::write(
         &state.progress_doc_path,
         progress_doc_from_context(loop_name, repo_root, state, &context_pack),
@@ -2300,6 +2329,7 @@ fn allocate_loop_paths_in_store(
         if !state_dir.exists() {
             return Ok(CreatedRalphLoopState {
                 progress_doc_path: state_dir.join(PROGRESS_DOC_FILE_NAME),
+                charter_doc_path: state_dir.join(CHARTER_DOC_FILE_NAME),
                 context_pack_path: state_dir.join(CONTEXT_PACK_FILE_NAME),
                 state_dir,
             });
@@ -2426,6 +2456,50 @@ impl<'a> LoopMetadata<'a> {
     }
 }
 
+fn initial_charter_doc(
+    loop_name: &str,
+    repo_root: &Path,
+    session_title: Option<&str>,
+    paths: &CreatedRalphLoopState,
+) -> String {
+    let session_title = session_title.unwrap_or("Untitled session");
+    format!(
+        "# Ralph Loop Charter: {loop_name}\n\n\
+         This charter is the immutable high-level source of truth for the Ralph loop. Normal Ralph work, audit, and replan flows must not rewrite this file. If the goal changes, create an explicit amendment or a new loop instead.\n\n\
+         ## Original objective\n\n\
+         Track and refine the intended goal captured from Bcode session `{session_title}`.\n\n\
+         ## Product intent\n\n\
+         Keep the mutable progress doc aligned with the user's overall goal while preserving important discovered context, tasks, decisions, and validation results.\n\n\
+         ## Non-negotiables\n\n\
+         - Preserve important context from the originating conversation.\n\
+         - Keep work aligned with the original objective, not just the next checklist item.\n\
+         - Do not mark work complete unless it has actually been verified.\n\
+         - Recalibrate the mutable progress doc when it drifts from this charter.\n\n\
+         ## In scope\n\n\
+         - Capture the intended work from the originating Bcode session.\n\
+         - Maintain a mutable progress doc for bounded Ralph iterations.\n\
+         - Audit and replan against this charter when progress drifts.\n\n\
+         ## Out of scope\n\n\
+         - Silently changing this charter during normal loop progression.\n\
+         - Deleting useful progress-doc context simply because priorities changed.\n\n\
+         ## Definition of done\n\n\
+         - [ ] The progress doc stays aligned with this charter's objective.\n\
+         - [ ] Important discovered context, decisions, and validation results are preserved.\n\
+         - [ ] The loop completes only after verified work satisfies the original objective.\n\n\
+         ## Alignment rules\n\n\
+         When auditing or replanning, compare `progress.md` against this charter. Preserve useful accumulated context and tasks, but regroup, reprioritize, clarify, or add checklist items when the mutable plan no longer serves the original goal. Flag drift explicitly instead of hiding it.\n\n\
+         ## Source context\n\n\
+         - Repository: `{repo_root}`\n\
+         - Progress doc: `{progress_doc}`\n\
+         - Context pack: `{context_pack}`\n\
+         - Ralph state directory: `{state_dir}`\n",
+        repo_root = repo_root.display(),
+        progress_doc = paths.progress_doc_path.display(),
+        context_pack = paths.context_pack_path.display(),
+        state_dir = paths.state_dir.display()
+    )
+}
+
 fn initial_progress_doc(
     loop_name: &str,
     repo_root: &Path,
@@ -2439,7 +2513,10 @@ fn initial_progress_doc(
          Track Ralph loop progress captured from Bcode session `{session_title}`.\n\n\
          ## Current status\n\n\
          - **State:** Created\n\
-         - **Repository:** `{repo_root}`\n\n\
+         - **Repository:** `{repo_root}`\n\
+         - **Immutable charter:** `{charter_doc}`\n\n\
+         ## Alignment guidance\n\n\
+         Use the immutable charter as the source of truth for the overall goal. This progress doc may evolve, but it should be recalibrated when it drifts from the charter. Preserve important context and tasks while realigning.\n\n\
          ## Definition of done\n\n\
          - [ ] Capture the intended goal, constraints, and non-goals from the current conversation.\n\
          - [ ] Confirm or create the isolated work area for this Ralph loop.\n\
@@ -2457,6 +2534,7 @@ fn initial_progress_doc(
          - Canonical progress doc path: `{progress_doc}`\n\
          - Ralph state directory: `{state_dir}`\n",
         repo_root = repo_root.display(),
+        charter_doc = paths.charter_doc_path.display(),
         progress_doc = paths.progress_doc_path.display(),
         state_dir = paths.state_dir.display()
     )
@@ -2478,6 +2556,77 @@ fn initial_context_pack(
         "created_at_ms": now_ms(),
     });
     serde_json::to_vec_pretty(&value).map_err(RalphStateError::Json)
+}
+
+fn charter_doc_from_context(
+    loop_name: &str,
+    repo_root: &Path,
+    paths: &CreatedRalphLoopState,
+    context_pack: &ContextPack,
+) -> String {
+    let latest_user_goal = context_pack
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.kind == "user_message")
+        .map_or(
+            "Review the captured context and refine this goal.",
+            |event| event.text.as_str(),
+        );
+    let originating_context = context_pack
+        .events
+        .iter()
+        .filter(|event| event.kind == "user_message")
+        .take(6)
+        .map(|event| format!("- #{}: {}", event.sequence, markdown_line(&event.text)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let originating_context = if originating_context.is_empty() {
+        "- No user-authored context was captured. Refine this charter manually before long-running work.".to_owned()
+    } else {
+        originating_context
+    };
+    format!(
+        "# Ralph Loop Charter: {loop_name}\n\n\
+         This charter is the immutable high-level source of truth for the Ralph loop. Normal Ralph work, audit, and replan flows must not rewrite this file. If the goal changes, create an explicit amendment or a new loop instead.\n\n\
+         ## Original objective\n\n\
+         {goal}\n\n\
+         ## Product intent\n\n\
+         Keep the mutable progress doc aligned with the user's overall goal while preserving important discovered context, tasks, decisions, and validation results.\n\n\
+         ## Non-negotiables\n\n\
+         - Preserve important context from the originating conversation.\n\
+         - Keep work aligned with the original objective, not just the next checklist item.\n\
+         - Do not mark work complete unless it has actually been verified.\n\
+         - Recalibrate the mutable progress doc when it drifts from this charter.\n\n\
+         ## Originating context\n\n\
+         {originating_context}\n\n\
+         ## In scope\n\n\
+         - Work required to satisfy the original objective.\n\
+         - Updates to the mutable progress doc that make the plan more accurate and actionable.\n\
+         - Audits and replans that realign execution with this charter.\n\n\
+         ## Out of scope\n\n\
+         - Silently changing this charter during normal loop progression.\n\
+         - Deleting useful progress-doc context simply because priorities changed.\n\
+         - Completing checklist items without verification.\n\n\
+         ## Definition of done\n\n\
+         - [ ] The progress doc stays aligned with this charter's objective.\n\
+         - [ ] Important discovered context, decisions, and validation results are preserved.\n\
+         - [ ] The loop completes only after verified work satisfies the original objective.\n\n\
+         ## Alignment rules\n\n\
+         When auditing or replanning, compare `progress.md` against this charter. Preserve useful accumulated context and tasks, but regroup, reprioritize, clarify, or add checklist items when the mutable plan no longer serves the original goal. Flag drift explicitly instead of hiding it.\n\n\
+         ## Source context\n\n\
+         - Repository: `{repo_root}`\n\
+         - Captured events: {event_count}\n\
+         - Progress doc: `{progress_doc}`\n\
+         - Context pack: `{context_pack}`\n\
+         - Ralph state directory: `{state_dir}`\n",
+        goal = markdown_paragraph(latest_user_goal),
+        repo_root = repo_root.display(),
+        event_count = context_pack.event_count,
+        progress_doc = paths.progress_doc_path.display(),
+        context_pack = paths.context_pack_path.display(),
+        state_dir = paths.state_dir.display()
+    )
 }
 
 fn progress_doc_from_context(
@@ -2522,7 +2671,10 @@ fn progress_doc_from_context(
          ## Current status\n\n\
          - **State:** Awaiting approval\n\
          - **Repository:** `{repo_root}`\n\
-         - **Captured events:** {event_count}\n\n\
+         - **Captured events:** {event_count}\n\
+         - **Immutable charter:** `{charter_doc}`\n\n\
+         ## Alignment guidance\n\n\
+         Use the immutable charter as the source of truth for the overall goal. This progress doc may evolve, but it should be recalibrated when it drifts from the charter. Preserve important context and tasks while realigning.\n\n\
          ## Captured context\n\n\
          {recent_context}\n\n\
          ## Definition of done\n\n\
@@ -2546,6 +2698,7 @@ fn progress_doc_from_context(
         goal = markdown_paragraph(latest_user_goal),
         repo_root = repo_root.display(),
         event_count = context_pack.event_count,
+        charter_doc = paths.charter_doc_path.display(),
         progress_doc = paths.progress_doc_path.display(),
         state_dir = paths.state_dir.display(),
         context_pack = paths.context_pack_path.display()
@@ -3105,6 +3258,85 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir should create");
         let store = RalphStateStore::from_ralph_state_root(temp.path().join("ralph"));
         (temp, store)
+    }
+
+    #[test]
+    fn creates_immutable_charter_and_references_it_from_progress_doc() {
+        let (_temp, store) = test_store();
+        let repo = tempfile::tempdir().expect("repo tempdir should create");
+        let state = store
+            .create_initial_loop_state("Architecture Goal", repo.path(), Some("Origin Session"))
+            .expect("loop state should create");
+
+        let charter =
+            std::fs::read_to_string(&state.charter_doc_path).expect("charter should be written");
+        let progress = std::fs::read_to_string(&state.progress_doc_path)
+            .expect("progress doc should be written");
+
+        assert!(charter.contains("immutable high-level source of truth"));
+        assert!(charter.contains("Origin Session"));
+        assert!(progress.contains("Immutable charter"));
+        assert!(progress.contains(&state.charter_doc_path.display().to_string()));
+    }
+
+    #[test]
+    fn generated_context_docs_use_charter_for_alignment() {
+        let (_temp, store) = test_store();
+        let repo = tempfile::tempdir().expect("repo tempdir should create");
+        let state = store
+            .create_initial_loop_state("Multiplayer", repo.path(), Some("Game Session"))
+            .expect("loop state should create");
+        let events = vec![SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 7,
+            session_id: bcode_session_models::SessionId::new(),
+            provenance: None,
+            kind: SessionEventKind::UserMessage {
+                client_id: bcode_session_models::ClientId(uuid::Uuid::new_v4()),
+                text: "Build the correct online multiplayer architecture.".to_owned(),
+            },
+        }];
+
+        store
+            .write_context_pack(&state, Some("Game Session"), &events)
+            .expect("context should write");
+        store
+            .generate_progress_doc_from_context(&state, "Multiplayer", repo.path())
+            .expect("docs should generate");
+
+        let charter =
+            std::fs::read_to_string(&state.charter_doc_path).expect("charter should be generated");
+        let progress = std::fs::read_to_string(&state.progress_doc_path)
+            .expect("progress doc should be generated");
+
+        assert!(charter.contains("Build the correct online multiplayer architecture."));
+        assert!(
+            charter.contains("Do not mark work complete unless it has actually been verified.")
+        );
+        assert!(progress.contains("Alignment guidance"));
+        assert!(progress.contains(&state.charter_doc_path.display().to_string()));
+    }
+
+    #[test]
+    fn audit_and_replan_prompts_include_immutable_charter() {
+        let (_temp, store) = test_store();
+        let repo = tempfile::tempdir().expect("repo tempdir should create");
+        let state = store
+            .create_initial_loop_state("Prompt Loop", repo.path(), Some("Prompt Session"))
+            .expect("loop state should create");
+        let summary = store
+            .latest_loop(repo.path())
+            .expect("loop should query")
+            .expect("loop should exist");
+
+        let audit = build_prompt(&summary, RalphPromptKind::Audit).expect("audit prompt builds");
+        let replan = build_prompt(&summary, RalphPromptKind::Replan).expect("replan prompt builds");
+
+        assert!(audit.contains("Immutable charter:"));
+        assert!(audit.contains(&state.charter_doc_path.display().to_string()));
+        assert!(audit.contains("Do not rewrite the charter"));
+        assert!(replan.contains("Immutable charter:"));
+        assert!(replan.contains("recalibrate it toward the charter"));
     }
 
     #[test]
