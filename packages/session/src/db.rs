@@ -193,6 +193,10 @@ pub struct SessionDbState {
     pub current_provider: Option<String>,
     /// Current model selection, if any.
     pub current_model: Option<String>,
+    /// Current reasoning effort selection, if any.
+    pub reasoning_effort: Option<String>,
+    /// Current reasoning summary selection, if any.
+    pub reasoning_summary: Option<String>,
     /// Projection-updated timestamp, when known.
     pub updated_at_ms: Option<u64>,
     /// Whether the input-history projection has at least one user message.
@@ -683,6 +687,8 @@ impl SessionDb {
                 "current_provider",
                 "working_directory",
                 "title",
+                "reasoning_effort",
+                "reasoning_summary",
                 "updated_at_ms",
             ])
             .where_eq("session_id", self.session_id.to_string())
@@ -708,6 +714,8 @@ impl SessionDb {
             )?),
             current_provider: optional_string(&row, "current_provider"),
             current_model: optional_string(&row, "current_model"),
+            reasoning_effort: optional_string(&row, "reasoning_effort"),
+            reasoning_summary: optional_string(&row, "reasoning_summary"),
             updated_at_ms: row
                 .get("updated_at_ms")
                 .and_then(|value| value.as_i64())
@@ -1306,97 +1314,117 @@ fn global_migrations() -> CodeMigrationSource<'static> {
 
 fn session_migrations() -> CodeMigrationSource<'static> {
     let mut source = CodeMigrationSource::new();
+    add_session_base_migrations(&mut source);
+    add_session_runtime_migrations(&mut source);
+    source
+}
+
+fn add_session_base_migrations(source: &mut CodeMigrationSource<'static>) {
     add_sql_migration(
-        &mut source,
+        source,
         "001_events_table",
         "CREATE TABLE IF NOT EXISTS events (\n    event_seq INTEGER PRIMARY KEY NOT NULL,\n    event_type TEXT NOT NULL,\n    schema_version INTEGER NOT NULL,\n    created_at_ms INTEGER,\n    causation_id TEXT,\n    correlation_id TEXT,\n    payload TEXT NOT NULL\n)",
         "DROP TABLE IF EXISTS events",
     );
     add_sql_migration(
-        &mut source,
+        source,
         "002_events_event_type_index",
         "CREATE INDEX IF NOT EXISTS idx_events_event_type ON events(event_type)",
         "DROP INDEX IF EXISTS idx_events_event_type",
     );
     add_sql_migration(
-        &mut source,
+        source,
         "003_session_state_table",
         "CREATE TABLE IF NOT EXISTS session_state (\n    session_id TEXT PRIMARY KEY NOT NULL,\n    last_event_seq INTEGER NOT NULL,\n    current_model TEXT,\n    current_provider TEXT,\n    working_directory TEXT,\n    title TEXT,\n    updated_at_ms INTEGER\n)",
         "DROP TABLE IF EXISTS session_state",
     );
     add_sql_migration(
-        &mut source,
+        source,
         "004_input_messages_table",
         "CREATE TABLE IF NOT EXISTS input_messages (\n    input_seq INTEGER PRIMARY KEY NOT NULL,\n    event_seq INTEGER NOT NULL,\n    created_at_ms INTEGER,\n    text TEXT NOT NULL,\n    working_directory TEXT,\n    model TEXT,\n    FOREIGN KEY(event_seq) REFERENCES events(event_seq)\n)",
         "DROP TABLE IF EXISTS input_messages",
     );
     add_sql_migration(
-        &mut source,
+        source,
         "005_input_messages_event_seq_index",
         "CREATE INDEX IF NOT EXISTS idx_input_messages_event_seq ON input_messages(event_seq)",
         "DROP INDEX IF EXISTS idx_input_messages_event_seq",
     );
     add_sql_migration(
-        &mut source,
+        source,
         "006_transcript_items_table",
         "CREATE TABLE IF NOT EXISTS transcript_items (\n    transcript_seq INTEGER PRIMARY KEY NOT NULL,\n    event_seq_start INTEGER NOT NULL,\n    event_seq_end INTEGER NOT NULL,\n    role TEXT NOT NULL,\n    kind TEXT NOT NULL,\n    status TEXT NOT NULL,\n    content TEXT,\n    created_at_ms INTEGER,\n    FOREIGN KEY(event_seq_start) REFERENCES events(event_seq)\n)",
         "DROP TABLE IF EXISTS transcript_items",
     );
     add_sql_migration(
-        &mut source,
+        source,
         "007_transcript_items_event_range_index",
         "CREATE INDEX IF NOT EXISTS idx_transcript_items_event_range ON transcript_items(event_seq_start, event_seq_end)",
         "DROP INDEX IF EXISTS idx_transcript_items_event_range",
     );
     add_sql_migration(
-        &mut source,
+        source,
         "008_tool_runs_table",
         "CREATE TABLE IF NOT EXISTS tool_runs (\n    tool_call_id TEXT PRIMARY KEY NOT NULL,\n    event_seq_start INTEGER NOT NULL,\n    event_seq_end INTEGER,\n    status TEXT NOT NULL,\n    tool_name TEXT,\n    started_at_ms INTEGER,\n    completed_at_ms INTEGER,\n    output_bytes INTEGER,\n    is_error INTEGER,\n    FOREIGN KEY(event_seq_start) REFERENCES events(event_seq)\n)",
         "DROP TABLE IF EXISTS tool_runs",
     );
     add_sql_migration(
-        &mut source,
+        source,
         "009_tool_runs_status_index",
         "CREATE INDEX IF NOT EXISTS idx_tool_runs_status ON tool_runs(status)",
         "DROP INDEX IF EXISTS idx_tool_runs_status",
     );
     add_sql_migration(
-        &mut source,
+        source,
         "010_projection_checkpoints_table",
         "CREATE TABLE IF NOT EXISTS projection_checkpoints (\n    projection_name TEXT PRIMARY KEY NOT NULL,\n    last_event_seq INTEGER NOT NULL,\n    projection_version INTEGER NOT NULL,\n    updated_at_ms INTEGER\n)",
         "DROP TABLE IF EXISTS projection_checkpoints",
     );
     add_sql_migration(
-        &mut source,
+        source,
         "011_snapshots_table",
         "CREATE TABLE IF NOT EXISTS snapshots (\n    snapshot_name TEXT PRIMARY KEY NOT NULL,\n    last_event_seq INTEGER NOT NULL,\n    schema_version INTEGER NOT NULL,\n    payload TEXT NOT NULL,\n    updated_at_ms INTEGER\n)",
         "DROP TABLE IF EXISTS snapshots",
     );
+}
+
+fn add_session_runtime_migrations(source: &mut CodeMigrationSource<'static>) {
     add_sql_migration(
-        &mut source,
+        source,
         "012_runtime_work_table",
         "CREATE TABLE IF NOT EXISTS runtime_work (\n    work_id TEXT PRIMARY KEY NOT NULL,\n    event_seq_start INTEGER NOT NULL,\n    event_seq_end INTEGER,\n    parent_work_id TEXT,\n    kind TEXT NOT NULL,\n    label TEXT NOT NULL,\n    status TEXT NOT NULL,\n    started_at_ms INTEGER,\n    finished_at_ms INTEGER,\n    message TEXT,\n    cancellable INTEGER NOT NULL DEFAULT 0,\n    FOREIGN KEY(event_seq_start) REFERENCES events(event_seq)\n)",
         "DROP TABLE IF EXISTS runtime_work",
     );
     add_sql_migration(
-        &mut source,
+        source,
         "013_runtime_work_status_index",
         "CREATE INDEX IF NOT EXISTS idx_runtime_work_status ON runtime_work(status)",
         "DROP INDEX IF EXISTS idx_runtime_work_status",
     );
     add_sql_migration(
-        &mut source,
+        source,
         "014_runtime_work_parent_index",
         "CREATE INDEX IF NOT EXISTS idx_runtime_work_parent_work_id ON runtime_work(parent_work_id)",
         "DROP INDEX IF EXISTS idx_runtime_work_parent_work_id",
     );
     add_sql_migration(
-        &mut source,
+        source,
         "015_session_drafts_table",
         "CREATE TABLE IF NOT EXISTS session_drafts (\n    session_id TEXT PRIMARY KEY NOT NULL,\n    text TEXT NOT NULL,\n    updated_at_ms INTEGER NOT NULL\n)",
         "DROP TABLE IF EXISTS session_drafts",
     );
-    source
+    add_sql_migration(
+        source,
+        "016_session_state_reasoning_effort_column",
+        "ALTER TABLE session_state ADD COLUMN reasoning_effort TEXT",
+        "ALTER TABLE session_state DROP COLUMN reasoning_effort",
+    );
+    add_sql_migration(
+        source,
+        "017_session_state_reasoning_summary_column",
+        "ALTER TABLE session_state ADD COLUMN reasoning_summary TEXT",
+        "ALTER TABLE session_state DROP COLUMN reasoning_summary",
+    );
 }
 
 fn add_sql_migration(
@@ -1465,6 +1493,14 @@ async fn project_event(db: &dyn Database, event: &SessionEvent) -> SessionDbResu
             db.update("session_state")
                 .value("current_provider", provider.clone())
                 .value("current_model", model.clone())
+                .where_eq("session_id", event.session_id.to_string())
+                .execute(db)
+                .await?;
+        }
+        SessionEventKind::ReasoningChanged { effort, summary } => {
+            db.update("session_state")
+                .value("reasoning_effort", effort.clone())
+                .value("reasoning_summary", summary.clone())
                 .where_eq("session_id", event.session_id.to_string())
                 .execute(db)
                 .await?;
