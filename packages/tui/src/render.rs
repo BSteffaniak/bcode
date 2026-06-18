@@ -58,7 +58,7 @@ pub struct TuiTheme {
 impl TuiTheme {
     #[must_use]
     pub fn for_app(app: &BmuxApp) -> Self {
-        Self::for_agent(app.current_agent_id(), app.current_agent_accent())
+        Self::for_agent(app.display_agent_id(), app.display_agent_accent())
     }
 
     #[must_use]
@@ -478,7 +478,7 @@ fn header_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
             Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
             false,
         )
-        .required(app.current_agent_id().to_owned(), accent, false)
+        .required(app.display_agent_id().to_owned(), accent, false)
         .required(session_title, Style::new(), true)
         .optional(
             format!("model {}", app.selected_model_id().unwrap_or("default")),

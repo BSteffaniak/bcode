@@ -480,7 +480,7 @@ async fn handle_chat_key<W: Write>(
     match outcome.request {
         KeyRequest::None => {}
         KeyRequest::Interrupt => request_turn_cancellation(context.services.client, chat).await,
-        KeyRequest::CycleAgent => cycle_session_agent(context.services.client, chat).await,
+        KeyRequest::CycleAgent => cycle_session_agent(chat),
         KeyRequest::Submit { placement } => {
             let (mut io, services) = context.flow_context();
             match composer_flow::submit_composer(&mut io, &services, chat, placement).await {
@@ -517,24 +517,25 @@ async fn request_turn_cancellation(client: &BcodeClient, chat: &mut ActiveChat) 
     }
 }
 
-async fn cycle_session_agent(client: &BcodeClient, chat: &mut ActiveChat) {
-    let Some(agent) = chat.agents.next_agent(chat.app.current_agent_id()) else {
+fn cycle_session_agent(chat: &mut ActiveChat) {
+    let current_agent_id = chat
+        .app
+        .pending_agent_id()
+        .unwrap_or_else(|| chat.app.current_agent_id());
+    let Some(agent) = chat.agents.next_agent(current_agent_id) else {
         chat.app.set_status("no agents available".to_owned());
         return;
     };
     let agent_id = agent.id.clone();
     let agent_name = agent.name.clone();
-    let Some(session_id) = chat.app.session_id() else {
+    let agent_accent = agent.accent.clone();
+    if chat.app.session_id().is_some() {
+        chat.app.set_pending_agent(agent_id, agent_accent);
+        chat.app
+            .set_status(format!("agent {agent_name} selected for next message"));
+    } else {
         chat.agents.apply_agent_to_app(&mut chat.app, agent_id);
         chat.app.set_status(format!("agent set to {agent_name}"));
-        return;
-    };
-    match client.set_session_agent(session_id, agent_id.clone()).await {
-        Ok(()) => {
-            chat.agents.apply_agent_to_app(&mut chat.app, agent_id);
-            chat.app.set_status(format!("agent set to {agent_name}"));
-        }
-        Err(error) => chat.app.set_status(format!("agent switch failed: {error}")),
     }
 }
 

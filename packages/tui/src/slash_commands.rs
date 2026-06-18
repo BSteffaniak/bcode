@@ -502,7 +502,7 @@ async fn cancel_runtime_command(
 
 async fn handle_agent_command(
     client: &BcodeClient,
-    session_id: Option<SessionId>,
+    _session_id: Option<SessionId>,
     current_agent_id: &str,
     parts: &[&str],
 ) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
@@ -527,12 +527,6 @@ async fn handle_agent_command(
             "unknown agent profile: {agent_id}"
         )));
     };
-
-    if let Some(session_id) = session_id {
-        client
-            .set_session_agent(session_id, agent.id.clone())
-            .await?;
-    }
 
     Ok(SlashCommandOutcome::DraftAgentSelected {
         agent_id: agent.id.clone(),

@@ -136,6 +136,8 @@ pub struct BmuxApp {
     selected_model_id: Option<String>,
     current_agent_id: String,
     current_agent_accent: Option<String>,
+    pending_agent_id: Option<String>,
+    pending_agent_accent: Option<String>,
     reasoning_visible: bool,
     thinking_label: String,
     reasoning_effort: Option<String>,
@@ -304,6 +306,8 @@ impl BmuxApp {
             selected_model_id: None,
             current_agent_id: "build".to_owned(),
             current_agent_accent: None,
+            pending_agent_id: None,
+            pending_agent_accent: None,
             reasoning_visible: true,
             thinking_label: "shown · effort: provider default · summary: provider default"
                 .to_owned(),
@@ -417,22 +421,66 @@ impl BmuxApp {
         &self.current_agent_id
     }
 
+    /// Return the pending agent id for the next submission, if one is staged.
+    #[must_use]
+    pub fn pending_agent_id(&self) -> Option<&str> {
+        self.pending_agent_id.as_deref()
+    }
+
+    /// Return the agent id that should be presented in the UI.
+    #[must_use]
+    pub fn display_agent_id(&self) -> &str {
+        self.pending_agent_id
+            .as_deref()
+            .unwrap_or(&self.current_agent_id)
+    }
+
     /// Return the configured current agent accent, if known.
     #[must_use]
     pub fn current_agent_accent(&self) -> Option<&str> {
         self.current_agent_accent.as_deref()
     }
 
+    /// Return the agent accent that should be presented in the UI.
+    #[must_use]
+    pub fn display_agent_accent(&self) -> Option<&str> {
+        self.pending_agent_accent
+            .as_deref()
+            .or_else(|| self.current_agent_accent())
+    }
+
     /// Set the current agent id.
     pub fn set_current_agent_id(&mut self, agent_id: impl Into<String>) {
         self.current_agent_id = agent_id.into();
         self.current_agent_accent = None;
+        self.clear_pending_agent();
     }
 
     /// Set the current agent id and optional configured accent.
     pub fn set_current_agent(&mut self, agent_id: impl Into<String>, accent: Option<String>) {
         self.current_agent_id = agent_id.into();
         self.current_agent_accent = accent;
+        self.clear_pending_agent();
+    }
+
+    /// Stage an agent selection for the next submitted message.
+    pub fn set_pending_agent(&mut self, agent_id: impl Into<String>, accent: Option<String>) {
+        self.pending_agent_id = Some(agent_id.into());
+        self.pending_agent_accent = accent;
+    }
+
+    /// Clear any staged agent selection.
+    pub fn clear_pending_agent(&mut self) {
+        self.pending_agent_id = None;
+        self.pending_agent_accent = None;
+    }
+
+    /// Commit the staged agent selection locally and return its id, if present.
+    pub fn take_pending_agent(&mut self) -> Option<String> {
+        let agent_id = self.pending_agent_id.take()?;
+        self.current_agent_id.clone_from(&agent_id);
+        self.current_agent_accent = self.pending_agent_accent.take();
+        Some(agent_id)
     }
 
     /// Return the current thinking display label.

@@ -2,6 +2,7 @@
 
 use std::io::Write;
 
+use bcode_client::BcodeClient;
 use bcode_session_models::SessionId;
 
 use super::runtime_context::{TuiIo, TuiServices};
@@ -83,8 +84,14 @@ fn apply_draft_agent_selection(
     agent_name: &str,
     agent_accent: Option<String>,
 ) {
-    chat.app.set_current_agent(agent_id, agent_accent);
-    chat.app.set_status(format!("agent set to {agent_name}"));
+    if chat.app.session_id().is_some() {
+        chat.app.set_pending_agent(agent_id, agent_accent);
+        chat.app
+            .set_status(format!("agent {agent_name} selected for next message"));
+    } else {
+        chat.app.set_current_agent(agent_id, agent_accent);
+        chat.app.set_status(format!("agent set to {agent_name}"));
+    }
 }
 
 async fn open_thinking_settings(
@@ -272,6 +279,19 @@ async fn handle_slash_command<W: Write>(
     Ok(None)
 }
 
+async fn commit_pending_agent(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    session_id: SessionId,
+) -> Result<(), TuiError> {
+    let Some(agent_id) = chat.app.pending_agent_id().map(ToOwned::to_owned) else {
+        return Ok(());
+    };
+    client.set_session_agent(session_id, agent_id).await?;
+    let _committed = chat.app.take_pending_agent();
+    Ok(())
+}
+
 /// Submit the staged composer text.
 pub async fn submit_composer<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
@@ -298,6 +318,11 @@ pub async fn submit_composer<W: Write>(
     }
     let session_id =
         session_flow::persist_draft_session(io.terminal, services.client, chat).await?;
+    if let Err(error) = commit_pending_agent(services.client, chat, session_id).await {
+        chat.app.restore_pending_submission(&message);
+        chat.app.set_status(format!("agent switch failed: {error}"));
+        return Ok(None);
+    }
     match services
         .client
         .send_user_message(session_id, message.clone(), placement)
