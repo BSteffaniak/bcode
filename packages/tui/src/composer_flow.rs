@@ -15,10 +15,6 @@ use super::{
 /// Result of submitting staged composer text.
 pub type SubmitComposerOutcome = Option<thinking_dialog::ThinkingDialogState>;
 
-fn has_known_slash_command(message: &str) -> bool {
-    slash_registry::slash_command_name(message).is_some_and(slash_registry::is_builtin_command_name)
-}
-
 fn apply_draft_agent_selection(
     chat: &mut ActiveChat,
     agent_id: String,
@@ -64,12 +60,14 @@ async fn handle_slash_command<W: Write>(
     chat: &mut ActiveChat,
     session_id: Option<SessionId>,
     message: &str,
+    resolution: slash_registry::SlashResolution,
 ) -> Result<SubmitComposerOutcome, TuiError> {
-    match slash_commands::execute(
+    match slash_commands::execute_resolved(
         services.client,
         session_id,
         chat.app.current_agent_id(),
         message,
+        resolution,
     )
     .await?
     {
@@ -246,12 +244,17 @@ pub async fn submit_composer<W: Write>(
         chat.app.clear_pending_submission(&message);
         return Ok(None);
     }
-    if has_known_slash_command(&message) {
-        let command = slash_registry::slash_command_name(&message);
-        if session_id.is_some()
-            || command.is_some_and(slash_registry::is_draft_safe_builtin_command)
-        {
-            return handle_slash_command(io, services, chat, session_id, &message).await;
+    let slash_resolution = if slash_registry::slash_command_name(&message).is_some() {
+        slash_registry::resolve(services.client, &message)
+            .await
+            .ok()
+    } else {
+        None
+    };
+    if let Some(resolution) = slash_resolution.filter(slash_registry::SlashResolution::is_known) {
+        if session_id.is_some() || resolution.is_draft_safe() {
+            return handle_slash_command(io, services, chat, session_id, &message, resolution)
+                .await;
         }
         chat.app.clear_pending_submission(&message);
         chat.app.set_status(
@@ -301,13 +304,5 @@ pub async fn submit_composer<W: Write>(
             chat.app.set_status(format!("send failed: {error}"));
             Ok(None)
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn recognizes_import_rescan_slash_command() {
-        assert!(super::has_known_slash_command("/rescan-imports"));
     }
 }

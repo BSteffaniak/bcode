@@ -205,7 +205,18 @@ async fn slash_items(
     {
         thinking_items(parts[1], status.reasoning.as_ref())
     } else {
-        static_items()
+        let mut items = static_items();
+        if let Ok(skills) = client.list_skills().await {
+            items.extend(skills.skills.into_iter().filter_map(|skill| {
+                slash_registry::is_non_conflicting_skill_alias(&skill.id).then(|| {
+                    let description = skill
+                        .description
+                        .unwrap_or_else(|| format!("Invoke skill {}", skill.name));
+                    item(format!("/{}", skill.id), description)
+                })
+            }));
+        }
+        items
     };
     filter_items(candidates, trimmed)
 }

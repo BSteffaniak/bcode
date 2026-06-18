@@ -1,5 +1,8 @@
 //! Slash command registry metadata for the TUI.
 
+use bcode_client::BcodeClient;
+use bcode_skill_models::SkillId;
+
 /// Static metadata for a builtin slash command name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuiltinSlashCommand {
@@ -336,6 +339,38 @@ const STATIC_COMPLETIONS: &[SlashCompletion] = &[
     },
 ];
 
+/// Resolution for a submitted slash command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlashResolution {
+    /// Command resolved to a builtin slash command.
+    Builtin(BuiltinSlashCommand),
+    /// Command resolved to a non-conflicting skill alias.
+    SkillAlias {
+        skill_id: SkillId,
+        arguments: String,
+    },
+    /// Command did not resolve to any known slash command.
+    Unknown,
+}
+
+impl SlashResolution {
+    /// Return true when the resolution is a known slash command.
+    #[must_use]
+    pub const fn is_known(&self) -> bool {
+        matches!(self, Self::Builtin(_) | Self::SkillAlias { .. })
+    }
+
+    /// Return true when the command can run before a persisted session exists.
+    #[must_use]
+    pub const fn is_draft_safe(&self) -> bool {
+        match self {
+            Self::Builtin(command) => command.draft_safe(),
+            Self::SkillAlias { .. } => true,
+            Self::Unknown => false,
+        }
+    }
+}
+
 /// Return static builtin slash command metadata.
 #[must_use]
 pub const fn builtin_commands() -> &'static [BuiltinSlashCommand] {
@@ -363,16 +398,54 @@ pub fn is_builtin_command_name(command: &str) -> bool {
     builtin_command(command).is_some()
 }
 
-/// Return true when the builtin slash command can run before a persisted session exists.
-#[must_use]
-pub fn is_draft_safe_builtin_command(command: &str) -> bool {
-    builtin_command(command).is_some_and(BuiltinSlashCommand::draft_safe)
-}
-
 /// Return the first slash command token without its leading slash.
 #[must_use]
 pub fn slash_command_name(message: &str) -> Option<&str> {
     message
         .strip_prefix('/')
         .and_then(|command| command.split_whitespace().next())
+}
+
+fn slash_command_arguments(message: &str) -> String {
+    message
+        .strip_prefix('/')
+        .and_then(|command| command.split_once(char::is_whitespace))
+        .map_or_else(String::new, |(_command, arguments)| {
+            arguments.trim_start().to_owned()
+        })
+}
+
+/// Return true when a skill ID can be exposed as a top-level slash alias.
+#[must_use]
+pub fn is_non_conflicting_skill_alias(skill_id: &SkillId) -> bool {
+    !is_builtin_command_name(skill_id.as_str())
+}
+
+/// Resolve a submitted slash command without executing side effects.
+///
+/// # Errors
+///
+/// Returns an error when dynamic skill discovery fails.
+pub async fn resolve(
+    client: &BcodeClient,
+    message: &str,
+) -> Result<SlashResolution, bcode_client::ClientError> {
+    let Some(command) = slash_command_name(message) else {
+        return Ok(SlashResolution::Unknown);
+    };
+    if let Some(builtin) = builtin_command(command) {
+        return Ok(SlashResolution::Builtin(builtin));
+    }
+    let skills = client.list_skills().await?;
+    let Some(skill) = skills
+        .skills
+        .into_iter()
+        .find(|skill| skill.id.as_str() == command && is_non_conflicting_skill_alias(&skill.id))
+    else {
+        return Ok(SlashResolution::Unknown);
+    };
+    Ok(SlashResolution::SkillAlias {
+        skill_id: skill.id,
+        arguments: slash_command_arguments(message),
+    })
 }

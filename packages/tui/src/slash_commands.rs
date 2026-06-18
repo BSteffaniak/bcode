@@ -542,22 +542,51 @@ async fn handle_agent_command(
 ///
 /// Returns an error when the daemon rejects a requested operation.
 #[allow(clippy::too_many_lines)]
-pub async fn execute(
+pub async fn execute_resolved(
     client: &BcodeClient,
     session_id: Option<SessionId>,
     current_agent_id: &str,
     message: &str,
+    resolution: slash_registry::SlashResolution,
 ) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
     let parts = message.split_whitespace().collect::<Vec<_>>();
-    let Some(command) = parts.first().map(|part| part.trim_start_matches('/')) else {
-        return Ok(SlashCommandOutcome::Unknown(message.to_owned()));
-    };
-    if !slash_registry::is_builtin_command_name(command) {
-        return Ok(SlashCommandOutcome::Unknown(message.to_owned()));
+    match resolution {
+        slash_registry::SlashResolution::Builtin(command) => {
+            execute_builtin(
+                client,
+                session_id,
+                current_agent_id,
+                message,
+                &parts,
+                command.name(),
+            )
+            .await
+        }
+        slash_registry::SlashResolution::SkillAlias {
+            skill_id,
+            arguments,
+        } => Ok(SlashCommandOutcome::InvokeSkill {
+            skill_id,
+            arguments,
+        }),
+        slash_registry::SlashResolution::Unknown => {
+            Ok(SlashCommandOutcome::Unknown(message.to_owned()))
+        }
     }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn execute_builtin(
+    client: &BcodeClient,
+    session_id: Option<SessionId>,
+    current_agent_id: &str,
+    message: &str,
+    parts: &[&str],
+    command: &str,
+) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
     match command {
         "sessions" => Ok(SlashCommandOutcome::PickSession),
-        "resync" => resync_command(client, &parts).await,
+        "resync" => resync_command(client, parts).await,
         "rescan-imports" => client.refresh_session_catalog(None).await.map(|list| {
             SlashCommandOutcome::Handled(format!(
                 "session catalog refresh requested (revision {})",
@@ -566,7 +595,7 @@ pub async fn execute(
         }),
         "new" => Ok(SlashCommandOutcome::NewDraftSession),
         "plan" | "build" | "agent" => {
-            handle_agent_command(client, session_id, current_agent_id, &parts).await
+            handle_agent_command(client, session_id, current_agent_id, parts).await
         }
         "compact" => {
             let Some(session_id) = session_id else {
@@ -647,9 +676,9 @@ pub async fn execute(
                     "cwd requires an active session".to_owned(),
                 ));
             };
-            cwd_command(client, session_id, &parts).await
+            cwd_command(client, session_id, parts).await
         }
-        "worktree" | "worktrees" => worktree_command(client, session_id, &parts).await,
+        "worktree" | "worktrees" => worktree_command(client, session_id, parts).await,
         "fork" => {
             if session_id.is_none() {
                 return Ok(SlashCommandOutcome::Handled(
@@ -670,8 +699,8 @@ pub async fn execute(
                 session_id: result.session.id,
             })
         }
-        "ralph" => Ok(ralph_command(&parts)),
-        "goal" => Ok(goal_command(&parts)),
+        "ralph" => Ok(ralph_command(parts)),
+        "goal" => Ok(goal_command(parts)),
         "skills" => Ok(SlashCommandOutcome::PickSkill),
         "skill" => {
             if parts.get(1) == Some(&"describe") {
@@ -691,13 +720,13 @@ pub async fn execute(
                     arguments: parts.iter().skip(2).copied().collect::<Vec<_>>().join(" "),
                 });
             };
-            skill_command(client, session_id, &parts).await
+            skill_command(client, session_id, parts).await
         }
         "thinking" => {
             let Some(session_id) = session_id else {
                 return Ok(SlashCommandOutcome::ToggleThinkingDisplay);
             };
-            thinking_command(client, session_id, &parts).await
+            thinking_command(client, session_id, parts).await
         }
         "stop" => {
             let Some(session_id) = session_id else {
@@ -713,7 +742,7 @@ pub async fn execute(
                     "runtime cancellation requires an active session".to_owned(),
                 ));
             };
-            cancel_runtime_command(client, session_id, &parts).await
+            cancel_runtime_command(client, session_id, parts).await
         }
         "runtime" | "status" => {
             let Some(session_id) = session_id else {
@@ -721,7 +750,7 @@ pub async fn execute(
                     "runtime: no active session".to_owned(),
                 ));
             };
-            runtime_status(client, session_id, &parts).await
+            runtime_status(client, session_id, parts).await
         }
         _ => Ok(SlashCommandOutcome::Unknown(message.to_owned())),
     }
