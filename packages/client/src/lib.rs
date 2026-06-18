@@ -169,6 +169,7 @@ pub struct AttachedSessionHistory {
     pub history: Vec<SessionEvent>,
     pub input_history: Vec<SessionInputHistoryEntry>,
     pub import_warnings: Vec<SessionImportWarning>,
+    pub draft: Option<String>,
 }
 
 const CLIENT_RUNTIME_ENV_VARS: &[&str] = &[
@@ -549,6 +550,42 @@ impl BcodeClient {
     async fn server_stop_with_mode(&self, mode: ServerStopMode) -> Result<(), ClientError> {
         match self.send_request(Request::ServerStop { mode }).await? {
             ResponsePayload::ServerStopping => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Return the persisted composer draft for a scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn composer_draft(
+        &self,
+        scope: bcode_ipc::ComposerDraftScope,
+    ) -> Result<Option<String>, ClientError> {
+        match self.send_request(Request::ComposerDraft { scope }).await? {
+            ResponsePayload::ComposerDraft { draft } => Ok(draft),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Set or clear the persisted composer draft for a scope.
+    ///
+    /// Empty text clears the draft.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn set_composer_draft(
+        &self,
+        scope: bcode_ipc::ComposerDraftScope,
+        text: String,
+    ) -> Result<(), ClientError> {
+        match self
+            .send_request(Request::SetComposerDraft { scope, text })
+            .await?
+        {
+            ResponsePayload::ComposerDraftSet => Ok(()),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -1790,6 +1827,7 @@ impl ClientConnection {
                 history,
                 input_history,
                 import_warnings,
+                draft,
                 session,
                 ..
             } => Ok(AttachedSessionHistory {
@@ -1797,6 +1835,7 @@ impl ClientConnection {
                 history,
                 input_history,
                 import_warnings,
+                draft,
             }),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -1835,6 +1874,7 @@ impl ClientConnection {
                 history,
                 input_history,
                 import_warnings,
+                draft,
                 session,
                 ..
             } => Ok(AttachedSessionHistory {
@@ -1842,6 +1882,7 @@ impl ClientConnection {
                 history,
                 input_history,
                 import_warnings,
+                draft,
             }),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -1868,6 +1909,7 @@ impl ClientConnection {
                 history,
                 input_history,
                 import_warnings,
+                draft,
                 session,
                 ..
             } => Ok(AttachedSessionHistory {
@@ -1875,6 +1917,7 @@ impl ClientConnection {
                 history,
                 input_history,
                 import_warnings,
+                draft,
             }),
             _ => Err(ClientError::UnexpectedResponse),
         }

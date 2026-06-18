@@ -4,7 +4,7 @@ use std::io::Write;
 use std::time::{Duration, Instant, SystemTime};
 
 use bcode_client::BcodeClient;
-use bcode_ipc::Event as BcodeEvent;
+use bcode_ipc::{ComposerDraftScope, Event as BcodeEvent};
 use bcode_session_models::SessionEventKind;
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{Event, FocusEvent};
@@ -27,6 +27,67 @@ use super::{
 };
 
 const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const DRAFT_SAVE_DEBOUNCE: Duration = Duration::from_millis(900);
+
+#[derive(Debug, Clone)]
+struct DraftAutosave {
+    launch_working_directory: std::path::PathBuf,
+    last_seen_text: String,
+    last_saved_text: Option<String>,
+    dirty: bool,
+    save_at: Option<Instant>,
+}
+
+impl DraftAutosave {
+    fn new(launch_working_directory: std::path::PathBuf, initial_text: String) -> Self {
+        Self {
+            launch_working_directory,
+            last_seen_text: initial_text.clone(),
+            last_saved_text: Some(initial_text),
+            dirty: false,
+            save_at: None,
+        }
+    }
+
+    fn scope(&self, chat: &ActiveChat) -> ComposerDraftScope {
+        chat.session_id.map_or_else(
+            || ComposerDraftScope::DraftSession {
+                launch_working_directory: self.launch_working_directory.clone(),
+            },
+            |session_id| ComposerDraftScope::Session { session_id },
+        )
+    }
+
+    fn observe(&mut self, chat: &ActiveChat, now: Instant) {
+        let text = chat.app.composer().text();
+        if text == self.last_seen_text {
+            return;
+        }
+        text.clone_into(&mut self.last_seen_text);
+        self.dirty = true;
+        self.save_at = Some(now + DRAFT_SAVE_DEBOUNCE);
+    }
+
+    fn next_save_at(&self) -> Option<Instant> {
+        self.dirty.then_some(self.save_at).flatten()
+    }
+
+    async fn save_now(&mut self, client: &BcodeClient, chat: &ActiveChat) {
+        if !self.dirty && self.last_saved_text.as_deref() == Some(chat.app.composer().text()) {
+            return;
+        }
+        let text = chat.app.composer().text().to_owned();
+        if client
+            .set_composer_draft(self.scope(chat), text.clone())
+            .await
+            .is_ok()
+        {
+            self.last_saved_text = Some(text);
+            self.dirty = false;
+            self.save_at = None;
+        }
+    }
+}
 
 struct ModalState {
     palette: Option<BmuxCommandPalette>,
@@ -54,6 +115,7 @@ impl<'a, 'b, W: Write> ChatEventContext<'a, 'b, W> {
 }
 
 /// Run the active chat UI loop.
+#[allow(clippy::too_many_lines)]
 pub async fn run_with_client<W: Write>(
     terminal: &mut Terminal<&mut W>,
     terminal_events: &mut TuiInput,
@@ -61,6 +123,7 @@ pub async fn run_with_client<W: Write>(
     keymap: &BmuxKeyMap,
     chat: &mut ActiveChat,
     mouse_scroll_rows: usize,
+    launch_working_directory: std::path::PathBuf,
 ) -> Result<(), TuiError> {
     let mut modals = ModalState {
         palette: None,
@@ -69,6 +132,10 @@ pub async fn run_with_client<W: Write>(
         thinking_dialog: None,
     };
     sync_chat_key_labels(chat, keymap);
+    let mut draft_autosave = DraftAutosave::new(
+        launch_working_directory,
+        chat.app.composer().text().to_owned(),
+    );
     let mut invalidation_queue = InvalidationQueue::default();
     refresh_invalidation_queue(chat, &mut invalidation_queue);
     let mut needs_redraw = true;
@@ -102,6 +169,13 @@ pub async fn run_with_client<W: Write>(
             needs_redraw = true;
         }
 
+        draft_autosave.observe(chat, Instant::now());
+        if let Some(save_at) = draft_autosave.next_save_at()
+            && Instant::now() >= save_at
+        {
+            draft_autosave.save_now(client, chat).await;
+        }
+
         let redraw_at = next_redraw_at(last_redraw);
         if needs_redraw && Instant::now() >= redraw_at {
             draw_chat_frame(terminal, chat, &mut modals)?;
@@ -115,8 +189,10 @@ pub async fn run_with_client<W: Write>(
             &mut invalidation_queue,
             chat,
             needs_redraw.then_some(redraw_at),
+            draft_autosave.next_save_at(),
         )
         .await?;
+        let before_session_id = chat.session_id;
         match event {
             ChatLoopEvent::Terminal(event) => {
                 let event_invalidation = if matches!(event, Event::Resize(_)) {
@@ -156,10 +232,16 @@ pub async fn run_with_client<W: Write>(
                     needs_redraw = true;
                 }
             }
-            ChatLoopEvent::RedrawFrame => {}
+            ChatLoopEvent::Timer => {}
+        }
+        if before_session_id != chat.session_id {
+            draft_autosave.last_saved_text = None;
+            draft_autosave.dirty = true;
+            draft_autosave.save_at = Some(Instant::now());
         }
     }
 
+    draft_autosave.save_now(client, chat).await;
     Ok(())
 }
 
@@ -168,7 +250,7 @@ enum ChatLoopEvent {
     Bcode(Box<BcodeEvent>),
     Async(Box<session_flow::ChatAsyncEvent>),
     TimedInvalidations(Vec<super::invalidation::InvalidationKey>),
-    RedrawFrame,
+    Timer,
 }
 
 fn next_redraw_at(last_redraw: Instant) -> Instant {
@@ -244,18 +326,17 @@ async fn next_chat_loop_event(
     invalidation_queue: &mut InvalidationQueue,
     chat: &mut ActiveChat,
     redraw_at: Option<Instant>,
+    draft_save_at: Option<Instant>,
 ) -> Result<ChatLoopEvent, TuiError> {
     let now = Instant::now();
     let due = invalidation_queue.take_due(now);
     if !due.is_empty() {
         return Ok(ChatLoopEvent::TimedInvalidations(due));
     }
-    let next_timer_at = match (invalidation_queue.next_at(), redraw_at) {
-        (Some(invalidation_at), Some(redraw_at)) => Some(invalidation_at.min(redraw_at)),
-        (Some(invalidation_at), None) => Some(invalidation_at),
-        (None, Some(redraw_at)) => Some(redraw_at),
-        (None, None) => None,
-    };
+    let next_timer_at = [invalidation_queue.next_at(), redraw_at, draft_save_at]
+        .into_iter()
+        .flatten()
+        .min();
     if let Some(next_at) = next_timer_at {
         let delay = next_at.saturating_duration_since(now);
         return tokio::select! {
@@ -278,7 +359,7 @@ async fn next_chat_loop_event(
                 let now = Instant::now();
                 let due = invalidation_queue.take_due(now);
                 if due.is_empty() {
-                    Ok(ChatLoopEvent::RedrawFrame)
+                    Ok(ChatLoopEvent::Timer)
                 } else {
                     Ok(ChatLoopEvent::TimedInvalidations(due))
                 }

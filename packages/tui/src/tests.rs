@@ -1139,6 +1139,7 @@ async fn async_session_open_preserves_typed_draft() {
             text: "previous prompt".to_owned(),
         }],
         import_warnings: Vec::new(),
+        draft: None,
     };
 
     super::session_flow::complete_switch_session(

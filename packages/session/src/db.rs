@@ -375,6 +375,82 @@ impl GlobalSessionDb {
             .collect()
     }
 
+    /// Return a launch-directory-scoped draft-session composer draft.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails or the row is malformed.
+    pub async fn draft_session_composer_draft(
+        &self,
+        launch_working_directory: &Path,
+    ) -> SessionDbResult<Option<String>> {
+        let scope_key = launch_working_directory.to_string_lossy().to_string();
+        let row = self
+            .db
+            .select("composer_drafts")
+            .columns(&["text"])
+            .where_eq("scope_kind", "draft_session")
+            .where_eq("scope_key", scope_key)
+            .execute_first(&**self.db)
+            .await?;
+        row.as_ref()
+            .map(|row| required_string(row, "text"))
+            .transpose()
+    }
+
+    /// Upsert or clear a launch-directory-scoped draft-session composer draft.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails.
+    pub async fn set_draft_session_composer_draft(
+        &self,
+        launch_working_directory: &Path,
+        text: &str,
+        updated_at_ms: u64,
+    ) -> SessionDbResult<()> {
+        let scope_key = launch_working_directory.to_string_lossy().to_string();
+        if text.is_empty() {
+            self.db
+                .delete("composer_drafts")
+                .where_eq("scope_kind", "draft_session")
+                .where_eq("scope_key", scope_key)
+                .execute(&**self.db)
+                .await?;
+            return Ok(());
+        }
+        let existing = self
+            .db
+            .select("composer_drafts")
+            .columns(&["scope_key"])
+            .where_eq("scope_kind", "draft_session")
+            .where_eq("scope_key", scope_key.clone())
+            .execute_first(&**self.db)
+            .await?;
+        if existing.is_some() {
+            self.db
+                .update("composer_drafts")
+                .value("launch_working_directory", scope_key.clone())
+                .value("text", text.to_owned())
+                .value("updated_at_ms", seq_to_value(updated_at_ms))
+                .where_eq("scope_kind", "draft_session")
+                .where_eq("scope_key", scope_key)
+                .execute(&**self.db)
+                .await?;
+        } else {
+            self.db
+                .insert("composer_drafts")
+                .value("scope_kind", "draft_session")
+                .value("scope_key", scope_key.clone())
+                .value("launch_working_directory", scope_key)
+                .value("text", text.to_owned())
+                .value("updated_at_ms", seq_to_value(updated_at_ms))
+                .execute(&**self.db)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Return the underlying database trait object.
     #[must_use]
     pub fn database(&self) -> &dyn Database {
@@ -422,6 +498,69 @@ impl SessionDb {
             session_id,
             db: Arc::new(db),
         })
+    }
+
+    /// Return the current composer draft, if one is persisted for this session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails or the row is malformed.
+    pub async fn session_composer_draft(&self) -> SessionDbResult<Option<String>> {
+        let row = self
+            .db
+            .select("session_drafts")
+            .columns(&["text"])
+            .where_eq("session_id", self.session_id.to_string())
+            .execute_first(&**self.db)
+            .await?;
+        row.as_ref()
+            .map(|row| required_string(row, "text"))
+            .transpose()
+    }
+
+    /// Upsert or clear this session's composer draft.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails.
+    pub async fn set_session_composer_draft(
+        &self,
+        text: &str,
+        updated_at_ms: u64,
+    ) -> SessionDbResult<()> {
+        if text.is_empty() {
+            self.db
+                .delete("session_drafts")
+                .where_eq("session_id", self.session_id.to_string())
+                .execute(&**self.db)
+                .await?;
+            return Ok(());
+        }
+        let existing = self
+            .db
+            .select("session_drafts")
+            .columns(&["session_id"])
+            .where_eq("session_id", self.session_id.to_string())
+            .execute_first(&**self.db)
+            .await?;
+        if existing.is_some() {
+            self.db
+                .update("session_drafts")
+                .value("text", text.to_owned())
+                .value("updated_at_ms", seq_to_value(updated_at_ms))
+                .where_eq("session_id", self.session_id.to_string())
+                .execute(&**self.db)
+                .await?;
+        } else {
+            self.db
+                .insert("session_drafts")
+                .value("session_id", self.session_id.to_string())
+                .value("text", text.to_owned())
+                .value("updated_at_ms", seq_to_value(updated_at_ms))
+                .execute(&**self.db)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Return tool-run projection rows with `running` status.
@@ -1156,6 +1295,12 @@ fn global_migrations() -> CodeMigrationSource<'static> {
         "CREATE INDEX IF NOT EXISTS idx_sessions_updated_at_ms ON sessions(updated_at_ms)",
         "DROP INDEX IF EXISTS idx_sessions_updated_at_ms",
     );
+    add_sql_migration(
+        &mut source,
+        "003_global_composer_drafts_table",
+        "CREATE TABLE IF NOT EXISTS composer_drafts (\n    scope_kind TEXT NOT NULL,\n    scope_key TEXT NOT NULL,\n    launch_working_directory TEXT,\n    session_id TEXT,\n    text TEXT NOT NULL,\n    updated_at_ms INTEGER NOT NULL,\n    PRIMARY KEY(scope_kind, scope_key)\n)",
+        "DROP TABLE IF EXISTS composer_drafts",
+    );
     source
 }
 
@@ -1244,6 +1389,12 @@ fn session_migrations() -> CodeMigrationSource<'static> {
         "014_runtime_work_parent_index",
         "CREATE INDEX IF NOT EXISTS idx_runtime_work_parent_work_id ON runtime_work(parent_work_id)",
         "DROP INDEX IF EXISTS idx_runtime_work_parent_work_id",
+    );
+    add_sql_migration(
+        &mut source,
+        "015_session_drafts_table",
+        "CREATE TABLE IF NOT EXISTS session_drafts (\n    session_id TEXT PRIMARY KEY NOT NULL,\n    text TEXT NOT NULL,\n    updated_at_ms INTEGER NOT NULL\n)",
+        "DROP TABLE IF EXISTS session_drafts",
     );
     source
 }

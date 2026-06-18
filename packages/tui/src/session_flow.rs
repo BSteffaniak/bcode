@@ -210,6 +210,8 @@ pub fn complete_switch_session(
             chat.agents.refresh_app_agent_metadata(&mut chat.app);
             if !draft_text.is_empty() {
                 chat.app.replace_composer_with(&draft_text);
+            } else if let Some(draft) = attached.draft {
+                chat.app.replace_composer_with(&draft);
             }
             chat.app.apply_session_summary(&attached.session);
             chat.app.set_status("session opened".to_owned());
@@ -358,6 +360,14 @@ pub async fn persist_draft_session<W: Write>(
     terminal.draw(|frame| super::render::render(&mut chat.app, frame))?;
     let draft_agent_id = chat.app.current_agent_id().to_owned();
     let session = client.create_session(None).await?;
+    let _ = client
+        .set_composer_draft(
+            bcode_ipc::ComposerDraftScope::DraftSession {
+                launch_working_directory: std::env::current_dir()?,
+            },
+            String::new(),
+        )
+        .await;
     if draft_agent_id != "build" {
         client
             .set_session_agent(session.id, draft_agent_id.clone())

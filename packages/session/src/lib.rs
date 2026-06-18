@@ -1014,6 +1014,90 @@ impl SessionManager {
         Ok(summary)
     }
 
+    /// Set or clear a persisted composer draft for a session.
+    ///
+    /// Empty text clears the persisted draft without appending a session event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session does not exist or the draft cannot be written.
+    pub async fn set_session_composer_draft(
+        &self,
+        session_id: SessionId,
+        text: String,
+    ) -> Result<(), SessionError> {
+        self.ensure_session_loaded(session_id).await?;
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
+        db.set_session_composer_draft(&text, self.next_activity_timestamp_ms())
+            .await?;
+        Ok(())
+    }
+
+    /// Return a persisted composer draft for a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session does not exist or the draft cannot be read.
+    pub async fn session_composer_draft(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<String>, SessionError> {
+        self.ensure_session_loaded(session_id).await?;
+        let Some(store) = &self.store else {
+            return Ok(None);
+        };
+        let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
+        Ok(db.session_composer_draft().await?)
+    }
+
+    /// Set or clear a launch-cwd-scoped draft-session composer draft.
+    ///
+    /// Empty text clears the persisted draft without creating a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the draft cannot be written.
+    pub async fn set_draft_session_composer_draft(
+        &self,
+        launch_working_directory: PathBuf,
+        text: String,
+    ) -> Result<(), SessionError> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let launch_working_directory = normalize_working_directory(&launch_working_directory);
+        let db = db::GlobalSessionDb::open_turso_in_root(&store.root_path()).await?;
+        db.set_draft_session_composer_draft(
+            &launch_working_directory,
+            &text,
+            self.next_activity_timestamp_ms(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Return a launch-cwd-scoped draft-session composer draft.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the draft cannot be read.
+    pub async fn draft_session_composer_draft(
+        &self,
+        launch_working_directory: PathBuf,
+    ) -> Result<Option<String>, SessionError> {
+        let Some(store) = &self.store else {
+            return Ok(None);
+        };
+        let launch_working_directory = normalize_working_directory(&launch_working_directory);
+        let db = db::GlobalSessionDb::open_turso_in_root(&store.root_path()).await?;
+        Ok(db
+            .draft_session_composer_draft(&launch_working_directory)
+            .await?)
+    }
+
     /// List known sessions from the session catalog.
     pub async fn list_sessions(&self, working_directory: &Path) -> Vec<SessionSummary> {
         self.start_catalog_load();

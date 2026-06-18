@@ -85,6 +85,16 @@ pub async fn run_event_loop_with_startup<W: Write>(
     app.apply_tui_config(config.tui);
     let agents = session_flow::AgentCatalog::load(&client).await?;
     agents.refresh_app_agent_metadata(&mut app);
+    let launch_working_directory = std::env::current_dir()?;
+    if session_id.is_none()
+        && let Ok(Some(draft)) = client
+            .composer_draft(bcode_ipc::ComposerDraftScope::DraftSession {
+                launch_working_directory: launch_working_directory.clone(),
+            })
+            .await
+    {
+        app.replace_composer_with(&draft);
+    }
     let mut chat = session_flow::ActiveChat {
         app,
         agents,
@@ -105,9 +115,12 @@ pub async fn run_event_loop_with_startup<W: Write>(
         session_flow::start_switch_session(&client, &mut chat, session_id, initial_window_request);
     } else if let Some(status) = auth_security_status {
         chat.app.set_status(status);
-    } else {
+    } else if chat.app.composer().is_empty() {
         chat.app
             .set_status("New draft session; send a message to save it".to_owned());
+    } else {
+        chat.app
+            .set_status("Draft restored; send a message to save session".to_owned());
     }
     if startup_action == StartupTuiAction::OpenRalphHome {
         let mut io = TuiIo {
@@ -129,6 +142,7 @@ pub async fn run_event_loop_with_startup<W: Write>(
             &keymap,
             &mut chat,
             mouse_scroll_rows,
+            launch_working_directory,
         )
         .await
     };

@@ -1728,6 +1728,12 @@ async fn handle_request(
         Request::Ping => handle_ping(request_id, writer).await,
         Request::ServerStatus => handle_server_status(request_id, state, writer).await,
         Request::ServerStop { mode } => handle_server_stop(request_id, state, writer, mode).await,
+        Request::SetComposerDraft { scope, text } => {
+            handle_set_composer_draft(request_id, state, writer, scope, text).await
+        }
+        Request::ComposerDraft { scope } => {
+            handle_composer_draft(request_id, state, writer, scope).await
+        }
         Request::CreateSession {
             name,
             working_directory,
@@ -2193,6 +2199,64 @@ async fn handle_server_stop(
     .await?;
     state.request_shutdown();
     Ok(())
+}
+
+async fn handle_set_composer_draft(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    scope: bcode_ipc::ComposerDraftScope,
+    text: String,
+) -> Result<(), ServerError> {
+    match scope {
+        bcode_ipc::ComposerDraftScope::Session { session_id } => {
+            state
+                .sessions
+                .set_session_composer_draft(session_id, text)
+                .await?;
+        }
+        bcode_ipc::ComposerDraftScope::DraftSession {
+            launch_working_directory,
+        } => {
+            state
+                .sessions
+                .set_draft_session_composer_draft(launch_working_directory, text)
+                .await?;
+        }
+    }
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::ComposerDraftSet),
+    )
+    .await
+}
+
+async fn handle_composer_draft(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    scope: bcode_ipc::ComposerDraftScope,
+) -> Result<(), ServerError> {
+    let draft = match scope {
+        bcode_ipc::ComposerDraftScope::Session { session_id } => {
+            state.sessions.session_composer_draft(session_id).await?
+        }
+        bcode_ipc::ComposerDraftScope::DraftSession {
+            launch_working_directory,
+        } => {
+            state
+                .sessions
+                .draft_session_composer_draft(launch_working_directory)
+                .await?
+        }
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::ComposerDraft { draft }),
+    )
+    .await
 }
 
 async fn handle_create_session(
@@ -4559,6 +4623,7 @@ async fn handle_attach_session(
             restore_active_skills_from_history(&attachment.history, state, session_id).await;
             *attached_session = Some(session_id);
             state.attach_client_session(client_id, session_id).await;
+            let draft = state.sessions.session_composer_draft(session_id).await?;
             send_response(
                 writer,
                 request_id,
@@ -4568,6 +4633,7 @@ async fn handle_attach_session(
                     history: compact_attach_history(attachment.history),
                     input_history: attachment.input_history,
                     import_warnings: Vec::new(),
+                    draft,
                 }),
             )
             .await?;
@@ -4819,6 +4885,7 @@ async fn finish_attach_session_projection_window_success(
         usize_to_u64(compacted_history.len()),
     );
     let send_started_at = Instant::now();
+    let draft = state.sessions.session_composer_draft(session_id).await?;
     send_response(
         context.writer,
         context.request_id,
@@ -4828,6 +4895,7 @@ async fn finish_attach_session_projection_window_success(
             history: compacted_history,
             input_history: attachment.input_history,
             import_warnings: Vec::new(),
+            draft,
         }),
     )
     .await?;
@@ -4902,6 +4970,7 @@ async fn finish_attach_session_recent_success(
         usize_to_u64(compacted_history.len()),
     );
     let send_started_at = Instant::now();
+    let draft = state.sessions.session_composer_draft(session_id).await?;
     send_response(
         context.writer,
         context.request_id,
@@ -4911,6 +4980,7 @@ async fn finish_attach_session_recent_success(
             history: compacted_history,
             input_history: attachment.input_history,
             import_warnings: Vec::new(),
+            draft,
         }),
     )
     .await?;

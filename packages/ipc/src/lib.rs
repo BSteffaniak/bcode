@@ -182,6 +182,16 @@ impl Envelope {
     }
 }
 
+/// Scope for durable composer draft persistence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerDraftScope {
+    /// Draft belongs to a persisted session.
+    Session { session_id: SessionId },
+    /// Draft belongs to the unsaved draft session for the launch working directory.
+    DraftSession { launch_working_directory: PathBuf },
+}
+
 /// Request payload variants for Bcode client/server IPC.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -376,6 +386,13 @@ pub enum Request {
     AttachSessionProjectionWindow {
         session_id: SessionId,
         request: ProjectionWindowRequest,
+    },
+    SetComposerDraft {
+        scope: ComposerDraftScope,
+        text: String,
+    },
+    ComposerDraft {
+        scope: ComposerDraftScope,
     },
 }
 
@@ -917,6 +934,8 @@ pub enum ResponsePayload {
         input_history: Vec<SessionInputHistoryEntry>,
         #[serde(default)]
         import_warnings: Vec<SessionImportWarning>,
+        #[serde(default)]
+        draft: Option<String>,
     },
     MessageSent,
     TurnCancellationRequested {
@@ -1024,6 +1043,10 @@ pub enum ResponsePayload {
         events: Vec<SessionEvent>,
     },
     RuntimeWorkSubscribed,
+    ComposerDraft {
+        draft: Option<String>,
+    },
+    ComposerDraftSet,
 }
 
 /// Structured error response.
@@ -1121,6 +1144,7 @@ enum IpcResponsePayload {
         history: Vec<IpcSessionEvent>,
         input_history: Vec<SessionInputHistoryEntry>,
         import_warnings: Vec<SessionImportWarning>,
+        draft: Option<String>,
     },
     MessageSent,
     TurnCancellationRequested {
@@ -1225,6 +1249,10 @@ enum IpcResponsePayload {
         events: Vec<IpcSessionEvent>,
     },
     RuntimeWorkSubscribed,
+    ComposerDraft {
+        draft: Option<String>,
+    },
+    ComposerDraftSet,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1307,13 +1335,19 @@ impl From<&ResponsePayload> for IpcResponsePayload {
                 history,
                 input_history,
                 import_warnings,
+                draft,
             } => Self::Attached {
                 session_id: session_id.clone(),
                 session: session.clone(),
                 history: history.iter().map(IpcSessionEvent::from).collect(),
                 input_history: input_history.clone(),
                 import_warnings: import_warnings.clone(),
+                draft: draft.clone(),
             },
+            ResponsePayload::ComposerDraft { draft } => Self::ComposerDraft {
+                draft: draft.clone(),
+            },
+            ResponsePayload::ComposerDraftSet => Self::ComposerDraftSet,
             ResponsePayload::MessageSent => Self::MessageSent,
             ResponsePayload::TurnCancellationRequested { cancelled } => {
                 Self::TurnCancellationRequested {
@@ -1492,13 +1526,17 @@ impl TryFrom<IpcResponsePayload> for ResponsePayload {
                 history,
                 input_history,
                 import_warnings,
+                draft,
             } => Ok(Self::Attached {
                 session_id,
                 session,
                 history: ipc_events_to_session_events(history)?,
                 input_history,
                 import_warnings,
+                draft,
             }),
+            IpcResponsePayload::ComposerDraft { draft } => Ok(Self::ComposerDraft { draft }),
+            IpcResponsePayload::ComposerDraftSet => Ok(Self::ComposerDraftSet),
             IpcResponsePayload::MessageSent => Ok(Self::MessageSent),
             IpcResponsePayload::TurnCancellationRequested { cancelled } => {
                 Ok(Self::TurnCancellationRequested { cancelled })
@@ -3309,6 +3347,7 @@ mod tests {
             history: Vec::new(),
             input_history: Vec::new(),
             import_warnings: Vec::new(),
+            draft: Some("draft text".to_owned()),
         });
 
         let encoded = encode(&response).expect("response should encode");
@@ -3838,6 +3877,7 @@ mod tests {
                     history: vec![event.clone()],
                     input_history: Vec::new(),
                     import_warnings: Vec::new(),
+                    draft: Some("draft text".to_owned()),
                 }),
                 Response::Ok(ResponsePayload::SessionHistory {
                     session_id,
