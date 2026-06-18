@@ -24,6 +24,8 @@ pub enum KeyRequest {
     Interrupt,
     /// Cycle to the next available agent.
     CycleAgent,
+    /// Cycle to the next supported thinking effort.
+    CycleThinkingEffort,
 }
 
 /// Result of handling one key stroke.
@@ -101,6 +103,10 @@ fn handle_chat_action(app: &mut BmuxApp, action: Option<BmuxAction>) -> Option<K
         BmuxAction::AgentCycle => KeyOutcome {
             redraw: true,
             request: KeyRequest::CycleAgent,
+        },
+        BmuxAction::ThinkingEffortCycle => KeyOutcome {
+            redraw: true,
+            request: KeyRequest::CycleThinkingEffort,
         },
         BmuxAction::InputHistoryPrevious => history_previous(app),
         BmuxAction::InputHistoryNext => history_next(app),

@@ -628,10 +628,27 @@ async fn handle_chat_key<W: Write>(
     let outcome = input::handle_key(&mut chat.app, context.services.keymap, stroke);
     slash_flow::update_slash_palette(context.services.client, chat, &mut modals.slash_palette)
         .await;
-    match outcome.request {
+    handle_chat_key_request(context, chat, modals, outcome.request).await?;
+    Ok(outcome.redraw)
+}
+
+async fn handle_chat_key_request<W: Write>(
+    context: &mut ChatEventContext<'_, '_, W>,
+    chat: &mut ActiveChat,
+    modals: &mut ModalState,
+    request: KeyRequest,
+) -> Result<(), TuiError> {
+    match request {
         KeyRequest::None => {}
         KeyRequest::Interrupt => request_turn_cancellation(context.services.client, chat).await,
         KeyRequest::CycleAgent => cycle_session_agent(context.services.client, chat).await,
+        KeyRequest::CycleThinkingEffort => {
+            if let Err(error) =
+                thinking_flow::cycle_thinking_effort(context.services.client, chat).await
+            {
+                helpers::report_client_error(&mut chat.app, "thinking effort failed", &error);
+            }
+        }
         KeyRequest::Submit { placement } => {
             let (mut io, services) = context.flow_context();
             match composer_flow::submit_composer(&mut io, &services, chat, placement).await {
@@ -643,7 +660,7 @@ async fn handle_chat_key<W: Write>(
             }
         }
     }
-    Ok(outcome.redraw)
+    Ok(())
 }
 
 async fn request_turn_cancellation(client: &BcodeClient, chat: &mut ActiveChat) {

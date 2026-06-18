@@ -242,6 +242,7 @@ fn handle_skill_picker_action(
         | BmuxAction::ClipboardPasteImage
         | BmuxAction::CommandPaletteOpen
         | BmuxAction::AgentCycle
+        | BmuxAction::ThinkingEffortCycle
         | BmuxAction::TranscriptPageUp
         | BmuxAction::TranscriptPageDown
         | BmuxAction::TranscriptTop

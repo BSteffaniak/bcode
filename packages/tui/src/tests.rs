@@ -381,6 +381,31 @@ fn default_tab_requests_agent_cycle_in_chat_input() {
 }
 
 #[test]
+fn default_shift_tab_requests_thinking_effort_cycle_in_chat_input() {
+    let keymap = BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.replace_composer_with("draft");
+    let shift_tab = KeyStroke::with_modifiers(
+        KeyCode::Tab,
+        Modifiers {
+            shift: true,
+            ..Modifiers::NONE
+        },
+    );
+
+    assert_eq!(
+        keymap.action_for_key(BmuxScope::Chat, shift_tab),
+        Some(BmuxAction::ThinkingEffortCycle)
+    );
+
+    let outcome = input::handle_key(&mut app, &keymap, shift_tab);
+
+    assert!(outcome.redraw);
+    assert_eq!(outcome.request, KeyRequest::CycleThinkingEffort);
+    assert_eq!(app.composer().text(), "draft");
+}
+
+#[test]
 fn configured_agent_cycle_binding_can_be_changed() {
     let mut config = bcode_config::TuiConfig::default();
     config.keybindings.chat = BTreeMap::from([("ctrl+a".to_owned(), "tui.agent.cycle".to_owned())]);

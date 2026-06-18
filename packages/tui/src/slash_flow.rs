@@ -11,7 +11,7 @@ use super::helpers;
 use super::runtime_context::{TuiIo, TuiServices};
 use super::{
     TuiError, composer_flow, input, input::KeyRequest, session_flow::ActiveChat, slash_palette,
-    slash_palette_render,
+    slash_palette_render, thinking_flow,
 };
 
 /// Refresh slash completions for the current composer text.
@@ -92,6 +92,17 @@ pub async fn handle_slash_palette_key<W: Write>(
             update_slash_palette(services.client, chat, slash_palette).await;
             match outcome.request {
                 KeyRequest::None | KeyRequest::CycleAgent => {}
+                KeyRequest::CycleThinkingEffort => {
+                    if let Err(error) =
+                        thinking_flow::cycle_thinking_effort(services.client, chat).await
+                    {
+                        helpers::report_client_error(
+                            &mut chat.app,
+                            "thinking effort failed",
+                            &error,
+                        );
+                    }
+                }
                 KeyRequest::Interrupt => request_turn_cancellation(services.client, chat).await,
                 KeyRequest::Submit { placement } => {
                     let outcome = submit_from_slash_palette(io, services, chat, placement).await;

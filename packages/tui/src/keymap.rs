@@ -30,6 +30,7 @@ pub enum BmuxAction {
     ClipboardPasteImage,
     CommandPaletteOpen,
     AgentCycle,
+    ThinkingEffortCycle,
     TranscriptPageUp,
     TranscriptPageDown,
     TranscriptTop,
@@ -82,6 +83,7 @@ impl BmuxAction {
             "app.clipboard.pasteImage" => Self::ClipboardPasteImage,
             "app.command_palette" => Self::CommandPaletteOpen,
             "tui.agent.cycle" => Self::AgentCycle,
+            "tui.thinking.effort.cycle" => Self::ThinkingEffortCycle,
             "transcript.pageUp" => Self::TranscriptPageUp,
             "transcript.pageDown" => Self::TranscriptPageDown,
             "transcript.top" => Self::TranscriptTop,
@@ -175,6 +177,7 @@ impl BmuxKeyMap {
             (BmuxAction::ClipboardPasteImage, "paste image"),
             (BmuxAction::CommandPaletteOpen, "palette"),
             (BmuxAction::AgentCycle, "agent"),
+            (BmuxAction::ThinkingEffortCycle, "think"),
         ]
         .into_iter()
         .filter_map(|(action, label)| {
@@ -232,6 +235,7 @@ impl BmuxKeyMap {
             | BmuxAction::ClipboardPasteImage
             | BmuxAction::CommandPaletteOpen
             | BmuxAction::AgentCycle
+            | BmuxAction::ThinkingEffortCycle
             | BmuxAction::TranscriptPageUp
             | BmuxAction::TranscriptPageDown
             | BmuxAction::TranscriptTop
@@ -284,6 +288,7 @@ impl BmuxKeyMap {
             | BmuxAction::ClipboardPasteImage
             | BmuxAction::CommandPaletteOpen
             | BmuxAction::AgentCycle
+            | BmuxAction::ThinkingEffortCycle
             | BmuxAction::TranscriptPageUp
             | BmuxAction::TranscriptPageDown
             | BmuxAction::TranscriptTop
@@ -385,6 +390,7 @@ fn default_bindings() -> BTreeMap<BmuxScope, Vec<(KeyStroke, BmuxAction)>> {
                 bind("ctrl+v", BmuxAction::ClipboardPasteImage),
                 bind("ctrl+p", BmuxAction::CommandPaletteOpen),
                 bind("tab", BmuxAction::AgentCycle),
+                bind("shift+tab", BmuxAction::ThinkingEffortCycle),
                 bind("pageUp", BmuxAction::TranscriptPageUp),
                 bind("pageDown", BmuxAction::TranscriptPageDown),
                 bind("ctrl+home", BmuxAction::TranscriptTop),

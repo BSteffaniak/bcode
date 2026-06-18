@@ -920,6 +920,7 @@ fn handle_picker_filter_key(
             | BmuxAction::ClipboardPasteImage
             | BmuxAction::CommandPaletteOpen
             | BmuxAction::AgentCycle
+            | BmuxAction::ThinkingEffortCycle
             | BmuxAction::TranscriptPageUp
             | BmuxAction::TranscriptPageDown
             | BmuxAction::TranscriptTop
