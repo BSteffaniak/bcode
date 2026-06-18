@@ -3,7 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
 
-use bcode_config::{TuiConfig, TuiInlineDiffConfig, TuiThemeConfig, TuiThinkingConfig};
+use bcode_config::{
+    TuiAccentTransitionCurve, TuiConfig, TuiInlineDiffConfig, TuiThemeConfig, TuiThinkingConfig,
+};
 use bcode_session_models::{
     LiveToolArgumentPreview, ModelTurnOutcome, ProviderStreamEvent, SessionEvent, SessionEventKind,
     SessionHistoryCursor, SessionId, SessionInputHistoryEntry, SessionLiveEvent,
@@ -137,6 +139,7 @@ struct ThemeTransitionState {
     target_accent: Color,
     started_at: Instant,
     duration: Duration,
+    curve: TuiAccentTransitionCurve,
 }
 
 impl ThemeTransitionState {
@@ -147,6 +150,7 @@ impl ThemeTransitionState {
             target_accent: accent,
             started_at: now,
             duration: Duration::ZERO,
+            curve: TuiAccentTransitionCurve::EaseOut,
         }
     }
 
@@ -162,6 +166,7 @@ impl ThemeTransitionState {
             self.target_accent = target;
             self.started_at = now;
             self.duration = Duration::ZERO;
+            self.curve = config.accent_transition_curve;
             return;
         }
         self.source_accent = self.accent_at(now);
@@ -169,6 +174,7 @@ impl ThemeTransitionState {
         self.target_accent = target;
         self.started_at = now;
         self.duration = Duration::from_millis(duration_ms);
+        self.curve = config.accent_transition_curve;
     }
 
     fn accent_at(&self, now: Instant) -> Color {
@@ -189,6 +195,7 @@ impl ThemeTransitionState {
             self.target_accent,
             elapsed_ms,
             duration_ms,
+            self.curve,
         )
     }
 
@@ -3135,19 +3142,30 @@ fn is_transcript_scroll_animation_invalidation(key: &InvalidationKey) -> bool {
     key.as_str() == TRANSCRIPT_SCROLL_ANIMATION_INVALIDATION_KEY
 }
 
-fn interpolate_color(source: Color, target: Color, elapsed_ms: u64, duration_ms: u64) -> Color {
+fn interpolate_color(
+    source: Color,
+    target: Color,
+    elapsed_ms: u64,
+    duration_ms: u64,
+    curve: TuiAccentTransitionCurve,
+) -> Color {
     let source = color_rgb(source);
     let target = color_rgb(target);
     Color::Rgb(
-        interpolate_channel(source[0], target[0], elapsed_ms, duration_ms),
-        interpolate_channel(source[1], target[1], elapsed_ms, duration_ms),
-        interpolate_channel(source[2], target[2], elapsed_ms, duration_ms),
+        interpolate_channel(source[0], target[0], elapsed_ms, duration_ms, curve),
+        interpolate_channel(source[1], target[1], elapsed_ms, duration_ms, curve),
+        interpolate_channel(source[2], target[2], elapsed_ms, duration_ms, curve),
     )
 }
 
-fn interpolate_channel(source: u8, target: u8, elapsed_ms: u64, duration_ms: u64) -> u8 {
-    let eased_numerator = ease_out_cubic_numerator(elapsed_ms, duration_ms);
-    let denominator = u128::from(duration_ms).saturating_pow(3).max(1);
+fn interpolate_channel(
+    source: u8,
+    target: u8,
+    elapsed_ms: u64,
+    duration_ms: u64,
+    curve: TuiAccentTransitionCurve,
+) -> u8 {
+    let (eased_numerator, denominator) = transition_progress(elapsed_ms, duration_ms, curve);
     let source = i128::from(source);
     let delta = i128::from(target).saturating_sub(source);
     let scaled_delta = delta.saturating_mul(i128::try_from(eased_numerator).unwrap_or(i128::MAX))
@@ -3155,13 +3173,44 @@ fn interpolate_channel(source: u8, target: u8, elapsed_ms: u64, duration_ms: u64
     u8::try_from(source.saturating_add(scaled_delta).clamp(0, 255)).unwrap_or(u8::MAX)
 }
 
-fn ease_out_cubic_numerator(elapsed_ms: u64, duration_ms: u64) -> u128 {
+fn transition_progress(
+    elapsed_ms: u64,
+    duration_ms: u64,
+    curve: TuiAccentTransitionCurve,
+) -> (u128, u128) {
     let duration = u128::from(duration_ms).max(1);
     let elapsed = u128::from(elapsed_ms).min(duration);
+    match curve {
+        TuiAccentTransitionCurve::Linear => (elapsed, duration),
+        TuiAccentTransitionCurve::EaseIn => {
+            (elapsed.saturating_pow(3), duration.saturating_pow(3).max(1))
+        }
+        TuiAccentTransitionCurve::EaseOut => ease_out_cubic_progress(elapsed, duration),
+        TuiAccentTransitionCurve::EaseInOut => ease_in_out_cubic_progress(elapsed, duration),
+    }
+}
+
+fn ease_out_cubic_progress(elapsed: u128, duration: u128) -> (u128, u128) {
+    let denominator = duration.saturating_pow(3).max(1);
     let remaining = duration.saturating_sub(elapsed);
-    duration
-        .saturating_pow(3)
-        .saturating_sub(remaining.saturating_pow(3))
+    (
+        denominator.saturating_sub(remaining.saturating_pow(3)),
+        denominator,
+    )
+}
+
+fn ease_in_out_cubic_progress(elapsed: u128, duration: u128) -> (u128, u128) {
+    let denominator = duration.saturating_pow(3).saturating_mul(2).max(1);
+    let half_duration = duration / 2;
+    if elapsed <= half_duration {
+        (elapsed.saturating_pow(3).saturating_mul(4), denominator)
+    } else {
+        let remaining_twice = duration.saturating_sub(elapsed).saturating_mul(2);
+        (
+            denominator.saturating_sub(remaining_twice.saturating_pow(3)),
+            denominator,
+        )
+    }
 }
 
 const fn color_rgb(color: Color) -> [u8; 3] {

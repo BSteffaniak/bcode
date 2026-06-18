@@ -1062,6 +1062,21 @@ pub struct TuiConfig {
     pub inline_diff: TuiInlineDiffConfig,
 }
 
+/// Duration/easing curve for terminal UI accent color transitions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiAccentTransitionCurve {
+    /// Constant-speed transition.
+    Linear,
+    /// Cubic slow-start transition.
+    EaseIn,
+    /// Cubic fast-start transition.
+    #[default]
+    EaseOut,
+    /// Cubic slow-start and slow-end transition.
+    EaseInOut,
+}
+
 /// Terminal UI theme rendering configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TuiThemeConfig {
@@ -1071,6 +1086,9 @@ pub struct TuiThemeConfig {
     /// Duration of accent color transitions in milliseconds.
     #[serde(default = "default_tui_accent_transition_ms")]
     pub accent_transition_ms: u64,
+    /// Easing curve used for accent color transitions.
+    #[serde(default)]
+    pub accent_transition_curve: TuiAccentTransitionCurve,
 }
 
 impl TuiThemeConfig {
@@ -1090,6 +1108,7 @@ impl Default for TuiThemeConfig {
         Self {
             accent_transition: TuiAccentTransitionMode::Transition,
             accent_transition_ms: default_tui_accent_transition_ms(),
+            accent_transition_curve: TuiAccentTransitionCurve::EaseOut,
         }
     }
 }
@@ -3413,8 +3432,9 @@ mod tests {
         BcodeConfig, CompactionMode, ConfigLoadOverrides, ContextStrategyMode,
         DEFAULT_AGENT_PROFILE_PLUGIN_ID, DEFAULT_CODE_REVIEW_PLUGIN_ID, DEFAULT_DOCUMENT_PLUGIN_ID,
         DEFAULT_FILESYSTEM_PLUGIN_ID, DEFAULT_GIT_PLUGIN_ID, DEFAULT_PI_SESSION_IMPORT_PLUGIN_ID,
-        DEFAULT_SHELL_PLUGIN_ID, DEFAULT_WEB_SEARCH_PLUGIN_ID, PluginSelection, TuiMouseConfig,
-        default_config_paths_from, default_permissions_state_path, load_config_from_paths,
+        DEFAULT_SHELL_PLUGIN_ID, DEFAULT_WEB_SEARCH_PLUGIN_ID, PluginSelection,
+        TuiAccentTransitionCurve, TuiMouseConfig, default_config_paths_from,
+        default_permissions_state_path, load_config_from_paths,
         load_config_from_paths_with_overrides, load_permissions_state_from, merge_config_values,
         upsert_agent_permission_rule,
     };
@@ -3448,6 +3468,33 @@ triple_click_select = "all"
         assert_eq!(
             config.tui.mouse.triple_click_select,
             super::TuiMouseClickSelection::All
+        );
+    }
+
+    #[test]
+    fn tui_theme_transition_curve_loads_from_toml() {
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[tui.theme]
+accent_transition = "transition"
+accent_transition_ms = 180
+accent_transition_curve = "ease_in_out"
+"#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(config.tui.theme.accent_transition_ms, 180);
+        assert_eq!(
+            config.tui.theme.accent_transition_curve,
+            TuiAccentTransitionCurve::EaseInOut
+        );
+    }
+
+    #[test]
+    fn tui_theme_transition_curve_defaults_to_ease_out() {
+        assert_eq!(
+            BcodeConfig::default().tui.theme.accent_transition_curve,
+            TuiAccentTransitionCurve::EaseOut
         );
     }
 

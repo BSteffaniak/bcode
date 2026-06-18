@@ -2,12 +2,14 @@
 
 use std::{
     collections::BTreeMap,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use bcode_agent_profile::AgentInfo;
 use bcode_client::AttachedSessionHistory;
-use bcode_config::{TuiAccentTransitionMode, TuiConfig, TuiThemeConfig, TuiThinkingConfig};
+use bcode_config::{
+    TuiAccentTransitionCurve, TuiAccentTransitionMode, TuiConfig, TuiThemeConfig, TuiThinkingConfig,
+};
 use bcode_session_models::{
     ClientId, LiveFileEditPreview, LiveShellCommandPreview, LiveToolArgumentPreview, RuntimeWorkId,
     RuntimeWorkKind, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
@@ -35,6 +37,17 @@ use super::{
     transcript_document::TranscriptDocument,
 };
 
+fn theme_transition_config(curve: TuiAccentTransitionCurve) -> TuiConfig {
+    TuiConfig {
+        theme: TuiThemeConfig {
+            accent_transition: TuiAccentTransitionMode::Transition,
+            accent_transition_ms: 100,
+            accent_transition_curve: curve,
+        },
+        ..TuiConfig::default()
+    }
+}
+
 fn disable_theme_transition(app: &mut BmuxApp) {
     app.apply_tui_config(TuiConfig {
         theme: TuiThemeConfig {
@@ -43,6 +56,63 @@ fn disable_theme_transition(app: &mut BmuxApp) {
         },
         ..TuiConfig::default()
     });
+}
+
+#[test]
+fn theme_transition_curves_shape_midpoint_progress() {
+    let target = bmux_tui::style::Color::Rgb(100, 0, 0);
+    let started_at = Instant::now();
+
+    let mut linear = BmuxApp::new_with_history(None, &[], &[], false);
+    linear.apply_tui_config(theme_transition_config(TuiAccentTransitionCurve::Linear));
+    assert_eq!(
+        linear.animated_accent(target, started_at),
+        bmux_tui::style::Color::Rgb(100, 116, 139)
+    );
+    assert_eq!(
+        linear.animated_accent(target, started_at + Duration::from_millis(50)),
+        bmux_tui::style::Color::Rgb(100, 58, 70)
+    );
+
+    let mut ease_in = BmuxApp::new_with_history(None, &[], &[], false);
+    ease_in.apply_tui_config(theme_transition_config(TuiAccentTransitionCurve::EaseIn));
+    assert_eq!(
+        ease_in.animated_accent(target, started_at),
+        bmux_tui::style::Color::Rgb(100, 116, 139)
+    );
+    assert_eq!(
+        ease_in.animated_accent(target, started_at + Duration::from_millis(50)),
+        bmux_tui::style::Color::Rgb(100, 102, 122)
+    );
+
+    let mut ease_out = BmuxApp::new_with_history(None, &[], &[], false);
+    ease_out.apply_tui_config(theme_transition_config(TuiAccentTransitionCurve::EaseOut));
+    assert_eq!(
+        ease_out.animated_accent(target, started_at),
+        bmux_tui::style::Color::Rgb(100, 116, 139)
+    );
+    assert_eq!(
+        ease_out.animated_accent(target, started_at + Duration::from_millis(50)),
+        bmux_tui::style::Color::Rgb(100, 15, 18)
+    );
+}
+
+#[test]
+fn immediate_theme_transition_ignores_curve() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.apply_tui_config(TuiConfig {
+        theme: TuiThemeConfig {
+            accent_transition: TuiAccentTransitionMode::Immediate,
+            accent_transition_ms: 100,
+            accent_transition_curve: TuiAccentTransitionCurve::EaseIn,
+        },
+        ..TuiConfig::default()
+    });
+
+    assert_eq!(
+        app.animated_accent(bmux_tui::style::Color::Rgb(1, 2, 3), Instant::now()),
+        bmux_tui::style::Color::Rgb(1, 2, 3)
+    );
 }
 
 #[test]
