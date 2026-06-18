@@ -3897,6 +3897,7 @@ mod tests {
         let events = vec![SessionEvent {
             schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence: 7,
+            timestamp_ms: 1,
             session_id: bcode_session_models::SessionId::new(),
             provenance: None,
             kind: SessionEventKind::UserMessage {
