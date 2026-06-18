@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
 
-use super::{OLDER_HISTORY_EVENT_LIMIT, TuiError, session_flow::ActiveChat};
+use super::TuiError;
 
 const INITIAL_TRANSCRIPT_OVERSCAN_VIEWPORTS: usize = 2;
 const INITIAL_TRANSCRIPT_MIN_ITEMS: usize = 12;
@@ -53,7 +53,7 @@ pub async fn load_timeline_jump_events(
     client: &BcodeClient,
     session_id: SessionId,
     sequence: u64,
-) -> Result<Vec<bcode_session_models::SessionEvent>, TuiError> {
+) -> Result<(Vec<bcode_session_models::SessionEvent>, bool, bool), TuiError> {
     let half_limit = TIMELINE_JUMP_MAX_EVENTS_SCANNED / 2;
     let older = client
         .session_history_page(
@@ -86,43 +86,7 @@ pub async fn load_timeline_jump_events(
     );
     events.sort_by_key(|event| event.sequence);
     events.dedup_by_key(|event| event.sequence);
-    Ok(events)
-}
-
-/// Load the next older page of transcript history when available.
-#[allow(dead_code)]
-pub async fn load_older_history(
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-) -> Result<(), TuiError> {
-    let Some(cursor) = chat.app.older_history_cursor() else {
-        return Ok(());
-    };
-    chat.app.set_loading_older_history(true);
-    let Some(session_id) = chat.session_id else {
-        return Ok(());
-    };
-    match client
-        .session_history_page(
-            session_id,
-            SessionHistoryQuery {
-                cursor: Some(cursor),
-                limit: OLDER_HISTORY_EVENT_LIMIT,
-                direction: SessionHistoryDirection::Backward,
-            },
-        )
-        .await
-    {
-        Ok(page) => {
-            chat.app.prepend_older_history(&page.events, page.has_more);
-        }
-        Err(error) => {
-            chat.app.set_loading_older_history(false);
-            chat.app
-                .set_status(format!("older history load failed: {error}"));
-        }
-    }
-    Ok(())
+    Ok((events, older.has_more, newer.has_more))
 }
 
 /// Attach to a session and forward live events into the UI event channel.

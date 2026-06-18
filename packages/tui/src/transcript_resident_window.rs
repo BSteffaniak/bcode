@@ -97,6 +97,12 @@ impl TranscriptResidentWindow {
         self.events.first().map(|event| event.sequence)
     }
 
+    /// Return newest resident event sequence.
+    #[must_use]
+    pub fn newest_sequence(&self) -> Option<u64> {
+        self.events.last().map(|event| event.sequence)
+    }
+
     /// Return a cursor that can reload dropped older events.
     #[cfg(test)]
     #[must_use]

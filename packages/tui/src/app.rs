@@ -498,9 +498,17 @@ impl BmuxApp {
     }
 
     /// Replace the resident transcript with a bounded replay window.
-    pub fn replace_transcript_window(&mut self, events: &[SessionEvent]) {
+    pub fn replace_transcript_window(
+        &mut self,
+        events: &[SessionEvent],
+        has_older: bool,
+        has_newer: bool,
+        anchor_sequence: u64,
+    ) {
         self.latest_history_sequence = events.last().map(|event| event.sequence);
         self.transcript_window.replace_window(events);
+        self.older_history
+            .replace_centered(events, has_older, has_newer, anchor_sequence);
         self.rebuild_transcript_from_history();
         self.reconcile_tool_state_with_resident_transcript();
         self.pending_visual_overflow_bottom = None;
@@ -1096,6 +1104,23 @@ impl BmuxApp {
         self.older_history.should_load()
     }
 
+    /// Mark newer history as loading or idle.
+    pub const fn set_loading_newer_history(&mut self, loading: bool) {
+        self.older_history.set_loading_newer(loading);
+    }
+
+    /// Return the cursor for loading newer history.
+    #[must_use]
+    pub const fn newer_history_cursor(&self) -> Option<SessionHistoryCursor> {
+        self.older_history.newer_cursor()
+    }
+
+    /// Return whether a newer-history request should be started.
+    #[must_use]
+    pub const fn should_load_newer_history(&self) -> bool {
+        self.older_history.should_load_newer()
+    }
+
     /// Return the current activity state.
     #[must_use]
     pub const fn activity(&self) -> &ActivityState {
@@ -1328,7 +1353,7 @@ impl BmuxApp {
     pub fn scroll_transcript_down(&mut self, rows: usize) -> bool {
         self.cancel_transcript_scroll_animation_for_manual_scroll();
         self.mark_manual_transcript_scroll();
-        let changed = self.viewport.scroll_down(rows);
+        let changed = self.viewport.scroll_down(rows, &mut self.older_history);
         if self.viewport.at_bottom_threshold() {
             self.scroll_mode = TranscriptScrollMode::BottomFollow;
             self.latest_hidden_activity_at = None;
@@ -1666,7 +1691,8 @@ impl BmuxApp {
         TranscriptWindowPolicy {
             max_events: RESIDENT_TRANSCRIPT_MAX_EVENTS,
             target_events: RESIDENT_TRANSCRIPT_TARGET_EVENTS,
-            allow_trim: self.can_trim_resident_transcript_window(),
+            allow_trim: self.can_trim_resident_transcript_window()
+                && !self.older_history.has_newer_history(),
         }
     }
 
@@ -1726,6 +1752,30 @@ impl BmuxApp {
         }
     }
 
+    /// Append newer history and preserve bounded window state.
+    pub fn append_newer_history(&mut self, events: &[SessionEvent], has_more: bool) {
+        if events.is_empty() {
+            self.older_history.update_newer_cursor(&[], false);
+            self.older_history.set_loading_newer(false);
+            "latest session history".clone_into(&mut self.status);
+            return;
+        }
+
+        self.latest_history_sequence = events.last().map(|event| event.sequence);
+        self.transcript_window.append_history(events);
+        let mut newer =
+            transcript_items_from_events_with_reasoning(events, self.reasoning_visible());
+        self.transcript.merge_append(&mut newer);
+        self.older_history.update_newer_cursor(events, has_more);
+        self.older_history.set_loading_newer(false);
+        if self.older_history.has_newer_history() {
+            "loaded newer history".clone_into(&mut self.status);
+        } else {
+            "latest session history".clone_into(&mut self.status);
+        }
+        self.trim_resident_transcript_window_if_needed();
+    }
+
     /// Absorb one live session event.
     #[allow(clippy::too_many_lines)]
     pub fn absorb_session_event(&mut self, event: &SessionEvent) {
@@ -1734,6 +1784,13 @@ impl BmuxApp {
                 .latest_history_sequence
                 .is_some_and(|sequence| event.sequence <= sequence)
         {
+            return;
+        }
+        if event_affects_transcript_rows(event) && self.older_history.has_newer_history() {
+            self.older_history
+                .mark_newer_available_after(self.transcript_window.newest_sequence());
+            self.latest_history_sequence = Some(event.sequence);
+            self.set_status("new activity below".to_owned());
             return;
         }
         if event_affects_transcript_rows(event) {

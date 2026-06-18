@@ -115,7 +115,8 @@ struct ModalState {
     slash_palette: Option<slash_palette::SlashPalette>,
     permission_dialog: Option<PermissionDialogState>,
     permission_poll: AsyncPermissionPoll,
-    older_history_load: AsyncOlderHistoryLoad,
+    older_history_load: AsyncHistoryPageLoad,
+    newer_history_load: AsyncHistoryPageLoad,
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
 }
@@ -136,13 +137,13 @@ impl AsyncPermissionPoll {
 }
 
 #[derive(Debug)]
-struct AsyncOlderHistoryLoad {
+struct AsyncHistoryPageLoad {
     task: Option<tokio::task::JoinHandle<Result<SessionHistoryPage, ClientError>>>,
     session_id: Option<SessionId>,
     cursor: Option<SessionHistoryCursor>,
 }
 
-impl AsyncOlderHistoryLoad {
+impl AsyncHistoryPageLoad {
     const fn new() -> Self {
         Self {
             task: None,
@@ -186,7 +187,8 @@ pub async fn run_with_client<W: Write>(
         slash_palette: None,
         permission_dialog: None,
         permission_poll: AsyncPermissionPoll::new(Instant::now()),
-        older_history_load: AsyncOlderHistoryLoad::new(),
+        older_history_load: AsyncHistoryPageLoad::new(),
+        newer_history_load: AsyncHistoryPageLoad::new(),
         thinking_dialog: None,
         timeline_dialog: None,
     };
@@ -318,7 +320,9 @@ async fn handle_loop_housekeeping(
 ) -> bool {
     let mut needs_redraw = false;
     needs_redraw |= poll_older_history_load(chat, &mut modals.older_history_load).await;
+    needs_redraw |= poll_newer_history_load(chat, &mut modals.newer_history_load).await;
     needs_redraw |= maybe_start_older_history_load(client, chat, &mut modals.older_history_load);
+    needs_redraw |= maybe_start_newer_history_load(client, chat, &mut modals.newer_history_load);
     needs_redraw |= poll_permission_list(chat, modals).await;
     maybe_start_permission_poll(client, chat, modals);
     needs_redraw
@@ -327,7 +331,7 @@ async fn handle_loop_housekeeping(
 fn maybe_start_older_history_load(
     client: &BcodeClient,
     chat: &mut ActiveChat,
-    load: &mut AsyncOlderHistoryLoad,
+    load: &mut AsyncHistoryPageLoad,
 ) -> bool {
     if load.task.is_some() || !chat.app.should_load_older_history() {
         return false;
@@ -357,7 +361,7 @@ fn maybe_start_older_history_load(
     true
 }
 
-async fn poll_older_history_load(chat: &mut ActiveChat, load: &mut AsyncOlderHistoryLoad) -> bool {
+async fn poll_older_history_load(chat: &mut ActiveChat, load: &mut AsyncHistoryPageLoad) -> bool {
     let Some(task) = load.task.take_if(|task| task.is_finished()) else {
         return false;
     };
@@ -376,6 +380,63 @@ async fn poll_older_history_load(chat: &mut ActiveChat, load: &mut AsyncOlderHis
             chat.app.set_loading_older_history(false);
             chat.app
                 .set_status(format!("Older history task failed: {error}"));
+        }
+    }
+    true
+}
+
+fn maybe_start_newer_history_load(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    load: &mut AsyncHistoryPageLoad,
+) -> bool {
+    if load.task.is_some() || !chat.app.should_load_newer_history() {
+        return false;
+    }
+    let Some(cursor) = chat.app.newer_history_cursor() else {
+        return false;
+    };
+    let Some(session_id) = chat.session_id else {
+        return false;
+    };
+    chat.app.set_loading_newer_history(true);
+    load.session_id = Some(session_id);
+    load.cursor = Some(cursor);
+    let client = client.clone();
+    load.task = Some(tokio::spawn(async move {
+        client
+            .session_history_page(
+                session_id,
+                SessionHistoryQuery {
+                    cursor: Some(cursor),
+                    limit: super::OLDER_HISTORY_EVENT_LIMIT,
+                    direction: SessionHistoryDirection::Forward,
+                },
+            )
+            .await
+    }));
+    true
+}
+
+async fn poll_newer_history_load(chat: &mut ActiveChat, load: &mut AsyncHistoryPageLoad) -> bool {
+    let Some(task) = load.task.take_if(|task| task.is_finished()) else {
+        return false;
+    };
+    let request_session_id = load.session_id.take();
+    load.cursor = None;
+    match task.await {
+        Ok(Ok(page)) if request_session_id == chat.session_id => {
+            chat.app.append_newer_history(&page.events, page.has_more);
+        }
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            chat.app.set_loading_newer_history(false);
+            report_nonfatal_client_error(chat, "Newer history unavailable", &error);
+        }
+        Err(error) => {
+            chat.app.set_loading_newer_history(false);
+            chat.app
+                .set_status(format!("Newer history task failed: {error}"));
         }
     }
     true

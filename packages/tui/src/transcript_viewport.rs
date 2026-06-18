@@ -134,7 +134,7 @@ impl TranscriptViewport {
     }
 
     /// Scroll down by rendered rows.
-    pub fn scroll_down(&mut self, rows: usize) -> bool {
+    pub fn scroll_down(&mut self, rows: usize, history: &mut OlderHistoryState) -> bool {
         if rows == 0 {
             return false;
         }
@@ -142,6 +142,11 @@ impl TranscriptViewport {
         let viewport_height = usize::from(self.viewport_height);
         match self.mode {
             TranscriptViewportMode::FollowBottom => {
+                if history.has_newer_history() && !history.loading_newer() {
+                    let previous_request = history.newer_reveal_request();
+                    history.request_load_newer(rows.max(1));
+                    return previous_request != history.newer_reveal_request();
+                }
                 self.bottom_overscroll = self
                     .bottom_overscroll
                     .saturating_add(rows)
@@ -152,6 +157,15 @@ impl TranscriptViewport {
                 let bottom_top = self.previous_total_rows.saturating_sub(viewport_height);
                 let next_top = current_top.saturating_add(rows);
                 if next_top >= bottom_top {
+                    if history.has_newer_history() && !history.loading_newer() {
+                        let previous_request = history.newer_reveal_request();
+                        history.request_load_newer(next_top.saturating_sub(bottom_top).max(1));
+                        self.mode = TranscriptViewportMode::FollowBottom;
+                        self.bottom_overscroll = 0;
+                        self.refresh_offset_cache();
+                        return *self != previous
+                            || previous_request != history.newer_reveal_request();
+                    }
                     self.mode = TranscriptViewportMode::FollowBottom;
                     self.bottom_overscroll = next_top
                         .saturating_sub(bottom_top)
