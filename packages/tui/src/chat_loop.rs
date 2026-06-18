@@ -457,6 +457,9 @@ fn handle_async_event(
             chat.status_hydration_task = None;
             session_flow::complete_draft_status_hydration(chat, hydrated);
         }
+        session_flow::ChatAsyncEvent::AgentCatalogHydrated(hydrated) => {
+            session_flow::complete_agent_catalog_hydration(chat, hydrated);
+        }
     }
 }
 

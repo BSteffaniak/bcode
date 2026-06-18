@@ -15,10 +15,6 @@ use super::startup_action::StartupTuiAction;
 use super::terminal_events::TuiInput;
 use super::{TuiError, chat_loop, ralph_flow, session_flow};
 
-fn is_nonfatal_client_startup_error(error: &TuiError) -> bool {
-    matches!(error, TuiError::Client(error) if error.is_daemon_unavailable())
-}
-
 fn auth_security_status(config: &bcode_config::BcodeConfig) -> Option<String> {
     let selection = config.resolved_model_selection();
     let auth_profile_name = std::env::var(bcode_config::BCODE_AUTH_PROFILE_ENV)
@@ -87,25 +83,9 @@ pub async fn run_event_loop_with_startup<W: Write>(
     let (async_event_sender, async_event_receiver) = mpsc::unbounded_channel();
     let mut app = BmuxApp::new_with_history(session_id, &[], &[], false);
     app.apply_tui_config(config.tui);
-    let agents = match session_flow::AgentCatalog::load(&client).await {
-        Ok(agents) => agents,
-        Err(error) if is_nonfatal_client_startup_error(&error) => {
-            app.set_status(format!("Agent metadata unavailable: {error}"));
-            session_flow::AgentCatalog::default()
-        }
-        Err(error) => return Err(error),
-    };
+    let agents = session_flow::AgentCatalog::default();
     agents.refresh_app_agent_metadata(&mut app);
     let launch_working_directory = std::env::current_dir()?;
-    if session_id.is_none()
-        && let Ok(Some(draft)) = client
-            .composer_draft(bcode_ipc::ComposerDraftScope::DraftSession {
-                launch_working_directory: launch_working_directory.clone(),
-            })
-            .await
-    {
-        app.replace_composer_with(&draft);
-    }
     let mut chat = session_flow::ActiveChat {
         app,
         agents,
@@ -119,13 +99,18 @@ pub async fn run_event_loop_with_startup<W: Write>(
         status_hydration_task: None,
         opening_session_id: None,
     };
+    session_flow::start_agent_catalog_hydration(&client, &chat);
     if let Some(session_id) = session_id {
         let initial_window_request = session_flow::initial_transcript_window_request(
             super::render::transcript_area_for_frame(&chat.app, terminal.area()),
         );
         session_flow::start_switch_session(&client, &mut chat, session_id, initial_window_request);
     } else {
-        session_flow::start_draft_status_hydration(&client, &mut chat);
+        session_flow::start_draft_status_hydration(
+            &client,
+            &mut chat,
+            launch_working_directory.clone(),
+        );
         if let Some(status) = auth_security_status {
             chat.app.set_status(status);
         } else if chat.app.composer().is_empty() {

@@ -177,7 +177,6 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
         } => cancel_session_turn(session_id, clear_queue).await?,
         Commands::Attach { session_id } => attach_session(session_id).await?,
         Commands::Tui { session_id } => {
-            ensure_server_running().await?;
             bcode_tui::run(session_id).await?;
         }
         Commands::Send {
