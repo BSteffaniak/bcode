@@ -1,5 +1,6 @@
 //! Slash completion state for the TUI.
 
+use super::slash_registry;
 use bcode_client::BcodeClient;
 use bcode_session_models::SessionId;
 
@@ -300,59 +301,11 @@ fn normalize(value: &str) -> String {
 }
 
 fn static_items() -> Vec<SlashItem> {
-    [
-        ("/plan", "Switch to plan agent"),
-        ("/build", "Switch to build agent"),
-        ("/sessions", "Open session picker"),
-        ("/new", "Create and switch to a new session"),
-        ("/compact", "Compact current session context"),
-        ("/model", "Open model picker"),
-        ("/models", "Open model picker"),
-        ("/set-model ", "Set model by id"),
-        ("/provider", "Show current provider"),
-        ("/set-provider ", "Set provider by id"),
-        ("/thinking", "Open thinking settings"),
-        ("/thinking status", "Show thinking settings status"),
-        ("/thinking capabilities", "Show model thinking capabilities"),
-        (
-            "/thinking effort",
-            "Open thinking settings focused on effort",
-        ),
-        (
-            "/thinking summary",
-            "Open thinking settings focused on summary",
-        ),
-        ("/diff", "Toggle diff panel"),
-        ("/fork", "Fork current session"),
-        ("/clone", "Clone current session"),
-        ("/worktree", "Create worktree"),
-        ("/worktrees", "Create worktree"),
-        ("/worktree list", "List Git worktrees"),
-        ("/worktree create", "Open worktree create dialog"),
-        ("/worktree attach ", "Set session working directory"),
-        ("/ralph", "Open Ralph UI"),
-        ("/ralph ui", "Open Ralph UI"),
-        ("/ralph start", "Start/setup Ralph loop"),
-        ("/ralph run", "Prepare Ralph run"),
-        ("/ralph approve", "Approve prepared Ralph run"),
-        ("/ralph status", "Show Ralph status"),
-        ("/ralph runs", "List Ralph runs"),
-        ("/ralph iterations", "List Ralph iterations"),
-        ("/ralph stop", "Stop active Ralph run"),
-        ("/ralph resume", "Resume interrupted Ralph run"),
-        ("/ralph audit", "Build Ralph audit prompt"),
-        ("/ralph replan", "Build Ralph replan prompt"),
-        ("/ralph open", "Open Ralph progress doc"),
-        ("/goal", "Start/continue Ralph goal workflow"),
-        ("/rescan-imports", "Rescan and open importable sessions"),
-        ("/skills", "Open skill picker"),
-        ("/agent ", "Set session agent by id"),
-        ("/skill ", "Invoke skill by id"),
-        ("/skill describe ", "Describe skill by id"),
-    ]
-    .into_iter()
-    .map(|(command, description)| item(command, description))
-    .collect()
+    slash_registry::static_completions()
+        .iter()
+        .copied()
+        .map(|completion| item(completion.command(), completion.description()))
+        .collect()
 }
 
 fn item(command: impl Into<String>, description: impl Into<String>) -> SlashItem {

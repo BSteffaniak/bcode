@@ -1,5 +1,6 @@
 //! Backend-agnostic slash commands for the TUI.
 
+use super::slash_registry;
 use bcode_client::BcodeClient;
 use bcode_session_models::SessionId;
 use bcode_worktree_models::WorktreeListRequest;
@@ -551,6 +552,9 @@ pub async fn execute(
     let Some(command) = parts.first().map(|part| part.trim_start_matches('/')) else {
         return Ok(SlashCommandOutcome::Unknown(message.to_owned()));
     };
+    if !slash_registry::is_builtin_command_name(command) {
+        return Ok(SlashCommandOutcome::Unknown(message.to_owned()));
+    }
     match command {
         "sessions" => Ok(SlashCommandOutcome::PickSession),
         "resync" => resync_command(client, &parts).await,

@@ -9,73 +9,14 @@ use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::ActiveChat;
 use super::{
     TuiError, model_flow, ralph_flow, session_flow, session_fork_flow, skill_flow, slash_commands,
-    thinking_dialog, worktree_flow,
+    slash_registry, thinking_dialog, worktree_flow,
 };
 
 /// Result of submitting staged composer text.
 pub type SubmitComposerOutcome = Option<thinking_dialog::ThinkingDialogState>;
 
-fn is_slash_command_name(command: &str) -> bool {
-    matches!(
-        command,
-        "sessions"
-            | "new"
-            | "plan"
-            | "build"
-            | "agent"
-            | "compact"
-            | "model"
-            | "models"
-            | "set-model"
-            | "provider"
-            | "set-provider"
-            | "diff"
-            | "cwd"
-            | "worktree"
-            | "worktrees"
-            | "fork"
-            | "clone"
-            | "skills"
-            | "skill"
-            | "thinking"
-            | "rescan-imports"
-            | "runtime"
-            | "status"
-            | "ralph"
-            | "goal"
-    )
-}
-
-fn is_draft_safe_slash_command(command: &str) -> bool {
-    matches!(
-        command,
-        "sessions"
-            | "new"
-            | "plan"
-            | "build"
-            | "agent"
-            | "diff"
-            | "worktree"
-            | "worktrees"
-            | "fork"
-            | "clone"
-            | "skills"
-            | "skill"
-            | "thinking"
-            | "rescan-imports"
-            | "ralph"
-            | "goal"
-    )
-}
-
-fn slash_command_name(message: &str) -> Option<&str> {
-    message
-        .strip_prefix('/')
-        .and_then(|command| command.split_whitespace().next())
-}
-
 fn has_known_slash_command(message: &str) -> bool {
-    slash_command_name(message).is_some_and(is_slash_command_name)
+    slash_registry::slash_command_name(message).is_some_and(slash_registry::is_builtin_command_name)
 }
 
 fn apply_draft_agent_selection(
@@ -306,8 +247,10 @@ pub async fn submit_composer<W: Write>(
         return Ok(None);
     }
     if has_known_slash_command(&message) {
-        let command = slash_command_name(&message);
-        if session_id.is_some() || command.is_some_and(is_draft_safe_slash_command) {
+        let command = slash_registry::slash_command_name(&message);
+        if session_id.is_some()
+            || command.is_some_and(slash_registry::is_draft_safe_builtin_command)
+        {
             return handle_slash_command(io, services, chat, session_id, &message).await;
         }
         chat.app.clear_pending_submission(&message);
