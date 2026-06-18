@@ -264,7 +264,13 @@ async fn cancel_turn(client: &BcodeClient, chat: &mut ActiveChat) -> Result<(), 
         chat.app.set_status("No active session".to_owned());
         return Ok(());
     };
-    let cancelled = client.cancel_session_turn(session_id).await?;
+    let cancelled = match client.cancel_session_turn(session_id).await {
+        Ok(cancelled) => cancelled,
+        Err(error) => {
+            helpers::report_client_issue(&mut chat.app, "cancel unavailable", &error);
+            return Ok(());
+        }
+    };
     if cancelled {
         chat.app.set_cancelling();
         chat.app.set_status("cancel requested".to_owned());
@@ -280,13 +286,19 @@ async fn compact_context(client: &BcodeClient, chat: &mut ActiveChat) -> Result<
         chat.app.set_status("No active session".to_owned());
         return Ok(());
     };
-    let message = client.compact_session(session_id).await?;
+    let message = match client.compact_session(session_id).await {
+        Ok(message) => message,
+        Err(error) => {
+            helpers::report_client_issue(&mut chat.app, "compact unavailable", &error);
+            return Ok(());
+        }
+    };
     chat.app.set_status(message);
     Ok(())
 }
 
 async fn show_worktrees(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Result<(), TuiError> {
-    let response = services
+    let response = match services
         .client
         .list_worktrees(WorktreeListRequest {
             cwd: chat
@@ -294,7 +306,14 @@ async fn show_worktrees(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Re
                 .working_directory()
                 .map(std::path::Path::to_path_buf),
         })
-        .await?;
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            helpers::report_client_issue(&mut chat.app, "worktrees unavailable", &error);
+            return Ok(());
+        }
+    };
     let lines = response
         .worktrees
         .into_iter()

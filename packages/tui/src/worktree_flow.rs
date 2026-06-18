@@ -37,6 +37,7 @@ pub async fn create_for_current_session<W: Write>(
     create_with_dialog(io, services, chat).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn create_with_dialog<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
@@ -89,7 +90,7 @@ async fn create_with_dialog<W: Write>(
                     };
                     let new_session =
                         target == worktree_create_dialog::WorktreeCreateTarget::NewSession;
-                    let response = services
+                    let response = match services
                         .client
                         .create_worktree(bcode_worktree_models::WorktreeCreateRequest {
                             name,
@@ -107,7 +108,18 @@ async fn create_with_dialog<W: Write>(
                             new_session,
                             no_setup: false,
                         })
-                        .await?;
+                        .await
+                    {
+                        Ok(response) => response,
+                        Err(error) => {
+                            helpers::report_client_issue(
+                                &mut chat.app,
+                                "worktree create failed",
+                                &error,
+                            );
+                            return Ok(());
+                        }
+                    };
                     handle_created_worktree(io, services, chat, response, target)?;
                     return Ok(());
                 }
@@ -222,10 +234,17 @@ pub async fn attach_current_session<W: Write>(
         .app
         .working_directory()
         .map(std::path::Path::to_path_buf);
-    let response = services
+    let response = match services
         .client
         .list_worktrees(bcode_worktree_models::WorktreeListRequest { cwd })
-        .await?;
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            helpers::report_client_issue(&mut chat.app, "worktree list unavailable", &error);
+            return Ok(());
+        }
+    };
     let mut picker = worktree_picker::WorktreePickerApp::new(response.worktrees);
     loop {
         io.terminal.resize(helpers::terminal_area()?);
@@ -250,7 +269,17 @@ pub async fn attach_current_session<W: Write>(
                     else {
                         continue;
                     };
-                    attach_path(services.client, chat, path).await?;
+                    if let Err(error) = attach_path(services.client, chat, path).await {
+                        if let TuiError::Client(error) = error {
+                            helpers::report_client_issue(
+                                &mut chat.app,
+                                "worktree attach failed",
+                                &error,
+                            );
+                            return Ok(());
+                        }
+                        return Err(error);
+                    }
                     return Ok(());
                 }
                 PickerKeyOutcome::Canceled => return Err(TuiError::Canceled),
@@ -262,7 +291,17 @@ pub async fn attach_current_session<W: Write>(
                         .selected_worktree()
                         .map(|worktree| worktree.path.clone())
                 {
-                    attach_path(services.client, chat, path).await?;
+                    if let Err(error) = attach_path(services.client, chat, path).await {
+                        if let TuiError::Client(error) = error {
+                            helpers::report_client_issue(
+                                &mut chat.app,
+                                "worktree attach failed",
+                                &error,
+                            );
+                            return Ok(());
+                        }
+                        return Err(error);
+                    }
                     return Ok(());
                 }
             }
@@ -272,6 +311,7 @@ pub async fn attach_current_session<W: Write>(
 }
 
 /// Pick a worktree and remove it after confirmation.
+#[allow(clippy::too_many_lines)]
 pub async fn remove_worktree<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
@@ -281,10 +321,17 @@ pub async fn remove_worktree<W: Write>(
         .app
         .working_directory()
         .map(std::path::Path::to_path_buf);
-    let response = services
+    let response = match services
         .client
         .list_worktrees(bcode_worktree_models::WorktreeListRequest { cwd: cwd.clone() })
-        .await?;
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            helpers::report_client_issue(&mut chat.app, "worktree list unavailable", &error);
+            return Ok(());
+        }
+    };
     let linked = response
         .worktrees
         .into_iter()
@@ -321,14 +368,25 @@ pub async fn remove_worktree<W: Write>(
                         else {
                             continue;
                         };
-                        let removed = services
+                        let removed = match services
                             .client
                             .remove_worktree(bcode_worktree_models::WorktreeRemoveRequest {
                                 cwd: cwd.clone(),
                                 path: path.clone(),
                                 force,
                             })
-                            .await?;
+                            .await
+                        {
+                            Ok(removed) => removed,
+                            Err(error) => {
+                                helpers::report_client_issue(
+                                    &mut chat.app,
+                                    "worktree remove failed",
+                                    &error,
+                                );
+                                return Ok(());
+                            }
+                        };
                         chat.app
                             .set_status(format!("removed worktree {}", removed.path.display()));
                         return Ok(());
@@ -343,14 +401,25 @@ pub async fn remove_worktree<W: Write>(
                         .selected_worktree()
                         .map(|worktree| worktree.path.clone())
                 {
-                    let removed = services
+                    let removed = match services
                         .client
                         .remove_worktree(bcode_worktree_models::WorktreeRemoveRequest {
                             cwd: cwd.clone(),
                             path: path.clone(),
                             force: false,
                         })
-                        .await?;
+                        .await
+                    {
+                        Ok(removed) => removed,
+                        Err(error) => {
+                            helpers::report_client_issue(
+                                &mut chat.app,
+                                "worktree remove failed",
+                                &error,
+                            );
+                            return Ok(());
+                        }
+                    };
                     chat.app
                         .set_status(format!("removed worktree {}", removed.path.display()));
                     return Ok(());
@@ -370,9 +439,16 @@ async fn attach_path(
         chat.app.set_status("No active session".to_owned());
         return Ok(());
     };
-    let session = client
+    let session = match client
         .change_session_working_directory(session_id, path.clone())
-        .await?;
+        .await
+    {
+        Ok(session) => session,
+        Err(error) => {
+            helpers::report_client_issue(&mut chat.app, "worktree attach failed", &error);
+            return Ok(());
+        }
+    };
     chat.app.apply_session_summary(&session);
     session_flow::hydrate_status(client, &mut chat.app).await;
     chat.app.set_status(format!("worktree: {}", path.display()));

@@ -1,6 +1,6 @@
 //! Backend-agnostic slash commands for the TUI.
 
-use super::slash_registry;
+use super::{daemon_issue, slash_registry};
 use bcode_client::BcodeClient;
 use bcode_session_models::SessionId;
 use bcode_worktree_models::WorktreeListRequest;
@@ -561,6 +561,11 @@ async fn handle_agent_command(
     })
 }
 
+fn slash_client_issue(label: &str, error: &bcode_client::ClientError) -> SlashCommandOutcome {
+    let issue = daemon_issue::classify_client_error(error);
+    SlashCommandOutcome::Handled(issue.message(label).status)
+}
+
 /// Execute a slash command.
 ///
 /// # Errors
@@ -575,7 +580,7 @@ pub async fn execute_resolved(
     resolution: slash_registry::SlashResolution,
 ) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
     let parts = message.split_whitespace().collect::<Vec<_>>();
-    match resolution {
+    let outcome = match resolution {
         slash_registry::SlashResolution::Builtin(command) => {
             execute_builtin(
                 client,
@@ -597,6 +602,10 @@ pub async fn execute_resolved(
         slash_registry::SlashResolution::Unknown => {
             Ok(SlashCommandOutcome::Unknown(message.to_owned()))
         }
+    };
+    match outcome {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => Ok(slash_client_issue("slash command unavailable", &error)),
     }
 }
 

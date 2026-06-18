@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 
 use bcode_agent_profile::AgentInfo;
-use bcode_client::{AttachedSessionHistory, BcodeClient, SessionList};
+use bcode_client::{AttachedSessionHistory, BcodeClient, SessionCatalogWatcher, SessionList};
 use bcode_ipc::{
     Event as BcodeEvent, RuntimeWorkSnapshot, SessionCatalogSourceStatus, SessionCatalogStatus,
 };
@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::app::BmuxApp;
+use super::daemon_issue;
 use super::helpers;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::picker_mouse::picker_row_from_mouse;
@@ -496,7 +497,13 @@ pub async fn persist_draft_session<W: Write>(
     chat.app.set_status("Creating session…".to_owned());
     terminal.draw(|frame| super::render::render(&mut chat.app, frame))?;
     let draft_agent_id = chat.app.current_agent_id().to_owned();
-    let session = client.create_session(None).await?;
+    let session = match client.create_session(None).await {
+        Ok(session) => session,
+        Err(error) => {
+            helpers::report_client_issue(&mut chat.app, "session creation unavailable", &error);
+            return Err(error.into());
+        }
+    };
     let _ = client
         .set_composer_draft(
             bcode_ipc::ComposerDraftScope::DraftSession {
@@ -506,15 +513,30 @@ pub async fn persist_draft_session<W: Write>(
         )
         .await;
     if draft_agent_id != "build" {
-        client
+        if let Err(error) = client
             .set_session_agent(session.id, draft_agent_id.clone())
-            .await?;
+            .await
+        {
+            helpers::report_client_issue(&mut chat.app, "session agent unavailable", &error);
+            return Err(error.into());
+        }
         chat.agents
             .apply_agent_to_app(&mut chat.app, draft_agent_id);
     }
-    let (attached, event_task) =
-        history_flow::attach_session_event_stream(client, session.id, chat.event_sender.clone())
-            .await?;
+    let (attached, event_task) = match history_flow::attach_session_event_stream(
+        client,
+        session.id,
+        chat.event_sender.clone(),
+    )
+    .await
+    {
+        Ok(attached) => attached,
+        Err(TuiError::Client(error)) => {
+            helpers::report_client_issue(&mut chat.app, "session event stream unavailable", &error);
+            return Err(error.into());
+        }
+        Err(error) => return Err(error),
+    };
     chat.session_id = Some(session.id);
     chat.event_task = Some(event_task);
     chat.app.apply_session_summary(&attached.session);
@@ -719,6 +741,58 @@ pub enum PickSessionOutcome {
     Draft,
 }
 
+async fn initialize_session_catalog_watcher(
+    client: &BcodeClient,
+    picker: &mut session_picker::SessionPickerApp,
+    create_hint: &str,
+) -> Option<SessionCatalogWatcher> {
+    match client.watch_session_catalog().await {
+        Ok(mut watcher) => {
+            picker.set_loading_status(format!(
+                "Loading sessions: discovering sources{create_hint}"
+            ));
+            match watcher.initial_snapshot().await {
+                Ok(snapshot) => apply_session_list(picker, snapshot),
+                Err(error) => {
+                    set_picker_client_issue(picker, "session catalog unavailable", &error);
+                    return None;
+                }
+            }
+            Some(watcher)
+        }
+        Err(error) => {
+            set_picker_client_issue(picker, "session catalog unavailable", &error);
+            None
+        }
+    }
+}
+
+async fn apply_next_catalog_snapshot(
+    watcher: &mut Option<SessionCatalogWatcher>,
+    picker: &mut session_picker::SessionPickerApp,
+) {
+    let Some(active_watcher) = watcher else {
+        return;
+    };
+    match active_watcher.next_snapshot().await {
+        Ok(snapshot) => apply_session_list(picker, snapshot),
+        Err(error) => {
+            set_picker_client_issue(picker, "session catalog unavailable", &error);
+            *watcher = None;
+        }
+    }
+}
+
+fn set_picker_client_issue(
+    picker: &mut session_picker::SessionPickerApp,
+    label: &str,
+    error: &bcode_client::ClientError,
+) {
+    let issue = daemon_issue::classify_client_error(error);
+    picker.set_status(issue.message(label).status);
+    picker.set_idle_empty_message();
+}
+
 /// Pick an existing session or request a new draft.
 #[allow(clippy::too_many_lines)]
 pub async fn pick_session<W: Write>(
@@ -730,22 +804,26 @@ pub async fn pick_session<W: Write>(
         "Loading sessions: connecting to catalog; press Ctrl-N to create one".to_owned(),
     );
     draw_session_picker(io.terminal, &mut picker, services.theme)?;
-    let mut watcher = services.client.watch_session_catalog().await?;
-    picker.set_loading_status(
-        "Loading sessions: discovering sources; press Ctrl-N to create one".to_owned(),
-    );
+    let mut watcher = initialize_session_catalog_watcher(
+        services.client,
+        &mut picker,
+        "; press Ctrl-N to create one",
+    )
+    .await;
     draw_session_picker(io.terminal, &mut picker, services.theme)?;
-    apply_session_list(&mut picker, watcher.initial_snapshot().await?);
     loop {
         draw_session_picker(io.terminal, &mut picker, services.theme)?;
-        let event = tokio::select! {
-            snapshot = watcher.next_snapshot() => {
-                apply_session_list(&mut picker, snapshot?);
-                continue;
+        let event = if watcher.is_some() {
+            tokio::select! {
+                () = apply_next_catalog_snapshot(&mut watcher, &mut picker) => {
+                    continue;
+                }
+                event = io.input.recv() => {
+                    event?
+                }
             }
-            event = io.input.recv() => {
-                event?
-            }
+        } else {
+            io.input.recv().await?
         };
         let Some(event) = event else {
             continue;
@@ -762,10 +840,22 @@ pub async fn pick_session<W: Write>(
                     return Ok(PickSessionOutcome::Draft);
                 }
                 PickerKeyOutcome::Rename => {
-                    rename_picker_session(services.client, &mut picker).await?;
+                    if let Err(error) = rename_picker_session(services.client, &mut picker).await {
+                        if let TuiError::Client(error) = error {
+                            set_picker_client_issue(&mut picker, "session rename failed", &error);
+                        } else {
+                            return Err(error);
+                        }
+                    }
                 }
                 PickerKeyOutcome::Delete => {
-                    delete_picker_session(services.client, &mut picker).await?;
+                    if let Err(error) = delete_picker_session(services.client, &mut picker).await {
+                        if let TuiError::Client(error) = error {
+                            set_picker_client_issue(&mut picker, "session delete failed", &error);
+                        } else {
+                            return Err(error);
+                        }
+                    }
                 }
                 PickerKeyOutcome::Selected => {
                     if let Some(session_id) = import_selected_session(
@@ -811,10 +901,8 @@ pub async fn pick_session_for_mutation<W: Write>(
     let mut picker = session_picker::SessionPickerApp::new(Vec::new());
     picker.set_loading_status("Loading sessions: connecting to catalog".to_owned());
     draw_session_picker(io.terminal, &mut picker, services.theme)?;
-    let mut watcher = services.client.watch_session_catalog().await?;
-    picker.set_loading_status("Loading sessions: discovering sources".to_owned());
+    let mut watcher = initialize_session_catalog_watcher(services.client, &mut picker, "").await;
     draw_session_picker(io.terminal, &mut picker, services.theme)?;
-    apply_session_list(&mut picker, watcher.initial_snapshot().await?);
     let mut pending_start_mode = Some(start_mode);
     loop {
         if let Some(start_mode) = pending_start_mode.take() {
@@ -828,14 +916,17 @@ pub async fn pick_session_for_mutation<W: Write>(
             }
         }
         draw_session_picker(io.terminal, &mut picker, services.theme)?;
-        let event = tokio::select! {
-            snapshot = watcher.next_snapshot() => {
-                apply_session_list(&mut picker, snapshot?);
-                continue;
+        let event = if watcher.is_some() {
+            tokio::select! {
+                () = apply_next_catalog_snapshot(&mut watcher, &mut picker) => {
+                    continue;
+                }
+                event = io.input.recv() => {
+                    event?
+                }
             }
-            event = io.input.recv() => {
-                event?
-            }
+        } else {
+            io.input.recv().await?
         };
         let Some(event) = event else {
             continue;
@@ -857,10 +948,22 @@ pub async fn pick_session_for_mutation<W: Write>(
                 | PickerKeyOutcome::Create
                 | PickerKeyOutcome::Selected => {}
                 PickerKeyOutcome::Rename => {
-                    rename_picker_session(services.client, &mut picker).await?;
+                    if let Err(error) = rename_picker_session(services.client, &mut picker).await {
+                        if let TuiError::Client(error) = error {
+                            set_picker_client_issue(&mut picker, "session rename failed", &error);
+                        } else {
+                            return Err(error);
+                        }
+                    }
                 }
                 PickerKeyOutcome::Delete => {
-                    delete_picker_session(services.client, &mut picker).await?;
+                    if let Err(error) = delete_picker_session(services.client, &mut picker).await {
+                        if let TuiError::Client(error) = error {
+                            set_picker_client_issue(&mut picker, "session delete failed", &error);
+                        } else {
+                            return Err(error);
+                        }
+                    }
                 }
                 PickerKeyOutcome::Canceled => {
                     return Ok(());
@@ -1037,11 +1140,14 @@ async fn rename_picker_session(
     let name = picker.rename().buffer().text().trim();
     let name = (!name.is_empty()).then(|| name.to_owned());
     match client.rename_session(session_id, name).await {
-        Ok(_) => {
-            picker.replace_sessions(client.list_sessions().await?);
-            picker.finish_mutation("Session renamed".to_owned());
-        }
-        Err(error) => picker.finish_mutation(format!("rename failed: {error}")),
+        Ok(_) => match client.list_sessions().await {
+            Ok(sessions) => {
+                picker.replace_sessions(sessions);
+                picker.finish_mutation("Session renamed".to_owned());
+            }
+            Err(error) => set_picker_client_issue(picker, "session refresh failed", &error),
+        },
+        Err(error) => set_picker_client_issue(picker, "session rename failed", &error),
     }
     Ok(())
 }
@@ -1055,11 +1161,14 @@ async fn delete_picker_session(
         return Ok(());
     };
     match client.delete_session(session_id).await {
-        Ok(_) => {
-            picker.replace_sessions(client.list_sessions().await?);
-            picker.finish_mutation("Session deleted".to_owned());
-        }
-        Err(error) => picker.finish_mutation(format!("delete failed: {error}")),
+        Ok(_) => match client.list_sessions().await {
+            Ok(sessions) => {
+                picker.replace_sessions(sessions);
+                picker.finish_mutation("Session deleted".to_owned());
+            }
+            Err(error) => set_picker_client_issue(picker, "session refresh failed", &error),
+        },
+        Err(error) => set_picker_client_issue(picker, "session delete failed", &error),
     }
     Ok(())
 }
