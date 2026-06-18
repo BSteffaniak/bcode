@@ -127,6 +127,12 @@ impl TranscriptScrollAnimation {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentMetadataHydration {
+    Pending,
+    Hydrated,
+}
+
 /// State owned by the terminal user interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BmuxApp {
@@ -139,6 +145,7 @@ pub struct BmuxApp {
     current_agent_accent: Option<String>,
     pending_agent_id: Option<String>,
     pending_agent_accent: Option<String>,
+    agent_metadata_hydration: AgentMetadataHydration,
     reasoning_visible: bool,
     thinking_label: String,
     reasoning_effort: Option<String>,
@@ -309,6 +316,7 @@ impl BmuxApp {
             current_agent_accent: None,
             pending_agent_id: None,
             pending_agent_accent: None,
+            agent_metadata_hydration: AgentMetadataHydration::Pending,
             reasoning_visible: true,
             thinking_label: "shown · effort: provider default · summary: provider default"
                 .to_owned(),
@@ -472,6 +480,24 @@ impl BmuxApp {
     #[must_use]
     pub fn pending_agent_id(&self) -> Option<&str> {
         self.pending_agent_id.as_deref()
+    }
+
+    /// Return true once daemon-backed agent presentation metadata has hydrated.
+    #[must_use]
+    pub const fn is_agent_metadata_hydrated(&self) -> bool {
+        matches!(
+            self.agent_metadata_hydration,
+            AgentMetadataHydration::Hydrated
+        )
+    }
+
+    /// Set whether daemon-backed agent presentation metadata has hydrated.
+    pub const fn set_agent_metadata_hydrated(&mut self, hydrated: bool) {
+        self.agent_metadata_hydration = if hydrated {
+            AgentMetadataHydration::Hydrated
+        } else {
+            AgentMetadataHydration::Pending
+        };
     }
 
     /// Return the agent id that should be presented in the UI.

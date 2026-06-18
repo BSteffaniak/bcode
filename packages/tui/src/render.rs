@@ -56,17 +56,33 @@ pub struct TuiTheme {
 }
 
 impl TuiTheme {
+    const PENDING_AGENT_METADATA_ACCENT: Color = Color::Rgb(100, 116, 139);
+
     #[must_use]
     pub fn for_app(app: &BmuxApp) -> Self {
-        Self::for_agent(app.display_agent_id(), app.display_agent_accent())
+        Self::for_agent(
+            app.display_agent_id(),
+            app.display_agent_accent(),
+            app.is_agent_metadata_hydrated(),
+        )
     }
 
     #[must_use]
-    pub fn for_agent(agent_id: &str, configured_accent: Option<&str>) -> Self {
+    pub fn for_agent(
+        agent_id: &str,
+        configured_accent: Option<&str>,
+        agent_metadata_hydrated: bool,
+    ) -> Self {
         Self {
             accent: configured_accent
                 .and_then(parse_agent_accent_color)
-                .unwrap_or_else(|| agent_accent_color(agent_id)),
+                .unwrap_or_else(|| {
+                    if agent_metadata_hydrated {
+                        agent_accent_color(agent_id)
+                    } else {
+                        Self::PENDING_AGENT_METADATA_ACCENT
+                    }
+                }),
         }
     }
 }

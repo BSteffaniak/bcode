@@ -801,6 +801,7 @@ fn header_shortens_session_id_on_wide_panes() {
 #[test]
 fn header_accent_color_tracks_arbitrary_selected_agent() {
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.set_agent_metadata_hydrated(true);
     app.set_current_agent_id("one");
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
     let mut frame = Frame::new(&mut buffer);
@@ -816,6 +817,7 @@ fn header_accent_color_tracks_arbitrary_selected_agent() {
 #[test]
 fn composer_border_accent_color_tracks_arbitrary_selected_agent() {
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.set_agent_metadata_hydrated(true);
     app.set_current_agent_id("two");
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
     let mut frame = Frame::new(&mut buffer);
@@ -834,6 +836,7 @@ fn composer_border_accent_color_tracks_arbitrary_selected_agent() {
 #[test]
 fn same_agent_gets_same_accent_across_chrome() {
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.set_agent_metadata_hydrated(true);
     app.set_current_agent_id("custom-agent");
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
     let mut frame = Frame::new(&mut buffer);
@@ -866,6 +869,7 @@ fn configured_agent_accent_overrides_fallback_color() {
 #[test]
 fn invalid_configured_agent_accent_falls_back_to_agent_color() {
     let mut fallback_app = BmuxApp::new_with_history(None, &[], &[], false);
+    fallback_app.set_agent_metadata_hydrated(true);
     fallback_app.set_current_agent_id("quiet-plan");
     let mut fallback_buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
     let mut fallback_frame = Frame::new(&mut fallback_buffer);
@@ -875,6 +879,7 @@ fn invalid_configured_agent_accent_falls_back_to_agent_color() {
         .and_then(|cell| cell.style.fg);
 
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.set_agent_metadata_hydrated(true);
     app.set_current_agent("quiet-plan", Some("not-a-color".to_owned()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
     let mut frame = Frame::new(&mut buffer);
@@ -1253,7 +1258,7 @@ fn slash_palette_renders_above_composer() {
         &palette,
         Rect::new(2, 18, 76, 1),
         &mut frame,
-        render::TuiTheme::for_agent("build", None),
+        render::TuiTheme::for_agent("build", None, true),
     );
     let output = rendered_text(&buffer);
 
