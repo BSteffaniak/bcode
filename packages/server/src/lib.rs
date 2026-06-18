@@ -549,41 +549,91 @@ fn model_metadata_override(
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct ModelReasoningOverride {
+    effort_values: Option<Vec<String>>,
+    default_effort: Option<String>,
+    visible_summary_supported: Option<bool>,
+    summary_values: Option<Vec<String>>,
+    default_summary: Option<String>,
+    raw_reasoning_supported: Option<bool>,
+}
+
+impl ModelReasoningOverride {
+    const fn is_empty(&self) -> bool {
+        self.effort_values.is_none()
+            && self.default_effort.is_none()
+            && self.visible_summary_supported.is_none()
+            && self.summary_values.is_none()
+            && self.default_summary.is_none()
+            && self.raw_reasoning_supported.is_none()
+    }
+}
+
 fn model_reasoning_override(
     context: &bcode_model::ProviderRequestContext,
     model_id: &str,
-) -> Option<bcode_model::ModelReasoningInfo> {
+) -> Option<ModelReasoningOverride> {
     let prefix = format!("model_metadata.{model_id}.reasoning.");
-    let effort_values = context
-        .settings
-        .get(&format!("{prefix}effort_values"))
-        .map_or_else(Vec::new, |value| split_config_values(value));
-    let summary_values = context
-        .settings
-        .get(&format!("{prefix}summary_values"))
-        .map_or_else(Vec::new, |value| split_config_values(value));
-    let default_effort = non_empty_setting(context, &format!("{prefix}default_effort"));
-    let default_summary = non_empty_setting(context, &format!("{prefix}default_summary"));
-    let visible_summary_supported =
-        bool_setting(context, &format!("{prefix}visible_summary_supported"));
-    let raw_reasoning_supported =
-        bool_setting(context, &format!("{prefix}raw_reasoning_supported"));
+    let override_ = ModelReasoningOverride {
+        effort_values: context
+            .settings
+            .get(&format!("{prefix}effort_values"))
+            .map(|value| split_config_values(value)),
+        summary_values: context
+            .settings
+            .get(&format!("{prefix}summary_values"))
+            .map(|value| split_config_values(value)),
+        default_effort: non_empty_setting(context, &format!("{prefix}default_effort")),
+        default_summary: non_empty_setting(context, &format!("{prefix}default_summary")),
+        visible_summary_supported: bool_setting(
+            context,
+            &format!("{prefix}visible_summary_supported"),
+        ),
+        raw_reasoning_supported: bool_setting(context, &format!("{prefix}raw_reasoning_supported")),
+    };
+    (!override_.is_empty()).then_some(override_)
+}
 
-    (!effort_values.is_empty()
-        || !summary_values.is_empty()
-        || default_effort.is_some()
-        || default_summary.is_some()
-        || visible_summary_supported.is_some()
-        || raw_reasoning_supported.is_some())
-    .then(|| bcode_model::ModelReasoningInfo {
-        effort_values,
-        default_effort,
-        visible_summary_supported: visible_summary_supported.unwrap_or_default(),
-        summary_values,
-        default_summary,
-        raw_reasoning_supported: raw_reasoning_supported.unwrap_or_default(),
-        source: bcode_model::ModelReasoningCapabilitySource::ConfigOverride,
-    })
+fn merge_reasoning_override(
+    base: Option<bcode_model::ModelReasoningInfo>,
+    override_: Option<ModelReasoningOverride>,
+) -> Option<bcode_model::ModelReasoningInfo> {
+    match (base, override_) {
+        (Some(mut base), Some(override_)) => {
+            if let Some(effort_values) = override_.effort_values {
+                base.effort_values = effort_values;
+            }
+            if let Some(default_effort) = override_.default_effort {
+                base.default_effort = Some(default_effort);
+            }
+            if let Some(visible_summary_supported) = override_.visible_summary_supported {
+                base.visible_summary_supported = visible_summary_supported;
+            }
+            if let Some(summary_values) = override_.summary_values {
+                base.summary_values = summary_values;
+            }
+            if let Some(default_summary) = override_.default_summary {
+                base.default_summary = Some(default_summary);
+            }
+            if let Some(raw_reasoning_supported) = override_.raw_reasoning_supported {
+                base.raw_reasoning_supported = raw_reasoning_supported;
+            }
+            base.source = bcode_model::ModelReasoningCapabilitySource::ConfigOverride;
+            Some(base)
+        }
+        (Some(base), None) => Some(base),
+        (None, Some(override_)) => Some(bcode_model::ModelReasoningInfo {
+            effort_values: override_.effort_values.unwrap_or_default(),
+            default_effort: override_.default_effort,
+            visible_summary_supported: override_.visible_summary_supported.unwrap_or_default(),
+            summary_values: override_.summary_values.unwrap_or_default(),
+            default_summary: override_.default_summary,
+            raw_reasoning_supported: override_.raw_reasoning_supported.unwrap_or_default(),
+            source: bcode_model::ModelReasoningCapabilitySource::ConfigOverride,
+        }),
+        (None, None) => None,
+    }
 }
 
 fn split_config_values(value: &str) -> Vec<String> {
@@ -6242,14 +6292,15 @@ async fn model_status_for_selection(
     let reasoning_override = model_id
         .as_deref()
         .and_then(|model_id| model_reasoning_override(&selection.provider_context, model_id));
+    let base_reasoning = selection
+        .reasoning_capabilities
+        .or_else(|| model.as_ref().and_then(|model| model.reasoning.clone()));
     bcode_ipc::SessionModelStatus {
         provider_plugin_id: selection.provider_plugin_id,
         model_id,
         context_window,
         max_output_tokens,
-        reasoning: reasoning_override
-            .or(selection.reasoning_capabilities)
-            .or_else(|| model.as_ref().and_then(|model| model.reasoning.clone())),
+        reasoning: merge_reasoning_override(base_reasoning, reasoning_override),
         reasoning_effort: selection.reasoning_effort,
         reasoning_summary: selection.reasoning_summary,
         prompt_cache_mode: Some(prompt_cache_mode_name(state.prompt_cache_mode).to_string()),
@@ -10453,22 +10504,17 @@ async fn resolve_model_reasoning_info(
     selected_model_id: Option<&str>,
     provider_context: &bcode_model::ProviderRequestContext,
 ) -> Option<bcode_model::ModelReasoningInfo> {
-    if let Some(reasoning) =
-        selected_model_id.and_then(|model_id| model_reasoning_override(provider_context, model_id))
-    {
-        return Some(reasoning);
-    }
-    if let Some(reasoning) = resolve_model_reasoning_info_from_provider(
+    let provider_reasoning = resolve_model_reasoning_info_from_provider(
         state,
         provider_plugin_id,
         selected_model_id,
         provider_context.clone(),
     )
     .await
-    {
-        return Some(reasoning);
-    }
-    state.selected_reasoning_capabilities.clone()
+    .or_else(|| state.selected_reasoning_capabilities.clone());
+    let override_ =
+        selected_model_id.and_then(|model_id| model_reasoning_override(provider_context, model_id));
+    merge_reasoning_override(provider_reasoning, override_)
 }
 
 async fn resolve_model_reasoning_info_from_provider(
