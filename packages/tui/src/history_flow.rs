@@ -90,6 +90,7 @@ pub async fn load_timeline_jump_events(
 }
 
 /// Load the next older page of transcript history when available.
+#[allow(dead_code)]
 pub async fn load_older_history(
     client: &BcodeClient,
     chat: &mut ActiveChat,

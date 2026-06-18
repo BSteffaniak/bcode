@@ -1104,6 +1104,7 @@ dependencies = [
  "bcode_skill_models",
  "sshenv_vault",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

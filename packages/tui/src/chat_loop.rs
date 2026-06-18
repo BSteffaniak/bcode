@@ -4,8 +4,11 @@ use std::io::Write;
 use std::time::{Duration, Instant, SystemTime};
 
 use bcode_client::{BcodeClient, ClientError};
-use bcode_ipc::{ComposerDraftScope, Event as BcodeEvent};
-use bcode_session_models::SessionEventKind;
+use bcode_ipc::{ComposerDraftScope, Event as BcodeEvent, PermissionSummary};
+use bcode_session_models::{
+    SessionEventKind, SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage,
+    SessionHistoryQuery, SessionId,
+};
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
@@ -22,14 +25,15 @@ use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::{self, ActiveChat};
 use super::terminal_events::TuiInput;
 use super::{
-    TuiError, command_palette_render, composer_flow, history_flow, input, input::KeyRequest,
-    mouse_flow, palette_flow, permission_dialog_render, permission_flow, render, slash_flow,
-    slash_palette, slash_palette_render, thinking_dialog_render, thinking_flow,
-    timeline_dialog_render, timeline_flow,
+    TuiError, command_palette_render, composer_flow, input, input::KeyRequest, mouse_flow,
+    palette_flow, permission_dialog_render, permission_flow, render, slash_flow, slash_palette,
+    slash_palette_render, thinking_dialog_render, thinking_flow, timeline_dialog_render,
+    timeline_flow,
 };
 
 const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const DRAFT_SAVE_DEBOUNCE: Duration = Duration::from_millis(900);
+const PERMISSION_POLL_INTERVAL: Duration = Duration::from_millis(750);
 
 #[derive(Debug, Clone)]
 struct DraftAutosave {
@@ -109,8 +113,42 @@ struct ModalState {
     palette: Option<BmuxCommandPalette>,
     slash_palette: Option<slash_palette::SlashPalette>,
     permission_dialog: Option<PermissionDialogState>,
+    permission_poll: AsyncPermissionPoll,
+    older_history_load: AsyncOlderHistoryLoad,
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
+}
+
+#[derive(Debug)]
+struct AsyncPermissionPoll {
+    task: Option<tokio::task::JoinHandle<Result<Vec<PermissionSummary>, ClientError>>>,
+    next_poll_at: Instant,
+}
+
+impl AsyncPermissionPoll {
+    const fn new(now: Instant) -> Self {
+        Self {
+            task: None,
+            next_poll_at: now,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AsyncOlderHistoryLoad {
+    task: Option<tokio::task::JoinHandle<Result<SessionHistoryPage, ClientError>>>,
+    session_id: Option<SessionId>,
+    cursor: Option<SessionHistoryCursor>,
+}
+
+impl AsyncOlderHistoryLoad {
+    const fn new() -> Self {
+        Self {
+            task: None,
+            session_id: None,
+            cursor: None,
+        }
+    }
 }
 
 struct ChatEventContext<'a, 'b, W: Write> {
@@ -146,6 +184,8 @@ pub async fn run_with_client<W: Write>(
         palette: None,
         slash_palette: None,
         permission_dialog: None,
+        permission_poll: AsyncPermissionPoll::new(Instant::now()),
+        older_history_load: AsyncOlderHistoryLoad::new(),
         thinking_dialog: None,
         timeline_dialog: None,
     };
@@ -167,7 +207,7 @@ pub async fn run_with_client<W: Write>(
             needs_redraw = true;
         }
 
-        if handle_loop_housekeeping(client, chat, &mut modals).await? {
+        if handle_loop_housekeeping(client, chat, &mut modals).await {
             needs_redraw = true;
         }
 
@@ -274,38 +314,120 @@ async fn handle_loop_housekeeping(
     client: &BcodeClient,
     chat: &mut ActiveChat,
     modals: &mut ModalState,
-) -> Result<bool, TuiError> {
+) -> bool {
     let mut needs_redraw = false;
-    if chat.app.should_load_older_history() {
-        match history_flow::load_older_history(client, chat).await {
-            Ok(()) => needs_redraw = true,
-            Err(error) if is_nonfatal_tui_daemon_error(&error) => {
-                report_nonfatal_tui_error(chat, "Older history unavailable", &error);
-                needs_redraw = true;
-            }
-            Err(error) => return Err(error),
+    needs_redraw |= poll_older_history_load(chat, &mut modals.older_history_load).await;
+    needs_redraw |= maybe_start_older_history_load(client, chat, &mut modals.older_history_load);
+    needs_redraw |= poll_permission_list(chat, modals).await;
+    maybe_start_permission_poll(client, chat, modals);
+    needs_redraw
+}
+
+fn maybe_start_older_history_load(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    load: &mut AsyncOlderHistoryLoad,
+) -> bool {
+    if load.task.is_some() || !chat.app.should_load_older_history() {
+        return false;
+    }
+    let Some(cursor) = chat.app.older_history_cursor() else {
+        return false;
+    };
+    let Some(session_id) = chat.session_id else {
+        return false;
+    };
+    chat.app.set_loading_older_history(true);
+    load.session_id = Some(session_id);
+    load.cursor = Some(cursor);
+    let client = client.clone();
+    load.task = Some(tokio::spawn(async move {
+        client
+            .session_history_page(
+                session_id,
+                SessionHistoryQuery {
+                    cursor: Some(cursor),
+                    limit: super::OLDER_HISTORY_EVENT_LIMIT,
+                    direction: SessionHistoryDirection::Backward,
+                },
+            )
+            .await
+    }));
+    true
+}
+
+async fn poll_older_history_load(chat: &mut ActiveChat, load: &mut AsyncOlderHistoryLoad) -> bool {
+    let Some(task) = load.task.take_if(|task| task.is_finished()) else {
+        return false;
+    };
+    let request_session_id = load.session_id.take();
+    load.cursor = None;
+    match task.await {
+        Ok(Ok(page)) if request_session_id == chat.session_id => {
+            chat.app.prepend_older_history(&page.events, page.has_more);
+        }
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            chat.app.set_loading_older_history(false);
+            report_nonfatal_client_error(chat, "Older history unavailable", &error);
+        }
+        Err(error) => {
+            chat.app.set_loading_older_history(false);
+            chat.app
+                .set_status(format!("Older history task failed: {error}"));
         }
     }
+    true
+}
 
-    if modals.permission_dialog.is_none() {
-        match client.list_permissions().await {
-            Ok(permissions) => {
-                if let Some(permission) = permissions
+fn maybe_start_permission_poll(client: &BcodeClient, chat: &ActiveChat, modals: &mut ModalState) {
+    if modals.permission_dialog.is_some()
+        || modals.permission_poll.task.is_some()
+        || Instant::now() < modals.permission_poll.next_poll_at
+        || chat.session_id.is_none()
+    {
+        return;
+    }
+    let client = client.clone();
+    modals.permission_poll.task =
+        Some(tokio::spawn(async move { client.list_permissions().await }));
+}
+
+async fn poll_permission_list(chat: &mut ActiveChat, modals: &mut ModalState) -> bool {
+    let Some(task) = modals
+        .permission_poll
+        .task
+        .take_if(|task| task.is_finished())
+    else {
+        return false;
+    };
+    modals.permission_poll.next_poll_at = Instant::now() + PERMISSION_POLL_INTERVAL;
+    match task.await {
+        Ok(Ok(permissions)) => {
+            if modals.permission_dialog.is_none()
+                && let Some(permission) = permissions
                     .into_iter()
                     .find(|permission| Some(permission.session_id) == chat.session_id)
-                {
-                    modals.permission_dialog = Some(PermissionDialogState::new(permission));
-                    needs_redraw = true;
-                }
+            {
+                modals.permission_dialog = Some(PermissionDialogState::new(permission));
+                return true;
             }
-            Err(error) if error.is_daemon_unavailable() => {
+        }
+        Ok(Err(error)) => {
+            if error.is_daemon_unavailable() {
                 report_nonfatal_client_error(chat, "Permissions unavailable", &error);
-                needs_redraw = true;
+                return true;
             }
-            Err(error) => return Err(error.into()),
+            report_nonfatal_client_error(chat, "Permission check failed", &error);
+            return true;
+        }
+        Err(error) => {
+            chat.app
+                .set_status(format!("Permission check task failed: {error}"));
+            return true;
         }
     }
-    Ok(needs_redraw)
+    false
 }
 
 fn is_nonfatal_tui_daemon_error(error: &TuiError) -> bool {

@@ -26,7 +26,11 @@ use bcode_session_models::{
 };
 use bcode_skill_models::{SkillId, SkillList, SkillManifest};
 use std::collections::{BTreeMap, VecDeque};
+use std::time::Duration;
 use thiserror::Error;
+
+const CLIENT_IPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const CLIENT_DAEMON_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 /// Grouped runtime-work lifecycle span.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +120,8 @@ pub enum ClientError {
     DaemonStart(#[from] DaemonStartError),
     #[error("server returned error {code}: {message}")]
     Server { code: String, message: String },
+    #[error("client request timed out after {timeout:?}")]
+    RequestTimeout { timeout: Duration },
     #[error("unexpected response payload")]
     UnexpectedResponse,
     #[error("unexpected IPC envelope kind")]
@@ -147,6 +153,7 @@ impl ClientError {
             Self::Transport(_)
             | Self::Codec(_)
             | Self::Server { .. }
+            | Self::RequestTimeout { .. }
             | Self::UnexpectedResponse
             | Self::UnexpectedEnvelope => false,
         }
@@ -1646,7 +1653,7 @@ impl BcodeClient {
                 {
                     last_error = Some(error);
                     self.ensure_daemon_available().await?;
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    tokio::time::sleep(CLIENT_DAEMON_RETRY_DELAY).await;
                 }
                 Err(error) => return Err(error),
             }
@@ -1675,7 +1682,7 @@ impl BcodeClient {
                 {
                     last_error = Some(error);
                     self.ensure_daemon_available().await?;
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    tokio::time::sleep(CLIENT_DAEMON_RETRY_DELAY).await;
                 }
                 Err(error) => return Err(error),
             }
@@ -2001,7 +2008,12 @@ impl ClientConnection {
         send_envelope(&mut self.stream, &envelope).await?;
 
         loop {
-            let envelope = recv_envelope(&mut self.stream).await?;
+            let envelope =
+                tokio::time::timeout(CLIENT_IPC_REQUEST_TIMEOUT, recv_envelope(&mut self.stream))
+                    .await
+                    .map_err(|_| ClientError::RequestTimeout {
+                        timeout: CLIENT_IPC_REQUEST_TIMEOUT,
+                    })??;
             if envelope.kind == EnvelopeKind::Event {
                 self.pending_events
                     .push_back(decode_event(&envelope.payload).map_err(ClientError::from)?);

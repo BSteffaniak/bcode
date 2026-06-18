@@ -13,6 +13,7 @@ use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
+use std::future::Future;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -122,6 +123,7 @@ pub enum ChatAsyncEvent {
 pub struct DraftStatusHydrationResult {
     pub model: Option<bcode_ipc::SessionModelStatus>,
     pub composer_draft: Option<String>,
+    pub error: Option<String>,
 }
 
 /// Result from asynchronously hydrating agent metadata.
@@ -142,6 +144,16 @@ pub struct StatusHydrationResult {
     pub model: Option<bcode_ipc::SessionModelStatus>,
     pub active_skill_count: Option<usize>,
     pub runtime_work: Option<Vec<RuntimeWorkSnapshot>>,
+    pub error: Option<String>,
+}
+
+async fn optional_tui_client_result<T>(
+    future: impl Future<Output = Result<T, bcode_client::ClientError>>,
+) -> (Option<T>, Option<String>) {
+    match future.await {
+        Ok(value) => (Some(value), None),
+        Err(error) => (None, Some(error.to_string())),
+    }
 }
 
 /// Compute the semantic initial transcript-window request from the visible transcript area.
@@ -302,20 +314,18 @@ pub fn start_draft_status_hydration(
     let client = client.clone();
     let async_event_sender = chat.async_event_sender.clone();
     chat.status_hydration_task = Some(tokio::spawn(async move {
-        let (model, composer_draft) =
-            tokio::join!(async { client.default_model_status().await.ok() }, async {
-                client
-                    .composer_draft(bcode_ipc::ComposerDraftScope::DraftSession {
-                        launch_working_directory,
-                    })
-                    .await
-                    .ok()
-                    .flatten()
-            },);
+        let (model, model_error) = optional_tui_client_result(client.default_model_status()).await;
+        let draft_scope = bcode_ipc::ComposerDraftScope::DraftSession {
+            launch_working_directory,
+        };
+        let (composer_draft, draft_error) =
+            optional_tui_client_result(client.composer_draft(draft_scope)).await;
+        let error = model_error.or(draft_error);
         let _ = async_event_sender.send(ChatAsyncEvent::DraftStatusHydrated(
             DraftStatusHydrationResult {
                 model,
-                composer_draft,
+                composer_draft: composer_draft.flatten(),
+                error,
             },
         ));
     }));
@@ -329,22 +339,19 @@ pub fn start_status_hydration(client: &BcodeClient, chat: &mut ActiveChat, sessi
     let client = client.clone();
     let async_event_sender = chat.async_event_sender.clone();
     chat.status_hydration_task = Some(tokio::spawn(async move {
-        let model = client.session_model_status(session_id).await.ok();
-        let (active_skill_count, runtime_work) = tokio::join!(
-            async {
-                client
-                    .active_skills(session_id)
-                    .await
-                    .ok()
-                    .map(|skills| skills.len())
-            },
-            async { client.list_runtime_work(session_id).await.ok() },
+        let (model, model_error) =
+            optional_tui_client_result(client.session_model_status(session_id)).await;
+        let ((active_skills, skills_error), (runtime_work, runtime_work_error)) = tokio::join!(
+            optional_tui_client_result(client.active_skills(session_id)),
+            optional_tui_client_result(client.list_runtime_work(session_id)),
         );
+        let error = model_error.or(skills_error).or(runtime_work_error);
         let _ = async_event_sender.send(ChatAsyncEvent::StatusHydrated(StatusHydrationResult {
             session_id,
             model,
-            active_skill_count,
+            active_skill_count: active_skills.map(|skills| skills.len()),
             runtime_work,
+            error,
         }));
     }));
 }
@@ -362,6 +369,10 @@ pub fn complete_draft_status_hydration(
     {
         chat.app.replace_composer_with(&draft);
         chat.app.set_status("Draft restored".to_owned());
+    }
+    if let Some(error) = hydrated.error {
+        chat.app
+            .set_status(format!("Draft status unavailable: {error}"));
     }
     if let Some(model) = hydrated.model {
         chat.app.apply_model_status(model);
@@ -388,6 +399,11 @@ pub fn complete_status_hydration(chat: &mut ActiveChat, hydrated: StatusHydratio
         chat.app.apply_runtime_work_snapshots(&work);
     }
     let skill_count = hydrated.active_skill_count.unwrap_or(0);
+    if let Some(error) = hydrated.error {
+        chat.app
+            .set_status(format!("Session status unavailable: {error}"));
+        return;
+    }
     chat.app
         .set_status(format!("model: {model_text}; active skills: {skill_count}"));
 }
