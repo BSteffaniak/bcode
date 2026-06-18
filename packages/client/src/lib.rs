@@ -143,9 +143,9 @@ impl ClientError {
                     | std::io::ErrorKind::BrokenPipe
                     | std::io::ErrorKind::UnexpectedEof
             ),
+            Self::DaemonStart(_) => true,
             Self::Transport(_)
             | Self::Codec(_)
-            | Self::DaemonStart(_)
             | Self::Server { .. }
             | Self::UnexpectedResponse
             | Self::UnexpectedEnvelope => false,

@@ -3,7 +3,7 @@
 use std::io::Write;
 use std::time::{Duration, Instant, SystemTime};
 
-use bcode_client::BcodeClient;
+use bcode_client::{BcodeClient, ClientError};
 use bcode_ipc::{ComposerDraftScope, Event as BcodeEvent};
 use bcode_session_models::SessionEventKind;
 use bmux_keyboard::{KeyCode, KeyStroke};
@@ -153,19 +153,7 @@ pub async fn run_with_client<W: Write>(
             needs_redraw = true;
         }
 
-        if chat.app.should_load_older_history() {
-            history_flow::load_older_history(client, chat).await?;
-            needs_redraw = true;
-        }
-
-        if modals.permission_dialog.is_none()
-            && let Some(permission) = client
-                .list_permissions()
-                .await?
-                .into_iter()
-                .find(|permission| Some(permission.session_id) == chat.session_id)
-        {
-            modals.permission_dialog = Some(PermissionDialogState::new(permission));
+        if handle_loop_housekeeping(client, chat, &mut modals).await? {
             needs_redraw = true;
         }
 
@@ -214,8 +202,17 @@ pub async fn run_with_client<W: Write>(
                     terminal_events,
                     mouse_scroll_rows,
                 };
-                if handle_event(&mut context, chat, &mut modals, event).await? {
-                    needs_redraw = event_invalidation.needs_render();
+                match handle_event(&mut context, chat, &mut modals, event).await {
+                    Ok(handled) => {
+                        if handled {
+                            needs_redraw = event_invalidation.needs_render();
+                        }
+                    }
+                    Err(error) if is_nonfatal_tui_daemon_error(&error) => {
+                        report_nonfatal_tui_error(chat, "Daemon unavailable", &error);
+                        needs_redraw = true;
+                    }
+                    Err(error) => return Err(error),
                 }
             }
             ChatLoopEvent::Bcode(event) => {
@@ -255,6 +252,56 @@ enum ChatLoopEvent {
     Async(Box<session_flow::ChatAsyncEvent>),
     TimedInvalidations(Vec<super::invalidation::InvalidationKey>),
     Timer,
+}
+
+async fn handle_loop_housekeeping(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    modals: &mut ModalState,
+) -> Result<bool, TuiError> {
+    let mut needs_redraw = false;
+    if chat.app.should_load_older_history() {
+        match history_flow::load_older_history(client, chat).await {
+            Ok(()) => needs_redraw = true,
+            Err(error) if is_nonfatal_tui_daemon_error(&error) => {
+                report_nonfatal_tui_error(chat, "Older history unavailable", &error);
+                needs_redraw = true;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    if modals.permission_dialog.is_none() {
+        match client.list_permissions().await {
+            Ok(permissions) => {
+                if let Some(permission) = permissions
+                    .into_iter()
+                    .find(|permission| Some(permission.session_id) == chat.session_id)
+                {
+                    modals.permission_dialog = Some(PermissionDialogState::new(permission));
+                    needs_redraw = true;
+                }
+            }
+            Err(error) if error.is_daemon_unavailable() => {
+                report_nonfatal_client_error(chat, "Permissions unavailable", &error);
+                needs_redraw = true;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(needs_redraw)
+}
+
+fn is_nonfatal_tui_daemon_error(error: &TuiError) -> bool {
+    matches!(error, TuiError::Client(error) if error.is_daemon_unavailable())
+}
+
+fn report_nonfatal_tui_error(chat: &mut ActiveChat, label: &str, error: &TuiError) {
+    chat.app.set_status(format!("{label}: {error}"));
+}
+
+fn report_nonfatal_client_error(chat: &mut ActiveChat, label: &str, error: &ClientError) {
+    chat.app.set_status(format!("{label}: {error}"));
 }
 
 fn next_redraw_at(last_redraw: Instant) -> Instant {
@@ -577,7 +624,7 @@ async fn handle_chat_key<W: Write>(
     match outcome.request {
         KeyRequest::None => {}
         KeyRequest::Interrupt => request_turn_cancellation(context.services.client, chat).await,
-        KeyRequest::CycleAgent => cycle_session_agent(chat),
+        KeyRequest::CycleAgent => cycle_session_agent(context.services.client, chat).await,
         KeyRequest::Submit { placement } => {
             let (mut io, services) = context.flow_context();
             match composer_flow::submit_composer(&mut io, &services, chat, placement).await {
@@ -622,7 +669,24 @@ fn agent_selection_status(chat: &ActiveChat, agent_name: &str) -> String {
     }
 }
 
-fn cycle_session_agent(chat: &mut ActiveChat) {
+async fn cycle_session_agent(client: &BcodeClient, chat: &mut ActiveChat) {
+    if chat.agents.is_empty() {
+        match session_flow::AgentCatalog::load(client).await {
+            Ok(agents) => {
+                chat.agents = agents;
+                chat.agents.refresh_app_agent_metadata(&mut chat.app);
+            }
+            Err(error) if is_nonfatal_tui_daemon_error(&error) => {
+                report_nonfatal_tui_error(chat, "Agent metadata unavailable", &error);
+                return;
+            }
+            Err(error) => {
+                chat.app
+                    .set_status(format!("agent metadata failed: {error}"));
+                return;
+            }
+        }
+    }
     let current_agent_id = chat
         .app
         .pending_agent_id()

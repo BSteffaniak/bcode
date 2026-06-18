@@ -414,56 +414,67 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
         return Ok(());
     }
 
-    let lock = StartupLock::acquire()?;
-    cleanup_stale_daemon_records().await?;
-    cleanup_stale_endpoint(&options.endpoint)?;
-    if probe_daemon_ready(&options.endpoint).await {
-        drop(lock);
-        if !options.quiet {
-            println!("server already running");
-            println!("namespace: {}", daemon_namespace());
-            println!("log: {}", options.log_path.display());
-        }
-        return Ok(());
-    }
-
-    if let Some(parent) = options.log_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut log_file = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&options.log_path)?;
-    writeln!(log_file, "--- bcode daemon start ---")?;
-    let stderr_log = log_file.try_clone()?;
-
-    let exe = std::env::current_exe()?;
-    let mut child = tokio::process::Command::new(exe)
-        .args(["server", "run"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(log_file))
-        .stderr(std::process::Stdio::from(stderr_log))
-        .spawn()?;
-
-    match wait_for_server_ready(&options.endpoint, &mut child, &options.log_path).await {
-        Ok(()) => {
+    let mut startup_attempts = 0;
+    loop {
+        startup_attempts += 1;
+        let lock = StartupLock::acquire()?;
+        cleanup_stale_daemon_records().await?;
+        cleanup_stale_endpoint(&options.endpoint)?;
+        if probe_daemon_ready(&options.endpoint).await {
             drop(lock);
             if !options.quiet {
-                println!("server started");
+                println!("server already running");
                 println!("namespace: {}", daemon_namespace());
                 println!("log: {}", options.log_path.display());
             }
-            Ok(())
+            return Ok(());
         }
-        Err(error) if error.is_existing_daemon_race() => {
-            if wait_for_existing_daemon(&options.endpoint).await {
+
+        if let Some(parent) = options.log_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut log_file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&options.log_path)?;
+        writeln!(log_file, "--- bcode daemon start ---")?;
+        let stderr_log = log_file.try_clone()?;
+
+        let exe = std::env::current_exe()?;
+        let mut child = tokio::process::Command::new(exe)
+            .args(["server", "run"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(log_file))
+            .stderr(std::process::Stdio::from(stderr_log))
+            .spawn()?;
+
+        match wait_for_server_ready(&options.endpoint, &mut child, &options.log_path).await {
+            Ok(()) => {
                 drop(lock);
+                if !options.quiet {
+                    println!("server started");
+                    println!("namespace: {}", daemon_namespace());
+                    println!("log: {}", options.log_path.display());
+                }
                 return Ok(());
             }
-            Err(error)
+            Err(error) if error.is_existing_daemon_race() && startup_attempts < 3 => {
+                drop(lock);
+                if wait_for_existing_daemon(&options.endpoint).await {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(error) if error.is_existing_daemon_race() => {
+                if wait_for_existing_daemon(&options.endpoint).await {
+                    drop(lock);
+                    return Ok(());
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
         }
-        Err(error) => Err(error),
     }
 }
 

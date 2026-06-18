@@ -83,6 +83,12 @@ impl AgentCatalog {
         self.apply_agent_to_app(app, agent_id);
     }
 
+    /// Return true when the catalog has no agent profiles.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.agents.is_empty()
+    }
+
     /// Return the next agent after the current one in catalog order.
     #[must_use]
     pub fn next_agent(&self, current_agent_id: &str) -> Option<&AgentInfo> {
