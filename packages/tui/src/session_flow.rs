@@ -174,10 +174,14 @@ pub fn start_switch_session(
     let draft_text = chat.app.composer().text().to_owned();
     chat.opening_session_id = Some(next_session_id);
     chat.session_id = None;
-    chat.app = BmuxApp::new_with_history(Some(next_session_id), &[], &[], false);
+    let previous_app = std::mem::replace(
+        &mut chat.app,
+        BmuxApp::new_with_history(Some(next_session_id), &[], &[], false),
+    );
     chat.app.apply_tui_config(tui_config);
     chat.app
         .set_agent_metadata_hydrated(agent_metadata_hydrated);
+    chat.app.take_theme_transition_state_from(&previous_app);
     chat.agents.refresh_app_agent_metadata(&mut chat.app);
     if !draft_text.is_empty() {
         chat.app.replace_composer_with(&draft_text);
@@ -223,15 +227,19 @@ pub fn complete_switch_session(
             let tui_config = chat.app.tui_config().clone();
             let agent_metadata_hydrated = chat.app.is_agent_metadata_hydrated();
             let has_older_history = opened.has_older_history;
-            chat.app = BmuxApp::new_with_history(
-                Some(opened.session_id),
-                &attached.history,
-                &attached.input_history,
-                has_older_history,
+            let previous_app = std::mem::replace(
+                &mut chat.app,
+                BmuxApp::new_with_history(
+                    Some(opened.session_id),
+                    &attached.history,
+                    &attached.input_history,
+                    has_older_history,
+                ),
             );
             chat.app.apply_tui_config(tui_config);
             chat.app
                 .set_agent_metadata_hydrated(agent_metadata_hydrated);
+            chat.app.take_theme_transition_state_from(&previous_app);
             chat.agents.refresh_app_agent_metadata(&mut chat.app);
             if !draft_text.is_empty() {
                 chat.app.replace_composer_with(&draft_text);
@@ -447,10 +455,14 @@ pub fn switch_to_draft_session(chat: &mut ActiveChat) {
     let tui_config = chat.app.tui_config().clone();
     let agent_metadata_hydrated = chat.app.is_agent_metadata_hydrated();
     let current_agent_id = chat.app.current_agent_id().to_owned();
-    chat.app = BmuxApp::new_with_history(None, &[], &[], false);
+    let previous_app = std::mem::replace(
+        &mut chat.app,
+        BmuxApp::new_with_history(None, &[], &[], false),
+    );
     chat.app.apply_tui_config(tui_config);
     chat.app
         .set_agent_metadata_hydrated(agent_metadata_hydrated);
+    chat.app.take_theme_transition_state_from(&previous_app);
     chat.agents
         .apply_agent_to_app(&mut chat.app, current_agent_id);
     chat.app.set_status("New draft".to_owned());

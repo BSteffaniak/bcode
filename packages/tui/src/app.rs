@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
 
-use bcode_config::{TuiConfig, TuiInlineDiffConfig, TuiThinkingConfig};
+use bcode_config::{TuiConfig, TuiInlineDiffConfig, TuiThemeConfig, TuiThinkingConfig};
 use bcode_session_models::{
     LiveToolArgumentPreview, ModelTurnOutcome, ProviderStreamEvent, SessionEvent, SessionEventKind,
     SessionHistoryCursor, SessionId, SessionInputHistoryEntry, SessionLiveEvent,
@@ -26,6 +26,7 @@ use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
 use bmux_tui::diff::{DiffFileSummary, DiffLine};
 use bmux_tui::event::MouseEvent;
 use bmux_tui::geometry::Rect;
+use bmux_tui::style::Color;
 use bmux_tui_components::text_input::{
     TextInputControl, TextInputOutcome, TextInputPolicy, TextInputState,
 };
@@ -68,6 +69,8 @@ const TRANSCRIPT_SCROLL_ANIMATION_DURATION: Duration = Duration::from_millis(180
 const TRANSCRIPT_SCROLL_ANIMATION_FRAME: Duration = Duration::from_millis(16);
 const TRANSCRIPT_SCROLL_ANIMATION_INVALIDATION_KEY: &str = "transcript-scroll-animation";
 const LATEST_BAR_ANIMATION_INVALIDATION_KEY: &str = "latest-bar-animation";
+const THEME_TRANSITION_INVALIDATION_KEY: &str = "theme-transition";
+const THEME_TRANSITION_FRAME: Duration = Duration::from_millis(16);
 const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(420);
 const RESIDENT_TRANSCRIPT_MAX_EVENTS: usize = 1_024;
 const RESIDENT_TRANSCRIPT_TARGET_EVENTS: usize = 512;
@@ -128,6 +131,86 @@ impl TranscriptScrollAnimation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ThemeTransitionState {
+    displayed_accent: Color,
+    source_accent: Color,
+    target_accent: Color,
+    started_at: Instant,
+    duration: Duration,
+}
+
+impl ThemeTransitionState {
+    const fn new(accent: Color, now: Instant) -> Self {
+        Self {
+            displayed_accent: accent,
+            source_accent: accent,
+            target_accent: accent,
+            started_at: now,
+            duration: Duration::ZERO,
+        }
+    }
+
+    fn set_target(&mut self, target: Color, config: TuiThemeConfig, now: Instant) {
+        if self.target_accent == target {
+            self.displayed_accent = self.accent_at(now);
+            return;
+        }
+        let duration_ms = config.effective_accent_transition_ms();
+        if duration_ms == 0 {
+            self.displayed_accent = target;
+            self.source_accent = target;
+            self.target_accent = target;
+            self.started_at = now;
+            self.duration = Duration::ZERO;
+            return;
+        }
+        self.source_accent = self.accent_at(now);
+        self.displayed_accent = self.source_accent;
+        self.target_accent = target;
+        self.started_at = now;
+        self.duration = Duration::from_millis(duration_ms);
+    }
+
+    fn accent_at(&self, now: Instant) -> Color {
+        if self.duration.is_zero() {
+            return self.target_accent;
+        }
+        let duration_ms = u64::try_from(self.duration.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let elapsed_ms = u64::try_from(now.saturating_duration_since(self.started_at).as_millis())
+            .unwrap_or(u64::MAX)
+            .min(duration_ms);
+        if elapsed_ms >= duration_ms {
+            return self.target_accent;
+        }
+        interpolate_color(
+            self.source_accent,
+            self.target_accent,
+            elapsed_ms,
+            duration_ms,
+        )
+    }
+
+    fn update(&mut self, now: Instant) -> Color {
+        self.displayed_accent = self.accent_at(now);
+        self.displayed_accent
+    }
+
+    fn is_active(&self, now: Instant) -> bool {
+        !self.duration.is_zero()
+            && now.saturating_duration_since(self.started_at) < self.duration
+            && self.displayed_accent != self.target_accent
+    }
+
+    const fn finish(&mut self) {
+        self.displayed_accent = self.target_accent;
+        self.source_accent = self.target_accent;
+        self.duration = Duration::ZERO;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentMetadataHydration {
     Pending,
     Hydrated,
@@ -146,6 +229,7 @@ pub struct BmuxApp {
     pending_agent_id: Option<String>,
     pending_agent_accent: Option<String>,
     agent_metadata_hydration: AgentMetadataHydration,
+    theme_transition: ThemeTransitionState,
     reasoning_visible: bool,
     thinking_label: String,
     reasoning_effort: Option<String>,
@@ -317,6 +401,7 @@ impl BmuxApp {
             pending_agent_id: None,
             pending_agent_accent: None,
             agent_metadata_hydration: AgentMetadataHydration::Pending,
+            theme_transition: ThemeTransitionState::new(Color::Rgb(100, 116, 139), now),
             reasoning_visible: true,
             thinking_label: "shown · effort: provider default · summary: provider default"
                 .to_owned(),
@@ -498,6 +583,24 @@ impl BmuxApp {
         } else {
             AgentMetadataHydration::Pending
         };
+    }
+
+    /// Return the current animated accent color for rendering.
+    pub fn animated_accent(&mut self, target_accent: Color, now: Instant) -> Color {
+        self.theme_transition
+            .set_target(target_accent, self.tui_config.theme, now);
+        self.theme_transition.update(now)
+    }
+
+    /// Return true when a theme transition should request more frames.
+    #[must_use]
+    pub fn theme_transition_active(&self, now: Instant) -> bool {
+        self.theme_transition.is_active(now)
+    }
+
+    /// Move theme transition state from another app after recreating app state.
+    pub(crate) const fn take_theme_transition_state_from(&mut self, source: &Self) {
+        self.theme_transition = source.theme_transition;
     }
 
     /// Return the agent id that should be presented in the UI.
@@ -1867,6 +1970,12 @@ impl BmuxApp {
                 self.live_preview_frame.next_frame_at.unwrap_or(now),
             ));
         }
+        if self.theme_transition_active(now) {
+            requests.push(InvalidationRequest::new(
+                InvalidationKey::new(THEME_TRANSITION_INVALIDATION_KEY),
+                now + THEME_TRANSITION_FRAME,
+            ));
+        }
         requests.extend(self.tool_elapsed_invalidation_requests(now, now_system));
         requests
     }
@@ -1892,6 +2001,11 @@ impl BmuxApp {
                 self.live_preview_frame.dirty = false;
                 self.live_preview_frame.next_frame_at = None;
                 invalidation.merge(UiInvalidation::Layout)
+            } else if is_theme_transition_invalidation(key) {
+                if !self.theme_transition_active(now) {
+                    self.theme_transition.finish();
+                }
+                invalidation.merge(UiInvalidation::Paint)
             } else if is_tool_elapsed_invalidation(key) {
                 invalidation.merge(UiInvalidation::Layout)
             } else {
@@ -3013,8 +3127,64 @@ fn is_live_preview_frame_invalidation(key: &InvalidationKey) -> bool {
     key.as_str() == LIVE_PREVIEW_FRAME_INVALIDATION_KEY
 }
 
+fn is_theme_transition_invalidation(key: &InvalidationKey) -> bool {
+    key.as_str() == THEME_TRANSITION_INVALIDATION_KEY
+}
+
 fn is_transcript_scroll_animation_invalidation(key: &InvalidationKey) -> bool {
     key.as_str() == TRANSCRIPT_SCROLL_ANIMATION_INVALIDATION_KEY
+}
+
+fn interpolate_color(source: Color, target: Color, elapsed_ms: u64, duration_ms: u64) -> Color {
+    let source = color_rgb(source);
+    let target = color_rgb(target);
+    Color::Rgb(
+        interpolate_channel(source[0], target[0], elapsed_ms, duration_ms),
+        interpolate_channel(source[1], target[1], elapsed_ms, duration_ms),
+        interpolate_channel(source[2], target[2], elapsed_ms, duration_ms),
+    )
+}
+
+fn interpolate_channel(source: u8, target: u8, elapsed_ms: u64, duration_ms: u64) -> u8 {
+    let eased_numerator = ease_out_cubic_numerator(elapsed_ms, duration_ms);
+    let denominator = u128::from(duration_ms).saturating_pow(3).max(1);
+    let source = i128::from(source);
+    let delta = i128::from(target).saturating_sub(source);
+    let scaled_delta = delta.saturating_mul(i128::try_from(eased_numerator).unwrap_or(i128::MAX))
+        / i128::try_from(denominator).unwrap_or(1);
+    u8::try_from(source.saturating_add(scaled_delta).clamp(0, 255)).unwrap_or(u8::MAX)
+}
+
+fn ease_out_cubic_numerator(elapsed_ms: u64, duration_ms: u64) -> u128 {
+    let duration = u128::from(duration_ms).max(1);
+    let elapsed = u128::from(elapsed_ms).min(duration);
+    let remaining = duration.saturating_sub(elapsed);
+    duration
+        .saturating_pow(3)
+        .saturating_sub(remaining.saturating_pow(3))
+}
+
+const fn color_rgb(color: Color) -> [u8; 3] {
+    match color {
+        Color::Black => [0, 0, 0],
+        Color::Red => [205, 49, 49],
+        Color::Green => [13, 188, 121],
+        Color::Yellow => [229, 229, 16],
+        Color::Blue => [36, 114, 200],
+        Color::Magenta => [188, 63, 188],
+        Color::Cyan => [17, 168, 205],
+        Color::White => [229, 229, 229],
+        Color::BrightBlack => [102, 102, 102],
+        Color::BrightRed => [241, 76, 76],
+        Color::BrightGreen => [35, 209, 139],
+        Color::BrightYellow => [245, 245, 67],
+        Color::BrightBlue => [59, 142, 234],
+        Color::BrightMagenta => [214, 112, 214],
+        Color::BrightCyan => [41, 184, 219],
+        Color::BrightWhite => [255, 255, 255],
+        Color::Rgb(red, green, blue) => [red, green, blue],
+        Color::Indexed(_) | Color::Default => [100, 116, 139],
+    }
 }
 
 fn normalized_tool_name(tool_name: &str) -> String {

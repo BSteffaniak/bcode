@@ -7,7 +7,7 @@ use std::{
 
 use bcode_agent_profile::AgentInfo;
 use bcode_client::AttachedSessionHistory;
-use bcode_config::TuiThinkingConfig;
+use bcode_config::{TuiAccentTransitionMode, TuiConfig, TuiThemeConfig, TuiThinkingConfig};
 use bcode_session_models::{
     ClientId, LiveFileEditPreview, LiveShellCommandPreview, LiveToolArgumentPreview, RuntimeWorkId,
     RuntimeWorkKind, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
@@ -34,6 +34,16 @@ use super::{
     transcript::{TranscriptItem, TranscriptItemKind, transcript_items_from_events_with_reasoning},
     transcript_document::TranscriptDocument,
 };
+
+fn disable_theme_transition(app: &mut BmuxApp) {
+    app.apply_tui_config(TuiConfig {
+        theme: TuiThemeConfig {
+            accent_transition: TuiAccentTransitionMode::Immediate,
+            ..TuiThemeConfig::default()
+        },
+        ..TuiConfig::default()
+    });
+}
 
 #[test]
 fn provider_tool_call_delta_trace_does_not_replace_status() {
@@ -801,6 +811,7 @@ fn header_shortens_session_id_on_wide_panes() {
 #[test]
 fn header_accent_color_tracks_arbitrary_selected_agent() {
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    disable_theme_transition(&mut app);
     app.set_agent_metadata_hydrated(true);
     app.set_current_agent_id("one");
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
@@ -817,6 +828,7 @@ fn header_accent_color_tracks_arbitrary_selected_agent() {
 #[test]
 fn composer_border_accent_color_tracks_arbitrary_selected_agent() {
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    disable_theme_transition(&mut app);
     app.set_agent_metadata_hydrated(true);
     app.set_current_agent_id("two");
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
@@ -854,6 +866,7 @@ fn same_agent_gets_same_accent_across_chrome() {
 #[test]
 fn configured_agent_accent_overrides_fallback_color() {
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    disable_theme_transition(&mut app);
     app.set_current_agent("quiet-plan", Some("#6b7280".to_owned()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
     let mut frame = Frame::new(&mut buffer);

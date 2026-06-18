@@ -1054,9 +1054,59 @@ pub struct TuiConfig {
     /// Provider-exposed reasoning / thinking display configuration.
     #[serde(default)]
     pub thinking: TuiThinkingConfig,
+    /// Theme rendering configuration.
+    #[serde(default)]
+    pub theme: TuiThemeConfig,
     /// Inline diff preview rendering configuration.
     #[serde(default)]
     pub inline_diff: TuiInlineDiffConfig,
+}
+
+/// Terminal UI theme rendering configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuiThemeConfig {
+    /// How accent color changes should be applied.
+    #[serde(default)]
+    pub accent_transition: TuiAccentTransitionMode,
+    /// Duration of accent color transitions in milliseconds.
+    #[serde(default = "default_tui_accent_transition_ms")]
+    pub accent_transition_ms: u64,
+}
+
+impl TuiThemeConfig {
+    /// Return the effective accent transition duration in milliseconds.
+    #[must_use]
+    pub const fn effective_accent_transition_ms(self) -> u64 {
+        if matches!(self.accent_transition, TuiAccentTransitionMode::Immediate) {
+            0
+        } else {
+            self.accent_transition_ms
+        }
+    }
+}
+
+impl Default for TuiThemeConfig {
+    fn default() -> Self {
+        Self {
+            accent_transition: TuiAccentTransitionMode::Transition,
+            accent_transition_ms: default_tui_accent_transition_ms(),
+        }
+    }
+}
+
+const fn default_tui_accent_transition_ms() -> u64 {
+    450
+}
+
+/// Terminal UI accent color transition behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiAccentTransitionMode {
+    /// Apply accent color changes immediately.
+    Immediate,
+    /// Animate accent color changes over the configured duration.
+    #[default]
+    Transition,
 }
 
 /// Terminal UI inline diff preview rendering configuration.

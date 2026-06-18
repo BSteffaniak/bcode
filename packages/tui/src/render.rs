@@ -58,15 +58,23 @@ pub struct TuiTheme {
 impl TuiTheme {
     const PENDING_AGENT_METADATA_ACCENT: Color = Color::Rgb(100, 116, 139);
 
+    pub fn for_app(app: &mut BmuxApp, now: Instant) -> Self {
+        let target = Self::target_for_app(app);
+        Self {
+            accent: app.animated_accent(target, now),
+        }
+    }
+
     #[must_use]
-    pub fn for_app(app: &BmuxApp) -> Self {
-        Self::for_agent(
+    pub fn target_for_app(app: &BmuxApp) -> Color {
+        Self::target_agent_accent(
             app.display_agent_id(),
             app.display_agent_accent(),
             app.is_agent_metadata_hydrated(),
         )
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn for_agent(
         agent_id: &str,
@@ -74,16 +82,24 @@ impl TuiTheme {
         agent_metadata_hydrated: bool,
     ) -> Self {
         Self {
-            accent: configured_accent
-                .and_then(parse_agent_accent_color)
-                .unwrap_or_else(|| {
-                    if agent_metadata_hydrated {
-                        agent_accent_color(agent_id)
-                    } else {
-                        Self::PENDING_AGENT_METADATA_ACCENT
-                    }
-                }),
+            accent: Self::target_agent_accent(agent_id, configured_accent, agent_metadata_hydrated),
         }
+    }
+
+    fn target_agent_accent(
+        agent_id: &str,
+        configured_accent: Option<&str>,
+        agent_metadata_hydrated: bool,
+    ) -> Color {
+        configured_accent
+            .and_then(parse_agent_accent_color)
+            .unwrap_or_else(|| {
+                if agent_metadata_hydrated {
+                    agent_accent_color(agent_id)
+                } else {
+                    Self::PENDING_AGENT_METADATA_ACCENT
+                }
+            })
     }
 }
 
@@ -169,7 +185,7 @@ pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>, layout: FrameLa
         return;
     }
 
-    let theme = TuiTheme::for_app(app);
+    let theme = TuiTheme::for_app(app, Instant::now());
     render_header(app, layout.header, frame, theme);
     render_composer(app, layout.composer, frame, theme);
     render_body(app, layout.body, frame);
@@ -223,7 +239,7 @@ fn frame_layout(app: &BmuxApp, area: Rect) -> Option<FrameLayout> {
         latest_bar,
         status,
         composer,
-        composer_content: composer_panel(TuiTheme::for_app(app).accent).inner_area(composer),
+        composer_content: composer_panel(TuiTheme::target_for_app(app)).inner_area(composer),
     })
 }
 

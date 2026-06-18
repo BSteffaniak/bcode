@@ -127,7 +127,7 @@ pub async fn run_event_loop_with_startup<W: Write>(
         let services = TuiServices {
             client: &client,
             keymap: &keymap,
-            theme: TuiTheme::for_app(&chat.app),
+            theme: TuiTheme::for_app(&mut chat.app, std::time::Instant::now()),
         };
         ralph_flow::open_home(&mut io, &services, &mut chat).await?;
     }

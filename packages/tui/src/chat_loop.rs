@@ -196,7 +196,7 @@ pub async fn run_with_client<W: Write>(
                     services: TuiServices {
                         client,
                         keymap,
-                        theme: render::TuiTheme::for_app(&chat.app),
+                        theme: render::TuiTheme::for_app(&mut chat.app, Instant::now()),
                     },
                     terminal,
                     terminal_events,
@@ -316,7 +316,7 @@ fn draw_chat_frame<W: Write>(
     modals: &mut ModalState,
 ) -> Result<(), TuiError> {
     let layout = render::prepare_frame(&mut chat.app, terminal.area());
-    let theme = render::TuiTheme::for_app(&chat.app);
+    let theme = render::TuiTheme::for_app(&mut chat.app, Instant::now());
     terminal.draw(|frame| {
         if let Some(layout) = layout {
             render::render_prepared(&mut chat.app, frame, layout);
