@@ -79,15 +79,29 @@ impl DraftAutosave {
             return;
         }
         let text = chat.app.composer().text().to_owned();
-        if client
-            .set_composer_draft(self.scope(chat), text.clone())
-            .await
-            .is_ok()
-        {
+        let scope = self.scope(chat);
+        if Self::save_scope_text(client, scope, text.clone()).await {
             self.last_saved_text = Some(text);
             self.dirty = false;
             self.save_at = None;
         }
+    }
+
+    async fn clear_scope(client: &BcodeClient, scope: ComposerDraftScope) {
+        let _ = Self::save_scope_text(client, scope, String::new()).await;
+    }
+
+    async fn save_scope_text(
+        client: &BcodeClient,
+        scope: ComposerDraftScope,
+        text: String,
+    ) -> bool {
+        client.set_composer_draft(scope, text).await.is_ok()
+    }
+
+    fn mark_dirty_now(&mut self) {
+        self.dirty = true;
+        self.save_at = Some(Instant::now());
     }
 }
 
@@ -202,7 +216,9 @@ pub async fn run_with_client<W: Write>(
                     terminal_events,
                     mouse_scroll_rows,
                 };
-                match handle_event(&mut context, chat, &mut modals, event).await {
+                match handle_event(&mut context, chat, &mut modals, event, &mut draft_autosave)
+                    .await
+                {
                     Ok(handled) => {
                         if handled {
                             needs_redraw = event_invalidation.needs_render();
@@ -482,6 +498,7 @@ async fn handle_event<W: Write>(
     chat: &mut ActiveChat,
     modals: &mut ModalState,
     event: Event,
+    draft_autosave: &mut DraftAutosave,
 ) -> Result<bool, TuiError> {
     match event {
         Event::Resize(size) => {
@@ -490,7 +507,7 @@ async fn handle_event<W: Write>(
                 .resize(Rect::new(0, 0, size.width, size.height));
             Ok(true)
         }
-        Event::Key(stroke) => handle_chat_key(context, chat, modals, stroke).await,
+        Event::Key(stroke) => handle_chat_key(context, chat, modals, stroke, draft_autosave).await,
         Event::Paste(text) => {
             if let Some(palette) = &mut modals.palette {
                 palette.state_mut().query.insert_str(&text);
@@ -548,6 +565,7 @@ async fn handle_chat_key<W: Write>(
     chat: &mut ActiveChat,
     modals: &mut ModalState,
     stroke: KeyStroke,
+    draft_autosave: &mut DraftAutosave,
 ) -> Result<bool, TuiError> {
     if modals.timeline_dialog.is_some() {
         return timeline_flow::handle_timeline_key(
@@ -628,7 +646,7 @@ async fn handle_chat_key<W: Write>(
     let outcome = input::handle_key(&mut chat.app, context.services.keymap, stroke);
     slash_flow::update_slash_palette(context.services.client, chat, &mut modals.slash_palette)
         .await;
-    handle_chat_key_request(context, chat, modals, outcome.request).await?;
+    handle_chat_key_request(context, chat, modals, outcome.request, Some(draft_autosave)).await?;
     Ok(outcome.redraw)
 }
 
@@ -637,6 +655,7 @@ async fn handle_chat_key_request<W: Write>(
     chat: &mut ActiveChat,
     modals: &mut ModalState,
     request: KeyRequest,
+    draft_autosave: Option<&mut DraftAutosave>,
 ) -> Result<(), TuiError> {
     match request {
         KeyRequest::None => {}
@@ -650,6 +669,7 @@ async fn handle_chat_key_request<W: Write>(
             }
         }
         KeyRequest::Submit { placement } => {
+            let pre_submit_scope = draft_autosave.as_ref().map(|autosave| autosave.scope(chat));
             let (mut io, services) = context.flow_context();
             match composer_flow::submit_composer(&mut io, &services, chat, placement).await {
                 Ok(Some(request)) => {
@@ -657,6 +677,13 @@ async fn handle_chat_key_request<W: Write>(
                 }
                 Ok(None) => {}
                 Err(error) => helpers::report_client_error(&mut chat.app, "send failed", &error),
+            }
+            if let Some(autosave) = draft_autosave {
+                if let Some(scope) = pre_submit_scope {
+                    DraftAutosave::clear_scope(context.services.client, scope).await;
+                }
+                autosave.mark_dirty_now();
+                autosave.save_now(context.services.client, chat).await;
             }
         }
     }
