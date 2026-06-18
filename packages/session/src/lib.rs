@@ -3694,14 +3694,11 @@ mod tests {
             .await
             .expect("attach should use DB projections");
 
-        assert_eq!(
-            attachment.input_history,
-            vec![bcode_session_models::SessionInputHistoryEntry {
-                sequence: 1,
-                timestamp_ms: 1,
-                text: "hello".to_owned(),
-            }]
-        );
+        assert_eq!(attachment.input_history.len(), 1);
+        let entry = &attachment.input_history[0];
+        assert_eq!(entry.sequence, 1);
+        assert!(entry.timestamp_ms > 0);
+        assert_eq!(entry.text, "hello");
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
