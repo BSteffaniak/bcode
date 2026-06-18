@@ -3613,6 +3613,7 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::ClientAttached { .. }
         | SessionEventKind::ClientDetached { .. }
         | SessionEventKind::ModelChanged { .. }
+        | SessionEventKind::ReasoningChanged { .. }
         | SessionEventKind::AgentChanged { .. }
         | SessionEventKind::ModelTurnStarted { .. }
         | SessionEventKind::ModelTurnCancelRequested { .. }

@@ -282,9 +282,6 @@ async fn commit_pending_reasoning(
 ) -> Result<(), TuiError> {
     let effort = chat.app.reasoning_effort().map(ToOwned::to_owned);
     let summary = chat.app.reasoning_summary().map(ToOwned::to_owned);
-    if effort.is_none() && summary.is_none() {
-        return Ok(());
-    }
     client
         .set_session_reasoning(session_id, effort, summary)
         .await?;

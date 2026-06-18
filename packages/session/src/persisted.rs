@@ -381,6 +381,13 @@ enum PersistedSessionEventKind {
         message: String,
         occurred_at_ms: u64,
     },
+    /// Durable session-specific model reasoning selection.
+    ReasoningChanged {
+        #[serde(default)]
+        effort: Option<String>,
+        #[serde(default)]
+        summary: Option<String>,
+    },
 }
 
 impl From<&SessionEventKind> for PersistedSessionEventKind {
@@ -680,6 +687,10 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 message: message.clone(),
                 occurred_at_ms: *occurred_at_ms,
             },
+            SessionEventKind::ReasoningChanged { effort, summary } => Self::ReasoningChanged {
+                effort: effort.clone(),
+                summary: summary.clone(),
+            },
         }
     }
 }
@@ -958,6 +969,9 @@ impl PersistedSessionEventKind {
                 message,
                 occurred_at_ms,
             },
+            Self::ReasoningChanged { effort, summary } => {
+                SessionEventKind::ReasoningChanged { effort, summary }
+            }
         }
     }
 }
@@ -1406,6 +1420,10 @@ mod tests {
                 source_prompt_sequence: Some(0),
                 forked_at_ms: 15,
                 kind: SessionForkKind::Fork,
+            },
+            SessionEventKind::ReasoningChanged {
+                effort: Some("none".to_string()),
+                summary: Some("auto".to_string()),
             },
         ]
     }

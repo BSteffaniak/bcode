@@ -1672,6 +1672,7 @@ const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::PermissionRequested { .. } => "permission_requested",
         SessionEventKind::PermissionResolved { .. } => "permission_resolved",
         SessionEventKind::ModelChanged { .. } => "model_changed",
+        SessionEventKind::ReasoningChanged { .. } => "reasoning_changed",
         SessionEventKind::SystemMessage { .. } => "system_message",
         SessionEventKind::AgentChanged { .. } => "agent_changed",
         SessionEventKind::ModelTurnStarted { .. } => "model_turn_started",

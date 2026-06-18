@@ -422,6 +422,8 @@ pub(crate) struct SessionState {
     has_user_message: bool,
     current_provider: Option<String>,
     current_model: Option<String>,
+    reasoning_effort: Option<String>,
+    reasoning_summary: Option<String>,
     current_agent: Option<String>,
     latest_compaction_sequence: Option<u64>,
     total_metered_tokens: u64,
@@ -980,6 +982,8 @@ impl SessionManager {
             has_user_message: false,
             current_provider: None,
             current_model: None,
+            reasoning_effort: None,
+            reasoning_summary: None,
             current_agent: None,
             latest_compaction_sequence: None,
             total_metered_tokens: 0,
@@ -1650,6 +1654,19 @@ impl SessionManager {
         handle.current_model_selection().await
     }
 
+    /// Return the latest session-specific reasoning selection if one has been set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist.
+    pub async fn current_reasoning_selection(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(Option<String>, Option<String>), SessionError> {
+        let handle = self.session_handle(session_id).await?;
+        handle.current_reasoning_selection().await
+    }
+
     /// Return the latest session-specific agent selection if one has been set.
     ///
     /// # Errors
@@ -2127,6 +2144,24 @@ impl SessionManager {
         .await
     }
 
+    /// Append a reasoning-changed event to a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_reasoning_changed(
+        &self,
+        session_id: SessionId,
+        effort: Option<String>,
+        summary: Option<String>,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(
+            session_id,
+            SessionEventKind::ReasoningChanged { effort, summary },
+        )
+        .await
+    }
+
     /// Append an agent-changed event to a session.
     ///
     /// # Errors
@@ -2365,6 +2400,8 @@ impl SessionState {
             has_user_message: false,
             current_provider: None,
             current_model: None,
+            reasoning_effort: None,
+            reasoning_summary: None,
             current_agent: None,
             latest_compaction_sequence: None,
             total_metered_tokens: 0,
@@ -2410,6 +2447,8 @@ impl SessionState {
             has_user_message: state.has_user_message,
             current_provider: state.current_provider,
             current_model: state.current_model,
+            reasoning_effort: None,
+            reasoning_summary: None,
             current_agent: None,
             latest_compaction_sequence: state.latest_compaction_sequence,
             total_metered_tokens: 0,
@@ -2514,6 +2553,10 @@ impl SessionState {
             SessionEventKind::ModelChanged { provider, model } => {
                 self.current_provider = Some(provider.clone());
                 self.current_model = Some(model.clone());
+            }
+            SessionEventKind::ReasoningChanged { effort, summary } => {
+                self.reasoning_effort.clone_from(effort);
+                self.reasoning_summary.clone_from(summary);
             }
             SessionEventKind::AgentChanged { agent_id } => {
                 self.current_agent = Some(agent_id.clone());

@@ -6115,32 +6115,46 @@ async fn handle_set_session_reasoning(
     effort: Option<String>,
     summary: Option<String>,
 ) -> Result<(), ServerError> {
+    match state
+        .sessions
+        .append_reasoning_changed(session_id, effort.clone(), summary.clone())
+        .await
     {
-        let mut selections = state.session_model_selections.lock().await;
-        let selection = selections
-            .entry(session_id)
-            .or_insert_with(|| SessionModelSelection {
-                provider_plugin_id: state.selected_provider_plugin_id.clone(),
-                model_id: state.selected_model_id.clone(),
-                thinking_level: None,
-                reasoning_effort: state.selected_reasoning.effort.clone(),
-                reasoning_summary: state.selected_reasoning.summary.clone(),
-                reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
-                provider_context: state.selected_provider_context.clone(),
-            });
-        if effort.is_some() {
-            selection.reasoning_effort = effort;
+        Ok(event) => {
+            {
+                let mut selections = state.session_model_selections.lock().await;
+                let selection =
+                    selections
+                        .entry(session_id)
+                        .or_insert_with(|| SessionModelSelection {
+                            provider_plugin_id: state.selected_provider_plugin_id.clone(),
+                            model_id: state.selected_model_id.clone(),
+                            thinking_level: None,
+                            reasoning_effort: state.selected_reasoning.effort.clone(),
+                            reasoning_summary: state.selected_reasoning.summary.clone(),
+                            reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
+                            provider_context: state.selected_provider_context.clone(),
+                        });
+                selection.reasoning_effort = effort;
+                selection.reasoning_summary = summary;
+            }
+            publish_session_event(state, &event).await;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionModelSet),
+            )
+            .await
         }
-        if summary.is_some() {
-            selection.reasoning_summary = summary;
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(session_error_response(&error)),
+            )
+            .await
         }
     }
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::SessionModelSet),
-    )
-    .await
 }
 
 async fn handle_session_model_status(
@@ -9985,10 +9999,17 @@ async fn session_model_selection_with_runtime_context(
     session_id: SessionId,
     runtime_context: Option<ClientRuntimeContext>,
 ) -> SessionModelSelection {
+    let mut selection = session_model_selection(state, session_id).await;
     if let Some(context) = runtime_context {
-        return model_selection_from_runtime_context(state, context);
+        if context.selected_provider_plugin_id.is_some() {
+            selection.provider_plugin_id = context.selected_provider_plugin_id;
+        }
+        if context.selected_model_id.is_some() {
+            selection.model_id = context.selected_model_id;
+        }
+        selection.provider_context = context.provider_context;
     }
-    session_model_selection(state, session_id).await
+    selection
 }
 
 fn default_model_selection_with_runtime_context(
@@ -10031,25 +10052,41 @@ async fn session_model_selection(
     if let Some(selection) = state.session_model_selections.lock().await.get(&session_id) {
         return selection.clone();
     }
+    let fallback_reasoning = || {
+        (
+            state.selected_reasoning.effort.clone(),
+            state.selected_reasoning.summary.clone(),
+        )
+    };
     let selection = if let Ok(Some((provider, model))) =
         state.sessions.current_model_selection(session_id).await
     {
+        let (reasoning_effort, reasoning_summary) = state
+            .sessions
+            .current_reasoning_selection(session_id)
+            .await
+            .unwrap_or_else(|_| fallback_reasoning());
         SessionModelSelection {
             provider_plugin_id: provider_to_selection(&provider),
             model_id: model_to_selection(&model),
             thinking_level: None,
-            reasoning_effort: state.selected_reasoning.effort.clone(),
-            reasoning_summary: state.selected_reasoning.summary.clone(),
+            reasoning_effort,
+            reasoning_summary,
             reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
             provider_context: state.selected_provider_context.clone(),
         }
     } else {
+        let (reasoning_effort, reasoning_summary) = state
+            .sessions
+            .current_reasoning_selection(session_id)
+            .await
+            .unwrap_or_else(|_| fallback_reasoning());
         SessionModelSelection {
             provider_plugin_id: state.selected_provider_plugin_id.clone(),
             model_id: state.selected_model_id.clone(),
             thinking_level: None,
-            reasoning_effort: state.selected_reasoning.effort.clone(),
-            reasoning_summary: state.selected_reasoning.summary.clone(),
+            reasoning_effort,
+            reasoning_summary,
             reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
             provider_context: state.selected_provider_context.clone(),
         }
@@ -13074,6 +13111,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::PermissionRequested { .. } => "permission_requested",
         SessionEventKind::PermissionResolved { .. } => "permission_resolved",
         SessionEventKind::ModelChanged { .. } => "model_changed",
+        SessionEventKind::ReasoningChanged { .. } => "reasoning_changed",
         SessionEventKind::SystemMessage { .. } => "system_message",
         SessionEventKind::AgentChanged { .. } => "agent_changed",
         SessionEventKind::ModelTurnStarted { .. } => "model_turn_started",

@@ -4565,6 +4565,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::PermissionRequested { .. } => "permission_requested",
         SessionEventKind::PermissionResolved { .. } => "permission_resolved",
         SessionEventKind::ModelChanged { .. } => "model_changed",
+        SessionEventKind::ReasoningChanged { .. } => "reasoning_changed",
         SessionEventKind::SystemMessage { .. } => "system_message",
         SessionEventKind::AgentChanged { .. } => "agent_changed",
         SessionEventKind::ModelTurnStarted { .. } => "model_turn_started",
@@ -4935,6 +4936,14 @@ fn print_non_trace_session_event(event: &SessionEvent) {
         }
         SessionEventKind::ModelChanged { provider, model } => {
             println!("#{} model changed: {provider}/{model}", event.sequence);
+        }
+        SessionEventKind::ReasoningChanged { effort, summary } => {
+            println!(
+                "#{} reasoning changed: effort={} summary={}",
+                event.sequence,
+                effort.as_deref().unwrap_or("provider default"),
+                summary.as_deref().unwrap_or("provider default")
+            );
         }
         SessionEventKind::AgentChanged { agent_id } => {
             println!("#{} agent changed: {agent_id}", event.sequence);

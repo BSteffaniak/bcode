@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 24;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 25;
 
 /// Return the current Unix timestamp in milliseconds.
 #[must_use]
@@ -1239,6 +1239,13 @@ pub enum SessionEventKind {
         kind: String,
         message: String,
         occurred_at_ms: u64,
+    },
+    /// Durable session-specific model reasoning selection.
+    ReasoningChanged {
+        #[serde(default)]
+        effort: Option<String>,
+        #[serde(default)]
+        summary: Option<String>,
     },
 }
 

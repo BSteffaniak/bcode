@@ -1889,6 +1889,10 @@ enum IpcSessionEventKind {
         message: String,
         occurred_at_ms: u64,
     },
+    ReasoningChanged {
+        effort: Option<String>,
+        summary: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2301,6 +2305,10 @@ impl From<&SessionEventKind> for IpcSessionEventKind {
                 message: message.clone(),
                 occurred_at_ms: occurred_at_ms.clone(),
             },
+            SessionEventKind::ReasoningChanged { effort, summary } => Self::ReasoningChanged {
+                effort: effort.clone(),
+                summary: summary.clone(),
+            },
         }
     }
 }
@@ -2589,6 +2597,9 @@ impl TryFrom<IpcSessionEventKind> for SessionEventKind {
                 message,
                 occurred_at_ms,
             }),
+            IpcSessionEventKind::ReasoningChanged { effort, summary } => {
+                Ok(Self::ReasoningChanged { effort, summary })
+            }
         }
     }
 }

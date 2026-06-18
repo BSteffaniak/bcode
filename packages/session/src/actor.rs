@@ -188,6 +188,12 @@ impl SessionHandle {
         self.send(SessionCommand::CurrentModelSelection).await
     }
 
+    pub async fn current_reasoning_selection(
+        &self,
+    ) -> Result<(Option<String>, Option<String>), SessionError> {
+        self.send(SessionCommand::CurrentReasoningSelection).await
+    }
+
     pub async fn current_agent_selection(&self) -> Result<Option<String>, SessionError> {
         self.send(SessionCommand::CurrentAgentSelection).await
     }
@@ -282,6 +288,7 @@ enum SessionCommand {
     ActiveToolRuns(oneshot::Sender<Result<Vec<crate::db::ToolRun>, SessionError>>),
     ActiveRuntimeWork(oneshot::Sender<Result<Vec<crate::db::RuntimeWorkProjection>, SessionError>>),
     CurrentModelSelection(oneshot::Sender<Option<(String, String)>>),
+    CurrentReasoningSelection(oneshot::Sender<(Option<String>, Option<String>)>),
     CurrentAgentSelection(oneshot::Sender<Option<String>>),
     SetCurrentAgent {
         agent_id: String,
@@ -409,6 +416,12 @@ impl SessionActor {
                         .clone()
                         .zip(self.state.current_model.clone()),
                 );
+            }
+            SessionCommand::CurrentReasoningSelection(reply) => {
+                let _ = reply.send((
+                    self.state.reasoning_effort.clone(),
+                    self.state.reasoning_summary.clone(),
+                ));
             }
             SessionCommand::CurrentAgentSelection(reply) => {
                 let _ = reply.send(self.state.current_agent.clone());
