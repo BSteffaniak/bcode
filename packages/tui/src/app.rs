@@ -7,10 +7,11 @@ use bcode_config::{
     TuiAccentTransitionCurve, TuiConfig, TuiInlineDiffConfig, TuiThemeConfig, TuiThinkingConfig,
 };
 use bcode_session_models::{
-    LiveToolArgumentPreview, ModelTurnOutcome, ProviderStreamEvent, SessionEvent, SessionEventKind,
-    SessionHistoryCursor, SessionId, SessionInputHistoryEntry, SessionLiveEvent,
-    SessionLiveEventKind, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
-    ToolInvocationPresentation, ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
+    LiveToolArgumentPreview, ModelTurnOutcome, ProviderStreamEvent, RuntimeWorkStatus,
+    SessionEvent, SessionEventKind, SessionHistoryCursor, SessionId, SessionInputHistoryEntry,
+    SessionLiveEvent, SessionLiveEventKind, SessionTraceEvent, SessionTracePayload,
+    SessionTracePhase, ToolInvocationPresentation, ToolInvocationResult, ToolInvocationStreamEvent,
+    ToolOutputStream,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2027,7 +2028,15 @@ impl BmuxApp {
             }
             SessionEventKind::ModelTurnFinished {
                 outcome, message, ..
-            } => self.finish_model_turn(*outcome, message.as_deref(), application),
+            } => {
+                self.finish_model_turn(*outcome, message.as_deref(), application);
+                if *outcome == ModelTurnOutcome::Error {
+                    self.push_system_message(&format!(
+                        "Model turn failed: {}",
+                        message.as_deref().unwrap_or("no details recorded")
+                    ));
+                }
+            }
             SessionEventKind::ModelUsage { turn_id, usage } => {
                 self.push_model_usage(turn_id, usage, application);
             }
@@ -2087,11 +2096,45 @@ impl BmuxApp {
             }
             SessionEventKind::RuntimeWorkStarted { .. }
             | SessionEventKind::RuntimeWorkCancelRequested { .. }
-            | SessionEventKind::RuntimeWorkProgress { .. }
-            | SessionEventKind::RuntimeWorkFinished { .. } => {
+            | SessionEventKind::RuntimeWorkProgress { .. } => {
                 if application.live_activity() {
                     self.apply_runtime_work_event(event);
                 }
+            }
+            SessionEventKind::RuntimeWorkFinished {
+                work_id,
+                status,
+                message,
+                ..
+            } => {
+                if application.live_activity() {
+                    self.apply_runtime_work_event(event);
+                }
+                if work_id.0.starts_with("ralph:")
+                    && matches!(
+                        status,
+                        RuntimeWorkStatus::Failed
+                            | RuntimeWorkStatus::TimedOut
+                            | RuntimeWorkStatus::Cancelled
+                    )
+                {
+                    self.push_system_message(&format!(
+                        "Ralph work {status:?}: {}",
+                        message.as_deref().unwrap_or("no details recorded")
+                    ));
+                }
+            }
+            SessionEventKind::RalphLifecycle {
+                loop_name,
+                kind,
+                message,
+                state_dir,
+                ..
+            } => {
+                self.push_system_message(&format!(
+                    "Ralph {kind}\n* Loop: {loop_name}\n* {message}\n* State: {}",
+                    state_dir.display()
+                ));
             }
             _ => {}
         }
@@ -3713,7 +3756,8 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::ToolInvocationPresentation { .. }
         | SessionEventKind::RalphLifecycle { .. }
         | SessionEventKind::AssistantReasoningDelta { .. }
-        | SessionEventKind::AssistantReasoningMessage { .. } => true,
+        | SessionEventKind::AssistantReasoningMessage { .. }
+        | SessionEventKind::ModelTurnFinished { .. } => true,
         SessionEventKind::SkillSuggested { reason, .. } => reason.is_some(),
         SessionEventKind::SessionCreated { .. }
         | SessionEventKind::ClientAttached { .. }
@@ -3723,7 +3767,6 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::AgentChanged { .. }
         | SessionEventKind::ModelTurnStarted { .. }
         | SessionEventKind::ModelTurnCancelRequested { .. }
-        | SessionEventKind::ModelTurnFinished { .. }
         | SessionEventKind::SessionRenamed { .. }
         | SessionEventKind::SessionImported { .. }
         | SessionEventKind::SessionForked { .. }
