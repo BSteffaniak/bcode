@@ -114,11 +114,9 @@ pub async fn run_event_loop_with_startup<W: Write>(
         if let Some(status) = auth_security_status {
             chat.app.set_status(status);
         } else if chat.app.composer().is_empty() {
-            chat.app
-                .set_status("New draft session; send a message to save it".to_owned());
+            chat.app.set_status("New draft".to_owned());
         } else {
-            chat.app
-                .set_status("Draft restored; send a message to save session".to_owned());
+            chat.app.set_status("Draft restored".to_owned());
         }
     }
     if startup_action == StartupTuiAction::OpenRalphHome {

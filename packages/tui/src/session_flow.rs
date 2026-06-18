@@ -346,8 +346,7 @@ pub fn complete_draft_status_hydration(
         && chat.app.composer().is_empty()
     {
         chat.app.replace_composer_with(&draft);
-        chat.app
-            .set_status("Draft restored; send a message to save session".to_owned());
+        chat.app.set_status("Draft restored".to_owned());
     }
     if let Some(model) = hydrated.model {
         chat.app.apply_model_status(model);
@@ -444,8 +443,7 @@ pub fn switch_to_draft_session(chat: &mut ActiveChat) {
     chat.app.apply_tui_config(tui_config);
     chat.agents
         .apply_agent_to_app(&mut chat.app, current_agent_id);
-    chat.app
-        .set_status("New draft session; send a message to save it".to_owned());
+    chat.app.set_status("New draft".to_owned());
 }
 
 /// Create and attach a persisted session for the active draft chat.
