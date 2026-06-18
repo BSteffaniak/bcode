@@ -114,6 +114,12 @@ pub fn next_agent<'a>(agents: &'a [AgentInfo], current_agent_id: &str) -> Option
 pub enum ChatAsyncEvent {
     SessionOpened(SessionOpenResult),
     StatusHydrated(StatusHydrationResult),
+    DraftStatusHydrated(DraftStatusHydrationResult),
+}
+
+/// Result from asynchronously hydrating draft-session status.
+pub struct DraftStatusHydrationResult {
+    pub model: Option<bcode_ipc::SessionModelStatus>,
 }
 
 /// Result from asynchronously opening a session.
@@ -231,6 +237,21 @@ pub fn complete_switch_session(
     }
 }
 
+/// Start non-critical draft-session status hydration in the background.
+pub fn start_draft_status_hydration(client: &BcodeClient, chat: &mut ActiveChat) {
+    if let Some(hydration_task) = chat.status_hydration_task.take() {
+        hydration_task.abort();
+    }
+    let client = client.clone();
+    let async_event_sender = chat.async_event_sender.clone();
+    chat.status_hydration_task = Some(tokio::spawn(async move {
+        let model = client.default_model_status().await.ok();
+        let _ = async_event_sender.send(ChatAsyncEvent::DraftStatusHydrated(
+            DraftStatusHydrationResult { model },
+        ));
+    }));
+}
+
 /// Start non-critical session status hydration in the background.
 pub fn start_status_hydration(client: &BcodeClient, chat: &mut ActiveChat, session_id: SessionId) {
     if let Some(hydration_task) = chat.status_hydration_task.take() {
@@ -257,6 +278,19 @@ pub fn start_status_hydration(client: &BcodeClient, chat: &mut ActiveChat, sessi
             runtime_work,
         }));
     }));
+}
+
+/// Apply completed non-critical draft status hydration.
+pub fn complete_draft_status_hydration(
+    chat: &mut ActiveChat,
+    hydrated: DraftStatusHydrationResult,
+) {
+    if chat.session_id.is_some() || chat.opening_session_id.is_some() {
+        return;
+    }
+    if let Some(model) = hydrated.model {
+        chat.app.apply_model_status(model);
+    }
 }
 
 /// Apply completed non-critical session status hydration.

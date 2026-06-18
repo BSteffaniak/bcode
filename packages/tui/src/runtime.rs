@@ -124,14 +124,17 @@ pub async fn run_event_loop_with_startup<W: Write>(
             super::render::transcript_area_for_frame(&chat.app, terminal.area()),
         );
         session_flow::start_switch_session(&client, &mut chat, session_id, initial_window_request);
-    } else if let Some(status) = auth_security_status {
-        chat.app.set_status(status);
-    } else if chat.app.composer().is_empty() {
-        chat.app
-            .set_status("New draft session; send a message to save it".to_owned());
     } else {
-        chat.app
-            .set_status("Draft restored; send a message to save session".to_owned());
+        session_flow::start_draft_status_hydration(&client, &mut chat);
+        if let Some(status) = auth_security_status {
+            chat.app.set_status(status);
+        } else if chat.app.composer().is_empty() {
+            chat.app
+                .set_status("New draft session; send a message to save it".to_owned());
+        } else {
+            chat.app
+                .set_status("Draft restored; send a message to save session".to_owned());
+        }
     }
     if startup_action == StartupTuiAction::OpenRalphHome {
         let mut io = TuiIo {

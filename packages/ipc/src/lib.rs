@@ -282,6 +282,7 @@ pub enum Request {
     SessionModelStatus {
         session_id: SessionId,
     },
+    DefaultModelStatus,
     SessionModelList {
         provider_plugin_id: Option<String>,
     },

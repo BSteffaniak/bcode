@@ -1162,6 +1162,18 @@ impl BcodeClient {
         }
     }
 
+    /// Return active model metadata for a new draft session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn default_model_status(&self) -> Result<bcode_ipc::SessionModelStatus, ClientError> {
+        match self.send_request(Request::DefaultModelStatus).await? {
+            ResponsePayload::SessionModelStatus { status } => Ok(status),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Return available models for a provider.
     ///
     /// # Errors

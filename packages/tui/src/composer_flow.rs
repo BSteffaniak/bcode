@@ -142,6 +142,7 @@ async fn handle_slash_command<W: Write>(
         slash_commands::SlashCommandOutcome::NewDraftSession => {
             chat.app.clear_pending_submission(message);
             session_flow::switch_to_draft_session(chat);
+            session_flow::start_draft_status_hydration(services.client, chat);
         }
         slash_commands::SlashCommandOutcome::DraftAgentSelected {
             agent_id,
@@ -164,6 +165,7 @@ async fn handle_slash_command<W: Write>(
                 }
                 session_flow::PickSessionOutcome::Draft => {
                     session_flow::switch_to_draft_session(chat);
+                    session_flow::start_draft_status_hydration(services.client, chat);
                 }
             }
         }

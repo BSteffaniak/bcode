@@ -1996,6 +1996,9 @@ async fn handle_request(
         Request::SessionModelStatus { session_id } => {
             handle_session_model_status(request_id, client_id, state, writer, session_id).await
         }
+        Request::DefaultModelStatus => {
+            handle_default_model_status(request_id, client_id, state, writer).await
+        }
         Request::SessionModelList { provider_plugin_id } => {
             handle_session_model_list(request_id, client_id, state, writer, provider_plugin_id)
                 .await
@@ -6036,6 +6039,38 @@ async fn handle_session_model_status(
         state.client_runtime_context(client_id).await,
     )
     .await;
+    let status = model_status_for_selection(state, selection).await;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::SessionModelStatus { status }),
+    )
+    .await
+}
+
+async fn handle_default_model_status(
+    request_id: u64,
+    client_id: ClientId,
+    state: &ServerState,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    let selection = default_model_selection_with_runtime_context(
+        state,
+        state.client_runtime_context(client_id).await,
+    );
+    let status = model_status_for_selection(state, selection).await;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::SessionModelStatus { status }),
+    )
+    .await
+}
+
+async fn model_status_for_selection(
+    state: &ServerState,
+    selection: SessionModelSelection,
+) -> bcode_ipc::SessionModelStatus {
     let models = invoke_model_provider_json_blocking::<_, ModelList>(
         state,
         selection.provider_plugin_id.clone(),
@@ -6073,33 +6108,24 @@ async fn handle_session_model_status(
     } else {
         model.as_ref().and_then(|model| model.metadata_source)
     };
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::SessionModelStatus {
-            status: bcode_ipc::SessionModelStatus {
-                provider_plugin_id: selection.provider_plugin_id,
-                model_id,
-                context_window,
-                max_output_tokens,
-                reasoning: selection
-                    .reasoning_capabilities
-                    .or_else(|| model.as_ref().and_then(|model| model.reasoning.clone())),
-                reasoning_effort: selection.reasoning_effort,
-                reasoning_summary: selection.reasoning_summary,
-                prompt_cache_mode: Some(
-                    prompt_cache_mode_name(state.prompt_cache_mode).to_string(),
-                ),
-                conversation_reuse_mode: Some(
-                    conversation_reuse_mode_name(state.conversation_reuse_mode).to_string(),
-                ),
-                compaction_mode: Some(compaction_mode_name(state.auto_compaction.mode).to_string()),
-                cache: cache_info,
-                metadata_source,
-            },
-        }),
-    )
-    .await
+    bcode_ipc::SessionModelStatus {
+        provider_plugin_id: selection.provider_plugin_id,
+        model_id,
+        context_window,
+        max_output_tokens,
+        reasoning: selection
+            .reasoning_capabilities
+            .or_else(|| model.as_ref().and_then(|model| model.reasoning.clone())),
+        reasoning_effort: selection.reasoning_effort,
+        reasoning_summary: selection.reasoning_summary,
+        prompt_cache_mode: Some(prompt_cache_mode_name(state.prompt_cache_mode).to_string()),
+        conversation_reuse_mode: Some(
+            conversation_reuse_mode_name(state.conversation_reuse_mode).to_string(),
+        ),
+        compaction_mode: Some(compaction_mode_name(state.auto_compaction.mode).to_string()),
+        cache: cache_info,
+        metadata_source,
+    }
 }
 
 async fn handle_session_model_list(
@@ -9840,18 +9866,42 @@ async fn session_model_selection_with_runtime_context(
     runtime_context: Option<ClientRuntimeContext>,
 ) -> SessionModelSelection {
     if let Some(context) = runtime_context {
-        let selection = SessionModelSelection {
-            provider_plugin_id: context.selected_provider_plugin_id,
-            model_id: context.selected_model_id,
-            thinking_level: None,
-            reasoning_effort: state.selected_reasoning.effort.clone(),
-            reasoning_summary: state.selected_reasoning.summary.clone(),
-            reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
-            provider_context: context.provider_context,
-        };
-        return selection;
+        return model_selection_from_runtime_context(state, context);
     }
     session_model_selection(state, session_id).await
+}
+
+fn default_model_selection_with_runtime_context(
+    state: &ServerState,
+    runtime_context: Option<ClientRuntimeContext>,
+) -> SessionModelSelection {
+    if let Some(context) = runtime_context {
+        return model_selection_from_runtime_context(state, context);
+    }
+    SessionModelSelection {
+        provider_plugin_id: state.selected_provider_plugin_id.clone(),
+        model_id: state.selected_model_id.clone(),
+        thinking_level: None,
+        reasoning_effort: state.selected_reasoning.effort.clone(),
+        reasoning_summary: state.selected_reasoning.summary.clone(),
+        reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
+        provider_context: state.selected_provider_context.clone(),
+    }
+}
+
+fn model_selection_from_runtime_context(
+    state: &ServerState,
+    context: ClientRuntimeContext,
+) -> SessionModelSelection {
+    SessionModelSelection {
+        provider_plugin_id: context.selected_provider_plugin_id,
+        model_id: context.selected_model_id,
+        thinking_level: None,
+        reasoning_effort: state.selected_reasoning.effort.clone(),
+        reasoning_summary: state.selected_reasoning.summary.clone(),
+        reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
+        provider_context: context.provider_context,
+    }
 }
 
 async fn session_model_selection(
