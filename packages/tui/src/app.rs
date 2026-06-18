@@ -287,6 +287,7 @@ pub struct BmuxApp {
     active_tool_calls: BTreeSet<String>,
     tool_activity_seen: bool,
     pending_assistant_stream_anchor: bool,
+    pending_transcript_top_anchor_sequence: Option<u64>,
     older_history: OlderHistoryState,
     activity: ActivityState,
     status: String,
@@ -460,6 +461,7 @@ impl BmuxApp {
             active_tool_calls: BTreeSet::new(),
             tool_activity_seen: false,
             pending_assistant_stream_anchor: false,
+            pending_transcript_top_anchor_sequence: None,
             older_history: OlderHistoryState::new(history, has_older_history),
             activity: ActivityState::Idle,
             status: String::from("TUI connected. Enter submits; Esc/Ctrl-C exits."),
@@ -512,6 +514,13 @@ impl BmuxApp {
         self.rebuild_transcript_from_history();
         self.reconcile_tool_state_with_resident_transcript();
         self.pending_visual_overflow_bottom = None;
+    }
+
+    /// Defer top-anchoring a transcript event sequence until the layout cache is current.
+    pub const fn request_transcript_top_anchor_sequence(&mut self, sequence: u64) {
+        self.pending_transcript_top_anchor_sequence = Some(sequence);
+        self.transcript_scroll_animation = None;
+        self.scroll_mode = TranscriptScrollMode::ManualDetached;
     }
 
     /// Jump to a committed transcript item and top-anchor it in the viewport.
@@ -1535,6 +1544,19 @@ impl BmuxApp {
     /// Resolve deferred user-message and live-stream top anchoring against the latest cached layout.
     pub fn sync_transcript_anchor_requests(&mut self) {
         if self.manual_transcript_scroll_active() || self.transcript_scroll_animation.is_some() {
+            return;
+        }
+        if let Some(sequence) = self.pending_transcript_top_anchor_sequence {
+            if let Some(index) = self.transcript_index_for_sequence(sequence)
+                && let Some(top_row) = self
+                    .transcript_layout
+                    .entry_start_row(VisibleTranscriptSource::Transcript, index)
+            {
+                self.pending_transcript_top_anchor_sequence = None;
+                self.transcript_scroll_animation = None;
+                self.scroll_mode = TranscriptScrollMode::ManualDetached;
+                self.viewport.follow_anchor(top_row);
+            }
             return;
         }
         if self.submitted_user_message_following == SubmittedUserMessageFollowing::PendingAnchor {

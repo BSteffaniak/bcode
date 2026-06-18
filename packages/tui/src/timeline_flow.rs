@@ -98,9 +98,13 @@ async fn jump_to_selected_timeline_entry(
         };
     chat.app
         .replace_transcript_window(&events, has_older, has_newer, entry.sequence());
-    if let Some(index) = chat.app.transcript_index_for_sequence(entry.sequence())
-        && chat.app.jump_to_transcript_index(index)
+    if chat
+        .app
+        .transcript_index_for_sequence(entry.sequence())
+        .is_some()
     {
+        chat.app
+            .request_transcript_top_anchor_sequence(entry.sequence());
         chat.app.set_status("jumped to timeline message".to_owned());
     } else {
         chat.app.set_status(format!(
