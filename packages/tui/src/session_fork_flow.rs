@@ -39,14 +39,29 @@ pub async fn fork_current_session<W: Write>(
         &format!("[fork] {source_title}"),
     );
     let submission = run_dialog(io, &mut dialog, services.theme).await?;
-    let Some(prompt) = select_prompt_for_fork(io, services, session_id).await? else {
-        chat.app.set_status("fork canceled".to_owned());
-        return Ok(());
+    let prompt = match select_prompt_for_fork(io, services, session_id).await {
+        Ok(Some(prompt)) => prompt,
+        Ok(None) => {
+            chat.app.set_status("fork canceled".to_owned());
+            return Ok(());
+        }
+        Err(TuiError::Client(error)) => {
+            helpers::report_client_issue(&mut chat.app, "fork prompt history unavailable", &error);
+            return Ok(());
+        }
+        Err(error) => return Err(error),
     };
-    let result = services
+    let result = match services
         .client
         .fork_session(session_id, prompt.sequence, submission.name)
-        .await?;
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            helpers::report_client_issue(&mut chat.app, "session fork failed", &error);
+            return Ok(());
+        }
+    };
     let draft = result.draft.or(Some(prompt.text));
     if submission.switch_after_create {
         let new_session_id = result.session.id;
@@ -119,7 +134,7 @@ async fn recent_user_prompts(
     services: &TuiServices<'_>,
     session_id: bcode_session_models::SessionId,
 ) -> Result<Vec<ForkPromptCandidate>, TuiError> {
-    let page = services
+    let page = match services
         .client
         .session_history_page(
             session_id,
@@ -129,7 +144,11 @@ async fn recent_user_prompts(
                 direction: SessionHistoryDirection::Backward,
             },
         )
-        .await?;
+        .await
+    {
+        Ok(page) => page,
+        Err(error) => return Err(error.into()),
+    };
     Ok(page
         .events
         .iter()
@@ -283,10 +302,17 @@ pub async fn clone_current_session<W: Write>(
     if !submission.install_draft {
         chat.app.replace_composer_with("");
     }
-    let result = services
+    let result = match services
         .client
         .clone_session(session_id, submission.name)
-        .await?;
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            helpers::report_client_issue(&mut chat.app, "session clone failed", &error);
+            return Ok(());
+        }
+    };
     if submission.switch_after_create {
         let new_session_id = result.session.id;
         session_flow::switch_session(io.terminal, services.client, chat, new_session_id)?;

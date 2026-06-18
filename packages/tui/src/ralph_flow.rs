@@ -27,7 +27,7 @@ use super::helpers;
 use super::keymap::BmuxKeyMap;
 use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::ActiveChat;
-use super::{TuiError, ralph_start_dialog, ralph_start_dialog_render};
+use super::{TuiError, daemon_issue, ralph_start_dialog, ralph_start_dialog_render};
 
 /// Open the plugin-owned Ralph home UI.
 pub async fn open_home<W: Write>(
@@ -58,6 +58,17 @@ pub async fn open_home<W: Write>(
                         chat.app.set_status("Ralph action canceled".to_owned());
                         flash_message = Some(
                             "Action canceled. Choose the next Ralph action when ready.".to_owned(),
+                        );
+                    }
+                    Err(error) if daemon_issue::is_nonfatal_tui_error(&error) => {
+                        daemon_issue::report_tui_issue(
+                            &mut chat.app,
+                            "Ralph action unavailable",
+                            &error,
+                        );
+                        flash_message = Some(
+                            "Ralph action unavailable; daemon/plugin issue was reported in chat."
+                                .to_owned(),
                         );
                     }
                     Err(error) => return Err(error),

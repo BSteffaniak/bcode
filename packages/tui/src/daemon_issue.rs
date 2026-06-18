@@ -138,7 +138,10 @@ fn classify_server_error(code: &str, message: &str) -> TuiDaemonIssue {
 /// Return whether a TUI error should degrade the UI instead of exiting it.
 #[must_use]
 pub const fn is_nonfatal_tui_error(error: &TuiError) -> bool {
-    matches!(error, TuiError::Client(_))
+    matches!(
+        error,
+        TuiError::Client(_) | TuiError::PluginService { .. } | TuiError::SessionUnavailable { .. }
+    )
 }
 
 /// Report a recoverable client error to the app.
@@ -151,6 +154,26 @@ pub fn report_client_issue(app: &mut BmuxApp, label: &str, error: &ClientError) 
 pub fn report_tui_issue(app: &mut BmuxApp, label: &str, error: &TuiError) {
     if let TuiError::Client(error) = error {
         report_client_issue(app, label, error);
+        return;
+    }
+    let message = match error {
+        TuiError::PluginService { code, message } => Some(
+            TuiDaemonIssue::ServerRejected {
+                code: code.clone(),
+                message: message.clone(),
+            }
+            .message(label),
+        ),
+        TuiError::SessionUnavailable { reason, .. } => {
+            Some(TuiDaemonIssue::SessionUnavailable.message(&format!("{label}: {reason}")))
+        }
+        _ => None,
+    };
+    if let Some(message) = message {
+        app.set_status(message.status.clone());
+        if let Some(detail) = message.detail {
+            app.push_system_note(format!("{}\n\n{detail}", message.status));
+        }
         return;
     }
     let message = format!("{label}: {error}");
