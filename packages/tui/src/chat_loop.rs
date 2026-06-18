@@ -11,6 +11,7 @@ use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
 
+use super::activity::ActivityState;
 use super::clipboard_image;
 use super::command_palette::BmuxCommandPalette;
 use super::helpers;
@@ -598,6 +599,14 @@ async fn request_turn_cancellation(client: &BcodeClient, chat: &mut ActiveChat) 
     }
 }
 
+fn agent_selection_status(chat: &ActiveChat, agent_name: &str) -> String {
+    if matches!(chat.app.activity(), ActivityState::Idle) {
+        format!("agent {agent_name} selected")
+    } else {
+        format!("agent {agent_name} selected for next message")
+    }
+}
+
 fn cycle_session_agent(chat: &mut ActiveChat) {
     let current_agent_id = chat
         .app
@@ -613,7 +622,7 @@ fn cycle_session_agent(chat: &mut ActiveChat) {
     if chat.app.session_id().is_some() {
         chat.app.set_pending_agent(agent_id, agent_accent);
         chat.app
-            .set_status(format!("agent {agent_name} selected for next message"));
+            .set_status(agent_selection_status(chat, &agent_name));
     } else {
         chat.agents.apply_agent_to_app(&mut chat.app, agent_id);
         chat.app.set_status(format!("agent set to {agent_name}"));

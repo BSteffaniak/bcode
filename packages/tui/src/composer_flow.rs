@@ -5,6 +5,7 @@ use std::io::Write;
 use bcode_client::BcodeClient;
 use bcode_session_models::SessionId;
 
+use super::activity::ActivityState;
 use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::ActiveChat;
 use super::{
@@ -15,6 +16,14 @@ use super::{
 /// Result of submitting staged composer text.
 pub type SubmitComposerOutcome = Option<thinking_dialog::ThinkingDialogState>;
 
+fn agent_selection_status(chat: &ActiveChat, agent_name: &str) -> String {
+    if matches!(chat.app.activity(), ActivityState::Idle) {
+        format!("agent {agent_name} selected")
+    } else {
+        format!("agent {agent_name} selected for next message")
+    }
+}
+
 fn apply_draft_agent_selection(
     chat: &mut ActiveChat,
     agent_id: String,
@@ -24,7 +33,7 @@ fn apply_draft_agent_selection(
     if chat.app.session_id().is_some() {
         chat.app.set_pending_agent(agent_id, agent_accent);
         chat.app
-            .set_status(format!("agent {agent_name} selected for next message"));
+            .set_status(agent_selection_status(chat, agent_name));
     } else {
         chat.app.set_current_agent(agent_id, agent_accent);
         chat.app.set_status(format!("agent set to {agent_name}"));
