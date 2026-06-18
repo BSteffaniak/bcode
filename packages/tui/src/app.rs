@@ -690,8 +690,8 @@ impl BmuxApp {
     pub fn model_header_label(&self) -> String {
         let model = self.selected_model_id().unwrap_or("default");
         self.reasoning_header_label().map_or_else(
-            || format!("model {model}"),
-            |reasoning| format!("model {model} (reasoning: {reasoning})"),
+            || model.to_owned(),
+            |reasoning| format!("{model} [{reasoning}]"),
         )
     }
 

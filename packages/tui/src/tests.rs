@@ -4141,10 +4141,7 @@ fn thinking_label_uses_effective_values() {
         app.thinking_label(),
         "shown · effort: medium · summary: detailed"
     );
-    assert_eq!(
-        app.model_header_label(),
-        "model default (reasoning: medium)"
-    );
+    assert_eq!(app.model_header_label(), "default [medium]");
 }
 
 #[test]
