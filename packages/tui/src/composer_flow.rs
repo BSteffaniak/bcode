@@ -54,12 +54,11 @@ async fn open_thinking_settings(
     session_id: Option<SessionId>,
     focus: thinking_dialog::ThinkingDialogFocus,
 ) -> Result<SubmitComposerOutcome, TuiError> {
-    let Some(session_id) = session_id else {
-        chat.app
-            .set_status("thinking settings require an active session".to_owned());
-        return Ok(None);
+    let status = if let Some(session_id) = session_id {
+        services.client.session_model_status(session_id).await?
+    } else {
+        services.client.default_model_status().await?
     };
-    let status = services.client.session_model_status(session_id).await?;
     chat.app.apply_model_status(status.clone());
     chat.app
         .set_status("thinking settings: enter apply, esc cancel".to_owned());

@@ -48,13 +48,14 @@ async fn apply_thinking_dialog(
     chat: &mut ActiveChat,
     thinking_dialog: &mut Option<ThinkingDialogState>,
 ) -> Result<bool, TuiError> {
-    let Some(session_id) = chat.app.session_id() else {
-        chat.app.set_status("No active session".to_owned());
-        *thinking_dialog = None;
-        return Ok(true);
-    };
     let Some(dialog) = thinking_dialog.take() else {
         return Ok(false);
+    };
+    let Some(session_id) = chat.app.session_id() else {
+        chat.app.set_reasoning_visible(dialog.visible());
+        chat.app
+            .set_status("thinking display applied; effort requires an active session".to_owned());
+        return Ok(true);
     };
     client
         .set_session_reasoning(

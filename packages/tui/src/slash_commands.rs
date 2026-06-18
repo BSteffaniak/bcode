@@ -146,6 +146,29 @@ async fn runtime_status(
     )))
 }
 
+fn draft_thinking_command(parts: &[&str]) -> SlashCommandOutcome {
+    match parts.get(1).copied() {
+        None => SlashCommandOutcome::OpenThinkingSettings(
+            super::thinking_dialog::ThinkingDialogFocus::Display,
+        ),
+        Some("effort") if parts.len() == 2 => SlashCommandOutcome::OpenThinkingSettings(
+            super::thinking_dialog::ThinkingDialogFocus::Effort,
+        ),
+        Some("summary") if parts.len() == 2 => SlashCommandOutcome::OpenThinkingSettings(
+            super::thinking_dialog::ThinkingDialogFocus::Summary,
+        ),
+        Some("show") => SlashCommandOutcome::SetThinkingDisplay(true),
+        Some("hide") => SlashCommandOutcome::SetThinkingDisplay(false),
+        Some("toggle") => SlashCommandOutcome::ToggleThinkingDisplay,
+        Some("status" | "capabilities") => {
+            SlashCommandOutcome::Handled("thinking status requires an active session".to_owned())
+        }
+        Some(_) => SlashCommandOutcome::Handled(
+            "setting thinking effort requires an active session".to_owned(),
+        ),
+    }
+}
+
 async fn thinking_command(
     client: &BcodeClient,
     session_id: SessionId,
@@ -726,7 +749,7 @@ async fn execute_builtin(
         }
         "thinking" => {
             let Some(session_id) = session_id else {
-                return Ok(SlashCommandOutcome::ToggleThinkingDisplay);
+                return Ok(draft_thinking_command(parts));
             };
             thinking_command(client, session_id, parts).await
         }
