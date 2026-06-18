@@ -13,7 +13,7 @@ use super::render::TuiTheme;
 use super::runtime_context::{TuiIo, TuiServices};
 use super::startup_action::StartupTuiAction;
 use super::terminal_events::TuiInput;
-use super::{TuiError, chat_loop, ralph_flow, session_flow};
+use super::{TuiError, chat_loop, daemon_issue, ralph_flow, session_flow};
 
 fn auth_security_status(config: &bcode_config::BcodeConfig) -> Option<String> {
     let selection = config.resolved_model_selection();
@@ -129,7 +129,13 @@ pub async fn run_event_loop_with_startup<W: Write>(
             keymap: &keymap,
             theme: TuiTheme::for_app(&mut chat.app, std::time::Instant::now()),
         };
-        ralph_flow::open_home(&mut io, &services, &mut chat).await?;
+        if let Err(error) = ralph_flow::open_home(&mut io, &services, &mut chat).await {
+            if daemon_issue::is_nonfatal_tui_error(&error) {
+                daemon_issue::report_tui_issue(&mut chat.app, "Ralph unavailable", &error);
+            } else {
+                return Err(error);
+            }
+        }
     }
     let result = {
         chat_loop::run_with_client(

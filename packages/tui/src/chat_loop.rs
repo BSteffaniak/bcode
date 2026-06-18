@@ -17,6 +17,7 @@ use bmux_tui::terminal::Terminal;
 use super::activity::ActivityState;
 use super::clipboard_image;
 use super::command_palette::BmuxCommandPalette;
+use super::daemon_issue;
 use super::helpers;
 use super::invalidation::InvalidationQueue;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
@@ -430,16 +431,16 @@ async fn poll_permission_list(chat: &mut ActiveChat, modals: &mut ModalState) ->
     false
 }
 
-fn is_nonfatal_tui_daemon_error(error: &TuiError) -> bool {
-    matches!(error, TuiError::Client(error) if error.is_daemon_unavailable())
+const fn is_nonfatal_tui_daemon_error(error: &TuiError) -> bool {
+    daemon_issue::is_nonfatal_tui_error(error)
 }
 
 fn report_nonfatal_tui_error(chat: &mut ActiveChat, label: &str, error: &TuiError) {
-    chat.app.set_status(format!("{label}: {error}"));
+    daemon_issue::report_tui_issue(&mut chat.app, label, error);
 }
 
 fn report_nonfatal_client_error(chat: &mut ActiveChat, label: &str, error: &ClientError) {
-    chat.app.set_status(format!("{label}: {error}"));
+    daemon_issue::report_client_issue(&mut chat.app, label, error);
 }
 
 fn next_redraw_at(last_redraw: Instant) -> Instant {

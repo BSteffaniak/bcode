@@ -23,7 +23,13 @@ pub async fn pick_skill_for_session<W: Write>(
     services: &TuiServices<'_>,
     chat: &mut ActiveChat,
 ) -> Result<(), TuiError> {
-    let skills = services.client.list_skills().await?;
+    let skills = match services.client.list_skills().await {
+        Ok(skills) => skills,
+        Err(error) => {
+            helpers::report_client_issue(&mut chat.app, "skills unavailable", &error);
+            return Ok(());
+        }
+    };
     if skills.skills.is_empty() {
         chat.app.set_status("no skills available".to_owned());
         chat.app
@@ -126,7 +132,13 @@ pub async fn show_active_skills(
         chat.app.set_status("No active session".to_owned());
         return Ok(());
     };
-    let skills = client.active_skills(session_id).await?;
+    let skills = match client.active_skills(session_id).await {
+        Ok(skills) => skills,
+        Err(error) => {
+            helpers::report_client_issue(&mut chat.app, "active skills unavailable", &error);
+            return Ok(());
+        }
+    };
     let mut lines = vec![format!("Active skills: {}", skills.len())];
     lines.extend(skills.iter().map(|skill| {
         let suffix = if skill.truncated { " truncated" } else { "" };
@@ -302,7 +314,13 @@ async fn describe_skill(
     chat: &mut ActiveChat,
     skill_id: SkillId,
 ) -> Result<(), TuiError> {
-    let manifest = client.describe_skill(skill_id.clone()).await?;
+    let manifest = match client.describe_skill(skill_id.clone()).await {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            helpers::report_client_issue(&mut chat.app, "skill details unavailable", &error);
+            return Ok(());
+        }
+    };
     let description = manifest
         .summary
         .description
@@ -333,9 +351,20 @@ async fn activate_skill<W: Write>(
     chat: &mut ActiveChat,
     skill_id: SkillId,
 ) -> Result<(), TuiError> {
-    let session_id = active_or_persisted_session_id(io, client, chat).await?;
-    client.activate_skill(session_id, skill_id.clone()).await?;
-    chat.app.set_status(format!("activated skill {skill_id}"));
+    let session_id = match active_or_persisted_session_id(io, client, chat).await {
+        Ok(session_id) => session_id,
+        Err(TuiError::Client(error)) => {
+            helpers::report_client_issue(&mut chat.app, "skill activation unavailable", &error);
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    match client.activate_skill(session_id, skill_id.clone()).await {
+        Ok(()) => chat.app.set_status(format!("activated skill {skill_id}")),
+        Err(error) => {
+            helpers::report_client_issue(&mut chat.app, "skill activation failed", &error);
+        }
+    }
     Ok(())
 }
 
@@ -345,11 +374,20 @@ async fn deactivate_skill<W: Write>(
     chat: &mut ActiveChat,
     skill_id: SkillId,
 ) -> Result<(), TuiError> {
-    let session_id = active_or_persisted_session_id(io, client, chat).await?;
-    client
-        .deactivate_skill(session_id, skill_id.clone())
-        .await?;
-    chat.app.set_status(format!("deactivated skill {skill_id}"));
+    let session_id = match active_or_persisted_session_id(io, client, chat).await {
+        Ok(session_id) => session_id,
+        Err(TuiError::Client(error)) => {
+            helpers::report_client_issue(&mut chat.app, "skill deactivation unavailable", &error);
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    match client.deactivate_skill(session_id, skill_id.clone()).await {
+        Ok(()) => chat.app.set_status(format!("deactivated skill {skill_id}")),
+        Err(error) => {
+            helpers::report_client_issue(&mut chat.app, "skill deactivation failed", &error);
+        }
+    }
     Ok(())
 }
 
@@ -361,16 +399,30 @@ pub async fn invoke_skill_for_session<W: Write>(
     skill_id: SkillId,
     arguments: String,
 ) -> Result<(), TuiError> {
-    let session_id = active_or_persisted_session_id(io, services.client, chat).await?;
+    let session_id = match active_or_persisted_session_id(io, services.client, chat).await {
+        Ok(session_id) => session_id,
+        Err(TuiError::Client(error)) => {
+            helpers::report_client_issue(&mut chat.app, "skill invocation unavailable", &error);
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     let display_text = if arguments.trim().is_empty() {
         format!("Invoke skill {skill_id}")
     } else {
         format!("Invoke skill {skill_id}: {arguments}")
     };
-    let acceptance = services
+    let acceptance = match services
         .client
         .invoke_skill(session_id, skill_id.clone(), arguments, display_text)
-        .await?;
+        .await
+    {
+        Ok(acceptance) => acceptance,
+        Err(error) => {
+            helpers::report_client_issue(&mut chat.app, "skill invocation failed", &error);
+            return Ok(());
+        }
+    };
     chat.app.set_status(if acceptance.queued {
         format!("skill {skill_id} queued")
     } else {

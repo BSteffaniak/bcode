@@ -149,11 +149,10 @@ impl ClientError {
                     | std::io::ErrorKind::BrokenPipe
                     | std::io::ErrorKind::UnexpectedEof
             ),
-            Self::DaemonStart(_) => true,
+            Self::RequestTimeout { .. } | Self::DaemonStart(_) => true,
             Self::Transport(_)
             | Self::Codec(_)
             | Self::Server { .. }
-            | Self::RequestTimeout { .. }
             | Self::UnexpectedResponse
             | Self::UnexpectedEnvelope => false,
         }
@@ -1674,7 +1673,11 @@ impl BcodeClient {
     pub async fn connect(&self, client_name: &str) -> Result<ClientConnection, ClientError> {
         let mut last_error = None;
         for _ in 0..3 {
-            match self.connect_once(client_name).await {
+            match tokio::time::timeout(CLIENT_IPC_REQUEST_TIMEOUT, self.connect_once(client_name))
+                .await
+                .map_err(|_| ClientError::RequestTimeout {
+                    timeout: CLIENT_IPC_REQUEST_TIMEOUT,
+                })? {
                 Ok(connection) => return Ok(connection),
                 Err(error)
                     if self.daemon_availability == DaemonAvailability::AutoStart

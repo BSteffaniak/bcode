@@ -24,7 +24,13 @@ pub async fn show_model_status(
         chat.app.set_status("No active session".to_owned());
         return Ok(());
     };
-    let status = client.session_model_status(session_id).await?;
+    let status = match client.session_model_status(session_id).await {
+        Ok(status) => status,
+        Err(error) => {
+            helpers::report_client_issue(&mut chat.app, "model status unavailable", &error);
+            return Ok(());
+        }
+    };
     let provider = status
         .provider_plugin_id
         .as_deref()
@@ -46,7 +52,13 @@ pub async fn show_server_model_status(
     client: &BcodeClient,
     chat: &mut ActiveChat,
 ) -> Result<(), TuiError> {
-    let status = client.server_status().await?;
+    let status = match client.server_status().await {
+        Ok(status) => status,
+        Err(error) => {
+            helpers::report_client_issue(&mut chat.app, "server model status unavailable", &error);
+            return Ok(());
+        }
+    };
     let provider = status
         .selected_provider_plugin_id
         .as_deref()
@@ -66,7 +78,13 @@ pub async fn show_runtime_status(
     client: &BcodeClient,
     chat: &mut ActiveChat,
 ) -> Result<(), TuiError> {
-    let status = client.server_status().await?;
+    let status = match client.server_status().await {
+        Ok(status) => status,
+        Err(error) => {
+            helpers::report_client_issue(&mut chat.app, "runtime status unavailable", &error);
+            return Ok(());
+        }
+    };
     let running = status
         .plugin_runtime
         .iter()
@@ -105,6 +123,11 @@ pub async fn show_runtime_status(
     Ok(())
 }
 
+enum ModelProviderPick {
+    Selected(Option<String>),
+    Canceled,
+}
+
 /// Pick and set the active model for the current session.
 pub async fn pick_model_for_session<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
@@ -115,12 +138,21 @@ pub async fn pick_model_for_session<W: Write>(
         chat.app.set_status("No active session".to_owned());
         return Ok(());
     };
-    let provider_plugin_id = pick_model_provider(io, services).await?;
-    let models = services
+    let provider_plugin_id = match pick_model_provider(io, services, chat).await? {
+        Some(ModelProviderPick::Selected(provider)) => provider,
+        Some(ModelProviderPick::Canceled) | None => return Ok(()),
+    };
+    let models = match services
         .client
         .session_model_list(provider_plugin_id.clone())
-        .await?
-        .models;
+        .await
+    {
+        Ok(list) => list.models,
+        Err(error) => {
+            helpers::report_client_issue(&mut chat.app, "model list unavailable", &error);
+            return Ok(());
+        }
+    };
     let status = provider_plugin_id.as_ref().map_or_else(
         || "Select a model".to_owned(),
         |provider| format!("Select a model from {provider}"),
@@ -189,16 +221,22 @@ pub async fn pick_model_for_session<W: Write>(
 async fn pick_model_provider<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
-) -> Result<Option<String>, TuiError> {
-    let providers = services
-        .client
-        .plugin_services()
-        .await?
-        .into_iter()
-        .filter(|service| service.interface_id == bcode_model::MODEL_PROVIDER_INTERFACE_ID)
-        .collect::<Vec<_>>();
+    chat: &mut ActiveChat,
+) -> Result<Option<ModelProviderPick>, TuiError> {
+    let providers = match services.client.plugin_services().await {
+        Ok(services) => services
+            .into_iter()
+            .filter(|service| service.interface_id == bcode_model::MODEL_PROVIDER_INTERFACE_ID)
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            helpers::report_client_issue(&mut chat.app, "model providers unavailable", &error);
+            return Ok(None);
+        }
+    };
     if providers.len() <= 1 {
-        return Ok(providers.first().map(|provider| provider.plugin_id.clone()));
+        return Ok(Some(ModelProviderPick::Selected(
+            providers.first().map(|provider| provider.plugin_id.clone()),
+        )));
     }
     let mut picker = provider_picker::ProviderPickerApp::new(providers);
     loop {
@@ -216,8 +254,12 @@ async fn pick_model_provider<W: Write>(
                 picker.refresh_filter();
             }
             Event::Key(stroke) => match stroke.key {
-                KeyCode::Escape => return Ok(None),
-                KeyCode::Enter => return Ok(picker.selected_provider_id()),
+                KeyCode::Escape => return Ok(Some(ModelProviderPick::Canceled)),
+                KeyCode::Enter => {
+                    return Ok(Some(ModelProviderPick::Selected(
+                        picker.selected_provider_id(),
+                    )));
+                }
                 KeyCode::Up => picker.select_previous(),
                 KeyCode::Down => picker.select_next(),
                 _ => {
@@ -232,7 +274,9 @@ async fn pick_model_provider<W: Write>(
                 if let Some(row) = picker_row_from_mouse(mouse)
                     && picker.select_visible(row)
                 {
-                    return Ok(picker.selected_provider_id());
+                    return Ok(Some(ModelProviderPick::Selected(
+                        picker.selected_provider_id(),
+                    )));
                 }
             }
             Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick | Event::User(_) => {}

@@ -9,8 +9,8 @@ use super::activity::ActivityState;
 use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::ActiveChat;
 use super::{
-    TuiError, model_flow, ralph_flow, session_flow, session_fork_flow, skill_flow, slash_commands,
-    slash_registry, thinking_dialog, worktree_flow,
+    TuiError, helpers, model_flow, ralph_flow, session_flow, session_fork_flow, skill_flow,
+    slash_commands, slash_registry, thinking_dialog, worktree_flow,
 };
 
 /// Result of submitting staged composer text.
@@ -54,10 +54,16 @@ async fn open_thinking_settings(
     session_id: Option<SessionId>,
     focus: thinking_dialog::ThinkingDialogFocus,
 ) -> Result<SubmitComposerOutcome, TuiError> {
-    let status = if let Some(session_id) = session_id {
-        services.client.session_model_status(session_id).await?
+    let status = match if let Some(session_id) = session_id {
+        services.client.session_model_status(session_id).await
     } else {
-        services.client.default_model_status().await?
+        services.client.default_model_status().await
+    } {
+        Ok(status) => status,
+        Err(error) => {
+            helpers::report_client_issue(&mut chat.app, "thinking settings unavailable", &error);
+            return Ok(None);
+        }
     };
     chat.app.apply_model_status(status.clone());
     chat.app
@@ -270,9 +276,16 @@ async fn commit_pending_agent(
     let Some(agent_id) = chat.app.pending_agent_id().map(ToOwned::to_owned) else {
         return Ok(());
     };
-    client.set_session_agent(session_id, agent_id).await?;
-    let _committed = chat.app.take_pending_agent();
-    Ok(())
+    match client.set_session_agent(session_id, agent_id).await {
+        Ok(()) => {
+            let _committed = chat.app.take_pending_agent();
+            Ok(())
+        }
+        Err(error) => {
+            helpers::report_client_issue(&mut chat.app, "agent switch failed", &error);
+            Err(error.into())
+        }
+    }
 }
 
 async fn commit_pending_reasoning(
@@ -320,7 +333,15 @@ pub async fn submit_composer<W: Write>(
         return Ok(None);
     }
     let session_id =
-        session_flow::persist_draft_session(io.terminal, services.client, chat).await?;
+        match session_flow::persist_draft_session(io.terminal, services.client, chat).await {
+            Ok(session_id) => session_id,
+            Err(TuiError::Client(error)) => {
+                chat.app.restore_pending_submission(&message);
+                helpers::report_client_issue(&mut chat.app, "session creation unavailable", &error);
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
     if let Err(error) = commit_pending_agent(services.client, chat, session_id).await {
         chat.app.restore_pending_submission(&message);
         chat.app.set_status(format!("agent switch failed: {error}"));
@@ -364,7 +385,7 @@ pub async fn submit_composer<W: Write>(
         }
         Err(error) => {
             chat.app.restore_pending_submission(&message);
-            chat.app.set_status(format!("send failed: {error}"));
+            helpers::report_client_issue(&mut chat.app, "send failed", &error);
             Ok(None)
         }
     }

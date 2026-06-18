@@ -11,6 +11,7 @@ use crossterm::terminal::size;
 
 use super::TuiError;
 use super::app::BmuxApp;
+use super::daemon_issue;
 
 /// Apply a key stroke to a text buffer using the default text-input bindings.
 ///
@@ -49,9 +50,12 @@ const fn shifted_text_character(stroke: KeyStroke) -> Option<char> {
 
 /// Report a client error in status and transcript.
 pub fn report_client_error(app: &mut BmuxApp, label: &str, error: &TuiError) {
-    let message = format!("{label}: {error}");
-    app.set_status(message.clone());
-    app.push_system_note(message);
+    daemon_issue::report_tui_issue(app, label, error);
+}
+
+/// Report a recoverable daemon/client issue in status and transcript.
+pub fn report_client_issue(app: &mut BmuxApp, label: &str, error: &bcode_client::ClientError) {
+    daemon_issue::report_client_issue(app, label, error);
 }
 
 /// Resize a terminal from current crossterm dimensions.

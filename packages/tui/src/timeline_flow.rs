@@ -83,8 +83,16 @@ async fn jump_to_selected_timeline_entry(
         return Ok(true);
     };
     chat.app.set_status("loading timeline message…".to_owned());
-    let events =
-        history_flow::load_timeline_jump_events(client, session_id, entry.sequence()).await?;
+    let events = match history_flow::load_timeline_jump_events(client, session_id, entry.sequence())
+        .await
+    {
+        Ok(events) => events,
+        Err(TuiError::Client(error)) => {
+            super::helpers::report_client_issue(&mut chat.app, "timeline jump unavailable", &error);
+            return Ok(true);
+        }
+        Err(error) => return Err(error),
+    };
     chat.app.replace_transcript_window(&events);
     if let Some(index) = chat.app.transcript_index_for_sequence(entry.sequence())
         && chat.app.jump_to_transcript_index(index)
