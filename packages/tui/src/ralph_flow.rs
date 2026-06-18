@@ -49,6 +49,9 @@ pub async fn open_home<W: Write>(
             super::ralph_launcher::RalphHomeOutcome::Action(action) => {
                 match dispatch_home_action(action, io, services, chat).await {
                     Ok(()) => {
+                        if action == super::ralph_launcher::RalphHomeAction::RebuildLoopContext {
+                            return Ok(());
+                        }
                         flash_message = Some(flash_message_for_action(action));
                     }
                     Err(TuiError::Canceled) => {
@@ -934,7 +937,6 @@ pub async fn rebuild_loop_context<W: Write>(
             .as_ref()
             .map_or_else(|| "<none>".to_owned(), |path| path.display().to_string())
     ));
-    chat.app.set_idle();
     chat.app
         .set_status("Ralph rebuild conversation started".to_owned());
     Ok(())
