@@ -51,20 +51,21 @@ async fn apply_thinking_dialog(
     let Some(dialog) = thinking_dialog.take() else {
         return Ok(false);
     };
+    let effort = dialog.effort().map(ToOwned::to_owned);
+    let summary = dialog.summary().map(ToOwned::to_owned);
+    let visible = dialog.visible();
     let Some(session_id) = chat.app.session_id() else {
-        chat.app.set_reasoning_visible(dialog.visible());
-        chat.app
-            .set_status("thinking display applied; effort requires an active session".to_owned());
+        chat.app.apply_reasoning_selection(effort, summary, visible);
+        chat.app.set_status(format!(
+            "thinking settings applied: {}",
+            chat.app.thinking_label()
+        ));
         return Ok(true);
     };
     client
-        .set_session_reasoning(
-            session_id,
-            dialog.effort().map(ToOwned::to_owned),
-            dialog.summary().map(ToOwned::to_owned),
-        )
+        .set_session_reasoning(session_id, effort, summary)
         .await?;
-    chat.app.set_reasoning_visible(dialog.visible());
+    chat.app.set_reasoning_visible(visible);
     if let Ok(status) = client.session_model_status(session_id).await {
         chat.app.apply_model_status(status);
     }

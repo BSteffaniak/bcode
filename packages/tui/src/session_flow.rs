@@ -502,8 +502,28 @@ pub async fn persist_draft_session<W: Write>(
     chat.session_id = Some(session.id);
     chat.event_task = Some(event_task);
     chat.app.apply_session_summary(&attached.session);
+    if let Err(error) = commit_draft_reasoning(client, &chat.app, session.id).await {
+        chat.app
+            .set_status(format!("thinking settings failed: {error}"));
+    }
     hydrate_status(client, &mut chat.app).await;
     Ok(session.id)
+}
+
+async fn commit_draft_reasoning(
+    client: &BcodeClient,
+    app: &BmuxApp,
+    session_id: SessionId,
+) -> Result<(), TuiError> {
+    let effort = app.reasoning_effort().map(ToOwned::to_owned);
+    let summary = app.reasoning_summary().map(ToOwned::to_owned);
+    if effort.is_none() && summary.is_none() {
+        return Ok(());
+    }
+    client
+        .set_session_reasoning(session_id, effort, summary)
+        .await?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1147,6 +1147,30 @@ impl BmuxApp {
         self.rebuild_transcript_from_history();
     }
 
+    /// Apply selected reasoning settings locally.
+    pub fn apply_reasoning_selection(
+        &mut self,
+        effort: Option<String>,
+        summary: Option<String>,
+        visible: bool,
+    ) {
+        self.reasoning_effort = effort;
+        self.reasoning_summary = summary;
+        self.set_reasoning_visible(visible);
+    }
+
+    /// Return the selected reasoning effort, if any.
+    #[must_use]
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        self.reasoning_effort.as_deref()
+    }
+
+    /// Return the selected reasoning summary, if any.
+    #[must_use]
+    pub fn reasoning_summary(&self) -> Option<&str> {
+        self.reasoning_summary.as_deref()
+    }
+
     /// Apply configured thinking display visibility.
     pub fn apply_thinking_config(&mut self, config: TuiThinkingConfig) {
         self.set_reasoning_visible(config.show);

@@ -275,6 +275,22 @@ async fn commit_pending_agent(
     Ok(())
 }
 
+async fn commit_pending_reasoning(
+    client: &BcodeClient,
+    chat: &ActiveChat,
+    session_id: SessionId,
+) -> Result<(), TuiError> {
+    let effort = chat.app.reasoning_effort().map(ToOwned::to_owned);
+    let summary = chat.app.reasoning_summary().map(ToOwned::to_owned);
+    if effort.is_none() && summary.is_none() {
+        return Ok(());
+    }
+    client
+        .set_session_reasoning(session_id, effort, summary)
+        .await?;
+    Ok(())
+}
+
 /// Submit the staged composer text.
 pub async fn submit_composer<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
@@ -311,6 +327,12 @@ pub async fn submit_composer<W: Write>(
     if let Err(error) = commit_pending_agent(services.client, chat, session_id).await {
         chat.app.restore_pending_submission(&message);
         chat.app.set_status(format!("agent switch failed: {error}"));
+        return Ok(None);
+    }
+    if let Err(error) = commit_pending_reasoning(services.client, chat, session_id).await {
+        chat.app.restore_pending_submission(&message);
+        chat.app
+            .set_status(format!("thinking settings failed: {error}"));
         return Ok(None);
     }
     match services
