@@ -8,56 +8,9 @@ use bmux_tui::terminal::Terminal;
 use tokio::sync::mpsc;
 
 use super::app::BmuxApp;
-use super::keymap::BmuxKeyMap;
-use super::render::TuiTheme;
-use super::runtime_context::{TuiIo, TuiServices};
 use super::startup_action::StartupTuiAction;
 use super::terminal_events::TuiInput;
-use super::{TuiError, chat_loop, daemon_issue, ralph_flow, session_flow};
-
-fn auth_security_status(config: &bcode_config::BcodeConfig) -> Option<String> {
-    let selection = config.resolved_model_selection();
-    let auth_profile_name = std::env::var(bcode_config::BCODE_AUTH_PROFILE_ENV)
-        .ok()
-        .filter(|profile| !profile.trim().is_empty())
-        .or(selection.auth_profile)?;
-    let auth_profile = config.auth.profiles.get(&auth_profile_name)?;
-    if auth_profile.backend != "sshenv" {
-        return None;
-    }
-    let vault = auth_profile.settings.get("vault").map_or_else(
-        bcode_config::default_auth_vault_path,
-        std::path::PathBuf::from,
-    );
-    let profile = auth_profile
-        .settings
-        .get("profile")
-        .map_or(auth_profile_name.as_str(), String::as_str);
-    let policy = bcode_provider_auth::security::device_seal_policy_for_auth_profile(auth_profile);
-    let report = bcode_provider_auth::security::reconcile_auth_vault_security_report(
-        &vault,
-        profile,
-        policy,
-        auth_profile
-            .settings
-            .get("recipient_key")
-            .map(String::as_str),
-    );
-    report
-        .diagnostics
-        .iter()
-        .find(|diagnostic| {
-            diagnostic.severity
-                == bcode_provider_auth::security::AuthSecurityDiagnosticSeverity::Error
-        })
-        .or_else(|| {
-            report.diagnostics.iter().find(|diagnostic| {
-                diagnostic.severity
-                    == bcode_provider_auth::security::AuthSecurityDiagnosticSeverity::Warning
-            })
-        })
-        .map(|diagnostic| format!("⚠ {} Run `bcode auth status`.", diagnostic.message))
-}
+use super::{TuiError, chat_loop, session_flow};
 
 /// Attach to a session and run the active chat loop.
 pub async fn run_event_loop<W: Write>(
@@ -74,18 +27,14 @@ pub async fn run_event_loop_with_startup<W: Write>(
     startup_action: StartupTuiAction,
 ) -> Result<(), TuiError> {
     let client = BcodeClient::default_endpoint();
-    let config = bcode_config::load_config()?;
-    let auth_security_status = auth_security_status(&config);
-    let keymap = BmuxKeyMap::from_config(&config.tui);
-    let mouse_scroll_rows = config.tui.mouse.effective_scroll_rows();
     let mut terminal_events = TuiInput::start();
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
     let (async_event_sender, async_event_receiver) = mpsc::unbounded_channel();
     let mut app = BmuxApp::new_with_history(session_id, &[], &[], false);
-    app.apply_tui_config(config.tui);
     let agents = session_flow::AgentCatalog::default();
     agents.refresh_app_agent_metadata(&mut app);
-    let launch_working_directory = std::env::current_dir()?;
+    let launch_working_directory = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let mut settings = chat_loop::TuiRuntimeSettings::bootstrap(launch_working_directory.clone());
     let mut chat = session_flow::ActiveChat {
         app,
         agents,
@@ -99,6 +48,7 @@ pub async fn run_event_loop_with_startup<W: Write>(
         status_hydration_task: None,
         opening_session_id: None,
     };
+    session_flow::start_config_hydration(&chat);
     session_flow::start_agent_catalog_hydration(&client, &chat);
     if let Some(session_id) = session_id {
         let initial_window_request = session_flow::initial_transcript_window_request(
@@ -106,46 +56,16 @@ pub async fn run_event_loop_with_startup<W: Write>(
         );
         session_flow::start_switch_session(&client, &mut chat, session_id, initial_window_request);
     } else {
-        session_flow::start_draft_status_hydration(
-            &client,
-            &mut chat,
-            launch_working_directory.clone(),
-        );
-        if let Some(status) = auth_security_status {
-            chat.app.set_status(status);
-        } else if chat.app.composer().is_empty() {
-            chat.app.set_status("New draft".to_owned());
-        } else {
-            chat.app.set_status("Draft restored".to_owned());
-        }
-    }
-    if startup_action == StartupTuiAction::OpenRalphHome {
-        let mut io = TuiIo {
-            terminal,
-            input: &mut terminal_events,
-        };
-        let services = TuiServices {
-            client: &client,
-            keymap: &keymap,
-            theme: TuiTheme::for_app(&mut chat.app, std::time::Instant::now()),
-        };
-        if let Err(error) = ralph_flow::open_home(&mut io, &services, &mut chat).await {
-            if daemon_issue::is_nonfatal_tui_error(&error) {
-                daemon_issue::report_tui_issue(&mut chat.app, "Ralph unavailable", &error);
-            } else {
-                return Err(error);
-            }
-        }
+        chat.app.set_status("New draft".to_owned());
     }
     let result = {
         chat_loop::run_with_client(
             terminal,
             &mut terminal_events,
             &client,
-            &keymap,
+            &mut settings,
             &mut chat,
-            mouse_scroll_rows,
-            launch_working_directory,
+            startup_action,
         )
         .await
     };

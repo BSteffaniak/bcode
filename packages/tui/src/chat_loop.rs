@@ -4,6 +4,7 @@ use std::io::Write;
 use std::time::{Duration, Instant, SystemTime};
 
 use bcode_client::{BcodeClient, ClientError};
+use bcode_config::TuiConfig;
 use bcode_ipc::{ComposerDraftScope, Event as BcodeEvent, PermissionSummary};
 use bcode_session_models::{
     SessionEventKind, SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage,
@@ -153,6 +154,32 @@ impl AsyncHistoryPageLoad {
     }
 }
 
+pub struct TuiRuntimeSettings {
+    keymap: BmuxKeyMap,
+    mouse_scroll_rows: usize,
+    launch_working_directory: std::path::PathBuf,
+}
+
+impl TuiRuntimeSettings {
+    pub fn bootstrap(launch_working_directory: std::path::PathBuf) -> Self {
+        let tui_config = TuiConfig::default();
+        Self {
+            keymap: BmuxKeyMap::from_config(&tui_config),
+            mouse_scroll_rows: tui_config.mouse.effective_scroll_rows(),
+            launch_working_directory,
+        }
+    }
+
+    pub fn apply_tui_config(&mut self, tui_config: &TuiConfig) {
+        self.keymap = BmuxKeyMap::from_config(tui_config);
+        self.mouse_scroll_rows = tui_config.mouse.effective_scroll_rows();
+    }
+
+    pub fn launch_working_directory(&self) -> &std::path::Path {
+        &self.launch_working_directory
+    }
+}
+
 struct ChatEventContext<'a, 'b, W: Write> {
     services: TuiServices<'a>,
     terminal: &'a mut Terminal<&'b mut W>,
@@ -177,10 +204,9 @@ pub async fn run_with_client<W: Write>(
     terminal: &mut Terminal<&mut W>,
     terminal_events: &mut TuiInput,
     client: &BcodeClient,
-    keymap: &BmuxKeyMap,
+    settings: &mut TuiRuntimeSettings,
     chat: &mut ActiveChat,
-    mouse_scroll_rows: usize,
-    launch_working_directory: std::path::PathBuf,
+    startup_action: super::startup_action::StartupTuiAction,
 ) -> Result<(), TuiError> {
     let mut modals = ModalState {
         palette: None,
@@ -192,9 +218,9 @@ pub async fn run_with_client<W: Write>(
         thinking_dialog: None,
         timeline_dialog: None,
     };
-    sync_chat_key_labels(chat, keymap);
+    sync_chat_key_labels(chat, &settings.keymap);
     let mut draft_autosave = DraftAutosave::new(
-        launch_working_directory,
+        settings.launch_working_directory.clone(),
         chat.app.composer().text().to_owned(),
     );
     let mut invalidation_queue = InvalidationQueue::default();
@@ -204,8 +230,10 @@ pub async fn run_with_client<W: Write>(
         .checked_sub(TARGET_FRAME_INTERVAL)
         .unwrap_or_else(Instant::now);
 
+    let mut startup_action = Some(startup_action);
+
     while !chat.app.should_exit() {
-        sync_chat_key_labels(chat, keymap);
+        sync_chat_key_labels(chat, &settings.keymap);
         if drain_bcode_events(chat) {
             needs_redraw = true;
         }
@@ -228,6 +256,26 @@ pub async fn run_with_client<W: Write>(
         let redraw_at = next_redraw_at(last_redraw);
         if needs_redraw && Instant::now() >= redraw_at {
             draw_chat_frame(terminal, chat, &mut modals)?;
+            if let Some(action) = startup_action.take()
+                && action == super::startup_action::StartupTuiAction::OpenRalphHome
+            {
+                let mut io = TuiIo {
+                    terminal,
+                    input: terminal_events,
+                };
+                let services = TuiServices {
+                    client,
+                    keymap: &settings.keymap,
+                    theme: render::TuiTheme::for_app(&mut chat.app, Instant::now()),
+                };
+                if let Err(error) = super::ralph_flow::open_home(&mut io, &services, chat).await {
+                    if daemon_issue::is_nonfatal_tui_error(&error) {
+                        daemon_issue::report_tui_issue(&mut chat.app, "Ralph unavailable", &error);
+                    } else {
+                        return Err(error);
+                    }
+                }
+            }
             refresh_invalidation_queue(chat, &mut invalidation_queue);
             needs_redraw = false;
             last_redraw = Instant::now();
@@ -252,12 +300,12 @@ pub async fn run_with_client<W: Write>(
                 let mut context = ChatEventContext {
                     services: TuiServices {
                         client,
-                        keymap,
+                        keymap: &settings.keymap,
                         theme: render::TuiTheme::for_app(&mut chat.app, Instant::now()),
                     },
                     terminal,
                     terminal_events,
-                    mouse_scroll_rows,
+                    mouse_scroll_rows: settings.mouse_scroll_rows,
                 };
                 match handle_event(&mut context, chat, &mut modals, event, &mut draft_autosave)
                     .await
@@ -280,7 +328,7 @@ pub async fn run_with_client<W: Write>(
                 }
             }
             ChatLoopEvent::Async(event) => {
-                handle_async_event(client, chat, event);
+                handle_async_event(client, settings, chat, event);
                 needs_redraw = true;
             }
             ChatLoopEvent::TimedInvalidations(keys) => {
@@ -641,6 +689,7 @@ async fn next_chat_loop_event(
 
 fn handle_async_event(
     client: &BcodeClient,
+    settings: &mut TuiRuntimeSettings,
     chat: &mut ActiveChat,
     event: Box<session_flow::ChatAsyncEvent>,
 ) {
@@ -659,6 +708,12 @@ fn handle_async_event(
         }
         session_flow::ChatAsyncEvent::AgentCatalogHydrated(hydrated) => {
             session_flow::complete_agent_catalog_hydration(chat, hydrated);
+        }
+        session_flow::ChatAsyncEvent::ConfigHydrated(hydrated) => {
+            session_flow::complete_config_hydration(client, settings, chat, *hydrated);
+        }
+        session_flow::ChatAsyncEvent::AuthSecurityHydrated(hydrated) => {
+            session_flow::complete_auth_security_hydration(chat, hydrated);
         }
     }
 }

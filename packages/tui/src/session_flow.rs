@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::app::BmuxApp;
+use super::chat_loop::TuiRuntimeSettings;
 use super::daemon_issue;
 use super::helpers;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
@@ -118,6 +119,18 @@ pub enum ChatAsyncEvent {
     StatusHydrated(StatusHydrationResult),
     DraftStatusHydrated(DraftStatusHydrationResult),
     AgentCatalogHydrated(AgentCatalogHydrationResult),
+    ConfigHydrated(Box<ConfigHydrationResult>),
+    AuthSecurityHydrated(AuthSecurityHydrationResult),
+}
+
+/// Result from asynchronously loading user configuration.
+pub struct ConfigHydrationResult {
+    pub config: Result<bcode_config::BcodeConfig, String>,
+}
+
+/// Result from asynchronously reconciling auth security status.
+pub struct AuthSecurityHydrationResult {
+    pub status: Option<String>,
 }
 
 /// Result from asynchronously hydrating draft-session status.
@@ -269,6 +282,108 @@ pub fn complete_switch_session(
                 .push_system_note(format!("session open failed: {error}"));
         }
     }
+}
+
+/// Start loading user configuration in the background.
+pub fn start_config_hydration(chat: &ActiveChat) {
+    let async_event_sender = chat.async_event_sender.clone();
+    tokio::spawn(async move {
+        let config = bcode_config::load_config().map_err(|error| error.to_string());
+        let _ = async_event_sender.send(ChatAsyncEvent::ConfigHydrated(Box::new(
+            ConfigHydrationResult { config },
+        )));
+    });
+}
+
+/// Apply completed user configuration hydration.
+pub fn complete_config_hydration(
+    client: &BcodeClient,
+    settings: &mut TuiRuntimeSettings,
+    chat: &mut ActiveChat,
+    hydrated: ConfigHydrationResult,
+) {
+    match hydrated.config {
+        Ok(config) => {
+            settings.apply_tui_config(&config.tui);
+            chat.app.apply_tui_config(config.tui.clone());
+            start_auth_security_hydration(chat, config);
+            if chat.session_id.is_none() && chat.opening_session_id.is_none() {
+                start_draft_status_hydration(
+                    client,
+                    chat,
+                    settings.launch_working_directory().to_path_buf(),
+                );
+            }
+        }
+        Err(error) => {
+            chat.app.set_status(format!("Config unavailable: {error}"));
+        }
+    }
+}
+
+/// Start non-critical auth security reconciliation in the background.
+pub fn start_auth_security_hydration(chat: &ActiveChat, config: bcode_config::BcodeConfig) {
+    let async_event_sender = chat.async_event_sender.clone();
+    tokio::spawn(async move {
+        let status = auth_security_status(&config);
+        let _ = async_event_sender.send(ChatAsyncEvent::AuthSecurityHydrated(
+            AuthSecurityHydrationResult { status },
+        ));
+    });
+}
+
+/// Apply completed auth security status hydration.
+pub fn complete_auth_security_hydration(
+    chat: &mut ActiveChat,
+    hydrated: AuthSecurityHydrationResult,
+) {
+    if let Some(status) = hydrated.status {
+        chat.app.set_status(status);
+    }
+}
+
+fn auth_security_status(config: &bcode_config::BcodeConfig) -> Option<String> {
+    let selection = config.resolved_model_selection();
+    let auth_profile_name = std::env::var(bcode_config::BCODE_AUTH_PROFILE_ENV)
+        .ok()
+        .filter(|profile| !profile.trim().is_empty())
+        .or(selection.auth_profile)?;
+    let auth_profile = config.auth.profiles.get(&auth_profile_name)?;
+    if auth_profile.backend != "sshenv" {
+        return None;
+    }
+    let vault = auth_profile.settings.get("vault").map_or_else(
+        bcode_config::default_auth_vault_path,
+        std::path::PathBuf::from,
+    );
+    let profile = auth_profile
+        .settings
+        .get("profile")
+        .map_or(auth_profile_name.as_str(), String::as_str);
+    let policy = bcode_provider_auth::security::device_seal_policy_for_auth_profile(auth_profile);
+    let report = bcode_provider_auth::security::reconcile_auth_vault_security_report(
+        &vault,
+        profile,
+        policy,
+        auth_profile
+            .settings
+            .get("recipient_key")
+            .map(String::as_str),
+    );
+    report
+        .diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.severity
+                == bcode_provider_auth::security::AuthSecurityDiagnosticSeverity::Error
+        })
+        .or_else(|| {
+            report.diagnostics.iter().find(|diagnostic| {
+                diagnostic.severity
+                    == bcode_provider_auth::security::AuthSecurityDiagnosticSeverity::Warning
+            })
+        })
+        .map(|diagnostic| format!("⚠ {} Run `bcode auth status`.", diagnostic.message))
 }
 
 /// Start non-critical agent metadata hydration in the background.
