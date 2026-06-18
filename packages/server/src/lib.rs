@@ -1770,10 +1770,10 @@ async fn handle_request(
             handle_ralph_status(request_id, state, writer, request).await
         }
         Request::RunRalphLoop(request) => {
-            handle_run_ralph_loop(request_id, state, writer, request).await
+            handle_run_ralph_loop(request_id, client_id, state, writer, request).await
         }
         Request::ApproveRalphRun(request) => {
-            handle_approve_ralph_run(request_id, state, writer, request).await
+            handle_approve_ralph_run(request_id, client_id, state, writer, request).await
         }
         Request::CancelRalphLoop(request) => {
             Box::pin(handle_cancel_ralph_loop(request_id, state, writer, request)).await
@@ -2475,11 +2475,18 @@ async fn handle_ralph_status(
 
 async fn handle_run_ralph_loop(
     request_id: u64,
+    client_id: ClientId,
     state: &Arc<ServerState>,
     writer: &SharedWriter,
     request: RalphRunRequest,
 ) -> Result<(), ServerError> {
-    match start_ralph_runner(state, request).await {
+    match start_ralph_runner(
+        state,
+        request,
+        state.client_runtime_context(client_id).await,
+    )
+    .await
+    {
         Ok(response) => {
             send_response(
                 writer,
@@ -2585,11 +2592,18 @@ async fn prepare_ralph_resume(
 
 async fn handle_approve_ralph_run(
     request_id: u64,
+    client_id: ClientId,
     state: &Arc<ServerState>,
     writer: &SharedWriter,
     request: RalphApproveRequest,
 ) -> Result<(), ServerError> {
-    match approve_ralph_run(state, request).await {
+    match approve_ralph_run(
+        state,
+        request,
+        state.client_runtime_context(client_id).await,
+    )
+    .await
+    {
         Ok(response) => {
             send_response(
                 writer,
@@ -2612,6 +2626,7 @@ async fn handle_approve_ralph_run(
 async fn approve_ralph_run(
     state: &Arc<ServerState>,
     request: RalphApproveRequest,
+    runtime_context: Option<ClientRuntimeContext>,
 ) -> Result<RalphRunResponse, String> {
     let summary = resolve_ralph_loop(
         &state.ralph_store,
@@ -2640,7 +2655,7 @@ async fn approve_ralph_run(
     let mut approved_run = active_run;
     approved_run.status.clear();
     approved_run.status.push_str("running");
-    spawn_ralph_runner_task(state, approved_run.clone(), summary).await?;
+    spawn_ralph_runner_task(state, approved_run.clone(), summary, runtime_context).await?;
     Ok(RalphRunResponse {
         run: ralph_run_summary(approved_run),
     })
@@ -2650,6 +2665,7 @@ async fn spawn_ralph_runner_task(
     state: &Arc<ServerState>,
     run: bcode_ralph::RalphRunRecord,
     summary: bcode_ralph::RalphLoopSummary,
+    runtime_context: Option<ClientRuntimeContext>,
 ) -> Result<(), String> {
     let mut active_ralph_runs = state.active_ralph_runs.lock().await;
     if active_ralph_runs.contains_key(&run.state_dir) {
@@ -2658,7 +2674,7 @@ async fn spawn_ralph_runner_task(
     let runner_state = Arc::clone(state);
     let state_dir = run.state_dir.clone();
     let handle = tokio::spawn(async move {
-        run_ralph_runner_skeleton(runner_state, run, summary).await;
+        run_ralph_runner_skeleton(runner_state, run, summary, runtime_context).await;
     });
     active_ralph_runs.insert(state_dir, handle);
     drop(active_ralph_runs);
@@ -2680,6 +2696,7 @@ fn effective_ralph_run_limits(
 async fn start_ralph_runner(
     state: &Arc<ServerState>,
     request: RalphRunRequest,
+    runtime_context: Option<ClientRuntimeContext>,
 ) -> Result<RalphRunResponse, String> {
     let summary = resolve_ralph_loop(
         &state.ralph_store,
@@ -2742,7 +2759,7 @@ async fn start_ralph_runner(
     }
 
     drop(active_ralph_runs);
-    spawn_ralph_runner_task(state, run, summary).await?;
+    spawn_ralph_runner_task(state, run, summary, runtime_context).await?;
     Ok(response)
 }
 
@@ -2842,6 +2859,7 @@ async fn submit_ralph_skeleton_work_turn(
     parent_work_id: &RuntimeWorkId,
     run_id: &str,
     work_prompt: String,
+    runtime_context: Option<ClientRuntimeContext>,
 ) -> Option<ModelTurnCompletion> {
     let session_id = runtime_session_id?;
     let work_turn_id = RuntimeWorkId::new(format!("ralph:{run_id}:work:1"));
@@ -2862,11 +2880,12 @@ async fn submit_ralph_skeleton_work_turn(
         1,
     )
     .await;
-    let completion = submit_session_model_turn_and_wait(state, session_id, work_prompt)
-        .await
-        .unwrap_or_else(|error| {
-            ModelTurnCompletion::with_message(ModelTurnOutcome::Error, error.to_string())
-        });
+    let completion =
+        submit_session_model_turn_and_wait(state, session_id, work_prompt, runtime_context)
+            .await
+            .unwrap_or_else(|error| {
+                ModelTurnCompletion::with_message(ModelTurnOutcome::Error, error.to_string())
+            });
     finish_ralph_runtime_work(
         state,
         runtime_session_id,
@@ -2884,6 +2903,7 @@ async fn submit_ralph_skeleton_audit_turn(
     parent_work_id: &RuntimeWorkId,
     run_id: &str,
     audit_prompt: String,
+    runtime_context: Option<ClientRuntimeContext>,
 ) -> Option<ModelTurnCompletion> {
     let session_id = runtime_session_id?;
     let audit_turn_id = RuntimeWorkId::new(format!("ralph:{run_id}:audit:1"));
@@ -2904,11 +2924,12 @@ async fn submit_ralph_skeleton_audit_turn(
         1,
     )
     .await;
-    let completion = submit_session_model_turn_and_wait(state, session_id, audit_prompt)
-        .await
-        .unwrap_or_else(|error| {
-            ModelTurnCompletion::with_message(ModelTurnOutcome::Error, error.to_string())
-        });
+    let completion =
+        submit_session_model_turn_and_wait(state, session_id, audit_prompt, runtime_context)
+            .await
+            .unwrap_or_else(|error| {
+                ModelTurnCompletion::with_message(ModelTurnOutcome::Error, error.to_string())
+            });
     finish_ralph_runtime_work(
         state,
         runtime_session_id,
@@ -2926,6 +2947,7 @@ async fn submit_ralph_skeleton_replan_turn(
     parent_work_id: &RuntimeWorkId,
     run_id: &str,
     replan_prompt: String,
+    runtime_context: Option<ClientRuntimeContext>,
 ) -> Option<ModelTurnCompletion> {
     let session_id = runtime_session_id?;
     let replan_turn_id = RuntimeWorkId::new(format!("ralph:{run_id}:replan:1"));
@@ -2946,11 +2968,12 @@ async fn submit_ralph_skeleton_replan_turn(
         1,
     )
     .await;
-    let completion = submit_session_model_turn_and_wait(state, session_id, replan_prompt)
-        .await
-        .unwrap_or_else(|error| {
-            ModelTurnCompletion::with_message(ModelTurnOutcome::Error, error.to_string())
-        });
+    let completion =
+        submit_session_model_turn_and_wait(state, session_id, replan_prompt, runtime_context)
+            .await
+            .unwrap_or_else(|error| {
+                ModelTurnCompletion::with_message(ModelTurnOutcome::Error, error.to_string())
+            });
     finish_ralph_runtime_work(
         state,
         runtime_session_id,
@@ -3398,6 +3421,7 @@ async fn submit_ralph_audit_after_validation(
     summary: &bcode_ralph::RalphLoopSummary,
     run: &bcode_ralph::RalphRunRecord,
     iteration: Option<&bcode_ralph::RalphIterationRecord>,
+    runtime_context: Option<ClientRuntimeContext>,
 ) -> Option<ModelTurnCompletion> {
     let prompt = bcode_ralph::build_prompt(summary, bcode_ralph::RalphPromptKind::Audit)
         .unwrap_or_else(|error| {
@@ -3418,6 +3442,7 @@ async fn submit_ralph_audit_after_validation(
         parent_work_id,
         &run.run_id,
         prompt,
+        runtime_context,
     )
     .await
 }
@@ -3429,6 +3454,7 @@ async fn submit_ralph_replan_after_audit(
     summary: &bcode_ralph::RalphLoopSummary,
     run: &bcode_ralph::RalphRunRecord,
     iteration: Option<&bcode_ralph::RalphIterationRecord>,
+    runtime_context: Option<ClientRuntimeContext>,
 ) -> Option<ModelTurnCompletion> {
     let prompt = bcode_ralph::build_prompt(summary, bcode_ralph::RalphPromptKind::Replan)
         .unwrap_or_else(|error| {
@@ -3449,6 +3475,7 @@ async fn submit_ralph_replan_after_audit(
         parent_work_id,
         &run.run_id,
         prompt,
+        runtime_context,
     )
     .await
 }
@@ -3460,6 +3487,7 @@ async fn apply_ralph_post_audit_decision(
     summary: &bcode_ralph::RalphLoopSummary,
     run: &bcode_ralph::RalphRunRecord,
     iteration: Option<&bcode_ralph::RalphIterationRecord>,
+    runtime_context: Option<ClientRuntimeContext>,
 ) -> (&'static str, &'static str, &'static str) {
     let Some(decision) = iteration.and_then(|iteration| {
         ralph_stop_decision_after_audit(&state.ralph_store, summary, run, iteration).ok()
@@ -3483,6 +3511,7 @@ async fn apply_ralph_post_audit_decision(
         summary,
         run,
         iteration,
+        runtime_context,
     )
     .await;
     if replan_completion
@@ -3555,6 +3584,7 @@ async fn complete_ralph_skeleton_after_iteration(
     summary: &bcode_ralph::RalphLoopSummary,
     run: &bcode_ralph::RalphRunRecord,
     iteration: Option<&bcode_ralph::RalphIterationRecord>,
+    runtime_context: Option<ClientRuntimeContext>,
 ) -> RalphIterationCompletion {
     let validation_passed = if let Some(iteration) = iteration {
         run_ralph_iteration_validations(
@@ -3593,6 +3623,7 @@ async fn complete_ralph_skeleton_after_iteration(
         summary,
         run,
         iteration,
+        runtime_context.clone(),
     )
     .await;
     let audit_outcome = audit_completion
@@ -3610,6 +3641,7 @@ async fn complete_ralph_skeleton_after_iteration(
                 summary,
                 run,
                 iteration,
+                runtime_context.clone(),
             )
             .await;
             (run_status, stop_reason, error_message.to_owned())
@@ -3652,6 +3684,7 @@ async fn run_ralph_runner_skeleton(
     state: Arc<ServerState>,
     run: bcode_ralph::RalphRunRecord,
     summary: bcode_ralph::RalphLoopSummary,
+    runtime_context: Option<ClientRuntimeContext>,
 ) {
     let runtime_session_id = run
         .session_id
@@ -3740,6 +3773,7 @@ async fn run_ralph_runner_skeleton(
             &runtime_work_id,
             &run.run_id,
             work_prompt.clone(),
+            runtime_context.clone(),
         )
         .await;
         let work_failure = work_completion
@@ -3784,6 +3818,7 @@ async fn run_ralph_runner_skeleton(
             &summary,
             &run,
             iteration.as_ref(),
+            runtime_context.clone(),
         )
         .await;
         if completion.continue_loop {
@@ -5862,6 +5897,7 @@ async fn submit_session_model_turn_and_wait(
     state: &Arc<ServerState>,
     session_id: SessionId,
     text: String,
+    runtime_context: Option<ClientRuntimeContext>,
 ) -> Result<ModelTurnCompletion, ServerError> {
     let (sender, receiver) = oneshot::channel();
     enqueue_followup_command(
@@ -5869,7 +5905,7 @@ async fn submit_session_model_turn_and_wait(
         session_id,
         FollowupCommand::UserMessage {
             client_id: ClientId::new(),
-            runtime_context: None,
+            runtime_context,
             text,
             placement: bcode_ipc::PromptPlacement::FollowUp,
             completion: Some(sender),
@@ -13621,10 +13657,10 @@ mod tests {
             require_approval: true,
         };
 
-        start_ralph_runner(&state, request.clone())
+        start_ralph_runner(&state, request.clone(), None)
             .await
             .expect("first run should prepare");
-        let error = start_ralph_runner(&state, request)
+        let error = start_ralph_runner(&state, request, None)
             .await
             .expect_err("second active run should be rejected");
 
@@ -13649,6 +13685,7 @@ mod tests {
                 no_progress_limit: Some(1),
                 require_approval: true,
             },
+            None,
         )
         .await
         .expect("run should prepare");
@@ -13906,6 +13943,7 @@ mod tests {
             &summary,
             &run,
             Some(&iteration),
+            None,
         )
         .await;
         let refreshed = ralph
