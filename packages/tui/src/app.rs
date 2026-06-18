@@ -223,6 +223,18 @@ enum AgentMetadataHydration {
     Hydrated,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReasoningSupport {
+    Unsupported,
+    Supported,
+}
+
+impl ReasoningSupport {
+    const fn is_supported(self) -> bool {
+        matches!(self, Self::Supported)
+    }
+}
+
 /// State owned by the terminal user interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BmuxApp {
@@ -241,6 +253,7 @@ pub struct BmuxApp {
     thinking_label: String,
     reasoning_effort: Option<String>,
     reasoning_summary: Option<String>,
+    reasoning_support: ReasoningSupport,
     reasoning_default_effort: Option<String>,
     reasoning_default_summary: Option<String>,
     token_usage: TokenUsageMeter,
@@ -410,10 +423,10 @@ impl BmuxApp {
             agent_metadata_hydration: AgentMetadataHydration::Pending,
             theme_transition: ThemeTransitionState::new(Color::Rgb(100, 116, 139), now),
             reasoning_visible: true,
-            thinking_label: "shown · effort: provider default · summary: provider default"
-                .to_owned(),
+            thinking_label: "shown · unsupported".to_owned(),
             reasoning_effort: None,
             reasoning_summary: None,
+            reasoning_support: ReasoningSupport::Unsupported,
             reasoning_default_effort: None,
             reasoning_default_summary: None,
             token_usage: TokenUsageMeter::default(),
@@ -672,6 +685,25 @@ impl BmuxApp {
         &self.thinking_label
     }
 
+    /// Return the model label shown in the header.
+    #[must_use]
+    pub fn model_header_label(&self) -> String {
+        let model = self.selected_model_id().unwrap_or("default");
+        self.reasoning_header_label().map_or_else(
+            || format!("model {model}"),
+            |reasoning| format!("model {model} (reasoning: {reasoning})"),
+        )
+    }
+
+    fn reasoning_header_label(&self) -> Option<&str> {
+        self.reasoning_support.is_supported().then(|| {
+            self.reasoning_effort
+                .as_deref()
+                .or(self.reasoning_default_effort.as_deref())
+                .unwrap_or("supported")
+        })
+    }
+
     /// Return the token/context footer summary.
     #[must_use]
     pub fn token_summary(&self) -> String {
@@ -901,6 +933,11 @@ impl BmuxApp {
         }
         self.reasoning_effort = status.reasoning_effort.clone();
         self.reasoning_summary = status.reasoning_summary.clone();
+        self.reasoning_support = if status.reasoning.is_some() {
+            ReasoningSupport::Supported
+        } else {
+            ReasoningSupport::Unsupported
+        };
         self.reasoning_default_effort = status
             .reasoning
             .as_ref()
@@ -1121,6 +1158,10 @@ impl BmuxApp {
         } else {
             "hidden"
         };
+        if !self.reasoning_support.is_supported() {
+            self.thinking_label = format!("{display} · unsupported");
+            return;
+        }
         let effort = self
             .reasoning_effort
             .as_deref()

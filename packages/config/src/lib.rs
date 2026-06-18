@@ -259,6 +259,9 @@ impl BcodeConfig {
                 max_output_tokens.to_string(),
             );
         }
+        if let Some(reasoning) = reasoning_capabilities_from_config(&metadata.reasoning) {
+            insert_model_reasoning_settings(&mut selection.settings, model_id, &reasoning);
+        }
     }
 
     fn apply_model_alias(&self, selection: &mut ResolvedModelSelection) {
@@ -1759,6 +1762,8 @@ pub struct ModelMetadataConfig {
     pub context_window: Option<u32>,
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    #[serde(default)]
+    pub reasoning: ReasoningConfig,
 }
 
 /// Resolved model selection after applying the active model profile, if any.
@@ -1814,6 +1819,65 @@ fn merge_reasoning_config(base: &ReasoningConfig, overlay: &ReasoningConfig) -> 
             .raw_reasoning_supported
             .or(base.raw_reasoning_supported),
     }
+}
+
+fn reasoning_capabilities_from_config(
+    reasoning: &ReasoningConfig,
+) -> Option<bcode_model::ModelReasoningInfo> {
+    (!reasoning.effort_values.is_empty()
+        || !reasoning.summary_values.is_empty()
+        || reasoning.default_effort.is_some()
+        || reasoning.default_summary.is_some()
+        || reasoning.visible_summary_supported.is_some()
+        || reasoning.raw_reasoning_supported.is_some())
+    .then(|| bcode_model::ModelReasoningInfo {
+        effort_values: reasoning.effort_values.clone(),
+        default_effort: reasoning.default_effort.clone(),
+        visible_summary_supported: reasoning.visible_summary_supported.unwrap_or_default(),
+        summary_values: reasoning.summary_values.clone(),
+        default_summary: reasoning.default_summary.clone(),
+        raw_reasoning_supported: reasoning.raw_reasoning_supported.unwrap_or_default(),
+        source: bcode_model::ModelReasoningCapabilitySource::ConfigOverride,
+    })
+}
+
+fn insert_model_reasoning_settings(
+    settings: &mut BTreeMap<String, String>,
+    model_id: &str,
+    reasoning: &bcode_model::ModelReasoningInfo,
+) {
+    if !reasoning.effort_values.is_empty() {
+        settings.insert(
+            format!("model_metadata.{model_id}.reasoning.effort_values"),
+            reasoning.effort_values.join(","),
+        );
+    }
+    if let Some(default_effort) = &reasoning.default_effort {
+        settings.insert(
+            format!("model_metadata.{model_id}.reasoning.default_effort"),
+            default_effort.clone(),
+        );
+    }
+    settings.insert(
+        format!("model_metadata.{model_id}.reasoning.visible_summary_supported"),
+        reasoning.visible_summary_supported.to_string(),
+    );
+    if !reasoning.summary_values.is_empty() {
+        settings.insert(
+            format!("model_metadata.{model_id}.reasoning.summary_values"),
+            reasoning.summary_values.join(","),
+        );
+    }
+    if let Some(default_summary) = &reasoning.default_summary {
+        settings.insert(
+            format!("model_metadata.{model_id}.reasoning.default_summary"),
+            default_summary.clone(),
+        );
+    }
+    settings.insert(
+        format!("model_metadata.{model_id}.reasoning.raw_reasoning_supported"),
+        reasoning.raw_reasoning_supported.to_string(),
+    );
 }
 
 impl From<&PluginConfig> for PluginSelection {

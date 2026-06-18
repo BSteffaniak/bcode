@@ -23,12 +23,10 @@ impl ThinkingDialogFocus {
     }
 }
 
-const FALLBACK_EFFORT_VALUES: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh"];
-const FALLBACK_SUMMARY_VALUES: &[&str] = &["auto", "concise", "detailed"];
-
 /// Pending thinking settings dialog state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThinkingDialogState {
+    supported: bool,
     visible: bool,
     effort: Option<String>,
     summary: Option<String>,
@@ -50,17 +48,16 @@ impl ThinkingDialogState {
             |reasoning| reasoning.source,
         );
         Self {
+            supported: reasoning.is_some(),
             visible,
             effort: status.reasoning_effort.clone(),
             summary: status.reasoning_summary.clone(),
-            effort_values: reasoning_values_with_fallback(
-                reasoning.map(|reasoning| reasoning.effort_values.as_slice()),
-                FALLBACK_EFFORT_VALUES,
-            ),
-            summary_values: reasoning_values_with_fallback(
-                reasoning.map(|reasoning| reasoning.summary_values.as_slice()),
-                FALLBACK_SUMMARY_VALUES,
-            ),
+            effort_values: reasoning
+                .map(|reasoning| reasoning.effort_values.clone())
+                .unwrap_or_default(),
+            summary_values: reasoning
+                .map(|reasoning| reasoning.summary_values.clone())
+                .unwrap_or_default(),
             default_effort: reasoning.and_then(|reasoning| reasoning.default_effort.clone()),
             default_summary: reasoning.and_then(|reasoning| reasoning.default_summary.clone()),
             source,
@@ -78,6 +75,12 @@ impl ThinkingDialogState {
         let mut state = Self::new(visible, status);
         state.focused_row = focus.row();
         state
+    }
+
+    /// Return whether the current model advertises reasoning support.
+    #[must_use]
+    pub const fn supported(&self) -> bool {
+        self.supported
     }
 
     /// Return whether reasoning display is enabled.
@@ -164,8 +167,12 @@ impl ThinkingDialogState {
     pub fn cycle_focused(&mut self) {
         match self.focused_row {
             0 => self.visible = !self.visible,
-            1 => self.effort = next_value(self.effort.as_deref(), &self.effort_values),
-            2 => self.summary = next_value(self.summary.as_deref(), &self.summary_values),
+            1 if self.supported => {
+                self.effort = next_value(self.effort.as_deref(), &self.effort_values);
+            }
+            2 if self.supported => {
+                self.summary = next_value(self.summary.as_deref(), &self.summary_values);
+            }
             _ => {}
         }
     }
@@ -183,13 +190,4 @@ fn next_value(current: Option<&str>, values: &[String]) -> Option<String> {
         .and_then(|current| values.iter().position(|value| value == current))
         .map_or(0, |index| index.saturating_add(1) % values.len());
     values.get(next_index).cloned()
-}
-
-fn reasoning_values_with_fallback(values: Option<&[String]>, fallback: &[&str]) -> Vec<String> {
-    let values = values.unwrap_or_default();
-    if values.is_empty() {
-        fallback.iter().map(|value| (*value).to_owned()).collect()
-    } else {
-        values.to_vec()
-    }
 }

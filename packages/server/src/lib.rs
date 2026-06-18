@@ -549,6 +549,68 @@ fn model_metadata_override(
     }
 }
 
+fn model_reasoning_override(
+    context: &bcode_model::ProviderRequestContext,
+    model_id: &str,
+) -> Option<bcode_model::ModelReasoningInfo> {
+    let prefix = format!("model_metadata.{model_id}.reasoning.");
+    let effort_values = context
+        .settings
+        .get(&format!("{prefix}effort_values"))
+        .map_or_else(Vec::new, |value| split_config_values(value));
+    let summary_values = context
+        .settings
+        .get(&format!("{prefix}summary_values"))
+        .map_or_else(Vec::new, |value| split_config_values(value));
+    let default_effort = non_empty_setting(context, &format!("{prefix}default_effort"));
+    let default_summary = non_empty_setting(context, &format!("{prefix}default_summary"));
+    let visible_summary_supported =
+        bool_setting(context, &format!("{prefix}visible_summary_supported"));
+    let raw_reasoning_supported =
+        bool_setting(context, &format!("{prefix}raw_reasoning_supported"));
+
+    (!effort_values.is_empty()
+        || !summary_values.is_empty()
+        || default_effort.is_some()
+        || default_summary.is_some()
+        || visible_summary_supported.is_some()
+        || raw_reasoning_supported.is_some())
+    .then(|| bcode_model::ModelReasoningInfo {
+        effort_values,
+        default_effort,
+        visible_summary_supported: visible_summary_supported.unwrap_or_default(),
+        summary_values,
+        default_summary,
+        raw_reasoning_supported: raw_reasoning_supported.unwrap_or_default(),
+        source: bcode_model::ModelReasoningCapabilitySource::ConfigOverride,
+    })
+}
+
+fn split_config_values(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn non_empty_setting(context: &bcode_model::ProviderRequestContext, key: &str) -> Option<String> {
+    context
+        .settings
+        .get(key)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn bool_setting(context: &bcode_model::ProviderRequestContext, key: &str) -> Option<bool> {
+    context
+        .settings
+        .get(key)
+        .and_then(|value| value.parse::<bool>().ok())
+}
+
 #[derive(Debug, Clone)]
 struct TraceStore {
     root: PathBuf,
@@ -5981,6 +6043,8 @@ fn reasoning_capabilities_from_config(
 ) -> Option<bcode_model::ModelReasoningInfo> {
     (!reasoning.effort_values.is_empty()
         || !reasoning.summary_values.is_empty()
+        || reasoning.default_effort.is_some()
+        || reasoning.default_summary.is_some()
         || reasoning.visible_summary_supported.is_some()
         || reasoning.raw_reasoning_supported.is_some())
     .then(|| bcode_model::ModelReasoningInfo {
@@ -6161,13 +6225,16 @@ async fn model_status_for_selection(
     } else {
         model.as_ref().and_then(|model| model.metadata_source)
     };
+    let reasoning_override = model_id
+        .as_deref()
+        .and_then(|model_id| model_reasoning_override(&selection.provider_context, model_id));
     bcode_ipc::SessionModelStatus {
         provider_plugin_id: selection.provider_plugin_id,
         model_id,
         context_window,
         max_output_tokens,
-        reasoning: selection
-            .reasoning_capabilities
+        reasoning: reasoning_override
+            .or(selection.reasoning_capabilities)
             .or_else(|| model.as_ref().and_then(|model| model.reasoning.clone())),
         reasoning_effort: selection.reasoning_effort,
         reasoning_summary: selection.reasoning_summary,
@@ -10228,17 +10295,33 @@ async fn build_model_turn_request(
     state
         .metrics
         .record_histogram("model.context.tool_count", tools.len() as u64);
+    let model_id = model_id_for_provider_request(selected_model_id);
+    let reasoning_capabilities = resolve_model_reasoning_info(
+        state,
+        provider_plugin_id,
+        selected_model_id,
+        &selection.provider_context,
+    )
+    .await;
     let parameters_timer = state.metrics.timer();
     let parameters = {
         let mut p = ModelParameters::default();
         if let Some(level) = &selection.thinking_level {
             p.reasoning_effort = Some(*level);
         }
-        if let Some(effort) = &selection.reasoning_effort {
-            p.reasoning_effort_value = Some(effort.clone());
-        }
-        if let Some(summary) = &selection.reasoning_summary {
-            p.reasoning_summary = Some(summary.clone());
+        if let Some(reasoning) = reasoning_capabilities.as_ref() {
+            if let Some(effort) = supported_reasoning_value(
+                selection.reasoning_effort.as_deref(),
+                &reasoning.effort_values,
+            ) {
+                p.reasoning_effort_value = Some(effort.to_owned());
+            }
+            if let Some(summary) = supported_reasoning_value(
+                selection.reasoning_summary.as_deref(),
+                &reasoning.summary_values,
+            ) {
+                p.reasoning_summary = Some(summary.to_owned());
+            }
         }
         p
     };
@@ -10246,7 +10329,6 @@ async fn build_model_turn_request(
         "model.request_build.parameters_duration_ms",
         parameters_timer.elapsed_ms(),
     );
-    let model_id = model_id_for_provider_request(selected_model_id);
     let projection_timer = state.metrics.timer();
     let projection = ConversationProjection::new(
         session_id,
@@ -10315,6 +10397,61 @@ fn insert_reasoning_metadata(
     if let Some(summary) = &parameters.reasoning_summary {
         metadata.insert("reasoning_summary".to_string(), summary.clone());
     }
+}
+
+fn supported_reasoning_value<'a>(
+    requested: Option<&'a str>,
+    supported: &[String],
+) -> Option<&'a str> {
+    let requested = requested?.trim();
+    if requested.is_empty() {
+        return None;
+    }
+    (supported.is_empty() || supported.iter().any(|value| value == requested)).then_some(requested)
+}
+
+async fn resolve_model_reasoning_info(
+    state: &ServerState,
+    provider_plugin_id: Option<&str>,
+    selected_model_id: Option<&str>,
+    provider_context: &bcode_model::ProviderRequestContext,
+) -> Option<bcode_model::ModelReasoningInfo> {
+    if let Some(reasoning) =
+        selected_model_id.and_then(|model_id| model_reasoning_override(provider_context, model_id))
+    {
+        return Some(reasoning);
+    }
+    if let Some(reasoning) = resolve_model_reasoning_info_from_provider(
+        state,
+        provider_plugin_id,
+        selected_model_id,
+        provider_context.clone(),
+    )
+    .await
+    {
+        return Some(reasoning);
+    }
+    state.selected_reasoning_capabilities.clone()
+}
+
+async fn resolve_model_reasoning_info_from_provider(
+    state: &ServerState,
+    provider_plugin_id: Option<&str>,
+    selected_model_id: Option<&str>,
+    provider_context: bcode_model::ProviderRequestContext,
+) -> Option<bcode_model::ModelReasoningInfo> {
+    let models = invoke_model_provider_json_blocking::<_, ModelList>(
+        state,
+        provider_plugin_id.map(ToOwned::to_owned),
+        OP_MODELS,
+        bcode_model::ModelListRequest {
+            provider_context,
+            selected_model_id: selected_model_id.map(ToOwned::to_owned),
+        },
+    )
+    .await
+    .ok()?;
+    select_model_info(&models.models, selected_model_id).and_then(|model| model.reasoning)
 }
 
 fn insert_model_cache_metadata(

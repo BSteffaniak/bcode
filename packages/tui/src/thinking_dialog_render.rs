@@ -60,6 +60,12 @@ fn rows(state: &ThinkingDialogState, theme: TuiTheme) -> Vec<Line> {
         "Control what reasoning is requested and whether provider-visible reasoning is shown.",
         Style::new().fg(Color::BrightWhite).bg(MODAL_BG),
     )]));
+    if !state.supported() {
+        rows.push(Line::from_spans(vec![Span::styled(
+            "This model does not advertise reasoning support. Add a model metadata override to enable it.",
+            Style::new().fg(Color::Yellow).bg(MODAL_BG),
+        )]));
+    }
     rows.push(modal_blank_line());
     rows.push(setting_row(
         state.focused_row() == 0,
@@ -71,7 +77,11 @@ fn rows(state: &ThinkingDialogState, theme: TuiTheme) -> Vec<Line> {
     rows.push(setting_row(
         state.focused_row() == 1,
         "Reasoning effort",
-        state.effective_effort_label(),
+        if state.supported() {
+            state.effective_effort_label()
+        } else {
+            "unsupported"
+        },
         Some(&values_help(
             state.effort_values(),
             state.effort_values_source(),
@@ -81,7 +91,11 @@ fn rows(state: &ThinkingDialogState, theme: TuiTheme) -> Vec<Line> {
     rows.push(setting_row(
         state.focused_row() == 2,
         "Reasoning summary",
-        state.effective_summary_label(),
+        if state.supported() {
+            state.effective_summary_label()
+        } else {
+            "unsupported"
+        },
         Some(&values_help(
             state.summary_values(),
             state.summary_values_source(),

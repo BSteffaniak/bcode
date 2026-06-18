@@ -511,13 +511,8 @@ fn header_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
             false,
         )
         .required(app.display_agent_id().to_owned(), accent, false)
+        .required(app.model_header_label(), Style::new(), false)
         .required(session_title, Style::new(), true)
-        .optional(
-            format!("model {}", app.selected_model_id().unwrap_or("default")),
-            Style::new(),
-            80,
-            false,
-        )
         .optional(
             format!(
                 "provider {}",
@@ -525,12 +520,6 @@ fn header_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
             ),
             accent,
             50,
-            false,
-        )
-        .optional(
-            format!("thinking {}", app.thinking_label()),
-            muted,
-            30,
             false,
         );
 

@@ -4141,6 +4141,10 @@ fn thinking_label_uses_effective_values() {
         app.thinking_label(),
         "shown · effort: medium · summary: detailed"
     );
+    assert_eq!(
+        app.model_header_label(),
+        "model default (reasoning: medium)"
+    );
 }
 
 #[test]
@@ -4220,7 +4224,7 @@ fn thinking_dialog_can_start_focused_on_effort_or_summary() {
 }
 
 #[test]
-fn thinking_dialog_cycles_fallback_values_when_provider_values_are_unknown() {
+fn thinking_dialog_does_not_cycle_when_reasoning_is_unsupported() {
     let status = bcode_ipc::SessionModelStatus {
         provider_plugin_id: None,
         model_id: None,
@@ -4239,18 +4243,12 @@ fn thinking_dialog_cycles_fallback_values_when_provider_values_are_unknown() {
 
     dialog.focus_next();
     dialog.cycle_focused();
-    assert_eq!(dialog.effort(), Some("none"));
-    assert_eq!(
-        dialog.effort_values_source(),
-        bcode_model::ModelReasoningCapabilitySource::GenericFallback
-    );
+    assert_eq!(dialog.effort(), None);
+    assert!(dialog.effort_values().is_empty());
     dialog.focus_next();
     dialog.cycle_focused();
-    assert_eq!(dialog.summary(), Some("auto"));
-    assert_eq!(
-        dialog.summary_values_source(),
-        bcode_model::ModelReasoningCapabilitySource::GenericFallback
-    );
+    assert_eq!(dialog.summary(), None);
+    assert!(dialog.summary_values().is_empty());
 }
 
 #[test]
