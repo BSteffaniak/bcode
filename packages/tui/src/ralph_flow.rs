@@ -1161,6 +1161,16 @@ pub async fn show_status(
 /// Prepare the latest Ralph loop through the server-side runner API.
 pub async fn run_loop(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Result<(), TuiError> {
     let repo_root = current_repo_root(chat)?;
+    if let Some(draft) = active_unapplied_rebuild_draft(&repo_root)? {
+        chat.app.push_system_note(format!(
+            "Ralph rebuild draft is active\n* Draft: {}\n* Status: {}\n* Target loop: {}\n* Next: View/Revise/Approve/Apply the rebuild draft before preparing another autonomous run. This prevents running against stale loop context.",
+            draft.draft_id, draft.status, draft.loop_name
+        ));
+        chat.app.set_status(
+            "active rebuild draft must be applied or canceled before running".to_owned(),
+        );
+        return Ok(());
+    }
     let response = services
         .client
         .run_ralph_loop(RalphRunRequest {
@@ -1208,6 +1218,61 @@ pub async fn approve_run(
     Ok(())
 }
 
+fn format_run_detail(run: &RalphRunSummary) -> String {
+    let stop_reason = run
+        .stop_reason
+        .as_deref()
+        .map_or_else(String::new, |reason| format!(" ({reason})"));
+    let error = run
+        .error_message
+        .as_deref()
+        .map_or_else(String::new, |message| {
+            format!(
+                "\n  Error: {}\n  Recovery: {}",
+                compact_failure_message(message),
+                recovery_hint(run.stop_reason.as_deref(), Some(message))
+            )
+        });
+    format!(
+        "* {} — {}{}{}\n  Session: {}",
+        run.run_id,
+        run.status,
+        stop_reason,
+        error,
+        run.session_id.as_deref().unwrap_or("<none>")
+    )
+}
+
+fn compact_failure_message(message: &str) -> String {
+    const MAX_LEN: usize = 240;
+    let single_line = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.len() <= MAX_LEN {
+        single_line
+    } else {
+        format!("{}…", &single_line[..MAX_LEN])
+    }
+}
+
+fn recovery_hint(stop_reason: Option<&str>, error_message: Option<&str>) -> &'static str {
+    let reason = stop_reason.unwrap_or_default().to_ascii_lowercase();
+    let message = error_message.unwrap_or_default().to_ascii_lowercase();
+    if reason.contains("daemon restart") || message.contains("daemon restart") {
+        "use Resume safely; if resume is unavailable, audit/replan before retrying"
+    } else if message.contains("rate") || message.contains("429") {
+        "wait and retry, or switch provider/model if the limit persists"
+    } else if message.contains("context")
+        && (message.contains("large") || message.contains("length"))
+    {
+        "compact/replan context, then retry the run"
+    } else if message.contains("permission") || message.contains("denied") {
+        "grant/approve the required permission, then resume or retry"
+    } else if reason.contains("model_turn_failed") {
+        "open Iterations for turn details, then Retry/Resume or Audit/Replan"
+    } else {
+        "open Iterations for details; retry only after the cause is understood"
+    }
+}
+
 /// List recent Ralph runs for the current repository.
 pub async fn list_runs(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Result<(), TuiError> {
     let repo_root = current_repo_root(chat)?;
@@ -1229,16 +1294,7 @@ pub async fn list_runs(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Res
         response
             .runs
             .iter()
-            .map(|run| {
-                format!(
-                    "* {} — {}{}",
-                    run.run_id,
-                    run.status,
-                    run.stop_reason
-                        .as_deref()
-                        .map_or_else(String::new, |reason| format!(" ({reason})"))
-                )
-            })
+            .map(format_run_detail)
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -1280,14 +1336,24 @@ pub async fn list_iterations(
             .iterations
             .iter()
             .map(|iteration| {
-                format!(
-                    "* #{} — {}{}",
-                    iteration.iteration_number,
-                    iteration.status,
+                let stop_reason = iteration
+                    .stop_reason
+                    .as_deref()
+                    .map_or_else(String::new, |reason| format!(" ({reason})"));
+                let error =
                     iteration
-                        .stop_reason
+                        .error_message
                         .as_deref()
-                        .map_or_else(String::new, |reason| format!(" ({reason})"))
+                        .map_or_else(String::new, |message| {
+                            format!(
+                                "\n  Error: {}\n  Recovery: {}",
+                                compact_failure_message(message),
+                                recovery_hint(iteration.stop_reason.as_deref(), Some(message))
+                            )
+                        });
+                format!(
+                    "* #{} — {}{}{}",
+                    iteration.iteration_number, iteration.status, stop_reason, error
                 )
             })
             .collect::<Vec<_>>()
@@ -1370,7 +1436,7 @@ fn format_status_note(
         || "none".to_owned(),
         |run| {
             format!(
-                "{} ({}){}{}{}",
+                "{} ({}){}{}{}{}",
                 run.run_id,
                 run.status,
                 run.runtime_work_id
@@ -1379,6 +1445,15 @@ fn format_status_note(
                 run.stop_reason
                     .as_deref()
                     .map_or_else(String::new, |reason| format!(", stop: {reason}")),
+                run.error_message
+                    .as_deref()
+                    .map_or_else(String::new, |message| {
+                        format!(
+                            ", error: {}, recovery: {}",
+                            compact_failure_message(message),
+                            recovery_hint(run.stop_reason.as_deref(), Some(message))
+                        )
+                    }),
                 if run.cancel_requested {
                     ", cancel requested"
                 } else {
@@ -1469,6 +1544,20 @@ fn current_repo_root(chat: &ActiveChat) -> Result<std::path::PathBuf, TuiError> 
         .working_directory()
         .map_or_else(std::env::current_dir, |path| Ok(path.to_path_buf()))
         .map_err(TuiError::Io)
+}
+
+fn active_unapplied_rebuild_draft(
+    repo_root: &std::path::Path,
+) -> Result<Option<ralph_state::RalphSetupDraft>, TuiError> {
+    Ok(ralph_state::latest_setup_draft(repo_root)?
+        .filter(|draft| draft.mode == ralph_state::RalphSetupDraftMode::RebuildExistingLoop)
+        .filter(|draft| {
+            !matches!(
+                draft.status,
+                ralph_state::RalphSetupDraftStatus::Canceled
+                    | ralph_state::RalphSetupDraftStatus::ConvertedToLoop
+            )
+        }))
 }
 
 /// Start the Ralph loop setup flow.

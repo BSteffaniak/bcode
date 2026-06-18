@@ -2981,6 +2981,23 @@ fn ralph_run_failure_from_model_completion(
     {
         return Some(("blocked", "user_question", message));
     }
+    if lower.contains("rate") || lower.contains("429") {
+        return Some(("blocked", "rate_limited", message));
+    }
+    if lower.contains("context") && (lower.contains("large") || lower.contains("length")) {
+        return Some(("blocked", "context_too_large", message));
+    }
+    if lower.contains("provider") || lower.contains("unavailable") {
+        return Some(("blocked", "provider_unavailable", message));
+    }
+    if lower.contains("tool") && (lower.contains("failed") || lower.contains("error")) {
+        return Some(("blocked", "tool_error", message));
+    }
+    if lower.contains("session")
+        && (lower.contains("missing") || lower.contains("invalid") || lower.contains("state"))
+    {
+        return Some(("blocked", "session_state_error", message));
+    }
     match completion.outcome {
         ModelTurnOutcome::Cancelled => Some(("stopped", "cancelled", message)),
         ModelTurnOutcome::ProviderUnavailable => Some(("blocked", "provider_unavailable", message)),

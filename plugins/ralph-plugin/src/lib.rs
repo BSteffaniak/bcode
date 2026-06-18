@@ -482,6 +482,15 @@ impl RalphHomeSurface {
                 )),
             );
             y = y.saturating_add(1);
+            if let Some(message) = &run.error_message {
+                write_line(
+                    frame,
+                    area,
+                    y,
+                    Line::from(format!("    error: {}", compact_message(message))),
+                );
+                y = y.saturating_add(1);
+            }
         }
         y
     }
@@ -779,6 +788,16 @@ impl PluginTuiSurface for RalphHomeSurface {
             },
             _ => PluginTuiAction::None,
         }
+    }
+}
+
+fn compact_message(message: &str) -> String {
+    const MAX_LEN: usize = 140;
+    let single_line = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.len() <= MAX_LEN {
+        single_line
+    } else {
+        format!("{}…", &single_line[..MAX_LEN])
     }
 }
 
