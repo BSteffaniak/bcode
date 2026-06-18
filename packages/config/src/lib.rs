@@ -1095,7 +1095,7 @@ impl Default for TuiThemeConfig {
 }
 
 const fn default_tui_accent_transition_ms() -> u64 {
-    450
+    220
 }
 
 /// Terminal UI accent color transition behavior.
