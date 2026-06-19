@@ -221,20 +221,25 @@ enum EffectKey {
 }
 
 /// Queue of effects requested before the chat loop runner can start them.
+///
+/// The queue keeps only the latest pending request for each effect key. This
+/// mirrors runner semantics and avoids spawning then immediately aborting stale
+/// work when multiple state transitions request the same background effect
+/// before the loop has a chance to drain the queue.
 #[derive(Default)]
 pub struct TuiEffectQueue {
-    effects: Vec<TuiEffect>,
+    effects: BTreeMap<EffectKey, TuiEffect>,
 }
 
 impl TuiEffectQueue {
     /// Queue an effect for the chat loop effect runner.
     pub fn push(&mut self, effect: TuiEffect) {
-        self.effects.push(effect);
+        self.effects.insert(effect.key(), effect);
     }
 
     /// Drain queued effects.
-    fn drain(&mut self) -> std::vec::Drain<'_, TuiEffect> {
-        self.effects.drain(..)
+    fn drain(&mut self) -> Vec<TuiEffect> {
+        std::mem::take(&mut self.effects).into_values().collect()
     }
 }
 
