@@ -290,6 +290,7 @@ pub struct BmuxApp {
     pending_transcript_top_anchor_sequence: Option<u64>,
     older_history: OlderHistoryState,
     activity: ActivityState,
+    daemon_connection: DaemonConnectionState,
     status: String,
     key_hints: String,
     jump_to_latest_key_label: String,
@@ -297,6 +298,26 @@ pub struct BmuxApp {
     exit: ExitState,
     cursor: CursorBlink,
     live_preview_frame: LivePreviewFrameState,
+}
+
+/// Daemon connection state used to describe startup readiness in the status chrome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DaemonConnectionState {
+    /// The TUI has not yet completed a daemon-backed request.
+    #[default]
+    Connecting,
+    /// At least one daemon-backed request completed successfully.
+    Connected,
+    /// A daemon-backed startup request failed before any success was observed.
+    Unavailable,
+}
+
+impl DaemonConnectionState {
+    /// Return whether daemon-backed TUI services are connected.
+    #[must_use]
+    pub const fn is_connected(self) -> bool {
+        matches!(self, Self::Connected)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -464,7 +485,8 @@ impl BmuxApp {
             pending_transcript_top_anchor_sequence: None,
             older_history: OlderHistoryState::new(history, has_older_history),
             activity: ActivityState::Idle,
-            status: String::from("TUI connected. Enter submits; Esc/Ctrl-C exits."),
+            daemon_connection: DaemonConnectionState::Connecting,
+            status: String::from("Connecting to daemon… Enter submits; Esc/Ctrl-C exits."),
             key_hints: String::from("enter send · escape interrupt · ctrl+d exit · ctrl+p palette"),
             jump_to_latest_key_label: "ctrl+end".to_owned(),
             tui_config: TuiConfig::default(),
@@ -1134,6 +1156,29 @@ impl BmuxApp {
     #[must_use]
     pub const fn activity(&self) -> &ActivityState {
         &self.activity
+    }
+
+    /// Return daemon connection state for startup/readiness chrome.
+    #[must_use]
+    pub const fn daemon_connection(&self) -> DaemonConnectionState {
+        self.daemon_connection
+    }
+
+    /// Store daemon connection state for startup/readiness chrome.
+    pub const fn set_daemon_connection(&mut self, daemon_connection: DaemonConnectionState) {
+        self.daemon_connection = daemon_connection;
+    }
+
+    /// Mark that at least one daemon-backed request has completed successfully.
+    pub const fn mark_daemon_connected(&mut self) {
+        self.daemon_connection = DaemonConnectionState::Connected;
+    }
+
+    /// Mark daemon-backed services as unavailable if no successful request has completed yet.
+    pub const fn mark_daemon_unavailable(&mut self) {
+        if !self.daemon_connection.is_connected() {
+            self.daemon_connection = DaemonConnectionState::Unavailable;
+        }
     }
 
     /// Return the current status line.

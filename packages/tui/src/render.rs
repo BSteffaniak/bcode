@@ -26,7 +26,7 @@ use bmux_tui::style::{Color, Modifier};
 use bmux_tui_components::text_input::TextInputControl;
 
 use super::activity::ActivityState;
-use super::app::{BmuxApp, LiveToolPreviewState, composer_policy};
+use super::app::{BmuxApp, DaemonConnectionState, LiveToolPreviewState, composer_policy};
 use super::diff_extract::FileEditTranscript;
 use super::pending_submission::{PendingSubmission, PendingSubmissionState};
 use super::tool_present::{
@@ -3106,7 +3106,7 @@ impl ChromeLine {
 fn statusline_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
     let muted = Style::new().fg(Color::BrightBlack);
     let mut line = ChromeLine::new(" · ", muted).required(
-        activity_label(app.activity()),
+        activity_label(app.activity(), app.daemon_connection()),
         Style::new().fg(theme.accent),
         true,
     );
@@ -3213,9 +3213,13 @@ fn truncate_chrome_part(part: &str, max_width: usize) -> String {
     format!("…{suffix}")
 }
 
-fn activity_label(activity: &ActivityState) -> String {
+fn activity_label(activity: &ActivityState, daemon_connection: DaemonConnectionState) -> String {
     match activity {
-        ActivityState::Idle => "ready".to_owned(),
+        ActivityState::Idle => match daemon_connection {
+            DaemonConnectionState::Connecting => format!("{} connecting…", spinner_frame()),
+            DaemonConnectionState::Unavailable => "daemon unavailable".to_owned(),
+            DaemonConnectionState::Connected => "ready".to_owned(),
+        },
         ActivityState::Thinking => format!("{} thinking", spinner_frame()),
         ActivityState::Compacting { detail } => {
             format!("{} compacting · {detail}", spinner_frame())

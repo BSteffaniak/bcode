@@ -116,6 +116,8 @@ pub enum TuiEffectResult {
     },
     /// Draft-session status hydration completed.
     DraftStatusLoaded {
+        /// Whether at least one daemon-backed request completed successfully.
+        daemon_connected: bool,
         /// Default model status, if available.
         model: Option<bcode_ipc::SessionModelStatus>,
         /// Restored composer draft, if available.
@@ -125,6 +127,8 @@ pub enum TuiEffectResult {
     },
     /// Attached session status hydration completed.
     SessionStatusLoaded {
+        /// Whether at least one daemon-backed request completed successfully.
+        daemon_connected: bool,
         /// Session that was hydrated.
         session_id: SessionId,
         /// Model status, if available.
@@ -519,6 +523,7 @@ async fn load_draft_status(
     let (composer_draft, draft_error) =
         optional_client_result(client.composer_draft(draft_scope)).await;
     TuiEffectResult::DraftStatusLoaded {
+        daemon_connected: model.is_some() || composer_draft.is_some(),
         model,
         composer_draft: composer_draft.flatten(),
         error: model_error.or(draft_error),
@@ -533,6 +538,7 @@ async fn load_session_status(client: &BcodeClient, session_id: SessionId) -> Tui
         optional_client_result(client.list_runtime_work(session_id)),
     );
     TuiEffectResult::SessionStatusLoaded {
+        daemon_connected: model.is_some() || active_skills.is_some() || runtime_work.is_some(),
         session_id,
         model,
         active_skill_count: active_skills.map(|skills| skills.len()),
