@@ -1015,15 +1015,16 @@ async fn stream_chat_completion_with_failover(
         }
     }
     let mut last_error = None;
-    for candidate in available_candidates
-        .into_iter()
-        .chain(cooldown_candidates.into_iter())
-    {
-        if skipped_profiles
-            .iter()
-            .any(|profile| Some(profile) == candidate.profile.as_ref())
+    let mut warned_cooldown_profiles = BTreeSet::new();
+    for candidate in available_candidates {
+        let is_cooldown_candidate = cooldown_candidates.iter().any(|cooldown_candidate| {
+            cooldown_candidate.profile.as_ref() == candidate.profile.as_ref()
+        });
+        if is_cooldown_candidate
             && let Some(profile) = &candidate.profile
+            && !warned_cooldown_profiles.contains(profile)
         {
+            warned_cooldown_profiles.insert(profile.clone());
             turn.push(ProviderTurnEvent::Warning {
                 message: format!(
                     "OpenAI subscription auth profile '{profile}' is on cooldown; probing it because no earlier subscription completed the request."
@@ -1035,7 +1036,15 @@ async fn stream_chat_completion_with_failover(
         candidate_request.provider_context.auth = Some(candidate.auth.clone());
         candidate_request.provider_context.env = candidate.env.clone();
         match stream_chat_completion_inner(&candidate_request, turn).await {
-            Ok(outcome) => return Ok(outcome),
+            Ok(outcome) => {
+                if let Some(profile) = candidate.profile.as_deref() {
+                    auth_pool_state::clear_profile_quota_limited(
+                        request.provider_context.auth_pool.as_deref(),
+                        Some(profile),
+                    );
+                }
+                return Ok(outcome);
+            }
             Err(error) if is_subscription_quota_error(&error) => {
                 if let Some(profile) = &candidate.profile {
                     auth_pool_state::mark_profile_quota_limited(

@@ -51,6 +51,16 @@ pub fn mark_profile_quota_limited(
     save_state(&state);
 }
 
+pub fn clear_profile_quota_limited(pool: Option<&str>, profile: Option<&str>) {
+    let Some(key) = state_key(pool, profile) else {
+        return;
+    };
+    let mut state = load_state();
+    if state.entries.remove(&key).is_some() {
+        save_state(&state);
+    }
+}
+
 fn state_key(pool: Option<&str>, profile: Option<&str>) -> Option<String> {
     let pool = pool.filter(|value| !value.trim().is_empty())?;
     let profile = profile.filter(|value| !value.trim().is_empty())?;
