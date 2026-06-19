@@ -32,6 +32,14 @@ bcode auth pool reset-cooldown openai openai
 bcode auth pool reset-cooldown openai
 ```
 
+Refresh an existing secondary subscription token by passing its profile name:
+
+```sh
+bcode login openai --add-subscription --profile openai-2
+```
+
+Without `--profile`, `--add-subscription` registers the next new runtime profile, such as `openai-3`.
+
 ## Declarative config
 
 The CLI writes ordinary declarative config. You can also author it directly:

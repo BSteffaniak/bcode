@@ -745,7 +745,8 @@ enum LoginCommand {
         /// Use device-code login. Requires `Codex` device authorization enabled in `ChatGPT` settings.
         #[arg(long)]
         headless: bool,
-        /// Add this login as another `ChatGPT` subscription in the `OpenAI` failover auth pool.
+        /// Add this login as another `ChatGPT` subscription in the runtime `OpenAI` failover pool.
+        /// Use `--profile openai-2` to refresh an existing secondary subscription.
         #[arg(long)]
         add_subscription: bool,
         #[arg(long)]
@@ -1939,8 +1940,22 @@ fn resolve_add_subscription_login_target(
     explicit_vault: Option<PathBuf>,
 ) -> LoginTarget {
     let config = bcode_config::load_config().unwrap_or_default();
-    let profile = explicit_profile.unwrap_or_else(|| next_subscription_profile_name(&config));
-    let vault_path = explicit_vault.unwrap_or_else(bcode_config::default_auth_vault_path);
+    let registry = bcode_config::load_runtime_auth_subscriptions();
+    let profile = explicit_profile.map_or_else(
+        || next_subscription_profile_name(&config, &registry),
+        |profile| {
+            if runtime_subscription_profile_exists(&registry, "openai", &profile) {
+                println!(
+                    "Refreshing existing OpenAI subscription auth profile '{profile}' in runtime auth state."
+                );
+            }
+            profile
+        },
+    );
+    let vault_path = explicit_vault.unwrap_or_else(|| {
+        runtime_subscription_vault(&registry, "openai", &profile)
+            .unwrap_or_else(bcode_config::default_auth_vault_path)
+    });
     LoginTarget {
         auth_profile: profile.clone(),
         storage_profile: profile,
@@ -1952,13 +1967,51 @@ fn resolve_add_subscription_login_target(
     }
 }
 
-fn next_subscription_profile_name(config: &bcode_config::BcodeConfig) -> String {
-    if !config.auth.profiles.contains_key("openai") {
+fn runtime_subscription_profile_exists(
+    registry: &bcode_config::RuntimeAuthSubscriptions,
+    pool: &str,
+    profile: &str,
+) -> bool {
+    registry.pools.get(pool).is_some_and(|pool| {
+        pool.profiles
+            .iter()
+            .any(|candidate| candidate.auth_profile == profile)
+    })
+}
+
+fn runtime_subscription_vault(
+    registry: &bcode_config::RuntimeAuthSubscriptions,
+    pool: &str,
+    profile: &str,
+) -> Option<PathBuf> {
+    registry
+        .pools
+        .get(pool)?
+        .profiles
+        .iter()
+        .find(|candidate| candidate.auth_profile == profile)
+        .map(|candidate| candidate.vault.clone())
+}
+
+fn next_subscription_profile_name(
+    config: &bcode_config::BcodeConfig,
+    registry: &bcode_config::RuntimeAuthSubscriptions,
+) -> String {
+    if !config.auth.profiles.contains_key("openai")
+        && !runtime_subscription_profile_exists(registry, "openai", "openai")
+    {
         return "openai".to_string();
     }
     for index in 2.. {
         let candidate = format!("openai-{index}");
-        if !config.auth.profiles.contains_key(&candidate) {
+        if !config.auth.profiles.contains_key(&candidate)
+            && !runtime_subscription_profile_exists(registry, "openai", &candidate)
+        {
+            if index > 2 {
+                println!(
+                    "Adding new OpenAI subscription auth profile '{candidate}'. To refresh an existing subscription instead, pass `--profile openai-2` (or the profile shown by `bcode auth pool status openai`)."
+                );
+            }
             return candidate;
         }
     }
