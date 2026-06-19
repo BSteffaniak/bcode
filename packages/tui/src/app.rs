@@ -307,6 +307,8 @@ pub enum DaemonConnectionState {
     /// The TUI has not yet completed a daemon-backed request.
     #[default]
     Connecting,
+    /// The daemon is being started for an explicit foreground action.
+    Starting,
     /// At least one daemon-backed request completed successfully.
     Connected,
     /// A daemon-backed request failed after a previous success.

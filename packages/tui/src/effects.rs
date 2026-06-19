@@ -2,21 +2,44 @@
 
 use std::collections::BTreeMap;
 
-use bcode_client::{BcodeClient, ClientError};
-use bcode_ipc::{ComposerDraftScope, PermissionSummary};
+use bcode_client::{BcodeClient, ClientError, MessageAcceptance};
+use bcode_ipc::{ComposerDraftScope, PermissionSummary, PromptPlacement};
 use bcode_session_models::{
     ProjectionWindowRequest, SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage,
-    SessionHistoryQuery, SessionId,
+    SessionHistoryQuery, SessionId, SessionSummary,
 };
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::{Duration, timeout};
 
 use super::{
     TuiError, daemon_issue, history_flow,
     session_flow::{self, AgentCatalog},
     slash_palette, thinking_flow,
 };
+
+const TUI_FOREGROUND_ACTION_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Submit-message effect request payload.
+pub struct SubmitMessageRequest {
+    /// Existing session, if already attached.
+    pub session_id: Option<SessionId>,
+    /// Working directory to use when creating a draft session.
+    pub launch_working_directory: std::path::PathBuf,
+    /// Message text to submit.
+    pub message: String,
+    /// Prompt placement semantics.
+    pub placement: PromptPlacement,
+    /// Agent to apply before sending, if any.
+    pub agent_id: Option<String>,
+    /// Reasoning effort to apply before sending.
+    pub reasoning_effort: Option<String>,
+    /// Reasoning summary to apply before sending.
+    pub reasoning_summary: Option<String>,
+    /// Event sender for a newly-created session stream.
+    pub event_sender: mpsc::UnboundedSender<bcode_ipc::Event>,
+}
 
 /// Background work requested by local TUI event handling.
 pub enum TuiEffect {
@@ -77,6 +100,11 @@ pub enum TuiEffect {
         query: String,
         /// Active session, if any.
         session_id: Option<SessionId>,
+    },
+    /// Submit a user message through the daemon-backed session pipeline.
+    SubmitMessage {
+        /// Submit request.
+        request: Box<SubmitMessageRequest>,
     },
     /// Request cancellation of the active turn for a session.
     CancelTurn { session_id: SessionId },
@@ -228,6 +256,13 @@ pub enum TuiEffectResult {
         /// Loaded palette state.
         palette: slash_palette::SlashPalette,
     },
+    /// Submit message completed.
+    SubmitMessage {
+        /// Message text originally submitted.
+        message: String,
+        /// Submit result.
+        result: Box<Result<SubmitMessageResult, ClientError>>,
+    },
     /// Result for active turn cancellation.
     CancelTurn {
         /// Session the request targeted.
@@ -269,6 +304,7 @@ impl TuiEffectResult {
             }
             Self::PermissionList { result } => DaemonObservation::from_client_result(result),
             Self::SaveDraft { result, .. } => DaemonObservation::from_client_result(result),
+            Self::SubmitMessage { result, .. } => DaemonObservation::from_client_result(result),
             Self::CancelTurn { result, .. } => DaemonObservation::from_client_result(result),
             Self::CycleThinkingEffort { result, .. } => {
                 DaemonObservation::from_client_result(result)
@@ -278,6 +314,21 @@ impl TuiEffectResult {
             | Self::SlashPaletteLoaded { .. } => DaemonObservation::None,
         }
     }
+}
+
+/// Submit-message effect success payload.
+#[derive(Debug)]
+pub struct SubmitMessageResult {
+    /// Session that received the message.
+    pub session_id: SessionId,
+    /// Newly-created/attached session summary, if the submit created a session.
+    pub created_session: Option<SessionSummary>,
+    /// Server acceptance for the submitted message.
+    pub acceptance: MessageAcceptance,
+    /// Agent committed during submission.
+    pub committed_agent_id: Option<String>,
+    /// Event stream task for a newly-created session.
+    pub event_task: Option<JoinHandle<()>>,
 }
 
 /// Reasoning effort cycle outcome.
@@ -306,6 +357,7 @@ enum EffectKey {
     PermissionList,
     DraftSave,
     SlashPalette,
+    SubmitMessage(usize),
     CancelTurn(SessionId),
     CycleThinkingEffort(Option<SessionId>),
 }
@@ -484,6 +536,7 @@ impl TuiEffect {
             Self::ListPermissions => EffectKey::PermissionList,
             Self::SaveDraft { .. } => EffectKey::DraftSave,
             Self::LoadSlashPalette { .. } => EffectKey::SlashPalette,
+            Self::SubmitMessage { request } => EffectKey::SubmitMessage(request.message.len()),
             Self::CancelTurn { session_id } => EffectKey::CancelTurn(*session_id),
             Self::CycleThinkingEffort { session_id, .. } => {
                 EffectKey::CycleThinkingEffort(*session_id)
@@ -562,6 +615,7 @@ impl TuiEffect {
                 let palette = slash_palette::SlashPalette::new(&client, session_id, &query).await;
                 TuiEffectResult::SlashPaletteLoaded { query, palette }
             }
+            Self::SubmitMessage { request } => run_submit_message(&client, *request).await,
             Self::CancelTurn { session_id } => TuiEffectResult::CancelTurn {
                 session_id,
                 result: client.cancel_session_turn(session_id).await,
@@ -587,6 +641,90 @@ impl TuiEffect {
             }
         }
     }
+}
+
+async fn run_submit_message(
+    client: &BcodeClient,
+    request: SubmitMessageRequest,
+) -> TuiEffectResult {
+    let message = request.message.clone();
+    TuiEffectResult::SubmitMessage {
+        message,
+        result: Box::new(
+            timeout(
+                TUI_FOREGROUND_ACTION_TIMEOUT,
+                submit_message(client, request),
+            )
+            .await
+            .map_err(|_| ClientError::RequestTimeout {
+                timeout: TUI_FOREGROUND_ACTION_TIMEOUT,
+            })
+            .and_then(std::convert::identity),
+        ),
+    }
+}
+
+async fn submit_message(
+    client: &BcodeClient,
+    request: SubmitMessageRequest,
+) -> Result<SubmitMessageResult, ClientError> {
+    let SubmitMessageRequest {
+        session_id,
+        launch_working_directory,
+        message,
+        placement,
+        agent_id,
+        reasoning_effort,
+        reasoning_summary,
+        event_sender,
+    } = request;
+    let mut created_session = None;
+    let mut event_task = None;
+    let session_id = if let Some(session_id) = session_id {
+        session_id
+    } else {
+        let session = client
+            .create_session_in_working_directory(None, launch_working_directory.clone())
+            .await?;
+        let _ = client
+            .set_composer_draft(
+                ComposerDraftScope::DraftSession {
+                    launch_working_directory,
+                },
+                String::new(),
+            )
+            .await;
+        let (attached, task) =
+            history_flow::attach_session_event_stream(client, session.id, event_sender)
+                .await
+                .map_err(|error| match error {
+                    TuiError::Client(error) => error,
+                    other => ClientError::Server {
+                        code: "tui_session_attach_failed".to_owned(),
+                        message: other.to_string(),
+                    },
+                })?;
+        let session_id = session.id;
+        created_session = Some(attached.session);
+        event_task = Some(task);
+        session_id
+    };
+    if let Some(agent_id) = agent_id.clone() {
+        client.set_session_agent(session_id, agent_id).await?;
+    }
+    client
+        .set_session_reasoning(session_id, reasoning_effort, reasoning_summary)
+        .await?;
+    let acceptance = client
+        .send_user_message(session_id, message, placement)
+        .await?;
+    Ok(SubmitMessageResult {
+        session_id,
+        created_session,
+        acceptance,
+        committed_agent_id: agent_id,
+        event_task,
+    })
 }
 
 async fn optional_client_result<T>(

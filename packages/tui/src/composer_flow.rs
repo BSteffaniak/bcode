@@ -2,11 +2,11 @@
 
 use std::io::Write;
 
-use bcode_client::BcodeClient;
 use bcode_session_models::SessionId;
 
 use super::activity::ActivityState;
-use super::effects::TuiEffect;
+use super::app::DaemonConnectionState;
+use super::effects::{SubmitMessageRequest, TuiEffect};
 use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::ActiveChat;
 use super::{
@@ -260,39 +260,6 @@ async fn handle_slash_command<W: Write>(
     Ok(None)
 }
 
-async fn commit_pending_agent(
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-    session_id: SessionId,
-) -> Result<(), TuiError> {
-    let Some(agent_id) = chat.app.pending_agent_id().map(ToOwned::to_owned) else {
-        return Ok(());
-    };
-    match client.set_session_agent(session_id, agent_id).await {
-        Ok(()) => {
-            let _committed = chat.app.take_pending_agent();
-            Ok(())
-        }
-        Err(error) => {
-            helpers::report_client_issue(&mut chat.app, "agent switch failed", &error);
-            Err(error.into())
-        }
-    }
-}
-
-async fn commit_pending_reasoning(
-    client: &BcodeClient,
-    chat: &ActiveChat,
-    session_id: SessionId,
-) -> Result<(), TuiError> {
-    let effort = chat.app.reasoning_effort().map(ToOwned::to_owned);
-    let summary = chat.app.reasoning_summary().map(ToOwned::to_owned);
-    client
-        .set_session_reasoning(session_id, effort, summary)
-        .await?;
-    Ok(())
-}
-
 /// Submit the staged composer text.
 pub async fn submit_composer<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
@@ -307,7 +274,7 @@ pub async fn submit_composer<W: Write>(
         return Ok(None);
     }
     let slash_resolution = if slash_registry::slash_command_name(&message).is_some() {
-        slash_registry::resolve(services.client, &message)
+        slash_registry::resolve(services.passive_client, &message)
             .await
             .ok()
     } else {
@@ -324,61 +291,26 @@ pub async fn submit_composer<W: Write>(
         );
         return Ok(None);
     }
-    let session_id =
-        match session_flow::persist_draft_session(io.terminal, services.client, chat).await {
-            Ok(session_id) => session_id,
-            Err(TuiError::Client(error)) => {
-                chat.app.restore_pending_submission(&message);
-                helpers::report_client_issue(&mut chat.app, "session creation unavailable", &error);
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
-        };
-    if let Err(error) = commit_pending_agent(services.client, chat, session_id).await {
-        chat.app.restore_pending_submission(&message);
-        chat.app.set_status(format!("agent switch failed: {error}"));
-        return Ok(None);
-    }
-    if let Err(error) = commit_pending_reasoning(services.client, chat, session_id).await {
-        chat.app.restore_pending_submission(&message);
-        chat.app
-            .set_status(format!("thinking settings failed: {error}"));
-        return Ok(None);
-    }
-    match services
-        .client
-        .send_user_message(session_id, message.clone(), placement)
-        .await
-    {
-        Ok(acceptance) => {
-            match acceptance.disposition {
-                bcode_ipc::MessageAcceptanceDisposition::AppliedSteering => {
-                    chat.app.mark_pending_submission_sent();
-                    chat.app.set_status("Steering sent".to_owned());
-                }
-                bcode_ipc::MessageAcceptanceDisposition::QueuedFollowUp
-                | bcode_ipc::MessageAcceptanceDisposition::QueuedTurn => {
-                    chat.app.set_idle();
-                    chat.app
-                        .mark_pending_submission_queued(acceptance.queue_position);
-                    chat.app.set_status(format!(
-                        "Message queued{}",
-                        acceptance
-                            .queue_position
-                            .map_or_else(String::new, |position| format!(" at #{position}"))
-                    ));
-                }
-                bcode_ipc::MessageAcceptanceDisposition::StartedTurn => {
-                    chat.app.mark_pending_submission_sent();
-                    chat.app.set_status("Message sent".to_owned());
-                }
-            }
-            Ok(None)
-        }
-        Err(error) => {
-            chat.app.restore_pending_submission(&message);
-            helpers::report_client_issue(&mut chat.app, "send failed", &error);
-            Ok(None)
-        }
-    }
+    let agent_id = if session_id.is_some() {
+        chat.app.pending_agent_id().map(ToOwned::to_owned)
+    } else {
+        let current = chat.app.current_agent_id().to_owned();
+        (current != "build").then_some(current)
+    };
+    chat.start_effect(TuiEffect::SubmitMessage {
+        request: Box::new(SubmitMessageRequest {
+            session_id,
+            launch_working_directory: std::env::current_dir()?,
+            message,
+            placement,
+            agent_id,
+            reasoning_effort: chat.app.reasoning_effort().map(ToOwned::to_owned),
+            reasoning_summary: chat.app.reasoning_summary().map(ToOwned::to_owned),
+            event_sender: chat.event_sender.clone(),
+        }),
+    });
+    chat.app
+        .set_daemon_connection(DaemonConnectionState::Starting);
+    chat.app.set_status("starting daemon…".to_owned());
+    Ok(None)
 }

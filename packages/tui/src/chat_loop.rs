@@ -3,7 +3,7 @@
 use std::io::Write;
 use std::time::{Duration, Instant, SystemTime};
 
-use bcode_client::{BcodeClient, ClientError};
+use bcode_client::{BcodeClient, ClientError, DaemonAvailability};
 use bcode_config::TuiConfig;
 use bcode_ipc::{ComposerDraftScope, Event as BcodeEvent};
 use bcode_session_models::SessionEventKind;
@@ -272,7 +272,10 @@ pub async fn run_with_client<W: Write>(
     chat: &mut ActiveChat,
     startup_action: super::startup_action::StartupTuiAction,
 ) -> Result<(), TuiError> {
-    let mut loop_state = ChatLoopState::new(client);
+    let passive_client = client
+        .clone()
+        .with_daemon_availability(DaemonAvailability::RequireRunning);
+    let mut loop_state = ChatLoopState::new(&passive_client);
     loop_state.drain_pending_effects(chat);
     sync_chat_key_labels(chat, &settings.keymap);
     let mut draft_autosave = DraftAutosave::new(
@@ -321,6 +324,7 @@ pub async fn run_with_client<W: Write>(
                 };
                 let services = TuiServices {
                     client,
+                    passive_client: &passive_client,
                     keymap: &settings.keymap,
                     theme: render::TuiTheme::for_app(&mut chat.app, Instant::now()),
                 };
@@ -356,6 +360,7 @@ pub async fn run_with_client<W: Write>(
                 let mut context = ChatEventContext {
                     services: TuiServices {
                         client,
+                        passive_client: &passive_client,
                         keymap: &settings.keymap,
                         theme: render::TuiTheme::for_app(&mut chat.app, Instant::now()),
                     },
@@ -545,6 +550,9 @@ fn apply_effect_result(
         }
         TuiEffectResult::SlashPaletteLoaded { query, palette } => {
             apply_slash_palette_result(chat, loop_state, &query, palette);
+        }
+        TuiEffectResult::SubmitMessage { message, result } => {
+            apply_submit_message_result(chat, &message, *result);
         }
         TuiEffectResult::CancelTurn { session_id, result } => {
             apply_cancel_turn_result(chat, session_id, result);
@@ -760,6 +768,58 @@ fn apply_slash_palette_result(
         palette.select_command(&previous);
     }
     loop_state.slash_palette = (!palette.is_empty()).then_some(palette);
+}
+
+fn apply_submit_message_result(
+    chat: &mut ActiveChat,
+    message: &str,
+    result: Result<super::effects::SubmitMessageResult, ClientError>,
+) {
+    match result {
+        Ok(result) => {
+            chat.session_id = Some(result.session_id);
+            chat.app
+                .set_daemon_connection(super::app::DaemonConnectionState::Connected);
+            if let Some(session) = result.created_session {
+                chat.app.apply_session_summary(&session);
+            }
+            if let Some(event_task) = result.event_task
+                && let Some(previous_task) = chat.event_task.replace(event_task)
+            {
+                previous_task.abort();
+            }
+            if result.committed_agent_id.is_some() {
+                let _committed = chat.app.take_pending_agent();
+            }
+            match result.acceptance.disposition {
+                bcode_ipc::MessageAcceptanceDisposition::AppliedSteering => {
+                    chat.app.mark_pending_submission_sent();
+                    chat.app.set_status("Steering sent".to_owned());
+                }
+                bcode_ipc::MessageAcceptanceDisposition::QueuedFollowUp
+                | bcode_ipc::MessageAcceptanceDisposition::QueuedTurn => {
+                    chat.app.set_idle();
+                    chat.app
+                        .mark_pending_submission_queued(result.acceptance.queue_position);
+                    chat.app.set_status(format!(
+                        "Message queued{}",
+                        result
+                            .acceptance
+                            .queue_position
+                            .map_or_else(String::new, |position| format!(" at #{position}"))
+                    ));
+                }
+                bcode_ipc::MessageAcceptanceDisposition::StartedTurn => {
+                    chat.app.mark_pending_submission_sent();
+                    chat.app.set_status("Message sent".to_owned());
+                }
+            }
+        }
+        Err(error) => {
+            chat.app.restore_pending_submission(message);
+            daemon_issue::report_client_issue(&mut chat.app, "send failed", &error);
+        }
+    }
 }
 
 fn apply_cancel_turn_result(

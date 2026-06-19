@@ -94,7 +94,7 @@ pub enum CliError {
 pub async fn run() -> Result<(), CliError> {
     init_tracing();
     let cli = Cli::parse();
-    handle_cli(cli).await
+    Box::pin(handle_cli(cli)).await
 }
 
 async fn handle_cli(cli: Cli) -> Result<(), CliError> {

@@ -22,7 +22,10 @@ pub struct TuiIo<'a, 'b, W: Write> {
 /// Immutable service dependencies shared by TUI flows.
 #[derive(Clone, Copy)]
 pub struct TuiServices<'a> {
+    /// Interactive client used for explicit user actions; may start the daemon.
     pub client: &'a BcodeClient,
+    /// Passive client used for background hydration/polling; never starts the daemon.
+    pub passive_client: &'a BcodeClient,
     pub keymap: &'a BmuxKeyMap,
     pub theme: TuiTheme,
 }
