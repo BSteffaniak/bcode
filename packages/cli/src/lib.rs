@@ -666,6 +666,10 @@ enum ModelCommand {
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
     Status,
+    Profile {
+        #[command(subcommand)]
+        command: AuthProfileCommand,
+    },
     Pool {
         #[command(subcommand)]
         command: AuthPoolCommand,
@@ -681,8 +685,18 @@ enum AuthCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum AuthProfileCommand {
+    List,
+    Show { profile: String },
+}
+
+#[derive(Debug, Subcommand)]
 enum AuthPoolCommand {
     List,
+    Profiles {
+        #[arg(default_value = "openai")]
+        pool: String,
+    },
     Status {
         #[arg(default_value = "openai")]
         pool: String,
@@ -1217,9 +1231,15 @@ fn handle_provider_command(command: ProviderCommand) -> Result<(), CliError> {
 fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
     match command {
         AuthCommand::Status => auth_status(),
+        AuthCommand::Profile { command } => match command {
+            AuthProfileCommand::List => auth_profile_list(),
+            AuthProfileCommand::Show { profile } => auth_profile_show(&profile),
+        },
         AuthCommand::Pool { command } => match command {
             AuthPoolCommand::List => auth_pool_list(),
-            AuthPoolCommand::Status { pool } => auth_pool_status(&pool),
+            AuthPoolCommand::Profiles { pool } | AuthPoolCommand::Status { pool } => {
+                auth_pool_status(&pool)
+            }
             AuthPoolCommand::ResetCooldown { pool, profile } => {
                 auth_pool_reset_cooldown(&pool, profile.as_deref())
             }
@@ -1230,6 +1250,106 @@ fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
             recipient_key,
         } => auth_login(profile, vault, recipient_key),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthProfileSummary {
+    profile: String,
+    source: &'static str,
+    backend: String,
+    scheme: Option<String>,
+    provider: Option<String>,
+    storage_profile: Option<String>,
+    vault: Option<PathBuf>,
+}
+
+fn auth_profile_summaries(config: &bcode_config::BcodeConfig) -> Vec<AuthProfileSummary> {
+    let registry = bcode_config::load_runtime_auth_subscriptions();
+    let mut summaries = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (profile, auth_profile) in &config.auth.profiles {
+        seen.insert(profile.clone());
+        summaries.push(AuthProfileSummary {
+            profile: profile.clone(),
+            source: "declared",
+            backend: auth_profile.backend.clone(),
+            scheme: auth_profile.scheme.clone(),
+            provider: auth_profile.settings.get("provider").cloned(),
+            storage_profile: auth_profile.settings.get("profile").cloned(),
+            vault: auth_profile.settings.get("vault").map(PathBuf::from),
+        });
+    }
+    for pool in registry.pools.values() {
+        for profile in &pool.profiles {
+            if !seen.insert(profile.auth_profile.clone()) {
+                continue;
+            }
+            summaries.push(AuthProfileSummary {
+                profile: profile.auth_profile.clone(),
+                source: "runtime",
+                backend: "sshenv".to_string(),
+                scheme: Some(profile.scheme.clone()),
+                provider: Some(profile.provider.clone()),
+                storage_profile: Some(profile.storage_profile.clone()),
+                vault: Some(profile.vault.clone()),
+            });
+        }
+    }
+    summaries.sort_by(|left, right| left.profile.cmp(&right.profile));
+    summaries
+}
+
+fn auth_profile_list() -> Result<(), CliError> {
+    let config = bcode_config::load_config()?;
+    let summaries = auth_profile_summaries(&config);
+    if summaries.is_empty() {
+        println!("No auth profiles declared or registered.");
+        return Ok(());
+    }
+    println!("PROFILE\tSOURCE\tBACKEND\tSCHEME\tPROVIDER\tSTORAGE\tVAULT");
+    for summary in summaries {
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            summary.profile,
+            summary.source,
+            summary.backend,
+            summary.scheme.as_deref().unwrap_or("-"),
+            summary.provider.as_deref().unwrap_or("-"),
+            summary.storage_profile.as_deref().unwrap_or("-"),
+            summary
+                .vault
+                .as_ref()
+                .map_or_else(|| "-".to_string(), |vault| vault.display().to_string())
+        );
+    }
+    Ok(())
+}
+
+fn auth_profile_show(profile: &str) -> Result<(), CliError> {
+    let config = bcode_config::load_config()?;
+    let Some(summary) = auth_profile_summaries(&config)
+        .into_iter()
+        .find(|summary| summary.profile == profile)
+    else {
+        println!("Auth profile '{profile}' is not declared or registered.");
+        return Ok(());
+    };
+    println!("Auth profile: {}", summary.profile);
+    println!("Source: {}", summary.source);
+    println!("Backend: {}", summary.backend);
+    if let Some(scheme) = summary.scheme {
+        println!("Scheme: {scheme}");
+    }
+    if let Some(provider) = summary.provider {
+        println!("Provider: {provider}");
+    }
+    if let Some(storage_profile) = summary.storage_profile {
+        println!("Storage profile: {storage_profile}");
+    }
+    if let Some(vault) = summary.vault {
+        println!("Vault: {}", vault.display());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -1373,13 +1493,34 @@ fn print_auth_pool_profile_status(
         && entry.cooldown_until_unix > now
     {
         println!(
-            "  {profile}: {source}, {config_status}, cooldown {} remaining, reason: {}",
+            "  {profile}: {source}, {config_status}, storage {storage}, vault {vault}, cooldown {} remaining, reason: {}",
             format_duration(entry.cooldown_until_unix.saturating_sub(now)),
-            entry.reason
+            entry.reason,
+            storage = auth_pool_profile_storage(config, profile).unwrap_or_else(|| "-".to_string()),
+            vault = auth_pool_profile_vault(config, profile).unwrap_or_else(|| "-".to_string()),
         );
         return;
     }
-    println!("  {profile}: {source}, {config_status}, available");
+    println!(
+        "  {profile}: {source}, {config_status}, storage {storage}, vault {vault}, available",
+        storage = auth_pool_profile_storage(config, profile).unwrap_or_else(|| "-".to_string()),
+        vault = auth_pool_profile_vault(config, profile).unwrap_or_else(|| "-".to_string()),
+    );
+}
+
+fn auth_pool_profile_storage(config: &bcode_config::BcodeConfig, profile: &str) -> Option<String> {
+    auth_profile_summaries(config)
+        .into_iter()
+        .find(|summary| summary.profile == profile)
+        .and_then(|summary| summary.storage_profile)
+}
+
+fn auth_pool_profile_vault(config: &bcode_config::BcodeConfig, profile: &str) -> Option<String> {
+    auth_profile_summaries(config)
+        .into_iter()
+        .find(|summary| summary.profile == profile)
+        .and_then(|summary| summary.vault)
+        .map(|vault| vault.display().to_string())
 }
 
 fn auth_pool_reset_cooldown(pool_name: &str, profile: Option<&str>) -> Result<(), CliError> {

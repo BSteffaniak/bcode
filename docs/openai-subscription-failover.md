@@ -32,6 +32,14 @@ bcode auth pool reset-cooldown openai openai
 bcode auth pool reset-cooldown openai
 ```
 
+List profiles:
+
+```sh
+bcode auth profile list
+bcode auth profile show openai-2
+bcode auth pool profiles openai
+```
+
 Refresh an existing secondary subscription token by passing its profile name:
 
 ```sh
