@@ -43,6 +43,19 @@ use thiserror::Error;
 use tokio::sync::{Mutex, broadcast, watch};
 use tokio::task::spawn_blocking;
 
+/// Runtime model and reasoning selections restored from a session.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionRuntimeSelection {
+    /// Session-specific provider plugin id, when explicitly selected.
+    pub provider_plugin_id: Option<String>,
+    /// Session-specific model id, when explicitly selected.
+    pub model_id: Option<String>,
+    /// Session-specific reasoning effort, when explicitly selected.
+    pub reasoning_effort: Option<String>,
+    /// Session-specific reasoning summary, when explicitly selected.
+    pub reasoning_summary: Option<String>,
+}
+
 /// Errors returned by session management operations.
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -1641,6 +1654,19 @@ impl SessionManager {
         handle.model_context_events().await
     }
 
+    /// Return the latest session-specific runtime selection state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist.
+    pub async fn current_runtime_selection(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionRuntimeSelection, SessionError> {
+        let handle = self.session_handle(session_id).await?;
+        handle.current_runtime_selection().await
+    }
+
     /// Return the latest session-specific model selection if one has been set.
     ///
     /// # Errors
@@ -1649,7 +1675,7 @@ impl SessionManager {
     pub async fn current_model_selection(
         &self,
         session_id: SessionId,
-    ) -> Result<Option<(String, String)>, SessionError> {
+    ) -> Result<(Option<String>, Option<String>), SessionError> {
         let handle = self.session_handle(session_id).await?;
         handle.current_model_selection().await
     }

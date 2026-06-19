@@ -184,7 +184,15 @@ impl SessionHandle {
         self.send(SessionCommand::ActiveRuntimeWork).await?
     }
 
-    pub async fn current_model_selection(&self) -> Result<Option<(String, String)>, SessionError> {
+    pub async fn current_runtime_selection(
+        &self,
+    ) -> Result<crate::SessionRuntimeSelection, SessionError> {
+        self.send(SessionCommand::CurrentRuntimeSelection).await
+    }
+
+    pub async fn current_model_selection(
+        &self,
+    ) -> Result<(Option<String>, Option<String>), SessionError> {
         self.send(SessionCommand::CurrentModelSelection).await
     }
 
@@ -287,7 +295,8 @@ enum SessionCommand {
     ModelContextEvents(oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>),
     ActiveToolRuns(oneshot::Sender<Result<Vec<crate::db::ToolRun>, SessionError>>),
     ActiveRuntimeWork(oneshot::Sender<Result<Vec<crate::db::RuntimeWorkProjection>, SessionError>>),
-    CurrentModelSelection(oneshot::Sender<Option<(String, String)>>),
+    CurrentRuntimeSelection(oneshot::Sender<crate::SessionRuntimeSelection>),
+    CurrentModelSelection(oneshot::Sender<(Option<String>, Option<String>)>),
     CurrentReasoningSelection(oneshot::Sender<(Option<String>, Option<String>)>),
     CurrentAgentSelection(oneshot::Sender<Option<String>>),
     SetCurrentAgent {
@@ -409,13 +418,19 @@ impl SessionActor {
             SessionCommand::ActiveRuntimeWork(reply) => {
                 let _ = reply.send(self.active_runtime_work().await);
             }
+            SessionCommand::CurrentRuntimeSelection(reply) => {
+                let _ = reply.send(crate::SessionRuntimeSelection {
+                    provider_plugin_id: self.state.current_provider.clone(),
+                    model_id: self.state.current_model.clone(),
+                    reasoning_effort: self.state.reasoning_effort.clone(),
+                    reasoning_summary: self.state.reasoning_summary.clone(),
+                });
+            }
             SessionCommand::CurrentModelSelection(reply) => {
-                let _ = reply.send(
-                    self.state
-                        .current_provider
-                        .clone()
-                        .zip(self.state.current_model.clone()),
-                );
+                let _ = reply.send((
+                    self.state.current_provider.clone(),
+                    self.state.current_model.clone(),
+                ));
             }
             SessionCommand::CurrentReasoningSelection(reply) => {
                 let _ = reply.send((

@@ -10105,44 +10105,37 @@ async fn session_model_selection(
     if let Some(selection) = state.session_model_selections.lock().await.get(&session_id) {
         return selection.clone();
     }
-    let fallback_reasoning = || {
-        (
-            state.selected_reasoning.effort.clone(),
-            state.selected_reasoning.summary.clone(),
-        )
+    let fallback_runtime_selection = || bcode_session::SessionRuntimeSelection {
+        provider_plugin_id: state.selected_provider_plugin_id.clone(),
+        model_id: state.selected_model_id.clone(),
+        reasoning_effort: state.selected_reasoning.effort.clone(),
+        reasoning_summary: state.selected_reasoning.summary.clone(),
     };
-    let selection = if let Ok(Some((provider, model))) =
-        state.sessions.current_model_selection(session_id).await
-    {
-        let (reasoning_effort, reasoning_summary) = state
-            .sessions
-            .current_reasoning_selection(session_id)
-            .await
-            .unwrap_or_else(|_| fallback_reasoning());
-        SessionModelSelection {
-            provider_plugin_id: provider_to_selection(&provider),
-            model_id: model_to_selection(&model),
-            thinking_level: None,
-            reasoning_effort,
-            reasoning_summary,
-            reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
-            provider_context: state.selected_provider_context.clone(),
-        }
-    } else {
-        let (reasoning_effort, reasoning_summary) = state
-            .sessions
-            .current_reasoning_selection(session_id)
-            .await
-            .unwrap_or_else(|_| fallback_reasoning());
-        SessionModelSelection {
-            provider_plugin_id: state.selected_provider_plugin_id.clone(),
-            model_id: state.selected_model_id.clone(),
-            thinking_level: None,
-            reasoning_effort,
-            reasoning_summary,
-            reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
-            provider_context: state.selected_provider_context.clone(),
-        }
+    let runtime_selection = state
+        .sessions
+        .current_runtime_selection(session_id)
+        .await
+        .unwrap_or_else(|_| fallback_runtime_selection());
+    let selection = SessionModelSelection {
+        provider_plugin_id: runtime_selection
+            .provider_plugin_id
+            .as_deref()
+            .and_then(provider_to_selection)
+            .or_else(|| state.selected_provider_plugin_id.clone()),
+        model_id: runtime_selection
+            .model_id
+            .as_deref()
+            .and_then(model_to_selection)
+            .or_else(|| state.selected_model_id.clone()),
+        thinking_level: None,
+        reasoning_effort: runtime_selection
+            .reasoning_effort
+            .or_else(|| state.selected_reasoning.effort.clone()),
+        reasoning_summary: runtime_selection
+            .reasoning_summary
+            .or_else(|| state.selected_reasoning.summary.clone()),
+        reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
+        provider_context: state.selected_provider_context.clone(),
     };
     state
         .session_model_selections
