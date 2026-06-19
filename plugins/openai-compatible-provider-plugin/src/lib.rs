@@ -999,16 +999,36 @@ async fn stream_chat_completion_with_failover(
         return stream_chat_completion_inner(request, turn).await;
     }
     let mut skipped_profiles = Vec::new();
-    let mut last_error = None;
+    let mut available_candidates = Vec::new();
+    let mut cooldown_candidates = Vec::new();
     for candidate in &request.provider_context.auth_candidates {
-        if !auth_pool_state::is_profile_available(
+        if auth_pool_state::is_profile_available(
             request.provider_context.auth_pool.as_deref(),
             candidate.profile.as_deref(),
         ) {
+            available_candidates.push(candidate);
+        } else {
             if let Some(profile) = &candidate.profile {
                 skipped_profiles.push(profile.clone());
             }
-            continue;
+            cooldown_candidates.push(candidate);
+        }
+    }
+    let mut last_error = None;
+    for candidate in available_candidates
+        .into_iter()
+        .chain(cooldown_candidates.into_iter())
+    {
+        if skipped_profiles
+            .iter()
+            .any(|profile| Some(profile) == candidate.profile.as_ref())
+            && let Some(profile) = &candidate.profile
+        {
+            turn.push(ProviderTurnEvent::Warning {
+                message: format!(
+                    "OpenAI subscription auth profile '{profile}' is on cooldown; probing it because no earlier subscription completed the request."
+                ),
+            });
         }
         let mut candidate_request = request.clone();
         candidate_request.provider_context.auth_profile = candidate.profile.clone();
