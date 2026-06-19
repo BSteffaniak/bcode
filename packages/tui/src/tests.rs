@@ -1257,6 +1257,7 @@ async fn async_session_open_preserves_typed_draft() {
         }],
         import_warnings: Vec::new(),
         draft: None,
+        runtime_selection: bcode_ipc::SessionRuntimeSelection::default(),
     };
 
     super::session_flow::complete_switch_session(

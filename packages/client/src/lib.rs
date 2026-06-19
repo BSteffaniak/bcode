@@ -177,6 +177,7 @@ pub struct AttachedSessionHistory {
     pub input_history: Vec<SessionInputHistoryEntry>,
     pub import_warnings: Vec<SessionImportWarning>,
     pub draft: Option<String>,
+    pub runtime_selection: bcode_ipc::SessionRuntimeSelection,
 }
 
 const CLIENT_RUNTIME_ENV_VARS: &[&str] = &[
@@ -1908,6 +1909,7 @@ impl ClientConnection {
                 input_history,
                 import_warnings,
                 draft,
+                runtime_selection,
                 session,
                 ..
             } => Ok(AttachedSessionHistory {
@@ -1916,6 +1918,7 @@ impl ClientConnection {
                 input_history,
                 import_warnings,
                 draft,
+                runtime_selection,
             }),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -1955,6 +1958,7 @@ impl ClientConnection {
                 input_history,
                 import_warnings,
                 draft,
+                runtime_selection,
                 session,
                 ..
             } => Ok(AttachedSessionHistory {
@@ -1963,6 +1967,7 @@ impl ClientConnection {
                 input_history,
                 import_warnings,
                 draft,
+                runtime_selection,
             }),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -1990,6 +1995,7 @@ impl ClientConnection {
                 input_history,
                 import_warnings,
                 draft,
+                runtime_selection,
                 session,
                 ..
             } => Ok(AttachedSessionHistory {
@@ -1998,6 +2004,7 @@ impl ClientConnection {
                 input_history,
                 import_warnings,
                 draft,
+                runtime_selection,
             }),
             _ => Err(ClientError::UnexpectedResponse),
         }

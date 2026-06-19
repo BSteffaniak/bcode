@@ -957,6 +957,19 @@ impl BmuxApp {
         true
     }
 
+    /// Apply restored session runtime selection to the app.
+    pub fn apply_runtime_selection(&mut self, selection: bcode_ipc::SessionRuntimeSelection) {
+        if selection.provider_plugin_id.is_some() {
+            self.selected_provider_plugin_id = selection.provider_plugin_id;
+        }
+        if selection.model_id.is_some() {
+            self.selected_model_id = selection.model_id;
+        }
+        self.reasoning_effort = selection.reasoning_effort;
+        self.reasoning_summary = selection.reasoning_summary;
+        self.refresh_thinking_label();
+    }
+
     /// Apply hydrated model metadata to the app.
     pub fn apply_model_status(&mut self, status: bcode_ipc::SessionModelStatus) {
         if status.provider_plugin_id.is_some() {

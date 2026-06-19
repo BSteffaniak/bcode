@@ -501,6 +501,19 @@ pub struct DaemonStatus {
     pub started_at_unix_ms: u64,
 }
 
+/// Runtime selections restored from a session.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRuntimeSelection {
+    #[serde(default)]
+    pub provider_plugin_id: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub reasoning_summary: Option<String>,
+}
+
 /// Active model metadata for a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionModelStatus {
@@ -937,6 +950,8 @@ pub enum ResponsePayload {
         import_warnings: Vec<SessionImportWarning>,
         #[serde(default)]
         draft: Option<String>,
+        #[serde(default)]
+        runtime_selection: SessionRuntimeSelection,
     },
     MessageSent,
     TurnCancellationRequested {
@@ -1146,6 +1161,7 @@ enum IpcResponsePayload {
         input_history: Vec<SessionInputHistoryEntry>,
         import_warnings: Vec<SessionImportWarning>,
         draft: Option<String>,
+        runtime_selection: SessionRuntimeSelection,
     },
     MessageSent,
     TurnCancellationRequested {
@@ -1337,6 +1353,7 @@ impl From<&ResponsePayload> for IpcResponsePayload {
                 input_history,
                 import_warnings,
                 draft,
+                runtime_selection,
             } => Self::Attached {
                 session_id: session_id.clone(),
                 session: session.clone(),
@@ -1344,6 +1361,7 @@ impl From<&ResponsePayload> for IpcResponsePayload {
                 input_history: input_history.clone(),
                 import_warnings: import_warnings.clone(),
                 draft: draft.clone(),
+                runtime_selection: runtime_selection.clone(),
             },
             ResponsePayload::ComposerDraft { draft } => Self::ComposerDraft {
                 draft: draft.clone(),
@@ -1528,6 +1546,7 @@ impl TryFrom<IpcResponsePayload> for ResponsePayload {
                 input_history,
                 import_warnings,
                 draft,
+                runtime_selection,
             } => Ok(Self::Attached {
                 session_id,
                 session,
@@ -1535,6 +1554,7 @@ impl TryFrom<IpcResponsePayload> for ResponsePayload {
                 input_history,
                 import_warnings,
                 draft,
+                runtime_selection,
             }),
             IpcResponsePayload::ComposerDraft { draft } => Ok(Self::ComposerDraft { draft }),
             IpcResponsePayload::ComposerDraftSet => Ok(Self::ComposerDraftSet),
@@ -3364,6 +3384,7 @@ mod tests {
             input_history: Vec::new(),
             import_warnings: Vec::new(),
             draft: Some("draft text".to_owned()),
+            runtime_selection: SessionRuntimeSelection::default(),
         });
 
         let encoded = encode(&response).expect("response should encode");
@@ -3896,6 +3917,7 @@ mod tests {
                     input_history: Vec::new(),
                     import_warnings: Vec::new(),
                     draft: Some("draft text".to_owned()),
+                    runtime_selection: SessionRuntimeSelection::default(),
                 }),
                 Response::Ok(ResponsePayload::SessionHistory {
                     session_id,

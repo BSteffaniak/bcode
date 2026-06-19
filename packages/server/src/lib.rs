@@ -4803,6 +4803,7 @@ async fn handle_attach_session(
                     input_history: attachment.input_history,
                     import_warnings: Vec::new(),
                     draft,
+                    runtime_selection: session_runtime_selection_payload(state, session_id).await,
                 }),
             )
             .await?;
@@ -5065,6 +5066,7 @@ async fn finish_attach_session_projection_window_success(
             input_history: attachment.input_history,
             import_warnings: Vec::new(),
             draft,
+            runtime_selection: session_runtime_selection_payload(state, session_id).await,
         }),
     )
     .await?;
@@ -5150,6 +5152,7 @@ async fn finish_attach_session_recent_success(
             input_history: attachment.input_history,
             import_warnings: Vec::new(),
             draft,
+            runtime_selection: session_runtime_selection_payload(state, session_id).await,
         }),
     )
     .await?;
@@ -10159,6 +10162,26 @@ fn model_to_selection(model: &str) -> Option<String> {
     } else {
         Some(model.to_string())
     }
+}
+
+async fn session_runtime_selection_payload(
+    state: &ServerState,
+    session_id: SessionId,
+) -> bcode_ipc::SessionRuntimeSelection {
+    state
+        .sessions
+        .current_runtime_selection(session_id)
+        .await
+        .map(|selection| bcode_ipc::SessionRuntimeSelection {
+            provider_plugin_id: selection
+                .provider_plugin_id
+                .as_deref()
+                .and_then(provider_to_selection),
+            model_id: selection.model_id.as_deref().and_then(model_to_selection),
+            reasoning_effort: selection.reasoning_effort,
+            reasoning_summary: selection.reasoning_summary,
+        })
+        .unwrap_or_default()
 }
 
 fn has_model_provider(state: &ServerState, provider_plugin_id: Option<&str>) -> bool {
