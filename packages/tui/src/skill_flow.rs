@@ -17,13 +17,14 @@ use super::{
     text_input_flow,
 };
 
+#[allow(clippy::too_many_lines)]
 /// Pick and perform a skill action for the active session.
 pub async fn pick_skill_for_session<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
     chat: &mut ActiveChat,
 ) -> Result<(), TuiError> {
-    let skills = match services.client.list_skills().await {
+    let skills = match services.passive_client.list_skills().await {
         Ok(skills) => skills,
         Err(error) => {
             helpers::report_client_issue(&mut chat.app, "skills unavailable", &error);
@@ -61,7 +62,9 @@ pub async fn pick_skill_for_session<W: Write>(
                     skill_picker::SkillPickerAction::Continue => {}
                     skill_picker::SkillPickerAction::Cancel => return Ok(()),
                     skill_picker::SkillPickerAction::Help(skill_id) => {
-                        if let Err(error) = describe_skill(services.client, chat, skill_id).await {
+                        if let Err(error) =
+                            describe_skill(services.passive_client, chat, skill_id).await
+                        {
                             helpers::report_client_error(
                                 &mut chat.app,
                                 "skill help failed",

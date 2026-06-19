@@ -554,6 +554,20 @@ fn apply_effect_result(
         TuiEffectResult::SubmitMessage { message, result } => {
             apply_submit_message_result(chat, &message, *result);
         }
+        TuiEffectResult::SetSessionModel {
+            session_id,
+            provider_plugin_id,
+            model_id,
+            result,
+        } => {
+            apply_set_session_model_result(
+                chat,
+                session_id,
+                provider_plugin_id.as_ref(),
+                &model_id,
+                result,
+            );
+        }
         TuiEffectResult::CompactContext { session_id, result } => {
             apply_compact_context_result(chat, session_id, result);
         }
@@ -824,6 +838,27 @@ fn apply_submit_message_result(
         Err(error) => {
             chat.app.restore_pending_submission(message);
             daemon_issue::report_client_issue(&mut chat.app, "send failed", &error);
+        }
+    }
+}
+
+fn apply_set_session_model_result(
+    chat: &mut ActiveChat,
+    session_id: bcode_session_models::SessionId,
+    provider_plugin_id: Option<&String>,
+    model_id: &str,
+    result: Result<(), ClientError>,
+) {
+    if chat.session_id != Some(session_id) {
+        return;
+    }
+    match result {
+        Ok(()) => chat.app.set_status(provider_plugin_id.map_or_else(
+            || format!("model set to {model_id}"),
+            |provider| format!("model set to {provider}/{model_id}"),
+        )),
+        Err(error) => {
+            daemon_issue::report_client_issue(&mut chat.app, "model selection failed", &error);
         }
     }
 }

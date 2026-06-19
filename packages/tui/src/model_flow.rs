@@ -7,6 +7,7 @@ use bmux_keyboard::KeyCode;
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
 
+use super::effects::TuiEffect;
 use super::helpers;
 use super::picker_mouse::picker_row_from_mouse;
 use super::runtime_context::{TuiIo, TuiServices};
@@ -143,7 +144,7 @@ pub async fn pick_model_for_session<W: Write>(
         Some(ModelProviderPick::Canceled) | None => return Ok(()),
     };
     let models = match services
-        .client
+        .passive_client
         .session_model_list(provider_plugin_id.clone())
         .await
     {
@@ -176,14 +177,12 @@ pub async fn pick_model_for_session<W: Write>(
                 KeyCode::Escape => return Ok(()),
                 KeyCode::Enter => {
                     if let Some(model_id) = picker.selected_model_id() {
-                        set_session_model(
-                            services.client,
+                        start_set_session_model(
                             chat,
                             session_id,
-                            provider_plugin_id.as_ref(),
+                            provider_plugin_id.clone(),
                             model_id,
-                        )
-                        .await;
+                        );
                         return Ok(());
                     }
                 }
@@ -202,14 +201,7 @@ pub async fn pick_model_for_session<W: Write>(
                     && picker.select_visible(row)
                     && let Some(model_id) = picker.selected_model_id()
                 {
-                    set_session_model(
-                        services.client,
-                        chat,
-                        session_id,
-                        provider_plugin_id.as_ref(),
-                        model_id,
-                    )
-                    .await;
+                    start_set_session_model(chat, session_id, provider_plugin_id.clone(), model_id);
                     return Ok(());
                 }
             }
@@ -223,7 +215,7 @@ async fn pick_model_provider<W: Write>(
     services: &TuiServices<'_>,
     chat: &mut ActiveChat,
 ) -> Result<Option<ModelProviderPick>, TuiError> {
-    let providers = match services.client.plugin_services().await {
+    let providers = match services.passive_client.plugin_services().await {
         Ok(services) => services
             .into_iter()
             .filter(|service| service.interface_id == bcode_model::MODEL_PROVIDER_INTERFACE_ID)
@@ -284,22 +276,16 @@ async fn pick_model_provider<W: Write>(
     }
 }
 
-async fn set_session_model(
-    client: &BcodeClient,
+fn start_set_session_model(
     chat: &mut ActiveChat,
     session_id: bcode_session_models::SessionId,
-    provider_plugin_id: Option<&String>,
+    provider_plugin_id: Option<String>,
     model_id: String,
 ) {
-    if let Err(error) = client
-        .set_session_model(session_id, provider_plugin_id.cloned(), model_id.clone())
-        .await
-    {
-        helpers::report_client_error(&mut chat.app, "model selection failed", &error.into());
-    } else {
-        chat.app.set_status(provider_plugin_id.as_ref().map_or_else(
-            || format!("model set to {model_id}"),
-            |provider| format!("model set to {provider}/{model_id}"),
-        ));
-    }
+    chat.start_effect(TuiEffect::SetSessionModel {
+        session_id,
+        provider_plugin_id,
+        model_id,
+    });
+    chat.app.set_status("applying model…".to_owned());
 }

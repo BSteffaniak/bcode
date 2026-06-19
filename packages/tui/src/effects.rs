@@ -107,6 +107,15 @@ pub enum TuiEffect {
         /// Submit request.
         request: Box<SubmitMessageRequest>,
     },
+    /// Set the active model for a session.
+    SetSessionModel {
+        /// Session to update.
+        session_id: SessionId,
+        /// Provider plugin id, when explicitly selected.
+        provider_plugin_id: Option<String>,
+        /// Model id to set.
+        model_id: String,
+    },
     /// Request context compaction for the current session.
     CompactContext {
         /// Session to compact.
@@ -274,6 +283,17 @@ pub enum TuiEffectResult {
         /// Submit result.
         result: Box<Result<SubmitMessageResult, ClientError>>,
     },
+    /// Session model selection completed.
+    SetSessionModel {
+        /// Session that was updated.
+        session_id: SessionId,
+        /// Provider plugin id, when explicitly selected.
+        provider_plugin_id: Option<String>,
+        /// Model id that was requested.
+        model_id: String,
+        /// Daemon response.
+        result: Result<(), ClientError>,
+    },
     /// Context compaction completed.
     CompactContext {
         /// Session the request targeted.
@@ -302,6 +322,7 @@ pub enum TuiEffectResult {
     },
 }
 
+#[allow(clippy::match_same_arms)]
 impl TuiEffectResult {
     /// Return the daemon connectivity observation implied by this effect result.
     #[must_use]
@@ -327,6 +348,7 @@ impl TuiEffectResult {
             }
             Self::PermissionList { result } => DaemonObservation::from_client_result(result),
             Self::SaveDraft { result, .. } => DaemonObservation::from_client_result(result),
+            Self::SetSessionModel { result, .. } => DaemonObservation::from_client_result(result),
             Self::SubmitMessage { result, .. } => DaemonObservation::from_client_result(result),
             Self::CompactContext { result, .. } => DaemonObservation::from_client_result(result),
             Self::ListWorktrees { result } => DaemonObservation::from_client_result(result),
@@ -383,6 +405,7 @@ enum EffectKey {
     DraftSave,
     SlashPalette,
     SubmitMessage(usize),
+    SetSessionModel(SessionId),
     CompactContext(SessionId),
     WorktreeList,
     CancelTurn(SessionId),
@@ -409,6 +432,7 @@ impl TuiEffect {
     const fn daemon_intent(&self) -> EffectDaemonIntent {
         match self {
             Self::SubmitMessage { .. }
+            | Self::SetSessionModel { .. }
             | Self::CompactContext { .. }
             | Self::CancelTurn { .. }
             | Self::CycleThinkingEffort { .. } => EffectDaemonIntent::Foreground,
@@ -601,6 +625,7 @@ impl TuiEffect {
             Self::SaveDraft { .. } => EffectKey::DraftSave,
             Self::LoadSlashPalette { .. } => EffectKey::SlashPalette,
             Self::SubmitMessage { request } => EffectKey::SubmitMessage(request.message.len()),
+            Self::SetSessionModel { session_id, .. } => EffectKey::SetSessionModel(*session_id),
             Self::CompactContext { session_id } => EffectKey::CompactContext(*session_id),
             Self::ListWorktrees { .. } => EffectKey::WorktreeList,
             Self::CancelTurn { session_id } => EffectKey::CancelTurn(*session_id),
@@ -683,6 +708,18 @@ impl TuiEffect {
                 TuiEffectResult::SlashPaletteLoaded { query, palette }
             }
             Self::SubmitMessage { request } => run_submit_message(&client, *request).await,
+            Self::SetSessionModel {
+                session_id,
+                provider_plugin_id,
+                model_id,
+            } => TuiEffectResult::SetSessionModel {
+                session_id,
+                provider_plugin_id: provider_plugin_id.clone(),
+                model_id: model_id.clone(),
+                result: client
+                    .set_session_model(session_id, provider_plugin_id, model_id)
+                    .await,
+            },
             Self::CompactContext { session_id } => TuiEffectResult::CompactContext {
                 session_id,
                 result: client.compact_session(session_id).await,
