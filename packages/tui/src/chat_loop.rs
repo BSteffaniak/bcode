@@ -487,6 +487,7 @@ async fn poll_finished_effects(
     needs_redraw
 }
 
+#[allow(clippy::too_many_lines)]
 fn apply_effect_result(
     settings: &mut TuiRuntimeSettings,
     chat: &mut ActiveChat,
@@ -580,6 +581,15 @@ fn apply_effect_result(
         }
         TuiEffectResult::ListWorktrees { result } => {
             apply_list_worktrees_result(chat, result);
+        }
+        TuiEffectResult::AttachWorktree { path, result } => {
+            apply_attach_worktree_result(chat, &path, result);
+        }
+        TuiEffectResult::CreateWorktree { result } => {
+            apply_create_worktree_result(chat, result);
+        }
+        TuiEffectResult::RemoveWorktree { result } => {
+            apply_remove_worktree_result(chat, result);
         }
         TuiEffectResult::CancelTurn { session_id, result } => {
             apply_cancel_turn_result(chat, session_id, result);
@@ -960,6 +970,58 @@ fn apply_list_worktrees_result(
             .join("\n"),
     );
     chat.app.set_status("shown worktrees".to_owned());
+}
+
+fn apply_attach_worktree_result(
+    chat: &mut ActiveChat,
+    path: &std::path::Path,
+    result: Result<bcode_session_models::SessionSummary, ClientError>,
+) {
+    match result {
+        Ok(session) => {
+            chat.app.apply_session_summary(&session);
+            chat.app.set_status(format!("worktree: {}", path.display()));
+        }
+        Err(error) => {
+            daemon_issue::report_client_issue(&mut chat.app, "worktree attach failed", &error);
+        }
+    }
+}
+
+fn apply_create_worktree_result(
+    chat: &mut ActiveChat,
+    result: Result<bcode_worktree_models::WorktreeCreateResponse, ClientError>,
+) {
+    let response = match result {
+        Ok(response) => response,
+        Err(error) => {
+            daemon_issue::report_client_issue(&mut chat.app, "worktree create failed", &error);
+            return;
+        }
+    };
+    let path = response.path.clone();
+    if let Some(session) = response.session {
+        let session_id = session.id;
+        chat.app.apply_session_summary(&session);
+        chat.session_id = Some(session_id);
+    }
+    chat.app
+        .push_system_note(format!("Created worktree\n* Path: {}", path.display()));
+    chat.app.set_status("created worktree".to_owned());
+}
+
+fn apply_remove_worktree_result(
+    chat: &mut ActiveChat,
+    result: Result<bcode_worktree_models::WorktreeRemoveResponse, ClientError>,
+) {
+    match result {
+        Ok(removed) => chat
+            .app
+            .set_status(format!("removed worktree {}", removed.path.display())),
+        Err(error) => {
+            daemon_issue::report_client_issue(&mut chat.app, "worktree remove failed", &error);
+        }
+    }
 }
 
 fn apply_cancel_turn_result(

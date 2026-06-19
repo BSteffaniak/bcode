@@ -3,8 +3,8 @@
 use std::io::Write;
 use std::path::PathBuf;
 
+use super::effects::TuiEffect;
 use super::runtime_context::{TuiIo, TuiServices};
-use bcode_client::BcodeClient;
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_text_edit::SelectionMode;
 use bmux_tui::event::{Event, FocusEvent, MouseEvent};
@@ -16,7 +16,7 @@ use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::picker_mouse::picker_row_from_mouse;
 use super::session_flow::ActiveChat;
 use super::{
-    TuiError, session_flow, text_input_flow, worktree_create_dialog, worktree_create_dialog_render,
+    TuiError, text_input_flow, worktree_create_dialog, worktree_create_dialog_render,
     worktree_picker, worktree_picker_render,
 };
 
@@ -90,9 +90,8 @@ async fn create_with_dialog<W: Write>(
                     };
                     let new_session =
                         target == worktree_create_dialog::WorktreeCreateTarget::NewSession;
-                    let response = match services
-                        .client
-                        .create_worktree(bcode_worktree_models::WorktreeCreateRequest {
+                    chat.start_effect(TuiEffect::CreateWorktree {
+                        request: bcode_worktree_models::WorktreeCreateRequest {
                             name,
                             cwd: chat
                                 .app
@@ -107,20 +106,9 @@ async fn create_with_dialog<W: Write>(
                             attach_session_id,
                             new_session,
                             no_setup: false,
-                        })
-                        .await
-                    {
-                        Ok(response) => response,
-                        Err(error) => {
-                            helpers::report_client_issue(
-                                &mut chat.app,
-                                "worktree create failed",
-                                &error,
-                            );
-                            return Ok(());
-                        }
-                    };
-                    handle_created_worktree(io, services, chat, response, target)?;
+                        },
+                    });
+                    chat.app.set_status("creating worktree…".to_owned());
                     return Ok(());
                 }
                 KeyCode::Left
@@ -186,44 +174,6 @@ fn handle_dialog_mouse(
         .handle_mouse(dialog.name_mut(), mouse);
 }
 
-fn handle_created_worktree<W: Write>(
-    io: &mut TuiIo<'_, '_, W>,
-    _services: &TuiServices<'_>,
-    chat: &mut ActiveChat,
-    response: bcode_worktree_models::WorktreeCreateResponse,
-    target: worktree_create_dialog::WorktreeCreateTarget,
-) -> Result<(), TuiError> {
-    let path = response.path.clone();
-    match target {
-        worktree_create_dialog::WorktreeCreateTarget::CurrentSession => {
-            if let Some(session) = response.session {
-                chat.app.apply_session_summary(&session);
-            }
-            chat.app.push_system_note(format!(
-                "Created worktree for current session\n* Path: {}",
-                path.display()
-            ));
-            chat.app.set_status("created worktree".to_owned());
-        }
-        worktree_create_dialog::WorktreeCreateTarget::NewSession => {
-            let Some(session) = response.session else {
-                chat.app
-                    .set_status("created worktree, but no session was returned".to_owned());
-                return Ok(());
-            };
-            let session_id = session.id;
-            chat.app.push_system_note(format!(
-                "Created worktree with new session\n* Path: {}\n* Session: {session_id}",
-                path.display()
-            ));
-            session_flow::switch_session(io.terminal, chat, session_id)?;
-            chat.app
-                .set_status("created worktree and switched session".to_owned());
-        }
-    }
-    Ok(())
-}
-
 /// Pick a worktree and attach the current session to it.
 pub async fn attach_current_session<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
@@ -235,7 +185,7 @@ pub async fn attach_current_session<W: Write>(
         .working_directory()
         .map(std::path::Path::to_path_buf);
     let response = match services
-        .client
+        .passive_client
         .list_worktrees(bcode_worktree_models::WorktreeListRequest { cwd })
         .await
     {
@@ -269,17 +219,7 @@ pub async fn attach_current_session<W: Write>(
                     else {
                         continue;
                     };
-                    if let Err(error) = attach_path(services.client, chat, path).await {
-                        if let TuiError::Client(error) = error {
-                            helpers::report_client_issue(
-                                &mut chat.app,
-                                "worktree attach failed",
-                                &error,
-                            );
-                            return Ok(());
-                        }
-                        return Err(error);
-                    }
+                    start_attach_worktree(chat, path);
                     return Ok(());
                 }
                 PickerKeyOutcome::Canceled => return Err(TuiError::Canceled),
@@ -291,17 +231,7 @@ pub async fn attach_current_session<W: Write>(
                         .selected_worktree()
                         .map(|worktree| worktree.path.clone())
                 {
-                    if let Err(error) = attach_path(services.client, chat, path).await {
-                        if let TuiError::Client(error) = error {
-                            helpers::report_client_issue(
-                                &mut chat.app,
-                                "worktree attach failed",
-                                &error,
-                            );
-                            return Ok(());
-                        }
-                        return Err(error);
-                    }
+                    start_attach_worktree(chat, path);
                     return Ok(());
                 }
             }
@@ -322,7 +252,7 @@ pub async fn remove_worktree<W: Write>(
         .working_directory()
         .map(std::path::Path::to_path_buf);
     let response = match services
-        .client
+        .passive_client
         .list_worktrees(bcode_worktree_models::WorktreeListRequest { cwd: cwd.clone() })
         .await
     {
@@ -368,27 +298,7 @@ pub async fn remove_worktree<W: Write>(
                         else {
                             continue;
                         };
-                        let removed = match services
-                            .client
-                            .remove_worktree(bcode_worktree_models::WorktreeRemoveRequest {
-                                cwd: cwd.clone(),
-                                path: path.clone(),
-                                force,
-                            })
-                            .await
-                        {
-                            Ok(removed) => removed,
-                            Err(error) => {
-                                helpers::report_client_issue(
-                                    &mut chat.app,
-                                    "worktree remove failed",
-                                    &error,
-                                );
-                                return Ok(());
-                            }
-                        };
-                        chat.app
-                            .set_status(format!("removed worktree {}", removed.path.display()));
+                        start_remove_worktree(chat, cwd.clone(), path, force);
                         return Ok(());
                     }
                     PickerKeyOutcome::Canceled => return Err(TuiError::Canceled),
@@ -401,27 +311,7 @@ pub async fn remove_worktree<W: Write>(
                         .selected_worktree()
                         .map(|worktree| worktree.path.clone())
                 {
-                    let removed = match services
-                        .client
-                        .remove_worktree(bcode_worktree_models::WorktreeRemoveRequest {
-                            cwd: cwd.clone(),
-                            path: path.clone(),
-                            force: false,
-                        })
-                        .await
-                    {
-                        Ok(removed) => removed,
-                        Err(error) => {
-                            helpers::report_client_issue(
-                                &mut chat.app,
-                                "worktree remove failed",
-                                &error,
-                            );
-                            return Ok(());
-                        }
-                    };
-                    chat.app
-                        .set_status(format!("removed worktree {}", removed.path.display()));
+                    start_remove_worktree(chat, cwd.clone(), path, false);
                     return Ok(());
                 }
             }
@@ -430,29 +320,20 @@ pub async fn remove_worktree<W: Write>(
     }
 }
 
-async fn attach_path(
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-    path: PathBuf,
-) -> Result<(), TuiError> {
+fn start_remove_worktree(chat: &mut ActiveChat, cwd: Option<PathBuf>, path: PathBuf, force: bool) {
+    chat.start_effect(TuiEffect::RemoveWorktree {
+        request: bcode_worktree_models::WorktreeRemoveRequest { cwd, path, force },
+    });
+    chat.app.set_status("removing worktree…".to_owned());
+}
+
+fn start_attach_worktree(chat: &mut ActiveChat, path: PathBuf) {
     let Some(session_id) = chat.app.session_id() else {
         chat.app.set_status("No active session".to_owned());
-        return Ok(());
+        return;
     };
-    let session = match client
-        .change_session_working_directory(session_id, path.clone())
-        .await
-    {
-        Ok(session) => session,
-        Err(error) => {
-            helpers::report_client_issue(&mut chat.app, "worktree attach failed", &error);
-            return Ok(());
-        }
-    };
-    chat.app.apply_session_summary(&session);
-    session_flow::hydrate_status(client, &mut chat.app).await;
-    chat.app.set_status(format!("worktree: {}", path.display()));
-    Ok(())
+    chat.start_effect(TuiEffect::AttachWorktree { session_id, path });
+    chat.app.set_status("attaching worktree…".to_owned());
 }
 
 fn handle_picker_key(

@@ -9,7 +9,10 @@ use bcode_session_models::{
     SessionHistoryQuery, SessionId, SessionSummary,
 };
 use bcode_skill_models::SkillId;
-use bcode_worktree_models::{WorktreeListRequest, WorktreeListResponse};
+use bcode_worktree_models::{
+    WorktreeCreateRequest, WorktreeCreateResponse, WorktreeListRequest, WorktreeListResponse,
+    WorktreeRemoveRequest, WorktreeRemoveResponse,
+};
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -158,6 +161,23 @@ pub enum TuiEffect {
     ListWorktrees {
         /// Request payload.
         request: WorktreeListRequest,
+    },
+    /// Attach current session to a worktree path.
+    AttachWorktree {
+        /// Session to attach.
+        session_id: SessionId,
+        /// Selected worktree path.
+        path: std::path::PathBuf,
+    },
+    /// Create a worktree.
+    CreateWorktree {
+        /// Request payload.
+        request: WorktreeCreateRequest,
+    },
+    /// Remove a worktree.
+    RemoveWorktree {
+        /// Request payload.
+        request: WorktreeRemoveRequest,
     },
     /// Request cancellation of the active turn for a session.
     CancelTurn { session_id: SessionId },
@@ -348,6 +368,23 @@ pub enum TuiEffectResult {
         /// Worktree list result.
         result: Result<WorktreeListResponse, ClientError>,
     },
+    /// Worktree attach completed.
+    AttachWorktree {
+        /// Selected worktree path.
+        path: std::path::PathBuf,
+        /// Attach result.
+        result: Result<SessionSummary, ClientError>,
+    },
+    /// Worktree creation completed.
+    CreateWorktree {
+        /// Worktree creation result.
+        result: Result<WorktreeCreateResponse, ClientError>,
+    },
+    /// Worktree removal completed.
+    RemoveWorktree {
+        /// Worktree removal result.
+        result: Result<WorktreeRemoveResponse, ClientError>,
+    },
     /// Result for active turn cancellation.
     CancelTurn {
         /// Session the request targeted.
@@ -395,6 +432,9 @@ impl TuiEffectResult {
             Self::SubmitMessage { result, .. } => DaemonObservation::from_client_result(result),
             Self::CompactContext { result, .. } => DaemonObservation::from_client_result(result),
             Self::ListWorktrees { result } => DaemonObservation::from_client_result(result),
+            Self::AttachWorktree { result, .. } => DaemonObservation::from_client_result(result),
+            Self::CreateWorktree { result } => DaemonObservation::from_client_result(result),
+            Self::RemoveWorktree { result } => DaemonObservation::from_client_result(result),
             Self::CancelTurn { result, .. } => DaemonObservation::from_client_result(result),
             Self::CycleThinkingEffort { result, .. } => {
                 DaemonObservation::from_client_result(result)
@@ -465,6 +505,9 @@ enum EffectKey {
     SetSessionModel(SessionId),
     CompactContext(SessionId),
     WorktreeList,
+    AttachWorktree(SessionId),
+    CreateWorktree,
+    RemoveWorktree,
     CancelTurn(SessionId),
     CycleThinkingEffort(Option<SessionId>),
 }
@@ -492,6 +535,9 @@ impl TuiEffect {
             | Self::SkillAction { .. }
             | Self::SetSessionModel { .. }
             | Self::CompactContext { .. }
+            | Self::AttachWorktree { .. }
+            | Self::CreateWorktree { .. }
+            | Self::RemoveWorktree { .. }
             | Self::CancelTurn { .. }
             | Self::CycleThinkingEffort { .. } => EffectDaemonIntent::Foreground,
             Self::OpenSession { .. }
@@ -687,6 +733,9 @@ impl TuiEffect {
             Self::SetSessionModel { session_id, .. } => EffectKey::SetSessionModel(*session_id),
             Self::CompactContext { session_id } => EffectKey::CompactContext(*session_id),
             Self::ListWorktrees { .. } => EffectKey::WorktreeList,
+            Self::AttachWorktree { session_id, .. } => EffectKey::AttachWorktree(*session_id),
+            Self::CreateWorktree { .. } => EffectKey::CreateWorktree,
+            Self::RemoveWorktree { .. } => EffectKey::RemoveWorktree,
             Self::CancelTurn { session_id } => EffectKey::CancelTurn(*session_id),
             Self::CycleThinkingEffort { session_id, .. } => {
                 EffectKey::CycleThinkingEffort(*session_id)
@@ -786,6 +835,18 @@ impl TuiEffect {
             },
             Self::ListWorktrees { request } => TuiEffectResult::ListWorktrees {
                 result: client.list_worktrees(request).await,
+            },
+            Self::AttachWorktree { session_id, path } => TuiEffectResult::AttachWorktree {
+                path: path.clone(),
+                result: client
+                    .change_session_working_directory(session_id, path)
+                    .await,
+            },
+            Self::CreateWorktree { request } => TuiEffectResult::CreateWorktree {
+                result: client.create_worktree(request).await,
+            },
+            Self::RemoveWorktree { request } => TuiEffectResult::RemoveWorktree {
+                result: client.remove_worktree(request).await,
             },
             Self::CancelTurn { session_id } => TuiEffectResult::CancelTurn {
                 session_id,
