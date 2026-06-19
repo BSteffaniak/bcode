@@ -1220,6 +1220,7 @@ fn new_draft_preserves_selected_agent() {
         session_open_task: None,
         status_hydration_task: None,
         opening_session_id: None,
+        startup_effects: Vec::new(),
     };
     chat.app.set_current_agent_id("plan");
 
@@ -1245,6 +1246,7 @@ async fn async_session_open_preserves_typed_draft() {
         session_open_task: None,
         status_hydration_task: None,
         opening_session_id: Some(session_id),
+        startup_effects: Vec::new(),
     };
     chat.app.replace_composer_with("draft while opening");
     let (_event_sender, event_receiver) = tokio::sync::broadcast::channel::<SessionEvent>(1);
@@ -1301,6 +1303,7 @@ async fn async_session_open_initial_state_preserves_existing_draft() {
         session_open_task: None,
         status_hydration_task: None,
         opening_session_id: None,
+        startup_effects: Vec::new(),
     };
     chat.app.replace_composer_with("draft before opening");
 

@@ -9,10 +9,12 @@ use bcode_session_models::{
     SessionId,
 };
 
-use super::{slash_palette, thinking_flow};
+use super::{session_flow::AgentCatalog, slash_palette, thinking_flow};
 
 /// Background work requested by local TUI event handling.
 pub enum TuiEffect {
+    /// Load agent metadata.
+    LoadAgentCatalog,
     /// Load an older history page before the currently displayed timeline.
     LoadOlderHistory {
         /// Session to load.
@@ -60,6 +62,11 @@ pub enum TuiEffect {
 
 /// Completed TUI background work.
 pub enum TuiEffectResult {
+    /// Agent metadata load completed.
+    AgentCatalogLoaded {
+        /// Agent catalog result.
+        agents: Result<AgentCatalog, String>,
+    },
     /// Older history page load completed.
     OlderHistoryLoaded {
         /// Session that was requested.
@@ -124,6 +131,7 @@ pub struct ThinkingCycleResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum EffectKey {
+    AgentCatalog,
     OlderHistory,
     NewerHistory,
     PermissionList,
@@ -230,6 +238,7 @@ impl TuiEffectRunner {
 impl TuiEffect {
     const fn key(&self) -> EffectKey {
         match self {
+            Self::LoadAgentCatalog => EffectKey::AgentCatalog,
             Self::LoadOlderHistory { .. } => EffectKey::OlderHistory,
             Self::LoadNewerHistory { .. } => EffectKey::NewerHistory,
             Self::ListPermissions => EffectKey::PermissionList,
@@ -244,6 +253,11 @@ impl TuiEffect {
 
     async fn run(self, client: BcodeClient) -> TuiEffectResult {
         match self {
+            Self::LoadAgentCatalog => TuiEffectResult::AgentCatalogLoaded {
+                agents: AgentCatalog::load(&client)
+                    .await
+                    .map_err(|error| error.to_string()),
+            },
             Self::LoadOlderHistory { session_id, cursor } => TuiEffectResult::OlderHistoryLoaded {
                 session_id,
                 result: client

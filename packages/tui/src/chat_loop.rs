@@ -193,6 +193,9 @@ pub async fn run_with_client<W: Write>(
         thinking_dialog: None,
         timeline_dialog: None,
     };
+    for effect in chat.startup_effects.drain(..) {
+        modals.effects.start(effect);
+    }
     sync_chat_key_labels(chat, &settings.keymap);
     let mut draft_autosave = DraftAutosave::new(
         settings.launch_working_directory.clone(),
@@ -407,111 +410,202 @@ fn apply_effect_result(
     result: TuiEffectResult,
 ) {
     match result {
-        TuiEffectResult::OlderHistoryLoaded { session_id, result } => match result {
-            Ok(page) if Some(session_id) == chat.session_id => {
-                chat.app.prepend_older_history(&page.events, page.has_more);
+        TuiEffectResult::AgentCatalogLoaded { agents } => {
+            apply_agent_catalog_result(chat, agents);
+        }
+        TuiEffectResult::OlderHistoryLoaded { session_id, result } => {
+            apply_older_history_result(chat, session_id, result);
+        }
+        TuiEffectResult::NewerHistoryLoaded { session_id, result } => {
+            apply_newer_history_result(chat, session_id, result);
+        }
+        TuiEffectResult::PermissionList { result } => {
+            apply_permission_list_result(chat, modals, result);
+        }
+        TuiEffectResult::SaveDraft { text, result } => {
+            apply_save_draft_result(chat, draft_autosave, text, result);
+        }
+        TuiEffectResult::SlashPaletteLoaded { query, palette } => {
+            apply_slash_palette_result(chat, modals, &query, palette);
+        }
+        TuiEffectResult::CancelTurn { session_id, result } => {
+            apply_cancel_turn_result(chat, session_id, result);
+        }
+        TuiEffectResult::CycleThinkingEffort { session_id, result } => {
+            apply_thinking_cycle_result(chat, session_id, *result);
+        }
+    }
+}
+
+fn apply_agent_catalog_result(
+    chat: &mut ActiveChat,
+    agents: Result<session_flow::AgentCatalog, String>,
+) {
+    match agents {
+        Ok(agents) => {
+            chat.app.set_agent_metadata_hydrated(true);
+            chat.agents = agents;
+            chat.agents.refresh_app_agent_metadata(&mut chat.app);
+        }
+        Err(error) => {
+            chat.app
+                .set_status(format!("Agent metadata unavailable: {error}"));
+        }
+    }
+}
+
+fn apply_older_history_result(
+    chat: &mut ActiveChat,
+    session_id: bcode_session_models::SessionId,
+    result: Result<bcode_session_models::SessionHistoryPage, ClientError>,
+) {
+    match result {
+        Ok(page) if Some(session_id) == chat.session_id => {
+            chat.app.prepend_older_history(&page.events, page.has_more);
+        }
+        Ok(_stale) => {}
+        Err(error) => {
+            if Some(session_id) == chat.session_id {
+                chat.app.set_loading_older_history(false);
             }
-            Ok(_stale) => {}
-            Err(error) => {
-                if Some(session_id) == chat.session_id {
-                    chat.app.set_loading_older_history(false);
-                }
-                report_nonfatal_client_error(chat, "Older history unavailable", &error);
+            report_nonfatal_client_error(chat, "Older history unavailable", &error);
+        }
+    }
+}
+
+fn apply_newer_history_result(
+    chat: &mut ActiveChat,
+    session_id: bcode_session_models::SessionId,
+    result: Result<bcode_session_models::SessionHistoryPage, ClientError>,
+) {
+    match result {
+        Ok(page) if Some(session_id) == chat.session_id => {
+            chat.app.append_newer_history(&page.events, page.has_more);
+        }
+        Ok(_stale) => {}
+        Err(error) => {
+            if Some(session_id) == chat.session_id {
+                chat.app.set_loading_newer_history(false);
             }
-        },
-        TuiEffectResult::NewerHistoryLoaded { session_id, result } => match result {
-            Ok(page) if Some(session_id) == chat.session_id => {
-                chat.app.append_newer_history(&page.events, page.has_more);
-            }
-            Ok(_stale) => {}
-            Err(error) => {
-                if Some(session_id) == chat.session_id {
-                    chat.app.set_loading_newer_history(false);
-                }
-                report_nonfatal_client_error(chat, "Newer history unavailable", &error);
-            }
-        },
-        TuiEffectResult::PermissionList { result } => match result {
-            Ok(permissions) => {
-                modals.permission_poll.last_error_status = None;
-                if modals.permission_dialog.is_none()
-                    && let Some(permission) = permissions
-                        .into_iter()
-                        .find(|permission| Some(permission.session_id) == chat.session_id)
-                {
-                    modals.permission_dialog = Some(PermissionDialogState::new(permission));
-                }
-            }
-            Err(error) => {
-                let label = if error.is_daemon_unavailable() {
-                    modals.permission_poll.next_poll_at =
-                        Instant::now() + PERMISSION_POLL_DAEMON_DOWN_INTERVAL;
-                    "Permissions unavailable"
-                } else {
-                    "Permission check failed"
-                };
-                let status = daemon_issue::client_issue_status(label, &error);
-                if modals.permission_poll.last_error_status.as_deref() != Some(&status) {
-                    chat.app.set_status(status.clone());
-                }
-                modals.permission_poll.last_error_status = Some(status);
-            }
-        },
-        TuiEffectResult::SaveDraft { text, result } => match result {
-            Ok(()) => draft_autosave.mark_save_completed(text),
-            Err(error) => report_nonfatal_client_error(chat, "Draft autosave unavailable", &error),
-        },
-        TuiEffectResult::SlashPaletteLoaded { query, mut palette } => {
-            if query == chat.app.composer().text() {
-                if let Some(previous) = modals
-                    .slash_palette
-                    .as_ref()
-                    .filter(|current| current.query() == query)
-                    .and_then(|current| current.selected_command().map(str::to_owned))
-                {
-                    palette.select_command(&previous);
-                }
-                modals.slash_palette = (!palette.is_empty()).then_some(palette);
+            report_nonfatal_client_error(chat, "Newer history unavailable", &error);
+        }
+    }
+}
+
+fn apply_permission_list_result(
+    chat: &mut ActiveChat,
+    modals: &mut ModalState,
+    result: Result<Vec<bcode_ipc::PermissionSummary>, ClientError>,
+) {
+    match result {
+        Ok(permissions) => {
+            modals.permission_poll.last_error_status = None;
+            if modals.permission_dialog.is_none()
+                && let Some(permission) = permissions
+                    .into_iter()
+                    .find(|permission| Some(permission.session_id) == chat.session_id)
+            {
+                modals.permission_dialog = Some(PermissionDialogState::new(permission));
             }
         }
-        TuiEffectResult::CancelTurn { session_id, result } => match result {
-            Ok(true) if Some(session_id) == chat.app.session_id() => {
-                chat.app
-                    .set_status("turn cancellation requested".to_owned());
+        Err(error) => {
+            let label = if error.is_daemon_unavailable() {
+                modals.permission_poll.next_poll_at =
+                    Instant::now() + PERMISSION_POLL_DAEMON_DOWN_INTERVAL;
+                "Permissions unavailable"
+            } else {
+                "Permission check failed"
+            };
+            let status = daemon_issue::client_issue_status(label, &error);
+            if modals.permission_poll.last_error_status.as_deref() != Some(&status) {
+                chat.app.set_status(status.clone());
             }
-            Ok(false) if Some(session_id) == chat.app.session_id() => {
+            modals.permission_poll.last_error_status = Some(status);
+        }
+    }
+}
+
+fn apply_save_draft_result(
+    chat: &mut ActiveChat,
+    draft_autosave: &mut DraftAutosave,
+    text: String,
+    result: Result<(), ClientError>,
+) {
+    match result {
+        Ok(()) => draft_autosave.mark_save_completed(text),
+        Err(error) => report_nonfatal_client_error(chat, "Draft autosave unavailable", &error),
+    }
+}
+
+fn apply_slash_palette_result(
+    chat: &ActiveChat,
+    modals: &mut ModalState,
+    query: &str,
+    mut palette: slash_palette::SlashPalette,
+) {
+    if query != chat.app.composer().text() {
+        return;
+    }
+    if let Some(previous) = modals
+        .slash_palette
+        .as_ref()
+        .filter(|current| current.query() == query)
+        .and_then(|current| current.selected_command().map(str::to_owned))
+    {
+        palette.select_command(&previous);
+    }
+    modals.slash_palette = (!palette.is_empty()).then_some(palette);
+}
+
+fn apply_cancel_turn_result(
+    chat: &mut ActiveChat,
+    session_id: bcode_session_models::SessionId,
+    result: Result<bool, ClientError>,
+) {
+    match result {
+        Ok(true) if Some(session_id) == chat.app.session_id() => {
+            chat.app
+                .set_status("turn cancellation requested".to_owned());
+        }
+        Ok(false) if Some(session_id) == chat.app.session_id() => {
+            chat.app.set_idle();
+            chat.app.set_status("no active turn".to_owned());
+        }
+        Ok(_) => {}
+        Err(error) => {
+            if Some(session_id) == chat.app.session_id() {
                 chat.app.set_idle();
-                chat.app.set_status("no active turn".to_owned());
             }
-            Ok(_) => {}
-            Err(error) => {
-                if Some(session_id) == chat.app.session_id() {
-                    chat.app.set_idle();
-                }
-                report_nonfatal_client_error(chat, "Cancel unavailable", &error);
+            report_nonfatal_client_error(chat, "Cancel unavailable", &error);
+        }
+    }
+}
+
+fn apply_thinking_cycle_result(
+    chat: &mut ActiveChat,
+    session_id: Option<bcode_session_models::SessionId>,
+    result: Result<super::effects::ThinkingCycleResult, ClientError>,
+) {
+    match result {
+        Ok(result) if session_id == chat.app.session_id() => {
+            if let Some(status) = result.status {
+                chat.app.apply_model_status(status);
             }
-        },
-        TuiEffectResult::CycleThinkingEffort { session_id, result } => match *result {
-            Ok(result) if session_id == chat.app.session_id() => {
-                if let Some(status) = result.status {
-                    chat.app.apply_model_status(status);
-                }
-                if let Some(next_effort) = result.next_effort {
-                    chat.app.apply_reasoning_selection(
-                        Some(next_effort.clone()),
-                        result.summary,
-                        result.visible,
-                    );
-                    chat.app
-                        .set_status(format!("thinking effort set to {next_effort}"));
-                } else {
-                    chat.app
-                        .set_status("thinking effort unavailable for current model".to_owned());
-                }
+            if let Some(next_effort) = result.next_effort {
+                chat.app.apply_reasoning_selection(
+                    Some(next_effort.clone()),
+                    result.summary,
+                    result.visible,
+                );
+                chat.app
+                    .set_status(format!("thinking effort set to {next_effort}"));
+            } else {
+                chat.app
+                    .set_status("thinking effort unavailable for current model".to_owned());
             }
-            Ok(_stale) => {}
-            Err(error) => report_nonfatal_client_error(chat, "thinking effort failed", &error),
-        },
+        }
+        Ok(_stale) => {}
+        Err(error) => report_nonfatal_client_error(chat, "thinking effort failed", &error),
     }
 }
 
@@ -762,9 +856,6 @@ fn handle_async_event(
         session_flow::ChatAsyncEvent::DraftStatusHydrated(hydrated) => {
             chat.status_hydration_task = None;
             session_flow::complete_draft_status_hydration(chat, hydrated);
-        }
-        session_flow::ChatAsyncEvent::AgentCatalogHydrated(hydrated) => {
-            session_flow::complete_agent_catalog_hydration(chat, hydrated);
         }
         session_flow::ChatAsyncEvent::ConfigHydrated(hydrated) => {
             session_flow::complete_config_hydration(client, settings, chat, *hydrated);

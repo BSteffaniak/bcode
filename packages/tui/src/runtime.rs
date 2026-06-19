@@ -8,6 +8,7 @@ use bmux_tui::terminal::Terminal;
 use tokio::sync::mpsc;
 
 use super::app::BmuxApp;
+use super::effects::TuiEffect;
 use super::startup_action::StartupTuiAction;
 use super::terminal_events::TuiInput;
 use super::{TuiError, chat_loop, session_flow};
@@ -47,9 +48,10 @@ pub async fn run_event_loop_with_startup<W: Write>(
         session_open_task: None,
         status_hydration_task: None,
         opening_session_id: None,
+        startup_effects: Vec::new(),
     };
     session_flow::start_config_hydration(&chat);
-    session_flow::start_agent_catalog_hydration(&client, &chat);
+    chat.start_effect(TuiEffect::LoadAgentCatalog);
     if let Some(session_id) = session_id {
         let initial_window_request = session_flow::initial_transcript_window_request(
             super::render::transcript_area_for_frame(&chat.app, terminal.area()),

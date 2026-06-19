@@ -41,6 +41,14 @@ pub struct ActiveChat {
     pub session_open_task: Option<JoinHandle<()>>,
     pub status_hydration_task: Option<JoinHandle<()>>,
     pub opening_session_id: Option<SessionId>,
+    pub startup_effects: Vec<super::effects::TuiEffect>,
+}
+
+impl ActiveChat {
+    /// Queue a background effect to start when the chat loop is ready.
+    pub fn start_effect(&mut self, effect: super::effects::TuiEffect) {
+        self.startup_effects.push(effect);
+    }
 }
 
 /// TUI-side catalog of agent profile metadata.
@@ -118,7 +126,6 @@ pub enum ChatAsyncEvent {
     SessionOpened(SessionOpenResult),
     StatusHydrated(StatusHydrationResult),
     DraftStatusHydrated(DraftStatusHydrationResult),
-    AgentCatalogHydrated(AgentCatalogHydrationResult),
     ConfigHydrated(Box<ConfigHydrationResult>),
     AuthSecurityHydrated(AuthSecurityHydrationResult),
 }
@@ -138,11 +145,6 @@ pub struct DraftStatusHydrationResult {
     pub model: Option<bcode_ipc::SessionModelStatus>,
     pub composer_draft: Option<String>,
     pub error: Option<String>,
-}
-
-/// Result from asynchronously hydrating agent metadata.
-pub struct AgentCatalogHydrationResult {
-    pub agents: Result<AgentCatalog, String>,
 }
 
 /// Result from asynchronously opening a session.
@@ -384,38 +386,6 @@ fn auth_security_status(config: &bcode_config::BcodeConfig) -> Option<String> {
             })
         })
         .map(|diagnostic| format!("⚠ {} Run `bcode auth status`.", diagnostic.message))
-}
-
-/// Start non-critical agent metadata hydration in the background.
-pub fn start_agent_catalog_hydration(client: &BcodeClient, chat: &ActiveChat) {
-    let client = client.clone();
-    let async_event_sender = chat.async_event_sender.clone();
-    tokio::spawn(async move {
-        let agents = AgentCatalog::load(&client)
-            .await
-            .map_err(|error| error.to_string());
-        let _ = async_event_sender.send(ChatAsyncEvent::AgentCatalogHydrated(
-            AgentCatalogHydrationResult { agents },
-        ));
-    });
-}
-
-/// Apply completed non-critical agent metadata hydration.
-pub fn complete_agent_catalog_hydration(
-    chat: &mut ActiveChat,
-    hydrated: AgentCatalogHydrationResult,
-) {
-    match hydrated.agents {
-        Ok(agents) => {
-            chat.app.set_agent_metadata_hydrated(true);
-            chat.agents = agents;
-            chat.agents.refresh_app_agent_metadata(&mut chat.app);
-        }
-        Err(error) => {
-            chat.app
-                .set_status(format!("Agent metadata unavailable: {error}"));
-        }
-    }
 }
 
 /// Start non-critical draft-session status hydration in the background.
