@@ -3,12 +3,20 @@
 use std::collections::BTreeMap;
 
 use bcode_client::{BcodeClient, ClientError};
+use bcode_ipc::ComposerDraftScope;
 use bcode_session_models::SessionId;
 
 use super::{slash_palette, thinking_flow};
 
 /// Background work requested by local TUI event handling.
 pub enum TuiEffect {
+    /// Save composer draft text for a scope.
+    SaveDraft {
+        /// Draft scope to save.
+        scope: ComposerDraftScope,
+        /// Draft text.
+        text: String,
+    },
     /// Load slash command completions for a composer query.
     LoadSlashPalette {
         /// Current slash query.
@@ -33,6 +41,13 @@ pub enum TuiEffect {
 
 /// Completed TUI background work.
 pub enum TuiEffectResult {
+    /// Composer draft save completed.
+    SaveDraft {
+        /// Saved draft text.
+        text: String,
+        /// Save result.
+        result: Result<(), ClientError>,
+    },
     /// Slash palette load completed.
     SlashPaletteLoaded {
         /// Query used to build completions.
@@ -71,6 +86,7 @@ pub struct ThinkingCycleResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum EffectKey {
+    DraftSave,
     SlashPalette,
     CancelTurn(SessionId),
     CycleThinkingEffort(Option<SessionId>),
@@ -80,6 +96,7 @@ enum EffectKey {
 pub struct TuiEffectRunner {
     client: BcodeClient,
     tasks: BTreeMap<EffectKey, tokio::task::JoinHandle<TuiEffectResult>>,
+    queued_latest: BTreeMap<EffectKey, TuiEffect>,
 }
 
 impl TuiEffectRunner {
@@ -89,6 +106,7 @@ impl TuiEffectRunner {
         Self {
             client: client.clone(),
             tasks: BTreeMap::new(),
+            queued_latest: BTreeMap::new(),
         }
     }
 
@@ -111,11 +129,23 @@ impl TuiEffectRunner {
         self.spawn(key, effect);
     }
 
+    /// Queue the latest effect with this key to run after the current one finishes.
+    pub fn queue_latest(&mut self, effect: TuiEffect) -> bool {
+        let key = effect.key();
+        if self.tasks.contains_key(&key) {
+            self.queued_latest.insert(key, effect);
+            return false;
+        }
+        self.spawn(key, effect);
+        true
+    }
+
     /// Abort an in-flight effect with the same key as the supplied effect.
     pub fn abort_matching(&mut self, effect: &TuiEffect) {
         if let Some(task) = self.tasks.remove(&effect.key()) {
             task.abort();
         }
+        self.queued_latest.remove(&effect.key());
     }
 
     fn spawn(&mut self, key: EffectKey, effect: TuiEffect) {
@@ -140,12 +170,16 @@ impl TuiEffectRunner {
                 Ok(result) => results.push(result),
                 Err(_error) => {}
             }
+            if let Some(effect) = self.queued_latest.remove(&key) {
+                self.spawn(key, effect);
+            }
         }
         results
     }
 
     /// Abort all in-flight effects.
     pub fn abort_all(&mut self) {
+        self.queued_latest.clear();
         for (_key, task) in std::mem::take(&mut self.tasks) {
             task.abort();
         }
@@ -155,6 +189,7 @@ impl TuiEffectRunner {
 impl TuiEffect {
     const fn key(&self) -> EffectKey {
         match self {
+            Self::SaveDraft { .. } => EffectKey::DraftSave,
             Self::LoadSlashPalette { .. } => EffectKey::SlashPalette,
             Self::CancelTurn { session_id } => EffectKey::CancelTurn(*session_id),
             Self::CycleThinkingEffort { session_id, .. } => {
@@ -165,6 +200,10 @@ impl TuiEffect {
 
     async fn run(self, client: BcodeClient) -> TuiEffectResult {
         match self {
+            Self::SaveDraft { scope, text } => {
+                let result = client.set_composer_draft(scope, text.clone()).await;
+                TuiEffectResult::SaveDraft { text, result }
+            }
             Self::LoadSlashPalette { query, session_id } => {
                 let palette = slash_palette::SlashPalette::new(&client, session_id, &query).await;
                 TuiEffectResult::SlashPaletteLoaded { query, palette }

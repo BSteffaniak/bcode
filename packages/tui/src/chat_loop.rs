@@ -112,28 +112,12 @@ struct ModalState {
     palette: Option<BmuxCommandPalette>,
     slash_palette: Option<slash_palette::SlashPalette>,
     effects: TuiEffectRunner,
-    draft_save: AsyncDraftSave,
     permission_dialog: Option<PermissionDialogState>,
     permission_poll: AsyncPermissionPoll,
     older_history_load: AsyncHistoryPageLoad,
     newer_history_load: AsyncHistoryPageLoad,
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
-}
-
-#[derive(Debug)]
-struct AsyncDraftSave {
-    task: Option<tokio::task::JoinHandle<Result<String, ClientError>>>,
-    pending: Option<(ComposerDraftScope, String)>,
-}
-
-impl AsyncDraftSave {
-    const fn new() -> Self {
-        Self {
-            task: None,
-            pending: None,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -228,7 +212,6 @@ pub async fn run_with_client<W: Write>(
         palette: None,
         slash_palette: None,
         effects: TuiEffectRunner::new(client),
-        draft_save: AsyncDraftSave::new(),
         permission_dialog: None,
         permission_poll: AsyncPermissionPoll::new(Instant::now()),
         older_history_load: AsyncHistoryPageLoad::new(),
@@ -268,7 +251,7 @@ pub async fn run_with_client<W: Write>(
         if let Some(save_at) = draft_autosave.next_save_at()
             && Instant::now() >= save_at
         {
-            start_draft_save(client, chat, &mut draft_autosave, &mut modals.draft_save);
+            start_draft_save(chat, &mut draft_autosave, &mut modals.effects);
         }
 
         let redraw_at = next_redraw_at(last_redraw);
@@ -367,9 +350,6 @@ pub async fn run_with_client<W: Write>(
         }
     }
 
-    if let Some(task) = modals.draft_save.task.take() {
-        task.abort();
-    }
     modals.effects.abort_all();
     Ok(())
 }
@@ -391,8 +371,7 @@ async fn handle_loop_housekeeping(
     let mut needs_redraw = false;
     needs_redraw |= poll_older_history_load(chat, &mut modals.older_history_load).await;
     needs_redraw |= poll_newer_history_load(chat, &mut modals.newer_history_load).await;
-    needs_redraw |= poll_draft_save(client, chat, draft_autosave, &mut modals.draft_save).await;
-    needs_redraw |= poll_finished_effects(chat, modals).await;
+    needs_redraw |= poll_finished_effects(chat, draft_autosave, modals).await;
     needs_redraw |= maybe_start_older_history_load(client, chat, &mut modals.older_history_load);
     needs_redraw |= maybe_start_newer_history_load(client, chat, &mut modals.newer_history_load);
     needs_redraw |= poll_permission_list(chat, modals).await;
@@ -514,17 +493,30 @@ async fn poll_newer_history_load(chat: &mut ActiveChat, load: &mut AsyncHistoryP
     true
 }
 
-async fn poll_finished_effects(chat: &mut ActiveChat, modals: &mut ModalState) -> bool {
+async fn poll_finished_effects(
+    chat: &mut ActiveChat,
+    draft_autosave: &mut DraftAutosave,
+    modals: &mut ModalState,
+) -> bool {
     let results = modals.effects.poll_finished().await;
     let needs_redraw = !results.is_empty();
     for result in results {
-        apply_effect_result(chat, modals, result);
+        apply_effect_result(chat, draft_autosave, modals, result);
     }
     needs_redraw
 }
 
-fn apply_effect_result(chat: &mut ActiveChat, modals: &mut ModalState, result: TuiEffectResult) {
+fn apply_effect_result(
+    chat: &mut ActiveChat,
+    draft_autosave: &mut DraftAutosave,
+    modals: &mut ModalState,
+    result: TuiEffectResult,
+) {
     match result {
+        TuiEffectResult::SaveDraft { text, result } => match result {
+            Ok(()) => draft_autosave.mark_save_completed(text),
+            Err(error) => report_nonfatal_client_error(chat, "Draft autosave unavailable", &error),
+        },
         TuiEffectResult::SlashPaletteLoaded { query, mut palette } => {
             if query == chat.app.composer().text() {
                 if let Some(previous) = modals
@@ -611,55 +603,15 @@ fn start_cancel_turn(chat: &mut ActiveChat, effects: &mut TuiEffectRunner) {
 }
 
 fn start_draft_save(
-    client: &BcodeClient,
     chat: &ActiveChat,
     draft_autosave: &mut DraftAutosave,
-    draft_save: &mut AsyncDraftSave,
+    effects: &mut TuiEffectRunner,
 ) {
-    let Some(request) = draft_autosave.pending_save(chat) else {
+    let Some((scope, text)) = draft_autosave.pending_save(chat) else {
         return;
     };
     draft_autosave.mark_save_started();
-    if draft_save.task.is_some() {
-        draft_save.pending = Some(request);
-        return;
-    }
-    start_draft_save_request(client, draft_save, request);
-}
-
-fn start_draft_save_request(
-    client: &BcodeClient,
-    draft_save: &mut AsyncDraftSave,
-    request: (ComposerDraftScope, String),
-) {
-    let client = client.clone();
-    let (scope, text) = request;
-    draft_save.task = Some(tokio::spawn(async move {
-        client.set_composer_draft(scope, text.clone()).await?;
-        Ok(text)
-    }));
-}
-
-async fn poll_draft_save(
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-    draft_autosave: &mut DraftAutosave,
-    draft_save: &mut AsyncDraftSave,
-) -> bool {
-    let Some(task) = draft_save.task.take_if(|task| task.is_finished()) else {
-        return false;
-    };
-    match task.await {
-        Ok(Ok(saved_text)) => draft_autosave.mark_save_completed(saved_text),
-        Ok(Err(error)) => report_nonfatal_client_error(chat, "Draft autosave unavailable", &error),
-        Err(error) => chat
-            .app
-            .set_status(format!("Draft autosave task failed: {error}")),
-    }
-    if let Some(request) = draft_save.pending.take() {
-        start_draft_save_request(client, draft_save, request);
-    }
-    true
+    effects.queue_latest(TuiEffect::SaveDraft { scope, text });
 }
 
 fn update_slash_palette_async(chat: &ActiveChat, modals: &mut ModalState) -> bool {
@@ -1119,24 +1071,13 @@ async fn handle_chat_key_request<W: Write>(
             }
             if let Some(autosave) = draft_autosave {
                 if let Some(scope) = pre_submit_scope {
-                    let request = DraftAutosave::clear_scope_request(scope);
-                    if modals.draft_save.task.is_some() {
-                        modals.draft_save.pending = Some(request);
-                    } else {
-                        start_draft_save_request(
-                            context.services.client,
-                            &mut modals.draft_save,
-                            request,
-                        );
-                    }
+                    let (scope, text) = DraftAutosave::clear_scope_request(scope);
+                    modals
+                        .effects
+                        .queue_latest(TuiEffect::SaveDraft { scope, text });
                 }
                 autosave.mark_dirty_now();
-                start_draft_save(
-                    context.services.client,
-                    chat,
-                    autosave,
-                    &mut modals.draft_save,
-                );
+                start_draft_save(chat, autosave, &mut modals.effects);
             }
         }
     }
