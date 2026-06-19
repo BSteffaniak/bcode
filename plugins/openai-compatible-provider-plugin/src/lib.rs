@@ -1016,11 +1016,13 @@ async fn stream_chat_completion_with_failover(
     }
     let mut last_error = None;
     let mut warned_cooldown_profiles = BTreeSet::new();
-    for candidate in available_candidates {
-        let is_cooldown_candidate = cooldown_candidates.iter().any(|cooldown_candidate| {
-            cooldown_candidate.profile.as_ref() == candidate.profile.as_ref()
-        });
-        if is_cooldown_candidate
+    for candidate in available_candidates
+        .into_iter()
+        .chain(cooldown_candidates.into_iter())
+    {
+        if skipped_profiles
+            .iter()
+            .any(|profile| Some(profile) == candidate.profile.as_ref())
             && let Some(profile) = &candidate.profile
             && !warned_cooldown_profiles.contains(profile)
         {
