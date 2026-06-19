@@ -6,10 +6,7 @@ use std::time::{Duration, Instant, SystemTime};
 use bcode_client::{BcodeClient, ClientError};
 use bcode_config::TuiConfig;
 use bcode_ipc::{ComposerDraftScope, Event as BcodeEvent};
-use bcode_session_models::{
-    SessionEventKind, SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage,
-    SessionHistoryQuery, SessionId,
-};
+use bcode_session_models::SessionEventKind;
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
@@ -114,8 +111,6 @@ struct ModalState {
     effects: TuiEffectRunner,
     permission_dialog: Option<PermissionDialogState>,
     permission_poll: AsyncPermissionPoll,
-    older_history_load: AsyncHistoryPageLoad,
-    newer_history_load: AsyncHistoryPageLoad,
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
 }
@@ -131,23 +126,6 @@ impl AsyncPermissionPoll {
         Self {
             next_poll_at: now,
             last_error_status: None,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct AsyncHistoryPageLoad {
-    task: Option<tokio::task::JoinHandle<Result<SessionHistoryPage, ClientError>>>,
-    session_id: Option<SessionId>,
-    cursor: Option<SessionHistoryCursor>,
-}
-
-impl AsyncHistoryPageLoad {
-    const fn new() -> Self {
-        Self {
-            task: None,
-            session_id: None,
-            cursor: None,
         }
     }
 }
@@ -212,8 +190,6 @@ pub async fn run_with_client<W: Write>(
         effects: TuiEffectRunner::new(client),
         permission_dialog: None,
         permission_poll: AsyncPermissionPoll::new(Instant::now()),
-        older_history_load: AsyncHistoryPageLoad::new(),
-        newer_history_load: AsyncHistoryPageLoad::new(),
         thinking_dialog: None,
         timeline_dialog: None,
     };
@@ -237,7 +213,7 @@ pub async fn run_with_client<W: Write>(
             needs_redraw = true;
         }
 
-        if handle_loop_housekeeping(client, chat, &mut draft_autosave, &mut modals).await {
+        if handle_loop_housekeeping(chat, &mut draft_autosave, &mut modals).await {
             needs_redraw = true;
         }
 
@@ -361,27 +337,20 @@ enum ChatLoopEvent {
 }
 
 async fn handle_loop_housekeeping(
-    client: &BcodeClient,
     chat: &mut ActiveChat,
     draft_autosave: &mut DraftAutosave,
     modals: &mut ModalState,
 ) -> bool {
     let mut needs_redraw = false;
-    needs_redraw |= poll_older_history_load(chat, &mut modals.older_history_load).await;
-    needs_redraw |= poll_newer_history_load(chat, &mut modals.newer_history_load).await;
     needs_redraw |= poll_finished_effects(chat, draft_autosave, modals).await;
-    needs_redraw |= maybe_start_older_history_load(client, chat, &mut modals.older_history_load);
-    needs_redraw |= maybe_start_newer_history_load(client, chat, &mut modals.newer_history_load);
+    needs_redraw |= maybe_start_older_history_load(chat, modals);
+    needs_redraw |= maybe_start_newer_history_load(chat, modals);
     maybe_start_permission_poll(chat, modals);
     needs_redraw
 }
 
-fn maybe_start_older_history_load(
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-    load: &mut AsyncHistoryPageLoad,
-) -> bool {
-    if load.task.is_some() || !chat.app.should_load_older_history() {
+fn maybe_start_older_history_load(chat: &mut ActiveChat, modals: &mut ModalState) -> bool {
+    if !chat.app.should_load_older_history() {
         return false;
     }
     let Some(cursor) = chat.app.older_history_cursor() else {
@@ -390,55 +359,17 @@ fn maybe_start_older_history_load(
     let Some(session_id) = chat.session_id else {
         return false;
     };
-    chat.app.set_loading_older_history(true);
-    load.session_id = Some(session_id);
-    load.cursor = Some(cursor);
-    let client = client.clone();
-    load.task = Some(tokio::spawn(async move {
-        client
-            .session_history_page(
-                session_id,
-                SessionHistoryQuery {
-                    cursor: Some(cursor),
-                    limit: super::OLDER_HISTORY_EVENT_LIMIT,
-                    direction: SessionHistoryDirection::Backward,
-                },
-            )
-            .await
-    }));
-    true
-}
-
-async fn poll_older_history_load(chat: &mut ActiveChat, load: &mut AsyncHistoryPageLoad) -> bool {
-    let Some(task) = load.task.take_if(|task| task.is_finished()) else {
-        return false;
-    };
-    let request_session_id = load.session_id.take();
-    load.cursor = None;
-    match task.await {
-        Ok(Ok(page)) if request_session_id == chat.session_id => {
-            chat.app.prepend_older_history(&page.events, page.has_more);
-        }
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => {
-            chat.app.set_loading_older_history(false);
-            report_nonfatal_client_error(chat, "Older history unavailable", &error);
-        }
-        Err(error) => {
-            chat.app.set_loading_older_history(false);
-            chat.app
-                .set_status(format!("Older history task failed: {error}"));
-        }
+    let started = modals
+        .effects
+        .start(TuiEffect::LoadOlderHistory { session_id, cursor });
+    if started {
+        chat.app.set_loading_older_history(true);
     }
-    true
+    started
 }
 
-fn maybe_start_newer_history_load(
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-    load: &mut AsyncHistoryPageLoad,
-) -> bool {
-    if load.task.is_some() || !chat.app.should_load_newer_history() {
+fn maybe_start_newer_history_load(chat: &mut ActiveChat, modals: &mut ModalState) -> bool {
+    if !chat.app.should_load_newer_history() {
         return false;
     }
     let Some(cursor) = chat.app.newer_history_cursor() else {
@@ -447,47 +378,13 @@ fn maybe_start_newer_history_load(
     let Some(session_id) = chat.session_id else {
         return false;
     };
-    chat.app.set_loading_newer_history(true);
-    load.session_id = Some(session_id);
-    load.cursor = Some(cursor);
-    let client = client.clone();
-    load.task = Some(tokio::spawn(async move {
-        client
-            .session_history_page(
-                session_id,
-                SessionHistoryQuery {
-                    cursor: Some(cursor),
-                    limit: super::OLDER_HISTORY_EVENT_LIMIT,
-                    direction: SessionHistoryDirection::Forward,
-                },
-            )
-            .await
-    }));
-    true
-}
-
-async fn poll_newer_history_load(chat: &mut ActiveChat, load: &mut AsyncHistoryPageLoad) -> bool {
-    let Some(task) = load.task.take_if(|task| task.is_finished()) else {
-        return false;
-    };
-    let request_session_id = load.session_id.take();
-    load.cursor = None;
-    match task.await {
-        Ok(Ok(page)) if request_session_id == chat.session_id => {
-            chat.app.append_newer_history(&page.events, page.has_more);
-        }
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => {
-            chat.app.set_loading_newer_history(false);
-            report_nonfatal_client_error(chat, "Newer history unavailable", &error);
-        }
-        Err(error) => {
-            chat.app.set_loading_newer_history(false);
-            chat.app
-                .set_status(format!("Newer history task failed: {error}"));
-        }
+    let started = modals
+        .effects
+        .start(TuiEffect::LoadNewerHistory { session_id, cursor });
+    if started {
+        chat.app.set_loading_newer_history(true);
     }
-    true
+    started
 }
 
 async fn poll_finished_effects(
@@ -510,6 +407,30 @@ fn apply_effect_result(
     result: TuiEffectResult,
 ) {
     match result {
+        TuiEffectResult::OlderHistoryLoaded { session_id, result } => match result {
+            Ok(page) if Some(session_id) == chat.session_id => {
+                chat.app.prepend_older_history(&page.events, page.has_more);
+            }
+            Ok(_stale) => {}
+            Err(error) => {
+                if Some(session_id) == chat.session_id {
+                    chat.app.set_loading_older_history(false);
+                }
+                report_nonfatal_client_error(chat, "Older history unavailable", &error);
+            }
+        },
+        TuiEffectResult::NewerHistoryLoaded { session_id, result } => match result {
+            Ok(page) if Some(session_id) == chat.session_id => {
+                chat.app.append_newer_history(&page.events, page.has_more);
+            }
+            Ok(_stale) => {}
+            Err(error) => {
+                if Some(session_id) == chat.session_id {
+                    chat.app.set_loading_newer_history(false);
+                }
+                report_nonfatal_client_error(chat, "Newer history unavailable", &error);
+            }
+        },
         TuiEffectResult::PermissionList { result } => match result {
             Ok(permissions) => {
                 modals.permission_poll.last_error_status = None;

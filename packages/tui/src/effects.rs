@@ -4,12 +4,29 @@ use std::collections::BTreeMap;
 
 use bcode_client::{BcodeClient, ClientError};
 use bcode_ipc::{ComposerDraftScope, PermissionSummary};
-use bcode_session_models::SessionId;
+use bcode_session_models::{
+    SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery,
+    SessionId,
+};
 
 use super::{slash_palette, thinking_flow};
 
 /// Background work requested by local TUI event handling.
 pub enum TuiEffect {
+    /// Load an older history page before the currently displayed timeline.
+    LoadOlderHistory {
+        /// Session to load.
+        session_id: SessionId,
+        /// Pagination cursor.
+        cursor: SessionHistoryCursor,
+    },
+    /// Load a newer history page after the currently displayed timeline.
+    LoadNewerHistory {
+        /// Session to load.
+        session_id: SessionId,
+        /// Pagination cursor.
+        cursor: SessionHistoryCursor,
+    },
     /// Poll pending permission requests.
     ListPermissions,
     /// Save composer draft text for a scope.
@@ -43,6 +60,20 @@ pub enum TuiEffect {
 
 /// Completed TUI background work.
 pub enum TuiEffectResult {
+    /// Older history page load completed.
+    OlderHistoryLoaded {
+        /// Session that was requested.
+        session_id: SessionId,
+        /// History page result.
+        result: Result<SessionHistoryPage, ClientError>,
+    },
+    /// Newer history page load completed.
+    NewerHistoryLoaded {
+        /// Session that was requested.
+        session_id: SessionId,
+        /// History page result.
+        result: Result<SessionHistoryPage, ClientError>,
+    },
     /// Permission poll completed.
     PermissionList {
         /// Permission list result.
@@ -93,6 +124,8 @@ pub struct ThinkingCycleResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum EffectKey {
+    OlderHistory,
+    NewerHistory,
     PermissionList,
     DraftSave,
     SlashPalette,
@@ -197,6 +230,8 @@ impl TuiEffectRunner {
 impl TuiEffect {
     const fn key(&self) -> EffectKey {
         match self {
+            Self::LoadOlderHistory { .. } => EffectKey::OlderHistory,
+            Self::LoadNewerHistory { .. } => EffectKey::NewerHistory,
             Self::ListPermissions => EffectKey::PermissionList,
             Self::SaveDraft { .. } => EffectKey::DraftSave,
             Self::LoadSlashPalette { .. } => EffectKey::SlashPalette,
@@ -209,6 +244,32 @@ impl TuiEffect {
 
     async fn run(self, client: BcodeClient) -> TuiEffectResult {
         match self {
+            Self::LoadOlderHistory { session_id, cursor } => TuiEffectResult::OlderHistoryLoaded {
+                session_id,
+                result: client
+                    .session_history_page(
+                        session_id,
+                        SessionHistoryQuery {
+                            cursor: Some(cursor),
+                            limit: super::OLDER_HISTORY_EVENT_LIMIT,
+                            direction: SessionHistoryDirection::Backward,
+                        },
+                    )
+                    .await,
+            },
+            Self::LoadNewerHistory { session_id, cursor } => TuiEffectResult::NewerHistoryLoaded {
+                session_id,
+                result: client
+                    .session_history_page(
+                        session_id,
+                        SessionHistoryQuery {
+                            cursor: Some(cursor),
+                            limit: super::OLDER_HISTORY_EVENT_LIMIT,
+                            direction: SessionHistoryDirection::Forward,
+                        },
+                    )
+                    .await,
+            },
             Self::ListPermissions => TuiEffectResult::PermissionList {
                 result: client.list_permissions().await,
             },
