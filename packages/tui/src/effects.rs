@@ -5,10 +5,17 @@ use std::collections::BTreeMap;
 use bcode_client::{BcodeClient, ClientError};
 use bcode_session_models::SessionId;
 
-use super::thinking_flow;
+use super::{slash_palette, thinking_flow};
 
 /// Background work requested by local TUI event handling.
 pub enum TuiEffect {
+    /// Load slash command completions for a composer query.
+    LoadSlashPalette {
+        /// Current slash query.
+        query: String,
+        /// Active session, if any.
+        session_id: Option<SessionId>,
+    },
     /// Request cancellation of the active turn for a session.
     CancelTurn { session_id: SessionId },
     /// Cycle reasoning effort for the current model/session.
@@ -26,6 +33,13 @@ pub enum TuiEffect {
 
 /// Completed TUI background work.
 pub enum TuiEffectResult {
+    /// Slash palette load completed.
+    SlashPaletteLoaded {
+        /// Query used to build completions.
+        query: String,
+        /// Loaded palette state.
+        palette: slash_palette::SlashPalette,
+    },
     /// Result for active turn cancellation.
     CancelTurn {
         /// Session the request targeted.
@@ -57,6 +71,7 @@ pub struct ThinkingCycleResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum EffectKey {
+    SlashPalette,
     CancelTurn(SessionId),
     CycleThinkingEffort(Option<SessionId>),
 }
@@ -83,10 +98,30 @@ impl TuiEffectRunner {
         if self.tasks.contains_key(&key) {
             return false;
         }
+        self.spawn(key, effect);
+        true
+    }
+
+    /// Replace any in-flight effect with the same key.
+    pub fn replace(&mut self, effect: TuiEffect) {
+        let key = effect.key();
+        if let Some(task) = self.tasks.remove(&key) {
+            task.abort();
+        }
+        self.spawn(key, effect);
+    }
+
+    /// Abort an in-flight effect with the same key as the supplied effect.
+    pub fn abort_matching(&mut self, effect: &TuiEffect) {
+        if let Some(task) = self.tasks.remove(&effect.key()) {
+            task.abort();
+        }
+    }
+
+    fn spawn(&mut self, key: EffectKey, effect: TuiEffect) {
         let client = self.client.clone();
         let task = tokio::spawn(async move { effect.run(client).await });
         self.tasks.insert(key, task);
-        true
     }
 
     /// Poll completed effects without blocking on running tasks.
@@ -120,6 +155,7 @@ impl TuiEffectRunner {
 impl TuiEffect {
     const fn key(&self) -> EffectKey {
         match self {
+            Self::LoadSlashPalette { .. } => EffectKey::SlashPalette,
             Self::CancelTurn { session_id } => EffectKey::CancelTurn(*session_id),
             Self::CycleThinkingEffort { session_id, .. } => {
                 EffectKey::CycleThinkingEffort(*session_id)
@@ -129,6 +165,10 @@ impl TuiEffect {
 
     async fn run(self, client: BcodeClient) -> TuiEffectResult {
         match self {
+            Self::LoadSlashPalette { query, session_id } => {
+                let palette = slash_palette::SlashPalette::new(&client, session_id, &query).await;
+                TuiEffectResult::SlashPaletteLoaded { query, palette }
+            }
             Self::CancelTurn { session_id } => TuiEffectResult::CancelTurn {
                 session_id,
                 result: client.cancel_session_turn(session_id).await,

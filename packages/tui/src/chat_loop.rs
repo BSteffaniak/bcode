@@ -111,7 +111,6 @@ impl DraftAutosave {
 struct ModalState {
     palette: Option<BmuxCommandPalette>,
     slash_palette: Option<slash_palette::SlashPalette>,
-    slash_palette_load: AsyncSlashPaletteLoad,
     effects: TuiEffectRunner,
     draft_save: AsyncDraftSave,
     permission_dialog: Option<PermissionDialogState>,
@@ -150,21 +149,6 @@ impl AsyncPermissionPoll {
             task: None,
             next_poll_at: now,
             last_error_status: None,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct AsyncSlashPaletteLoad {
-    task: Option<tokio::task::JoinHandle<slash_palette::SlashPalette>>,
-    query: Option<String>,
-}
-
-impl AsyncSlashPaletteLoad {
-    const fn new() -> Self {
-        Self {
-            task: None,
-            query: None,
         }
     }
 }
@@ -243,7 +227,6 @@ pub async fn run_with_client<W: Write>(
     let mut modals = ModalState {
         palette: None,
         slash_palette: None,
-        slash_palette_load: AsyncSlashPaletteLoad::new(),
         effects: TuiEffectRunner::new(client),
         draft_save: AsyncDraftSave::new(),
         permission_dialog: None,
@@ -409,10 +392,9 @@ async fn handle_loop_housekeeping(
     needs_redraw |= poll_older_history_load(chat, &mut modals.older_history_load).await;
     needs_redraw |= poll_newer_history_load(chat, &mut modals.newer_history_load).await;
     needs_redraw |= poll_draft_save(client, chat, draft_autosave, &mut modals.draft_save).await;
-    needs_redraw |= poll_finished_effects(chat, &mut modals.effects).await;
+    needs_redraw |= poll_finished_effects(chat, modals).await;
     needs_redraw |= maybe_start_older_history_load(client, chat, &mut modals.older_history_load);
     needs_redraw |= maybe_start_newer_history_load(client, chat, &mut modals.newer_history_load);
-    needs_redraw |= poll_slash_palette_load(chat, modals).await;
     needs_redraw |= poll_permission_list(chat, modals).await;
     maybe_start_permission_poll(client, chat, modals);
     needs_redraw
@@ -532,17 +514,30 @@ async fn poll_newer_history_load(chat: &mut ActiveChat, load: &mut AsyncHistoryP
     true
 }
 
-async fn poll_finished_effects(chat: &mut ActiveChat, effects: &mut TuiEffectRunner) -> bool {
-    let results = effects.poll_finished().await;
+async fn poll_finished_effects(chat: &mut ActiveChat, modals: &mut ModalState) -> bool {
+    let results = modals.effects.poll_finished().await;
     let needs_redraw = !results.is_empty();
     for result in results {
-        apply_effect_result(chat, result);
+        apply_effect_result(chat, modals, result);
     }
     needs_redraw
 }
 
-fn apply_effect_result(chat: &mut ActiveChat, result: TuiEffectResult) {
+fn apply_effect_result(chat: &mut ActiveChat, modals: &mut ModalState, result: TuiEffectResult) {
     match result {
+        TuiEffectResult::SlashPaletteLoaded { query, mut palette } => {
+            if query == chat.app.composer().text() {
+                if let Some(previous) = modals
+                    .slash_palette
+                    .as_ref()
+                    .filter(|current| current.query() == query)
+                    .and_then(|current| current.selected_command().map(str::to_owned))
+                {
+                    palette.select_command(&previous);
+                }
+                modals.slash_palette = (!palette.is_empty()).then_some(palette);
+            }
+        }
         TuiEffectResult::CancelTurn { session_id, result } => match result {
             Ok(true) if Some(session_id) == chat.app.session_id() => {
                 chat.app
@@ -667,23 +662,17 @@ async fn poll_draft_save(
     true
 }
 
-fn update_slash_palette_async(
-    client: &BcodeClient,
-    chat: &ActiveChat,
-    modals: &mut ModalState,
-) -> bool {
+fn update_slash_palette_async(chat: &ActiveChat, modals: &mut ModalState) -> bool {
     let current_query = chat.app.composer().text();
     if !current_query.starts_with('/') {
         modals.slash_palette = None;
-        if let Some(task) = modals.slash_palette_load.task.take() {
-            task.abort();
-        }
-        modals.slash_palette_load.query = None;
+        modals.effects.abort_matching(&TuiEffect::LoadSlashPalette {
+            query: String::new(),
+            session_id: None,
+        });
         return true;
     }
-    if modals.slash_palette_load.query.as_deref() == Some(current_query) {
-        return true;
-    }
+    let query = current_query.to_owned();
     let previous = modals
         .slash_palette
         .as_ref()
@@ -692,44 +681,10 @@ fn update_slash_palette_async(
     if previous.is_none() {
         modals.slash_palette = None;
     }
-    if let Some(task) = modals.slash_palette_load.task.take() {
-        task.abort();
-    }
-    let client = client.clone();
-    let query = current_query.to_owned();
-    let session_id = chat.app.session_id();
-    modals.slash_palette_load.query = Some(query.clone());
-    modals.slash_palette_load.task = Some(tokio::spawn(async move {
-        let mut palette = slash_palette::SlashPalette::new(&client, session_id, &query).await;
-        if let Some(previous) = previous {
-            palette.select_command(&previous);
-        }
-        palette
-    }));
-    true
-}
-
-async fn poll_slash_palette_load(chat: &mut ActiveChat, modals: &mut ModalState) -> bool {
-    let Some(task) = modals
-        .slash_palette_load
-        .task
-        .take_if(|task| task.is_finished())
-    else {
-        return false;
-    };
-    let query = modals.slash_palette_load.query.take();
-    match task.await {
-        Ok(palette) if query.as_deref() == Some(chat.app.composer().text()) => {
-            modals.slash_palette = (!palette.is_empty()).then_some(palette);
-        }
-        Ok(_stale) => {}
-        Err(error) => {
-            if !error.is_cancelled() {
-                chat.app
-                    .set_status(format!("slash command load failed: {error}"));
-            }
-        }
-    }
+    modals.effects.replace(TuiEffect::LoadSlashPalette {
+        query,
+        session_id: chat.app.session_id(),
+    });
     true
 }
 
@@ -1006,7 +961,7 @@ async fn handle_event<W: Write>(
             chat.app.reset_input_history_navigation();
             chat.app.paste_composer_text(&text);
             chat.app.wake_cursor();
-            update_slash_palette_async(context.services.client, chat, modals);
+            update_slash_palette_async(chat, modals);
             Ok(true)
         }
         Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick => Ok(true),
@@ -1124,14 +1079,14 @@ async fn handle_chat_key<W: Write>(
     }
     if is_clipboard_image_paste_key(context.services.keymap, stroke) {
         paste_clipboard_image(chat);
-        update_slash_palette_async(context.services.client, chat, modals);
+        update_slash_palette_async(chat, modals);
         return Ok(true);
     }
     let outcome = input::handle_key(&mut chat.app, context.services.keymap, stroke);
     if chat.app.should_exit() {
         return Ok(true);
     }
-    update_slash_palette_async(context.services.client, chat, modals);
+    update_slash_palette_async(chat, modals);
     handle_chat_key_request(context, chat, modals, outcome.request, Some(draft_autosave)).await?;
     Ok(outcome.redraw)
 }
