@@ -3,13 +3,15 @@
 use std::collections::BTreeMap;
 
 use bcode_client::{BcodeClient, ClientError};
-use bcode_ipc::ComposerDraftScope;
+use bcode_ipc::{ComposerDraftScope, PermissionSummary};
 use bcode_session_models::SessionId;
 
 use super::{slash_palette, thinking_flow};
 
 /// Background work requested by local TUI event handling.
 pub enum TuiEffect {
+    /// Poll pending permission requests.
+    ListPermissions,
     /// Save composer draft text for a scope.
     SaveDraft {
         /// Draft scope to save.
@@ -41,6 +43,11 @@ pub enum TuiEffect {
 
 /// Completed TUI background work.
 pub enum TuiEffectResult {
+    /// Permission poll completed.
+    PermissionList {
+        /// Permission list result.
+        result: Result<Vec<PermissionSummary>, ClientError>,
+    },
     /// Composer draft save completed.
     SaveDraft {
         /// Saved draft text.
@@ -86,6 +93,7 @@ pub struct ThinkingCycleResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum EffectKey {
+    PermissionList,
     DraftSave,
     SlashPalette,
     CancelTurn(SessionId),
@@ -189,6 +197,7 @@ impl TuiEffectRunner {
 impl TuiEffect {
     const fn key(&self) -> EffectKey {
         match self {
+            Self::ListPermissions => EffectKey::PermissionList,
             Self::SaveDraft { .. } => EffectKey::DraftSave,
             Self::LoadSlashPalette { .. } => EffectKey::SlashPalette,
             Self::CancelTurn { session_id } => EffectKey::CancelTurn(*session_id),
@@ -200,6 +209,9 @@ impl TuiEffect {
 
     async fn run(self, client: BcodeClient) -> TuiEffectResult {
         match self {
+            Self::ListPermissions => TuiEffectResult::PermissionList {
+                result: client.list_permissions().await,
+            },
             Self::SaveDraft { scope, text } => {
                 let result = client.set_composer_draft(scope, text.clone()).await;
                 TuiEffectResult::SaveDraft { text, result }

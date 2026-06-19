@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use bcode_client::{BcodeClient, ClientError};
 use bcode_config::TuiConfig;
-use bcode_ipc::{ComposerDraftScope, Event as BcodeEvent, PermissionSummary};
+use bcode_ipc::{ComposerDraftScope, Event as BcodeEvent};
 use bcode_session_models::{
     SessionEventKind, SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage,
     SessionHistoryQuery, SessionId,
@@ -122,7 +122,6 @@ struct ModalState {
 
 #[derive(Debug)]
 struct AsyncPermissionPoll {
-    task: Option<tokio::task::JoinHandle<Result<Vec<PermissionSummary>, ClientError>>>,
     next_poll_at: Instant,
     last_error_status: Option<String>,
 }
@@ -130,7 +129,6 @@ struct AsyncPermissionPoll {
 impl AsyncPermissionPoll {
     const fn new(now: Instant) -> Self {
         Self {
-            task: None,
             next_poll_at: now,
             last_error_status: None,
         }
@@ -374,8 +372,7 @@ async fn handle_loop_housekeeping(
     needs_redraw |= poll_finished_effects(chat, draft_autosave, modals).await;
     needs_redraw |= maybe_start_older_history_load(client, chat, &mut modals.older_history_load);
     needs_redraw |= maybe_start_newer_history_load(client, chat, &mut modals.newer_history_load);
-    needs_redraw |= poll_permission_list(chat, modals).await;
-    maybe_start_permission_poll(client, chat, modals);
+    maybe_start_permission_poll(chat, modals);
     needs_redraw
 }
 
@@ -513,6 +510,32 @@ fn apply_effect_result(
     result: TuiEffectResult,
 ) {
     match result {
+        TuiEffectResult::PermissionList { result } => match result {
+            Ok(permissions) => {
+                modals.permission_poll.last_error_status = None;
+                if modals.permission_dialog.is_none()
+                    && let Some(permission) = permissions
+                        .into_iter()
+                        .find(|permission| Some(permission.session_id) == chat.session_id)
+                {
+                    modals.permission_dialog = Some(PermissionDialogState::new(permission));
+                }
+            }
+            Err(error) => {
+                let label = if error.is_daemon_unavailable() {
+                    modals.permission_poll.next_poll_at =
+                        Instant::now() + PERMISSION_POLL_DAEMON_DOWN_INTERVAL;
+                    "Permissions unavailable"
+                } else {
+                    "Permission check failed"
+                };
+                let status = daemon_issue::client_issue_status(label, &error);
+                if modals.permission_poll.last_error_status.as_deref() != Some(&status) {
+                    chat.app.set_status(status.clone());
+                }
+                modals.permission_poll.last_error_status = Some(status);
+            }
+        },
         TuiEffectResult::SaveDraft { text, result } => match result {
             Ok(()) => draft_autosave.mark_save_completed(text),
             Err(error) => report_nonfatal_client_error(chat, "Draft autosave unavailable", &error),
@@ -640,61 +663,16 @@ fn update_slash_palette_async(chat: &ActiveChat, modals: &mut ModalState) -> boo
     true
 }
 
-fn maybe_start_permission_poll(client: &BcodeClient, chat: &ActiveChat, modals: &mut ModalState) {
+fn maybe_start_permission_poll(chat: &ActiveChat, modals: &mut ModalState) {
     if modals.permission_dialog.is_some()
-        || modals.permission_poll.task.is_some()
         || Instant::now() < modals.permission_poll.next_poll_at
         || chat.session_id.is_none()
     {
         return;
     }
-    let client = client.clone();
-    modals.permission_poll.task =
-        Some(tokio::spawn(async move { client.list_permissions().await }));
-}
-
-async fn poll_permission_list(chat: &mut ActiveChat, modals: &mut ModalState) -> bool {
-    let Some(task) = modals
-        .permission_poll
-        .task
-        .take_if(|task| task.is_finished())
-    else {
-        return false;
-    };
-    modals.permission_poll.next_poll_at = Instant::now() + PERMISSION_POLL_INTERVAL;
-    match task.await {
-        Ok(Ok(permissions)) => {
-            modals.permission_poll.last_error_status = None;
-            if modals.permission_dialog.is_none()
-                && let Some(permission) = permissions
-                    .into_iter()
-                    .find(|permission| Some(permission.session_id) == chat.session_id)
-            {
-                modals.permission_dialog = Some(PermissionDialogState::new(permission));
-                return true;
-            }
-        }
-        Ok(Err(error)) => {
-            let label = if error.is_daemon_unavailable() {
-                modals.permission_poll.next_poll_at =
-                    Instant::now() + PERMISSION_POLL_DAEMON_DOWN_INTERVAL;
-                "Permissions unavailable"
-            } else {
-                "Permission check failed"
-            };
-            let status = daemon_issue::client_issue_status(label, &error);
-            let changed = modals.permission_poll.last_error_status.as_deref() != Some(&status);
-            modals.permission_poll.last_error_status = Some(status.clone());
-            chat.app.set_status(status);
-            return changed;
-        }
-        Err(error) => {
-            chat.app
-                .set_status(format!("Permission check task failed: {error}"));
-            return true;
-        }
+    if modals.effects.start(TuiEffect::ListPermissions) {
+        modals.permission_poll.next_poll_at = Instant::now() + PERMISSION_POLL_INTERVAL;
     }
-    false
 }
 
 const fn is_nonfatal_tui_daemon_error(error: &TuiError) -> bool {
