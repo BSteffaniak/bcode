@@ -8,6 +8,7 @@ use bcode_session_models::{
     ProjectionWindowRequest, SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage,
     SessionHistoryQuery, SessionId, SessionSummary,
 };
+use bcode_worktree_models::{WorktreeListRequest, WorktreeListResponse};
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -105,6 +106,16 @@ pub enum TuiEffect {
     SubmitMessage {
         /// Submit request.
         request: Box<SubmitMessageRequest>,
+    },
+    /// Request context compaction for the current session.
+    CompactContext {
+        /// Session to compact.
+        session_id: SessionId,
+    },
+    /// List worktrees for the current repository.
+    ListWorktrees {
+        /// Request payload.
+        request: WorktreeListRequest,
     },
     /// Request cancellation of the active turn for a session.
     CancelTurn { session_id: SessionId },
@@ -263,6 +274,18 @@ pub enum TuiEffectResult {
         /// Submit result.
         result: Box<Result<SubmitMessageResult, ClientError>>,
     },
+    /// Context compaction completed.
+    CompactContext {
+        /// Session the request targeted.
+        session_id: SessionId,
+        /// Daemon response.
+        result: Result<String, ClientError>,
+    },
+    /// Worktree list completed.
+    ListWorktrees {
+        /// Worktree list result.
+        result: Result<WorktreeListResponse, ClientError>,
+    },
     /// Result for active turn cancellation.
     CancelTurn {
         /// Session the request targeted.
@@ -305,6 +328,8 @@ impl TuiEffectResult {
             Self::PermissionList { result } => DaemonObservation::from_client_result(result),
             Self::SaveDraft { result, .. } => DaemonObservation::from_client_result(result),
             Self::SubmitMessage { result, .. } => DaemonObservation::from_client_result(result),
+            Self::CompactContext { result, .. } => DaemonObservation::from_client_result(result),
+            Self::ListWorktrees { result } => DaemonObservation::from_client_result(result),
             Self::CancelTurn { result, .. } => DaemonObservation::from_client_result(result),
             Self::CycleThinkingEffort { result, .. } => {
                 DaemonObservation::from_client_result(result)
@@ -358,6 +383,8 @@ enum EffectKey {
     DraftSave,
     SlashPalette,
     SubmitMessage(usize),
+    CompactContext(SessionId),
+    WorktreeList,
     CancelTurn(SessionId),
     CycleThinkingEffort(Option<SessionId>),
 }
@@ -367,6 +394,38 @@ enum EffectSchedule {
     StartIfIdle,
     Replace,
     QueueLatest,
+}
+
+/// Daemon availability intent for an effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectDaemonIntent {
+    /// Use the passive client and never start the daemon.
+    Passive,
+    /// Use the foreground client and allow daemon autostart.
+    Foreground,
+}
+
+impl TuiEffect {
+    const fn daemon_intent(&self) -> EffectDaemonIntent {
+        match self {
+            Self::SubmitMessage { .. }
+            | Self::CompactContext { .. }
+            | Self::CancelTurn { .. }
+            | Self::CycleThinkingEffort { .. } => EffectDaemonIntent::Foreground,
+            Self::OpenSession { .. }
+            | Self::LoadConfig
+            | Self::ReconcileAuthSecurity { .. }
+            | Self::LoadDraftStatus { .. }
+            | Self::LoadSessionStatus { .. }
+            | Self::LoadAgentCatalog
+            | Self::LoadOlderHistory { .. }
+            | Self::LoadNewerHistory { .. }
+            | Self::ListPermissions
+            | Self::SaveDraft { .. }
+            | Self::LoadSlashPalette { .. }
+            | Self::ListWorktrees { .. } => EffectDaemonIntent::Passive,
+        }
+    }
 }
 
 /// Queue of effects requested before the chat loop runner can start them.
@@ -408,17 +467,19 @@ impl TuiEffectQueue {
 
 /// Owns and polls daemon-backed TUI background work.
 pub struct TuiEffectRunner {
-    client: BcodeClient,
+    foreground_client: BcodeClient,
+    passive_client: BcodeClient,
     tasks: BTreeMap<EffectKey, tokio::task::JoinHandle<TuiEffectResult>>,
     queued_latest: BTreeMap<EffectKey, TuiEffect>,
 }
 
 impl TuiEffectRunner {
-    /// Create an effect runner using the provided client.
+    /// Create an effect runner using foreground and passive clients.
     #[must_use]
-    pub fn new(client: &BcodeClient) -> Self {
+    pub fn new(foreground_client: &BcodeClient, passive_client: &BcodeClient) -> Self {
         Self {
-            client: client.clone(),
+            foreground_client: foreground_client.clone(),
+            passive_client: passive_client.clone(),
             tasks: BTreeMap::new(),
             queued_latest: BTreeMap::new(),
         }
@@ -463,7 +524,10 @@ impl TuiEffectRunner {
     }
 
     fn spawn(&mut self, key: EffectKey, effect: TuiEffect) {
-        let client = self.client.clone();
+        let client = match effect.daemon_intent() {
+            EffectDaemonIntent::Passive => self.passive_client.clone(),
+            EffectDaemonIntent::Foreground => self.foreground_client.clone(),
+        };
         let task = tokio::spawn(async move { Box::pin(effect.run(client)).await });
         self.tasks.insert(key, task);
     }
@@ -537,6 +601,8 @@ impl TuiEffect {
             Self::SaveDraft { .. } => EffectKey::DraftSave,
             Self::LoadSlashPalette { .. } => EffectKey::SlashPalette,
             Self::SubmitMessage { request } => EffectKey::SubmitMessage(request.message.len()),
+            Self::CompactContext { session_id } => EffectKey::CompactContext(*session_id),
+            Self::ListWorktrees { .. } => EffectKey::WorktreeList,
             Self::CancelTurn { session_id } => EffectKey::CancelTurn(*session_id),
             Self::CycleThinkingEffort { session_id, .. } => {
                 EffectKey::CycleThinkingEffort(*session_id)
@@ -544,6 +610,7 @@ impl TuiEffect {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run(self, client: BcodeClient) -> TuiEffectResult {
         match self {
             Self::OpenSession {
@@ -616,6 +683,13 @@ impl TuiEffect {
                 TuiEffectResult::SlashPaletteLoaded { query, palette }
             }
             Self::SubmitMessage { request } => run_submit_message(&client, *request).await,
+            Self::CompactContext { session_id } => TuiEffectResult::CompactContext {
+                session_id,
+                result: client.compact_session(session_id).await,
+            },
+            Self::ListWorktrees { request } => TuiEffectResult::ListWorktrees {
+                result: client.list_worktrees(request).await,
+            },
             Self::CancelTurn { session_id } => TuiEffectResult::CancelTurn {
                 session_id,
                 result: client.cancel_session_turn(session_id).await,

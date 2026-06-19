@@ -2,7 +2,6 @@
 
 use std::io::Write;
 
-use bcode_client::BcodeClient;
 use bcode_worktree_models::WorktreeListRequest;
 use bmux_keyboard::KeyStroke;
 use bmux_tui::palette::{CommandPalette, CommandPaletteKeyOutcome};
@@ -110,7 +109,10 @@ async fn execute_palette_command<W: Write>(
         PaletteCommand::ToggleDiff
         | PaletteCommand::Help
         | PaletteCommand::CancelTurn
-        | PaletteCommand::CompactContext => execute_chat_command(services, chat, command).await,
+        | PaletteCommand::CompactContext => {
+            execute_chat_command(services, chat, command);
+            Ok(())
+        }
     }
 }
 
@@ -172,7 +174,7 @@ async fn execute_worktree_command<W: Write>(
     command: PaletteCommand,
 ) -> Result<(), TuiError> {
     match command {
-        PaletteCommand::ListWorktrees => show_worktrees(services, chat).await?,
+        PaletteCommand::ListWorktrees => show_worktrees(chat),
         PaletteCommand::CreateSessionWorktree => {
             worktree_flow::create_for_current_session(io, services, chat).await?;
         }
@@ -195,13 +197,13 @@ async fn execute_model_command<W: Write>(
 ) -> Result<(), TuiError> {
     match command {
         PaletteCommand::ShowModelStatus => {
-            model_flow::show_model_status(services.client, chat).await?;
+            model_flow::show_model_status(services.passive_client, chat).await?;
         }
         PaletteCommand::ShowServerModelStatus => {
-            model_flow::show_server_model_status(services.client, chat).await?;
+            model_flow::show_server_model_status(services.passive_client, chat).await?;
         }
         PaletteCommand::ShowRuntimeStatus => {
-            model_flow::show_runtime_status(services.client, chat).await?;
+            model_flow::show_runtime_status(services.passive_client, chat).await?;
         }
         PaletteCommand::SelectModel => {
             model_flow::pick_model_for_session(io, services, chat).await?;
@@ -222,18 +224,18 @@ async fn execute_skill_command<W: Write>(
             skill_flow::pick_skill_for_session(io, services, chat).await?;
         }
         PaletteCommand::ActiveSkills => {
-            skill_flow::show_active_skills(services.client, chat).await?;
+            skill_flow::show_active_skills(services.passive_client, chat).await?;
         }
         _ => {}
     }
     Ok(())
 }
 
-async fn execute_chat_command(
-    services: &TuiServices<'_>,
+fn execute_chat_command(
+    _services: &TuiServices<'_>,
     chat: &mut ActiveChat,
     command: PaletteCommand,
-) -> Result<(), TuiError> {
+) {
     match command {
         PaletteCommand::ToggleDiff => {
             let _changed = chat.app.toggle_diff_visible();
@@ -244,85 +246,41 @@ async fn execute_chat_command(
             });
         }
         PaletteCommand::Help => show_bmux_help(chat),
-        PaletteCommand::CancelTurn => cancel_turn(services.client, chat).await?,
-        PaletteCommand::CompactContext => compact_context(services.client, chat).await?,
+        PaletteCommand::CancelTurn => start_cancel_turn(chat),
+        PaletteCommand::CompactContext => start_compact_context(chat),
         _ => {}
     }
-    Ok(())
 }
 
-async fn cancel_turn(client: &BcodeClient, chat: &mut ActiveChat) -> Result<(), TuiError> {
+fn start_cancel_turn(chat: &mut ActiveChat) {
     let Some(session_id) = chat.app.session_id() else {
         chat.app.set_status("No active session".to_owned());
-        return Ok(());
+        return;
     };
-    let cancelled = match client.cancel_session_turn(session_id).await {
-        Ok(cancelled) => cancelled,
-        Err(error) => {
-            helpers::report_client_issue(&mut chat.app, "cancel unavailable", &error);
-            return Ok(());
-        }
-    };
-    if cancelled {
-        chat.app.set_cancelling();
-        chat.app.set_status("cancel requested".to_owned());
-    } else {
-        chat.app.set_idle();
-        chat.app.set_status("no active turn to cancel".to_owned());
-    }
-    Ok(())
+    chat.start_effect(TuiEffect::CancelTurn { session_id });
+    chat.app.set_cancelling();
+    chat.app.set_status("cancel requested".to_owned());
 }
 
-async fn compact_context(client: &BcodeClient, chat: &mut ActiveChat) -> Result<(), TuiError> {
+fn start_compact_context(chat: &mut ActiveChat) {
     let Some(session_id) = chat.app.session_id() else {
         chat.app.set_status("No active session".to_owned());
-        return Ok(());
+        return;
     };
-    let message = match client.compact_session(session_id).await {
-        Ok(message) => message,
-        Err(error) => {
-            helpers::report_client_issue(&mut chat.app, "compact unavailable", &error);
-            return Ok(());
-        }
-    };
-    chat.app.set_status(message);
-    Ok(())
+    chat.start_effect(TuiEffect::CompactContext { session_id });
+    chat.app.set_status("compacting context…".to_owned());
 }
 
-async fn show_worktrees(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Result<(), TuiError> {
-    let response = match services
-        .client
-        .list_worktrees(WorktreeListRequest {
+fn show_worktrees(chat: &mut ActiveChat) {
+    chat.start_effect(TuiEffect::ListWorktrees {
+        request: WorktreeListRequest {
             cwd: chat
                 .app
                 .working_directory()
                 .map(std::path::Path::to_path_buf),
-        })
-        .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            helpers::report_client_issue(&mut chat.app, "worktrees unavailable", &error);
-            return Ok(());
-        }
-    };
-    let lines = response
-        .worktrees
-        .into_iter()
-        .map(|worktree| {
-            let marker = if worktree.is_main { "main" } else { "linked" };
-            let branch = worktree.branch.unwrap_or_else(|| "<detached>".to_string());
-            format!("* {marker} {branch} — {}", worktree.path.display())
-        })
-        .collect::<Vec<_>>();
-    chat.app.push_system_note(
-        std::iter::once(format!("Worktrees for {}", response.repo_root.display()))
-            .chain(lines)
-            .collect::<Vec<_>>()
-            .join("\n"),
-    );
-    chat.app.set_status("shown worktrees".to_owned());
-    Ok(())
+        },
+    });
+    chat.app.set_status("loading worktrees…".to_owned());
 }
 
 fn show_bmux_help(chat: &mut ActiveChat) {

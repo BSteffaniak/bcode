@@ -117,11 +117,11 @@ struct ChatLoopState {
 }
 
 impl ChatLoopState {
-    fn new(client: &BcodeClient) -> Self {
+    fn new(foreground_client: &BcodeClient, passive_client: &BcodeClient) -> Self {
         Self {
             palette: None,
             slash_palette: None,
-            effects: TuiEffectRunner::new(client),
+            effects: TuiEffectRunner::new(foreground_client, passive_client),
             daemon_connection: DaemonConnectionMonitor::default(),
             permission_dialog: None,
             permission_poll: PermissionPollSchedule::new(Instant::now()),
@@ -275,7 +275,7 @@ pub async fn run_with_client<W: Write>(
     let passive_client = client
         .clone()
         .with_daemon_availability(DaemonAvailability::RequireRunning);
-    let mut loop_state = ChatLoopState::new(&passive_client);
+    let mut loop_state = ChatLoopState::new(client, &passive_client);
     loop_state.drain_pending_effects(chat);
     sync_chat_key_labels(chat, &settings.keymap);
     let mut draft_autosave = DraftAutosave::new(
@@ -554,6 +554,12 @@ fn apply_effect_result(
         TuiEffectResult::SubmitMessage { message, result } => {
             apply_submit_message_result(chat, &message, *result);
         }
+        TuiEffectResult::CompactContext { session_id, result } => {
+            apply_compact_context_result(chat, session_id, result);
+        }
+        TuiEffectResult::ListWorktrees { result } => {
+            apply_list_worktrees_result(chat, result);
+        }
         TuiEffectResult::CancelTurn { session_id, result } => {
             apply_cancel_turn_result(chat, session_id, result);
         }
@@ -820,6 +826,51 @@ fn apply_submit_message_result(
             daemon_issue::report_client_issue(&mut chat.app, "send failed", &error);
         }
     }
+}
+
+fn apply_compact_context_result(
+    chat: &mut ActiveChat,
+    session_id: bcode_session_models::SessionId,
+    result: Result<String, ClientError>,
+) {
+    if chat.session_id != Some(session_id) {
+        return;
+    }
+    match result {
+        Ok(message) => chat.app.set_status(message),
+        Err(error) => {
+            daemon_issue::report_client_issue(&mut chat.app, "compact unavailable", &error);
+        }
+    }
+}
+
+fn apply_list_worktrees_result(
+    chat: &mut ActiveChat,
+    result: Result<bcode_worktree_models::WorktreeListResponse, ClientError>,
+) {
+    let response = match result {
+        Ok(response) => response,
+        Err(error) => {
+            daemon_issue::report_client_issue(&mut chat.app, "worktrees unavailable", &error);
+            return;
+        }
+    };
+    let lines = response
+        .worktrees
+        .into_iter()
+        .map(|worktree| {
+            let marker = if worktree.is_main { "main" } else { "linked" };
+            let branch = worktree.branch.unwrap_or_else(|| "<detached>".to_owned());
+            format!("* {marker} {branch} — {}", worktree.path.display())
+        })
+        .collect::<Vec<_>>();
+    chat.app.push_system_note(
+        std::iter::once(format!("Worktrees for {}", response.repo_root.display()))
+            .chain(lines)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    chat.app.set_status("shown worktrees".to_owned());
 }
 
 fn apply_cancel_turn_result(
