@@ -138,6 +138,18 @@ pub enum TuiEffect {
         /// Submit request.
         request: Box<SubmitMessageRequest>,
     },
+    /// Rename a session.
+    RenameSession {
+        /// Session to rename.
+        session_id: SessionId,
+        /// New optional name.
+        name: Option<String>,
+    },
+    /// Delete a session.
+    DeleteSession {
+        /// Session to delete.
+        session_id: SessionId,
+    },
     /// Fork a session from a prompt.
     ForkSession {
         /// Source session id.
@@ -366,6 +378,18 @@ pub enum TuiEffectResult {
         /// Submit result.
         result: Box<Result<SubmitMessageResult, ClientError>>,
     },
+    /// Session rename completed.
+    RenameSession {
+        /// Rename result.
+        result: Result<SessionSummary, ClientError>,
+    },
+    /// Session delete completed.
+    DeleteSession {
+        /// Deleted session id.
+        session_id: SessionId,
+        /// Delete result.
+        result: Result<SessionSummary, ClientError>,
+    },
     /// Session fork completed.
     ForkSession {
         /// Whether to switch to the forked session.
@@ -481,6 +505,8 @@ impl TuiEffectResult {
             }
             Self::PermissionList { result } => DaemonObservation::from_client_result(result),
             Self::SaveDraft { result, .. } => DaemonObservation::from_client_result(result),
+            Self::RenameSession { result } => DaemonObservation::from_client_result(result),
+            Self::DeleteSession { result, .. } => DaemonObservation::from_client_result(result),
             Self::ForkSession { result, .. } => DaemonObservation::from_client_result(result),
             Self::CloneSession { result, .. } => DaemonObservation::from_client_result(result),
             Self::SkillAction { result, .. } => DaemonObservation::from_client_result(result),
@@ -556,6 +582,8 @@ enum EffectKey {
     PermissionList,
     DraftSave,
     SlashPalette,
+    RenameSession(SessionId),
+    DeleteSession(SessionId),
     ForkSession(SessionId),
     CloneSession(SessionId),
     SubmitMessage(usize),
@@ -589,7 +617,9 @@ enum EffectDaemonIntent {
 impl TuiEffect {
     const fn daemon_intent(&self) -> EffectDaemonIntent {
         match self {
-            Self::ForkSession { .. }
+            Self::RenameSession { .. }
+            | Self::DeleteSession { .. }
+            | Self::ForkSession { .. }
             | Self::CloneSession { .. }
             | Self::SubmitMessage { .. }
             | Self::SkillAction { .. }
@@ -788,6 +818,8 @@ impl TuiEffect {
             Self::ListPermissions => EffectKey::PermissionList,
             Self::SaveDraft { .. } => EffectKey::DraftSave,
             Self::LoadSlashPalette { .. } => EffectKey::SlashPalette,
+            Self::RenameSession { session_id, .. } => EffectKey::RenameSession(*session_id),
+            Self::DeleteSession { session_id } => EffectKey::DeleteSession(*session_id),
             Self::ForkSession { session_id, .. } => EffectKey::ForkSession(*session_id),
             Self::CloneSession { session_id, .. } => EffectKey::CloneSession(*session_id),
             Self::SubmitMessage { request } => EffectKey::SubmitMessage(request.message.len()),
@@ -877,6 +909,13 @@ impl TuiEffect {
                 let palette = slash_palette::SlashPalette::new(&client, session_id, &query).await;
                 TuiEffectResult::SlashPaletteLoaded { query, palette }
             }
+            Self::RenameSession { session_id, name } => TuiEffectResult::RenameSession {
+                result: client.rename_session(session_id, name).await,
+            },
+            Self::DeleteSession { session_id } => TuiEffectResult::DeleteSession {
+                session_id,
+                result: client.delete_session(session_id).await,
+            },
             Self::ForkSession {
                 session_id,
                 prompt_sequence,

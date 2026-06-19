@@ -162,7 +162,7 @@ async fn handle_slash_command<W: Write>(
         }
         slash_commands::SlashCommandOutcome::PickSession => {
             chat.app.clear_pending_submission(message);
-            match session_flow::pick_session(io, services).await? {
+            match session_flow::pick_session(io, services, chat).await? {
                 session_flow::PickSessionOutcome::Existing(next_session_id) => {
                     session_flow::switch_session(io.terminal, chat, next_session_id)?;
                 }

@@ -129,21 +129,24 @@ async fn execute_session_command<W: Write>(
                 launch_working_directory: std::env::current_dir()?,
             });
         }
-        PaletteCommand::SwitchSession => match session_flow::pick_session(io, services).await? {
-            session_flow::PickSessionOutcome::Existing(selected_session_id) => {
-                session_flow::switch_session(io.terminal, chat, selected_session_id)?;
+        PaletteCommand::SwitchSession => {
+            match session_flow::pick_session(io, services, chat).await? {
+                session_flow::PickSessionOutcome::Existing(selected_session_id) => {
+                    session_flow::switch_session(io.terminal, chat, selected_session_id)?;
+                }
+                session_flow::PickSessionOutcome::Draft => {
+                    session_flow::switch_to_draft_session(chat);
+                    chat.replace_effect(TuiEffect::LoadDraftStatus {
+                        launch_working_directory: std::env::current_dir()?,
+                    });
+                }
             }
-            session_flow::PickSessionOutcome::Draft => {
-                session_flow::switch_to_draft_session(chat);
-                chat.replace_effect(TuiEffect::LoadDraftStatus {
-                    launch_working_directory: std::env::current_dir()?,
-                });
-            }
-        },
+        }
         PaletteCommand::RenameSession => {
             session_flow::pick_session_for_mutation(
                 io,
                 services,
+                chat,
                 session_flow::SessionPickerStartMode::Rename,
             )
             .await?;
@@ -152,6 +155,7 @@ async fn execute_session_command<W: Write>(
             session_flow::pick_session_for_mutation(
                 io,
                 services,
+                chat,
                 session_flow::SessionPickerStartMode::Delete,
             )
             .await?;

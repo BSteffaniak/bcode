@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 
 use super::app::BmuxApp;
 use super::daemon_issue;
+use super::effects::TuiEffect;
 use super::helpers;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::picker_mouse::picker_row_from_mouse;
@@ -651,6 +652,7 @@ fn set_picker_client_issue(
 pub async fn pick_session<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
 ) -> Result<PickSessionOutcome, TuiError> {
     let mut picker = session_picker::SessionPickerApp::new(Vec::new());
     picker.set_loading_status(
@@ -693,22 +695,10 @@ pub async fn pick_session<W: Write>(
                     return Ok(PickSessionOutcome::Draft);
                 }
                 PickerKeyOutcome::Rename => {
-                    if let Err(error) = rename_picker_session(services.client, &mut picker).await {
-                        if let TuiError::Client(error) = error {
-                            set_picker_client_issue(&mut picker, "session rename failed", &error);
-                        } else {
-                            return Err(error);
-                        }
-                    }
+                    rename_picker_session(chat, &mut picker);
                 }
                 PickerKeyOutcome::Delete => {
-                    if let Err(error) = delete_picker_session(services.client, &mut picker).await {
-                        if let TuiError::Client(error) = error {
-                            set_picker_client_issue(&mut picker, "session delete failed", &error);
-                        } else {
-                            return Err(error);
-                        }
-                    }
+                    delete_picker_session(chat, &mut picker);
                 }
                 PickerKeyOutcome::Selected => {
                     if let Some(session_id) = import_selected_session(
@@ -749,6 +739,7 @@ pub async fn pick_session<W: Write>(
 pub async fn pick_session_for_mutation<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
     start_mode: SessionPickerStartMode,
 ) -> Result<(), TuiError> {
     let mut picker = session_picker::SessionPickerApp::new(Vec::new());
@@ -801,22 +792,10 @@ pub async fn pick_session_for_mutation<W: Write>(
                 | PickerKeyOutcome::Create
                 | PickerKeyOutcome::Selected => {}
                 PickerKeyOutcome::Rename => {
-                    if let Err(error) = rename_picker_session(services.client, &mut picker).await {
-                        if let TuiError::Client(error) = error {
-                            set_picker_client_issue(&mut picker, "session rename failed", &error);
-                        } else {
-                            return Err(error);
-                        }
-                    }
+                    rename_picker_session(chat, &mut picker);
                 }
                 PickerKeyOutcome::Delete => {
-                    if let Err(error) = delete_picker_session(services.client, &mut picker).await {
-                        if let TuiError::Client(error) = error {
-                            set_picker_client_issue(&mut picker, "session delete failed", &error);
-                        } else {
-                            return Err(error);
-                        }
-                    }
+                    delete_picker_session(chat, &mut picker);
                 }
                 PickerKeyOutcome::Canceled => {
                     return Ok(());
@@ -982,46 +961,22 @@ fn handle_picker_delete_key(
     }
 }
 
-async fn rename_picker_session(
-    client: &BcodeClient,
-    picker: &mut session_picker::SessionPickerApp,
-) -> Result<(), TuiError> {
+fn rename_picker_session(chat: &mut ActiveChat, picker: &mut session_picker::SessionPickerApp) {
     let Some(session_id) = picker.selected_session_id() else {
         picker.finish_mutation("No session selected to rename".to_owned());
-        return Ok(());
+        return;
     };
     let name = picker.rename().buffer().text().trim();
     let name = (!name.is_empty()).then(|| name.to_owned());
-    match client.rename_session(session_id, name).await {
-        Ok(_) => match client.list_sessions().await {
-            Ok(sessions) => {
-                picker.replace_sessions(sessions);
-                picker.finish_mutation("Session renamed".to_owned());
-            }
-            Err(error) => set_picker_client_issue(picker, "session refresh failed", &error),
-        },
-        Err(error) => set_picker_client_issue(picker, "session rename failed", &error),
-    }
-    Ok(())
+    chat.start_effect(TuiEffect::RenameSession { session_id, name });
+    picker.finish_mutation("Renaming session…".to_owned());
 }
 
-async fn delete_picker_session(
-    client: &BcodeClient,
-    picker: &mut session_picker::SessionPickerApp,
-) -> Result<(), TuiError> {
+fn delete_picker_session(chat: &mut ActiveChat, picker: &mut session_picker::SessionPickerApp) {
     let Some(session_id) = picker.selected_session_id() else {
         picker.finish_mutation("No session selected to delete".to_owned());
-        return Ok(());
+        return;
     };
-    match client.delete_session(session_id).await {
-        Ok(_) => match client.list_sessions().await {
-            Ok(sessions) => {
-                picker.replace_sessions(sessions);
-                picker.finish_mutation("Session deleted".to_owned());
-            }
-            Err(error) => set_picker_client_issue(picker, "session refresh failed", &error),
-        },
-        Err(error) => set_picker_client_issue(picker, "session delete failed", &error),
-    }
-    Ok(())
+    chat.start_effect(TuiEffect::DeleteSession { session_id });
+    picker.finish_mutation("Deleting session…".to_owned());
 }

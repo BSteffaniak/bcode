@@ -555,6 +555,12 @@ fn apply_effect_result(
         TuiEffectResult::SubmitMessage { message, result } => {
             apply_submit_message_result(chat, &message, *result);
         }
+        TuiEffectResult::RenameSession { result } => {
+            apply_rename_session_result(chat, result);
+        }
+        TuiEffectResult::DeleteSession { session_id, result } => {
+            apply_delete_session_result(chat, session_id, result);
+        }
         TuiEffectResult::ForkSession {
             switch_after_create,
             install_draft,
@@ -885,6 +891,39 @@ fn apply_submit_message_result(
         Err(error) => {
             chat.app.restore_pending_submission(message);
             daemon_issue::report_client_issue(&mut chat.app, "send failed", &error);
+        }
+    }
+}
+
+fn apply_rename_session_result(
+    chat: &mut ActiveChat,
+    result: Result<bcode_session_models::SessionSummary, ClientError>,
+) {
+    match result {
+        Ok(session) => {
+            chat.app.apply_session_summary(&session);
+            chat.app.set_status("Session renamed".to_owned());
+        }
+        Err(error) => {
+            daemon_issue::report_client_issue(&mut chat.app, "session rename failed", &error);
+        }
+    }
+}
+
+fn apply_delete_session_result(
+    chat: &mut ActiveChat,
+    session_id: bcode_session_models::SessionId,
+    result: Result<bcode_session_models::SessionSummary, ClientError>,
+) {
+    match result {
+        Ok(_session) => {
+            if chat.app.session_id() == Some(session_id) {
+                session_flow::switch_to_draft_session(chat);
+            }
+            chat.app.set_status("Session deleted".to_owned());
+        }
+        Err(error) => {
+            daemon_issue::report_client_issue(&mut chat.app, "session delete failed", &error);
         }
     }
 }
