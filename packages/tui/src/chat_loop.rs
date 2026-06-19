@@ -19,6 +19,7 @@ use super::activity::ActivityState;
 use super::clipboard_image;
 use super::command_palette::BmuxCommandPalette;
 use super::daemon_issue;
+use super::effects::{TuiEffect, TuiEffectResult, TuiEffectRunner};
 use super::helpers;
 use super::invalidation::InvalidationQueue;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
@@ -111,53 +112,14 @@ struct ModalState {
     palette: Option<BmuxCommandPalette>,
     slash_palette: Option<slash_palette::SlashPalette>,
     slash_palette_load: AsyncSlashPaletteLoad,
+    effects: TuiEffectRunner,
     draft_save: AsyncDraftSave,
-    cancel_turn: AsyncCancelTurn,
-    thinking_cycle: AsyncThinkingCycle,
     permission_dialog: Option<PermissionDialogState>,
     permission_poll: AsyncPermissionPoll,
     older_history_load: AsyncHistoryPageLoad,
     newer_history_load: AsyncHistoryPageLoad,
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
-}
-
-#[derive(Debug)]
-struct AsyncThinkingCycle {
-    task: Option<tokio::task::JoinHandle<Result<ThinkingCycleResult, ClientError>>>,
-    session_id: Option<SessionId>,
-}
-
-impl AsyncThinkingCycle {
-    const fn new() -> Self {
-        Self {
-            task: None,
-            session_id: None,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct ThinkingCycleResult {
-    next_effort: Option<String>,
-    summary: Option<String>,
-    visible: bool,
-    status: Option<bcode_ipc::SessionModelStatus>,
-}
-
-#[derive(Debug)]
-struct AsyncCancelTurn {
-    task: Option<tokio::task::JoinHandle<Result<bool, ClientError>>>,
-    session_id: Option<SessionId>,
-}
-
-impl AsyncCancelTurn {
-    const fn new() -> Self {
-        Self {
-            task: None,
-            session_id: None,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -282,9 +244,8 @@ pub async fn run_with_client<W: Write>(
         palette: None,
         slash_palette: None,
         slash_palette_load: AsyncSlashPaletteLoad::new(),
+        effects: TuiEffectRunner::new(client),
         draft_save: AsyncDraftSave::new(),
-        cancel_turn: AsyncCancelTurn::new(),
-        thinking_cycle: AsyncThinkingCycle::new(),
         permission_dialog: None,
         permission_poll: AsyncPermissionPoll::new(Instant::now()),
         older_history_load: AsyncHistoryPageLoad::new(),
@@ -426,12 +387,7 @@ pub async fn run_with_client<W: Write>(
     if let Some(task) = modals.draft_save.task.take() {
         task.abort();
     }
-    if let Some(task) = modals.cancel_turn.task.take() {
-        task.abort();
-    }
-    if let Some(task) = modals.thinking_cycle.task.take() {
-        task.abort();
-    }
+    modals.effects.abort_all();
     Ok(())
 }
 
@@ -453,8 +409,7 @@ async fn handle_loop_housekeeping(
     needs_redraw |= poll_older_history_load(chat, &mut modals.older_history_load).await;
     needs_redraw |= poll_newer_history_load(chat, &mut modals.newer_history_load).await;
     needs_redraw |= poll_draft_save(client, chat, draft_autosave, &mut modals.draft_save).await;
-    needs_redraw |= poll_cancel_turn(chat, &mut modals.cancel_turn).await;
-    needs_redraw |= poll_thinking_cycle(chat, &mut modals.thinking_cycle).await;
+    needs_redraw |= poll_finished_effects(chat, &mut modals.effects).await;
     needs_redraw |= maybe_start_older_history_load(client, chat, &mut modals.older_history_load);
     needs_redraw |= maybe_start_newer_history_load(client, chat, &mut modals.newer_history_load);
     needs_redraw |= poll_slash_palette_load(chat, modals).await;
@@ -577,143 +532,87 @@ async fn poll_newer_history_load(chat: &mut ActiveChat, load: &mut AsyncHistoryP
     true
 }
 
-fn start_thinking_cycle(
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-    thinking_cycle: &mut AsyncThinkingCycle,
-) {
-    if thinking_cycle.task.is_some() {
+async fn poll_finished_effects(chat: &mut ActiveChat, effects: &mut TuiEffectRunner) -> bool {
+    let results = effects.poll_finished().await;
+    let needs_redraw = !results.is_empty();
+    for result in results {
+        apply_effect_result(chat, result);
+    }
+    needs_redraw
+}
+
+fn apply_effect_result(chat: &mut ActiveChat, result: TuiEffectResult) {
+    match result {
+        TuiEffectResult::CancelTurn { session_id, result } => match result {
+            Ok(true) if Some(session_id) == chat.app.session_id() => {
+                chat.app
+                    .set_status("turn cancellation requested".to_owned());
+            }
+            Ok(false) if Some(session_id) == chat.app.session_id() => {
+                chat.app.set_idle();
+                chat.app.set_status("no active turn".to_owned());
+            }
+            Ok(_) => {}
+            Err(error) => {
+                if Some(session_id) == chat.app.session_id() {
+                    chat.app.set_idle();
+                }
+                report_nonfatal_client_error(chat, "Cancel unavailable", &error);
+            }
+        },
+        TuiEffectResult::CycleThinkingEffort { session_id, result } => match *result {
+            Ok(result) if session_id == chat.app.session_id() => {
+                if let Some(status) = result.status {
+                    chat.app.apply_model_status(status);
+                }
+                if let Some(next_effort) = result.next_effort {
+                    chat.app.apply_reasoning_selection(
+                        Some(next_effort.clone()),
+                        result.summary,
+                        result.visible,
+                    );
+                    chat.app
+                        .set_status(format!("thinking effort set to {next_effort}"));
+                } else {
+                    chat.app
+                        .set_status("thinking effort unavailable for current model".to_owned());
+                }
+            }
+            Ok(_stale) => {}
+            Err(error) => report_nonfatal_client_error(chat, "thinking effort failed", &error),
+        },
+    }
+}
+
+fn start_thinking_cycle(chat: &mut ActiveChat, effects: &mut TuiEffectRunner) {
+    let started = effects.start(TuiEffect::CycleThinkingEffort {
+        session_id: chat.app.session_id(),
+        current_effort: chat.app.reasoning_effort().map(ToOwned::to_owned),
+        current_summary: chat.app.reasoning_summary().map(ToOwned::to_owned),
+        visible: chat.app.reasoning_visible(),
+    });
+    if started {
+        chat.app.set_status("updating thinking effort…".to_owned());
+    } else {
         chat.app
             .set_status("thinking effort change already in progress".to_owned());
-        return;
     }
-    let session_id = chat.app.session_id();
-    let current_effort = chat.app.reasoning_effort().map(ToOwned::to_owned);
-    let current_summary = chat.app.reasoning_summary().map(ToOwned::to_owned);
-    let visible = chat.app.reasoning_visible();
-    chat.app.set_status("updating thinking effort…".to_owned());
-    let client = client.clone();
-    thinking_cycle.session_id = session_id;
-    thinking_cycle.task = Some(tokio::spawn(async move {
-        let status = if let Some(session_id) = session_id {
-            client.session_model_status(session_id).await?
-        } else {
-            client.default_model_status().await?
-        };
-        let Some(next_effort) =
-            thinking_flow::next_effort_for_status(&status, current_effort.as_deref())
-        else {
-            return Ok(ThinkingCycleResult {
-                next_effort: None,
-                summary: current_summary,
-                visible,
-                status: Some(status),
-            });
-        };
-        let summary = current_summary.or_else(|| status.reasoning_summary.clone());
-        if let Some(session_id) = session_id {
-            client
-                .set_session_reasoning(session_id, Some(next_effort.clone()), summary.clone())
-                .await?;
-        }
-        Ok(ThinkingCycleResult {
-            next_effort: Some(next_effort),
-            summary,
-            visible,
-            status: Some(status),
-        })
-    }));
 }
 
-async fn poll_thinking_cycle(
-    chat: &mut ActiveChat,
-    thinking_cycle: &mut AsyncThinkingCycle,
-) -> bool {
-    let Some(task) = thinking_cycle.task.take_if(|task| task.is_finished()) else {
-        return false;
-    };
-    let session_id = thinking_cycle.session_id.take();
-    match task.await {
-        Ok(Ok(result)) if session_id == chat.app.session_id() => {
-            if let Some(status) = result.status {
-                chat.app.apply_model_status(status);
-            }
-            if let Some(next_effort) = result.next_effort {
-                chat.app.apply_reasoning_selection(
-                    Some(next_effort.clone()),
-                    result.summary,
-                    result.visible,
-                );
-                chat.app
-                    .set_status(format!("thinking effort set to {next_effort}"));
-            } else {
-                chat.app
-                    .set_status("thinking effort unavailable for current model".to_owned());
-            }
-        }
-        Ok(Ok(_stale)) => {}
-        Ok(Err(error)) => report_nonfatal_client_error(chat, "thinking effort failed", &error),
-        Err(error) => chat
-            .app
-            .set_status(format!("Thinking effort task failed: {error}")),
-    }
-    true
-}
-
-fn start_cancel_turn(
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-    cancel_turn: &mut AsyncCancelTurn,
-) {
+fn start_cancel_turn(chat: &mut ActiveChat, effects: &mut TuiEffectRunner) {
     let Some(session_id) = chat.app.session_id() else {
         chat.app.set_status("No active session".to_owned());
         return;
     };
-    if cancel_turn.task.is_some() {
+    let started = effects.start(TuiEffect::CancelTurn { session_id });
+    if started {
+        chat.app.set_cancelling();
+        chat.app
+            .set_status("turn cancellation requested".to_owned());
+    } else {
         chat.app
             .set_status("turn cancellation already requested".to_owned());
-        return;
     }
-    chat.app.set_cancelling();
-    chat.app
-        .set_status("turn cancellation requested".to_owned());
-    let client = client.clone();
-    cancel_turn.session_id = Some(session_id);
-    cancel_turn.task = Some(tokio::spawn(async move {
-        client.cancel_session_turn(session_id).await
-    }));
-}
-
-async fn poll_cancel_turn(chat: &mut ActiveChat, cancel_turn: &mut AsyncCancelTurn) -> bool {
-    let Some(task) = cancel_turn.task.take_if(|task| task.is_finished()) else {
-        return false;
-    };
-    let session_id = cancel_turn.session_id.take();
-    match task.await {
-        Ok(Ok(true)) if session_id == chat.app.session_id() => {
-            chat.app
-                .set_status("turn cancellation requested".to_owned());
-        }
-        Ok(Ok(false)) if session_id == chat.app.session_id() => {
-            chat.app.set_idle();
-            chat.app.set_status("no active turn".to_owned());
-        }
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => {
-            if session_id == chat.app.session_id() {
-                chat.app.set_idle();
-            }
-            report_nonfatal_client_error(chat, "Cancel unavailable", &error);
-        }
-        Err(error) => {
-            if session_id == chat.app.session_id() {
-                chat.app.set_idle();
-            }
-            chat.app
-                .set_status(format!("Cancel turn task failed: {error}"));
-        }
-    }
-    true
 }
 
 fn start_draft_save(
@@ -1247,11 +1146,11 @@ async fn handle_chat_key_request<W: Write>(
     match request {
         KeyRequest::None => {}
         KeyRequest::Interrupt => {
-            start_cancel_turn(context.services.client, chat, &mut modals.cancel_turn);
+            start_cancel_turn(chat, &mut modals.effects);
         }
         KeyRequest::CycleAgent => cycle_session_agent(chat),
         KeyRequest::CycleThinkingEffort => {
-            start_thinking_cycle(context.services.client, chat, &mut modals.thinking_cycle);
+            start_thinking_cycle(chat, &mut modals.effects);
         }
         KeyRequest::Submit { placement } => {
             let pre_submit_scope = draft_autosave.as_ref().map(|autosave| autosave.scope(chat));
