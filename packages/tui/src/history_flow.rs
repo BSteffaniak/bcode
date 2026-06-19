@@ -1,6 +1,6 @@
 //! History and session event-stream plumbing for the TUI.
 
-use bcode_client::BcodeClient;
+use bcode_client::{BcodeClient, DaemonAvailability};
 use bcode_ipc::Event as BcodeEvent;
 use bcode_session_models::{
     ProjectionWindowAnchor, ProjectionWindowDirection, ProjectionWindowLimits,
@@ -128,8 +128,11 @@ pub async fn attach_session_event_stream_with_limit(
         }
         Err(error) => return Err(error.into()),
     };
+    let reconnect_client = client
+        .clone()
+        .with_daemon_availability(DaemonAvailability::RequireRunning);
     let event_task = spawn_reconnecting_recent_event_stream(
-        client.clone(),
+        reconnect_client,
         session_id,
         event_sender,
         limit,
@@ -161,8 +164,11 @@ pub async fn attach_session_event_stream_with_window_request(
         }
         Err(error) => return Err(error.into()),
     };
+    let reconnect_client = client
+        .clone()
+        .with_daemon_availability(DaemonAvailability::RequireRunning);
     let event_task = spawn_reconnecting_window_event_stream(
-        client.clone(),
+        reconnect_client,
         session_id,
         event_sender,
         request,

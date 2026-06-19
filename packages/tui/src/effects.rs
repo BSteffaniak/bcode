@@ -83,6 +83,8 @@ pub enum TuiEffect {
         initial_window_request: ProjectionWindowRequest,
         /// Event sender for the live session stream.
         event_sender: mpsc::UnboundedSender<bcode_ipc::Event>,
+        /// Whether this explicit open may start the daemon.
+        allow_daemon_start: bool,
     },
     /// Load user configuration.
     LoadConfig,
@@ -655,7 +657,11 @@ enum EffectDaemonIntent {
 impl TuiEffect {
     const fn daemon_intent(&self) -> EffectDaemonIntent {
         match self {
-            Self::RenameSession { .. }
+            Self::OpenSession {
+                allow_daemon_start: true,
+                ..
+            }
+            | Self::RenameSession { .. }
             | Self::DeleteSession { .. }
             | Self::ForkSession { .. }
             | Self::CloneSession { .. }
@@ -670,7 +676,10 @@ impl TuiEffect {
             | Self::RemoveWorktree { .. }
             | Self::CancelTurn { .. }
             | Self::CycleThinkingEffort { .. } => EffectDaemonIntent::Foreground,
-            Self::OpenSession { .. }
+            Self::OpenSession {
+                allow_daemon_start: false,
+                ..
+            }
             | Self::LoadConfig
             | Self::ReconcileAuthSecurity { .. }
             | Self::LoadDraftStatus { .. }
@@ -888,6 +897,7 @@ impl TuiEffect {
                 session_id,
                 initial_window_request,
                 event_sender,
+                allow_daemon_start: _,
             } => TuiEffectResult::SessionOpened {
                 session_id,
                 has_older_history: true,
