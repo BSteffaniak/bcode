@@ -8,9 +8,9 @@ use bcode_plugin::PluginSelection;
 use bcode_skill_models::SkillId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::env;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::{env, fs};
 use thiserror::Error;
 
 /// Default Bcode config file name.
@@ -2329,6 +2329,97 @@ fn update_writable_config(
         })?;
     }
     std::fs::write(&path, config_to_toml(&config)).map_err(|source| ConfigError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    Ok(path)
+}
+
+/// Non-secret runtime subscription registry for provider logins that should not mutate declarative config.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeAuthSubscriptions {
+    #[serde(default)]
+    pub pools: BTreeMap<String, RuntimeAuthSubscriptionPool>,
+}
+
+/// Runtime subscriptions associated with one logical auth pool.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeAuthSubscriptionPool {
+    #[serde(default)]
+    pub provider_plugin_id: Option<String>,
+    #[serde(default)]
+    pub profiles: Vec<RuntimeAuthSubscriptionProfile>,
+}
+
+/// Runtime subscription profile metadata. Secret values remain in the auth vault.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeAuthSubscriptionProfile {
+    pub auth_profile: String,
+    pub storage_profile: String,
+    pub vault: PathBuf,
+    pub provider: String,
+    pub scheme: String,
+}
+
+/// Return the runtime auth subscription registry path.
+#[must_use]
+pub fn runtime_auth_subscriptions_path() -> PathBuf {
+    if let Ok(path) = env::var("BCODE_AUTH_SUBSCRIPTIONS") {
+        return PathBuf::from(path);
+    }
+    default_state_dir().join("auth").join("subscriptions.json")
+}
+
+/// Load runtime auth subscriptions from user state.
+#[must_use]
+pub fn load_runtime_auth_subscriptions() -> RuntimeAuthSubscriptions {
+    let path = runtime_auth_subscriptions_path();
+    let Ok(contents) = fs::read_to_string(path) else {
+        return RuntimeAuthSubscriptions::default();
+    };
+    serde_json::from_str(&contents).unwrap_or_default()
+}
+
+/// Register a runtime auth subscription without mutating declarative config.
+///
+/// # Errors
+///
+/// Returns an error when the registry cannot be written.
+pub fn register_runtime_auth_subscription(
+    pool: &str,
+    profile: RuntimeAuthSubscriptionProfile,
+) -> Result<PathBuf, ConfigError> {
+    let path = runtime_auth_subscriptions_path();
+    let mut registry = load_runtime_auth_subscriptions();
+    let pool_entry =
+        registry
+            .pools
+            .entry(pool.to_string())
+            .or_insert_with(|| RuntimeAuthSubscriptionPool {
+                provider_plugin_id: Some("bcode.openai-compatible".to_string()),
+                profiles: Vec::new(),
+            });
+    pool_entry.provider_plugin_id = Some("bcode.openai-compatible".to_string());
+    if let Some(existing) = pool_entry
+        .profiles
+        .iter_mut()
+        .find(|existing| existing.auth_profile == profile.auth_profile)
+    {
+        *existing = profile;
+    } else {
+        pool_entry.profiles.push(profile);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let contents =
+        serde_json::to_string_pretty(&registry).map_err(|source| ConfigError::Composition {
+            message: format!("failed to serialize runtime auth subscriptions: {source}"),
+        })?;
+    fs::write(&path, contents).map_err(|source| ConfigError::Io {
         path: path.clone(),
         source,
     })?;

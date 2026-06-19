@@ -239,10 +239,14 @@ fn current_runtime_context() -> Option<ClientRuntimeContext> {
         .collect::<BTreeMap<_, _>>();
     let mut resolved = config.resolved_model_selection();
     resolved.auth_profile = selected_auth_profile(&resolved);
-    resolved.auth_pool = selected_auth_pool(&resolved);
+    resolved.auth_pool = selected_auth_pool(&config, &resolved);
     let auth = merge_selected_auth_profile_env(&config, resolved.auth_profile.as_deref(), &mut env);
-    let auth_candidates =
-        merge_selected_auth_pool_env(&config, resolved.auth_pool.as_deref(), &mut env);
+    let auth_candidates = merge_selected_auth_pool_env(
+        &config,
+        resolved.auth_pool.as_deref(),
+        resolved.auth_profile.as_deref(),
+        &mut env,
+    );
     let env_keys = env.keys().cloned().map(|key| (key, true)).collect();
     Some(ClientRuntimeContext {
         selected_provider_plugin_id: resolved.provider_plugin_id,
@@ -268,15 +272,26 @@ fn selected_auth_profile(resolved: &bcode_config::ResolvedModelSelection) -> Opt
         .or_else(|| resolved.auth_profile.clone())
 }
 
-fn selected_auth_pool(resolved: &bcode_config::ResolvedModelSelection) -> Option<String> {
-    if std::env::var(bcode_config::BCODE_AUTH_PROFILE_ENV)
-        .ok()
-        .filter(|profile| !profile.trim().is_empty())
-        .is_some()
-    {
-        return None;
-    }
-    resolved.auth_pool.clone()
+fn selected_auth_pool(
+    config: &bcode_config::BcodeConfig,
+    resolved: &bcode_config::ResolvedModelSelection,
+) -> Option<String> {
+    resolved.auth_pool.clone().or_else(|| {
+        resolved
+            .auth_profile
+            .as_deref()
+            .filter(|auth_profile| is_openai_chatgpt_auth_profile(config, auth_profile))
+            .map(|_| "openai".to_string())
+    })
+}
+
+fn is_openai_chatgpt_auth_profile(config: &bcode_config::BcodeConfig, auth_profile: &str) -> bool {
+    let Some(profile) = config.auth.profiles.get(auth_profile) else {
+        return false;
+    };
+    profile.settings.get("provider").map(String::as_str) == Some("openai")
+        && (profile.scheme.as_deref() == Some("chatgpt")
+            || profile.settings.get("mode").map(String::as_str) == Some("chatgpt"))
 }
 
 fn merge_selected_auth_profile_env(
@@ -302,36 +317,110 @@ fn merge_selected_auth_profile_env(
 fn merge_selected_auth_pool_env(
     config: &bcode_config::BcodeConfig,
     auth_pool: Option<&str>,
+    primary_auth_profile: Option<&str>,
     env: &mut BTreeMap<String, String>,
 ) -> Vec<bcode_model::ProviderAuthCandidate> {
     let Some(auth_pool_name) = auth_pool else {
         return Vec::new();
     };
-    let Some(auth_pool) = config.auth.pools.get(auth_pool_name) else {
-        return Vec::new();
-    };
-    auth_pool
-        .profiles
-        .iter()
-        .filter_map(|auth_profile_name| {
-            config
-                .auth
-                .profiles
-                .get(auth_profile_name)
-                .map(|auth_profile| {
-                    let resolved =
-                        bcode_provider_auth::resolve_auth_profile(auth_profile_name, auth_profile);
-                    for (key, value) in &resolved.env {
-                        env.entry(key.clone()).or_insert_with(|| value.clone());
-                    }
-                    bcode_model::ProviderAuthCandidate {
-                        profile: Some(auth_profile_name.clone()),
-                        auth: resolved.auth,
-                        env: resolved.env,
-                    }
-                })
-        })
-        .collect()
+    let mut candidates = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    if let Some(primary_auth_profile) = primary_auth_profile {
+        push_config_auth_candidate(
+            config,
+            primary_auth_profile,
+            env,
+            &mut candidates,
+            &mut seen,
+        );
+    }
+    if let Some(auth_pool) = config.auth.pools.get(auth_pool_name) {
+        for auth_profile_name in &auth_pool.profiles {
+            push_config_auth_candidate(config, auth_profile_name, env, &mut candidates, &mut seen);
+        }
+    }
+    let registry = bcode_config::load_runtime_auth_subscriptions();
+    if let Some(pool) = registry.pools.get(auth_pool_name) {
+        for profile in &pool.profiles {
+            if seen.contains(&profile.auth_profile) {
+                continue;
+            }
+            let auth_profile = runtime_subscription_auth_profile(profile);
+            let resolved =
+                bcode_provider_auth::resolve_auth_profile(&profile.auth_profile, &auth_profile);
+            for (key, value) in &resolved.env {
+                env.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+            candidates.push(bcode_model::ProviderAuthCandidate {
+                profile: Some(profile.auth_profile.clone()),
+                auth: resolved.auth,
+                env: resolved.env,
+            });
+            seen.insert(profile.auth_profile.clone());
+        }
+    }
+    candidates
+}
+
+fn push_config_auth_candidate(
+    config: &bcode_config::BcodeConfig,
+    auth_profile_name: &str,
+    env: &mut BTreeMap<String, String>,
+    candidates: &mut Vec<bcode_model::ProviderAuthCandidate>,
+    seen: &mut std::collections::BTreeSet<String>,
+) {
+    if !seen.insert(auth_profile_name.to_string()) {
+        return;
+    }
+    if let Some(auth_profile) = config.auth.profiles.get(auth_profile_name) {
+        let resolved = bcode_provider_auth::resolve_auth_profile(auth_profile_name, auth_profile);
+        for (key, value) in &resolved.env {
+            env.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+        candidates.push(bcode_model::ProviderAuthCandidate {
+            profile: Some(auth_profile_name.to_string()),
+            auth: resolved.auth,
+            env: resolved.env,
+        });
+    }
+}
+
+fn runtime_subscription_auth_profile(
+    profile: &bcode_config::RuntimeAuthSubscriptionProfile,
+) -> bcode_config::AuthProfileConfig {
+    bcode_config::AuthProfileConfig {
+        backend: "sshenv".to_string(),
+        scheme: Some(profile.scheme.clone()),
+        settings: BTreeMap::from([
+            ("provider".to_string(), profile.provider.clone()),
+            ("profile".to_string(), profile.storage_profile.clone()),
+            ("vault".to_string(), profile.vault.display().to_string()),
+            ("mode".to_string(), profile.scheme.clone()),
+        ]),
+        map: BTreeMap::from([
+            (
+                "access_token".to_string(),
+                bcode_config::AuthCredentialMapping {
+                    env: Some("BCODE_OPENAI_CODEX_ACCESS_TOKEN".to_string()),
+                    key: None,
+                },
+            ),
+            (
+                "refresh_token".to_string(),
+                bcode_config::AuthCredentialMapping {
+                    env: Some("BCODE_OPENAI_CODEX_REFRESH_TOKEN".to_string()),
+                    key: None,
+                },
+            ),
+            (
+                "expires_at".to_string(),
+                bcode_config::AuthCredentialMapping {
+                    env: Some("BCODE_OPENAI_CODEX_EXPIRES_AT".to_string()),
+                    key: None,
+                },
+            ),
+        ]),
+    }
 }
 
 fn merge_legacy_openai_auth_profile_env(

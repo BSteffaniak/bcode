@@ -32,7 +32,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rand::TryRngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{IsTerminal as _, Read as _, Write as _};
@@ -1274,15 +1274,30 @@ fn auth_pool_state_key(pool: &str, profile: &str) -> String {
 
 fn auth_pool_list() -> Result<(), CliError> {
     let config = bcode_config::load_config()?;
-    if config.auth.pools.is_empty() {
-        println!("No auth pools declared.");
+    let registry = bcode_config::load_runtime_auth_subscriptions();
+    let names = config
+        .auth
+        .pools
+        .keys()
+        .chain(registry.pools.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if names.is_empty() {
+        println!("No auth pools declared or registered.");
         return Ok(());
     }
-    for (name, pool) in &config.auth.pools {
+    for name in names {
+        let declared_count = config
+            .auth
+            .pools
+            .get(&name)
+            .map_or(0, |pool| pool.profiles.len());
+        let runtime_count = registry
+            .pools
+            .get(&name)
+            .map_or(0, |pool| pool.profiles.len());
         println!(
-            "{name}: {} profile(s), strategy {:?}",
-            pool.profiles.len(),
-            pool.strategy
+            "{name}: {declared_count} declared profile(s), {runtime_count} runtime subscription(s)"
         );
     }
     Ok(())
@@ -1290,42 +1305,80 @@ fn auth_pool_list() -> Result<(), CliError> {
 
 fn auth_pool_status(pool_name: &str) -> Result<(), CliError> {
     let config = bcode_config::load_config()?;
-    let Some(pool) = config.auth.pools.get(pool_name) else {
-        println!("Auth pool '{pool_name}' is not declared.");
+    let registry = bcode_config::load_runtime_auth_subscriptions();
+    let declared_pool = config.auth.pools.get(pool_name);
+    let runtime_pool = registry.pools.get(pool_name);
+    if declared_pool.is_none() && runtime_pool.is_none() {
+        println!("Auth pool '{pool_name}' is not declared or registered.");
         return Ok(());
-    };
+    }
     println!("Auth pool: {pool_name}");
-    if let Some(provider_plugin_id) = &pool.provider_plugin_id {
+    if let Some(provider_plugin_id) = declared_pool
+        .and_then(|pool| pool.provider_plugin_id.as_ref())
+        .or_else(|| runtime_pool.and_then(|pool| pool.provider_plugin_id.as_ref()))
+    {
         println!("Provider plugin: {provider_plugin_id}");
     }
-    println!("Strategy: {:?}", pool.strategy);
-    if pool.profiles.is_empty() {
+    if let Some(pool) = declared_pool {
+        println!("Strategy: {:?}", pool.strategy);
+    }
+    let profiles = declared_pool
+        .map(|pool| pool.profiles.clone())
+        .unwrap_or_default();
+    let runtime_profiles = runtime_pool
+        .map(|pool| {
+            pool.profiles
+                .iter()
+                .map(|profile| profile.auth_profile.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if profiles.is_empty() && runtime_profiles.is_empty() {
         println!("Profiles: none");
         return Ok(());
     }
     let state = load_openai_auth_pool_state();
     let now = unix_now_secs();
     println!("Profiles:");
-    for profile in &pool.profiles {
-        let config_status = if config.auth.profiles.contains_key(profile) {
-            "configured"
-        } else {
-            "missing"
-        };
-        let key = auth_pool_state_key(pool_name, profile);
-        if let Some(entry) = state.entries.get(&key)
-            && entry.cooldown_until_unix > now
-        {
-            println!(
-                "  {profile}: {config_status}, cooldown {} remaining, reason: {}",
-                format_duration(entry.cooldown_until_unix.saturating_sub(now)),
-                entry.reason
-            );
+    for profile in profiles {
+        print_auth_pool_profile_status(&config, pool_name, &profile, "declared", &state, now);
+    }
+    for profile in runtime_profiles {
+        if declared_pool.is_some_and(|pool| pool.profiles.contains(&profile)) {
             continue;
         }
-        println!("  {profile}: {config_status}, available");
+        print_auth_pool_profile_status(&config, pool_name, &profile, "runtime", &state, now);
     }
     Ok(())
+}
+
+fn print_auth_pool_profile_status(
+    config: &bcode_config::BcodeConfig,
+    pool_name: &str,
+    profile: &str,
+    source: &str,
+    state: &OpenAiAuthPoolStateFile,
+    now: u64,
+) {
+    let config_status = if config.auth.profiles.contains_key(profile) {
+        "configured"
+    } else if source == "runtime" {
+        "registered"
+    } else {
+        "missing"
+    };
+    let key = auth_pool_state_key(pool_name, profile);
+    if let Some(entry) = state.entries.get(&key)
+        && entry.cooldown_until_unix > now
+    {
+        println!(
+            "  {profile}: {source}, {config_status}, cooldown {} remaining, reason: {}",
+            format_duration(entry.cooldown_until_unix.saturating_sub(now)),
+            entry.reason
+        );
+        return;
+    }
+    println!("  {profile}: {source}, {config_status}, available");
 }
 
 fn auth_pool_reset_cooldown(pool_name: &str, profile: Option<&str>) -> Result<(), CliError> {
@@ -2321,12 +2374,17 @@ async fn login_openai_chatgpt(
         "OPENAI",
         || {
             if add_subscription {
-                bcode_config::add_openai_chatgpt_subscription_auth(
+                let registry_path = bcode_config::register_runtime_auth_subscription(
                     "openai",
-                    target.auth_profile.as_str(),
-                    &target.vault_path,
-                    model,
-                )
+                    bcode_config::RuntimeAuthSubscriptionProfile {
+                        auth_profile: target.auth_profile.clone(),
+                        storage_profile: target.storage_profile.clone(),
+                        vault: target.vault_path.clone(),
+                        provider: "openai".to_string(),
+                        scheme: "chatgpt".to_string(),
+                    },
+                )?;
+                Ok(registry_path)
             } else {
                 bcode_config::set_openai_sshenv_auth_mode(
                     target.auth_profile.clone(),

@@ -1051,7 +1051,8 @@ fn is_subscription_quota_error(error: &ProviderError) -> bool {
     }
     let code = error.code.to_ascii_lowercase();
     let message = error.message.to_ascii_lowercase();
-    code.contains("quota")
+    code.contains("usage_limit")
+        || code.contains("quota")
         || code.contains("rate_limit")
         || message.contains("quota")
         || message.contains("usage limit")
@@ -4356,7 +4357,21 @@ fn category_from_openai_error(status: u16, code: &str, message: &str) -> Provide
     if is_context_length_error(code, message) {
         return ProviderErrorCategory::ContextLength;
     }
+    if is_usage_limit_error(code, message) {
+        return ProviderErrorCategory::RateLimit;
+    }
     category_from_status(status)
+}
+
+fn is_usage_limit_error(code: &str, message: &str) -> bool {
+    let code = code.to_ascii_lowercase();
+    let message = message.to_ascii_lowercase();
+    code.contains("usage_limit")
+        || code.contains("quota")
+        || code.contains("rate_limit")
+        || message.contains("usage limit")
+        || message.contains("quota")
+        || message.contains("rate limit")
 }
 
 const fn category_from_status(status: u16) -> ProviderErrorCategory {
