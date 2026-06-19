@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use bcode_client::{BcodeClient, ClientError, MessageAcceptance};
 use bcode_ipc::{ComposerDraftScope, PermissionSummary, PromptPlacement};
 use bcode_session_models::{
-    ProjectionWindowRequest, SessionForkResult, SessionHistoryCursor, SessionHistoryDirection,
-    SessionHistoryPage, SessionHistoryQuery, SessionId, SessionSummary,
+    ProjectionWindowRequest, RuntimeWorkId, SessionForkResult, SessionHistoryCursor,
+    SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery, SessionId, SessionSummary,
 };
 use bcode_skill_models::SkillId;
 use bcode_worktree_models::{
@@ -193,6 +193,24 @@ pub enum TuiEffect {
         provider_plugin_id: Option<String>,
         /// Model id to set.
         model_id: String,
+    },
+    /// Set session reasoning preferences.
+    SetSessionReasoning {
+        /// Session to update.
+        session_id: SessionId,
+        /// Optional reasoning effort.
+        effort: Option<String>,
+        /// Optional reasoning summary.
+        summary: Option<String>,
+        /// Success status text.
+        status: String,
+    },
+    /// Cancel runtime work for a session.
+    CancelRuntimeWork {
+        /// Session that owns the work.
+        session_id: SessionId,
+        /// Runtime work id.
+        work_id: RuntimeWorkId,
     },
     /// Request context compaction for the current session.
     CompactContext {
@@ -434,6 +452,20 @@ pub enum TuiEffectResult {
         /// Daemon response.
         result: Result<(), ClientError>,
     },
+    /// Session reasoning update completed.
+    SetSessionReasoning {
+        /// Success status text.
+        status: String,
+        /// Daemon response.
+        result: Result<(), ClientError>,
+    },
+    /// Runtime work cancellation completed.
+    CancelRuntimeWork {
+        /// Cancelled work id.
+        work_id: RuntimeWorkId,
+        /// Daemon response.
+        result: Result<bool, ClientError>,
+    },
     /// Context compaction completed.
     CompactContext {
         /// Session the request targeted.
@@ -511,8 +543,12 @@ impl TuiEffectResult {
             Self::CloneSession { result, .. } => DaemonObservation::from_client_result(result),
             Self::SkillAction { result, .. } => DaemonObservation::from_client_result(result),
             Self::SetSessionModel { result, .. } => DaemonObservation::from_client_result(result),
+            Self::SetSessionReasoning { result, .. } => {
+                DaemonObservation::from_client_result(result)
+            }
             Self::SubmitMessage { result, .. } => DaemonObservation::from_client_result(result),
             Self::CompactContext { result, .. } => DaemonObservation::from_client_result(result),
+            Self::CancelRuntimeWork { result, .. } => DaemonObservation::from_client_result(result),
             Self::ListWorktrees { result } => DaemonObservation::from_client_result(result),
             Self::AttachWorktree { result, .. } => DaemonObservation::from_client_result(result),
             Self::CreateWorktree { result } => DaemonObservation::from_client_result(result),
@@ -589,6 +625,8 @@ enum EffectKey {
     SubmitMessage(usize),
     SkillAction(SkillId),
     SetSessionModel(SessionId),
+    SetSessionReasoning(SessionId),
+    CancelRuntimeWork(SessionId),
     CompactContext(SessionId),
     WorktreeList,
     AttachWorktree(SessionId),
@@ -624,6 +662,8 @@ impl TuiEffect {
             | Self::SubmitMessage { .. }
             | Self::SkillAction { .. }
             | Self::SetSessionModel { .. }
+            | Self::SetSessionReasoning { .. }
+            | Self::CancelRuntimeWork { .. }
             | Self::CompactContext { .. }
             | Self::AttachWorktree { .. }
             | Self::CreateWorktree { .. }
@@ -825,6 +865,10 @@ impl TuiEffect {
             Self::SubmitMessage { request } => EffectKey::SubmitMessage(request.message.len()),
             Self::SkillAction { request } => EffectKey::SkillAction(request.skill_id.clone()),
             Self::SetSessionModel { session_id, .. } => EffectKey::SetSessionModel(*session_id),
+            Self::SetSessionReasoning { session_id, .. } => {
+                EffectKey::SetSessionReasoning(*session_id)
+            }
+            Self::CancelRuntimeWork { session_id, .. } => EffectKey::CancelRuntimeWork(*session_id),
             Self::CompactContext { session_id } => EffectKey::CompactContext(*session_id),
             Self::ListWorktrees { .. } => EffectKey::WorktreeList,
             Self::AttachWorktree { session_id, .. } => EffectKey::AttachWorktree(*session_id),
@@ -956,6 +1000,24 @@ impl TuiEffect {
                 result: client
                     .set_session_model(session_id, provider_plugin_id, model_id)
                     .await,
+            },
+            Self::SetSessionReasoning {
+                session_id,
+                effort,
+                summary,
+                status,
+            } => TuiEffectResult::SetSessionReasoning {
+                status,
+                result: client
+                    .set_session_reasoning(session_id, effort, summary)
+                    .await,
+            },
+            Self::CancelRuntimeWork {
+                session_id,
+                work_id,
+            } => TuiEffectResult::CancelRuntimeWork {
+                work_id: work_id.clone(),
+                result: client.cancel_runtime_work(session_id, work_id).await,
             },
             Self::CompactContext { session_id } => TuiEffectResult::CompactContext {
                 session_id,

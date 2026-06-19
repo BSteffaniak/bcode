@@ -612,6 +612,9 @@ fn apply_effect_result(
                 result,
             );
         }
+        TuiEffectResult::SetSessionReasoning { status, result } => {
+            apply_set_session_reasoning_result(chat, status, result);
+        }
         TuiEffectResult::CompactContext { session_id, result } => {
             apply_compact_context_result(chat, session_id, result);
         }
@@ -626,6 +629,9 @@ fn apply_effect_result(
         }
         TuiEffectResult::RemoveWorktree { result } => {
             apply_remove_worktree_result(chat, result);
+        }
+        TuiEffectResult::CancelRuntimeWork { work_id, result } => {
+            apply_cancel_runtime_work_result(chat, &work_id, result);
         }
         TuiEffectResult::CancelTurn { session_id, result } => {
             apply_cancel_turn_result(chat, session_id, result);
@@ -1067,6 +1073,19 @@ fn apply_set_session_model_result(
     }
 }
 
+fn apply_set_session_reasoning_result(
+    chat: &mut ActiveChat,
+    status: String,
+    result: Result<(), ClientError>,
+) {
+    match result {
+        Ok(()) => chat.app.set_status(status),
+        Err(error) => {
+            daemon_issue::report_client_issue(&mut chat.app, "thinking setting failed", &error);
+        }
+    }
+}
+
 fn apply_compact_context_result(
     chat: &mut ActiveChat,
     session_id: bcode_session_models::SessionId,
@@ -1160,6 +1179,24 @@ fn apply_remove_worktree_result(
             .set_status(format!("removed worktree {}", removed.path.display())),
         Err(error) => {
             daemon_issue::report_client_issue(&mut chat.app, "worktree remove failed", &error);
+        }
+    }
+}
+
+fn apply_cancel_runtime_work_result(
+    chat: &mut ActiveChat,
+    work_id: &bcode_session_models::RuntimeWorkId,
+    result: Result<bool, ClientError>,
+) {
+    match result {
+        Ok(true) => chat
+            .app
+            .set_status(format!("runtime work cancellation requested: {work_id}")),
+        Ok(false) => chat
+            .app
+            .set_status(format!("runtime work not active: {work_id}")),
+        Err(error) => {
+            daemon_issue::report_client_issue(&mut chat.app, "runtime cancellation failed", &error);
         }
     }
 }

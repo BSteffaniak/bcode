@@ -13,6 +13,7 @@ use super::{
     TuiError, helpers, model_flow, ralph_flow, session_flow, session_fork_flow, skill_flow,
     slash_commands, slash_registry, thinking_dialog, worktree_flow,
 };
+use bcode_session_models::RuntimeWorkId;
 
 /// Result of submitting staged composer text.
 pub type SubmitComposerOutcome = Option<ComposerModalRequest>;
@@ -88,7 +89,7 @@ async fn handle_slash_command<W: Write>(
     resolution: slash_registry::SlashResolution,
 ) -> Result<SubmitComposerOutcome, TuiError> {
     match slash_commands::execute_resolved(
-        services.client,
+        services.passive_client,
         session_id,
         chat.app.current_agent_id(),
         message,
@@ -197,11 +198,73 @@ async fn handle_slash_command<W: Write>(
             chat.app.clear_pending_submission(message);
             session_fork_flow::fork_current_session(io, services, chat).await?;
         }
-        slash_commands::SlashCommandOutcome::SessionCloned { session_id } => {
+        slash_commands::SlashCommandOutcome::CloneSession { session_id, name } => {
             chat.app.clear_pending_submission(message);
-            session_flow::switch_session(io.terminal, chat, session_id)?;
+            chat.start_effect(TuiEffect::CloneSession {
+                session_id,
+                name,
+                switch_after_create: true,
+                install_draft: true,
+                initial_window_request: super::history_flow::initial_transcript_window_request(
+                    super::render::transcript_area_for_frame(&chat.app, io.terminal.area()),
+                ),
+            });
+            chat.app.set_status("cloning session…".to_owned());
+        }
+        slash_commands::SlashCommandOutcome::SetSessionModel {
+            session_id,
+            provider_plugin_id,
+            model_id,
+        } => {
+            chat.app.clear_pending_submission(message);
+            chat.start_effect(TuiEffect::SetSessionModel {
+                session_id,
+                provider_plugin_id,
+                model_id,
+            });
+            chat.app.set_status("setting model…".to_owned());
+        }
+        slash_commands::SlashCommandOutcome::SetSessionReasoning {
+            session_id,
+            effort,
+            summary,
+            status,
+        } => {
+            chat.app.clear_pending_submission(message);
+            chat.start_effect(TuiEffect::SetSessionReasoning {
+                session_id,
+                effort,
+                summary,
+                status,
+            });
+            chat.app.set_status("setting thinking…".to_owned());
+        }
+        slash_commands::SlashCommandOutcome::CancelTurn { session_id } => {
+            chat.app.clear_pending_submission(message);
+            chat.start_effect(TuiEffect::CancelTurn { session_id });
+            chat.app.set_status("requesting cancellation…".to_owned());
+        }
+        slash_commands::SlashCommandOutcome::CancelRuntimeWork {
+            session_id,
+            work_id,
+        } => {
+            chat.app.clear_pending_submission(message);
+            chat.start_effect(TuiEffect::CancelRuntimeWork {
+                session_id,
+                work_id: RuntimeWorkId::new(work_id),
+            });
             chat.app
-                .set_status("cloned session and switched".to_owned());
+                .set_status("requesting runtime cancellation…".to_owned());
+        }
+        slash_commands::SlashCommandOutcome::CompactContext { session_id } => {
+            chat.app.clear_pending_submission(message);
+            chat.start_effect(TuiEffect::CompactContext { session_id });
+            chat.app.set_status("compacting context…".to_owned());
+        }
+        slash_commands::SlashCommandOutcome::AttachWorktree { session_id, path } => {
+            chat.app.clear_pending_submission(message);
+            chat.start_effect(TuiEffect::AttachWorktree { session_id, path });
+            chat.app.set_status("attaching worktree…".to_owned());
         }
         slash_commands::SlashCommandOutcome::OpenRalphHome => {
             chat.app.clear_pending_submission(message);

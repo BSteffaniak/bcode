@@ -3,7 +3,9 @@
 use super::{daemon_issue, slash_registry};
 use bcode_client::BcodeClient;
 use bcode_session_models::SessionId;
+use bcode_skill_models::SkillId;
 use bcode_worktree_models::WorktreeListRequest;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommandOutcome {
@@ -27,8 +29,38 @@ pub enum SlashCommandOutcome {
     OpenWorktreeCreateDialog,
     /// Open fork session wizard.
     OpenForkSessionWizard,
-    /// Switch to a newly cloned session.
-    SessionCloned { session_id: SessionId },
+    /// Clone a session.
+    CloneSession {
+        session_id: SessionId,
+        name: Option<String>,
+    },
+    /// Set the active model for a session.
+    SetSessionModel {
+        session_id: SessionId,
+        provider_plugin_id: Option<String>,
+        model_id: String,
+    },
+    /// Set reasoning effort/summary for a session.
+    SetSessionReasoning {
+        session_id: SessionId,
+        effort: Option<String>,
+        summary: Option<String>,
+        status: String,
+    },
+    /// Request active turn cancellation.
+    CancelTurn { session_id: SessionId },
+    /// Request runtime work cancellation.
+    CancelRuntimeWork {
+        session_id: SessionId,
+        work_id: String,
+    },
+    /// Request context compaction.
+    CompactContext { session_id: SessionId },
+    /// Attach the active session to a path.
+    AttachWorktree {
+        session_id: SessionId,
+        path: PathBuf,
+    },
     /// Open the plugin-owned Ralph home UI.
     OpenRalphHome,
     /// Open Ralph loop start dialog.
@@ -199,12 +231,12 @@ async fn thinking_command(
             ) {
                 return Ok(SlashCommandOutcome::Handled(message));
             }
-            client
-                .set_session_reasoning(session_id, Some(effort.clone()), None)
-                .await?;
-            Ok(SlashCommandOutcome::Handled(format!(
-                "thinking effort set to {effort}"
-            )))
+            Ok(SlashCommandOutcome::SetSessionReasoning {
+                session_id,
+                effort: Some(effort.clone()),
+                summary: None,
+                status: format!("thinking effort set to {effort}"),
+            })
         }
         Some("summary") if parts.len() > 2 => {
             let summary = parts[2].to_owned();
@@ -218,12 +250,12 @@ async fn thinking_command(
             ) {
                 return Ok(SlashCommandOutcome::Handled(message));
             }
-            client
-                .set_session_reasoning(session_id, None, Some(summary.clone()))
-                .await?;
-            Ok(SlashCommandOutcome::Handled(format!(
-                "thinking summary set to {summary}"
-            )))
+            Ok(SlashCommandOutcome::SetSessionReasoning {
+                session_id,
+                effort: None,
+                summary: Some(summary.clone()),
+                status: format!("thinking summary set to {summary}"),
+            })
         }
         Some("show") => Ok(SlashCommandOutcome::SetThinkingDisplay(true)),
         Some("hide") => Ok(SlashCommandOutcome::SetThinkingDisplay(false)),
@@ -239,12 +271,12 @@ async fn thinking_command(
             ) {
                 return Ok(SlashCommandOutcome::Handled(message));
             }
-            client
-                .set_session_reasoning(session_id, Some(value.to_owned()), None)
-                .await?;
-            Ok(SlashCommandOutcome::Handled(format!(
-                "thinking effort set to {value}"
-            )))
+            Ok(SlashCommandOutcome::SetSessionReasoning {
+                session_id,
+                effort: Some(value.to_owned()),
+                summary: None,
+                status: format!("thinking effort set to {value}"),
+            })
         }
     }
 }
@@ -348,24 +380,15 @@ fn goal_command(parts: &[&str]) -> SlashCommandOutcome {
     ralph_command(&ralph_parts)
 }
 
-async fn cwd_command(
-    client: &BcodeClient,
-    session_id: SessionId,
-    parts: &[&str],
-) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
+fn cwd_command(session_id: SessionId, parts: &[&str]) -> SlashCommandOutcome {
     if parts.len() <= 1 {
-        return Ok(SlashCommandOutcome::Handled(
-            "usage: /cwd <path>".to_owned(),
-        ));
+        return SlashCommandOutcome::Handled("usage: /cwd <path>".to_owned());
     }
     let working_directory = parts.iter().skip(1).copied().collect::<Vec<_>>().join(" ");
-    let session = client
-        .change_session_working_directory(session_id, working_directory)
-        .await?;
-    Ok(SlashCommandOutcome::Handled(format!(
-        "working directory set to {}",
-        session.working_directory.display()
-    )))
+    SlashCommandOutcome::AttachWorktree {
+        session_id,
+        path: PathBuf::from(working_directory),
+    }
 }
 
 fn ralph_command(parts: &[&str]) -> SlashCommandOutcome {
@@ -417,13 +440,10 @@ async fn worktree_command(
                 ));
             };
             let path = parts.iter().skip(2).copied().collect::<Vec<_>>().join(" ");
-            let session = client
-                .change_session_working_directory(session_id, path)
-                .await?;
-            Ok(SlashCommandOutcome::Handled(format!(
-                "working directory set to {}",
-                session.working_directory.display()
-            )))
+            Ok(SlashCommandOutcome::AttachWorktree {
+                session_id,
+                path: PathBuf::from(path),
+            })
         }
         Some(_) => Ok(SlashCommandOutcome::Handled(
             "usage: /worktree [list|create|attach <path>]".to_string(),
@@ -462,7 +482,6 @@ async fn resync_command(
 
 async fn skill_command(
     client: &BcodeClient,
-    session_id: SessionId,
     parts: &[&str],
 ) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
     if parts.get(1) == Some(&"describe") && parts.len() > 2 {
@@ -471,59 +490,26 @@ async fn skill_command(
     let Some(skill) = parts.get(1) else {
         return Ok(SlashCommandOutcome::PickSkill);
     };
-    let skill_id = bcode_skill_models::SkillId::new(*skill);
+    let skill_id = SkillId::new(*skill);
     let arguments = parts.iter().skip(2).copied().collect::<Vec<_>>().join(" ");
-    let display_text = if arguments.is_empty() {
-        format!("Invoke skill {skill_id}")
-    } else {
-        format!("Invoke skill {skill_id}: {arguments}")
-    };
-    let acceptance = client
-        .invoke_skill(session_id, skill_id.clone(), arguments, display_text)
-        .await?;
-    Ok(SlashCommandOutcome::Handled(if acceptance.queued {
-        format!("skill {skill_id} queued")
-    } else {
-        format!("skill {skill_id} invoked")
-    }))
+    Ok(SlashCommandOutcome::InvokeSkill {
+        skill_id,
+        arguments,
+    })
 }
 
-async fn stop_command(
-    client: &BcodeClient,
-    session_id: SessionId,
-) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
-    let cancelled = client
-        .cancel_session_turn_with_options(session_id, true)
-        .await?;
-    Ok(SlashCommandOutcome::Handled(if cancelled {
-        "turn cancellation requested; queued messages cleared; use /runtime to inspect active work"
-            .to_string()
-    } else {
-        "no active turn".to_string()
-    }))
+const fn stop_command(session_id: SessionId) -> SlashCommandOutcome {
+    SlashCommandOutcome::CancelTurn { session_id }
 }
 
-async fn cancel_runtime_command(
-    client: &BcodeClient,
-    session_id: SessionId,
-    parts: &[&str],
-) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
+fn cancel_runtime_command(session_id: SessionId, parts: &[&str]) -> SlashCommandOutcome {
     let Some(work_id) = parts.get(1) else {
-        return Ok(SlashCommandOutcome::Handled(
-            "usage: /cancel-runtime <work-id>".to_string(),
-        ));
+        return SlashCommandOutcome::Handled("usage: /cancel-runtime <work-id>".to_string());
     };
-    let cancelled = client
-        .cancel_runtime_work(
-            session_id,
-            bcode_session_models::RuntimeWorkId::new(*work_id),
-        )
-        .await?;
-    Ok(SlashCommandOutcome::Handled(if cancelled {
-        "runtime work cancellation requested".to_string()
-    } else {
-        "no active runtime work".to_string()
-    }))
+    SlashCommandOutcome::CancelRuntimeWork {
+        session_id,
+        work_id: (*work_id).to_owned(),
+    }
 }
 
 async fn handle_agent_command(
@@ -637,8 +623,7 @@ async fn execute_builtin(
                     "compact requires an active session".to_owned(),
                 ));
             };
-            let message = client.compact_session(session_id).await?;
-            Ok(SlashCommandOutcome::Handled(message))
+            Ok(SlashCommandOutcome::CompactContext { session_id })
         }
         "model" | "models" if parts.len() == 1 => Ok(SlashCommandOutcome::PickModel),
         "model" | "set-model" if parts.len() > 1 => {
@@ -648,12 +633,11 @@ async fn execute_builtin(
                 ));
             };
             let model_id = parts[1].to_owned();
-            client
-                .set_session_model(session_id, None, model_id.clone())
-                .await?;
-            Ok(SlashCommandOutcome::Handled(format!(
-                "model set to {model_id}"
-            )))
+            Ok(SlashCommandOutcome::SetSessionModel {
+                session_id,
+                provider_plugin_id: None,
+                model_id,
+            })
         }
         "provider" | "set-provider" if parts.len() > 1 => {
             let Some(session_id) = session_id else {
@@ -667,12 +651,11 @@ async fn execute_builtin(
                 .await?
                 .model_id
                 .unwrap_or_else(|| "default".to_owned());
-            client
-                .set_session_model(session_id, Some(provider.clone()), model_id.clone())
-                .await?;
-            Ok(SlashCommandOutcome::Handled(format!(
-                "provider set to {provider}; model {model_id}"
-            )))
+            Ok(SlashCommandOutcome::SetSessionModel {
+                session_id,
+                provider_plugin_id: Some(provider),
+                model_id,
+            })
         }
         "provider" => {
             let Some(session_id) = session_id else {
@@ -710,7 +693,7 @@ async fn execute_builtin(
                     "cwd requires an active session".to_owned(),
                 ));
             };
-            cwd_command(client, session_id, parts).await
+            Ok(cwd_command(session_id, parts))
         }
         "worktree" | "worktrees" => worktree_command(client, session_id, parts).await,
         "fork" => {
@@ -728,10 +711,7 @@ async fn execute_builtin(
                 ));
             };
             let name = parts.get(1).map(|value| (*value).to_owned());
-            let result = client.clone_session(session_id, name).await?;
-            Ok(SlashCommandOutcome::SessionCloned {
-                session_id: result.session.id,
-            })
+            Ok(SlashCommandOutcome::CloneSession { session_id, name })
         }
         "ralph" => Ok(ralph_command(parts)),
         "goal" => Ok(goal_command(parts)),
@@ -745,7 +725,7 @@ async fn execute_builtin(
                     "usage: /skill describe <skill-id>".to_owned(),
                 ));
             }
-            let Some(session_id) = session_id else {
+            if session_id.is_none() {
                 let Some(skill) = parts.get(1) else {
                     return Ok(SlashCommandOutcome::PickSkill);
                 };
@@ -753,8 +733,8 @@ async fn execute_builtin(
                     skill_id: bcode_skill_models::SkillId::new(*skill),
                     arguments: parts.iter().skip(2).copied().collect::<Vec<_>>().join(" "),
                 });
-            };
-            skill_command(client, session_id, parts).await
+            }
+            skill_command(client, parts).await
         }
         "thinking" => {
             let Some(session_id) = session_id else {
@@ -769,7 +749,7 @@ async fn execute_builtin(
                     "stop requires an active session".to_owned(),
                 ));
             };
-            stop_command(client, session_id).await
+            Ok(stop_command(session_id))
         }
         "cancel-runtime" => {
             let Some(session_id) = session_id else {
@@ -777,7 +757,7 @@ async fn execute_builtin(
                     "runtime cancellation requires an active session".to_owned(),
                 ));
             };
-            cancel_runtime_command(client, session_id, parts).await
+            Ok(cancel_runtime_command(session_id, parts))
         }
         "runtime" | "status" => {
             let Some(session_id) = session_id else {
