@@ -112,12 +112,28 @@ struct ModalState {
     slash_palette: Option<slash_palette::SlashPalette>,
     slash_palette_load: AsyncSlashPaletteLoad,
     draft_save: AsyncDraftSave,
+    cancel_turn: AsyncCancelTurn,
     permission_dialog: Option<PermissionDialogState>,
     permission_poll: AsyncPermissionPoll,
     older_history_load: AsyncHistoryPageLoad,
     newer_history_load: AsyncHistoryPageLoad,
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
+}
+
+#[derive(Debug)]
+struct AsyncCancelTurn {
+    task: Option<tokio::task::JoinHandle<Result<bool, ClientError>>>,
+    session_id: Option<SessionId>,
+}
+
+impl AsyncCancelTurn {
+    const fn new() -> Self {
+        Self {
+            task: None,
+            session_id: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -243,6 +259,7 @@ pub async fn run_with_client<W: Write>(
         slash_palette: None,
         slash_palette_load: AsyncSlashPaletteLoad::new(),
         draft_save: AsyncDraftSave::new(),
+        cancel_turn: AsyncCancelTurn::new(),
         permission_dialog: None,
         permission_poll: AsyncPermissionPoll::new(Instant::now()),
         older_history_load: AsyncHistoryPageLoad::new(),
@@ -384,6 +401,9 @@ pub async fn run_with_client<W: Write>(
     if let Some(task) = modals.draft_save.task.take() {
         task.abort();
     }
+    if let Some(task) = modals.cancel_turn.task.take() {
+        task.abort();
+    }
     Ok(())
 }
 
@@ -405,6 +425,7 @@ async fn handle_loop_housekeeping(
     needs_redraw |= poll_older_history_load(chat, &mut modals.older_history_load).await;
     needs_redraw |= poll_newer_history_load(chat, &mut modals.newer_history_load).await;
     needs_redraw |= poll_draft_save(client, chat, draft_autosave, &mut modals.draft_save).await;
+    needs_redraw |= poll_cancel_turn(chat, &mut modals.cancel_turn).await;
     needs_redraw |= maybe_start_older_history_load(client, chat, &mut modals.older_history_load);
     needs_redraw |= maybe_start_newer_history_load(client, chat, &mut modals.newer_history_load);
     needs_redraw |= poll_slash_palette_load(chat, modals).await;
@@ -522,6 +543,62 @@ async fn poll_newer_history_load(chat: &mut ActiveChat, load: &mut AsyncHistoryP
             chat.app.set_loading_newer_history(false);
             chat.app
                 .set_status(format!("Newer history task failed: {error}"));
+        }
+    }
+    true
+}
+
+fn start_cancel_turn(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    cancel_turn: &mut AsyncCancelTurn,
+) {
+    let Some(session_id) = chat.app.session_id() else {
+        chat.app.set_status("No active session".to_owned());
+        return;
+    };
+    if cancel_turn.task.is_some() {
+        chat.app
+            .set_status("turn cancellation already requested".to_owned());
+        return;
+    }
+    chat.app.set_cancelling();
+    chat.app
+        .set_status("turn cancellation requested".to_owned());
+    let client = client.clone();
+    cancel_turn.session_id = Some(session_id);
+    cancel_turn.task = Some(tokio::spawn(async move {
+        client.cancel_session_turn(session_id).await
+    }));
+}
+
+async fn poll_cancel_turn(chat: &mut ActiveChat, cancel_turn: &mut AsyncCancelTurn) -> bool {
+    let Some(task) = cancel_turn.task.take_if(|task| task.is_finished()) else {
+        return false;
+    };
+    let session_id = cancel_turn.session_id.take();
+    match task.await {
+        Ok(Ok(true)) if session_id == chat.app.session_id() => {
+            chat.app
+                .set_status("turn cancellation requested".to_owned());
+        }
+        Ok(Ok(false)) if session_id == chat.app.session_id() => {
+            chat.app.set_idle();
+            chat.app.set_status("no active turn".to_owned());
+        }
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            if session_id == chat.app.session_id() {
+                chat.app.set_idle();
+            }
+            report_nonfatal_client_error(chat, "Cancel unavailable", &error);
+        }
+        Err(error) => {
+            if session_id == chat.app.session_id() {
+                chat.app.set_idle();
+            }
+            chat.app
+                .set_status(format!("Cancel turn task failed: {error}"));
         }
     }
     true
@@ -1057,8 +1134,10 @@ async fn handle_chat_key_request<W: Write>(
 ) -> Result<(), TuiError> {
     match request {
         KeyRequest::None => {}
-        KeyRequest::Interrupt => request_turn_cancellation(context.services.client, chat).await,
-        KeyRequest::CycleAgent => cycle_session_agent(context.services.client, chat).await,
+        KeyRequest::Interrupt => {
+            start_cancel_turn(context.services.client, chat, &mut modals.cancel_turn);
+        }
+        KeyRequest::CycleAgent => cycle_session_agent(chat),
         KeyRequest::CycleThinkingEffort => {
             if let Err(error) =
                 thinking_flow::cycle_thinking_effort(context.services.client, chat).await
@@ -1102,28 +1181,6 @@ async fn handle_chat_key_request<W: Write>(
     Ok(())
 }
 
-async fn request_turn_cancellation(client: &BcodeClient, chat: &mut ActiveChat) {
-    let Some(session_id) = chat.app.session_id() else {
-        chat.app.set_status("No active session".to_owned());
-        return;
-    };
-    match client.cancel_session_turn(session_id).await {
-        Ok(true) => {
-            chat.app.set_cancelling();
-            chat.app
-                .set_status("turn cancellation requested".to_owned());
-        }
-        Ok(false) => {
-            chat.app.set_idle();
-            chat.app.set_status("no active turn".to_owned());
-        }
-        Err(error) => {
-            chat.app.set_idle();
-            chat.app.set_status(format!("cancel failed: {error}"));
-        }
-    }
-}
-
 fn agent_selection_status(chat: &ActiveChat, agent_name: &str) -> String {
     if matches!(chat.app.activity(), ActivityState::Idle) {
         format!("agent {agent_name} selected")
@@ -1132,23 +1189,11 @@ fn agent_selection_status(chat: &ActiveChat, agent_name: &str) -> String {
     }
 }
 
-async fn cycle_session_agent(client: &BcodeClient, chat: &mut ActiveChat) {
+fn cycle_session_agent(chat: &mut ActiveChat) {
     if chat.agents.is_empty() {
-        match session_flow::AgentCatalog::load(client).await {
-            Ok(agents) => {
-                chat.agents = agents;
-                chat.agents.refresh_app_agent_metadata(&mut chat.app);
-            }
-            Err(error) if is_nonfatal_tui_daemon_error(&error) => {
-                report_nonfatal_tui_error(chat, "Agent metadata unavailable", &error);
-                return;
-            }
-            Err(error) => {
-                chat.app
-                    .set_status(format!("agent metadata failed: {error}"));
-                return;
-            }
-        }
+        chat.app
+            .set_status("Agent metadata is still loading".to_owned());
+        return;
     }
     let current_agent_id = chat
         .app
