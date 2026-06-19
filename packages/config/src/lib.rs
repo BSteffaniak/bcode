@@ -3629,6 +3629,49 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
+    fn auth_pool_config_loads_from_toml_and_resolves_model_profile() {
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[auth.profiles.openai]
+backend = "sshenv"
+scheme = "chatgpt"
+
+[auth.profiles.openai-2]
+backend = "sshenv"
+scheme = "chatgpt"
+
+[auth.pools.openai]
+provider_plugin_id = "bcode.openai-compatible"
+strategy = "failover"
+profiles = ["openai", "openai-2"]
+
+[model.profiles.openai]
+provider_plugin_id = "bcode.openai-compatible"
+model_id = "gpt-5.5"
+auth_pool = "openai"
+"#,
+        )
+        .expect("config should parse");
+
+        let pool = config
+            .auth
+            .pools
+            .get("openai")
+            .expect("auth pool should parse");
+        assert_eq!(pool.profiles, vec!["openai", "openai-2"]);
+        assert_eq!(
+            pool.provider_plugin_id.as_deref(),
+            Some("bcode.openai-compatible")
+        );
+
+        let mut config = config;
+        config.model.profile = Some("openai".to_string());
+        let selection = config.resolved_model_selection();
+        assert_eq!(selection.auth_pool.as_deref(), Some("openai"));
+        assert_eq!(selection.auth_profile, None);
+    }
+
+    #[test]
     fn tui_mouse_config_loads_from_toml() {
         let config: BcodeConfig = toml::from_str(
             r#"

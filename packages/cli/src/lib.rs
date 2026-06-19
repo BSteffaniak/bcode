@@ -666,6 +666,10 @@ enum ModelCommand {
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
     Status,
+    Pool {
+        #[command(subcommand)]
+        command: AuthPoolCommand,
+    },
     Login {
         #[arg(long)]
         profile: Option<String>,
@@ -673,6 +677,14 @@ enum AuthCommand {
         vault: Option<PathBuf>,
         #[arg(long)]
         recipient_key: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthPoolCommand {
+    Status {
+        #[arg(default_value = "openai")]
+        pool: String,
     },
 }
 
@@ -1198,12 +1210,42 @@ fn handle_provider_command(command: ProviderCommand) -> Result<(), CliError> {
 fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
     match command {
         AuthCommand::Status => auth_status(),
+        AuthCommand::Pool { command } => match command {
+            AuthPoolCommand::Status { pool } => auth_pool_status(&pool),
+        },
         AuthCommand::Login {
             profile,
             vault,
             recipient_key,
         } => auth_login(profile, vault, recipient_key),
     }
+}
+
+fn auth_pool_status(pool_name: &str) -> Result<(), CliError> {
+    let config = bcode_config::load_config()?;
+    let Some(pool) = config.auth.pools.get(pool_name) else {
+        println!("Auth pool '{pool_name}' is not declared.");
+        return Ok(());
+    };
+    println!("Auth pool: {pool_name}");
+    if let Some(provider_plugin_id) = &pool.provider_plugin_id {
+        println!("Provider plugin: {provider_plugin_id}");
+    }
+    println!("Strategy: {:?}", pool.strategy);
+    if pool.profiles.is_empty() {
+        println!("Profiles: none");
+        return Ok(());
+    }
+    println!("Profiles:");
+    for profile in &pool.profiles {
+        let status = if config.auth.profiles.contains_key(profile) {
+            "configured"
+        } else {
+            "missing"
+        };
+        println!("  {profile}: {status}");
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]

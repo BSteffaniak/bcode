@@ -4,6 +4,7 @@
 
 //! OpenAI-compatible model provider plugin for Bcode.
 
+mod auth_pool_state;
 mod model_catalog;
 
 use base64::Engine as _;
@@ -970,8 +971,18 @@ async fn stream_chat_completion_with_failover(
     if request.provider_context.auth_candidates.is_empty() {
         return stream_chat_completion_inner(request, turn).await;
     }
+    let mut skipped_profiles = Vec::new();
     let mut last_error = None;
     for candidate in &request.provider_context.auth_candidates {
+        if !auth_pool_state::is_profile_available(
+            request.provider_context.auth_pool.as_deref(),
+            candidate.profile.as_deref(),
+        ) {
+            if let Some(profile) = &candidate.profile {
+                skipped_profiles.push(profile.clone());
+            }
+            continue;
+        }
         let mut candidate_request = request.clone();
         candidate_request.provider_context.auth_profile = candidate.profile.clone();
         candidate_request.provider_context.auth = Some(candidate.auth.clone());
@@ -980,6 +991,13 @@ async fn stream_chat_completion_with_failover(
             Ok(outcome) => return Ok(outcome),
             Err(error) if is_subscription_quota_error(&error) => {
                 if let Some(profile) = &candidate.profile {
+                    auth_pool_state::mark_profile_quota_limited(
+                        request.provider_context.auth_pool.as_deref(),
+                        Some(profile),
+                        quota_error_reason(&error),
+                        &error.message,
+                        quota_error_cooldown(&error),
+                    );
                     turn.push(ProviderTurnEvent::Warning {
                         message: format!(
                             "OpenAI subscription auth profile '{profile}' appears quota-limited; trying the next configured subscription."
@@ -995,7 +1013,7 @@ async fn stream_chat_completion_with_failover(
         provider_error(
             "openai_auth_pool_exhausted",
             ProviderErrorCategory::RateLimit,
-            "all configured OpenAI subscription auth profiles are quota-limited",
+            all_subscriptions_exhausted_message(&skipped_profiles),
         )
     }))
 }
@@ -1012,6 +1030,36 @@ fn is_subscription_quota_error(error: &ProviderError) -> bool {
         || message.contains("usage limit")
         || message.contains("rate limit")
         || message.contains("too many requests")
+}
+
+fn quota_error_reason(error: &ProviderError) -> &'static str {
+    let message = error.message.to_ascii_lowercase();
+    if message.contains("week") || message.contains("weekly") {
+        "weekly_quota"
+    } else if message.contains("rate limit") || message.contains("too many requests") {
+        "rate_limit"
+    } else {
+        "quota"
+    }
+}
+
+fn quota_error_cooldown(error: &ProviderError) -> Duration {
+    if quota_error_reason(error) == "weekly_quota" {
+        Duration::from_secs(7 * 24 * 60 * 60)
+    } else {
+        Duration::from_secs(5 * 60 * 60)
+    }
+}
+
+fn all_subscriptions_exhausted_message(skipped_profiles: &[String]) -> String {
+    if skipped_profiles.is_empty() {
+        "all configured OpenAI subscriptions are currently quota-limited; add another subscription with `bcode login openai --add-subscription` or try again after reset".to_string()
+    } else {
+        format!(
+            "all configured OpenAI subscriptions are currently quota-limited; skipped cooldown profiles: {}; add another subscription with `bcode login openai --add-subscription` or try again after reset",
+            skipped_profiles.join(", ")
+        )
+    }
 }
 
 async fn stream_chat_completion_inner(
@@ -4214,6 +4262,23 @@ mod tests {
             model_ids_are_explicit: true,
             request_timeout: None,
         }
+    }
+
+    #[test]
+    fn subscription_quota_detection_matches_quota_rate_limit_only() {
+        let quota = provider_error(
+            "rate_limit_exceeded",
+            ProviderErrorCategory::RateLimit,
+            "usage limit reached for this subscription",
+        );
+        assert!(is_subscription_quota_error(&quota));
+
+        let context = provider_error(
+            "context_length_exceeded",
+            ProviderErrorCategory::ContextLength,
+            "maximum context length exceeded",
+        );
+        assert!(!is_subscription_quota_error(&context));
     }
 
     #[test]
