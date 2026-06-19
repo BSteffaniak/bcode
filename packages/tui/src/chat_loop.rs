@@ -226,7 +226,7 @@ pub async fn run_with_client<W: Write>(
         if let Some(save_at) = draft_autosave.next_save_at()
             && Instant::now() >= save_at
         {
-            start_draft_save(chat, &mut draft_autosave, &mut loop_state.effects);
+            start_draft_save(chat, &mut draft_autosave);
         }
 
         let redraw_at = next_redraw_at(last_redraw);
@@ -489,11 +489,11 @@ fn apply_config_result(
         Ok(config) => {
             settings.apply_tui_config(&config.tui);
             chat.app.apply_tui_config(config.tui.clone());
-            chat.start_effect(TuiEffect::ReconcileAuthSecurity {
+            chat.replace_effect(TuiEffect::ReconcileAuthSecurity {
                 config: Box::new(config),
             });
             if chat.session_id.is_none() && chat.opening_session_id.is_none() {
-                chat.start_effect(TuiEffect::LoadDraftStatus {
+                chat.replace_effect(TuiEffect::LoadDraftStatus {
                     launch_working_directory: settings.launch_working_directory().to_path_buf(),
                 });
             }
@@ -770,16 +770,12 @@ fn start_cancel_turn(chat: &mut ActiveChat, effects: &mut TuiEffectRunner) {
     }
 }
 
-fn start_draft_save(
-    chat: &ActiveChat,
-    draft_autosave: &mut DraftAutosave,
-    effects: &mut TuiEffectRunner,
-) {
+fn start_draft_save(chat: &mut ActiveChat, draft_autosave: &mut DraftAutosave) {
     let Some((scope, text)) = draft_autosave.pending_save(chat) else {
         return;
     };
     draft_autosave.mark_save_started();
-    effects.queue_latest(TuiEffect::SaveDraft { scope, text });
+    chat.queue_latest_effect(TuiEffect::SaveDraft { scope, text });
 }
 
 fn update_slash_palette_async(chat: &ActiveChat, loop_state: &mut ChatLoopState) -> bool {
@@ -1167,12 +1163,10 @@ async fn handle_chat_key_request<W: Write>(
             if let Some(autosave) = draft_autosave {
                 if let Some(scope) = pre_submit_scope {
                     let (scope, text) = DraftAutosave::clear_scope_request(scope);
-                    loop_state
-                        .effects
-                        .queue_latest(TuiEffect::SaveDraft { scope, text });
+                    chat.queue_latest_effect(TuiEffect::SaveDraft { scope, text });
                 }
                 autosave.mark_dirty_now();
-                start_draft_save(chat, autosave, &mut loop_state.effects);
+                start_draft_save(chat, autosave);
             }
         }
     }

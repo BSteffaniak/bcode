@@ -123,7 +123,7 @@ async fn execute_session_command<W: Write>(
     match command {
         PaletteCommand::NewSession => {
             session_flow::switch_to_draft_session(chat);
-            chat.start_effect(TuiEffect::LoadDraftStatus {
+            chat.replace_effect(TuiEffect::LoadDraftStatus {
                 launch_working_directory: std::env::current_dir()?,
             });
         }
@@ -133,7 +133,7 @@ async fn execute_session_command<W: Write>(
             }
             session_flow::PickSessionOutcome::Draft => {
                 session_flow::switch_to_draft_session(chat);
-                chat.start_effect(TuiEffect::LoadDraftStatus {
+                chat.replace_effect(TuiEffect::LoadDraftStatus {
                     launch_working_directory: std::env::current_dir()?,
                 });
             }

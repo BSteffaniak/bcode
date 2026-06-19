@@ -220,6 +220,13 @@ enum EffectKey {
     CycleThinkingEffort(Option<SessionId>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectSchedule {
+    StartIfIdle,
+    Replace,
+    QueueLatest,
+}
+
 /// Queue of effects requested before the chat loop runner can start them.
 ///
 /// The queue keeps only the latest pending request for each effect key. This
@@ -228,17 +235,31 @@ enum EffectKey {
 /// before the loop has a chance to drain the queue.
 #[derive(Default)]
 pub struct TuiEffectQueue {
-    effects: BTreeMap<EffectKey, TuiEffect>,
+    effects: BTreeMap<EffectKey, (EffectSchedule, TuiEffect)>,
 }
 
 impl TuiEffectQueue {
-    /// Queue an effect for the chat loop effect runner.
-    pub fn push(&mut self, effect: TuiEffect) {
-        self.effects.insert(effect.key(), effect);
+    /// Queue an effect using normal start-if-idle scheduling.
+    pub fn start(&mut self, effect: TuiEffect) {
+        self.push(effect, EffectSchedule::StartIfIdle);
+    }
+
+    /// Queue an effect that should replace any in-flight effect with the same key.
+    pub fn replace(&mut self, effect: TuiEffect) {
+        self.push(effect, EffectSchedule::Replace);
+    }
+
+    /// Queue the latest effect with this key to run after the current one finishes.
+    pub fn queue_latest(&mut self, effect: TuiEffect) {
+        self.push(effect, EffectSchedule::QueueLatest);
+    }
+
+    fn push(&mut self, effect: TuiEffect, schedule: EffectSchedule) {
+        self.effects.insert(effect.key(), (schedule, effect));
     }
 
     /// Drain queued effects.
-    fn drain(&mut self) -> Vec<TuiEffect> {
+    fn drain(&mut self) -> Vec<(EffectSchedule, TuiEffect)> {
         std::mem::take(&mut self.effects).into_values().collect()
     }
 }
@@ -333,9 +354,19 @@ impl TuiEffectRunner {
     /// Returns true when at least one pending effect was started.
     pub fn drain_pending(&mut self, pending_effects: &mut TuiEffectQueue) -> bool {
         let mut started = false;
-        for effect in pending_effects.drain() {
-            self.replace(effect);
-            started = true;
+        for (schedule, effect) in pending_effects.drain() {
+            match schedule {
+                EffectSchedule::StartIfIdle => {
+                    started |= self.start(effect);
+                }
+                EffectSchedule::Replace => {
+                    self.replace(effect);
+                    started = true;
+                }
+                EffectSchedule::QueueLatest => {
+                    started |= self.queue_latest(effect);
+                }
+            }
         }
         started
     }

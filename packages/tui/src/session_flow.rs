@@ -39,7 +39,17 @@ pub struct ActiveChat {
 impl ActiveChat {
     /// Queue a background effect to start when the chat loop effect runner is available.
     pub fn start_effect(&mut self, effect: super::effects::TuiEffect) {
-        self.pending_effects.push(effect);
+        self.pending_effects.start(effect);
+    }
+
+    /// Queue a background effect that should replace stale in-flight work with the same key.
+    pub fn replace_effect(&mut self, effect: super::effects::TuiEffect) {
+        self.pending_effects.replace(effect);
+    }
+
+    /// Queue the latest background effect to run after in-flight work with the same key.
+    pub fn queue_latest_effect(&mut self, effect: super::effects::TuiEffect) {
+        self.pending_effects.queue_latest(effect);
     }
 }
 
@@ -149,7 +159,7 @@ pub fn start_switch_session(
         chat.app.replace_composer_with(&draft_text);
     }
     chat.app.set_status("Opening session…".to_owned());
-    chat.start_effect(super::effects::TuiEffect::OpenSession {
+    chat.replace_effect(super::effects::TuiEffect::OpenSession {
         session_id: next_session_id,
         initial_window_request,
         event_sender: chat.event_sender.clone(),
@@ -198,7 +208,7 @@ pub fn complete_switch_session(
             }
             chat.app.apply_session_summary(&attached.session);
             chat.app.set_status("session opened".to_owned());
-            chat.start_effect(super::effects::TuiEffect::LoadSessionStatus { session_id });
+            chat.replace_effect(super::effects::TuiEffect::LoadSessionStatus { session_id });
         }
         Err(error) => {
             chat.app.set_status(format!("session open failed: {error}"));

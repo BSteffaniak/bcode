@@ -148,7 +148,7 @@ async fn handle_slash_command<W: Write>(
         slash_commands::SlashCommandOutcome::NewDraftSession => {
             chat.app.clear_pending_submission(message);
             session_flow::switch_to_draft_session(chat);
-            chat.start_effect(TuiEffect::LoadDraftStatus {
+            chat.replace_effect(TuiEffect::LoadDraftStatus {
                 launch_working_directory: std::env::current_dir()?,
             });
         }
@@ -168,7 +168,7 @@ async fn handle_slash_command<W: Write>(
                 }
                 session_flow::PickSessionOutcome::Draft => {
                     session_flow::switch_to_draft_session(chat);
-                    chat.start_effect(TuiEffect::LoadDraftStatus {
+                    chat.replace_effect(TuiEffect::LoadDraftStatus {
                         launch_working_directory: std::env::current_dir()?,
                     });
                 }
