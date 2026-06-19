@@ -1619,8 +1619,10 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
             selected_provider_context: bcode_model::ProviderRequestContext {
                 model_profile: resolved_model.model_profile,
                 auth_profile: resolved_model.auth_profile,
+                auth_pool: resolved_model.auth_pool,
                 settings: resolved_model.settings,
                 auth: None,
+                auth_candidates: Vec::new(),
                 request: resolved_model.request,
                 env: BTreeMap::new(),
             },

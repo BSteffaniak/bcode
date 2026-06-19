@@ -187,6 +187,7 @@ impl BcodeConfig {
             selected_model_id: self.model.model_id.clone(),
             model_profile: self.model.profile.clone(),
             auth_profile: None,
+            auth_pool: None,
             settings: BTreeMap::new(),
             request: BTreeMap::new(),
             reasoning: self.model.reasoning.clone(),
@@ -199,6 +200,7 @@ impl BcodeConfig {
                 selection.model_id.clone_from(&profile.model_id);
             }
             selection.auth_profile.clone_from(&profile.auth_profile);
+            selection.auth_pool.clone_from(&profile.auth_pool);
             selection.settings = profile.settings.clone();
             selection.request = provider_request_values_from_json(&profile.request);
             selection.reasoning = merge_reasoning_config(&self.model.reasoning, &profile.reasoning);
@@ -223,6 +225,7 @@ impl BcodeConfig {
             if provider_changed {
                 selection.model_profile = None;
                 selection.auth_profile = None;
+                selection.auth_pool = None;
                 selection.settings.clear();
             }
         }
@@ -1421,6 +1424,41 @@ pub struct AuthConfig {
     pub openai: Option<AuthProviderConfig>,
     #[serde(default)]
     pub profiles: BTreeMap<String, AuthProfileConfig>,
+    #[serde(default)]
+    pub pools: BTreeMap<String, AuthPoolConfig>,
+}
+
+/// Ordered provider auth profiles that can satisfy the same model/provider request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthPoolConfig {
+    #[serde(default)]
+    pub provider_plugin_id: Option<String>,
+    #[serde(default)]
+    pub strategy: AuthPoolStrategy,
+    #[serde(default)]
+    pub profiles: Vec<String>,
+    #[serde(default)]
+    pub quota: AuthPoolQuotaConfig,
+}
+
+/// Auth pool selection strategy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthPoolStrategy {
+    /// Use the first healthy profile and fail over when provider-owned quota detection requires it.
+    #[default]
+    Failover,
+}
+
+/// Provider-specific quota/cooldown policy hints for an auth pool.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthPoolQuotaConfig {
+    #[serde(default)]
+    pub unknown_cooldown: Option<String>,
+    #[serde(default)]
+    pub rate_limit_cooldown: Option<String>,
+    #[serde(default)]
+    pub weekly_cooldown: Option<String>,
 }
 
 /// Generic authentication profile configuration.
@@ -1736,6 +1774,8 @@ pub struct ModelProfileConfig {
     #[serde(default)]
     pub auth_profile: Option<String>,
     #[serde(default)]
+    pub auth_pool: Option<String>,
+    #[serde(default)]
     pub settings: BTreeMap<String, String>,
     #[serde(default)]
     pub reasoning: ReasoningConfig,
@@ -1774,6 +1814,7 @@ pub struct ResolvedModelSelection {
     pub selected_model_id: Option<String>,
     pub model_profile: Option<String>,
     pub auth_profile: Option<String>,
+    pub auth_pool: Option<String>,
     pub settings: BTreeMap<String, String>,
     pub request: BTreeMap<String, bcode_model::ProviderRequestValue>,
     pub reasoning: ReasoningConfig,
@@ -2061,6 +2102,84 @@ pub fn set_openai_compatible_sshenv_auth_mode(
                     provider_plugin_id: "bcode.openai-compatible".to_string(),
                     model_id: Some(model_id),
                     auth_profile: Some(profile),
+                    auth_pool: None,
+                    settings: BTreeMap::new(),
+                    reasoning: ReasoningConfig::default(),
+                    request: BTreeMap::new(),
+                });
+        }
+        Ok(())
+    })
+}
+
+/// Configure an `OpenAI` `ChatGPT` subscription auth profile and add it to a failover auth pool.
+///
+/// # Errors
+///
+/// Returns an error when the config cannot be read, updated, or written.
+pub fn add_openai_chatgpt_subscription_auth(
+    pool: &str,
+    profile: &str,
+    vault: &Path,
+    model_id: Option<String>,
+) -> Result<PathBuf, ConfigError> {
+    update_writable_config(|config| {
+        let vault_setting = vault.display().to_string();
+        config
+            .plugins
+            .enabled
+            .insert("bcode.openai-compatible".to_string());
+        config.model.provider_plugin_id = Some("bcode.openai-compatible".to_string());
+        if let Some(model_id) = model_id {
+            config.model.model_id = Some(model_id);
+        }
+        let mut settings = BTreeMap::new();
+        settings.insert("provider".to_string(), "openai".to_string());
+        settings.insert("profile".to_string(), profile.to_string());
+        settings.insert("vault".to_string(), vault_setting);
+        settings.insert("mode".to_string(), "chatgpt".to_string());
+        config.auth.profiles.insert(
+            profile.to_string(),
+            AuthProfileConfig {
+                backend: "sshenv".to_string(),
+                scheme: Some("chatgpt".to_string()),
+                map: openai_compatible_auth_map("openai", &AuthMode::ChatGpt),
+                settings,
+            },
+        );
+        let auth_pool = config
+            .auth
+            .pools
+            .entry(pool.to_string())
+            .or_insert_with(|| AuthPoolConfig {
+                provider_plugin_id: Some("bcode.openai-compatible".to_string()),
+                strategy: AuthPoolStrategy::Failover,
+                profiles: Vec::new(),
+                quota: AuthPoolQuotaConfig::default(),
+            });
+        auth_pool.provider_plugin_id = Some("bcode.openai-compatible".to_string());
+        auth_pool.strategy = AuthPoolStrategy::Failover;
+        if !auth_pool
+            .profiles
+            .iter()
+            .any(|candidate| candidate == profile)
+        {
+            auth_pool.profiles.push(profile.to_string());
+        }
+        if let Some(model_id) = config.model.model_id.clone() {
+            config
+                .model
+                .profiles
+                .entry(pool.to_string())
+                .and_modify(|model_profile| {
+                    model_profile.auth_profile = None;
+                    model_profile.auth_pool = Some(pool.to_string());
+                })
+                .or_insert_with(|| ModelProfileConfig {
+                    provider_plugin_id: "bcode.openai-compatible".to_string(),
+                    model_id: Some(model_id),
+                    auth_profile: None,
+                    auth_pool: Some(pool.to_string()),
                     settings: BTreeMap::new(),
                     reasoning: ReasoningConfig::default(),
                     request: BTreeMap::new(),
@@ -2167,6 +2286,7 @@ pub fn set_bedrock_model_profile(
                 provider_plugin_id: "bcode.bedrock".to_string(),
                 model_id: Some(model_id),
                 auth_profile: Some(auth_profile.clone()),
+                auth_pool: None,
                 settings,
                 reasoning: ReasoningConfig::default(),
                 request: BTreeMap::new(),

@@ -317,6 +317,19 @@ pub struct ProviderAuthStorageRef {
     pub vault: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderAuthCandidate {
+    /// Auth profile name for this candidate.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Semantic auth material for this candidate.
+    #[serde(default)]
+    pub auth: ProviderAuthContext,
+    /// Compatibility environment values scoped to this candidate.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
 /// Provider-neutral request context resolved by the host from model/provider profiles.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderRequestContext {
@@ -325,10 +338,15 @@ pub struct ProviderRequestContext {
     #[serde(default)]
     pub auth_profile: Option<String>,
     #[serde(default)]
+    pub auth_pool: Option<String>,
+    #[serde(default)]
     pub settings: BTreeMap<String, String>,
     /// Semantic auth material resolved from the selected auth profile.
     #[serde(default)]
     pub auth: Option<ProviderAuthContext>,
+    /// Ordered semantic auth candidates resolved from the selected auth pool.
+    #[serde(default)]
+    pub auth_candidates: Vec<ProviderAuthCandidate>,
     /// Provider-native request fields merged into the outbound provider request.
     ///
     /// These values are non-secret provider-specific request options resolved from model profiles

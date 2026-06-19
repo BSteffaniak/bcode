@@ -727,6 +727,9 @@ enum LoginCommand {
         /// Use device-code login. Requires `Codex` device authorization enabled in `ChatGPT` settings.
         #[arg(long)]
         headless: bool,
+        /// Add this login as another `ChatGPT` subscription in the `OpenAI` failover auth pool.
+        #[arg(long)]
+        add_subscription: bool,
         #[arg(long)]
         profile: Option<String>,
         #[arg(long)]
@@ -1457,6 +1460,7 @@ async fn handle_login_command(command: LoginCommand) -> Result<(), CliError> {
             chatgpt,
             browser,
             headless,
+            add_subscription,
             profile,
             vault,
             recipient_key,
@@ -1465,9 +1469,20 @@ async fn handle_login_command(command: LoginCommand) -> Result<(), CliError> {
             login_openai(OpenAiLoginOptions {
                 api_key,
                 base_url,
-                chatgpt,
-                browser,
-                headless,
+                mode: OpenAiLoginMode {
+                    auth: if add_subscription {
+                        OpenAiLoginKind::AddSubscription
+                    } else if chatgpt {
+                        OpenAiLoginKind::ChatGpt
+                    } else {
+                        OpenAiLoginKind::Auto
+                    },
+                    flow: if headless && !browser {
+                        OpenAiLoginFlow::DeviceCode
+                    } else {
+                        OpenAiLoginFlow::Browser
+                    },
+                },
                 profile,
                 vault,
                 recipient_key,
@@ -1499,13 +1514,34 @@ async fn handle_login_command(command: LoginCommand) -> Result<(), CliError> {
 struct OpenAiLoginOptions {
     api_key: Option<String>,
     base_url: Option<String>,
-    chatgpt: bool,
-    browser: bool,
-    headless: bool,
+    mode: OpenAiLoginMode,
     profile: Option<String>,
     vault: Option<PathBuf>,
     recipient_key: Option<String>,
     model: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpenAiLoginMode {
+    auth: OpenAiLoginKind,
+    flow: OpenAiLoginFlow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenAiLoginKind {
+    Auto,
+    ChatGpt,
+    AddSubscription,
+}
+
+impl OpenAiLoginKind {
+    const fn is_add_subscription(self) -> bool {
+        matches!(self, Self::AddSubscription)
+    }
+
+    const fn is_chatgpt(self) -> bool {
+        matches!(self, Self::ChatGpt | Self::AddSubscription)
+    }
 }
 
 struct XaiLoginOptions {
@@ -1518,14 +1554,26 @@ struct XaiLoginOptions {
 }
 
 async fn login_openai(options: OpenAiLoginOptions) -> Result<(), CliError> {
-    let target = resolve_login_target(
-        LoginProvider::OpenAi,
-        options.profile,
-        options.vault,
-        options.recipient_key.as_deref(),
-    )?;
+    if options.mode.auth.is_add_subscription()
+        && (options.api_key.is_some() || options.base_url.is_some())
+    {
+        return Err(CliError::LoginProfile(
+            "`bcode login openai --add-subscription` adds ChatGPT subscription OAuth accounts; API-key pooled auth is not supported yet. Remove --api-key/--base-url or omit --add-subscription.".to_string(),
+        ));
+    }
+    let target = if options.mode.auth.is_add_subscription() {
+        resolve_add_subscription_login_target(options.profile.clone(), options.vault.clone())
+    } else {
+        resolve_login_target(
+            LoginProvider::OpenAi,
+            options.profile,
+            options.vault,
+            options.recipient_key.as_deref(),
+        )?
+    };
     let store = open_auth_store(&target.vault_path)?;
-    if options.api_key.is_some() || (options.base_url.is_some() && !options.chatgpt) {
+    if options.api_key.is_some() || (options.base_url.is_some() && !options.mode.auth.is_chatgpt())
+    {
         login_openai_api_key(
             &store,
             &target,
@@ -1534,12 +1582,14 @@ async fn login_openai(options: OpenAiLoginOptions) -> Result<(), CliError> {
             options.model,
         )
     } else {
-        let flow = if options.headless && !options.browser {
-            OpenAiLoginFlow::DeviceCode
-        } else {
-            OpenAiLoginFlow::Browser
-        };
-        login_openai_chatgpt(&store, target, options.model, flow).await
+        login_openai_chatgpt(
+            &store,
+            target,
+            options.model,
+            options.mode.flow,
+            options.mode.auth.is_add_subscription(),
+        )
+        .await
     }
 }
 
@@ -1665,6 +1715,37 @@ fn resolve_login_target(
         explicit_vault,
         explicit_recipient_key,
     )
+}
+
+fn resolve_add_subscription_login_target(
+    explicit_profile: Option<String>,
+    explicit_vault: Option<PathBuf>,
+) -> LoginTarget {
+    let config = bcode_config::load_config().unwrap_or_default();
+    let profile = explicit_profile.unwrap_or_else(|| next_subscription_profile_name(&config));
+    let vault_path = explicit_vault.unwrap_or_else(bcode_config::default_auth_vault_path);
+    LoginTarget {
+        auth_profile: profile.clone(),
+        storage_profile: profile,
+        vault_path,
+        api_key_env: None,
+        config_update: LoginConfigUpdate::Writable,
+        device_seal_policy: bcode_provider_auth::security::AuthDeviceSealPolicy::Preferred,
+        recipient_key: None,
+    }
+}
+
+fn next_subscription_profile_name(config: &bcode_config::BcodeConfig) -> String {
+    if !config.auth.profiles.contains_key("openai") {
+        return "openai".to_string();
+    }
+    for index in 2.. {
+        let candidate = format!("openai-{index}");
+        if !config.auth.profiles.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded subscription profile search should return")
 }
 
 fn active_login_auth_profile(config: &bcode_config::BcodeConfig) -> Option<String> {
@@ -2017,6 +2098,7 @@ async fn login_openai_chatgpt(
     target: LoginTarget,
     model: Option<String>,
     flow: OpenAiLoginFlow,
+    add_subscription: bool,
 ) -> Result<(), CliError> {
     let oauth = run_openai_codex_oauth(flow).await?;
     let expires_at = unix_timestamp() + oauth.expires_in.unwrap_or(3600).saturating_sub(60);
@@ -2074,12 +2156,21 @@ async fn login_openai_chatgpt(
         &target,
         "OPENAI",
         || {
-            bcode_config::set_openai_sshenv_auth_mode(
-                target.auth_profile.clone(),
-                target.vault_path.clone(),
-                model,
-                AuthMode::ChatGpt,
-            )
+            if add_subscription {
+                bcode_config::add_openai_chatgpt_subscription_auth(
+                    "openai",
+                    target.auth_profile.as_str(),
+                    &target.vault_path,
+                    model,
+                )
+            } else {
+                bcode_config::set_openai_sshenv_auth_mode(
+                    target.auth_profile.clone(),
+                    target.vault_path.clone(),
+                    model,
+                    AuthMode::ChatGpt,
+                )
+            }
         },
     );
     Ok(())

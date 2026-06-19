@@ -941,7 +941,7 @@ fn append_text_with_space(buffer: &mut String, text: &str) {
 }
 
 async fn stream_chat_completion(request: &ModelTurnRequest, turn: &TurnState) {
-    match stream_chat_completion_inner(request, turn).await {
+    match stream_chat_completion_with_failover(request, turn).await {
         Ok(StreamOutcome::Finished) => turn.push(ProviderTurnEvent::TurnFinished {
             stop_reason: StopReason::EndTurn,
         }),
@@ -961,6 +961,57 @@ async fn stream_chat_completion(request: &ModelTurnRequest, turn: &TurnState) {
             });
         }
     }
+}
+
+async fn stream_chat_completion_with_failover(
+    request: &ModelTurnRequest,
+    turn: &TurnState,
+) -> Result<StreamOutcome, ProviderError> {
+    if request.provider_context.auth_candidates.is_empty() {
+        return stream_chat_completion_inner(request, turn).await;
+    }
+    let mut last_error = None;
+    for candidate in &request.provider_context.auth_candidates {
+        let mut candidate_request = request.clone();
+        candidate_request.provider_context.auth_profile = candidate.profile.clone();
+        candidate_request.provider_context.auth = Some(candidate.auth.clone());
+        candidate_request.provider_context.env = candidate.env.clone();
+        match stream_chat_completion_inner(&candidate_request, turn).await {
+            Ok(outcome) => return Ok(outcome),
+            Err(error) if is_subscription_quota_error(&error) => {
+                if let Some(profile) = &candidate.profile {
+                    turn.push(ProviderTurnEvent::Warning {
+                        message: format!(
+                            "OpenAI subscription auth profile '{profile}' appears quota-limited; trying the next configured subscription."
+                        ),
+                    });
+                }
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        provider_error(
+            "openai_auth_pool_exhausted",
+            ProviderErrorCategory::RateLimit,
+            "all configured OpenAI subscription auth profiles are quota-limited",
+        )
+    }))
+}
+
+fn is_subscription_quota_error(error: &ProviderError) -> bool {
+    if error.category != ProviderErrorCategory::RateLimit {
+        return false;
+    }
+    let code = error.code.to_ascii_lowercase();
+    let message = error.message.to_ascii_lowercase();
+    code.contains("quota")
+        || code.contains("rate_limit")
+        || message.contains("quota")
+        || message.contains("usage limit")
+        || message.contains("rate limit")
+        || message.contains("too many requests")
 }
 
 async fn stream_chat_completion_inner(

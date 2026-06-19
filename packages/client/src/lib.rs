@@ -238,7 +238,10 @@ fn current_runtime_context() -> Option<ClientRuntimeContext> {
         .collect::<BTreeMap<_, _>>();
     let mut resolved = config.resolved_model_selection();
     resolved.auth_profile = selected_auth_profile(&resolved);
+    resolved.auth_pool = selected_auth_pool(&resolved);
     let auth = merge_selected_auth_profile_env(&config, resolved.auth_profile.as_deref(), &mut env);
+    let auth_candidates =
+        merge_selected_auth_pool_env(&config, resolved.auth_pool.as_deref(), &mut env);
     let env_keys = env.keys().cloned().map(|key| (key, true)).collect();
     Some(ClientRuntimeContext {
         selected_provider_plugin_id: resolved.provider_plugin_id,
@@ -246,8 +249,10 @@ fn current_runtime_context() -> Option<ClientRuntimeContext> {
         provider_context: bcode_model::ProviderRequestContext {
             model_profile: resolved.model_profile,
             auth_profile: resolved.auth_profile,
+            auth_pool: resolved.auth_pool,
             settings: resolved.settings,
             auth,
+            auth_candidates,
             request: resolved.request,
             env,
         },
@@ -260,6 +265,17 @@ fn selected_auth_profile(resolved: &bcode_config::ResolvedModelSelection) -> Opt
         .ok()
         .filter(|profile| !profile.trim().is_empty())
         .or_else(|| resolved.auth_profile.clone())
+}
+
+fn selected_auth_pool(resolved: &bcode_config::ResolvedModelSelection) -> Option<String> {
+    if std::env::var(bcode_config::BCODE_AUTH_PROFILE_ENV)
+        .ok()
+        .filter(|profile| !profile.trim().is_empty())
+        .is_some()
+    {
+        return None;
+    }
+    resolved.auth_pool.clone()
 }
 
 fn merge_selected_auth_profile_env(
@@ -280,6 +296,41 @@ fn merge_selected_auth_profile_env(
     }
     merge_legacy_openai_auth_profile_env(config, env);
     None
+}
+
+fn merge_selected_auth_pool_env(
+    config: &bcode_config::BcodeConfig,
+    auth_pool: Option<&str>,
+    env: &mut BTreeMap<String, String>,
+) -> Vec<bcode_model::ProviderAuthCandidate> {
+    let Some(auth_pool_name) = auth_pool else {
+        return Vec::new();
+    };
+    let Some(auth_pool) = config.auth.pools.get(auth_pool_name) else {
+        return Vec::new();
+    };
+    auth_pool
+        .profiles
+        .iter()
+        .filter_map(|auth_profile_name| {
+            config
+                .auth
+                .profiles
+                .get(auth_profile_name)
+                .map(|auth_profile| {
+                    let resolved =
+                        bcode_provider_auth::resolve_auth_profile(auth_profile_name, auth_profile);
+                    for (key, value) in &resolved.env {
+                        env.entry(key.clone()).or_insert_with(|| value.clone());
+                    }
+                    bcode_model::ProviderAuthCandidate {
+                        profile: Some(auth_profile_name.clone()),
+                        auth: resolved.auth,
+                        env: resolved.env,
+                    }
+                })
+        })
+        .collect()
 }
 
 fn merge_legacy_openai_auth_profile_env(
