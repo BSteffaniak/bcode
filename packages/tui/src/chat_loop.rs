@@ -36,6 +36,7 @@ use super::{
 const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const DRAFT_SAVE_DEBOUNCE: Duration = Duration::from_millis(900);
 const PERMISSION_POLL_INTERVAL: Duration = Duration::from_millis(750);
+const PERMISSION_POLL_DAEMON_DOWN_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
 struct DraftAutosave {
@@ -126,6 +127,7 @@ struct ModalState {
 struct AsyncPermissionPoll {
     task: Option<tokio::task::JoinHandle<Result<Vec<PermissionSummary>, ClientError>>>,
     next_poll_at: Instant,
+    last_error_status: Option<String>,
 }
 
 impl AsyncPermissionPoll {
@@ -133,6 +135,7 @@ impl AsyncPermissionPoll {
         Self {
             task: None,
             next_poll_at: now,
+            last_error_status: None,
         }
     }
 }
@@ -514,6 +517,7 @@ async fn poll_permission_list(chat: &mut ActiveChat, modals: &mut ModalState) ->
     modals.permission_poll.next_poll_at = Instant::now() + PERMISSION_POLL_INTERVAL;
     match task.await {
         Ok(Ok(permissions)) => {
+            modals.permission_poll.last_error_status = None;
             if modals.permission_dialog.is_none()
                 && let Some(permission) = permissions
                     .into_iter()
@@ -524,12 +528,18 @@ async fn poll_permission_list(chat: &mut ActiveChat, modals: &mut ModalState) ->
             }
         }
         Ok(Err(error)) => {
-            if error.is_daemon_unavailable() {
-                report_nonfatal_client_error(chat, "Permissions unavailable", &error);
-                return true;
-            }
-            report_nonfatal_client_error(chat, "Permission check failed", &error);
-            return true;
+            let label = if error.is_daemon_unavailable() {
+                modals.permission_poll.next_poll_at =
+                    Instant::now() + PERMISSION_POLL_DAEMON_DOWN_INTERVAL;
+                "Permissions unavailable"
+            } else {
+                "Permission check failed"
+            };
+            let status = daemon_issue::client_issue_status(label, &error);
+            let changed = modals.permission_poll.last_error_status.as_deref() != Some(&status);
+            modals.permission_poll.last_error_status = Some(status.clone());
+            chat.app.set_status(status);
+            return changed;
         }
         Err(error) => {
             chat.app
@@ -549,7 +559,8 @@ fn report_nonfatal_tui_error(chat: &mut ActiveChat, label: &str, error: &TuiErro
 }
 
 fn report_nonfatal_client_error(chat: &mut ActiveChat, label: &str, error: &ClientError) {
-    daemon_issue::report_client_issue(&mut chat.app, label, error);
+    chat.app
+        .set_status(daemon_issue::client_issue_status(label, error));
 }
 
 fn next_redraw_at(last_redraw: Instant) -> Instant {

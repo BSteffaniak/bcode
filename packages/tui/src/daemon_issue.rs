@@ -144,6 +144,12 @@ pub const fn is_nonfatal_tui_error(error: &TuiError) -> bool {
     )
 }
 
+/// Return the status text for a recoverable client error.
+#[must_use]
+pub fn client_issue_status(label: &str, error: &ClientError) -> String {
+    classify_client_error(error).message(label).status
+}
+
 /// Report a recoverable client error to the app.
 pub fn report_client_issue(app: &mut BmuxApp, label: &str, error: &ClientError) {
     let issue = classify_client_error(error);

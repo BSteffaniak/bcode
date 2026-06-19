@@ -30,6 +30,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 const CLIENT_IPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const CLIENT_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_DAEMON_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 /// Grouped runtime-work lifecycle span.
@@ -473,12 +474,18 @@ impl BcodeClient {
         if self.daemon_availability == DaemonAvailability::RequireRunning {
             return Ok(());
         }
-        ensure_daemon_running(&EnsureDaemonOptions {
-            endpoint: self.endpoint.clone(),
-            quiet: true,
-            log_path: bcode_daemon_lifecycle::default_daemon_log_path(),
-        })
-        .await?;
+        tokio::time::timeout(
+            CLIENT_DAEMON_START_TIMEOUT,
+            ensure_daemon_running(&EnsureDaemonOptions {
+                endpoint: self.endpoint.clone(),
+                quiet: true,
+                log_path: bcode_daemon_lifecycle::default_daemon_log_path(),
+            }),
+        )
+        .await
+        .map_err(|_| ClientError::RequestTimeout {
+            timeout: CLIENT_DAEMON_START_TIMEOUT,
+        })??;
         Ok(())
     }
 
