@@ -133,12 +133,14 @@ fn openai_request_projection(request: &ModelTurnRequest) -> ProviderRequestProje
             let previous_response_id = responses_previous_response_id(&settings, request);
             let project_reused_history =
                 dialect.projects_reused_history() && previous_response_id.is_some();
-            let projection = responses_projection(
+            let mut projection = responses_projection(
                 request,
                 responses_instruction_strategy(&settings),
                 project_reused_history,
                 dialect,
             );
+            let had_provider_reasoning_state = has_provider_reasoning_state(dialect, request);
+            prepend_provider_reasoning_state(&mut projection.input, dialect, request);
             let sent = responses_projected_message_count(request, project_reused_history);
             ProviderRequestProjection {
                 provider: Some("bcode.openai-compatible".to_string()),
@@ -151,9 +153,12 @@ fn openai_request_projection(request: &ModelTurnRequest) -> ProviderRequestProje
                 emitted_cache_point_count: Some(0),
                 dropped_cache_point_count: Some(prompt_cache_point_count(request)),
                 used_previous_response_id: previous_response_id.is_some(),
-                detail: Some(
-                    "explicit cache points are not supported by this API shape".to_string(),
-                ),
+                detail: Some(format!(
+                    "explicit cache points are not supported by this API shape; prompt_cache_key={}; reasoning_context={}; provider_reasoning_state={}",
+                    dialect.uses_codex_request_shape(),
+                    dialect.uses_codex_request_shape(),
+                    had_provider_reasoning_state
+                )),
                 ..ProviderRequestProjection::default()
             }
         }
@@ -492,6 +497,8 @@ struct ResponsesReasoningOptions {
     effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -516,6 +523,19 @@ enum ResponsesInputItem {
         call_id: String,
         output: String,
     },
+    Reasoning {
+        id: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        summary: Vec<ResponsesReasoningSummary>,
+        encrypted_content: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ResponsesReasoningSummary {
+    SummaryText { text: String },
 }
 
 #[derive(Debug, Serialize)]
@@ -746,6 +766,13 @@ struct ToolCallAccumulator {
     name: Option<String>,
     arguments: String,
     started: bool,
+}
+
+#[derive(Debug, Default)]
+struct ReasoningItemAccumulator {
+    id: Option<String>,
+    encrypted_content: Option<String>,
+    summary: Vec<String>,
 }
 
 fn push_runtime_error(turn: &TurnState, error: &str) {
@@ -1291,6 +1318,7 @@ async fn read_responses_stream_events(
     let mut buffer = String::new();
     let name_map = projected_tool_name_map(request, dialect)?;
     let mut tool_calls = BTreeMap::new();
+    let mut reasoning_items = BTreeMap::new();
     let mut saw_tool_call = false;
     loop {
         if turn.is_cancelled() {
@@ -1307,6 +1335,7 @@ async fn read_responses_stream_events(
                     turn,
                     dialect,
                     &mut tool_calls,
+                    &mut reasoning_items,
                     &mut saw_tool_call,
                     &name_map,
                 )?;
@@ -1324,6 +1353,7 @@ fn process_responses_stream_buffer(
     turn: &TurnState,
     dialect: OpenAiCompatibleDialect,
     tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
+    reasoning_items: &mut BTreeMap<u32, ReasoningItemAccumulator>,
     saw_tool_call: &mut bool,
     name_map: &BTreeMap<String, String>,
 ) -> Result<StreamOutcome, ProviderError> {
@@ -1338,6 +1368,7 @@ fn process_responses_stream_buffer(
             turn,
             dialect,
             tool_calls,
+            reasoning_items,
             saw_tool_call,
             name_map,
         )?;
@@ -1353,6 +1384,7 @@ fn process_responses_stream_line(
     turn: &TurnState,
     dialect: OpenAiCompatibleDialect,
     tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
+    reasoning_items: &mut BTreeMap<u32, ReasoningItemAccumulator>,
     saw_tool_call: &mut bool,
     name_map: &BTreeMap<String, String>,
 ) -> Result<StreamOutcome, ProviderError> {
@@ -1398,6 +1430,7 @@ fn process_responses_stream_line(
         }
         "response.output_item.added" | "response.output_item.done" => {
             process_responses_output_item(&event, turn, tool_calls, saw_tool_call, name_map);
+            process_responses_reasoning_output_item(&event, reasoning_items);
         }
         "response.function_call_arguments.delta" => {
             process_responses_function_arguments_delta(&event, turn, tool_calls);
@@ -1426,6 +1459,7 @@ fn process_responses_stream_line(
                     value: response_id.to_string(),
                 });
             }
+            push_responses_provider_state(turn, reasoning_items);
             return Ok(outcome);
         }
         "response.failed" | "error" => {
@@ -1486,6 +1520,70 @@ fn process_responses_output_item(
             name: original_tool_name(name, name_map),
         });
         entry.started = true;
+    }
+}
+
+fn process_responses_reasoning_output_item(
+    event: &serde_json::Value,
+    reasoning_items: &mut BTreeMap<u32, ReasoningItemAccumulator>,
+) {
+    let Some(item) = event.get("item") else {
+        return;
+    };
+    if item.get("type").and_then(serde_json::Value::as_str) != Some("reasoning") {
+        return;
+    }
+    let output_index = event
+        .get("output_index")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|index| u32::try_from(index).ok())
+        .unwrap_or_else(|| u32::try_from(reasoning_items.len()).unwrap_or(u32::MAX));
+    let entry = reasoning_items.entry(output_index).or_default();
+    if let Some(id) = item.get("id").and_then(serde_json::Value::as_str) {
+        entry.id = Some(id.to_string());
+    }
+    if let Some(encrypted_content) = item
+        .get("encrypted_content")
+        .and_then(serde_json::Value::as_str)
+        .filter(|encrypted_content| !encrypted_content.is_empty())
+    {
+        entry.encrypted_content = Some(encrypted_content.to_string());
+    }
+    if let Some(summary) = item.get("summary").and_then(serde_json::Value::as_array) {
+        entry.summary = summary
+            .iter()
+            .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+            .filter(|text| !text.is_empty())
+            .map(ToString::to_string)
+            .collect();
+    }
+}
+
+fn push_responses_provider_state(
+    turn: &TurnState,
+    reasoning_items: &BTreeMap<u32, ReasoningItemAccumulator>,
+) {
+    let state = OpenAiProviderState {
+        reasoning_items: reasoning_items
+            .values()
+            .filter_map(|item| {
+                Some(OpenAiReasoningStateItem {
+                    id: item.id.clone()?,
+                    summary: item.summary.clone(),
+                    encrypted_content: item.encrypted_content.clone()?,
+                })
+            })
+            .filter(|item| !item.id.is_empty() && !item.encrypted_content.is_empty())
+            .collect(),
+    };
+    if state.reasoning_items.is_empty() {
+        return;
+    }
+    if let Ok(value) = serde_json::to_string(&state) {
+        turn.push(ProviderTurnEvent::ProviderMetadata {
+            key: "provider_state".to_string(),
+            value,
+        });
     }
 }
 
@@ -1830,12 +1928,13 @@ fn build_responses_request(
     model_id: &str,
 ) -> Result<serde_json::Value, ProviderError> {
     let previous_response_id = responses_previous_response_id(settings, request);
-    let projection = responses_projection(
+    let mut projection = responses_projection(
         request,
         responses_instruction_strategy(settings),
         settings.dialect.projects_reused_history() && previous_response_id.is_some(),
         settings.dialect,
     );
+    prepend_provider_reasoning_state(&mut projection.input, settings.dialect, request);
     let typed_request = ResponsesRequest {
         model: model_id.to_string(),
         instructions: projection.instructions,
@@ -1853,7 +1952,7 @@ fn build_responses_request(
             .dialect
             .uses_codex_request_shape()
             .then_some(ResponsesTextOptions { verbosity: "low" }),
-        reasoning: responses_reasoning_options(request),
+        reasoning: responses_reasoning_options(settings, request),
         include: responses_include(settings.dialect.reasoning_request_shape(), request),
         prompt_cache_key: settings
             .dialect
@@ -1874,7 +1973,10 @@ fn build_responses_request(
     Ok(body)
 }
 
-fn responses_reasoning_options(request: &ModelTurnRequest) -> Option<ResponsesReasoningOptions> {
+fn responses_reasoning_options(
+    settings: &Settings,
+    request: &ModelTurnRequest,
+) -> Option<ResponsesReasoningOptions> {
     let effort = request
         .parameters
         .reasoning_effort_value
@@ -1886,7 +1988,17 @@ fn responses_reasoning_options(request: &ModelTurnRequest) -> Option<ResponsesRe
                 .map(reasoning_effort_name)
         });
     let summary = request.parameters.reasoning_summary.clone();
-    (effort.is_some() || summary.is_some()).then_some(ResponsesReasoningOptions { effort, summary })
+    let context = settings
+        .dialect
+        .uses_codex_request_shape()
+        .then_some("current_turn");
+    (effort.is_some() || summary.is_some() || context.is_some()).then_some(
+        ResponsesReasoningOptions {
+            effort,
+            summary,
+            context,
+        },
+    )
 }
 
 fn responses_include(
@@ -1953,7 +2065,7 @@ const fn responses_instruction_strategy(_settings: &Settings) -> ResponsesInstru
 }
 
 const fn responses_store_enabled(settings: &Settings, request: &ModelTurnRequest) -> bool {
-    settings.dialect.supports_native_conversation_reuse()
+    matches!(settings.dialect, OpenAiCompatibleDialect::ResponsesApi)
         && request.conversation_reuse.mode.is_enabled()
 }
 
@@ -1988,6 +2100,96 @@ fn responses_projection(
         instructions,
         input,
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct OpenAiProviderState {
+    #[serde(default)]
+    reasoning_items: Vec<OpenAiReasoningStateItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OpenAiReasoningStateItem {
+    id: String,
+    #[serde(default)]
+    summary: Vec<String>,
+    encrypted_content: String,
+}
+
+fn has_provider_reasoning_state(
+    dialect: OpenAiCompatibleDialect,
+    request: &ModelTurnRequest,
+) -> bool {
+    if !dialect.uses_codex_request_shape() {
+        return false;
+    }
+    request
+        .conversation_reuse
+        .provider_state
+        .as_ref()
+        .and_then(|value| serde_json::from_value::<OpenAiProviderState>(value.clone()).ok())
+        .is_some_and(|state| {
+            state
+                .reasoning_items
+                .iter()
+                .any(|item| !item.id.is_empty() && !item.encrypted_content.is_empty())
+        })
+}
+
+fn prepend_provider_reasoning_state(
+    input: &mut Vec<ResponsesInputItem>,
+    dialect: OpenAiCompatibleDialect,
+    request: &ModelTurnRequest,
+) {
+    if !dialect.uses_codex_request_shape() {
+        return;
+    }
+    let Some(provider_state) = request.conversation_reuse.provider_state.as_ref() else {
+        return;
+    };
+    let Ok(state) = serde_json::from_value::<OpenAiProviderState>(provider_state.clone()) else {
+        return;
+    };
+    let reasoning_items = state
+        .reasoning_items
+        .into_iter()
+        .filter(|item| !item.id.is_empty() && !item.encrypted_content.is_empty())
+        .map(|item| ResponsesInputItem::Reasoning {
+            id: item.id,
+            summary: item
+                .summary
+                .into_iter()
+                .filter(|text| !text.is_empty())
+                .map(|text| ResponsesReasoningSummary::SummaryText { text })
+                .collect(),
+            encrypted_content: item.encrypted_content,
+        })
+        .collect::<Vec<_>>();
+    if reasoning_items.is_empty() {
+        return;
+    }
+    let insert_index = provider_reasoning_insert_index(input);
+    input.splice(insert_index..insert_index, reasoning_items);
+}
+
+fn provider_reasoning_insert_index(input: &[ResponsesInputItem]) -> usize {
+    if input.is_empty() {
+        return 0;
+    }
+    let trailing_tool_protocol_start = input
+        .iter()
+        .rposition(|item| {
+            !matches!(
+                item,
+                ResponsesInputItem::FunctionCall { .. }
+                    | ResponsesInputItem::FunctionCallOutput { .. }
+            )
+        })
+        .map_or(0, |index| index.saturating_add(1));
+    if trailing_tool_protocol_start < input.len() {
+        return trailing_tool_protocol_start;
+    }
+    input.len().saturating_sub(1)
 }
 
 fn response_instruction_bundle(request: &ModelTurnRequest) -> Option<String> {
@@ -2093,6 +2295,18 @@ fn push_sanitized_responses_input_item(
         ResponsesInputItem::Message { role, content } => {
             append_missing_responses_tool_outputs(input, pending_tool_call_ids);
             input.push(ResponsesInputItem::Message { role, content });
+        }
+        ResponsesInputItem::Reasoning {
+            id,
+            summary,
+            encrypted_content,
+        } => {
+            append_missing_responses_tool_outputs(input, pending_tool_call_ids);
+            input.push(ResponsesInputItem::Reasoning {
+                id,
+                summary,
+                encrypted_content,
+            });
         }
     }
 }
@@ -4651,6 +4865,7 @@ mod tests {
                 key: Some("key".to_string()),
                 previous_provider_response_id: Some("resp_previous".to_string()),
                 new_messages_start_index: Some(0),
+                provider_state: None,
             },
             metadata: BTreeMap::new(),
         };
@@ -4673,6 +4888,56 @@ mod tests {
             Some(false)
         );
         assert!(encoded.get("previous_response_id").is_none());
+        assert!(encoded.get("prompt_cache_retention").is_none());
+        assert_eq!(
+            encoded
+                .get("reasoning")
+                .and_then(|reasoning| reasoning.get("context"))
+                .and_then(serde_json::Value::as_str),
+            Some("current_turn")
+        );
+    }
+
+    #[test]
+    fn chatgpt_codex_replays_encrypted_reasoning_provider_state() {
+        let mut request = test_request(vec![text_message(MessageRole::User, "new")]);
+        request.conversation_reuse.provider_state = Some(serde_json::json!({
+            "reasoning_items": [{
+                "id": "rs_1",
+                "summary": ["kept summary"],
+                "encrypted_content": "encrypted"
+            }]
+        }));
+        let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
+
+        let encoded =
+            build_responses_request(&settings, &request, "model").expect("request should build");
+        let input = encoded
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .expect("input should be an array");
+
+        assert_eq!(
+            input
+                .first()
+                .and_then(|item| item.get("type"))
+                .and_then(serde_json::Value::as_str),
+            Some("reasoning")
+        );
+        assert_eq!(
+            input
+                .first()
+                .and_then(|item| item.get("id"))
+                .and_then(serde_json::Value::as_str),
+            Some("rs_1")
+        );
+        assert_eq!(
+            input
+                .first()
+                .and_then(|item| item.get("encrypted_content"))
+                .and_then(serde_json::Value::as_str),
+            Some("encrypted")
+        );
     }
 
     #[test]
@@ -4713,6 +4978,7 @@ mod tests {
                 key: Some("key".to_string()),
                 previous_provider_response_id: Some("resp_1".to_string()),
                 new_messages_start_index: Some(2),
+                provider_state: None,
             },
             metadata: BTreeMap::new(),
         };
@@ -4799,7 +5065,7 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_codex_request_uses_full_history_when_reuse_hint_exists() {
+    fn chatgpt_codex_request_does_not_send_previous_response_id() {
         let mut request = test_request(vec![
             text_message(MessageRole::User, "old"),
             text_message(MessageRole::Assistant, "old answer"),
@@ -4810,6 +5076,7 @@ mod tests {
             key: Some("key".to_string()),
             previous_provider_response_id: Some("resp_1".to_string()),
             new_messages_start_index: Some(2),
+            provider_state: None,
         };
         let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
 
@@ -4828,6 +5095,14 @@ mod tests {
             Some(false)
         );
         assert!(encoded.get("previous_response_id").is_none());
+        assert!(encoded.get("prompt_cache_retention").is_none());
+        assert_eq!(
+            encoded
+                .get("reasoning")
+                .and_then(|reasoning| reasoning.get("context"))
+                .and_then(serde_json::Value::as_str),
+            Some("current_turn")
+        );
         assert_eq!(
             encoded
                 .get("tool_choice")
@@ -4854,6 +5129,7 @@ mod tests {
             key: Some("key".to_string()),
             previous_provider_response_id: Some("resp_1".to_string()),
             new_messages_start_index: Some(2),
+            provider_state: None,
         };
         let settings = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
 
@@ -4903,6 +5179,7 @@ mod tests {
     fn responses_tool_argument_delta_emits_progress_event() {
         let turn = TurnState::default();
         let mut tool_calls = BTreeMap::new();
+        let mut reasoning_items = BTreeMap::new();
         let mut saw_tool_call = false;
         let name_map = BTreeMap::new();
 
@@ -4911,6 +5188,7 @@ mod tests {
             &turn,
             OpenAiCompatibleDialect::ResponsesApi,
             &mut tool_calls,
+            &mut reasoning_items,
             &mut saw_tool_call,
             &name_map,
         )
@@ -4920,6 +5198,7 @@ mod tests {
             &turn,
             OpenAiCompatibleDialect::ResponsesApi,
             &mut tool_calls,
+            &mut reasoning_items,
             &mut saw_tool_call,
             &name_map,
         )
@@ -4973,6 +5252,7 @@ mod tests {
             .expect("tool names should project");
         let turn = TurnState::default();
         let mut tool_calls = BTreeMap::new();
+        let mut reasoning_items = BTreeMap::new();
         let mut saw_tool_call = false;
 
         let added = process_responses_stream_line(
@@ -4980,6 +5260,7 @@ mod tests {
             &turn,
             OpenAiCompatibleDialect::ChatGptCodex,
             &mut tool_calls,
+            &mut reasoning_items,
             &mut saw_tool_call,
             &name_map,
         )
@@ -4989,6 +5270,7 @@ mod tests {
             &turn,
             OpenAiCompatibleDialect::ChatGptCodex,
             &mut tool_calls,
+            &mut reasoning_items,
             &mut saw_tool_call,
             &name_map,
         )
@@ -5010,6 +5292,7 @@ mod tests {
     fn responses_completed_emits_provider_response_id_metadata() {
         let turn = TurnState::default();
         let mut tool_calls = BTreeMap::new();
+        let mut reasoning_items = BTreeMap::new();
         let mut saw_tool_call = false;
         let name_map = BTreeMap::new();
 
@@ -5018,6 +5301,7 @@ mod tests {
             &turn,
             OpenAiCompatibleDialect::ResponsesApi,
             &mut tool_calls,
+            &mut reasoning_items,
             &mut saw_tool_call,
             &name_map,
         )
@@ -5032,9 +5316,10 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_codex_completed_does_not_emit_reuse_metadata() {
+    fn chatgpt_codex_completed_does_not_emit_provider_response_id_metadata() {
         let turn = TurnState::default();
         let mut tool_calls = BTreeMap::new();
+        let mut reasoning_items = BTreeMap::new();
         let mut saw_tool_call = false;
         let name_map = BTreeMap::new();
 
@@ -5043,6 +5328,7 @@ mod tests {
             &turn,
             OpenAiCompatibleDialect::ChatGptCodex,
             &mut tool_calls,
+            &mut reasoning_items,
             &mut saw_tool_call,
             &name_map,
         )
@@ -5051,7 +5337,48 @@ mod tests {
         assert!(matches!(outcome, StreamOutcome::Finished));
         assert!(!turn.drain().iter().any(|event| matches!(
             event,
-            ProviderTurnEvent::ProviderMetadata { key, .. } if key == "provider_response_id"
+            ProviderTurnEvent::ProviderMetadata { key, .. }
+                if key == "provider_response_id"
+        )));
+    }
+
+    #[test]
+    fn responses_completed_emits_encrypted_reasoning_provider_state() {
+        let turn = TurnState::default();
+        let mut tool_calls = BTreeMap::new();
+        let mut reasoning_items = BTreeMap::new();
+        let mut saw_tool_call = false;
+        let name_map = BTreeMap::new();
+
+        process_responses_stream_line(
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","encrypted_content":"encrypted","summary":[{"type":"summary_text","text":"kept summary"}]}}"#,
+            &turn,
+            OpenAiCompatibleDialect::ChatGptCodex,
+            &mut tool_calls,
+            &mut reasoning_items,
+            &mut saw_tool_call,
+            &name_map,
+        )
+        .expect("reasoning item should process");
+        let outcome = process_responses_stream_line(
+            r#"data: {"type":"response.completed","response":{"id":"resp_123"}}"#,
+            &turn,
+            OpenAiCompatibleDialect::ChatGptCodex,
+            &mut tool_calls,
+            &mut reasoning_items,
+            &mut saw_tool_call,
+            &name_map,
+        )
+        .expect("completed event should process");
+
+        let events = turn.drain();
+        assert!(matches!(outcome, StreamOutcome::Finished));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ProviderMetadata { key, value }
+                if key == "provider_state"
+                    && value.contains("rs_1")
+                    && value.contains("encrypted")
         )));
     }
 
@@ -5080,6 +5407,7 @@ mod tests {
     fn responses_stream_context_length_error_is_classified_for_overflow_recovery() {
         let turn = TurnState::default();
         let mut tool_calls = BTreeMap::new();
+        let mut reasoning_items = BTreeMap::new();
         let mut saw_tool_call = false;
         let name_map = BTreeMap::new();
 
@@ -5088,6 +5416,7 @@ mod tests {
             &turn,
             OpenAiCompatibleDialect::ResponsesApi,
             &mut tool_calls,
+            &mut reasoning_items,
             &mut saw_tool_call,
             &name_map,
         )

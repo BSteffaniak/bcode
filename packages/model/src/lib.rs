@@ -455,6 +455,9 @@ pub struct ConversationReuseHints {
     /// First message index not covered by `previous_provider_response_id`.
     #[serde(default)]
     pub new_messages_start_index: Option<usize>,
+    /// Provider-private state from prior turns, such as encrypted reasoning continuation payloads.
+    #[serde(default)]
+    pub provider_state: Option<serde_json::Value>,
 }
 
 /// Provider-native conversation reuse policy level.

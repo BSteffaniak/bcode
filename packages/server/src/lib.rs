@@ -478,6 +478,8 @@ struct ProviderStateRecord {
     continuation: Option<ProviderContinuationState>,
     #[serde(default)]
     telemetry: ProviderTelemetryState,
+    #[serde(default)]
+    provider_state: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -9912,9 +9914,6 @@ async fn update_provider_metadata_state(
     key: &str,
     value: String,
 ) {
-    if key != "provider_response_id" {
-        return;
-    }
     let reuse_key = state
         .active_model_turn_snapshot(session_id)
         .await
@@ -9922,6 +9921,22 @@ async fn update_provider_metadata_state(
     let Some(reuse_key) = reuse_key else {
         return;
     };
+
+    if key == "provider_state" {
+        let Ok(provider_state_value) = serde_json::from_str::<serde_json::Value>(&value) else {
+            return;
+        };
+        let mut provider_state = state.provider_state.lock().await;
+        let record = provider_state.records.entry(reuse_key).or_default();
+        record.provider_state = Some(provider_state_value);
+        provider_state.save();
+        drop(provider_state);
+        return;
+    }
+
+    if key != "provider_response_id" {
+        return;
+    }
     let reusable_message_count = state
         .active_model_turn_snapshot(session_id)
         .await
@@ -10882,12 +10897,15 @@ async fn plan_conversation_reuse(
     }
 
     let reuse_key = projection.reuse_key();
-    let previous = state
+    let record = state
         .provider_state
         .lock()
         .await
         .records
         .get(&reuse_key)
+        .cloned();
+    let previous = record
+        .as_ref()
         .and_then(|record| record.continuation.clone())
         .filter(|continuation| continuation.reusable_message_count <= message_count);
 
@@ -10900,6 +10918,7 @@ async fn plan_conversation_reuse(
         new_messages_start_index: previous
             .as_ref()
             .map(|continuation| continuation.reusable_message_count),
+        provider_state: record.and_then(|record| record.provider_state),
     }
 }
 
