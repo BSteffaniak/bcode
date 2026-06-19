@@ -555,6 +555,36 @@ fn apply_effect_result(
         TuiEffectResult::SubmitMessage { message, result } => {
             apply_submit_message_result(chat, &message, *result);
         }
+        TuiEffectResult::ForkSession {
+            switch_after_create,
+            install_draft,
+            draft,
+            initial_window_request,
+            result,
+        } => {
+            apply_fork_session_result(
+                chat,
+                switch_after_create,
+                install_draft,
+                draft,
+                initial_window_request,
+                result,
+            );
+        }
+        TuiEffectResult::CloneSession {
+            switch_after_create,
+            install_draft,
+            initial_window_request,
+            result,
+        } => {
+            apply_clone_session_result(
+                chat,
+                switch_after_create,
+                install_draft,
+                initial_window_request,
+                result,
+            );
+        }
         TuiEffectResult::SkillAction {
             action,
             skill_id,
@@ -856,6 +886,77 @@ fn apply_submit_message_result(
             chat.app.restore_pending_submission(message);
             daemon_issue::report_client_issue(&mut chat.app, "send failed", &error);
         }
+    }
+}
+
+fn apply_fork_session_result(
+    chat: &mut ActiveChat,
+    switch_after_create: bool,
+    install_draft: bool,
+    draft: Option<String>,
+    initial_window_request: bcode_session_models::ProjectionWindowRequest,
+    result: Result<bcode_session_models::SessionForkResult, ClientError>,
+) {
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            daemon_issue::report_client_issue(&mut chat.app, "session fork failed", &error);
+            return;
+        }
+    };
+    let draft = result.draft.or(draft);
+    if switch_after_create {
+        let new_session_id = result.session.id;
+        session_flow::start_switch_session(chat, new_session_id, initial_window_request);
+        if install_draft {
+            if let Some(draft) = draft.as_deref() {
+                chat.app.replace_composer_with(draft);
+            }
+        } else {
+            chat.app.replace_composer_with("");
+        }
+        chat.app
+            .set_status("forked session and switched".to_owned());
+    } else {
+        chat.app.apply_session_summary(&result.session);
+        if install_draft {
+            if let Some(draft) = draft.as_deref() {
+                chat.app.replace_composer_with(draft);
+            }
+        } else {
+            chat.app.replace_composer_with("");
+        }
+        chat.app
+            .set_status(format!("forked session {}", result.session.id));
+    }
+}
+
+fn apply_clone_session_result(
+    chat: &mut ActiveChat,
+    switch_after_create: bool,
+    install_draft: bool,
+    initial_window_request: bcode_session_models::ProjectionWindowRequest,
+    result: Result<bcode_session_models::SessionForkResult, ClientError>,
+) {
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            daemon_issue::report_client_issue(&mut chat.app, "session clone failed", &error);
+            return;
+        }
+    };
+    if !install_draft {
+        chat.app.replace_composer_with("");
+    }
+    if switch_after_create {
+        let new_session_id = result.session.id;
+        session_flow::start_switch_session(chat, new_session_id, initial_window_request);
+        chat.app
+            .set_status("cloned session and switched".to_owned());
+    } else {
+        chat.app.apply_session_summary(&result.session);
+        chat.app
+            .set_status(format!("cloned session {}", result.session.id));
     }
 }
 

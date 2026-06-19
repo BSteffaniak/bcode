@@ -15,9 +15,10 @@ use bmux_tui::style::{Color, Modifier};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
 use bmux_tui_components::text_input::TextInputControl;
 
+use super::effects::TuiEffect;
 use super::helpers;
 use super::runtime_context::{TuiIo, TuiServices};
-use super::session_flow::{self, ActiveChat};
+use super::session_flow::ActiveChat;
 use super::{TuiError, session_fork_dialog, session_fork_dialog_render};
 
 /// Open the fork dialog for the current session.
@@ -51,41 +52,18 @@ pub async fn fork_current_session<W: Write>(
         }
         Err(error) => return Err(error),
     };
-    let result = match services
-        .client
-        .fork_session(session_id, prompt.sequence, submission.name)
-        .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            helpers::report_client_issue(&mut chat.app, "session fork failed", &error);
-            return Ok(());
-        }
-    };
-    let draft = result.draft.or(Some(prompt.text));
-    if submission.switch_after_create {
-        let new_session_id = result.session.id;
-        session_flow::switch_session(io.terminal, chat, new_session_id)?;
-        if submission.install_draft {
-            if let Some(draft) = draft.as_deref() {
-                chat.app.replace_composer_with(draft);
-            }
-        } else {
-            chat.app.replace_composer_with("");
-        }
-        chat.app
-            .set_status("forked session and switched".to_owned());
-    } else {
-        if submission.install_draft {
-            if let Some(draft) = draft.as_deref() {
-                chat.app.replace_composer_with(draft);
-            }
-        } else {
-            chat.app.replace_composer_with("");
-        }
-        chat.app
-            .set_status(format!("forked session {}", result.session.id));
-    }
+    chat.start_effect(TuiEffect::ForkSession {
+        session_id,
+        prompt_sequence: prompt.sequence,
+        name: submission.name,
+        draft: Some(prompt.text),
+        switch_after_create: submission.switch_after_create,
+        install_draft: submission.install_draft,
+        initial_window_request: super::history_flow::initial_transcript_window_request(
+            super::render::transcript_area_for_frame(&chat.app, io.terminal.area()),
+        ),
+    });
+    chat.app.set_status("forking session…".to_owned());
     Ok(())
 }
 
@@ -135,7 +113,7 @@ async fn recent_user_prompts(
     session_id: bcode_session_models::SessionId,
 ) -> Result<Vec<ForkPromptCandidate>, TuiError> {
     let page = match services
-        .client
+        .passive_client
         .session_history_page(
             session_id,
             SessionHistoryQuery {
@@ -299,30 +277,16 @@ pub async fn clone_current_session<W: Write>(
         &format!("[clone] {source_title}"),
     );
     let submission = run_dialog(io, &mut dialog, services.theme).await?;
-    if !submission.install_draft {
-        chat.app.replace_composer_with("");
-    }
-    let result = match services
-        .client
-        .clone_session(session_id, submission.name)
-        .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            helpers::report_client_issue(&mut chat.app, "session clone failed", &error);
-            return Ok(());
-        }
-    };
-    if submission.switch_after_create {
-        let new_session_id = result.session.id;
-        session_flow::switch_session(io.terminal, chat, new_session_id)?;
-        chat.app
-            .set_status("cloned session and switched".to_owned());
-    } else {
-        chat.app.apply_session_summary(&result.session);
-        chat.app
-            .set_status(format!("cloned session {}", result.session.id));
-    }
+    chat.start_effect(TuiEffect::CloneSession {
+        session_id,
+        name: submission.name,
+        switch_after_create: submission.switch_after_create,
+        install_draft: submission.install_draft,
+        initial_window_request: super::history_flow::initial_transcript_window_request(
+            super::render::transcript_area_for_frame(&chat.app, io.terminal.area()),
+        ),
+    });
+    chat.app.set_status("cloning session…".to_owned());
     Ok(())
 }
 

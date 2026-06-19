@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use bcode_client::{BcodeClient, ClientError, MessageAcceptance};
 use bcode_ipc::{ComposerDraftScope, PermissionSummary, PromptPlacement};
 use bcode_session_models::{
-    ProjectionWindowRequest, SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage,
-    SessionHistoryQuery, SessionId, SessionSummary,
+    ProjectionWindowRequest, SessionForkResult, SessionHistoryCursor, SessionHistoryDirection,
+    SessionHistoryPage, SessionHistoryQuery, SessionId, SessionSummary,
 };
 use bcode_skill_models::SkillId;
 use bcode_worktree_models::{
@@ -137,6 +137,36 @@ pub enum TuiEffect {
     SubmitMessage {
         /// Submit request.
         request: Box<SubmitMessageRequest>,
+    },
+    /// Fork a session from a prompt.
+    ForkSession {
+        /// Source session id.
+        session_id: SessionId,
+        /// Prompt sequence to fork from.
+        prompt_sequence: u64,
+        /// Optional new session name.
+        name: Option<String>,
+        /// Draft text to install after completion.
+        draft: Option<String>,
+        /// Whether to switch to the forked session.
+        switch_after_create: bool,
+        /// Whether to install draft text.
+        install_draft: bool,
+        /// Initial transcript window when switching.
+        initial_window_request: ProjectionWindowRequest,
+    },
+    /// Clone a session.
+    CloneSession {
+        /// Source session id.
+        session_id: SessionId,
+        /// Optional new session name.
+        name: Option<String>,
+        /// Whether to switch to the cloned session.
+        switch_after_create: bool,
+        /// Whether to keep current draft text.
+        install_draft: bool,
+        /// Initial transcript window when switching.
+        initial_window_request: ProjectionWindowRequest,
     },
     /// Perform a skill action for a session.
     SkillAction {
@@ -336,6 +366,30 @@ pub enum TuiEffectResult {
         /// Submit result.
         result: Box<Result<SubmitMessageResult, ClientError>>,
     },
+    /// Session fork completed.
+    ForkSession {
+        /// Whether to switch to the forked session.
+        switch_after_create: bool,
+        /// Whether to install draft text.
+        install_draft: bool,
+        /// Fallback draft text.
+        draft: Option<String>,
+        /// Initial transcript window when switching.
+        initial_window_request: ProjectionWindowRequest,
+        /// Fork result.
+        result: Result<SessionForkResult, ClientError>,
+    },
+    /// Session clone completed.
+    CloneSession {
+        /// Whether to switch to the cloned session.
+        switch_after_create: bool,
+        /// Whether to keep current draft text.
+        install_draft: bool,
+        /// Initial transcript window when switching.
+        initial_window_request: ProjectionWindowRequest,
+        /// Clone result.
+        result: Result<SessionForkResult, ClientError>,
+    },
     /// Skill action completed.
     SkillAction {
         /// Skill action kind.
@@ -427,6 +481,8 @@ impl TuiEffectResult {
             }
             Self::PermissionList { result } => DaemonObservation::from_client_result(result),
             Self::SaveDraft { result, .. } => DaemonObservation::from_client_result(result),
+            Self::ForkSession { result, .. } => DaemonObservation::from_client_result(result),
+            Self::CloneSession { result, .. } => DaemonObservation::from_client_result(result),
             Self::SkillAction { result, .. } => DaemonObservation::from_client_result(result),
             Self::SetSessionModel { result, .. } => DaemonObservation::from_client_result(result),
             Self::SubmitMessage { result, .. } => DaemonObservation::from_client_result(result),
@@ -500,6 +556,8 @@ enum EffectKey {
     PermissionList,
     DraftSave,
     SlashPalette,
+    ForkSession(SessionId),
+    CloneSession(SessionId),
     SubmitMessage(usize),
     SkillAction(SkillId),
     SetSessionModel(SessionId),
@@ -531,7 +589,9 @@ enum EffectDaemonIntent {
 impl TuiEffect {
     const fn daemon_intent(&self) -> EffectDaemonIntent {
         match self {
-            Self::SubmitMessage { .. }
+            Self::ForkSession { .. }
+            | Self::CloneSession { .. }
+            | Self::SubmitMessage { .. }
             | Self::SkillAction { .. }
             | Self::SetSessionModel { .. }
             | Self::CompactContext { .. }
@@ -728,6 +788,8 @@ impl TuiEffect {
             Self::ListPermissions => EffectKey::PermissionList,
             Self::SaveDraft { .. } => EffectKey::DraftSave,
             Self::LoadSlashPalette { .. } => EffectKey::SlashPalette,
+            Self::ForkSession { session_id, .. } => EffectKey::ForkSession(*session_id),
+            Self::CloneSession { session_id, .. } => EffectKey::CloneSession(*session_id),
             Self::SubmitMessage { request } => EffectKey::SubmitMessage(request.message.len()),
             Self::SkillAction { request } => EffectKey::SkillAction(request.skill_id.clone()),
             Self::SetSessionModel { session_id, .. } => EffectKey::SetSessionModel(*session_id),
@@ -815,6 +877,33 @@ impl TuiEffect {
                 let palette = slash_palette::SlashPalette::new(&client, session_id, &query).await;
                 TuiEffectResult::SlashPaletteLoaded { query, palette }
             }
+            Self::ForkSession {
+                session_id,
+                prompt_sequence,
+                name,
+                draft,
+                switch_after_create,
+                install_draft,
+                initial_window_request,
+            } => TuiEffectResult::ForkSession {
+                switch_after_create,
+                install_draft,
+                draft,
+                initial_window_request,
+                result: client.fork_session(session_id, prompt_sequence, name).await,
+            },
+            Self::CloneSession {
+                session_id,
+                name,
+                switch_after_create,
+                install_draft,
+                initial_window_request,
+            } => TuiEffectResult::CloneSession {
+                switch_after_create,
+                install_draft,
+                initial_window_request,
+                result: client.clone_session(session_id, name).await,
+            },
             Self::SubmitMessage { request } => run_submit_message(&client, *request).await,
             Self::SkillAction { request } => run_skill_action(&client, *request).await,
             Self::SetSessionModel {
