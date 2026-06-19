@@ -115,6 +115,56 @@ struct ChatLoopState {
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
 }
 
+impl ChatLoopState {
+    fn new(client: &BcodeClient) -> Self {
+        Self {
+            palette: None,
+            slash_palette: None,
+            effects: TuiEffectRunner::new(client),
+            permission_dialog: None,
+            permission_poll: PermissionPollSchedule::new(Instant::now()),
+            thinking_dialog: None,
+            timeline_dialog: None,
+        }
+    }
+
+    fn drain_pending_effects(&mut self, chat: &mut ActiveChat) -> bool {
+        self.effects.drain_pending(&mut chat.pending_effects)
+    }
+
+    async fn poll_finished_effects(&mut self) -> Vec<TuiEffectResult> {
+        self.effects.poll_finished().await
+    }
+
+    fn abort_all_effects(&mut self) {
+        self.effects.abort_all();
+    }
+
+    fn start_effect(&mut self, effect: TuiEffect) -> bool {
+        self.effects.start(effect)
+    }
+
+    fn replace_effect(&mut self, effect: TuiEffect) {
+        self.effects.replace(effect);
+    }
+
+    fn abort_matching_effect(&mut self, effect: &TuiEffect) {
+        self.effects.abort_matching(effect);
+    }
+
+    fn maybe_start_permission_poll(&mut self, chat: &ActiveChat) {
+        if self.permission_dialog.is_some()
+            || Instant::now() < self.permission_poll.next_poll_at
+            || chat.session_id.is_none()
+        {
+            return;
+        }
+        if self.start_effect(TuiEffect::ListPermissions) {
+            self.permission_poll.next_poll_at = Instant::now() + PERMISSION_POLL_INTERVAL;
+        }
+    }
+}
+
 #[derive(Debug)]
 struct PermissionPollSchedule {
     next_poll_at: Instant,
@@ -184,16 +234,8 @@ pub async fn run_with_client<W: Write>(
     chat: &mut ActiveChat,
     startup_action: super::startup_action::StartupTuiAction,
 ) -> Result<(), TuiError> {
-    let mut loop_state = ChatLoopState {
-        palette: None,
-        slash_palette: None,
-        effects: TuiEffectRunner::new(client),
-        permission_dialog: None,
-        permission_poll: PermissionPollSchedule::new(Instant::now()),
-        thinking_dialog: None,
-        timeline_dialog: None,
-    };
-    loop_state.effects.drain_pending(&mut chat.pending_effects);
+    let mut loop_state = ChatLoopState::new(client);
+    loop_state.drain_pending_effects(chat);
     sync_chat_key_labels(chat, &settings.keymap);
     let mut draft_autosave = DraftAutosave::new(
         settings.launch_working_directory.clone(),
@@ -327,7 +369,7 @@ pub async fn run_with_client<W: Write>(
         }
     }
 
-    loop_state.effects.abort_all();
+    loop_state.abort_all_effects();
     Ok(())
 }
 
@@ -346,10 +388,10 @@ async fn handle_loop_housekeeping(
 ) -> bool {
     let mut needs_redraw = false;
     needs_redraw |= poll_finished_effects(settings, chat, draft_autosave, loop_state).await;
-    needs_redraw |= drain_pending_chat_effects(chat, &mut loop_state.effects);
+    needs_redraw |= loop_state.drain_pending_effects(chat);
     needs_redraw |= maybe_start_older_history_load(chat, loop_state);
     needs_redraw |= maybe_start_newer_history_load(chat, loop_state);
-    maybe_start_permission_poll(chat, loop_state);
+    loop_state.maybe_start_permission_poll(chat);
     needs_redraw
 }
 
@@ -363,9 +405,7 @@ fn maybe_start_older_history_load(chat: &mut ActiveChat, loop_state: &mut ChatLo
     let Some(session_id) = chat.session_id else {
         return false;
     };
-    let started = loop_state
-        .effects
-        .start(TuiEffect::LoadOlderHistory { session_id, cursor });
+    let started = loop_state.start_effect(TuiEffect::LoadOlderHistory { session_id, cursor });
     if started {
         chat.app.set_loading_older_history(true);
     }
@@ -382,17 +422,11 @@ fn maybe_start_newer_history_load(chat: &mut ActiveChat, loop_state: &mut ChatLo
     let Some(session_id) = chat.session_id else {
         return false;
     };
-    let started = loop_state
-        .effects
-        .start(TuiEffect::LoadNewerHistory { session_id, cursor });
+    let started = loop_state.start_effect(TuiEffect::LoadNewerHistory { session_id, cursor });
     if started {
         chat.app.set_loading_newer_history(true);
     }
     started
-}
-
-fn drain_pending_chat_effects(chat: &mut ActiveChat, effects: &mut TuiEffectRunner) -> bool {
-    effects.drain_pending(&mut chat.pending_effects)
 }
 
 async fn poll_finished_effects(
@@ -401,7 +435,7 @@ async fn poll_finished_effects(
     draft_autosave: &mut DraftAutosave,
     loop_state: &mut ChatLoopState,
 ) -> bool {
-    let results = loop_state.effects.poll_finished().await;
+    let results = loop_state.poll_finished_effects().await;
     let needs_redraw = !results.is_empty();
     for result in results {
         apply_effect_result(settings, chat, draft_autosave, loop_state, result);
@@ -739,8 +773,8 @@ fn apply_thinking_cycle_result(
     }
 }
 
-fn start_thinking_cycle(chat: &mut ActiveChat, effects: &mut TuiEffectRunner) {
-    let started = effects.start(TuiEffect::CycleThinkingEffort {
+fn start_thinking_cycle(chat: &mut ActiveChat, loop_state: &mut ChatLoopState) {
+    let started = loop_state.start_effect(TuiEffect::CycleThinkingEffort {
         session_id: chat.app.session_id(),
         current_effort: chat.app.reasoning_effort().map(ToOwned::to_owned),
         current_summary: chat.app.reasoning_summary().map(ToOwned::to_owned),
@@ -754,12 +788,12 @@ fn start_thinking_cycle(chat: &mut ActiveChat, effects: &mut TuiEffectRunner) {
     }
 }
 
-fn start_cancel_turn(chat: &mut ActiveChat, effects: &mut TuiEffectRunner) {
+fn start_cancel_turn(chat: &mut ActiveChat, loop_state: &mut ChatLoopState) {
     let Some(session_id) = chat.app.session_id() else {
         chat.app.set_status("No active session".to_owned());
         return;
     };
-    let started = effects.start(TuiEffect::CancelTurn { session_id });
+    let started = loop_state.start_effect(TuiEffect::CancelTurn { session_id });
     if started {
         chat.app.set_cancelling();
         chat.app
@@ -782,12 +816,10 @@ fn update_slash_palette_async(chat: &ActiveChat, loop_state: &mut ChatLoopState)
     let current_query = chat.app.composer().text();
     if !current_query.starts_with('/') {
         loop_state.slash_palette = None;
-        loop_state
-            .effects
-            .abort_matching(&TuiEffect::LoadSlashPalette {
-                query: String::new(),
-                session_id: None,
-            });
+        loop_state.abort_matching_effect(&TuiEffect::LoadSlashPalette {
+            query: String::new(),
+            session_id: None,
+        });
         return true;
     }
     let query = current_query.to_owned();
@@ -799,23 +831,11 @@ fn update_slash_palette_async(chat: &ActiveChat, loop_state: &mut ChatLoopState)
     if previous.is_none() {
         loop_state.slash_palette = None;
     }
-    loop_state.effects.replace(TuiEffect::LoadSlashPalette {
+    loop_state.replace_effect(TuiEffect::LoadSlashPalette {
         query,
         session_id: chat.app.session_id(),
     });
     true
-}
-
-fn maybe_start_permission_poll(chat: &ActiveChat, loop_state: &mut ChatLoopState) {
-    if loop_state.permission_dialog.is_some()
-        || Instant::now() < loop_state.permission_poll.next_poll_at
-        || chat.session_id.is_none()
-    {
-        return;
-    }
-    if loop_state.effects.start(TuiEffect::ListPermissions) {
-        loop_state.permission_poll.next_poll_at = Instant::now() + PERMISSION_POLL_INTERVAL;
-    }
 }
 
 const fn is_nonfatal_tui_daemon_error(error: &TuiError) -> bool {
@@ -1144,11 +1164,11 @@ async fn handle_chat_key_request<W: Write>(
     match request {
         KeyRequest::None => {}
         KeyRequest::Interrupt => {
-            start_cancel_turn(chat, &mut loop_state.effects);
+            start_cancel_turn(chat, loop_state);
         }
         KeyRequest::CycleAgent => cycle_session_agent(chat),
         KeyRequest::CycleThinkingEffort => {
-            start_thinking_cycle(chat, &mut loop_state.effects);
+            start_thinking_cycle(chat, loop_state);
         }
         KeyRequest::Submit { placement } => {
             let pre_submit_scope = draft_autosave.as_ref().map(|autosave| autosave.scope(chat));
