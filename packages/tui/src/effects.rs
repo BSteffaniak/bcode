@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::{
-    TuiError, history_flow,
+    TuiError, daemon_issue, history_flow,
     session_flow::{self, AgentCatalog},
     slash_palette, thinking_flow,
 };
@@ -91,6 +91,56 @@ pub enum TuiEffect {
         /// Current local visibility state.
         visible: bool,
     },
+}
+
+/// Daemon connectivity observation reported by completed effects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonObservation {
+    /// The effect does not say anything about daemon connectivity.
+    None,
+    /// A daemon-backed request completed successfully.
+    Success,
+    /// The daemon was unavailable or unreachable.
+    Unavailable(String),
+    /// A daemon-backed request failed after reaching the daemon or for an unknown reason.
+    Failed(String),
+}
+
+impl DaemonObservation {
+    fn from_client_error(error: &ClientError) -> Self {
+        if error.is_daemon_unavailable() {
+            Self::Unavailable(error.to_string())
+        } else {
+            Self::Failed(error.to_string())
+        }
+    }
+
+    fn from_client_result<T>(result: &Result<T, ClientError>) -> Self {
+        match result {
+            Ok(_) => Self::Success,
+            Err(error) => Self::from_client_error(error),
+        }
+    }
+
+    fn from_tui_result<T>(result: &Result<T, TuiError>) -> Self {
+        match result {
+            Ok(_) => Self::Success,
+            Err(error) if daemon_issue::is_nonfatal_tui_error(error) => {
+                Self::Unavailable(error.to_string())
+            }
+            Err(error) => Self::Failed(error.to_string()),
+        }
+    }
+
+    fn from_optional_error(connected: bool, error: Option<&str>) -> Self {
+        if connected {
+            Self::Success
+        } else if let Some(error) = error {
+            Self::Unavailable(error.to_owned())
+        } else {
+            Self::None
+        }
+    }
 }
 
 /// Completed TUI background work.
@@ -192,6 +242,42 @@ pub enum TuiEffectResult {
         /// Cycle result.
         result: Box<Result<ThinkingCycleResult, ClientError>>,
     },
+}
+
+impl TuiEffectResult {
+    /// Return the daemon connectivity observation implied by this effect result.
+    #[must_use]
+    pub fn daemon_observation(&self) -> DaemonObservation {
+        match self {
+            Self::SessionOpened { result, .. } => DaemonObservation::from_tui_result(result),
+            Self::DraftStatusLoaded {
+                daemon_connected,
+                error,
+                ..
+            }
+            | Self::SessionStatusLoaded {
+                daemon_connected,
+                error,
+                ..
+            } => DaemonObservation::from_optional_error(*daemon_connected, error.as_deref()),
+            Self::AgentCatalogLoaded { agents } => match agents {
+                Ok(_) => DaemonObservation::Success,
+                Err(error) => DaemonObservation::Unavailable(error.clone()),
+            },
+            Self::OlderHistoryLoaded { result, .. } | Self::NewerHistoryLoaded { result, .. } => {
+                DaemonObservation::from_client_result(result)
+            }
+            Self::PermissionList { result } => DaemonObservation::from_client_result(result),
+            Self::SaveDraft { result, .. } => DaemonObservation::from_client_result(result),
+            Self::CancelTurn { result, .. } => DaemonObservation::from_client_result(result),
+            Self::CycleThinkingEffort { result, .. } => {
+                DaemonObservation::from_client_result(result)
+            }
+            Self::ConfigLoaded { .. }
+            | Self::AuthSecurityReconciled { .. }
+            | Self::SlashPaletteLoaded { .. } => DaemonObservation::None,
+        }
+    }
 }
 
 /// Reasoning effort cycle outcome.

@@ -16,7 +16,7 @@ use super::activity::ActivityState;
 use super::clipboard_image;
 use super::command_palette::BmuxCommandPalette;
 use super::daemon_issue;
-use super::effects::{TuiEffect, TuiEffectResult, TuiEffectRunner};
+use super::effects::{DaemonObservation, TuiEffect, TuiEffectResult, TuiEffectRunner};
 use super::helpers;
 use super::invalidation::InvalidationQueue;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
@@ -109,6 +109,7 @@ struct ChatLoopState {
     palette: Option<BmuxCommandPalette>,
     slash_palette: Option<slash_palette::SlashPalette>,
     effects: TuiEffectRunner,
+    daemon_connection: DaemonConnectionMonitor,
     permission_dialog: Option<PermissionDialogState>,
     permission_poll: PermissionPollSchedule,
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
@@ -121,6 +122,7 @@ impl ChatLoopState {
             palette: None,
             slash_palette: None,
             effects: TuiEffectRunner::new(client),
+            daemon_connection: DaemonConnectionMonitor::default(),
             permission_dialog: None,
             permission_poll: PermissionPollSchedule::new(Instant::now()),
             thinking_dialog: None,
@@ -152,6 +154,12 @@ impl ChatLoopState {
         self.effects.abort_matching(effect);
     }
 
+    fn observe_daemon(&mut self, chat: &mut ActiveChat, observation: DaemonObservation) {
+        if let Some(state) = self.daemon_connection.observe(observation) {
+            chat.app.set_daemon_connection(state);
+        }
+    }
+
     fn maybe_start_permission_poll(&mut self, chat: &ActiveChat) {
         if self.permission_dialog.is_some()
             || Instant::now() < self.permission_poll.next_poll_at
@@ -161,6 +169,36 @@ impl ChatLoopState {
         }
         if self.start_effect(TuiEffect::ListPermissions) {
             self.permission_poll.next_poll_at = Instant::now() + PERMISSION_POLL_INTERVAL;
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct DaemonConnectionMonitor {
+    saw_success: bool,
+    last_error: Option<String>,
+}
+
+impl DaemonConnectionMonitor {
+    fn observe(
+        &mut self,
+        observation: DaemonObservation,
+    ) -> Option<super::app::DaemonConnectionState> {
+        match observation {
+            DaemonObservation::None => None,
+            DaemonObservation::Success => {
+                self.saw_success = true;
+                self.last_error = None;
+                Some(super::app::DaemonConnectionState::Connected)
+            }
+            DaemonObservation::Unavailable(error) | DaemonObservation::Failed(error) => {
+                self.last_error = Some(error);
+                Some(if self.saw_success {
+                    super::app::DaemonConnectionState::Reconnecting
+                } else {
+                    super::app::DaemonConnectionState::Unavailable
+                })
+            }
         }
     }
 }
@@ -438,6 +476,7 @@ async fn poll_finished_effects(
     let results = loop_state.poll_finished_effects().await;
     let needs_redraw = !results.is_empty();
     for result in results {
+        loop_state.observe_daemon(chat, result.daemon_observation());
         apply_effect_result(settings, chat, draft_autosave, loop_state, result);
     }
     needs_redraw
@@ -456,8 +495,6 @@ fn apply_effect_result(
             has_older_history,
             result,
         } => {
-            let daemon_error = result.as_ref().err().map(ToString::to_string);
-            apply_daemon_connection_result(chat, result.is_ok(), daemon_error.as_deref());
             session_flow::complete_switch_session(chat, session_id, has_older_history, result);
         }
         TuiEffectResult::ConfigLoaded { config } => {
@@ -467,23 +504,21 @@ fn apply_effect_result(
             apply_auth_security_result(chat, status);
         }
         TuiEffectResult::DraftStatusLoaded {
-            daemon_connected,
+            daemon_connected: _,
             model,
             composer_draft,
             error,
         } => {
-            apply_daemon_connection_result(chat, daemon_connected, error.as_deref());
             apply_draft_status_result(chat, model, composer_draft, error);
         }
         TuiEffectResult::SessionStatusLoaded {
-            daemon_connected,
+            daemon_connected: _,
             session_id,
             model,
             active_skill_count,
             runtime_work,
             error,
         } => {
-            apply_daemon_connection_result(chat, daemon_connected, error.as_deref());
             apply_session_status_result(
                 chat,
                 session_id,
@@ -517,18 +552,6 @@ fn apply_effect_result(
         TuiEffectResult::CycleThinkingEffort { session_id, result } => {
             apply_thinking_cycle_result(chat, session_id, *result);
         }
-    }
-}
-
-const fn apply_daemon_connection_result(
-    chat: &mut ActiveChat,
-    connected: bool,
-    error: Option<&str>,
-) {
-    if connected {
-        chat.app.mark_daemon_connected();
-    } else if error.is_some() {
-        chat.app.mark_daemon_unavailable();
     }
 }
 
@@ -625,13 +648,11 @@ fn apply_agent_catalog_result(
 ) {
     match agents {
         Ok(agents) => {
-            chat.app.mark_daemon_connected();
             chat.app.set_agent_metadata_hydrated(true);
             chat.agents = agents;
             chat.agents.refresh_app_agent_metadata(&mut chat.app);
         }
         Err(error) => {
-            chat.app.mark_daemon_unavailable();
             chat.app
                 .set_status(format!("Agent metadata unavailable: {error}"));
         }
@@ -683,7 +704,6 @@ fn apply_permission_list_result(
 ) {
     match result {
         Ok(permissions) => {
-            chat.app.mark_daemon_connected();
             loop_state.permission_poll.last_error_status = None;
             if loop_state.permission_dialog.is_none()
                 && let Some(permission) = permissions
@@ -694,7 +714,6 @@ fn apply_permission_list_result(
             }
         }
         Err(error) => {
-            chat.app.mark_daemon_unavailable();
             let label = if error.is_daemon_unavailable() {
                 loop_state.permission_poll.next_poll_at =
                     Instant::now() + PERMISSION_POLL_DAEMON_DOWN_INTERVAL;

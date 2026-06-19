@@ -1177,7 +1177,7 @@ fn status_line_includes_unknown_context_before_spent_tokens() {
 fn status_line_drops_low_priority_segments_in_narrow_panes() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-    app.mark_daemon_connected();
+    app.set_daemon_connection(super::app::DaemonConnectionState::Connected);
     app.set_status("important status message".to_owned());
     let mut buffer = Buffer::empty(Rect::new(0, 0, 36, 8));
     let mut frame = Frame::new(&mut buffer);

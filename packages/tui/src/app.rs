@@ -308,16 +308,10 @@ pub enum DaemonConnectionState {
     Connecting,
     /// At least one daemon-backed request completed successfully.
     Connected,
+    /// A daemon-backed request failed after a previous success.
+    Reconnecting,
     /// A daemon-backed startup request failed before any success was observed.
     Unavailable,
-}
-
-impl DaemonConnectionState {
-    /// Return whether daemon-backed TUI services are connected.
-    #[must_use]
-    pub const fn is_connected(self) -> bool {
-        matches!(self, Self::Connected)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1167,18 +1161,6 @@ impl BmuxApp {
     /// Store daemon connection state for startup/readiness chrome.
     pub const fn set_daemon_connection(&mut self, daemon_connection: DaemonConnectionState) {
         self.daemon_connection = daemon_connection;
-    }
-
-    /// Mark that at least one daemon-backed request has completed successfully.
-    pub const fn mark_daemon_connected(&mut self) {
-        self.daemon_connection = DaemonConnectionState::Connected;
-    }
-
-    /// Mark daemon-backed services as unavailable if no successful request has completed yet.
-    pub const fn mark_daemon_unavailable(&mut self) {
-        if !self.daemon_connection.is_connected() {
-            self.daemon_connection = DaemonConnectionState::Unavailable;
-        }
     }
 
     /// Return the current status line.

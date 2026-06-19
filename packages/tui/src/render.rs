@@ -3217,8 +3217,9 @@ fn activity_label(activity: &ActivityState, daemon_connection: DaemonConnectionS
     match activity {
         ActivityState::Idle => match daemon_connection {
             DaemonConnectionState::Connecting => format!("{} connecting…", spinner_frame()),
-            DaemonConnectionState::Unavailable => "daemon unavailable".to_owned(),
             DaemonConnectionState::Connected => "ready".to_owned(),
+            DaemonConnectionState::Reconnecting => format!("{} reconnecting…", spinner_frame()),
+            DaemonConnectionState::Unavailable => "daemon unavailable".to_owned(),
         },
         ActivityState::Thinking => format!("{} thinking", spinner_frame()),
         ActivityState::Compacting { detail } => {
