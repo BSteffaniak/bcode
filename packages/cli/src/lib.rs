@@ -682,9 +682,15 @@ enum AuthCommand {
 
 #[derive(Debug, Subcommand)]
 enum AuthPoolCommand {
+    List,
     Status {
         #[arg(default_value = "openai")]
         pool: String,
+    },
+    ResetCooldown {
+        #[arg(default_value = "openai")]
+        pool: String,
+        profile: Option<String>,
     },
 }
 
@@ -1211,7 +1217,11 @@ fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
     match command {
         AuthCommand::Status => auth_status(),
         AuthCommand::Pool { command } => match command {
+            AuthPoolCommand::List => auth_pool_list(),
             AuthPoolCommand::Status { pool } => auth_pool_status(&pool),
+            AuthPoolCommand::ResetCooldown { pool, profile } => {
+                auth_pool_reset_cooldown(&pool, profile.as_deref())
+            }
         },
         AuthCommand::Login {
             profile,
@@ -1219,6 +1229,63 @@ fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
             recipient_key,
         } => auth_login(profile, vault, recipient_key),
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+struct OpenAiAuthPoolStateFile {
+    #[serde(default)]
+    entries: BTreeMap<String, OpenAiAuthPoolProfileState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct OpenAiAuthPoolProfileState {
+    cooldown_until_unix: u64,
+    reason: String,
+    #[serde(default)]
+    last_error: Option<String>,
+}
+
+fn auth_pool_state_path() -> PathBuf {
+    bcode_config::default_state_dir()
+        .join("provider")
+        .join("openai-compatible-auth-pool-state.json")
+}
+
+fn load_openai_auth_pool_state() -> OpenAiAuthPoolStateFile {
+    let path = auth_pool_state_path();
+    let Ok(contents) = fs::read_to_string(path) else {
+        return OpenAiAuthPoolStateFile::default();
+    };
+    serde_json::from_str(&contents).unwrap_or_default()
+}
+
+fn save_openai_auth_pool_state(state: &OpenAiAuthPoolStateFile) -> Result<(), CliError> {
+    let path = auth_pool_state_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_string_pretty(state)?)?;
+    Ok(())
+}
+
+fn auth_pool_state_key(pool: &str, profile: &str) -> String {
+    format!("{pool}/{profile}")
+}
+
+fn auth_pool_list() -> Result<(), CliError> {
+    let config = bcode_config::load_config()?;
+    if config.auth.pools.is_empty() {
+        println!("No auth pools declared.");
+        return Ok(());
+    }
+    for (name, pool) in &config.auth.pools {
+        println!(
+            "{name}: {} profile(s), strategy {:?}",
+            pool.profiles.len(),
+            pool.strategy
+        );
+    }
+    Ok(())
 }
 
 fn auth_pool_status(pool_name: &str) -> Result<(), CliError> {
@@ -1236,16 +1303,71 @@ fn auth_pool_status(pool_name: &str) -> Result<(), CliError> {
         println!("Profiles: none");
         return Ok(());
     }
+    let state = load_openai_auth_pool_state();
+    let now = unix_now_secs();
     println!("Profiles:");
     for profile in &pool.profiles {
-        let status = if config.auth.profiles.contains_key(profile) {
+        let config_status = if config.auth.profiles.contains_key(profile) {
             "configured"
         } else {
             "missing"
         };
-        println!("  {profile}: {status}");
+        let key = auth_pool_state_key(pool_name, profile);
+        if let Some(entry) = state.entries.get(&key)
+            && entry.cooldown_until_unix > now
+        {
+            println!(
+                "  {profile}: {config_status}, cooldown {} remaining, reason: {}",
+                format_duration(entry.cooldown_until_unix.saturating_sub(now)),
+                entry.reason
+            );
+            continue;
+        }
+        println!("  {profile}: {config_status}, available");
     }
     Ok(())
+}
+
+fn auth_pool_reset_cooldown(pool_name: &str, profile: Option<&str>) -> Result<(), CliError> {
+    let mut state = load_openai_auth_pool_state();
+    let removed = if let Some(profile) = profile {
+        usize::from(
+            state
+                .entries
+                .remove(&auth_pool_state_key(pool_name, profile))
+                .is_some(),
+        )
+    } else {
+        let prefix = format!("{pool_name}/");
+        let before = state.entries.len();
+        state.entries.retain(|key, _| !key.starts_with(&prefix));
+        before.saturating_sub(state.entries.len())
+    };
+    save_openai_auth_pool_state(&state)?;
+    println!(
+        "Reset {removed} cooldown entr{} for auth pool '{pool_name}'.",
+        if removed == 1 { "y" } else { "ies" }
+    );
+    Ok(())
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn format_duration(seconds: u64) -> String {
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else {
+        format!("{minutes}m")
+    }
 }
 
 #[allow(clippy::too_many_lines)]

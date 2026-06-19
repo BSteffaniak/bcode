@@ -18,10 +18,18 @@ bcode login openai --add-subscription
 
 `--add-subscription` implies `ChatGPT` OAuth mode. API-key pools are not supported yet, so `--api-key` and `--base-url` are rejected with `--add-subscription`.
 
-Inspect the declared pool:
+Inspect the declared pool and any runtime cooldown state:
 
 ```sh
 bcode auth pool status openai
+```
+
+Reset cooldown state if you know an account is usable again:
+
+```sh
+bcode auth pool reset-cooldown openai openai
+# or reset all profiles in the pool
+bcode auth pool reset-cooldown openai
 ```
 
 ## Declarative config
