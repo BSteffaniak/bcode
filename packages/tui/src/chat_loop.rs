@@ -113,12 +113,36 @@ struct ModalState {
     slash_palette_load: AsyncSlashPaletteLoad,
     draft_save: AsyncDraftSave,
     cancel_turn: AsyncCancelTurn,
+    thinking_cycle: AsyncThinkingCycle,
     permission_dialog: Option<PermissionDialogState>,
     permission_poll: AsyncPermissionPoll,
     older_history_load: AsyncHistoryPageLoad,
     newer_history_load: AsyncHistoryPageLoad,
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
+}
+
+#[derive(Debug)]
+struct AsyncThinkingCycle {
+    task: Option<tokio::task::JoinHandle<Result<ThinkingCycleResult, ClientError>>>,
+    session_id: Option<SessionId>,
+}
+
+impl AsyncThinkingCycle {
+    const fn new() -> Self {
+        Self {
+            task: None,
+            session_id: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ThinkingCycleResult {
+    next_effort: Option<String>,
+    summary: Option<String>,
+    visible: bool,
+    status: Option<bcode_ipc::SessionModelStatus>,
 }
 
 #[derive(Debug)]
@@ -260,6 +284,7 @@ pub async fn run_with_client<W: Write>(
         slash_palette_load: AsyncSlashPaletteLoad::new(),
         draft_save: AsyncDraftSave::new(),
         cancel_turn: AsyncCancelTurn::new(),
+        thinking_cycle: AsyncThinkingCycle::new(),
         permission_dialog: None,
         permission_poll: AsyncPermissionPoll::new(Instant::now()),
         older_history_load: AsyncHistoryPageLoad::new(),
@@ -404,6 +429,9 @@ pub async fn run_with_client<W: Write>(
     if let Some(task) = modals.cancel_turn.task.take() {
         task.abort();
     }
+    if let Some(task) = modals.thinking_cycle.task.take() {
+        task.abort();
+    }
     Ok(())
 }
 
@@ -426,6 +454,7 @@ async fn handle_loop_housekeeping(
     needs_redraw |= poll_newer_history_load(chat, &mut modals.newer_history_load).await;
     needs_redraw |= poll_draft_save(client, chat, draft_autosave, &mut modals.draft_save).await;
     needs_redraw |= poll_cancel_turn(chat, &mut modals.cancel_turn).await;
+    needs_redraw |= poll_thinking_cycle(chat, &mut modals.thinking_cycle).await;
     needs_redraw |= maybe_start_older_history_load(client, chat, &mut modals.older_history_load);
     needs_redraw |= maybe_start_newer_history_load(client, chat, &mut modals.newer_history_load);
     needs_redraw |= poll_slash_palette_load(chat, modals).await;
@@ -544,6 +573,89 @@ async fn poll_newer_history_load(chat: &mut ActiveChat, load: &mut AsyncHistoryP
             chat.app
                 .set_status(format!("Newer history task failed: {error}"));
         }
+    }
+    true
+}
+
+fn start_thinking_cycle(
+    client: &BcodeClient,
+    chat: &mut ActiveChat,
+    thinking_cycle: &mut AsyncThinkingCycle,
+) {
+    if thinking_cycle.task.is_some() {
+        chat.app
+            .set_status("thinking effort change already in progress".to_owned());
+        return;
+    }
+    let session_id = chat.app.session_id();
+    let current_effort = chat.app.reasoning_effort().map(ToOwned::to_owned);
+    let current_summary = chat.app.reasoning_summary().map(ToOwned::to_owned);
+    let visible = chat.app.reasoning_visible();
+    chat.app.set_status("updating thinking effort…".to_owned());
+    let client = client.clone();
+    thinking_cycle.session_id = session_id;
+    thinking_cycle.task = Some(tokio::spawn(async move {
+        let status = if let Some(session_id) = session_id {
+            client.session_model_status(session_id).await?
+        } else {
+            client.default_model_status().await?
+        };
+        let Some(next_effort) =
+            thinking_flow::next_effort_for_status(&status, current_effort.as_deref())
+        else {
+            return Ok(ThinkingCycleResult {
+                next_effort: None,
+                summary: current_summary,
+                visible,
+                status: Some(status),
+            });
+        };
+        let summary = current_summary.or_else(|| status.reasoning_summary.clone());
+        if let Some(session_id) = session_id {
+            client
+                .set_session_reasoning(session_id, Some(next_effort.clone()), summary.clone())
+                .await?;
+        }
+        Ok(ThinkingCycleResult {
+            next_effort: Some(next_effort),
+            summary,
+            visible,
+            status: Some(status),
+        })
+    }));
+}
+
+async fn poll_thinking_cycle(
+    chat: &mut ActiveChat,
+    thinking_cycle: &mut AsyncThinkingCycle,
+) -> bool {
+    let Some(task) = thinking_cycle.task.take_if(|task| task.is_finished()) else {
+        return false;
+    };
+    let session_id = thinking_cycle.session_id.take();
+    match task.await {
+        Ok(Ok(result)) if session_id == chat.app.session_id() => {
+            if let Some(status) = result.status {
+                chat.app.apply_model_status(status);
+            }
+            if let Some(next_effort) = result.next_effort {
+                chat.app.apply_reasoning_selection(
+                    Some(next_effort.clone()),
+                    result.summary,
+                    result.visible,
+                );
+                chat.app
+                    .set_status(format!("thinking effort set to {next_effort}"));
+            } else {
+                chat.app
+                    .set_status("thinking effort unavailable for current model".to_owned());
+            }
+        }
+        Ok(Ok(_stale)) => {}
+        Ok(Err(error)) => report_nonfatal_client_error(chat, "thinking effort failed", &error),
+        Err(error) => chat
+            .app
+            .set_status(format!("Thinking effort task failed: {error}")),
     }
     true
 }
@@ -1139,11 +1251,7 @@ async fn handle_chat_key_request<W: Write>(
         }
         KeyRequest::CycleAgent => cycle_session_agent(chat),
         KeyRequest::CycleThinkingEffort => {
-            if let Err(error) =
-                thinking_flow::cycle_thinking_effort(context.services.client, chat).await
-            {
-                helpers::report_client_error(&mut chat.app, "thinking effort failed", &error);
-            }
+            start_thinking_cycle(context.services.client, chat, &mut modals.thinking_cycle);
         }
         KeyRequest::Submit { placement } => {
             let pre_submit_scope = draft_autosave.as_ref().map(|autosave| autosave.scope(chat));

@@ -44,7 +44,10 @@ pub async fn cycle_thinking_effort(
     Ok(())
 }
 
-fn next_effort_for_status(status: &SessionModelStatus, app_effort: Option<&str>) -> Option<String> {
+pub fn next_effort_for_status(
+    status: &SessionModelStatus,
+    app_effort: Option<&str>,
+) -> Option<String> {
     let reasoning = status.reasoning.as_ref()?;
     let current = app_effort
         .or(status.reasoning_effort.as_deref())
