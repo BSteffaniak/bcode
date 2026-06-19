@@ -305,10 +305,6 @@ pub async fn run_with_client<W: Write>(
                     needs_redraw = true;
                 }
             }
-            ChatLoopEvent::Async(event) => {
-                handle_async_event(chat, event);
-                needs_redraw = true;
-            }
             ChatLoopEvent::TimedInvalidations(keys) => {
                 if chat
                     .app
@@ -334,7 +330,6 @@ pub async fn run_with_client<W: Write>(
 enum ChatLoopEvent {
     Terminal(Event),
     Bcode(Box<BcodeEvent>),
-    Async(Box<session_flow::ChatAsyncEvent>),
     TimedInvalidations(Vec<super::invalidation::InvalidationKey>),
     Timer,
 }
@@ -420,6 +415,13 @@ fn apply_effect_result(
     result: TuiEffectResult,
 ) {
     match result {
+        TuiEffectResult::SessionOpened {
+            session_id,
+            has_older_history,
+            result,
+        } => {
+            session_flow::complete_switch_session(chat, session_id, has_older_history, result);
+        }
         TuiEffectResult::ConfigLoaded { config } => {
             apply_config_result(settings, chat, *config);
         }
@@ -924,10 +926,6 @@ async fn next_chat_loop_event(
                 || ChatLoopEvent::TimedInvalidations(Vec::new()),
                 |event| ChatLoopEvent::Bcode(Box::new(event)),
             )),
-            async_event = chat.async_event_receiver.recv() => Ok(async_event.map_or_else(
-                || ChatLoopEvent::TimedInvalidations(Vec::new()),
-                |event| ChatLoopEvent::Async(Box::new(event)),
-            )),
             event = terminal_events.recv() => event.map(|event| {
                 event.map_or_else(
                     || ChatLoopEvent::TimedInvalidations(Vec::new()),
@@ -951,25 +949,12 @@ async fn next_chat_loop_event(
             || ChatLoopEvent::TimedInvalidations(Vec::new()),
             |event| ChatLoopEvent::Bcode(Box::new(event)),
         )),
-        async_event = chat.async_event_receiver.recv() => Ok(async_event.map_or_else(
-            || ChatLoopEvent::TimedInvalidations(Vec::new()),
-            |event| ChatLoopEvent::Async(Box::new(event)),
-        )),
         event = terminal_events.recv() => event.map(|event| {
             event.map_or_else(
                 || ChatLoopEvent::TimedInvalidations(Vec::new()),
                 ChatLoopEvent::Terminal,
             )
         }),
-    }
-}
-
-fn handle_async_event(chat: &mut ActiveChat, event: Box<session_flow::ChatAsyncEvent>) {
-    match *event {
-        session_flow::ChatAsyncEvent::SessionOpened(opened) => {
-            chat.session_open_task = None;
-            session_flow::complete_switch_session(chat, opened);
-        }
     }
 }
 

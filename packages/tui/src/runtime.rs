@@ -30,7 +30,6 @@ pub async fn run_event_loop_with_startup<W: Write>(
     let client = BcodeClient::default_endpoint();
     let mut terminal_events = TuiInput::start();
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
-    let (async_event_sender, async_event_receiver) = mpsc::unbounded_channel();
     let mut app = BmuxApp::new_with_history(session_id, &[], &[], false);
     let agents = session_flow::AgentCatalog::default();
     agents.refresh_app_agent_metadata(&mut app);
@@ -43,10 +42,6 @@ pub async fn run_event_loop_with_startup<W: Write>(
         event_sender,
         event_receiver,
         event_task: None,
-        async_event_sender,
-        async_event_receiver,
-        session_open_task: None,
-        status_hydration_task: None,
         opening_session_id: None,
         startup_effects: Vec::new(),
     };
@@ -56,7 +51,7 @@ pub async fn run_event_loop_with_startup<W: Write>(
         let initial_window_request = session_flow::initial_transcript_window_request(
             super::render::transcript_area_for_frame(&chat.app, terminal.area()),
         );
-        session_flow::start_switch_session(&client, &mut chat, session_id, initial_window_request);
+        session_flow::start_switch_session(&mut chat, session_id, initial_window_request);
     } else {
         chat.app.set_status("New draft".to_owned());
     }
@@ -73,12 +68,6 @@ pub async fn run_event_loop_with_startup<W: Write>(
     };
     if let Some(event_task) = chat.event_task.take() {
         event_task.abort();
-    }
-    if let Some(open_task) = chat.session_open_task.take() {
-        open_task.abort();
-    }
-    if let Some(hydration_task) = chat.status_hydration_task.take() {
-        hydration_task.abort();
     }
     result
 }

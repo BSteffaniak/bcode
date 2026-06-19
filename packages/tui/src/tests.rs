@@ -1207,7 +1207,6 @@ fn draft_agent_selection_updates_header() {
 #[test]
 fn new_draft_preserves_selected_agent() {
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let (async_sender, async_receiver) = tokio::sync::mpsc::unbounded_channel();
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(None, &[], &[], false),
         agents: super::session_flow::AgentCatalog::default(),
@@ -1215,10 +1214,6 @@ fn new_draft_preserves_selected_agent() {
         event_sender: sender,
         event_receiver: receiver,
         event_task: None,
-        async_event_sender: async_sender,
-        async_event_receiver: async_receiver,
-        session_open_task: None,
-        status_hydration_task: None,
         opening_session_id: None,
         startup_effects: Vec::new(),
     };
@@ -1232,7 +1227,6 @@ fn new_draft_preserves_selected_agent() {
 #[tokio::test]
 async fn async_session_open_preserves_typed_draft() {
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let (async_sender, async_receiver) = tokio::sync::mpsc::unbounded_channel();
     let session_id = SessionId::new();
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(Some(session_id), &[], &[], false),
@@ -1241,10 +1235,6 @@ async fn async_session_open_preserves_typed_draft() {
         event_sender: sender,
         event_receiver: receiver,
         event_task: None,
-        async_event_sender: async_sender,
-        async_event_receiver: async_receiver,
-        session_open_task: None,
-        status_hydration_task: None,
         opening_session_id: Some(session_id),
         startup_effects: Vec::new(),
     };
@@ -1270,16 +1260,14 @@ async fn async_session_open_preserves_typed_draft() {
 
     super::session_flow::complete_switch_session(
         &mut chat,
-        super::session_flow::SessionOpenResult {
-            session_id,
-            has_older_history: true,
-            result: Ok((
-                attached,
-                tokio::spawn(async move {
-                    drop(event_receiver);
-                }),
-            )),
-        },
+        session_id,
+        true,
+        Ok((
+            attached,
+            tokio::spawn(async move {
+                drop(event_receiver);
+            }),
+        )),
     );
 
     assert_eq!(chat.app.composer().text(), "draft while opening");
@@ -1288,7 +1276,6 @@ async fn async_session_open_preserves_typed_draft() {
 #[tokio::test]
 async fn async_session_open_initial_state_preserves_existing_draft() {
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let (async_sender, async_receiver) = tokio::sync::mpsc::unbounded_channel();
     let session_id = SessionId::new();
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(None, &[], &[], false),
@@ -1297,24 +1284,16 @@ async fn async_session_open_initial_state_preserves_existing_draft() {
         event_sender: sender,
         event_receiver: receiver,
         event_task: None,
-        async_event_sender: async_sender,
-        async_event_receiver: async_receiver,
-        session_open_task: None,
-        status_hydration_task: None,
         opening_session_id: None,
         startup_effects: Vec::new(),
     };
     chat.app.replace_composer_with("draft before opening");
 
     super::session_flow::start_switch_session(
-        &bcode_client::BcodeClient::default_endpoint(),
         &mut chat,
         session_id,
         super::session_flow::initial_transcript_window_request(Rect::new(0, 0, 80, 24)),
     );
-    if let Some(open_task) = chat.session_open_task.take() {
-        open_task.abort();
-    }
 
     assert_eq!(chat.app.composer().text(), "draft before opening");
 }

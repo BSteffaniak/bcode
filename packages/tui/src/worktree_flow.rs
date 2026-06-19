@@ -188,7 +188,7 @@ fn handle_dialog_mouse(
 
 fn handle_created_worktree<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
-    services: &TuiServices<'_>,
+    _services: &TuiServices<'_>,
     chat: &mut ActiveChat,
     response: bcode_worktree_models::WorktreeCreateResponse,
     target: worktree_create_dialog::WorktreeCreateTarget,
@@ -216,7 +216,7 @@ fn handle_created_worktree<W: Write>(
                 "Created worktree with new session\n* Path: {}\n* Session: {session_id}",
                 path.display()
             ));
-            session_flow::switch_session(io.terminal, services.client, chat, session_id)?;
+            session_flow::switch_session(io.terminal, chat, session_id)?;
             chat.app
                 .set_status("created worktree and switched session".to_owned());
         }

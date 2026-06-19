@@ -5,17 +5,30 @@ use std::collections::BTreeMap;
 use bcode_client::{BcodeClient, ClientError};
 use bcode_ipc::{ComposerDraftScope, PermissionSummary};
 use bcode_session_models::{
-    SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery,
-    SessionId,
+    ProjectionWindowRequest, SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage,
+    SessionHistoryQuery, SessionId,
 };
 
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
 use super::{
+    TuiError, history_flow,
     session_flow::{self, AgentCatalog},
     slash_palette, thinking_flow,
 };
 
 /// Background work requested by local TUI event handling.
 pub enum TuiEffect {
+    /// Attach to a session and start its event stream.
+    OpenSession {
+        /// Session to open.
+        session_id: SessionId,
+        /// Initial projection window request.
+        initial_window_request: ProjectionWindowRequest,
+        /// Event sender for the live session stream.
+        event_sender: mpsc::UnboundedSender<bcode_ipc::Event>,
+    },
     /// Load user configuration.
     LoadConfig,
     /// Reconcile auth security status for a loaded config.
@@ -82,6 +95,15 @@ pub enum TuiEffect {
 
 /// Completed TUI background work.
 pub enum TuiEffectResult {
+    /// Session open completed.
+    SessionOpened {
+        /// Session that was opened.
+        session_id: SessionId,
+        /// Whether older history exists before the attached window.
+        has_older_history: bool,
+        /// Attach result and event-stream task.
+        result: Result<(bcode_client::AttachedSessionHistory, JoinHandle<()>), TuiError>,
+    },
     /// User configuration load completed.
     ConfigLoaded {
         /// Config load result.
@@ -183,6 +205,7 @@ pub struct ThinkingCycleResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum EffectKey {
+    SessionOpen,
     Config,
     AuthSecurity,
     DraftStatus,
@@ -294,6 +317,7 @@ impl TuiEffectRunner {
 impl TuiEffect {
     const fn key(&self) -> EffectKey {
         match self {
+            Self::OpenSession { .. } => EffectKey::SessionOpen,
             Self::LoadConfig => EffectKey::Config,
             Self::ReconcileAuthSecurity { .. } => EffectKey::AuthSecurity,
             Self::LoadDraftStatus { .. } => EffectKey::DraftStatus,
@@ -313,6 +337,21 @@ impl TuiEffect {
 
     async fn run(self, client: BcodeClient) -> TuiEffectResult {
         match self {
+            Self::OpenSession {
+                session_id,
+                initial_window_request,
+                event_sender,
+            } => TuiEffectResult::SessionOpened {
+                session_id,
+                has_older_history: true,
+                result: history_flow::attach_session_event_stream_with_window_request(
+                    &client,
+                    session_id,
+                    event_sender,
+                    initial_window_request,
+                )
+                .await,
+            },
             Self::LoadConfig => TuiEffectResult::ConfigLoaded {
                 config: Box::new(bcode_config::load_config().map_err(|error| error.to_string())),
             },

@@ -164,12 +164,7 @@ async fn handle_slash_command<W: Write>(
             chat.app.clear_pending_submission(message);
             match session_flow::pick_session(io, services).await? {
                 session_flow::PickSessionOutcome::Existing(next_session_id) => {
-                    session_flow::switch_session(
-                        io.terminal,
-                        services.client,
-                        chat,
-                        next_session_id,
-                    )?;
+                    session_flow::switch_session(io.terminal, chat, next_session_id)?;
                 }
                 session_flow::PickSessionOutcome::Draft => {
                     session_flow::switch_to_draft_session(chat);
@@ -204,7 +199,7 @@ async fn handle_slash_command<W: Write>(
         }
         slash_commands::SlashCommandOutcome::SessionCloned { session_id } => {
             chat.app.clear_pending_submission(message);
-            session_flow::switch_session(io.terminal, services.client, chat, session_id)?;
+            session_flow::switch_session(io.terminal, chat, session_id)?;
             chat.app
                 .set_status("cloned session and switched".to_owned());
         }

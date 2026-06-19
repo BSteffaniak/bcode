@@ -32,10 +32,6 @@ pub struct ActiveChat {
     pub event_sender: mpsc::UnboundedSender<BcodeEvent>,
     pub event_receiver: mpsc::UnboundedReceiver<BcodeEvent>,
     pub event_task: Option<JoinHandle<()>>,
-    pub async_event_sender: mpsc::UnboundedSender<ChatAsyncEvent>,
-    pub async_event_receiver: mpsc::UnboundedReceiver<ChatAsyncEvent>,
-    pub session_open_task: Option<JoinHandle<()>>,
-    pub status_hydration_task: Option<JoinHandle<()>>,
     pub opening_session_id: Option<SessionId>,
     pub startup_effects: Vec<super::effects::TuiEffect>,
 }
@@ -117,18 +113,6 @@ pub fn next_agent<'a>(agents: &'a [AgentInfo], current_agent_id: &str) -> Option
         .or_else(|| agents.first())
 }
 
-/// Async TUI work completion event.
-pub enum ChatAsyncEvent {
-    SessionOpened(SessionOpenResult),
-}
-
-/// Result from asynchronously opening a session.
-pub struct SessionOpenResult {
-    pub session_id: SessionId,
-    pub has_older_history: bool,
-    pub result: Result<(AttachedSessionHistory, JoinHandle<()>), TuiError>,
-}
-
 /// Compute the semantic initial transcript-window request from the visible transcript area.
 #[must_use]
 pub fn initial_transcript_window_request(
@@ -139,17 +123,10 @@ pub fn initial_transcript_window_request(
 
 /// Start asynchronously opening a session without blocking the chat input loop.
 pub fn start_switch_session(
-    client: &BcodeClient,
     chat: &mut ActiveChat,
     next_session_id: SessionId,
     initial_window_request: bcode_session_models::ProjectionWindowRequest,
 ) {
-    if let Some(open_task) = chat.session_open_task.take() {
-        open_task.abort();
-    }
-    if let Some(hydration_task) = chat.status_hydration_task.take() {
-        hydration_task.abort();
-    }
     if let Some(event_task) = chat.event_task.take() {
         event_task.abort();
     }
@@ -172,46 +149,38 @@ pub fn start_switch_session(
         chat.app.replace_composer_with(&draft_text);
     }
     chat.app.set_status("Opening session…".to_owned());
-    let client = client.clone();
-    let event_sender = chat.event_sender.clone();
-    let async_event_sender = chat.async_event_sender.clone();
-    chat.session_open_task = Some(tokio::spawn(async move {
-        let result = history_flow::attach_session_event_stream_with_window_request(
-            &client,
-            next_session_id,
-            event_sender,
-            initial_window_request,
-        )
-        .await;
-        let _ = async_event_sender.send(ChatAsyncEvent::SessionOpened(SessionOpenResult {
-            session_id: next_session_id,
-            has_older_history: true,
-            result,
-        }));
-    }));
+    chat.start_effect(super::effects::TuiEffect::OpenSession {
+        session_id: next_session_id,
+        initial_window_request,
+        event_sender: chat.event_sender.clone(),
+    });
 }
 
 /// Apply a completed asynchronous session-open result.
-pub fn complete_switch_session(chat: &mut ActiveChat, opened: SessionOpenResult) {
-    if chat.opening_session_id != Some(opened.session_id) {
-        if let Ok((_, event_task)) = opened.result {
+pub fn complete_switch_session(
+    chat: &mut ActiveChat,
+    session_id: SessionId,
+    has_older_history: bool,
+    result: Result<(AttachedSessionHistory, JoinHandle<()>), TuiError>,
+) {
+    if chat.opening_session_id != Some(session_id) {
+        if let Ok((_, event_task)) = result {
             event_task.abort();
         }
         return;
     }
     chat.opening_session_id = None;
-    match opened.result {
+    match result {
         Ok((attached, next_task)) => {
             let draft_text = chat.app.composer().text().to_owned();
             chat.event_task = Some(next_task);
-            chat.session_id = Some(opened.session_id);
+            chat.session_id = Some(session_id);
             let tui_config = chat.app.tui_config().clone();
             let agent_metadata_hydrated = chat.app.is_agent_metadata_hydrated();
-            let has_older_history = opened.has_older_history;
             let previous_app = std::mem::replace(
                 &mut chat.app,
                 BmuxApp::new_with_history(
-                    Some(opened.session_id),
+                    Some(session_id),
                     &attached.history,
                     &attached.input_history,
                     has_older_history,
@@ -229,9 +198,7 @@ pub fn complete_switch_session(chat: &mut ActiveChat, opened: SessionOpenResult)
             }
             chat.app.apply_session_summary(&attached.session);
             chat.app.set_status("session opened".to_owned());
-            chat.start_effect(super::effects::TuiEffect::LoadSessionStatus {
-                session_id: opened.session_id,
-            });
+            chat.start_effect(super::effects::TuiEffect::LoadSessionStatus { session_id });
         }
         Err(error) => {
             chat.app.set_status(format!("session open failed: {error}"));
@@ -313,14 +280,12 @@ pub async fn hydrate_status(client: &BcodeClient, app: &mut BmuxApp) {
 /// Switch the active chat to another session.
 pub fn switch_session<W: Write>(
     terminal: &mut Terminal<&mut W>,
-    client: &BcodeClient,
     chat: &mut ActiveChat,
     next_session_id: SessionId,
 ) -> Result<(), TuiError> {
     chat.app.set_status("Opening session…".to_owned());
     terminal.draw(|frame| super::render::render(&mut chat.app, frame))?;
     start_switch_session(
-        client,
         chat,
         next_session_id,
         initial_transcript_window_request(super::render::transcript_area_for_frame(
@@ -335,12 +300,6 @@ pub fn switch_session<W: Write>(
 pub fn switch_to_draft_session(chat: &mut ActiveChat) {
     if let Some(event_task) = chat.event_task.take() {
         event_task.abort();
-    }
-    if let Some(open_task) = chat.session_open_task.take() {
-        open_task.abort();
-    }
-    if let Some(hydration_task) = chat.status_hydration_task.take() {
-        hydration_task.abort();
     }
     while chat.event_receiver.try_recv().is_ok() {}
     chat.opening_session_id = None;

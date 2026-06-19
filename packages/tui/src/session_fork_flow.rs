@@ -65,7 +65,7 @@ pub async fn fork_current_session<W: Write>(
     let draft = result.draft.or(Some(prompt.text));
     if submission.switch_after_create {
         let new_session_id = result.session.id;
-        session_flow::switch_session(io.terminal, services.client, chat, new_session_id)?;
+        session_flow::switch_session(io.terminal, chat, new_session_id)?;
         if submission.install_draft {
             if let Some(draft) = draft.as_deref() {
                 chat.app.replace_composer_with(draft);
@@ -315,7 +315,7 @@ pub async fn clone_current_session<W: Write>(
     };
     if submission.switch_after_create {
         let new_session_id = result.session.id;
-        session_flow::switch_session(io.terminal, services.client, chat, new_session_id)?;
+        session_flow::switch_session(io.terminal, chat, new_session_id)?;
         chat.app
             .set_status("cloned session and switched".to_owned());
     } else {

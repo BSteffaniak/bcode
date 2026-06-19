@@ -129,12 +129,7 @@ async fn execute_session_command<W: Write>(
         }
         PaletteCommand::SwitchSession => match session_flow::pick_session(io, services).await? {
             session_flow::PickSessionOutcome::Existing(selected_session_id) => {
-                session_flow::switch_session(
-                    io.terminal,
-                    services.client,
-                    chat,
-                    selected_session_id,
-                )?;
+                session_flow::switch_session(io.terminal, chat, selected_session_id)?;
             }
             session_flow::PickSessionOutcome::Draft => {
                 session_flow::switch_to_draft_session(chat);
