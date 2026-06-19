@@ -8,7 +8,7 @@ use bmux_tui::terminal::Terminal;
 use tokio::sync::mpsc;
 
 use super::app::BmuxApp;
-use super::effects::TuiEffect;
+use super::effects::{TuiEffect, TuiEffectQueue};
 use super::startup_action::StartupTuiAction;
 use super::terminal_events::TuiInput;
 use super::{TuiError, chat_loop, session_flow};
@@ -43,7 +43,7 @@ pub async fn run_event_loop_with_startup<W: Write>(
         event_receiver,
         event_task: None,
         opening_session_id: None,
-        pending_effects: Vec::new(),
+        pending_effects: TuiEffectQueue::default(),
     };
     chat.start_effect(TuiEffect::LoadConfig);
     chat.start_effect(TuiEffect::LoadAgentCatalog);

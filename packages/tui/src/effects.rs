@@ -220,6 +220,24 @@ enum EffectKey {
     CycleThinkingEffort(Option<SessionId>),
 }
 
+/// Queue of effects requested before the chat loop runner can start them.
+#[derive(Default)]
+pub struct TuiEffectQueue {
+    effects: Vec<TuiEffect>,
+}
+
+impl TuiEffectQueue {
+    /// Queue an effect for the chat loop effect runner.
+    pub fn push(&mut self, effect: TuiEffect) {
+        self.effects.push(effect);
+    }
+
+    /// Drain queued effects.
+    fn drain(&mut self) -> std::vec::Drain<'_, TuiEffect> {
+        self.effects.drain(..)
+    }
+}
+
 /// Owns and polls daemon-backed TUI background work.
 pub struct TuiEffectRunner {
     client: BcodeClient,
@@ -308,9 +326,9 @@ impl TuiEffectRunner {
     /// Start all pending effects produced before or during the loop iteration.
     ///
     /// Returns true when at least one pending effect was started.
-    pub fn drain_pending(&mut self, pending_effects: &mut Vec<TuiEffect>) -> bool {
+    pub fn drain_pending(&mut self, pending_effects: &mut TuiEffectQueue) -> bool {
         let mut started = false;
-        for effect in pending_effects.drain(..) {
+        for effect in pending_effects.drain() {
             self.replace(effect);
             started = true;
         }

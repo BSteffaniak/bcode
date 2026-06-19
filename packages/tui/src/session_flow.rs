@@ -33,7 +33,7 @@ pub struct ActiveChat {
     pub event_receiver: mpsc::UnboundedReceiver<BcodeEvent>,
     pub event_task: Option<JoinHandle<()>>,
     pub opening_session_id: Option<SessionId>,
-    pub pending_effects: Vec<super::effects::TuiEffect>,
+    pub pending_effects: super::effects::TuiEffectQueue,
 }
 
 impl ActiveChat {
