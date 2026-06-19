@@ -6,6 +6,7 @@ use bcode_client::BcodeClient;
 use bcode_session_models::SessionId;
 
 use super::activity::ActivityState;
+use super::effects::TuiEffect;
 use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::ActiveChat;
 use super::{
@@ -147,11 +148,9 @@ async fn handle_slash_command<W: Write>(
         slash_commands::SlashCommandOutcome::NewDraftSession => {
             chat.app.clear_pending_submission(message);
             session_flow::switch_to_draft_session(chat);
-            session_flow::start_draft_status_hydration(
-                services.client,
-                chat,
-                std::env::current_dir()?,
-            );
+            chat.start_effect(TuiEffect::LoadDraftStatus {
+                launch_working_directory: std::env::current_dir()?,
+            });
         }
         slash_commands::SlashCommandOutcome::DraftAgentSelected {
             agent_id,
@@ -174,11 +173,9 @@ async fn handle_slash_command<W: Write>(
                 }
                 session_flow::PickSessionOutcome::Draft => {
                     session_flow::switch_to_draft_session(chat);
-                    session_flow::start_draft_status_hydration(
-                        services.client,
-                        chat,
-                        std::env::current_dir()?,
-                    );
+                    chat.start_effect(TuiEffect::LoadDraftStatus {
+                        launch_working_directory: std::env::current_dir()?,
+                    });
                 }
             }
         }

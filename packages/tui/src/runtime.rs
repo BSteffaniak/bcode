@@ -50,7 +50,7 @@ pub async fn run_event_loop_with_startup<W: Write>(
         opening_session_id: None,
         startup_effects: Vec::new(),
     };
-    session_flow::start_config_hydration(&chat);
+    chat.start_effect(TuiEffect::LoadConfig);
     chat.start_effect(TuiEffect::LoadAgentCatalog);
     if let Some(session_id) = session_id {
         let initial_window_request = session_flow::initial_transcript_window_request(

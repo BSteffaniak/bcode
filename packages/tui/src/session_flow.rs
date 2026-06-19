@@ -5,20 +5,16 @@ use std::io::Write;
 
 use bcode_agent_profile::AgentInfo;
 use bcode_client::{AttachedSessionHistory, BcodeClient, SessionCatalogWatcher, SessionList};
-use bcode_ipc::{
-    Event as BcodeEvent, RuntimeWorkSnapshot, SessionCatalogSourceStatus, SessionCatalogStatus,
-};
+use bcode_ipc::{Event as BcodeEvent, SessionCatalogSourceStatus, SessionCatalogStatus};
 use bcode_session_models::SessionId;
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
-use std::future::Future;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::app::BmuxApp;
-use super::chat_loop::TuiRuntimeSettings;
 use super::daemon_issue;
 use super::helpers;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
@@ -124,27 +120,6 @@ pub fn next_agent<'a>(agents: &'a [AgentInfo], current_agent_id: &str) -> Option
 /// Async TUI work completion event.
 pub enum ChatAsyncEvent {
     SessionOpened(SessionOpenResult),
-    StatusHydrated(StatusHydrationResult),
-    DraftStatusHydrated(DraftStatusHydrationResult),
-    ConfigHydrated(Box<ConfigHydrationResult>),
-    AuthSecurityHydrated(AuthSecurityHydrationResult),
-}
-
-/// Result from asynchronously loading user configuration.
-pub struct ConfigHydrationResult {
-    pub config: Result<bcode_config::BcodeConfig, String>,
-}
-
-/// Result from asynchronously reconciling auth security status.
-pub struct AuthSecurityHydrationResult {
-    pub status: Option<String>,
-}
-
-/// Result from asynchronously hydrating draft-session status.
-pub struct DraftStatusHydrationResult {
-    pub model: Option<bcode_ipc::SessionModelStatus>,
-    pub composer_draft: Option<String>,
-    pub error: Option<String>,
 }
 
 /// Result from asynchronously opening a session.
@@ -152,24 +127,6 @@ pub struct SessionOpenResult {
     pub session_id: SessionId,
     pub has_older_history: bool,
     pub result: Result<(AttachedSessionHistory, JoinHandle<()>), TuiError>,
-}
-
-/// Result from asynchronously hydrating non-critical session status.
-pub struct StatusHydrationResult {
-    pub session_id: SessionId,
-    pub model: Option<bcode_ipc::SessionModelStatus>,
-    pub active_skill_count: Option<usize>,
-    pub runtime_work: Option<Vec<RuntimeWorkSnapshot>>,
-    pub error: Option<String>,
-}
-
-async fn optional_tui_client_result<T>(
-    future: impl Future<Output = Result<T, bcode_client::ClientError>>,
-) -> (Option<T>, Option<String>) {
-    match future.await {
-        Ok(value) => (Some(value), None),
-        Err(error) => (None, Some(error.to_string())),
-    }
 }
 
 /// Compute the semantic initial transcript-window request from the visible transcript area.
@@ -235,11 +192,7 @@ pub fn start_switch_session(
 }
 
 /// Apply a completed asynchronous session-open result.
-pub fn complete_switch_session(
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-    opened: SessionOpenResult,
-) {
+pub fn complete_switch_session(chat: &mut ActiveChat, opened: SessionOpenResult) {
     if chat.opening_session_id != Some(opened.session_id) {
         if let Ok((_, event_task)) = opened.result {
             event_task.abort();
@@ -276,7 +229,9 @@ pub fn complete_switch_session(
             }
             chat.app.apply_session_summary(&attached.session);
             chat.app.set_status("session opened".to_owned());
-            start_status_hydration(client, chat, opened.session_id);
+            chat.start_effect(super::effects::TuiEffect::LoadSessionStatus {
+                session_id: opened.session_id,
+            });
         }
         Err(error) => {
             chat.app.set_status(format!("session open failed: {error}"));
@@ -286,65 +241,7 @@ pub fn complete_switch_session(
     }
 }
 
-/// Start loading user configuration in the background.
-pub fn start_config_hydration(chat: &ActiveChat) {
-    let async_event_sender = chat.async_event_sender.clone();
-    tokio::spawn(async move {
-        let config = bcode_config::load_config().map_err(|error| error.to_string());
-        let _ = async_event_sender.send(ChatAsyncEvent::ConfigHydrated(Box::new(
-            ConfigHydrationResult { config },
-        )));
-    });
-}
-
-/// Apply completed user configuration hydration.
-pub fn complete_config_hydration(
-    client: &BcodeClient,
-    settings: &mut TuiRuntimeSettings,
-    chat: &mut ActiveChat,
-    hydrated: ConfigHydrationResult,
-) {
-    match hydrated.config {
-        Ok(config) => {
-            settings.apply_tui_config(&config.tui);
-            chat.app.apply_tui_config(config.tui.clone());
-            start_auth_security_hydration(chat, config);
-            if chat.session_id.is_none() && chat.opening_session_id.is_none() {
-                start_draft_status_hydration(
-                    client,
-                    chat,
-                    settings.launch_working_directory().to_path_buf(),
-                );
-            }
-        }
-        Err(error) => {
-            chat.app.set_status(format!("Config unavailable: {error}"));
-        }
-    }
-}
-
-/// Start non-critical auth security reconciliation in the background.
-pub fn start_auth_security_hydration(chat: &ActiveChat, config: bcode_config::BcodeConfig) {
-    let async_event_sender = chat.async_event_sender.clone();
-    tokio::spawn(async move {
-        let status = auth_security_status(&config);
-        let _ = async_event_sender.send(ChatAsyncEvent::AuthSecurityHydrated(
-            AuthSecurityHydrationResult { status },
-        ));
-    });
-}
-
-/// Apply completed auth security status hydration.
-pub fn complete_auth_security_hydration(
-    chat: &mut ActiveChat,
-    hydrated: AuthSecurityHydrationResult,
-) {
-    if let Some(status) = hydrated.status {
-        chat.app.set_status(status);
-    }
-}
-
-fn auth_security_status(config: &bcode_config::BcodeConfig) -> Option<String> {
+pub fn auth_security_status(config: &bcode_config::BcodeConfig) -> Option<String> {
     let selection = config.resolved_model_selection();
     let auth_profile_name = std::env::var(bcode_config::BCODE_AUTH_PROFILE_ENV)
         .ok()
@@ -386,112 +283,6 @@ fn auth_security_status(config: &bcode_config::BcodeConfig) -> Option<String> {
             })
         })
         .map(|diagnostic| format!("⚠ {} Run `bcode auth status`.", diagnostic.message))
-}
-
-/// Start non-critical draft-session status hydration in the background.
-pub fn start_draft_status_hydration(
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-    launch_working_directory: std::path::PathBuf,
-) {
-    if let Some(hydration_task) = chat.status_hydration_task.take() {
-        hydration_task.abort();
-    }
-    let client = client.clone();
-    let async_event_sender = chat.async_event_sender.clone();
-    chat.status_hydration_task = Some(tokio::spawn(async move {
-        let (model, model_error) = optional_tui_client_result(client.default_model_status()).await;
-        let draft_scope = bcode_ipc::ComposerDraftScope::DraftSession {
-            launch_working_directory,
-        };
-        let (composer_draft, draft_error) =
-            optional_tui_client_result(client.composer_draft(draft_scope)).await;
-        let error = model_error.or(draft_error);
-        let _ = async_event_sender.send(ChatAsyncEvent::DraftStatusHydrated(
-            DraftStatusHydrationResult {
-                model,
-                composer_draft: composer_draft.flatten(),
-                error,
-            },
-        ));
-    }));
-}
-
-/// Start non-critical session status hydration in the background.
-pub fn start_status_hydration(client: &BcodeClient, chat: &mut ActiveChat, session_id: SessionId) {
-    if let Some(hydration_task) = chat.status_hydration_task.take() {
-        hydration_task.abort();
-    }
-    let client = client.clone();
-    let async_event_sender = chat.async_event_sender.clone();
-    chat.status_hydration_task = Some(tokio::spawn(async move {
-        let (model, model_error) =
-            optional_tui_client_result(client.session_model_status(session_id)).await;
-        let ((active_skills, skills_error), (runtime_work, runtime_work_error)) = tokio::join!(
-            optional_tui_client_result(client.active_skills(session_id)),
-            optional_tui_client_result(client.list_runtime_work(session_id)),
-        );
-        let error = model_error.or(skills_error).or(runtime_work_error);
-        let _ = async_event_sender.send(ChatAsyncEvent::StatusHydrated(StatusHydrationResult {
-            session_id,
-            model,
-            active_skill_count: active_skills.map(|skills| skills.len()),
-            runtime_work,
-            error,
-        }));
-    }));
-}
-
-/// Apply completed non-critical draft status hydration.
-pub fn complete_draft_status_hydration(
-    chat: &mut ActiveChat,
-    hydrated: DraftStatusHydrationResult,
-) {
-    if chat.session_id.is_some() || chat.opening_session_id.is_some() {
-        return;
-    }
-    if let Some(draft) = hydrated.composer_draft
-        && chat.app.composer().is_empty()
-    {
-        chat.app.replace_composer_with(&draft);
-        chat.app.set_status("Draft restored".to_owned());
-    }
-    if let Some(error) = hydrated.error {
-        chat.app
-            .set_status(format!("Draft status unavailable: {error}"));
-    }
-    if let Some(model) = hydrated.model {
-        chat.app.apply_model_status(model);
-    }
-}
-
-/// Apply completed non-critical session status hydration.
-pub fn complete_status_hydration(chat: &mut ActiveChat, hydrated: StatusHydrationResult) {
-    if chat.session_id != Some(hydrated.session_id) {
-        return;
-    }
-    let model_text = hydrated.model.as_ref().map_or_else(
-        || "model unknown".to_owned(),
-        |status| {
-            let provider = status.provider_plugin_id.as_deref().unwrap_or("auto");
-            let model = status.model_id.as_deref().unwrap_or("default");
-            format!("{provider}/{model}")
-        },
-    );
-    if let Some(model) = hydrated.model {
-        chat.app.apply_model_status(model);
-    }
-    if let Some(work) = hydrated.runtime_work {
-        chat.app.apply_runtime_work_snapshots(&work);
-    }
-    let skill_count = hydrated.active_skill_count.unwrap_or(0);
-    if let Some(error) = hydrated.error {
-        chat.app
-            .set_status(format!("Session status unavailable: {error}"));
-        return;
-    }
-    chat.app
-        .set_status(format!("model: {model_text}; active skills: {skill_count}"));
 }
 
 /// Hydrate model and skill status for the active session.

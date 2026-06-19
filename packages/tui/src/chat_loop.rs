@@ -216,7 +216,7 @@ pub async fn run_with_client<W: Write>(
             needs_redraw = true;
         }
 
-        if handle_loop_housekeeping(chat, &mut draft_autosave, &mut modals).await {
+        if handle_loop_housekeeping(settings, chat, &mut draft_autosave, &mut modals).await {
             needs_redraw = true;
         }
 
@@ -306,7 +306,7 @@ pub async fn run_with_client<W: Write>(
                 }
             }
             ChatLoopEvent::Async(event) => {
-                handle_async_event(client, settings, chat, event);
+                handle_async_event(chat, event);
                 needs_redraw = true;
             }
             ChatLoopEvent::TimedInvalidations(keys) => {
@@ -340,12 +340,14 @@ enum ChatLoopEvent {
 }
 
 async fn handle_loop_housekeeping(
+    settings: &mut TuiRuntimeSettings,
     chat: &mut ActiveChat,
     draft_autosave: &mut DraftAutosave,
     modals: &mut ModalState,
 ) -> bool {
     let mut needs_redraw = false;
-    needs_redraw |= poll_finished_effects(chat, draft_autosave, modals).await;
+    needs_redraw |= poll_finished_effects(settings, chat, draft_autosave, modals).await;
+    drain_queued_chat_effects(chat, modals);
     needs_redraw |= maybe_start_older_history_load(chat, modals);
     needs_redraw |= maybe_start_newer_history_load(chat, modals);
     maybe_start_permission_poll(chat, modals);
@@ -390,7 +392,14 @@ fn maybe_start_newer_history_load(chat: &mut ActiveChat, modals: &mut ModalState
     started
 }
 
+fn drain_queued_chat_effects(chat: &mut ActiveChat, modals: &mut ModalState) {
+    for effect in chat.startup_effects.drain(..) {
+        modals.effects.replace(effect);
+    }
+}
+
 async fn poll_finished_effects(
+    settings: &mut TuiRuntimeSettings,
     chat: &mut ActiveChat,
     draft_autosave: &mut DraftAutosave,
     modals: &mut ModalState,
@@ -398,18 +407,48 @@ async fn poll_finished_effects(
     let results = modals.effects.poll_finished().await;
     let needs_redraw = !results.is_empty();
     for result in results {
-        apply_effect_result(chat, draft_autosave, modals, result);
+        apply_effect_result(settings, chat, draft_autosave, modals, result);
     }
     needs_redraw
 }
 
 fn apply_effect_result(
+    settings: &mut TuiRuntimeSettings,
     chat: &mut ActiveChat,
     draft_autosave: &mut DraftAutosave,
     modals: &mut ModalState,
     result: TuiEffectResult,
 ) {
     match result {
+        TuiEffectResult::ConfigLoaded { config } => {
+            apply_config_result(settings, chat, *config);
+        }
+        TuiEffectResult::AuthSecurityReconciled { status } => {
+            apply_auth_security_result(chat, status);
+        }
+        TuiEffectResult::DraftStatusLoaded {
+            model,
+            composer_draft,
+            error,
+        } => {
+            apply_draft_status_result(chat, model, composer_draft, error);
+        }
+        TuiEffectResult::SessionStatusLoaded {
+            session_id,
+            model,
+            active_skill_count,
+            runtime_work,
+            error,
+        } => {
+            apply_session_status_result(
+                chat,
+                session_id,
+                model,
+                active_skill_count,
+                runtime_work,
+                error,
+            );
+        }
         TuiEffectResult::AgentCatalogLoaded { agents } => {
             apply_agent_catalog_result(chat, agents);
         }
@@ -435,6 +474,93 @@ fn apply_effect_result(
             apply_thinking_cycle_result(chat, session_id, *result);
         }
     }
+}
+
+fn apply_config_result(
+    settings: &mut TuiRuntimeSettings,
+    chat: &mut ActiveChat,
+    config: Result<bcode_config::BcodeConfig, String>,
+) {
+    match config {
+        Ok(config) => {
+            settings.apply_tui_config(&config.tui);
+            chat.app.apply_tui_config(config.tui.clone());
+            chat.start_effect(TuiEffect::ReconcileAuthSecurity {
+                config: Box::new(config),
+            });
+            if chat.session_id.is_none() && chat.opening_session_id.is_none() {
+                chat.start_effect(TuiEffect::LoadDraftStatus {
+                    launch_working_directory: settings.launch_working_directory().to_path_buf(),
+                });
+            }
+        }
+        Err(error) => chat.app.set_status(format!("Config unavailable: {error}")),
+    }
+}
+
+fn apply_auth_security_result(chat: &mut ActiveChat, status: Option<String>) {
+    if let Some(status) = status {
+        chat.app.set_status(status);
+    }
+}
+
+fn apply_draft_status_result(
+    chat: &mut ActiveChat,
+    model: Option<bcode_ipc::SessionModelStatus>,
+    composer_draft: Option<String>,
+    error: Option<String>,
+) {
+    if chat.session_id.is_some() || chat.opening_session_id.is_some() {
+        return;
+    }
+    if let Some(draft) = composer_draft
+        && chat.app.composer().is_empty()
+    {
+        chat.app.replace_composer_with(&draft);
+        chat.app.set_status("Draft restored".to_owned());
+    }
+    if let Some(error) = error {
+        chat.app
+            .set_status(format!("Draft status unavailable: {error}"));
+    }
+    if let Some(model) = model {
+        chat.app.apply_model_status(model);
+    }
+}
+
+fn apply_session_status_result(
+    chat: &mut ActiveChat,
+    session_id: bcode_session_models::SessionId,
+    model: Option<bcode_ipc::SessionModelStatus>,
+    active_skill_count: Option<usize>,
+    runtime_work: Option<Vec<bcode_ipc::RuntimeWorkSnapshot>>,
+    error: Option<String>,
+) {
+    if chat.session_id != Some(session_id) {
+        return;
+    }
+    let model_text = model.as_ref().map_or_else(
+        || "model unknown".to_owned(),
+        |status| {
+            let provider = status.provider_plugin_id.as_deref().unwrap_or("auto");
+            let model = status.model_id.as_deref().unwrap_or("default");
+            format!("{provider}/{model}")
+        },
+    );
+    if let Some(model) = model {
+        chat.app.apply_model_status(model);
+    }
+    if let Some(work) = runtime_work {
+        chat.app.apply_runtime_work_snapshots(&work);
+    }
+    let skill_count = active_skill_count.unwrap_or(0);
+    if let Some(error) = error {
+        chat.app
+            .set_status(format!("Session status unavailable: {error}"));
+        return;
+    }
+    chat.app
+        .set_status(format!("model: {model_text}; active skills: {skill_count}"));
 }
 
 fn apply_agent_catalog_result(
@@ -838,30 +964,11 @@ async fn next_chat_loop_event(
     }
 }
 
-fn handle_async_event(
-    client: &BcodeClient,
-    settings: &mut TuiRuntimeSettings,
-    chat: &mut ActiveChat,
-    event: Box<session_flow::ChatAsyncEvent>,
-) {
+fn handle_async_event(chat: &mut ActiveChat, event: Box<session_flow::ChatAsyncEvent>) {
     match *event {
         session_flow::ChatAsyncEvent::SessionOpened(opened) => {
             chat.session_open_task = None;
-            session_flow::complete_switch_session(client, chat, opened);
-        }
-        session_flow::ChatAsyncEvent::StatusHydrated(hydrated) => {
-            chat.status_hydration_task = None;
-            session_flow::complete_status_hydration(chat, hydrated);
-        }
-        session_flow::ChatAsyncEvent::DraftStatusHydrated(hydrated) => {
-            chat.status_hydration_task = None;
-            session_flow::complete_draft_status_hydration(chat, hydrated);
-        }
-        session_flow::ChatAsyncEvent::ConfigHydrated(hydrated) => {
-            session_flow::complete_config_hydration(client, settings, chat, *hydrated);
-        }
-        session_flow::ChatAsyncEvent::AuthSecurityHydrated(hydrated) => {
-            session_flow::complete_auth_security_hydration(chat, hydrated);
+            session_flow::complete_switch_session(chat, opened);
         }
     }
 }

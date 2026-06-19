@@ -1269,7 +1269,6 @@ async fn async_session_open_preserves_typed_draft() {
     };
 
     super::session_flow::complete_switch_session(
-        &bcode_client::BcodeClient::default_endpoint(),
         &mut chat,
         super::session_flow::SessionOpenResult {
             session_id,

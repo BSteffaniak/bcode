@@ -9,10 +9,30 @@ use bcode_session_models::{
     SessionId,
 };
 
-use super::{session_flow::AgentCatalog, slash_palette, thinking_flow};
+use super::{
+    session_flow::{self, AgentCatalog},
+    slash_palette, thinking_flow,
+};
 
 /// Background work requested by local TUI event handling.
 pub enum TuiEffect {
+    /// Load user configuration.
+    LoadConfig,
+    /// Reconcile auth security status for a loaded config.
+    ReconcileAuthSecurity {
+        /// Loaded configuration.
+        config: Box<bcode_config::BcodeConfig>,
+    },
+    /// Load draft-session status.
+    LoadDraftStatus {
+        /// Directory for draft-session draft scope.
+        launch_working_directory: std::path::PathBuf,
+    },
+    /// Load non-critical status for an attached session.
+    LoadSessionStatus {
+        /// Session to hydrate.
+        session_id: SessionId,
+    },
     /// Load agent metadata.
     LoadAgentCatalog,
     /// Load an older history page before the currently displayed timeline.
@@ -62,6 +82,38 @@ pub enum TuiEffect {
 
 /// Completed TUI background work.
 pub enum TuiEffectResult {
+    /// User configuration load completed.
+    ConfigLoaded {
+        /// Config load result.
+        config: Box<Result<bcode_config::BcodeConfig, String>>,
+    },
+    /// Auth security reconciliation completed.
+    AuthSecurityReconciled {
+        /// Status to display, if any.
+        status: Option<String>,
+    },
+    /// Draft-session status hydration completed.
+    DraftStatusLoaded {
+        /// Default model status, if available.
+        model: Option<bcode_ipc::SessionModelStatus>,
+        /// Restored composer draft, if available.
+        composer_draft: Option<String>,
+        /// First non-critical error encountered.
+        error: Option<String>,
+    },
+    /// Attached session status hydration completed.
+    SessionStatusLoaded {
+        /// Session that was hydrated.
+        session_id: SessionId,
+        /// Model status, if available.
+        model: Option<bcode_ipc::SessionModelStatus>,
+        /// Active skill count, if available.
+        active_skill_count: Option<usize>,
+        /// Runtime work snapshots, if available.
+        runtime_work: Option<Vec<bcode_ipc::RuntimeWorkSnapshot>>,
+        /// First non-critical error encountered.
+        error: Option<String>,
+    },
     /// Agent metadata load completed.
     AgentCatalogLoaded {
         /// Agent catalog result.
@@ -131,6 +183,10 @@ pub struct ThinkingCycleResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum EffectKey {
+    Config,
+    AuthSecurity,
+    DraftStatus,
+    SessionStatus,
     AgentCatalog,
     OlderHistory,
     NewerHistory,
@@ -159,7 +215,7 @@ impl TuiEffectRunner {
         }
     }
 
-    /// Start an effect according to its concurrency policy.
+    /// Start an effect if another effect with the same key is not running.
     pub fn start(&mut self, effect: TuiEffect) -> bool {
         let key = effect.key();
         if self.tasks.contains_key(&key) {
@@ -199,7 +255,7 @@ impl TuiEffectRunner {
 
     fn spawn(&mut self, key: EffectKey, effect: TuiEffect) {
         let client = self.client.clone();
-        let task = tokio::spawn(async move { effect.run(client).await });
+        let task = tokio::spawn(async move { Box::pin(effect.run(client)).await });
         self.tasks.insert(key, task);
     }
 
@@ -238,6 +294,10 @@ impl TuiEffectRunner {
 impl TuiEffect {
     const fn key(&self) -> EffectKey {
         match self {
+            Self::LoadConfig => EffectKey::Config,
+            Self::ReconcileAuthSecurity { .. } => EffectKey::AuthSecurity,
+            Self::LoadDraftStatus { .. } => EffectKey::DraftStatus,
+            Self::LoadSessionStatus { .. } => EffectKey::SessionStatus,
             Self::LoadAgentCatalog => EffectKey::AgentCatalog,
             Self::LoadOlderHistory { .. } => EffectKey::OlderHistory,
             Self::LoadNewerHistory { .. } => EffectKey::NewerHistory,
@@ -253,6 +313,18 @@ impl TuiEffect {
 
     async fn run(self, client: BcodeClient) -> TuiEffectResult {
         match self {
+            Self::LoadConfig => TuiEffectResult::ConfigLoaded {
+                config: Box::new(bcode_config::load_config().map_err(|error| error.to_string())),
+            },
+            Self::ReconcileAuthSecurity { config } => TuiEffectResult::AuthSecurityReconciled {
+                status: session_flow::auth_security_status(&config),
+            },
+            Self::LoadDraftStatus {
+                launch_working_directory,
+            } => load_draft_status(&client, launch_working_directory).await,
+            Self::LoadSessionStatus { session_id } => {
+                Box::pin(load_session_status(&client, session_id)).await
+            }
             Self::LoadAgentCatalog => TuiEffectResult::AgentCatalogLoaded {
                 agents: AgentCatalog::load(&client)
                     .await
@@ -319,6 +391,48 @@ impl TuiEffect {
                 }
             }
         }
+    }
+}
+
+async fn optional_client_result<T>(
+    future: impl std::future::Future<Output = Result<T, ClientError>>,
+) -> (Option<T>, Option<String>) {
+    match future.await {
+        Ok(value) => (Some(value), None),
+        Err(error) => (None, Some(error.to_string())),
+    }
+}
+
+async fn load_draft_status(
+    client: &BcodeClient,
+    launch_working_directory: std::path::PathBuf,
+) -> TuiEffectResult {
+    let (model, model_error) = optional_client_result(client.default_model_status()).await;
+    let draft_scope = ComposerDraftScope::DraftSession {
+        launch_working_directory,
+    };
+    let (composer_draft, draft_error) =
+        optional_client_result(client.composer_draft(draft_scope)).await;
+    TuiEffectResult::DraftStatusLoaded {
+        model,
+        composer_draft: composer_draft.flatten(),
+        error: model_error.or(draft_error),
+    }
+}
+
+async fn load_session_status(client: &BcodeClient, session_id: SessionId) -> TuiEffectResult {
+    let (model, model_error) =
+        optional_client_result(client.session_model_status(session_id)).await;
+    let ((active_skills, skills_error), (runtime_work, runtime_work_error)) = tokio::join!(
+        optional_client_result(client.active_skills(session_id)),
+        optional_client_result(client.list_runtime_work(session_id)),
+    );
+    TuiEffectResult::SessionStatusLoaded {
+        session_id,
+        model,
+        active_skill_count: active_skills.map(|skills| skills.len()),
+        runtime_work,
+        error: model_error.or(skills_error).or(runtime_work_error),
     }
 }
 

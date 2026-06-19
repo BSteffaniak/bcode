@@ -8,6 +8,7 @@ use bmux_keyboard::KeyStroke;
 use bmux_tui::palette::{CommandPalette, CommandPaletteKeyOutcome};
 
 use super::command_palette::{BmuxCommandPalette, PaletteCommand};
+use super::effects::TuiEffect;
 use super::helpers;
 use super::picker_mouse::command_palette_row_from_mouse;
 use super::runtime_context::{TuiIo, TuiServices};
@@ -122,11 +123,9 @@ async fn execute_session_command<W: Write>(
     match command {
         PaletteCommand::NewSession => {
             session_flow::switch_to_draft_session(chat);
-            session_flow::start_draft_status_hydration(
-                services.client,
-                chat,
-                std::env::current_dir()?,
-            );
+            chat.start_effect(TuiEffect::LoadDraftStatus {
+                launch_working_directory: std::env::current_dir()?,
+            });
         }
         PaletteCommand::SwitchSession => match session_flow::pick_session(io, services).await? {
             session_flow::PickSessionOutcome::Existing(selected_session_id) => {
@@ -139,11 +138,9 @@ async fn execute_session_command<W: Write>(
             }
             session_flow::PickSessionOutcome::Draft => {
                 session_flow::switch_to_draft_session(chat);
-                session_flow::start_draft_status_hydration(
-                    services.client,
-                    chat,
-                    std::env::current_dir()?,
-                );
+                chat.start_effect(TuiEffect::LoadDraftStatus {
+                    launch_working_directory: std::env::current_dir()?,
+                });
             }
         },
         PaletteCommand::RenameSession => {
