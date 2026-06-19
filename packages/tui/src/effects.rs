@@ -661,6 +661,9 @@ impl TuiEffect {
                 allow_daemon_start: true,
                 ..
             }
+            | Self::LoadDraftStatus { .. }
+            | Self::LoadSessionStatus { .. }
+            | Self::LoadAgentCatalog
             | Self::RenameSession { .. }
             | Self::DeleteSession { .. }
             | Self::ForkSession { .. }
@@ -682,9 +685,6 @@ impl TuiEffect {
             }
             | Self::LoadConfig
             | Self::ReconcileAuthSecurity { .. }
-            | Self::LoadDraftStatus { .. }
-            | Self::LoadSessionStatus { .. }
-            | Self::LoadAgentCatalog
             | Self::LoadOlderHistory { .. }
             | Self::LoadNewerHistory { .. }
             | Self::ListPermissions

@@ -51,7 +51,7 @@ pub async fn run_event_loop_with_startup<W: Write>(
         let initial_window_request = session_flow::initial_transcript_window_request(
             super::render::transcript_area_for_frame(&chat.app, terminal.area()),
         );
-        session_flow::start_switch_session_passive(&mut chat, session_id, initial_window_request);
+        session_flow::start_switch_session(&mut chat, session_id, initial_window_request);
     } else {
         chat.app.set_status("New draft".to_owned());
     }

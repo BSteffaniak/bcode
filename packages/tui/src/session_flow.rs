@@ -138,24 +138,6 @@ pub fn start_switch_session(
     next_session_id: SessionId,
     initial_window_request: bcode_session_models::ProjectionWindowRequest,
 ) {
-    start_switch_session_with_daemon_policy(chat, next_session_id, initial_window_request, true);
-}
-
-/// Start a passive asynchronous switch to a persisted session.
-pub fn start_switch_session_passive(
-    chat: &mut ActiveChat,
-    next_session_id: SessionId,
-    initial_window_request: bcode_session_models::ProjectionWindowRequest,
-) {
-    start_switch_session_with_daemon_policy(chat, next_session_id, initial_window_request, false);
-}
-
-fn start_switch_session_with_daemon_policy(
-    chat: &mut ActiveChat,
-    next_session_id: SessionId,
-    initial_window_request: bcode_session_models::ProjectionWindowRequest,
-    allow_daemon_start: bool,
-) {
     if let Some(event_task) = chat.event_task.take() {
         event_task.abort();
     }
@@ -184,7 +166,7 @@ fn start_switch_session_with_daemon_policy(
         session_id: next_session_id,
         initial_window_request,
         event_sender: chat.event_sender.clone(),
-        allow_daemon_start,
+        allow_daemon_start: true,
     });
 }
 
