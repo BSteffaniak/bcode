@@ -525,7 +525,7 @@ enum ResponsesInputItem {
     },
     Reasoning {
         id: String,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(default)]
         summary: Vec<ResponsesReasoningSummary>,
         encrypted_content: String,
     },
@@ -4904,7 +4904,7 @@ mod tests {
         request.conversation_reuse.provider_state = Some(serde_json::json!({
             "reasoning_items": [{
                 "id": "rs_1",
-                "summary": ["kept summary"],
+                "summary": [],
                 "encrypted_content": "encrypted"
             }]
         }));
@@ -4930,6 +4930,14 @@ mod tests {
                 .and_then(|item| item.get("id"))
                 .and_then(serde_json::Value::as_str),
             Some("rs_1")
+        );
+        assert_eq!(
+            input
+                .first()
+                .and_then(|item| item.get("summary"))
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(0)
         );
         assert_eq!(
             input
