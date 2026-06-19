@@ -10054,10 +10054,10 @@ async fn session_model_selection_with_runtime_context(
 ) -> SessionModelSelection {
     let mut selection = session_model_selection(state, session_id).await;
     if let Some(context) = runtime_context {
-        if context.selected_provider_plugin_id.is_some() {
+        if selection.provider_plugin_id.is_none() {
             selection.provider_plugin_id = context.selected_provider_plugin_id;
         }
-        if context.selected_model_id.is_some() {
+        if selection.model_id.is_none() {
             selection.model_id = context.selected_model_id;
         }
         selection.provider_context = context.provider_context;
