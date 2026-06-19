@@ -187,7 +187,7 @@ async fn handle_slash_command<W: Write>(
             arguments,
         } => {
             chat.app.clear_pending_submission(message);
-            skill_flow::invoke_skill_for_session(io, services, chat, skill_id, arguments).await?;
+            skill_flow::start_invoke_skill_for_session(chat, skill_id, arguments)?;
         }
         slash_commands::SlashCommandOutcome::OpenWorktreeCreateDialog => {
             chat.app.clear_pending_submission(message);

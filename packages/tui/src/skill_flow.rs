@@ -2,6 +2,7 @@
 
 use std::io::Write;
 
+use super::effects::{SkillActionKind, SkillActionRequest, TuiEffect};
 use super::runtime_context::{TuiIo, TuiServices};
 use bcode_client::BcodeClient;
 use bcode_skill_models::SkillId;
@@ -13,8 +14,7 @@ use super::helpers;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::picker_mouse::picker_row_from_mouse;
 use super::{
-    TuiError, session_flow, session_flow::ActiveChat, skill_picker, skill_picker_render,
-    text_input_flow,
+    TuiError, session_flow::ActiveChat, skill_picker, skill_picker_render, text_input_flow,
 };
 
 #[allow(clippy::too_many_lines)]
@@ -74,42 +74,28 @@ pub async fn pick_skill_for_session<W: Write>(
                         return Ok(());
                     }
                     skill_picker::SkillPickerAction::Activate(skill_id) => {
-                        if let Err(error) =
-                            activate_skill(io, services.client, chat, skill_id).await
-                        {
-                            helpers::report_client_error(
-                                &mut chat.app,
-                                "skill activation failed",
-                                &error,
-                            );
-                        }
+                        start_skill_action(
+                            chat,
+                            SkillActionKind::Activate,
+                            skill_id,
+                            String::new(),
+                        )?;
                         return Ok(());
                     }
                     skill_picker::SkillPickerAction::Deactivate(skill_id) => {
-                        if let Err(error) =
-                            deactivate_skill(io, services.client, chat, skill_id).await
-                        {
-                            helpers::report_client_error(
-                                &mut chat.app,
-                                "skill deactivation failed",
-                                &error,
-                            );
-                        }
+                        start_skill_action(
+                            chat,
+                            SkillActionKind::Deactivate,
+                            skill_id,
+                            String::new(),
+                        )?;
                         return Ok(());
                     }
                     skill_picker::SkillPickerAction::Invoke {
                         skill_id,
                         arguments,
                     } => {
-                        if let Err(error) =
-                            invoke_skill_for_session(io, services, chat, skill_id, arguments).await
-                        {
-                            helpers::report_client_error(
-                                &mut chat.app,
-                                "skill invocation failed",
-                                &error,
-                            );
-                        }
+                        start_skill_action(chat, SkillActionKind::Invoke, skill_id, arguments)?;
                         return Ok(());
                     }
                 }
@@ -340,97 +326,36 @@ async fn describe_skill(
     Ok(())
 }
 
-async fn active_or_persisted_session_id<W: Write>(
-    io: &mut TuiIo<'_, '_, W>,
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-) -> Result<bcode_session_models::SessionId, TuiError> {
-    session_flow::persist_draft_session(io.terminal, client, chat).await
-}
-
-async fn activate_skill<W: Write>(
-    io: &mut TuiIo<'_, '_, W>,
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-    skill_id: SkillId,
-) -> Result<(), TuiError> {
-    let session_id = match active_or_persisted_session_id(io, client, chat).await {
-        Ok(session_id) => session_id,
-        Err(TuiError::Client(error)) => {
-            helpers::report_client_issue(&mut chat.app, "skill activation unavailable", &error);
-            return Ok(());
-        }
-        Err(error) => return Err(error),
-    };
-    match client.activate_skill(session_id, skill_id.clone()).await {
-        Ok(()) => chat.app.set_status(format!("activated skill {skill_id}")),
-        Err(error) => {
-            helpers::report_client_issue(&mut chat.app, "skill activation failed", &error);
-        }
-    }
-    Ok(())
-}
-
-async fn deactivate_skill<W: Write>(
-    io: &mut TuiIo<'_, '_, W>,
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-    skill_id: SkillId,
-) -> Result<(), TuiError> {
-    let session_id = match active_or_persisted_session_id(io, client, chat).await {
-        Ok(session_id) => session_id,
-        Err(TuiError::Client(error)) => {
-            helpers::report_client_issue(&mut chat.app, "skill deactivation unavailable", &error);
-            return Ok(());
-        }
-        Err(error) => return Err(error),
-    };
-    match client.deactivate_skill(session_id, skill_id.clone()).await {
-        Ok(()) => chat.app.set_status(format!("deactivated skill {skill_id}")),
-        Err(error) => {
-            helpers::report_client_issue(&mut chat.app, "skill deactivation failed", &error);
-        }
-    }
-    Ok(())
-}
-
-/// Invoke a skill for the active session, creating a draft session first when needed.
-pub async fn invoke_skill_for_session<W: Write>(
-    io: &mut TuiIo<'_, '_, W>,
-    services: &TuiServices<'_>,
+pub fn start_invoke_skill_for_session(
     chat: &mut ActiveChat,
     skill_id: SkillId,
     arguments: String,
 ) -> Result<(), TuiError> {
-    let session_id = match active_or_persisted_session_id(io, services.client, chat).await {
-        Ok(session_id) => session_id,
-        Err(TuiError::Client(error)) => {
-            helpers::report_client_issue(&mut chat.app, "skill invocation unavailable", &error);
-            return Ok(());
-        }
-        Err(error) => return Err(error),
-    };
-    let display_text = if arguments.trim().is_empty() {
-        format!("Invoke skill {skill_id}")
-    } else {
-        format!("Invoke skill {skill_id}: {arguments}")
-    };
-    let acceptance = match services
-        .client
-        .invoke_skill(session_id, skill_id.clone(), arguments, display_text)
-        .await
-    {
-        Ok(acceptance) => acceptance,
-        Err(error) => {
-            helpers::report_client_issue(&mut chat.app, "skill invocation failed", &error);
-            return Ok(());
-        }
-    };
-    chat.app.set_status(if acceptance.queued {
-        format!("skill {skill_id} queued")
-    } else {
-        format!("skill {skill_id} invoked")
+    start_skill_action(chat, SkillActionKind::Invoke, skill_id, arguments)
+}
+
+fn start_skill_action(
+    chat: &mut ActiveChat,
+    action: SkillActionKind,
+    skill_id: SkillId,
+    arguments: String,
+) -> Result<(), TuiError> {
+    chat.start_effect(TuiEffect::SkillAction {
+        request: Box::new(SkillActionRequest {
+            session_id: chat.app.session_id(),
+            launch_working_directory: std::env::current_dir()?,
+            skill_id,
+            action,
+            arguments,
+            event_sender: chat.event_sender.clone(),
+        }),
     });
+    let label = match action {
+        SkillActionKind::Activate => "activating skill…",
+        SkillActionKind::Deactivate => "deactivating skill…",
+        SkillActionKind::Invoke => "invoking skill…",
+    };
+    chat.app.set_status(label.to_owned());
     Ok(())
 }
 

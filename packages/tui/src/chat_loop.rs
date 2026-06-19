@@ -554,6 +554,13 @@ fn apply_effect_result(
         TuiEffectResult::SubmitMessage { message, result } => {
             apply_submit_message_result(chat, &message, *result);
         }
+        TuiEffectResult::SkillAction {
+            action,
+            skill_id,
+            result,
+        } => {
+            apply_skill_action_result(chat, action, &skill_id, *result);
+        }
         TuiEffectResult::SetSessionModel {
             session_id,
             provider_plugin_id,
@@ -838,6 +845,53 @@ fn apply_submit_message_result(
         Err(error) => {
             chat.app.restore_pending_submission(message);
             daemon_issue::report_client_issue(&mut chat.app, "send failed", &error);
+        }
+    }
+}
+
+fn apply_skill_action_result(
+    chat: &mut ActiveChat,
+    action: super::effects::SkillActionKind,
+    skill_id: &bcode_skill_models::SkillId,
+    result: Result<super::effects::SkillActionResult, ClientError>,
+) {
+    match result {
+        Ok(result) => {
+            chat.session_id = Some(result.session_id);
+            if let Some(session) = result.created_session {
+                chat.app.apply_session_summary(&session);
+            }
+            if let Some(event_task) = result.event_task
+                && let Some(previous_task) = chat.event_task.replace(event_task)
+            {
+                previous_task.abort();
+            }
+            match action {
+                super::effects::SkillActionKind::Activate => {
+                    chat.app.set_status(format!("activated skill {skill_id}"));
+                }
+                super::effects::SkillActionKind::Deactivate => {
+                    chat.app.set_status(format!("deactivated skill {skill_id}"));
+                }
+                super::effects::SkillActionKind::Invoke => {
+                    let queued = result
+                        .acceptance
+                        .is_some_and(|acceptance| acceptance.queued);
+                    chat.app.set_status(if queued {
+                        format!("skill {skill_id} queued")
+                    } else {
+                        format!("skill {skill_id} invoked")
+                    });
+                }
+            }
+        }
+        Err(error) => {
+            let label = match action {
+                super::effects::SkillActionKind::Activate => "skill activation failed",
+                super::effects::SkillActionKind::Deactivate => "skill deactivation failed",
+                super::effects::SkillActionKind::Invoke => "skill invocation failed",
+            };
+            daemon_issue::report_client_issue(&mut chat.app, label, &error);
         }
     }
 }

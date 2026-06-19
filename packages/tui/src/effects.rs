@@ -8,6 +8,7 @@ use bcode_session_models::{
     ProjectionWindowRequest, SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage,
     SessionHistoryQuery, SessionId, SessionSummary,
 };
+use bcode_skill_models::SkillId;
 use bcode_worktree_models::{WorktreeListRequest, WorktreeListResponse};
 
 use tokio::sync::mpsc;
@@ -38,6 +39,33 @@ pub struct SubmitMessageRequest {
     pub reasoning_effort: Option<String>,
     /// Reasoning summary to apply before sending.
     pub reasoning_summary: Option<String>,
+    /// Event sender for a newly-created session stream.
+    pub event_sender: mpsc::UnboundedSender<bcode_ipc::Event>,
+}
+
+/// Skill action kind requested by the TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillActionKind {
+    /// Activate the skill for the session.
+    Activate,
+    /// Deactivate the skill for the session.
+    Deactivate,
+    /// Invoke the skill for one turn.
+    Invoke,
+}
+
+/// Skill action effect request payload.
+pub struct SkillActionRequest {
+    /// Existing session, if already attached.
+    pub session_id: Option<SessionId>,
+    /// Working directory to use when creating a draft session.
+    pub launch_working_directory: std::path::PathBuf,
+    /// Skill to act on.
+    pub skill_id: SkillId,
+    /// Skill action kind.
+    pub action: SkillActionKind,
+    /// Arguments for invocation.
+    pub arguments: String,
     /// Event sender for a newly-created session stream.
     pub event_sender: mpsc::UnboundedSender<bcode_ipc::Event>,
 }
@@ -106,6 +134,11 @@ pub enum TuiEffect {
     SubmitMessage {
         /// Submit request.
         request: Box<SubmitMessageRequest>,
+    },
+    /// Perform a skill action for a session.
+    SkillAction {
+        /// Skill action request.
+        request: Box<SkillActionRequest>,
     },
     /// Set the active model for a session.
     SetSessionModel {
@@ -283,6 +316,15 @@ pub enum TuiEffectResult {
         /// Submit result.
         result: Box<Result<SubmitMessageResult, ClientError>>,
     },
+    /// Skill action completed.
+    SkillAction {
+        /// Skill action kind.
+        action: SkillActionKind,
+        /// Skill acted on.
+        skill_id: SkillId,
+        /// Skill action result.
+        result: Box<Result<SkillActionResult, ClientError>>,
+    },
     /// Session model selection completed.
     SetSessionModel {
         /// Session that was updated.
@@ -348,6 +390,7 @@ impl TuiEffectResult {
             }
             Self::PermissionList { result } => DaemonObservation::from_client_result(result),
             Self::SaveDraft { result, .. } => DaemonObservation::from_client_result(result),
+            Self::SkillAction { result, .. } => DaemonObservation::from_client_result(result),
             Self::SetSessionModel { result, .. } => DaemonObservation::from_client_result(result),
             Self::SubmitMessage { result, .. } => DaemonObservation::from_client_result(result),
             Self::CompactContext { result, .. } => DaemonObservation::from_client_result(result),
@@ -361,6 +404,19 @@ impl TuiEffectResult {
             | Self::SlashPaletteLoaded { .. } => DaemonObservation::None,
         }
     }
+}
+
+/// Skill action effect success payload.
+#[derive(Debug)]
+pub struct SkillActionResult {
+    /// Session that received the skill action.
+    pub session_id: SessionId,
+    /// Newly-created/attached session summary, if the action created a session.
+    pub created_session: Option<SessionSummary>,
+    /// Event stream task for a newly-created session.
+    pub event_task: Option<JoinHandle<()>>,
+    /// Invocation acceptance when invoking a skill.
+    pub acceptance: Option<MessageAcceptance>,
 }
 
 /// Submit-message effect success payload.
@@ -405,6 +461,7 @@ enum EffectKey {
     DraftSave,
     SlashPalette,
     SubmitMessage(usize),
+    SkillAction(SkillId),
     SetSessionModel(SessionId),
     CompactContext(SessionId),
     WorktreeList,
@@ -432,6 +489,7 @@ impl TuiEffect {
     const fn daemon_intent(&self) -> EffectDaemonIntent {
         match self {
             Self::SubmitMessage { .. }
+            | Self::SkillAction { .. }
             | Self::SetSessionModel { .. }
             | Self::CompactContext { .. }
             | Self::CancelTurn { .. }
@@ -611,7 +669,7 @@ impl TuiEffectRunner {
 }
 
 impl TuiEffect {
-    const fn key(&self) -> EffectKey {
+    fn key(&self) -> EffectKey {
         match self {
             Self::OpenSession { .. } => EffectKey::SessionOpen,
             Self::LoadConfig => EffectKey::Config,
@@ -625,6 +683,7 @@ impl TuiEffect {
             Self::SaveDraft { .. } => EffectKey::DraftSave,
             Self::LoadSlashPalette { .. } => EffectKey::SlashPalette,
             Self::SubmitMessage { request } => EffectKey::SubmitMessage(request.message.len()),
+            Self::SkillAction { request } => EffectKey::SkillAction(request.skill_id.clone()),
             Self::SetSessionModel { session_id, .. } => EffectKey::SetSessionModel(*session_id),
             Self::CompactContext { session_id } => EffectKey::CompactContext(*session_id),
             Self::ListWorktrees { .. } => EffectKey::WorktreeList,
@@ -708,6 +767,7 @@ impl TuiEffect {
                 TuiEffectResult::SlashPaletteLoaded { query, palette }
             }
             Self::SubmitMessage { request } => run_submit_message(&client, *request).await,
+            Self::SkillAction { request } => run_skill_action(&client, *request).await,
             Self::SetSessionModel {
                 session_id,
                 provider_plugin_id,
@@ -752,6 +812,98 @@ impl TuiEffect {
             }
         }
     }
+}
+
+async fn ensure_session_for_foreground_action(
+    client: &BcodeClient,
+    session_id: Option<SessionId>,
+    launch_working_directory: std::path::PathBuf,
+    event_sender: mpsc::UnboundedSender<bcode_ipc::Event>,
+) -> Result<(SessionId, Option<SessionSummary>, Option<JoinHandle<()>>), ClientError> {
+    if let Some(session_id) = session_id {
+        return Ok((session_id, None, None));
+    }
+    let session = client
+        .create_session_in_working_directory(None, launch_working_directory.clone())
+        .await?;
+    let _ = client
+        .set_composer_draft(
+            ComposerDraftScope::DraftSession {
+                launch_working_directory,
+            },
+            String::new(),
+        )
+        .await;
+    let (attached, task) =
+        history_flow::attach_session_event_stream(client, session.id, event_sender)
+            .await
+            .map_err(|error| match error {
+                TuiError::Client(error) => error,
+                other => ClientError::Server {
+                    code: "tui_session_attach_failed".to_owned(),
+                    message: other.to_string(),
+                },
+            })?;
+    Ok((session.id, Some(attached.session), Some(task)))
+}
+
+async fn run_skill_action(client: &BcodeClient, request: SkillActionRequest) -> TuiEffectResult {
+    let action = request.action;
+    let skill_id = request.skill_id.clone();
+    TuiEffectResult::SkillAction {
+        action,
+        skill_id,
+        result: Box::new(skill_action(client, request).await),
+    }
+}
+
+async fn skill_action(
+    client: &BcodeClient,
+    request: SkillActionRequest,
+) -> Result<SkillActionResult, ClientError> {
+    let SkillActionRequest {
+        session_id,
+        launch_working_directory,
+        skill_id,
+        action,
+        arguments,
+        event_sender,
+    } = request;
+    let (session_id, created_session, event_task) = ensure_session_for_foreground_action(
+        client,
+        session_id,
+        launch_working_directory,
+        event_sender,
+    )
+    .await?;
+    let acceptance = match action {
+        SkillActionKind::Activate => {
+            client.activate_skill(session_id, skill_id).await?;
+            None
+        }
+        SkillActionKind::Deactivate => {
+            client.deactivate_skill(session_id, skill_id).await?;
+            None
+        }
+        SkillActionKind::Invoke => {
+            let display_text = if arguments.trim().is_empty() {
+                format!("Invoke skill {skill_id}")
+            } else {
+                format!("Invoke skill {skill_id}: {arguments}")
+            };
+            Some(
+                client
+                    .invoke_skill(session_id, skill_id, arguments, display_text)
+                    .await?,
+            )
+        }
+    };
+    Ok(SkillActionResult {
+        session_id,
+        created_session,
+        event_task,
+        acceptance,
+    })
 }
 
 async fn run_submit_message(
