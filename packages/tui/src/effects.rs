@@ -305,6 +305,18 @@ impl TuiEffectRunner {
         results
     }
 
+    /// Start all pending effects produced before or during the loop iteration.
+    ///
+    /// Returns true when at least one pending effect was started.
+    pub fn drain_pending(&mut self, pending_effects: &mut Vec<TuiEffect>) -> bool {
+        let mut started = false;
+        for effect in pending_effects.drain(..) {
+            self.replace(effect);
+            started = true;
+        }
+        started
+    }
+
     /// Abort all in-flight effects.
     pub fn abort_all(&mut self) {
         self.queued_latest.clear();

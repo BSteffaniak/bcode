@@ -105,23 +105,23 @@ impl DraftAutosave {
     }
 }
 
-struct ModalState {
+struct ChatLoopState {
     palette: Option<BmuxCommandPalette>,
     slash_palette: Option<slash_palette::SlashPalette>,
     effects: TuiEffectRunner,
     permission_dialog: Option<PermissionDialogState>,
-    permission_poll: AsyncPermissionPoll,
+    permission_poll: PermissionPollSchedule,
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
 }
 
 #[derive(Debug)]
-struct AsyncPermissionPoll {
+struct PermissionPollSchedule {
     next_poll_at: Instant,
     last_error_status: Option<String>,
 }
 
-impl AsyncPermissionPoll {
+impl PermissionPollSchedule {
     const fn new(now: Instant) -> Self {
         Self {
             next_poll_at: now,
@@ -184,18 +184,16 @@ pub async fn run_with_client<W: Write>(
     chat: &mut ActiveChat,
     startup_action: super::startup_action::StartupTuiAction,
 ) -> Result<(), TuiError> {
-    let mut modals = ModalState {
+    let mut loop_state = ChatLoopState {
         palette: None,
         slash_palette: None,
         effects: TuiEffectRunner::new(client),
         permission_dialog: None,
-        permission_poll: AsyncPermissionPoll::new(Instant::now()),
+        permission_poll: PermissionPollSchedule::new(Instant::now()),
         thinking_dialog: None,
         timeline_dialog: None,
     };
-    for effect in chat.startup_effects.drain(..) {
-        modals.effects.start(effect);
-    }
+    loop_state.effects.drain_pending(&mut chat.pending_effects);
     sync_chat_key_labels(chat, &settings.keymap);
     let mut draft_autosave = DraftAutosave::new(
         settings.launch_working_directory.clone(),
@@ -216,7 +214,7 @@ pub async fn run_with_client<W: Write>(
             needs_redraw = true;
         }
 
-        if handle_loop_housekeeping(settings, chat, &mut draft_autosave, &mut modals).await {
+        if handle_loop_housekeeping(settings, chat, &mut draft_autosave, &mut loop_state).await {
             needs_redraw = true;
         }
 
@@ -228,12 +226,12 @@ pub async fn run_with_client<W: Write>(
         if let Some(save_at) = draft_autosave.next_save_at()
             && Instant::now() >= save_at
         {
-            start_draft_save(chat, &mut draft_autosave, &mut modals.effects);
+            start_draft_save(chat, &mut draft_autosave, &mut loop_state.effects);
         }
 
         let redraw_at = next_redraw_at(last_redraw);
         if needs_redraw && Instant::now() >= redraw_at {
-            draw_chat_frame(terminal, chat, &mut modals)?;
+            draw_chat_frame(terminal, chat, &mut loop_state)?;
             if let Some(action) = startup_action.take()
                 && action == super::startup_action::StartupTuiAction::OpenRalphHome
             {
@@ -285,8 +283,14 @@ pub async fn run_with_client<W: Write>(
                     terminal_events,
                     mouse_scroll_rows: settings.mouse_scroll_rows,
                 };
-                match handle_event(&mut context, chat, &mut modals, event, &mut draft_autosave)
-                    .await
+                match handle_event(
+                    &mut context,
+                    chat,
+                    &mut loop_state,
+                    event,
+                    &mut draft_autosave,
+                )
+                .await
                 {
                     Ok(handled) => {
                         if handled {
@@ -323,7 +327,7 @@ pub async fn run_with_client<W: Write>(
         }
     }
 
-    modals.effects.abort_all();
+    loop_state.effects.abort_all();
     Ok(())
 }
 
@@ -338,18 +342,18 @@ async fn handle_loop_housekeeping(
     settings: &mut TuiRuntimeSettings,
     chat: &mut ActiveChat,
     draft_autosave: &mut DraftAutosave,
-    modals: &mut ModalState,
+    loop_state: &mut ChatLoopState,
 ) -> bool {
     let mut needs_redraw = false;
-    needs_redraw |= poll_finished_effects(settings, chat, draft_autosave, modals).await;
-    drain_queued_chat_effects(chat, modals);
-    needs_redraw |= maybe_start_older_history_load(chat, modals);
-    needs_redraw |= maybe_start_newer_history_load(chat, modals);
-    maybe_start_permission_poll(chat, modals);
+    needs_redraw |= poll_finished_effects(settings, chat, draft_autosave, loop_state).await;
+    needs_redraw |= drain_pending_chat_effects(chat, &mut loop_state.effects);
+    needs_redraw |= maybe_start_older_history_load(chat, loop_state);
+    needs_redraw |= maybe_start_newer_history_load(chat, loop_state);
+    maybe_start_permission_poll(chat, loop_state);
     needs_redraw
 }
 
-fn maybe_start_older_history_load(chat: &mut ActiveChat, modals: &mut ModalState) -> bool {
+fn maybe_start_older_history_load(chat: &mut ActiveChat, loop_state: &mut ChatLoopState) -> bool {
     if !chat.app.should_load_older_history() {
         return false;
     }
@@ -359,7 +363,7 @@ fn maybe_start_older_history_load(chat: &mut ActiveChat, modals: &mut ModalState
     let Some(session_id) = chat.session_id else {
         return false;
     };
-    let started = modals
+    let started = loop_state
         .effects
         .start(TuiEffect::LoadOlderHistory { session_id, cursor });
     if started {
@@ -368,7 +372,7 @@ fn maybe_start_older_history_load(chat: &mut ActiveChat, modals: &mut ModalState
     started
 }
 
-fn maybe_start_newer_history_load(chat: &mut ActiveChat, modals: &mut ModalState) -> bool {
+fn maybe_start_newer_history_load(chat: &mut ActiveChat, loop_state: &mut ChatLoopState) -> bool {
     if !chat.app.should_load_newer_history() {
         return false;
     }
@@ -378,7 +382,7 @@ fn maybe_start_newer_history_load(chat: &mut ActiveChat, modals: &mut ModalState
     let Some(session_id) = chat.session_id else {
         return false;
     };
-    let started = modals
+    let started = loop_state
         .effects
         .start(TuiEffect::LoadNewerHistory { session_id, cursor });
     if started {
@@ -387,22 +391,20 @@ fn maybe_start_newer_history_load(chat: &mut ActiveChat, modals: &mut ModalState
     started
 }
 
-fn drain_queued_chat_effects(chat: &mut ActiveChat, modals: &mut ModalState) {
-    for effect in chat.startup_effects.drain(..) {
-        modals.effects.replace(effect);
-    }
+fn drain_pending_chat_effects(chat: &mut ActiveChat, effects: &mut TuiEffectRunner) -> bool {
+    effects.drain_pending(&mut chat.pending_effects)
 }
 
 async fn poll_finished_effects(
     settings: &mut TuiRuntimeSettings,
     chat: &mut ActiveChat,
     draft_autosave: &mut DraftAutosave,
-    modals: &mut ModalState,
+    loop_state: &mut ChatLoopState,
 ) -> bool {
-    let results = modals.effects.poll_finished().await;
+    let results = loop_state.effects.poll_finished().await;
     let needs_redraw = !results.is_empty();
     for result in results {
-        apply_effect_result(settings, chat, draft_autosave, modals, result);
+        apply_effect_result(settings, chat, draft_autosave, loop_state, result);
     }
     needs_redraw
 }
@@ -411,7 +413,7 @@ fn apply_effect_result(
     settings: &mut TuiRuntimeSettings,
     chat: &mut ActiveChat,
     draft_autosave: &mut DraftAutosave,
-    modals: &mut ModalState,
+    loop_state: &mut ChatLoopState,
     result: TuiEffectResult,
 ) {
     match result {
@@ -461,13 +463,13 @@ fn apply_effect_result(
             apply_newer_history_result(chat, session_id, result);
         }
         TuiEffectResult::PermissionList { result } => {
-            apply_permission_list_result(chat, modals, result);
+            apply_permission_list_result(chat, loop_state, result);
         }
         TuiEffectResult::SaveDraft { text, result } => {
             apply_save_draft_result(chat, draft_autosave, text, result);
         }
         TuiEffectResult::SlashPaletteLoaded { query, palette } => {
-            apply_slash_palette_result(chat, modals, &query, palette);
+            apply_slash_palette_result(chat, loop_state, &query, palette);
         }
         TuiEffectResult::CancelTurn { session_id, result } => {
             apply_cancel_turn_result(chat, session_id, result);
@@ -622,33 +624,33 @@ fn apply_newer_history_result(
 
 fn apply_permission_list_result(
     chat: &mut ActiveChat,
-    modals: &mut ModalState,
+    loop_state: &mut ChatLoopState,
     result: Result<Vec<bcode_ipc::PermissionSummary>, ClientError>,
 ) {
     match result {
         Ok(permissions) => {
-            modals.permission_poll.last_error_status = None;
-            if modals.permission_dialog.is_none()
+            loop_state.permission_poll.last_error_status = None;
+            if loop_state.permission_dialog.is_none()
                 && let Some(permission) = permissions
                     .into_iter()
                     .find(|permission| Some(permission.session_id) == chat.session_id)
             {
-                modals.permission_dialog = Some(PermissionDialogState::new(permission));
+                loop_state.permission_dialog = Some(PermissionDialogState::new(permission));
             }
         }
         Err(error) => {
             let label = if error.is_daemon_unavailable() {
-                modals.permission_poll.next_poll_at =
+                loop_state.permission_poll.next_poll_at =
                     Instant::now() + PERMISSION_POLL_DAEMON_DOWN_INTERVAL;
                 "Permissions unavailable"
             } else {
                 "Permission check failed"
             };
             let status = daemon_issue::client_issue_status(label, &error);
-            if modals.permission_poll.last_error_status.as_deref() != Some(&status) {
+            if loop_state.permission_poll.last_error_status.as_deref() != Some(&status) {
                 chat.app.set_status(status.clone());
             }
-            modals.permission_poll.last_error_status = Some(status);
+            loop_state.permission_poll.last_error_status = Some(status);
         }
     }
 }
@@ -667,14 +669,14 @@ fn apply_save_draft_result(
 
 fn apply_slash_palette_result(
     chat: &ActiveChat,
-    modals: &mut ModalState,
+    loop_state: &mut ChatLoopState,
     query: &str,
     mut palette: slash_palette::SlashPalette,
 ) {
     if query != chat.app.composer().text() {
         return;
     }
-    if let Some(previous) = modals
+    if let Some(previous) = loop_state
         .slash_palette
         .as_ref()
         .filter(|current| current.query() == query)
@@ -682,7 +684,7 @@ fn apply_slash_palette_result(
     {
         palette.select_command(&previous);
     }
-    modals.slash_palette = (!palette.is_empty()).then_some(palette);
+    loop_state.slash_palette = (!palette.is_empty()).then_some(palette);
 }
 
 fn apply_cancel_turn_result(
@@ -780,41 +782,43 @@ fn start_draft_save(
     effects.queue_latest(TuiEffect::SaveDraft { scope, text });
 }
 
-fn update_slash_palette_async(chat: &ActiveChat, modals: &mut ModalState) -> bool {
+fn update_slash_palette_async(chat: &ActiveChat, loop_state: &mut ChatLoopState) -> bool {
     let current_query = chat.app.composer().text();
     if !current_query.starts_with('/') {
-        modals.slash_palette = None;
-        modals.effects.abort_matching(&TuiEffect::LoadSlashPalette {
-            query: String::new(),
-            session_id: None,
-        });
+        loop_state.slash_palette = None;
+        loop_state
+            .effects
+            .abort_matching(&TuiEffect::LoadSlashPalette {
+                query: String::new(),
+                session_id: None,
+            });
         return true;
     }
     let query = current_query.to_owned();
-    let previous = modals
+    let previous = loop_state
         .slash_palette
         .as_ref()
         .filter(|palette| palette.query() == current_query)
         .and_then(|palette| palette.selected_command().map(str::to_owned));
     if previous.is_none() {
-        modals.slash_palette = None;
+        loop_state.slash_palette = None;
     }
-    modals.effects.replace(TuiEffect::LoadSlashPalette {
+    loop_state.effects.replace(TuiEffect::LoadSlashPalette {
         query,
         session_id: chat.app.session_id(),
     });
     true
 }
 
-fn maybe_start_permission_poll(chat: &ActiveChat, modals: &mut ModalState) {
-    if modals.permission_dialog.is_some()
-        || Instant::now() < modals.permission_poll.next_poll_at
+fn maybe_start_permission_poll(chat: &ActiveChat, loop_state: &mut ChatLoopState) {
+    if loop_state.permission_dialog.is_some()
+        || Instant::now() < loop_state.permission_poll.next_poll_at
         || chat.session_id.is_none()
     {
         return;
     }
-    if modals.effects.start(TuiEffect::ListPermissions) {
-        modals.permission_poll.next_poll_at = Instant::now() + PERMISSION_POLL_INTERVAL;
+    if loop_state.effects.start(TuiEffect::ListPermissions) {
+        loop_state.permission_poll.next_poll_at = Instant::now() + PERMISSION_POLL_INTERVAL;
     }
 }
 
@@ -840,7 +844,7 @@ fn next_redraw_at(last_redraw: Instant) -> Instant {
 fn draw_chat_frame<W: Write>(
     terminal: &mut Terminal<&mut W>,
     chat: &mut ActiveChat,
-    modals: &mut ModalState,
+    loop_state: &mut ChatLoopState,
 ) -> Result<(), TuiError> {
     let layout = render::prepare_frame(&mut chat.app, terminal.area());
     let theme = render::TuiTheme::for_app(&mut chat.app, Instant::now());
@@ -848,7 +852,7 @@ fn draw_chat_frame<W: Write>(
         if let Some(layout) = layout {
             render::render_prepared(&mut chat.app, frame, layout);
         }
-        if let Some(slash_palette) = &modals.slash_palette {
+        if let Some(slash_palette) = &loop_state.slash_palette {
             slash_palette_render::render_palette(
                 slash_palette,
                 chat.app.composer_content_area(),
@@ -856,16 +860,16 @@ fn draw_chat_frame<W: Write>(
                 theme,
             );
         }
-        if let Some(palette) = &mut modals.palette {
+        if let Some(palette) = &mut loop_state.palette {
             command_palette_render::render_palette(palette, frame, theme);
         }
-        if let Some(dialog) = &modals.permission_dialog {
+        if let Some(dialog) = &loop_state.permission_dialog {
             permission_dialog_render::render_permission_dialog(dialog, frame);
         }
-        if let Some(dialog) = &modals.thinking_dialog {
+        if let Some(dialog) = &loop_state.thinking_dialog {
             thinking_dialog_render::render_thinking_dialog(dialog, frame, theme);
         }
-        if let Some(dialog) = &mut modals.timeline_dialog {
+        if let Some(dialog) = &mut loop_state.timeline_dialog {
             timeline_dialog_render::render_timeline_dialog(dialog, frame, theme);
         }
     })?;
@@ -975,7 +979,7 @@ fn refresh_invalidation_queue(chat: &ActiveChat, queue: &mut InvalidationQueue) 
 async fn handle_event<W: Write>(
     context: &mut ChatEventContext<'_, '_, W>,
     chat: &mut ActiveChat,
-    modals: &mut ModalState,
+    loop_state: &mut ChatLoopState,
     event: Event,
     draft_autosave: &mut DraftAutosave,
 ) -> Result<bool, TuiError> {
@@ -986,35 +990,37 @@ async fn handle_event<W: Write>(
                 .resize(Rect::new(0, 0, size.width, size.height));
             Ok(true)
         }
-        Event::Key(stroke) => handle_chat_key(context, chat, modals, stroke, draft_autosave).await,
+        Event::Key(stroke) => {
+            handle_chat_key(context, chat, loop_state, stroke, draft_autosave).await
+        }
         Event::Paste(text) => {
-            if let Some(palette) = &mut modals.palette {
+            if let Some(palette) = &mut loop_state.palette {
                 palette.state_mut().query.insert_str(&text);
                 return Ok(true);
             }
             chat.app.reset_input_history_navigation();
             chat.app.paste_composer_text(&text);
             chat.app.wake_cursor();
-            update_slash_palette_async(chat, modals);
+            update_slash_palette_async(chat, loop_state);
             Ok(true)
         }
         Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick => Ok(true),
         Event::Mouse(mouse) => {
-            if modals.palette.is_some() {
+            if loop_state.palette.is_some() {
                 let (mut io, services) = context.flow_context();
                 return palette_flow::handle_palette_mouse(
                     &mut io,
                     &services,
                     chat,
-                    &mut modals.palette,
+                    &mut loop_state.palette,
                     mouse,
                 )
                 .await;
             }
-            if modals.slash_palette.is_some() {
+            if loop_state.slash_palette.is_some() {
                 return Ok(slash_flow::handle_slash_palette_mouse(
                     chat,
-                    &mut modals.slash_palette,
+                    &mut loop_state.slash_palette,
                     context.terminal,
                     mouse,
                 ));
@@ -1024,7 +1030,7 @@ async fn handle_event<W: Write>(
                 hit_id,
                 context.services.client,
                 chat,
-                &mut modals.permission_dialog,
+                &mut loop_state.permission_dialog,
                 mouse,
                 context.mouse_scroll_rows,
             )
@@ -1037,42 +1043,42 @@ async fn handle_event<W: Write>(
 async fn handle_chat_key<W: Write>(
     context: &mut ChatEventContext<'_, '_, W>,
     chat: &mut ActiveChat,
-    modals: &mut ModalState,
+    loop_state: &mut ChatLoopState,
     stroke: KeyStroke,
     draft_autosave: &mut DraftAutosave,
 ) -> Result<bool, TuiError> {
-    if modals.timeline_dialog.is_some() {
+    if loop_state.timeline_dialog.is_some() {
         return timeline_flow::handle_timeline_key(
             context.services.client,
             chat,
-            &mut modals.timeline_dialog,
+            &mut loop_state.timeline_dialog,
             stroke,
         )
         .await;
     }
-    if modals.thinking_dialog.is_some() {
+    if loop_state.thinking_dialog.is_some() {
         return thinking_flow::handle_thinking_key(
             context.services.client,
             chat,
-            &mut modals.thinking_dialog,
+            &mut loop_state.thinking_dialog,
             stroke,
         )
         .await;
     }
-    if modals.slash_palette.is_some() {
+    if loop_state.slash_palette.is_some() {
         if let Some(dialog) = {
             let (mut io, services) = context.flow_context();
             slash_flow::handle_slash_palette_key(
                 &mut io,
                 &services,
                 chat,
-                &mut modals.slash_palette,
+                &mut loop_state.slash_palette,
                 stroke,
             )
             .await?
             .flatten()
         } {
-            apply_composer_modal_request(modals, dialog);
+            apply_composer_modal_request(loop_state, dialog);
         }
         return Ok(true);
     }
@@ -1084,69 +1090,76 @@ async fn handle_chat_key<W: Write>(
     if changed {
         return Ok(true);
     }
-    if modals.permission_dialog.is_some() {
+    if loop_state.permission_dialog.is_some() {
         return permission_flow::handle_permission_key(
             context.services.client,
             context.services.keymap,
             chat,
-            &mut modals.permission_dialog,
+            &mut loop_state.permission_dialog,
             stroke,
         )
         .await;
     }
-    if modals.palette.is_some() {
+    if loop_state.palette.is_some() {
         let (mut io, services) = context.flow_context();
         return palette_flow::handle_palette_key(
             &mut io,
             &services,
             chat,
-            &mut modals.palette,
+            &mut loop_state.palette,
             stroke,
         )
         .await;
     }
     if is_palette_open_key(context.services.keymap, stroke) {
-        modals.palette = Some(BmuxCommandPalette::new());
+        loop_state.palette = Some(BmuxCommandPalette::new());
         chat.app
             .set_status("command palette: type to filter, enter to run, esc close".to_owned());
         return Ok(true);
     }
     if is_clipboard_image_paste_key(context.services.keymap, stroke) {
         paste_clipboard_image(chat);
-        update_slash_palette_async(chat, modals);
+        update_slash_palette_async(chat, loop_state);
         return Ok(true);
     }
     let outcome = input::handle_key(&mut chat.app, context.services.keymap, stroke);
     if chat.app.should_exit() {
         return Ok(true);
     }
-    update_slash_palette_async(chat, modals);
-    handle_chat_key_request(context, chat, modals, outcome.request, Some(draft_autosave)).await?;
+    update_slash_palette_async(chat, loop_state);
+    handle_chat_key_request(
+        context,
+        chat,
+        loop_state,
+        outcome.request,
+        Some(draft_autosave),
+    )
+    .await?;
     Ok(outcome.redraw)
 }
 
 async fn handle_chat_key_request<W: Write>(
     context: &mut ChatEventContext<'_, '_, W>,
     chat: &mut ActiveChat,
-    modals: &mut ModalState,
+    loop_state: &mut ChatLoopState,
     request: KeyRequest,
     draft_autosave: Option<&mut DraftAutosave>,
 ) -> Result<(), TuiError> {
     match request {
         KeyRequest::None => {}
         KeyRequest::Interrupt => {
-            start_cancel_turn(chat, &mut modals.effects);
+            start_cancel_turn(chat, &mut loop_state.effects);
         }
         KeyRequest::CycleAgent => cycle_session_agent(chat),
         KeyRequest::CycleThinkingEffort => {
-            start_thinking_cycle(chat, &mut modals.effects);
+            start_thinking_cycle(chat, &mut loop_state.effects);
         }
         KeyRequest::Submit { placement } => {
             let pre_submit_scope = draft_autosave.as_ref().map(|autosave| autosave.scope(chat));
             let (mut io, services) = context.flow_context();
             match composer_flow::submit_composer(&mut io, &services, chat, placement).await {
                 Ok(Some(request)) => {
-                    apply_composer_modal_request(modals, request);
+                    apply_composer_modal_request(loop_state, request);
                 }
                 Ok(None) => {}
                 Err(error) => helpers::report_client_error(&mut chat.app, "send failed", &error),
@@ -1154,12 +1167,12 @@ async fn handle_chat_key_request<W: Write>(
             if let Some(autosave) = draft_autosave {
                 if let Some(scope) = pre_submit_scope {
                     let (scope, text) = DraftAutosave::clear_scope_request(scope);
-                    modals
+                    loop_state
                         .effects
                         .queue_latest(TuiEffect::SaveDraft { scope, text });
                 }
                 autosave.mark_dirty_now();
-                start_draft_save(chat, autosave, &mut modals.effects);
+                start_draft_save(chat, autosave, &mut loop_state.effects);
             }
         }
     }
@@ -1202,15 +1215,15 @@ fn cycle_session_agent(chat: &mut ActiveChat) {
 }
 
 fn apply_composer_modal_request(
-    modals: &mut ModalState,
+    loop_state: &mut ChatLoopState,
     request: composer_flow::ComposerModalRequest,
 ) {
     match request {
         composer_flow::ComposerModalRequest::Thinking(dialog) => {
-            modals.thinking_dialog = Some(dialog);
+            loop_state.thinking_dialog = Some(dialog);
         }
         composer_flow::ComposerModalRequest::Timeline(dialog) => {
-            modals.timeline_dialog = Some(dialog);
+            loop_state.timeline_dialog = Some(dialog);
         }
     }
 }

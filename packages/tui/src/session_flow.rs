@@ -33,13 +33,13 @@ pub struct ActiveChat {
     pub event_receiver: mpsc::UnboundedReceiver<BcodeEvent>,
     pub event_task: Option<JoinHandle<()>>,
     pub opening_session_id: Option<SessionId>,
-    pub startup_effects: Vec<super::effects::TuiEffect>,
+    pub pending_effects: Vec<super::effects::TuiEffect>,
 }
 
 impl ActiveChat {
-    /// Queue a background effect to start when the chat loop is ready.
+    /// Queue a background effect to start when the chat loop effect runner is available.
     pub fn start_effect(&mut self, effect: super::effects::TuiEffect) {
-        self.startup_effects.push(effect);
+        self.pending_effects.push(effect);
     }
 }
 

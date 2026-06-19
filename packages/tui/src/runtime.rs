@@ -43,7 +43,7 @@ pub async fn run_event_loop_with_startup<W: Write>(
         event_receiver,
         event_task: None,
         opening_session_id: None,
-        startup_effects: Vec::new(),
+        pending_effects: Vec::new(),
     };
     chat.start_effect(TuiEffect::LoadConfig);
     chat.start_effect(TuiEffect::LoadAgentCatalog);
