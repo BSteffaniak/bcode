@@ -210,6 +210,50 @@ impl SettingsStore {
         })
     }
 
+    /// Persist the current onboarding section and mark it visited.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when onboarding progress or section state cannot be
+    /// written.
+    pub fn visit_onboarding_section(
+        &self,
+        section_id: SetupSectionId,
+        visited_at_ms: u64,
+    ) -> SettingsResult<()> {
+        self.save_onboarding_progress(&OnboardingProgress {
+            mode: "first_run".to_owned(),
+            first_run_completed: false,
+            last_section: Some(section_id.as_str().to_owned()),
+            last_opened_at_ms: Some(visited_at_ms),
+            completed_at_ms: None,
+        })?;
+        self.save_onboarding_section(&OnboardingSection {
+            section_id: section_id.as_str().to_owned(),
+            status: SetupSectionStatus::Visited.as_str().to_owned(),
+            visited: true,
+            visited_at_ms: Some(visited_at_ms),
+            completed_at_ms: None,
+            skipped_at_ms: None,
+            dismissed: false,
+        })
+    }
+
+    /// Persist onboarding as completed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when onboarding progress cannot be written.
+    pub fn complete_onboarding(&self, completed_at_ms: u64) -> SettingsResult<()> {
+        self.save_onboarding_progress(&OnboardingProgress {
+            mode: "first_run".to_owned(),
+            first_run_completed: true,
+            last_section: Some(SetupSectionId::Launch.as_str().to_owned()),
+            last_opened_at_ms: Some(completed_at_ms),
+            completed_at_ms: Some(completed_at_ms),
+        })
+    }
+
     /// Persist one onboarding setup-map section state.
     ///
     /// # Errors
@@ -881,6 +925,185 @@ pub fn security_trust_panel(
     }
 }
 
+/// Model setup card view model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSetupCard {
+    /// Selected model profile, if any.
+    pub model_profile: Option<String>,
+    /// Selected model identifier, if any.
+    pub model_id: Option<String>,
+    /// Whether a usable model selection exists.
+    pub configured: bool,
+    /// User-facing story copy.
+    pub story: String,
+}
+
+/// Build a model setup card.
+#[must_use]
+pub fn model_setup_card(model_profile: Option<String>, model_id: Option<String>) -> ModelSetupCard {
+    let configured = model_profile.is_some() || model_id.is_some();
+    let story = if configured {
+        "Bcode has a model path selected, so onboarding can focus on quality, cost, and context preferences."
+            .to_owned()
+    } else {
+        "Choose a default model so Bcode can start quickly while still letting you switch models later."
+            .to_owned()
+    };
+    ModelSetupCard {
+        model_profile,
+        model_id,
+        configured,
+        story,
+    }
+}
+
+/// Permission setup card view model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionSetupCard {
+    /// Whether explicit permission configuration exists.
+    pub configured: bool,
+    /// User-facing story copy.
+    pub story: String,
+}
+
+/// Build a permission setup card.
+#[must_use]
+pub fn permission_setup_card(configured: bool) -> PermissionSetupCard {
+    let story = if configured {
+        "Permission rules are configured, so Bcode can explain and enforce your preferred safety boundaries."
+            .to_owned()
+    } else {
+        "Review a permission preset so Bcode knows when to ask, when to proceed, and what should stay blocked."
+            .to_owned()
+    };
+    PermissionSetupCard { configured, story }
+}
+
+/// Import setup card view model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportSetupCard {
+    /// Whether session import configuration exists.
+    pub configured: bool,
+    /// Whether this section is optional.
+    pub optional: bool,
+    /// User-facing story copy.
+    pub story: String,
+}
+
+/// Build an import setup card.
+#[must_use]
+pub fn import_setup_card(configured: bool) -> ImportSetupCard {
+    let story = if configured {
+        "Import settings are configured, so Bcode can help bring useful history forward without replaying sessions during normal setup."
+            .to_owned()
+    } else {
+        "Session import is optional. Review it if you want Bcode to discover supported history sources later."
+            .to_owned()
+    };
+    ImportSetupCard {
+        configured,
+        optional: !configured,
+        story,
+    }
+}
+
+/// Plugin setup card view model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginSetupCard {
+    /// Enabled plugin IDs.
+    pub enabled_plugins: BTreeSet<String>,
+    /// Disabled plugin IDs.
+    pub disabled_plugins: BTreeSet<String>,
+    /// User-facing story copy.
+    pub story: String,
+}
+
+/// Build a plugin setup card.
+#[must_use]
+pub fn plugin_setup_card(
+    enabled_plugins: BTreeSet<String>,
+    disabled_plugins: BTreeSet<String>,
+) -> PluginSetupCard {
+    let story = if enabled_plugins.is_empty() && disabled_plugins.is_empty() {
+        "Bundled plugins are ready by default, and every capability remains reviewable and disableable."
+            .to_owned()
+    } else {
+        "Plugin choices are customized. Bcode will respect enabled and disabled plugin state during launch."
+            .to_owned()
+    };
+    PluginSetupCard {
+        enabled_plugins,
+        disabled_plugins,
+        story,
+    }
+}
+
+/// Setup plan action generated before mutating configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupPlanAction {
+    /// Related setup-map section.
+    pub section_id: SetupSectionId,
+    /// Stable action kind.
+    pub kind: String,
+    /// User-facing action title.
+    pub title: String,
+    /// User-facing action explanation.
+    pub body: String,
+    /// Whether this action mutates user config/state when applied.
+    pub mutating: bool,
+}
+
+/// Final setup plan review model.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupPlanReview {
+    /// Actions to show before apply/launch.
+    pub actions: Vec<SetupPlanAction>,
+    /// Whether launch is available without more required setup.
+    pub launch_ready: bool,
+}
+
+/// Generate a conservative setup plan from the reconciled setup state and recommendations.
+#[must_use]
+pub fn generate_setup_plan(
+    sections: &[ReconciledSetupSection],
+    recommendations: &[SetupRecommendation],
+) -> SetupPlanReview {
+    let blocked = sections
+        .iter()
+        .any(|section| section.status == SetupSectionStatus::Blocked);
+    let mut actions = recommendations
+        .iter()
+        .filter(|recommendation| recommendation.dismissed_at_ms.is_none())
+        .map(|recommendation| SetupPlanAction {
+            section_id: setup_section_id_from_str(&recommendation.section_id)
+                .unwrap_or(SetupSectionId::Welcome),
+            kind: recommendation.kind.clone(),
+            title: recommendation.title.clone(),
+            body: recommendation.body.clone(),
+            mutating: true,
+        })
+        .collect::<Vec<_>>();
+    if !blocked && actions.is_empty() {
+        actions.push(SetupPlanAction {
+            section_id: SetupSectionId::Launch,
+            kind: "launch".to_owned(),
+            title: "Launch Bcode".to_owned(),
+            body: "Your setup is ready enough to start using Bcode.".to_owned(),
+            mutating: false,
+        });
+    }
+    SetupPlanReview {
+        actions,
+        launch_ready: !blocked,
+    }
+}
+
+fn setup_section_id_from_str(value: &str) -> Option<SetupSectionId> {
+    SetupSectionId::all()
+        .into_iter()
+        .find(|section| section.as_str() == value)
+}
+
 /// Bounded, sanitized onboarding/environment detection result.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetupDetectionSnapshot {
@@ -1478,12 +1701,83 @@ mod tests {
     }
 
     #[test]
+    fn section_visit_and_completion_persist_resume_state() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let store = SettingsStore::from_settings_db_path(temp.path().join("settings.db"));
+
+        store
+            .visit_onboarding_section(SetupSectionId::Providers, 700)
+            .expect("visit should persist");
+        let progress = store
+            .onboarding_progress()
+            .expect("progress should load")
+            .expect("progress should exist");
+        assert_eq!(progress.last_section.as_deref(), Some("providers"));
+        assert!(!progress.first_run_completed);
+        assert_eq!(
+            store
+                .onboarding_sections()
+                .expect("sections should load")
+                .first()
+                .expect("section should exist")
+                .section_id,
+            "providers"
+        );
+
+        store
+            .complete_onboarding(701)
+            .expect("completion should persist");
+        let progress = store
+            .onboarding_progress()
+            .expect("progress should reload")
+            .expect("progress should still exist");
+        assert!(progress.first_run_completed);
+        assert_eq!(progress.completed_at_ms, Some(701));
+    }
+
+    #[test]
+    fn setup_plan_review_uses_recommendations_and_launch_state() {
+        let blocked_sections = vec![ReconciledSetupSection {
+            section_id: SetupSectionId::SecureVault,
+            status: SetupSectionStatus::Blocked,
+            visited: true,
+        }];
+        let recommendation = SetupRecommendation {
+            recommendation_id: "secure-openai-env".to_owned(),
+            section_id: SetupSectionId::SecureVault.as_str().to_owned(),
+            kind: "secure_env_secret".to_owned(),
+            status: SetupSectionStatus::Recommended.as_str().to_owned(),
+            priority: 100,
+            title: "Secure detected OpenAI key".to_owned(),
+            body: "Move this detected key into secure storage.".to_owned(),
+            created_at_ms: 800,
+            dismissed_at_ms: None,
+        };
+
+        let blocked_plan = generate_setup_plan(&blocked_sections, &[recommendation]);
+        assert!(!blocked_plan.launch_ready);
+        assert_eq!(blocked_plan.actions[0].kind, "secure_env_secret");
+
+        let launch_plan = generate_setup_plan(&[], &[]);
+        assert!(launch_plan.launch_ready);
+        assert_eq!(launch_plan.actions[0].kind, "launch");
+    }
+
+    #[test]
     fn setup_view_models_include_story_copy() {
         let provider = provider_setup_card("bcode.openai-compatible", true, false);
         let security = security_trust_panel(true, true);
+        let model = model_setup_card(Some("fast".to_owned()), None);
+        let permission = permission_setup_card(false);
+        let import = import_setup_card(false);
+        let plugin = plugin_setup_card(BTreeSet::new(), BTreeSet::new());
 
         assert!(provider.story.contains("secure auth path"));
         assert!(security.story.contains("device sealing"));
+        assert!(model.story.contains("model path"));
+        assert!(permission.story.contains("permission preset"));
+        assert!(import.story.contains("Session import is optional"));
+        assert!(plugin.story.contains("Bundled plugins"));
     }
 
     #[test]
