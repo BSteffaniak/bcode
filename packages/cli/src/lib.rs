@@ -5777,6 +5777,10 @@ fn provider_stream_event_summary(event: &bcode_session_models::ProviderStreamEve
                 )
             },
         ),
+        bcode_session_models::ProviderStreamEvent::RetryScheduled {
+            message,
+            retry_at_unix,
+        } => format!("provider retry scheduled retry_at_unix={retry_at_unix} message={message}"),
     }
 }
 

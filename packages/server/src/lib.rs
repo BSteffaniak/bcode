@@ -8484,7 +8484,8 @@ async fn handle_compaction_events(
             ProviderTurnEvent::TurnStarted
             | ProviderTurnEvent::ReasoningDelta { .. }
             | ProviderTurnEvent::RequestProjection { .. }
-            | ProviderTurnEvent::ProviderMetadata { .. } => {}
+            | ProviderTurnEvent::ProviderMetadata { .. }
+            | ProviderTurnEvent::RetryScheduled { .. } => {}
         }
     }
     CompactionPollStatus::Continue
@@ -9358,6 +9359,7 @@ const fn model_event_is_progress(event: &ProviderTurnEvent) -> bool {
         | ProviderTurnEvent::TurnStarted
         | ProviderTurnEvent::Usage { .. }
         | ProviderTurnEvent::Warning { .. }
+        | ProviderTurnEvent::RetryScheduled { .. }
         | ProviderTurnEvent::ProviderMetadata { .. }
         | ProviderTurnEvent::Error { .. }
         | ProviderTurnEvent::Cancelled
@@ -9538,6 +9540,29 @@ async fn handle_provider_turn_event(
             )
             .await;
             append_system_event(state, session_id, format!("model warning: {message}")).await;
+        }
+        ProviderTurnEvent::RetryScheduled {
+            message,
+            retry_at_unix,
+        } => {
+            append_provider_event_trace(
+                state,
+                session_id,
+                turn_id,
+                "retry_scheduled",
+                Some(message.clone()),
+            )
+            .await;
+            publish_provider_stream_progress_live(
+                state,
+                session_id,
+                turn_id,
+                ProviderStreamEvent::RetryScheduled {
+                    message,
+                    retry_at_unix,
+                },
+            )
+            .await;
         }
         ProviderTurnEvent::Usage { usage } => {
             append_provider_event_trace(state, session_id, turn_id, "usage", None).await;

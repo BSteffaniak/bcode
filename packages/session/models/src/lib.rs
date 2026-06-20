@@ -886,6 +886,13 @@ pub enum ProviderStreamEvent {
         /// Active tool-call progress, when the provider was streaming tool arguments.
         active_tool_call: Option<ProviderToolCallProgress>,
     },
+    /// Provider scheduled an automatic retry after a rate-limit/quota reset wait.
+    RetryScheduled {
+        /// User-facing retry message.
+        message: String,
+        /// Unix timestamp when retry should be attempted.
+        retry_at_unix: u64,
+    },
 }
 
 /// Structured provider tool-call argument progress.

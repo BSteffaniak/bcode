@@ -1012,9 +1012,13 @@ async fn stream_chat_completion_with_failover(
                     return Err(error);
                 }
                 let wait_seconds = retry_at_unix.saturating_sub(now);
+                turn.push(ProviderTurnEvent::RetryScheduled {
+                    message: "All configured OpenAI subscriptions are quota-limited".to_string(),
+                    retry_at_unix,
+                });
                 turn.push(ProviderTurnEvent::Warning {
                     message: format!(
-                        "All configured OpenAI subscriptions are quota-limited. Retrying after {} when the next subscription should reset. Press Esc to cancel.",
+                        "All configured OpenAI subscriptions are quota-limited. Retrying in {}. Press Esc to cancel.",
                         format_duration(wait_seconds)
                     ),
                 });
@@ -1537,6 +1541,7 @@ fn process_responses_stream_buffer(
     Ok(StreamOutcome::Cancelled)
 }
 
+#[allow(clippy::too_many_lines)]
 fn process_responses_stream_line(
     line: &str,
     turn: &TurnState,
@@ -1632,11 +1637,21 @@ fn process_responses_stream_line(
                 .and_then(|error| error.get("code").or_else(|| error.get("type")))
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("responses_stream_failed");
-            return Err(provider_error(
+            let status = event
+                .get("status")
+                .or_else(|| event.get("status_code"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|status| u16::try_from(status).ok())
+                .unwrap_or(400);
+            let mut error = provider_error(
                 code,
-                category_from_openai_error(400, code, message),
+                category_from_openai_error(status, code, message),
                 message,
-            ));
+            );
+            if error.category == ProviderErrorCategory::RateLimit {
+                error.retry = retry_hint_from_json_value(&event).map(Box::new);
+            }
+            return Err(error);
         }
         _ => {}
     }
@@ -4543,39 +4558,16 @@ fn retry_hint_from_response(headers: Option<&HeaderMap>, body: &str) -> Option<P
 }
 
 fn retry_hint_from_headers(headers: &HeaderMap) -> Option<ProviderRetryHint> {
-    header_seconds(headers, "retry-after-ms").map_or_else(
-        || {
-            header_seconds(headers, "retry-after")
-                .map(|seconds| ProviderRetryHint {
-                    retry_after_ms: Some(seconds.saturating_mul(1_000)),
-                    retry_at_unix: Some(unix_timestamp().saturating_add(seconds)),
-                    source: Some("retry-after".to_string()),
-                })
-                .or_else(|| header_http_date(headers, "retry-after"))
-                .or_else(|| x_ratelimit_reset_hint(headers))
-        },
-        |milliseconds| {
-            Some(ProviderRetryHint {
-                retry_after_ms: Some(milliseconds),
-                retry_at_unix: Some(unix_timestamp().saturating_add(milliseconds.div_ceil(1_000))),
-                source: Some("retry-after-ms".to_string()),
-            })
-        },
-    )
-}
-
-fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get(name)?
-        .to_str()
-        .ok()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-}
-
-fn header_seconds(headers: &HeaderMap, name: &str) -> Option<u64> {
-    parse_seconds_value(&header_value(headers, name)?)
+    let normalized = headers
+        .iter()
+        .filter_map(|(key, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (key.as_str().to_ascii_lowercase(), value.trim().to_string()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    retry_hint_from_header_map_values(&normalized)
 }
 
 fn parse_seconds_value(value: &str) -> Option<u64> {
@@ -4591,49 +4583,105 @@ fn parse_seconds_value(value: &str) -> Option<u64> {
     }
 }
 
-fn header_http_date(headers: &HeaderMap, name: &str) -> Option<ProviderRetryHint> {
-    let value = header_value(headers, name)?;
-    let date = httpdate::parse_http_date(&value).ok()?;
-    let retry_at_unix = date.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-    Some(ProviderRetryHint {
-        retry_after_ms: retry_at_unix
-            .saturating_sub(unix_timestamp())
-            .checked_mul(1_000),
-        retry_at_unix: Some(retry_at_unix),
-        source: Some(name.to_string()),
+fn retry_hint_from_body(body: &str) -> Option<ProviderRetryHint> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    retry_hint_from_json_value(&value)
+}
+
+fn retry_hint_from_json_value(value: &serde_json::Value) -> Option<ProviderRetryHint> {
+    retry_hint_from_json_headers(value).or_else(|| {
+        find_json_reset_value(value).map(|retry_at_unix| ProviderRetryHint {
+            retry_after_ms: retry_at_unix
+                .saturating_sub(unix_timestamp())
+                .checked_mul(1_000),
+            retry_at_unix: Some(retry_at_unix),
+            source: Some("body".to_string()),
+        })
     })
 }
 
-fn x_ratelimit_reset_hint(headers: &HeaderMap) -> Option<ProviderRetryHint> {
+fn retry_hint_from_json_headers(value: &serde_json::Value) -> Option<ProviderRetryHint> {
+    let headers = value.get("headers")?.as_object()?;
+    let mut normalized = BTreeMap::new();
+    for (key, value) in headers {
+        if let Some(value) = header_json_value(value) {
+            normalized.insert(key.to_ascii_lowercase(), value);
+        }
+    }
+    retry_hint_from_header_map_values(&normalized)
+}
+
+fn header_json_value(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .or_else(|| value.as_u64().map(|number| number.to_string()))
+        .or_else(|| value.as_i64().map(|number| number.to_string()))
+        .or_else(|| value.as_bool().map(|boolean| boolean.to_string()))
+}
+
+fn retry_hint_from_header_map_values(
+    headers: &BTreeMap<String, String>,
+) -> Option<ProviderRetryHint> {
+    headers
+        .get("retry-after-ms")
+        .and_then(|value| parse_millis_value(value))
+        .map_or_else(
+            || {
+                headers
+                    .get("retry-after")
+                    .and_then(|value| parse_retry_after_value(value, "retry-after"))
+                    .or_else(|| x_ratelimit_reset_hint_from_values(headers))
+                    .or_else(|| codex_window_hint_from_values(headers))
+            },
+            |milliseconds| {
+                Some(ProviderRetryHint {
+                    retry_after_ms: Some(milliseconds),
+                    retry_at_unix: Some(
+                        unix_timestamp().saturating_add(milliseconds.div_ceil(1_000)),
+                    ),
+                    source: Some("retry-after-ms".to_string()),
+                })
+            },
+        )
+}
+
+fn parse_millis_value(value: &str) -> Option<u64> {
+    value.parse::<u64>().ok()
+}
+
+fn x_ratelimit_reset_hint_from_values(
+    headers: &BTreeMap<String, String>,
+) -> Option<ProviderRetryHint> {
     [
         "x-ratelimit-reset-requests",
         "x-ratelimit-reset-tokens",
         "x-ratelimit-reset",
     ]
     .into_iter()
-    .find_map(|name| header_reset_value(headers, name))
-}
-
-fn header_reset_value(headers: &HeaderMap, name: &str) -> Option<ProviderRetryHint> {
-    let value = header_value(headers, name)?;
-    parse_reset_value(&value).map(|retry_at_unix| ProviderRetryHint {
-        retry_after_ms: retry_at_unix
-            .saturating_sub(unix_timestamp())
-            .checked_mul(1_000),
-        retry_at_unix: Some(retry_at_unix),
-        source: Some(name.to_string()),
+    .find_map(|name| {
+        headers.get(name).and_then(|value| {
+            parse_reset_value(value).map(|retry_at_unix| ProviderRetryHint {
+                retry_after_ms: retry_at_unix
+                    .saturating_sub(unix_timestamp())
+                    .checked_mul(1_000),
+                retry_at_unix: Some(retry_at_unix),
+                source: Some(name.to_string()),
+            })
+        })
     })
 }
 
-fn retry_hint_from_body(body: &str) -> Option<ProviderRetryHint> {
-    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
-    find_json_reset_value(&value).map(|retry_at_unix| ProviderRetryHint {
-        retry_after_ms: retry_at_unix
-            .saturating_sub(unix_timestamp())
-            .checked_mul(1_000),
-        retry_at_unix: Some(retry_at_unix),
-        source: Some("body".to_string()),
-    })
+fn codex_window_hint_from_values(headers: &BTreeMap<String, String>) -> Option<ProviderRetryHint> {
+    headers
+        .get("x-codex-primary-window-minutes")
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|minutes| minutes.saturating_mul(60))
+        .map(|seconds| ProviderRetryHint {
+            retry_after_ms: seconds.checked_mul(1_000),
+            retry_at_unix: Some(unix_timestamp().saturating_add(seconds)),
+            source: Some("x-codex-primary-window-minutes".to_string()),
+        })
 }
 
 fn find_json_reset_value(value: &serde_json::Value) -> Option<u64> {
@@ -4666,21 +4714,113 @@ fn parse_json_reset_value(value: &serde_json::Value) -> Option<u64> {
 }
 
 fn parse_reset_value(value: &str) -> Option<u64> {
-    value.parse::<u64>().ok().map_or_else(
+    parse_duration_seconds(value).map_or_else(
         || {
+            value.parse::<u64>().ok().map_or_else(
+                || {
+                    httpdate::parse_http_date(value)
+                        .ok()
+                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_secs())
+                },
+                |number| {
+                    if number > 2_000_000_000 {
+                        Some(number)
+                    } else {
+                        Some(unix_timestamp().saturating_add(number))
+                    }
+                },
+            )
+        },
+        |seconds| Some(unix_timestamp().saturating_add(seconds)),
+    )
+}
+
+fn parse_retry_after_value(value: &str, source: &str) -> Option<ProviderRetryHint> {
+    parse_seconds_value(value)
+        .or_else(|| parse_duration_seconds(value))
+        .map(|seconds| ProviderRetryHint {
+            retry_after_ms: seconds.checked_mul(1_000),
+            retry_at_unix: Some(unix_timestamp().saturating_add(seconds)),
+            source: Some(source.to_string()),
+        })
+        .or_else(|| {
             httpdate::parse_http_date(value)
                 .ok()
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|duration| duration.as_secs())
-        },
-        |number| {
-            if number > 2_000_000_000 {
-                Some(number)
-            } else {
-                Some(unix_timestamp().saturating_add(number))
+                .map(|retry_at_unix| ProviderRetryHint {
+                    retry_after_ms: retry_at_unix
+                        .saturating_sub(unix_timestamp())
+                        .checked_mul(1_000),
+                    retry_at_unix: Some(retry_at_unix),
+                    source: Some(source.to_string()),
+                })
+        })
+}
+
+fn parse_duration_seconds(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().all(|character| character.is_ascii_digit()) {
+        return None;
+    }
+    let mut total_millis = 0_u64;
+    let mut number = String::new();
+    let mut parsed_unit = false;
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character.is_ascii_digit() || character == '.' {
+            number.push(character);
+            continue;
+        }
+        if character.is_whitespace() {
+            continue;
+        }
+        let unit = if character == 'm' && chars.peek() == Some(&'s') {
+            chars.next();
+            "ms"
+        } else if matches!(character, 'd' | 'h' | 'm' | 's') {
+            match character {
+                'd' => "d",
+                'h' => "h",
+                'm' => "m",
+                's' => "s",
+                _ => return None,
             }
-        },
-    )
+        } else {
+            return None;
+        };
+        let millis = duration_component_millis(&number, unit)?;
+        total_millis = total_millis.saturating_add(millis);
+        number.clear();
+        parsed_unit = true;
+    }
+    if !number.is_empty() || !parsed_unit {
+        return None;
+    }
+    Some(total_millis.div_ceil(1_000))
+}
+
+fn duration_component_millis(number: &str, unit: &str) -> Option<u64> {
+    let (whole, fraction) = number
+        .split_once('.')
+        .map_or((number, ""), |(whole, fraction)| (whole, fraction));
+    let whole = whole.parse::<u64>().ok()?;
+    let multiplier = match unit {
+        "ms" => 1,
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => return None,
+    };
+    let whole_millis = whole.checked_mul(multiplier)?;
+    if fraction.is_empty() {
+        return Some(whole_millis);
+    }
+    let denominator = 10_u64.checked_pow(u32::try_from(fraction.len()).ok()?)?;
+    let numerator = fraction.parse::<u64>().ok()?;
+    Some(whole_millis.saturating_add(numerator.saturating_mul(multiplier) / denominator))
 }
 
 fn category_from_openai_error(status: u16, code: &str, message: &str) -> ProviderErrorCategory {

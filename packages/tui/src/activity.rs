@@ -24,6 +24,13 @@ pub enum ActivityState {
         /// User-facing progress detail.
         detail: String,
     },
+    /// Waiting to retry a provider request after quota/rate-limit reset.
+    RetryWait {
+        /// User-facing message.
+        message: String,
+        /// Unix timestamp when retry should occur.
+        retry_at_unix: u64,
+    },
     /// Writing a file through a filesystem tool.
     WritingFile,
     /// Editing a file through a filesystem tool.

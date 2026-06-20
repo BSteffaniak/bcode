@@ -3232,6 +3232,14 @@ fn activity_label(activity: &ActivityState, daemon_connection: DaemonConnectionS
         ActivityState::ProviderStream { detail } => {
             format!("{} provider stream · {detail}", spinner_frame())
         }
+        ActivityState::RetryWait {
+            message,
+            retry_at_unix,
+        } => format!(
+            "{} {message}; retrying in {} · Esc to cancel",
+            spinner_frame(),
+            format_retry_remaining(*retry_at_unix)
+        ),
         ActivityState::WritingFile => format!("{} writing", spinner_frame()),
         ActivityState::EditingFile => format!("{} editing", spinner_frame()),
         ActivityState::RunningTool { name } => {
@@ -3241,6 +3249,25 @@ fn activity_label(activity: &ActivityState, daemon_connection: DaemonConnectionS
             format!("permission {}", tool_activity_label(name))
         }
         ActivityState::Cancelling => format!("{} cancelling", spinner_frame()),
+    }
+}
+
+fn format_retry_remaining(retry_at_unix: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    let seconds = retry_at_unix.saturating_sub(now);
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3_600;
+    let minutes = (seconds % 3_600).div_ceil(60);
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        "less than 1m".to_owned()
     }
 }
 

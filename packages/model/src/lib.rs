@@ -865,6 +865,10 @@ pub enum ProviderTurnEvent {
     Warning {
         message: String,
     },
+    RetryScheduled {
+        message: String,
+        retry_at_unix: u64,
+    },
     Error {
         error: ProviderError,
     },

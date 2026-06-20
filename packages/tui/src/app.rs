@@ -3340,6 +3340,16 @@ impl BmuxApp {
                 });
                 self.status = detail;
             }
+            ProviderStreamEvent::RetryScheduled {
+                message,
+                retry_at_unix,
+            } => {
+                self.set_activity(ActivityState::RetryWait {
+                    message: message.clone(),
+                    retry_at_unix: *retry_at_unix,
+                });
+                self.status = format!("{message}; retrying soon");
+            }
         }
     }
 
