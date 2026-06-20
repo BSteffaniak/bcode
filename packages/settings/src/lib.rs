@@ -91,6 +91,34 @@ impl SettingsStore {
         Ok(())
     }
 
+    /// Persist a setup readiness report into control state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the report cannot be serialized or persisted.
+    pub fn save_readiness_report(
+        &self,
+        report: &SetupReadinessReport,
+        updated_at_ms: u64,
+    ) -> SettingsResult<()> {
+        self.put_control_state(
+            "setup.readiness_report",
+            &serde_json::to_value(report)?,
+            updated_at_ms,
+        )
+    }
+
+    /// Return the persisted setup readiness report if one exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the report cannot be read or decoded.
+    pub fn readiness_report(&self) -> SettingsResult<Option<SetupReadinessReport>> {
+        self.control_state("setup.readiness_report")?
+            .map(|value| serde_json::from_value(value.value).map_err(Into::into))
+            .transpose()
+    }
+
     /// Apply a generated setup plan through available settings/domain services.
     ///
     /// Current mutating plan actions are represented as persisted
@@ -1377,6 +1405,87 @@ pub struct SetupPlanAction {
     pub mutating: bool,
 }
 
+/// Setup readiness severity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupReadinessSeverity {
+    /// Informational item.
+    Info,
+    /// Recommended but not blocking.
+    Recommended,
+    /// Blocks launch/readiness.
+    Blocking,
+}
+
+/// Setup readiness item surfaced before launch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupReadinessItem {
+    /// Related setup section.
+    pub section_id: SetupSectionId,
+    /// Item severity.
+    pub severity: SetupReadinessSeverity,
+    /// User-facing title.
+    pub title: String,
+    /// User-facing body.
+    pub body: String,
+}
+
+/// Aggregate setup readiness report.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupReadinessReport {
+    /// Readiness items.
+    pub items: Vec<SetupReadinessItem>,
+    /// Whether setup is launch-ready.
+    pub launch_ready: bool,
+}
+
+/// Build a readiness report from reconciled setup sections and recommendations.
+#[must_use]
+pub fn setup_readiness_report(
+    sections: &[ReconciledSetupSection],
+    recommendations: &[SetupRecommendation],
+) -> SetupReadinessReport {
+    let mut items = Vec::new();
+    for section in sections {
+        match section.status {
+            SetupSectionStatus::Blocked => items.push(SetupReadinessItem {
+                section_id: section.section_id,
+                severity: SetupReadinessSeverity::Blocking,
+                title: format!("{} is blocked", section.section_id.as_str()),
+                body: "Resolve this setup section before launch.".to_owned(),
+            }),
+            SetupSectionStatus::Recommended | SetupSectionStatus::NeedsAttention => {
+                items.push(SetupReadinessItem {
+                    section_id: section.section_id,
+                    severity: SetupReadinessSeverity::Recommended,
+                    title: format!("Review {}", section.section_id.as_str()),
+                    body: "This setup section has recommended follow-up work.".to_owned(),
+                });
+            }
+            _ => {}
+        }
+    }
+    for recommendation in recommendations
+        .iter()
+        .filter(|recommendation| recommendation.dismissed_at_ms.is_none())
+    {
+        items.push(SetupReadinessItem {
+            section_id: setup_section_id_from_str(&recommendation.section_id)
+                .unwrap_or(SetupSectionId::Welcome),
+            severity: SetupReadinessSeverity::Recommended,
+            title: recommendation.title.clone(),
+            body: recommendation.body.clone(),
+        });
+    }
+    let launch_ready = !items
+        .iter()
+        .any(|item| item.severity == SetupReadinessSeverity::Blocking);
+    SetupReadinessReport {
+        items,
+        launch_ready,
+    }
+}
+
 /// Final setup plan review model.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetupPlanReview {
@@ -1438,6 +1547,7 @@ pub fn generate_setup_plan(
     let blocked = sections
         .iter()
         .any(|section| section.status == SetupSectionStatus::Blocked);
+    let readiness = setup_readiness_report(sections, recommendations);
     let mut actions = recommendations
         .iter()
         .filter(|recommendation| recommendation.dismissed_at_ms.is_none())
@@ -1461,7 +1571,7 @@ pub fn generate_setup_plan(
     }
     SetupPlanReview {
         actions,
-        launch_ready: !blocked,
+        launch_ready: !blocked && readiness.launch_ready,
     }
 }
 
@@ -2283,6 +2393,76 @@ mod tests {
         assert_eq!(
             store.experience_mode().expect("mode should reload"),
             SettingsExperienceMode::ControlCenter
+        );
+    }
+
+    #[test]
+    fn readiness_report_identifies_blocking_and_recommended_items() {
+        let sections = vec![
+            ReconciledSetupSection {
+                section_id: SetupSectionId::SecureVault,
+                status: SetupSectionStatus::Blocked,
+                visited: true,
+            },
+            ReconciledSetupSection {
+                section_id: SetupSectionId::Plugins,
+                status: SetupSectionStatus::Recommended,
+                visited: false,
+            },
+        ];
+        let recommendation = SetupRecommendation {
+            recommendation_id: "secure-openai-env".to_owned(),
+            section_id: SetupSectionId::SecureVault.as_str().to_owned(),
+            kind: "secure_env_secret".to_owned(),
+            status: SetupSectionStatus::Recommended.as_str().to_owned(),
+            priority: 100,
+            title: "Secure detected OpenAI key".to_owned(),
+            body: "Move this detected key into secure storage.".to_owned(),
+            created_at_ms: 1,
+            dismissed_at_ms: None,
+        };
+
+        let report = setup_readiness_report(&sections, &[recommendation]);
+
+        assert!(!report.launch_ready);
+        assert!(
+            report
+                .items
+                .iter()
+                .any(|item| item.severity == SetupReadinessSeverity::Blocking)
+        );
+        assert!(
+            report
+                .items
+                .iter()
+                .any(|item| item.severity == SetupReadinessSeverity::Recommended)
+        );
+    }
+
+    #[test]
+    fn readiness_report_round_trips_through_control_state() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let store = SettingsStore::from_settings_db_path(temp.path().join("settings.db"));
+        let report = SetupReadinessReport {
+            items: vec![SetupReadinessItem {
+                section_id: SetupSectionId::Plugins,
+                severity: SetupReadinessSeverity::Recommended,
+                title: "Review plugins".to_owned(),
+                body: "Plugin settings are customizable.".to_owned(),
+            }],
+            launch_ready: true,
+        };
+
+        store
+            .save_readiness_report(&report, 55)
+            .expect("report should save");
+
+        assert_eq!(
+            store
+                .readiness_report()
+                .expect("report should load")
+                .expect("report should exist"),
+            report
         );
     }
 

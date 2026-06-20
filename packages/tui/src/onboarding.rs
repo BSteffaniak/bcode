@@ -1,8 +1,9 @@
 //! Onboarding/setup-map TUI view models and shell helpers.
 
 use bcode_settings::{
-    ReconciledSetupSection, SettingsError, SettingsStore, SetupConfigSummary, SetupMapSnapshot,
-    SetupReconciliationInput, SetupSectionId, SetupSectionStatus,
+    ReconciledSetupSection, SettingsDbHealth, SettingsDegradedPanel, SettingsError, SettingsStore,
+    SetupConfigSummary, SetupMapSnapshot, SetupReadinessReport, SetupReconciliationInput,
+    SetupSectionId, SetupSectionStatus, settings_degraded_panel,
 };
 use bmux_tui_components::stepper::{StepItem, StepStatus};
 
@@ -28,6 +29,45 @@ pub struct OnboardingWalkthroughReport {
     pub rendered_map: String,
     /// Whether persisted focus survived reload.
     pub persisted_focus_reloaded: bool,
+}
+
+/// High-level onboarding input actions handled by the setup-map shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardingInputAction {
+    /// Move focus to the next setup section.
+    Next,
+    /// Move focus to the previous setup section.
+    Previous,
+    /// Persist/currently select the focused section.
+    Select,
+    /// Quit/close onboarding.
+    Quit,
+}
+
+/// Outcome of handling an onboarding input action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardingActionOutcome {
+    /// Focus moved to another section.
+    FocusChanged(SetupSectionId),
+    /// Focus was persisted/selected.
+    Selected(SetupSectionId),
+    /// Onboarding should close.
+    Quit,
+    /// No state changed.
+    Ignored,
+}
+
+/// Text render snapshot for the onboarding setup shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnboardingRenderModel {
+    /// Setup-map lines.
+    pub map_lines: Vec<String>,
+    /// Footer/help lines.
+    pub footer_lines: Vec<String>,
+    /// Optional degraded settings-state panel.
+    pub degraded_panel: Option<SettingsDegradedPanel>,
+    /// Optional readiness report.
+    pub readiness_report: Option<SetupReadinessReport>,
 }
 
 impl OnboardingShell {
@@ -104,6 +144,38 @@ impl OnboardingShell {
         store.visit_onboarding_section(self.focused_section(), visited_at_ms)
     }
 
+    /// Handle a high-level onboarding input action.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when selecting the focused section cannot be persisted.
+    pub fn handle_action(
+        &mut self,
+        action: OnboardingInputAction,
+        store: &SettingsStore,
+        at_ms: u64,
+    ) -> Result<OnboardingActionOutcome, SettingsError> {
+        match action {
+            OnboardingInputAction::Next => {
+                self.focus_next();
+                Ok(OnboardingActionOutcome::FocusChanged(
+                    self.focused_section(),
+                ))
+            }
+            OnboardingInputAction::Previous => {
+                self.focus_previous();
+                Ok(OnboardingActionOutcome::FocusChanged(
+                    self.focused_section(),
+                ))
+            }
+            OnboardingInputAction::Select => {
+                self.persist_focus(store, at_ms)?;
+                Ok(OnboardingActionOutcome::Selected(self.focused_section()))
+            }
+            OnboardingInputAction::Quit => Ok(OnboardingActionOutcome::Quit),
+        }
+    }
+
     /// Return BMUX stepper items for rendering the setup map with existing primitives.
     #[must_use]
     pub fn step_items(&self) -> Vec<StepItem<'static>> {
@@ -126,6 +198,37 @@ impl OnboardingShell {
             sections: self.sections.clone(),
         }
         .render_text_map()
+    }
+
+    /// Build a text render model for onboarding/control-center shell rendering.
+    #[must_use]
+    pub fn render_model(
+        &self,
+        health: &SettingsDbHealth,
+        readiness_report: Option<SetupReadinessReport>,
+    ) -> OnboardingRenderModel {
+        let map_lines = self
+            .sections
+            .iter()
+            .map(|section| {
+                format!(
+                    "{} [{}]{}",
+                    setup_section_label(section.section_id),
+                    section.status.as_str(),
+                    if section.visited { " ✓" } else { "" }
+                )
+            })
+            .collect();
+        OnboardingRenderModel {
+            map_lines,
+            footer_lines: vec![
+                "←/↑ previous  →/↓ next  Enter select  Esc close".to_owned(),
+                "Setup state is persisted locally and user config remains TOML-backed.".to_owned(),
+            ],
+            degraded_panel: (!matches!(health, SettingsDbHealth::Available))
+                .then(|| settings_degraded_panel(health)),
+            readiness_report,
+        }
     }
 
     /// Run a non-interactive first-run walkthrough smoke test.
@@ -242,6 +345,56 @@ mod tests {
         shell.focus_previous();
         assert_eq!(shell.focused_section(), SetupSectionId::Welcome);
         assert_eq!(shell.step_items().len(), SetupSectionId::all().len());
+    }
+
+    #[test]
+    fn shell_handles_actions_and_builds_render_model() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let store = SettingsStore::from_settings_db_path(temp.path().join("settings.db"));
+        let summary = SetupConfigSummary::default();
+        let mut shell = OnboardingShell::load(&store, &summary).expect("shell should load");
+
+        assert_eq!(
+            shell
+                .handle_action(OnboardingInputAction::Next, &store, 50)
+                .expect("next should succeed"),
+            OnboardingActionOutcome::FocusChanged(SetupSectionId::Detection)
+        );
+        assert_eq!(
+            shell
+                .handle_action(OnboardingInputAction::Select, &store, 51)
+                .expect("select should persist"),
+            OnboardingActionOutcome::Selected(SetupSectionId::Detection)
+        );
+        let render = shell.render_model(&SettingsDbHealth::Available, None);
+
+        assert!(
+            render
+                .map_lines
+                .iter()
+                .any(|line| line.contains("Scout Tower"))
+        );
+        assert!(
+            render
+                .footer_lines
+                .iter()
+                .any(|line| line.contains("Enter"))
+        );
+        assert!(render.degraded_panel.is_none());
+    }
+
+    #[test]
+    fn render_model_includes_degraded_panel() {
+        let summary = SetupConfigSummary::default();
+        let shell = OnboardingShell::from_reconciliation(&[], &summary.reconciliation_input());
+        let render = shell.render_model(
+            &SettingsDbHealth::Unavailable {
+                message: "bad db".to_owned(),
+            },
+            None,
+        );
+
+        assert!(render.degraded_panel.is_some());
     }
 
     #[test]
