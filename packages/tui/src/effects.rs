@@ -36,6 +36,10 @@ pub struct SubmitMessageRequest {
     pub message: String,
     /// Prompt placement semantics.
     pub placement: PromptPlacement,
+    /// Provider to apply before sending, if any.
+    pub provider_plugin_id: Option<String>,
+    /// Model to apply before sending, if any.
+    pub model_id: Option<String>,
     /// Agent to apply before sending, if any.
     pub agent_id: Option<String>,
     /// Reasoning effort to apply before sending.
@@ -1197,6 +1201,8 @@ async fn submit_message(
         launch_working_directory,
         message,
         placement,
+        provider_plugin_id,
+        model_id,
         agent_id,
         reasoning_effort,
         reasoning_summary,
@@ -1233,6 +1239,11 @@ async fn submit_message(
         event_task = Some(task);
         session_id
     };
+    if let Some(model_id) = model_id {
+        client
+            .set_session_model(session_id, provider_plugin_id, model_id)
+            .await?;
+    }
     if let Some(agent_id) = agent_id.clone() {
         client.set_session_agent(session_id, agent_id).await?;
     }

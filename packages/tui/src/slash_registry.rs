@@ -80,23 +80,23 @@ const BUILTIN_COMMANDS: &[BuiltinSlashCommand] = &[
     },
     BuiltinSlashCommand {
         name: "model",
-        draft_safe: false,
+        draft_safe: true,
     },
     BuiltinSlashCommand {
         name: "models",
-        draft_safe: false,
+        draft_safe: true,
     },
     BuiltinSlashCommand {
         name: "set-model",
-        draft_safe: false,
+        draft_safe: true,
     },
     BuiltinSlashCommand {
         name: "provider",
-        draft_safe: false,
+        draft_safe: true,
     },
     BuiltinSlashCommand {
         name: "set-provider",
-        draft_safe: false,
+        draft_safe: true,
     },
     BuiltinSlashCommand {
         name: "context-strategy",

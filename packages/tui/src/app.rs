@@ -2316,6 +2316,18 @@ impl BmuxApp {
         self.wake_cursor();
     }
 
+    /// Apply a locally selected model before a persisted session exists.
+    pub fn apply_local_model_selection(&mut self, provider: Option<String>, model: &str) {
+        self.selected_provider_plugin_id = provider;
+        self.selected_model_id = model_to_display_selection(model);
+        self.token_usage.clear_model_info();
+        let provider_label = self
+            .selected_provider_plugin_id
+            .as_deref()
+            .unwrap_or("auto");
+        self.status = format!("model selected for next session: {provider_label}/{model}");
+    }
+
     fn apply_model_changed(&mut self, provider: &str, model: &str) {
         self.selected_provider_plugin_id = provider_to_display_selection(provider);
         self.selected_model_id = model_to_display_selection(model);

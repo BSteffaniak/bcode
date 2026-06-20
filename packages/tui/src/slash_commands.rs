@@ -34,6 +34,11 @@ pub enum SlashCommandOutcome {
         session_id: SessionId,
         name: Option<String>,
     },
+    /// Set the model for the next draft session.
+    SetLocalModel {
+        provider_plugin_id: Option<String>,
+        model_id: String,
+    },
     /// Set the active model for a session.
     SetSessionModel {
         session_id: SessionId,
@@ -627,43 +632,47 @@ async fn execute_builtin(
         }
         "model" | "models" if parts.len() == 1 => Ok(SlashCommandOutcome::PickModel),
         "model" | "set-model" if parts.len() > 1 => {
-            let Some(session_id) = session_id else {
-                return Ok(SlashCommandOutcome::Handled(
-                    "model selection requires an active session".to_owned(),
-                ));
-            };
             let model_id = parts[1].to_owned();
-            Ok(SlashCommandOutcome::SetSessionModel {
-                session_id,
-                provider_plugin_id: None,
-                model_id,
-            })
+            if let Some(session_id) = session_id {
+                Ok(SlashCommandOutcome::SetSessionModel {
+                    session_id,
+                    provider_plugin_id: None,
+                    model_id,
+                })
+            } else {
+                Ok(SlashCommandOutcome::SetLocalModel {
+                    provider_plugin_id: None,
+                    model_id,
+                })
+            }
         }
         "provider" | "set-provider" if parts.len() > 1 => {
-            let Some(session_id) = session_id else {
-                return Ok(SlashCommandOutcome::Handled(
-                    "provider selection requires an active session".to_owned(),
-                ));
-            };
             let provider = parts[1].to_owned();
-            let model_id = client
-                .session_model_status(session_id)
-                .await?
-                .model_id
-                .unwrap_or_else(|| "default".to_owned());
-            Ok(SlashCommandOutcome::SetSessionModel {
-                session_id,
-                provider_plugin_id: Some(provider),
-                model_id,
-            })
+            let status = if let Some(session_id) = session_id {
+                client.session_model_status(session_id).await?
+            } else {
+                client.default_model_status().await?
+            };
+            let model_id = status.model_id.unwrap_or_else(|| "default".to_owned());
+            if let Some(session_id) = session_id {
+                Ok(SlashCommandOutcome::SetSessionModel {
+                    session_id,
+                    provider_plugin_id: Some(provider),
+                    model_id,
+                })
+            } else {
+                Ok(SlashCommandOutcome::SetLocalModel {
+                    provider_plugin_id: Some(provider),
+                    model_id,
+                })
+            }
         }
         "provider" => {
-            let Some(session_id) = session_id else {
-                return Ok(SlashCommandOutcome::Handled(
-                    "provider status requires an active session".to_owned(),
-                ));
+            let status = if let Some(session_id) = session_id {
+                client.session_model_status(session_id).await?
+            } else {
+                client.default_model_status().await?
             };
-            let status = client.session_model_status(session_id).await?;
             Ok(SlashCommandOutcome::Handled(format!(
                 "current provider: {}",
                 status.provider_plugin_id.as_deref().unwrap_or("auto")

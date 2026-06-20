@@ -129,16 +129,13 @@ enum ModelProviderPick {
     Canceled,
 }
 
-/// Pick and set the active model for the current session.
+/// Pick and set the active model for the current or next session.
 pub async fn pick_model_for_session<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
     chat: &mut ActiveChat,
 ) -> Result<(), TuiError> {
-    let Some(session_id) = chat.app.session_id() else {
-        chat.app.set_status("No active session".to_owned());
-        return Ok(());
-    };
+    let session_id = chat.app.session_id();
     let provider_plugin_id = match pick_model_provider(io, services, chat).await? {
         Some(ModelProviderPick::Selected(provider)) => provider,
         Some(ModelProviderPick::Canceled) | None => return Ok(()),
@@ -177,7 +174,7 @@ pub async fn pick_model_for_session<W: Write>(
                 KeyCode::Escape => return Ok(()),
                 KeyCode::Enter => {
                     if let Some(model_id) = picker.selected_model_id() {
-                        start_set_session_model(
+                        apply_model_selection(
                             chat,
                             session_id,
                             provider_plugin_id.clone(),
@@ -201,7 +198,7 @@ pub async fn pick_model_for_session<W: Write>(
                     && picker.select_visible(row)
                     && let Some(model_id) = picker.selected_model_id()
                 {
-                    start_set_session_model(chat, session_id, provider_plugin_id.clone(), model_id);
+                    apply_model_selection(chat, session_id, provider_plugin_id.clone(), model_id);
                     return Ok(());
                 }
             }
@@ -276,16 +273,21 @@ async fn pick_model_provider<W: Write>(
     }
 }
 
-fn start_set_session_model(
+fn apply_model_selection(
     chat: &mut ActiveChat,
-    session_id: bcode_session_models::SessionId,
+    session_id: Option<bcode_session_models::SessionId>,
     provider_plugin_id: Option<String>,
     model_id: String,
 ) {
-    chat.start_effect(TuiEffect::SetSessionModel {
-        session_id,
-        provider_plugin_id,
-        model_id,
-    });
-    chat.app.set_status("applying model…".to_owned());
+    if let Some(session_id) = session_id {
+        chat.start_effect(TuiEffect::SetSessionModel {
+            session_id,
+            provider_plugin_id,
+            model_id,
+        });
+        chat.app.set_status("applying model…".to_owned());
+    } else {
+        chat.app
+            .apply_local_model_selection(provider_plugin_id, &model_id);
+    }
 }

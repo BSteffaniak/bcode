@@ -211,6 +211,14 @@ async fn handle_slash_command<W: Write>(
             });
             chat.app.set_status("cloning session…".to_owned());
         }
+        slash_commands::SlashCommandOutcome::SetLocalModel {
+            provider_plugin_id,
+            model_id,
+        } => {
+            chat.app.clear_pending_submission(message);
+            chat.app
+                .apply_local_model_selection(provider_plugin_id, &model_id);
+        }
         slash_commands::SlashCommandOutcome::SetSessionModel {
             session_id,
             provider_plugin_id,
@@ -360,12 +368,26 @@ pub async fn submit_composer<W: Write>(
         let current = chat.app.current_agent_id().to_owned();
         (current != "build").then_some(current)
     };
+    let draft_provider_plugin_id = if session_id.is_none() {
+        chat.app
+            .selected_provider_plugin_id()
+            .map(ToOwned::to_owned)
+    } else {
+        None
+    };
+    let draft_model_id = if session_id.is_none() {
+        chat.app.selected_model_id().map(ToOwned::to_owned)
+    } else {
+        None
+    };
     chat.start_effect(TuiEffect::SubmitMessage {
         request: Box::new(SubmitMessageRequest {
             session_id,
             launch_working_directory: std::env::current_dir()?,
             message,
             placement,
+            provider_plugin_id: draft_provider_plugin_id,
+            model_id: draft_model_id,
             agent_id,
             reasoning_effort: chat.app.reasoning_effort().map(ToOwned::to_owned),
             reasoning_summary: chat.app.reasoning_summary().map(ToOwned::to_owned),
