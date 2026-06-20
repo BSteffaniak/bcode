@@ -37,7 +37,6 @@ use super::transcript::{FileEditPhase, TranscriptItem, TranscriptItemKind};
 use super::transcript_layout::TranscriptLayoutSignature;
 use crate::time_format::{format_elapsed_millis, format_millis};
 use bmux_tui::text_width::{display_width as text_display_width, truncate_to_display_width};
-use std::num::ParseIntError;
 use unicode_segmentation::UnicodeSegmentation;
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -56,22 +55,11 @@ pub struct TuiTheme {
 }
 
 impl TuiTheme {
-    const PENDING_AGENT_METADATA_ACCENT: Color = Color::Rgb(100, 116, 139);
-
-    pub fn for_app(app: &mut BmuxApp, now: Instant) -> Self {
-        let target = Self::target_for_app(app);
-        Self {
-            accent: app.animated_accent(target, now),
-        }
-    }
-
     #[must_use]
-    pub fn target_for_app(app: &BmuxApp) -> Color {
-        Self::target_agent_accent(
-            app.display_agent_id(),
-            app.display_agent_accent(),
-            app.is_agent_metadata_hydrated(),
-        )
+    pub const fn for_app(app: &BmuxApp) -> Self {
+        Self {
+            accent: app.presented_theme().accent,
+        }
     }
 
     #[cfg(test)]
@@ -82,61 +70,13 @@ impl TuiTheme {
         agent_metadata_hydrated: bool,
     ) -> Self {
         Self {
-            accent: Self::target_agent_accent(agent_id, configured_accent, agent_metadata_hydrated),
+            accent: super::theme::target_agent_accent(
+                agent_id,
+                configured_accent,
+                agent_metadata_hydrated,
+            ),
         }
     }
-
-    fn target_agent_accent(
-        agent_id: &str,
-        configured_accent: Option<&str>,
-        agent_metadata_hydrated: bool,
-    ) -> Color {
-        configured_accent
-            .and_then(parse_agent_accent_color)
-            .unwrap_or_else(|| {
-                if agent_metadata_hydrated {
-                    agent_accent_color(agent_id)
-                } else {
-                    Self::PENDING_AGENT_METADATA_ACCENT
-                }
-            })
-    }
-}
-
-fn parse_agent_accent_color(accent: &str) -> Option<Color> {
-    let hex = accent.strip_prefix('#')?;
-    if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
-    }
-    let [red, green, blue] = parse_hex_rgb(hex).ok()?;
-    Some(Color::Rgb(red, green, blue))
-}
-
-fn parse_hex_rgb(hex: &str) -> Result<[u8; 3], ParseIntError> {
-    Ok([
-        u8::from_str_radix(&hex[0..2], 16)?,
-        u8::from_str_radix(&hex[2..4], 16)?,
-        u8::from_str_radix(&hex[4..6], 16)?,
-    ])
-}
-
-fn agent_accent_color(agent_id: &str) -> Color {
-    fallback_agent_accent_color(agent_id)
-}
-
-fn fallback_agent_accent_color(agent_id: &str) -> Color {
-    const PALETTE: [Color; 6] = [
-        Color::Cyan,
-        Color::Rgb(167, 139, 250),
-        Color::Rgb(52, 211, 153),
-        Color::Rgb(245, 158, 11),
-        Color::Rgb(96, 165, 250),
-        Color::Rgb(244, 114, 182),
-    ];
-    let hash = agent_id.bytes().fold(0_usize, |hash, byte| {
-        hash.wrapping_mul(33).wrapping_add(usize::from(byte))
-    });
-    PALETTE[hash % PALETTE.len()]
 }
 
 /// Prepared geometry for one TUI frame.
@@ -185,7 +125,7 @@ pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>, layout: FrameLa
         return;
     }
 
-    let theme = TuiTheme::for_app(app, Instant::now());
+    let theme = TuiTheme::for_app(app);
     render_header(app, layout.header, frame, theme);
     render_composer(app, layout.composer, frame, theme);
     render_body(app, layout.body, frame);
@@ -239,7 +179,7 @@ fn frame_layout(app: &BmuxApp, area: Rect) -> Option<FrameLayout> {
         latest_bar,
         status,
         composer,
-        composer_content: composer_panel(TuiTheme::target_for_app(app)).inner_area(composer),
+        composer_content: composer_panel(TuiTheme::for_app(app).accent).inner_area(composer),
     })
 }
 

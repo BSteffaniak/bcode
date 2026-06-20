@@ -47,6 +47,7 @@ use super::pending_submission::PendingSubmission;
 use super::pending_submissions::PendingSubmissions;
 use super::runtime_work_view::RuntimeWorkViewState;
 use super::temporal::next_elapsed_invalidation_capped;
+use super::theme::{PresentedTheme, ResolvedTheme};
 use super::timeline_dialog::TimelineEntry;
 use super::tool_invocation_view::{
     TerminalInvocationItemContext, ToolInvocationPresentationInput, ToolInvocationRequestContext,
@@ -268,6 +269,8 @@ pub struct BmuxApp {
     pending_agent_id: Option<String>,
     pending_agent_accent: Option<String>,
     agent_metadata_hydration: AgentMetadataHydration,
+    target_theme: ResolvedTheme,
+    presented_theme: PresentedTheme,
     theme_transition: ThemeTransitionState,
     reasoning_visible: bool,
     thinking_label: String,
@@ -449,6 +452,9 @@ impl BmuxApp {
         has_older_history: bool,
     ) -> Self {
         let now = Instant::now();
+        let initial_theme = ResolvedTheme {
+            accent: super::theme::PENDING_AGENT_METADATA_ACCENT,
+        };
         let mut app = Self {
             session_id,
             session_title: None,
@@ -460,7 +466,9 @@ impl BmuxApp {
             pending_agent_id: None,
             pending_agent_accent: None,
             agent_metadata_hydration: AgentMetadataHydration::Pending,
-            theme_transition: ThemeTransitionState::new(Color::Rgb(100, 116, 139), now),
+            target_theme: initial_theme,
+            presented_theme: initial_theme.into(),
+            theme_transition: ThemeTransitionState::new(initial_theme.accent, now),
             reasoning_visible: true,
             thinking_label: "shown · unsupported".to_owned(),
             reasoning_effort: None,
@@ -606,6 +614,7 @@ impl BmuxApp {
     pub fn apply_tui_config(&mut self, config: TuiConfig) {
         self.apply_thinking_config(config.thinking);
         self.tui_config = config;
+        self.sync_theme_target(Instant::now());
     }
 
     /// Return terminal UI configuration.
@@ -654,19 +663,35 @@ impl BmuxApp {
     }
 
     /// Set whether daemon-backed agent presentation metadata has hydrated.
-    pub const fn set_agent_metadata_hydrated(&mut self, hydrated: bool) {
+    pub fn set_agent_metadata_hydrated(&mut self, hydrated: bool) {
         self.agent_metadata_hydration = if hydrated {
             AgentMetadataHydration::Hydrated
         } else {
             AgentMetadataHydration::Pending
         };
+        self.sync_theme_target(Instant::now());
+    }
+
+    /// Return the theme currently presented by the UI.
+    #[must_use]
+    pub const fn presented_theme(&self) -> PresentedTheme {
+        self.presented_theme
+    }
+
+    /// Advance theme animations for the supplied time.
+    pub fn update_theme_animation(&mut self, now: Instant) -> UiInvalidation {
+        let accent = self.theme_transition.update(now);
+        self.presented_theme = PresentedTheme { accent };
+        UiInvalidation::Paint
     }
 
     /// Return the current animated accent color for rendering.
+    #[cfg(test)]
     pub fn animated_accent(&mut self, target_accent: Color, now: Instant) -> Color {
         self.theme_transition
             .set_target(target_accent, self.tui_config.theme, now);
-        self.theme_transition.update(now)
+        self.update_theme_animation(now);
+        self.presented_theme.accent
     }
 
     /// Return true when a theme transition should request more frames.
@@ -676,8 +701,19 @@ impl BmuxApp {
     }
 
     /// Move theme transition state from another app after recreating app state.
-    pub(crate) const fn take_theme_transition_state_from(&mut self, source: &Self) {
+    pub(crate) fn take_theme_transition_state_from(&mut self, source: &Self) {
+        self.target_theme = source.target_theme;
+        self.presented_theme = source.presented_theme;
         self.theme_transition = source.theme_transition;
+        self.sync_theme_target(Instant::now());
+    }
+
+    fn sync_theme_target(&mut self, now: Instant) {
+        let target = super::theme::resolve_theme(self);
+        self.target_theme = target;
+        self.theme_transition
+            .set_target(target.accent, self.tui_config.theme, now);
+        self.update_theme_animation(now);
     }
 
     /// Return the agent id that should be presented in the UI.
@@ -706,24 +742,26 @@ impl BmuxApp {
     pub fn set_current_agent_id(&mut self, agent_id: impl Into<String>) {
         self.current_agent_id = agent_id.into();
         self.current_agent_accent = None;
-        self.clear_pending_agent();
+        self.clear_pending_agent_fields();
+        self.sync_theme_target(Instant::now());
     }
 
     /// Set the current agent id and optional configured accent.
     pub fn set_current_agent(&mut self, agent_id: impl Into<String>, accent: Option<String>) {
         self.current_agent_id = agent_id.into();
         self.current_agent_accent = accent;
-        self.clear_pending_agent();
+        self.clear_pending_agent_fields();
+        self.sync_theme_target(Instant::now());
     }
 
     /// Stage an agent selection for the next submitted message.
     pub fn set_pending_agent(&mut self, agent_id: impl Into<String>, accent: Option<String>) {
         self.pending_agent_id = Some(agent_id.into());
         self.pending_agent_accent = accent;
+        self.sync_theme_target(Instant::now());
     }
 
-    /// Clear any staged agent selection.
-    pub fn clear_pending_agent(&mut self) {
+    fn clear_pending_agent_fields(&mut self) {
         self.pending_agent_id = None;
         self.pending_agent_accent = None;
     }
@@ -733,6 +771,7 @@ impl BmuxApp {
         let agent_id = self.pending_agent_id.take()?;
         self.current_agent_id.clone_from(&agent_id);
         self.current_agent_accent = self.pending_agent_accent.take();
+        self.sync_theme_target(Instant::now());
         Some(agent_id)
     }
 
@@ -2346,8 +2385,12 @@ impl BmuxApp {
                 self.live_preview_frame.next_frame_at = None;
                 invalidation.merge(UiInvalidation::Layout)
             } else if is_theme_transition_invalidation(key) {
+                self.update_theme_animation(now);
                 if !self.theme_transition_active(now) {
                     self.theme_transition.finish();
+                    self.presented_theme = PresentedTheme {
+                        accent: self.target_theme.accent,
+                    };
                 }
                 invalidation.merge(UiInvalidation::Paint)
             } else if is_tool_elapsed_invalidation(key) {

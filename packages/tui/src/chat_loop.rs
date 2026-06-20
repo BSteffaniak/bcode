@@ -326,7 +326,7 @@ pub async fn run_with_client<W: Write>(
                     client,
                     passive_client: &passive_client,
                     keymap: &settings.keymap,
-                    theme: render::TuiTheme::for_app(&mut chat.app, Instant::now()),
+                    theme: render::TuiTheme::for_app(&chat.app),
                 };
                 if let Err(error) = super::ralph_flow::open_home(&mut io, &services, chat).await {
                     if daemon_issue::is_nonfatal_tui_error(&error) {
@@ -362,7 +362,7 @@ pub async fn run_with_client<W: Write>(
                         client,
                         passive_client: &passive_client,
                         keymap: &settings.keymap,
-                        theme: render::TuiTheme::for_app(&mut chat.app, Instant::now()),
+                        theme: render::TuiTheme::for_app(&chat.app),
                     },
                     terminal,
                     terminal_events,
@@ -1364,7 +1364,7 @@ fn draw_chat_frame<W: Write>(
     loop_state: &mut ChatLoopState,
 ) -> Result<(), TuiError> {
     let layout = render::prepare_frame(&mut chat.app, terminal.area());
-    let theme = render::TuiTheme::for_app(&mut chat.app, Instant::now());
+    let theme = render::TuiTheme::for_app(&chat.app);
     terminal.draw(|frame| {
         if let Some(layout) = layout {
             render::render_prepared(&mut chat.app, frame, layout);

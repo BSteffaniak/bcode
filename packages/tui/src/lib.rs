@@ -71,6 +71,7 @@ pub(crate) mod terminal_events;
 #[cfg(test)]
 pub(crate) mod tests;
 pub(crate) mod text_input_flow;
+pub(crate) mod theme;
 mod thinking_dialog;
 pub(crate) mod thinking_dialog_render;
 pub(crate) mod thinking_flow;
