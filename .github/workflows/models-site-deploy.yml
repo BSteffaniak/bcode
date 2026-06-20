@@ -65,14 +65,15 @@ jobs:
           AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
           INTERNAL_REFRESH_TOKEN: ${{ secrets.INTERNAL_REFRESH_TOKEN }}
         run: |
+          test -n "$AWS_ACCESS_KEY_ID"
+          test -n "$AWS_SECRET_ACCESS_KEY"
+          test -n "$INTERNAL_REFRESH_TOKEN"
           printf '%s' "$AWS_ACCESS_KEY_ID" | wrangler secret put AWS_ACCESS_KEY_ID
           printf '%s' "$AWS_SECRET_ACCESS_KEY" | wrangler secret put AWS_SECRET_ACCESS_KEY
           if [ -n "$AWS_SESSION_TOKEN" ]; then
             printf '%s' "$AWS_SESSION_TOKEN" | wrangler secret put AWS_SESSION_TOKEN
           fi
-          if [ -n "$INTERNAL_REFRESH_TOKEN" ]; then
-            printf '%s' "$INTERNAL_REFRESH_TOKEN" | wrangler secret put INTERNAL_REFRESH_TOKEN
-          fi
+          printf '%s' "$INTERNAL_REFRESH_TOKEN" | wrangler secret put INTERNAL_REFRESH_TOKEN
 
       - name: Configure preview Worker secrets
         if: ${{ github.event.inputs.environment == 'preview' }}
@@ -85,14 +86,15 @@ jobs:
           AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
           INTERNAL_REFRESH_TOKEN: ${{ secrets.INTERNAL_REFRESH_TOKEN }}
         run: |
+          test -n "$AWS_ACCESS_KEY_ID"
+          test -n "$AWS_SECRET_ACCESS_KEY"
+          test -n "$INTERNAL_REFRESH_TOKEN"
           printf '%s' "$AWS_ACCESS_KEY_ID" | wrangler secret put AWS_ACCESS_KEY_ID --env preview
           printf '%s' "$AWS_SECRET_ACCESS_KEY" | wrangler secret put AWS_SECRET_ACCESS_KEY --env preview
           if [ -n "$AWS_SESSION_TOKEN" ]; then
             printf '%s' "$AWS_SESSION_TOKEN" | wrangler secret put AWS_SESSION_TOKEN --env preview
           fi
-          if [ -n "$INTERNAL_REFRESH_TOKEN" ]; then
-            printf '%s' "$INTERNAL_REFRESH_TOKEN" | wrangler secret put INTERNAL_REFRESH_TOKEN --env preview
-          fi
+          printf '%s' "$INTERNAL_REFRESH_TOKEN" | wrangler secret put INTERNAL_REFRESH_TOKEN --env preview
 
       - name: Deploy production Worker and assets
         if: ${{ github.event.inputs.environment != 'preview' }}

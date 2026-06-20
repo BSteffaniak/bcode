@@ -30,9 +30,10 @@ async function handleRequest(request, env, ctx) {
       if (request.method !== 'POST') return jsonResponse({ error: 'method not allowed' }, 405);
       if (!authorized(request, env)) return jsonResponse({ error: 'unauthorized' }, 401);
       const providerId = decodeURIComponent(url.pathname.slice('/api/internal/refresh/'.length));
-      return jsonResponse(await refreshProvider(providerId, env));
+      return jsonResponse(await refreshProvider(providerId, env, { force: true }));
     }
     if (url.pathname === '/api/internal/health') {
+      if (!authorized(request, env)) return jsonResponse({ error: 'unauthorized' }, 401);
       return jsonResponse({ ok: true, dynamic_providers: Object.keys(PROVIDER_REGISTRY) });
     }
     if (url.pathname === '/' || url.pathname === '/home') {
@@ -41,7 +42,8 @@ async function handleRequest(request, env, ctx) {
     if (env.ASSETS) return env.ASSETS.fetch(request);
     return jsonResponse({ error: 'not found' }, 404);
   } catch (error) {
-    return jsonResponse({ error: String(error && error.stack ? error.stack : error) }, 500);
+    console.error(error);
+    return jsonResponse({ error: 'internal server error' }, 500);
   }
 }
 
@@ -116,20 +118,89 @@ async function readSnapshot(providerId, env) {
   return object.json();
 }
 
-async function refreshProvider(providerId, env) {
+async function refreshProvider(providerId, env, options = {}) {
   const provider = PROVIDER_REGISTRY[providerId];
   if (!provider) throw new Error(`unknown dynamic provider: ${providerId}`);
-  const snapshot = await provider.discover(env);
-  if (env.LIVE_SNAPSHOTS) {
+  if (!env.LIVE_SNAPSHOTS) throw new Error('LIVE_SNAPSHOTS binding is required for refresh');
+
+  await assertRefreshAllowed(providerId, env, options);
+  const lock = await acquireRefreshLock(providerId, env);
+  try {
+    const snapshot = await provider.discover(env);
     const body = JSON.stringify(snapshot, null, 2);
     await env.LIVE_SNAPSHOTS.put(snapshotKey(providerId), body, {
       httpMetadata: { contentType: 'application/json' },
     });
-    await env.LIVE_SNAPSHOTS.put(historyKey(providerId, snapshot.generated_at), body, {
-      httpMetadata: { contentType: 'application/json' },
+    if (booleanEnv(env.LIVE_WRITE_HISTORY, false)) {
+      await env.LIVE_SNAPSHOTS.put(historyKey(providerId, snapshot.generated_at), body, {
+        httpMetadata: { contentType: 'application/json' },
+      });
+    }
+    await writeRefreshStatus(providerId, env, {
+      last_success_at: snapshot.generated_at,
+      last_failure_at: null,
+      last_error: null,
     });
+    return { refreshed: true, provider_id: providerId, model_count: Object.keys(snapshot.models || {}).length, snapshot };
+  } catch (error) {
+    await writeRefreshStatus(providerId, env, {
+      last_success_at: null,
+      last_failure_at: new Date().toISOString(),
+      last_error: publicError(error),
+    });
+    throw error;
+  } finally {
+    await releaseRefreshLock(providerId, env, lock);
   }
-  return { refreshed: true, provider_id: providerId, model_count: Object.keys(snapshot.models || {}).length, snapshot };
+}
+
+async function assertRefreshAllowed(providerId, env, options) {
+  const status = await readJsonObject(refreshStatusKey(providerId), env);
+  const failedAt = Date.parse((status && status.last_failure_at) || '');
+  const cooldownSeconds = numberEnv(env.LIVE_REFRESH_FAILURE_COOLDOWN_SECONDS, 300);
+  if (!options.force && Number.isFinite(failedAt) && Date.now() - failedAt < cooldownSeconds * 1000) {
+    throw new Error(`refresh for ${providerId} is cooling down after a recent failure`);
+  }
+}
+
+async function acquireRefreshLock(providerId, env) {
+  const existing = await readJsonObject(refreshLockKey(providerId), env);
+  const expiresAt = Date.parse((existing && existing.expires_at) || '');
+  if (Number.isFinite(expiresAt) && expiresAt > Date.now()) {
+    throw new Error(`refresh for ${providerId} is already running`);
+  }
+  const ttlSeconds = numberEnv(env.LIVE_REFRESH_LOCK_SECONDS, 120);
+  const lock = {
+    owner: crypto.randomUUID(),
+    created_at: new Date().toISOString(),
+    expires_at: new Date(Date.now() + ttlSeconds * 1000).toISOString(),
+  };
+  await putJsonObject(refreshLockKey(providerId), lock, env);
+  return lock;
+}
+
+async function releaseRefreshLock(providerId, env, lock) {
+  const existing = await readJsonObject(refreshLockKey(providerId), env);
+  if (existing && existing.owner === lock.owner) {
+    await putJsonObject(refreshLockKey(providerId), {
+      owner: null,
+      created_at: existing.created_at,
+      expires_at: new Date(0).toISOString(),
+    }, env);
+  }
+}
+
+async function readJsonObject(key, env) {
+  if (!env.LIVE_SNAPSHOTS) return null;
+  const object = await env.LIVE_SNAPSHOTS.get(key);
+  if (!object) return null;
+  return object.json();
+}
+
+async function putJsonObject(key, value, env) {
+  await env.LIVE_SNAPSHOTS.put(key, JSON.stringify(value, null, 2), {
+    httpMetadata: { contentType: 'application/json' },
+  });
 }
 
 function snapshotKey(providerId) {
@@ -138,6 +209,14 @@ function snapshotKey(providerId) {
 
 function historyKey(providerId, generatedAt) {
   return `live/v1/${providerId}/history/${generatedAt.replaceAll(':', '-')}.json`;
+}
+
+function refreshLockKey(providerId) {
+  return `live/v1/${providerId}/refresh-lock.json`;
+}
+
+function refreshStatusKey(providerId) {
+  return `live/v1/${providerId}/refresh-status.json`;
 }
 
 function mergeSnapshot(catalog, snapshot) {
@@ -358,7 +437,7 @@ function includesImage(values) {
 }
 
 function authorized(request, env) {
-  if (!env.INTERNAL_REFRESH_TOKEN) return true;
+  if (!env.INTERNAL_REFRESH_TOKEN) return false;
   return request.headers.get('authorization') === `Bearer ${env.INTERNAL_REFRESH_TOKEN}`;
 }
 
@@ -372,6 +451,15 @@ function csv(value) {
 function numberEnv(value, fallback) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function booleanEnv(value, fallback) {
+  if (value === undefined || value === null || value === '') return fallback;
+  return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
+}
+
+function publicError(error) {
+  return String(error && error.message ? error.message : error).slice(0, 500);
 }
 
 function utf8(value) {

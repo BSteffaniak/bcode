@@ -9,3 +9,6 @@ preview_bedrock_regions = ["us-east-1"]
 
 live_fresh_for_seconds = 900
 live_max_stale_seconds = 21600
+
+live_refresh_lock_seconds             = 120
+live_refresh_failure_cooldown_seconds = 300

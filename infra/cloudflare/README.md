@@ -26,7 +26,10 @@ Runtime discovery/deploy:
 * `AWS_ACCESS_KEY_ID`
 * `AWS_SECRET_ACCESS_KEY`
 * optional `AWS_SESSION_TOKEN`
-* optional `INTERNAL_REFRESH_TOKEN`
+* `INTERNAL_REFRESH_TOKEN`
+
+The internal refresh token is required. Internal routes fail closed when it is
+not configured.
 
 ## One-click flow
 
@@ -63,6 +66,23 @@ tofu apply \
   -var cloudflare_account_id="$CLOUDFLARE_ACCOUNT_ID" \
   -var cloudflare_zone_id="$CLOUDFLARE_ZONE_ID"
 ```
+
+## Security notes
+
+Use dedicated, least-privilege credentials:
+
+* Cloudflare API token scoped to this account/zone with only Workers, Workers
+  Routes, DNS, and R2 bucket permissions needed by the workflows.
+* R2 state access key scoped to the OpenTofu state bucket.
+* AWS IAM principal scoped to Bedrock model discovery/listing only.
+
+Runtime hardening:
+
+* `/api/internal/*` routes require `INTERNAL_REFRESH_TOKEN` and fail closed when
+  it is missing.
+* Worker errors are logged server-side and return generic public 500 responses.
+* Provider refresh has a bounded lock and failure cooldown.
+* R2 history snapshots are disabled by default with `LIVE_WRITE_HISTORY=false`.
 
 ## Notes
 

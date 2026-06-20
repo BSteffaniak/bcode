@@ -74,6 +74,18 @@ variable "live_max_stale_seconds" {
   default     = 21600
 }
 
+variable "live_refresh_lock_seconds" {
+  description = "Seconds before a refresh lock expires."
+  type        = number
+  default     = 120
+}
+
+variable "live_refresh_failure_cooldown_seconds" {
+  description = "Seconds to suppress automatic refresh after a provider failure."
+  type        = number
+  default     = 300
+}
+
 variable "dns_placeholder_ipv4" {
   description = "Proxied placeholder A record target for Worker-routed hostnames."
   type        = string
