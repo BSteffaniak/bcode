@@ -872,7 +872,7 @@ fn apply_submit_message_result(
             }
             match result.acceptance.disposition {
                 bcode_ipc::MessageAcceptanceDisposition::AppliedSteering => {
-                    chat.app.clear_pending_submission(message);
+                    chat.app.mark_pending_submission_sent();
                     chat.app.set_status("Steering sent".to_owned());
                 }
                 bcode_ipc::MessageAcceptanceDisposition::QueuedFollowUp
@@ -889,7 +889,7 @@ fn apply_submit_message_result(
                     ));
                 }
                 bcode_ipc::MessageAcceptanceDisposition::StartedTurn => {
-                    chat.app.clear_pending_submission(message);
+                    chat.app.mark_pending_submission_sent();
                     chat.app.set_status("Message sent".to_owned());
                 }
             }

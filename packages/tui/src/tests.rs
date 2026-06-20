@@ -260,11 +260,14 @@ fn pending_submissions_mutations_bump_revision() {
     pending.mark_first_queued(Some(1));
     assert_eq!(pending.revision(), 2);
 
+    pending.mark_first_sent();
+    assert_eq!(pending.revision(), 3);
+
     pending.remove("missing");
-    assert_eq!(pending.revision(), 2);
+    assert_eq!(pending.revision(), 3);
 
     pending.remove("hello");
-    assert_eq!(pending.revision(), 3);
+    assert_eq!(pending.revision(), 4);
 }
 
 #[test]

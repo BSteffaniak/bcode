@@ -659,6 +659,9 @@ pub fn transcript_item_rows(
 }
 
 pub fn pending_submission_rows(pending: &PendingSubmission, width: u16) -> Vec<Line> {
+    if matches!(pending.state(), PendingSubmissionState::Sent) {
+        return Vec::new();
+    }
     let mut rows = Vec::new();
     push_pending_submission_rows(&mut rows, pending, width);
     rows
@@ -2815,6 +2818,9 @@ fn push_permission_request_rows(
 }
 
 fn push_pending_submission_rows(rows: &mut Vec<Line>, pending: &PendingSubmission, width: u16) {
+    if matches!(pending.state(), PendingSubmissionState::Sent) {
+        return;
+    }
     let title = format!("You · {}", pending_label(pending.state()));
     push_message_block(rows, &title, pending.text(), Color::Blue, width);
 }
@@ -2928,6 +2934,7 @@ fn spans_width(spans: &[Span]) -> usize {
 fn pending_label(state: PendingSubmissionState) -> String {
     match state {
         PendingSubmissionState::Sending => "sending".to_owned(),
+        PendingSubmissionState::Sent => "sent".to_owned(),
         PendingSubmissionState::Queued { queue_position } => queue_position.map_or_else(
             || "queued".to_owned(),
             |position| format!("queued #{position}"),

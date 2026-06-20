@@ -1431,6 +1431,11 @@ impl BmuxApp {
         self.pending_submissions.mark_first_queued(queue_position);
     }
 
+    /// Mark the oldest pending submission as sent to the server.
+    pub fn mark_pending_submission_sent(&mut self) {
+        self.pending_submissions.mark_first_sent();
+    }
+
     /// Remove a pending submission and restore it into the composer.
     pub fn restore_pending_submission(&mut self, text: &str) {
         self.pending_submissions.clear_staged_if(text);
