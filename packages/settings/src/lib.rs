@@ -1007,6 +1007,125 @@ pub fn security_trust_panel(
     }
 }
 
+/// Authentication security detection summary.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthSecurityDetection {
+    /// Whether any configured auth profile uses sshenv.
+    pub sshenv_available: bool,
+    /// Whether any configured auth profile requests device sealing.
+    pub device_seal_requested: bool,
+    /// Profiles backed by sshenv.
+    pub sshenv_profiles: BTreeSet<String>,
+}
+
+/// Detect configured sshenv/device-seal auth state without opening or mutating vaults.
+#[must_use]
+pub fn detect_auth_security_from_config(
+    config: &bcode_config::BcodeConfig,
+) -> AuthSecurityDetection {
+    let mut detection = AuthSecurityDetection::default();
+    for (profile_name, profile) in &config.auth.profiles {
+        if profile.backend == "sshenv" {
+            detection.sshenv_available = true;
+            detection.sshenv_profiles.insert(profile_name.clone());
+            if profile
+                .settings
+                .get("device_seal")
+                .is_none_or(|value| !matches!(value.as_str(), "off" | "false" | "disabled"))
+            {
+                detection.device_seal_requested = true;
+            }
+        }
+    }
+    if config
+        .auth
+        .openai
+        .as_ref()
+        .is_some_and(|auth| auth.backend == "sshenv")
+    {
+        detection.sshenv_available = true;
+        detection.sshenv_profiles.insert("openai".to_owned());
+        detection.device_seal_requested = true;
+    }
+    detection
+}
+
+/// Planned secure credential import sourced from an environment variable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecureCredentialImportPlan {
+    /// Source environment variable name. The value is intentionally not stored.
+    pub env_var: String,
+    /// Target auth profile.
+    pub auth_profile: String,
+    /// Canonical credential key such as `api_key`.
+    pub credential_key: String,
+    /// Whether this plan requires secure storage before apply.
+    pub requires_secure_storage: bool,
+}
+
+/// Build secure-import plans from sanitized detection entries.
+#[must_use]
+pub fn secure_import_plans_from_detection(
+    entries: &[DetectionCacheEntry],
+) -> Vec<SecureCredentialImportPlan> {
+    entries
+        .iter()
+        .filter(|entry| {
+            entry.detector == "environment"
+                && matches!(
+                    entry.key.as_str(),
+                    "OPENAI_API_KEY" | "XAI_API_KEY" | "OPENROUTER_API_KEY" | "GITHUB_TOKEN"
+                )
+        })
+        .map(|entry| SecureCredentialImportPlan {
+            env_var: entry.key.clone(),
+            auth_profile: auth_profile_for_env_var(&entry.key).to_owned(),
+            credential_key: "api_key".to_owned(),
+            requires_secure_storage: true,
+        })
+        .collect()
+}
+
+fn auth_profile_for_env_var(env_var: &str) -> &'static str {
+    match env_var {
+        "OPENAI_API_KEY" => "openai",
+        "XAI_API_KEY" => "xai",
+        "OPENROUTER_API_KEY" => "openrouter",
+        "GITHUB_TOKEN" => "github",
+        _ => "default",
+    }
+}
+
+/// Post-import reconciliation summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecureImportReconciliation {
+    /// Plans that now have matching configured sshenv auth profiles.
+    pub imported_profiles: BTreeSet<String>,
+    /// Plans that still need secure auth config.
+    pub pending_profiles: BTreeSet<String>,
+}
+
+/// Reconcile secure-import plans against current config/auth state.
+#[must_use]
+pub fn reconcile_secure_import_plans(
+    plans: &[SecureCredentialImportPlan],
+    auth_detection: &AuthSecurityDetection,
+) -> SecureImportReconciliation {
+    let mut imported_profiles = BTreeSet::new();
+    let mut pending_profiles = BTreeSet::new();
+    for plan in plans {
+        if auth_detection.sshenv_profiles.contains(&plan.auth_profile) {
+            imported_profiles.insert(plan.auth_profile.clone());
+        } else {
+            pending_profiles.insert(plan.auth_profile.clone());
+        }
+    }
+    SecureImportReconciliation {
+        imported_profiles,
+        pending_profiles,
+    }
+}
+
 /// Model setup card view model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelSetupCard {
@@ -1783,6 +1902,45 @@ mod tests {
     }
 
     #[test]
+    fn auth_security_detection_finds_sshenv_and_device_seal_config() {
+        let mut config = bcode_config::BcodeConfig::default();
+        config.auth.profiles.insert(
+            "openai".to_owned(),
+            bcode_config::AuthProfileConfig {
+                backend: "sshenv".to_owned(),
+                settings: BTreeMap::from([("device_seal".to_owned(), "required".to_owned())]),
+                ..bcode_config::AuthProfileConfig::default()
+            },
+        );
+
+        let detection = detect_auth_security_from_config(&config);
+
+        assert!(detection.sshenv_available);
+        assert!(detection.device_seal_requested);
+        assert!(detection.sshenv_profiles.contains("openai"));
+    }
+
+    #[test]
+    fn secure_import_plans_never_include_secret_values_and_reconcile_post_import() {
+        let vars = BTreeMap::from([("OPENAI_API_KEY".to_owned(), "sk-secret-value".to_owned())]);
+        let snapshot = detect_setup_environment_from_vars(&vars, 950);
+        let plans = secure_import_plans_from_detection(&snapshot.entries);
+        let encoded = serde_json::to_string(&plans).expect("plans should encode");
+        let auth_detection = AuthSecurityDetection {
+            sshenv_available: true,
+            device_seal_requested: true,
+            sshenv_profiles: BTreeSet::from(["openai".to_owned()]),
+        };
+        let reconciliation = reconcile_secure_import_plans(&plans, &auth_detection);
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].env_var, "OPENAI_API_KEY");
+        assert!(!encoded.contains("sk-secret-value"));
+        assert!(reconciliation.imported_profiles.contains("openai"));
+        assert!(reconciliation.pending_profiles.is_empty());
+    }
+
+    #[test]
     fn section_visit_and_completion_persist_resume_state() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let store = SettingsStore::from_settings_db_path(temp.path().join("settings.db"));
@@ -1890,7 +2048,13 @@ mod tests {
     #[test]
     fn setup_view_models_include_story_copy() {
         let provider = provider_setup_card("bcode.openai-compatible", true, false);
-        let security = security_trust_panel(true, true);
+        let detection = AuthSecurityDetection {
+            sshenv_available: true,
+            device_seal_requested: true,
+            sshenv_profiles: BTreeSet::from(["openai".to_owned()]),
+        };
+        let security =
+            security_trust_panel(detection.sshenv_available, detection.device_seal_requested);
         let model = model_setup_card(Some("fast".to_owned()), None);
         let permission = permission_setup_card(false);
         let import = import_setup_card(false);
