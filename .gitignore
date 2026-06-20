@@ -1,5 +1,6 @@
 target/
 debug/
+dist/
 
 # dependencies
 node_modules/
