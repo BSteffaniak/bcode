@@ -10,6 +10,7 @@ on:
         type: choice
         options:
           - bootstrap
+          - import-live-bucket
           - plan
           - apply
 
@@ -46,6 +47,18 @@ jobs:
             -backend-config="access_key=${AWS_ACCESS_KEY_ID}" \
             -backend-config="secret_key=${AWS_SECRET_ACCESS_KEY}" \
             -backend-config="endpoints={s3=\"https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com\"}"
+
+      - name: Import existing live R2 bucket
+        if: ${{ github.event.inputs.action == 'import-live-bucket' }}
+        working-directory: infra/cloudflare/main
+        run: |
+          if tofu state list | grep -qx 'cloudflare_r2_bucket.live'; then
+            echo 'cloudflare_r2_bucket.live is already in state'
+          else
+            tofu import \
+              cloudflare_r2_bucket.live \
+              "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/models-catalog-live/default"
+          fi
 
       - name: Main plan
         if: ${{ github.event.inputs.action == 'plan' }}
