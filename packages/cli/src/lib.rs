@@ -69,6 +69,8 @@ pub enum CliError {
     SemanticMigrationAudit(#[from] bcode_session::semantic_migration::SemanticMigrationAuditError),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("settings error: {0}")]
+    Settings(#[from] bcode_settings::SettingsError),
     #[error("TUI error: {0}")]
     Tui(#[from] bcode_tui::TuiError),
     #[error("plugin error: {0}")]
@@ -116,7 +118,27 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Box::pin(run_new_session_tui(cli.worktree)).await?;
         return Ok(());
     }
+    if cli.onboard {
+        Box::pin(handle_onboard_command(OnboardOptions::default())).await?;
+        return Ok(());
+    }
     match cli.command.unwrap_or_default() {
+        Commands::Onboard {
+            reset,
+            dry_run,
+            non_interactive,
+            provider,
+            skip_launch,
+        } => {
+            handle_onboard_command(OnboardOptions {
+                reset,
+                dry_run,
+                non_interactive,
+                provider,
+                skip_launch,
+            })
+            .await?;
+        }
         Commands::Server { command } => handle_server_command(command).await?,
         Commands::Session { command } => handle_session_command(command).await?,
         Commands::Worktree { command } => handle_worktree_command(command).await?,
@@ -172,6 +194,62 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Default)]
+struct OnboardOptions {
+    reset: bool,
+    dry_run: bool,
+    non_interactive: bool,
+    provider: Option<String>,
+    skip_launch: bool,
+}
+
+async fn handle_onboard_command(options: OnboardOptions) -> Result<(), CliError> {
+    let store = bcode_settings::SettingsStore::default();
+    if options.reset {
+        store.reset_database()?;
+    }
+    let config = bcode_config::load_config()?;
+    let summary = bcode_settings::SetupConfigSummary::from_config(&config);
+    let mut input = summary.reconciliation_input();
+    if let Some(provider) = options.provider.as_deref() {
+        input
+            .configured_sections
+            .insert(bcode_settings::SetupSectionId::Providers);
+        println!("onboarding provider hint: {provider}");
+    }
+    let progress = store.onboarding_progress()?;
+    input.current_section = progress
+        .and_then(|progress| progress.last_section)
+        .as_deref()
+        .and_then(onboard_section_from_str);
+    let persisted_sections = store.onboarding_sections()?;
+    let shell =
+        bcode_tui::onboarding::OnboardingShell::from_reconciliation(&persisted_sections, &input);
+    let render = shell.render_model(&store.health(), store.readiness_report()?);
+    if options.dry_run || options.non_interactive {
+        println!("Bcode onboarding setup map\n");
+        println!("{}", render.snapshot_text());
+        if options.skip_launch {
+            println!("\nlaunch will be skipped after onboarding");
+        }
+        return Ok(());
+    }
+    println!(
+        "Bcode onboarding interactive TUI is not wired yet. Showing current setup map preview.\n"
+    );
+    println!("{}", render.snapshot_text());
+    println!(
+        "\nRun `bcode onboard --non-interactive` for this preview without interactive launch."
+    );
+    Ok(())
+}
+
+fn onboard_section_from_str(value: &str) -> Option<bcode_settings::SetupSectionId> {
+    bcode_settings::SetupSectionId::all()
+        .into_iter()
+        .find(|section| section.as_str() == value)
+}
+
 async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
     match command {
         Commands::Cancel {
@@ -186,6 +264,7 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
             session_id,
             message,
         } => send_message(session_id, message).await?,
+        Commands::Onboard { .. } => unreachable!("handled by handle_cli"),
         Commands::Server { .. }
         | Commands::Session { .. }
         | Commands::Worktree { .. }
@@ -259,12 +338,32 @@ struct Cli {
     /// Select a model profile from configuration for this client connection.
     #[arg(long, value_name = "MODEL_PROFILE")]
     profile: Option<String>,
+    /// Force the onboarding/setup-map flow.
+    #[arg(long = "onboard", global = true)]
+    onboard: bool,
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    Onboard {
+        /// Reset onboarding progress before launching the setup map.
+        #[arg(long)]
+        reset: bool,
+        /// Print detected onboarding state without launching the TUI.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print a non-interactive onboarding summary.
+        #[arg(long)]
+        non_interactive: bool,
+        /// Preselect a provider path for onboarding.
+        #[arg(long, value_name = "PROVIDER")]
+        provider: Option<String>,
+        /// Do not launch a session after onboarding completes.
+        #[arg(long)]
+        skip_launch: bool,
+    },
     Server {
         #[command(subcommand)]
         command: ServerCommand,

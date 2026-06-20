@@ -1320,6 +1320,7 @@ dependencies = [
  "bcode_session",
  "bcode_session_import",
  "bcode_session_models",
+ "bcode_settings",
  "bcode_tui",
  "bcode_worktree_models",
  "bmux_keyboard",
