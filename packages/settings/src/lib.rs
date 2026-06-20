@@ -220,7 +220,8 @@ impl SettingsStore {
         updated_at_ms: u64,
     ) -> SettingsResult<()> {
         let key = key.to_owned();
-        let value_json = serde_json::to_string(value)?;
+        let sanitized_value = redact_secret_like_json(value.clone());
+        let value_json = serde_json::to_string(&sanitized_value)?;
         self.with_database(move |database| {
             Box::pin(async move {
                 database
@@ -671,6 +672,71 @@ impl SettingsStore {
         .join()
         .map_err(|_| SettingsError::DatabaseWorkerPanicked)?
     }
+}
+
+/// Secret-safety audit report for persisted/rendered setup state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretAuditReport {
+    /// Whether the audited payload appears secret-safe.
+    pub safe: bool,
+    /// Labels describing suspected secret-bearing fields or values.
+    pub findings: Vec<String>,
+}
+
+/// Audit JSON/text intended for settings DB, logs, or TUI snapshots for obvious secret material.
+#[must_use]
+pub fn audit_no_secret_material(label: &str, payload: &str) -> SecretAuditReport {
+    let lower = payload.to_ascii_lowercase();
+    let mut findings = Vec::new();
+    for marker in [
+        "sk-",
+        "api_key=",
+        "apikey=",
+        "access_token=",
+        "secret_access_key=",
+        "password=",
+        "bearer ",
+    ] {
+        if lower.contains(marker) {
+            findings.push(format!("{label} contains marker {marker}"));
+        }
+    }
+    SecretAuditReport {
+        safe: findings.is_empty(),
+        findings,
+    }
+}
+
+/// Recursively redact secret-like JSON keys before storing diagnostic state.
+#[must_use]
+pub fn redact_secret_like_json(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| {
+                    let redacted = if is_secret_like_key(&key) {
+                        json!({ "redacted": true })
+                    } else {
+                        redact_secret_like_json(value)
+                    };
+                    (key, redacted)
+                })
+                .collect(),
+        ),
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(redact_secret_like_json).collect())
+        }
+        other => other,
+    }
+}
+
+fn is_secret_like_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    lower.contains("secret")
+        || lower.contains("token")
+        || lower.contains("password")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
 }
 
 /// Settings database health state.
@@ -1635,6 +1701,20 @@ pub fn detect_setup_environment_from_vars(
         }
     }
 
+    for name in ["SSHENV_PROFILE", "SSHENV_VAULT", "SSHENV_DEVICE_SEAL"] {
+        if vars.get(name).is_some_and(|value| !value.is_empty()) {
+            entries.push(DetectionCacheEntry {
+                detector: "environment".to_owned(),
+                key: name.to_owned(),
+                value: json!({ "present": true, "value_stored": false }),
+                confidence: "medium".to_owned(),
+                source: "environment".to_owned(),
+                detected_at_ms,
+                expires_at_ms: None,
+            });
+        }
+    }
+
     for name in metadata_names {
         if let Some(value) = vars.get(name).filter(|value| !value.is_empty()) {
             entries.push(DetectionCacheEntry {
@@ -2074,6 +2154,43 @@ mod tests {
             store.health(),
             SettingsDbHealth::Unavailable { .. }
         ));
+    }
+
+    #[test]
+    fn control_state_redacts_secret_like_json_keys() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let store = SettingsStore::from_settings_db_path(temp.path().join("settings.db"));
+
+        store
+            .put_control_state(
+                "setup.secret-test",
+                &json!({
+                    "api_key": "sk-secret-value",
+                    "nested": { "access_token": "token-secret" },
+                    "safe": "visible",
+                }),
+                5,
+            )
+            .expect("state should write");
+        let value = store
+            .control_state("setup.secret-test")
+            .expect("state should load")
+            .expect("state should exist");
+        let encoded = serde_json::to_string(&value).expect("state should encode");
+
+        assert!(encoded.contains("visible"));
+        assert!(!encoded.contains("sk-secret-value"));
+        assert!(!encoded.contains("token-secret"));
+    }
+
+    #[test]
+    fn secret_audit_flags_obvious_secret_markers() {
+        let safe = audit_no_secret_material("safe", "OPENAI_API_KEY present but value hidden");
+        let unsafe_report = audit_no_secret_material("unsafe", "api_key=sk-secret-value");
+
+        assert!(safe.safe);
+        assert!(!unsafe_report.safe);
+        assert!(!unsafe_report.findings.is_empty());
     }
 
     #[test]
@@ -2537,6 +2654,7 @@ mod tests {
             ("AWS_PROFILE".to_owned(), "work".to_owned()),
             ("BCODE_AUTH_TOKEN".to_owned(), "bcode-secret".to_owned()),
             ("BCODE_MODEL_PROFILE".to_owned(), "fast".to_owned()),
+            ("SSHENV_VAULT".to_owned(), "/tmp/secret/path".to_owned()),
         ]);
 
         let snapshot = detect_setup_environment_from_vars(&vars, 500);
@@ -2546,6 +2664,7 @@ mod tests {
         assert!(encoded.contains("work"));
         assert!(!encoded.contains("sk-secret-value"));
         assert!(!encoded.contains("bcode-secret"));
+        assert!(!encoded.contains("/tmp/secret/path"));
         assert!(encoded.contains("fast"));
         assert_eq!(snapshot.recommendations.len(), 1);
     }

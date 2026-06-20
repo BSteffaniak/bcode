@@ -70,6 +70,33 @@ pub struct OnboardingRenderModel {
     pub readiness_report: Option<SetupReadinessReport>,
 }
 
+impl OnboardingRenderModel {
+    /// Return this render model as a single string for snapshot/smoke validation.
+    #[must_use]
+    pub fn snapshot_text(&self) -> String {
+        let mut lines = self.map_lines.clone();
+        lines.extend(self.footer_lines.clone());
+        if let Some(panel) = &self.degraded_panel {
+            lines.push(panel.message.clone());
+        }
+        if let Some(report) = &self.readiness_report {
+            lines.extend(
+                report
+                    .items
+                    .iter()
+                    .map(|item| format!("{}: {}", item.section_id.as_str(), item.title)),
+            );
+        }
+        lines.join("\n")
+    }
+
+    /// Audit this render model for obvious secret material.
+    #[must_use]
+    pub fn secret_audit(&self) -> bcode_settings::SecretAuditReport {
+        bcode_settings::audit_no_secret_material("onboarding-render", &self.snapshot_text())
+    }
+}
+
 impl OnboardingShell {
     /// Build the onboarding shell from persisted settings DB state and real config summary.
     ///
@@ -395,6 +422,17 @@ mod tests {
         );
 
         assert!(render.degraded_panel.is_some());
+    }
+
+    #[test]
+    fn render_model_snapshot_audits_secret_safe() {
+        let summary = SetupConfigSummary::default();
+        let shell = OnboardingShell::from_reconciliation(&[], &summary.reconciliation_input());
+        let render = shell.render_model(&SettingsDbHealth::Available, None);
+        let audit = render.secret_audit();
+
+        assert!(audit.safe);
+        assert!(render.snapshot_text().contains("Base Camp"));
     }
 
     #[test]
