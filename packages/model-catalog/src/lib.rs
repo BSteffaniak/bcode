@@ -19,6 +19,13 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod remote;
+
+pub use remote::{
+    DEFAULT_REMOTE_CATALOG_URL, RemoteCatalogClient, RemoteCatalogOptions, overlay_remote_catalog,
+    overlay_remote_live,
+};
+
 /// Result type used by catalog operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -31,6 +38,8 @@ pub enum Error {
     Toml(toml::de::Error),
     /// JSON serialization error.
     Json(serde_json::Error),
+    /// Remote catalog overlay error.
+    RemoteCatalog(String),
     /// Validation error.
     Validation(String),
 }
@@ -41,6 +50,7 @@ impl Display for Error {
             Self::Io(error) => write!(f, "I/O error: {error}"),
             Self::Toml(error) => write!(f, "TOML error: {error}"),
             Self::Json(error) => write!(f, "JSON error: {error}"),
+            Self::RemoteCatalog(message) => write!(f, "remote catalog error: {message}"),
             Self::Validation(message) => write!(f, "catalog validation error: {message}"),
         }
     }
@@ -92,6 +102,32 @@ impl ModelCatalog {
     /// Returns an error if catalog source loading or validation fails.
     pub fn load_bundled() -> Result<Self> {
         load_catalog(&default_source_dir()).map(Self::new)
+    }
+
+    /// Load the bundled catalog and opportunistically overlay remote catalog data.
+    ///
+    /// Remote fetch/cache failures are ignored so the bundled catalog remains the
+    /// reliable source of truth and Bcode stays usable offline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if bundled catalog source loading or validation fails.
+    pub async fn load_bundled_with_remote_overlay() -> Result<Self> {
+        Self::load_bundled_with_remote_options(&RemoteCatalogOptions::default()).await
+    }
+
+    /// Load the bundled catalog and opportunistically overlay remote catalog data.
+    ///
+    /// Remote fetch/cache failures are ignored so the bundled catalog remains the
+    /// reliable source of truth and Bcode stays usable offline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if bundled catalog source loading or validation fails.
+    pub async fn load_bundled_with_remote_options(options: &RemoteCatalogOptions) -> Result<Self> {
+        let mut document = load_catalog(&default_source_dir())?;
+        apply_remote_overlay_best_effort(&mut document, options).await;
+        Ok(Self::new(document))
     }
 
     /// Get provider catalog data.
@@ -172,6 +208,31 @@ impl ModelCatalog {
         }
 
         result
+    }
+}
+
+async fn apply_remote_overlay_best_effort(
+    document: &mut CatalogDocument,
+    options: &RemoteCatalogOptions,
+) {
+    if options.disabled {
+        return;
+    }
+    let Ok(client) = RemoteCatalogClient::new(options.clone()) else {
+        return;
+    };
+    if let Ok(remote_catalog) = client.fetch_catalog().await {
+        overlay_remote_catalog(document, &remote_catalog);
+    }
+    let provider_ids = document.providers.keys().cloned().collect::<Vec<_>>();
+    let mut snapshots = Vec::new();
+    for provider_id in &provider_ids {
+        if let Ok(snapshot) = client.fetch_live_snapshot(provider_id).await {
+            snapshots.push(snapshot);
+        }
+    }
+    if !snapshots.is_empty() {
+        overlay_remote_live(document, &snapshots);
     }
 }
 
@@ -503,7 +564,10 @@ pub fn load_live_snapshots(live_dir: &Path) -> Result<Vec<LiveCatalogSnapshot>> 
 }
 
 /// Merge generated live snapshots into a catalog document.
-pub fn merge_live_snapshots(catalog: &mut CatalogDocument, snapshots: &[LiveCatalogSnapshot]) {
+pub(crate) fn merge_live_snapshots(
+    catalog: &mut CatalogDocument,
+    snapshots: &[LiveCatalogSnapshot],
+) {
     for snapshot in snapshots {
         let Some(provider) = catalog.providers.get_mut(&snapshot.provider_id) else {
             continue;
@@ -568,7 +632,7 @@ fn live_model_entry(
     }
 }
 
-const fn merge_capabilities(
+pub(crate) const fn merge_capabilities(
     left: &CatalogCapabilities,
     right: &CatalogCapabilities,
 ) -> CatalogCapabilities {

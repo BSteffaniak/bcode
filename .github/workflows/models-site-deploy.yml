@@ -42,11 +42,11 @@ jobs:
       - name: Validate model catalog
         run: cargo run --release -p bcode_model_catalog -- validate
 
-      - name: Build catalog artifacts
-        run: cargo run --release -p bcode_model_catalog -- build --output dist/v1
-
       - name: Build static models site
         run: cargo run --release -p bcode_models_site -- gen --output dist
+
+      - name: Build catalog artifacts
+        run: cargo run --release -p bcode_model_catalog -- build --output dist/v1
 
       - name: Check Worker syntax
         run: node --check workers/models-catalog/src/worker.js

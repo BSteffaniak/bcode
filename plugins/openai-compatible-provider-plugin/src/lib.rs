@@ -3088,6 +3088,19 @@ fn model_infos_from_items(
     }
 }
 
+async fn model_infos_from_items_with_remote(
+    models: Vec<ModelResponseItem>,
+    default_model: Option<&str>,
+) -> Vec<ModelInfo> {
+    let discovered = model_infos_from_items(models, default_model);
+    if let Ok(catalog) = bcode_model_catalog::ModelCatalog::load_bundled_with_remote_overlay().await
+    {
+        catalog.merge_provider_models("openai", discovered, true)
+    } else {
+        discovered
+    }
+}
+
 fn pricing_from_provider_api(
     metadata: &BTreeMap<String, serde_json::Value>,
 ) -> Option<ModelPricingInfo> {
@@ -3394,10 +3407,7 @@ async fn discover_models_async(
         )
     })?;
     append_missing_model_items(&mut body.data, &settings.model_ids);
-    Ok(model_infos_from_items(
-        body.data,
-        settings.default_model.as_deref(),
-    ))
+    Ok(model_infos_from_items_with_remote(body.data, settings.default_model.as_deref()).await)
 }
 
 impl OpenAiCompatibleProviderPlugin {

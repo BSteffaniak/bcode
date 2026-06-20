@@ -1567,8 +1567,10 @@ dependencies = [
  "bcode_model",
  "bcode_model_catalog_models",
  "clap",
+ "reqwest",
  "serde",
  "serde_json",
+ "tokio",
  "toml 1.1.2+spec-1.1.0",
 ]
 

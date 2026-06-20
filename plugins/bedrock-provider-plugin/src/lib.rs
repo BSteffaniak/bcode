@@ -1893,7 +1893,9 @@ async fn discover_models(settings: &Settings) -> Result<ModelDiscovery, Provider
             visibility: bcode_model::ModelVisibility::Visible,
         })
         .collect();
-    let models = if let Ok(catalog) = bcode_model_catalog::ModelCatalog::load_bundled() {
+    let models = if let Ok(catalog) =
+        bcode_model_catalog::ModelCatalog::load_bundled_with_remote_overlay().await
+    {
         catalog.merge_provider_models("bedrock", models, false)
     } else {
         models

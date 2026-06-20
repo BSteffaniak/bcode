@@ -20,8 +20,10 @@ test = false
 bcode_model                = { workspace = true }
 bcode_model_catalog_models = { workspace = true }
 clap                       = { workspace = true, features = ["derive", "std"] }
+reqwest                    = { workspace = true, features = ["json", "rustls-tls"] }
 serde                      = { workspace = true, features = ["derive"] }
 serde_json                 = { workspace = true, features = ["std"] }
+tokio                      = { workspace = true, features = ["rt"] }
 toml                       = { workspace = true, features = ["parse", "serde", "std"] }
 
 [features]

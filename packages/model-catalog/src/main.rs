@@ -3,7 +3,8 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use bcode_model_catalog::{
-    OutputFormat, build_artifacts_with_live, default_source_dir, load_catalog,
+    OutputFormat, RemoteCatalogClient, RemoteCatalogOptions, build_artifacts_with_live,
+    default_source_dir, load_catalog,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
@@ -39,6 +40,8 @@ enum Command {
         #[arg(long, default_value = "pretty-json")]
         format: CliOutputFormat,
     },
+    /// Show bundled/remote catalog status.
+    Status,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -78,6 +81,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             output,
             format,
         } => build_artifacts_with_live(&source, live.as_deref(), &output, format.into())?,
+        Command::Status => print_status()?,
+    }
+    Ok(())
+}
+
+fn print_status() -> Result<(), Box<dyn std::error::Error>> {
+    let bundled = load_catalog(&default_source_dir())?;
+    let options = RemoteCatalogOptions::default();
+    println!("bundled_revision={}", bundled.catalog_revision);
+    println!("bundled_generated_at={}", bundled.generated_at);
+    println!("bundled_providers={}", bundled.providers.len());
+    println!("remote_url={}", options.base_url);
+    println!("remote_cache_dir={}", options.cache_dir.display());
+    println!("remote_disabled={}", options.disabled);
+    if options.disabled {
+        return Ok(());
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let client = RemoteCatalogClient::new(options)?;
+    match runtime.block_on(client.fetch_catalog()) {
+        Ok(remote) => {
+            println!("remote_status=available");
+            println!("remote_revision={}", remote.catalog_revision);
+            println!("remote_generated_at={}", remote.generated_at);
+            println!("remote_providers={}", remote.providers.len());
+        }
+        Err(error) => {
+            println!("remote_status=unavailable");
+            println!("remote_error={error}");
+        }
     }
     Ok(())
 }
