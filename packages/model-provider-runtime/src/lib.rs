@@ -126,6 +126,7 @@ pub fn provider_error(
                 | ProviderErrorCategory::ProviderInternal
         ),
         provider_message: None,
+        retry: None,
     }
 }
 

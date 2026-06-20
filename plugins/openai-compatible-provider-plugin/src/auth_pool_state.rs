@@ -16,6 +16,8 @@ struct AuthPoolProfileState {
     reason: String,
     #[serde(default)]
     last_error: Option<String>,
+    #[serde(default)]
+    reset_source: Option<String>,
 }
 
 pub fn is_profile_available(pool: Option<&str>, profile: Option<&str>) -> bool {
@@ -36,6 +38,24 @@ pub fn mark_profile_quota_limited(
     message: &str,
     cooldown: Duration,
 ) {
+    mark_profile_quota_limited_until(
+        pool,
+        profile,
+        reason,
+        message,
+        now_unix().saturating_add(cooldown.as_secs()),
+        None,
+    );
+}
+
+pub fn mark_profile_quota_limited_until(
+    pool: Option<&str>,
+    profile: Option<&str>,
+    reason: &str,
+    message: &str,
+    cooldown_until_unix: u64,
+    reset_source: Option<&str>,
+) {
     let Some(key) = state_key(pool, profile) else {
         return;
     };
@@ -43,12 +63,23 @@ pub fn mark_profile_quota_limited(
     state.entries.insert(
         key,
         AuthPoolProfileState {
-            cooldown_until_unix: now_unix().saturating_add(cooldown.as_secs()),
+            cooldown_until_unix,
             reason: reason.to_string(),
             last_error: Some(message.to_string()),
+            reset_source: reset_source.map(ToString::to_string),
         },
     );
     save_state(&state);
+}
+
+pub fn profile_cooldown_until(pool: Option<&str>, profile: Option<&str>) -> Option<u64> {
+    let key = state_key(pool, profile)?;
+    let state = load_state();
+    state
+        .entries
+        .get(&key)
+        .map(|entry| entry.cooldown_until_unix)
+        .filter(|until| *until > now_unix())
 }
 
 pub fn clear_profile_quota_limited(pool: Option<&str>, profile: Option<&str>) {

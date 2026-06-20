@@ -14971,6 +14971,7 @@ mod tests {
             message: "too many tokens".to_string(),
             retryable: false,
             provider_message: None,
+            retry: None,
         };
 
         assert!(is_context_length_provider_error(&error));
@@ -14984,6 +14985,7 @@ mod tests {
             message: "EOF while parsing a string".to_string(),
             retryable: false,
             provider_message: None,
+            retry: None,
         };
 
         assert!(is_tool_arguments_decode_provider_error(&error));
@@ -14999,6 +15001,7 @@ mod tests {
             message: "invalid JSON".to_string(),
             retryable: false,
             provider_message: None,
+            retry: None,
         };
         let invalid_request_error = bcode_model::ProviderError {
             code: "bad_request".to_string(),
@@ -15006,6 +15009,7 @@ mod tests {
             message: "bad request".to_string(),
             retryable: false,
             provider_message: None,
+            retry: None,
         };
 
         assert!(should_defer_visible_provider_error(&malformed_tool_error));

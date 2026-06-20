@@ -20,6 +20,7 @@ bcode_model = { workspace = true }
 bcode_model_provider_runtime = { workspace = true }
 bcode_plugin_sdk = { workspace = true }
 bcode_provider_auth = { workspace = true }
+httpdate = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }

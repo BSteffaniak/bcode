@@ -955,6 +955,19 @@ pub struct ProviderError {
     pub retryable: bool,
     #[serde(default)]
     pub provider_message: Option<String>,
+    #[serde(default)]
+    pub retry: Option<Box<ProviderRetryHint>>,
+}
+
+/// Provider-reported retry timing metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRetryHint {
+    #[serde(default)]
+    pub retry_after_ms: Option<u64>,
+    #[serde(default)]
+    pub retry_at_unix: Option<u64>,
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// Provider error category.

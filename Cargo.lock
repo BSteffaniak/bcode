@@ -1329,6 +1329,7 @@ dependencies = [
  "bcode_model_provider_runtime",
  "bcode_plugin_sdk",
  "bcode_provider_auth",
+ "httpdate",
  "reqwest",
  "serde",
  "serde_json",

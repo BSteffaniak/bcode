@@ -16,14 +16,15 @@ use bcode_model::{
     ModelReasoningCapabilitySource, ModelTurnRequest, NativeWebSearchRequest,
     NativeWebSearchResponse, NativeWebSearchResult, OP_CANCEL_TURN, OP_CAPABILITIES,
     OP_FINISH_TURN, OP_MODELS, OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS, OP_START_TURN,
-    OP_VALIDATE_CONFIG, PollTurnEventsRequest, PollTurnEventsResponse, ProviderCapabilities,
-    ProviderCapability, ProviderError, ProviderErrorCategory, ProviderRequestContext,
-    ProviderRequestProjection, ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage,
-    ToolCall, ValidateConfigResponse,
+    OP_VALIDATE_CONFIG, PollTurnEventsRequest, PollTurnEventsResponse, ProviderAuthCandidate,
+    ProviderCapabilities, ProviderCapability, ProviderError, ProviderErrorCategory,
+    ProviderRequestContext, ProviderRequestProjection, ProviderRetryHint, ProviderTurnEvent,
+    StartTurnResponse, StopReason, TokenUsage, ToolCall, ValidateConfigResponse,
 };
 use bcode_model_provider_runtime::ProviderRuntime;
 use bcode_plugin_sdk::prelude::*;
 use reqwest::Client;
+use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -998,23 +999,53 @@ async fn stream_chat_completion_with_failover(
     if request.provider_context.auth_candidates.is_empty() {
         return stream_chat_completion_inner(request, turn).await;
     }
-    let mut skipped_profiles = Vec::new();
-    let mut available_candidates = Vec::new();
-    let mut cooldown_candidates = Vec::new();
-    for candidate in &request.provider_context.auth_candidates {
-        if auth_pool_state::is_profile_available(
-            request.provider_context.auth_pool.as_deref(),
-            candidate.profile.as_deref(),
-        ) {
-            available_candidates.push(candidate);
-        } else {
-            if let Some(profile) = &candidate.profile {
-                skipped_profiles.push(profile.clone());
+    loop {
+        match try_auth_candidates_once(request, turn).await? {
+            CandidateAttemptOutcome::Finished(outcome) => return Ok(outcome),
+            CandidateAttemptOutcome::Exhausted {
+                error,
+                retry_at_unix,
+            } => {
+                let Some(retry_at_unix) = retry_at_unix else {
+                    return Err(error);
+                };
+                let now = unix_timestamp();
+                if retry_at_unix <= now {
+                    return Err(error);
+                }
+                let wait_seconds = retry_at_unix.saturating_sub(now);
+                turn.push(ProviderTurnEvent::Warning {
+                    message: format!(
+                        "All configured OpenAI subscriptions are quota-limited. Retrying after {} when the next subscription should reset. Press Esc to cancel.",
+                        format_duration(wait_seconds)
+                    ),
+                });
+                if wait_for_retry_or_cancel(turn, wait_seconds).await {
+                    return Ok(StreamOutcome::Cancelled);
+                }
             }
-            cooldown_candidates.push(candidate);
         }
     }
+}
+
+#[derive(Debug)]
+enum CandidateAttemptOutcome {
+    Finished(StreamOutcome),
+    Exhausted {
+        error: ProviderError,
+        retry_at_unix: Option<u64>,
+    },
+}
+
+async fn try_auth_candidates_once(
+    request: &ModelTurnRequest,
+    turn: &TurnState,
+) -> Result<CandidateAttemptOutcome, ProviderError> {
+    let (available_candidates, cooldown_candidates, skipped_profiles) =
+        partition_auth_candidates(request);
+
     let mut last_error = None;
+    let mut earliest_retry_at_unix = None;
     let mut warned_cooldown_profiles = BTreeSet::new();
     for candidate in available_candidates
         .into_iter()
@@ -1045,17 +1076,39 @@ async fn stream_chat_completion_with_failover(
                         Some(profile),
                     );
                 }
-                return Ok(outcome);
+                return Ok(CandidateAttemptOutcome::Finished(outcome));
             }
             Err(error) if is_subscription_quota_error(&error) => {
                 if let Some(profile) = &candidate.profile {
-                    auth_pool_state::mark_profile_quota_limited(
-                        request.provider_context.auth_pool.as_deref(),
-                        Some(profile),
-                        quota_error_reason(&error),
-                        &error.message,
-                        quota_error_cooldown(&error),
-                    );
+                    let retry_at_unix = quota_error_retry_at_unix(&error);
+                    if let Some(retry_at_unix) = retry_at_unix {
+                        auth_pool_state::mark_profile_quota_limited_until(
+                            request.provider_context.auth_pool.as_deref(),
+                            Some(profile),
+                            quota_error_reason(&error),
+                            &error.message,
+                            retry_at_unix,
+                            error.retry.as_ref().and_then(|hint| hint.source.as_deref()),
+                        );
+                    } else {
+                        auth_pool_state::mark_profile_quota_limited(
+                            request.provider_context.auth_pool.as_deref(),
+                            Some(profile),
+                            quota_error_reason(&error),
+                            &error.message,
+                            quota_error_cooldown(&error),
+                        );
+                    }
+                    let profile_retry_at = retry_at_unix.or_else(|| {
+                        auth_pool_state::profile_cooldown_until(
+                            request.provider_context.auth_pool.as_deref(),
+                            Some(profile),
+                        )
+                    });
+                    earliest_retry_at_unix = earliest_retry_at_unix
+                        .into_iter()
+                        .chain(profile_retry_at)
+                        .min();
                     turn.push(ProviderTurnEvent::Warning {
                         message: format!(
                             "OpenAI subscription auth profile '{profile}' appears quota-limited; trying the next configured subscription."
@@ -1067,13 +1120,63 @@ async fn stream_chat_completion_with_failover(
             Err(error) => return Err(error),
         }
     }
-    Err(last_error.unwrap_or_else(|| {
+    let error = last_error.unwrap_or_else(|| {
         provider_error(
             "openai_auth_pool_exhausted",
             ProviderErrorCategory::RateLimit,
             all_subscriptions_exhausted_message(&skipped_profiles),
         )
-    }))
+    });
+    Ok(CandidateAttemptOutcome::Exhausted {
+        error,
+        retry_at_unix: earliest_retry_at_unix,
+    })
+}
+
+fn partition_auth_candidates(
+    request: &ModelTurnRequest,
+) -> (
+    Vec<&ProviderAuthCandidate>,
+    Vec<&ProviderAuthCandidate>,
+    Vec<String>,
+) {
+    let mut skipped_profiles = Vec::new();
+    let mut available_candidates = Vec::new();
+    let mut cooldown_candidates = Vec::new();
+    for candidate in &request.provider_context.auth_candidates {
+        if auth_pool_state::is_profile_available(
+            request.provider_context.auth_pool.as_deref(),
+            candidate.profile.as_deref(),
+        ) {
+            available_candidates.push(candidate);
+        } else {
+            if let Some(profile) = &candidate.profile {
+                skipped_profiles.push(profile.clone());
+            }
+            cooldown_candidates.push(candidate);
+        }
+    }
+    (available_candidates, cooldown_candidates, skipped_profiles)
+}
+
+async fn wait_for_retry_or_cancel(turn: &TurnState, wait_seconds: u64) -> bool {
+    if wait_seconds == 0 {
+        return false;
+    }
+    let sleep = tokio::time::sleep(Duration::from_secs(wait_seconds));
+    tokio::pin!(sleep);
+    tokio::select! {
+        () = &mut sleep => false,
+        () = turn.cancel_notify.notified() => true,
+    }
+}
+
+fn quota_error_retry_at_unix(error: &ProviderError) -> Option<u64> {
+    error
+        .retry
+        .as_ref()
+        .and_then(|hint| hint.retry_at_unix)
+        .or_else(|| Some(unix_timestamp().saturating_add(quota_error_cooldown(error).as_secs())))
 }
 
 fn is_subscription_quota_error(error: &ProviderError) -> bool {
@@ -1107,6 +1210,21 @@ fn quota_error_cooldown(error: &ProviderError) -> Duration {
         Duration::from_secs(7 * 24 * 60 * 60)
     } else {
         Duration::from_secs(5 * 60 * 60)
+    }
+}
+
+fn format_duration(seconds: u64) -> String {
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        "less than 1m".to_string()
     }
 }
 
@@ -1261,8 +1379,13 @@ async fn send_chat_completion_request(
         })?;
     let status = response.status();
     if !status.is_success() {
+        let headers = response.headers().clone();
         let body = response.text().await.unwrap_or_default();
-        return Err(error_from_status(status.as_u16(), &body));
+        return Err(error_from_status_and_headers(
+            status.as_u16(),
+            Some(&headers),
+            &body,
+        ));
     }
     Ok(response)
 }
@@ -1307,8 +1430,13 @@ async fn send_responses_request(
     })?;
     let status = response.status();
     if !status.is_success() {
+        let headers = response.headers().clone();
         let body = response.text().await.unwrap_or_default();
-        return Err(error_from_status(status.as_u16(), &body));
+        return Err(error_from_status_and_headers(
+            status.as_u16(),
+            Some(&headers),
+            &body,
+        ));
     }
     Ok(response)
 }
@@ -4476,6 +4604,14 @@ fn responses_or_chat_endpoint(settings: &Settings) -> String {
 }
 
 fn error_from_status(status: u16, body: &str) -> ProviderError {
+    error_from_status_and_headers(status, None, body)
+}
+
+fn error_from_status_and_headers(
+    status: u16,
+    headers: Option<&HeaderMap>,
+    body: &str,
+) -> ProviderError {
     let parsed = serde_json::from_str::<ErrorResponseBody>(body).ok();
     let message = parsed
         .as_ref()
@@ -4487,7 +4623,158 @@ fn error_from_status(status: u16, body: &str) -> ProviderError {
         .and_then(|error| error.code.clone().or_else(|| error.r#type.clone()))
         .unwrap_or_else(|| format!("http_{status}"));
     let category = category_from_openai_error(status, &code, &message);
-    provider_error(code, category, message)
+    let mut error = provider_error(code, category, message);
+    if category == ProviderErrorCategory::RateLimit {
+        error.retry = retry_hint_from_response(headers, body).map(Box::new);
+    }
+    error
+}
+
+fn retry_hint_from_response(headers: Option<&HeaderMap>, body: &str) -> Option<ProviderRetryHint> {
+    headers
+        .and_then(retry_hint_from_headers)
+        .or_else(|| retry_hint_from_body(body))
+}
+
+fn retry_hint_from_headers(headers: &HeaderMap) -> Option<ProviderRetryHint> {
+    header_seconds(headers, "retry-after-ms").map_or_else(
+        || {
+            header_seconds(headers, "retry-after")
+                .map(|seconds| ProviderRetryHint {
+                    retry_after_ms: Some(seconds.saturating_mul(1_000)),
+                    retry_at_unix: Some(unix_timestamp().saturating_add(seconds)),
+                    source: Some("retry-after".to_string()),
+                })
+                .or_else(|| header_http_date(headers, "retry-after"))
+                .or_else(|| x_ratelimit_reset_hint(headers))
+        },
+        |milliseconds| {
+            Some(ProviderRetryHint {
+                retry_after_ms: Some(milliseconds),
+                retry_at_unix: Some(unix_timestamp().saturating_add(milliseconds.div_ceil(1_000))),
+                source: Some("retry-after-ms".to_string()),
+            })
+        },
+    )
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)?
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn header_seconds(headers: &HeaderMap, name: &str) -> Option<u64> {
+    parse_seconds_value(&header_value(headers, name)?)
+}
+
+fn parse_seconds_value(value: &str) -> Option<u64> {
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(seconds);
+    }
+    let (whole, fraction) = value.split_once('.')?;
+    let seconds = whole.parse::<u64>().ok()?;
+    if fraction.chars().any(|character| character != '0') {
+        Some(seconds.saturating_add(1))
+    } else {
+        Some(seconds)
+    }
+}
+
+fn header_http_date(headers: &HeaderMap, name: &str) -> Option<ProviderRetryHint> {
+    let value = header_value(headers, name)?;
+    let date = httpdate::parse_http_date(&value).ok()?;
+    let retry_at_unix = date.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    Some(ProviderRetryHint {
+        retry_after_ms: retry_at_unix
+            .saturating_sub(unix_timestamp())
+            .checked_mul(1_000),
+        retry_at_unix: Some(retry_at_unix),
+        source: Some(name.to_string()),
+    })
+}
+
+fn x_ratelimit_reset_hint(headers: &HeaderMap) -> Option<ProviderRetryHint> {
+    [
+        "x-ratelimit-reset-requests",
+        "x-ratelimit-reset-tokens",
+        "x-ratelimit-reset",
+    ]
+    .into_iter()
+    .find_map(|name| header_reset_value(headers, name))
+}
+
+fn header_reset_value(headers: &HeaderMap, name: &str) -> Option<ProviderRetryHint> {
+    let value = header_value(headers, name)?;
+    parse_reset_value(&value).map(|retry_at_unix| ProviderRetryHint {
+        retry_after_ms: retry_at_unix
+            .saturating_sub(unix_timestamp())
+            .checked_mul(1_000),
+        retry_at_unix: Some(retry_at_unix),
+        source: Some(name.to_string()),
+    })
+}
+
+fn retry_hint_from_body(body: &str) -> Option<ProviderRetryHint> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    find_json_reset_value(&value).map(|retry_at_unix| ProviderRetryHint {
+        retry_after_ms: retry_at_unix
+            .saturating_sub(unix_timestamp())
+            .checked_mul(1_000),
+        retry_at_unix: Some(retry_at_unix),
+        source: Some("body".to_string()),
+    })
+}
+
+fn find_json_reset_value(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in ["retry_after_ms", "retryAfterMs"] {
+                if let Some(number) = map.get(key).and_then(serde_json::Value::as_u64) {
+                    return Some(unix_timestamp().saturating_add(number.div_ceil(1_000)));
+                }
+            }
+            for key in ["retry_after", "retryAfter", "reset_at", "resetAt"] {
+                if let Some(value) = map.get(key)
+                    && let Some(reset) = parse_json_reset_value(value)
+                {
+                    return Some(reset);
+                }
+            }
+            map.values().find_map(find_json_reset_value)
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(find_json_reset_value),
+        _ => None,
+    }
+}
+
+fn parse_json_reset_value(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .map(|seconds| unix_timestamp().saturating_add(seconds))
+        .or_else(|| value.as_str().and_then(parse_reset_value))
+}
+
+fn parse_reset_value(value: &str) -> Option<u64> {
+    value.parse::<u64>().ok().map_or_else(
+        || {
+            httpdate::parse_http_date(value)
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs())
+        },
+        |number| {
+            if number > 2_000_000_000 {
+                Some(number)
+            } else {
+                Some(unix_timestamp().saturating_add(number))
+            }
+        },
+    )
 }
 
 fn category_from_openai_error(status: u16, code: &str, message: &str) -> ProviderErrorCategory {
@@ -4577,6 +4864,7 @@ fn provider_error(
                 | ProviderErrorCategory::ProviderInternal
         ),
         provider_message: None,
+        retry: None,
     }
 }
 
