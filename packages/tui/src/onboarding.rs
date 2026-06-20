@@ -13,6 +13,23 @@ pub struct OnboardingShell {
     focused_index: usize,
 }
 
+/// Automated onboarding walkthrough smoke-test report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnboardingWalkthroughReport {
+    /// Initial focused setup section.
+    pub initial_section: SetupSectionId,
+    /// Focused section after moving next.
+    pub next_section: SetupSectionId,
+    /// Focused section after moving back.
+    pub previous_section: SetupSectionId,
+    /// Number of BMUX stepper items produced.
+    pub step_count: usize,
+    /// Compact text map rendered during the walkthrough.
+    pub rendered_map: String,
+    /// Whether persisted focus survived reload.
+    pub persisted_focus_reloaded: bool,
+}
+
 impl OnboardingShell {
     /// Build the onboarding shell from persisted settings DB state and real config summary.
     ///
@@ -111,6 +128,37 @@ impl OnboardingShell {
         .render_text_map()
     }
 
+    /// Run a non-interactive first-run walkthrough smoke test.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when focus persistence or reload fails.
+    pub fn smoke_walkthrough(
+        store: &SettingsStore,
+        config_summary: &SetupConfigSummary,
+        visited_at_ms: u64,
+    ) -> Result<OnboardingWalkthroughReport, SettingsError> {
+        let mut shell = Self::load(store, config_summary)?;
+        let initial_section = shell.focused_section();
+        let rendered_map = shell.render_text_map();
+        let step_count = shell.step_items().len();
+        shell.focus_next();
+        let next_section = shell.focused_section();
+        shell.persist_focus(store, visited_at_ms)?;
+        let reloaded = Self::load(store, config_summary)?;
+        let persisted_focus_reloaded = reloaded.focused_section() == next_section;
+        shell.focus_previous();
+        let previous_section = shell.focused_section();
+        Ok(OnboardingWalkthroughReport {
+            initial_section,
+            next_section,
+            previous_section,
+            step_count,
+            rendered_map,
+            persisted_focus_reloaded,
+        })
+    }
+
     fn mark_current_focus(&mut self) {
         let focused = self.focused_section();
         for section in &mut self.sections {
@@ -197,18 +245,19 @@ mod tests {
     }
 
     #[test]
-    fn shell_loads_and_persists_focus() {
+    fn smoke_walkthrough_reports_navigation_and_persistence() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let store = SettingsStore::from_settings_db_path(temp.path().join("settings.db"));
         let summary = SetupConfigSummary::default();
 
-        let mut shell = OnboardingShell::load(&store, &summary).expect("shell should load");
-        shell.focus_next();
-        shell
-            .persist_focus(&store, 42)
-            .expect("focus should persist");
-        let reloaded = OnboardingShell::load(&store, &summary).expect("shell should reload");
+        let report = OnboardingShell::smoke_walkthrough(&store, &summary, 43)
+            .expect("smoke walkthrough should pass");
 
-        assert_eq!(reloaded.focused_section(), SetupSectionId::Detection);
+        assert_eq!(report.initial_section, SetupSectionId::Welcome);
+        assert_eq!(report.next_section, SetupSectionId::Detection);
+        assert_eq!(report.previous_section, SetupSectionId::Welcome);
+        assert_eq!(report.step_count, SetupSectionId::all().len());
+        assert!(report.rendered_map.contains("welcome"));
+        assert!(report.persisted_focus_reloaded);
     }
 }
