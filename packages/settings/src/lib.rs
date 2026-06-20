@@ -2,15 +2,22 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! Settings database persistence for Bcode.
+//! Settings orchestration and runtime control-state persistence for Bcode.
 //!
-//! The settings database stores durable local settings and control-center
-//! metadata that should survive across Bcode sessions. It intentionally does
-//! not store secrets; credential values belong in the configured secure auth
-//! store.
+//! User-editable Bcode configuration should remain in TOML/config layers so it
+//! can be hand-edited, merged, templated, and overridden the same way existing
+//! `bcode.toml` configuration works. This crate may grow service APIs that
+//! safely write those TOML-backed overrides through the config domain.
+//!
+//! The database in this crate is for runtime/control-center state: onboarding
+//! progress, visited setup-map sections, dismissed recommendations, sanitized
+//! detection cache entries, and similar durable state that is not intended to be
+//! hand-edited. It intentionally does not store secrets; credential values
+//! belong in the configured secure auth store.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -29,7 +36,7 @@ const DATABASE_OPEN_MAX_RETRY_DELAY: Duration = Duration::from_millis(250);
 const DATABASE_OPEN_RETRY_ATTEMPTS: u32 = 5;
 const ONBOARDING_PROGRESS_ID: i64 = 1;
 
-/// Durable Bcode settings database location.
+/// Durable Bcode runtime settings/control-state database location.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsStore {
     settings_db_path: PathBuf,
@@ -56,19 +63,28 @@ impl SettingsStore {
         &self.settings_db_path
     }
 
-    /// Persist a generic JSON setting.
+    /// Persist a control-center JSON state value.
+    ///
+    /// This is for durable runtime/UI state that should not live in user-edited
+    /// TOML config. User-configurable settings should be saved through
+    /// dedicated config mutation APIs instead.
     ///
     /// # Errors
     ///
     /// Returns an error when the settings database cannot be opened, migrated,
     /// serialized, or written.
-    pub fn put_setting(&self, key: &str, value: &Value, updated_at_ms: u64) -> SettingsResult<()> {
+    pub fn put_control_state(
+        &self,
+        key: &str,
+        value: &Value,
+        updated_at_ms: u64,
+    ) -> SettingsResult<()> {
         let key = key.to_owned();
         let value_json = serde_json::to_string(value)?;
         self.with_database(move |database| {
             Box::pin(async move {
                 database
-                    .upsert("settings_kv")
+                    .upsert("control_state_kv")
                     .value("key", key)
                     .value("value_json", value_json)
                     .value("updated_at_ms", u64_to_i64(updated_at_ms))
@@ -79,25 +95,25 @@ impl SettingsStore {
         })
     }
 
-    /// Return a generic JSON setting.
+    /// Return a control-center JSON state value.
     ///
     /// # Errors
     ///
     /// Returns an error when the settings database cannot be opened, migrated,
     /// read, or decoded.
-    pub fn get_setting(&self, key: &str) -> SettingsResult<Option<SettingsValue>> {
+    pub fn control_state(&self, key: &str) -> SettingsResult<Option<ControlStateValue>> {
         let key = key.to_owned();
         self.with_database(move |database| {
             Box::pin(async move {
                 let rows = database
-                    .select("settings_kv")
+                    .select("control_state_kv")
                     .columns(&["key", "value_json", "updated_at_ms"])
                     .filter(Box::new(where_eq("key", key)))
                     .execute(database.as_ref())
                     .await?;
                 rows.into_iter()
                     .next()
-                    .map(|row| setting_value_from_row(&row))
+                    .map(|row| control_state_value_from_row(&row))
                     .transpose()
             })
         })
@@ -372,12 +388,12 @@ impl SettingsStore {
     }
 }
 
-/// Stored generic JSON setting.
+/// Stored control-center JSON state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SettingsValue {
-    /// Setting key.
+pub struct ControlStateValue {
+    /// State key.
     pub key: String,
-    /// Setting JSON value.
+    /// State JSON value.
     pub value: Value,
     /// Last update timestamp in milliseconds since Unix epoch.
     pub updated_at_ms: u64,
@@ -459,6 +475,187 @@ pub struct SetupRecommendation {
     pub dismissed_at_ms: Option<u64>,
 }
 
+/// Stable setup-map sections used by first-run onboarding and Settings / Control Center.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupSectionId {
+    /// First impression and setup overview.
+    Welcome,
+    /// Environment/config detection summary.
+    Detection,
+    /// Secure credential storage and device sealing.
+    SecureVault,
+    /// Provider authentication and profile setup.
+    Providers,
+    /// Model profile/default setup.
+    Models,
+    /// Permission preset/rule review.
+    Permissions,
+    /// Session import review.
+    Imports,
+    /// Plugin review/customization.
+    Plugins,
+    /// Final review and launch.
+    Launch,
+}
+
+impl SetupSectionId {
+    /// Return the stable storage identifier for this setup section.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Welcome => "welcome",
+            Self::Detection => "detection",
+            Self::SecureVault => "secure_vault",
+            Self::Providers => "providers",
+            Self::Models => "models",
+            Self::Permissions => "permissions",
+            Self::Imports => "imports",
+            Self::Plugins => "plugins",
+            Self::Launch => "launch",
+        }
+    }
+
+    /// Return all setup sections in the default map order.
+    #[must_use]
+    pub const fn all() -> [Self; 9] {
+        [
+            Self::Welcome,
+            Self::Detection,
+            Self::SecureVault,
+            Self::Providers,
+            Self::Models,
+            Self::Permissions,
+            Self::Imports,
+            Self::Plugins,
+            Self::Launch,
+        ]
+    }
+}
+
+/// Reconciled setup section status for onboarding rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupSectionStatus {
+    /// The user has not visited this section.
+    Unvisited,
+    /// The user has visited this section.
+    Visited,
+    /// This section is currently focused.
+    Current,
+    /// Real product/config state indicates this section is complete.
+    Complete,
+    /// This section has an active recommendation.
+    Recommended,
+    /// This section is optional for the current setup.
+    Optional,
+    /// The user explicitly skipped this section.
+    Skipped,
+    /// This section cannot be completed until another issue is resolved.
+    Blocked,
+    /// This section is complete and tied to secure storage state.
+    Secured,
+    /// This section needs attention.
+    NeedsAttention,
+}
+
+impl SetupSectionStatus {
+    /// Return the stable storage identifier for this status.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unvisited => "unvisited",
+            Self::Visited => "visited",
+            Self::Current => "current",
+            Self::Complete => "complete",
+            Self::Recommended => "recommended",
+            Self::Optional => "optional",
+            Self::Skipped => "skipped",
+            Self::Blocked => "blocked",
+            Self::Secured => "secured",
+            Self::NeedsAttention => "needs_attention",
+        }
+    }
+}
+
+/// External real-state summary used to reconcile onboarding display state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupReconciliationInput {
+    /// Currently focused setup section.
+    pub current_section: Option<SetupSectionId>,
+    /// Sections whose real product/config state is complete.
+    pub configured_sections: BTreeSet<SetupSectionId>,
+    /// Sections whose real product/config state is secured.
+    pub secured_sections: BTreeSet<SetupSectionId>,
+    /// Sections blocked by missing prerequisites or degraded state.
+    pub blocked_sections: BTreeSet<SetupSectionId>,
+    /// Sections with active recommendations.
+    pub recommended_sections: BTreeSet<SetupSectionId>,
+    /// Sections that are optional in the current setup.
+    pub optional_sections: BTreeSet<SetupSectionId>,
+}
+
+/// Reconciled setup-map section snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconciledSetupSection {
+    /// Stable setup section identifier.
+    pub section_id: SetupSectionId,
+    /// Display status after reconciling persisted UX state with real state.
+    pub status: SetupSectionStatus,
+    /// Whether the user has visited this section.
+    pub visited: bool,
+}
+
+/// Reconcile setup-map sections from persisted UX state and real product/config state.
+#[must_use]
+pub fn reconcile_setup_sections(
+    persisted_sections: &[OnboardingSection],
+    input: &SetupReconciliationInput,
+) -> Vec<ReconciledSetupSection> {
+    let visited_sections = persisted_sections
+        .iter()
+        .filter(|section| section.visited)
+        .map(|section| section.section_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let skipped_sections = persisted_sections
+        .iter()
+        .filter(|section| section.status == SetupSectionStatus::Skipped.as_str())
+        .map(|section| section.section_id.as_str())
+        .collect::<BTreeSet<_>>();
+
+    SetupSectionId::all()
+        .into_iter()
+        .map(|section_id| {
+            let section_key = section_id.as_str();
+            let visited = visited_sections.contains(section_key);
+            let status = if input.current_section == Some(section_id) {
+                SetupSectionStatus::Current
+            } else if input.secured_sections.contains(&section_id) {
+                SetupSectionStatus::Secured
+            } else if input.configured_sections.contains(&section_id) {
+                SetupSectionStatus::Complete
+            } else if input.blocked_sections.contains(&section_id) {
+                SetupSectionStatus::Blocked
+            } else if input.recommended_sections.contains(&section_id) {
+                SetupSectionStatus::Recommended
+            } else if skipped_sections.contains(section_key) {
+                SetupSectionStatus::Skipped
+            } else if input.optional_sections.contains(&section_id) {
+                SetupSectionStatus::Optional
+            } else if visited {
+                SetupSectionStatus::Visited
+            } else {
+                SetupSectionStatus::Unvisited
+            };
+            ReconciledSetupSection {
+                section_id,
+                status,
+                visited,
+            }
+        })
+        .collect()
+}
+
 /// Settings persistence result type.
 pub type SettingsResult<T> = Result<T, SettingsError>;
 
@@ -530,7 +727,7 @@ async fn run_migrations(database: &dyn Database) -> SettingsResult<()> {
 
 fn settings_migrations() -> CodeMigrationSource<'static> {
     let mut source = CodeMigrationSource::new();
-    source.add_migration(settings_kv_table_migration());
+    source.add_migration(control_state_kv_table_migration());
     source.add_migration(onboarding_progress_table_migration());
     source.add_migration(onboarding_sections_table_migration());
     source.add_migration(detection_cache_table_migration());
@@ -538,11 +735,11 @@ fn settings_migrations() -> CodeMigrationSource<'static> {
     source
 }
 
-fn settings_kv_table_migration() -> CodeMigration<'static> {
+fn control_state_kv_table_migration() -> CodeMigration<'static> {
     CodeMigration::new(
-        "001_settings_kv".to_owned(),
+        "001_control_state_kv".to_owned(),
         Box::new(
-            create_table("settings_kv")
+            create_table("control_state_kv")
                 .if_not_exists(true)
                 .column(text_column("key"))
                 .column(text_column("value_json"))
@@ -671,8 +868,8 @@ fn nullable_int_column(name: &str) -> Column {
     }
 }
 
-fn setting_value_from_row(row: &Row) -> SettingsResult<SettingsValue> {
-    Ok(SettingsValue {
+fn control_state_value_from_row(row: &Row) -> SettingsResult<ControlStateValue> {
+    Ok(ControlStateValue {
         key: required_text(row, "key")?,
         value: serde_json::from_str(&required_text(row, "value_json")?)?,
         updated_at_ms: i64_to_u64(required_i64(row, "updated_at_ms")?),
@@ -774,17 +971,17 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn settings_kv_round_trips() {
+    fn control_state_kv_round_trips() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let store = SettingsStore::from_settings_db_path(temp.path().join("settings.db"));
 
         store
-            .put_setting("setup.theme", &json!({"name": "default"}), 100)
-            .expect("setting should be written");
+            .put_control_state("setup.theme", &json!({"name": "default"}), 100)
+            .expect("control state should be written");
         let value = store
-            .get_setting("setup.theme")
-            .expect("setting should be read")
-            .expect("setting should exist");
+            .control_state("setup.theme")
+            .expect("control state should be read")
+            .expect("control state should exist");
 
         assert_eq!(value.key, "setup.theme");
         assert_eq!(value.value, json!({"name": "default"}));
@@ -872,6 +1069,76 @@ mod tests {
                 .setup_recommendations()
                 .expect("recommendations should load"),
             vec![recommendation]
+        );
+    }
+
+    #[test]
+    fn reconciliation_prefers_real_state_over_persisted_ux_state() {
+        let persisted = vec![
+            OnboardingSection {
+                section_id: SetupSectionId::Providers.as_str().to_owned(),
+                status: SetupSectionStatus::Visited.as_str().to_owned(),
+                visited: true,
+                visited_at_ms: Some(10),
+                completed_at_ms: None,
+                skipped_at_ms: None,
+                dismissed: false,
+            },
+            OnboardingSection {
+                section_id: SetupSectionId::Imports.as_str().to_owned(),
+                status: SetupSectionStatus::Skipped.as_str().to_owned(),
+                visited: true,
+                visited_at_ms: Some(11),
+                completed_at_ms: None,
+                skipped_at_ms: Some(12),
+                dismissed: false,
+            },
+        ];
+        let input = SetupReconciliationInput {
+            current_section: Some(SetupSectionId::Models),
+            configured_sections: BTreeSet::from([SetupSectionId::Providers]),
+            secured_sections: BTreeSet::from([SetupSectionId::SecureVault]),
+            blocked_sections: BTreeSet::from([SetupSectionId::Permissions]),
+            recommended_sections: BTreeSet::from([SetupSectionId::Plugins]),
+            optional_sections: BTreeSet::from([SetupSectionId::Imports]),
+        };
+
+        let sections = reconcile_setup_sections(&persisted, &input);
+        let status_for = |section_id| {
+            sections
+                .iter()
+                .find(|section| section.section_id == section_id)
+                .expect("section should exist")
+                .status
+        };
+
+        assert_eq!(
+            status_for(SetupSectionId::Models),
+            SetupSectionStatus::Current
+        );
+        assert_eq!(
+            status_for(SetupSectionId::SecureVault),
+            SetupSectionStatus::Secured
+        );
+        assert_eq!(
+            status_for(SetupSectionId::Providers),
+            SetupSectionStatus::Complete
+        );
+        assert_eq!(
+            status_for(SetupSectionId::Permissions),
+            SetupSectionStatus::Blocked
+        );
+        assert_eq!(
+            status_for(SetupSectionId::Plugins),
+            SetupSectionStatus::Recommended
+        );
+        assert_eq!(
+            status_for(SetupSectionId::Imports),
+            SetupSectionStatus::Skipped
+        );
+        assert_eq!(
+            status_for(SetupSectionId::Welcome),
+            SetupSectionStatus::Unvisited
         );
     }
 }
