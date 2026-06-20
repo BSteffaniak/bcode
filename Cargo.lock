@@ -1599,6 +1599,8 @@ name = "bcode_model_provider_runtime"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_model",
+ "httpdate",
+ "serde_json",
  "tokio",
 ]
 

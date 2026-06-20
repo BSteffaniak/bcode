@@ -29,7 +29,7 @@ use bcode_model::{
     StartTurnResponse, StopReason, TokenUsage, ToolCall, ToolDefinition, ValidateConfigResponse,
 };
 use bcode_model_provider_runtime::{
-    ProviderRuntime, StreamOutcome, TurnState, TurnStore, provider_error,
+    ProviderRuntime, StreamOutcome, TurnState, TurnStore, provider_error, retry_hint_from_body,
 };
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -2176,7 +2176,11 @@ fn bedrock_sdk_error(
     } else {
         ProviderErrorCategory::ProviderInternal
     };
-    provider_error("bedrock_request_failed", category, message)
+    let mut error = provider_error("bedrock_request_failed", category, message.clone());
+    if category == ProviderErrorCategory::RateLimit {
+        error.retry = retry_hint_from_body(&message).map(Box::new);
+    }
+    error
 }
 
 fn bedrock_discovery_error(error: &(impl std::fmt::Debug + ToString + ?Sized)) -> ProviderError {
@@ -2192,7 +2196,11 @@ fn bedrock_discovery_error(error: &(impl std::fmt::Debug + ToString + ?Sized)) -
     } else {
         ProviderErrorCategory::ProviderInternal
     };
-    provider_error("bedrock_model_discovery_failed", category, message)
+    let mut error = provider_error("bedrock_model_discovery_failed", category, message.clone());
+    if category == ProviderErrorCategory::RateLimit {
+        error.retry = retry_hint_from_body(&message).map(Box::new);
+    }
+    error
 }
 
 fn bedrock_stream_error(error: &(impl ToString + ?Sized)) -> ProviderError {

@@ -4,7 +4,7 @@
 
 //! Shared turn lifecycle support for native model provider plugins.
 
-use bcode_model::{ProviderError, ProviderErrorCategory, ProviderTurnEvent};
+use bcode_model::{ProviderError, ProviderErrorCategory, ProviderRetryHint, ProviderTurnEvent};
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -130,6 +130,297 @@ pub fn provider_error(
     }
 }
 
+/// Extract retry timing metadata from provider HTTP headers and an optional body.
+#[must_use]
+pub fn retry_hint_from_response_parts(
+    headers: &BTreeMap<String, String>,
+    body: Option<&str>,
+) -> Option<ProviderRetryHint> {
+    retry_hint_from_headers(headers).or_else(|| body.and_then(retry_hint_from_body))
+}
+
+/// Extract retry timing metadata from provider HTTP headers.
+#[must_use]
+pub fn retry_hint_from_headers(headers: &BTreeMap<String, String>) -> Option<ProviderRetryHint> {
+    let headers = normalized_headers(headers);
+    headers
+        .get("retry-after-ms")
+        .and_then(|value| parse_millis_value(value))
+        .map_or_else(
+            || {
+                headers
+                    .get("retry-after")
+                    .and_then(|value| parse_retry_after_value(value, "retry-after"))
+                    .or_else(|| x_ratelimit_reset_hint_from_values(&headers))
+                    .or_else(|| anthropic_ratelimit_reset_hint(&headers))
+                    .or_else(|| codex_window_hint_from_values(&headers))
+            },
+            |milliseconds| {
+                Some(ProviderRetryHint {
+                    retry_after_ms: Some(milliseconds),
+                    retry_at_unix: Some(
+                        unix_timestamp().saturating_add(milliseconds.div_ceil(1_000)),
+                    ),
+                    source: Some("retry-after-ms".to_string()),
+                })
+            },
+        )
+}
+
+fn normalized_headers(headers: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    headers
+        .iter()
+        .map(|(key, value)| (key.to_ascii_lowercase(), value.trim().to_string()))
+        .collect()
+}
+
+/// Extract retry timing metadata from a JSON response body.
+#[must_use]
+pub fn retry_hint_from_body(body: &str) -> Option<ProviderRetryHint> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    retry_hint_from_json_value(&value)
+}
+
+/// Extract retry timing metadata from a JSON response/event value.
+#[must_use]
+pub fn retry_hint_from_json_value(value: &serde_json::Value) -> Option<ProviderRetryHint> {
+    retry_hint_from_json_headers(value).or_else(|| {
+        find_json_reset_value(value).map(|retry_at_unix| ProviderRetryHint {
+            retry_after_ms: retry_at_unix
+                .saturating_sub(unix_timestamp())
+                .checked_mul(1_000),
+            retry_at_unix: Some(retry_at_unix),
+            source: Some("body".to_string()),
+        })
+    })
+}
+
+fn retry_hint_from_json_headers(value: &serde_json::Value) -> Option<ProviderRetryHint> {
+    let headers = value.get("headers")?.as_object()?;
+    let mut normalized = BTreeMap::new();
+    for (key, value) in headers {
+        if let Some(value) = header_json_value(value) {
+            normalized.insert(key.to_ascii_lowercase(), value);
+        }
+    }
+    retry_hint_from_headers(&normalized)
+}
+
+fn header_json_value(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .or_else(|| value.as_u64().map(|number| number.to_string()))
+        .or_else(|| value.as_i64().map(|number| number.to_string()))
+        .or_else(|| value.as_bool().map(|boolean| boolean.to_string()))
+}
+
+fn parse_millis_value(value: &str) -> Option<u64> {
+    value.parse::<u64>().ok()
+}
+
+fn x_ratelimit_reset_hint_from_values(
+    headers: &BTreeMap<String, String>,
+) -> Option<ProviderRetryHint> {
+    headers.iter().find_map(|(name, value)| {
+        name.strip_prefix("x-ratelimit-reset-")
+            .filter(|suffix| !suffix.is_empty())
+            .map_or_else(
+                || (name == "x-ratelimit-reset").then_some(name.as_str()),
+                |_| Some(name.as_str()),
+            )
+            .and_then(|source| reset_hint(value, source))
+    })
+}
+
+fn anthropic_ratelimit_reset_hint(headers: &BTreeMap<String, String>) -> Option<ProviderRetryHint> {
+    headers.iter().find_map(|(name, value)| {
+        (name.starts_with("anthropic-ratelimit-") && name.ends_with("-reset"))
+            .then(|| reset_hint(value, name))
+            .flatten()
+    })
+}
+
+fn codex_window_hint_from_values(headers: &BTreeMap<String, String>) -> Option<ProviderRetryHint> {
+    headers
+        .get("x-codex-primary-window-minutes")
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|minutes| minutes.saturating_mul(60))
+        .map(|seconds| ProviderRetryHint {
+            retry_after_ms: seconds.checked_mul(1_000),
+            retry_at_unix: Some(unix_timestamp().saturating_add(seconds)),
+            source: Some("x-codex-primary-window-minutes".to_string()),
+        })
+}
+
+fn reset_hint(value: &str, source: &str) -> Option<ProviderRetryHint> {
+    parse_reset_value(value).map(|retry_at_unix| ProviderRetryHint {
+        retry_after_ms: retry_at_unix
+            .saturating_sub(unix_timestamp())
+            .checked_mul(1_000),
+        retry_at_unix: Some(retry_at_unix),
+        source: Some(source.to_string()),
+    })
+}
+
+fn find_json_reset_value(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in ["retry_after_ms", "retryAfterMs"] {
+                if let Some(number) = map.get(key).and_then(serde_json::Value::as_u64) {
+                    return Some(unix_timestamp().saturating_add(number.div_ceil(1_000)));
+                }
+            }
+            for key in ["retry_after", "retryAfter", "reset_at", "resetAt"] {
+                if let Some(value) = map.get(key)
+                    && let Some(reset) = parse_json_reset_value(value)
+                {
+                    return Some(reset);
+                }
+            }
+            map.values().find_map(find_json_reset_value)
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(find_json_reset_value),
+        _ => None,
+    }
+}
+
+fn parse_json_reset_value(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .map(|seconds| unix_timestamp().saturating_add(seconds))
+        .or_else(|| value.as_str().and_then(parse_reset_value))
+}
+
+fn parse_reset_value(value: &str) -> Option<u64> {
+    parse_duration_seconds(value).map_or_else(
+        || {
+            value.parse::<u64>().ok().map_or_else(
+                || {
+                    httpdate::parse_http_date(value)
+                        .ok()
+                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_secs())
+                },
+                |number| {
+                    if number > 2_000_000_000 {
+                        Some(number)
+                    } else {
+                        Some(unix_timestamp().saturating_add(number))
+                    }
+                },
+            )
+        },
+        |seconds| Some(unix_timestamp().saturating_add(seconds)),
+    )
+}
+
+fn parse_retry_after_value(value: &str, source: &str) -> Option<ProviderRetryHint> {
+    parse_seconds_value(value)
+        .or_else(|| parse_duration_seconds(value))
+        .map(|seconds| ProviderRetryHint {
+            retry_after_ms: seconds.checked_mul(1_000),
+            retry_at_unix: Some(unix_timestamp().saturating_add(seconds)),
+            source: Some(source.to_string()),
+        })
+        .or_else(|| {
+            httpdate::parse_http_date(value)
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs())
+                .map(|retry_at_unix| ProviderRetryHint {
+                    retry_after_ms: retry_at_unix
+                        .saturating_sub(unix_timestamp())
+                        .checked_mul(1_000),
+                    retry_at_unix: Some(retry_at_unix),
+                    source: Some(source.to_string()),
+                })
+        })
+}
+
+fn parse_seconds_value(value: &str) -> Option<u64> {
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(seconds);
+    }
+    let (whole, fraction) = value.split_once('.')?;
+    let seconds = whole.parse::<u64>().ok()?;
+    if fraction.chars().any(|character| character != '0') {
+        Some(seconds.saturating_add(1))
+    } else {
+        Some(seconds)
+    }
+}
+
+fn parse_duration_seconds(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().all(|character| character.is_ascii_digit()) {
+        return None;
+    }
+    let mut total_millis = 0_u64;
+    let mut number = String::new();
+    let mut parsed_unit = false;
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character.is_ascii_digit() || character == '.' {
+            number.push(character);
+            continue;
+        }
+        if character.is_whitespace() {
+            continue;
+        }
+        let unit = if character == 'm' && chars.peek() == Some(&'s') {
+            chars.next();
+            "ms"
+        } else if matches!(character, 'd' | 'h' | 'm' | 's') {
+            match character {
+                'd' => "d",
+                'h' => "h",
+                'm' => "m",
+                's' => "s",
+                _ => return None,
+            }
+        } else {
+            return None;
+        };
+        let millis = duration_component_millis(&number, unit)?;
+        total_millis = total_millis.saturating_add(millis);
+        number.clear();
+        parsed_unit = true;
+    }
+    if !number.is_empty() || !parsed_unit {
+        return None;
+    }
+    Some(total_millis.div_ceil(1_000))
+}
+
+fn duration_component_millis(number: &str, unit: &str) -> Option<u64> {
+    let (whole, fraction) = number
+        .split_once('.')
+        .map_or((number, ""), |(whole, fraction)| (whole, fraction));
+    let whole = whole.parse::<u64>().ok()?;
+    let multiplier = match unit {
+        "ms" => 1,
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => return None,
+    };
+    let whole_millis = whole.checked_mul(multiplier)?;
+    if fraction.is_empty() {
+        return Some(whole_millis);
+    }
+    let denominator = 10_u64.checked_pow(u32::try_from(fraction.len()).ok()?)?;
+    let numerator = fraction.parse::<u64>().ok()?;
+    Some(whole_millis.saturating_add(numerator.saturating_mul(multiplier) / denominator))
+}
+
+#[must_use]
+fn unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
 /// Shared Tokio runtime for native model provider plugins.
 ///
 /// The plugin service ABI is synchronous, but providers need async networking for
