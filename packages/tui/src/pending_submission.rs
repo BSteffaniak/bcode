@@ -22,11 +22,6 @@ impl PendingSubmission {
         self.state = PendingSubmissionState::Queued { queue_position };
     }
 
-    /// Mark the submission as sent.
-    pub const fn mark_sent(&mut self) {
-        self.state = PendingSubmissionState::Sent;
-    }
-
     /// Return pending text.
     #[must_use]
     pub fn text(&self) -> &str {
@@ -45,8 +40,6 @@ impl PendingSubmission {
 pub enum PendingSubmissionState {
     /// Client request is in flight.
     Sending,
-    /// Server accepted the request immediately.
-    Sent,
     /// Server queued the request.
     Queued {
         /// Server-reported queue position.

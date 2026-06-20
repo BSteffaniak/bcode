@@ -50,14 +50,6 @@ impl PendingSubmissions {
         }
     }
 
-    /// Mark the oldest pending submission as sent.
-    pub fn mark_first_sent(&mut self) {
-        if let Some(pending) = self.items.first_mut() {
-            pending.mark_sent();
-            self.bump_revision();
-        }
-    }
-
     /// Remove a pending submission by text.
     pub fn remove(&mut self, text: &str) {
         if let Some(index) = self.items.iter().position(|pending| pending.text() == text) {

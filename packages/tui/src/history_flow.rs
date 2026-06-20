@@ -9,7 +9,6 @@ use bcode_session_models::{
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, sleep};
 
 use super::TuiError;
 
@@ -19,8 +18,6 @@ const INITIAL_TRANSCRIPT_MAX_ITEMS: usize = 64;
 const INITIAL_TRANSCRIPT_MAX_EVENTS_SCANNED: usize = 2_048;
 const INITIAL_TRANSCRIPT_MAX_BYTES: usize = 512 * 1024;
 const TIMELINE_JUMP_MAX_EVENTS_SCANNED: usize = 1_024;
-const EVENT_STREAM_RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(100);
-const EVENT_STREAM_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(2);
 
 /// Build the projection-window request used for initial session attach.
 #[must_use]
@@ -231,11 +228,11 @@ fn spawn_reconnecting_window_event_stream(
 }
 
 async fn reconnecting_event_stream<F>(
-    client: BcodeClient,
-    session_id: SessionId,
+    _client: BcodeClient,
+    _session_id: SessionId,
     event_sender: mpsc::UnboundedSender<BcodeEvent>,
     mut connection: bcode_client::ClientConnection,
-    attach: F,
+    _attach: F,
 ) where
     F: for<'a> Fn(
             &'a mut bcode_client::ClientConnection,
@@ -247,75 +244,9 @@ async fn reconnecting_event_stream<F>(
         > + Send
         + 'static,
 {
-    let mut reconnect_delay = EVENT_STREAM_RECONNECT_INITIAL_DELAY;
-    let mut latest_sequence = 0;
-    loop {
-        while let Ok(event) = connection.recv_event().await {
-            reconnect_delay = EVENT_STREAM_RECONNECT_INITIAL_DELAY;
-            latest_sequence = latest_sequence.max(event_sequence(&event));
-            if event_sender.send(event).is_err() {
-                return;
-            }
-        }
-
-        loop {
-            if event_sender.is_closed() {
-                return;
-            }
-            sleep(reconnect_delay).await;
-            reconnect_delay =
-                (reconnect_delay.saturating_mul(2)).min(EVENT_STREAM_RECONNECT_MAX_DELAY);
-
-            let Ok(mut next_connection) = client.connect("bcode-tui-bmux").await else {
-                continue;
-            };
-            if attach(&mut next_connection, session_id).await.is_ok() {
-                if let Ok(replayed_latest_sequence) =
-                    replay_gap(&client, session_id, latest_sequence, &event_sender).await
-                {
-                    latest_sequence = latest_sequence.max(replayed_latest_sequence);
-                }
-                connection = next_connection;
-                reconnect_delay = EVENT_STREAM_RECONNECT_INITIAL_DELAY;
-                break;
-            }
+    while let Ok(event) = connection.recv_event().await {
+        if event_sender.send(event).is_err() {
+            return;
         }
     }
-}
-
-const fn event_sequence(event: &BcodeEvent) -> u64 {
-    match event {
-        BcodeEvent::Session(event) | BcodeEvent::RuntimeWork(event) => event.sequence,
-        BcodeEvent::SessionLive(_) | BcodeEvent::SessionCatalogUpdated { .. } => 0,
-    }
-}
-
-async fn replay_gap(
-    client: &BcodeClient,
-    session_id: SessionId,
-    latest_sequence: u64,
-    event_sender: &mpsc::UnboundedSender<BcodeEvent>,
-) -> Result<u64, bcode_client::ClientError> {
-    let page = client
-        .session_history_page(
-            session_id,
-            SessionHistoryQuery {
-                cursor: Some(SessionHistoryCursor {
-                    sequence: latest_sequence.saturating_add(1),
-                }),
-                limit: 512,
-                direction: SessionHistoryDirection::Forward,
-            },
-        )
-        .await?;
-    let mut replayed_latest_sequence = latest_sequence;
-    for event in page.events {
-        if event.sequence > latest_sequence {
-            replayed_latest_sequence = replayed_latest_sequence.max(event.sequence);
-            if event_sender.send(BcodeEvent::Session(event)).is_err() {
-                break;
-            }
-        }
-    }
-    Ok(replayed_latest_sequence)
 }

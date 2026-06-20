@@ -311,8 +311,8 @@ pub enum DaemonConnectionState {
     Starting,
     /// At least one daemon-backed request completed successfully.
     Connected,
-    /// A daemon-backed request failed after a previous success.
-    Reconnecting,
+    /// The daemon is intentionally offline/asleep while the TUI remains usable.
+    IdleOffline,
     /// A daemon-backed startup request failed before any success was observed.
     Unavailable,
 }
@@ -1321,11 +1321,6 @@ impl BmuxApp {
     /// Mark the oldest pending submission as queued by the server.
     pub fn mark_pending_submission_queued(&mut self, queue_position: Option<u32>) {
         self.pending_submissions.mark_first_queued(queue_position);
-    }
-
-    /// Mark the oldest pending submission as sent to the server.
-    pub fn mark_pending_submission_sent(&mut self) {
-        self.pending_submissions.mark_first_sent();
     }
 
     /// Remove a pending submission and restore it into the composer.

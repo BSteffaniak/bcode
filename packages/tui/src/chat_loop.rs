@@ -194,7 +194,7 @@ impl DaemonConnectionMonitor {
             DaemonObservation::Unavailable(error) | DaemonObservation::Failed(error) => {
                 self.last_error = Some(error);
                 Some(if self.saw_success {
-                    super::app::DaemonConnectionState::Reconnecting
+                    super::app::DaemonConnectionState::IdleOffline
                 } else {
                     super::app::DaemonConnectionState::Unavailable
                 })
@@ -872,7 +872,7 @@ fn apply_submit_message_result(
             }
             match result.acceptance.disposition {
                 bcode_ipc::MessageAcceptanceDisposition::AppliedSteering => {
-                    chat.app.mark_pending_submission_sent();
+                    chat.app.clear_pending_submission(message);
                     chat.app.set_status("Steering sent".to_owned());
                 }
                 bcode_ipc::MessageAcceptanceDisposition::QueuedFollowUp
@@ -889,7 +889,7 @@ fn apply_submit_message_result(
                     ));
                 }
                 bcode_ipc::MessageAcceptanceDisposition::StartedTurn => {
-                    chat.app.mark_pending_submission_sent();
+                    chat.app.clear_pending_submission(message);
                     chat.app.set_status("Message sent".to_owned());
                 }
             }

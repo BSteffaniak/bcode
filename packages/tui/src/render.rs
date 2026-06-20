@@ -2928,7 +2928,6 @@ fn spans_width(spans: &[Span]) -> usize {
 fn pending_label(state: PendingSubmissionState) -> String {
     match state {
         PendingSubmissionState::Sending => "sending".to_owned(),
-        PendingSubmissionState::Sent => "sent".to_owned(),
         PendingSubmissionState::Queued { queue_position } => queue_position.map_or_else(
             || "queued".to_owned(),
             |position| format!("queued #{position}"),
@@ -3218,8 +3217,9 @@ fn activity_label(activity: &ActivityState, daemon_connection: DaemonConnectionS
         ActivityState::Idle => match daemon_connection {
             DaemonConnectionState::Connecting => format!("{} connecting…", spinner_frame()),
             DaemonConnectionState::Starting => format!("{} starting daemon…", spinner_frame()),
-            DaemonConnectionState::Connected => "ready".to_owned(),
-            DaemonConnectionState::Reconnecting => format!("{} reconnecting…", spinner_frame()),
+            DaemonConnectionState::Connected | DaemonConnectionState::IdleOffline => {
+                "ready".to_owned()
+            }
             DaemonConnectionState::Unavailable => "daemon unavailable".to_owned(),
         },
         ActivityState::Thinking => format!("{} thinking", spinner_frame()),
