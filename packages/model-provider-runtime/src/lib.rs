@@ -10,6 +10,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::{Duration, Instant};
 use tokio::sync::{Notify, oneshot};
 
 /// Outcome from a provider streaming turn.
@@ -559,3 +560,168 @@ impl std::fmt::Display for ProviderRuntimeError {
 }
 
 impl std::error::Error for ProviderRuntimeError {}
+
+/// Request for a single provider model turn.
+#[derive(Debug, Clone)]
+pub struct SingleTurnRequest {
+    pub provider_plugin_id: Option<String>,
+    pub model_id: String,
+    pub provider_context: bcode_model::ProviderRequestContext,
+    pub prompt: String,
+    pub system_prompt: Option<String>,
+    pub parameters: bcode_model::ModelParameters,
+    pub metadata: BTreeMap<String, String>,
+    pub timeout: Duration,
+}
+
+/// Result of a single provider model turn.
+#[derive(Debug, Clone)]
+pub struct SingleTurnResult {
+    pub status: SingleTurnStatus,
+    pub text: String,
+    pub latency_ms: u128,
+    pub error: Option<bcode_model::ProviderError>,
+}
+
+/// Status of a single provider model turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SingleTurnStatus {
+    Finished,
+    Cancelled,
+    Timeout,
+    ProviderError,
+}
+
+/// Blocking provider invoker used by the reusable single-turn executor.
+pub trait BlockingModelProviderInvoker {
+    /// Invoke one typed model provider operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when provider routing, request encoding, service invocation, service
+    /// response status, or response decoding fails.
+    fn invoke_json<Q, R>(
+        &mut self,
+        provider_plugin_id: Option<&str>,
+        operation: &'static str,
+        request: &Q,
+    ) -> Result<R, String>
+    where
+        Q: serde::Serialize,
+        R: serde::de::DeserializeOwned;
+}
+
+/// Run a small single-turn provider request through the normal provider operation pipeline.
+///
+/// # Errors
+///
+/// Returns an error when provider service invocation fails before a provider turn can be
+/// represented as a model result.
+pub fn run_single_turn_blocking<I>(
+    invoker: &mut I,
+    request: SingleTurnRequest,
+) -> Result<SingleTurnResult, String>
+where
+    I: BlockingModelProviderInvoker,
+{
+    let start = Instant::now();
+    let session_id = bcode_session_models::SessionId::new();
+    let turn_request = bcode_model::ModelTurnRequest {
+        session_id,
+        turn_id: format!("single-turn-{session_id}"),
+        model_id: request.model_id,
+        provider_context: request.provider_context,
+        system_prompt: request.system_prompt,
+        messages: vec![bcode_model::ModelMessage {
+            role: bcode_model::MessageRole::User,
+            content: vec![bcode_model::ContentBlock::Text {
+                text: request.prompt,
+            }],
+        }],
+        tools: Vec::new(),
+        parameters: request.parameters,
+        prompt_cache: bcode_model::PromptCacheHints::default(),
+        conversation_reuse: bcode_model::ConversationReuseHints::default(),
+        metadata: request.metadata,
+    };
+    let start_response: bcode_model::StartTurnResponse = invoker.invoke_json(
+        request.provider_plugin_id.as_deref(),
+        bcode_model::OP_START_TURN,
+        &turn_request,
+    )?;
+    let mut text = String::new();
+    let mut last_error = None;
+    loop {
+        if start.elapsed() >= request.timeout {
+            finish_single_turn(
+                invoker,
+                request.provider_plugin_id.as_deref(),
+                &start_response.provider_turn_id,
+            );
+            return Ok(SingleTurnResult {
+                status: SingleTurnStatus::Timeout,
+                text,
+                latency_ms: start.elapsed().as_millis(),
+                error: last_error,
+            });
+        }
+        let poll: bcode_model::PollTurnEventsResponse = invoker.invoke_json(
+            request.provider_plugin_id.as_deref(),
+            bcode_model::OP_POLL_TURN_EVENTS,
+            &bcode_model::PollTurnEventsRequest {
+                provider_turn_id: start_response.provider_turn_id.clone(),
+            },
+        )?;
+        for event in poll.events {
+            match event {
+                bcode_model::ProviderTurnEvent::TextDelta { text: delta } => text.push_str(&delta),
+                bcode_model::ProviderTurnEvent::Error { error } => last_error = Some(error),
+                bcode_model::ProviderTurnEvent::TurnFinished { .. } => {
+                    finish_single_turn(
+                        invoker,
+                        request.provider_plugin_id.as_deref(),
+                        &start_response.provider_turn_id,
+                    );
+                    return Ok(SingleTurnResult {
+                        status: if last_error.is_some() {
+                            SingleTurnStatus::ProviderError
+                        } else {
+                            SingleTurnStatus::Finished
+                        },
+                        text,
+                        latency_ms: start.elapsed().as_millis(),
+                        error: last_error,
+                    });
+                }
+                bcode_model::ProviderTurnEvent::Cancelled => {
+                    finish_single_turn(
+                        invoker,
+                        request.provider_plugin_id.as_deref(),
+                        &start_response.provider_turn_id,
+                    );
+                    return Ok(SingleTurnResult {
+                        status: SingleTurnStatus::Cancelled,
+                        text,
+                        latency_ms: start.elapsed().as_millis(),
+                        error: last_error,
+                    });
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn finish_single_turn<I>(invoker: &mut I, provider_plugin_id: Option<&str>, provider_turn_id: &str)
+where
+    I: BlockingModelProviderInvoker,
+{
+    let _: Result<bcode_model::AckResponse, String> = invoker.invoke_json(
+        provider_plugin_id,
+        bcode_model::OP_FINISH_TURN,
+        &bcode_model::FinishTurnRequest {
+            provider_turn_id: provider_turn_id.to_string(),
+        },
+    );
+}

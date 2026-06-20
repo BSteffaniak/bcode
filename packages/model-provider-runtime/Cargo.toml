@@ -11,10 +11,12 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_model = { workspace = true }
-httpdate    = { workspace = true }
-serde_json  = { workspace = true }
-tokio       = { workspace = true, features = ["rt", "sync", "time"] }
+bcode_model          = { workspace = true }
+bcode_session_models = { workspace = true }
+httpdate             = { workspace = true }
+serde                = { workspace = true }
+serde_json           = { workspace = true }
+tokio                = { workspace = true, features = ["rt", "sync", "time"] }
 
 [features]
 default          = []

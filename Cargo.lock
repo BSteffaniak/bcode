@@ -1313,6 +1313,7 @@ dependencies = [
  "bcode_ipc",
  "bcode_metrics",
  "bcode_model",
+ "bcode_model_provider_runtime",
  "bcode_plugin",
  "bcode_provider_auth",
  "bcode_server",
@@ -1599,7 +1600,9 @@ name = "bcode_model_provider_runtime"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_model",
+ "bcode_session_models",
  "httpdate",
+ "serde",
  "serde_json",
  "tokio",
 ]

@@ -1271,7 +1271,12 @@ async fn verify_model_inner(
         return Err(provider_error(
             "missing_openai_auth",
             ProviderErrorCategory::Auth,
-            "run `bcode login openai` or configure OpenAI-compatible API-key auth",
+            format!(
+                "run `bcode login openai` or configure OpenAI-compatible API-key auth; auth diagnostics: source={}, mode={}, detail={}",
+                settings.auth_diagnostics.source,
+                settings.auth_diagnostics.mode,
+                settings.auth_diagnostics.detail
+            ),
         ));
     }
     let client = model_stream_client(settings.request_timeout).map_err(|error| {
@@ -3896,6 +3901,31 @@ fn openai_auth_settings(
         }
         if auth.credentials.contains_key("access_token") {
             return semantic_chatgpt_auth_settings(auth);
+        }
+    }
+    if let Some(auth_profile_name) = &context.auth_profile
+        && let Ok(config) = bcode_config::load_config()
+        && let Some(auth_profile) = config.auth.profiles.get(auth_profile_name)
+    {
+        let resolved = bcode_provider_auth::resolve_auth_profile(auth_profile_name, auth_profile);
+        if let Some(api_key) = resolved.auth.credentials.get("api_key") {
+            return (
+                AuthSettings::ApiKey(api_key.value.clone()),
+                AuthDiagnostics {
+                    source: "resolved_auth_profile".to_string(),
+                    mode: resolved
+                        .auth
+                        .scheme
+                        .clone()
+                        .unwrap_or_else(|| "api_key".to_string()),
+                    detail: format!(
+                        "resolved auth profile '{auth_profile_name}' credential 'api_key'"
+                    ),
+                },
+            );
+        }
+        if resolved.auth.credentials.contains_key("access_token") {
+            return semantic_chatgpt_auth_settings(&resolved.auth);
         }
     }
     if let Some(api_key_env) = configured_api_key_env(context) {
