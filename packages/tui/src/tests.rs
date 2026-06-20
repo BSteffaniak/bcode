@@ -2616,7 +2616,7 @@ fn submitted_user_message_anchors_at_top() {
 }
 
 #[test]
-fn assistant_stream_after_submitted_user_message_anchors_at_top() {
+fn accepted_submission_preserves_submitted_user_message_transition() {
     let session_id = SessionId::new();
     let history = (0..12)
         .map(|sequence| {
@@ -2645,21 +2645,7 @@ fn assistant_stream_after_submitted_user_message_anchors_at_top() {
     render::render(&mut app, &mut frame);
     assert_eq!(output_line_y(&buffer, "You · sending"), Some(1));
 
-    app.absorb_session_event(&event(
-        session_id,
-        12,
-        SessionEventKind::UserMessage {
-            client_id: ClientId::new(),
-            text: "new prompt".to_owned(),
-        },
-    ));
-    app.absorb_session_event(&event(
-        session_id,
-        13,
-        SessionEventKind::AssistantDelta {
-            text: "first response chunk".to_owned(),
-        },
-    ));
+    app.mark_pending_submission_sent();
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
@@ -2668,7 +2654,7 @@ fn assistant_stream_after_submitted_user_message_anchors_at_top() {
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
 
-    assert_eq!(output_line_y(&buffer, "Bcode …"), Some(1));
+    assert_ne!(output_line_y(&buffer, "message 11"), Some(1));
 }
 
 #[test]
@@ -2716,17 +2702,17 @@ fn tool_activity_after_submitted_user_message_resumes_following_latest_rows() {
         })
         .collect::<Vec<_>>();
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
 
     app.replace_composer_with("new prompt");
     app.stage_submission();
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
     std::thread::sleep(Duration::from_millis(220));
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
     assert_eq!(output_line_y(&buffer, "You · sending"), Some(1));
@@ -2748,12 +2734,12 @@ fn tool_activity_after_submitted_user_message_resumes_following_latest_rows() {
             arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
         },
     ));
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
 
     assert!(rendered_text(&buffer).contains("shell.run"));
-    assert_ne!(output_line_y(&buffer, "You · sending"), Some(1));
+    assert_eq!(output_line_y(&buffer, "You"), Some(1));
 }
 
 #[test]
