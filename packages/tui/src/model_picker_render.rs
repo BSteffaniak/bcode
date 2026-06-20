@@ -4,7 +4,7 @@ use bmux_tui::frame::Frame;
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 
-use super::model_picker::ModelPickerApp;
+use super::model_picker::{ModelPickerApp, ModelPickerMode};
 use super::picker_render::{
     picker_list_area, render_picker_chrome, render_picker_list, render_picker_status,
 };
@@ -12,13 +12,17 @@ use super::render::TuiTheme;
 
 /// Render the model picker.
 pub fn render_model_picker(app: &mut ModelPickerApp, frame: &mut Frame<'_>, theme: TuiTheme) {
+    let help = match app.mode() {
+        ModelPickerMode::Actions => {
+            "  Enter selects  / filter  Esc cancels  s sort  S reverse  i ignore  u unignore  I ignored"
+        }
+        ModelPickerMode::Filter => "  Typing filters  Enter selects  Esc exits filter",
+    };
     let Some((inner, list_y)) = render_picker_chrome(
         " Models ",
         &Line::from_spans(vec![
             Span::styled("Select model", Style::new().add_modifier(Modifier::BOLD)),
-            Span::raw(
-                "  Enter selects  Esc cancels  s sort  S reverse  i ignore  u unignore  I ignored",
-            ),
+            Span::raw(help),
         ]),
         app.filter_mut(),
         "Filter models",

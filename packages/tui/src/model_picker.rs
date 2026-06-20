@@ -34,6 +34,15 @@ pub enum ModelSortDirection {
     Desc,
 }
 
+/// Model picker interaction mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelPickerMode {
+    /// Picker actions are focused.
+    Actions,
+    /// Filter text input is focused.
+    Filter,
+}
+
 /// Model picker state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelPickerApp {
@@ -44,6 +53,7 @@ pub struct ModelPickerApp {
     show_ignored: bool,
     sort_key: ModelSortKey,
     sort_direction: ModelSortDirection,
+    mode: ModelPickerMode,
 }
 
 impl ModelPickerApp {
@@ -59,6 +69,7 @@ impl ModelPickerApp {
             show_ignored: false,
             sort_key: ModelSortKey::Default,
             sort_direction: ModelSortDirection::Desc,
+            mode: ModelPickerMode::Actions,
         };
         app.refresh_filter();
         app
@@ -102,6 +113,22 @@ impl ModelPickerApp {
         let rows = self.visible_rows();
         let widths = ModelPickerColumnWidths::from_rows(&rows, usable_list_width(width));
         rows.iter().map(|row| model_item(row, &widths)).collect()
+    }
+
+    /// Return current interaction mode.
+    #[must_use]
+    pub const fn mode(&self) -> ModelPickerMode {
+        self.mode
+    }
+
+    /// Focus the filter text input.
+    pub const fn focus_filter(&mut self) {
+        self.mode = ModelPickerMode::Filter;
+    }
+
+    /// Focus picker actions.
+    pub const fn focus_actions(&mut self) {
+        self.mode = ModelPickerMode::Actions;
     }
 
     /// Set status text.
