@@ -42,6 +42,20 @@ pub fn render_model_picker(app: &mut ModelPickerApp, frame: &mut Frame<'_>, them
     let Some(list_area) = picker_list_area(inner, list_y, bottom_y) else {
         return;
     };
-    let items = app.list_items();
-    render_picker_list(&items, app.list_state_mut(), list_area, frame);
+    if list_area.height == 0 {
+        return;
+    }
+    frame.write_line_with_fallback_style(
+        bmux_tui::geometry::Rect::new(list_area.x, list_area.y, list_area.width, 1),
+        &app.header_line(list_area.width),
+        super::picker_render::picker_base_style(),
+    );
+    let item_area = bmux_tui::geometry::Rect::new(
+        list_area.x,
+        list_area.y.saturating_add(1),
+        list_area.width,
+        list_area.height.saturating_sub(1),
+    );
+    let items = app.list_items(item_area.width);
+    render_picker_list(&items, app.list_state_mut(), item_area, frame);
 }
