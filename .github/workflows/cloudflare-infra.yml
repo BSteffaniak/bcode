@@ -1,0 +1,58 @@
+name: Cloudflare Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "OpenTofu action to run"
+        required: true
+        default: plan
+        type: choice
+        options:
+          - bootstrap
+          - plan
+          - apply
+
+jobs:
+  opentofu:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      TF_VAR_cloudflare_zone_id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@v1
+
+      - name: Bootstrap remote state bucket
+        if: ${{ github.event.inputs.action == 'bootstrap' }}
+        working-directory: infra/cloudflare/bootstrap
+        run: |
+          tofu init
+          tofu apply -auto-approve
+
+      - name: Main init
+        if: ${{ github.event.inputs.action != 'bootstrap' }}
+        working-directory: infra/cloudflare/main
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_STATE_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_STATE_SECRET_ACCESS_KEY }}
+        run: |
+          tofu init \
+            -backend-config="access_key=${AWS_ACCESS_KEY_ID}" \
+            -backend-config="secret_key=${AWS_SECRET_ACCESS_KEY}" \
+            -backend-config="endpoints={s3=\"https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com\"}"
+
+      - name: Main plan
+        if: ${{ github.event.inputs.action == 'plan' }}
+        working-directory: infra/cloudflare/main
+        run: tofu plan
+
+      - name: Main apply
+        if: ${{ github.event.inputs.action == 'apply' }}
+        working-directory: infra/cloudflare/main
+        run: tofu apply -auto-approve

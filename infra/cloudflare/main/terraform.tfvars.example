@@ -1,0 +1,11 @@
+cloudflare_account_id = "00000000000000000000000000000000"
+cloudflare_zone_id    = "00000000000000000000000000000000"
+
+models_hostname  = "models.bmux.dev"
+preview_hostname = "models-preview.bmux.dev"
+
+bedrock_regions         = ["us-east-1", "us-west-2"]
+preview_bedrock_regions = ["us-east-1"]
+
+live_fresh_for_seconds = 900
+live_max_stale_seconds = 21600
