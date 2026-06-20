@@ -541,6 +541,8 @@ pub struct SessionModelStatus {
     pub cache: Option<bcode_model::ModelCacheInfo>,
     #[serde(default)]
     pub metadata_source: Option<bcode_model::ModelMetadataSource>,
+    #[serde(default)]
+    pub pricing: Option<bcode_model::ModelPricingInfo>,
 }
 
 /// Service interface provided by a loaded plugin.

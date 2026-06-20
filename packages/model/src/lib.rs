@@ -97,6 +97,104 @@ pub struct ModelInfo {
     pub cache: ModelCacheInfo,
     #[serde(default)]
     pub metadata_source: Option<ModelMetadataSource>,
+    #[serde(default)]
+    pub pricing: Option<ModelPricingInfo>,
+}
+
+/// Model token pricing metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelPricingInfo {
+    /// ISO 4217 currency code, for example `USD`.
+    pub currency: String,
+    /// Pricing unit for each token bucket.
+    pub unit: ModelPricingUnit,
+    /// Price for uncached input tokens.
+    #[serde(default)]
+    pub input: Option<ModelTokenPrice>,
+    /// Price for cached input tokens.
+    #[serde(default)]
+    pub cached_input: Option<ModelTokenPrice>,
+    /// Price for input tokens written to an explicit prompt cache.
+    #[serde(default)]
+    pub cache_write_input: Option<ModelTokenPrice>,
+    /// Price for generated output tokens.
+    #[serde(default)]
+    pub output: Option<ModelTokenPrice>,
+    /// Price source.
+    pub source: ModelPricingSource,
+}
+
+/// Model pricing unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelPricingUnit {
+    /// Prices are expressed per one million tokens.
+    PerMillionTokens,
+}
+
+/// Price for a token bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelTokenPrice {
+    /// Price in micros of the pricing currency.
+    pub micros: u64,
+}
+
+impl ModelTokenPrice {
+    /// Construct a token price from currency micros.
+    #[must_use]
+    pub const fn from_micros(micros: u64) -> Self {
+        Self { micros }
+    }
+}
+
+/// Source used by a provider to resolve model pricing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelPricingSource {
+    UserOverride,
+    ProviderApi,
+    BundledCatalog,
+    PatternMatch,
+    Unknown,
+}
+
+/// Estimated model-call cost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCostEstimate {
+    /// ISO 4217 currency code.
+    pub currency: String,
+    /// Total estimated cost in micros of the pricing currency.
+    pub total_micros: u64,
+    /// Price metadata source used for the estimate.
+    pub source: ModelPricingSource,
+}
+
+impl ModelPricingInfo {
+    /// Estimate cost for provider-reported token usage.
+    #[must_use]
+    pub fn estimate_cost(&self, usage: &TokenUsage) -> Option<ModelCostEstimate> {
+        let cached = usage.cached_input_tokens.unwrap_or_default();
+        let cache_write = usage.cache_write_input_tokens.unwrap_or_default();
+        let uncached_input = usage.uncached_input_tokens().unwrap_or_default();
+        let output = usage.output_tokens.unwrap_or_default();
+        let mut total_micros = 0_u64;
+        total_micros = total_micros.saturating_add(price_bucket_micros(uncached_input, self.input));
+        total_micros = total_micros.saturating_add(price_bucket_micros(cached, self.cached_input));
+        total_micros =
+            total_micros.saturating_add(price_bucket_micros(cache_write, self.cache_write_input));
+        total_micros = total_micros.saturating_add(price_bucket_micros(output, self.output));
+        (total_micros > 0).then(|| ModelCostEstimate {
+            currency: self.currency.clone(),
+            total_micros,
+            source: self.source,
+        })
+    }
+}
+
+fn price_bucket_micros(tokens: u32, price: Option<ModelTokenPrice>) -> u64 {
+    price.map_or(0, |price| {
+        u64::from(tokens).saturating_mul(price.micros) / 1_000_000
+    })
 }
 
 /// Source used by a provider to resolve model metadata such as token limits.
@@ -878,7 +976,9 @@ pub enum ProviderErrorCategory {
 
 #[cfg(test)]
 mod tests {
-    use super::TokenUsage;
+    use super::{
+        ModelPricingInfo, ModelPricingSource, ModelPricingUnit, ModelTokenPrice, TokenUsage,
+    };
 
     #[test]
     fn token_usage_prefers_provider_reported_total() {
@@ -901,5 +1001,44 @@ mod tests {
         };
 
         assert_eq!(usage.metered_total_tokens(), Some(15));
+    }
+
+    #[test]
+    fn pricing_estimate_charges_cached_input_separately() {
+        let pricing = ModelPricingInfo {
+            currency: "USD".to_string(),
+            unit: ModelPricingUnit::PerMillionTokens,
+            input: Some(ModelTokenPrice::from_micros(1_000_000)),
+            cached_input: Some(ModelTokenPrice::from_micros(100_000)),
+            cache_write_input: Some(ModelTokenPrice::from_micros(1_250_000)),
+            output: Some(ModelTokenPrice::from_micros(4_000_000)),
+            source: ModelPricingSource::BundledCatalog,
+        };
+        let usage = TokenUsage {
+            input_tokens: Some(2_000_000),
+            cached_input_tokens: Some(500_000),
+            cache_write_input_tokens: Some(100_000),
+            output_tokens: Some(250_000),
+            ..TokenUsage::default()
+        };
+
+        let cost = pricing.estimate_cost(&usage).expect("cost should estimate");
+
+        assert_eq!(cost.total_micros, 2_675_000);
+    }
+
+    #[test]
+    fn pricing_estimate_is_unknown_without_priced_buckets() {
+        let pricing = ModelPricingInfo {
+            currency: "USD".to_string(),
+            unit: ModelPricingUnit::PerMillionTokens,
+            input: None,
+            cached_input: None,
+            cache_write_input: None,
+            output: None,
+            source: ModelPricingSource::Unknown,
+        };
+
+        assert!(pricing.estimate_cost(&TokenUsage::default()).is_none());
     }
 }

@@ -2951,6 +2951,7 @@ fn model_infos_from_items(
                 reasoning: reasoning_info_for_model(&model, default_reasoning_request_shape()),
                 cache: openai_model_cache_info(),
                 metadata_source: Some(metadata.source),
+                pricing: model_catalog::pricing_for(&model.id, &model.metadata),
             }
         })
         .collect()

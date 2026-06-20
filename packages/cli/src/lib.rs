@@ -118,7 +118,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Session { command } => handle_session_command(command).await?,
         Commands::Worktree { command } => handle_worktree_command(command).await?,
         Commands::Blims { command } => blims::handle_blims_command(command).await?,
-        Commands::Review { command } => handle_review_command(command).await?,
+        Commands::Review { command } => Box::pin(handle_review_command(command)).await?,
         Commands::Ralph { repo } => handle_ralph_command(repo).await?,
         Commands::Plugin { command } => match command {
             PluginCommand::List { root } => list_plugins(&root)?,

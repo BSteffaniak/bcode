@@ -1008,6 +1008,7 @@ impl BmuxApp {
                 reasoning: status.reasoning.clone(),
                 cache: bcode_model::ModelCacheInfo::default(),
                 metadata_source: None,
+                pricing: status.pricing.clone(),
             });
         self.token_usage.apply_model_info(model.as_ref());
     }
@@ -3499,6 +3500,7 @@ fn tool_request_status(tool_name: &str, arguments_json: &str) -> Option<String> 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct TokenUsageMeter {
     session_tokens: u64,
+    session_cost_micros: Option<u64>,
     latest_context_input_tokens: Option<u32>,
     latest_cached_input_tokens: Option<u32>,
     latest_cache_write_input_tokens: Option<u32>,
@@ -3507,12 +3509,30 @@ struct TokenUsageMeter {
     latest_total_message_count: Option<usize>,
     latest_prompt_cache_points: Option<usize>,
     context_window: Option<u32>,
+    pricing: Option<bcode_model::ModelPricingInfo>,
 }
 
 impl TokenUsageMeter {
     fn absorb(&mut self, usage: &bcode_session_models::SessionTokenUsage) {
         if let Some(tokens) = usage.metered_total_tokens() {
             self.session_tokens = self.session_tokens.saturating_add(u64::from(tokens));
+        }
+        if let Some(pricing) = &self.pricing {
+            let usage = bcode_model::TokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                total_tokens: usage.total_tokens,
+                cached_input_tokens: usage.cached_input_tokens,
+                cache_write_input_tokens: usage.cache_write_input_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
+            };
+            if let Some(cost) = pricing.estimate_cost(&usage) {
+                self.session_cost_micros = Some(
+                    self.session_cost_micros
+                        .unwrap_or_default()
+                        .saturating_add(cost.total_micros),
+                );
+            }
         }
         if let Some(input_tokens) = usage.context_input_tokens() {
             self.latest_context_input_tokens = Some(input_tokens);
@@ -3521,14 +3541,16 @@ impl TokenUsageMeter {
         self.latest_cache_write_input_tokens = usage.cache_write_input_tokens;
     }
 
-    const fn apply_model_info(&mut self, model: Option<&bcode_model::ModelInfo>) {
+    fn apply_model_info(&mut self, model: Option<&bcode_model::ModelInfo>) {
         if let Some(model) = model {
             self.context_window = model.context_window;
+            self.pricing.clone_from(&model.pricing);
         }
     }
 
-    const fn clear_model_info(&mut self) {
+    fn clear_model_info(&mut self) {
         self.context_window = None;
+        self.pricing = None;
     }
 
     const fn apply_model_request(
@@ -3575,6 +3597,9 @@ impl TokenUsageMeter {
             parts.push(format!("cache points {points}"));
         }
         parts.push(format!("spent {} tok", compact_u64(self.session_tokens)));
+        if let Some(cost_micros) = self.session_cost_micros {
+            parts.push(format!("~{}", format_usd_micros(cost_micros)));
+        }
         parts.join(" · ")
     }
 
@@ -3621,6 +3646,16 @@ fn compact_u64(value: u64) -> String {
         format!("{whole}.{decimal}k")
     } else {
         value.to_string()
+    }
+}
+
+fn format_usd_micros(micros: u64) -> String {
+    let dollars = micros / 1_000_000;
+    let cents = (micros % 1_000_000) / 10_000;
+    if dollars == 0 && cents == 0 && micros > 0 {
+        "<$0.01".to_string()
+    } else {
+        format!("${dollars}.{cents:02}")
     }
 }
 

@@ -873,6 +873,7 @@ fn header_drops_low_priority_segments_in_narrow_panes() {
         compaction_mode: None,
         cache: None,
         metadata_source: None,
+        pricing: None,
     });
     let mut buffer = Buffer::empty(Rect::new(0, 0, 36, 8));
     let mut frame = Frame::new(&mut buffer);
@@ -1074,6 +1075,7 @@ fn header_and_footer_include_model_agent_and_token_context() {
         compaction_mode: None,
         cache: None,
         metadata_source: None,
+        pricing: None,
     });
     let mut buffer = Buffer::empty(Rect::new(0, 0, 180, 12));
     let mut frame = Frame::new(&mut buffer);
@@ -1129,6 +1131,7 @@ fn status_line_prioritizes_context_over_spent_tokens() {
         compaction_mode: None,
         cache: None,
         metadata_source: None,
+        pricing: None,
     });
     let mut buffer = Buffer::empty(Rect::new(0, 0, 68, 8));
     let mut frame = Frame::new(&mut buffer);
@@ -4139,6 +4142,7 @@ fn thinking_label_uses_effective_values() {
         compaction_mode: None,
         cache: None,
         metadata_source: None,
+        pricing: None,
     });
     app.set_reasoning_visible(true);
 
@@ -4172,6 +4176,7 @@ fn thinking_dialog_cycles_supported_values() {
         compaction_mode: None,
         cache: None,
         metadata_source: None,
+        pricing: None,
     };
     let mut dialog = super::thinking_dialog::ThinkingDialogState::new(false, &status);
 
@@ -4208,6 +4213,7 @@ fn thinking_dialog_can_start_focused_on_effort_or_summary() {
         compaction_mode: None,
         cache: None,
         metadata_source: None,
+        pricing: None,
     };
 
     let effort = super::thinking_dialog::ThinkingDialogState::new_focused(
@@ -4240,6 +4246,7 @@ fn thinking_dialog_does_not_cycle_when_reasoning_is_unsupported() {
         compaction_mode: None,
         cache: None,
         metadata_source: None,
+        pricing: None,
     };
     let mut dialog = super::thinking_dialog::ThinkingDialogState::new(false, &status);
 

@@ -6317,6 +6317,7 @@ async fn model_status_for_selection(
         compaction_mode: Some(compaction_mode_name(state.auto_compaction.mode).to_string()),
         cache: cache_info,
         metadata_source,
+        pricing: model.as_ref().and_then(|model| model.pricing.clone()),
     }
 }
 
@@ -15114,6 +15115,7 @@ mod tests {
                 reasoning: None,
                 cache: bcode_model::ModelCacheInfo::default(),
                 metadata_source: None,
+                pricing: None,
             },
             bcode_model::ModelInfo {
                 model_id: "selected".to_string(),
@@ -15125,6 +15127,7 @@ mod tests {
                 reasoning: None,
                 cache: bcode_model::ModelCacheInfo::default(),
                 metadata_source: None,
+                pricing: None,
             },
         ];
 
