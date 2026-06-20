@@ -20,10 +20,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 mod remote;
+mod verification;
 
 pub use remote::{
     DEFAULT_REMOTE_CATALOG_URL, RemoteCatalogClient, RemoteCatalogOptions, overlay_remote_catalog,
     overlay_remote_live,
+};
+pub use verification::{
+    DEFAULT_OPENAI_BASE_URL, DEFAULT_VERIFY_PROMPT, VerificationAuthMode, VerificationOptions,
+    VerificationReport, VerificationResult, VerificationStatus, run_verification,
 };
 
 /// Result type used by catalog operations.

@@ -1,0 +1,95 @@
+name: Model Verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: "Provider to verify"
+        required: true
+        default: openai
+        type: choice
+        options:
+          - openai
+      prompt:
+        description: "Prompt sent to each model"
+        required: true
+        default: say ok
+      max_models:
+        description: "Maximum models to verify"
+        required: false
+        default: "100"
+      id_pattern:
+        description: "Optional model id glob, for example gpt-4o-*"
+        required: false
+      catalog_only:
+        description: "Only verify catalog models not returned by provider discovery"
+        required: false
+        default: false
+        type: boolean
+      discovered_only:
+        description: "Only verify models returned by provider discovery"
+        required: false
+        default: false
+        type: boolean
+      auth_mode:
+        description: "Auth mode: auto, api-key, or subscription"
+        required: true
+        default: api-key
+        type: choice
+        options:
+          - auto
+          - api-key
+          - subscription
+      dry_run:
+        description: "List candidate models without sending verification requests"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify models
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BCODE_OPENAI_API_KEY: ${{ secrets.BCODE_OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/model-verification
+          args=(
+            verify
+            --provider "${{ github.event.inputs.provider }}"
+            --prompt "${{ github.event.inputs.prompt }}"
+            --auth-mode "${{ github.event.inputs.auth_mode }}"
+            --output "target/model-verification/${{ github.event.inputs.provider }}.json"
+          )
+          if [ -n "${{ github.event.inputs.max_models }}" ]; then
+            args+=(--max-models "${{ github.event.inputs.max_models }}")
+          fi
+          if [ -n "${{ github.event.inputs.id_pattern }}" ]; then
+            args+=(--id-pattern "${{ github.event.inputs.id_pattern }}")
+          fi
+          if [ "${{ github.event.inputs.catalog_only }}" = "true" ]; then
+            args+=(--catalog-only)
+          fi
+          if [ "${{ github.event.inputs.discovered_only }}" = "true" ]; then
+            args+=(--discovered-only)
+          fi
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          cargo run --release -p bcode_model_catalog -- "${args[@]}"
+
+      - name: Upload verification report
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-verification-${{ github.event.inputs.provider }}
+          path: target/model-verification/*.json
