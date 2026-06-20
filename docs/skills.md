@@ -1,6 +1,6 @@
 # Bcode Skills Architecture
 
-Bcode skills are planned as reusable, discoverable capability packs that provide task-specific agent guidance, resources, and optional plugin-backed behavior without bypassing Bcode's existing plugin, tool, session, and permission architecture.
+Bcode skills are reusable, discoverable capability packs that provide task-specific agent guidance, resources, and optional plugin-backed behavior without bypassing Bcode's existing plugin, tool, session, and permission architecture.
 
 ## Goals
 
@@ -8,7 +8,7 @@ Bcode skills are planned as reusable, discoverable capability packs that provide
 * Performant: Bcode must not load all skill bodies into every model turn.
 * Maintainable: skill behavior should remain domain-driven and plugin/service-oriented.
 * Extendable: folder-based skills, bundled skills, and plugin-provided skills should share one registry model.
-* Compatible: support the common AI-coding-agent convention of a skill directory containing a markdown instruction file plus optional assets.
+* Compatible: support common AI-coding-agent skill directories containing a markdown instruction file plus optional assets.
 
 ## Skill package format
 
@@ -30,7 +30,7 @@ skill-name/
   examples/
 ```
 
-`SKILL.md` uses TOML or YAML-like front matter followed by markdown instructions. Bcode should initially accept conservative key/value and array metadata, then preserve unknown fields for future compatibility where practical.
+`SKILL.md` uses TOML or YAML-like front matter followed by markdown instructions.
 
 Example:
 
@@ -54,18 +54,27 @@ permissions:
 # Rust Debugging
 
 Use this skill when investigating Rust build, clippy, test, or runtime failures.
-
-## Process
-
-1. Inspect the exact error.
-2. Identify the smallest relevant code path.
-3. Prefer focused fixes.
-4. Run the most relevant validation.
 ```
+
+### Model-invocation visibility
+
+Skills are included in the model-visible skill catalog by default. To keep a skill available for explicit invocation while hiding it from automatic/model catalog discovery, set either spelling in front matter:
+
+```yaml
+disable_model_invocation: true
+```
+
+or the Pi/Agent Skills compatible spelling:
+
+```yaml
+disable-model-invocation: true
+```
+
+Hidden skills still appear in user-facing skill listings and can still be invoked directly unless disabled globally.
 
 ## Sources and precedence
 
-Skill discovery should be layered and deterministic:
+Skill discovery is layered and deterministic:
 
 1. Repository-local skills: `.bcode/skills/`
 2. Generic repository skills: `skills/`
@@ -73,13 +82,13 @@ Skill discovery should be layered and deterministic:
 4. User config skills: `${XDG_CONFIG_HOME}/bcode/skills/` or `~/.config/bcode/skills/`
 5. User state skills: `${BCODE_STATE_DIR}/skills/`, `${XDG_STATE_HOME}/bcode/skills/`, or `~/.local/state/bcode/skills/`
 6. Explicit configured paths from `bcode.toml`
-7. Bundled skills from Bcode/plugin distributions
+7. Bundled skills from Bcode/plugin distributions when present
 
-When duplicate IDs exist, higher-precedence sources shadow lower-precedence sources. Shadowed skills should appear in diagnostics rather than causing startup failure.
+When duplicate IDs exist, higher-precedence sources shadow lower-precedence sources. Shadowed skills appear in diagnostics rather than causing startup failure.
 
 ## Configuration
 
-Initial global config shape:
+Global skill configuration:
 
 ```toml
 [skills]
@@ -101,16 +110,70 @@ paths = []
 ids = ["experimental-skill"]
 ```
 
-Per-agent overrides can be added after the global flow is stable:
+### Skill catalog prompt configuration
+
+Bcode injects a compact skill catalog into dynamic system context by default. This catalog contains metadata only; full skill bodies are loaded only when a skill is invoked or explicitly read.
 
 ```toml
-[agent.plan.skills]
-auto_activate = "suggest"
-disabled = []
-
-[agent.build.skills]
-auto_activate = "suggest"
+[skills.prompt]
+catalog = "summary" # off | names_only | summary
+max_bytes = 8192
+max_description_chars = 240
+include_sources = true
+include_keywords = false
 ```
+
+Catalog behavior:
+
+* `off`: do not add an available-skills catalog to model context.
+* `names_only`: include IDs, names, and locations.
+* `summary`: include IDs, names, descriptions, locations, sources, and optionally keywords.
+* Skills with `disable_model_invocation = true` are omitted from the catalog.
+* Catalog output is byte-bounded and may include a truncation marker.
+
+The catalog uses an XML-style format similar to Pi/Agent Skills:
+
+```xml
+The following Bcode skills provide specialized instructions for specific tasks.
+Use available Bcode filesystem/document tools to load a skill file when the task matches its description.
+User skills are discovered from configured roots including ~/.config/bcode/skills when user skills are enabled.
+When a skill file references a relative path, resolve it against the skill directory.
+
+<available_skills>
+  <skill>
+    <id>rust-debugging</id>
+    <name>Rust Debugging</name>
+    <description>Diagnose Rust compiler, clippy, test, and runtime failures</description>
+    <location>/Users/me/.config/bcode/skills/rust-debugging/SKILL.md</location>
+    <source>user-config:skills</source>
+  </skill>
+</available_skills>
+```
+
+## System prompt configuration
+
+The base system prompt can be used as-is or replaced while still keeping selected Bcode-managed sections.
+
+```toml
+[system_prompt]
+mode = "default" # default | replace
+text = ""
+
+[system_prompt.sections]
+repository_context = true
+dynamic_repository_context = true
+agent_suffix = true
+skill_catalog = true
+```
+
+Behavior:
+
+* `mode = "default"` uses Bcode's built-in coding-agent prompt as the base.
+* `mode = "replace"` uses `text` as the base prompt.
+* Enabled sections are appended to either base mode.
+* `system_prompt.sections.skill_catalog = false` disables catalog injection even if `[skills.prompt]` is enabled.
+* `skills.enabled = false` disables skill discovery and therefore disables the skill catalog.
+* `skills.prompt.catalog = "off"` disables only the prompt catalog while keeping skills available elsewhere.
 
 ## Invocation modes
 
@@ -123,7 +186,21 @@ Users can activate a skill directly:
 /skill rust-debugging diagnose cargo test failure
 ```
 
-Explicit activation records a durable session event and causes the active skill context to be injected into subsequent model turns until deactivated or the session ends.
+Explicit activation records durable session events and causes bounded skill context to be injected into model turns. Bcode formats invoked skill context as a visible XML-style block:
+
+```xml
+<skill id="rust-debugging" name="Rust Debugging" location="/Users/me/.config/bcode/skills/rust-debugging/SKILL.md">
+References are relative to /Users/me/.config/bcode/skills/rust-debugging.
+Source label: user-config:skills
+Skill resource root: /Users/me/.config/bcode/skills
+Version: 0.1.0
+
+# Rust Debugging
+...
+</skill>
+```
+
+The skill body is bounded by `skills.max_context_bytes`. Relative references should be resolved against the skill directory using available Bcode filesystem/document tools.
 
 ### Suggestion
 
@@ -135,7 +212,7 @@ In `on` mode, Bcode may automatically activate matching skills, but this should 
 
 ## Plugin interface
 
-Skills should have a versioned service interface so folder skills and plugin-provided skills can share one host path.
+Skills use a versioned service interface so folder skills and plugin-provided skills can share one host path.
 
 Interface ID:
 
@@ -150,18 +227,18 @@ Operations:
 * `context`: return bounded prompt/context text for a skill activation.
 * `invoke`: optional operation for plugin-backed behavior.
 
-Folder-based skills can be implemented by a bundled provider plugin or by a server-side registry crate. Plugin-provided skills should not receive direct filesystem or shell privileges; they must still route execution through Bcode tools and permissions.
+Folder-based skills are handled by the server-side registry. Plugin-provided skills should not receive direct filesystem or shell privileges; they must still route execution through Bcode tools and permissions.
 
 ## Domain crates
 
-When implementation begins, use domain-specific crates rather than generic shared crates:
+Skill implementation uses domain-specific crates rather than generic shared crates:
 
 ```text
 packages/skill/models
 packages/skill
 ```
 
-`packages/skill/models` should contain leaf data types only:
+`packages/skill/models` contains leaf data types only:
 
 * `SkillId`
 * `SkillSummary`
@@ -175,35 +252,25 @@ packages/skill
 * `InvokeSkillResponse`
 * `SkillError`
 
-`packages/skill` should own discovery, parsing, validation, indexing, and context loading. It should not own TUI rendering, model-provider implementation, or session storage.
+`packages/skill` owns discovery, parsing, validation, indexing, catalog formatting, and context loading. It does not own TUI rendering, model-provider implementation, or session storage.
 
 ## Model-context behavior
 
-Bcode must not inject every skill into every model request.
+Bcode does not inject every skill body into every model request.
 
-Expected flow:
+Flow:
 
 1. Index compact summaries at startup or on demand.
-2. Match or list summaries without reading large bodies.
-3. Lazy-load full instructions only when a skill is activated or described.
-4. Inject only active skill contexts into model turns.
-5. Enforce `max_context_bytes` across all active skills.
-6. Include provenance in injected context.
+2. Inject a bounded metadata catalog into dynamic system context when enabled.
+3. Match or list summaries without reading large bodies.
+4. Lazy-load full instructions only when a skill is activated or described.
+5. Inject only active/invoked skill contexts into model turns.
+6. Enforce `max_context_bytes` for active skill context.
+7. Include provenance in injected context and session events.
 
-Injected context should be clearly delimited:
+## Session events and TUI visibility
 
-```text
-Active Bcode skill: rust-debugging
-Source: repo:.bcode/skills/rust-debugging/SKILL.md
-Version: 0.1.0
-
-Instructions:
-...
-```
-
-## Session events
-
-Add durable events so skill behavior is replayable and auditable:
+Durable skill events include:
 
 * `SkillSuggested`
 * `SkillActivated`
@@ -211,7 +278,7 @@ Add durable events so skill behavior is replayable and auditable:
 * `SkillContextLoaded`
 * `SkillInvocationFailed`
 
-Events should include skill ID, source, version when known, activation mode, and context byte counts where relevant.
+`SkillContextLoaded` includes the skill ID, source, byte count, truncation flag, and a bounded preview. The TUI renders a transcript item when context is loaded so users can verify which skill content was injected without storing the full skill body in the event log.
 
 ## Permissions and safety
 
@@ -224,17 +291,17 @@ Rules:
 * Skill scripts are inert resources until explicitly invoked.
 * Script execution, if added, must use a dedicated permission category such as `skill.script.execute` and should ask by default.
 * Discovery must canonicalize paths and reject traversal outside the skill root.
-* Skill context includes the exact `Skill file`, `Skill directory`, and `Skill resource root` so the model can read relative references on demand instead of Bcode eagerly inlining them.
+* Skill context includes the exact skill file, skill directory, and skill resource root so the model can read relative references on demand instead of Bcode eagerly inlining them.
 * When applying a skill, Bcode instructs the model to resolve relative files/scripts/assets from the skill directory and to map common external tool names (`Bash`, `Read`, `Edit`, `Write`) to Bcode tools.
 * Symlinks are followed by default for compatibility with Nix/Home Manager and similar config managers. Set `follow_symlinks = false` to opt out.
 * For directory skills such as `skills/commit-message/SKILL.md`, Bcode infers `commit-message` from the parent directory when front matter omits `id`.
 * For flat skills such as `skills/commit-message.md`, Bcode infers `commit-message` from the file stem when front matter omits `id`.
-* malformed skills should produce diagnostics and be skipped, not crash startup.
-* Session traces should record loaded skill source and byte counts.
+* Malformed skills produce diagnostics and are skipped, not allowed to crash startup.
+* Session traces record loaded skill source, byte counts, and bounded previews.
 
 ## TUI UX
 
-Initial slash commands:
+Skill commands:
 
 ```text
 /skills
@@ -243,12 +310,18 @@ Initial slash commands:
 /skill off <id>
 ```
 
+Current TUI behavior:
+
+* `/skills` lists available skills.
+* `/skill <id>` activates a skill.
+* Loaded skill context produces status text and a transcript preview item.
+
 Later enhancements:
 
 * command palette entries
-* skill picker modal
+* richer skill picker modal
 * active-skill status chips
-* skill details preview
+* expandable skill details preview
 * accept/dismiss UI for suggestions
 
 ## Performance requirements
@@ -257,16 +330,27 @@ Later enhancements:
 * Avoid broad recursive scans outside configured source roots.
 * Cache parsed summaries with file metadata or content hashes.
 * Lazy-load instruction bodies and resources.
-* Enforce max sizes for skill files, resource files, and model context contribution.
+* Enforce max sizes for skill files, resource files, model-visible catalog output, and model context contribution.
 * Report diagnostics instead of failing entire registry builds.
 
-## Implementation phases
+## Implementation status
 
-1. Spec and docs: this document plus progress tracking.
-2. Models and registry: add skill model types, parser, scanner, diagnostics, and tests.
-3. Server/client IPC: list, describe, activate, deactivate, active skills.
-4. TUI slash commands: `/skills`, `/skill`, `/skill active`, `/skill off`.
-5. Model context integration: active skill injection with budgets and traces.
-6. Plugin interface: `bcode.skill/v1` with list/describe/context/invoke.
-7. Suggestions: keyword/rule matching and configurable activation mode.
-8. Resources/scripts: resource loading and explicitly permissioned script execution.
+Implemented:
+
+* Skill model and registry crates.
+* Folder and flat-file discovery.
+* Skill summary listing and explicit activation.
+* Dynamic system-context skill catalog.
+* Prompt catalog configuration.
+* System prompt replacement/section configuration.
+* Pi-compatible `disable-model-invocation` support.
+* XML-style explicit skill context injection.
+* Session/TUI loaded-skill previews.
+
+Still planned:
+
+* Dedicated behavior tests for catalog formatting and prompt config combinations.
+* Live filesystem reload/watch behavior for skill roots.
+* Richer TUI expand/collapse UI for loaded skill context.
+* Bundled/shared skill roots when there are concrete bundled skills to ship.
+* Explicit script/resource execution flows with dedicated permission categories.
