@@ -29,6 +29,7 @@ members = [
     "packages/ipc",
     "packages/model",
     "packages/model-provider-runtime",
+    "packages/model-discovery",
     "packages/model-catalog",
     "packages/model-catalog/models",
     "packages/models-site",
@@ -89,6 +90,7 @@ bcode_metrics                           = { version = "0.0.1-alpha.0", default-f
 bcode_model                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/model" }
 bcode_model_catalog                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/model-catalog" }
 bcode_model_catalog_models              = { version = "0.0.1-alpha.0", default-features = false, path = "packages/model-catalog/models" }
+bcode_model_discovery                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/model-discovery" }
 bcode_model_provider_runtime            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/model-provider-runtime" }
 bcode_models_site                       = { version = "0.0.1-alpha.0", default-features = false, path = "packages/models-site" }
 bcode_models_site_ui                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/models-site/ui" }

@@ -7,6 +7,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub use live::{LiveCatalogSnapshot, LiveModel, LiveModelMetadata};
+
+mod live;
+
 /// Catalog schema version emitted by this crate.
 pub const SCHEMA_VERSION: &str = "1.0.0";
 
@@ -146,6 +150,9 @@ pub struct ModelCatalogEntry {
     /// Reasoning-specific metadata.
     #[serde(default)]
     pub reasoning: Option<CatalogReasoning>,
+    /// Live provider metadata overlaid from generated snapshots.
+    #[serde(default)]
+    pub live: Option<LiveModelMetadata>,
     /// Metadata source/verification data.
     #[serde(default)]
     pub source: CatalogSourceMetadata,

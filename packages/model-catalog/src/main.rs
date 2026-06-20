@@ -2,7 +2,9 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-use bcode_model_catalog::{OutputFormat, build_artifacts, default_source_dir, load_catalog};
+use bcode_model_catalog::{
+    OutputFormat, build_artifacts_with_live, default_source_dir, load_catalog,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
@@ -30,6 +32,9 @@ enum Command {
         /// Output directory for generated artifacts.
         #[arg(long)]
         output: PathBuf,
+        /// Directory containing generated live snapshot JSON files.
+        #[arg(long)]
+        live: Option<PathBuf>,
         /// Output format.
         #[arg(long, default_value = "pretty-json")]
         format: CliOutputFormat,
@@ -69,9 +74,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Build {
             source,
+            live,
             output,
             format,
-        } => build_artifacts(&source, &output, format.into())?,
+        } => build_artifacts_with_live(&source, live.as_deref(), &output, format.into())?,
     }
     Ok(())
 }

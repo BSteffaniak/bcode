@@ -1,0 +1,28 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-utilities"]
+description = "Generated live model catalog discovery"
+edition     = { workspace = true }
+keywords    = ["bcode", "models", "discovery"]
+license     = { workspace = true }
+name        = "bcode_model_discovery"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[[bin]]
+name = "bcode-model-discovery"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+aws-config                 = { workspace = true }
+aws-sdk-bedrock            = { workspace = true }
+bcode_model_catalog_models = { workspace = true }
+clap                       = { workspace = true, features = ["derive", "std"] }
+serde_json                 = { workspace = true, features = ["std"] }
+tokio                      = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[features]
+default          = []
+fail-on-warnings = ["bcode_model_catalog_models/fail-on-warnings"]

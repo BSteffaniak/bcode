@@ -20,6 +20,7 @@ node_modules/
 *.sqlite
 *.sqlite3
 *.bak
+model-live/
 
 # agent/editor state
 .aider*

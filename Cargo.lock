@@ -1577,6 +1577,19 @@ name = "bcode_model_catalog_models"
 version = "0.0.1-alpha.0"
 dependencies = [
  "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "bcode_model_discovery"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "aws-config",
+ "aws-sdk-bedrock",
+ "bcode_model_catalog_models",
+ "clap",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

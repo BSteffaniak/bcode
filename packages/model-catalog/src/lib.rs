@@ -11,7 +11,8 @@ use bcode_model::{
 };
 use bcode_model_catalog_models::{
     BcodeSupportStatus, CatalogCapabilities, CatalogDocument, CatalogModelStatus, CatalogPricing,
-    ModelCatalogDefaults, ModelCatalogEntry, ProviderCatalog,
+    LiveCatalogSnapshot, LiveModelMetadata, ModelCatalogDefaults, ModelCatalogEntry,
+    ProviderCatalog,
 };
 use serde_json::json;
 use std::fmt::{Display, Formatter};
@@ -440,7 +441,154 @@ pub fn validate_catalog(catalog: &CatalogDocument) -> Result<()> {
 ///
 /// Returns an error if catalog loading, validation, serialization, or file writes fail.
 pub fn build_artifacts(source_dir: &Path, output_dir: &Path, format: OutputFormat) -> Result<()> {
-    let catalog = load_catalog(source_dir)?;
+    build_artifacts_with_live(source_dir, None, output_dir, format)
+}
+
+/// Build static catalog artifacts with optional generated live snapshots.
+///
+/// # Errors
+///
+/// Returns an error if catalog loading, live snapshot loading, validation, serialization, or file writes fail.
+pub fn build_artifacts_with_live(
+    source_dir: &Path,
+    live_dir: Option<&Path>,
+    output_dir: &Path,
+    format: OutputFormat,
+) -> Result<()> {
+    let mut catalog = load_catalog(source_dir)?;
+    let live_snapshots = if let Some(live_dir) = live_dir {
+        load_live_snapshots(live_dir)?
+    } else {
+        Vec::new()
+    };
+    merge_live_snapshots(&mut catalog, &live_snapshots);
+    write_artifacts(&catalog, output_dir, format)?;
+
+    if !live_snapshots.is_empty() {
+        let live_output_dir = output_dir.join("live");
+        fs::create_dir_all(&live_output_dir)?;
+        for snapshot in &live_snapshots {
+            write_json(
+                &live_output_dir.join(format!("{}.json", snapshot.provider_id)),
+                snapshot,
+                format,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Load generated live snapshots from a directory.
+///
+/// # Errors
+///
+/// Returns an error if the directory cannot be read or a snapshot cannot be parsed.
+pub fn load_live_snapshots(live_dir: &Path) -> Result<Vec<LiveCatalogSnapshot>> {
+    let mut snapshots = Vec::new();
+    if !live_dir.exists() {
+        return Ok(snapshots);
+    }
+    for entry in fs::read_dir(live_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let contents = fs::read_to_string(&path)?;
+        let snapshot: LiveCatalogSnapshot = serde_json::from_str(&contents)?;
+        snapshots.push(snapshot);
+    }
+    Ok(snapshots)
+}
+
+/// Merge generated live snapshots into a catalog document.
+pub fn merge_live_snapshots(catalog: &mut CatalogDocument, snapshots: &[LiveCatalogSnapshot]) {
+    for snapshot in snapshots {
+        let Some(provider) = catalog.providers.get_mut(&snapshot.provider_id) else {
+            continue;
+        };
+        for live_model in snapshot.models.values() {
+            let entry = provider
+                .models
+                .entry(live_model.model_id.clone())
+                .or_insert_with(|| live_model_entry(live_model, snapshot));
+            if entry.display_name.trim().is_empty()
+                && let Some(display_name) = &live_model.display_name
+            {
+                entry.display_name.clone_from(display_name);
+            }
+            if entry.context_window.is_none() {
+                entry.context_window = live_model.context_window;
+            }
+            if entry.max_output_tokens.is_none() {
+                entry.max_output_tokens = live_model.max_output_tokens;
+            }
+            entry.capabilities = merge_capabilities(&entry.capabilities, &live_model.capabilities);
+            entry.live = Some(LiveModelMetadata {
+                status: live_model.status.clone(),
+                regions: live_model.regions.clone(),
+                last_seen_at: Some(snapshot.generated_at.clone()),
+                source: Some("provider_live".to_string()),
+            });
+        }
+    }
+}
+
+fn live_model_entry(
+    live_model: &bcode_model_catalog_models::LiveModel,
+    snapshot: &LiveCatalogSnapshot,
+) -> ModelCatalogEntry {
+    ModelCatalogEntry {
+        model_id: live_model.model_id.clone(),
+        display_name: live_model
+            .display_name
+            .clone()
+            .unwrap_or_else(|| live_model.model_id.clone()),
+        aliases: std::collections::BTreeSet::new(),
+        status: CatalogModelStatus::Unknown,
+        bcode_support: BcodeSupportStatus::Unknown,
+        context_window: live_model.context_window,
+        max_output_tokens: live_model.max_output_tokens,
+        family: None,
+        provider_model_kind: None,
+        replaced_by: None,
+        notes: None,
+        documentation_url: None,
+        pricing: None,
+        capabilities: live_model.capabilities.clone(),
+        reasoning: None,
+        live: Some(LiveModelMetadata {
+            status: live_model.status.clone(),
+            regions: live_model.regions.clone(),
+            last_seen_at: Some(snapshot.generated_at.clone()),
+            source: Some("provider_live".to_string()),
+        }),
+        source: bcode_model_catalog_models::CatalogSourceMetadata::default(),
+    }
+}
+
+const fn merge_capabilities(
+    left: &CatalogCapabilities,
+    right: &CatalogCapabilities,
+) -> CatalogCapabilities {
+    CatalogCapabilities {
+        text_input: left.text_input || right.text_input,
+        image_input: left.image_input || right.image_input,
+        text_output: left.text_output || right.text_output,
+        tool_use: left.tool_use || right.tool_use,
+        structured_outputs: left.structured_outputs || right.structured_outputs,
+        reasoning: left.reasoning || right.reasoning,
+        prompt_cache: left.prompt_cache || right.prompt_cache,
+        native_web_search: left.native_web_search || right.native_web_search,
+    }
+}
+
+fn write_artifacts(
+    catalog: &CatalogDocument,
+    output_dir: &Path,
+    format: OutputFormat,
+) -> Result<()> {
     fs::create_dir_all(output_dir.join("providers"))?;
 
     write_json(&output_dir.join("catalog.json"), &catalog, format)?;

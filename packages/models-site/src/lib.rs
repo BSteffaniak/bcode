@@ -6,7 +6,7 @@
 
 use std::sync::LazyLock;
 
-use bcode_model_catalog::{OutputFormat, build_artifacts, default_source_dir, load_catalog};
+use bcode_model_catalog::{OutputFormat, default_source_dir, load_catalog};
 use hyperchad::app::{App, AppBuilder, renderer::DefaultRenderer};
 use hyperchad::color::Color;
 use hyperchad::router::Router;
@@ -52,12 +52,18 @@ pub fn build_app(builder: AppBuilder) -> Result<App<DefaultRenderer>, hyperchad:
 
 /// Build catalog API artifacts next to the HyperChad-generated static site.
 ///
+/// Optional live snapshots can be provided with `--live <dir>`.
+///
 /// # Errors
 ///
 /// Returns an error if catalog artifacts cannot be generated.
-pub fn build_catalog_artifacts(output_dir: &std::path::Path) -> bcode_model_catalog::Result<()> {
-    build_artifacts(
+pub fn build_catalog_artifacts(
+    output_dir: &std::path::Path,
+    live_dir: Option<&std::path::Path>,
+) -> bcode_model_catalog::Result<()> {
+    bcode_model_catalog::build_artifacts_with_live(
         &default_source_dir(),
+        live_dir,
         &output_dir.join("v1"),
         OutputFormat::PrettyJson,
     )
