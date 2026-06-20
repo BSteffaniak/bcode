@@ -893,12 +893,33 @@ fn apply_submit_message_result(
                     chat.app.set_status("Message sent".to_owned());
                 }
             }
+            ensure_session_stream_after_foreground_wake(chat);
         }
         Err(error) => {
             chat.app.restore_pending_submission(message);
             daemon_issue::report_client_issue(&mut chat.app, "send failed", &error);
         }
     }
+}
+
+fn ensure_session_stream_after_foreground_wake(chat: &mut ActiveChat) {
+    let Some(session_id) = chat.session_id else {
+        return;
+    };
+    if chat
+        .event_task
+        .as_ref()
+        .is_some_and(|event_task| !event_task.is_finished())
+    {
+        return;
+    }
+    session_flow::start_switch_session(
+        chat,
+        session_id,
+        session_flow::initial_transcript_window_request(bmux_tui::geometry::Rect::new(
+            0, 0, 80, 24,
+        )),
+    );
 }
 
 fn apply_rename_session_result(
