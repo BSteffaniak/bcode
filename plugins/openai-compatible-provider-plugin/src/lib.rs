@@ -2853,7 +2853,6 @@ impl OpenAiCompatibleProviderPlugin {
     fn models(&self, request: &ModelListRequest) -> ModelList {
         let settings = settings_for_context(&request.provider_context);
         if !settings.model_ids_are_explicit
-            && settings.default_model.is_none()
             && let Some(discovered_models) = self.discover_models(&settings)
         {
             return ModelList {
@@ -3305,13 +3304,14 @@ async fn discover_models_async(
     if !status.is_success() {
         return Err(error_from_status(status.as_u16(), &body));
     }
-    let body = serde_json::from_str::<ModelsResponseBody>(&body).map_err(|error| {
+    let mut body = serde_json::from_str::<ModelsResponseBody>(&body).map_err(|error| {
         provider_error(
             "models_response_decode_failed",
             ProviderErrorCategory::ProviderInternal,
             error.to_string(),
         )
     })?;
+    append_missing_model_items(&mut body.data, &settings.model_ids);
     Ok(model_infos_from_items(
         body.data,
         settings.default_model.as_deref(),
@@ -3466,6 +3466,17 @@ fn settings_for_context(context: &ProviderRequestContext) -> Settings {
     let mut model_ids = model_ids_env
         .as_deref()
         .map_or_else(|| default_model_ids(chatgpt_mode), parse_model_list);
+    let extra_model_ids = first_context_env(
+        context,
+        [
+            "BCODE_XAI_EXTRA_MODELS",
+            "XAI_EXTRA_MODELS",
+            "BCODE_OPENAI_EXTRA_MODELS",
+            "OPENAI_EXTRA_MODELS",
+        ],
+    )
+    .map_or_else(Vec::new, |models| parse_model_list(&models));
+    append_unique_model_ids(&mut model_ids, extra_model_ids);
     if let Some(default_model) = &default_model
         && !model_ids.contains(default_model)
     {
@@ -3988,13 +3999,84 @@ fn saved_chatgpt_auth_settings(saved: &SavedOpenAiAuth) -> (AuthSettings, AuthDi
 
 fn default_model_ids(chatgpt_mode: bool) -> Vec<String> {
     if chatgpt_mode {
+        // Bundled ChatGPT/Codex fallback catalog. API-key users still use the
+        // provider `/models` endpoint; this list is only for subscription auth,
+        // where the Codex backend does not expose the same public model-list API.
+        // Source checked against OpenAI API docs/llms-full and model pages; this
+        // fallback includes text/chat/reasoning/coding models Bcode can drive and
+        // intentionally excludes image, audio, realtime, transcription, embedding,
+        // moderation, and other non-chat model families.
         return [
             "gpt-5.5",
+            "gpt-5.5-2026-04-23",
+            "gpt-5.5-pro",
+            "gpt-5.5-pro-2026-04-23",
             "gpt-5.4",
+            "gpt-5.4-2026-03-05",
+            "gpt-5.4-pro",
+            "gpt-5.4-pro-2026-03-05",
             "gpt-5.4-mini",
+            "gpt-5.4-mini-2026-03-17",
+            "gpt-5.4-nano",
+            "gpt-5.4-nano-2026-03-17",
+            "gpt-5.3-chat-latest",
+            "gpt-5.3-codex-spark",
             "gpt-5.3-codex",
+            "gpt-5.2",
+            "gpt-5.2-2025-12-11",
+            "gpt-5.2-chat-latest",
+            "gpt-5.2-pro",
+            "gpt-5.2-pro-2025-12-11",
             "gpt-5.2-codex",
+            "gpt-5.1",
+            "gpt-5.1-2025-11-13",
+            "gpt-5.1-chat-latest",
+            "gpt-5.1-codex",
+            "gpt-5.1-codex-max",
             "gpt-5.1-codex-mini",
+            "gpt-5",
+            "gpt-5-2025-08-07",
+            "gpt-5-chat-latest",
+            "gpt-5-chat-latest-2025-08-07",
+            "gpt-5-pro",
+            "gpt-5-pro-2025-10-06",
+            "gpt-5-mini",
+            "gpt-5-mini-2025-08-07",
+            "gpt-5-nano",
+            "gpt-5-nano-2025-08-07",
+            "gpt-5-codex",
+            "gpt-5-codex-mini",
+            "codex-mini-latest",
+            "gpt-4.5-preview",
+            "gpt-4.5",
+            "gpt-4.1",
+            "gpt-4.1-2025-04-14",
+            "gpt-4.1-mini",
+            "gpt-4.1-mini-2025-04-14",
+            "gpt-4.1-nano",
+            "gpt-4.1-nano-2025-04-14",
+            "chatgpt-4o-latest",
+            "gpt-4o",
+            "gpt-4o-2024-11-20",
+            "gpt-4o-2024-08-06",
+            "gpt-4o-2024-05-13",
+            "gpt-4o-mini",
+            "gpt-4o-mini-2024-07-18",
+            "o4-mini",
+            "o4-mini-2025-04-16",
+            "o3-pro",
+            "o3-pro-2025-06-10",
+            "o3",
+            "o3-2025-04-16",
+            "o3-mini",
+            "o3-mini-2025-01-31",
+            "o1-pro",
+            "o1-pro-2025-03-19",
+            "o1",
+            "o1-2024-12-17",
+            "o1-preview",
+            "o1-mini",
+            "o1-mini-2024-09-12",
         ]
         .into_iter()
         .map(ToString::to_string)
@@ -4271,6 +4353,29 @@ fn parse_model_list(models: &str) -> Vec<String> {
         .filter(|model| !model.is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+fn append_unique_model_ids(
+    model_ids: &mut Vec<String>,
+    extra_model_ids: impl IntoIterator<Item = String>,
+) {
+    for model_id in extra_model_ids {
+        if !model_ids.contains(&model_id) {
+            model_ids.push(model_id);
+        }
+    }
+}
+
+fn append_missing_model_items(models: &mut Vec<ModelResponseItem>, model_ids: &[String]) {
+    for model_id in model_ids {
+        if models.iter().all(|model| model.id != *model_id) {
+            models.push(ModelResponseItem {
+                id: model_id.clone(),
+                created: None,
+                metadata: BTreeMap::new(),
+            });
+        }
+    }
 }
 
 fn first_context_env<const N: usize>(
@@ -4710,6 +4815,53 @@ mod tests {
                 text: text.to_string(),
             }],
         }
+    }
+
+    #[test]
+    fn append_missing_model_items_merges_configured_models() {
+        let mut models = vec![model_item("gpt-5", 100)];
+        append_missing_model_items(
+            &mut models,
+            &["gpt-5".to_string(), "gpt-5.3-codex-spark".to_string()],
+        );
+
+        assert_eq!(models.len(), 2);
+        assert!(models.iter().any(|model| model.id == "gpt-5.3-codex-spark"));
+    }
+
+    #[test]
+    fn configured_default_model_does_not_make_model_list_explicit() {
+        let mut context = ProviderRequestContext::default();
+        context
+            .env
+            .insert("OPENAI_MODEL".to_string(), "gpt-5".to_string());
+        context.env.insert(
+            "OPENAI_EXTRA_MODELS".to_string(),
+            "gpt-5.3-codex-spark".to_string(),
+        );
+
+        let settings = settings_for_context(&context);
+
+        assert!(!settings.model_ids_are_explicit);
+        assert_eq!(settings.default_model.as_deref(), Some("gpt-5"));
+        assert!(
+            settings
+                .model_ids
+                .contains(&"gpt-5.3-codex-spark".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_model_list_still_overrides_discovery() {
+        let mut context = ProviderRequestContext::default();
+        context
+            .env
+            .insert("OPENAI_MODELS".to_string(), "model-a,model-b".to_string());
+
+        let settings = settings_for_context(&context);
+
+        assert!(settings.model_ids_are_explicit);
+        assert_eq!(settings.model_ids, ["model-a", "model-b"]);
     }
 
     #[test]
