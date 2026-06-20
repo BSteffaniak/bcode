@@ -1,0 +1,32 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Settings database persistence for Bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "settings", "persistence"]
+license     = { workspace = true }
+name        = "bcode_settings"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_config = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true }
+switchy = { workspace = true, features = [
+    "database",
+    "database-schema",
+    "database-connection",
+    "database-connection-turso",
+    "schema",
+] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

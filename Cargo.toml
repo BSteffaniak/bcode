@@ -42,6 +42,7 @@ members = [
     "packages/provider-auth",
     "packages/ralph",
     "packages/server",
+    "packages/settings",
     "packages/session",
     "packages/session-import",
     "packages/skill",
@@ -106,6 +107,7 @@ bcode_server                            = { version = "0.0.1-alpha.0", default-f
 bcode_session                           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session" }
 bcode_session_import                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-import" }
 bcode_session_models                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session/models" }
+bcode_settings                          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/settings" }
 bcode_shell_plugin                      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/shell-plugin" }
 bcode_skill                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/skill" }
 bcode_skill_models                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/skill/models" }
