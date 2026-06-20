@@ -41,6 +41,7 @@ use super::diff_panel::DiffPanel;
 use super::exit_state::ExitState;
 use super::input_history::{InputHistory, InputHistoryOutcome};
 use super::invalidation::{InvalidationKey, InvalidationRequest, UiInvalidation};
+use super::keymap::{BmuxAction, BmuxKeyActivation, BmuxKeyBinding, BmuxScope};
 use super::older_history::OlderHistoryState;
 use super::pending_submission::PendingSubmission;
 use super::pending_submissions::PendingSubmissions;
@@ -91,6 +92,24 @@ impl LivePreviewFrameState {
             next_frame_at: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingKeyActivation {
+    scope: BmuxScope,
+    stroke: bmux_keyboard::KeyStroke,
+    action: BmuxAction,
+    taps: u8,
+    expires_at: Instant,
+}
+
+/// Result of evaluating key activation behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyActivationOutcome {
+    /// The binding action should run now.
+    Activated(BmuxAction),
+    /// More taps are required before the action should run.
+    Pending,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,6 +318,7 @@ pub struct BmuxApp {
     exit: ExitState,
     cursor: CursorBlink,
     live_preview_frame: LivePreviewFrameState,
+    pending_key_activation: Option<PendingKeyActivation>,
 }
 
 /// Daemon connection state used to describe startup readiness in the status chrome.
@@ -490,6 +510,7 @@ impl BmuxApp {
             exit: ExitState::default(),
             cursor: CursorBlink::new(),
             live_preview_frame: LivePreviewFrameState::new(),
+            pending_key_activation: None,
         };
         app.absorb_history(history);
         app
@@ -1196,6 +1217,91 @@ impl BmuxApp {
     /// Store configured key hints for the status line.
     pub fn set_key_hints(&mut self, key_hints: String) {
         self.key_hints = key_hints;
+    }
+
+    /// Clear any pending multi-tap key activation.
+    pub const fn clear_pending_key_activation(&mut self) {
+        self.pending_key_activation = None;
+    }
+
+    /// Evaluate whether a key binding should run now or wait for more taps.
+    pub fn activate_key_binding(
+        &mut self,
+        scope: BmuxScope,
+        binding: &BmuxKeyBinding,
+    ) -> KeyActivationOutcome {
+        self.activate_key_binding_at(scope, binding, Instant::now())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn activate_key_binding_for_test(
+        &mut self,
+        scope: BmuxScope,
+        binding: &BmuxKeyBinding,
+        now: Instant,
+    ) -> KeyActivationOutcome {
+        self.activate_key_binding_at(scope, binding, now)
+    }
+
+    fn activate_key_binding_at(
+        &mut self,
+        scope: BmuxScope,
+        binding: &BmuxKeyBinding,
+        now: Instant,
+    ) -> KeyActivationOutcome {
+        match binding.activation() {
+            BmuxKeyActivation::Immediate => {
+                self.pending_key_activation = None;
+                KeyActivationOutcome::Activated(binding.action())
+            }
+            BmuxKeyActivation::MultiTap {
+                required_taps,
+                window_ms,
+                prompt,
+            } => self.activate_multi_tap_binding(
+                scope,
+                binding,
+                *required_taps,
+                *window_ms,
+                prompt,
+                now,
+            ),
+        }
+    }
+
+    fn activate_multi_tap_binding(
+        &mut self,
+        scope: BmuxScope,
+        binding: &BmuxKeyBinding,
+        required_taps: u8,
+        window_ms: u64,
+        prompt: &str,
+        now: Instant,
+    ) -> KeyActivationOutcome {
+        let taps = self
+            .pending_key_activation
+            .filter(|pending| {
+                pending.scope == scope
+                    && pending.stroke == binding.stroke()
+                    && pending.action == binding.action()
+                    && pending.expires_at >= now
+            })
+            .map_or(1, |pending| pending.taps.saturating_add(1));
+
+        if taps >= required_taps.max(1) {
+            self.pending_key_activation = None;
+            return KeyActivationOutcome::Activated(binding.action());
+        }
+
+        self.pending_key_activation = Some(PendingKeyActivation {
+            scope,
+            stroke: binding.stroke(),
+            action: binding.action(),
+            taps,
+            expires_at: now + Duration::from_millis(window_ms),
+        });
+        self.set_status(prompt.to_owned());
+        KeyActivationOutcome::Pending
     }
 
     /// Store the configured key label for jumping to latest transcript content.

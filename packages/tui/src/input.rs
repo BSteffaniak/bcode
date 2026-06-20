@@ -3,7 +3,7 @@
 use bmux_keyboard::KeyStroke;
 use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyOutcome};
 
-use super::app::BmuxApp;
+use super::app::{BmuxApp, KeyActivationOutcome};
 use super::helpers;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 const TRANSCRIPT_SCROLL_ROWS: usize = 3;
@@ -39,10 +39,23 @@ pub struct KeyOutcome {
 
 /// Handle a key stroke.
 pub fn handle_key(app: &mut BmuxApp, keymap: &BmuxKeyMap, stroke: KeyStroke) -> KeyOutcome {
-    if let Some(outcome) = handle_chat_action(app, keymap.action_for_key(BmuxScope::Chat, stroke)) {
-        return outcome;
+    if let Some(binding) = keymap.binding_for_key(BmuxScope::Chat, stroke) {
+        match app.activate_key_binding(BmuxScope::Chat, &binding) {
+            KeyActivationOutcome::Activated(action) => {
+                if let Some(outcome) = handle_chat_action(app, Some(action)) {
+                    return outcome;
+                }
+            }
+            KeyActivationOutcome::Pending => {
+                return KeyOutcome {
+                    redraw: true,
+                    request: KeyRequest::None,
+                };
+            }
+        }
     }
     if let Some(motion) = keymap.editor_selection_motion_for_key(stroke) {
+        app.clear_pending_key_activation();
         app.extend_composer_selection(motion);
         return KeyOutcome {
             redraw: true,
@@ -50,6 +63,7 @@ pub fn handle_key(app: &mut BmuxApp, keymap: &BmuxKeyMap, stroke: KeyStroke) -> 
         };
     }
     if let Some(command) = keymap.editor_command_for_key(stroke) {
+        app.clear_pending_key_activation();
         app.reset_input_history_navigation();
         app.composer_mut().apply_command(command);
         app.wake_cursor();
@@ -65,8 +79,12 @@ pub fn handle_key(app: &mut BmuxApp, keymap: &BmuxKeyMap, stroke: KeyStroke) -> 
         TextInputEnterBehavior::Submit,
     );
     match outcome {
-        TextInputKeyOutcome::Submitted => submit(app, bcode_ipc::PromptPlacement::Steering),
+        TextInputKeyOutcome::Submitted => {
+            app.clear_pending_key_activation();
+            submit(app, bcode_ipc::PromptPlacement::Steering)
+        }
         TextInputKeyOutcome::Edited => {
+            app.clear_pending_key_activation();
             app.reset_input_history_navigation();
             app.wake_cursor();
             KeyOutcome {

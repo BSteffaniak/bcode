@@ -25,10 +25,10 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
 
 use super::{
-    app::BmuxApp,
+    app::{BmuxApp, KeyActivationOutcome},
     input,
     input::KeyRequest,
-    keymap::{BmuxAction, BmuxKeyMap, BmuxScope},
+    keymap::{BmuxAction, BmuxKeyActivation, BmuxKeyBinding, BmuxKeyMap, BmuxScope},
     pending_submissions::PendingSubmissions,
     render, slash_palette, slash_palette_render,
     temporal::next_elapsed_invalidation_capped,
@@ -320,14 +320,120 @@ fn multiline_paste_preserves_line_breaks_in_composer() {
 }
 
 #[test]
-fn escape_interrupt_does_not_exit_chat() {
+fn escape_requires_double_tap_to_interrupt_without_exiting_chat() {
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
     let keymap = BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
 
-    let outcome = input::handle_key(&mut app, &keymap, key(KeyCode::Escape));
+    let first = input::handle_key(&mut app, &keymap, key(KeyCode::Escape));
+    let second = input::handle_key(&mut app, &keymap, key(KeyCode::Escape));
+
+    assert_eq!(first.request, KeyRequest::None);
+    assert!(first.redraw);
+    assert_eq!(app.status(), "hit esc twice to cancel");
+    assert_eq!(second.request, KeyRequest::Interrupt);
+    assert!(!app.should_exit());
+}
+
+#[test]
+fn multi_tap_key_activation_supports_three_taps() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    let now = Instant::now();
+    let binding = BmuxKeyBinding::new(
+        key(KeyCode::Escape),
+        BmuxAction::AppInterrupt,
+        BmuxKeyActivation::MultiTap {
+            required_taps: 3,
+            window_ms: 1_500,
+            prompt: "tap again".to_owned(),
+        },
+    );
+
+    let first = app.activate_key_binding_for_test(BmuxScope::Chat, &binding, now);
+    let second = app.activate_key_binding_for_test(
+        BmuxScope::Chat,
+        &binding,
+        now + Duration::from_millis(100),
+    );
+    let third = app.activate_key_binding_for_test(
+        BmuxScope::Chat,
+        &binding,
+        now + Duration::from_millis(200),
+    );
+
+    assert_eq!(first, KeyActivationOutcome::Pending);
+    assert_eq!(second, KeyActivationOutcome::Pending);
+    assert_eq!(
+        third,
+        KeyActivationOutcome::Activated(BmuxAction::AppInterrupt)
+    );
+}
+
+#[test]
+fn multi_tap_key_activation_resets_after_timeout() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    let now = Instant::now();
+    let binding = BmuxKeyBinding::new(
+        key(KeyCode::Escape),
+        BmuxAction::AppInterrupt,
+        BmuxKeyActivation::MultiTap {
+            required_taps: 2,
+            window_ms: 500,
+            prompt: "tap again".to_owned(),
+        },
+    );
+
+    let first = app.activate_key_binding_for_test(BmuxScope::Chat, &binding, now);
+    let expired_second = app.activate_key_binding_for_test(
+        BmuxScope::Chat,
+        &binding,
+        now + Duration::from_millis(600),
+    );
+
+    assert_eq!(first, KeyActivationOutcome::Pending);
+    assert_eq!(expired_second, KeyActivationOutcome::Pending);
+}
+
+#[test]
+fn other_key_resets_pending_multi_tap_activation() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    let keymap = BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
+
+    let escape = input::handle_key(&mut app, &keymap, key(KeyCode::Escape));
+    let tab = input::handle_key(&mut app, &keymap, key(KeyCode::Tab));
+    let escape_again = input::handle_key(&mut app, &keymap, key(KeyCode::Escape));
+
+    assert_eq!(escape.request, KeyRequest::None);
+    assert_eq!(tab.request, KeyRequest::CycleAgent);
+    assert_eq!(escape_again.request, KeyRequest::None);
+}
+
+#[test]
+fn immediate_key_activation_runs_without_pending_state() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    let binding = BmuxKeyBinding::new(
+        key(KeyCode::Tab),
+        BmuxAction::AgentCycle,
+        BmuxKeyActivation::Immediate,
+    );
+
+    let outcome = app.activate_key_binding_for_test(BmuxScope::Chat, &binding, Instant::now());
+
+    assert_eq!(
+        outcome,
+        KeyActivationOutcome::Activated(BmuxAction::AgentCycle)
+    );
+}
+
+#[test]
+fn configured_interrupt_binding_stays_immediate() {
+    let mut config = bcode_config::TuiConfig::default();
+    config.keybindings.chat = BTreeMap::from([("ctrl+c".to_owned(), "app.interrupt".to_owned())]);
+    let keymap = BmuxKeyMap::from_config(&config);
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+
+    let outcome = input::handle_key(&mut app, &keymap, ctrl_key('c'));
 
     assert_eq!(outcome.request, KeyRequest::Interrupt);
-    assert!(!app.should_exit());
 }
 
 #[test]

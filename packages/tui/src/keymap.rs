@@ -127,10 +127,70 @@ impl BmuxAction {
     }
 }
 
+/// Key binding activation behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BmuxKeyActivation {
+    /// Run the action on the first matching key stroke.
+    Immediate,
+    /// Run the action only after repeated taps within a bounded window.
+    MultiTap {
+        /// Number of taps required before the action runs.
+        required_taps: u8,
+        /// Time window, in milliseconds, between taps.
+        window_ms: u64,
+        /// Status prompt to show while waiting for more taps.
+        prompt: String,
+    },
+}
+
+impl BmuxKeyActivation {
+    const fn immediate() -> Self {
+        Self::Immediate
+    }
+}
+
+/// A resolved TUI key binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BmuxKeyBinding {
+    stroke: KeyStroke,
+    action: BmuxAction,
+    activation: BmuxKeyActivation,
+}
+
+impl BmuxKeyBinding {
+    /// Create a key binding.
+    #[must_use]
+    pub const fn new(stroke: KeyStroke, action: BmuxAction, activation: BmuxKeyActivation) -> Self {
+        Self {
+            stroke,
+            action,
+            activation,
+        }
+    }
+
+    /// Return the key stroke that triggers this binding.
+    #[must_use]
+    pub const fn stroke(&self) -> KeyStroke {
+        self.stroke
+    }
+
+    /// Return the action this binding invokes.
+    #[must_use]
+    pub const fn action(&self) -> BmuxAction {
+        self.action
+    }
+
+    /// Return the activation behavior for this binding.
+    #[must_use]
+    pub const fn activation(&self) -> &BmuxKeyActivation {
+        &self.activation
+    }
+}
+
 /// Compiled TUI keymap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BmuxKeyMap {
-    bindings: BTreeMap<BmuxScope, Vec<(KeyStroke, BmuxAction)>>,
+    bindings: BTreeMap<BmuxScope, Vec<BmuxKeyBinding>>,
 }
 
 impl BmuxKeyMap {
@@ -160,10 +220,18 @@ impl BmuxKeyMap {
     /// Return the action for a key in `scope`.
     #[must_use]
     pub fn action_for_key(&self, scope: BmuxScope, stroke: KeyStroke) -> Option<BmuxAction> {
+        self.binding_for_key(scope, stroke)
+            .map(|binding| binding.action())
+    }
+
+    /// Return the binding for a key in `scope`.
+    #[must_use]
+    pub fn binding_for_key(&self, scope: BmuxScope, stroke: KeyStroke) -> Option<BmuxKeyBinding> {
         self.bindings.get(&scope).and_then(|bindings| {
             bindings
                 .iter()
-                .find_map(|(binding, action)| (*binding == stroke).then_some(*action))
+                .find(|binding| binding.stroke == stroke)
+                .cloned()
         })
     }
 
@@ -198,7 +266,7 @@ impl BmuxKeyMap {
         self.bindings.get(&scope).and_then(|bindings| {
             bindings
                 .iter()
-                .find_map(|(stroke, bound)| (*bound == action).then_some(*stroke))
+                .find_map(|binding| (binding.action == action).then_some(binding.stroke))
         })
     }
 
@@ -367,7 +435,7 @@ fn key_label(stroke: KeyStroke) -> String {
     parts.join("+")
 }
 
-fn default_bindings() -> BTreeMap<BmuxScope, Vec<(KeyStroke, BmuxAction)>> {
+fn default_bindings() -> BTreeMap<BmuxScope, Vec<BmuxKeyBinding>> {
     BTreeMap::from([
         (
             BmuxScope::Chat,
@@ -386,7 +454,13 @@ fn default_bindings() -> BTreeMap<BmuxScope, Vec<(KeyStroke, BmuxAction)>> {
                 bind("shift+up", BmuxAction::EditorSelectUp),
                 bind("shift+down", BmuxAction::EditorSelectDown),
                 bind("ctrl+d", BmuxAction::AppExit),
-                bind("escape", BmuxAction::AppInterrupt),
+                multi_tap_bind(
+                    "escape",
+                    BmuxAction::AppInterrupt,
+                    2,
+                    1_500,
+                    "hit esc twice to cancel",
+                ),
                 bind("ctrl+v", BmuxAction::ClipboardPasteImage),
                 bind("ctrl+p", BmuxAction::CommandPaletteOpen),
                 bind("tab", BmuxAction::AgentCycle),
@@ -447,7 +521,7 @@ fn default_bindings() -> BTreeMap<BmuxScope, Vec<(KeyStroke, BmuxAction)>> {
 }
 
 fn apply_scope(
-    bindings: &mut BTreeMap<BmuxScope, Vec<(KeyStroke, BmuxAction)>>,
+    bindings: &mut BTreeMap<BmuxScope, Vec<BmuxKeyBinding>>,
     scope: BmuxScope,
     configured: &BTreeMap<String, String>,
 ) {
@@ -458,26 +532,48 @@ fn apply_scope(
         .iter()
         .filter_map(|(key, action_id)| {
             BmuxAction::from_id(action_id)
-                .and_then(|action| parse_key(key).map(|stroke| (stroke, action)))
+                .and_then(|action| parse_key(key).map(|stroke| binding(stroke, action)))
         })
         .collect::<Vec<_>>();
     if configured_bindings.is_empty() {
         return;
     }
 
-    scope_bindings.retain(|(existing_stroke, existing_action)| {
-        !configured_bindings
-            .iter()
-            .any(|(stroke, action)| existing_action == action || existing_stroke == stroke)
+    scope_bindings.retain(|existing| {
+        !configured_bindings.iter().any(|configured| {
+            existing.action == configured.action || existing.stroke == configured.stroke
+        })
     });
     scope_bindings.extend(configured_bindings);
 }
 
-fn bind(key: &str, action: BmuxAction) -> (KeyStroke, BmuxAction) {
-    (
+fn bind(key: &str, action: BmuxAction) -> BmuxKeyBinding {
+    binding(
         parse_key(key).expect("default BMUX key binding must parse"),
         action,
     )
+}
+
+fn multi_tap_bind(
+    key: &str,
+    action: BmuxAction,
+    required_taps: u8,
+    window_ms: u64,
+    prompt: &str,
+) -> BmuxKeyBinding {
+    BmuxKeyBinding::new(
+        parse_key(key).expect("default BMUX key binding must parse"),
+        action,
+        BmuxKeyActivation::MultiTap {
+            required_taps,
+            window_ms,
+            prompt: prompt.to_owned(),
+        },
+    )
+}
+
+const fn binding(stroke: KeyStroke, action: BmuxAction) -> BmuxKeyBinding {
+    BmuxKeyBinding::new(stroke, action, BmuxKeyActivation::immediate())
 }
 
 fn parse_key(input: &str) -> Option<KeyStroke> {

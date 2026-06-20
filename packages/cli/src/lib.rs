@@ -110,7 +110,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         if cli.command.is_some() {
             return Err(CliError::NewSessionWithCommand);
         }
-        run_new_session_tui(cli.worktree).await?;
+        Box::pin(run_new_session_tui(cli.worktree)).await?;
         return Ok(());
     }
     match cli.command.unwrap_or_default() {
