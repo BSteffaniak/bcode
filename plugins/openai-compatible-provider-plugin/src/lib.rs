@@ -5,7 +5,6 @@
 //! OpenAI-compatible model provider plugin for Bcode.
 
 mod auth_pool_state;
-mod model_catalog;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -13,7 +12,8 @@ use bcode_config::AuthMode;
 use bcode_model::{
     AckResponse, CancelTurnRequest, ContentBlock, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID,
     MessageRole, ModelCapability, ModelInfo, ModelList, ModelListRequest, ModelMessage,
-    ModelReasoningCapabilitySource, ModelTurnRequest, NativeWebSearchRequest,
+    ModelMetadataSource, ModelPricingInfo, ModelPricingSource, ModelPricingUnit,
+    ModelReasoningCapabilitySource, ModelTokenPrice, ModelTurnRequest, NativeWebSearchRequest,
     NativeWebSearchResponse, NativeWebSearchResult, OP_CANCEL_TURN, OP_CAPABILITIES,
     OP_FINISH_TURN, OP_MODELS, OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS, OP_START_TURN,
     OP_VALIDATE_CONFIG, PollTurnEventsRequest, PollTurnEventsResponse, ProviderAuthCandidate,
@@ -3067,21 +3067,19 @@ fn model_infos_from_items(
         .or_else(|| models.first().map(|model| model.id.clone()));
     let discovered = models
         .into_iter()
-        .map(|model| {
-            let metadata = model_catalog::resolve(&model.id, &model.metadata);
-            ModelInfo {
-                is_default: selected_default.as_deref() == Some(model.id.as_str()),
-                model_id: model.id.clone(),
-                display_name: model.id.clone(),
-                context_window: Some(metadata.metadata.context_window),
-                max_output_tokens: Some(metadata.metadata.max_output_tokens),
-                capabilities: model_capabilities_for(&model),
-                reasoning: reasoning_info_for_model(&model, default_reasoning_request_shape()),
-                cache: openai_model_cache_info(),
-                metadata_source: Some(metadata.source),
-                pricing: model_catalog::pricing_for(&model.id, &model.metadata),
-                visibility: bcode_model::ModelVisibility::Visible,
-            }
+        .map(|model| ModelInfo {
+            is_default: selected_default.as_deref() == Some(model.id.as_str()),
+            model_id: model.id.clone(),
+            display_name: model.id.clone(),
+            context_window: provider_api_context_window(&model.metadata),
+            max_output_tokens: provider_api_max_output_tokens(&model.metadata),
+            capabilities: model_capabilities_for(&model),
+            reasoning: reasoning_info_for_model(&model, default_reasoning_request_shape()),
+            cache: openai_model_cache_info(),
+            metadata_source: provider_api_context_window(&model.metadata)
+                .map(|_| ModelMetadataSource::ProviderApi),
+            pricing: pricing_from_provider_api(&model.metadata),
+            visibility: bcode_model::ModelVisibility::Visible,
         })
         .collect::<Vec<_>>();
 
@@ -3090,6 +3088,97 @@ fn model_infos_from_items(
     } else {
         discovered
     }
+}
+
+fn pricing_from_provider_api(
+    metadata: &BTreeMap<String, serde_json::Value>,
+) -> Option<ModelPricingInfo> {
+    let input = first_u64(metadata, &["input_price_micros", "inputPriceMicros"])
+        .map(ModelTokenPrice::from_micros);
+    let output = first_u64(metadata, &["output_price_micros", "outputPriceMicros"])
+        .map(ModelTokenPrice::from_micros);
+    if input.is_none() && output.is_none() {
+        return None;
+    }
+    Some(ModelPricingInfo {
+        currency: metadata
+            .get("currency")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("USD")
+            .to_string(),
+        unit: ModelPricingUnit::PerMillionTokens,
+        input,
+        cached_input: first_u64(
+            metadata,
+            &["cached_input_price_micros", "cachedInputPriceMicros"],
+        )
+        .map(ModelTokenPrice::from_micros),
+        cache_write_input: first_u64(
+            metadata,
+            &[
+                "cache_write_input_price_micros",
+                "cacheWriteInputPriceMicros",
+            ],
+        )
+        .map(ModelTokenPrice::from_micros),
+        output,
+        source: ModelPricingSource::ProviderApi,
+    })
+}
+
+fn provider_api_context_window(metadata: &BTreeMap<String, serde_json::Value>) -> Option<u32> {
+    first_u32(
+        metadata,
+        &[
+            "context_window",
+            "contextWindow",
+            "max_context_length",
+            "maxContextLength",
+            "max_input_tokens",
+            "maxInputTokens",
+        ],
+    )
+}
+
+fn provider_api_max_output_tokens(metadata: &BTreeMap<String, serde_json::Value>) -> Option<u32> {
+    first_u32(
+        metadata,
+        &[
+            "max_output_tokens",
+            "maxOutputTokens",
+            "max_completion_tokens",
+            "maxCompletionTokens",
+            "max_tokens",
+            "maxTokens",
+        ],
+    )
+}
+
+fn first_u32(metadata: &BTreeMap<String, serde_json::Value>, keys: &[&str]) -> Option<u32> {
+    keys.iter()
+        .filter_map(|key| metadata.get(*key))
+        .find_map(value_to_u32)
+        .filter(|value| *value > 0)
+}
+
+fn first_u64(metadata: &BTreeMap<String, serde_json::Value>, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .filter_map(|key| metadata.get(*key))
+        .find_map(value_to_u64)
+        .filter(|value| *value > 0)
+}
+
+fn value_to_u64(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|value| value.parse::<u64>().ok()))
+}
+
+fn value_to_u32(value: &serde_json::Value) -> Option<u32> {
+    value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .or_else(|| value.as_str().and_then(|value| value.parse::<u32>().ok()))
 }
 
 fn openai_model_cache_info() -> bcode_model::ModelCacheInfo {

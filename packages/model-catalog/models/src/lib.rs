@@ -49,9 +49,29 @@ pub struct ProviderCatalog {
     /// Provider homepage or documentation URL.
     #[serde(default)]
     pub website_url: Option<String>,
+    /// Provider defaults used for discovered models without exact catalog metadata.
+    #[serde(default)]
+    pub defaults: Option<ModelCatalogDefaults>,
     /// Models keyed by provider-native model id.
     #[serde(default)]
     pub models: BTreeMap<String, ModelCatalogEntry>,
+}
+
+/// Default metadata for provider-discovered models without exact catalog entries.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCatalogDefaults {
+    /// Default context window in tokens.
+    #[serde(default)]
+    pub context_window: Option<u32>,
+    /// Default maximum output tokens.
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    /// Default capability metadata.
+    #[serde(default)]
+    pub capabilities: CatalogCapabilities,
+    /// Default reasoning-specific metadata.
+    #[serde(default)]
+    pub reasoning: Option<CatalogReasoning>,
 }
 
 /// Provider integration/API kind.

@@ -3,6 +3,16 @@ display_name = "Amazon Bedrock"
 kind = "bedrock"
 website_url = "https://aws.amazon.com/bedrock/"
 
+[defaults]
+context_window = 128000
+max_output_tokens = 16384
+
+[defaults.capabilities]
+text_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+
 [models."anthropic.claude-3-5-sonnet-20241022-v2:0"]
 model_id = "anthropic.claude-3-5-sonnet-20241022-v2:0"
 display_name = "Claude 3.5 Sonnet v2"

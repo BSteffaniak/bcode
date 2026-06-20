@@ -3,6 +3,17 @@ display_name = "OpenAI"
 kind = "open_ai_compatible"
 website_url = "https://openai.com"
 
+[defaults]
+context_window = 128000
+max_output_tokens = 16384
+
+[defaults.capabilities]
+text_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+prompt_cache = true
+
 [models."gpt-5"]
 model_id = "gpt-5"
 display_name = "GPT-5"

@@ -11,7 +11,7 @@ use bcode_model::{
 };
 use bcode_model_catalog_models::{
     BcodeSupportStatus, CatalogCapabilities, CatalogDocument, CatalogModelStatus, CatalogPricing,
-    ModelCatalogEntry, ProviderCatalog,
+    ModelCatalogDefaults, ModelCatalogEntry, ProviderCatalog,
 };
 use serde_json::json;
 use std::fmt::{Display, Formatter};
@@ -116,6 +116,22 @@ impl ModelCatalog {
         }
     }
 
+    /// Enrich a provider-discovered model with catalog metadata and provider defaults.
+    #[must_use]
+    pub fn enrich_model_with_defaults(&self, provider_id: &str, model: ModelInfo) -> ModelInfo {
+        if let Some(entry) = self.model(provider_id, &model.model_id) {
+            return enrich_from_entry(model, entry);
+        }
+        if let Some(defaults) = self
+            .provider(provider_id)
+            .and_then(|provider| provider.defaults.as_ref())
+        {
+            enrich_from_defaults(model, defaults)
+        } else {
+            model
+        }
+    }
+
     /// Convert all catalog entries for a provider into `ModelInfo` values.
     #[must_use]
     pub fn provider_models_as_model_info(&self, provider_id: &str) -> Vec<ModelInfo> {
@@ -141,7 +157,7 @@ impl ModelCatalog {
         let mut result = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         for model in discovered {
-            let model = self.enrich_model(provider_id, model);
+            let model = self.enrich_model_with_defaults(provider_id, model);
             seen.insert(model.model_id.clone());
             result.push(model);
         }
@@ -188,24 +204,51 @@ fn find_provider_model<'a>(
     })
 }
 
+fn enrich_from_defaults(mut model: ModelInfo, defaults: &ModelCatalogDefaults) -> ModelInfo {
+    if model.context_window.is_none() && defaults.context_window.is_some() {
+        model.context_window = defaults.context_window;
+        model.metadata_source = Some(ModelMetadataSource::ProviderDefault);
+    }
+    if model.max_output_tokens.is_none() && defaults.max_output_tokens.is_some() {
+        model.max_output_tokens = defaults.max_output_tokens;
+        model.metadata_source = Some(ModelMetadataSource::ProviderDefault);
+    }
+    model
+        .capabilities
+        .extend(capabilities_from_catalog(&defaults.capabilities));
+    if model.cache.capabilities.is_empty() {
+        model.cache = cache_info_from_catalog(&defaults.capabilities);
+    }
+    if model.reasoning.is_none() {
+        model.reasoning = reasoning_from_catalog_parts(defaults.reasoning.as_ref());
+    }
+    model
+}
+
 fn enrich_from_entry(mut model: ModelInfo, entry: &ModelCatalogEntry) -> ModelInfo {
     model.display_name.clone_from(&entry.display_name);
-    if entry.context_window.is_some() {
+    if model.context_window.is_none() && entry.context_window.is_some() {
         model.context_window = entry.context_window;
         model.metadata_source = Some(ModelMetadataSource::BundledCatalog);
     }
-    if entry.max_output_tokens.is_some() {
+    if model.max_output_tokens.is_none() && entry.max_output_tokens.is_some() {
         model.max_output_tokens = entry.max_output_tokens;
         model.metadata_source = Some(ModelMetadataSource::BundledCatalog);
     }
     model
         .capabilities
         .extend(capabilities_from_catalog(&entry.capabilities));
-    model.cache = cache_info_from_catalog(&entry.capabilities);
-    if let Some(pricing) = pricing_from_catalog(entry.pricing.as_ref()) {
+    if model.cache.capabilities.is_empty() {
+        model.cache = cache_info_from_catalog(&entry.capabilities);
+    }
+    if model.pricing.is_none()
+        && let Some(pricing) = pricing_from_catalog(entry.pricing.as_ref())
+    {
         model.pricing = Some(pricing);
     }
-    if let Some(reasoning) = reasoning_from_catalog(entry) {
+    if model.reasoning.is_none()
+        && let Some(reasoning) = reasoning_from_catalog(entry)
+    {
         model.reasoning = Some(reasoning);
     }
     if entry.status == CatalogModelStatus::Deprecated {
@@ -292,7 +335,13 @@ fn pricing_from_catalog(pricing: Option<&CatalogPricing>) -> Option<ModelPricing
 }
 
 fn reasoning_from_catalog(entry: &ModelCatalogEntry) -> Option<ModelReasoningInfo> {
-    let reasoning = entry.reasoning.as_ref()?;
+    reasoning_from_catalog_parts(entry.reasoning.as_ref())
+}
+
+fn reasoning_from_catalog_parts(
+    reasoning: Option<&bcode_model_catalog_models::CatalogReasoning>,
+) -> Option<ModelReasoningInfo> {
+    let reasoning = reasoning?;
     Some(ModelReasoningInfo {
         effort_values: reasoning.effort_values.iter().cloned().collect(),
         default_effort: reasoning.default_effort.clone(),

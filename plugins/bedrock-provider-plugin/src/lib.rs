@@ -4,8 +4,6 @@
 
 //! Amazon Bedrock model provider plugin for Bcode.
 
-mod model_catalog;
-
 use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
 use aws_sdk_bedrock as bedrock;
@@ -24,8 +22,8 @@ use base64::Engine as _;
 use bcode_model::{
     AckResponse, CancelTurnRequest, ContentBlock, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID,
     MessageRole, ModelCapability, ModelInfo, ModelList, ModelListRequest, ModelMessage,
-    ModelMetadataSource, ModelTurnRequest, OP_CANCEL_TURN, OP_CAPABILITIES, OP_FINISH_TURN,
-    OP_MODELS, OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG, PollTurnEventsRequest,
+    ModelTurnRequest, OP_CANCEL_TURN, OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS,
+    OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG, PollTurnEventsRequest,
     PollTurnEventsResponse, ProviderCapabilities, ProviderCapability, ProviderError,
     ProviderErrorCategory, ProviderRequestContext, ProviderRequestProjection, ProviderTurnEvent,
     StartTurnResponse, StopReason, TokenUsage, ToolCall, ToolDefinition, ValidateConfigResponse,
@@ -1265,27 +1263,24 @@ fn ensure_selected_model_info(
 fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Vec<ModelInfo> {
     let models = model_ids
         .iter()
-        .map(|model_id| {
-            let metadata = model_catalog::metadata_for(model_id);
-            ModelInfo {
-                model_id: model_id.clone(),
-                display_name: model_id.clone(),
-                is_default: default_model == Some(model_id.as_str()),
-                context_window: Some(metadata.context_window),
-                max_output_tokens: Some(metadata.max_output_tokens),
-                capabilities: [
-                    ModelCapability::StreamingText,
-                    ModelCapability::ToolCalls,
-                    ModelCapability::PromptCaching,
-                ]
-                .into_iter()
-                .collect(),
-                reasoning: None,
-                cache: bedrock_model_cache_info(),
-                metadata_source: Some(ModelMetadataSource::BundledCatalog),
-                pricing: None,
-                visibility: bcode_model::ModelVisibility::Visible,
-            }
+        .map(|model_id| ModelInfo {
+            model_id: model_id.clone(),
+            display_name: model_id.clone(),
+            is_default: default_model == Some(model_id.as_str()),
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: [
+                ModelCapability::StreamingText,
+                ModelCapability::ToolCalls,
+                ModelCapability::PromptCaching,
+            ]
+            .into_iter()
+            .collect(),
+            reasoning: None,
+            cache: bedrock_model_cache_info(),
+            metadata_source: None,
+            pricing: None,
+            visibility: bcode_model::ModelVisibility::Visible,
         })
         .collect::<Vec<_>>();
 
@@ -1878,27 +1873,24 @@ async fn discover_models(settings: &Settings) -> Result<ModelDiscovery, Provider
         .map(|candidate| candidate.model_id.clone());
     let models: Vec<ModelInfo> = candidates
         .into_iter()
-        .map(|candidate| {
-            let metadata = model_catalog::metadata_for(&candidate.model_id);
-            ModelInfo {
-                is_default: default_model_id.as_deref() == Some(candidate.model_id.as_str()),
-                model_id: candidate.model_id,
-                display_name: candidate.display_name,
-                context_window: Some(metadata.context_window),
-                max_output_tokens: Some(metadata.max_output_tokens),
-                capabilities: [
-                    ModelCapability::StreamingText,
-                    ModelCapability::ToolCalls,
-                    ModelCapability::PromptCaching,
-                ]
-                .into_iter()
-                .collect(),
-                reasoning: None,
-                cache: bedrock_model_cache_info(),
-                metadata_source: Some(ModelMetadataSource::BundledCatalog),
-                pricing: None,
-                visibility: bcode_model::ModelVisibility::Visible,
-            }
+        .map(|candidate| ModelInfo {
+            is_default: default_model_id.as_deref() == Some(candidate.model_id.as_str()),
+            model_id: candidate.model_id,
+            display_name: candidate.display_name,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: [
+                ModelCapability::StreamingText,
+                ModelCapability::ToolCalls,
+                ModelCapability::PromptCaching,
+            ]
+            .into_iter()
+            .collect(),
+            reasoning: None,
+            cache: bedrock_model_cache_info(),
+            metadata_source: None,
+            pricing: None,
+            visibility: bcode_model::ModelVisibility::Visible,
         })
         .collect();
     let models = if let Ok(catalog) = bcode_model_catalog::ModelCatalog::load_bundled() {
