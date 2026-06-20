@@ -3065,7 +3065,7 @@ fn model_infos_from_items(
     let selected_default = default_model
         .map(ToString::to_string)
         .or_else(|| models.first().map(|model| model.id.clone()));
-    models
+    let discovered = models
         .into_iter()
         .map(|model| {
             let metadata = model_catalog::resolve(&model.id, &model.metadata);
@@ -3083,7 +3083,13 @@ fn model_infos_from_items(
                 visibility: bcode_model::ModelVisibility::Visible,
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    if let Ok(catalog) = bcode_model_catalog::ModelCatalog::load_bundled() {
+        catalog.merge_provider_models("openai", discovered, true)
+    } else {
+        discovered
+    }
 }
 
 fn openai_model_cache_info() -> bcode_model::ModelCacheInfo {

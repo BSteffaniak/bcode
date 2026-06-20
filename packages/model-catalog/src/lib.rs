@@ -4,7 +4,15 @@
 
 //! Model catalog loading, validation, and static artifact generation.
 
-use bcode_model_catalog_models::{CatalogDocument, ProviderCatalog};
+use bcode_model::{
+    ModelCacheCapability, ModelCacheInfo, ModelCapability, ModelInfo, ModelMetadataSource,
+    ModelPricingInfo, ModelPricingSource, ModelPricingUnit, ModelReasoningCapabilitySource,
+    ModelReasoningInfo, ModelTokenPrice,
+};
+use bcode_model_catalog_models::{
+    BcodeSupportStatus, CatalogCapabilities, CatalogDocument, CatalogModelStatus, CatalogPricing,
+    ModelCatalogEntry, ProviderCatalog,
+};
 use serde_json::json;
 use std::fmt::{Display, Formatter};
 use std::fs;
@@ -57,7 +65,229 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-/// Output format for generated artifacts.
+/// Runtime wrapper around a model catalog document.
+#[derive(Debug, Clone)]
+pub struct ModelCatalog {
+    document: CatalogDocument,
+}
+
+impl ModelCatalog {
+    /// Create a catalog wrapper from a loaded document.
+    #[must_use]
+    pub const fn new(document: CatalogDocument) -> Self {
+        Self { document }
+    }
+
+    /// Access the underlying catalog document.
+    #[must_use]
+    pub const fn document(&self) -> &CatalogDocument {
+        &self.document
+    }
+
+    /// Load the checked-in bundled catalog source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if catalog source loading or validation fails.
+    pub fn load_bundled() -> Result<Self> {
+        load_catalog(&default_source_dir()).map(Self::new)
+    }
+
+    /// Get provider catalog data.
+    #[must_use]
+    pub fn provider(&self, provider_id: &str) -> Option<&ProviderCatalog> {
+        self.document.providers.get(provider_id)
+    }
+
+    /// Get a model catalog entry by exact id or alias.
+    #[must_use]
+    pub fn model(&self, provider_id: &str, model_id: &str) -> Option<&ModelCatalogEntry> {
+        self.provider(provider_id)
+            .and_then(|provider| find_provider_model(provider, model_id))
+    }
+
+    /// Enrich a provider-discovered model with catalog metadata.
+    #[must_use]
+    pub fn enrich_model(&self, provider_id: &str, model: ModelInfo) -> ModelInfo {
+        if let Some(entry) = self.model(provider_id, &model.model_id) {
+            enrich_from_entry(model, entry)
+        } else {
+            model
+        }
+    }
+
+    /// Convert all catalog entries for a provider into `ModelInfo` values.
+    #[must_use]
+    pub fn provider_models_as_model_info(&self, provider_id: &str) -> Vec<ModelInfo> {
+        self.provider(provider_id)
+            .map(|provider| {
+                provider
+                    .models
+                    .values()
+                    .map(model_info_from_catalog_entry)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Merge discovered provider models with catalog-only models.
+    #[must_use]
+    pub fn merge_provider_models(
+        &self,
+        provider_id: &str,
+        discovered: Vec<ModelInfo>,
+        include_catalog_only: bool,
+    ) -> Vec<ModelInfo> {
+        let mut models = discovered
+            .into_iter()
+            .map(|model| {
+                let model = self.enrich_model(provider_id, model);
+                (model.model_id.clone(), model)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        if include_catalog_only {
+            for model in self.provider_models_as_model_info(provider_id) {
+                models.entry(model.model_id.clone()).or_insert(model);
+            }
+        }
+
+        models.into_values().collect()
+    }
+}
+
+fn find_provider_model<'a>(
+    provider: &'a ProviderCatalog,
+    model_id: &str,
+) -> Option<&'a ModelCatalogEntry> {
+    provider.models.get(model_id).or_else(|| {
+        provider.models.values().find(|entry| {
+            entry.aliases.contains(model_id)
+                || entry.aliases.iter().any(|alias| {
+                    alias
+                        .strip_suffix('*')
+                        .is_some_and(|prefix| model_id.starts_with(prefix))
+                })
+        })
+    })
+}
+
+fn enrich_from_entry(mut model: ModelInfo, entry: &ModelCatalogEntry) -> ModelInfo {
+    model.display_name.clone_from(&entry.display_name);
+    if entry.context_window.is_some() {
+        model.context_window = entry.context_window;
+        model.metadata_source = Some(ModelMetadataSource::BundledCatalog);
+    }
+    if entry.max_output_tokens.is_some() {
+        model.max_output_tokens = entry.max_output_tokens;
+        model.metadata_source = Some(ModelMetadataSource::BundledCatalog);
+    }
+    model
+        .capabilities
+        .extend(capabilities_from_catalog(&entry.capabilities));
+    model.cache = cache_info_from_catalog(&entry.capabilities);
+    if let Some(pricing) = pricing_from_catalog(entry.pricing.as_ref()) {
+        model.pricing = Some(pricing);
+    }
+    if let Some(reasoning) = reasoning_from_catalog(entry) {
+        model.reasoning = Some(reasoning);
+    }
+    if entry.status == CatalogModelStatus::Deprecated {
+        model.visibility = bcode_model::ModelVisibility::Unsupported {
+            reason: "model is deprecated in catalog".to_string(),
+        };
+    }
+    if entry.bcode_support == BcodeSupportStatus::Unsupported {
+        model.visibility = bcode_model::ModelVisibility::Unsupported {
+            reason: "model is marked unsupported by Bcode catalog".to_string(),
+        };
+    }
+    model
+}
+
+fn model_info_from_catalog_entry(entry: &ModelCatalogEntry) -> ModelInfo {
+    let mut model = ModelInfo {
+        model_id: entry.model_id.clone(),
+        display_name: entry.display_name.clone(),
+        is_default: false,
+        context_window: entry.context_window,
+        max_output_tokens: entry.max_output_tokens,
+        capabilities: capabilities_from_catalog(&entry.capabilities),
+        reasoning: reasoning_from_catalog(entry),
+        cache: cache_info_from_catalog(&entry.capabilities),
+        metadata_source: Some(ModelMetadataSource::BundledCatalog),
+        pricing: pricing_from_catalog(entry.pricing.as_ref()),
+        visibility: bcode_model::ModelVisibility::Visible,
+    };
+    if entry.bcode_support == BcodeSupportStatus::Unsupported {
+        model.visibility = bcode_model::ModelVisibility::Unsupported {
+            reason: "model is marked unsupported by Bcode catalog".to_string(),
+        };
+    }
+    model
+}
+
+fn capabilities_from_catalog(
+    capabilities: &CatalogCapabilities,
+) -> std::collections::BTreeSet<ModelCapability> {
+    let mut result = std::collections::BTreeSet::new();
+    if capabilities.text_output {
+        result.insert(ModelCapability::StreamingText);
+    }
+    if capabilities.tool_use {
+        result.insert(ModelCapability::ToolCalls);
+    }
+    if capabilities.prompt_cache {
+        result.insert(ModelCapability::PromptCaching);
+    }
+    if capabilities.reasoning {
+        result.insert(ModelCapability::Reasoning);
+    }
+    result
+}
+
+fn cache_info_from_catalog(capabilities: &CatalogCapabilities) -> ModelCacheInfo {
+    let mut cache = ModelCacheInfo::default();
+    if capabilities.prompt_cache {
+        cache.capabilities.extend([
+            ModelCacheCapability::PromptCacheKey,
+            ModelCacheCapability::AutomaticPrefixCache,
+            ModelCacheCapability::CacheUsageReporting,
+        ]);
+    }
+    cache
+}
+
+fn pricing_from_catalog(pricing: Option<&CatalogPricing>) -> Option<ModelPricingInfo> {
+    let pricing = pricing?;
+    Some(ModelPricingInfo {
+        currency: pricing.currency.clone(),
+        unit: ModelPricingUnit::PerMillionTokens,
+        input: pricing.input_micros.map(ModelTokenPrice::from_micros),
+        cached_input: pricing
+            .cached_input_micros
+            .map(ModelTokenPrice::from_micros),
+        cache_write_input: pricing
+            .cache_write_input_micros
+            .map(ModelTokenPrice::from_micros),
+        output: pricing.output_micros.map(ModelTokenPrice::from_micros),
+        source: ModelPricingSource::BundledCatalog,
+    })
+}
+
+fn reasoning_from_catalog(entry: &ModelCatalogEntry) -> Option<ModelReasoningInfo> {
+    let reasoning = entry.reasoning.as_ref()?;
+    Some(ModelReasoningInfo {
+        effort_values: reasoning.effort_values.iter().cloned().collect(),
+        default_effort: reasoning.default_effort.clone(),
+        visible_summary_supported: !reasoning.summary_values.is_empty(),
+        summary_values: reasoning.summary_values.iter().cloned().collect(),
+        default_summary: reasoning.summary_values.iter().next().cloned(),
+        raw_reasoning_supported: false,
+        source: ModelReasoningCapabilitySource::KnownModelTable,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
     /// Compact JSON.
@@ -207,5 +437,71 @@ fn generated_at() -> String {
 /// Default source directory for checked-in catalog TOML files.
 #[must_use]
 pub fn default_source_dir() -> PathBuf {
-    PathBuf::from("catalog/models")
+    let cwd_relative = PathBuf::from("catalog/models");
+    if cwd_relative.exists() {
+        return cwd_relative;
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("catalog/models")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bcode_model::{ModelCacheInfo, ModelCapability, ModelVisibility};
+
+    #[test]
+    fn catalog_enriches_exact_model_metadata_and_pricing() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let model = ModelInfo {
+            model_id: "gpt-4o".to_string(),
+            display_name: "gpt-4o".to_string(),
+            is_default: false,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: std::collections::BTreeSet::default(),
+            reasoning: None,
+            cache: ModelCacheInfo::default(),
+            metadata_source: None,
+            pricing: None,
+            visibility: ModelVisibility::Visible,
+        };
+
+        let enriched = catalog.enrich_model("openai", model);
+
+        assert_eq!(enriched.display_name, "GPT-4o");
+        assert_eq!(enriched.context_window, Some(128_000));
+        assert_eq!(enriched.max_output_tokens, Some(16_384));
+        assert_eq!(
+            enriched.metadata_source,
+            Some(ModelMetadataSource::BundledCatalog)
+        );
+        assert_eq!(
+            enriched
+                .pricing
+                .and_then(|pricing| pricing.input)
+                .map(|price| price.micros),
+            Some(2_500_000)
+        );
+        assert!(enriched.capabilities.contains(&ModelCapability::ToolCalls));
+    }
+
+    #[test]
+    fn catalog_alias_prefixes_match_model_variants() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let entry = catalog
+            .model("openai", "gpt-4o-2024-08-06")
+            .expect("alias should resolve");
+
+        assert_eq!(entry.model_id, "gpt-4o");
+    }
+
+    #[test]
+    fn merge_can_include_catalog_only_models() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let merged = catalog.merge_provider_models("openai", Vec::new(), true);
+
+        assert!(merged.iter().any(|model| model.model_id == "gpt-4o"));
+    }
 }

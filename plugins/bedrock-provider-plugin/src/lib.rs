@@ -1263,7 +1263,7 @@ fn ensure_selected_model_info(
 }
 
 fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Vec<ModelInfo> {
-    model_ids
+    let models = model_ids
         .iter()
         .map(|model_id| {
             let metadata = model_catalog::metadata_for(model_id);
@@ -1287,7 +1287,13 @@ fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Ve
                 visibility: bcode_model::ModelVisibility::Visible,
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    if let Ok(catalog) = bcode_model_catalog::ModelCatalog::load_bundled() {
+        catalog.merge_provider_models("bedrock", models, false)
+    } else {
+        models
+    }
 }
 
 fn bedrock_model_cache_info() -> bcode_model::ModelCacheInfo {
@@ -1870,7 +1876,7 @@ async fn discover_models(settings: &Settings) -> Result<ModelDiscovery, Provider
     let default_model_id = candidates
         .first()
         .map(|candidate| candidate.model_id.clone());
-    let models = candidates
+    let models: Vec<ModelInfo> = candidates
         .into_iter()
         .map(|candidate| {
             let metadata = model_catalog::metadata_for(&candidate.model_id);
@@ -1895,6 +1901,11 @@ async fn discover_models(settings: &Settings) -> Result<ModelDiscovery, Provider
             }
         })
         .collect();
+    let models = if let Ok(catalog) = bcode_model_catalog::ModelCatalog::load_bundled() {
+        catalog.merge_provider_models("bedrock", models, false)
+    } else {
+        models
+    };
     Ok(ModelDiscovery {
         models,
         default_model_id,

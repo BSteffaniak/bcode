@@ -1277,6 +1277,7 @@ dependencies = [
  "base64 0.22.1",
  "bcode_config",
  "bcode_model",
+ "bcode_model_catalog",
  "bcode_model_provider_runtime",
  "bcode_plugin_sdk",
  "serde",
@@ -1563,6 +1564,7 @@ dependencies = [
 name = "bcode_model_catalog"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_model",
  "bcode_model_catalog_models",
  "clap",
  "serde",
@@ -1617,6 +1619,7 @@ dependencies = [
  "base64 0.22.1",
  "bcode_config",
  "bcode_model",
+ "bcode_model_catalog",
  "bcode_model_provider_runtime",
  "bcode_plugin_sdk",
  "bcode_provider_auth",

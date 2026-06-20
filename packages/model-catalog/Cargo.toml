@@ -11,15 +11,13 @@ readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 
-[lib]
-test = false
-
 [[bin]]
 name = "bcode-model-catalog"
 path = "src/main.rs"
 test = false
 
 [dependencies]
+bcode_model                = { workspace = true }
 bcode_model_catalog_models = { workspace = true }
 clap                       = { workspace = true, features = ["derive", "std"] }
 serde                      = { workspace = true, features = ["derive"] }

@@ -79,7 +79,7 @@ pub struct ModelCatalogEntry {
     pub model_id: String,
     /// Human-readable model name.
     pub display_name: String,
-    /// Alternative ids or route aliases.
+    /// Supported aliases; exact model ids or glob-like patterns ending in `*`.
     #[serde(default)]
     pub aliases: BTreeSet<String>,
     /// Provider/public availability status.
@@ -93,6 +93,21 @@ pub struct ModelCatalogEntry {
     /// Maximum output tokens.
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    /// Provider-specific model family name.
+    #[serde(default)]
+    pub family: Option<String>,
+    /// Provider-specific model kind/classification.
+    #[serde(default)]
+    pub provider_model_kind: Option<String>,
+    /// Replacement model id, when this model is deprecated.
+    #[serde(default)]
+    pub replaced_by: Option<String>,
+    /// Human notes for this model.
+    #[serde(default)]
+    pub notes: Option<String>,
+    /// Public documentation URL for this model.
+    #[serde(default)]
+    pub documentation_url: Option<String>,
     /// Pricing metadata.
     #[serde(default)]
     pub pricing: Option<CatalogPricing>,
