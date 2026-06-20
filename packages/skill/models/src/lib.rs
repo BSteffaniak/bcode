@@ -123,6 +123,8 @@ pub struct SkillSummary {
     pub activation: SkillActivation,
     #[serde(default)]
     pub diagnostics: Vec<SkillDiagnostic>,
+    #[serde(default)]
+    pub disable_model_invocation: bool,
 }
 
 /// Full validated skill manifest plus markdown instructions.

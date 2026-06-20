@@ -47,7 +47,10 @@ use bcode_session_models::{
     ToolInvocationStreamEvent, ToolOutputStream as SessionToolOutputStream, TraceBlobRef,
     TraceRedaction,
 };
-use bcode_skill::{SkillRegistry, SkillRegistryOptions, SkillSourceRoot};
+use bcode_skill::{
+    SkillPromptCatalogMode, SkillPromptCatalogOptions, SkillRegistry, SkillRegistryOptions,
+    SkillSourceRoot, format_skill_catalog_for_prompt,
+};
 use bcode_skill_models::{
     SkillActivationMode, SkillContextResponse, SkillId, SkillList, SkillSource, SkillSourceKind,
 };
@@ -136,8 +139,10 @@ pub struct ServerState {
     tool_output_context_chars: usize,
     model_streaming: bcode_config::StreamingConfig,
     auto_compaction: bcode_config::CompactionConfig,
+    system_prompt: bcode_config::SystemPromptConfig,
     skills: Option<SkillRegistry>,
     skill_context_bytes: usize,
+    skill_prompt_options: SkillPromptCatalogOptions,
     active_skills: Mutex<BTreeMap<SessionId, BTreeSet<SkillId>>>,
     turn_skills: Mutex<BTreeMap<(SessionId, u64), SkillTurnInvocation>>,
     session_runtimes: Mutex<BTreeMap<SessionId, SessionRuntimeHandle>>,
@@ -777,8 +782,10 @@ struct ServerStateInit {
     tool_output_context_chars: usize,
     model_streaming: bcode_config::StreamingConfig,
     auto_compaction: bcode_config::CompactionConfig,
+    system_prompt: bcode_config::SystemPromptConfig,
     skills: Option<SkillRegistry>,
     skill_context_bytes: usize,
+    skill_prompt_options: SkillPromptCatalogOptions,
     daemon_status: DaemonStatus,
     daemon_record_path: Option<PathBuf>,
     metrics: MetricsRegistry,
@@ -810,8 +817,10 @@ impl ServerState {
             tool_output_context_chars: init.tool_output_context_chars,
             model_streaming: init.model_streaming,
             auto_compaction: init.auto_compaction,
+            system_prompt: init.system_prompt,
             skills: init.skills,
             skill_context_bytes: init.skill_context_bytes,
+            skill_prompt_options: init.skill_prompt_options,
             active_skills: Mutex::default(),
             turn_skills: Mutex::default(),
             session_runtimes: Mutex::default(),
@@ -1639,7 +1648,9 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
             tool_output_context_chars: config.model.tool_output.context_chars,
             model_streaming: config.model.streaming,
             auto_compaction: config.model.compaction,
+            system_prompt: config.system_prompt,
             skill_context_bytes: config.skills.max_context_bytes,
+            skill_prompt_options: skill_prompt_options_from_config(&config.skills.prompt),
             skills,
             daemon_status,
             daemon_record_path: Some(bcode_daemon_lifecycle::record_path(
@@ -10388,11 +10399,20 @@ async fn build_model_turn_request(
         working_directory_timer.elapsed_ms(),
     );
     let system_prompt_timer = state.metrics.timer();
+    let skill_catalog = if state.system_prompt.sections.skill_catalog {
+        state.skills.as_ref().map_or_else(String::new, |registry| {
+            format_skill_catalog_for_prompt(&registry.list(), &state.skill_prompt_options)
+        })
+    } else {
+        String::new()
+    };
     let (system_prompt, dynamic_system_context) = build_coding_system_prompt_parts(
         &working_directory,
+        &state.system_prompt,
         agent_context
             .as_ref()
             .and_then(|context| context.system_prompt_suffix.as_deref()),
+        Some(&skill_catalog),
     );
     state.metrics.record_histogram(
         "model.request_build.system_prompt_duration_ms",
@@ -10436,6 +10456,7 @@ async fn build_model_turn_request(
         skill_contexts.len() as u64,
     );
     for skill_context in skill_contexts {
+        let preview = skill_context_preview(&skill_context.context);
         messages.insert(
             system_prefix_len,
             ModelMessage {
@@ -10455,6 +10476,8 @@ async fn build_model_turn_request(
                     bytes_loaded: skill_context.bytes_loaded,
                     truncated: skill_context.truncated,
                     loaded_at_ms: current_time_ms(),
+                    preview: Some(preview),
+                    source: Some(skill_context.source),
                 },
             )
             .await;
@@ -11067,24 +11090,42 @@ const MAX_GIT_STATUS_CHARS: usize = 4_000;
 
 fn build_coding_system_prompt_parts(
     cwd: &Path,
+    config: &bcode_config::SystemPromptConfig,
     agent_prompt_suffix: Option<&str>,
+    skill_catalog: Option<&str>,
 ) -> (String, String) {
     let (stable_context, dynamic_context) = build_repository_context_parts(cwd);
-    let mut stable = format!(
-        "{DEFAULT_CODING_SYSTEM_PROMPT}\n\n{}",
-        truncate_text(&stable_context, MAX_REPOSITORY_CONTEXT_CHARS)
-    );
-    if let Some(suffix) = agent_prompt_suffix
+    let mut stable = match config.mode {
+        bcode_config::SystemPromptMode::Default => DEFAULT_CODING_SYSTEM_PROMPT.to_string(),
+        bcode_config::SystemPromptMode::Replace => config.text.clone().unwrap_or_default(),
+    };
+    if config.sections.repository_context {
+        stable.push_str("\n\n");
+        stable.push_str(&truncate_text(
+            &stable_context,
+            MAX_REPOSITORY_CONTEXT_CHARS,
+        ));
+    }
+    if config.sections.agent_suffix
+        && let Some(suffix) = agent_prompt_suffix
         && !suffix.trim().is_empty()
     {
         stable.push_str("\n\nAgent-specific instructions:\n");
         stable.push_str(suffix.trim());
     }
 
-    (
-        stable,
-        truncate_text(&dynamic_context, MAX_REPOSITORY_CONTEXT_CHARS),
-    )
+    let mut dynamic = if config.sections.dynamic_repository_context {
+        truncate_text(&dynamic_context, MAX_REPOSITORY_CONTEXT_CHARS)
+    } else {
+        String::new()
+    };
+    if let Some(skill_catalog) = skill_catalog
+        && !skill_catalog.trim().is_empty()
+    {
+        dynamic.push_str(skill_catalog);
+    }
+
+    (stable, dynamic)
 }
 
 fn build_repository_context_parts(cwd: &Path) -> (String, String) {
@@ -13514,6 +13555,22 @@ fn build_skill_registry(config: &bcode_config::BcodeConfig) -> Option<SkillRegis
     }
 }
 
+const fn skill_prompt_options_from_config(
+    config: &bcode_config::SkillPromptConfig,
+) -> SkillPromptCatalogOptions {
+    SkillPromptCatalogOptions {
+        mode: match config.catalog {
+            bcode_config::SkillPromptCatalogMode::Off => SkillPromptCatalogMode::Off,
+            bcode_config::SkillPromptCatalogMode::NamesOnly => SkillPromptCatalogMode::NamesOnly,
+            bcode_config::SkillPromptCatalogMode::Summary => SkillPromptCatalogMode::Summary,
+        },
+        max_bytes: config.max_bytes,
+        max_description_chars: config.max_description_chars,
+        include_sources: config.include_sources,
+        include_keywords: config.include_keywords,
+    }
+}
+
 fn rebuild_active_skills_from_history(
     events: &[bcode_session_models::SessionEvent],
 ) -> BTreeSet<SkillId> {
@@ -13596,6 +13653,12 @@ async fn suggest_skills_for_prompt(
             publish_session_event(state, &event).await;
         }
     }
+}
+
+const MAX_SKILL_CONTEXT_PREVIEW_CHARS: usize = 2_000;
+
+fn skill_context_preview(context: &str) -> String {
+    truncate_text(context, MAX_SKILL_CONTEXT_PREVIEW_CHARS)
 }
 
 async fn turn_skill_contexts(
@@ -15239,7 +15302,12 @@ mod tests {
     #[test]
     fn coding_system_prompt_splits_stable_and_dynamic_context() {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let (stable, dynamic) = build_coding_system_prompt_parts(&cwd, Some("agent suffix"));
+        let (stable, dynamic) = build_coding_system_prompt_parts(
+            &cwd,
+            &bcode_config::SystemPromptConfig::default(),
+            Some("agent suffix"),
+            Some("<skills />"),
+        );
 
         assert!(stable.contains(DEFAULT_CODING_SYSTEM_PROMPT));
         assert!(stable.contains("Stable repository context:"));
@@ -15324,6 +15392,8 @@ mod tests {
                 auto_compaction: bcode_config::CompactionConfig::default(),
                 skills: None,
                 skill_context_bytes: 0,
+                skill_prompt_options: SkillPromptCatalogOptions::default(),
+                system_prompt: bcode_config::SystemPromptConfig::default(),
                 daemon_status: DaemonStatus::default(),
                 daemon_record_path: None,
                 metrics: MetricsRegistry::default(),
@@ -15640,6 +15710,8 @@ mod tests {
                 auto_compaction: bcode_config::CompactionConfig::default(),
                 skills: None,
                 skill_context_bytes: 0,
+                skill_prompt_options: SkillPromptCatalogOptions::default(),
+                system_prompt: bcode_config::SystemPromptConfig::default(),
                 daemon_status: DaemonStatus::default(),
                 daemon_record_path: None,
                 metrics: MetricsRegistry::default(),
@@ -15738,6 +15810,8 @@ mod tests {
                 auto_compaction: bcode_config::CompactionConfig::default(),
                 skills: None,
                 skill_context_bytes: 0,
+                skill_prompt_options: SkillPromptCatalogOptions::default(),
+                system_prompt: bcode_config::SystemPromptConfig::default(),
                 daemon_status: DaemonStatus::default(),
                 daemon_record_path: None,
                 metrics: MetricsRegistry::default(),

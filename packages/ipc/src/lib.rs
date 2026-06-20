@@ -1832,6 +1832,8 @@ enum IpcSessionEventKind {
         bytes_loaded: usize,
         truncated: bool,
         loaded_at_ms: u64,
+        source: Option<SkillSource>,
+        preview: Option<String>,
     },
     SkillInvocationFailed {
         skill_id: SkillId,
@@ -2182,11 +2184,15 @@ impl From<&SessionEventKind> for IpcSessionEventKind {
                 bytes_loaded,
                 truncated,
                 loaded_at_ms,
+                source,
+                preview,
             } => Self::SkillContextLoaded {
                 skill_id: skill_id.clone(),
-                bytes_loaded: bytes_loaded.clone(),
-                truncated: truncated.clone(),
-                loaded_at_ms: loaded_at_ms.clone(),
+                bytes_loaded: *bytes_loaded,
+                truncated: *truncated,
+                loaded_at_ms: *loaded_at_ms,
+                source: source.clone(),
+                preview: preview.clone(),
             },
             SessionEventKind::SkillInvocationFailed {
                 skill_id,
@@ -2474,11 +2480,15 @@ impl TryFrom<IpcSessionEventKind> for SessionEventKind {
                 bytes_loaded,
                 truncated,
                 loaded_at_ms,
+                source,
+                preview,
             } => Ok(Self::SkillContextLoaded {
                 skill_id,
                 bytes_loaded,
                 truncated,
                 loaded_at_ms,
+                source,
+                preview,
             }),
             IpcSessionEventKind::SkillInvocationFailed {
                 skill_id,
@@ -3809,6 +3819,8 @@ mod tests {
                 bytes_loaded: 42,
                 truncated: false,
                 loaded_at_ms: 1,
+                source: None,
+                preview: None,
             },
             SessionEventKind::SkillInvocationFailed {
                 skill_id: SkillId::new("skill"),

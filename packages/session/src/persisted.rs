@@ -265,6 +265,10 @@ enum PersistedSessionEventKind {
         bytes_loaded: usize,
         truncated: bool,
         loaded_at_ms: u64,
+        #[serde(default)]
+        source: Option<SkillSource>,
+        #[serde(default)]
+        preview: Option<String>,
     },
     SkillInvocationFailed {
         skill_id: SkillId,
@@ -539,11 +543,15 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 bytes_loaded,
                 truncated,
                 loaded_at_ms,
+                source,
+                preview,
             } => Self::SkillContextLoaded {
                 skill_id: skill_id.clone(),
                 bytes_loaded: *bytes_loaded,
                 truncated: *truncated,
                 loaded_at_ms: *loaded_at_ms,
+                source: source.clone(),
+                preview: preview.clone(),
             },
             SessionEventKind::SkillInvocationFailed {
                 skill_id,
@@ -821,11 +829,15 @@ impl PersistedSessionEventKind {
                 bytes_loaded,
                 truncated,
                 loaded_at_ms,
+                source,
+                preview,
             } => SessionEventKind::SkillContextLoaded {
                 skill_id,
                 bytes_loaded,
                 truncated,
                 loaded_at_ms,
+                source,
+                preview,
             },
             Self::SkillInvocationFailed {
                 skill_id,
@@ -1337,6 +1349,8 @@ mod tests {
                 bytes_loaded: 12,
                 truncated: false,
                 loaded_at_ms: 5,
+                source: None,
+                preview: None,
             },
             SessionEventKind::SkillInvocationFailed {
                 skill_id: SkillId::new("skill"),

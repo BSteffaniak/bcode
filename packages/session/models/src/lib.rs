@@ -1131,6 +1131,10 @@ pub enum SessionEventKind {
         bytes_loaded: usize,
         truncated: bool,
         loaded_at_ms: u64,
+        #[serde(default)]
+        source: Option<SkillSource>,
+        #[serde(default)]
+        preview: Option<String>,
     },
     SkillInvocationFailed {
         skill_id: SkillId,

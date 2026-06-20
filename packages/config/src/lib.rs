@@ -140,6 +140,8 @@ pub struct BcodeConfig {
     #[serde(default)]
     pub skills: SkillsConfig,
     #[serde(default)]
+    pub system_prompt: SystemPromptConfig,
+    #[serde(default)]
     pub tui: TuiConfig,
     #[serde(default)]
     pub session_import: SessionImportConfig,
@@ -163,6 +165,7 @@ impl Default for BcodeConfig {
             auth: AuthConfig::default(),
             observability: ObservabilityConfig::default(),
             skills: SkillsConfig::default(),
+            system_prompt: SystemPromptConfig::default(),
             tui: TuiConfig::default(),
             session_import: SessionImportConfig::default(),
             daemon: DaemonConfig::default(),
@@ -709,6 +712,61 @@ pub fn bedrock_environment_is_configured() -> bool {
         .is_some_and(|spec| first_env_value_from_slice(spec.signal_env_vars).is_some())
 }
 
+/// System prompt assembly configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemPromptConfig {
+    #[serde(default)]
+    pub mode: SystemPromptMode,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub sections: SystemPromptSectionsConfig,
+}
+
+impl Default for SystemPromptConfig {
+    fn default() -> Self {
+        Self {
+            mode: SystemPromptMode::Default,
+            text: None,
+            sections: SystemPromptSectionsConfig::default(),
+        }
+    }
+}
+
+/// Base system prompt mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemPromptMode {
+    #[default]
+    Default,
+    Replace,
+}
+
+/// Toggleable system prompt sections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct SystemPromptSectionsConfig {
+    #[serde(default = "default_true")]
+    pub repository_context: bool,
+    #[serde(default = "default_true")]
+    pub dynamic_repository_context: bool,
+    #[serde(default = "default_true")]
+    pub agent_suffix: bool,
+    #[serde(default = "default_true")]
+    pub skill_catalog: bool,
+}
+
+impl Default for SystemPromptSectionsConfig {
+    fn default() -> Self {
+        Self {
+            repository_context: true,
+            dynamic_repository_context: true,
+            agent_suffix: true,
+            skill_catalog: true,
+        }
+    }
+}
+
 /// Skill discovery and activation configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
@@ -737,6 +795,8 @@ pub struct SkillsConfig {
     pub sources: SkillSourceConfig,
     #[serde(default)]
     pub disabled: DisabledSkillsConfig,
+    #[serde(default)]
+    pub prompt: SkillPromptConfig,
 }
 
 impl Default for SkillsConfig {
@@ -754,6 +814,7 @@ impl Default for SkillsConfig {
             follow_symlinks: true,
             sources: SkillSourceConfig::default(),
             disabled: DisabledSkillsConfig::default(),
+            prompt: SkillPromptConfig::default(),
         }
     }
 }
@@ -779,6 +840,51 @@ pub enum SkillAutoActivateMode {
     #[default]
     Suggest,
     On,
+}
+
+/// Skill prompt catalog configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillPromptConfig {
+    #[serde(default)]
+    pub catalog: SkillPromptCatalogMode,
+    #[serde(default = "default_skill_prompt_catalog_bytes")]
+    pub max_bytes: usize,
+    #[serde(default = "default_skill_prompt_description_chars")]
+    pub max_description_chars: usize,
+    #[serde(default = "default_true")]
+    pub include_sources: bool,
+    #[serde(default)]
+    pub include_keywords: bool,
+}
+
+impl Default for SkillPromptConfig {
+    fn default() -> Self {
+        Self {
+            catalog: SkillPromptCatalogMode::Summary,
+            max_bytes: default_skill_prompt_catalog_bytes(),
+            max_description_chars: default_skill_prompt_description_chars(),
+            include_sources: true,
+            include_keywords: false,
+        }
+    }
+}
+
+/// Skill prompt catalog rendering mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillPromptCatalogMode {
+    Off,
+    NamesOnly,
+    #[default]
+    Summary,
+}
+
+const fn default_skill_prompt_catalog_bytes() -> usize {
+    8 * 1024
+}
+
+const fn default_skill_prompt_description_chars() -> usize {
+    240
 }
 
 /// Additional skill source paths.
@@ -2862,6 +2968,7 @@ fn config_to_toml(config: &BcodeConfig) -> String {
     write_auth_toml(&mut output, &config.auth);
     write_observability_toml(&mut output, &config.observability);
     write_skills_toml(&mut output, &config.skills);
+    write_system_prompt_toml(&mut output, &config.system_prompt);
     write_tui_toml(&mut output, &config.tui);
     write_domain_toml(&mut output, "web_search", &config.web_search);
     output
@@ -3145,6 +3252,48 @@ fn write_model_metadata_toml(
                 .expect("writing to string should not fail");
         }
         output.push('\n');
+    }
+}
+
+fn write_system_prompt_toml(output: &mut String, system_prompt: &SystemPromptConfig) {
+    if system_prompt == &SystemPromptConfig::default() {
+        return;
+    }
+    output.push_str("[system_prompt]\n");
+    if system_prompt.mode != SystemPromptMode::Default {
+        writeln!(
+            output,
+            "mode = {}",
+            toml_string(system_prompt_mode_name(system_prompt.mode))
+        )
+        .expect("write to string");
+    }
+    if let Some(text) = &system_prompt.text {
+        writeln!(output, "text = {}", toml_string(text)).expect("write to string");
+    }
+    output.push('\n');
+    if system_prompt.sections != SystemPromptSectionsConfig::default() {
+        output.push_str("[system_prompt.sections]\n");
+        if !system_prompt.sections.repository_context {
+            output.push_str("repository_context = false\n");
+        }
+        if !system_prompt.sections.dynamic_repository_context {
+            output.push_str("dynamic_repository_context = false\n");
+        }
+        if !system_prompt.sections.agent_suffix {
+            output.push_str("agent_suffix = false\n");
+        }
+        if !system_prompt.sections.skill_catalog {
+            output.push_str("skill_catalog = false\n");
+        }
+        output.push('\n');
+    }
+}
+
+const fn system_prompt_mode_name(mode: SystemPromptMode) -> &'static str {
+    match mode {
+        SystemPromptMode::Default => "default",
+        SystemPromptMode::Replace => "replace",
     }
 }
 
@@ -3468,6 +3617,36 @@ fn write_skills_toml(output: &mut String, skills: &SkillsConfig) {
     }
     output.push('\n');
 
+    if skills.prompt != SkillPromptConfig::default() {
+        output.push_str("[skills.prompt]\n");
+        if skills.prompt.catalog != SkillPromptCatalogMode::Summary {
+            writeln!(
+                output,
+                "catalog = {}",
+                toml_string(skill_prompt_catalog_mode_name(skills.prompt.catalog))
+            )
+            .expect("write to string");
+        }
+        if skills.prompt.max_bytes != default_skill_prompt_catalog_bytes() {
+            writeln!(output, "max_bytes = {}", skills.prompt.max_bytes).expect("write to string");
+        }
+        if skills.prompt.max_description_chars != default_skill_prompt_description_chars() {
+            writeln!(
+                output,
+                "max_description_chars = {}",
+                skills.prompt.max_description_chars
+            )
+            .expect("write to string");
+        }
+        if !skills.prompt.include_sources {
+            output.push_str("include_sources = false\n");
+        }
+        if skills.prompt.include_keywords {
+            output.push_str("include_keywords = true\n");
+        }
+        output.push('\n');
+    }
+
     if !skills.sources.paths.is_empty() {
         output.push_str("[skills.sources]\npaths = [");
         for (index, path) in skills.sources.paths.iter().enumerate() {
@@ -3491,6 +3670,14 @@ const fn skill_auto_activate_mode_name(mode: SkillAutoActivateMode) -> &'static 
         SkillAutoActivateMode::Off => "off",
         SkillAutoActivateMode::Suggest => "suggest",
         SkillAutoActivateMode::On => "on",
+    }
+}
+
+const fn skill_prompt_catalog_mode_name(mode: SkillPromptCatalogMode) -> &'static str {
+    match mode {
+        SkillPromptCatalogMode::Off => "off",
+        SkillPromptCatalogMode::NamesOnly => "names_only",
+        SkillPromptCatalogMode::Summary => "summary",
     }
 }
 

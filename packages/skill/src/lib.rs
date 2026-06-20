@@ -17,6 +17,46 @@ use thiserror::Error;
 const DEFAULT_MAX_SKILL_FILE_BYTES: u64 = 256 * 1024;
 const DEFAULT_MAX_CONTEXT_BYTES: usize = 24 * 1024;
 const SKILL_FILE_NAMES: &[&str] = &["SKILL.md", "skill.md", "README.md"];
+const DEFAULT_PROMPT_CATALOG_BYTES: usize = 8 * 1024;
+const DEFAULT_PROMPT_DESCRIPTION_CHARS: usize = 240;
+
+/// Skill prompt catalog rendering mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillPromptCatalogMode {
+    /// Do not render a skill catalog.
+    Off,
+    /// Render skill IDs/names and locations only.
+    NamesOnly,
+    /// Render IDs/names, descriptions, locations, sources, and optionally keywords.
+    Summary,
+}
+
+/// Options for rendering model-visible skill catalog metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillPromptCatalogOptions {
+    /// Catalog rendering mode.
+    pub mode: SkillPromptCatalogMode,
+    /// Maximum bytes returned.
+    pub max_bytes: usize,
+    /// Maximum description characters per skill.
+    pub max_description_chars: usize,
+    /// Include source labels.
+    pub include_sources: bool,
+    /// Include activation keywords.
+    pub include_keywords: bool,
+}
+
+impl Default for SkillPromptCatalogOptions {
+    fn default() -> Self {
+        Self {
+            mode: SkillPromptCatalogMode::Summary,
+            max_bytes: DEFAULT_PROMPT_CATALOG_BYTES,
+            max_description_chars: DEFAULT_PROMPT_DESCRIPTION_CHARS,
+            include_sources: true,
+            include_keywords: false,
+        }
+    }
+}
 
 /// Errors returned by skill registry operations.
 #[derive(Debug, Error)]
@@ -82,6 +122,105 @@ impl Default for SkillRegistryOptions {
             disabled_ids: BTreeSet::new(),
         }
     }
+}
+
+/// Format a compact XML-style skill catalog for model prompt injection.
+#[must_use]
+pub fn format_skill_catalog_for_prompt(
+    list: &SkillList,
+    options: &SkillPromptCatalogOptions,
+) -> String {
+    if options.mode == SkillPromptCatalogMode::Off || options.max_bytes == 0 {
+        return String::new();
+    }
+    let visible_skills = list
+        .skills
+        .iter()
+        .filter(|skill| !skill.disable_model_invocation)
+        .collect::<Vec<_>>();
+    if visible_skills.is_empty() {
+        return String::new();
+    }
+
+    let mut output = String::from(
+        "\n\nThe following Bcode skills provide specialized instructions for specific tasks.\n\
+Use available Bcode filesystem/document tools to load a skill file when the task matches its description.\n\
+User skills are discovered from configured roots including ~/.config/bcode/skills when user skills are enabled.\n\
+When a skill file references a relative path, resolve it against the skill directory.\n\n\
+<available_skills>",
+    );
+    let mut truncated = false;
+
+    for skill in visible_skills {
+        let mut block = String::from("\n  <skill>");
+        block.push_str("\n    <id>");
+        block.push_str(&escape_xml(skill.id.as_str()));
+        block.push_str("</id>");
+        block.push_str("\n    <name>");
+        block.push_str(&escape_xml(&skill.name));
+        block.push_str("</name>");
+        if options.mode == SkillPromptCatalogMode::Summary
+            && let Some(description) = &skill.description
+        {
+            block.push_str("\n    <description>");
+            block.push_str(&escape_xml(&truncate_chars(
+                description,
+                options.max_description_chars,
+            )));
+            block.push_str("</description>");
+        }
+        if let Some(location) = skill.source.path.as_deref() {
+            block.push_str("\n    <location>");
+            block.push_str(&escape_xml(location));
+            block.push_str("</location>");
+        }
+        if options.mode == SkillPromptCatalogMode::Summary && options.include_sources {
+            block.push_str("\n    <source>");
+            block.push_str(&escape_xml(&skill.source.label));
+            block.push_str("</source>");
+        }
+        if options.mode == SkillPromptCatalogMode::Summary
+            && options.include_keywords
+            && !skill.activation.keywords.is_empty()
+        {
+            block.push_str("\n    <keywords>");
+            block.push_str(&escape_xml(&skill.activation.keywords.join(", ")));
+            block.push_str("</keywords>");
+        }
+        block.push_str("\n  </skill>");
+
+        if output.len() + block.len() + "\n</available_skills>".len() > options.max_bytes {
+            truncated = true;
+            break;
+        }
+        output.push_str(&block);
+    }
+    if truncated {
+        output.push_str("\n  <truncated>true</truncated>");
+    }
+    output.push_str("\n</available_skills>");
+    if output.len() > options.max_bytes {
+        output.truncate(options.max_bytes);
+    }
+    output
+}
+
+fn escape_xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut truncated = value.chars().take(max_chars).collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 /// In-memory skill registry.
@@ -179,11 +318,12 @@ impl SkillRegistry {
             .and_then(Path::parent)
             .map_or_else(String::new, |path| path.to_string_lossy().into_owned());
         let mut context = format!(
-            "Bcode skill invocation: {}\nSource label: {}\nSkill file: {}\nSkill directory: {}\nSkill resource root: {}\nVersion: {}\n\nWhen these instructions reference relative files, scripts, references, assets, or markdown links, use available Bcode filesystem tools to read them relative to the skill directory before applying the skill. Map common skill tool names to Bcode tools when needed: Bash -> shell.run, Read -> filesystem.read, Edit -> filesystem.edit, Write -> filesystem.write.\n\nInstructions:\n{}",
+            "<skill id=\"{}\" name=\"{}\" location=\"{}\">\nReferences are relative to {}.\nSource label: {}\nSkill resource root: {}\nVersion: {}\n\n{}\n</skill>",
             manifest.summary.id,
-            manifest.summary.source.label,
+            manifest.summary.name,
             skill_file,
             skill_directory,
+            manifest.summary.source.label,
             resource_root,
             manifest.summary.version.as_deref().unwrap_or("unknown"),
             manifest.instructions
@@ -394,6 +534,8 @@ fn parse_skill_markdown(
         source: source.clone(),
         activation: raw.activation.unwrap_or_default(),
         diagnostics: Vec::new(),
+        disable_model_invocation: raw.disable_model_invocation
+            || raw.disable_model_invocation_compat,
     };
     Ok(SkillManifest {
         summary,
@@ -525,6 +667,10 @@ struct RawSkillFrontmatter {
     version: Option<String>,
     activation: Option<SkillActivation>,
     permissions: Option<SkillPermissionHints>,
+    #[serde(default)]
+    disable_model_invocation: bool,
+    #[serde(default, rename = "disable-model-invocation")]
+    disable_model_invocation_compat: bool,
 }
 
 #[cfg(test)]

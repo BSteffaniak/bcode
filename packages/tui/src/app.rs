@@ -2227,8 +2227,16 @@ impl BmuxApp {
                 skill_id,
                 bytes_loaded,
                 truncated,
+                source,
+                preview,
                 ..
-            } => self.set_skill_context_status(skill_id, *bytes_loaded, *truncated),
+            } => self.set_skill_context_status(
+                skill_id,
+                *bytes_loaded,
+                *truncated,
+                source.as_ref(),
+                preview.as_deref(),
+            ),
             SessionEventKind::SkillInvocationFailed {
                 skill_id, error, ..
             } => self.push_skill_error(skill_id, error),
@@ -3468,9 +3476,29 @@ impl BmuxApp {
         skill_id: &impl std::fmt::Display,
         bytes_loaded: usize,
         truncated: bool,
+        source: Option<&SkillSource>,
+        preview: Option<&str>,
     ) {
         let suffix = if truncated { " truncated" } else { "" };
         self.status = format!("loaded skill context: {skill_id} ({bytes_loaded} bytes{suffix})");
+        let source_text = source.map_or_else(String::new, |source| {
+            let path = source
+                .path
+                .as_deref()
+                .map_or_else(String::new, |path| format!("\nFile: {path}"));
+            format!("\nSource: {}{path}", source.label)
+        });
+        let preview_text = preview.map_or_else(String::new, |preview| {
+            if preview.trim().is_empty() {
+                String::new()
+            } else {
+                format!("\n\nPreview:\n{preview}")
+            }
+        });
+        self.transcript.push(TranscriptItem::new(
+            "Skill context",
+            format!("loaded {skill_id}{source_text}\nBytes: {bytes_loaded}{suffix}{preview_text}"),
+        ));
     }
 
     fn push_skill_invoked(

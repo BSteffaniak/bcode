@@ -4610,6 +4610,8 @@ mod tests {
                     bytes_loaded: 1,
                     truncated: false,
                     loaded_at_ms: 1,
+                    source: None,
+                    preview: None,
                 },
             ),
             (
