@@ -63,6 +63,59 @@ impl SettingsStore {
         &self.settings_db_path
     }
 
+    /// Apply a generated setup plan through available settings/domain services.
+    ///
+    /// Current mutating plan actions are represented as persisted
+    /// recommendations/control-state transitions. Secret import plans are still
+    /// explicit preview objects and must be applied by the secure auth domain so
+    /// this method never handles raw secret values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when recommendation/control-state updates cannot be
+    /// persisted.
+    pub fn apply_setup_plan(
+        &self,
+        plan: &SetupPlanReview,
+        applied_at_ms: u64,
+    ) -> SettingsResult<AppliedSetupPlan> {
+        let mut applied_actions = Vec::new();
+        let mut skipped_actions = Vec::new();
+        for action in &plan.actions {
+            if action.kind == "launch" {
+                skipped_actions.push(action.clone());
+                continue;
+            }
+            if action.mutating {
+                self.put_control_state(
+                    &format!("setup.applied.{}", action.kind),
+                    &json!({
+                        "section_id": action.section_id.as_str(),
+                        "applied_at_ms": applied_at_ms,
+                    }),
+                    applied_at_ms,
+                )?;
+                applied_actions.push(action.clone());
+            } else {
+                skipped_actions.push(action.clone());
+            }
+        }
+        Ok(AppliedSetupPlan {
+            applied_actions,
+            skipped_actions,
+        })
+    }
+
+    /// Return the current settings/onboarding experience mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when onboarding progress cannot be read.
+    pub fn experience_mode(&self) -> SettingsResult<SettingsExperienceMode> {
+        let progress = self.onboarding_progress()?;
+        Ok(settings_experience_mode(progress.as_ref()))
+    }
+
     /// Add a model to the runtime TOML-backed ignore state.
     ///
     /// This is a user-visible settings mutation, so it writes through the
@@ -1263,6 +1316,49 @@ pub struct SetupPlanReview {
     pub launch_ready: bool,
 }
 
+impl SetupPlanReview {
+    /// Return a launch/start-session action when setup is ready enough.
+    #[must_use]
+    pub fn launch_action(&self) -> Option<SetupPlanAction> {
+        self.launch_ready.then(|| SetupPlanAction {
+            section_id: SetupSectionId::Launch,
+            kind: "launch".to_owned(),
+            title: "Launch Bcode".to_owned(),
+            body: "Your setup is ready enough to start using Bcode.".to_owned(),
+            mutating: false,
+        })
+    }
+}
+
+/// Result of applying a setup plan through settings/domain services.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedSetupPlan {
+    /// Applied actions.
+    pub applied_actions: Vec<SetupPlanAction>,
+    /// Skipped non-mutating actions such as launch prompts.
+    pub skipped_actions: Vec<SetupPlanAction>,
+}
+
+/// Onboarding/settings shell mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingsExperienceMode {
+    /// First-run onboarding should be shown.
+    FirstRunOnboarding,
+    /// The settings/control-center experience should be shown.
+    ControlCenter,
+}
+
+/// Determine whether to show first-run onboarding or return to Control Center.
+#[must_use]
+pub fn settings_experience_mode(progress: Option<&OnboardingProgress>) -> SettingsExperienceMode {
+    if progress.is_some_and(|progress| progress.first_run_completed) {
+        SettingsExperienceMode::ControlCenter
+    } else {
+        SettingsExperienceMode::FirstRunOnboarding
+    }
+}
+
 /// Generate a conservative setup plan from the reconciled setup state and recommendations.
 #[must_use]
 pub fn generate_setup_plan(
@@ -2015,6 +2111,74 @@ mod tests {
                 && section.status == SetupSectionStatus::Skipped.as_str()
         }));
         assert_eq!(dismissed.dismissed_at_ms, Some(903));
+    }
+
+    #[test]
+    fn setup_plan_apply_records_mutating_actions_and_skips_launch() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let store = SettingsStore::from_settings_db_path(temp.path().join("settings.db"));
+        let plan = SetupPlanReview {
+            actions: vec![
+                SetupPlanAction {
+                    section_id: SetupSectionId::SecureVault,
+                    kind: "secure_env_secret".to_owned(),
+                    title: "Secure detected key".to_owned(),
+                    body: "Move it to secure storage.".to_owned(),
+                    mutating: true,
+                },
+                SetupPlanAction {
+                    section_id: SetupSectionId::Launch,
+                    kind: "launch".to_owned(),
+                    title: "Launch Bcode".to_owned(),
+                    body: "Start using Bcode.".to_owned(),
+                    mutating: false,
+                },
+            ],
+            launch_ready: true,
+        };
+
+        let applied = store
+            .apply_setup_plan(&plan, 1_000)
+            .expect("plan should apply");
+        let state = store
+            .control_state("setup.applied.secure_env_secret")
+            .expect("control state should load")
+            .expect("control state should exist");
+
+        assert_eq!(applied.applied_actions.len(), 1);
+        assert_eq!(applied.skipped_actions.len(), 1);
+        assert_eq!(state.value["section_id"], "secure_vault");
+    }
+
+    #[test]
+    fn settings_experience_mode_switches_after_completion() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let store = SettingsStore::from_settings_db_path(temp.path().join("settings.db"));
+
+        assert_eq!(
+            store.experience_mode().expect("mode should load"),
+            SettingsExperienceMode::FirstRunOnboarding
+        );
+        store
+            .complete_onboarding(1_001)
+            .expect("onboarding should complete");
+        assert_eq!(
+            store.experience_mode().expect("mode should reload"),
+            SettingsExperienceMode::ControlCenter
+        );
+    }
+
+    #[test]
+    fn setup_plan_review_exposes_launch_action() {
+        let plan = SetupPlanReview {
+            actions: Vec::new(),
+            launch_ready: true,
+        };
+
+        let action = plan.launch_action().expect("launch action should exist");
+
+        assert_eq!(action.kind, "launch");
+        assert!(!action.mutating);
     }
 
     #[test]
