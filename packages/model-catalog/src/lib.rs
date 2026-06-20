@@ -138,21 +138,23 @@ impl ModelCatalog {
         discovered: Vec<ModelInfo>,
         include_catalog_only: bool,
     ) -> Vec<ModelInfo> {
-        let mut models = discovered
-            .into_iter()
-            .map(|model| {
-                let model = self.enrich_model(provider_id, model);
-                (model.model_id.clone(), model)
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut result = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for model in discovered {
+            let model = self.enrich_model(provider_id, model);
+            seen.insert(model.model_id.clone());
+            result.push(model);
+        }
 
         if include_catalog_only {
             for model in self.provider_models_as_model_info(provider_id) {
-                models.entry(model.model_id.clone()).or_insert(model);
+                if seen.insert(model.model_id.clone()) {
+                    result.push(model);
+                }
             }
         }
 
-        models.into_values().collect()
+        result
     }
 }
 
@@ -161,14 +163,28 @@ fn find_provider_model<'a>(
     model_id: &str,
 ) -> Option<&'a ModelCatalogEntry> {
     provider.models.get(model_id).or_else(|| {
-        provider.models.values().find(|entry| {
-            entry.aliases.contains(model_id)
-                || entry.aliases.iter().any(|alias| {
+        provider
+            .models
+            .values()
+            .filter_map(|entry| {
+                if entry.aliases.contains(model_id) {
+                    return Some((usize::MAX, entry));
+                }
+                entry.aliases.iter().find_map(|alias| {
+                    if let Some(needle) = alias
+                        .strip_prefix('*')
+                        .and_then(|value| value.strip_suffix('*'))
+                    {
+                        return model_id.contains(needle).then_some((needle.len(), entry));
+                    }
                     alias
                         .strip_suffix('*')
-                        .is_some_and(|prefix| model_id.starts_with(prefix))
+                        .filter(|prefix| model_id.starts_with(prefix))
+                        .map(|prefix| (prefix.len(), entry))
                 })
-        })
+            })
+            .max_by_key(|(prefix_len, _entry)| *prefix_len)
+            .map(|(_prefix_len, entry)| entry)
     })
 }
 

@@ -31,3 +31,273 @@ prompt_cache = true
 pricing = "manual"
 metadata = "manual"
 last_verified_at = "2026-06-20T00:00:00Z"
+
+[models."anthropic.claude"]
+model_id = "anthropic.claude"
+display_name = "Claude"
+aliases = ["*claude*"]
+status = "stable"
+bcode_support = "supported"
+family = "claude"
+context_window = 200000
+max_output_tokens = 64000
+
+[models."anthropic.claude".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+prompt_cache = true
+
+[models."anthropic.claude-opus-4"]
+model_id = "anthropic.claude-opus-4"
+display_name = "Claude Opus 4"
+aliases = ["*claude-opus-4*"]
+status = "stable"
+bcode_support = "supported"
+family = "claude"
+context_window = 200000
+max_output_tokens = 64000
+
+[models."anthropic.claude-opus-4".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+prompt_cache = true
+
+[models."anthropic.claude-sonnet-4"]
+model_id = "anthropic.claude-sonnet-4"
+display_name = "Claude Sonnet 4"
+aliases = ["*claude-sonnet-4*"]
+status = "stable"
+bcode_support = "supported"
+family = "claude"
+context_window = 200000
+max_output_tokens = 64000
+
+[models."anthropic.claude-sonnet-4".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+prompt_cache = true
+
+[models."anthropic.claude-haiku-4"]
+model_id = "anthropic.claude-haiku-4"
+display_name = "Claude Haiku 4"
+aliases = ["*claude-haiku-4*"]
+status = "stable"
+bcode_support = "supported"
+family = "claude"
+context_window = 200000
+max_output_tokens = 64000
+
+[models."anthropic.claude-haiku-4".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+prompt_cache = true
+
+[models."anthropic.claude-3-7"]
+model_id = "anthropic.claude-3-7"
+display_name = "Claude 3.7"
+aliases = ["*claude-3-7*"]
+status = "stable"
+bcode_support = "supported"
+family = "claude"
+context_window = 200000
+max_output_tokens = 64000
+
+[models."anthropic.claude-3-7".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+prompt_cache = true
+
+[models."anthropic.claude-3-haiku"]
+model_id = "anthropic.claude-3-haiku"
+display_name = "Claude 3 Haiku"
+aliases = ["*claude-3-haiku*"]
+status = "stable"
+bcode_support = "supported"
+family = "claude"
+context_window = 200000
+max_output_tokens = 64000
+
+[models."anthropic.claude-3-haiku".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+prompt_cache = true
+
+[models."anthropic.claude-3-opus"]
+model_id = "anthropic.claude-3-opus"
+display_name = "Claude 3 Opus"
+aliases = ["*claude-3-opus*"]
+status = "stable"
+bcode_support = "supported"
+family = "claude"
+context_window = 200000
+max_output_tokens = 64000
+
+[models."anthropic.claude-3-opus".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+prompt_cache = true
+
+[models."anthropic.claude-3-sonnet"]
+model_id = "anthropic.claude-3-sonnet"
+display_name = "Claude 3 Sonnet"
+aliases = ["*claude-3-sonnet*"]
+status = "stable"
+bcode_support = "supported"
+family = "claude"
+context_window = 200000
+max_output_tokens = 64000
+
+[models."anthropic.claude-3-sonnet".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+prompt_cache = true
+
+[models."amazon.nova"]
+model_id = "amazon.nova"
+display_name = "Amazon Nova"
+aliases = ["*nova*"]
+status = "stable"
+bcode_support = "supported"
+family = "nova"
+context_window = 300000
+max_output_tokens = 10000
+
+[models."amazon.nova".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+prompt_cache = true
+
+[models."meta.llama"]
+model_id = "meta.llama"
+display_name = "Llama"
+aliases = ["*llama3*", "*llama-3*", "*llama4*", "*llama-4*"]
+status = "stable"
+bcode_support = "supported"
+family = "llama"
+context_window = 128000
+max_output_tokens = 8192
+
+[models."meta.llama".capabilities]
+text_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+
+[models."mistral.mistral-large"]
+model_id = "mistral.mistral-large"
+display_name = "Mistral Large"
+aliases = ["*mistral-large*"]
+status = "stable"
+bcode_support = "supported"
+family = "mistral"
+context_window = 128000
+max_output_tokens = 8192
+
+[models."mistral.mistral-large".capabilities]
+text_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+
+[models."mistral.mixtral"]
+model_id = "mistral.mixtral"
+display_name = "Mixtral"
+aliases = ["*mixtral*"]
+status = "stable"
+bcode_support = "supported"
+family = "mistral"
+context_window = 32000
+max_output_tokens = 8192
+
+[models."mistral.mixtral".capabilities]
+text_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+
+[models."mistral.mistral"]
+model_id = "mistral.mistral"
+display_name = "Mistral"
+aliases = ["*mistral*"]
+status = "stable"
+bcode_support = "supported"
+family = "mistral"
+context_window = 32000
+max_output_tokens = 8192
+
+[models."mistral.mistral".capabilities]
+text_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+
+[models."amazon.titan"]
+model_id = "amazon.titan"
+display_name = "Amazon Titan"
+aliases = ["*titan*"]
+status = "stable"
+bcode_support = "supported"
+family = "titan"
+context_window = 8000
+max_output_tokens = 4096
+
+[models."amazon.titan".capabilities]
+text_input = true
+text_output = true
+
+[models."cohere.command-r"]
+model_id = "cohere.command-r"
+display_name = "Command R"
+aliases = ["*command-r*"]
+status = "stable"
+bcode_support = "supported"
+family = "command"
+context_window = 128000
+max_output_tokens = 4096
+
+[models."cohere.command-r".capabilities]
+text_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+
+[models."cohere.command"]
+model_id = "cohere.command"
+display_name = "Command"
+aliases = ["*command*"]
+status = "stable"
+bcode_support = "supported"
+family = "command"
+context_window = 4000
+max_output_tokens = 4000
+
+[models."cohere.command".capabilities]
+text_input = true
+text_output = true
