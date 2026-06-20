@@ -63,6 +63,34 @@ impl SettingsStore {
         &self.settings_db_path
     }
 
+    /// Check whether the settings DB can be opened and migrated.
+    ///
+    /// This is intended for Settings / Control Center degraded-state handling.
+    #[must_use]
+    pub fn health(&self) -> SettingsDbHealth {
+        match self.with_database(|_| Box::pin(async { Ok(()) })) {
+            Ok(()) => SettingsDbHealth::Available,
+            Err(error) => SettingsDbHealth::Unavailable {
+                message: error.to_string(),
+            },
+        }
+    }
+
+    /// Reset the settings database and `SQLite` sidecar files.
+    ///
+    /// This is intended for explicit repair/reset flows only. User-editable TOML
+    /// configuration and secure auth vaults are not touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any existing DB file or sidecar cannot be removed.
+    pub fn reset_database(&self) -> SettingsResult<()> {
+        remove_file_if_exists(&self.settings_db_path)?;
+        remove_file_if_exists(&sqlite_sidecar_path(&self.settings_db_path, "wal"))?;
+        remove_file_if_exists(&sqlite_sidecar_path(&self.settings_db_path, "shm"))?;
+        Ok(())
+    }
+
     /// Apply a generated setup plan through available settings/domain services.
     ///
     /// Current mutating plan actions are represented as persisted
@@ -614,6 +642,48 @@ impl SettingsStore {
         })
         .join()
         .map_err(|_| SettingsError::DatabaseWorkerPanicked)?
+    }
+}
+
+/// Settings database health state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SettingsDbHealth {
+    /// The database opened and migrations completed successfully.
+    Available,
+    /// The database is unavailable or corrupt and settings UI should degrade.
+    Unavailable {
+        /// User-facing diagnostic message.
+        message: String,
+    },
+}
+
+/// Settings/control-center degraded-state panel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingsDegradedPanel {
+    /// Whether normal control-center state is available.
+    pub available: bool,
+    /// User-facing diagnostic copy.
+    pub message: String,
+    /// Whether a reset/repair action should be offered.
+    pub reset_available: bool,
+}
+
+/// Build degraded-state copy for the settings database health state.
+#[must_use]
+pub fn settings_degraded_panel(health: &SettingsDbHealth) -> SettingsDegradedPanel {
+    match health {
+        SettingsDbHealth::Available => SettingsDegradedPanel {
+            available: true,
+            message: "Settings state is available.".to_owned(),
+            reset_available: false,
+        },
+        SettingsDbHealth::Unavailable { message } => SettingsDegradedPanel {
+            available: false,
+            message: format!(
+                "Settings state is unavailable. Bcode can keep running with degraded onboarding/control-center state. Details: {message}"
+            ),
+            reset_available: true,
+        },
     }
 }
 
@@ -1854,10 +1924,58 @@ fn detection_id(detector: &str, key: &str) -> String {
     format!("{detector}\u{1f}{key}")
 }
 
+fn remove_file_if_exists(path: &Path) -> SettingsResult<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{}-{suffix}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn health_reports_available_and_reset_removes_database() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let db_path = temp.path().join("settings.db");
+        let store = SettingsStore::from_settings_db_path(&db_path);
+
+        assert_eq!(store.health(), SettingsDbHealth::Available);
+        assert!(db_path.exists());
+        store
+            .reset_database()
+            .expect("database reset should succeed");
+        assert!(!db_path.exists());
+    }
+
+    #[test]
+    fn health_reports_unavailable_for_directory_database_path() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let store = SettingsStore::from_settings_db_path(temp.path());
+
+        assert!(matches!(
+            store.health(),
+            SettingsDbHealth::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn degraded_panel_explains_health_state() {
+        let panel = settings_degraded_panel(&SettingsDbHealth::Unavailable {
+            message: "cannot open".to_owned(),
+        });
+
+        assert!(!panel.available);
+        assert!(panel.reset_available);
+        assert!(panel.message.contains("degraded"));
+    }
 
     #[test]
     fn control_state_kv_round_trips() {
