@@ -1,6 +1,6 @@
 //! TUI model picker state.
 
-use bcode_model::ModelInfo;
+use bcode_model::{ModelInfo, ModelPricingInfo, ModelTokenPrice};
 use bmux_tui::list::{ListItem, ListState};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
@@ -96,7 +96,7 @@ impl ModelPickerApp {
 
 fn model_item(model: &ModelInfo) -> ListItem {
     let marker = if model.is_default { "* " } else { "  " };
-    ListItem::new(Line::from_spans(vec![
+    let mut spans = vec![
         Span::styled(marker, Style::new().fg(Color::BrightBlack)),
         Span::styled(
             model.model_id.clone(),
@@ -107,13 +107,74 @@ fn model_item(model: &ModelInfo) -> ListItem {
             model.display_name.clone(),
             Style::new().fg(Color::BrightBlack),
         ),
-    ]))
+    ];
+    if let Some(pricing) = model.pricing.as_ref().and_then(model_pricing_summary) {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(pricing, Style::new().fg(Color::Cyan)));
+    }
+    ListItem::new(Line::from_spans(spans))
+}
+
+fn model_pricing_summary(pricing: &ModelPricingInfo) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(input) = pricing.input {
+        parts.push(format!(
+            "in {}/M",
+            format_token_price(&pricing.currency, input)
+        ));
+    }
+    if let Some(cached) = pricing.cached_input {
+        parts.push(format!(
+            "cached {}/M",
+            format_token_price(&pricing.currency, cached)
+        ));
+    }
+    if let Some(cache_write) = pricing.cache_write_input {
+        parts.push(format!(
+            "write {}/M",
+            format_token_price(&pricing.currency, cache_write)
+        ));
+    }
+    if let Some(output) = pricing.output {
+        parts.push(format!(
+            "out {}/M",
+            format_token_price(&pricing.currency, output)
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+fn format_token_price(currency: &str, price: ModelTokenPrice) -> String {
+    let amount = format_micros_decimal(price.micros);
+    if currency == "USD" {
+        format!("${amount}")
+    } else {
+        format!("{currency} {amount}")
+    }
+}
+
+fn format_micros_decimal(micros: u64) -> String {
+    let whole = micros / 1_000_000;
+    let fractional = micros % 1_000_000;
+    if fractional == 0 {
+        return whole.to_string();
+    }
+    let mut value = format!("{whole}.{fractional:06}");
+    while value.ends_with('0') {
+        value.pop();
+    }
+    value
 }
 
 fn model_matches(model: &ModelInfo, query: &str) -> bool {
     query.is_empty()
         || model.model_id.to_ascii_lowercase().contains(query)
         || model.display_name.to_ascii_lowercase().contains(query)
+        || model
+            .pricing
+            .as_ref()
+            .and_then(model_pricing_summary)
+            .is_some_and(|pricing| pricing.to_ascii_lowercase().contains(query))
 }
 
 fn empty_item(message: &str) -> ListItem {
@@ -121,4 +182,49 @@ fn empty_item(message: &str) -> ListItem {
         message.to_owned(),
         Style::new().fg(Color::BrightBlack),
     )]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn price(micros: u64) -> ModelTokenPrice {
+        ModelTokenPrice::from_micros(micros)
+    }
+
+    #[test]
+    fn formats_model_pricing_summary() {
+        let pricing = ModelPricingInfo {
+            currency: "USD".to_string(),
+            unit: bcode_model::ModelPricingUnit::PerMillionTokens,
+            input: Some(price(1_250_000)),
+            cached_input: Some(price(125_000)),
+            cache_write_input: None,
+            output: Some(price(10_000_000)),
+            source: bcode_model::ModelPricingSource::PatternMatch,
+        };
+
+        assert_eq!(
+            model_pricing_summary(&pricing).as_deref(),
+            Some("in $1.25/M · cached $0.125/M · out $10/M")
+        );
+    }
+
+    #[test]
+    fn formats_non_usd_model_pricing_summary() {
+        let pricing = ModelPricingInfo {
+            currency: "EUR".to_string(),
+            unit: bcode_model::ModelPricingUnit::PerMillionTokens,
+            input: Some(price(2_000_000)),
+            cached_input: None,
+            cache_write_input: None,
+            output: Some(price(8_500_000)),
+            source: bcode_model::ModelPricingSource::ProviderApi,
+        };
+
+        assert_eq!(
+            model_pricing_summary(&pricing).as_deref(),
+            Some("in EUR 2/M · out EUR 8.5/M")
+        );
+    }
 }
