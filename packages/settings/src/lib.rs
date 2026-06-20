@@ -16,8 +16,8 @@
 //! belong in the configured secure auth store.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::BTreeSet;
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -61,6 +61,37 @@ impl SettingsStore {
     #[must_use]
     pub fn settings_db_path(&self) -> &Path {
         &self.settings_db_path
+    }
+
+    /// Add a model to the runtime TOML-backed ignore state.
+    ///
+    /// This is a user-visible settings mutation, so it writes through the
+    /// config package instead of storing the ignore rule in this database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the TOML-backed model ignore state cannot be read
+    /// or written.
+    pub fn ignore_model(
+        &self,
+        provider_plugin_id: &str,
+        model_id: String,
+    ) -> SettingsResult<PathBuf> {
+        bcode_config::ignore_model_in_state(provider_plugin_id, model_id).map_err(Into::into)
+    }
+
+    /// Remove a model from the runtime TOML-backed ignore state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the TOML-backed model ignore state cannot be read
+    /// or written.
+    pub fn unignore_model(
+        &self,
+        provider_plugin_id: &str,
+        model_id: &str,
+    ) -> SettingsResult<PathBuf> {
+        bcode_config::unignore_model_in_state(provider_plugin_id, model_id).map_err(Into::into)
     }
 
     /// Persist a control-center JSON state value.
@@ -656,6 +687,123 @@ pub fn reconcile_setup_sections(
         .collect()
 }
 
+/// Bounded, sanitized onboarding/environment detection result.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupDetectionSnapshot {
+    /// Sanitized detection entries suitable for settings DB persistence.
+    pub entries: Vec<DetectionCacheEntry>,
+    /// Recommended setup actions derived from detection.
+    pub recommendations: Vec<SetupRecommendation>,
+}
+
+/// Build a sanitized detection snapshot from environment variables.
+#[must_use]
+pub fn detect_setup_environment_from_vars(
+    vars: &BTreeMap<String, String>,
+    detected_at_ms: u64,
+) -> SetupDetectionSnapshot {
+    let secret_names = [
+        "OPENAI_API_KEY",
+        "XAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "GITHUB_TOKEN",
+    ];
+    let metadata_names = ["AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION"];
+
+    let mut entries = Vec::new();
+    let mut recommendations = Vec::new();
+
+    for name in secret_names {
+        if vars.get(name).is_some_and(|value| !value.is_empty()) {
+            entries.push(DetectionCacheEntry {
+                detector: "environment".to_owned(),
+                key: name.to_owned(),
+                value: json!({ "present": true, "secret_value_stored": false }),
+                confidence: "high".to_owned(),
+                source: "environment".to_owned(),
+                detected_at_ms,
+                expires_at_ms: None,
+            });
+            recommendations.push(SetupRecommendation {
+                recommendation_id: format!("secure-env-{}", name.to_ascii_lowercase()),
+                section_id: SetupSectionId::SecureVault.as_str().to_owned(),
+                kind: "secure_env_secret".to_owned(),
+                status: SetupSectionStatus::Recommended.as_str().to_owned(),
+                priority: 100,
+                title: format!("Secure detected {name}"),
+                body: "Move this detected environment credential into secure storage.".to_owned(),
+                created_at_ms: detected_at_ms,
+                dismissed_at_ms: None,
+            });
+        }
+    }
+
+    for name in metadata_names {
+        if let Some(value) = vars.get(name).filter(|value| !value.is_empty()) {
+            entries.push(DetectionCacheEntry {
+                detector: "environment".to_owned(),
+                key: name.to_owned(),
+                value: json!({ "present": true, "value": value }),
+                confidence: "high".to_owned(),
+                source: "environment".to_owned(),
+                detected_at_ms,
+                expires_at_ms: None,
+            });
+        }
+    }
+
+    SetupDetectionSnapshot {
+        entries,
+        recommendations,
+    }
+}
+
+/// Detect setup-relevant environment state from the current process environment.
+#[must_use]
+pub fn detect_setup_environment(detected_at_ms: u64) -> SetupDetectionSnapshot {
+    detect_setup_environment_from_vars(&std::env::vars().collect(), detected_at_ms)
+}
+
+/// Setup-map view model for the first TUI vertical slice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupMapSnapshot {
+    /// Reconciled setup sections.
+    pub sections: Vec<ReconciledSetupSection>,
+}
+
+impl SetupMapSnapshot {
+    /// Build a setup-map snapshot from persisted and real state.
+    #[must_use]
+    pub fn from_reconciliation(
+        persisted_sections: &[OnboardingSection],
+        input: &SetupReconciliationInput,
+    ) -> Self {
+        Self {
+            sections: reconcile_setup_sections(persisted_sections, input),
+        }
+    }
+
+    /// Render a compact text setup map for smoke tests and early TUI wiring.
+    #[must_use]
+    pub fn render_text_map(&self) -> String {
+        self.sections
+            .iter()
+            .map(|section| {
+                format!(
+                    "{}:{}{}",
+                    section.section_id.as_str(),
+                    section.status.as_str(),
+                    if section.visited { ":visited" } else { "" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" -> ")
+    }
+}
+
 /// Settings persistence result type.
 pub type SettingsResult<T> = Result<T, SettingsError>;
 
@@ -683,6 +831,9 @@ pub enum SettingsError {
     /// The database worker panicked.
     #[error("settings database worker panicked")]
     DatabaseWorkerPanicked,
+    /// A TOML-backed config/state operation failed.
+    #[error("settings config operation failed: {0}")]
+    Config(#[from] bcode_config::ConfigError),
 }
 
 async fn open_database(path: &Path) -> SettingsResult<Box<dyn Database>> {
@@ -1070,6 +1221,84 @@ mod tests {
                 .expect("recommendations should load"),
             vec![recommendation]
         );
+    }
+
+    #[test]
+    fn environment_detection_sanitizes_secret_values() {
+        let vars = BTreeMap::from([
+            ("OPENAI_API_KEY".to_owned(), "sk-secret-value".to_owned()),
+            ("AWS_PROFILE".to_owned(), "work".to_owned()),
+        ]);
+
+        let snapshot = detect_setup_environment_from_vars(&vars, 500);
+        let encoded = serde_json::to_string(&snapshot).expect("snapshot should encode");
+
+        assert!(encoded.contains("OPENAI_API_KEY"));
+        assert!(encoded.contains("work"));
+        assert!(!encoded.contains("sk-secret-value"));
+        assert_eq!(snapshot.recommendations.len(), 1);
+    }
+
+    #[test]
+    fn setup_map_snapshot_renders_compact_text_map() {
+        let persisted = vec![OnboardingSection {
+            section_id: SetupSectionId::Welcome.as_str().to_owned(),
+            status: SetupSectionStatus::Visited.as_str().to_owned(),
+            visited: true,
+            visited_at_ms: Some(1),
+            completed_at_ms: None,
+            skipped_at_ms: None,
+            dismissed: false,
+        }];
+        let input = SetupReconciliationInput {
+            current_section: Some(SetupSectionId::Welcome),
+            ..SetupReconciliationInput::default()
+        };
+
+        let snapshot = SetupMapSnapshot::from_reconciliation(&persisted, &input);
+        let rendered = snapshot.render_text_map();
+
+        assert!(rendered.starts_with("welcome:current:visited -> detection:unvisited"));
+        assert!(rendered.ends_with("launch:unvisited"));
+    }
+
+    #[test]
+    fn settings_service_model_ignore_writes_toml_state() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let state_path = temp.path().join("model-ignores.toml");
+        unsafe {
+            std::env::set_var("BCODE_MODEL_IGNORES_STATE", &state_path);
+        }
+        let store = SettingsStore::from_settings_db_path(temp.path().join("settings.db"));
+
+        store
+            .ignore_model("bcode.openai-compatible", "gpt-hidden".to_owned())
+            .expect("model ignore should be written");
+        let rules = bcode_config::load_model_ignores_state_from(&state_path)
+            .expect("model ignore state should load");
+        assert!(
+            rules
+                .get("bcode.openai-compatible")
+                .expect("provider ignore entry should exist")
+                .models
+                .contains("gpt-hidden")
+        );
+
+        store
+            .unignore_model("bcode.openai-compatible", "gpt-hidden")
+            .expect("model ignore should be removed");
+        let rules = bcode_config::load_model_ignores_state_from(&state_path)
+            .expect("model ignore state should reload");
+        assert!(
+            !rules
+                .get("bcode.openai-compatible")
+                .expect("provider ignore entry should still exist")
+                .models
+                .contains("gpt-hidden")
+        );
+        unsafe {
+            std::env::remove_var("BCODE_MODEL_IGNORES_STATE");
+        }
     }
 
     #[test]
