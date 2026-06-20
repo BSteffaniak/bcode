@@ -84,7 +84,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// enum layouts or envelope payload shapes change incompatibly so stale
 /// client/daemon pairs fail explicitly during envelope decode instead of
 /// interpreting payloads with mismatched positional layouts.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 3;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 4;
 
 /// Build-scoped daemon fingerprint generated at compile time.
 pub const BUILD_FINGERPRINT: &str = env!("BCODE_BUILD_FINGERPRINT");
@@ -3227,6 +3227,7 @@ mod tests {
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, FileChangeResult, SessionEventKind,
         SessionForkResult, SessionId, SessionSummary, ShellRunResult, ToolInvocationResult,
     };
+    use std::collections::BTreeSet;
 
     #[test]
     fn ipc_v1_golden_fixtures_decode_to_expected_payloads() {
@@ -3400,12 +3401,47 @@ mod tests {
     }
 
     #[test]
+    fn session_model_list_with_pricing_round_trips() {
+        let response = Response::Ok(ResponsePayload::SessionModelList {
+            provider_plugin_id: Some("provider".to_string()),
+            models: bcode_model::ModelList {
+                models: vec![bcode_model::ModelInfo {
+                    model_id: "model".to_string(),
+                    display_name: "Model".to_string(),
+                    is_default: true,
+                    context_window: Some(128_000),
+                    max_output_tokens: Some(16_000),
+                    capabilities: BTreeSet::new(),
+                    reasoning: None,
+                    cache: bcode_model::ModelCacheInfo::default(),
+                    metadata_source: None,
+                    pricing: Some(bcode_model::ModelPricingInfo {
+                        currency: "USD".to_string(),
+                        unit: bcode_model::ModelPricingUnit::PerMillionTokens,
+                        input: Some(bcode_model::ModelTokenPrice::from_micros(1_250_000)),
+                        cached_input: Some(bcode_model::ModelTokenPrice::from_micros(125_000)),
+                        cache_write_input: None,
+                        output: Some(bcode_model::ModelTokenPrice::from_micros(10_000_000)),
+                        source: bcode_model::ModelPricingSource::PatternMatch,
+                    }),
+                    visibility: bcode_model::ModelVisibility::Visible,
+                }],
+            },
+        });
+
+        let encoded = encode_response(&response).expect("response should encode");
+        let decoded = decode_response(&encoded).expect("response should decode");
+
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
     fn response_envelope_uses_current_protocol_version() {
         let envelope = response_envelope(7, &Response::Ok(ResponsePayload::MessageSent))
             .expect("response envelope should encode");
 
         assert_eq!(envelope.version, ProtocolVersion::current());
-        assert_eq!(ProtocolVersion::current().0, 3);
+        assert_eq!(ProtocolVersion::current().0, CURRENT_PROTOCOL_VERSION);
     }
 
     #[tokio::test]
@@ -3435,7 +3471,7 @@ mod tests {
             error,
             CodecError::UnsupportedVersion {
                 actual: 1,
-                expected: 3
+                expected: CURRENT_PROTOCOL_VERSION
             }
         ));
     }

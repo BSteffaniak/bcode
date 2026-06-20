@@ -130,6 +130,7 @@ enum ModelProviderPick {
 }
 
 /// Pick and set the active model for the current or next session.
+#[allow(clippy::too_many_lines)]
 pub async fn pick_model_for_session<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
@@ -170,34 +171,87 @@ pub async fn pick_model_for_session<W: Write>(
                 let _ = text_input_flow::handle_paste(picker.filter_mut(), &text);
                 picker.refresh_filter();
             }
-            Event::Key(stroke) => match stroke.key {
-                KeyCode::Escape => return Ok(()),
-                KeyCode::Enter => {
-                    if let Some(model_id) = picker.selected_model_id() {
-                        apply_model_selection(
-                            chat,
-                            session_id,
-                            provider_plugin_id.clone(),
-                            model_id,
-                        );
-                        return Ok(());
+            Event::Key(stroke) => {
+                match stroke.key {
+                    KeyCode::Escape => return Ok(()),
+                    KeyCode::Char('I') => picker.toggle_show_ignored(),
+                    KeyCode::Char('s') => picker.cycle_sort_key(),
+                    KeyCode::Char('S') => picker.reverse_sort_direction(),
+                    KeyCode::Char('i') => {
+                        if let Some(model_id) = picker.selected_model_id() {
+                            let provider = provider_plugin_id
+                                .as_deref()
+                                .unwrap_or("bcode.openai-compatible");
+                            match bcode_config::ignore_model_in_state(provider, model_id.clone()) {
+                                Ok(path) => {
+                                    picker.mark_state_ignored(&model_id);
+                                    picker.set_status(format!(
+                                        "Ignored {model_id} in state ({})",
+                                        path.display()
+                                    ));
+                                }
+                                Err(error) => picker
+                                    .set_status(format!("Failed to ignore {model_id}: {error}")),
+                            }
+                        }
+                    }
+                    KeyCode::Char('u') => {
+                        if let Some(model_id) = picker.selected_ignored_model_id() {
+                            let provider = provider_plugin_id
+                                .as_deref()
+                                .unwrap_or("bcode.openai-compatible");
+                            match bcode_config::unignore_model_in_state(provider, &model_id) {
+                                Ok(path) => {
+                                    picker.mark_state_unignored(&model_id);
+                                    picker.set_status(format!(
+                                        "Removed state ignore for {model_id} ({})",
+                                        path.display()
+                                    ));
+                                }
+                                Err(error) => picker
+                                    .set_status(format!("Failed to unignore {model_id}: {error}")),
+                            }
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if let Some(model_id) = picker.selected_model_id() {
+                            if picker.selected_ignored_model_id().is_some() {
+                                picker.set_status(format!(
+                                "{model_id} is ignored; press u to remove state ignore or I to hide ignored models"
+                            ));
+                                continue;
+                            }
+                            apply_model_selection(
+                                chat,
+                                session_id,
+                                provider_plugin_id.clone(),
+                                model_id,
+                            );
+                            return Ok(());
+                        }
+                    }
+                    KeyCode::Up => picker.select_previous(),
+                    KeyCode::Down => picker.select_next(),
+                    _ => {
+                        if text_input_flow::handle_key(picker.filter_mut(), services.keymap, stroke)
+                            != bmux_tui_components::text_input::TextInputOutcome::Ignored
+                        {
+                            picker.refresh_filter();
+                        }
                     }
                 }
-                KeyCode::Up => picker.select_previous(),
-                KeyCode::Down => picker.select_next(),
-                _ => {
-                    if text_input_flow::handle_key(picker.filter_mut(), services.keymap, stroke)
-                        != bmux_tui_components::text_input::TextInputOutcome::Ignored
-                    {
-                        picker.refresh_filter();
-                    }
-                }
-            },
+            }
             Event::Mouse(mouse) => {
                 if let Some(row) = picker_row_from_mouse(mouse)
                     && picker.select_visible(row)
                     && let Some(model_id) = picker.selected_model_id()
                 {
+                    if picker.selected_ignored_model_id().is_some() {
+                        picker.set_status(format!(
+                            "{model_id} is ignored; press u to remove state ignore or I to hide ignored models"
+                        ));
+                        continue;
+                    }
                     apply_model_selection(chat, session_id, provider_plugin_id.clone(), model_id);
                     return Ok(());
                 }

@@ -273,6 +273,7 @@ fn models() -> ModelList {
             cache: bcode_model::ModelCacheInfo::default(),
             metadata_source: Some(bcode_model::ModelMetadataSource::BundledCatalog),
             pricing: None,
+            visibility: bcode_model::ModelVisibility::Visible,
         }],
     }
 }

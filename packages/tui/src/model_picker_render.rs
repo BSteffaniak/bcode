@@ -16,7 +16,9 @@ pub fn render_model_picker(app: &mut ModelPickerApp, frame: &mut Frame<'_>, them
         " Models ",
         &Line::from_spans(vec![
             Span::styled("Select model", Style::new().add_modifier(Modifier::BOLD)),
-            Span::raw("  Enter selects  Esc cancels"),
+            Span::raw(
+                "  Enter selects  Esc cancels  s sort  S reverse  i ignore  u unignore  I ignored",
+            ),
         ]),
         app.filter_mut(),
         "Filter models",
@@ -26,12 +28,17 @@ pub fn render_model_picker(app: &mut ModelPickerApp, frame: &mut Frame<'_>, them
         return;
     };
 
-    let bottom_y = render_picker_status(
-        inner,
+    let status = format!(
+        "{} · {}{}",
         app.status(),
-        Style::new().fg(Color::BrightBlack),
-        frame,
+        app.sort_label(),
+        if app.show_ignored() {
+            " · ignored visible"
+        } else {
+            ""
+        }
     );
+    let bottom_y = render_picker_status(inner, &status, Style::new().fg(Color::BrightBlack), frame);
     let Some(list_area) = picker_list_area(inner, list_y, bottom_y) else {
         return;
     };

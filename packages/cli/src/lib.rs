@@ -655,6 +655,20 @@ enum ModelCommand {
     List,
     Capabilities,
     Validate,
+    Ignore {
+        model_id: String,
+        #[arg(long)]
+        provider: Option<String>,
+    },
+    Unignore {
+        model_id: String,
+        #[arg(long)]
+        provider: Option<String>,
+    },
+    Ignored {
+        #[arg(long)]
+        provider: Option<String>,
+    },
     Set {
         session_id: SessionId,
         model_id: String,
@@ -1181,16 +1195,57 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
 }
 
 async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
-    ensure_server_running().await?;
     match command {
-        ModelCommand::List => list_models().await?,
-        ModelCommand::Capabilities => model_capabilities().await?,
-        ModelCommand::Validate => model_validate_config().await?,
-        ModelCommand::Set {
-            session_id,
-            provider,
-            model_id,
-        } => set_session_model(session_id, provider, model_id).await?,
+        ModelCommand::Ignore { model_id, provider } => {
+            let provider = provider.unwrap_or_else(|| "bcode.openai-compatible".to_string());
+            let path = bcode_config::ignore_model_in_state(&provider, model_id.clone())?;
+            println!(
+                "Ignored model '{model_id}' for provider '{provider}' in {}",
+                path.display()
+            );
+        }
+        ModelCommand::Unignore { model_id, provider } => {
+            let provider = provider.unwrap_or_else(|| "bcode.openai-compatible".to_string());
+            let path = bcode_config::unignore_model_in_state(&provider, &model_id)?;
+            println!(
+                "Removed state ignore for model '{model_id}' and provider '{provider}' in {}",
+                path.display()
+            );
+        }
+        ModelCommand::Ignored { provider } => {
+            let state = bcode_config::load_model_ignores_state()?;
+            for (provider_id, rules) in state {
+                if provider
+                    .as_deref()
+                    .is_some_and(|filter| filter != provider_id)
+                {
+                    continue;
+                }
+                println!("{provider_id}");
+                for model in rules.models {
+                    println!("  model {model}");
+                }
+                for pattern in rules.patterns {
+                    println!("  pattern {pattern}");
+                }
+            }
+        }
+        other => {
+            ensure_server_running().await?;
+            match other {
+                ModelCommand::List => list_models().await?,
+                ModelCommand::Capabilities => model_capabilities().await?,
+                ModelCommand::Validate => model_validate_config().await?,
+                ModelCommand::Set {
+                    session_id,
+                    provider,
+                    model_id,
+                } => set_session_model(session_id, provider, model_id).await?,
+                ModelCommand::Ignore { .. }
+                | ModelCommand::Unignore { .. }
+                | ModelCommand::Ignored { .. } => unreachable!("handled above"),
+            }
+        }
     }
     Ok(())
 }

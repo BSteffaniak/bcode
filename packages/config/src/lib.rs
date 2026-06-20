@@ -1543,6 +1543,73 @@ pub struct ModelConfig {
     pub aliases: BTreeMap<String, ModelAliasConfig>,
     #[serde(default)]
     pub metadata: BTreeMap<String, ModelMetadataConfig>,
+    #[serde(default)]
+    pub ignored: BTreeMap<String, ModelIgnoreConfig>,
+}
+
+/// Declarative or state-backed model ignore rules for one provider.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelIgnoreConfig {
+    #[serde(default)]
+    pub models: BTreeSet<String>,
+    #[serde(default)]
+    pub patterns: Vec<String>,
+}
+
+/// Source that caused a model to be ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelIgnoreSource {
+    Config,
+    State,
+    Both,
+}
+
+/// Matched model ignore rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelIgnoreMatch {
+    pub source: ModelIgnoreSource,
+    pub rule: String,
+}
+
+/// Effective model ignore rules after unioning declarative config and runtime state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EffectiveModelIgnoreRules {
+    pub config: ModelIgnoreConfig,
+    pub state: ModelIgnoreConfig,
+}
+
+impl EffectiveModelIgnoreRules {
+    #[must_use]
+    pub fn is_ignored(&self, model_id: &str) -> Option<ModelIgnoreMatch> {
+        let config_rule = ignore_rule_match(&self.config, model_id);
+        let state_rule = ignore_rule_match(&self.state, model_id);
+        match (config_rule, state_rule) {
+            (Some(config), Some(state)) => Some(ModelIgnoreMatch {
+                source: ModelIgnoreSource::Both,
+                rule: format!("{config}; {state}"),
+            }),
+            (Some(rule), None) => Some(ModelIgnoreMatch {
+                source: ModelIgnoreSource::Config,
+                rule,
+            }),
+            (None, Some(rule)) => Some(ModelIgnoreMatch {
+                source: ModelIgnoreSource::State,
+                rule,
+            }),
+            (None, None) => None,
+        }
+    }
+}
+
+fn ignore_rule_match(rules: &ModelIgnoreConfig, model_id: &str) -> Option<String> {
+    if rules.models.contains(model_id) {
+        return Some(model_id.to_string());
+    }
+    rules
+        .patterns
+        .iter()
+        .find(|pattern| model_id.contains(pattern.as_str()))
+        .map(|pattern| format!("*{pattern}*"))
 }
 
 impl ModelConfig {
@@ -2470,6 +2537,169 @@ pub fn default_permissions_state_path() -> PathBuf {
         return PathBuf::from(path);
     }
     default_state_dir().join("permissions.toml")
+}
+
+/// Return the default runtime model ignores state file path.
+#[must_use]
+pub fn default_model_ignores_state_path() -> PathBuf {
+    if let Ok(path) = env::var("BCODE_MODEL_IGNORES_STATE") {
+        return PathBuf::from(path);
+    }
+    default_state_dir().join("model-ignores.toml")
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct ModelIgnoresState {
+    #[serde(default)]
+    providers: BTreeMap<String, ModelIgnoreConfig>,
+}
+
+/// Load runtime model ignore rules.
+///
+/// # Errors
+///
+/// Returns an error when the state file exists but cannot be read or parsed.
+pub fn load_model_ignores_state() -> Result<BTreeMap<String, ModelIgnoreConfig>, ConfigError> {
+    load_model_ignores_state_from(&default_model_ignores_state_path())
+}
+
+/// Load runtime model ignore rules from a specific path.
+///
+/// # Errors
+///
+/// Returns an error when the state file exists but cannot be read or parsed.
+pub fn load_model_ignores_state_from(
+    path: &Path,
+) -> Result<BTreeMap<String, ModelIgnoreConfig>, ConfigError> {
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let raw = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let state =
+        toml::from_str::<ModelIgnoresState>(&raw).map_err(|source| ConfigError::Composition {
+            message: format!("failed to parse {}: {source}", path.display()),
+        })?;
+    Ok(state.providers)
+}
+
+/// Return effective model ignore rules for a provider.
+///
+/// # Errors
+///
+/// Returns an error when config or state cannot be loaded.
+pub fn effective_model_ignore_rules(
+    provider_plugin_id: &str,
+) -> Result<EffectiveModelIgnoreRules, ConfigError> {
+    let config = load_config()?;
+    let state = load_model_ignores_state()?;
+    Ok(EffectiveModelIgnoreRules {
+        config: config
+            .model
+            .ignored
+            .get(provider_plugin_id)
+            .cloned()
+            .unwrap_or_default(),
+        state: state.get(provider_plugin_id).cloned().unwrap_or_default(),
+    })
+}
+
+/// Add a model to runtime ignores for a provider.
+///
+/// # Errors
+///
+/// Returns an error when state cannot be read or written.
+pub fn ignore_model_in_state(
+    provider_plugin_id: &str,
+    model_id: String,
+) -> Result<PathBuf, ConfigError> {
+    update_model_ignores_state(|providers| {
+        providers
+            .entry(provider_plugin_id.to_string())
+            .or_default()
+            .models
+            .insert(model_id);
+        Ok(())
+    })
+}
+
+/// Remove a model from runtime ignores for a provider.
+///
+/// # Errors
+///
+/// Returns an error when state cannot be read or written.
+pub fn unignore_model_in_state(
+    provider_plugin_id: &str,
+    model_id: &str,
+) -> Result<PathBuf, ConfigError> {
+    update_model_ignores_state(|providers| {
+        if let Some(rules) = providers.get_mut(provider_plugin_id) {
+            rules.models.remove(model_id);
+        }
+        Ok(())
+    })
+}
+
+fn update_model_ignores_state(
+    update: impl FnOnce(&mut BTreeMap<String, ModelIgnoreConfig>) -> Result<(), ConfigError>,
+) -> Result<PathBuf, ConfigError> {
+    let path = default_model_ignores_state_path();
+    let mut providers = if path.exists() {
+        load_model_ignores_state_from(&path)?
+    } else {
+        BTreeMap::new()
+    };
+    update(&mut providers)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    std::fs::write(&path, model_ignores_state_to_toml(&providers)).map_err(|source| {
+        ConfigError::Io {
+            path: path.clone(),
+            source,
+        }
+    })?;
+    Ok(path)
+}
+
+fn model_ignores_state_to_toml(providers: &BTreeMap<String, ModelIgnoreConfig>) -> String {
+    let mut output = String::new();
+    output.push_str(
+        "# Bcode runtime model ignore state. Managed automatically by the TUI and CLI.\n",
+    );
+    output.push_str(
+        "# Declarative [model.ignored] rules in bcode.toml are unioned with this file.\n\n",
+    );
+    for (provider, rules) in providers {
+        let escaped_provider = provider.replace('"', "\\\"");
+        let _ = writeln!(output, "[providers.\"{escaped_provider}\"]");
+        write_model_ignore_string_set(&mut output, "models", &rules.models);
+        write_string_slice(&mut output, "patterns", &rules.patterns);
+        output.push('\n');
+    }
+    output
+}
+
+fn write_model_ignore_string_set(output: &mut String, key: &str, values: &BTreeSet<String>) {
+    let values = values.iter().cloned().collect::<Vec<_>>();
+    write_string_slice(output, key, &values);
+}
+
+fn write_string_slice(output: &mut String, key: &str, values: &[String]) {
+    if values.is_empty() {
+        return;
+    }
+    let escaped = values
+        .iter()
+        .map(|value| format!("\"{}\"", value.replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = writeln!(output, "{key} = [{escaped}]");
 }
 
 /// Load the runtime permissions state file.

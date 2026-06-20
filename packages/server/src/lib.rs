@@ -4,6 +4,7 @@
 
 //! Local Bcode daemon runtime.
 
+mod model_ignores;
 mod runtime_work;
 pub mod session_catalog;
 mod session_import;
@@ -6259,7 +6260,7 @@ async fn model_status_for_selection(
     state: &ServerState,
     selection: SessionModelSelection,
 ) -> bcode_ipc::SessionModelStatus {
-    let models = invoke_model_provider_json_blocking::<_, ModelList>(
+    let mut models = invoke_model_provider_json_blocking::<_, ModelList>(
         state,
         selection.provider_plugin_id.clone(),
         OP_MODELS,
@@ -6270,6 +6271,15 @@ async fn model_status_for_selection(
     )
     .await
     .ok();
+    if let Some(models) = &mut models {
+        let provider_for_ignores = selection
+            .provider_plugin_id
+            .as_deref()
+            .unwrap_or("bcode.openai-compatible");
+        if let Ok(rules) = bcode_config::effective_model_ignore_rules(provider_for_ignores) {
+            model_ignores::apply_model_ignores(&mut models.models, &rules);
+        }
+    }
     let model = models
         .as_ref()
         .and_then(|models| select_model_info(&models.models, selection.model_id.as_deref()));
@@ -6352,7 +6362,13 @@ async fn handle_session_model_list(
     )
     .await
     {
-        Ok(models) => {
+        Ok(mut models) => {
+            let provider_for_ignores = selected_provider_plugin_id
+                .as_deref()
+                .unwrap_or("bcode.openai-compatible");
+            if let Ok(rules) = bcode_config::effective_model_ignore_rules(provider_for_ignores) {
+                model_ignores::apply_model_ignores(&mut models.models, &rules);
+            }
             send_response(
                 writer,
                 request_id,
@@ -6380,7 +6396,16 @@ fn select_model_info(
 ) -> Option<bcode_model::ModelInfo> {
     selected_model_id
         .and_then(|model_id| models.iter().find(|model| model.model_id == model_id))
-        .or_else(|| models.iter().find(|model| model.is_default))
+        .or_else(|| {
+            models
+                .iter()
+                .find(|model| model.is_default && !model_ignores::is_ignored(model))
+        })
+        .or_else(|| {
+            models
+                .iter()
+                .find(|model| !model_ignores::is_ignored(model))
+        })
         .or_else(|| models.first())
         .cloned()
 }
@@ -15120,6 +15145,7 @@ mod tests {
                 cache: bcode_model::ModelCacheInfo::default(),
                 metadata_source: None,
                 pricing: None,
+                visibility: bcode_model::ModelVisibility::Visible,
             },
             bcode_model::ModelInfo {
                 model_id: "selected".to_string(),
@@ -15132,6 +15158,7 @@ mod tests {
                 cache: bcode_model::ModelCacheInfo::default(),
                 metadata_source: None,
                 pricing: None,
+                visibility: bcode_model::ModelVisibility::Visible,
             },
         ];
 

@@ -3080,6 +3080,7 @@ fn model_infos_from_items(
                 cache: openai_model_cache_info(),
                 metadata_source: Some(metadata.source),
                 pricing: model_catalog::pricing_for(&model.id, &model.metadata),
+                visibility: bcode_model::ModelVisibility::Visible,
             }
         })
         .collect()

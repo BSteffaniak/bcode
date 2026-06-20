@@ -1284,6 +1284,7 @@ fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Ve
                 cache: bedrock_model_cache_info(),
                 metadata_source: Some(ModelMetadataSource::BundledCatalog),
                 pricing: None,
+                visibility: bcode_model::ModelVisibility::Visible,
             }
         })
         .collect()
@@ -1890,6 +1891,7 @@ async fn discover_models(settings: &Settings) -> Result<ModelDiscovery, Provider
                 cache: bedrock_model_cache_info(),
                 metadata_source: Some(ModelMetadataSource::BundledCatalog),
                 pricing: None,
+                visibility: bcode_model::ModelVisibility::Visible,
             }
         })
         .collect();

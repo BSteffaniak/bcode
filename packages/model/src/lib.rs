@@ -99,6 +99,32 @@ pub struct ModelInfo {
     pub metadata_source: Option<ModelMetadataSource>,
     #[serde(default)]
     pub pricing: Option<ModelPricingInfo>,
+    #[serde(default, skip)]
+    pub visibility: ModelVisibility,
+}
+
+/// Model picker/list visibility metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelVisibility {
+    #[default]
+    Visible,
+    Ignored {
+        source: ModelVisibilitySource,
+        rule: String,
+    },
+    Unsupported {
+        reason: String,
+    },
+}
+
+/// Source of a model visibility decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelVisibilitySource {
+    Config,
+    State,
+    Both,
 }
 
 /// Model token pricing metadata.
@@ -990,7 +1016,8 @@ pub enum ProviderErrorCategory {
 #[cfg(test)]
 mod tests {
     use super::{
-        ModelPricingInfo, ModelPricingSource, ModelPricingUnit, ModelTokenPrice, TokenUsage,
+        ModelInfo, ModelList, ModelPricingInfo, ModelPricingSource, ModelPricingUnit,
+        ModelTokenPrice, ModelVisibility, ModelVisibilitySource, TokenUsage,
     };
 
     #[test]
@@ -1053,5 +1080,32 @@ mod tests {
         };
 
         assert!(pricing.estimate_cost(&TokenUsage::default()).is_none());
+    }
+
+    #[test]
+    fn model_list_visibility_is_local_not_serialized() {
+        let list = ModelList {
+            models: vec![ModelInfo {
+                model_id: "hidden".to_string(),
+                display_name: "Hidden".to_string(),
+                is_default: false,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: std::collections::BTreeSet::new(),
+                reasoning: None,
+                cache: super::ModelCacheInfo::default(),
+                metadata_source: None,
+                pricing: None,
+                visibility: ModelVisibility::Ignored {
+                    source: ModelVisibilitySource::State,
+                    rule: "hidden".to_string(),
+                },
+            }],
+        };
+
+        let encoded = serde_json::to_string(&list).expect("model list should encode");
+        let decoded: ModelList = serde_json::from_str(&encoded).expect("model list should decode");
+
+        assert_eq!(decoded.models[0].visibility, ModelVisibility::Visible);
     }
 }
