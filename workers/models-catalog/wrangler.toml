@@ -1,0 +1,15 @@
+name = "models-catalog"
+main = "src/worker.js"
+compatibility_date = "2025-12-01"
+
+[observability]
+enabled = true
+
+# Example deployment config. Bucket names and asset paths can be overridden by deployment tooling.
+# [[r2_buckets]]
+# binding = "LIVE_SNAPSHOTS"
+# bucket_name = "models-catalog-live"
+#
+# [assets]
+# directory = "../../target/models-site"
+# binding = "ASSETS"
