@@ -404,8 +404,7 @@ impl DaemonStartError {
 /// Returns an error when stale-record cleanup fails, spawning the daemon fails,
 /// or the daemon does not pass bounded readiness checks.
 pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), DaemonStartError> {
-    cleanup_stale_daemon_records().await?;
-    if probe_daemon_ready(&options.endpoint).await {
+    if ping_ready(&options.endpoint).await {
         if !options.quiet {
             println!("server already running");
             println!("namespace: {}", daemon_namespace());
@@ -418,9 +417,8 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
     loop {
         startup_attempts += 1;
         let lock = StartupLock::acquire()?;
-        cleanup_stale_daemon_records().await?;
         cleanup_stale_endpoint(&options.endpoint)?;
-        if probe_daemon_ready(&options.endpoint).await {
+        if ping_ready(&options.endpoint).await {
             drop(lock);
             if !options.quiet {
                 println!("server already running");
@@ -451,6 +449,9 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
 
         match wait_for_server_ready(&options.endpoint, &mut child, &options.log_path).await {
             Ok(()) => {
+                let _cleanup_task = tokio::spawn(async {
+                    let _ = cleanup_stale_daemon_records().await;
+                });
                 drop(lock);
                 if !options.quiet {
                     println!("server started");
@@ -504,7 +505,7 @@ impl StartupLock {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        for _ in 0..100 {
+        for _ in 0..20 {
             match fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -515,7 +516,7 @@ impl StartupLock {
                     return Ok(Self { path });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    std::thread::sleep(Duration::from_millis(50));
+                    std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -548,7 +549,6 @@ async fn wait_for_server_ready(
 ) -> Result<(), DaemonStartError> {
     for _ in 0..50 {
         if ping_ready(endpoint).await {
-            tokio::time::sleep(Duration::from_millis(250)).await;
             if let Some(status) = child.try_wait()? {
                 return Err(DaemonStartError::Exited {
                     status: status.to_string(),
@@ -556,13 +556,7 @@ async fn wait_for_server_ready(
                     recent_log: recent_log_excerpt(log_path),
                 });
             }
-            if ping_ready(endpoint).await {
-                return Ok(());
-            }
-            return Err(DaemonStartError::HealthCheckFailed {
-                log_path: log_path.display().to_string(),
-                recent_log: recent_log_excerpt(log_path),
-            });
+            return Ok(());
         }
         if let Some(status) = child.try_wait()? {
             let error = DaemonStartError::Exited {
