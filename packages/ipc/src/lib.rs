@@ -111,7 +111,10 @@ impl Default for ProtocolVersion {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptPlacement {
-    /// Inject the prompt into the active conversation at the next safe model boundary.
+    /// Insert the prompt at the next safe conversation boundary.
+    ///
+    /// When a model request is already streaming, the next safe boundary is a queued follow-up
+    /// turn after the active response finishes.
     #[default]
     Steering,
     /// Queue the prompt to run as a follow-up turn after the active turn finishes.

@@ -265,15 +265,12 @@ enum SessionRuntimePhase {
 }
 
 impl SessionRuntimePhase {
-    const fn accepts_steering(self) -> bool {
-        matches!(
-            self,
-            Self::AppendingUser
-                | Self::PreparingModelRequest
-                | Self::ProviderActive
-                | Self::Compacting
-                | Self::FinishingTurn
-        )
+    const fn accepts_inline_steering(self) -> bool {
+        matches!(self, Self::AppendingUser | Self::PreparingModelRequest)
+    }
+
+    const fn has_active_work(self) -> bool {
+        !matches!(self, Self::Idle)
     }
 }
 
@@ -5190,17 +5187,22 @@ async fn enqueue_user_message_command(
     let handle = session_runtime_handle(state, session_id).await;
     let mut phase = handle.phase.lock().await;
     let steering_now =
-        placement == bcode_ipc::PromptPlacement::Steering && phase.accepts_steering();
+        placement == bcode_ipc::PromptPlacement::Steering && phase.accepts_inline_steering();
     let pending_before = if steering_now {
         0
     } else {
         handle.queued_followups.fetch_add(1, Ordering::AcqRel)
     };
-    let queued = !steering_now && (pending_before > 0 || phase.accepts_steering());
+    let queued = !steering_now && (pending_before > 0 || phase.has_active_work());
     let queue_position = queued.then(|| usize_to_u32_saturating(pending_before.saturating_add(1)));
     let disposition = if steering_now {
         bcode_ipc::MessageAcceptanceDisposition::AppliedSteering
-    } else if queued && placement == bcode_ipc::PromptPlacement::FollowUp {
+    } else if queued
+        && matches!(
+            placement,
+            bcode_ipc::PromptPlacement::FollowUp | bcode_ipc::PromptPlacement::Steering
+        )
+    {
         bcode_ipc::MessageAcceptanceDisposition::QueuedFollowUp
     } else if queued {
         bcode_ipc::MessageAcceptanceDisposition::QueuedTurn
@@ -5280,7 +5282,7 @@ async fn enqueue_followup_command(
     state.sessions.session_summary(session_id).await?;
     let handle = session_runtime_handle(state, session_id).await;
     let pending_before = handle.queued_followups.fetch_add(1, Ordering::AcqRel);
-    let queued = pending_before > 0 || handle.phase.lock().await.accepts_steering();
+    let queued = pending_before > 0 || handle.phase.lock().await.has_active_work();
     let queue_position = queued.then(|| usize_to_u32_saturating(pending_before.saturating_add(1)));
     let disposition = if queued {
         bcode_ipc::MessageAcceptanceDisposition::QueuedTurn
@@ -5647,8 +5649,8 @@ async fn service_runtime_priority_commands(
     }
 }
 
-async fn runtime_accepts_steering(phase: &Arc<Mutex<SessionRuntimePhase>>) -> bool {
-    phase.lock().await.accepts_steering()
+async fn runtime_accepts_inline_steering(phase: &Arc<Mutex<SessionRuntimePhase>>) -> bool {
+    phase.lock().await.accepts_inline_steering()
 }
 
 async fn set_runtime_phase(
@@ -5737,7 +5739,9 @@ async fn process_user_message_command(
     placement: bcode_ipc::PromptPlacement,
     completion_sender: Option<oneshot::Sender<ModelTurnCompletion>>,
 ) {
-    if placement == bcode_ipc::PromptPlacement::Steering && runtime_accepts_steering(&phase).await {
+    if placement == bcode_ipc::PromptPlacement::Steering
+        && runtime_accepts_inline_steering(&phase).await
+    {
         process_steering_message_command(
             state,
             permit.session_id(),
