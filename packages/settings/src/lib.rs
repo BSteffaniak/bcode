@@ -322,6 +322,25 @@ impl SettingsStore {
         })
     }
 
+    /// Persist a setup detection snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any sanitized detection entry or recommendation
+    /// cannot be written.
+    pub fn save_setup_detection_snapshot(
+        &self,
+        snapshot: &SetupDetectionSnapshot,
+    ) -> SettingsResult<()> {
+        for entry in &snapshot.entries {
+            self.save_detection_cache_entry(entry)?;
+        }
+        for recommendation in &snapshot.recommendations {
+            self.save_setup_recommendation(recommendation)?;
+        }
+        Ok(())
+    }
+
     /// Persist one setup recommendation.
     ///
     /// # Errors
@@ -687,6 +706,181 @@ pub fn reconcile_setup_sections(
         .collect()
 }
 
+/// User-visible config capability detected for setup/onboarding reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupConfigCapability {
+    /// Config currently has a provider selection.
+    ProviderSelection,
+    /// Config currently has a model selection.
+    ModelSelection,
+    /// Config currently has auth profiles or legacy auth config.
+    AuthConfiguration,
+    /// Permission/agent config is present.
+    PermissionConfiguration,
+    /// Session import config is present.
+    SessionImportConfiguration,
+}
+
+/// User-visible config summary for setup/onboarding reconciliation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupConfigSummary {
+    /// Detected config capabilities.
+    pub capabilities: BTreeSet<SetupConfigCapability>,
+    /// Enabled plugin IDs.
+    pub enabled_plugins: BTreeSet<String>,
+    /// Disabled plugin IDs.
+    pub disabled_plugins: BTreeSet<String>,
+}
+
+impl SetupConfigSummary {
+    /// Build a setup summary from loaded Bcode config.
+    #[must_use]
+    pub fn from_config(config: &bcode_config::BcodeConfig) -> Self {
+        let selection = config.resolved_model_selection();
+        let mut capabilities = BTreeSet::new();
+        if selection.provider_plugin_id.is_some() {
+            capabilities.insert(SetupConfigCapability::ProviderSelection);
+        }
+        if selection.model_id.is_some() || selection.model_profile.is_some() {
+            capabilities.insert(SetupConfigCapability::ModelSelection);
+        }
+        if config.auth.openai.is_some()
+            || !config.auth.profiles.is_empty()
+            || !config.auth.pools.is_empty()
+        {
+            capabilities.insert(SetupConfigCapability::AuthConfiguration);
+        }
+        if !config.agent.is_empty() {
+            capabilities.insert(SetupConfigCapability::PermissionConfiguration);
+        }
+        if config.session_import != bcode_config::SessionImportConfig::default() {
+            capabilities.insert(SetupConfigCapability::SessionImportConfiguration);
+        }
+        Self {
+            capabilities,
+            enabled_plugins: config.plugins.enabled.clone(),
+            disabled_plugins: config.plugins.disabled.clone(),
+        }
+    }
+
+    /// Convert this config summary into setup reconciliation facts.
+    #[must_use]
+    pub fn reconciliation_input(&self) -> SetupReconciliationInput {
+        let mut input = SetupReconciliationInput::default();
+        if self
+            .capabilities
+            .contains(&SetupConfigCapability::AuthConfiguration)
+        {
+            input.secured_sections.insert(SetupSectionId::SecureVault);
+        }
+        if self
+            .capabilities
+            .contains(&SetupConfigCapability::ProviderSelection)
+            || self
+                .capabilities
+                .contains(&SetupConfigCapability::AuthConfiguration)
+        {
+            input.configured_sections.insert(SetupSectionId::Providers);
+        }
+        if self
+            .capabilities
+            .contains(&SetupConfigCapability::ModelSelection)
+        {
+            input.configured_sections.insert(SetupSectionId::Models);
+        }
+        if self
+            .capabilities
+            .contains(&SetupConfigCapability::PermissionConfiguration)
+        {
+            input
+                .configured_sections
+                .insert(SetupSectionId::Permissions);
+        }
+        if self
+            .capabilities
+            .contains(&SetupConfigCapability::SessionImportConfiguration)
+        {
+            input.configured_sections.insert(SetupSectionId::Imports);
+        } else {
+            input.optional_sections.insert(SetupSectionId::Imports);
+        }
+        if !self.enabled_plugins.is_empty() || !self.disabled_plugins.is_empty() {
+            input.configured_sections.insert(SetupSectionId::Plugins);
+        } else {
+            input.optional_sections.insert(SetupSectionId::Plugins);
+        }
+        input
+    }
+}
+
+/// Provider setup card view model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSetupCard {
+    /// Provider/plugin identifier.
+    pub provider_plugin_id: String,
+    /// Whether the provider is selected/configured.
+    pub configured: bool,
+    /// Whether auth information exists for this provider.
+    pub auth_configured: bool,
+    /// Optional story copy explaining the next action.
+    pub story: String,
+}
+
+/// Build a provider setup card.
+#[must_use]
+pub fn provider_setup_card(
+    provider_plugin_id: impl Into<String>,
+    configured: bool,
+    auth_configured: bool,
+) -> ProviderSetupCard {
+    let provider_plugin_id = provider_plugin_id.into();
+    let story = if configured && auth_configured {
+        "This provider is ready to use with configured authentication.".to_owned()
+    } else if configured {
+        "This provider is selected, but Bcode still needs a secure auth path.".to_owned()
+    } else {
+        "Choose this provider if it matches the models and credentials you want Bcode to use."
+            .to_owned()
+    };
+    ProviderSetupCard {
+        provider_plugin_id,
+        configured,
+        auth_configured,
+        story,
+    }
+}
+
+/// Security trust panel view model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityTrustPanel {
+    /// Whether sshenv/secure storage appears available.
+    pub secure_storage_available: bool,
+    /// Whether device sealing appears available.
+    pub device_seal_available: bool,
+    /// Storytelling copy for the UI.
+    pub story: String,
+}
+
+/// Build security storytelling copy for onboarding.
+#[must_use]
+pub fn security_trust_panel(
+    secure_storage_available: bool,
+    device_seal_available: bool,
+) -> SecurityTrustPanel {
+    let story = match (secure_storage_available, device_seal_available) {
+        (true, true) => "Secure storage and device sealing are available. Bcode can keep credentials out of plaintext config and bind encrypted secrets to this machine.",
+        (true, false) => "Secure storage is available. Bcode can keep credentials out of plaintext shell files and config, even though device sealing was not detected.",
+        (false, _) => "Secure storage is not ready yet. Bcode should guide you to a safer credential path before launch.",
+    }
+    .to_owned();
+    SecurityTrustPanel {
+        secure_storage_available,
+        device_seal_available,
+        story,
+    }
+}
+
 /// Bounded, sanitized onboarding/environment detection result.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetupDetectionSnapshot {
@@ -753,6 +947,30 @@ pub fn detect_setup_environment_from_vars(
                 expires_at_ms: None,
             });
         }
+    }
+
+    // Detect Bcode-prefixed environment metadata without storing secret-like values.
+    for (name, value) in vars
+        .iter()
+        .filter(|(name, value)| name.starts_with("BCODE_") && !value.is_empty())
+    {
+        let looks_secret = name.contains("KEY")
+            || name.contains("TOKEN")
+            || name.contains("SECRET")
+            || name.contains("PASSWORD");
+        entries.push(DetectionCacheEntry {
+            detector: "environment".to_owned(),
+            key: name.clone(),
+            value: if looks_secret {
+                json!({ "present": true, "secret_value_stored": false })
+            } else {
+                json!({ "present": true, "value": value })
+            },
+            confidence: "high".to_owned(),
+            source: "environment".to_owned(),
+            detected_at_ms,
+            expires_at_ms: None,
+        });
     }
 
     SetupDetectionSnapshot {
@@ -1224,10 +1442,57 @@ mod tests {
     }
 
     #[test]
+    fn config_summary_maps_config_to_reconciliation_input() {
+        let mut config = bcode_config::BcodeConfig::default();
+        config.model.profile = Some("fast".to_owned());
+        config.model.profiles.insert(
+            "fast".to_owned(),
+            bcode_config::ModelProfileConfig {
+                provider_plugin_id: "bcode.openai-compatible".to_owned(),
+                model_id: Some("gpt-test".to_owned()),
+                ..bcode_config::ModelProfileConfig::default()
+            },
+        );
+        config.plugins.enabled.insert("bcode.filesystem".to_owned());
+
+        let summary = SetupConfigSummary::from_config(&config);
+        let input = summary.reconciliation_input();
+
+        assert!(
+            summary
+                .capabilities
+                .contains(&SetupConfigCapability::ProviderSelection)
+        );
+        assert!(
+            summary
+                .capabilities
+                .contains(&SetupConfigCapability::ModelSelection)
+        );
+        assert!(
+            input
+                .configured_sections
+                .contains(&SetupSectionId::Providers)
+        );
+        assert!(input.configured_sections.contains(&SetupSectionId::Models));
+        assert!(input.configured_sections.contains(&SetupSectionId::Plugins));
+    }
+
+    #[test]
+    fn setup_view_models_include_story_copy() {
+        let provider = provider_setup_card("bcode.openai-compatible", true, false);
+        let security = security_trust_panel(true, true);
+
+        assert!(provider.story.contains("secure auth path"));
+        assert!(security.story.contains("device sealing"));
+    }
+
+    #[test]
     fn environment_detection_sanitizes_secret_values() {
         let vars = BTreeMap::from([
             ("OPENAI_API_KEY".to_owned(), "sk-secret-value".to_owned()),
             ("AWS_PROFILE".to_owned(), "work".to_owned()),
+            ("BCODE_AUTH_TOKEN".to_owned(), "bcode-secret".to_owned()),
+            ("BCODE_MODEL_PROFILE".to_owned(), "fast".to_owned()),
         ]);
 
         let snapshot = detect_setup_environment_from_vars(&vars, 500);
@@ -1236,6 +1501,8 @@ mod tests {
         assert!(encoded.contains("OPENAI_API_KEY"));
         assert!(encoded.contains("work"));
         assert!(!encoded.contains("sk-secret-value"));
+        assert!(!encoded.contains("bcode-secret"));
+        assert!(encoded.contains("fast"));
         assert_eq!(snapshot.recommendations.len(), 1);
     }
 
@@ -1260,6 +1527,32 @@ mod tests {
 
         assert!(rendered.starts_with("welcome:current:visited -> detection:unvisited"));
         assert!(rendered.ends_with("launch:unvisited"));
+    }
+
+    #[test]
+    fn setup_detection_snapshot_persists_entries_and_recommendations() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let store = SettingsStore::from_settings_db_path(temp.path().join("settings.db"));
+        let vars = BTreeMap::from([(
+            "OPENROUTER_API_KEY".to_owned(),
+            "secret-openrouter-value".to_owned(),
+        )]);
+        let snapshot = detect_setup_environment_from_vars(&vars, 600);
+
+        store
+            .save_setup_detection_snapshot(&snapshot)
+            .expect("snapshot should persist");
+        let persisted_entries = store
+            .detection_cache_entries()
+            .expect("entries should load");
+        let persisted_recommendations = store
+            .setup_recommendations()
+            .expect("recommendations should load");
+        let encoded_entries = serde_json::to_string(&persisted_entries).expect("entries encode");
+
+        assert_eq!(persisted_entries.len(), 1);
+        assert_eq!(persisted_recommendations.len(), 1);
+        assert!(!encoded_entries.contains("secret-openrouter-value"));
     }
 
     #[test]
