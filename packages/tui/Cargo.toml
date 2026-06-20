@@ -27,6 +27,7 @@ bcode_provider_auth      = { workspace = true }
 bcode_ralph              = { workspace = true }
 bcode_ralph_plugin       = { workspace = true }
 bcode_session_models     = { workspace = true }
+bcode_settings           = { workspace = true }
 bcode_skill_models       = { workspace = true }
 bcode_syntax_render      = { workspace = true }
 bcode_worktree_models    = { workspace = true }
@@ -44,6 +45,9 @@ thiserror                = { workspace = true }
 tokio                    = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 unicode-segmentation     = { workspace = true }
 uuid                     = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [features]
 default                           = []

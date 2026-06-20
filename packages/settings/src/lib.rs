@@ -116,6 +116,7 @@ impl SettingsStore {
             Box::pin(async move {
                 database
                     .upsert("control_state_kv")
+                    .unique(&["key"])
                     .value("key", key)
                     .value("value_json", value_json)
                     .value("updated_at_ms", u64_to_i64(updated_at_ms))
@@ -162,6 +163,7 @@ impl SettingsStore {
             Box::pin(async move {
                 database
                     .upsert("onboarding_progress")
+                    .unique(&["id"])
                     .value("id", ONBOARDING_PROGRESS_ID)
                     .value("mode", progress.mode)
                     .value(
@@ -254,6 +256,48 @@ impl SettingsStore {
         })
     }
 
+    /// Mark an onboarding section skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when section state cannot be written.
+    pub fn skip_onboarding_section(
+        &self,
+        section_id: SetupSectionId,
+        skipped_at_ms: u64,
+    ) -> SettingsResult<()> {
+        self.save_onboarding_section(&OnboardingSection {
+            section_id: section_id.as_str().to_owned(),
+            status: SetupSectionStatus::Skipped.as_str().to_owned(),
+            visited: true,
+            visited_at_ms: Some(skipped_at_ms),
+            completed_at_ms: None,
+            skipped_at_ms: Some(skipped_at_ms),
+            dismissed: false,
+        })
+    }
+
+    /// Mark an onboarding section complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when section state cannot be written.
+    pub fn complete_onboarding_section(
+        &self,
+        section_id: SetupSectionId,
+        completed_at_ms: u64,
+    ) -> SettingsResult<()> {
+        self.save_onboarding_section(&OnboardingSection {
+            section_id: section_id.as_str().to_owned(),
+            status: SetupSectionStatus::Complete.as_str().to_owned(),
+            visited: true,
+            visited_at_ms: Some(completed_at_ms),
+            completed_at_ms: Some(completed_at_ms),
+            skipped_at_ms: None,
+            dismissed: false,
+        })
+    }
+
     /// Persist one onboarding setup-map section state.
     ///
     /// # Errors
@@ -265,7 +309,12 @@ impl SettingsStore {
         self.with_database(move |database| {
             Box::pin(async move {
                 database
-                    .upsert("onboarding_sections")
+                    .delete("onboarding_sections")
+                    .filter(Box::new(where_eq("section_id", section.section_id.clone())))
+                    .execute(database.as_ref())
+                    .await?;
+                database
+                    .insert("onboarding_sections")
                     .value("section_id", section.section_id)
                     .value("status", section.status)
                     .value("visited", bool_to_i64(section.visited))
@@ -322,6 +371,7 @@ impl SettingsStore {
             Box::pin(async move {
                 database
                     .upsert("detection_cache")
+                    .unique(&["detection_id"])
                     .value("detection_id", detection_id(&entry.detector, &entry.key))
                     .value("detector", entry.detector)
                     .value("key", entry.key)
@@ -399,7 +449,15 @@ impl SettingsStore {
         self.with_database(move |database| {
             Box::pin(async move {
                 database
-                    .upsert("setup_recommendations")
+                    .delete("setup_recommendations")
+                    .filter(Box::new(where_eq(
+                        "recommendation_id",
+                        recommendation.recommendation_id.clone(),
+                    )))
+                    .execute(database.as_ref())
+                    .await?;
+                database
+                    .insert("setup_recommendations")
                     .value("recommendation_id", recommendation.recommendation_id)
                     .value("section_id", recommendation.section_id)
                     .value("kind", recommendation.kind)
@@ -417,6 +475,30 @@ impl SettingsStore {
                 Ok(())
             })
         })
+    }
+
+    /// Dismiss a setup recommendation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when recommendation state cannot be read or written.
+    pub fn dismiss_setup_recommendation(
+        &self,
+        recommendation_id: &str,
+        dismissed_at_ms: u64,
+    ) -> SettingsResult<Option<SetupRecommendation>> {
+        let mut recommendations = self.setup_recommendations()?;
+        let Some(recommendation) = recommendations
+            .iter_mut()
+            .find(|recommendation| recommendation.recommendation_id == recommendation_id)
+        else {
+            return Ok(None);
+        };
+        "dismissed".clone_into(&mut recommendation.status);
+        recommendation.dismissed_at_ms = Some(dismissed_at_ms);
+        let updated = recommendation.clone();
+        self.save_setup_recommendation(&updated)?;
+        Ok(Some(updated))
     }
 
     /// Return all setup recommendations.
@@ -1733,6 +1815,48 @@ mod tests {
             .expect("progress should still exist");
         assert!(progress.first_run_completed);
         assert_eq!(progress.completed_at_ms, Some(701));
+    }
+
+    #[test]
+    fn section_completion_skip_and_recommendation_dismissal_persist() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let store = SettingsStore::from_settings_db_path(temp.path().join("settings.db"));
+        let recommendation = SetupRecommendation {
+            recommendation_id: "review-imports".to_owned(),
+            section_id: SetupSectionId::Imports.as_str().to_owned(),
+            kind: "review_optional_section".to_owned(),
+            status: SetupSectionStatus::Recommended.as_str().to_owned(),
+            priority: 10,
+            title: "Review imports".to_owned(),
+            body: "Review optional import sources.".to_owned(),
+            created_at_ms: 900,
+            dismissed_at_ms: None,
+        };
+
+        store
+            .complete_onboarding_section(SetupSectionId::Models, 901)
+            .expect("section completion should persist");
+        store
+            .skip_onboarding_section(SetupSectionId::Imports, 902)
+            .expect("section skip should persist");
+        store
+            .save_setup_recommendation(&recommendation)
+            .expect("recommendation should persist");
+        let dismissed = store
+            .dismiss_setup_recommendation("review-imports", 903)
+            .expect("dismissal should persist")
+            .expect("recommendation should exist");
+
+        let sections = store.onboarding_sections().expect("sections should load");
+        assert!(sections.iter().any(|section| {
+            section.section_id == "models"
+                && section.status == SetupSectionStatus::Complete.as_str()
+        }));
+        assert!(sections.iter().any(|section| {
+            section.section_id == "imports"
+                && section.status == SetupSectionStatus::Skipped.as_str()
+        }));
+        assert_eq!(dismissed.dismissed_at_ms, Some(903));
     }
 
     #[test]

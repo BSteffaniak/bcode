@@ -30,6 +30,7 @@ pub(crate) mod model_picker;
 pub(crate) mod model_picker_render;
 pub(crate) mod mouse_flow;
 pub(crate) mod older_history;
+pub mod onboarding;
 pub(crate) mod palette_flow;
 pub(crate) mod pending_submission;
 pub(crate) mod pending_submissions;
