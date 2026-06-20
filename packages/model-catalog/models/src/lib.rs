@@ -49,6 +49,15 @@ pub struct ProviderCatalog {
     /// Provider homepage or documentation URL.
     #[serde(default)]
     pub website_url: Option<String>,
+    /// Default interactive model id.
+    #[serde(default)]
+    pub default_model_id: Option<String>,
+    /// Default Codex/subscription model id.
+    #[serde(default)]
+    pub default_codex_model_id: Option<String>,
+    /// Bundled fallback model ids for providers without a live model-list API.
+    #[serde(default)]
+    pub fallback_model_ids: Vec<String>,
     /// Provider defaults used for discovered models without exact catalog metadata.
     #[serde(default)]
     pub defaults: Option<ModelCatalogDefaults>,
@@ -227,6 +236,9 @@ pub struct CatalogCapabilities {
     /// Supports prompt/cache discounts or cache controls.
     #[serde(default)]
     pub prompt_cache: bool,
+    /// Supports native provider web search.
+    #[serde(default)]
+    pub native_web_search: bool,
 }
 
 /// Reasoning-specific metadata.
@@ -241,6 +253,12 @@ pub struct CatalogReasoning {
     /// Supported summary values.
     #[serde(default)]
     pub summary_values: BTreeSet<String>,
+    /// Default summary value.
+    #[serde(default)]
+    pub default_summary: Option<String>,
+    /// Raw provider reasoning text can be requested.
+    #[serde(default)]
+    pub raw_reasoning_supported: bool,
 }
 
 /// Source and verification metadata for a catalog model.

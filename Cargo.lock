@@ -1620,6 +1620,7 @@ dependencies = [
  "bcode_config",
  "bcode_model",
  "bcode_model_catalog",
+ "bcode_model_catalog_models",
  "bcode_model_provider_runtime",
  "bcode_plugin_sdk",
  "bcode_provider_auth",

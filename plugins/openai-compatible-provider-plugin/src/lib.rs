@@ -35,8 +35,6 @@ use tokio::sync::Notify;
 use zeroize::Zeroizing;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-const DEFAULT_MODEL_ID: &str = "gpt-4.1-mini";
-const DEFAULT_CODEX_MODEL_ID: &str = "gpt-5.5";
 const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 const DEFAULT_XAI_MODEL_ID: &str = "grok-4.3"; // from https://docs.x.ai/developers/models/grok-4.3
 const PROVIDER_ID: &str = "bcode.openai-compatible";
@@ -3192,160 +3190,19 @@ fn openai_model_cache_info() -> bcode_model::ModelCacheInfo {
     }
 }
 
-fn model_capabilities_for(model: &ModelResponseItem) -> BTreeSet<ModelCapability> {
-    let mut capabilities = BTreeSet::from([
+fn model_capabilities_for(_model: &ModelResponseItem) -> BTreeSet<ModelCapability> {
+    BTreeSet::from([
         ModelCapability::StreamingText,
         ModelCapability::ToolCalls,
         ModelCapability::PromptCaching,
-        ModelCapability::Reasoning,
-    ]);
-    if model_supports_native_web_search(model) {
-        capabilities.insert(ModelCapability::NativeWebSearch);
-    }
-    capabilities
-}
-
-fn model_supports_native_web_search(model: &ModelResponseItem) -> bool {
-    let lower = model.id.to_ascii_lowercase();
-    lower.contains("gpt-4.1")
-        || lower.contains("gpt-5")
-        || lower.contains("o3")
-        || lower.contains("o4")
-        || lower.contains("grok")
+    ])
 }
 
 fn reasoning_info_for_model(
     model: &ModelResponseItem,
-    shape: ReasoningRequestShape,
+    _shape: ReasoningRequestShape,
 ) -> Option<bcode_model::ModelReasoningInfo> {
-    let metadata_reasoning = reasoning_info_from_metadata(&model.metadata);
-    if metadata_reasoning.is_some() {
-        return metadata_reasoning;
-    }
-    let lower = model.id.to_ascii_lowercase();
-    let known = known_reasoning_info(&lower, shape);
-    if known.is_some() {
-        return known;
-    }
-    if lower.contains("gpt-5") || lower.contains("o3") || lower.contains("o4") {
-        Some(reasoning_info(
-            shape.fallback_effort_values,
-            default_value(shape.fallback_effort_values, "medium"),
-            !shape.include_summary.is_empty(),
-            shape.fallback_summary_values,
-            default_value(shape.fallback_summary_values, "auto"),
-            false,
-            shape.source,
-        ))
-    } else {
-        None
-    }
-}
-
-fn known_reasoning_info(
-    model_id: &str,
-    shape: ReasoningRequestShape,
-) -> Option<bcode_model::ModelReasoningInfo> {
-    if model_id.contains("grok-4") {
-        return None;
-    }
-    if model_id.contains("grok") || model_id.contains("x-ai/") || model_id.contains("xai/") {
-        return Some(reasoning_info(
-            &["low", "high"],
-            None,
-            false,
-            &[],
-            None,
-            false,
-            ModelReasoningCapabilitySource::KnownModelTable,
-        ));
-    }
-    if model_id.contains("qwen3") || model_id.contains("qwen-3") {
-        return Some(reasoning_info(
-            &["none", "default"],
-            Some("default"),
-            false,
-            &[],
-            None,
-            true,
-            ModelReasoningCapabilitySource::KnownModelTable,
-        ));
-    }
-    if model_id.contains("gpt-oss") {
-        return Some(reasoning_info(
-            &["low", "medium", "high"],
-            Some("medium"),
-            false,
-            &[],
-            None,
-            true,
-            ModelReasoningCapabilitySource::KnownModelTable,
-        ));
-    }
-    if model_id.contains("gpt-5-pro") || model_id.contains("gpt-5.5-pro") {
-        return Some(reasoning_info(
-            &["high"],
-            Some("high"),
-            !shape.include_summary.is_empty(),
-            shape.fallback_summary_values,
-            default_value(shape.fallback_summary_values, "auto"),
-            false,
-            ModelReasoningCapabilitySource::KnownModelTable,
-        ));
-    }
-    if model_id.contains("gpt-5.5") {
-        return Some(reasoning_info(
-            &["none", "minimal", "low", "medium", "high", "xhigh"],
-            Some("medium"),
-            !shape.include_summary.is_empty(),
-            shape.fallback_summary_values,
-            default_value(shape.fallback_summary_values, "auto"),
-            false,
-            ModelReasoningCapabilitySource::KnownModelTable,
-        ));
-    }
-    if model_id.contains("gpt-5.1") {
-        return Some(reasoning_info(
-            &["none", "low", "medium", "high"],
-            Some("none"),
-            !shape.include_summary.is_empty(),
-            shape.fallback_summary_values,
-            default_value(shape.fallback_summary_values, "auto"),
-            false,
-            ModelReasoningCapabilitySource::KnownModelTable,
-        ));
-    }
-    None
-}
-
-fn reasoning_info(
-    effort_values: &[&str],
-    default_effort: Option<&str>,
-    visible_summary_supported: bool,
-    summary_values: &[&str],
-    default_summary: Option<&str>,
-    raw_reasoning_supported: bool,
-    source: ModelReasoningCapabilitySource,
-) -> bcode_model::ModelReasoningInfo {
-    bcode_model::ModelReasoningInfo {
-        effort_values: effort_values
-            .iter()
-            .map(|value| (*value).to_string())
-            .collect(),
-        default_effort: default_effort.map(str::to_string),
-        visible_summary_supported,
-        summary_values: summary_values
-            .iter()
-            .map(|value| (*value).to_string())
-            .collect(),
-        default_summary: default_summary.map(str::to_string),
-        raw_reasoning_supported,
-        source,
-    }
-}
-
-fn default_value<'a>(values: &'a [&str], value: &'a str) -> Option<&'a str> {
-    values.contains(&value).then_some(value)
+    reasoning_info_from_metadata(&model.metadata)
 }
 
 fn reasoning_info_from_metadata(
@@ -3651,6 +3508,30 @@ fn diagnostics_metadata(
     metadata
 }
 
+fn openai_provider_catalog() -> Option<bcode_model_catalog_models::ProviderCatalog> {
+    bcode_model_catalog::ModelCatalog::load_bundled()
+        .ok()
+        .and_then(|catalog| catalog.provider("openai").cloned())
+}
+
+fn openai_default_model_id() -> String {
+    openai_provider_catalog()
+        .and_then(|provider| provider.default_model_id)
+        .unwrap_or_else(|| "model".to_string())
+}
+
+fn openai_default_codex_model_id() -> String {
+    openai_provider_catalog()
+        .and_then(|provider| provider.default_codex_model_id)
+        .unwrap_or_else(|| "model".to_string())
+}
+
+fn catalog_fallback_model_ids() -> Vec<String> {
+    openai_provider_catalog()
+        .map(|provider| provider.fallback_model_ids)
+        .unwrap_or_default()
+}
+
 fn settings() -> Settings {
     settings_for_context(&ProviderRequestContext::default())
 }
@@ -3662,12 +3543,13 @@ fn settings_for_context(context: &ProviderRequestContext) -> Settings {
     let chatgpt_mode = (context_has_chatgpt_auth(context)
         || (allow_saved_auth && saved_openai_auth_is_chatgpt(&saved)))
         && !xai_mode;
+    let default_codex_model_id = openai_default_codex_model_id();
     let fallback_model = if xai_mode {
         DEFAULT_XAI_MODEL_ID.to_string()
     } else if chatgpt_mode {
-        DEFAULT_CODEX_MODEL_ID.to_string()
+        default_codex_model_id.clone()
     } else {
-        DEFAULT_MODEL_ID.to_string()
+        openai_default_model_id()
     };
     let default_model = first_context_env(
         context,
@@ -3678,7 +3560,7 @@ fn settings_for_context(context: &ProviderRequestContext) -> Settings {
             "OPENAI_MODEL",
         ],
     )
-    .or_else(|| chatgpt_mode.then(|| DEFAULT_CODEX_MODEL_ID.to_string()));
+    .or_else(|| chatgpt_mode.then(|| default_codex_model_id.clone()));
     let model_ids_env = first_context_env(
         context,
         [
@@ -4223,91 +4105,9 @@ fn saved_chatgpt_auth_settings(saved: &SavedOpenAiAuth) -> (AuthSettings, AuthDi
 }
 
 fn default_model_ids(chatgpt_mode: bool) -> Vec<String> {
-    if chatgpt_mode {
-        // Bundled ChatGPT/Codex fallback catalog. API-key users still use the
-        // provider `/models` endpoint; this list is only for subscription auth,
-        // where the Codex backend does not expose the same public model-list API.
-        // Source checked against OpenAI API docs/llms-full and model pages; this
-        // fallback includes text/chat/reasoning/coding models Bcode can drive and
-        // intentionally excludes image, audio, realtime, transcription, embedding,
-        // moderation, and other non-chat model families.
-        return [
-            "gpt-5.5",
-            "gpt-5.5-2026-04-23",
-            "gpt-5.5-pro",
-            "gpt-5.5-pro-2026-04-23",
-            "gpt-5.4",
-            "gpt-5.4-2026-03-05",
-            "gpt-5.4-pro",
-            "gpt-5.4-pro-2026-03-05",
-            "gpt-5.4-mini",
-            "gpt-5.4-mini-2026-03-17",
-            "gpt-5.4-nano",
-            "gpt-5.4-nano-2026-03-17",
-            "gpt-5.3-chat-latest",
-            "gpt-5.3-codex-spark",
-            "gpt-5.3-codex",
-            "gpt-5.2",
-            "gpt-5.2-2025-12-11",
-            "gpt-5.2-chat-latest",
-            "gpt-5.2-pro",
-            "gpt-5.2-pro-2025-12-11",
-            "gpt-5.2-codex",
-            "gpt-5.1",
-            "gpt-5.1-2025-11-13",
-            "gpt-5.1-chat-latest",
-            "gpt-5.1-codex",
-            "gpt-5.1-codex-max",
-            "gpt-5.1-codex-mini",
-            "gpt-5",
-            "gpt-5-2025-08-07",
-            "gpt-5-chat-latest",
-            "gpt-5-chat-latest-2025-08-07",
-            "gpt-5-pro",
-            "gpt-5-pro-2025-10-06",
-            "gpt-5-mini",
-            "gpt-5-mini-2025-08-07",
-            "gpt-5-nano",
-            "gpt-5-nano-2025-08-07",
-            "gpt-5-codex",
-            "gpt-5-codex-mini",
-            "codex-mini-latest",
-            "gpt-4.5-preview",
-            "gpt-4.5",
-            "gpt-4.1",
-            "gpt-4.1-2025-04-14",
-            "gpt-4.1-mini",
-            "gpt-4.1-mini-2025-04-14",
-            "gpt-4.1-nano",
-            "gpt-4.1-nano-2025-04-14",
-            "chatgpt-4o-latest",
-            "gpt-4o",
-            "gpt-4o-2024-11-20",
-            "gpt-4o-2024-08-06",
-            "gpt-4o-2024-05-13",
-            "gpt-4o-mini",
-            "gpt-4o-mini-2024-07-18",
-            "o4-mini",
-            "o4-mini-2025-04-16",
-            "o3-pro",
-            "o3-pro-2025-06-10",
-            "o3",
-            "o3-2025-04-16",
-            "o3-mini",
-            "o3-mini-2025-01-31",
-            "o1-pro",
-            "o1-pro-2025-03-19",
-            "o1",
-            "o1-2024-12-17",
-            "o1-preview",
-            "o1-mini",
-            "o1-mini-2024-09-12",
-        ]
-        .into_iter()
-        .map(ToString::to_string)
-        .collect();
-    }
-    Vec::new()
+    chatgpt_mode
+        .then(catalog_fallback_model_ids)
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Deserialize)]
@@ -5007,7 +4807,7 @@ mod tests {
             dialect,
             base_url: DEFAULT_BASE_URL.to_string(),
             default_model: Some("model".to_string()),
-            fallback_model: DEFAULT_MODEL_ID.to_string(),
+            fallback_model: openai_default_model_id(),
             model_ids: vec!["model".to_string()],
             model_ids_are_explicit: true,
             request_timeout: None,

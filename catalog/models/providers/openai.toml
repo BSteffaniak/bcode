@@ -2,6 +2,80 @@ provider_id = "openai"
 display_name = "OpenAI"
 kind = "open_ai_compatible"
 website_url = "https://openai.com"
+default_model_id = "gpt-4.1-mini"
+default_codex_model_id = "gpt-5.5"
+fallback_model_ids = [
+  "gpt-5.5",
+  "gpt-5.5-2026-04-23",
+  "gpt-5.5-pro",
+  "gpt-5.5-pro-2026-04-23",
+  "gpt-5.4",
+  "gpt-5.4-2026-03-05",
+  "gpt-5.4-pro",
+  "gpt-5.4-pro-2026-03-05",
+  "gpt-5.4-mini",
+  "gpt-5.4-mini-2026-03-17",
+  "gpt-5.4-nano",
+  "gpt-5.4-nano-2026-03-17",
+  "gpt-5.3-chat-latest",
+  "gpt-5.3-codex-spark",
+  "gpt-5.3-codex",
+  "gpt-5.2",
+  "gpt-5.2-2025-12-11",
+  "gpt-5.2-chat-latest",
+  "gpt-5.2-pro",
+  "gpt-5.2-pro-2025-12-11",
+  "gpt-5.2-codex",
+  "gpt-5.1",
+  "gpt-5.1-2025-11-13",
+  "gpt-5.1-chat-latest",
+  "gpt-5.1-codex",
+  "gpt-5.1-codex-max",
+  "gpt-5.1-codex-mini",
+  "gpt-5",
+  "gpt-5-2025-08-07",
+  "gpt-5-chat-latest",
+  "gpt-5-chat-latest-2025-08-07",
+  "gpt-5-pro",
+  "gpt-5-pro-2025-10-06",
+  "gpt-5-mini",
+  "gpt-5-mini-2025-08-07",
+  "gpt-5-nano",
+  "gpt-5-nano-2025-08-07",
+  "gpt-5-codex",
+  "gpt-5-codex-mini",
+  "codex-mini-latest",
+  "gpt-4.5-preview",
+  "gpt-4.5",
+  "gpt-4.1",
+  "gpt-4.1-2025-04-14",
+  "gpt-4.1-mini",
+  "gpt-4.1-mini-2025-04-14",
+  "gpt-4.1-nano",
+  "gpt-4.1-nano-2025-04-14",
+  "chatgpt-4o-latest",
+  "gpt-4o",
+  "gpt-4o-2024-11-20",
+  "gpt-4o-2024-08-06",
+  "gpt-4o-2024-05-13",
+  "gpt-4o-mini",
+  "gpt-4o-mini-2024-07-18",
+  "o4-mini",
+  "o4-mini-2025-04-16",
+  "o3-pro",
+  "o3-pro-2025-06-10",
+  "o3",
+  "o3-2025-04-16",
+  "o3-mini",
+  "o3-mini-2025-01-31",
+  "o1-pro",
+  "o1-pro-2025-03-19",
+  "o1",
+  "o1-2024-12-17",
+  "o1-preview",
+  "o1-mini",
+  "o1-mini-2024-09-12",
+]
 
 [defaults]
 context_window = 128000
@@ -39,6 +113,7 @@ tool_use = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+native_web_search = true
 
 [models."gpt-5".reasoning]
 effort_values = ["minimal", "low", "medium", "high"]
@@ -75,6 +150,13 @@ tool_use = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+native_web_search = true
+
+[models."gpt-5-pro".reasoning]
+effort_values = ["high"]
+default_effort = "high"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
 
 [models."gpt-5-codex"]
 model_id = "gpt-5-codex"
@@ -101,6 +183,13 @@ tool_use = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+native_web_search = true
+
+[models."gpt-5-codex".reasoning]
+effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
 
 [models."gpt-4.1"]
 model_id = "gpt-4.1"
@@ -126,6 +215,7 @@ text_output = true
 tool_use = true
 structured_outputs = true
 prompt_cache = true
+native_web_search = true
 
 [models."gpt-4.1-mini"]
 model_id = "gpt-4.1-mini"
@@ -151,6 +241,7 @@ text_output = true
 tool_use = true
 structured_outputs = true
 prompt_cache = true
+native_web_search = true
 
 [models."gpt-4.1-nano"]
 model_id = "gpt-4.1-nano"
@@ -176,6 +267,7 @@ text_output = true
 tool_use = true
 structured_outputs = true
 prompt_cache = true
+native_web_search = true
 
 [models."gpt-4o"]
 model_id = "gpt-4o"
@@ -201,6 +293,7 @@ text_output = true
 tool_use = true
 structured_outputs = true
 prompt_cache = true
+native_web_search = true
 
 [models."gpt-4o-mini"]
 model_id = "gpt-4o-mini"
@@ -226,6 +319,7 @@ text_output = true
 tool_use = true
 structured_outputs = true
 prompt_cache = true
+native_web_search = true
 
 [models."o3"]
 model_id = "o3"
@@ -252,6 +346,13 @@ tool_use = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+native_web_search = true
+
+[models."o3".reasoning]
+effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
 
 [models."o3-pro"]
 model_id = "o3-pro"
@@ -277,6 +378,13 @@ tool_use = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+native_web_search = true
+
+[models."o3-pro".reasoning]
+effort_values = ["high"]
+default_effort = "high"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
 
 [models."o4-mini"]
 model_id = "o4-mini"
@@ -303,6 +411,13 @@ tool_use = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+native_web_search = true
+
+[models."o4-mini".reasoning]
+effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
 
 [models."gpt-5.5"]
 model_id = "gpt-5.5"
@@ -329,6 +444,13 @@ tool_use = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+native_web_search = true
+
+[models."gpt-5.5".reasoning]
+effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
 
 [models."gpt-5.5-pro"]
 model_id = "gpt-5.5-pro"
@@ -355,6 +477,13 @@ tool_use = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+native_web_search = true
+
+[models."gpt-5.5-pro".reasoning]
+effort_values = ["high"]
+default_effort = "high"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
 
 [models."gpt-5.4"]
 model_id = "gpt-5.4"
@@ -381,6 +510,13 @@ tool_use = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+native_web_search = true
+
+[models."gpt-5.4".reasoning]
+effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
 
 [models."gpt-5.4-pro"]
 model_id = "gpt-5.4-pro"
@@ -407,6 +543,13 @@ tool_use = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+native_web_search = true
+
+[models."gpt-5.4-pro".reasoning]
+effort_values = ["high"]
+default_effort = "high"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
 
 [models."gpt-5.4-mini"]
 model_id = "gpt-5.4-mini"
@@ -433,6 +576,13 @@ tool_use = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+native_web_search = true
+
+[models."gpt-5.4-mini".reasoning]
+effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
 
 [models."gpt-5.4-nano"]
 model_id = "gpt-5.4-nano"
@@ -459,6 +609,13 @@ tool_use = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+native_web_search = true
+
+[models."gpt-5.4-nano".reasoning]
+effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
 
 [models."gpt-5.3-codex-spark"]
 model_id = "gpt-5.3-codex-spark"
@@ -485,6 +642,13 @@ tool_use = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+native_web_search = true
+
+[models."gpt-5.3-codex-spark".reasoning]
+effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
 
 [models."gpt-5.2-pro"]
 model_id = "gpt-5.2-pro"
@@ -511,6 +675,13 @@ tool_use = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+native_web_search = true
+
+[models."gpt-5.2-pro".reasoning]
+effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
 
 [models."gpt-5-mini"]
 model_id = "gpt-5-mini"
@@ -537,6 +708,13 @@ tool_use = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+native_web_search = true
+
+[models."gpt-5-mini".reasoning]
+effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
 
 [models."gpt-5-nano"]
 model_id = "gpt-5-nano"
@@ -563,6 +741,13 @@ tool_use = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+native_web_search = true
+
+[models."gpt-5-nano".reasoning]
+effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
 
 [models."o1"]
 model_id = "o1"
@@ -582,6 +767,13 @@ tool_use = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+native_web_search = true
+
+[models."o1".reasoning]
+effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
 
 [models."grok-4"]
 model_id = "grok-4"
@@ -600,6 +792,7 @@ tool_use = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+native_web_search = true
 
 [models."grok-3"]
 model_id = "grok-3"
@@ -617,6 +810,10 @@ text_output = true
 tool_use = true
 structured_outputs = true
 prompt_cache = true
+native_web_search = true
+
+[models."grok-3".reasoning]
+effort_values = ["low", "high"]
 
 [models."grok"]
 model_id = "grok"
@@ -634,6 +831,10 @@ text_output = true
 tool_use = true
 structured_outputs = true
 prompt_cache = true
+native_web_search = true
+
+[models."grok".reasoning]
+effort_values = ["low", "high"]
 
 [models."fable"]
 model_id = "fable"

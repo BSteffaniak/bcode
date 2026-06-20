@@ -302,6 +302,9 @@ fn capabilities_from_catalog(
     if capabilities.reasoning {
         result.insert(ModelCapability::Reasoning);
     }
+    if capabilities.native_web_search {
+        result.insert(ModelCapability::NativeWebSearch);
+    }
     result
 }
 
@@ -347,8 +350,11 @@ fn reasoning_from_catalog_parts(
         default_effort: reasoning.default_effort.clone(),
         visible_summary_supported: !reasoning.summary_values.is_empty(),
         summary_values: reasoning.summary_values.iter().cloned().collect(),
-        default_summary: reasoning.summary_values.iter().next().cloned(),
-        raw_reasoning_supported: false,
+        default_summary: reasoning
+            .default_summary
+            .clone()
+            .or_else(|| reasoning.summary_values.iter().next().cloned()),
+        raw_reasoning_supported: reasoning.raw_reasoning_supported,
         source: ModelReasoningCapabilitySource::KnownModelTable,
     })
 }

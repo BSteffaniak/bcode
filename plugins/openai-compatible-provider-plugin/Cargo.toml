@@ -18,6 +18,7 @@ base64 = { workspace = true }
 bcode_config = { workspace = true }
 bcode_model = { workspace = true }
 bcode_model_catalog = { workspace = true }
+bcode_model_catalog_models = { workspace = true }
 bcode_model_provider_runtime = { workspace = true }
 bcode_plugin_sdk = { workspace = true }
 bcode_provider_auth = { workspace = true }
