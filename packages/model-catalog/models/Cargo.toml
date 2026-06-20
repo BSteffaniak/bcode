@@ -1,0 +1,18 @@
+[package]
+authors     = { workspace = true }
+categories  = ["data-structures"]
+description = "Bcode model catalog schema types"
+edition     = { workspace = true }
+keywords    = ["bcode", "models", "catalog"]
+license     = { workspace = true }
+name        = "bcode_model_catalog_models"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+
+[features]
+default          = []
+fail-on-warnings = []

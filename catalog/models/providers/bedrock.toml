@@ -1,0 +1,33 @@
+provider_id = "bedrock"
+display_name = "Amazon Bedrock"
+kind = "bedrock"
+website_url = "https://aws.amazon.com/bedrock/"
+
+[models."anthropic.claude-3-5-sonnet-20241022-v2:0"]
+model_id = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+display_name = "Claude 3.5 Sonnet v2"
+status = "stable"
+bcode_support = "supported"
+context_window = 200000
+max_output_tokens = 8192
+
+[models."anthropic.claude-3-5-sonnet-20241022-v2:0".pricing]
+currency = "USD"
+unit = "per_million_tokens"
+input_micros = 3000000
+cached_input_micros = 300000
+cache_write_input_micros = 3750000
+output_micros = 15000000
+
+[models."anthropic.claude-3-5-sonnet-20241022-v2:0".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+prompt_cache = true
+
+[models."anthropic.claude-3-5-sonnet-20241022-v2:0".source]
+pricing = "manual"
+metadata = "manual"
+last_verified_at = "2026-06-20T00:00:00Z"

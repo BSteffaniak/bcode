@@ -1,0 +1,31 @@
+[package]
+authors     = { workspace = true }
+categories  = ["web-programming"]
+description = "Bcode models catalog website UI components"
+edition     = { workspace = true }
+keywords    = ["bcode", "models", "catalog", "ui"]
+license     = { workspace = true }
+name        = "bcode_models_site_ui"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_model_catalog_models = { workspace = true }
+hyperchad = { workspace = true, features = [
+    "color",
+    "renderer",
+    "router",
+    "template",
+    "transformer",
+    "transformer-models",
+] }
+hyperchad_color = { workspace = true }
+hyperchad_renderer = { workspace = true }
+hyperchad_template = { workspace = true }
+hyperchad_transformer = { workspace = true }
+hyperchad_transformer_models = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = ["bcode_model_catalog_models/fail-on-warnings"]

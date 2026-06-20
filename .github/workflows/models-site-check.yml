@@ -1,0 +1,31 @@
+name: Models Site Check
+
+on:
+  pull_request:
+    branches: ["master"]
+    paths:
+      - ".github/workflows/models-site-check.yml"
+      - "packages/model-catalog/**"
+      - "packages/models-site/**"
+      - "catalog/models/**"
+  push:
+    branches: ["master"]
+    paths:
+      - ".github/workflows/models-site-check.yml"
+      - "packages/model-catalog/**"
+      - "packages/models-site/**"
+      - "catalog/models/**"
+  workflow_dispatch:
+
+jobs:
+  models-site-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Validate model catalog
+        run: cargo run --release -p bcode_model_catalog -- validate
+      - name: Build static models site
+        run: cargo run --release -p bcode_models_site -- gen --output dist

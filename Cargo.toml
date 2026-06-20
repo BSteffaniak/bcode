@@ -29,6 +29,10 @@ members = [
     "packages/ipc",
     "packages/model",
     "packages/model-provider-runtime",
+    "packages/model-catalog",
+    "packages/model-catalog/models",
+    "packages/models-site",
+    "packages/models-site/ui",
     "packages/markdown-render",
     "packages/metrics",
     "packages/syntax-render",
@@ -83,7 +87,11 @@ bcode_ipc                               = { version = "0.0.1-alpha.0", default-f
 bcode_markdown_render                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/markdown-render" }
 bcode_metrics                           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/metrics" }
 bcode_model                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/model" }
+bcode_model_catalog                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/model-catalog" }
+bcode_model_catalog_models              = { version = "0.0.1-alpha.0", default-features = false, path = "packages/model-catalog/models" }
 bcode_model_provider_runtime            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/model-provider-runtime" }
+bcode_models_site                       = { version = "0.0.1-alpha.0", default-features = false, path = "packages/models-site" }
+bcode_models_site_ui                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/models-site/ui" }
 bcode_openai_compatible_provider_plugin = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/openai-compatible-provider-plugin" }
 bcode_opencode_session_import_plugin    = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/opencode-session-import-plugin" }
 bcode_pi_session_import_plugin          = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/pi-session-import-plugin" }
@@ -143,10 +151,13 @@ crossterm = { version = "0.29.0", default-features = false }
 git2 = { version = "0.20.3", default-features = false }
 globset = { version = "0.4.18", default-features = false }
 httpdate = { version = "1.0.3", default-features = false }
+hyperchad = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
 hyperchad_color = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
 hyperchad_markdown = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false, features = [
     "xss-protection",
 ] }
+hyperchad_renderer = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
+hyperchad_template = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
 hyperchad_transformer = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
 hyperchad_transformer_models = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
 image = { version = "0.25.10", default-features = false, features = [

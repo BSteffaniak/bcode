@@ -1,0 +1,32 @@
+name: Deploy Models Site
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - ".github/workflows/models-site-deploy.yml"
+      - "packages/model-catalog/**"
+      - "packages/models-site/**"
+      - "catalog/models/**"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Generate static models site
+        run: cargo run --release -p bcode_models_site -- gen --output dist
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy dist --project-name=bcode-models

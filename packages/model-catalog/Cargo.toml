@@ -1,0 +1,31 @@
+[package]
+authors     = { workspace = true }
+build       = "build.rs"
+categories  = ["command-line-utilities", "data-structures"]
+description = "Bcode model catalog loader and static artifact builder"
+edition     = { workspace = true }
+keywords    = ["bcode", "models", "catalog"]
+license     = { workspace = true }
+name        = "bcode_model_catalog"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+test = false
+
+[[bin]]
+name = "bcode-model-catalog"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+bcode_model_catalog_models = { workspace = true }
+clap                       = { workspace = true, features = ["derive", "std"] }
+serde                      = { workspace = true, features = ["derive"] }
+serde_json                 = { workspace = true, features = ["std"] }
+toml                       = { workspace = true, features = ["parse", "serde", "std"] }
+
+[features]
+default          = []
+fail-on-warnings = ["bcode_model_catalog_models/fail-on-warnings"]
