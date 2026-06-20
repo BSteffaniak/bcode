@@ -22,6 +22,7 @@ bcode_model_catalog_models = { workspace = true }
 bcode_model_provider_runtime = { workspace = true }
 bcode_plugin_sdk = { workspace = true }
 bcode_provider_auth = { workspace = true }
+bcode_session_models = { workspace = true }
 httpdate = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }

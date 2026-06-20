@@ -1641,6 +1641,7 @@ dependencies = [
  "bcode_model_provider_runtime",
  "bcode_plugin_sdk",
  "bcode_provider_auth",
+ "bcode_session_models",
  "httpdate",
  "reqwest",
  "serde",

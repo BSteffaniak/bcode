@@ -16,10 +16,10 @@ use bcode_model::{
     ModelReasoningCapabilitySource, ModelTokenPrice, ModelTurnRequest, NativeWebSearchRequest,
     NativeWebSearchResponse, NativeWebSearchResult, OP_CANCEL_TURN, OP_CAPABILITIES,
     OP_FINISH_TURN, OP_MODELS, OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS, OP_START_TURN,
-    OP_VALIDATE_CONFIG, PollTurnEventsRequest, PollTurnEventsResponse, ProviderAuthCandidate,
-    ProviderCapabilities, ProviderCapability, ProviderError, ProviderErrorCategory,
-    ProviderRequestContext, ProviderRequestProjection, ProviderTurnEvent, StartTurnResponse,
-    StopReason, TokenUsage, ToolCall, ValidateConfigResponse,
+    OP_VALIDATE_CONFIG, OP_VERIFY_MODEL, PollTurnEventsRequest, PollTurnEventsResponse,
+    ProviderAuthCandidate, ProviderCapabilities, ProviderCapability, ProviderError,
+    ProviderErrorCategory, ProviderRequestContext, ProviderRequestProjection, ProviderTurnEvent,
+    StartTurnResponse, StopReason, TokenUsage, ToolCall, ValidateConfigResponse,
 };
 use bcode_model_provider_runtime::{
     ProviderRuntime, retry_hint_from_json_value, retry_hint_from_response_parts,
@@ -32,7 +32,7 @@ use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use zeroize::Zeroizing;
 
@@ -208,6 +208,7 @@ impl OpenAiCompatibleProviderPlugin {
             OP_CAPABILITIES => json_response(&capabilities()),
             OP_MODELS => self.models_response(&context.request),
             OP_VALIDATE_CONFIG => json_response(&self.validate_config()),
+            OP_VERIFY_MODEL => self.verify_model(&context.request),
             OP_NATIVE_WEB_SEARCH => self.native_web_search(&context.request),
             OP_START_TURN => self.start_turn(&context.request),
             OP_POLL_TURN_EVENTS => self.poll_turn_events(&context.request),
@@ -222,6 +223,21 @@ impl OpenAiCompatibleProviderPlugin {
 
     fn models_response(&self, request: &ServiceRequest) -> ServiceResponse {
         json_response(&self.models(&model_list_request(request)))
+    }
+
+    fn verify_model(&self, request: &ServiceRequest) -> ServiceResponse {
+        let request = match request.payload_json::<bcode_model::VerifyModelRequest>() {
+            Ok(request) => request,
+            Err(error) => return invalid_request(&error),
+        };
+        match &self.runtime {
+            Ok(runtime) => match runtime.block_on(verify_model_inner(request)) {
+                Ok(Ok(response)) => json_response(&response),
+                Ok(Err(error)) => json_response(&verify_response_from_provider_error(&error)),
+                Err(error) => ServiceResponse::error("runtime_error", error.to_string()),
+            },
+            Err(error) => ServiceResponse::error("runtime_error", error),
+        }
     }
 
     fn native_web_search(&self, request: &ServiceRequest) -> ServiceResponse {
@@ -1240,6 +1256,128 @@ fn all_subscriptions_exhausted_message(skipped_profiles: &[String]) -> String {
             "all configured OpenAI subscriptions are currently quota-limited; skipped cooldown profiles: {}; add another subscription with `bcode login openai --add-subscription` or try again after reset",
             skipped_profiles.join(", ")
         )
+    }
+}
+
+async fn verify_model_inner(
+    request: bcode_model::VerifyModelRequest,
+) -> Result<bcode_model::VerifyModelResponse, ProviderError> {
+    let mut settings = settings_for_context(&request.provider_context);
+    if let Some(timeout_seconds) = request.timeout_seconds {
+        settings.request_timeout = Some(Duration::from_secs(timeout_seconds));
+    }
+    refresh_chatgpt_auth_if_needed(&mut settings).await?;
+    if matches!(settings.auth, AuthSettings::Missing) {
+        return Err(provider_error(
+            "missing_openai_auth",
+            ProviderErrorCategory::Auth,
+            "run `bcode login openai` or configure OpenAI-compatible API-key auth",
+        ));
+    }
+    let client = model_stream_client(settings.request_timeout).map_err(|error| {
+        provider_error(
+            "client_build_failed",
+            ProviderErrorCategory::ProviderInternal,
+            error.to_string(),
+        )
+    })?;
+    let turn_request = verification_turn_request(&request);
+    let start = Instant::now();
+    match (&settings.auth, settings.dialect) {
+        (AuthSettings::ApiKey(api_key), OpenAiCompatibleDialect::ChatCompletions) => {
+            send_chat_completion_request(
+                &client,
+                &settings,
+                api_key,
+                &turn_request,
+                &request.model_id,
+            )
+            .await?;
+        }
+        (AuthSettings::ApiKey(api_key), OpenAiCompatibleDialect::ResponsesApi) => {
+            send_responses_request(
+                &client,
+                &settings,
+                api_key,
+                &turn_request,
+                &request.model_id,
+            )
+            .await?;
+        }
+        (AuthSettings::ChatGpt { access_token, .. }, OpenAiCompatibleDialect::ChatGptCodex) => {
+            send_responses_request(
+                &client,
+                &settings,
+                access_token,
+                &turn_request,
+                &request.model_id,
+            )
+            .await?;
+        }
+        (AuthSettings::ChatGpt { .. }, _) => {
+            return Err(provider_error(
+                "invalid_dialect_for_auth",
+                ProviderErrorCategory::InvalidRequest,
+                "ChatGPT subscription auth requires the chatgpt_codex dialect",
+            ));
+        }
+        (AuthSettings::ApiKey(_), OpenAiCompatibleDialect::ChatGptCodex) => {
+            return Err(provider_error(
+                "invalid_dialect_for_auth",
+                ProviderErrorCategory::InvalidRequest,
+                "chatgpt_codex dialect requires ChatGPT subscription auth; use responses_api or chat_completions with API-key auth",
+            ));
+        }
+        (AuthSettings::Missing, _) => unreachable!("missing auth handled above"),
+    }
+    Ok(bcode_model::VerifyModelResponse {
+        status: bcode_model::VerifyModelStatus::Working,
+        latency_ms: Some(start.elapsed().as_millis()),
+        error_code: None,
+        message: None,
+    })
+}
+
+fn verification_turn_request(request: &bcode_model::VerifyModelRequest) -> ModelTurnRequest {
+    ModelTurnRequest {
+        session_id: bcode_session_models::SessionId::new(),
+        turn_id: format!("model-verify-{}", request.model_id),
+        model_id: request.model_id.clone(),
+        provider_context: request.provider_context.clone(),
+        system_prompt: None,
+        messages: vec![ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: request.prompt.clone(),
+            }],
+        }],
+        tools: Vec::new(),
+        parameters: bcode_model::ModelParameters {
+            max_output_tokens: Some(16),
+            ..bcode_model::ModelParameters::default()
+        },
+        prompt_cache: bcode_model::PromptCacheHints::default(),
+        conversation_reuse: bcode_model::ConversationReuseHints::default(),
+        metadata: BTreeMap::from([(
+            "bcode_request_kind".to_string(),
+            "model_verification".to_string(),
+        )]),
+    }
+}
+
+fn verify_response_from_provider_error(error: &ProviderError) -> bcode_model::VerifyModelResponse {
+    bcode_model::VerifyModelResponse {
+        status: match error.category {
+            ProviderErrorCategory::Auth => bcode_model::VerifyModelStatus::Unauthorized,
+            ProviderErrorCategory::ModelNotFound => bcode_model::VerifyModelStatus::NotFound,
+            ProviderErrorCategory::RateLimit => bcode_model::VerifyModelStatus::RateLimited,
+            ProviderErrorCategory::Timeout => bcode_model::VerifyModelStatus::Timeout,
+            ProviderErrorCategory::Network => bcode_model::VerifyModelStatus::NetworkError,
+            _ => bcode_model::VerifyModelStatus::ProviderError,
+        },
+        latency_ms: None,
+        error_code: Some(error.code.clone()),
+        message: Some(error.message.clone()),
     }
 }
 

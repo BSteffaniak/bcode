@@ -23,6 +23,9 @@ pub const OP_VALIDATE_CONFIG: &str = "validate_config";
 /// Operation for starting a model turn.
 pub const OP_START_TURN: &str = "start_turn";
 
+/// Operation for model verification.
+pub const OP_VERIFY_MODEL: &str = "verify_model";
+
 /// Operation for polling model turn stream events.
 pub const OP_POLL_TURN_EVENTS: &str = "poll_turn_events";
 
@@ -643,6 +646,47 @@ impl PromptCacheMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartTurnResponse {
     pub provider_turn_id: String,
+}
+
+/// Verify that a provider can answer a tiny request with one model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyModelRequest {
+    /// Selected model ID to verify.
+    pub model_id: String,
+    /// Prompt sent to the model.
+    pub prompt: String,
+    /// Request timeout in seconds.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub provider_context: ProviderRequestContext,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
+}
+
+/// Model verification response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyModelResponse {
+    pub status: VerifyModelStatus,
+    #[serde(default)]
+    pub latency_ms: Option<u128>,
+    #[serde(default)]
+    pub error_code: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// Verification status for one model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyModelStatus {
+    Working,
+    Unauthorized,
+    NotFound,
+    RateLimited,
+    Timeout,
+    ProviderError,
+    NetworkError,
 }
 
 /// Poll queued provider turn events.

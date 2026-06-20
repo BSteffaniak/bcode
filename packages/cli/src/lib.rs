@@ -669,6 +669,26 @@ enum ModelCommand {
         #[arg(long)]
         provider: Option<String>,
     },
+    Verify {
+        /// Prompt sent to each model.
+        #[arg(long, default_value = "say ok")]
+        prompt: String,
+        /// Maximum number of models to verify after filtering.
+        #[arg(long)]
+        max_models: Option<usize>,
+        /// Model id wildcard filter. Supports `*` globs.
+        #[arg(long)]
+        id_pattern: Option<String>,
+        /// Print candidate models without sending verification requests.
+        #[arg(long)]
+        dry_run: bool,
+        /// Output JSON report path.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Request timeout in seconds.
+        #[arg(long, default_value_t = 20)]
+        timeout_seconds: u64,
+    },
     Set {
         session_id: SessionId,
         model_id: String,
@@ -1236,6 +1256,24 @@ async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
                 ModelCommand::List => list_models().await?,
                 ModelCommand::Capabilities => model_capabilities().await?,
                 ModelCommand::Validate => model_validate_config().await?,
+                ModelCommand::Verify {
+                    prompt,
+                    max_models,
+                    id_pattern,
+                    dry_run,
+                    output,
+                    timeout_seconds,
+                } => {
+                    verify_models(
+                        prompt,
+                        max_models,
+                        id_pattern,
+                        dry_run,
+                        output,
+                        timeout_seconds,
+                    )
+                    .await?;
+                }
                 ModelCommand::Set {
                     session_id,
                     provider,
@@ -3457,6 +3495,185 @@ async fn model_capabilities() -> Result<(), CliError> {
     Ok(())
 }
 
+async fn verify_models(
+    prompt: String,
+    max_models: Option<usize>,
+    id_pattern: Option<String>,
+    dry_run: bool,
+    output: Option<PathBuf>,
+    timeout_seconds: u64,
+) -> Result<(), CliError> {
+    let models_response = call_model_provider_service(bcode_model::OP_MODELS).await?;
+    if let Some(error) = models_response.error {
+        println!("ERROR\t{}\t{}", error.code, error.message);
+        return Ok(());
+    }
+    let models: bcode_model::ModelList = serde_json::from_slice(&models_response.payload)?;
+    let mut candidates = models
+        .models
+        .into_iter()
+        .map(|model| model.model_id)
+        .filter(|model_id| {
+            id_pattern
+                .as_ref()
+                .is_none_or(|pattern| wildcard_match(pattern, model_id))
+        })
+        .collect::<Vec<_>>();
+    if let Some(max_models) = max_models {
+        candidates.truncate(max_models);
+    }
+    let mut results = BTreeMap::new();
+    for model_id in &candidates {
+        let result = if dry_run {
+            CliVerifyModelResult {
+                status: "dry_run".to_string(),
+                latency_ms: None,
+                error_code: None,
+                message: None,
+            }
+        } else {
+            verify_one_model(model_id, &prompt, timeout_seconds).await?
+        };
+        println!(
+            "{model_id}\t{}\t{}",
+            result.status,
+            result
+                .latency_ms
+                .map_or_else(|| "-".to_string(), |latency| format!("{latency}ms"))
+        );
+        results.insert(model_id.clone(), result);
+    }
+    let report = CliVerifyReport {
+        provider: "configured".to_string(),
+        verified_at: unix_timestamp_string(),
+        prompt,
+        dry_run,
+        total_models: candidates.len(),
+        results,
+    };
+    let body = serde_json::to_string_pretty(&report)?;
+    if let Some(output) = output {
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&output, body)?;
+        println!("wrote {}", output.display());
+    } else {
+        println!("{body}");
+    }
+    Ok(())
+}
+
+async fn verify_one_model(
+    model_id: &str,
+    prompt: &str,
+    timeout_seconds: u64,
+) -> Result<CliVerifyModelResult, CliError> {
+    let request = bcode_model::VerifyModelRequest {
+        model_id: model_id.to_string(),
+        prompt: prompt.to_string(),
+        timeout_seconds: Some(timeout_seconds),
+        provider_context: bcode_model::ProviderRequestContext::default(),
+        metadata: BTreeMap::new(),
+    };
+    let response = call_model_provider_service_payload(
+        bcode_model::OP_VERIFY_MODEL,
+        serde_json::to_vec(&request)?,
+    )
+    .await?;
+    if let Some(error) = response.error {
+        return Ok(CliVerifyModelResult {
+            status: "provider_error".to_string(),
+            latency_ms: None,
+            error_code: Some(error.code),
+            message: Some(error.message),
+        });
+    }
+    let response: bcode_model::VerifyModelResponse = serde_json::from_slice(&response.payload)?;
+    Ok(CliVerifyModelResult {
+        status: verify_status_name(response.status).to_string(),
+        latency_ms: response.latency_ms,
+        error_code: response.error_code,
+        message: response.message,
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct CliVerifyReport {
+    provider: String,
+    verified_at: String,
+    prompt: String,
+    dry_run: bool,
+    total_models: usize,
+    results: BTreeMap<String, CliVerifyModelResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct CliVerifyModelResult {
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latency_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+const fn verify_status_name(status: bcode_model::VerifyModelStatus) -> &'static str {
+    match status {
+        bcode_model::VerifyModelStatus::Working => "working",
+        bcode_model::VerifyModelStatus::Unauthorized => "unauthorized",
+        bcode_model::VerifyModelStatus::NotFound => "not_found",
+        bcode_model::VerifyModelStatus::RateLimited => "rate_limited",
+        bcode_model::VerifyModelStatus::Timeout => "timeout",
+        bcode_model::VerifyModelStatus::ProviderError => "provider_error",
+        bcode_model::VerifyModelStatus::NetworkError => "network_error",
+    }
+}
+
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let parts = pattern.split('*').collect::<Vec<_>>();
+    if parts.len() == 1 {
+        return pattern == value;
+    }
+    let mut remaining = value;
+    if let Some(first) = parts.first()
+        && !first.is_empty()
+    {
+        let Some(stripped) = remaining.strip_prefix(first) else {
+            return false;
+        };
+        remaining = stripped;
+    }
+    for part in parts.iter().skip(1).take(parts.len().saturating_sub(2)) {
+        if part.is_empty() {
+            continue;
+        }
+        let Some(index) = remaining.find(part) else {
+            return false;
+        };
+        remaining = &remaining[index + part.len()..];
+    }
+    if let Some(last) = parts.last()
+        && !last.is_empty()
+    {
+        return remaining.ends_with(last);
+    }
+    true
+}
+
+fn unix_timestamp_string() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or_else(
+            |_| "0".to_string(),
+            |duration| duration.as_secs().to_string(),
+        )
+}
+
 async fn model_validate_config() -> Result<(), CliError> {
     let response = call_model_provider_service(bcode_model::OP_VALIDATE_CONFIG).await?;
     if let Some(error) = response.error {
@@ -3478,6 +3695,13 @@ async fn model_validate_config() -> Result<(), CliError> {
 async fn call_model_provider_service(
     operation: &str,
 ) -> Result<bcode_ipc::PluginServiceResponse, CliError> {
+    call_model_provider_service_payload(operation, Vec::new()).await
+}
+
+async fn call_model_provider_service_payload(
+    operation: &str,
+    payload: Vec<u8>,
+) -> Result<bcode_ipc::PluginServiceResponse, CliError> {
     let config = bcode_config::load_config()?;
     let client = BcodeClient::default_endpoint();
     let resolved_model = config.resolved_model_selection();
@@ -3487,7 +3711,7 @@ async fn call_model_provider_service(
                 provider_plugin_id,
                 bcode_model::MODEL_PROVIDER_INTERFACE_ID.to_string(),
                 operation.to_string(),
-                Vec::new(),
+                payload,
             )
             .await
             .map_err(CliError::from)
@@ -3496,7 +3720,7 @@ async fn call_model_provider_service(
             .call_plugin_service(
                 bcode_model::MODEL_PROVIDER_INTERFACE_ID.to_string(),
                 operation.to_string(),
-                Vec::new(),
+                payload,
             )
             .await
             .map_err(CliError::from)
