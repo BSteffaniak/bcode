@@ -2007,11 +2007,20 @@ pub fn deterministic_onboarding_questionnaire(
     draft: &OnboardingDraftSetup,
     detection: &SetupDetectionSnapshot,
 ) -> OnboardingQuestionnaire {
+    let mut questions = welcome_questions(detection);
+    questions.extend(provider_questions(draft));
+    questions.extend(model_questions());
+    questions.extend(permission_questions());
+    questions.extend(import_plugin_questions());
+    OnboardingQuestionnaire { questions }
+}
+
+fn welcome_questions(detection: &SetupDetectionSnapshot) -> Vec<OnboardingQuestion> {
     let detected_credentials = detection
         .entries
         .iter()
         .any(|entry| entry.detector == "environment" && entry.key.ends_with("_API_KEY"));
-    let mut questions = vec![
+    vec![
         onboarding_question(
             "welcome-new-or-import",
             SetupSectionId::Welcome,
@@ -2052,7 +2061,11 @@ pub fn deterministic_onboarding_questionnaire(
             "Do you want to import existing session history?",
             &["review", "skip", "later"],
         ),
-    ];
+    ]
+}
+
+fn provider_questions(draft: &OnboardingDraftSetup) -> Vec<OnboardingQuestion> {
+    let mut questions = Vec::new();
     if draft.providers.is_empty() {
         questions.push(onboarding_question(
             "provider-choice",
@@ -2064,7 +2077,7 @@ pub fn deterministic_onboarding_questionnaire(
         questions.push(onboarding_question(
             "default-provider",
             SetupSectionId::Providers,
-            "Which configured provider should be default?",
+            "Which provider should be default?",
             &draft
                 .providers
                 .iter()
@@ -2072,13 +2085,114 @@ pub fn deterministic_onboarding_questionnaire(
                 .collect::<Vec<_>>(),
         ));
     }
-    questions.push(onboarding_question(
-        "default-model-profile",
-        SetupSectionId::Models,
-        "Pick a default model/profile.",
-        &["default", "fast", "balanced", "quality"],
-    ));
-    OnboardingQuestionnaire { questions }
+    questions.extend([
+        onboarding_question(
+            "api-key-or-subscription",
+            SetupSectionId::SecureVault,
+            "Do you have an API key/subscription already?",
+            &["api-key", "subscription", "not-yet"],
+        ),
+        onboarding_question(
+            "local-open-provider",
+            SetupSectionId::Providers,
+            "Do you want to use a local/open provider?",
+            &["local", "open-compatible", "cloud-only", "later"],
+        ),
+        onboarding_question(
+            "multiple-provider-profiles",
+            SetupSectionId::Providers,
+            "Do you want multiple provider profiles/subscriptions?",
+            &["single", "multiple", "later"],
+        ),
+    ]);
+    questions
+}
+
+fn model_questions() -> Vec<OnboardingQuestion> {
+    vec![
+        onboarding_question(
+            "default-model-profile",
+            SetupSectionId::Models,
+            "Pick a default model/profile.",
+            &["default", "fast", "balanced", "quality"],
+        ),
+        onboarding_question(
+            "model-tradeoff",
+            SetupSectionId::Models,
+            "Pick cost/speed/quality preference.",
+            &["speed", "balanced", "quality", "lowest-cost"],
+        ),
+        onboarding_question(
+            "reasoning-profile",
+            SetupSectionId::Models,
+            "Pick reasoning/default thinking profile when supported.",
+            &["standard", "deeper", "minimal", "provider-default"],
+        ),
+        onboarding_question(
+            "model-aliases",
+            SetupSectionId::Models,
+            "Configure aliases if desired.",
+            &["configure", "skip", "later"],
+        ),
+    ]
+}
+
+fn permission_questions() -> Vec<OnboardingQuestion> {
+    vec![
+        onboarding_question(
+            "permission-mode",
+            SetupSectionId::Permissions,
+            "Choose cautious/balanced/autonomous mode.",
+            &["cautious", "balanced", "autonomous"],
+        ),
+        onboarding_question(
+            "permission-ask-behavior",
+            SetupSectionId::Permissions,
+            "Bcode asks before sensitive tool/file/network operations based on your preset.",
+            &["review", "accept", "customize-later"],
+        ),
+        onboarding_question(
+            "permission-boundaries",
+            SetupSectionId::Permissions,
+            "Review tool/file/network boundaries.",
+            &["review", "accept", "customize-later"],
+        ),
+        onboarding_question(
+            "permission-later-customization",
+            SetupSectionId::Permissions,
+            "You can customize permissions later in Control Center.",
+            &["ok", "open-control-center-later"],
+        ),
+    ]
+}
+
+fn import_plugin_questions() -> Vec<OnboardingQuestion> {
+    vec![
+        onboarding_question(
+            "session-import-sources",
+            SetupSectionId::Imports,
+            "Review supported session import sources.",
+            &["review", "skip", "later"],
+        ),
+        onboarding_question(
+            "session-import-safe-optional",
+            SetupSectionId::Imports,
+            "Session import is optional and safe; normal setup does not replay or repair sessions.",
+            &["understood", "review", "skip"],
+        ),
+        onboarding_question(
+            "bundled-plugin-review",
+            SetupSectionId::Plugins,
+            "Review bundled plugins.",
+            &["review", "accept-defaults", "disable-some"],
+        ),
+        onboarding_question(
+            "disable-plugin-capabilities",
+            SetupSectionId::Plugins,
+            "Allow disabling plugin capabilities.",
+            &["disable-some", "keep-defaults", "later"],
+        ),
+    ]
 }
 
 fn onboarding_question(
