@@ -211,6 +211,29 @@ impl SettingsStore {
             .transpose()
     }
 
+    /// Reconcile applied onboarding plan state against actual config/auth state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when detection state cannot be read.
+    pub fn reconcile_setup_apply(
+        &self,
+        config: &bcode_config::BcodeConfig,
+    ) -> SettingsResult<SetupApplyReconciliation> {
+        let draft = self.onboarding_draft_setup()?;
+        let detection_entries = self.detection_cache_entries()?;
+        let secure_import_plans = secure_import_plans_from_detection(&detection_entries);
+        let auth_detection = detect_auth_security_from_config(config);
+        Ok(SetupApplyReconciliation {
+            draft_present: draft != OnboardingDraftSetup::default(),
+            config_summary: SetupConfigSummary::from_config(config),
+            secure_import_reconciliation: reconcile_secure_import_plans(
+                &secure_import_plans,
+                &auth_detection,
+            ),
+        })
+    }
+
     /// Apply a generated setup plan through available settings/domain services.
     ///
     /// Current mutating plan actions are represented as persisted
@@ -248,10 +271,16 @@ impl SettingsStore {
                 skipped_actions.push(action.clone());
             }
         }
-        Ok(AppliedSetupPlan {
+        let result = AppliedSetupPlan {
             applied_actions,
             skipped_actions,
-        })
+        };
+        self.put_control_state(
+            "setup.last_applied_plan",
+            &serde_json::to_value(&result)?,
+            applied_at_ms,
+        )?;
+        Ok(result)
     }
 
     /// Return the current settings/onboarding experience mode.
@@ -1742,6 +1771,105 @@ impl OnboardingDraftSetup {
     }
 }
 
+/// Reconciliation result after setup apply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupApplyReconciliation {
+    /// Whether draft setup state exists and was considered.
+    pub draft_present: bool,
+    /// Config summary after apply.
+    pub config_summary: SetupConfigSummary,
+    /// Secure import reconciliation based on actual auth config.
+    pub secure_import_reconciliation: SecureImportReconciliation,
+}
+
+/// Generate setup-plan review actions from draft choices and secure import plans.
+#[must_use]
+pub fn generate_setup_plan_from_draft(
+    draft: &OnboardingDraftSetup,
+    secure_import_plans: &[SecureCredentialImportPlan],
+    config_summary: &SetupConfigSummary,
+) -> SetupPlanReview {
+    let mut actions = Vec::new();
+    for provider in &draft.providers {
+        actions.push(SetupPlanAction {
+            section_id: SetupSectionId::Providers,
+            kind: format!("provider:{provider}"),
+            title: format!("Configure provider {provider}"),
+            body: "Persist provider selection through config/domain services when applying setup."
+                .to_owned(),
+            mutating: true,
+        });
+    }
+    for profile in &draft.auth_profiles {
+        actions.push(SetupPlanAction {
+            section_id: SetupSectionId::SecureVault,
+            kind: format!("auth-profile:{profile}"),
+            title: format!("Configure auth profile {profile}"),
+            body: "Persist secure auth profile references without storing raw secret values."
+                .to_owned(),
+            mutating: true,
+        });
+    }
+    if let Some(profile) = &draft.model_profile {
+        actions.push(SetupPlanAction {
+            section_id: SetupSectionId::Models,
+            kind: format!("model-profile:{profile}"),
+            title: format!("Select model profile {profile}"),
+            body: "Persist model profile/default through TOML-backed config APIs.".to_owned(),
+            mutating: true,
+        });
+    }
+    if let Some(preset) = &draft.permission_preset {
+        actions.push(SetupPlanAction {
+            section_id: SetupSectionId::Permissions,
+            kind: format!("permission-preset:{preset}"),
+            title: format!("Use {preset} permission preset"),
+            body: "Persist the selected permission behavior through permission/config services."
+                .to_owned(),
+            mutating: true,
+        });
+    }
+    if draft.session_import_reviewed {
+        actions.push(SetupPlanAction {
+            section_id: SetupSectionId::Imports,
+            kind: "session-import-reviewed".to_owned(),
+            title: "Record session import review".to_owned(),
+            body:
+                "Record that import sources were reviewed without replaying or repairing sessions."
+                    .to_owned(),
+            mutating: true,
+        });
+    }
+    if draft.plugins_reviewed {
+        actions.push(SetupPlanAction {
+            section_id: SetupSectionId::Plugins,
+            kind: "plugins-reviewed".to_owned(),
+            title: "Record plugin review".to_owned(),
+            body: "Record plugin review while leaving canonical plugin state in config/plugin services."
+                .to_owned(),
+            mutating: true,
+        });
+    }
+    for plan in secure_import_plans {
+        actions.push(SetupPlanAction {
+            section_id: SetupSectionId::SecureVault,
+            kind: format!("secure-import-preview:{}", plan.auth_profile),
+            title: format!("Securely import {}", plan.env_var),
+            body: "Preview secure import into sshenv; raw secret values are never stored here."
+                .to_owned(),
+            mutating: false,
+        });
+    }
+    let launch_ready = config_summary
+        .capabilities
+        .contains(&SetupConfigCapability::ProviderSelection)
+        || !draft.providers.is_empty();
+    SetupPlanReview {
+        actions,
+        launch_ready,
+    }
+}
+
 /// Setup readiness severity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2687,6 +2815,39 @@ mod tests {
         assert!(detection.sshenv_available);
         assert!(detection.device_seal_requested);
         assert!(detection.sshenv_profiles.contains("openai"));
+    }
+
+    #[test]
+    fn setup_plan_from_draft_applies_and_reconciles_state() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let store = SettingsStore::from_settings_db_path(temp.path().join("settings.db"));
+        let draft = OnboardingDraftSetup {
+            providers: BTreeSet::from(["openai-compatible".to_owned()]),
+            auth_profiles: BTreeSet::from(["default".to_owned()]),
+            model_profile: Some("default".to_owned()),
+            permission_preset: Some("balanced".to_owned()),
+            session_import_reviewed: true,
+            plugins_reviewed: true,
+        };
+        let config = bcode_config::BcodeConfig::default();
+        let plan =
+            generate_setup_plan_from_draft(&draft, &[], &SetupConfigSummary::from_config(&config));
+        let applied = store
+            .apply_setup_plan(&plan, 900)
+            .expect("plan should apply");
+        let reconciliation = store
+            .reconcile_setup_apply(&config)
+            .expect("reconciliation should load");
+
+        assert!(plan.launch_ready);
+        assert_eq!(applied.applied_actions.len(), plan.actions.len());
+        assert!(!reconciliation.draft_present);
+        assert!(
+            store
+                .control_state("setup.last_applied_plan")
+                .expect("control state should load")
+                .is_some()
+        );
     }
 
     #[test]

@@ -53,6 +53,8 @@ pub enum OnboardingInputAction {
     ReviewSessionImport,
     /// Mark plugins reviewed.
     ReviewPlugins,
+    /// Apply generated setup plan and reconcile actual state.
+    ApplyPlan,
     /// Mark the focused setup section complete.
     Complete,
     /// Mark the focused optional setup section skipped.
@@ -296,88 +298,199 @@ impl OnboardingShell {
         at_ms: u64,
     ) -> Result<OnboardingActionOutcome, SettingsError> {
         match action {
-            OnboardingInputAction::Next => {
-                self.focus_next();
-                Ok(OnboardingActionOutcome::FocusChanged(
-                    self.focused_section(),
-                ))
+            OnboardingInputAction::Next | OnboardingInputAction::Previous => {
+                Ok(self.handle_navigation_action(action))
             }
-            OnboardingInputAction::Previous => {
-                self.focus_previous();
-                Ok(OnboardingActionOutcome::FocusChanged(
-                    self.focused_section(),
-                ))
+            OnboardingInputAction::Select => self.handle_select_action(store, at_ms),
+            OnboardingInputAction::ToggleProvider
+            | OnboardingInputAction::ToggleAuthProfile
+            | OnboardingInputAction::SelectModelProfile
+            | OnboardingInputAction::CyclePermissionPreset
+            | OnboardingInputAction::ReviewSessionImport
+            | OnboardingInputAction::ReviewPlugins => {
+                self.handle_draft_action(action, store, at_ms)
             }
-            OnboardingInputAction::Select => {
-                self.persist_focus(store, at_ms)?;
-                self.status_message = Some(format!(
-                    "{} selected",
-                    setup_section_label(self.focused_section())
-                ));
-                Ok(OnboardingActionOutcome::Selected(self.focused_section()))
-            }
-            OnboardingInputAction::ToggleProvider => {
-                let draft = store.toggle_draft_provider("openai-compatible", at_ms)?;
-                self.status_message = Some(format!(
-                    "selected providers: {}",
-                    draft
-                        .providers
-                        .iter()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-                Ok(OnboardingActionOutcome::Selected(SetupSectionId::Providers))
-            }
-            OnboardingInputAction::ToggleAuthProfile => {
-                let draft = store.toggle_draft_auth_profile("default", at_ms)?;
-                self.status_message = Some(format!(
-                    "selected auth profiles: {}",
-                    draft
-                        .auth_profiles
-                        .iter()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-                Ok(OnboardingActionOutcome::Selected(
-                    SetupSectionId::SecureVault,
-                ))
-            }
-            OnboardingInputAction::SelectModelProfile => {
-                let draft = store.select_draft_model_profile("default", at_ms)?;
-                self.status_message = Some(format!(
-                    "selected model profile: {}",
-                    draft.model_profile.unwrap_or_else(|| "default".to_owned())
-                ));
-                Ok(OnboardingActionOutcome::Selected(SetupSectionId::Models))
-            }
+            OnboardingInputAction::ApplyPlan => self.handle_apply_plan_action(store, at_ms),
+            OnboardingInputAction::Complete
+            | OnboardingInputAction::Skip
+            | OnboardingInputAction::Launch => self.handle_completion_action(action, store, at_ms),
+            OnboardingInputAction::Quit => Ok(OnboardingActionOutcome::Quit),
+        }
+    }
+
+    fn handle_navigation_action(
+        &mut self,
+        action: OnboardingInputAction,
+    ) -> OnboardingActionOutcome {
+        match action {
+            OnboardingInputAction::Next => self.focus_next(),
+            OnboardingInputAction::Previous => self.focus_previous(),
+            _ => {}
+        }
+        OnboardingActionOutcome::FocusChanged(self.focused_section())
+    }
+
+    fn handle_select_action(
+        &mut self,
+        store: &SettingsStore,
+        at_ms: u64,
+    ) -> Result<OnboardingActionOutcome, SettingsError> {
+        self.persist_focus(store, at_ms)?;
+        self.status_message = Some(format!(
+            "{} selected",
+            setup_section_label(self.focused_section())
+        ));
+        Ok(OnboardingActionOutcome::Selected(self.focused_section()))
+    }
+
+    fn handle_draft_action(
+        &mut self,
+        action: OnboardingInputAction,
+        store: &SettingsStore,
+        at_ms: u64,
+    ) -> Result<OnboardingActionOutcome, SettingsError> {
+        match action {
+            OnboardingInputAction::ToggleProvider => self.toggle_provider(store, at_ms),
+            OnboardingInputAction::ToggleAuthProfile => self.toggle_auth_profile(store, at_ms),
+            OnboardingInputAction::SelectModelProfile => self.select_model_profile(store, at_ms),
             OnboardingInputAction::CyclePermissionPreset => {
-                let draft = store.cycle_draft_permission_preset(at_ms)?;
-                self.status_message = Some(format!(
-                    "permission preset: {}",
-                    draft
-                        .permission_preset
-                        .unwrap_or_else(|| "balanced".to_owned())
-                ));
-                Ok(OnboardingActionOutcome::Selected(
-                    SetupSectionId::Permissions,
-                ))
+                self.cycle_permission_preset(store, at_ms)
             }
-            OnboardingInputAction::ReviewSessionImport => {
-                let mut draft = store.onboarding_draft_setup()?;
-                draft.session_import_reviewed = true;
-                store.save_onboarding_draft_setup(&draft, at_ms)?;
-                self.status_message = Some("session import reviewed".to_owned());
-                Ok(OnboardingActionOutcome::Selected(SetupSectionId::Imports))
-            }
-            OnboardingInputAction::ReviewPlugins => {
-                let mut draft = store.onboarding_draft_setup()?;
-                draft.plugins_reviewed = true;
-                store.save_onboarding_draft_setup(&draft, at_ms)?;
-                self.status_message = Some("plugin setup reviewed".to_owned());
-                Ok(OnboardingActionOutcome::Selected(SetupSectionId::Plugins))
-            }
+            OnboardingInputAction::ReviewSessionImport => self.review_session_import(store, at_ms),
+            OnboardingInputAction::ReviewPlugins => self.review_plugins(store, at_ms),
+            _ => Ok(OnboardingActionOutcome::Ignored),
+        }
+    }
+
+    fn toggle_provider(
+        &mut self,
+        store: &SettingsStore,
+        at_ms: u64,
+    ) -> Result<OnboardingActionOutcome, SettingsError> {
+        let draft = store.toggle_draft_provider("openai-compatible", at_ms)?;
+        self.status_message = Some(format!(
+            "selected providers: {}",
+            draft
+                .providers
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        Ok(OnboardingActionOutcome::Selected(SetupSectionId::Providers))
+    }
+
+    fn toggle_auth_profile(
+        &mut self,
+        store: &SettingsStore,
+        at_ms: u64,
+    ) -> Result<OnboardingActionOutcome, SettingsError> {
+        let draft = store.toggle_draft_auth_profile("default", at_ms)?;
+        self.status_message = Some(format!(
+            "selected auth profiles: {}",
+            draft
+                .auth_profiles
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        Ok(OnboardingActionOutcome::Selected(
+            SetupSectionId::SecureVault,
+        ))
+    }
+
+    fn select_model_profile(
+        &mut self,
+        store: &SettingsStore,
+        at_ms: u64,
+    ) -> Result<OnboardingActionOutcome, SettingsError> {
+        let draft = store.select_draft_model_profile("default", at_ms)?;
+        self.status_message = Some(format!(
+            "selected model profile: {}",
+            draft.model_profile.unwrap_or_else(|| "default".to_owned())
+        ));
+        Ok(OnboardingActionOutcome::Selected(SetupSectionId::Models))
+    }
+
+    fn cycle_permission_preset(
+        &mut self,
+        store: &SettingsStore,
+        at_ms: u64,
+    ) -> Result<OnboardingActionOutcome, SettingsError> {
+        let draft = store.cycle_draft_permission_preset(at_ms)?;
+        self.status_message = Some(format!(
+            "permission preset: {}",
+            draft
+                .permission_preset
+                .unwrap_or_else(|| "balanced".to_owned())
+        ));
+        Ok(OnboardingActionOutcome::Selected(
+            SetupSectionId::Permissions,
+        ))
+    }
+
+    fn review_session_import(
+        &mut self,
+        store: &SettingsStore,
+        at_ms: u64,
+    ) -> Result<OnboardingActionOutcome, SettingsError> {
+        let mut draft = store.onboarding_draft_setup()?;
+        draft.session_import_reviewed = true;
+        store.save_onboarding_draft_setup(&draft, at_ms)?;
+        self.status_message = Some("session import reviewed".to_owned());
+        Ok(OnboardingActionOutcome::Selected(SetupSectionId::Imports))
+    }
+
+    fn review_plugins(
+        &mut self,
+        store: &SettingsStore,
+        at_ms: u64,
+    ) -> Result<OnboardingActionOutcome, SettingsError> {
+        let mut draft = store.onboarding_draft_setup()?;
+        draft.plugins_reviewed = true;
+        store.save_onboarding_draft_setup(&draft, at_ms)?;
+        self.status_message = Some("plugin setup reviewed".to_owned());
+        Ok(OnboardingActionOutcome::Selected(SetupSectionId::Plugins))
+    }
+
+    fn handle_apply_plan_action(
+        &mut self,
+        store: &SettingsStore,
+        at_ms: u64,
+    ) -> Result<OnboardingActionOutcome, SettingsError> {
+        let draft = store.onboarding_draft_setup()?;
+        let detection_entries = store.detection_cache_entries()?;
+        let secure_import_plans =
+            bcode_settings::secure_import_plans_from_detection(&detection_entries);
+        let config = bcode_config::load_config()?;
+        let plan = bcode_settings::generate_setup_plan_from_draft(
+            &draft,
+            &secure_import_plans,
+            &bcode_settings::SetupConfigSummary::from_config(&config),
+        );
+        let applied = store.apply_setup_plan(&plan, at_ms)?;
+        let reconciliation = store.reconcile_setup_apply(&config)?;
+        store.put_control_state(
+            "setup.last_apply_reconciliation",
+            &serde_json::to_value(&reconciliation)?,
+            at_ms,
+        )?;
+        self.status_message = Some(format!(
+            "applied {} setup actions; {} actions need external/domain follow-up",
+            applied.applied_actions.len(),
+            applied.skipped_actions.len()
+        ));
+        Ok(OnboardingActionOutcome::Selected(SetupSectionId::Launch))
+    }
+
+    fn handle_completion_action(
+        &mut self,
+        action: OnboardingInputAction,
+        store: &SettingsStore,
+        at_ms: u64,
+    ) -> Result<OnboardingActionOutcome, SettingsError> {
+        match action {
             OnboardingInputAction::Complete => {
                 let section_id = self.focused_section();
                 self.complete_focused_section(store, at_ms)?;
@@ -392,7 +505,7 @@ impl OnboardingShell {
                 self.launch_from_onboarding(store, at_ms)?;
                 Ok(OnboardingActionOutcome::LaunchReady)
             }
-            OnboardingInputAction::Quit => Ok(OnboardingActionOutcome::Quit),
+            _ => Ok(OnboardingActionOutcome::Ignored),
         }
     }
 
@@ -443,7 +556,7 @@ impl OnboardingShell {
             map_lines,
             focused_detail: self.focused_detail(),
             footer_lines: vec![
-                "←/↑ previous  →/↓ next  Enter select  p provider  a auth  m model  r permissions  i import  g plugins  c complete  s skip  l launch  Esc close"
+                "←/↑ previous  →/↓ next  Enter select  p provider  a auth  m model  r permissions  i import  g plugins  x apply  c complete  s skip  l launch  Esc close"
                     .to_owned(),
                 self.status_message.clone().unwrap_or_else(|| {
                     "Setup state is persisted locally and user config remains TOML-backed."
@@ -704,8 +817,18 @@ mod tests {
         assert!(draft.auth_profiles.contains("default"));
         assert_eq!(draft.model_profile.as_deref(), Some("default"));
         assert_eq!(draft.permission_preset.as_deref(), Some("cautious"));
-        assert!(draft.session_import_reviewed);
-        assert!(draft.plugins_reviewed);
+        assert_eq!(
+            shell
+                .handle_action(OnboardingInputAction::ApplyPlan, &store, 58)
+                .expect("setup plan should apply"),
+            OnboardingActionOutcome::Selected(SetupSectionId::Launch)
+        );
+        assert!(
+            store
+                .control_state("setup.last_apply_reconciliation")
+                .expect("reconciliation should load")
+                .is_some()
+        );
         let render = shell.render_model(&SettingsDbHealth::Available, None);
 
         assert!(

@@ -203,91 +203,61 @@ fn run_onboarding_loop<W: io::Write>(
             CrosstermEvent::Resize(width, height) => {
                 terminal.resize(Rect::new(0, 0, width, height));
             }
-            CrosstermEvent::Key(key) => match key.code {
-                CrosstermKeyCode::Esc | CrosstermKeyCode::Char('q') => return Ok(()),
-                CrosstermKeyCode::Right | CrosstermKeyCode::Down | CrosstermKeyCode::Char('j') => {
-                    shell.focus_next();
+            CrosstermEvent::Key(key) => {
+                if handle_onboarding_key(key.code, store, shell)? {
+                    return Ok(());
                 }
-                CrosstermKeyCode::Left | CrosstermKeyCode::Up | CrosstermKeyCode::Char('k') => {
-                    shell.focus_previous();
-                }
-                CrosstermKeyCode::Enter => {
-                    shell.handle_action(
-                        onboarding::OnboardingInputAction::Select,
-                        store,
-                        current_time_ms(),
-                    )?;
-                }
-                CrosstermKeyCode::Char('p') => {
-                    shell.handle_action(
-                        onboarding::OnboardingInputAction::ToggleProvider,
-                        store,
-                        current_time_ms(),
-                    )?;
-                }
-                CrosstermKeyCode::Char('a') => {
-                    shell.handle_action(
-                        onboarding::OnboardingInputAction::ToggleAuthProfile,
-                        store,
-                        current_time_ms(),
-                    )?;
-                }
-                CrosstermKeyCode::Char('m') => {
-                    shell.handle_action(
-                        onboarding::OnboardingInputAction::SelectModelProfile,
-                        store,
-                        current_time_ms(),
-                    )?;
-                }
-                CrosstermKeyCode::Char('r') => {
-                    shell.handle_action(
-                        onboarding::OnboardingInputAction::CyclePermissionPreset,
-                        store,
-                        current_time_ms(),
-                    )?;
-                }
-                CrosstermKeyCode::Char('i') => {
-                    shell.handle_action(
-                        onboarding::OnboardingInputAction::ReviewSessionImport,
-                        store,
-                        current_time_ms(),
-                    )?;
-                }
-                CrosstermKeyCode::Char('g') => {
-                    shell.handle_action(
-                        onboarding::OnboardingInputAction::ReviewPlugins,
-                        store,
-                        current_time_ms(),
-                    )?;
-                }
-                CrosstermKeyCode::Char('c') => {
-                    shell.handle_action(
-                        onboarding::OnboardingInputAction::Complete,
-                        store,
-                        current_time_ms(),
-                    )?;
-                }
-                CrosstermKeyCode::Char('s') => {
-                    shell.handle_action(
-                        onboarding::OnboardingInputAction::Skip,
-                        store,
-                        current_time_ms(),
-                    )?;
-                }
-                CrosstermKeyCode::Char('l') => {
-                    shell.handle_action(
-                        onboarding::OnboardingInputAction::Launch,
-                        store,
-                        current_time_ms(),
-                    )?;
-                }
-                _ => {}
-            },
+            }
             CrosstermEvent::FocusGained
             | CrosstermEvent::FocusLost
             | CrosstermEvent::Mouse(_)
             | CrosstermEvent::Paste(_) => {}
         }
+    }
+}
+
+fn handle_onboarding_key(
+    code: CrosstermKeyCode,
+    store: &bcode_settings::SettingsStore,
+    shell: &mut onboarding::OnboardingShell,
+) -> Result<bool, TuiError> {
+    match code {
+        CrosstermKeyCode::Esc | CrosstermKeyCode::Char('q') => Ok(true),
+        CrosstermKeyCode::Right | CrosstermKeyCode::Down | CrosstermKeyCode::Char('j') => {
+            shell.focus_next();
+            Ok(false)
+        }
+        CrosstermKeyCode::Left | CrosstermKeyCode::Up | CrosstermKeyCode::Char('k') => {
+            shell.focus_previous();
+            Ok(false)
+        }
+        _ => {
+            if let Some(action) = onboarding_action_for_key(code) {
+                shell.handle_action(action, store, current_time_ms())?;
+            }
+            Ok(false)
+        }
+    }
+}
+
+const fn onboarding_action_for_key(
+    code: CrosstermKeyCode,
+) -> Option<onboarding::OnboardingInputAction> {
+    match code {
+        CrosstermKeyCode::Enter => Some(onboarding::OnboardingInputAction::Select),
+        CrosstermKeyCode::Char('p') => Some(onboarding::OnboardingInputAction::ToggleProvider),
+        CrosstermKeyCode::Char('a') => Some(onboarding::OnboardingInputAction::ToggleAuthProfile),
+        CrosstermKeyCode::Char('m') => Some(onboarding::OnboardingInputAction::SelectModelProfile),
+        CrosstermKeyCode::Char('r') => {
+            Some(onboarding::OnboardingInputAction::CyclePermissionPreset)
+        }
+        CrosstermKeyCode::Char('i') => Some(onboarding::OnboardingInputAction::ReviewSessionImport),
+        CrosstermKeyCode::Char('g') => Some(onboarding::OnboardingInputAction::ReviewPlugins),
+        CrosstermKeyCode::Char('x') => Some(onboarding::OnboardingInputAction::ApplyPlan),
+        CrosstermKeyCode::Char('c') => Some(onboarding::OnboardingInputAction::Complete),
+        CrosstermKeyCode::Char('s') => Some(onboarding::OnboardingInputAction::Skip),
+        CrosstermKeyCode::Char('l') => Some(onboarding::OnboardingInputAction::Launch),
+        _ => None,
     }
 }
 
