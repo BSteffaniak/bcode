@@ -49,6 +49,23 @@ pub fn render_onboarding(
         y = y.saturating_add(1);
     }
 
+    let detail_x = area.x.saturating_add(area.width / 2).saturating_add(1);
+    let detail_width = area.width.saturating_sub(area.width / 2).saturating_sub(3);
+    let detail_y = area.y.saturating_add(3);
+    render_detail_panel(
+        &model.focused_detail.title,
+        &model.focused_detail.story,
+        &model.focused_detail.status,
+        &model.focused_detail.actions,
+        Rect::new(
+            detail_x,
+            detail_y,
+            detail_width,
+            area.height.saturating_sub(7),
+        ),
+        frame,
+    );
+
     if let Some(panel) = model.degraded_panel {
         y = y.saturating_add(1);
         frame.write_line_with_fallback_style(
@@ -79,6 +96,48 @@ pub fn render_onboarding(
     }
 }
 
+fn render_detail_panel(
+    title: &str,
+    story: &str,
+    status: &str,
+    actions: &[String],
+    area: Rect,
+    frame: &mut Frame<'_>,
+) {
+    let lines = [
+        format!("◇ {title}"),
+        format!("status: {status}"),
+        story.to_owned(),
+        "actions:".to_owned(),
+    ];
+    let mut y = area.y;
+    for line in lines {
+        if y >= area.y.saturating_add(area.height) {
+            return;
+        }
+        frame.write_line_with_fallback_style(
+            Rect::new(area.x, y, area.width, 1),
+            &Line::from_spans(vec![Span::styled(line, Style::new().fg(Color::White))]),
+            Style::new(),
+        );
+        y = y.saturating_add(1);
+    }
+    for action in actions {
+        if y >= area.y.saturating_add(area.height) {
+            return;
+        }
+        frame.write_line_with_fallback_style(
+            Rect::new(area.x.saturating_add(2), y, area.width.saturating_sub(2), 1),
+            &Line::from_spans(vec![Span::styled(
+                format!("• {action}"),
+                Style::new().fg(Color::Cyan),
+            )]),
+            Style::new(),
+        );
+        y = y.saturating_add(1);
+    }
+}
+
 fn style_for_line(line: &str) -> Style {
     if line.contains("[current]") {
         Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
@@ -86,6 +145,10 @@ fn style_for_line(line: &str) -> Style {
         Style::new().fg(Color::Green)
     } else if line.contains("[blocked]") || line.contains("[needs_attention]") {
         Style::new().fg(Color::Red)
+    } else if line.contains("[skipped]") || line.contains("[optional]") {
+        Style::new().fg(Color::BrightBlack)
+    } else if line.contains("[visited]") {
+        Style::new().fg(Color::Blue)
     } else if line.contains("[recommended]") {
         Style::new().fg(Color::Yellow)
     } else {

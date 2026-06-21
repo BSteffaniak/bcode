@@ -70,11 +70,28 @@ pub enum OnboardingActionOutcome {
     Ignored,
 }
 
+/// Story/detail content for a setup-map section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnboardingSectionDetail {
+    /// Section id.
+    pub section_id: SetupSectionId,
+    /// Display title.
+    pub title: String,
+    /// Short story explaining why this section matters.
+    pub story: String,
+    /// User-facing status label.
+    pub status: String,
+    /// Suggested actions for this section.
+    pub actions: Vec<String>,
+}
+
 /// Text render snapshot for the onboarding setup shell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OnboardingRenderModel {
     /// Setup-map lines.
     pub map_lines: Vec<String>,
+    /// Focused section detail/story panel.
+    pub focused_detail: OnboardingSectionDetail,
     /// Footer/help lines.
     pub footer_lines: Vec<String>,
     /// Optional degraded settings-state panel.
@@ -344,6 +361,7 @@ impl OnboardingShell {
             .collect();
         OnboardingRenderModel {
             map_lines,
+            focused_detail: self.focused_detail(),
             footer_lines: vec![
                 "←/↑ previous  →/↓ next  Enter select  c complete  s skip  l launch  Esc close"
                     .to_owned(),
@@ -355,6 +373,26 @@ impl OnboardingShell {
             degraded_panel: (!matches!(health, SettingsDbHealth::Available))
                 .then(|| settings_degraded_panel(health)),
             readiness_report,
+        }
+    }
+
+    /// Build detail/story content for the focused setup section.
+    #[must_use]
+    pub fn focused_detail(&self) -> OnboardingSectionDetail {
+        let section_id = self.focused_section();
+        let status = self
+            .sections
+            .get(self.focused_index)
+            .map_or(SetupSectionStatus::Unvisited, |section| section.status);
+        OnboardingSectionDetail {
+            section_id,
+            title: setup_section_label(section_id).to_owned(),
+            story: setup_section_story(section_id).to_owned(),
+            status: status.as_str().to_owned(),
+            actions: setup_section_actions(section_id)
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
         }
     }
 
@@ -419,6 +457,58 @@ pub const fn setup_section_label(section_id: SetupSectionId) -> &'static str {
         SetupSectionId::Imports => "Archive Gate",
         SetupSectionId::Plugins => "Workshop",
         SetupSectionId::Launch => "Launch",
+    }
+}
+
+/// Return the story copy for a setup section.
+#[must_use]
+pub const fn setup_section_story(section_id: SetupSectionId) -> &'static str {
+    match section_id {
+        SetupSectionId::Welcome => {
+            "Start at Base Camp: Bcode learns enough about your setup to get you coding without busywork."
+        }
+        SetupSectionId::Detection => {
+            "Scout Tower checks existing config, providers, models, plugins, sessions, and environment hints before asking questions."
+        }
+        SetupSectionId::SecureVault => {
+            "Secure Vault keeps provider secrets out of plaintext config and guides them into sshenv-backed encrypted storage."
+        }
+        SetupSectionId::Providers => {
+            "Signal Station connects the AI providers and subscriptions you want Bcode to use."
+        }
+        SetupSectionId::Models => {
+            "Engine Room chooses the model profile that balances speed, cost, and capability for your workflow."
+        }
+        SetupSectionId::Permissions => {
+            "Control Room sets how cautious or autonomous Bcode should be when using tools."
+        }
+        SetupSectionId::Imports => {
+            "Archive Gate can safely review importable session history without repairing or replaying logs on the normal path."
+        }
+        SetupSectionId::Plugins => {
+            "Workshop reviews bundled plugins so powerful behavior stays visible and disableable."
+        }
+        SetupSectionId::Launch => {
+            "Launch Pad reviews the plan, applies selected setup safely, and starts Bcode when everything is ready."
+        }
+    }
+}
+
+/// Return suggested actions for a setup section.
+#[must_use]
+pub const fn setup_section_actions(section_id: SetupSectionId) -> &'static [&'static str] {
+    match section_id {
+        SetupSectionId::Welcome => &["Review detected setup", "Choose quick or full setup"],
+        SetupSectionId::Detection => &["Run bounded detection", "Inspect safe metadata"],
+        SetupSectionId::SecureVault => {
+            &["Import credentials securely", "Explain sshenv/device seal"]
+        }
+        SetupSectionId::Providers => &["Add provider", "Choose default provider"],
+        SetupSectionId::Models => &["Pick default model", "Review model profile"],
+        SetupSectionId::Permissions => &["Choose permission preset", "Review tool boundaries"],
+        SetupSectionId::Imports => &["Review import sources", "Skip import for now"],
+        SetupSectionId::Plugins => &["Review bundled plugins", "Disable unwanted plugins"],
+        SetupSectionId::Launch => &["Review setup plan", "Launch Bcode"],
     }
 }
 
@@ -533,6 +623,8 @@ mod tests {
 
         assert!(audit.safe);
         assert!(render.snapshot_text().contains("Base Camp"));
+        assert!(render.focused_detail.story.contains("Base Camp"));
+        assert!(!render.focused_detail.actions.is_empty());
     }
 
     #[test]
