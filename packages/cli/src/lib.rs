@@ -289,13 +289,7 @@ fn handle_onboard_command(options: &OnboardOptions) -> Result<(), CliError> {
         }
         return Ok(());
     }
-    println!(
-        "Bcode onboarding interactive TUI is not wired yet. Showing current setup map preview.\n"
-    );
-    println!("{}", render.snapshot_text());
-    println!(
-        "\nRun `bcode onboard --non-interactive` for this preview without interactive launch."
-    );
+    bcode_tui::run_onboarding()?;
     Ok(())
 }
 

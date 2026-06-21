@@ -31,6 +31,7 @@ pub(crate) mod model_picker_render;
 pub(crate) mod mouse_flow;
 pub(crate) mod older_history;
 pub mod onboarding;
+pub(crate) mod onboarding_render;
 pub(crate) mod palette_flow;
 pub(crate) mod pending_submission;
 pub(crate) mod pending_submissions;
@@ -95,10 +96,15 @@ pub(crate) mod worktree_picker;
 pub(crate) mod worktree_picker_render;
 
 use std::io;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bcode_session_models::SessionId;
 use bmux_tui::crossterm::CrosstermTerminalGuard;
+use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
+use crossterm::event::{
+    self as crossterm_event, Event as CrosstermEvent, KeyCode as CrosstermKeyCode,
+};
 
 const CURSOR_BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const OLDER_HISTORY_EVENT_LIMIT: usize = 256;
@@ -112,6 +118,9 @@ pub enum TuiError {
     /// Config error.
     #[error("config error: {0}")]
     Config(#[from] bcode_config::ConfigError),
+    /// Settings error.
+    #[error("settings error: {0}")]
+    Settings(#[from] bcode_settings::SettingsError),
     /// I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -133,6 +142,76 @@ pub enum TuiError {
     /// Session selection was canceled.
     #[error("session selection canceled")]
     Canceled,
+}
+
+/// Run the first-run onboarding setup-map interface.
+///
+/// # Errors
+///
+/// Returns I/O, settings, or config errors.
+pub fn run_onboarding() -> Result<(), TuiError> {
+    let store = bcode_settings::SettingsStore::default();
+    let config = bcode_config::load_config()?;
+    let summary = bcode_settings::SetupConfigSummary::from_config(&config);
+    let mut shell = onboarding::OnboardingShell::load(&store, &summary)?;
+    let stdout = io::stdout();
+    let mut guard = CrosstermTerminalGuard::enter(stdout)?;
+    let result = {
+        let mut terminal = Terminal::new(
+            guard.writer_mut().ok_or_else(|| {
+                std::io::Error::other("terminal guard writer unavailable after entering terminal")
+            })?,
+            helpers::terminal_area()?,
+        );
+        run_onboarding_loop(&mut terminal, &store, &mut shell)
+    };
+    let _writer = guard.leave()?;
+    result
+}
+
+fn run_onboarding_loop<W: io::Write>(
+    terminal: &mut Terminal<&mut W>,
+    store: &bcode_settings::SettingsStore,
+    shell: &mut onboarding::OnboardingShell,
+) -> Result<(), TuiError> {
+    loop {
+        terminal.resize(helpers::terminal_area()?);
+        let health = store.health();
+        let readiness = store.readiness_report()?;
+        terminal.draw(|frame| {
+            onboarding_render::render_onboarding(shell, frame, &health, readiness.clone());
+        })?;
+        match crossterm_event::read()? {
+            CrosstermEvent::Resize(width, height) => {
+                terminal.resize(Rect::new(0, 0, width, height));
+            }
+            CrosstermEvent::Key(key) => match key.code {
+                CrosstermKeyCode::Esc | CrosstermKeyCode::Char('q') => return Ok(()),
+                CrosstermKeyCode::Right | CrosstermKeyCode::Down | CrosstermKeyCode::Char('j') => {
+                    shell.focus_next();
+                }
+                CrosstermKeyCode::Left | CrosstermKeyCode::Up | CrosstermKeyCode::Char('k') => {
+                    shell.focus_previous();
+                }
+                CrosstermKeyCode::Enter => shell.persist_focus(store, current_time_ms())?,
+                _ => {}
+            },
+            CrosstermEvent::FocusGained
+            | CrosstermEvent::FocusLost
+            | CrosstermEvent::Mouse(_)
+            | CrosstermEvent::Paste(_) => {}
+        }
+    }
+}
+
+fn current_time_ms() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 /// Return statically bundled plugin registrations compiled into `bcode_tui`.
