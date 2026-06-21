@@ -3553,7 +3553,7 @@ fn verify_models(
                 model_id,
                 &prompt,
                 timeout_seconds,
-            )?
+            )
         };
         println!(
             "{model_id}\t{}\t{}",
@@ -3593,33 +3593,31 @@ fn verify_one_model(
     model_id: &str,
     prompt: &str,
     timeout_seconds: u64,
-) -> Result<CliVerifyModelResult, CliError> {
-    let result = run_single_turn_blocking(
+) -> CliVerifyModelResult {
+    let Ok(result) = run_single_turn_blocking(
         invoker,
         SingleTurnRequest {
             provider_plugin_id: Some(provider_plugin_id.to_string()),
             model_id: model_id.to_string(),
             provider_context: context.clone(),
             prompt: prompt.to_string(),
-            system_prompt: None,
-            parameters: bcode_model::ModelParameters {
-                max_output_tokens: Some(16),
-                ..bcode_model::ModelParameters::default()
-            },
+            system_prompt: Some("You are Bcode's model verification probe. Follow the user's instruction exactly and answer briefly.".to_string()),
+            parameters: bcode_model::ModelParameters::default(),
             metadata: BTreeMap::from([(
                 "bcode_request_kind".to_string(),
                 "model_verification".to_string(),
             )]),
             timeout: std::time::Duration::from_secs(timeout_seconds),
         },
-    )
-    .map_err(CliError::LoginProfile)?;
+    ) else {
+        return auth_diagnostics_verify_result(context);
+    };
     let status = match result.status {
         SingleTurnStatus::Finished => "working",
         SingleTurnStatus::Cancelled | SingleTurnStatus::ProviderError => "provider_error",
         SingleTurnStatus::Timeout => "timeout",
     };
-    Ok(CliVerifyModelResult {
+    CliVerifyModelResult {
         status: result
             .error
             .as_ref()
@@ -3627,10 +3625,57 @@ fn verify_one_model(
         latency_ms: Some(result.latency_ms),
         error_code: result.error.as_ref().map(|error| error.code.clone()),
         message: result.error.map(|error| error.message),
-    })
+    }
+}
+
+fn auth_diagnostics_verify_result(
+    context: &bcode_model::ProviderRequestContext,
+) -> CliVerifyModelResult {
+    CliVerifyModelResult {
+        status: "unauthorized".to_string(),
+        latency_ms: None,
+        error_code: Some("missing_openai_auth".to_string()),
+        message: Some(auth_diagnostics_message(context)),
+    }
+}
+
+fn auth_diagnostics_message(context: &bcode_model::ProviderRequestContext) -> String {
+    let mut parts = Vec::new();
+    if let Some(profile) = &context.auth_profile {
+        parts.push(format!("auth_profile={profile}"));
+    }
+    if let Some(auth) = &context.auth {
+        if let Some(backend) = &auth.backend {
+            parts.push(format!("backend={backend}"));
+        }
+        if let Some(scheme) = &auth.scheme {
+            parts.push(format!("scheme={scheme}"));
+        }
+        let mut credential_names = auth.credentials.keys().cloned().collect::<Vec<_>>();
+        credential_names.sort();
+        parts.push(format!("credentials_present={credential_names:?}"));
+        for diagnostic in &auth.diagnostics {
+            parts.push(format!(
+                "diagnostic[{}:{}]={}",
+                diagnostic.severity, diagnostic.code, diagnostic.message
+            ));
+        }
+    }
+    if parts.is_empty() {
+        "auth context did not include credentials or diagnostics".to_string()
+    } else {
+        parts.join("; ")
+    }
 }
 
 fn provider_error_status(error: &bcode_model::ProviderError) -> String {
+    let message = error.message.to_lowercase();
+    if message.contains("model is not supported")
+        || message.contains("model is unsupported")
+        || message.contains("unsupported model")
+    {
+        return "not_supported".to_string();
+    }
     match error.category {
         bcode_model::ProviderErrorCategory::Auth => "unauthorized",
         bcode_model::ProviderErrorCategory::ModelNotFound => "not_found",
@@ -3766,33 +3811,20 @@ fn plugin_service_call_error(error: bcode_plugin::PluginServiceCallError) -> Cli
 fn load_cli_plugin_host() -> Result<bcode_plugin::PluginHost, CliError> {
     let config = bcode_config::load_config()?;
     let selection = bcode_plugin::PluginSelection::from(&config);
-    let plugins = bcode_plugin::filter_selected_plugins(discover_plugins_for_cli(&[])?, &selection);
-    bcode_plugin::PluginHost::load_registered_plugins(&plugins).map_err(CliError::Plugin)
+    let static_plugins = bcode_server::static_bundled_plugins();
+    bcode_plugin::PluginHost::load_defaults_with_static_bundled(&selection, &static_plugins)
+        .map_err(CliError::Plugin)
 }
 
 fn configured_provider_context(
     config: &bcode_config::BcodeConfig,
 ) -> bcode_model::ProviderRequestContext {
-    let selection = config.resolved_model_selection();
-    let mut context = bcode_model::ProviderRequestContext {
-        model_profile: selection.model_profile,
-        auth_profile: selection.auth_profile.clone(),
-        auth_pool: selection.auth_pool,
-        settings: selection.settings,
-        auth: None,
-        auth_candidates: Vec::new(),
-        request: selection.request,
-        env: BTreeMap::new(),
-    };
-    if let Some(auth_profile_name) = selection.auth_profile
-        && let Some(auth_profile) = config.auth.profiles.get(&auth_profile_name)
-    {
-        let resolved_auth =
-            bcode_provider_auth::resolve_auth_profile(&auth_profile_name, auth_profile);
-        context.env = resolved_auth.env;
-        context.auth = Some(resolved_auth.auth);
-    }
-    context
+    bcode_provider_auth::resolve_provider_request_context(
+        bcode_provider_auth::ProviderRequestContextResolution {
+            config,
+            selection: config.resolved_model_selection(),
+        },
+    )
 }
 
 async fn call_model_provider_service(

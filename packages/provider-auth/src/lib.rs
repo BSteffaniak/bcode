@@ -13,6 +13,67 @@ pub mod security;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+/// Request for resolving a provider request context from model and auth config.
+#[derive(Debug, Clone)]
+pub struct ProviderRequestContextResolution<'a> {
+    pub config: &'a bcode_config::BcodeConfig,
+    pub selection: bcode_config::ResolvedModelSelection,
+}
+
+/// Resolve model selection plus auth profile/pool config into provider request context.
+///
+/// This is the canonical host-side materialization path for provider auth. Callers should pass the
+/// returned context to provider plugins instead of asking plugins to rediscover config profiles.
+#[must_use]
+pub fn resolve_provider_request_context(
+    request: ProviderRequestContextResolution<'_>,
+) -> bcode_model::ProviderRequestContext {
+    let mut context = bcode_model::ProviderRequestContext {
+        model_profile: request.selection.model_profile,
+        auth_profile: request.selection.auth_profile.clone(),
+        auth_pool: request.selection.auth_pool.clone(),
+        settings: request.selection.settings,
+        auth: None,
+        auth_candidates: Vec::new(),
+        request: request.selection.request,
+        env: BTreeMap::new(),
+    };
+
+    if let Some(auth_profile_name) = request.selection.auth_profile.as_deref()
+        && let Some(auth_profile) = request.config.auth.profiles.get(auth_profile_name)
+    {
+        let resolved = resolve_auth_profile(auth_profile_name, auth_profile);
+        context.env = resolved.env;
+        context.auth = Some(resolved.auth);
+    }
+
+    if let Some(auth_pool_name) = request.selection.auth_pool.as_deref()
+        && let Some(auth_pool) = request.config.auth.pools.get(auth_pool_name)
+    {
+        context.auth_candidates = auth_pool
+            .profiles
+            .iter()
+            .filter_map(|profile_name| {
+                request
+                    .config
+                    .auth
+                    .profiles
+                    .get(profile_name)
+                    .map(|profile| {
+                        let resolved = resolve_auth_profile(profile_name, profile);
+                        bcode_model::ProviderAuthCandidate {
+                            profile: Some(profile_name.clone()),
+                            auth: resolved.auth,
+                            env: resolved.env,
+                        }
+                    })
+            })
+            .collect();
+    }
+
+    context
+}
+
 /// Auth material and compatibility environment resolved for a selected profile.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedProviderAuth {

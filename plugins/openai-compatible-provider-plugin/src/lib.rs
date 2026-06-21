@@ -3708,7 +3708,7 @@ fn settings() -> Settings {
 
 fn settings_for_context(context: &ProviderRequestContext) -> Settings {
     let saved = saved_openai_auth();
-    let allow_saved_auth = context.auth_profile.is_none();
+    let allow_saved_auth = context.auth.is_none();
     let xai_mode = env_has_xai_keys(context) || (allow_saved_auth && saved_has_xai_keys(&saved));
     let chatgpt_mode = (context_has_chatgpt_auth(context)
         || (allow_saved_auth && saved_openai_auth_is_chatgpt(&saved)))
@@ -3884,7 +3884,7 @@ fn openai_auth_settings(
     saved: &SavedOpenAiAuth,
     context: &ProviderRequestContext,
 ) -> (AuthSettings, AuthDiagnostics) {
-    let allow_saved_auth = context.auth_profile.is_none();
+    let allow_saved_auth = context.auth.is_none();
     if let Some(auth) = &context.auth {
         if let Some(api_key) = auth.credentials.get("api_key") {
             return (
@@ -4209,13 +4209,7 @@ fn context_auth_env_value(context: &ProviderRequestContext, name: &str) -> Optio
         .get(name)
         .filter(|value| !value.is_empty())
         .cloned()
-        .or_else(|| {
-            context
-                .auth_profile
-                .is_none()
-                .then(|| env_value(name))
-                .flatten()
-        })
+        .or_else(|| env_value(name))
 }
 
 fn context_env_value(context: &ProviderRequestContext, name: &str) -> Option<String> {

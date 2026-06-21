@@ -1334,7 +1334,9 @@ fn daemon_log_path() -> PathBuf {
     )
 }
 
-fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
+/// Return statically bundled plugin registrations enabled at compile time.
+#[must_use]
+pub fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
     vec![
         #[cfg(feature = "static-bundled-bedrock-provider-plugin")]
         bcode_plugin::StaticBundledPlugin::new(
@@ -1619,22 +1621,19 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
     );
     let configured_agent_ids: Vec<String> = config.agent.keys().cloned().collect();
     let skills = build_skill_registry(&config);
+    let selected_provider_context = bcode_provider_auth::resolve_provider_request_context(
+        bcode_provider_auth::ProviderRequestContextResolution {
+            config: &config,
+            selection: resolved_model.clone(),
+        },
+    );
     let state = Arc::new(ServerState::new(
         sessions,
         plugins,
         ServerStateInit {
             selected_provider_plugin_id: resolved_model.provider_plugin_id,
             selected_model_id: resolved_model.model_id,
-            selected_provider_context: bcode_model::ProviderRequestContext {
-                model_profile: resolved_model.model_profile,
-                auth_profile: resolved_model.auth_profile,
-                auth_pool: resolved_model.auth_pool,
-                settings: resolved_model.settings,
-                auth: None,
-                auth_candidates: Vec::new(),
-                request: resolved_model.request,
-                env: BTreeMap::new(),
-            },
+            selected_provider_context,
             prompt_cache_mode: config.model.effective_prompt_cache_mode(),
             conversation_reuse_mode: config.model.effective_conversation_reuse_mode(),
             selected_reasoning: resolved_model.reasoning.clone(),
