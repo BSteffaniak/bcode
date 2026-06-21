@@ -5,7 +5,6 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
-use bmux_tui_components::scroll_area::ScrollArea;
 
 use super::onboarding::OnboardingShell;
 
@@ -144,8 +143,7 @@ fn render_setup_map_panel(
         Color::Blue,
         frame,
     );
-    let lines = shell.board_lines();
-    ScrollArea::new(&lines).render(board_area, shell.board_scroll(), frame);
+    shell.render_board(board_area, frame);
 }
 
 fn render_confirmation_modal(title: &str, body: &str, area: Rect, frame: &mut Frame<'_>) {

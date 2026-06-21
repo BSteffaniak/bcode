@@ -59,6 +59,7 @@ pub(crate) mod session_fork_dialog_render;
 pub(crate) mod session_fork_flow;
 pub(crate) mod session_picker;
 pub(crate) mod session_picker_render;
+pub(crate) mod setup_board;
 pub(crate) mod skill_flow;
 pub(crate) mod skill_picker;
 pub(crate) mod skill_picker_render;
@@ -224,7 +225,7 @@ fn run_onboarding_loop<W: io::Write>(
             CrosstermEvent::Mouse(mouse) => {
                 let board_area = onboarding_render::onboarding_board_area(terminal.area());
                 let event = BmuxEvent::Mouse(convert_onboarding_mouse(mouse));
-                let _ = shell.handle_board_event(board_area, &event);
+                let _outcome = shell.handle_board_event(board_area, &event);
             }
             CrosstermEvent::FocusGained | CrosstermEvent::FocusLost | CrosstermEvent::Paste(_) => {}
         }
