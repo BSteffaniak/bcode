@@ -75,6 +75,8 @@ pub enum CliError {
     Tui(#[from] bcode_tui::TuiError),
     #[error("plugin error: {0}")]
     Plugin(#[from] bcode_plugin::PluginLoadError),
+    #[error("sshenv error: {0}")]
+    Sshenv(String),
     #[error("interrupted: {0}")]
     Signal(#[from] std::io::Error),
     #[error("--new cannot be combined with a subcommand")]
@@ -134,6 +136,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
             provider,
             skip_launch,
             control_center,
+            secure_import_env,
         } => handle_onboard_flags(
             reset,
             onboard_output_mode(dry_run, non_interactive),
@@ -148,6 +151,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
             } else {
                 OnboardExperienceMode::FirstRun
             },
+            secure_import_env,
         )?,
         Commands::Server { command } => handle_server_command(command).await?,
         Commands::Session { command } => handle_session_command(command).await?,
@@ -215,6 +219,7 @@ fn handle_onboard_flags(
     provider: Option<String>,
     launch_mode: OnboardLaunchMode,
     experience_mode: OnboardExperienceMode,
+    secure_import_env: Option<String>,
 ) -> Result<(), CliError> {
     handle_onboard_command(&OnboardOptions {
         reset,
@@ -222,6 +227,7 @@ fn handle_onboard_flags(
         provider,
         launch_mode,
         experience_mode,
+        secure_import_env,
     })
 }
 
@@ -281,6 +287,52 @@ struct OnboardOptions {
     provider: Option<String>,
     launch_mode: OnboardLaunchMode,
     experience_mode: OnboardExperienceMode,
+    secure_import_env: Option<String>,
+}
+
+fn import_onboarding_env_credential(
+    env_var: &str,
+    plans: &[bcode_settings::SecureCredentialImportPlan],
+    imported_at_ms: u64,
+) -> Result<(), CliError> {
+    let Some(plan) = plans.iter().find(|plan| plan.env_var == env_var) else {
+        println!("no detected secure-import plan for {env_var}");
+        return Ok(());
+    };
+    let Some(value) = std::env::var_os(env_var) else {
+        println!("{env_var} is not present; nothing imported");
+        return Ok(());
+    };
+    let value = value.to_string_lossy().into_owned();
+    let vault = bcode_config::default_auth_vault_path();
+    let store = sshenv_vault::SshenvStore::new(
+        sshenv_vault::SshenvStoreConfig::new(vault.clone()).with_private_key_paths(
+            bcode_provider_auth::security::vault_private_key_paths(&vault),
+        ),
+    );
+    store
+        .set_secret(
+            &plan.auth_profile,
+            &plan.credential_key,
+            zeroize::Zeroizing::new(value),
+        )
+        .map_err(|error| CliError::Sshenv(error.to_string()))?;
+    bcode_settings::SettingsStore::default().put_control_state(
+        "onboarding.secure_import.last",
+        &serde_json::json!({
+            "env_var": env_var,
+            "auth_profile": plan.auth_profile,
+            "credential_key": plan.credential_key,
+            "imported_at_ms": imported_at_ms,
+            "raw_value_stored": false,
+        }),
+        imported_at_ms,
+    )?;
+    println!(
+        "imported {env_var} into sshenv profile '{}' without storing the raw value in settings",
+        plan.auth_profile
+    );
+    Ok(())
 }
 
 fn handle_onboard_command(options: &OnboardOptions) -> Result<(), CliError> {
@@ -312,6 +364,9 @@ fn handle_onboard_command(options: &OnboardOptions) -> Result<(), CliError> {
     let auth_detection = bcode_settings::detect_auth_security_from_config(&config);
     let secure_import_plans =
         bcode_settings::secure_import_plans_from_detection(&detection.entries);
+    if let Some(env_var) = options.secure_import_env.as_deref() {
+        import_onboarding_env_credential(env_var, &secure_import_plans, now_ms)?;
+    }
     let secure_story =
         bcode_settings::secure_credential_story_panel(&secure_import_plans, &auth_detection);
     let draft = store.onboarding_draft_setup()?;
@@ -482,6 +537,9 @@ enum Commands {
         /// Reopen the setup map as Settings / Control Center.
         #[arg(long)]
         control_center: bool,
+        /// Securely import one detected environment credential into sshenv.
+        #[arg(long = "secure-import-env", value_name = "ENV_VAR")]
+        secure_import_env: Option<String>,
     },
     Server {
         #[command(subcommand)]
