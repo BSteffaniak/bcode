@@ -3,12 +3,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use bcode_settings::{SetupSectionId, SetupSectionStatus};
+use bmux_keyboard::KeyCode;
 use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 use bmux_tui_components::scroll_area::{ScrollArea, ScrollAreaOutcome, ScrollAreaState};
+
+const CLICK_DRAG_THRESHOLD_CELLS: u16 = 1;
 
 /// Semantic board spot rendered as a clickable board-game location.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +124,8 @@ pub struct SetupBoardState {
     pub hovered: Option<SetupSectionId>,
     /// Pressed spot, if any.
     pub pressed: Option<SetupSectionId>,
+    /// Mouse-down origin for click-vs-pan gesture arbitration.
+    pub press_origin: Option<Point>,
 }
 
 impl SetupBoardState {
@@ -132,6 +137,7 @@ impl SetupBoardState {
             focused,
             hovered: None,
             pressed: None,
+            press_origin: None,
         }
     }
 }
@@ -209,6 +215,11 @@ impl<'a> SetupBoard<'a> {
         {
             return outcome;
         }
+        if let Event::Key(key) = event
+            && let Some(outcome) = self.handle_key(state, key.key)
+        {
+            return outcome;
+        }
         let scroll_outcome = if matches!(scroll_outcome, ScrollAreaOutcome::Ignored) {
             scroll_area.handle_event(area, &mut state.scroll, event)
         } else {
@@ -235,6 +246,68 @@ impl<'a> SetupBoard<'a> {
             BoardSpotComponent::new(spot).render(&mut surface, state);
         }
         surface.into_lines()
+    }
+
+    fn handle_key(self, state: &mut SetupBoardState, key: KeyCode) -> Option<SetupBoardOutcome> {
+        match key {
+            KeyCode::Enter | KeyCode::Space => Some(SetupBoardOutcome::Selected(state.focused)),
+            KeyCode::Tab | KeyCode::Char('n') => self.focus_relative(state, FocusStep::Next),
+            KeyCode::Char('p') => self.focus_relative(state, FocusStep::Previous),
+            KeyCode::Left => self.focus_direction(state, Direction::Left),
+            KeyCode::Right => self.focus_direction(state, Direction::Right),
+            KeyCode::Up => self.focus_direction(state, Direction::Up),
+            KeyCode::Down => self.focus_direction(state, Direction::Down),
+            KeyCode::Char(_)
+            | KeyCode::Backspace
+            | KeyCode::Delete
+            | KeyCode::Escape
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Insert
+            | KeyCode::F(_) => None,
+        }
+    }
+
+    fn focus_relative(
+        self,
+        state: &mut SetupBoardState,
+        step: FocusStep,
+    ) -> Option<SetupBoardOutcome> {
+        let position = self
+            .spots
+            .iter()
+            .position(|spot| spot.id == state.focused)
+            .unwrap_or_default();
+        let next = match step {
+            FocusStep::Next => (position + 1).min(self.spots.len().saturating_sub(1)),
+            FocusStep::Previous => position.saturating_sub(1),
+        };
+        let id = self.spots.get(next)?.id;
+        state.focused = id;
+        Some(SetupBoardOutcome::Focused(id))
+    }
+
+    fn focus_direction(
+        self,
+        state: &mut SetupBoardState,
+        direction: Direction,
+    ) -> Option<SetupBoardOutcome> {
+        let layout = self.layout();
+        let current = layout
+            .spots
+            .iter()
+            .find(|spot| spot.model.id == state.focused)?;
+        let current_center = rect_center(current.rect);
+        let next = layout
+            .spots
+            .iter()
+            .filter(|spot| spot.model.id != state.focused)
+            .filter(|spot| direction.matches(current_center, rect_center(spot.rect)))
+            .min_by_key(|spot| direction.distance(current_center, rect_center(spot.rect)))?;
+        state.focused = next.model.id;
+        Some(SetupBoardOutcome::Focused(next.model.id))
     }
 
     fn handle_mouse(
@@ -270,6 +343,7 @@ impl<'a> SetupBoard<'a> {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 state.pressed = hit;
+                state.press_origin = Some(mouse.position);
                 if let Some(id) = hit {
                     state.focused = id;
                     Some(SetupBoardOutcome::Focused(id))
@@ -279,6 +353,7 @@ impl<'a> SetupBoard<'a> {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 let pressed = state.pressed.take();
+                state.press_origin = None;
                 if let (Some(pressed), Some(hit)) = (pressed, hit)
                     && pressed == hit
                 {
@@ -287,7 +362,13 @@ impl<'a> SetupBoard<'a> {
                 Some(SetupBoardOutcome::Redraw)
             }
             MouseEventKind::Drag(MouseButton::Left) if state.pressed.is_some() => {
+                if state.press_origin.is_some_and(|origin| {
+                    mouse_distance(origin, mouse.position) <= CLICK_DRAG_THRESHOLD_CELLS
+                }) {
+                    return Some(SetupBoardOutcome::Redraw);
+                }
                 state.pressed = None;
+                state.press_origin = None;
                 None
             }
             MouseEventKind::Down(_)
@@ -344,10 +425,67 @@ impl LaidOutBoardPath {
         surface.draw_vertical(to.x, mid_y, to.y.saturating_sub(1), "│", path_style());
         surface.put(to.x, to.y.saturating_sub(1), "▼", path_style());
         if from.x != to.x {
-            surface.put(from.x, mid_y, "┴", path_style());
-            surface.put(to.x, mid_y, "┬", path_style());
+            surface.put(
+                from.x,
+                mid_y,
+                if to.x > from.x { "╰" } else { "╯" },
+                path_style(),
+            );
+            surface.put(
+                to.x,
+                mid_y,
+                if to.x > from.x { "╮" } else { "╭" },
+                path_style(),
+            );
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FocusStep {
+    Next,
+    Previous,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl Direction {
+    const fn matches(self, from: Point, to: Point) -> bool {
+        match self {
+            Self::Left => to.x < from.x,
+            Self::Right => to.x > from.x,
+            Self::Up => to.y < from.y,
+            Self::Down => to.y > from.y,
+        }
+    }
+
+    fn distance(self, from: Point, to: Point) -> u32 {
+        let major = match self {
+            Self::Left => u32::from(from.x.saturating_sub(to.x)),
+            Self::Right => u32::from(to.x.saturating_sub(from.x)),
+            Self::Up => u32::from(from.y.saturating_sub(to.y)),
+            Self::Down => u32::from(to.y.saturating_sub(from.y)),
+        };
+        let minor = match self {
+            Self::Left | Self::Right => u32::from(from.y.abs_diff(to.y)),
+            Self::Up | Self::Down => u32::from(from.x.abs_diff(to.x)),
+        };
+        major.saturating_mul(10).saturating_add(minor)
+    }
+}
+
+const fn rect_center(rect: Rect) -> Point {
+    Point::new(rect.x + rect.width / 2, rect.y + rect.height / 2)
+}
+
+const fn mouse_distance(from: Point, to: Point) -> u16 {
+    from.x.abs_diff(to.x).saturating_add(from.y.abs_diff(to.y))
 }
 
 struct BoardLayoutEngine {
@@ -751,6 +889,88 @@ mod tests {
         assert!(text.contains("Secure Vault"));
         assert!(text.contains("Lockbox"));
         assert!(text.contains("🔒"));
+    }
+
+    #[test]
+    fn tiny_drag_from_spot_keeps_pending_click() {
+        let spots = vec![BoardSpot::new(
+            SetupSectionId::Welcome,
+            "Welcome",
+            "Base Camp",
+            SetupSectionStatus::Current,
+        )];
+        let board = SetupBoard::new(&spots, &[]);
+        let mut state = SetupBoardState::new(SetupSectionId::Welcome);
+        let area = Rect::new(0, 0, 8, 4);
+
+        let _outcome = board.handle_event(
+            area,
+            &mut state,
+            &Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                Point::new(3, 3),
+            )),
+        );
+        assert_eq!(
+            board.handle_event(
+                area,
+                &mut state,
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    Point::new(4, 3),
+                )),
+            ),
+            SetupBoardOutcome::Redraw
+        );
+        assert_eq!(state.scroll.horizontal_offset(), 0);
+        assert_eq!(state.pressed, Some(SetupSectionId::Welcome));
+    }
+
+    #[test]
+    fn keyboard_navigation_focuses_neighboring_spots() {
+        let spots = vec![
+            BoardSpot::new(
+                SetupSectionId::Welcome,
+                "Welcome",
+                "Base Camp",
+                SetupSectionStatus::Current,
+            )
+            .layer(0),
+            BoardSpot::new(
+                SetupSectionId::Detection,
+                "Detection",
+                "Scout Tower",
+                SetupSectionStatus::Complete,
+            )
+            .layer(1),
+            BoardSpot::new(
+                SetupSectionId::Providers,
+                "Providers",
+                "Signal Station",
+                SetupSectionStatus::Recommended,
+            )
+            .layer(1),
+        ];
+        let board = SetupBoard::new(&spots, &[]);
+        let mut state = SetupBoardState::new(SetupSectionId::Welcome);
+        let area = Rect::new(0, 0, 80, 20);
+
+        assert_eq!(
+            board.handle_event(
+                area,
+                &mut state,
+                &Event::Key(bmux_keyboard::KeyStroke::simple(KeyCode::Down)),
+            ),
+            SetupBoardOutcome::Focused(SetupSectionId::Detection)
+        );
+        assert_eq!(
+            board.handle_event(
+                area,
+                &mut state,
+                &Event::Key(bmux_keyboard::KeyStroke::simple(KeyCode::Enter)),
+            ),
+            SetupBoardOutcome::Selected(SetupSectionId::Detection)
+        );
     }
 
     #[test]
