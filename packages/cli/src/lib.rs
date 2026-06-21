@@ -264,8 +264,18 @@ fn handle_onboard_command(options: &OnboardOptions) -> Result<(), CliError> {
     .unwrap_or(u64::MAX);
     let detection = bcode_settings::detect_setup_environment(now_ms);
     store.save_setup_detection_snapshot(&detection)?;
-    store.visit_onboarding_section(bcode_settings::SetupSectionId::Welcome, now_ms)?;
     let config = bcode_config::load_config()?;
+    let auth_detection = bcode_settings::detect_auth_security_from_config(&config);
+    let secure_import_plans =
+        bcode_settings::secure_import_plans_from_detection(&detection.entries);
+    let secure_story =
+        bcode_settings::secure_credential_story_panel(&secure_import_plans, &auth_detection);
+    store.put_control_state(
+        "onboarding.secure_credential_story",
+        &serde_json::to_value(&secure_story)?,
+        now_ms,
+    )?;
+    store.visit_onboarding_section(bcode_settings::SetupSectionId::Welcome, now_ms)?;
     let summary = bcode_settings::SetupConfigSummary::from_config(&config);
     let mut input = summary.reconciliation_input();
     if let Some(provider) = options.provider.as_deref() {

@@ -121,6 +121,9 @@ pub enum TuiError {
     /// Settings error.
     #[error("settings error: {0}")]
     Settings(#[from] bcode_settings::SettingsError),
+    /// JSON error.
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
     /// I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -154,6 +157,16 @@ pub fn run_onboarding() -> Result<(), TuiError> {
     let detection = bcode_settings::detect_setup_environment(current_time_ms());
     store.save_setup_detection_snapshot(&detection)?;
     let config = bcode_config::load_config()?;
+    let auth_detection = bcode_settings::detect_auth_security_from_config(&config);
+    let secure_import_plans =
+        bcode_settings::secure_import_plans_from_detection(&detection.entries);
+    let secure_story =
+        bcode_settings::secure_credential_story_panel(&secure_import_plans, &auth_detection);
+    store.put_control_state(
+        "onboarding.secure_credential_story",
+        &serde_json::to_value(&secure_story)?,
+        current_time_ms(),
+    )?;
     let summary = bcode_settings::SetupConfigSummary::from_config(&config);
     let mut shell = onboarding::OnboardingShell::load(&store, &summary)?;
     let recommendations = store.setup_recommendations()?;

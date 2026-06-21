@@ -1313,6 +1313,53 @@ fn auth_profile_for_env_var(env_var: &str) -> &'static str {
     }
 }
 
+/// Security story panel for detected secure credential import opportunities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecureCredentialStoryPanel {
+    /// User-facing headline.
+    pub headline: String,
+    /// Security story bullets.
+    pub bullets: Vec<String>,
+    /// Detected credential source names; values are never included.
+    pub detected_sources: Vec<String>,
+    /// Device-seal explanation.
+    pub device_seal_message: String,
+    /// Recommended next actions.
+    pub recommended_actions: Vec<String>,
+}
+
+/// Build user-facing security story copy from sanitized secure-import plans.
+#[must_use]
+pub fn secure_credential_story_panel(
+    plans: &[SecureCredentialImportPlan],
+    auth_detection: &AuthSecurityDetection,
+) -> SecureCredentialStoryPanel {
+    let detected_sources = plans.iter().map(|plan| plan.env_var.clone()).collect();
+    let device_seal_message = if auth_detection.device_seal_requested {
+        "Device sealing is requested for configured sshenv profiles, so encrypted secrets can be bound to this machine where supported."
+    } else {
+        "Device sealing is not configured yet; onboarding can explain and enable it where supported."
+    }
+    .to_owned();
+    SecureCredentialStoryPanel {
+        headline: "Secure detected provider credentials".to_owned(),
+        bullets: vec![
+            "Bcode keeps provider secrets out of plaintext config.".to_owned(),
+            "Bcode avoids scattering tokens across shell startup files.".to_owned(),
+            "sshenv-backed storage is the guided secure path for loaded credentials.".to_owned(),
+            "Secret values are never displayed, logged, or persisted in the settings database."
+                .to_owned(),
+        ],
+        detected_sources,
+        device_seal_message,
+        recommended_actions: vec![
+            "Import detected credentials into sshenv-backed secure storage.".to_owned(),
+            "Reconcile auth profiles after import before marking setup complete.".to_owned(),
+            "Remove plaintext environment exports after secure import if appropriate.".to_owned(),
+        ],
+    }
+}
+
 /// Post-import reconciliation summary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecureImportReconciliation {
@@ -2496,6 +2543,34 @@ mod tests {
         assert!(detection.sshenv_available);
         assert!(detection.device_seal_requested);
         assert!(detection.sshenv_profiles.contains("openai"));
+    }
+
+    #[test]
+    fn secure_credential_story_panel_never_contains_secret_values() {
+        let entries = vec![DetectionCacheEntry {
+            detector: "environment".to_owned(),
+            key: "OPENAI_API_KEY".to_owned(),
+            value: json!({ "present": true, "secret_value_stored": false }),
+            confidence: "high".to_owned(),
+            source: "environment".to_owned(),
+            detected_at_ms: 70,
+            expires_at_ms: None,
+        }];
+        let plans = secure_import_plans_from_detection(&entries);
+        let panel = secure_credential_story_panel(
+            &plans,
+            &AuthSecurityDetection {
+                sshenv_available: true,
+                device_seal_requested: true,
+                sshenv_profiles: BTreeSet::from(["openai".to_owned()]),
+            },
+        );
+        let encoded = serde_json::to_string(&panel).expect("panel should encode");
+
+        assert!(encoded.contains("OPENAI_API_KEY"));
+        assert!(encoded.contains("sshenv"));
+        assert!(encoded.contains("Device sealing"));
+        assert!(!encoded.contains("sk-secret-value"));
     }
 
     #[test]
