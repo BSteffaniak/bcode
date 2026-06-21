@@ -133,62 +133,29 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
             non_interactive,
             provider,
             skip_launch,
-        } => {
-            handle_onboard_command(&OnboardOptions {
-                reset,
-                output_mode: onboard_output_mode(dry_run, non_interactive),
-                provider,
-                launch_mode: if skip_launch {
-                    OnboardLaunchMode::SkipLaunch
-                } else {
-                    OnboardLaunchMode::LaunchWhenReady
-                },
-            })?;
-        }
+            control_center,
+        } => handle_onboard_flags(
+            reset,
+            onboard_output_mode(dry_run, non_interactive),
+            provider,
+            if skip_launch {
+                OnboardLaunchMode::SkipLaunch
+            } else {
+                OnboardLaunchMode::LaunchWhenReady
+            },
+            if control_center {
+                OnboardExperienceMode::ControlCenter
+            } else {
+                OnboardExperienceMode::FirstRun
+            },
+        )?,
         Commands::Server { command } => handle_server_command(command).await?,
         Commands::Session { command } => handle_session_command(command).await?,
         Commands::Worktree { command } => handle_worktree_command(command).await?,
         Commands::Blims { command } => blims::handle_blims_command(command).await?,
         Commands::Review { command } => Box::pin(handle_review_command(command)).await?,
         Commands::Ralph { repo } => handle_ralph_command(repo).await?,
-        Commands::Plugin { command } => match command {
-            PluginCommand::List { root } => list_plugins(&root)?,
-            PluginCommand::Services { root, daemon } => {
-                list_plugin_services(&root, daemon).await?;
-            }
-            PluginCommand::Check { root } => check_plugins(&root)?,
-            PluginCommand::Invoke {
-                root,
-                daemon,
-                plugin_id,
-                interface_id,
-                operation,
-                payload,
-            } => {
-                invoke_plugin_service(
-                    &root,
-                    &plugin_id,
-                    &interface_id,
-                    &operation,
-                    payload,
-                    daemon,
-                )
-                .await?;
-            }
-            PluginCommand::Call {
-                root,
-                daemon,
-                interface_id,
-                operation,
-                payload,
-            } => call_plugin_service(&root, &interface_id, &operation, payload, daemon).await?,
-            PluginCommand::Publish {
-                root,
-                daemon,
-                topic,
-                payload,
-            } => publish_plugin_event(&root, &topic, payload, daemon).await?,
-        },
+        Commands::Plugin { command } => handle_plugin_command(command).await?,
         Commands::Model { command } => handle_model_command(command).await?,
         Commands::Auth { command } => handle_auth_command(command)?,
         Commands::Login { command } => handle_login_command(command).await?,
@@ -198,6 +165,64 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         command => handle_session_io_command(command).await?,
     }
     Ok(())
+}
+
+async fn handle_plugin_command(command: PluginCommand) -> Result<(), CliError> {
+    match command {
+        PluginCommand::List { root } => list_plugins(&root)?,
+        PluginCommand::Services { root, daemon } => {
+            list_plugin_services(&root, daemon).await?;
+        }
+        PluginCommand::Check { root } => check_plugins(&root)?,
+        PluginCommand::Invoke {
+            root,
+            daemon,
+            plugin_id,
+            interface_id,
+            operation,
+            payload,
+        } => {
+            invoke_plugin_service(
+                &root,
+                &plugin_id,
+                &interface_id,
+                &operation,
+                payload,
+                daemon,
+            )
+            .await?;
+        }
+        PluginCommand::Call {
+            root,
+            daemon,
+            interface_id,
+            operation,
+            payload,
+        } => call_plugin_service(&root, &interface_id, &operation, payload, daemon).await?,
+        PluginCommand::Publish {
+            root,
+            daemon,
+            topic,
+            payload,
+        } => publish_plugin_event(&root, &topic, payload, daemon).await?,
+    }
+    Ok(())
+}
+
+fn handle_onboard_flags(
+    reset: bool,
+    output_mode: OnboardOutputMode,
+    provider: Option<String>,
+    launch_mode: OnboardLaunchMode,
+    experience_mode: OnboardExperienceMode,
+) -> Result<(), CliError> {
+    handle_onboard_command(&OnboardOptions {
+        reset,
+        output_mode,
+        provider,
+        launch_mode,
+        experience_mode,
+    })
 }
 
 const fn onboard_output_mode(dry_run: bool, non_interactive: bool) -> OnboardOutputMode {
@@ -242,12 +267,20 @@ enum OnboardLaunchMode {
     SkipLaunch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum OnboardExperienceMode {
+    #[default]
+    FirstRun,
+    ControlCenter,
+}
+
 #[derive(Debug, Clone, Default)]
 struct OnboardOptions {
     reset: bool,
     output_mode: OnboardOutputMode,
     provider: Option<String>,
     launch_mode: OnboardLaunchMode,
+    experience_mode: OnboardExperienceMode,
 }
 
 fn handle_onboard_command(options: &OnboardOptions) -> Result<(), CliError> {
@@ -263,6 +296,17 @@ fn handle_onboard_command(options: &OnboardOptions) -> Result<(), CliError> {
     )
     .unwrap_or(u64::MAX);
     let detection = bcode_settings::detect_setup_environment(now_ms);
+    store.put_control_state(
+        "onboarding.experience_mode",
+        &serde_json::json!({
+            "mode": match options.experience_mode {
+                OnboardExperienceMode::FirstRun => "first_run",
+                OnboardExperienceMode::ControlCenter => "control_center",
+            },
+            "selected_at_ms": now_ms,
+        }),
+        now_ms,
+    )?;
     store.save_setup_detection_snapshot(&detection)?;
     let config = bcode_config::load_config()?;
     let auth_detection = bcode_settings::detect_auth_security_from_config(&config);
@@ -270,6 +314,13 @@ fn handle_onboard_command(options: &OnboardOptions) -> Result<(), CliError> {
         bcode_settings::secure_import_plans_from_detection(&detection.entries);
     let secure_story =
         bcode_settings::secure_credential_story_panel(&secure_import_plans, &auth_detection);
+    let draft = store.onboarding_draft_setup()?;
+    let questionnaire = bcode_settings::deterministic_onboarding_questionnaire(&draft, &detection);
+    store.put_control_state(
+        "onboarding.questionnaire",
+        &serde_json::to_value(&questionnaire)?,
+        now_ms,
+    )?;
     store.put_control_state(
         "onboarding.secure_credential_story",
         &serde_json::to_value(&secure_story)?,
@@ -428,6 +479,9 @@ enum Commands {
         /// Do not launch a session after onboarding completes.
         #[arg(long)]
         skip_launch: bool,
+        /// Reopen the setup map as Settings / Control Center.
+        #[arg(long)]
+        control_center: bool,
     },
     Server {
         #[command(subcommand)]

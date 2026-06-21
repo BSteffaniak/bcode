@@ -1870,6 +1870,120 @@ pub fn generate_setup_plan_from_draft(
     }
 }
 
+/// Deterministic onboarding question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnboardingQuestion {
+    /// Stable question id.
+    pub question_id: String,
+    /// Setup section that owns this question.
+    pub section_id: SetupSectionId,
+    /// User-facing prompt.
+    pub prompt: String,
+    /// Allowed deterministic answers.
+    pub options: Vec<String>,
+}
+
+/// Deterministic onboarding questionnaire assembled from detection/draft state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnboardingQuestionnaire {
+    /// Questions to ask or show in setup-map order.
+    pub questions: Vec<OnboardingQuestion>,
+}
+
+/// Build deterministic onboarding questions without LLM generation.
+#[must_use]
+pub fn deterministic_onboarding_questionnaire(
+    draft: &OnboardingDraftSetup,
+    detection: &SetupDetectionSnapshot,
+) -> OnboardingQuestionnaire {
+    let detected_credentials = detection
+        .entries
+        .iter()
+        .any(|entry| entry.detector == "environment" && entry.key.ends_with("_API_KEY"));
+    let mut questions = vec![
+        onboarding_question(
+            "welcome-new-or-import",
+            SetupSectionId::Welcome,
+            "Are you new to Bcode or importing/continuing existing setup?",
+            &["new", "import", "continue"],
+        ),
+        onboarding_question(
+            "welcome-depth",
+            SetupSectionId::Welcome,
+            "Do you want quick setup or full setup?",
+            &["quick", "full"],
+        ),
+        onboarding_question(
+            "credentials-present",
+            SetupSectionId::SecureVault,
+            if detected_credentials {
+                "We found provider credentials in your environment. Move them to secure storage?"
+            } else {
+                "Do you already have provider credentials available?"
+            },
+            &["secure-import", "enter-later", "skip"],
+        ),
+        onboarding_question(
+            "configure-providers-now",
+            SetupSectionId::Providers,
+            "Do you want to configure providers now?",
+            &["yes", "no", "later"],
+        ),
+        onboarding_question(
+            "review-permissions-now",
+            SetupSectionId::Permissions,
+            "Do you want to review permissions now?",
+            &["cautious", "balanced", "autonomous", "later"],
+        ),
+        onboarding_question(
+            "import-session-history",
+            SetupSectionId::Imports,
+            "Do you want to import existing session history?",
+            &["review", "skip", "later"],
+        ),
+    ];
+    if draft.providers.is_empty() {
+        questions.push(onboarding_question(
+            "provider-choice",
+            SetupSectionId::Providers,
+            "Which providers do you want to use?",
+            &["openai-compatible", "bedrock", "xai", "openrouter", "none"],
+        ));
+    } else {
+        questions.push(onboarding_question(
+            "default-provider",
+            SetupSectionId::Providers,
+            "Which configured provider should be default?",
+            &draft
+                .providers
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        ));
+    }
+    questions.push(onboarding_question(
+        "default-model-profile",
+        SetupSectionId::Models,
+        "Pick a default model/profile.",
+        &["default", "fast", "balanced", "quality"],
+    ));
+    OnboardingQuestionnaire { questions }
+}
+
+fn onboarding_question(
+    question_id: &str,
+    section_id: SetupSectionId,
+    prompt: &str,
+    options: &[&str],
+) -> OnboardingQuestion {
+    OnboardingQuestion {
+        question_id: question_id.to_owned(),
+        section_id,
+        prompt: prompt.to_owned(),
+        options: options.iter().map(ToString::to_string).collect(),
+    }
+}
+
 /// Setup readiness severity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2815,6 +2929,32 @@ mod tests {
         assert!(detection.sshenv_available);
         assert!(detection.device_seal_requested);
         assert!(detection.sshenv_profiles.contains("openai"));
+    }
+
+    #[test]
+    fn deterministic_questionnaire_contains_core_branching_questions() {
+        let mut vars = BTreeMap::new();
+        vars.insert("OPENAI_API_KEY".to_owned(), "sk-secret".to_owned());
+        let detection = detect_setup_environment_from_vars(&vars, 42);
+        let draft = OnboardingDraftSetup {
+            providers: BTreeSet::from(["openai-compatible".to_owned()]),
+            ..OnboardingDraftSetup::default()
+        };
+        let questionnaire = deterministic_onboarding_questionnaire(&draft, &detection);
+        let text = serde_json::to_string(&questionnaire).expect("questionnaire should encode");
+
+        assert!(questionnaire.questions.iter().any(|question| {
+            question.prompt.contains("quick setup") && question.options.contains(&"full".to_owned())
+        }));
+        assert!(questionnaire.questions.iter().any(|question| {
+            question.question_id == "credentials-present"
+                && question.prompt.contains("secure storage")
+        }));
+        assert!(questionnaire.questions.iter().any(|question| {
+            question.question_id == "default-provider"
+                && question.options.contains(&"openai-compatible".to_owned())
+        }));
+        assert!(!text.contains("sk-secret"));
     }
 
     #[test]

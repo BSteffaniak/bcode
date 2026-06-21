@@ -162,6 +162,13 @@ pub fn run_onboarding() -> Result<(), TuiError> {
         bcode_settings::secure_import_plans_from_detection(&detection.entries);
     let secure_story =
         bcode_settings::secure_credential_story_panel(&secure_import_plans, &auth_detection);
+    let draft = store.onboarding_draft_setup()?;
+    let questionnaire = bcode_settings::deterministic_onboarding_questionnaire(&draft, &detection);
+    store.put_control_state(
+        "onboarding.questionnaire",
+        &serde_json::to_value(&questionnaire)?,
+        current_time_ms(),
+    )?;
     store.put_control_state(
         "onboarding.secure_credential_story",
         &serde_json::to_value(&secure_story)?,
