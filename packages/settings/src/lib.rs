@@ -346,8 +346,12 @@ impl SettingsStore {
         self.with_database(move |database| {
             Box::pin(async move {
                 database
-                    .upsert("control_state_kv")
-                    .unique(&["key"])
+                    .delete("control_state_kv")
+                    .filter(Box::new(where_eq("key", key.clone())))
+                    .execute(database.as_ref())
+                    .await?;
+                database
+                    .insert("control_state_kv")
                     .value("key", key)
                     .value("value_json", value_json)
                     .value("updated_at_ms", u64_to_i64(updated_at_ms))
@@ -2958,6 +2962,22 @@ mod tests {
         assert_eq!(value.key, "setup.theme");
         assert_eq!(value.value, json!({"name": "default"}));
         assert_eq!(value.updated_at_ms, 100);
+
+        store
+            .put_control_state("setup.other", &json!({"name": "other"}), 101)
+            .expect("second control state should be written");
+        assert!(
+            store
+                .control_state("setup.theme")
+                .expect("first control state should reload")
+                .is_some()
+        );
+        assert!(
+            store
+                .control_state("setup.other")
+                .expect("second control state should load")
+                .is_some()
+        );
     }
 
     #[test]
