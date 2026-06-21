@@ -283,11 +283,10 @@ opt-level = 0
 
 # BMUX local development patches
 # [patch."https://github.com/BSteffaniak/bmux.git"]
-# bmux_attach_image_protocol = { path = "../wt-bmux/text-inputs/packages/attach-image-protocol" }
-# bmux_codec                 = { path = "../wt-bmux/text-inputs/packages/codec" }
-# bmux_ipc                   = { path = "../wt-bmux/text-inputs/packages/ipc" }
-# bmux_keyboard              = { path = "../wt-bmux/text-inputs/packages/keyboard" }
-# bmux_terminal_grid         = { path = "../wt-bmux/text-inputs/packages/terminal-grid" }
-# bmux_text_edit             = { path = "../wt-bmux/text-inputs/packages/text-edit" }
-# bmux_tui                   = { path = "../wt-bmux/text-inputs/packages/tui" }
-# bmux_tui_components        = { path = "../wt-bmux/text-inputs/packages/tui-components" }
+# bmux_codec          = { path = "/Volumes/ehdd/GitHub/bmux/packages/codec" }
+# bmux_ipc            = { path = "/Volumes/ehdd/GitHub/bmux/packages/ipc" }
+# bmux_keyboard       = { path = "/Volumes/ehdd/GitHub/bmux/packages/keyboard" }
+# bmux_terminal_grid  = { path = "/Volumes/ehdd/GitHub/bmux/packages/terminal-grid" }
+# bmux_text_edit      = { path = "/Volumes/ehdd/GitHub/bmux/packages/text-edit" }
+# bmux_tui            = { path = "/Volumes/ehdd/GitHub/bmux/packages/tui" }
+# bmux_tui_components = { path = "/Volumes/ehdd/GitHub/bmux/packages/tui-components" }

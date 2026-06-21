@@ -29,7 +29,7 @@ dependencies = [
  "actix-web",
  "derive_more 2.1.1",
  "futures-util",
- "log 0.4.32",
+ "log 0.4.33",
  "once_cell",
  "smallvec",
 ]
@@ -49,7 +49,7 @@ dependencies = [
  "derive_more 2.1.1",
  "futures-core",
  "http-range",
- "log 0.4.32",
+ "log 0.4.33",
  "mime 0.3.17",
  "mime_guess",
  "percent-encoding 2.3.2",
@@ -112,7 +112,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "http 0.2.12",
- "log 0.4.32",
+ "log 0.4.33",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -200,7 +200,7 @@ dependencies = [
  "awc",
  "futures-core",
  "futures-util",
- "log 0.4.32",
+ "log 0.4.33",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -263,7 +263,7 @@ dependencies = [
  "impl-more",
  "itoa",
  "language-tags 0.3.2",
- "log 0.4.32",
+ "log 0.4.33",
  "mime 0.3.17",
  "once_cell",
  "pin-project-lite",
@@ -506,7 +506,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -517,7 +517,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -550,7 +550,7 @@ checksum = "0348a1c054491f4bfe6ab86a7b6ab1e44e45d899005de92f58b3df180b36ddaf"
 dependencies = [
  "clipboard-win",
  "image",
- "log 0.4.32",
+ "log 0.4.33",
  "objc2",
  "objc2-app-kit",
  "objc2-core-foundation",
@@ -573,9 +573,9 @@ dependencies = [
 
 [[package]]
 name = "arrayvec"
-version = "0.7.6"
+version = "0.7.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
+checksum = "f02882884d3e1bc524fb12c79f107f6ad0e1cfd498c536ffb494301740995dfe"
 
 [[package]]
 name = "ascii"
@@ -678,7 +678,7 @@ dependencies = [
  "h2 0.3.27",
  "http 0.2.12",
  "itoa",
- "log 0.4.32",
+ "log 0.4.33",
  "mime 0.3.17",
  "percent-encoding 2.3.2",
  "pin-project-lite",
@@ -2048,7 +2048,7 @@ dependencies = [
  "itertools 0.12.1",
  "lazy_static",
  "lazycell",
- "log 0.4.32",
+ "log 0.4.33",
  "prettyplease",
  "proc-macro2",
  "quote",
@@ -2073,9 +2073,9 @@ checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
 
 [[package]]
 name = "bitvec"
-version = "1.0.1"
+version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bc2832c24239b0141d5674bb9174f9d68a8b5b3f2753311927c172ca46f7e9c"
+checksum = "ddcec3d12c579d40898fe0a9a358a803c23e9c52ca3c425707f81c9436211837"
 dependencies = [
  "funty",
  "radium",
@@ -2132,7 +2132,7 @@ dependencies = [
 [[package]]
 name = "bmux_attach_image_protocol"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#8adf87a90554cb48d433d5b08c252bcf3c3bd8b3"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#db0509a6c9e0efb381c51cef961086fcb69d180c"
 dependencies = [
  "bmux_codec",
  "serde",
@@ -2142,7 +2142,7 @@ dependencies = [
 [[package]]
 name = "bmux_codec"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#8adf87a90554cb48d433d5b08c252bcf3c3bd8b3"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#db0509a6c9e0efb381c51cef961086fcb69d180c"
 dependencies = [
  "serde",
 ]
@@ -2150,7 +2150,7 @@ dependencies = [
 [[package]]
 name = "bmux_ipc"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#8adf87a90554cb48d433d5b08c252bcf3c3bd8b3"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#db0509a6c9e0efb381c51cef961086fcb69d180c"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_codec",
@@ -2164,7 +2164,7 @@ dependencies = [
 [[package]]
 name = "bmux_keyboard"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#8adf87a90554cb48d433d5b08c252bcf3c3bd8b3"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#db0509a6c9e0efb381c51cef961086fcb69d180c"
 dependencies = [
  "crossterm",
 ]
@@ -2172,7 +2172,7 @@ dependencies = [
 [[package]]
 name = "bmux_terminal_grid"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#8adf87a90554cb48d433d5b08c252bcf3c3bd8b3"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#db0509a6c9e0efb381c51cef961086fcb69d180c"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -2183,7 +2183,7 @@ dependencies = [
 [[package]]
 name = "bmux_text_edit"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#8adf87a90554cb48d433d5b08c252bcf3c3bd8b3"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#db0509a6c9e0efb381c51cef961086fcb69d180c"
 dependencies = [
  "bmux_keyboard",
  "unicode-segmentation",
@@ -2193,7 +2193,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#8adf87a90554cb48d433d5b08c252bcf3c3bd8b3"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#db0509a6c9e0efb381c51cef961086fcb69d180c"
 dependencies = [
  "bmux_keyboard",
  "bmux_text_edit",
@@ -2205,7 +2205,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui_components"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#8adf87a90554cb48d433d5b08c252bcf3c3bd8b3"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#db0509a6c9e0efb381c51cef961086fcb69d180c"
 dependencies = [
  "bmux_keyboard",
  "bmux_text_edit",
@@ -2314,9 +2314,9 @@ checksum = "8f1fe948ff07f4bd06c30984e69f5b4899c516a3ef74f34df92a2df2ab535495"
 
 [[package]]
 name = "bytes"
-version = "1.11.1"
+version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
+checksum = "8ae3f5d315924270530207e2a68396c3cc547f6dca3fbdca317cfb1a51edb593"
 dependencies = [
  "serde",
 ]
@@ -2370,9 +2370,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.64"
+version = "1.2.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dad887fd958be91b5098c0248def011f4523ab786cd411be668777e55063501f"
+checksum = "e228eec9be7c17ccb640b59b36a5cd805ea2a564a4c5e162c2f659fea30d3b96"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -2599,7 +2599,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3017,7 +3017,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3218,7 +3218,7 @@ version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32e90c2accc4b07a8456ea0debdc2e7587bdd890680d71173a15d4ae604f6eef"
 dependencies = [
- "log 0.4.32",
+ "log 0.4.33",
 ]
 
 [[package]]
@@ -3228,7 +3228,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0621c04f2196ac3f488dd583365b9c09be011a4ab8b9f37248ffcc8f6198b56a"
 dependencies = [
  "env_filter",
- "log 0.4.32",
+ "log 0.4.33",
 ]
 
 [[package]]
@@ -3244,7 +3244,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3477,7 +3477,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d89dab3c7ff6e0a6e93af9cb87b41a98eb1b5635f5fd0d97fe552103f0290367"
 dependencies = [
- "log 0.4.32",
+ "log 0.4.33",
  "serde",
  "serde_json",
  "strum 0.26.3",
@@ -3620,7 +3620,7 @@ dependencies = [
  "cc",
  "cfg-if",
  "libc",
- "log 0.4.32",
+ "log 0.4.33",
  "rustversion",
  "windows-link",
  "windows-result",
@@ -3726,7 +3726,7 @@ dependencies = [
  "bitflags 2.13.0",
  "libc",
  "libgit2-sys",
- "log 0.4.32",
+ "log 0.4.33",
  "url 2.5.8",
 ]
 
@@ -4097,7 +4097,7 @@ dependencies = [
  "futures-util",
  "http 0.2.12",
  "hyper 0.14.32",
- "log 0.4.32",
+ "log 0.4.33",
  "rustls 0.21.12",
  "tokio",
  "tokio-rustls 0.24.1",
@@ -4150,7 +4150,7 @@ dependencies = [
  "libc",
  "percent-encoding 2.3.2",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "tokio",
  "tower-service",
  "tracing",
@@ -4182,7 +4182,7 @@ source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76
 dependencies = [
  "hyperchad_color",
  "hyperchad_transformer_models",
- "log 0.4.32",
+ "log 0.4.33",
  "moosicbox_arb",
  "moosicbox_assert",
  "serde",
@@ -4202,7 +4202,7 @@ dependencies = [
  "hyperchad_renderer",
  "hyperchad_renderer_html",
  "hyperchad_router",
- "log 0.4.32",
+ "log 0.4.33",
  "moosicbox_assert",
  "moosicbox_env_utils",
  "serde_json",
@@ -4217,7 +4217,7 @@ version = "0.3.0"
 source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
  "color-hex",
- "log 0.4.32",
+ "log 0.4.33",
  "moosicbox_assert",
  "serde",
  "thiserror 2.0.18",
@@ -4231,7 +4231,7 @@ dependencies = [
  "hyperchad_color",
  "hyperchad_transformer",
  "hyperchad_transformer_models",
- "log 0.4.32",
+ "log 0.4.33",
  "moosicbox_assert",
  "pulldown-cmark",
  "syntect",
@@ -4247,7 +4247,7 @@ dependencies = [
  "bytes",
  "hyperchad_color",
  "hyperchad_transformer",
- "log 0.4.32",
+ "log 0.4.33",
  "serde_json",
  "switchy_async",
 ]
@@ -4267,7 +4267,7 @@ dependencies = [
  "hyperchad_renderer_html_web_server",
  "hyperchad_router",
  "hyperchad_transformer",
- "log 0.4.32",
+ "log 0.4.33",
  "maud",
  "moosicbox_assert",
  "moosicbox_env_utils",
@@ -4294,7 +4294,7 @@ dependencies = [
  "flume 0.12.0",
  "futures-util",
  "hyperchad_renderer",
- "log 0.4.32",
+ "log 0.4.33",
  "moosicbox_assert",
  "moosicbox_env_utils",
  "moosicbox_logging",
@@ -4312,7 +4312,7 @@ dependencies = [
  "hyperchad_renderer",
  "hyperchad_renderer_html",
  "hyperchad_router",
- "log 0.4.32",
+ "log 0.4.33",
  "mime_guess",
  "moosicbox_assert",
  "moosicbox_env_utils",
@@ -4333,7 +4333,7 @@ dependencies = [
  "hyperchad_renderer",
  "lambda_http",
  "lambda_runtime",
- "log 0.4.32",
+ "log 0.4.33",
  "moosicbox_assert",
  "moosicbox_env_utils",
  "serde_json",
@@ -4348,7 +4348,7 @@ dependencies = [
  "bytes",
  "flume 0.12.0",
  "hyperchad_renderer",
- "log 0.4.32",
+ "log 0.4.33",
  "moosicbox_assert",
  "moosicbox_env_utils",
  "moosicbox_logging",
@@ -4366,7 +4366,7 @@ dependencies = [
  "futures",
  "hyperchad_renderer",
  "hyperchad_transformer",
- "log 0.4.32",
+ "log 0.4.33",
  "mime_multipart",
  "moosicbox_assert",
  "os_info",
@@ -4381,7 +4381,7 @@ name = "hyperchad_simulator"
 version = "0.3.0"
 source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
- "log 0.4.32",
+ "log 0.4.33",
  "moosicbox_assert",
  "serde",
  "serde_json",
@@ -4412,7 +4412,7 @@ version = "0.3.0"
 source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
  "hyperchad_actions",
- "log 0.4.32",
+ "log 0.4.33",
  "proc-macro2",
  "quote",
  "syn",
@@ -4427,7 +4427,7 @@ dependencies = [
  "hyperchad_template_actions_dsl",
  "hyperchad_transformer",
  "hyperchad_transformer_models",
- "log 0.4.32",
+ "log 0.4.33",
  "proc-macro2",
  "proc-macro2-diagnostics",
  "quote",
@@ -4443,7 +4443,7 @@ dependencies = [
  "hyperchad_actions",
  "hyperchad_color",
  "hyperchad_transformer_models",
- "log 0.4.32",
+ "log 0.4.33",
  "moosicbox_assert",
  "moosicbox_logging",
  "paste",
@@ -4461,7 +4461,7 @@ name = "hyperchad_transformer_models"
 version = "0.3.0"
 source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
- "log 0.4.32",
+ "log 0.4.33",
  "moosicbox_assert",
  "serde",
  "thiserror 2.0.18",
@@ -4474,7 +4474,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e06b90c8a0d252e203c94344b21e35a30f3a3a85dc7db5af8f8df9f3e0c63ef"
 dependencies = [
  "basic-toml",
- "log 0.4.32",
+ "log 0.4.33",
  "serde",
  "serde_derive",
  "thiserror 1.0.69",
@@ -4493,7 +4493,7 @@ dependencies = [
  "fluent-syntax",
  "i18n-embed-impl",
  "intl-memoizer",
- "log 0.4.32",
+ "log 0.4.33",
  "parking_lot",
  "rust-embed",
  "thiserror 1.0.69",
@@ -4543,7 +4543,7 @@ dependencies = [
  "core-foundation-sys",
  "iana-time-zone-haiku",
  "js-sys",
- "log 0.4.32",
+ "log 0.4.33",
  "wasm-bindgen",
  "windows-core",
 ]
@@ -5205,14 +5205,14 @@ version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e19e8d5c34a3e0e2223db8e060f9e8264aeeb5c5fc64a4ee9965c062211c024b"
 dependencies = [
- "log 0.4.32",
+ "log 0.4.33",
 ]
 
 [[package]]
 name = "log"
-version = "0.4.32"
+version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
+checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "loom"
@@ -5242,7 +5242,7 @@ dependencies = [
  "getrandom 0.3.4",
  "indexmap",
  "itoa",
- "log 0.4.32",
+ "log 0.4.33",
  "md-5",
  "nom 8.0.0",
  "nom_locate",
@@ -5317,7 +5317,7 @@ dependencies = [
  "fastrand",
  "flume 0.11.1",
  "if-addrs 0.15.0",
- "log 0.4.32",
+ "log 0.4.33",
  "mio",
  "socket-pktinfo",
  "socket2 0.6.4",
@@ -5404,7 +5404,7 @@ dependencies = [
  "encoding",
  "httparse",
  "hyper 0.10.16",
- "log 0.4.32",
+ "log 0.4.33",
  "mime 0.2.6",
  "tempfile",
  "textnonce",
@@ -5433,7 +5433,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02bd0af71c67b473010cbbc60715ee815645a4dc942899111f494b4b737d6fda"
 dependencies = [
  "libc",
- "log 0.4.32",
+ "log 0.4.33",
  "wasi 0.11.1+wasi-snapshot-preview1",
  "windows-sys 0.61.2",
 ]
@@ -5443,7 +5443,7 @@ name = "moosicbox_arb"
 version = "0.3.0"
 source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
- "log 0.4.32",
+ "log 0.4.33",
  "moosicbox_assert",
  "proptest",
  "serde_json",
@@ -5470,7 +5470,7 @@ source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76
 dependencies = [
  "async-trait",
  "chrono",
- "log 0.4.32",
+ "log 0.4.33",
  "switchy_database",
  "thiserror 2.0.18",
 ]
@@ -5493,7 +5493,7 @@ version = "0.3.0"
 source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
  "free_log_client",
- "log 0.4.32",
+ "log 0.4.33",
  "thiserror 2.0.18",
 ]
 
@@ -5505,7 +5505,7 @@ dependencies = [
  "actix-web",
  "futures",
  "futures-util",
- "log 0.4.32",
+ "log 0.4.33",
  "moosicbox_assert",
  "switchy_time",
  "tracing",
@@ -5599,7 +5599,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5981,7 +5981,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9cf20a545b305cf1da722b236b5155c9bb35f1d5ceb28c048bd96ca842f41b5b"
 dependencies = [
  "android_system_properties",
- "log 0.4.32",
+ "log 0.4.33",
  "nix 0.31.3",
  "objc2",
  "objc2-foundation",
@@ -6112,7 +6112,7 @@ dependencies = [
  "cff-parser",
  "encoding_rs",
  "euclid",
- "log 0.4.32",
+ "log 0.4.33",
  "lopdf",
  "postscript",
  "type1-encoding-parser",
@@ -6322,7 +6322,7 @@ dependencies = [
  "filedescriptor",
  "lazy_static",
  "libc",
- "log 0.4.32",
+ "log 0.4.33",
  "nix 0.28.0",
  "serial2",
  "shared_library",
@@ -6526,7 +6526,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls 0.23.40",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6563,7 +6563,7 @@ dependencies = [
  "cfg_aliases 0.2.1",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -6787,9 +6787,9 @@ dependencies = [
 
 [[package]]
 name = "reflink-copy"
-version = "0.1.29"
+version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13362233b147e57674c37b802d216b7c5e3dcccbed8967c84f0d8d223868ae27"
+checksum = "d9dd7ab4af0363d5ccfd2838d782a28196cf32a5cc2e4fe3c5dc83f2be588b8b"
 dependencies = [
  "cfg-if",
  "libc",
@@ -6859,7 +6859,7 @@ dependencies = [
  "hyper-rustls 0.27.9",
  "hyper-util",
  "js-sys",
- "log 0.4.32",
+ "log 0.4.33",
  "percent-encoding 2.3.2",
  "pin-project-lite",
  "quinn",
@@ -7123,7 +7123,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7132,7 +7132,7 @@ version = "0.21.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f56a14d1f48b391359b22f731fd4bd7e43c97f3c50eee276f3aa09c94784d3e"
 dependencies = [
- "log 0.4.32",
+ "log 0.4.33",
  "ring",
  "rustls-webpki 0.101.7",
  "sct",
@@ -7649,7 +7649,7 @@ dependencies = [
  "btparse",
  "color-backtrace",
  "ctrlc",
- "log 0.4.32",
+ "log 0.4.33",
  "scoped-tls",
  "shell-words",
  "simvar_utils",
@@ -7728,7 +7728,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7764,7 +7764,7 @@ checksum = "04f4048b05716cdb270e1e5960d9dd4d428e7ceaa939ee5348a84f6e43d52df1"
 dependencies = [
  "futures-core",
  "genawaiter",
- "log 0.4.32",
+ "log 0.4.33",
  "tokio",
 ]
 
@@ -7813,7 +7813,7 @@ dependencies = [
 [[package]]
 name = "sshenv_vault"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/sshenv.git?branch=master#66c2e1f1f3dbd8474309a722e39d0d1cf6a3d3a0"
+source = "git+https://github.com/BSteffaniak/sshenv.git?branch=master#969457fac2f47133af28de12ec998d4711726446"
 dependencies = [
  "aes-siv",
  "age",
@@ -7824,6 +7824,7 @@ dependencies = [
  "hkdf",
  "rand_core 0.6.4",
  "rpassword",
+ "security-framework",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -7838,7 +7839,7 @@ dependencies = [
 [[package]]
 name = "sshenv_vault_models"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/sshenv.git?branch=master#66c2e1f1f3dbd8474309a722e39d0d1cf6a3d3a0"
+source = "git+https://github.com/BSteffaniak/sshenv.git?branch=master#969457fac2f47133af28de12ec998d4711726446"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -8294,7 +8295,7 @@ source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76
 dependencies = [
  "flume 0.12.0",
  "futures",
- "log 0.4.32",
+ "log 0.4.33",
  "pin-project-lite",
  "scoped-tls",
  "switchy_async_macros",
@@ -8310,7 +8311,7 @@ name = "switchy_async_macros"
 version = "0.3.0"
 source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
- "log 0.4.32",
+ "log 0.4.33",
  "proc-macro2",
  "quote",
  "syn",
@@ -8323,7 +8324,7 @@ source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76
 dependencies = [
  "async-trait",
  "chrono",
- "log 0.4.32",
+ "log 0.4.33",
  "moosicbox_assert",
  "moosicbox_profiles",
  "regex",
@@ -8340,7 +8341,7 @@ name = "switchy_database_connection"
 version = "0.3.0"
 source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
- "log 0.4.32",
+ "log 0.4.33",
  "rusqlite",
  "switchy_async",
  "switchy_database",
@@ -8353,7 +8354,7 @@ name = "switchy_env"
 version = "0.3.0"
 source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
- "log 0.4.32",
+ "log 0.4.33",
  "thiserror 2.0.18",
 ]
 
@@ -8363,7 +8364,7 @@ version = "0.3.0"
 source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
  "bytes",
- "log 0.4.32",
+ "log 0.4.33",
  "switchy_async",
  "tokio",
 ]
@@ -8376,7 +8377,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures-util",
- "log 0.4.32",
+ "log 0.4.33",
  "paste",
  "strum 0.28.0",
  "switchy_http_models",
@@ -8401,7 +8402,7 @@ source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76
 dependencies = [
  "async-trait",
  "hostname",
- "log 0.4.32",
+ "log 0.4.33",
  "mdns-sd",
  "moosicbox_assert",
  "thiserror 2.0.18",
@@ -8412,7 +8413,7 @@ name = "switchy_random"
 version = "0.3.0"
 source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
- "log 0.4.32",
+ "log 0.4.33",
  "rand 0.8.5",
 ]
 
@@ -8425,7 +8426,7 @@ dependencies = [
  "bytes",
  "chrono",
  "hex",
- "log 0.4.32",
+ "log 0.4.33",
  "moosicbox_json_utils",
  "sha2 0.11.0",
  "switchy_async",
@@ -8441,7 +8442,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "flume 0.12.0",
- "log 0.4.32",
+ "log 0.4.33",
  "paste",
  "scoped-tls",
  "switchy_async",
@@ -8454,7 +8455,7 @@ name = "switchy_telemetry"
 version = "0.3.0"
 source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
- "log 0.4.32",
+ "log 0.4.33",
  "moosicbox_assert",
  "moosicbox_env_utils",
  "moosicbox_log_runtime",
@@ -8473,7 +8474,7 @@ version = "0.3.0"
 source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
  "chrono",
- "log 0.4.32",
+ "log 0.4.33",
  "scoped-tls",
  "switchy_random",
 ]
@@ -8487,7 +8488,7 @@ dependencies = [
  "async-trait",
  "futures",
  "itertools 0.14.0",
- "log 0.4.32",
+ "log 0.4.33",
  "moosicbox_assert",
  "pin-utils",
  "regex",
@@ -8505,7 +8506,7 @@ name = "switchy_uuid"
 version = "0.3.0"
 source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
- "log 0.4.32",
+ "log 0.4.33",
  "switchy_env",
  "switchy_random",
  "uuid",
@@ -8524,7 +8525,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures",
- "log 0.4.32",
+ "log 0.4.33",
  "moosicbox_assert",
  "paste",
  "serde",
@@ -8560,7 +8561,7 @@ version = "0.3.0"
 source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#881ee5e76f9ac92fddedc4281eb11758e47d9961"
 dependencies = [
  "bytes",
- "log 0.4.32",
+ "log 0.4.33",
  "moosicbox_assert",
  "serde",
  "serde_json",
@@ -8641,10 +8642,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9079,7 +9080,7 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
- "log 0.4.32",
+ "log 0.4.33",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
@@ -9125,7 +9126,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
 dependencies = [
- "log 0.4.32",
+ "log 0.4.33",
  "once_cell",
  "tracing-core",
 ]
@@ -9847,7 +9848,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10170,7 +10171,7 @@ dependencies = [
  "dirs",
  "glob",
  "jwalk",
- "log 0.4.32",
+ "log 0.4.33",
  "rquickjs",
  "serde",
  "serde_json",
@@ -10188,7 +10189,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "424082c0f1c5cecfda7f7832b93ecc70ca793a8a639088e431c70d497afa12db"
 dependencies = [
  "jwalk",
- "log 0.4.32",
+ "log 0.4.33",
  "rayon",
  "reflink-copy",
  "thiserror 2.0.18",
@@ -10201,7 +10202,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e070482002f7deee3ce63e919449b8734682f1ecd15cbaaeeebbca172abcfb72"
 dependencies = [
  "git2",
- "log 0.4.32",
+ "log 0.4.33",
  "thiserror 2.0.18",
 ]
 
@@ -10213,7 +10214,7 @@ checksum = "0901a89427d7d4eb78004aaaf940db81ad2a4e4fc2b21dc70768c68878685f4b"
 dependencies = [
  "globset",
  "jwalk",
- "log 0.4.32",
+ "log 0.4.33",
 ]
 
 [[package]]
@@ -10222,7 +10223,7 @@ version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1fad1d20b192159b6710394838167e85f1424a5d9cbff1223ff25d4555ada26"
 dependencies = [
- "log 0.4.32",
+ "log 0.4.33",
  "thiserror 2.0.18",
  "worktree_setup_config",
  "worktree_setup_copy",

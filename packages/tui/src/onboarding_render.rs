@@ -5,10 +5,30 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
+use bmux_tui_components::scroll_area::ScrollArea;
 
 use super::onboarding::OnboardingShell;
 
 const HERO_HEIGHT: u16 = 4;
+
+/// Return the board viewport area for a terminal area.
+#[must_use]
+pub const fn onboarding_board_area(area: Rect) -> Rect {
+    let content_y = area.y.saturating_add(HERO_HEIGHT).saturating_add(1);
+    let footer_height = 3;
+    let content_height = area
+        .height
+        .saturating_sub(HERO_HEIGHT)
+        .saturating_sub(footer_height)
+        .saturating_sub(2);
+    let map_width = area.width.saturating_mul(45) / 100;
+    Rect::new(
+        area.x.saturating_add(3),
+        content_y.saturating_add(1),
+        map_width.saturating_sub(5),
+        content_height.saturating_sub(2),
+    )
+}
 
 /// Render the onboarding shell into a terminal frame.
 pub fn render_onboarding(
@@ -42,7 +62,8 @@ pub fn render_onboarding(
         content_height,
     );
 
-    render_setup_map_panel(&model.map_lines, map_area, frame);
+    let board_area = onboarding_board_area(area);
+    render_setup_map_panel(shell, board_area, map_area, frame);
     render_detail_panel(
         &model.focused_detail.title,
         &model.focused_detail.story,
@@ -111,21 +132,20 @@ fn render_hero_panel(area: Rect, frame: &mut Frame<'_>) {
     );
 }
 
-fn render_setup_map_panel(lines: &[String], area: Rect, frame: &mut Frame<'_>) {
-    render_box(area, "Quest Board", Color::Blue, frame);
-    let mut y = area.y.saturating_add(1);
-    for line in lines {
-        if y >= area.y.saturating_add(area.height).saturating_sub(1) {
-            break;
-        }
-        let style = style_for_line(line);
-        frame.write_line_with_fallback_style(
-            Rect::new(area.x.saturating_add(2), y, area.width.saturating_sub(4), 1),
-            &Line::from_spans(vec![Span::styled(format_status_badge(line), style)]),
-            Style::new(),
-        );
-        y = y.saturating_add(1);
-    }
+fn render_setup_map_panel(
+    shell: &OnboardingShell,
+    board_area: Rect,
+    panel_area: Rect,
+    frame: &mut Frame<'_>,
+) {
+    render_box(
+        panel_area,
+        "Quest Board · drag / arrows to pan",
+        Color::Blue,
+        frame,
+    );
+    let lines = shell.board_lines();
+    ScrollArea::new(&lines).render(board_area, shell.board_scroll(), frame);
 }
 
 fn render_confirmation_modal(title: &str, body: &str, area: Rect, frame: &mut Frame<'_>) {
@@ -260,34 +280,6 @@ fn render_box(area: Rect, title: &str, color: Color, frame: &mut Frame<'_>) {
     );
 }
 
-fn format_status_badge(line: &str) -> String {
-    line.replace("[current]", "⟦current⟧")
-        .replace("[complete]", "⟦complete⟧")
-        .replace("[secured]", "⟦secured⟧")
-        .replace("[recommended]", "⟦recommended⟧")
-        .replace("[optional]", "⟦optional⟧")
-        .replace("[blocked]", "⟦blocked⟧")
-        .replace("[needs_attention]", "⟦needs attention⟧")
-}
-
 fn status_badge(status: &str) -> String {
     format!("⟦{status}⟧")
-}
-
-fn style_for_line(line: &str) -> Style {
-    if line.contains("[current]") {
-        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-    } else if line.contains("[complete]") || line.contains("[secured]") {
-        Style::new().fg(Color::Green)
-    } else if line.contains("[blocked]") || line.contains("[needs_attention]") {
-        Style::new().fg(Color::Red)
-    } else if line.contains("[skipped]") || line.contains("[optional]") {
-        Style::new().fg(Color::BrightBlack)
-    } else if line.contains("[visited]") {
-        Style::new().fg(Color::Blue)
-    } else if line.contains("[recommended]") {
-        Style::new().fg(Color::Yellow)
-    } else {
-        Style::new().fg(Color::White)
-    }
 }

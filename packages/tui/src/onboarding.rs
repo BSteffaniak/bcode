@@ -5,6 +5,7 @@ use bcode_settings::{
     SetupConfigSummary, SetupMapSnapshot, SetupReadinessReport, SetupReconciliationInput,
     SetupSectionId, SetupSectionStatus, settings_degraded_panel,
 };
+use bmux_tui_components::scroll_area::{ScrollArea, ScrollAreaOutcome, ScrollAreaState};
 use bmux_tui_components::stepper::{StepItem, StepStatus};
 
 /// First-run onboarding shell state for the setup-map vertical slice.
@@ -14,6 +15,7 @@ pub struct OnboardingShell {
     focused_index: usize,
     status_message: Option<String>,
     pending_confirmation: Option<OnboardingPendingConfirmation>,
+    board_scroll: ScrollAreaState,
 }
 
 /// Automated onboarding walkthrough smoke-test report.
@@ -210,6 +212,7 @@ impl OnboardingShell {
             focused_index,
             status_message: None,
             pending_confirmation: None,
+            board_scroll: ScrollAreaState::new(),
         }
     }
 
@@ -217,6 +220,15 @@ impl OnboardingShell {
     #[must_use]
     pub fn sections(&self) -> &[ReconciledSetupSection] {
         &self.sections
+    }
+
+    /// Return status for a setup section.
+    #[must_use]
+    pub fn section_status(&self, section_id: SetupSectionId) -> SetupSectionStatus {
+        self.sections
+            .iter()
+            .find(|section| section.section_id == section_id)
+            .map_or(SetupSectionStatus::Unvisited, |section| section.status)
     }
 
     /// Return the currently focused setup section.
@@ -574,6 +586,37 @@ impl OnboardingShell {
         }
     }
 
+    /// Return board scroll/pan state.
+    #[must_use]
+    pub const fn board_scroll(&self) -> &ScrollAreaState {
+        &self.board_scroll
+    }
+
+    /// Return mutable board scroll/pan state.
+    #[must_use]
+    pub const fn board_scroll_mut(&mut self) -> &mut ScrollAreaState {
+        &mut self.board_scroll
+    }
+
+    /// Handle board map scroll/pan event with hidden scrollbars.
+    pub fn handle_board_event(
+        &mut self,
+        area: bmux_tui::geometry::Rect,
+        event: &bmux_tui::event::Event,
+    ) -> ScrollAreaOutcome {
+        let lines = self.board_lines();
+        ScrollArea::new(&lines).handle_event(area, &mut self.board_scroll, event)
+    }
+
+    /// Return canonical board-game setup map lines.
+    #[must_use]
+    pub fn board_lines(&self) -> Vec<bmux_tui::prelude::Line> {
+        canonical_board_lines(self)
+            .into_iter()
+            .map(bmux_tui::prelude::Line::from)
+            .collect()
+    }
+
     /// Return BMUX stepper items for rendering the setup map with existing primitives.
     #[must_use]
     pub fn step_items(&self) -> Vec<StepItem<'static>> {
@@ -705,7 +748,73 @@ impl OnboardingShell {
 
 /// Return the human label for a setup section.
 #[must_use]
-pub const fn setup_section_label(section_id: SetupSectionId) -> &'static str {
+pub fn canonical_board_lines(shell: &OnboardingShell) -> Vec<String> {
+    let status = |section_id| board_status_glyph(shell.section_status(section_id));
+    vec![
+        "                         ╭──────────────╮".to_owned(),
+        "                         │  Welcome     │".to_owned(),
+        "                         │  Base Camp   │".to_owned(),
+        format!(
+            "                         ╰──────{}───────╯",
+            status(SetupSectionId::Welcome)
+        ),
+        "                                │".to_owned(),
+        "        ╭───────────────────────┼───────────────────────╮".to_owned(),
+        "        │                       │                       │".to_owned(),
+        "╭───────▼────────╮    ╭─────────▼────────╮    ╭─────────▼────────╮".to_owned(),
+        "│ Detection      │    │ Secure Vault     │    │ Providers        │".to_owned(),
+        "│ Scout Tower    │────│ Lockbox          │────│ Signal Station   │".to_owned(),
+        format!(
+            "╰───────{}────────╯    ╰─────────{}───────╯    ╰─────────{}────────╯",
+            status(SetupSectionId::Detection),
+            status(SetupSectionId::SecureVault),
+            status(SetupSectionId::Providers)
+        ),
+        "        │                       │                       │".to_owned(),
+        "        │              ╭────────▼────────╮              │".to_owned(),
+        "        │              │ Models          │              │".to_owned(),
+        "        ╰──────────────│ Engine Room     │──────────────╯".to_owned(),
+        format!(
+            "                       ╰────────{}────────╯",
+            status(SetupSectionId::Models)
+        ),
+        "                                │".to_owned(),
+        "        ╭───────────────────────┼───────────────────────╮".to_owned(),
+        "        │                       │                       │".to_owned(),
+        "╭───────▼────────╮    ╭─────────▼────────╮    ╭─────────▼────────╮".to_owned(),
+        "│ Permissions    │    │ Imports          │    │ Plugins          │".to_owned(),
+        "│ Control Room   │    │ Archive Gate     │    │ Workshop         │".to_owned(),
+        format!(
+            "╰───────{}────────╯    ╰─────────{}────────╯    ╰─────────{}────────╯",
+            status(SetupSectionId::Permissions),
+            status(SetupSectionId::Imports),
+            status(SetupSectionId::Plugins)
+        ),
+        "                                │".to_owned(),
+        "                         ╭──────▼───────╮".to_owned(),
+        "                         │ Launch       │".to_owned(),
+        "                         │ 🚀           │".to_owned(),
+        format!(
+            "                         ╰──────{}───────╯",
+            status(SetupSectionId::Launch)
+        ),
+    ]
+}
+
+const fn board_status_glyph(status: SetupSectionStatus) -> &'static str {
+    match status {
+        SetupSectionStatus::Complete => "✓",
+        SetupSectionStatus::Secured => "🔒",
+        SetupSectionStatus::Current => "●",
+        SetupSectionStatus::Visited => "◐",
+        SetupSectionStatus::Recommended => "◆",
+        SetupSectionStatus::Optional | SetupSectionStatus::Unvisited => "○",
+        SetupSectionStatus::Skipped => "·",
+        SetupSectionStatus::Blocked | SetupSectionStatus::NeedsAttention => "!",
+    }
+}
+
+const fn setup_section_label(section_id: SetupSectionId) -> &'static str {
     match section_id {
         SetupSectionId::Welcome => "Base Camp",
         SetupSectionId::Detection => "Scout Tower",

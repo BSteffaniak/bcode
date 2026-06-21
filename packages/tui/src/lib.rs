@@ -100,10 +100,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bcode_session_models::SessionId;
 use bmux_tui::crossterm::CrosstermTerminalGuard;
-use bmux_tui::geometry::Rect;
+use bmux_tui::event::{
+    Event as BmuxEvent, MouseButton as BmuxMouseButton, MouseEvent as BmuxMouseEvent,
+    MouseEventKind as BmuxMouseEventKind, MouseModifiers as BmuxMouseModifiers,
+};
+use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::terminal::Terminal;
 use crossterm::event::{
     self as crossterm_event, Event as CrosstermEvent, KeyCode as CrosstermKeyCode,
+    MouseButton as CrosstermMouseButton, MouseEvent as CrosstermMouseEvent,
+    MouseEventKind as CrosstermMouseEventKind,
 };
 
 const CURSOR_BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
@@ -215,10 +221,12 @@ fn run_onboarding_loop<W: io::Write>(
                     return Ok(());
                 }
             }
-            CrosstermEvent::FocusGained
-            | CrosstermEvent::FocusLost
-            | CrosstermEvent::Mouse(_)
-            | CrosstermEvent::Paste(_) => {}
+            CrosstermEvent::Mouse(mouse) => {
+                let board_area = onboarding_render::onboarding_board_area(terminal.area());
+                let event = BmuxEvent::Mouse(convert_onboarding_mouse(mouse));
+                let _ = shell.handle_board_event(board_area, &event);
+            }
+            CrosstermEvent::FocusGained | CrosstermEvent::FocusLost | CrosstermEvent::Paste(_) => {}
         }
     }
 }
@@ -274,6 +282,49 @@ const fn onboarding_action_for_key(
         CrosstermKeyCode::Char('s') => Some(onboarding::OnboardingInputAction::Skip),
         CrosstermKeyCode::Char('l') => Some(onboarding::OnboardingInputAction::Launch),
         _ => None,
+    }
+}
+
+const fn convert_onboarding_mouse(mouse: CrosstermMouseEvent) -> BmuxMouseEvent {
+    BmuxMouseEvent {
+        kind: convert_onboarding_mouse_kind(mouse.kind),
+        position: Point::new(mouse.column, mouse.row),
+        modifiers: BmuxMouseModifiers {
+            shift: mouse
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::SHIFT),
+            alt: mouse
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::ALT),
+            ctrl: mouse
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL),
+        },
+    }
+}
+
+const fn convert_onboarding_mouse_kind(kind: CrosstermMouseEventKind) -> BmuxMouseEventKind {
+    match kind {
+        CrosstermMouseEventKind::Down(button) => {
+            BmuxMouseEventKind::Down(convert_mouse_button(button))
+        }
+        CrosstermMouseEventKind::Up(button) => BmuxMouseEventKind::Up(convert_mouse_button(button)),
+        CrosstermMouseEventKind::Drag(button) => {
+            BmuxMouseEventKind::Drag(convert_mouse_button(button))
+        }
+        CrosstermMouseEventKind::Moved => BmuxMouseEventKind::Move,
+        CrosstermMouseEventKind::ScrollUp => BmuxMouseEventKind::ScrollUp,
+        CrosstermMouseEventKind::ScrollDown => BmuxMouseEventKind::ScrollDown,
+        CrosstermMouseEventKind::ScrollLeft => BmuxMouseEventKind::ScrollLeft,
+        CrosstermMouseEventKind::ScrollRight => BmuxMouseEventKind::ScrollRight,
+    }
+}
+
+const fn convert_mouse_button(button: CrosstermMouseButton) -> BmuxMouseButton {
+    match button {
+        CrosstermMouseButton::Left => BmuxMouseButton::Left,
+        CrosstermMouseButton::Right => BmuxMouseButton::Right,
+        CrosstermMouseButton::Middle => BmuxMouseButton::Middle,
     }
 }
 
