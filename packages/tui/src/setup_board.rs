@@ -11,8 +11,6 @@ use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 use bmux_tui_components::scroll_area::{ScrollArea, ScrollAreaOutcome, ScrollAreaState};
 
-const CLICK_DRAG_THRESHOLD_CELLS: u16 = 1;
-
 /// Semantic board spot rendered as a clickable board-game location.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoardSpot {
@@ -124,8 +122,6 @@ pub struct SetupBoardState {
     pub hovered: Option<SetupSectionId>,
     /// Pressed spot, if any.
     pub pressed: Option<SetupSectionId>,
-    /// Mouse-down origin for click-vs-pan gesture arbitration.
-    pub press_origin: Option<Point>,
 }
 
 impl SetupBoardState {
@@ -137,7 +133,6 @@ impl SetupBoardState {
             focused,
             hovered: None,
             pressed: None,
-            press_origin: None,
         }
     }
 }
@@ -343,17 +338,10 @@ impl<'a> SetupBoard<'a> {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 state.pressed = hit;
-                state.press_origin = Some(mouse.position);
-                if let Some(id) = hit {
-                    state.focused = id;
-                    Some(SetupBoardOutcome::Focused(id))
-                } else {
-                    None
-                }
+                hit.map(|_| SetupBoardOutcome::Redraw)
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 let pressed = state.pressed.take();
-                state.press_origin = None;
                 if let (Some(pressed), Some(hit)) = (pressed, hit)
                     && pressed == hit
                 {
@@ -362,13 +350,7 @@ impl<'a> SetupBoard<'a> {
                 Some(SetupBoardOutcome::Redraw)
             }
             MouseEventKind::Drag(MouseButton::Left) if state.pressed.is_some() => {
-                if state.press_origin.is_some_and(|origin| {
-                    mouse_distance(origin, mouse.position) <= CLICK_DRAG_THRESHOLD_CELLS
-                }) {
-                    return Some(SetupBoardOutcome::Redraw);
-                }
                 state.pressed = None;
-                state.press_origin = None;
                 None
             }
             MouseEventKind::Down(_)
@@ -482,10 +464,6 @@ impl Direction {
 
 const fn rect_center(rect: Rect) -> Point {
     Point::new(rect.x + rect.width / 2, rect.y + rect.height / 2)
-}
-
-const fn mouse_distance(from: Point, to: Point) -> u16 {
-    from.x.abs_diff(to.x).saturating_add(from.y.abs_diff(to.y))
 }
 
 struct BoardLayoutEngine {
@@ -892,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    fn tiny_drag_from_spot_keeps_pending_click() {
+    fn any_drag_from_spot_cancels_click() {
         let spots = vec![BoardSpot::new(
             SetupSectionId::Welcome,
             "Welcome",
@@ -911,19 +889,27 @@ mod tests {
                 Point::new(3, 3),
             )),
         );
-        assert_eq!(
+        let _outcome = board.handle_event(
+            area,
+            &mut state,
+            &Event::Mouse(MouseEvent::new(
+                MouseEventKind::Drag(MouseButton::Left),
+                Point::new(4, 3),
+            )),
+        );
+
+        assert_eq!(state.pressed, None);
+        assert_ne!(
             board.handle_event(
                 area,
                 &mut state,
                 &Event::Mouse(MouseEvent::new(
-                    MouseEventKind::Drag(MouseButton::Left),
+                    MouseEventKind::Up(MouseButton::Left),
                     Point::new(4, 3),
                 )),
             ),
-            SetupBoardOutcome::Redraw
+            SetupBoardOutcome::Selected(SetupSectionId::Welcome)
         );
-        assert_eq!(state.scroll.horizontal_offset(), 0);
-        assert_eq!(state.pressed, Some(SetupSectionId::Welcome));
     }
 
     #[test]
@@ -994,7 +980,7 @@ mod tests {
                     Point::new(3, 3)
                 )),
             ),
-            SetupBoardOutcome::Focused(SetupSectionId::Welcome)
+            SetupBoardOutcome::Redraw
         );
         assert_eq!(
             board.handle_event(
@@ -1031,7 +1017,7 @@ mod tests {
                     Point::new(13, 8)
                 )),
             ),
-            SetupBoardOutcome::Focused(SetupSectionId::Welcome)
+            SetupBoardOutcome::Redraw
         );
         assert_eq!(
             board.handle_event(
