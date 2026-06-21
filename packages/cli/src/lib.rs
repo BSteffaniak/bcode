@@ -262,6 +262,8 @@ fn handle_onboard_command(options: &OnboardOptions) -> Result<(), CliError> {
             .as_millis(),
     )
     .unwrap_or(u64::MAX);
+    let detection = bcode_settings::detect_setup_environment(now_ms);
+    store.save_setup_detection_snapshot(&detection)?;
     store.visit_onboarding_section(bcode_settings::SetupSectionId::Welcome, now_ms)?;
     let config = bcode_config::load_config()?;
     let summary = bcode_settings::SetupConfigSummary::from_config(&config);
@@ -278,9 +280,13 @@ fn handle_onboard_command(options: &OnboardOptions) -> Result<(), CliError> {
         .as_deref()
         .and_then(onboard_section_from_str);
     let persisted_sections = store.onboarding_sections()?;
+    let recommendations = store.setup_recommendations()?;
     let shell =
         bcode_tui::onboarding::OnboardingShell::from_reconciliation(&persisted_sections, &input);
-    let render = shell.render_model(&store.health(), store.readiness_report()?);
+    let readiness_report =
+        bcode_settings::setup_readiness_report(shell.sections(), &recommendations);
+    store.save_readiness_report(&readiness_report, now_ms)?;
+    let render = shell.render_model(&store.health(), Some(readiness_report));
     if options.output_mode != OnboardOutputMode::Preview {
         println!("Bcode onboarding setup map\n");
         println!("{}", render.snapshot_text());

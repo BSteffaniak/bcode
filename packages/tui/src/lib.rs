@@ -151,9 +151,14 @@ pub enum TuiError {
 /// Returns I/O, settings, or config errors.
 pub fn run_onboarding() -> Result<(), TuiError> {
     let store = bcode_settings::SettingsStore::default();
+    let detection = bcode_settings::detect_setup_environment(current_time_ms());
+    store.save_setup_detection_snapshot(&detection)?;
     let config = bcode_config::load_config()?;
     let summary = bcode_settings::SetupConfigSummary::from_config(&config);
     let mut shell = onboarding::OnboardingShell::load(&store, &summary)?;
+    let recommendations = store.setup_recommendations()?;
+    let readiness = bcode_settings::setup_readiness_report(shell.sections(), &recommendations);
+    store.save_readiness_report(&readiness, current_time_ms())?;
     let stdout = io::stdout();
     let mut guard = CrosstermTerminalGuard::enter(stdout)?;
     let result = {

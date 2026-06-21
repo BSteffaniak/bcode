@@ -166,6 +166,12 @@ impl OnboardingShell {
         }
     }
 
+    /// Return reconciled setup sections.
+    #[must_use]
+    pub fn sections(&self) -> &[ReconciledSetupSection] {
+        &self.sections
+    }
+
     /// Return the currently focused setup section.
     #[must_use]
     pub fn focused_section(&self) -> SetupSectionId {
