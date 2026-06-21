@@ -94,6 +94,40 @@ pub fn render_onboarding(
             Style::new(),
         );
     }
+    if let Some(confirmation) = model.pending_confirmation {
+        render_confirmation_modal(&confirmation.title, &confirmation.body, area, frame);
+    }
+}
+
+fn render_confirmation_modal(title: &str, body: &str, area: Rect, frame: &mut Frame<'_>) {
+    let modal_width = area.width.saturating_mul(2) / 3;
+    let modal_height = 6;
+    let modal_x = area
+        .x
+        .saturating_add(area.width.saturating_sub(modal_width) / 2);
+    let modal_y = area
+        .y
+        .saturating_add(area.height.saturating_sub(modal_height) / 2);
+    let lines = [
+        format!("╭─ {title} ─╮"),
+        body.to_owned(),
+        "Press y to confirm, n or Esc to cancel.".to_owned(),
+    ];
+    for (offset, line) in lines.iter().enumerate() {
+        frame.write_line_with_fallback_style(
+            Rect::new(
+                modal_x,
+                modal_y.saturating_add(u16::try_from(offset).unwrap_or(0)),
+                modal_width,
+                1,
+            ),
+            &Line::from_spans(vec![Span::styled(
+                line.clone(),
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )]),
+            Style::new(),
+        );
+    }
 }
 
 fn render_detail_panel(

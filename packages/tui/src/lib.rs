@@ -229,7 +229,14 @@ fn handle_onboarding_key(
     shell: &mut onboarding::OnboardingShell,
 ) -> Result<bool, TuiError> {
     match code {
-        CrosstermKeyCode::Esc | CrosstermKeyCode::Char('q') => Ok(true),
+        CrosstermKeyCode::Esc | CrosstermKeyCode::Char('q') => {
+            shell.handle_action(
+                onboarding::OnboardingInputAction::CancelConfirmation,
+                store,
+                current_time_ms(),
+            )?;
+            Ok(true)
+        }
         CrosstermKeyCode::Right | CrosstermKeyCode::Down | CrosstermKeyCode::Char('j') => {
             shell.focus_next();
             Ok(false)
@@ -261,6 +268,8 @@ const fn onboarding_action_for_key(
         CrosstermKeyCode::Char('i') => Some(onboarding::OnboardingInputAction::ReviewSessionImport),
         CrosstermKeyCode::Char('g') => Some(onboarding::OnboardingInputAction::ReviewPlugins),
         CrosstermKeyCode::Char('x') => Some(onboarding::OnboardingInputAction::ApplyPlan),
+        CrosstermKeyCode::Char('y') => Some(onboarding::OnboardingInputAction::Confirm),
+        CrosstermKeyCode::Char('n') => Some(onboarding::OnboardingInputAction::CancelConfirmation),
         CrosstermKeyCode::Char('c') => Some(onboarding::OnboardingInputAction::Complete),
         CrosstermKeyCode::Char('s') => Some(onboarding::OnboardingInputAction::Skip),
         CrosstermKeyCode::Char('l') => Some(onboarding::OnboardingInputAction::Launch),

@@ -13,6 +13,7 @@ pub struct OnboardingShell {
     sections: Vec<ReconciledSetupSection>,
     focused_index: usize,
     status_message: Option<String>,
+    pending_confirmation: Option<OnboardingPendingConfirmation>,
 }
 
 /// Automated onboarding walkthrough smoke-test report.
@@ -55,6 +56,10 @@ pub enum OnboardingInputAction {
     ReviewPlugins,
     /// Apply generated setup plan and reconcile actual state.
     ApplyPlan,
+    /// Confirm a pending modal/confirmation action.
+    Confirm,
+    /// Cancel a pending modal/confirmation action.
+    CancelConfirmation,
     /// Mark the focused setup section complete.
     Complete,
     /// Mark the focused optional setup section skipped.
@@ -82,6 +87,17 @@ pub enum OnboardingActionOutcome {
     Quit,
     /// No state changed.
     Ignored,
+}
+
+/// Pending modal/confirmation action in the onboarding shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnboardingPendingConfirmation {
+    /// Confirmation title.
+    pub title: String,
+    /// Confirmation body.
+    pub body: String,
+    /// Action to run when confirmed.
+    pub action: OnboardingInputAction,
 }
 
 /// Story/detail content for a setup-map section.
@@ -112,6 +128,8 @@ pub struct OnboardingRenderModel {
     pub degraded_panel: Option<SettingsDegradedPanel>,
     /// Optional readiness report.
     pub readiness_report: Option<SetupReadinessReport>,
+    /// Optional pending confirmation/modal state.
+    pub pending_confirmation: Option<OnboardingPendingConfirmation>,
 }
 
 impl OnboardingRenderModel {
@@ -130,6 +148,10 @@ impl OnboardingRenderModel {
                     .iter()
                     .map(|item| format!("{}: {}", item.section_id.as_str(), item.title)),
             );
+        }
+        if let Some(confirmation) = &self.pending_confirmation {
+            lines.push(format!("confirm: {}", confirmation.title));
+            lines.push(confirmation.body.clone());
         }
         lines.join("\n")
     }
@@ -177,6 +199,7 @@ impl OnboardingShell {
             sections: snapshot.sections,
             focused_index,
             status_message: None,
+            pending_confirmation: None,
         }
     }
 
@@ -310,7 +333,13 @@ impl OnboardingShell {
             | OnboardingInputAction::ReviewPlugins => {
                 self.handle_draft_action(action, store, at_ms)
             }
-            OnboardingInputAction::ApplyPlan => self.handle_apply_plan_action(store, at_ms),
+            OnboardingInputAction::ApplyPlan => Ok(self.request_apply_confirmation()),
+            OnboardingInputAction::Confirm => self.confirm_pending_action(store, at_ms),
+            OnboardingInputAction::CancelConfirmation => {
+                self.pending_confirmation = None;
+                self.status_message = Some("confirmation cancelled".to_owned());
+                Ok(OnboardingActionOutcome::Ignored)
+            }
             OnboardingInputAction::Complete
             | OnboardingInputAction::Skip
             | OnboardingInputAction::Launch => self.handle_completion_action(action, store, at_ms),
@@ -454,6 +483,31 @@ impl OnboardingShell {
         Ok(OnboardingActionOutcome::Selected(SetupSectionId::Plugins))
     }
 
+    fn request_apply_confirmation(&mut self) -> OnboardingActionOutcome {
+        self.pending_confirmation = Some(OnboardingPendingConfirmation {
+            title: "Apply setup plan?".to_owned(),
+            body: "Bcode will persist onboarding metadata, run secure imports only when explicitly requested, and reconcile actual config/auth state after apply. Press y to confirm or n/Esc to cancel.".to_owned(),
+            action: OnboardingInputAction::ApplyPlan,
+        });
+        self.status_message = Some("confirm setup apply".to_owned());
+        OnboardingActionOutcome::Ignored
+    }
+
+    fn confirm_pending_action(
+        &mut self,
+        store: &SettingsStore,
+        at_ms: u64,
+    ) -> Result<OnboardingActionOutcome, SettingsError> {
+        let Some(confirmation) = self.pending_confirmation.take() else {
+            self.status_message = Some("nothing to confirm".to_owned());
+            return Ok(OnboardingActionOutcome::Ignored);
+        };
+        match confirmation.action {
+            OnboardingInputAction::ApplyPlan => self.handle_apply_plan_action(store, at_ms),
+            _ => Ok(OnboardingActionOutcome::Ignored),
+        }
+    }
+
     fn handle_apply_plan_action(
         &mut self,
         store: &SettingsStore,
@@ -556,7 +610,7 @@ impl OnboardingShell {
             map_lines,
             focused_detail: self.focused_detail(),
             footer_lines: vec![
-                "←/↑ previous  →/↓ next  Enter select  p provider  a auth  m model  r permissions  i import  g plugins  x apply  c complete  s skip  l launch  Esc close"
+                "←/↑ previous  →/↓ next  Enter select  p provider  a auth  m model  r permissions  i import  g plugins  x apply  y confirm  n cancel  c complete  s skip  l launch  Esc close"
                     .to_owned(),
                 self.status_message.clone().unwrap_or_else(|| {
                     "Setup state is persisted locally and user config remains TOML-backed."
@@ -566,6 +620,7 @@ impl OnboardingShell {
             degraded_panel: (!matches!(health, SettingsDbHealth::Available))
                 .then(|| settings_degraded_panel(health)),
             readiness_report,
+            pending_confirmation: self.pending_confirmation.clone(),
         }
     }
 
@@ -820,6 +875,15 @@ mod tests {
         assert_eq!(
             shell
                 .handle_action(OnboardingInputAction::ApplyPlan, &store, 58)
+                .expect("setup plan should request confirmation"),
+            OnboardingActionOutcome::Ignored
+        );
+        let render = shell.render_model(&SettingsDbHealth::Available, None);
+        assert!(render.pending_confirmation.is_some());
+        assert!(render.snapshot_text().contains("Apply setup plan?"));
+        assert_eq!(
+            shell
+                .handle_action(OnboardingInputAction::Confirm, &store, 59)
                 .expect("setup plan should apply"),
             OnboardingActionOutcome::Selected(SetupSectionId::Launch)
         );
