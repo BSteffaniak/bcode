@@ -1511,6 +1511,57 @@ pub fn reconcile_secure_import_plans(
     }
 }
 
+/// Provider/auth setup card view model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderAuthSetupCard {
+    /// Existing configured provider/plugin identifiers.
+    pub configured_providers: BTreeSet<String>,
+    /// Draft selected provider identifiers.
+    pub draft_providers: BTreeSet<String>,
+    /// Existing auth profile/subscription identifiers.
+    pub auth_profiles: BTreeSet<String>,
+    /// Provider-specific setup copy.
+    pub provider_copy: Vec<String>,
+    /// Whether the default provider can be switched.
+    pub can_switch_default: bool,
+    /// Whether adding a provider later is supported.
+    pub can_add_later: bool,
+}
+
+/// Build a provider/auth setup card from config and draft state.
+#[must_use]
+pub fn provider_auth_setup_card(
+    config_summary: &SetupConfigSummary,
+    draft: &OnboardingDraftSetup,
+) -> ProviderAuthSetupCard {
+    let mut configured_providers = BTreeSet::new();
+    if config_summary
+        .capabilities
+        .contains(&SetupConfigCapability::ProviderSelection)
+    {
+        configured_providers.insert("configured-default".to_owned());
+    }
+    let auth_profiles = config_summary
+        .capabilities
+        .contains(&SetupConfigCapability::AuthConfiguration)
+        .then(|| "configured-auth".to_owned())
+        .into_iter()
+        .chain(draft.auth_profiles.iter().cloned())
+        .collect();
+    ProviderAuthSetupCard {
+        configured_providers,
+        draft_providers: draft.providers.clone(),
+        auth_profiles,
+        provider_copy: vec![
+            "OpenAI-compatible providers use API-key style credentials.".to_owned(),
+            "OpenRouter, XAI, and OpenAI-style keys are detected by source only.".to_owned(),
+            "Cloud providers may add metadata such as profile or region when supported.".to_owned(),
+        ],
+        can_switch_default: true,
+        can_add_later: true,
+    }
+}
+
 /// Model setup card view model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelSetupCard {
@@ -1520,6 +1571,14 @@ pub struct ModelSetupCard {
     pub model_id: Option<String>,
     /// Whether a usable model selection exists.
     pub configured: bool,
+    /// Provider/model compatibility notes.
+    pub compatibility_notes: Vec<String>,
+    /// Speed/cost/quality explanation.
+    pub tradeoff_copy: Vec<String>,
+    /// Whether reasoning/thinking defaults can be reviewed.
+    pub reasoning_defaults_available: bool,
+    /// Whether model ignore/unignore is available through TOML-backed config/state APIs.
+    pub ignore_unignore_available: bool,
     /// User-facing story copy.
     pub story: String,
 }
@@ -1539,6 +1598,18 @@ pub fn model_setup_card(model_profile: Option<String>, model_id: Option<String>)
         model_profile,
         model_id,
         configured,
+        compatibility_notes: vec![
+            "Provider/model compatibility is checked against provider-owned model metadata where available."
+                .to_owned(),
+            "You can switch providers or models later without editing settings DB rows.".to_owned(),
+        ],
+        tradeoff_copy: vec![
+            "Fast models reduce latency for routine edits.".to_owned(),
+            "Balanced profiles trade cost and quality for everyday coding.".to_owned(),
+            "Quality profiles favor deeper reasoning and larger context where supported.".to_owned(),
+        ],
+        reasoning_defaults_available: true,
+        ignore_unignore_available: true,
         story,
     }
 }
@@ -1548,6 +1619,14 @@ pub fn model_setup_card(model_profile: Option<String>, model_id: Option<String>)
 pub struct PermissionSetupCard {
     /// Whether explicit permission configuration exists.
     pub configured: bool,
+    /// Available deterministic permission presets.
+    pub presets: Vec<String>,
+    /// Explanation of when Bcode asks before using tools.
+    pub asks_when: Vec<String>,
+    /// Explanation of behavior that remains blocked.
+    pub blocked_behavior: Vec<String>,
+    /// Whether future Control Center customization is available.
+    pub control_center_customization: bool,
     /// User-facing story copy.
     pub story: String,
 }
@@ -1562,7 +1641,27 @@ pub fn permission_setup_card(configured: bool) -> PermissionSetupCard {
         "Review a permission preset so Bcode knows when to ask, when to proceed, and what should stay blocked."
             .to_owned()
     };
-    PermissionSetupCard { configured, story }
+    PermissionSetupCard {
+        configured,
+        presets: vec![
+            "cautious".to_owned(),
+            "balanced".to_owned(),
+            "autonomous".to_owned(),
+        ],
+        asks_when: vec![
+            "Cautious asks before most mutating actions.".to_owned(),
+            "Balanced proceeds on low-risk work and asks before sensitive changes.".to_owned(),
+            "Autonomous is for advanced users who still want hard safety boundaries.".to_owned(),
+        ],
+        blocked_behavior: vec![
+            "Broad destructive filesystem operations remain blocked unless explicitly allowed."
+                .to_owned(),
+            "Secret exfiltration and raw credential display are never allowed by onboarding."
+                .to_owned(),
+        ],
+        control_center_customization: true,
+        story,
+    }
 }
 
 /// Import setup card view model.
@@ -1572,6 +1671,10 @@ pub struct ImportSetupCard {
     pub configured: bool,
     /// Whether this section is optional.
     pub optional: bool,
+    /// Safe discovery behavior notes.
+    pub safety_notes: Vec<String>,
+    /// Whether explicit repair/doctor/reindex commands are required for damaged sources.
+    pub repair_is_explicit: bool,
     /// User-facing story copy.
     pub story: String,
 }
@@ -1589,6 +1692,14 @@ pub fn import_setup_card(configured: bool) -> ImportSetupCard {
     ImportSetupCard {
         configured,
         optional: !configured,
+        safety_notes: vec![
+            "Discovery is best-effort, bounded, and non-mutating.".to_owned(),
+            "Normal onboarding does not full-replay event logs.".to_owned(),
+            "Normal onboarding does not repair, rebuild, or write partial indexes for damaged sessions."
+                .to_owned(),
+            "Degraded or repair-required state is surfaced clearly for explicit follow-up.".to_owned(),
+        ],
+        repair_is_explicit: true,
         story,
     }
 }
@@ -2929,6 +3040,56 @@ mod tests {
         assert!(detection.sshenv_available);
         assert!(detection.device_seal_requested);
         assert!(detection.sshenv_profiles.contains("openai"));
+    }
+
+    #[test]
+    fn setup_cards_cover_provider_model_permissions_and_import_requirements() {
+        let draft = OnboardingDraftSetup {
+            providers: BTreeSet::from(["openai-compatible".to_owned(), "openrouter".to_owned()]),
+            auth_profiles: BTreeSet::from(["work".to_owned(), "personal".to_owned()]),
+            ..OnboardingDraftSetup::default()
+        };
+        let provider_card = provider_auth_setup_card(&SetupConfigSummary::default(), &draft);
+        let model_card = model_setup_card(Some("balanced".to_owned()), None);
+        let permission_card = permission_setup_card(false);
+        let import_card = import_setup_card(false);
+
+        assert_eq!(provider_card.draft_providers.len(), 2);
+        assert_eq!(provider_card.auth_profiles.len(), 2);
+        assert!(provider_card.can_switch_default);
+        assert!(provider_card.can_add_later);
+        assert!(
+            provider_card
+                .provider_copy
+                .iter()
+                .any(|copy| copy.contains("OpenRouter"))
+        );
+        assert!(model_card.configured);
+        assert!(model_card.reasoning_defaults_available);
+        assert!(model_card.ignore_unignore_available);
+        assert!(
+            model_card
+                .tradeoff_copy
+                .iter()
+                .any(|copy| copy.contains("cost"))
+        );
+        assert!(permission_card.presets.contains(&"cautious".to_owned()));
+        assert!(permission_card.presets.contains(&"balanced".to_owned()));
+        assert!(permission_card.presets.contains(&"autonomous".to_owned()));
+        assert!(
+            permission_card
+                .blocked_behavior
+                .iter()
+                .any(|copy| copy.contains("Secret"))
+        );
+        assert!(import_card.optional);
+        assert!(import_card.repair_is_explicit);
+        assert!(
+            import_card
+                .safety_notes
+                .iter()
+                .any(|note| note.contains("does not full-replay"))
+        );
     }
 
     #[test]
