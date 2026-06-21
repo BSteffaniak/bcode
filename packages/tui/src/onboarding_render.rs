@@ -8,6 +8,8 @@ use bmux_tui::style::{Color, Modifier};
 
 use super::onboarding::OnboardingShell;
 
+const HERO_HEIGHT: u16 = 4;
+
 /// Render the onboarding shell into a terminal frame.
 pub fn render_onboarding(
     shell: &OnboardingShell,
@@ -17,85 +19,112 @@ pub fn render_onboarding(
 ) {
     let area = frame.area();
     let model = shell.render_model(health, readiness);
-    let title = Line::from_spans(vec![
-        Span::styled(
-            " Bcode Setup Map ",
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  secure, flexible, ready to launch"),
-    ]);
-    frame.write_line_with_fallback_style(
-        Rect::new(
-            area.x.saturating_add(2),
-            area.y.saturating_add(1),
-            area.width.saturating_sub(4),
-            1,
-        ),
-        &title,
-        Style::new(),
+    render_hero_panel(area, frame);
+
+    let content_y = area.y.saturating_add(HERO_HEIGHT).saturating_add(1);
+    let footer_height = 3;
+    let content_height = area
+        .height
+        .saturating_sub(HERO_HEIGHT)
+        .saturating_sub(footer_height)
+        .saturating_sub(2);
+    let map_width = area.width.saturating_mul(45) / 100;
+    let map_area = Rect::new(
+        area.x.saturating_add(2),
+        content_y,
+        map_width.saturating_sub(3),
+        content_height,
+    );
+    let detail_area = Rect::new(
+        area.x.saturating_add(map_width).saturating_add(1),
+        content_y,
+        area.width.saturating_sub(map_width).saturating_sub(3),
+        content_height,
     );
 
-    let mut y = area.y.saturating_add(3);
-    for line in model.map_lines {
-        if y >= area.y.saturating_add(area.height).saturating_sub(4) {
-            break;
-        }
-        let style = style_for_line(&line);
-        frame.write_line_with_fallback_style(
-            Rect::new(area.x.saturating_add(4), y, area.width.saturating_sub(8), 1),
-            &Line::from_spans(vec![Span::styled(line, style)]),
-            Style::new(),
-        );
-        y = y.saturating_add(1);
-    }
-
-    let detail_x = area.x.saturating_add(area.width / 2).saturating_add(1);
-    let detail_width = area.width.saturating_sub(area.width / 2).saturating_sub(3);
-    let detail_y = area.y.saturating_add(3);
+    render_setup_map_panel(&model.map_lines, map_area, frame);
     render_detail_panel(
         &model.focused_detail.title,
         &model.focused_detail.story,
         &model.focused_detail.status,
         &model.focused_detail.actions,
-        Rect::new(
-            detail_x,
-            detail_y,
-            detail_width,
-            area.height.saturating_sub(7),
-        ),
+        detail_area,
         frame,
     );
 
     if let Some(panel) = model.degraded_panel {
-        y = y.saturating_add(1);
-        frame.write_line_with_fallback_style(
-            Rect::new(area.x.saturating_add(4), y, area.width.saturating_sub(8), 1),
-            &Line::from_spans(vec![Span::styled(
-                panel.message,
-                Style::new().fg(Color::Yellow),
-            )]),
-            Style::new(),
-        );
+        let degraded_y = area.y.saturating_add(area.height).saturating_sub(5);
+        render_status_line(&panel.message, degraded_y, area, Color::Yellow, frame);
     }
 
     let footer_y = area.y.saturating_add(area.height).saturating_sub(3);
     for (offset, footer) in model.footer_lines.iter().take(2).enumerate() {
-        frame.write_line_with_fallback_style(
-            Rect::new(
-                area.x.saturating_add(2),
-                footer_y.saturating_add(u16::try_from(offset).unwrap_or(0)),
-                area.width.saturating_sub(4),
-                1,
-            ),
-            &Line::from_spans(vec![Span::styled(
-                footer.clone(),
-                Style::new().fg(Color::BrightBlack),
-            )]),
-            Style::new(),
+        render_status_line(
+            footer,
+            footer_y.saturating_add(u16::try_from(offset).unwrap_or(0)),
+            area,
+            Color::BrightBlack,
+            frame,
         );
     }
     if let Some(confirmation) = model.pending_confirmation {
         render_confirmation_modal(&confirmation.title, &confirmation.body, area, frame);
+    }
+}
+
+fn render_hero_panel(area: Rect, frame: &mut Frame<'_>) {
+    let hero = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        HERO_HEIGHT,
+    );
+    render_box(hero, "Base Camp", Color::Cyan, frame);
+    frame.write_line_with_fallback_style(
+        Rect::new(
+            hero.x.saturating_add(2),
+            hero.y.saturating_add(1),
+            hero.width.saturating_sub(4),
+            1,
+        ),
+        &Line::from_spans(vec![
+            Span::styled(
+                "Bcode Setup Map",
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  · secure vaults, clear choices, clean launch"),
+        ]),
+        Style::new(),
+    );
+    frame.write_line_with_fallback_style(
+        Rect::new(
+            hero.x.saturating_add(2),
+            hero.y.saturating_add(2),
+            hero.width.saturating_sub(4),
+            1,
+        ),
+        &Line::from_spans(vec![Span::styled(
+            "Move through the quest board, review what will change, then launch when ready.",
+            Style::new().fg(Color::White),
+        )]),
+        Style::new(),
+    );
+}
+
+fn render_setup_map_panel(lines: &[String], area: Rect, frame: &mut Frame<'_>) {
+    render_box(area, "Quest Board", Color::Blue, frame);
+    let mut y = area.y.saturating_add(1);
+    for line in lines {
+        if y >= area.y.saturating_add(area.height).saturating_sub(1) {
+            break;
+        }
+        let style = style_for_line(line);
+        frame.write_line_with_fallback_style(
+            Rect::new(area.x.saturating_add(2), y, area.width.saturating_sub(4), 1),
+            &Line::from_spans(vec![Span::styled(format_status_badge(line), style)]),
+            Style::new(),
+        );
+        y = y.saturating_add(1);
     }
 }
 
@@ -108,21 +137,22 @@ fn render_confirmation_modal(title: &str, body: &str, area: Rect, frame: &mut Fr
     let modal_y = area
         .y
         .saturating_add(area.height.saturating_sub(modal_height) / 2);
-    let lines = [
-        format!("╭─ {title} ─╮"),
-        body.to_owned(),
-        "Press y to confirm, n or Esc to cancel.".to_owned(),
-    ];
+    let modal = Rect::new(modal_x, modal_y, modal_width, modal_height);
+    render_box(modal, title, Color::Yellow, frame);
+    let lines = [body, "Press y to confirm, n or Esc to cancel."];
     for (offset, line) in lines.iter().enumerate() {
         frame.write_line_with_fallback_style(
             Rect::new(
-                modal_x,
-                modal_y.saturating_add(u16::try_from(offset).unwrap_or(0)),
-                modal_width,
+                modal.x.saturating_add(2),
+                modal
+                    .y
+                    .saturating_add(1)
+                    .saturating_add(u16::try_from(offset).unwrap_or(0)),
+                modal.width.saturating_sub(4),
                 1,
             ),
             &Line::from_spans(vec![Span::styled(
-                line.clone(),
+                (*line).to_owned(),
                 Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             )]),
             Style::new(),
@@ -138,30 +168,31 @@ fn render_detail_panel(
     area: Rect,
     frame: &mut Frame<'_>,
 ) {
+    render_box(area, "Story Card", Color::Cyan, frame);
     let lines = [
         format!("◇ {title}"),
-        format!("status: {status}"),
+        format!("status: {}", status_badge(status)),
         story.to_owned(),
         "actions:".to_owned(),
     ];
-    let mut y = area.y;
+    let mut y = area.y.saturating_add(1);
     for line in lines {
-        if y >= area.y.saturating_add(area.height) {
+        if y >= area.y.saturating_add(area.height).saturating_sub(1) {
             return;
         }
         frame.write_line_with_fallback_style(
-            Rect::new(area.x, y, area.width, 1),
+            Rect::new(area.x.saturating_add(2), y, area.width.saturating_sub(4), 1),
             &Line::from_spans(vec![Span::styled(line, Style::new().fg(Color::White))]),
             Style::new(),
         );
         y = y.saturating_add(1);
     }
     for action in actions {
-        if y >= area.y.saturating_add(area.height) {
+        if y >= area.y.saturating_add(area.height).saturating_sub(1) {
             return;
         }
         frame.write_line_with_fallback_style(
-            Rect::new(area.x.saturating_add(2), y, area.width.saturating_sub(2), 1),
+            Rect::new(area.x.saturating_add(4), y, area.width.saturating_sub(6), 1),
             &Line::from_spans(vec![Span::styled(
                 format!("• {action}"),
                 Style::new().fg(Color::Cyan),
@@ -170,6 +201,77 @@ fn render_detail_panel(
         );
         y = y.saturating_add(1);
     }
+}
+
+fn render_status_line(text: &str, y: u16, area: Rect, color: Color, frame: &mut Frame<'_>) {
+    frame.write_line_with_fallback_style(
+        Rect::new(area.x.saturating_add(2), y, area.width.saturating_sub(4), 1),
+        &Line::from_spans(vec![Span::styled(text.to_owned(), Style::new().fg(color))]),
+        Style::new(),
+    );
+}
+
+fn render_box(area: Rect, title: &str, color: Color, frame: &mut Frame<'_>) {
+    if area.width < 4 || area.height < 2 {
+        return;
+    }
+    let horizontal = "─".repeat(usize::from(area.width.saturating_sub(2)));
+    let top = format!("╭{horizontal}╮");
+    let bottom = format!("╰{horizontal}╯");
+    frame.write_line_with_fallback_style(
+        Rect::new(area.x, area.y, area.width, 1),
+        &Line::from_spans(vec![Span::styled(top, Style::new().fg(color))]),
+        Style::new(),
+    );
+    frame.write_line_with_fallback_style(
+        Rect::new(
+            area.x.saturating_add(2),
+            area.y,
+            area.width.saturating_sub(4),
+            1,
+        ),
+        &Line::from_spans(vec![Span::styled(
+            format!(" {title} "),
+            Style::new().fg(color).add_modifier(Modifier::BOLD),
+        )]),
+        Style::new(),
+    );
+    for y in area.y.saturating_add(1)..area.y.saturating_add(area.height).saturating_sub(1) {
+        frame.write_line_with_fallback_style(
+            Rect::new(area.x, y, 1, 1),
+            &Line::from_spans(vec![Span::styled("│", Style::new().fg(color))]),
+            Style::new(),
+        );
+        frame.write_line_with_fallback_style(
+            Rect::new(area.x.saturating_add(area.width).saturating_sub(1), y, 1, 1),
+            &Line::from_spans(vec![Span::styled("│", Style::new().fg(color))]),
+            Style::new(),
+        );
+    }
+    frame.write_line_with_fallback_style(
+        Rect::new(
+            area.x,
+            area.y.saturating_add(area.height).saturating_sub(1),
+            area.width,
+            1,
+        ),
+        &Line::from_spans(vec![Span::styled(bottom, Style::new().fg(color))]),
+        Style::new(),
+    );
+}
+
+fn format_status_badge(line: &str) -> String {
+    line.replace("[current]", "⟦current⟧")
+        .replace("[complete]", "⟦complete⟧")
+        .replace("[secured]", "⟦secured⟧")
+        .replace("[recommended]", "⟦recommended⟧")
+        .replace("[optional]", "⟦optional⟧")
+        .replace("[blocked]", "⟦blocked⟧")
+        .replace("[needs_attention]", "⟦needs attention⟧")
+}
+
+fn status_badge(status: &str) -> String {
+    format!("⟦{status}⟧")
 }
 
 fn style_for_line(line: &str) -> Style {

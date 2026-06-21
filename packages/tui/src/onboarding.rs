@@ -156,6 +156,16 @@ impl OnboardingRenderModel {
         lines.join("\n")
     }
 
+    /// Whether this render model has enough structure for the polished setup-map layout.
+    #[must_use]
+    pub const fn has_visual_composition(&self) -> bool {
+        !self.map_lines.is_empty()
+            && !self.focused_detail.title.is_empty()
+            && !self.focused_detail.story.is_empty()
+            && !self.focused_detail.actions.is_empty()
+            && self.footer_lines.len() >= 2
+    }
+
     /// Audit this render model for obvious secret material.
     #[must_use]
     pub fn secret_audit(&self) -> bcode_settings::SecretAuditReport {
@@ -964,6 +974,7 @@ mod tests {
         assert!(written_config.contains("bcode.openai-compatible"));
         assert!(written_config.contains("backend = \"sshenv\""));
         let render = shell.render_model(&SettingsDbHealth::Available, None);
+        assert!(render.has_visual_composition());
 
         assert!(
             render
