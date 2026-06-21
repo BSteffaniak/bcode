@@ -6,7 +6,9 @@ default_model_id = "gpt-4.1-mini"
 default_codex_model_id = "gpt-5.5"
 fallback_model_ids = [
   "gpt-5.5",
-  "gpt-5-codex",
+  "gpt-5.4",
+  "gpt-5.4-mini",
+  "gpt-5.3-codex-spark",
 ]
 
 [defaults]
@@ -99,7 +101,6 @@ bcode_support = "supported"
 family = "gpt-5"
 context_window = 272000
 max_output_tokens = 100000
-supported_by = [{ provider = "openai", auth_mode = "chatgpt_subscription", api_surface = "chatgpt_codex", integration = "bcode" }]
 
 [models."gpt-5-codex".pricing]
 currency = "USD"
@@ -428,6 +429,7 @@ bcode_support = "supported"
 family = "gpt-5"
 context_window = 128000
 max_output_tokens = 100000
+supported_by = [{ provider = "openai", auth_mode = "chatgpt_subscription", api_surface = "chatgpt_codex", integration = "bcode" }]
 
 [models."gpt-5.4".pricing]
 currency = "USD"
@@ -494,6 +496,7 @@ bcode_support = "supported"
 family = "gpt-5"
 context_window = 128000
 max_output_tokens = 100000
+supported_by = [{ provider = "openai", auth_mode = "chatgpt_subscription", api_surface = "chatgpt_codex", integration = "bcode" }]
 
 [models."gpt-5.4-mini".pricing]
 currency = "USD"
@@ -560,6 +563,7 @@ bcode_support = "supported"
 family = "gpt-5"
 context_window = 272000
 max_output_tokens = 100000
+supported_by = [{ provider = "openai", auth_mode = "chatgpt_subscription", api_surface = "chatgpt_codex", integration = "bcode" }]
 
 [models."gpt-5.3-codex-spark".pricing]
 currency = "USD"
