@@ -517,6 +517,7 @@ impl OnboardingShell {
         let detection_entries = store.detection_cache_entries()?;
         let secure_import_plans =
             bcode_settings::secure_import_plans_from_detection(&detection_entries);
+        apply_draft_to_user_config(&draft)?;
         let config = bcode_config::load_config()?;
         let plan = bcode_settings::generate_setup_plan_from_draft(
             &draft,
@@ -777,10 +778,76 @@ fn setup_section_id_from_str(value: &str) -> Option<SetupSectionId> {
         .find(|section| section.as_str() == value)
 }
 
+fn apply_draft_to_user_config(
+    draft: &bcode_settings::OnboardingDraftSetup,
+) -> Result<(), SettingsError> {
+    for provider in &draft.providers {
+        match provider.as_str() {
+            "openai-compatible" | "openrouter" | "xai" => {
+                let provider_name = match provider.as_str() {
+                    "openrouter" => "openrouter",
+                    "xai" => "xai",
+                    _ => "openai",
+                };
+                bcode_config::set_openai_compatible_sshenv_auth_mode(
+                    provider_name,
+                    draft
+                        .auth_profiles
+                        .iter()
+                        .next()
+                        .cloned()
+                        .unwrap_or_else(|| "default".to_owned()),
+                    bcode_config::default_auth_vault_path(),
+                    draft.model_profile.clone(),
+                    bcode_config::AuthMode::ApiKey,
+                    None,
+                )?;
+            }
+            "bedrock" => {
+                bcode_config::set_bedrock_model_profile(
+                    draft.model_profile.as_deref().unwrap_or("default"),
+                    "anthropic.claude-3-5-sonnet-20241022-v2:0".to_owned(),
+                    None,
+                    None,
+                    None,
+                    &[],
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bcode_settings::OnboardingSection;
+
+    struct ConfigEnvGuard;
+
+    impl Drop for ConfigEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("BCODE_CONFIG");
+            }
+        }
+    }
+
+    fn isolated_config_store() -> (
+        tempfile::TempDir,
+        SettingsStore,
+        std::path::PathBuf,
+        ConfigEnvGuard,
+    ) {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let config_path = temp.path().join("bcode.toml");
+        unsafe {
+            std::env::set_var("BCODE_CONFIG", &config_path);
+        }
+        let store = SettingsStore::from_settings_db_path(temp.path().join("settings.db"));
+        (temp, store, config_path, ConfigEnvGuard)
+    }
 
     #[test]
     fn shell_navigates_and_renders_step_items() {
@@ -814,8 +881,7 @@ mod tests {
 
     #[test]
     fn shell_handles_actions_and_builds_render_model() {
-        let temp = tempfile::tempdir().expect("temp dir should be created");
-        let store = SettingsStore::from_settings_db_path(temp.path().join("settings.db"));
+        let (_temp, store, config_path, _guard) = isolated_config_store();
         let summary = SetupConfigSummary::default();
         let mut shell = OnboardingShell::load(&store, &summary).expect("shell should load");
 
@@ -893,6 +959,10 @@ mod tests {
                 .expect("reconciliation should load")
                 .is_some()
         );
+        let written_config =
+            std::fs::read_to_string(&config_path).expect("config should be written");
+        assert!(written_config.contains("bcode.openai-compatible"));
+        assert!(written_config.contains("backend = \"sshenv\""));
         let render = shell.render_model(&SettingsDbHealth::Available, None);
 
         assert!(
