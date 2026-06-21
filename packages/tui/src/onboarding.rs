@@ -41,6 +41,18 @@ pub enum OnboardingInputAction {
     Previous,
     /// Persist/currently select the focused section.
     Select,
+    /// Toggle/select a draft provider for the focused provider section.
+    ToggleProvider,
+    /// Toggle/select a draft auth profile/subscription.
+    ToggleAuthProfile,
+    /// Select a draft model profile.
+    SelectModelProfile,
+    /// Cycle the draft permission preset.
+    CyclePermissionPreset,
+    /// Mark session import reviewed.
+    ReviewSessionImport,
+    /// Mark plugins reviewed.
+    ReviewPlugins,
     /// Mark the focused setup section complete.
     Complete,
     /// Mark the focused optional setup section skipped.
@@ -304,6 +316,68 @@ impl OnboardingShell {
                 ));
                 Ok(OnboardingActionOutcome::Selected(self.focused_section()))
             }
+            OnboardingInputAction::ToggleProvider => {
+                let draft = store.toggle_draft_provider("openai-compatible", at_ms)?;
+                self.status_message = Some(format!(
+                    "selected providers: {}",
+                    draft
+                        .providers
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                Ok(OnboardingActionOutcome::Selected(SetupSectionId::Providers))
+            }
+            OnboardingInputAction::ToggleAuthProfile => {
+                let draft = store.toggle_draft_auth_profile("default", at_ms)?;
+                self.status_message = Some(format!(
+                    "selected auth profiles: {}",
+                    draft
+                        .auth_profiles
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                Ok(OnboardingActionOutcome::Selected(
+                    SetupSectionId::SecureVault,
+                ))
+            }
+            OnboardingInputAction::SelectModelProfile => {
+                let draft = store.select_draft_model_profile("default", at_ms)?;
+                self.status_message = Some(format!(
+                    "selected model profile: {}",
+                    draft.model_profile.unwrap_or_else(|| "default".to_owned())
+                ));
+                Ok(OnboardingActionOutcome::Selected(SetupSectionId::Models))
+            }
+            OnboardingInputAction::CyclePermissionPreset => {
+                let draft = store.cycle_draft_permission_preset(at_ms)?;
+                self.status_message = Some(format!(
+                    "permission preset: {}",
+                    draft
+                        .permission_preset
+                        .unwrap_or_else(|| "balanced".to_owned())
+                ));
+                Ok(OnboardingActionOutcome::Selected(
+                    SetupSectionId::Permissions,
+                ))
+            }
+            OnboardingInputAction::ReviewSessionImport => {
+                let mut draft = store.onboarding_draft_setup()?;
+                draft.session_import_reviewed = true;
+                store.save_onboarding_draft_setup(&draft, at_ms)?;
+                self.status_message = Some("session import reviewed".to_owned());
+                Ok(OnboardingActionOutcome::Selected(SetupSectionId::Imports))
+            }
+            OnboardingInputAction::ReviewPlugins => {
+                let mut draft = store.onboarding_draft_setup()?;
+                draft.plugins_reviewed = true;
+                store.save_onboarding_draft_setup(&draft, at_ms)?;
+                self.status_message = Some("plugin setup reviewed".to_owned());
+                Ok(OnboardingActionOutcome::Selected(SetupSectionId::Plugins))
+            }
             OnboardingInputAction::Complete => {
                 let section_id = self.focused_section();
                 self.complete_focused_section(store, at_ms)?;
@@ -369,7 +443,7 @@ impl OnboardingShell {
             map_lines,
             focused_detail: self.focused_detail(),
             footer_lines: vec![
-                "←/↑ previous  →/↓ next  Enter select  c complete  s skip  l launch  Esc close"
+                "←/↑ previous  →/↓ next  Enter select  p provider  a auth  m model  r permissions  i import  g plugins  c complete  s skip  l launch  Esc close"
                     .to_owned(),
                 self.status_message.clone().unwrap_or_else(|| {
                     "Setup state is persisted locally and user config remains TOML-backed."
@@ -589,6 +663,49 @@ mod tests {
                 .expect("select should persist"),
             OnboardingActionOutcome::Selected(SetupSectionId::Detection)
         );
+        assert_eq!(
+            shell
+                .handle_action(OnboardingInputAction::ToggleProvider, &store, 52)
+                .expect("provider toggle should persist"),
+            OnboardingActionOutcome::Selected(SetupSectionId::Providers)
+        );
+        assert_eq!(
+            shell
+                .handle_action(OnboardingInputAction::ToggleAuthProfile, &store, 53)
+                .expect("auth toggle should persist"),
+            OnboardingActionOutcome::Selected(SetupSectionId::SecureVault)
+        );
+        assert_eq!(
+            shell
+                .handle_action(OnboardingInputAction::SelectModelProfile, &store, 54)
+                .expect("model selection should persist"),
+            OnboardingActionOutcome::Selected(SetupSectionId::Models)
+        );
+        assert_eq!(
+            shell
+                .handle_action(OnboardingInputAction::CyclePermissionPreset, &store, 55)
+                .expect("permission preset should persist"),
+            OnboardingActionOutcome::Selected(SetupSectionId::Permissions)
+        );
+        assert_eq!(
+            shell
+                .handle_action(OnboardingInputAction::ReviewSessionImport, &store, 56)
+                .expect("import review should persist"),
+            OnboardingActionOutcome::Selected(SetupSectionId::Imports)
+        );
+        assert_eq!(
+            shell
+                .handle_action(OnboardingInputAction::ReviewPlugins, &store, 57)
+                .expect("plugin review should persist"),
+            OnboardingActionOutcome::Selected(SetupSectionId::Plugins)
+        );
+        let draft = store.onboarding_draft_setup().expect("draft should reload");
+        assert!(draft.providers.contains("openai-compatible"));
+        assert!(draft.auth_profiles.contains("default"));
+        assert_eq!(draft.model_profile.as_deref(), Some("default"));
+        assert_eq!(draft.permission_preset.as_deref(), Some("cautious"));
+        assert!(draft.session_import_reviewed);
+        assert!(draft.plugins_reviewed);
         let render = shell.render_model(&SettingsDbHealth::Available, None);
 
         assert!(

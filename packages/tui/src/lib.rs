@@ -218,6 +218,48 @@ fn run_onboarding_loop<W: io::Write>(
                         current_time_ms(),
                     )?;
                 }
+                CrosstermKeyCode::Char('p') => {
+                    shell.handle_action(
+                        onboarding::OnboardingInputAction::ToggleProvider,
+                        store,
+                        current_time_ms(),
+                    )?;
+                }
+                CrosstermKeyCode::Char('a') => {
+                    shell.handle_action(
+                        onboarding::OnboardingInputAction::ToggleAuthProfile,
+                        store,
+                        current_time_ms(),
+                    )?;
+                }
+                CrosstermKeyCode::Char('m') => {
+                    shell.handle_action(
+                        onboarding::OnboardingInputAction::SelectModelProfile,
+                        store,
+                        current_time_ms(),
+                    )?;
+                }
+                CrosstermKeyCode::Char('r') => {
+                    shell.handle_action(
+                        onboarding::OnboardingInputAction::CyclePermissionPreset,
+                        store,
+                        current_time_ms(),
+                    )?;
+                }
+                CrosstermKeyCode::Char('i') => {
+                    shell.handle_action(
+                        onboarding::OnboardingInputAction::ReviewSessionImport,
+                        store,
+                        current_time_ms(),
+                    )?;
+                }
+                CrosstermKeyCode::Char('g') => {
+                    shell.handle_action(
+                        onboarding::OnboardingInputAction::ReviewPlugins,
+                        store,
+                        current_time_ms(),
+                    )?;
+                }
                 CrosstermKeyCode::Char('c') => {
                     shell.handle_action(
                         onboarding::OnboardingInputAction::Complete,

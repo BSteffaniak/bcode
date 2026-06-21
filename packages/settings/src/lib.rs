@@ -108,6 +108,98 @@ impl SettingsStore {
         )
     }
 
+    /// Return the persisted onboarding draft setup choices.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when draft state cannot be decoded.
+    pub fn onboarding_draft_setup(&self) -> SettingsResult<OnboardingDraftSetup> {
+        self.control_state("onboarding.draft_setup")?
+            .map(|value| serde_json::from_value(value.value).map_err(Into::into))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
+    /// Persist onboarding draft setup choices.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when draft state cannot be written.
+    pub fn save_onboarding_draft_setup(
+        &self,
+        draft: &OnboardingDraftSetup,
+        saved_at_ms: u64,
+    ) -> SettingsResult<()> {
+        self.put_control_state(
+            "onboarding.draft_setup",
+            &serde_json::to_value(draft)?,
+            saved_at_ms,
+        )
+    }
+
+    /// Toggle a draft provider selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when draft state cannot be read or written.
+    pub fn toggle_draft_provider(
+        &self,
+        provider: &str,
+        at_ms: u64,
+    ) -> SettingsResult<OnboardingDraftSetup> {
+        let mut draft = self.onboarding_draft_setup()?;
+        draft.toggle_provider(provider);
+        self.save_onboarding_draft_setup(&draft, at_ms)?;
+        Ok(draft)
+    }
+
+    /// Toggle a draft auth profile selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when draft state cannot be read or written.
+    pub fn toggle_draft_auth_profile(
+        &self,
+        profile: &str,
+        at_ms: u64,
+    ) -> SettingsResult<OnboardingDraftSetup> {
+        let mut draft = self.onboarding_draft_setup()?;
+        draft.toggle_auth_profile(profile);
+        self.save_onboarding_draft_setup(&draft, at_ms)?;
+        Ok(draft)
+    }
+
+    /// Select a draft model profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when draft state cannot be read or written.
+    pub fn select_draft_model_profile(
+        &self,
+        profile: &str,
+        at_ms: u64,
+    ) -> SettingsResult<OnboardingDraftSetup> {
+        let mut draft = self.onboarding_draft_setup()?;
+        draft.set_model_profile(profile);
+        self.save_onboarding_draft_setup(&draft, at_ms)?;
+        Ok(draft)
+    }
+
+    /// Cycle the draft permission preset.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when draft state cannot be read or written.
+    pub fn cycle_draft_permission_preset(
+        &self,
+        at_ms: u64,
+    ) -> SettingsResult<OnboardingDraftSetup> {
+        let mut draft = self.onboarding_draft_setup()?;
+        draft.cycle_permission_preset();
+        self.save_onboarding_draft_setup(&draft, at_ms)?;
+        Ok(draft)
+    }
+
     /// Return the persisted setup readiness report if one exists.
     ///
     /// # Errors
@@ -1598,6 +1690,58 @@ pub fn should_auto_start_onboarding(
     }
 }
 
+/// Draft setup choices collected by onboarding before canonical config apply.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnboardingDraftSetup {
+    /// Selected provider identifiers.
+    pub providers: BTreeSet<String>,
+    /// Selected auth profile names/subscriptions.
+    pub auth_profiles: BTreeSet<String>,
+    /// Selected default model profile.
+    pub model_profile: Option<String>,
+    /// Selected permission preset.
+    pub permission_preset: Option<String>,
+    /// Whether session import has been reviewed.
+    pub session_import_reviewed: bool,
+    /// Whether plugin setup has been reviewed.
+    pub plugins_reviewed: bool,
+}
+
+impl OnboardingDraftSetup {
+    /// Toggle a provider selection.
+    pub fn toggle_provider(&mut self, provider: &str) {
+        if !self.providers.remove(provider) {
+            self.providers.insert(provider.to_owned());
+        }
+    }
+
+    /// Toggle an auth profile/subscription selection.
+    pub fn toggle_auth_profile(&mut self, profile: &str) {
+        if !self.auth_profiles.remove(profile) {
+            self.auth_profiles.insert(profile.to_owned());
+        }
+    }
+
+    /// Set the selected default model profile.
+    pub fn set_model_profile(&mut self, profile: &str) {
+        self.model_profile = Some(profile.to_owned());
+    }
+
+    /// Cycle the deterministic onboarding permission preset.
+    pub fn cycle_permission_preset(&mut self) {
+        let next = if self.permission_preset.is_none()
+            || self.permission_preset.as_deref() == Some("autonomous")
+        {
+            "cautious"
+        } else if self.permission_preset.as_deref() == Some("balanced") {
+            "autonomous"
+        } else {
+            "balanced"
+        };
+        self.permission_preset = Some(next.to_owned());
+    }
+}
+
 /// Setup readiness severity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2543,6 +2687,32 @@ mod tests {
         assert!(detection.sshenv_available);
         assert!(detection.device_seal_requested);
         assert!(detection.sshenv_profiles.contains("openai"));
+    }
+
+    #[test]
+    fn onboarding_draft_setup_persists_provider_auth_model_and_permissions() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let store = SettingsStore::from_settings_db_path(temp.path().join("settings.db"));
+
+        let draft = store
+            .toggle_draft_provider("openai-compatible", 10)
+            .expect("provider should toggle");
+        assert!(draft.providers.contains("openai-compatible"));
+        let draft = store
+            .toggle_draft_auth_profile("default", 11)
+            .expect("auth profile should toggle");
+        assert!(draft.auth_profiles.contains("default"));
+        let draft = store
+            .select_draft_model_profile("default", 12)
+            .expect("model profile should persist");
+        assert_eq!(draft.model_profile.as_deref(), Some("default"));
+        let draft = store
+            .cycle_draft_permission_preset(13)
+            .expect("permission preset should cycle");
+        assert_eq!(draft.permission_preset.as_deref(), Some("cautious"));
+
+        let reloaded = store.onboarding_draft_setup().expect("draft should reload");
+        assert_eq!(reloaded, draft);
     }
 
     #[test]
