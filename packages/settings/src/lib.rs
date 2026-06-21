@@ -1471,6 +1471,86 @@ pub struct SetupPlanAction {
     pub mutating: bool,
 }
 
+/// Onboarding startup command classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnboardingStartupCommand {
+    /// Normal TUI startup with no explicit subcommand.
+    NormalTui,
+    /// Explicit onboarding command or flag.
+    ExplicitOnboard,
+    /// New-session startup.
+    NewSession,
+    /// Server/daemon command.
+    Server,
+    /// Session/history/import/repair command.
+    SessionManagement,
+    /// Scriptable non-interactive command.
+    Scripting,
+}
+
+/// Decision for automatic first-run onboarding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnboardingAutoTriggerDecision {
+    /// Whether onboarding should start automatically.
+    pub should_start: bool,
+    /// User/developer readable reason.
+    pub reason: String,
+}
+
+/// Decide whether first-run onboarding should auto-start before the normal TUI.
+#[must_use]
+pub fn should_auto_start_onboarding(
+    command: OnboardingStartupCommand,
+    terminal_interactive: bool,
+    progress: Option<&OnboardingProgress>,
+    config_summary: &SetupConfigSummary,
+) -> OnboardingAutoTriggerDecision {
+    if command == OnboardingStartupCommand::ExplicitOnboard {
+        return OnboardingAutoTriggerDecision {
+            should_start: true,
+            reason: "explicit onboarding requested".to_owned(),
+        };
+    }
+    if command != OnboardingStartupCommand::NormalTui {
+        return OnboardingAutoTriggerDecision {
+            should_start: false,
+            reason: "command is not normal TUI startup".to_owned(),
+        };
+    }
+    if !terminal_interactive {
+        return OnboardingAutoTriggerDecision {
+            should_start: false,
+            reason: "terminal is not interactive".to_owned(),
+        };
+    }
+    if progress.is_some_and(|progress| progress.first_run_completed) {
+        return OnboardingAutoTriggerDecision {
+            should_start: false,
+            reason: "first-run onboarding already completed".to_owned(),
+        };
+    }
+    let has_provider = config_summary
+        .capabilities
+        .contains(&SetupConfigCapability::ProviderSelection);
+    let has_model = config_summary
+        .capabilities
+        .contains(&SetupConfigCapability::ModelSelection);
+    let has_auth = config_summary
+        .capabilities
+        .contains(&SetupConfigCapability::AuthConfiguration);
+    if has_provider && has_model && has_auth {
+        return OnboardingAutoTriggerDecision {
+            should_start: false,
+            reason: "usable provider/model/auth setup already exists".to_owned(),
+        };
+    }
+    OnboardingAutoTriggerDecision {
+        should_start: true,
+        reason: "normal interactive startup has incomplete setup".to_owned(),
+    }
+}
+
 /// Setup readiness severity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2340,6 +2420,63 @@ mod tests {
         );
         assert!(input.configured_sections.contains(&SetupSectionId::Models));
         assert!(input.configured_sections.contains(&SetupSectionId::Plugins));
+    }
+
+    #[test]
+    fn auto_start_onboarding_only_for_interactive_incomplete_normal_tui() {
+        let summary = SetupConfigSummary::default();
+        let decision =
+            should_auto_start_onboarding(OnboardingStartupCommand::NormalTui, true, None, &summary);
+
+        assert!(decision.should_start);
+        assert!(
+            !should_auto_start_onboarding(OnboardingStartupCommand::Server, true, None, &summary,)
+                .should_start
+        );
+        assert!(
+            !should_auto_start_onboarding(
+                OnboardingStartupCommand::NormalTui,
+                false,
+                None,
+                &summary,
+            )
+            .should_start
+        );
+    }
+
+    #[test]
+    fn auto_start_onboarding_skips_completed_or_usable_setup() {
+        let progress = OnboardingProgress {
+            mode: "first_run".to_owned(),
+            first_run_completed: true,
+            last_section: None,
+            last_opened_at_ms: None,
+            completed_at_ms: Some(1),
+        };
+        let completed_decision = should_auto_start_onboarding(
+            OnboardingStartupCommand::NormalTui,
+            true,
+            Some(&progress),
+            &SetupConfigSummary::default(),
+        );
+        let usable_summary = SetupConfigSummary {
+            capabilities: BTreeSet::from([
+                SetupConfigCapability::ProviderSelection,
+                SetupConfigCapability::ModelSelection,
+                SetupConfigCapability::AuthConfiguration,
+            ]),
+            enabled_plugins: BTreeSet::new(),
+            disabled_plugins: BTreeSet::new(),
+        };
+        let usable_decision = should_auto_start_onboarding(
+            OnboardingStartupCommand::NormalTui,
+            true,
+            None,
+            &usable_summary,
+        );
+
+        assert!(!completed_decision.should_start);
+        assert!(!usable_decision.should_start);
     }
 
     #[test]

@@ -119,7 +119,11 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         return Ok(());
     }
     if cli.onboard {
-        Box::pin(handle_onboard_command(OnboardOptions::default())).await?;
+        handle_onboard_command(&OnboardOptions::default())?;
+        return Ok(());
+    }
+    if cli.command.is_none() && should_auto_start_onboarding()? {
+        handle_onboard_command(&OnboardOptions::default())?;
         return Ok(());
     }
     match cli.command.unwrap_or_default() {
@@ -130,14 +134,16 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
             provider,
             skip_launch,
         } => {
-            handle_onboard_command(OnboardOptions {
+            handle_onboard_command(&OnboardOptions {
                 reset,
-                dry_run,
-                non_interactive,
+                output_mode: onboard_output_mode(dry_run, non_interactive),
                 provider,
-                skip_launch,
-            })
-            .await?;
+                launch_mode: if skip_launch {
+                    OnboardLaunchMode::SkipLaunch
+                } else {
+                    OnboardLaunchMode::LaunchWhenReady
+                },
+            })?;
         }
         Commands::Server { command } => handle_server_command(command).await?,
         Commands::Session { command } => handle_session_command(command).await?,
@@ -194,20 +200,69 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
     Ok(())
 }
 
+const fn onboard_output_mode(dry_run: bool, non_interactive: bool) -> OnboardOutputMode {
+    if dry_run {
+        OnboardOutputMode::DryRun
+    } else if non_interactive {
+        OnboardOutputMode::NonInteractive
+    } else {
+        OnboardOutputMode::Preview
+    }
+}
+
+fn should_auto_start_onboarding() -> Result<bool, CliError> {
+    if std::env::var_os("CI").is_some() || std::env::var_os("BCODE_NO_ONBOARD").is_some() {
+        return Ok(false);
+    }
+    let store = bcode_settings::SettingsStore::default();
+    let config = bcode_config::load_config()?;
+    let summary = bcode_settings::SetupConfigSummary::from_config(&config);
+    let progress = store.onboarding_progress()?;
+    Ok(bcode_settings::should_auto_start_onboarding(
+        bcode_settings::OnboardingStartupCommand::NormalTui,
+        std::io::stdout().is_terminal(),
+        progress.as_ref(),
+        &summary,
+    )
+    .should_start)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum OnboardOutputMode {
+    #[default]
+    Preview,
+    DryRun,
+    NonInteractive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum OnboardLaunchMode {
+    #[default]
+    LaunchWhenReady,
+    SkipLaunch,
+}
+
 #[derive(Debug, Clone, Default)]
 struct OnboardOptions {
     reset: bool,
-    dry_run: bool,
-    non_interactive: bool,
+    output_mode: OnboardOutputMode,
     provider: Option<String>,
-    skip_launch: bool,
+    launch_mode: OnboardLaunchMode,
 }
 
-async fn handle_onboard_command(options: OnboardOptions) -> Result<(), CliError> {
+fn handle_onboard_command(options: &OnboardOptions) -> Result<(), CliError> {
     let store = bcode_settings::SettingsStore::default();
     if options.reset {
         store.reset_database()?;
     }
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+    store.visit_onboarding_section(bcode_settings::SetupSectionId::Welcome, now_ms)?;
     let config = bcode_config::load_config()?;
     let summary = bcode_settings::SetupConfigSummary::from_config(&config);
     let mut input = summary.reconciliation_input();
@@ -226,10 +281,10 @@ async fn handle_onboard_command(options: OnboardOptions) -> Result<(), CliError>
     let shell =
         bcode_tui::onboarding::OnboardingShell::from_reconciliation(&persisted_sections, &input);
     let render = shell.render_model(&store.health(), store.readiness_report()?);
-    if options.dry_run || options.non_interactive {
+    if options.output_mode != OnboardOutputMode::Preview {
         println!("Bcode onboarding setup map\n");
         println!("{}", render.snapshot_text());
-        if options.skip_launch {
+        if options.launch_mode == OnboardLaunchMode::SkipLaunch {
             println!("\nlaunch will be skipped after onboarding");
         }
         return Ok(());
@@ -264,8 +319,8 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
             session_id,
             message,
         } => send_message(session_id, message).await?,
-        Commands::Onboard { .. } => unreachable!("handled by handle_cli"),
-        Commands::Server { .. }
+        Commands::Onboard { .. }
+        | Commands::Server { .. }
         | Commands::Session { .. }
         | Commands::Worktree { .. }
         | Commands::Blims { .. }
