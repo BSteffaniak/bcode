@@ -12,6 +12,7 @@ use bmux_tui_components::stepper::{StepItem, StepStatus};
 pub struct OnboardingShell {
     sections: Vec<ReconciledSetupSection>,
     focused_index: usize,
+    status_message: Option<String>,
 }
 
 /// Automated onboarding walkthrough smoke-test report.
@@ -40,6 +41,12 @@ pub enum OnboardingInputAction {
     Previous,
     /// Persist/currently select the focused section.
     Select,
+    /// Mark the focused setup section complete.
+    Complete,
+    /// Mark the focused optional setup section skipped.
+    Skip,
+    /// Mark first-run onboarding complete from the launch section.
+    Launch,
     /// Quit/close onboarding.
     Quit,
 }
@@ -51,6 +58,12 @@ pub enum OnboardingActionOutcome {
     FocusChanged(SetupSectionId),
     /// Focus was persisted/selected.
     Selected(SetupSectionId),
+    /// Focused section was marked complete.
+    Completed(SetupSectionId),
+    /// Focused section was skipped.
+    Skipped(SetupSectionId),
+    /// First-run onboarding completed and launch is allowed.
+    LaunchReady,
     /// Onboarding should close.
     Quit,
     /// No state changed.
@@ -132,6 +145,7 @@ impl OnboardingShell {
         Self {
             sections: snapshot.sections,
             focused_index,
+            status_message: None,
         }
     }
 
@@ -171,6 +185,70 @@ impl OnboardingShell {
         store.visit_onboarding_section(self.focused_section(), visited_at_ms)
     }
 
+    /// Return the latest user-facing shell status message.
+    #[must_use]
+    pub fn status_message(&self) -> Option<&str> {
+        self.status_message.as_deref()
+    }
+
+    /// Mark the focused section complete locally and persist it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when section completion cannot be persisted.
+    pub fn complete_focused_section(
+        &mut self,
+        store: &SettingsStore,
+        completed_at_ms: u64,
+    ) -> Result<(), SettingsError> {
+        let section_id = self.focused_section();
+        store.complete_onboarding_section(section_id, completed_at_ms)?;
+        if let Some(section) = self.sections.get_mut(self.focused_index) {
+            section.status = SetupSectionStatus::Complete;
+            section.visited = true;
+        }
+        self.status_message = Some(format!(
+            "{} marked complete",
+            setup_section_label(section_id)
+        ));
+        Ok(())
+    }
+
+    /// Mark the focused section skipped locally and persist it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when section skip state cannot be persisted.
+    pub fn skip_focused_section(
+        &mut self,
+        store: &SettingsStore,
+        skipped_at_ms: u64,
+    ) -> Result<(), SettingsError> {
+        let section_id = self.focused_section();
+        store.skip_onboarding_section(section_id, skipped_at_ms)?;
+        if let Some(section) = self.sections.get_mut(self.focused_index) {
+            section.status = SetupSectionStatus::Skipped;
+            section.visited = true;
+        }
+        self.status_message = Some(format!("{} skipped", setup_section_label(section_id)));
+        Ok(())
+    }
+
+    /// Mark first-run onboarding complete when launch is selected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when onboarding completion cannot be persisted.
+    pub fn launch_from_onboarding(
+        &mut self,
+        store: &SettingsStore,
+        completed_at_ms: u64,
+    ) -> Result<(), SettingsError> {
+        store.complete_onboarding(completed_at_ms)?;
+        self.status_message = Some("Onboarding complete — ready to launch Bcode".to_owned());
+        Ok(())
+    }
+
     /// Handle a high-level onboarding input action.
     ///
     /// # Errors
@@ -197,7 +275,25 @@ impl OnboardingShell {
             }
             OnboardingInputAction::Select => {
                 self.persist_focus(store, at_ms)?;
+                self.status_message = Some(format!(
+                    "{} selected",
+                    setup_section_label(self.focused_section())
+                ));
                 Ok(OnboardingActionOutcome::Selected(self.focused_section()))
+            }
+            OnboardingInputAction::Complete => {
+                let section_id = self.focused_section();
+                self.complete_focused_section(store, at_ms)?;
+                Ok(OnboardingActionOutcome::Completed(section_id))
+            }
+            OnboardingInputAction::Skip => {
+                let section_id = self.focused_section();
+                self.skip_focused_section(store, at_ms)?;
+                Ok(OnboardingActionOutcome::Skipped(section_id))
+            }
+            OnboardingInputAction::Launch => {
+                self.launch_from_onboarding(store, at_ms)?;
+                Ok(OnboardingActionOutcome::LaunchReady)
             }
             OnboardingInputAction::Quit => Ok(OnboardingActionOutcome::Quit),
         }
@@ -249,8 +345,12 @@ impl OnboardingShell {
         OnboardingRenderModel {
             map_lines,
             footer_lines: vec![
-                "←/↑ previous  →/↓ next  Enter select  Esc close".to_owned(),
-                "Setup state is persisted locally and user config remains TOML-backed.".to_owned(),
+                "←/↑ previous  →/↓ next  Enter select  c complete  s skip  l launch  Esc close"
+                    .to_owned(),
+                self.status_message.clone().unwrap_or_else(|| {
+                    "Setup state is persisted locally and user config remains TOML-backed."
+                        .to_owned()
+                }),
             ],
             degraded_panel: (!matches!(health, SettingsDbHealth::Available))
                 .then(|| settings_degraded_panel(health)),
@@ -433,6 +533,54 @@ mod tests {
 
         assert!(audit.safe);
         assert!(render.snapshot_text().contains("Base Camp"));
+    }
+
+    #[test]
+    fn shell_completes_skips_and_launches_sections() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let store = SettingsStore::from_settings_db_path(temp.path().join("settings.db"));
+        let summary = SetupConfigSummary::default();
+        let mut shell = OnboardingShell::load(&store, &summary).expect("shell should load");
+
+        assert_eq!(
+            shell
+                .handle_action(OnboardingInputAction::Complete, &store, 60)
+                .expect("complete should persist"),
+            OnboardingActionOutcome::Completed(SetupSectionId::Welcome)
+        );
+        shell.focus_next();
+        assert_eq!(
+            shell
+                .handle_action(OnboardingInputAction::Skip, &store, 61)
+                .expect("skip should persist"),
+            OnboardingActionOutcome::Skipped(SetupSectionId::Detection)
+        );
+        assert_eq!(
+            shell
+                .handle_action(OnboardingInputAction::Launch, &store, 62)
+                .expect("launch should complete onboarding"),
+            OnboardingActionOutcome::LaunchReady
+        );
+
+        let sections = store.onboarding_sections().expect("sections should load");
+        let progress = store
+            .onboarding_progress()
+            .expect("progress should load")
+            .expect("progress should exist");
+
+        assert!(sections.iter().any(|section| {
+            section.section_id == SetupSectionId::Welcome.as_str()
+                && section.status == SetupSectionStatus::Complete.as_str()
+        }));
+        assert!(sections.iter().any(|section| {
+            section.section_id == SetupSectionId::Detection.as_str()
+                && section.status == SetupSectionStatus::Skipped.as_str()
+        }));
+        assert!(progress.first_run_completed);
+        assert_eq!(
+            shell.status_message(),
+            Some("Onboarding complete — ready to launch Bcode")
+        );
     }
 
     #[test]

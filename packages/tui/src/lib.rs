@@ -193,7 +193,34 @@ fn run_onboarding_loop<W: io::Write>(
                 CrosstermKeyCode::Left | CrosstermKeyCode::Up | CrosstermKeyCode::Char('k') => {
                     shell.focus_previous();
                 }
-                CrosstermKeyCode::Enter => shell.persist_focus(store, current_time_ms())?,
+                CrosstermKeyCode::Enter => {
+                    shell.handle_action(
+                        onboarding::OnboardingInputAction::Select,
+                        store,
+                        current_time_ms(),
+                    )?;
+                }
+                CrosstermKeyCode::Char('c') => {
+                    shell.handle_action(
+                        onboarding::OnboardingInputAction::Complete,
+                        store,
+                        current_time_ms(),
+                    )?;
+                }
+                CrosstermKeyCode::Char('s') => {
+                    shell.handle_action(
+                        onboarding::OnboardingInputAction::Skip,
+                        store,
+                        current_time_ms(),
+                    )?;
+                }
+                CrosstermKeyCode::Char('l') => {
+                    shell.handle_action(
+                        onboarding::OnboardingInputAction::Launch,
+                        store,
+                        current_time_ms(),
+                    )?;
+                }
                 _ => {}
             },
             CrosstermEvent::FocusGained
