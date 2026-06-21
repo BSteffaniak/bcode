@@ -12,7 +12,7 @@ use bcode_model::{
 use bcode_model_catalog_models::{
     BcodeSupportStatus, CatalogCapabilities, CatalogDocument, CatalogModelStatus, CatalogPricing,
     LiveCatalogSnapshot, LiveModelMetadata, ModelCatalogDefaults, ModelCatalogEntry,
-    ProviderCatalog,
+    ModelSupportTarget, ProviderCatalog,
 };
 use serde_json::json;
 use std::fmt::{Display, Formatter};
@@ -188,6 +188,50 @@ impl ModelCatalog {
             .unwrap_or_default()
     }
 
+    /// Convert catalog entries for a provider matching a support target into `ModelInfo` values.
+    #[must_use]
+    pub fn provider_models_for_support_target(
+        &self,
+        provider_id: &str,
+        target: &ModelSupportTarget,
+        include_unknown: bool,
+    ) -> Vec<ModelInfo> {
+        self.provider(provider_id)
+            .map(|provider| {
+                provider
+                    .models
+                    .values()
+                    .filter(|entry| model_matches_support_target(entry, target, include_unknown))
+                    .map(model_info_from_catalog_entry)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Return fallback model ids matching a support target.
+    #[must_use]
+    pub fn fallback_model_ids_for_support_target(
+        &self,
+        provider_id: &str,
+        target: &ModelSupportTarget,
+    ) -> Vec<String> {
+        self.provider(provider_id)
+            .map(|provider| {
+                provider
+                    .fallback_model_ids
+                    .iter()
+                    .filter(|model_id| {
+                        provider
+                            .models
+                            .get(*model_id)
+                            .is_some_and(|entry| model_matches_support_target(entry, target, false))
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Merge discovered provider models with catalog-only models.
     #[must_use]
     pub fn merge_provider_models(
@@ -239,6 +283,18 @@ async fn apply_remote_overlay_best_effort(
     if !snapshots.is_empty() {
         overlay_remote_live(document, &snapshots);
     }
+}
+
+fn model_matches_support_target(
+    entry: &ModelCatalogEntry,
+    target: &ModelSupportTarget,
+    include_unknown: bool,
+) -> bool {
+    entry
+        .supported_by
+        .iter()
+        .any(|supported| supported.matches(target))
+        || (include_unknown && entry.supported_by.is_empty())
 }
 
 fn find_provider_model<'a>(
@@ -627,6 +683,7 @@ fn live_model_entry(
         pricing: None,
         capabilities: live_model.capabilities.clone(),
         reasoning: None,
+        supported_by: std::collections::BTreeSet::new(),
         live: Some(LiveModelMetadata {
             status: live_model.status.clone(),
             regions: live_model.regions.clone(),

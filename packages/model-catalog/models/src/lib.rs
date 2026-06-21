@@ -150,12 +150,59 @@ pub struct ModelCatalogEntry {
     /// Reasoning-specific metadata.
     #[serde(default)]
     pub reasoning: Option<CatalogReasoning>,
+    /// Compatibility targets this model is objectively known to support.
+    #[serde(default)]
+    pub supported_by: BTreeSet<ModelSupportTarget>,
     /// Live provider metadata overlaid from generated snapshots.
     #[serde(default)]
     pub live: Option<LiveModelMetadata>,
     /// Metadata source/verification data.
     #[serde(default)]
     pub source: CatalogSourceMetadata,
+}
+
+/// Objective compatibility target for a model.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ModelSupportTarget {
+    /// Provider domain, for example `openai`, `openrouter`, or `bedrock`.
+    pub provider: String,
+    /// Authentication mode required for this target, for example `api_key` or
+    /// `chatgpt_subscription`.
+    pub auth_mode: String,
+    /// Provider API surface, for example `responses_api`, `chat_completions`, or
+    /// `chatgpt_codex`.
+    pub api_surface: String,
+    /// Optional integration/runtime qualifier, for example `bcode` or `provider_native`.
+    #[serde(default)]
+    pub integration: Option<String>,
+}
+
+impl ModelSupportTarget {
+    /// Construct a support target.
+    #[must_use]
+    pub fn new(
+        provider: impl Into<String>,
+        auth_mode: impl Into<String>,
+        api_surface: impl Into<String>,
+        integration: Option<impl Into<String>>,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            auth_mode: auth_mode.into(),
+            api_surface: api_surface.into(),
+            integration: integration.map(Into::into),
+        }
+    }
+
+    /// Return true when this target is compatible with the requested active target.
+    #[must_use]
+    pub fn matches(&self, target: &Self) -> bool {
+        self.provider == target.provider
+            && self.auth_mode == target.auth_mode
+            && self.api_surface == target.api_surface
+            && (self.integration == target.integration
+                || self.integration.as_deref() == Some("provider_native"))
+    }
 }
 
 /// Provider/public status for a catalog model.

@@ -19,6 +19,13 @@ pub fn home(catalog: &CatalogDocument) -> Containers {
         .filter(|model| model.live.is_some())
         .count();
 
+    let compatible_count = catalog
+        .providers
+        .values()
+        .flat_map(|provider| provider.models.values())
+        .filter(|model| !model.supported_by.is_empty())
+        .count();
+
     container! {
         div padding=32 background="#0d1117" color="#c9d1d9" font-family="monospace" {
             h1 color="#7ee787" font-size=42 margin-bottom=8 { "models.bmux.dev" }
@@ -37,6 +44,19 @@ pub fn home(catalog: &CatalogDocument) -> Containers {
                 div color="#f0f6fc" font-size=22 { (live_model_count.to_string()) }
                 div color="#8b949e" font-size=12 { "live seen" }
             }
+            div background="#161b22" padding=16 border-radius=8 margin-bottom=12 border="1, #30363d" {
+                div color="#f0f6fc" font-size=22 { (compatible_count.to_string()) }
+                div color="#8b949e" font-size=12 { "compatibility-tagged" }
+            }
+            h2 color="#f0f6fc" font-size=24 margin-bottom=16 { "Compatibility filters" }
+            div background="#161b22" padding=16 border-radius=8 margin-bottom=32 border="1, #30363d" {
+                div color="#8b949e" font-size=13 margin-bottom=8 {
+                    "Models now expose objective support targets: provider + auth mode + API surface + integration. Bcode can use these targets to hide models that are not known to work with the active subscription or API key path."
+                }
+                div color="#c9d1d9" font-size=12 {
+                    "Example target: openai / chatgpt_subscription / chatgpt_codex / bcode"
+                }
+            }
             h2 color="#f0f6fc" font-size=24 margin-bottom=16 { "Providers" }
             @for provider in catalog.providers.values() {
                 div background="#161b22" padding=16 border-radius=8 margin-bottom=16 border="1, #30363d" {
@@ -54,12 +74,33 @@ pub fn home(catalog: &CatalogDocument) -> Containers {
                                 " · support " (format!("{:?}", model.bcode_support))
                             }
                             div color="#8b949e" font-size=12 { "live: " (live_label(model.live.as_ref())) }
+                            @if !model.supported_by.is_empty() {
+                                div color="#7ee787" font-size=12 margin-top=4 {
+                                    "supported by: " (support_targets_label(&model.supported_by))
+                                }
+                            }
                         }
                     }
                 }
             }
         }
     }
+}
+
+fn support_targets_label(
+    targets: &std::collections::BTreeSet<bcode_model_catalog_models::ModelSupportTarget>,
+) -> String {
+    targets
+        .iter()
+        .map(|target| {
+            let integration = target.integration.as_deref().unwrap_or("provider_native");
+            format!(
+                "{} / {} / {} / {}",
+                target.provider, target.auth_mode, target.api_surface, integration
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn optional_u32(value: Option<u32>) -> String {

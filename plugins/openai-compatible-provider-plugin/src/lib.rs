@@ -21,6 +21,7 @@ use bcode_model::{
     ProviderErrorCategory, ProviderRequestContext, ProviderRequestProjection, ProviderTurnEvent,
     StartTurnResponse, StopReason, TokenUsage, ToolCall, ValidateConfigResponse,
 };
+use bcode_model_catalog_models::ModelSupportTarget;
 use bcode_model_provider_runtime::{
     ProviderRuntime, retry_hint_from_json_value, retry_hint_from_response_parts,
 };
@@ -3697,8 +3698,14 @@ fn openai_default_codex_model_id() -> String {
 }
 
 fn catalog_fallback_model_ids() -> Vec<String> {
-    openai_provider_catalog()
-        .map(|provider| provider.fallback_model_ids)
+    let target = ModelSupportTarget::new(
+        "openai",
+        "chatgpt_subscription",
+        "chatgpt_codex",
+        Some("bcode"),
+    );
+    bcode_model_catalog::ModelCatalog::load_bundled()
+        .map(|catalog| catalog.fallback_model_ids_for_support_target("openai", &target))
         .unwrap_or_default()
 }
 
