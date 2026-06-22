@@ -15,6 +15,7 @@ use std::process::{Command, Stdio};
 const PACKAGE_NAME: &str = "bcode";
 const BINARY_NAME: &str = "bcode";
 const DIST_DIR: &str = "target/dist";
+const DEFAULT_DEV_CODESIGN_IDENTITY: &str = "Bcode Dev";
 
 #[derive(Debug)]
 struct XtaskError(String);
@@ -50,6 +51,7 @@ struct Options {
     version: String,
     out_dir: PathBuf,
     dev_binary: Option<PathBuf>,
+    dev_identity: String,
     skip_notarize: bool,
 }
 
@@ -70,6 +72,8 @@ impl Options {
         let mut version = env::var("VERSION").unwrap_or_else(|_| workspace_version());
         let mut out_dir = PathBuf::from(DIST_DIR);
         let mut dev_binary = None;
+        let mut dev_identity = env::var("BCODE_DEV_CODESIGN_IDENTITY")
+            .unwrap_or_else(|_| DEFAULT_DEV_CODESIGN_IDENTITY.to_owned());
         let mut skip_notarize = env_flag("BCODE_SKIP_NOTARIZE");
 
         while let Some(arg) = args.next() {
@@ -80,6 +84,7 @@ impl Options {
                 "--binary" => {
                     dev_binary = Some(PathBuf::from(require_value(&mut args, "--binary")?));
                 }
+                "--identity" => dev_identity = require_value(&mut args, "--identity")?,
                 "--skip-notarize" => skip_notarize = true,
                 "--help" | "-h" => return Ok(Self::help()),
                 unknown => return Err(format_error(format!("unknown option `{unknown}`"))),
@@ -92,6 +97,7 @@ impl Options {
             version,
             out_dir,
             dev_binary,
+            dev_identity,
             skip_notarize,
         })
     }
@@ -103,6 +109,7 @@ impl Options {
             version: workspace_version(),
             out_dir: PathBuf::from(DIST_DIR),
             dev_binary: None,
+            dev_identity: DEFAULT_DEV_CODESIGN_IDENTITY.to_owned(),
             skip_notarize: false,
         }
     }
@@ -204,12 +211,13 @@ fn dev_sign(options: &Options) -> Result<()> {
         .clone()
         .unwrap_or_else(|| built_binary(&options.target));
     ensure_file(&binary)?;
-    let identity = env::var("BCODE_DEV_CODESIGN_IDENTITY").map_err(|_| {
-        format_error("BCODE_DEV_CODESIGN_IDENTITY must name a persistent local signing certificate")
-    })?;
-    sign_macos_binary(&binary, &identity, false)?;
+    sign_macos_binary(&binary, &options.dev_identity, false)?;
     verify_macos_signature(&binary)?;
-    println!("dev-signed {}", binary.display());
+    println!(
+        "dev-signed {} with identity `{}`",
+        binary.display(),
+        options.dev_identity
+    );
     Ok(())
 }
 
@@ -494,7 +502,7 @@ fn print_help() {
          Usage:\n\
            cargo xtask release --target <triple> --version <version>\n\
            cargo xtask verify-release --target <triple> --version <version>\n\
-           cargo xtask dev-sign --target <triple> [--binary <path>]\n\n\
+           cargo xtask dev-sign --target <triple> [--binary <path>] [--identity <name>]\n\n\
          Supported release targets:\n\
            * aarch64-apple-darwin\n\
            * x86_64-apple-darwin\n\
@@ -503,7 +511,8 @@ fn print_help() {
          macOS release env:\n\
            * APPLE_CODESIGN_IDENTITY\n\
            * APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID for notarization\n\n\
-         macOS dev signing env:\n\
-           * BCODE_DEV_CODESIGN_IDENTITY"
+         macOS dev signing:\n\
+           * defaults to `Bcode Dev`\n\
+           * override with --identity or BCODE_DEV_CODESIGN_IDENTITY"
     );
 }

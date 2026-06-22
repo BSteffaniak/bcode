@@ -51,9 +51,16 @@ For local development, use a persistent local signing certificate to reduce
 Keychain prompts for rebuilt binaries:
 
 ```sh
-export BCODE_DEV_CODESIGN_IDENTITY="Bcode Dev"
 cargo build --release --package bcode
 cargo xtask dev-sign --target aarch64-apple-darwin
+```
+
+By default, `dev-sign` uses a local code-signing identity named `Bcode Dev`.
+Override it with either:
+
+```sh
+cargo xtask dev-sign --target aarch64-apple-darwin --identity "My Local Cert"
+BCODE_DEV_CODESIGN_IDENTITY="My Local Cert" cargo xtask dev-sign --target aarch64-apple-darwin
 ```
 
 This is not a replacement for release signing. It only helps on machines that
