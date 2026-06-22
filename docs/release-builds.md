@@ -76,7 +76,8 @@ provided, xtask creates a dedicated Bcode development-signing keychain at:
 
 The keychain password is generated locally, stored next to that keychain with
 user-only file permissions, and used only to unlock the dedicated signing
-keychain. The login keychain password is not required.
+keychain. The generated self-signed certificate is trusted for code signing in
+that dedicated keychain. The login keychain password is not required.
 Override the identity with either:
 
 ```sh
