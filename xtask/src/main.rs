@@ -41,6 +41,7 @@ enum CommandName {
     Release,
     VerifyRelease,
     DevSign,
+    DevRelease,
     Help,
 }
 
@@ -62,6 +63,7 @@ impl Options {
             Some("release") => CommandName::Release,
             Some("verify-release") => CommandName::VerifyRelease,
             Some("dev-sign") => CommandName::DevSign,
+            Some("dev-release") => CommandName::DevRelease,
             Some("help" | "--help" | "-h") | None => CommandName::Help,
             Some(command) => {
                 return Err(format_error(format!("unknown xtask command `{command}`")));
@@ -128,6 +130,7 @@ fn run() -> Result<()> {
         CommandName::Release => release(&options),
         CommandName::VerifyRelease => verify_release(&options),
         CommandName::DevSign => dev_sign(&options),
+        CommandName::DevRelease => dev_release(&options),
         CommandName::Help => {
             print_help();
             Ok(())
@@ -135,8 +138,7 @@ fn run() -> Result<()> {
     }
 }
 
-fn release(options: &Options) -> Result<()> {
-    let target_kind = TargetKind::parse(&options.target)?;
+fn build_bcode_release(target: &str) -> Result<()> {
     run_command(
         Command::new("cargo")
             .arg("build")
@@ -144,8 +146,13 @@ fn release(options: &Options) -> Result<()> {
             .arg("--package")
             .arg(PACKAGE_NAME)
             .arg("--target")
-            .arg(&options.target),
-    )?;
+            .arg(target),
+    )
+}
+
+fn release(options: &Options) -> Result<()> {
+    let target_kind = TargetKind::parse(&options.target)?;
+    build_bcode_release(&options.target)?;
 
     let binary = built_binary(&options.target);
     if target_kind == TargetKind::Macos {
@@ -195,6 +202,31 @@ fn verify_release(options: &Options) -> Result<()> {
     }
 
     println!("verified release artifact: {}", archive.display());
+    Ok(())
+}
+
+fn dev_release(options: &Options) -> Result<()> {
+    let target_kind = TargetKind::parse(&options.target)?;
+    build_bcode_release(&options.target)?;
+    let binary = built_binary(&options.target);
+    ensure_file(&binary)?;
+
+    match target_kind {
+        TargetKind::Macos => {
+            sign_macos_binary(&binary, &options.dev_identity, false)?;
+            verify_macos_signature(&binary)?;
+            println!(
+                "dev release ready: {} signed with identity `{}`",
+                binary.display(),
+                options.dev_identity
+            );
+        }
+        TargetKind::Linux => {
+            strip_binary(&binary);
+            println!("dev release ready: {}", binary.display());
+        }
+    }
+
     Ok(())
 }
 
@@ -502,6 +534,7 @@ fn print_help() {
          Usage:\n\
            cargo xtask release --target <triple> --version <version>\n\
            cargo xtask verify-release --target <triple> --version <version>\n\
+           cargo xtask dev-release [--target <triple>] [--identity <name>]\n\
            cargo xtask dev-sign --target <triple> [--binary <path>] [--identity <name>]\n\n\
          Supported release targets:\n\
            * aarch64-apple-darwin\n\

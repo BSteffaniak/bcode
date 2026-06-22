@@ -9,6 +9,7 @@ Bcode release artifacts are produced by the repository `xtask` release automatio
 cargo xtask release --target aarch64-apple-darwin --version v0.1.0
 cargo xtask release --target x86_64-unknown-linux-gnu --version v0.1.0
 cargo xtask verify-release --target aarch64-apple-darwin --version v0.1.0
+cargo xtask dev-release
 ```
 
 Supported v1 targets:
@@ -49,6 +50,16 @@ Set `BCODE_SKIP_NOTARIZE=1` or pass `--skip-notarize` to skip notarization.
 
 For local development, use a persistent local signing certificate to reduce
 Keychain prompts for rebuilt binaries:
+
+```sh
+cargo xtask dev-release
+```
+
+This builds `bcode` in release mode for the host target, signs it on macOS with
+the default development identity, verifies the signature, and prints the runnable
+binary path.
+
+To sign an already-built binary instead:
 
 ```sh
 cargo build --release --package bcode
