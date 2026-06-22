@@ -3554,7 +3554,6 @@ pub struct ReviewApp {
     pub show_resolved_threads: bool,
     /// Whether viewed files are hidden from the file sidebar.
     pub hide_viewed_files: bool,
-    pub expanded_diff_contexts: BTreeSet<DiffContextKey>,
     /// Session id to open after leaving review mode.
     pub session_to_open: Option<SessionId>,
     last_file_area: Option<Rect>,
@@ -3621,7 +3620,6 @@ impl ReviewApp {
             resolved_review_threads: BTreeSet::new(),
             show_resolved_threads: true,
             hide_viewed_files: false,
-            expanded_diff_contexts: BTreeSet::new(),
             session_to_open: None,
             last_file_area: None,
             last_diff_area: None,
@@ -6211,8 +6209,8 @@ impl ReviewApp {
             return;
         };
         let keys = self
-            .expanded_diff_contexts
-            .iter()
+            .diff_context_load_states
+            .keys()
             .filter(|key| key.file_index == file_index)
             .cloned()
             .collect::<Vec<_>>();
@@ -7866,12 +7864,10 @@ impl ReviewApp {
     /// Expand a collapsed unchanged diff context block.
     pub fn expand_diff_context(&mut self, key: &DiffContextKey) -> bool {
         self.preserve_viewport_while(|app| {
-            if !app.expanded_diff_contexts.insert(key.clone())
-                && matches!(
-                    app.diff_context_load_states.get(key),
-                    Some(DiffContextLoadState::Loading | DiffContextLoadState::Loaded)
-                )
-            {
+            if matches!(
+                app.diff_context_load_states.get(key),
+                Some(DiffContextLoadState::Loading | DiffContextLoadState::Loaded)
+            ) {
                 return false;
             }
             if let Some(path) = app.selected_file_path()
