@@ -6458,6 +6458,15 @@ impl ReviewApp {
             .and_then(|document| document.target_for_visual_row(self.diff_scroll).cloned())
     }
 
+    fn preserve_viewport_while(&mut self, change: impl FnOnce(&mut Self) -> bool) -> bool {
+        let viewport_target = self.top_visible_target();
+        let changed = change(self);
+        if changed {
+            self.restore_top_visible_target(viewport_target.as_ref());
+        }
+        changed
+    }
+
     fn restore_top_visible_target(&mut self, target: Option<&ReviewViewTarget>) {
         let Some(target) = target else {
             self.diff_scroll = self.diff_scroll.min(self.max_diff_scroll());
@@ -6528,15 +6537,7 @@ impl ReviewApp {
     }
 
     fn select_target_and_scroll(&mut self, target: ReviewViewTarget) -> bool {
-        let source_row = self
-            .current_review_view_document()
-            .and_then(|document| document.source_row_for_target(&target));
-        self.selected_view_target = Some(target);
-        if let Some(source_row) = source_row {
-            self.selected_diff_line = source_row;
-        }
-        self.scroll_selected_target_into_view();
-        true
+        self.select_view_target(target)
     }
 
     /// Return whether a visual row target is an inline action.
@@ -6583,12 +6584,31 @@ impl ReviewApp {
     /// Select a visible diff line by rendered row index.
     pub fn select_diff_line(&mut self, index: usize) -> bool {
         let clamped = index.min(self.source_rendered_diff_len().saturating_sub(1));
-        self.selected_view_target = None;
-        if clamped == self.selected_diff_line {
+        let next_target = self
+            .current_review_view_document()
+            .and_then(|document| document.target_for_source_row(clamped).cloned());
+        if clamped == self.selected_diff_line && self.selected_view_target == next_target {
             return false;
         }
         self.selected_diff_line = clamped;
-        self.ensure_selected_diff_line_visible();
+        self.selected_view_target = next_target;
+        self.scroll_selected_target_into_view();
+        true
+    }
+
+    fn select_view_target(&mut self, target: ReviewViewTarget) -> bool {
+        if self.selected_view_target.as_ref() == Some(&target) {
+            return false;
+        }
+        if let Some(source_row) = self
+            .current_review_view_document()
+            .and_then(|document| document.source_row_for_target(&target))
+        {
+            self.selected_diff_line = source_row;
+        }
+        self.sync_selected_thread_to_view_target(&target);
+        self.selected_view_target = Some(target);
+        self.scroll_selected_target_into_view();
         true
     }
 
@@ -6597,30 +6617,10 @@ impl ReviewApp {
         let Some(document) = self.current_review_view_document() else {
             return self.select_diff_line(visual_row);
         };
-        let Some(row) = document.row_for_visual_row(visual_row) else {
+        let Some(target) = document.target_for_visual_row(visual_row).cloned() else {
             return false;
         };
-        match &row.target {
-            ReviewViewTarget::SourceLine { source_row, .. }
-            | ReviewViewTarget::HunkHeader { source_row, .. } => self.select_diff_line(*source_row),
-            target @ ReviewViewTarget::OmittedContext { .. } => {
-                if self.selected_view_target.as_ref() == Some(target) {
-                    return false;
-                }
-                self.selected_view_target = Some(target.clone());
-                self.ensure_selected_diff_line_visible();
-                true
-            }
-            target => {
-                if self.selected_view_target.as_ref() == Some(target) {
-                    return false;
-                }
-                self.selected_view_target = Some(target.clone());
-                self.sync_selected_thread_to_view_target(target);
-                self.ensure_selected_diff_line_visible();
-                true
-            }
-        }
+        self.select_view_target(target)
     }
 
     /// Return the selected semantic target in the current review view.
@@ -6629,8 +6629,8 @@ impl ReviewApp {
         self.selected_view_target.clone().or_else(|| {
             self.current_review_view_document().and_then(|document| {
                 document
-                    .visual_row_for_source_row(self.selected_diff_line)
-                    .and_then(|visual_row| document.target_for_visual_row(visual_row).cloned())
+                    .target_for_source_row(self.selected_diff_line)
+                    .cloned()
             })
         })
     }
@@ -7791,29 +7791,32 @@ impl ReviewApp {
         else {
             return false;
         };
-        if self.collapsed_review_threads.remove(&thread_key) {
-            self.status_message = Some("expanded review thread".to_string());
-        } else {
-            self.collapsed_review_threads.insert(thread_key);
-            self.status_message = Some("collapsed review thread".to_string());
-        }
-        self.ensure_selected_diff_line_visible();
-        true
+        self.preserve_viewport_while(|app| {
+            if app.collapsed_review_threads.remove(&thread_key) {
+                app.status_message = Some("expanded review thread".to_string());
+            } else {
+                app.collapsed_review_threads.insert(thread_key);
+                app.status_message = Some("collapsed review thread".to_string());
+            }
+            true
+        })
     }
 
     /// Expand a collapsed unchanged diff context block.
     pub fn expand_diff_context(&mut self, key: &str) -> bool {
-        if !self.expanded_diff_contexts.insert(key.to_string()) {
-            return false;
-        }
-        if let Some(path) = self.selected_file_path()
-            && self.file_cache.get(&path).is_none()
-        {
-            self.pending_context_file_load = Some(path);
-        }
-        self.selected_view_target = None;
-        self.status_message = Some("expanded hidden diff context".to_string());
-        true
+        self.preserve_viewport_while(|app| {
+            if !app.expanded_diff_contexts.insert(key.to_string()) {
+                return false;
+            }
+            if let Some(path) = app.selected_file_path()
+                && app.file_cache.get(&path).is_none()
+            {
+                app.pending_context_file_load = Some(path);
+            }
+            app.selected_view_target = None;
+            app.status_message = Some("expanded hidden diff context".to_string());
+            true
+        })
     }
 
     /// Activate the currently selected inline action, if any.

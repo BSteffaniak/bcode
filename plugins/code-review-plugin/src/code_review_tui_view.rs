@@ -270,6 +270,13 @@ impl ReviewViewDocument {
         self.row_for_visual_row(visual_row).map(|row| &row.target)
     }
 
+    /// Return the semantic target for a source row.
+    #[must_use]
+    pub fn target_for_source_row(&self, source_row: usize) -> Option<&ReviewViewTarget> {
+        self.visual_row_for_source_row(source_row)
+            .and_then(|visual_row| self.target_for_visual_row(visual_row))
+    }
+
     /// Return the visual row for a source row.
     #[must_use]
     pub fn visual_row_for_source_row(&self, source_row: usize) -> Option<usize> {
