@@ -95,6 +95,12 @@ where
         true
     }
 
+    /// Remove a cached value so a future ensure call reloads it.
+    pub fn remove(&mut self, key: &K) {
+        self.values.remove(key);
+        self.in_flight.remove(key);
+    }
+
     /// Apply a completed async value update.
     pub fn apply(&mut self, update: AsyncValueUpdate<K, V>) {
         self.in_flight.remove(&update.key);

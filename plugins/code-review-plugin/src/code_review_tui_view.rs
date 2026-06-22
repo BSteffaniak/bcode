@@ -58,10 +58,9 @@ impl ReviewViewDocument {
                                 Some(reason.clone()),
                             ));
                         }
-                        (
-                            DiffContextLoadState::Loaded | DiffContextLoadState::Loading,
-                            Some(file),
-                        ) if file.unavailable_reason.is_none() => {
+                        (DiffContextLoadState::Loaded, Some(file))
+                            if file.unavailable_reason.is_none() =>
+                        {
                             push_expanded_context_rows(
                                 file_index, &key, file, start_line, end_line, &mut rows,
                             );
@@ -73,13 +72,15 @@ impl ReviewViewDocument {
                             end_line,
                             file.unavailable_reason.clone(),
                         )),
-                        (_, None) => rows.push(context_status_row(
-                            key.clone(),
-                            hidden_line_count(start_line, end_line),
-                            start_line,
-                            end_line,
-                            None,
-                        )),
+                        (DiffContextLoadState::Loading, _) | (_, None) => {
+                            rows.push(context_status_row(
+                                key.clone(),
+                                hidden_line_count(start_line, end_line),
+                                start_line,
+                                end_line,
+                                None,
+                            ));
+                        }
                     }
                 } else {
                     rows.push(ReviewViewRow {

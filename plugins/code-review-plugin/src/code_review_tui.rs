@@ -547,12 +547,16 @@ fn ensure_selected_repository_file_load(
     app: &mut ReviewApp,
     file_store: &mut AsyncValueStore<String, CachedReviewFile>,
 ) -> bool {
+    let retrying_context_load = app.pending_context_file_load.clone();
     let path = app
         .take_pending_file_load()
         .or_else(|| app.take_pending_context_file_load());
     let Some(path) = path else {
         return false;
     };
+    if retrying_context_load.as_ref() == Some(&path) {
+        file_store.remove(&path);
+    }
     let client = client.clone();
     let repo_path = repo_path.to_path_buf();
     let started = file_store.ensure(host, path, move |path| async move {
@@ -2429,6 +2433,13 @@ impl ReviewFileCache {
         self.lru.retain(|entry| entry != &path);
         self.lru.push(path);
         self.evict();
+    }
+
+    pub fn remove(&mut self, path: &str) {
+        if let Some(existing) = self.entries.remove(path) {
+            self.total_bytes = self.total_bytes.saturating_sub(existing.content.len());
+        }
+        self.lru.retain(|entry| entry != path);
     }
 
     fn evict(&mut self) {
@@ -7870,15 +7881,20 @@ impl ReviewApp {
             ) {
                 return false;
             }
-            if let Some(path) = app.selected_file_path()
-                && app.file_cache.get(&path).is_none()
-            {
-                app.pending_context_file_load = Some(path);
-                app.diff_context_load_states
-                    .insert(key.clone(), DiffContextLoadState::Loading);
-            } else {
-                app.diff_context_load_states
-                    .insert(key.clone(), DiffContextLoadState::Loaded);
+            if let Some(path) = app.selected_file_path() {
+                let cached_file_available = app
+                    .file_cache
+                    .get(&path)
+                    .is_some_and(|file| file.unavailable_reason.is_none());
+                if cached_file_available {
+                    app.diff_context_load_states
+                        .insert(key.clone(), DiffContextLoadState::Loaded);
+                } else {
+                    app.file_cache.remove(&path);
+                    app.pending_context_file_load = Some(path);
+                    app.diff_context_load_states
+                        .insert(key.clone(), DiffContextLoadState::Loading);
+                }
             }
             app.selected_view_target = None;
             app.status_message = Some("expanded hidden diff context".to_string());
