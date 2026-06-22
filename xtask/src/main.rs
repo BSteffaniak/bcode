@@ -385,6 +385,7 @@ fn create_default_dev_codesign_identity(identity: &str) -> Result<PathBuf> {
             .arg("21600")
             .arg(&keychain),
     )?;
+    add_keychain_to_user_search_list(&keychain)?;
 
     let dir = PathBuf::from("target/xtask/dev-codesign");
     recreate_dir(&dir)?;
@@ -456,6 +457,37 @@ fn create_default_dev_codesign_identity(identity: &str) -> Result<PathBuf> {
     )?;
 
     Ok(keychain)
+}
+
+fn add_keychain_to_user_search_list(keychain: &Path) -> Result<()> {
+    let output = command_output(
+        Command::new("security")
+            .arg("list-keychains")
+            .arg("-d")
+            .arg("user"),
+    )?;
+
+    let keychain_text = keychain.to_string_lossy();
+    let mut keychains = vec![keychain.to_path_buf()];
+    keychains.extend(output.lines().filter_map(|line| {
+        let existing = line.trim().trim_matches('"');
+        if existing.is_empty() || existing == keychain_text {
+            None
+        } else {
+            Some(PathBuf::from(existing))
+        }
+    }));
+
+    let mut command = Command::new("security");
+    command
+        .arg("list-keychains")
+        .arg("-d")
+        .arg("user")
+        .arg("-s");
+    for listed_keychain in keychains {
+        command.arg(listed_keychain);
+    }
+    run_command(&mut command)
 }
 
 fn trust_dev_codesign_certificate(keychain: &Path, certificate: &Path) -> Result<()> {
