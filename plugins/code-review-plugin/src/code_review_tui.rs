@@ -1866,7 +1866,7 @@ fn handle_mouse(app: &mut ReviewApp, mouse: MouseEvent) -> bool {
                 .is_some_and(|visual_row| app.handle_review_view_click(visual_row))
         }
         MouseEventKind::Drag(MouseButton::Left) => app
-            .diff_line_index_at(mouse.position.x, mouse.position.y)
+            .commentable_diff_line_index_at(mouse.position.x, mouse.position.y)
             .is_some_and(|index| app.update_mouse_range_selection(index)),
         MouseEventKind::Up(MouseButton::Left) => app.finish_mouse_range_selection(),
         MouseEventKind::Down(MouseButton::Right | MouseButton::Middle | MouseButton::Other(_))
@@ -6566,9 +6566,12 @@ impl ReviewApp {
         };
         let selected = self.select_view_visual_row(visual_row);
         match &row.target {
-            ReviewViewTarget::SourceLine { source_row, .. }
-            | ReviewViewTarget::HunkHeader { source_row, .. } => {
+            ReviewViewTarget::SourceLine { source_row, .. } => {
                 self.begin_mouse_range_selection(*source_row) || selected
+            }
+            ReviewViewTarget::HunkHeader { .. } => {
+                self.status_message = Some("select a diff line to comment".to_string());
+                selected
             }
             ReviewViewTarget::OmittedContext { key } => self.expand_diff_context(key) || selected,
             ReviewViewTarget::ExpandedContextLine { .. } => {
@@ -6739,6 +6742,22 @@ impl ReviewApp {
         Some(visual_row)
     }
 
+    /// Return visible commentable diff source row under terminal coordinates.
+    #[must_use]
+    pub fn commentable_diff_line_index_at(&self, x: u16, y: u16) -> Option<usize> {
+        let visual_row = self.view_visual_row_at(x, y)?;
+        let document = self.current_review_view_document()?;
+        match document.target_for_visual_row(visual_row)? {
+            ReviewViewTarget::SourceLine { source_row, .. } => Some(*source_row),
+            ReviewViewTarget::HunkHeader { .. }
+            | ReviewViewTarget::OmittedContext { .. }
+            | ReviewViewTarget::ExpandedContextLine { .. }
+            | ReviewViewTarget::Thread { .. }
+            | ReviewViewTarget::Comment { .. }
+            | ReviewViewTarget::ThreadAction { .. } => None,
+        }
+    }
+
     /// Return visible semantic row index under terminal coordinates.
     #[must_use]
     pub fn view_visual_row_at(&self, x: u16, y: u16) -> Option<usize> {
@@ -6800,7 +6819,13 @@ impl ReviewApp {
             self.status_message = Some("select a diff line to start range selection".to_string());
             return true;
         }
-        self.range_selection_start = Some(self.selected_diff_line);
+        let Some(ReviewViewTarget::SourceLine { source_row, .. }) =
+            self.selected_review_view_target()
+        else {
+            self.status_message = Some("select a diff line to start range selection".to_string());
+            return true;
+        };
+        self.range_selection_start = Some(source_row);
         self.status_message =
             Some("range selection started; move then c comment or a ask Bcode".to_string());
         true
@@ -6810,10 +6835,15 @@ impl ReviewApp {
     #[must_use]
     pub fn selected_range_bounds(&self) -> Option<(usize, usize)> {
         let start = self.range_selection_start?;
-        Some(if start <= self.selected_diff_line {
-            (start, self.selected_diff_line)
+        let Some(ReviewViewTarget::SourceLine { source_row, .. }) =
+            self.selected_review_view_target()
+        else {
+            return None;
+        };
+        Some(if start <= source_row {
+            (start, source_row)
         } else {
-            (self.selected_diff_line, start)
+            (source_row, start)
         })
     }
 
