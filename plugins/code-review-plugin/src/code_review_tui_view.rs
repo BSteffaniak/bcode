@@ -26,7 +26,7 @@ impl ReviewViewDocument {
         file: &ReviewFile,
         syntax_highlighting: bool,
         cached_file: Option<&CachedReviewFile>,
-        expanded_contexts: &BTreeSet<DiffContextKey>,
+        context_load_states: &BTreeMap<DiffContextKey, DiffContextLoadState>,
     ) -> Self {
         let display = ReviewDisplayBuilder::new()
             .syntax_highlighting(syntax_highlighting)
@@ -47,24 +47,34 @@ impl ReviewViewDocument {
                 let start_line = previous_new_line.saturating_add(1);
                 let end_line = hunk.new_start.saturating_sub(1);
                 let key = DiffContextKey::new(file_index, hunk_index, start_line, end_line);
-                if expanded_contexts.contains(&key) {
-                    match cached_file {
-                        Some(file) if file.unavailable_reason.is_some() => {
+                if let Some(load_state) = context_load_states.get(&key) {
+                    match (load_state, cached_file) {
+                        (DiffContextLoadState::Unavailable(reason), _) => {
                             rows.push(context_status_row(
                                 key.clone(),
                                 hidden_line_count(start_line, end_line),
                                 start_line,
                                 end_line,
-                                file.unavailable_reason.clone(),
+                                Some(reason.clone()),
                             ));
                         }
-                        Some(file) => {
+                        (
+                            DiffContextLoadState::Loaded | DiffContextLoadState::Loading,
+                            Some(file),
+                        ) if file.unavailable_reason.is_none() => {
                             push_expanded_context_rows(
                                 file_index, &key, file, start_line, end_line, &mut rows,
                             );
                         }
-                        None => rows.push(context_status_row(
-                            key,
+                        (_, Some(file)) => rows.push(context_status_row(
+                            key.clone(),
+                            hidden_line_count(start_line, end_line),
+                            start_line,
+                            end_line,
+                            file.unavailable_reason.clone(),
+                        )),
+                        (_, None) => rows.push(context_status_row(
+                            key.clone(),
                             hidden_line_count(start_line, end_line),
                             start_line,
                             end_line,
@@ -567,6 +577,17 @@ impl fmt::Display for DiffContextKey {
     }
 }
 
+/// Load state for a typed hidden diff context expansion.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DiffContextLoadState {
+    /// Full-file content has been requested.
+    Loading,
+    /// Full-file content is available.
+    Loaded,
+    /// Full-file content could not be loaded.
+    Unavailable(String),
+}
+
 /// Stable semantic target for selection, mouse, and actions.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ReviewViewTarget {
@@ -777,7 +798,7 @@ fn materialized_file_surface_rows(file: &ReviewFile) -> Vec<(Option<u32>, String
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use super::{ReviewThreadAnchor, ReviewViewBlock, ReviewViewDocument, ReviewViewTarget};
     use crate::code_review_tui::{
@@ -789,7 +810,7 @@ mod tests {
     fn diff_file_document_maps_visual_rows_to_semantic_targets() {
         let file = test_file();
 
-        let document = ReviewViewDocument::build_diff_file(7, &file, true, None, &BTreeSet::new());
+        let document = ReviewViewDocument::build_diff_file(7, &file, true, None, &BTreeMap::new());
 
         assert_eq!(document.rows.len(), 2);
         assert_eq!(
@@ -834,7 +855,7 @@ mod tests {
             severity: ReviewThreadSeverity::Info,
         };
 
-        let document = ReviewViewDocument::build_diff_file(7, &file, false, None, &BTreeSet::new())
+        let document = ReviewViewDocument::build_diff_file(7, &file, false, None, &BTreeMap::new())
             .with_inline_draft_threads(
                 7,
                 std::iter::once((anchor.clone(), vec![comment])),
@@ -885,7 +906,7 @@ mod tests {
             severity: ReviewThreadSeverity::Info,
         };
 
-        let document = ReviewViewDocument::build_diff_file(7, &file, false, None, &BTreeSet::new())
+        let document = ReviewViewDocument::build_diff_file(7, &file, false, None, &BTreeMap::new())
             .with_inline_draft_threads(
                 7,
                 std::iter::once((anchor, vec![comment])),

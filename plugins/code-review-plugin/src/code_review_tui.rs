@@ -35,8 +35,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::code_review_tui_render::materialized_file_surface_rows;
 use crate::code_review_tui_view::{
-    DiffContextKey, ReviewThreadAction, ReviewThreadAnchor, ReviewViewBlock, ReviewViewDocument,
-    ReviewViewTarget,
+    DiffContextKey, DiffContextLoadState, ReviewThreadAction, ReviewThreadAnchor, ReviewViewBlock,
+    ReviewViewDocument, ReviewViewTarget,
 };
 use crate::tui_host_types::{TuiError, helpers};
 
@@ -3446,7 +3446,7 @@ struct ReviewViewDocumentCacheKey {
     draft_signature: String,
     collapsed_threads: Vec<String>,
     resolved_threads: Vec<String>,
-    expanded_contexts: Vec<DiffContextKey>,
+    expanded_contexts: Vec<(DiffContextKey, DiffContextLoadState)>,
     show_resolved_threads: bool,
 }
 
@@ -3512,6 +3512,8 @@ pub struct ReviewApp {
     pub pending_file_load: Option<String>,
     /// Review file path queued for hidden diff context loading.
     pub pending_context_file_load: Option<String>,
+    /// Diff context load state keyed by typed context identity.
+    pub diff_context_load_states: BTreeMap<DiffContextKey, DiffContextLoadState>,
     /// Selected publisher index.
     pub selected_publisher: usize,
     /// Active publish UI state.
@@ -3597,6 +3599,7 @@ impl ReviewApp {
             file_viewports: BTreeMap::new(),
             pending_file_load: None,
             pending_context_file_load: None,
+            diff_context_load_states: BTreeMap::new(),
             selected_publisher: 0,
             publish_state: None,
             publish_readiness_ack: false,
@@ -6198,14 +6201,36 @@ impl ReviewApp {
         self.pending_context_file_load.take()
     }
 
+    fn mark_contexts_for_path(&mut self, path: &str, state: &DiffContextLoadState) {
+        let Some(file_index) = self
+            .review
+            .files
+            .iter()
+            .position(|file| file.display_path() == path)
+        else {
+            return;
+        };
+        let keys = self
+            .expanded_diff_contexts
+            .iter()
+            .filter(|key| key.file_index == file_index)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.diff_context_load_states.insert(key, state.clone());
+        }
+    }
+
     /// Store a lazily loaded repository file.
     pub fn store_loaded_file(&mut self, file: CachedReviewFile) {
         let viewport_target = self.top_visible_target();
+        let loaded_path = file.path.clone();
         self.pending_context_file_load = self
             .pending_context_file_load
             .take()
-            .filter(|path| path != &file.path);
+            .filter(|path| path != &loaded_path);
         self.file_cache.insert(file);
+        self.mark_contexts_for_path(&loaded_path, &DiffContextLoadState::Loaded);
         self.restore_top_visible_target(viewport_target.as_ref());
     }
 
@@ -6216,6 +6241,7 @@ impl ReviewApp {
             .pending_context_file_load
             .take()
             .filter(|pending_path| pending_path != &path);
+        let path_for_state = path.clone();
         self.file_cache.insert(CachedReviewFile {
             path,
             content: String::new(),
@@ -6223,8 +6249,9 @@ impl ReviewApp {
             size_bytes: 0,
             mtime_ms: None,
             is_binary: false,
-            unavailable_reason: Some(error),
+            unavailable_reason: Some(error.clone()),
         });
+        self.mark_contexts_for_path(&path_for_state, &DiffContextLoadState::Unavailable(error));
         self.restore_top_visible_target(viewport_target.as_ref());
     }
 
@@ -7839,13 +7866,23 @@ impl ReviewApp {
     /// Expand a collapsed unchanged diff context block.
     pub fn expand_diff_context(&mut self, key: &DiffContextKey) -> bool {
         self.preserve_viewport_while(|app| {
-            if !app.expanded_diff_contexts.insert(key.clone()) {
+            if !app.expanded_diff_contexts.insert(key.clone())
+                && matches!(
+                    app.diff_context_load_states.get(key),
+                    Some(DiffContextLoadState::Loading | DiffContextLoadState::Loaded)
+                )
+            {
                 return false;
             }
             if let Some(path) = app.selected_file_path()
                 && app.file_cache.get(&path).is_none()
             {
                 app.pending_context_file_load = Some(path);
+                app.diff_context_load_states
+                    .insert(key.clone(), DiffContextLoadState::Loading);
+            } else {
+                app.diff_context_load_states
+                    .insert(key.clone(), DiffContextLoadState::Loaded);
             }
             app.selected_view_target = None;
             app.status_message = Some("expanded hidden diff context".to_string());
@@ -8552,7 +8589,7 @@ impl ReviewApp {
                     self.selected_file_path()
                         .as_ref()
                         .and_then(|path| self.file_cache.get(path)),
-                    &self.expanded_diff_contexts,
+                    &self.diff_context_load_states,
                 )
             }
         };
@@ -8661,7 +8698,11 @@ impl ReviewApp {
             draft_signature,
             collapsed_threads: self.collapsed_review_threads.iter().cloned().collect(),
             resolved_threads: self.resolved_review_threads.iter().cloned().collect(),
-            expanded_contexts: self.expanded_diff_contexts.iter().cloned().collect(),
+            expanded_contexts: self
+                .diff_context_load_states
+                .iter()
+                .map(|(key, state)| (key.clone(), state.clone()))
+                .collect(),
             show_resolved_threads: self.show_resolved_threads,
         })
     }
