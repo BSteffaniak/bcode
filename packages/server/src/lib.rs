@@ -138,6 +138,7 @@ pub struct ServerState {
     max_tool_rounds: Option<u32>,
     tool_output_context_chars: usize,
     model_streaming: bcode_config::StreamingConfig,
+    model_retry: bcode_config::ModelRetryConfig,
     auto_compaction: bcode_config::CompactionConfig,
     system_prompt: bcode_config::SystemPromptConfig,
     skills: Option<SkillRegistry>,
@@ -795,6 +796,7 @@ struct ServerStateInit {
     max_tool_rounds: Option<u32>,
     tool_output_context_chars: usize,
     model_streaming: bcode_config::StreamingConfig,
+    model_retry: bcode_config::ModelRetryConfig,
     auto_compaction: bcode_config::CompactionConfig,
     system_prompt: bcode_config::SystemPromptConfig,
     skills: Option<SkillRegistry>,
@@ -830,6 +832,7 @@ impl ServerState {
             max_tool_rounds: init.max_tool_rounds,
             tool_output_context_chars: init.tool_output_context_chars,
             model_streaming: init.model_streaming,
+            model_retry: init.model_retry,
             auto_compaction: init.auto_compaction,
             system_prompt: init.system_prompt,
             skills: init.skills,
@@ -1660,6 +1663,7 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
             max_tool_rounds: config.model.effective_max_tool_rounds(),
             tool_output_context_chars: config.model.tool_output.context_chars,
             model_streaming: config.model.streaming,
+            model_retry: config.model.retry,
             auto_compaction: config.model.compaction,
             system_prompt: config.system_prompt,
             skill_context_bytes: config.skills.max_context_bytes,
@@ -7924,7 +7928,15 @@ fn decode_partial_json_string_from_value(value: &str, max_chars: usize) -> Parti
 struct ModelTurnRecoveryState {
     retried_after_context_overflow: bool,
     retried_after_malformed_tool_arguments: bool,
+    overload_retry_attempts: u8,
     retry_instruction: Option<&'static str>,
+}
+
+struct ProviderErrorRetryContext<'a> {
+    trigger_event_sequence: u64,
+    turn_id: &'a str,
+    selection: &'a SessionModelSelection,
+    cancel_state: &'a TurnCancelState,
 }
 
 enum ModelTurnRetry {
@@ -8970,14 +8982,18 @@ async fn run_model_turn_inner(
                 "model turn cancelled",
             );
         }
+        let retry_context = ProviderErrorRetryContext {
+            trigger_event_sequence: trigger_event.sequence,
+            turn_id: &request.turn_id,
+            selection: &selection,
+            cancel_state: cancel_state.as_ref(),
+        };
         match maybe_retry_after_provider_error(
             state,
             session_id,
-            trigger_event.sequence,
-            &request.turn_id,
             &outcome,
-            &selection,
             &mut recovery,
+            retry_context,
         )
         .await
         {
@@ -9019,11 +9035,9 @@ async fn run_model_turn_inner(
 async fn maybe_retry_after_provider_error(
     state: &ServerState,
     session_id: SessionId,
-    trigger_event_sequence: u64,
-    turn_id: &str,
     outcome: &ModelPollOutcome,
-    selection: &SessionModelSelection,
     recovery: &mut ModelTurnRecoveryState,
+    context: ProviderErrorRetryContext<'_>,
 ) -> ModelTurnRetry {
     let Some(error) = outcome.provider_error.as_ref() else {
         return ModelTurnRetry::None;
@@ -9038,7 +9052,7 @@ async fn maybe_retry_after_provider_error(
         append_provider_event_trace(
             state,
             session_id,
-            turn_id,
+            context.turn_id,
             "recoverable_error_retry",
             Some(format!(
                 "model emitted malformed tool arguments ({}: {}); retrying once",
@@ -9049,13 +9063,26 @@ async fn maybe_retry_after_provider_error(
         return ModelTurnRetry::Continue;
     }
 
+    if should_retry_after_overload_error(state, error, recovery.overload_retry_attempts) {
+        recovery.overload_retry_attempts = recovery.overload_retry_attempts.saturating_add(1);
+        return retry_after_overload_error(
+            state,
+            session_id,
+            context.turn_id,
+            error,
+            recovery.overload_retry_attempts,
+            context.cancel_state,
+        )
+        .await;
+    }
+
     if should_retry_after_context_overflow(state, error, recovery.retried_after_context_overflow) {
         recovery.retried_after_context_overflow = true;
         return match compact_session_after_context_overflow(
             state,
             session_id,
-            selection,
-            trigger_event_sequence,
+            context.selection,
+            context.trigger_event_sequence,
             error,
         )
         .await
@@ -9066,6 +9093,99 @@ async fn maybe_retry_after_provider_error(
     }
 
     ModelTurnRetry::None
+}
+
+fn should_retry_after_overload_error(
+    state: &ServerState,
+    error: &bcode_model::ProviderError,
+    attempts: u8,
+) -> bool {
+    attempts < state.model_retry.max_overload_retries && is_overloaded_provider_error(error)
+}
+
+fn is_overloaded_provider_error(error: &bcode_model::ProviderError) -> bool {
+    error.category == bcode_model::ProviderErrorCategory::Overloaded
+        || error.code == "server_is_overloaded"
+}
+
+async fn retry_after_overload_error(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+    error: &bcode_model::ProviderError,
+    attempt: u8,
+    cancel_state: &TurnCancelState,
+) -> ModelTurnRetry {
+    let delay = overload_retry_delay(&state.model_retry, error, attempt);
+    append_provider_event_trace(
+        state,
+        session_id,
+        turn_id,
+        "recoverable_error_retry",
+        Some(format!(
+            "model provider overloaded ({}: {}); retrying attempt {}/{} in {}ms",
+            error.code,
+            error.message,
+            attempt,
+            state.model_retry.max_overload_retries,
+            delay.as_millis()
+        )),
+    )
+    .await;
+    append_system_event(
+        state,
+        session_id,
+        format!(
+            "Model provider is overloaded. Retrying automatically in {} (attempt {}/{}).",
+            format_retry_delay(delay),
+            attempt,
+            state.model_retry.max_overload_retries
+        ),
+    )
+    .await;
+
+    tokio::select! {
+        () = tokio::time::sleep(delay) => ModelTurnRetry::Continue,
+        () = cancel_state.cancelled() => ModelTurnRetry::Return(ModelTurnCompletion::with_message(
+            ModelTurnOutcome::Cancelled,
+            "model turn cancelled",
+        )),
+    }
+}
+
+fn overload_retry_delay(
+    config: &bcode_config::ModelRetryConfig,
+    error: &bcode_model::ProviderError,
+    attempt: u8,
+) -> Duration {
+    let max_delay = Duration::from_millis(config.overload_max_delay_ms);
+    if let Some(retry) = error.retry.as_deref() {
+        if let Some(retry_after_ms) = retry.retry_after_ms {
+            return Duration::from_millis(retry_after_ms).min(max_delay);
+        }
+        if let Some(retry_at_unix) = retry.retry_at_unix {
+            let now = unix_timestamp();
+            if retry_at_unix > now {
+                return Duration::from_secs(retry_at_unix.saturating_sub(now)).min(max_delay);
+            }
+        }
+    }
+
+    let multiplier = 1_u64
+        .checked_shl(u32::from(attempt.saturating_sub(1)))
+        .unwrap_or(u64::MAX);
+    Duration::from_millis(config.overload_initial_delay_ms.saturating_mul(multiplier))
+        .min(max_delay)
+}
+
+fn format_retry_delay(delay: Duration) -> String {
+    if delay.as_millis() < 1_000 {
+        return format!("{}ms", delay.as_millis());
+    }
+    if delay.as_millis().is_multiple_of(1_000) {
+        return format!("{}s", delay.as_secs());
+    }
+    format!("{:.1}s", delay.as_secs_f64())
 }
 
 fn should_retry_after_context_overflow(
@@ -9143,7 +9263,9 @@ async fn append_deferred_provider_error_if_needed(
 }
 
 fn should_defer_visible_provider_error(error: &bcode_model::ProviderError) -> bool {
-    is_context_length_provider_error(error) || is_tool_arguments_decode_provider_error(error)
+    is_context_length_provider_error(error)
+        || is_tool_arguments_decode_provider_error(error)
+        || is_overloaded_provider_error(error)
 }
 
 fn is_context_length_provider_error(error: &bcode_model::ProviderError) -> bool {
@@ -12693,6 +12815,12 @@ fn current_time_ms() -> u64 {
         .unwrap_or_default()
 }
 
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
 fn elapsed_ms(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -15292,6 +15420,81 @@ mod tests {
     }
 
     #[test]
+    fn overloaded_errors_are_retryable_until_configured_limit() {
+        let error = bcode_model::ProviderError {
+            code: "server_is_overloaded".to_string(),
+            category: bcode_model::ProviderErrorCategory::Overloaded,
+            message: "try again later".to_string(),
+            retryable: true,
+            provider_message: None,
+            retry: None,
+        };
+        let mut state = test_server_state(SessionManager::default());
+        state.model_retry.max_overload_retries = 2;
+
+        assert!(is_overloaded_provider_error(&error));
+        assert!(should_retry_after_overload_error(&state, &error, 0));
+        assert!(should_retry_after_overload_error(&state, &error, 1));
+        assert!(!should_retry_after_overload_error(&state, &error, 2));
+    }
+
+    #[test]
+    fn overload_retry_delay_uses_retry_hint_with_config_cap() {
+        let error = bcode_model::ProviderError {
+            code: "server_is_overloaded".to_string(),
+            category: bcode_model::ProviderErrorCategory::Overloaded,
+            message: "try again later".to_string(),
+            retryable: true,
+            provider_message: None,
+            retry: Some(Box::new(bcode_model::ProviderRetryHint {
+                retry_after_ms: Some(60_000),
+                retry_at_unix: None,
+                source: Some("header".to_string()),
+            })),
+        };
+        let config = bcode_config::ModelRetryConfig {
+            max_overload_retries: 5,
+            overload_initial_delay_ms: 1_000,
+            overload_max_delay_ms: 10_000,
+        };
+
+        assert_eq!(
+            overload_retry_delay(&config, &error, 1),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn overload_retry_delay_uses_exponential_config_fallback() {
+        let error = bcode_model::ProviderError {
+            code: "server_is_overloaded".to_string(),
+            category: bcode_model::ProviderErrorCategory::Overloaded,
+            message: "try again later".to_string(),
+            retryable: true,
+            provider_message: None,
+            retry: None,
+        };
+        let config = bcode_config::ModelRetryConfig {
+            max_overload_retries: 5,
+            overload_initial_delay_ms: 1_000,
+            overload_max_delay_ms: 10_000,
+        };
+
+        assert_eq!(
+            overload_retry_delay(&config, &error, 1),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            overload_retry_delay(&config, &error, 4),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            overload_retry_delay(&config, &error, 5),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
     fn recoverable_provider_errors_are_deferred_until_retry_exhaustion() {
         let malformed_tool_error = bcode_model::ProviderError {
             code: TOOL_ARGUMENTS_DECODE_FAILED_CODE.to_string(),
@@ -15311,6 +15514,15 @@ mod tests {
         };
 
         assert!(should_defer_visible_provider_error(&malformed_tool_error));
+        let overload_error = bcode_model::ProviderError {
+            code: "server_is_overloaded".to_string(),
+            category: bcode_model::ProviderErrorCategory::Overloaded,
+            message: "try again later".to_string(),
+            retryable: true,
+            provider_message: None,
+            retry: None,
+        };
+        assert!(should_defer_visible_provider_error(&overload_error));
         assert!(!should_defer_visible_provider_error(&invalid_request_error));
     }
 
@@ -15570,6 +15782,7 @@ mod tests {
                 max_tool_rounds: None,
                 tool_output_context_chars: 1_000,
                 model_streaming: bcode_config::StreamingConfig::default(),
+                model_retry: bcode_config::ModelRetryConfig::default(),
                 auto_compaction: bcode_config::CompactionConfig::default(),
                 skills: None,
                 skill_context_bytes: 0,
@@ -15888,6 +16101,7 @@ mod tests {
                 max_tool_rounds: None,
                 tool_output_context_chars: 1_000,
                 model_streaming: bcode_config::StreamingConfig::default(),
+                model_retry: bcode_config::ModelRetryConfig::default(),
                 auto_compaction: bcode_config::CompactionConfig::default(),
                 skills: None,
                 skill_context_bytes: 0,
@@ -15988,6 +16202,7 @@ mod tests {
                 max_tool_rounds: None,
                 tool_output_context_chars: 1_000,
                 model_streaming: bcode_config::StreamingConfig::default(),
+                model_retry: bcode_config::ModelRetryConfig::default(),
                 auto_compaction: bcode_config::CompactionConfig::default(),
                 skills: None,
                 skill_context_bytes: 0,

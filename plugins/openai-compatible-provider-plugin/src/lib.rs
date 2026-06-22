@@ -1791,7 +1791,7 @@ fn process_responses_stream_line(
                 .unwrap_or(400);
             let mut error = provider_error(
                 code,
-                category_from_openai_error(status, code, message),
+                category_from_openai_error(status, code, None, message),
                 message,
             );
             if error.category == ProviderErrorCategory::RateLimit {
@@ -2004,11 +2004,12 @@ fn process_stream_line(
     if let Ok(err_body) = serde_json::from_str::<ErrorResponseBody>(data)
         && let Some(err) = err_body.error
     {
+        let error_type = err.r#type.as_deref().map(str::to_string);
         let code = err
             .code
             .or(err.r#type)
             .unwrap_or_else(|| "api_error".to_string());
-        let category = category_from_openai_error(400, &code, &err.message);
+        let category = category_from_openai_error(400, &code, error_type.as_deref(), &err.message);
         return Err(provider_error(code, category, err.message));
     }
 
@@ -4714,7 +4715,11 @@ fn error_from_status_and_headers(
         .and_then(|body| body.error.as_ref())
         .and_then(|error| error.code.clone().or_else(|| error.r#type.clone()))
         .unwrap_or_else(|| format!("http_{status}"));
-    let category = category_from_openai_error(status, &code, &message);
+    let error_type = parsed
+        .as_ref()
+        .and_then(|body| body.error.as_ref())
+        .and_then(|error| error.r#type.as_deref());
+    let category = category_from_openai_error(status, &code, error_type, &message);
     let mut error = provider_error(code, category, message);
     if category == ProviderErrorCategory::RateLimit {
         error.retry = retry_hint_from_response(headers, body).map(Box::new);
@@ -4743,14 +4748,49 @@ fn retry_hint_from_response(
     )
 }
 
-fn category_from_openai_error(status: u16, code: &str, message: &str) -> ProviderErrorCategory {
+fn category_from_openai_error(
+    status: u16,
+    code: &str,
+    error_type: Option<&str>,
+    message: &str,
+) -> ProviderErrorCategory {
     if is_context_length_error(code, message) {
         return ProviderErrorCategory::ContextLength;
+    }
+    if is_hard_overload_error(status, code, error_type) {
+        return ProviderErrorCategory::Overloaded;
     }
     if is_usage_limit_error(code, message) {
         return ProviderErrorCategory::RateLimit;
     }
+    if is_soft_overload_message(status, code, message) {
+        return ProviderErrorCategory::Overloaded;
+    }
     category_from_status(status)
+}
+
+fn is_hard_overload_error(status: u16, code: &str, error_type: Option<&str>) -> bool {
+    let code = code.to_ascii_lowercase();
+    let error_type = error_type.unwrap_or_default().to_ascii_lowercase();
+    status == 503
+        || status == 529
+        || code == "server_is_overloaded"
+        || code == "overloaded"
+        || code == "capacity_exceeded"
+        || error_type == "server_is_overloaded"
+        || error_type == "overloaded"
+}
+
+fn is_soft_overload_message(status: u16, code: &str, message: &str) -> bool {
+    if !(500..=599).contains(&status) {
+        return false;
+    }
+    let code = code.to_ascii_lowercase();
+    let message = message.to_ascii_lowercase();
+    code.contains("overload")
+        || message.contains("overloaded")
+        || message.contains("temporarily unavailable")
+        || message.contains("try again later")
 }
 
 fn is_usage_limit_error(code: &str, message: &str) -> bool {
@@ -4828,6 +4868,7 @@ fn provider_error(
                 | ProviderErrorCategory::Timeout
                 | ProviderErrorCategory::RateLimit
                 | ProviderErrorCategory::ProviderInternal
+                | ProviderErrorCategory::Overloaded
         ),
         provider_message: None,
         retry: None,
@@ -4882,6 +4923,39 @@ mod tests {
             model_ids_are_explicit: true,
             request_timeout: None,
         }
+    }
+
+    #[test]
+    fn openai_overloaded_error_maps_to_overloaded_category() {
+        let error = error_from_status(
+            500,
+            r#"{"error":{"message":"Our servers are currently overloaded. Please try again later.","code":"server_is_overloaded"}}"#,
+        );
+
+        assert_eq!(error.code, "server_is_overloaded");
+        assert_eq!(error.category, ProviderErrorCategory::Overloaded);
+        assert!(error.retryable);
+    }
+
+    #[test]
+    fn openai_service_unavailable_maps_to_overloaded_category() {
+        let error = error_from_status(
+            503,
+            r#"{"error":{"message":"Service unavailable","type":"server_error"}}"#,
+        );
+
+        assert_eq!(error.category, ProviderErrorCategory::Overloaded);
+        assert!(error.retryable);
+    }
+
+    #[test]
+    fn rate_limit_remains_separate_from_overload() {
+        let error = error_from_status(
+            429,
+            r#"{"error":{"message":"Rate limit exceeded. Please try again later.","code":"rate_limit_exceeded"}}"#,
+        );
+
+        assert_eq!(error.category, ProviderErrorCategory::RateLimit);
     }
 
     #[test]

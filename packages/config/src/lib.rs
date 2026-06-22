@@ -1640,6 +1640,8 @@ pub struct ModelConfig {
     #[serde(default)]
     pub streaming: StreamingConfig,
     #[serde(default)]
+    pub retry: ModelRetryConfig,
+    #[serde(default)]
     pub compaction: CompactionConfig,
     #[serde(default)]
     pub profile: Option<String>,
@@ -1843,6 +1845,42 @@ impl Default for StreamingConfig {
             no_progress_timeout_secs: default_streaming_no_progress_timeout_secs(),
         }
     }
+}
+
+/// Provider overload retry configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelRetryConfig {
+    /// Maximum automatic retry attempts for provider overload errors.
+    #[serde(default = "default_max_overload_retries")]
+    pub max_overload_retries: u8,
+    /// Initial overload retry delay in milliseconds.
+    #[serde(default = "default_overload_initial_delay_ms")]
+    pub overload_initial_delay_ms: u64,
+    /// Maximum overload retry delay in milliseconds.
+    #[serde(default = "default_overload_max_delay_ms")]
+    pub overload_max_delay_ms: u64,
+}
+
+impl Default for ModelRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_overload_retries: default_max_overload_retries(),
+            overload_initial_delay_ms: default_overload_initial_delay_ms(),
+            overload_max_delay_ms: default_overload_max_delay_ms(),
+        }
+    }
+}
+
+const fn default_max_overload_retries() -> u8 {
+    5
+}
+
+const fn default_overload_initial_delay_ms() -> u64 {
+    2_000
+}
+
+const fn default_overload_max_delay_ms() -> u64 {
+    30_000
 }
 
 /// Automatic context compaction configuration.
@@ -3014,6 +3052,32 @@ fn write_model_tool_output_toml(output: &mut String, tool_output: &ToolOutputCon
     output.push('\n');
 }
 
+fn write_model_retry_toml(output: &mut String, retry: &ModelRetryConfig) {
+    if retry == &ModelRetryConfig::default() {
+        return;
+    }
+    output.push_str("[model.retry]\n");
+    writeln!(
+        output,
+        "max_overload_retries = {}",
+        retry.max_overload_retries
+    )
+    .expect("writing to string should not fail");
+    writeln!(
+        output,
+        "overload_initial_delay_ms = {}",
+        retry.overload_initial_delay_ms
+    )
+    .expect("writing to string should not fail");
+    writeln!(
+        output,
+        "overload_max_delay_ms = {}",
+        retry.overload_max_delay_ms
+    )
+    .expect("writing to string should not fail");
+    output.push('\n');
+}
+
 fn write_model_streaming_toml(output: &mut String, streaming: &StreamingConfig) {
     if streaming == &StreamingConfig::default() {
         return;
@@ -3110,6 +3174,7 @@ fn write_model_toml(output: &mut String, model: &ModelConfig) {
     }
     write_model_tool_output_toml(output, &model.tool_output);
     write_model_streaming_toml(output, &model.streaming);
+    write_model_retry_toml(output, &model.retry);
     if model.compaction != CompactionConfig::default() {
         write_model_compaction_toml(output, &model.compaction);
     }
@@ -4177,6 +4242,23 @@ auth_pool = "openai"
         let selection = config.resolved_model_selection();
         assert_eq!(selection.auth_pool.as_deref(), Some("openai"));
         assert_eq!(selection.auth_profile, None);
+    }
+
+    #[test]
+    fn model_retry_config_loads_from_toml() {
+        let config: BcodeConfig = toml::from_str(
+            r"
+[model.retry]
+max_overload_retries = 3
+overload_initial_delay_ms = 1000
+overload_max_delay_ms = 10000
+",
+        )
+        .expect("config should parse");
+
+        assert_eq!(config.model.retry.max_overload_retries, 3);
+        assert_eq!(config.model.retry.overload_initial_delay_ms, 1_000);
+        assert_eq!(config.model.retry.overload_max_delay_ms, 10_000);
     }
 
     #[test]

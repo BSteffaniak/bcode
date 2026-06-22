@@ -1058,6 +1058,7 @@ pub enum ProviderErrorCategory {
     InvalidRequest,
     UnsupportedFeature,
     ProviderInternal,
+    Overloaded,
     Cancelled,
 }
 
@@ -1065,7 +1066,7 @@ pub enum ProviderErrorCategory {
 mod tests {
     use super::{
         ModelInfo, ModelList, ModelPricingInfo, ModelPricingSource, ModelPricingUnit,
-        ModelTokenPrice, ModelVisibility, ModelVisibilitySource, TokenUsage,
+        ModelTokenPrice, ModelVisibility, ModelVisibilitySource, ProviderErrorCategory, TokenUsage,
     };
 
     #[test]
@@ -1128,6 +1129,17 @@ mod tests {
         };
 
         assert!(pricing.estimate_cost(&TokenUsage::default()).is_none());
+    }
+
+    #[test]
+    fn overloaded_error_category_serializes_as_snake_case() {
+        let encoded = serde_json::to_string(&ProviderErrorCategory::Overloaded)
+            .expect("category should encode");
+        assert_eq!(encoded, "\"overloaded\"");
+
+        let decoded: ProviderErrorCategory =
+            serde_json::from_str(&encoded).expect("category should decode");
+        assert_eq!(decoded, ProviderErrorCategory::Overloaded);
     }
 
     #[test]
