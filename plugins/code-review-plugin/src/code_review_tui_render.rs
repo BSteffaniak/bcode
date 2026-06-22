@@ -41,7 +41,7 @@ pub fn render(app: &mut ReviewApp, frame: &mut Frame<'_>) {
     render_overlays(app, area, frame);
 }
 
-fn render_chrome(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_chrome(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     let header = Rect::new(area.x, area.y, area.width, 1);
     render_header(app, header, frame);
 
@@ -225,7 +225,7 @@ fn render_header_button(
     x.saturating_add(width)
 }
 
-fn render_header(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_header(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
     }
@@ -320,6 +320,90 @@ fn render_header(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                 .add_modifier(Modifier::BOLD),
         )]),
         Style::new().fg(Color::Black).bg(Color::Cyan),
+    );
+    register_header_thread_regions(app, area, &text);
+}
+
+fn register_header_thread_regions(app: &mut ReviewApp, area: Rect, text: &str) {
+    let drafts = app.draft_comment_count();
+    if drafts > 0 {
+        register_header_text_region(
+            app,
+            area,
+            text,
+            &format!("💬 {drafts} draft"),
+            ReviewMouseAction::ShowDraftThreads,
+            "show draft threads",
+        );
+    }
+    let (open_threads, resolved_threads) = app.thread_status_counts();
+    if open_threads == 0 && resolved_threads == 0 {
+        return;
+    }
+    register_header_text_region(
+        app,
+        area,
+        text,
+        "threads",
+        ReviewMouseAction::ShowAllThreads,
+        "show all threads",
+    );
+    register_header_text_region(
+        app,
+        area,
+        text,
+        &format!("{open_threads} open"),
+        ReviewMouseAction::ShowOpenThreads,
+        "show open threads",
+    );
+    let resolved_label = if app.show_resolved_threads {
+        format!("{resolved_threads} resolved")
+    } else {
+        format!("{resolved_threads} hidden")
+    };
+    register_header_text_region(
+        app,
+        area,
+        text,
+        &resolved_label,
+        ReviewMouseAction::ShowResolvedThreads,
+        "show resolved threads",
+    );
+    register_header_text_region(
+        app,
+        area,
+        text,
+        &format!("filter:{}", app.thread_filter.label()),
+        ReviewMouseAction::CycleThreadFilter,
+        "cycle thread filter",
+    );
+}
+
+fn register_header_text_region(
+    app: &mut ReviewApp,
+    area: Rect,
+    text: &str,
+    needle: &str,
+    action: ReviewMouseAction,
+    label: &'static str,
+) {
+    let Some(byte_index) = text.find(needle) else {
+        return;
+    };
+    let x_offset = u16::try_from(text[..byte_index].chars().count()).unwrap_or(u16::MAX);
+    if x_offset >= area.width {
+        return;
+    }
+    let width = u16::try_from(needle.chars().count()).unwrap_or(u16::MAX);
+    app.register_mouse_region(
+        Rect::new(
+            area.x.saturating_add(x_offset),
+            area.y,
+            width.min(area.width.saturating_sub(x_offset)),
+            1,
+        ),
+        action,
+        label,
     );
 }
 

@@ -1875,6 +1875,11 @@ fn handle_mouse(app: &mut ReviewApp, mouse: MouseEvent) -> bool {
 pub enum ReviewMouseAction {
     SidebarMode(ReviewSidebarMode),
     ThreadFilter(ReviewThreadFilter),
+    ShowDraftThreads,
+    ShowAllThreads,
+    ShowOpenThreads,
+    ShowResolvedThreads,
+    CycleThreadFilter,
     SelectThread(usize),
     SelectFile(usize),
     ToggleFileViewed(usize),
@@ -4667,6 +4672,11 @@ impl ReviewApp {
         match action {
             ReviewMouseAction::SidebarMode(mode) => self.set_sidebar_mode(mode),
             ReviewMouseAction::ThreadFilter(filter) => self.set_thread_filter(filter),
+            ReviewMouseAction::ShowDraftThreads => self.show_draft_threads(),
+            ReviewMouseAction::ShowAllThreads => self.show_all_threads(),
+            ReviewMouseAction::ShowOpenThreads => self.show_open_threads(),
+            ReviewMouseAction::ShowResolvedThreads => self.show_resolved_threads(),
+            ReviewMouseAction::CycleThreadFilter => self.cycle_thread_filter(),
             ReviewMouseAction::SelectThread(index) => {
                 let selected = self.select_thread(index);
                 self.jump_to_selected_thread() || selected
@@ -5639,6 +5649,58 @@ impl ReviewApp {
             .collect()
     }
 
+    /// Show all local draft threads in the sidebar.
+    pub fn show_draft_threads(&mut self) -> bool {
+        if self.draft_comment_count() == 0 {
+            self.status_message = Some("no draft review threads".to_string());
+            return true;
+        }
+        self.sidebar_visible = true;
+        self.sidebar_mode = ReviewSidebarMode::Threads;
+        self.thread_filter = ReviewThreadFilter::All;
+        self.selected_thread = 0;
+        self.thread_scroll = 0;
+        self.status_message = Some("showing draft review threads".to_string());
+        true
+    }
+
+    /// Show all review threads in the sidebar.
+    pub fn show_all_threads(&mut self) -> bool {
+        self.sidebar_visible = true;
+        self.sidebar_mode = ReviewSidebarMode::Threads;
+        self.set_thread_filter(ReviewThreadFilter::All);
+        if self.visible_thread_summaries().is_empty() {
+            self.status_message = Some("no review threads".to_string());
+        }
+        true
+    }
+
+    /// Show open review threads in the sidebar.
+    pub fn show_open_threads(&mut self) -> bool {
+        let (open_threads, _) = self.thread_status_counts();
+        if open_threads == 0 {
+            self.status_message = Some("no open review threads".to_string());
+            return true;
+        }
+        self.sidebar_visible = true;
+        self.sidebar_mode = ReviewSidebarMode::Threads;
+        self.set_thread_filter(ReviewThreadFilter::Open);
+        true
+    }
+
+    /// Show resolved review threads in the sidebar.
+    pub fn show_resolved_threads(&mut self) -> bool {
+        let (_, resolved_threads) = self.thread_status_counts();
+        if resolved_threads == 0 {
+            self.status_message = Some("no resolved review threads".to_string());
+            return true;
+        }
+        self.sidebar_visible = true;
+        self.sidebar_mode = ReviewSidebarMode::Threads;
+        self.show_resolved_threads = true;
+        self.set_thread_filter(ReviewThreadFilter::Resolved);
+        true
+    }
     /// Cycle thread sidebar filter.
     pub fn cycle_thread_filter(&mut self) -> bool {
         self.thread_filter = self.thread_filter.next();
