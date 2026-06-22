@@ -583,6 +583,9 @@ fn configure_dev_codesign_keychain(keychain: &Path, password: &str) -> Result<()
 
 fn dev_codesign_identity_can_sign(identity_hash: &str, keychain: &Path) -> Result<bool> {
     let probe = PathBuf::from("target/xtask/dev-codesign/codesign-probe");
+    if let Some(parent) = probe.parent() {
+        fs::create_dir_all(parent)?;
+    }
     fs::copy("/usr/bin/true", &probe).map_err(|error| {
         format_error(format!(
             "failed to create codesign probe {}: {error}",
