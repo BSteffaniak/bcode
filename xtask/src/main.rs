@@ -385,7 +385,6 @@ fn import_default_dev_identity_into_user_keychain(
             .arg("-T")
             .arg("/usr/bin/security"),
     )?;
-    trust_dev_codesign_certificate(&keychain, &certificate)?;
 
     let Some(identity_hash) = codesign_identity_hash_in_keychain(identity, &keychain)? else {
         return Err(format_error(format!(
@@ -547,8 +546,6 @@ fn create_default_dev_codesign_identity(identity: &str) -> Result<PathBuf> {
             .arg("/usr/bin/security"),
     )?;
 
-    trust_dev_codesign_certificate(&keychain, &certificate)?;
-
     run_sensitive_command(
         Command::new("security")
             .arg("set-key-partition-list")
@@ -635,20 +632,6 @@ fn add_keychain_to_user_search_list(keychain: &Path) -> Result<()> {
         command.arg(listed_keychain);
     }
     run_command(&mut command)
-}
-
-fn trust_dev_codesign_certificate(keychain: &Path, certificate: &Path) -> Result<()> {
-    run_command(
-        Command::new("security")
-            .arg("add-trusted-cert")
-            .arg("-r")
-            .arg("trustRoot")
-            .arg("-p")
-            .arg("codeSign")
-            .arg("-k")
-            .arg(keychain)
-            .arg(certificate),
-    )
 }
 
 fn dev_codesign_keychain_dir() -> Result<PathBuf> {
