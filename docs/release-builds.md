@@ -66,8 +66,11 @@ cargo build --release --package bcode
 cargo xtask dev-sign --target aarch64-apple-darwin
 ```
 
-By default, `dev-sign` uses a local code-signing identity named `Bcode Dev`.
-Override it with either:
+By default, `dev-release` and `dev-sign` use a local code-signing identity
+named `Bcode Dev`. If that identity does not exist yet and no override was
+provided, xtask creates and trusts a self-signed local code-signing certificate
+in your login keychain.
+Override the identity with either:
 
 ```sh
 cargo xtask dev-sign --target aarch64-apple-darwin --identity "My Local Cert"

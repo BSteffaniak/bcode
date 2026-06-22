@@ -53,6 +53,7 @@ struct Options {
     out_dir: PathBuf,
     dev_binary: Option<PathBuf>,
     dev_identity: String,
+    allow_create_dev_identity: bool,
     skip_notarize: bool,
 }
 
@@ -74,8 +75,10 @@ impl Options {
         let mut version = env::var("VERSION").unwrap_or_else(|_| workspace_version());
         let mut out_dir = PathBuf::from(DIST_DIR);
         let mut dev_binary = None;
-        let mut dev_identity = env::var("BCODE_DEV_CODESIGN_IDENTITY")
-            .unwrap_or_else(|_| DEFAULT_DEV_CODESIGN_IDENTITY.to_owned());
+        let env_dev_identity = env::var("BCODE_DEV_CODESIGN_IDENTITY").ok();
+        let mut allow_create_dev_identity = env_dev_identity.is_none();
+        let mut dev_identity =
+            env_dev_identity.unwrap_or_else(|| DEFAULT_DEV_CODESIGN_IDENTITY.to_owned());
         let mut skip_notarize = env_flag("BCODE_SKIP_NOTARIZE");
 
         while let Some(arg) = args.next() {
@@ -86,7 +89,10 @@ impl Options {
                 "--binary" => {
                     dev_binary = Some(PathBuf::from(require_value(&mut args, "--binary")?));
                 }
-                "--identity" => dev_identity = require_value(&mut args, "--identity")?,
+                "--identity" => {
+                    dev_identity = require_value(&mut args, "--identity")?;
+                    allow_create_dev_identity = false;
+                }
                 "--skip-notarize" => skip_notarize = true,
                 "--help" | "-h" => return Ok(Self::help()),
                 unknown => return Err(format_error(format!("unknown option `{unknown}`"))),
@@ -100,6 +106,7 @@ impl Options {
             out_dir,
             dev_binary,
             dev_identity,
+            allow_create_dev_identity,
             skip_notarize,
         })
     }
@@ -112,6 +119,7 @@ impl Options {
             out_dir: PathBuf::from(DIST_DIR),
             dev_binary: None,
             dev_identity: DEFAULT_DEV_CODESIGN_IDENTITY.to_owned(),
+            allow_create_dev_identity: true,
             skip_notarize: false,
         }
     }
@@ -213,6 +221,7 @@ fn dev_release(options: &Options) -> Result<()> {
 
     match target_kind {
         TargetKind::Macos => {
+            ensure_dev_codesign_identity(&options.dev_identity, options.allow_create_dev_identity)?;
             sign_macos_binary(&binary, &options.dev_identity, false)?;
             verify_macos_signature(&binary)?;
             println!(
@@ -243,6 +252,7 @@ fn dev_sign(options: &Options) -> Result<()> {
         .clone()
         .unwrap_or_else(|| built_binary(&options.target));
     ensure_file(&binary)?;
+    ensure_dev_codesign_identity(&options.dev_identity, options.allow_create_dev_identity)?;
     sign_macos_binary(&binary, &options.dev_identity, false)?;
     verify_macos_signature(&binary)?;
     println!(
@@ -271,6 +281,110 @@ impl TargetKind {
             )))
         }
     }
+}
+
+fn ensure_dev_codesign_identity(identity: &str, allow_create: bool) -> Result<()> {
+    if codesign_identity_exists(identity)? {
+        return Ok(());
+    }
+
+    if !allow_create || identity != DEFAULT_DEV_CODESIGN_IDENTITY {
+        return Err(format_error(format!(
+            "code-signing identity `{identity}` was not found; create it or choose another with --identity"
+        )));
+    }
+
+    println!("creating local development code-signing identity `{identity}`");
+    create_default_dev_codesign_identity(identity)?;
+
+    if codesign_identity_exists(identity)? {
+        Ok(())
+    } else {
+        Err(format_error(format!(
+            "created `{identity}`, but codesign still cannot find it"
+        )))
+    }
+}
+
+fn codesign_identity_exists(identity: &str) -> Result<bool> {
+    let output = command_output(
+        Command::new("security")
+            .arg("find-identity")
+            .arg("-v")
+            .arg("-p")
+            .arg("codesigning"),
+    )?;
+    Ok(output.lines().any(|line| line.contains(identity)))
+}
+
+fn create_default_dev_codesign_identity(identity: &str) -> Result<()> {
+    let dir = PathBuf::from("target/xtask/dev-codesign");
+    recreate_dir(&dir)?;
+    let key = dir.join("bcode-dev.key.pem");
+    let certificate = dir.join("bcode-dev.cert.pem");
+    let p12 = dir.join("bcode-dev.p12");
+
+    run_command(
+        Command::new("openssl")
+            .arg("req")
+            .arg("-new")
+            .arg("-newkey")
+            .arg("rsa:2048")
+            .arg("-x509")
+            .arg("-days")
+            .arg("3650")
+            .arg("-nodes")
+            .arg("-subj")
+            .arg(format!("/CN={identity}/"))
+            .arg("-addext")
+            .arg("extendedKeyUsage=codeSigning")
+            .arg("-keyout")
+            .arg(&key)
+            .arg("-out")
+            .arg(&certificate),
+    )?;
+
+    run_command(
+        Command::new("openssl")
+            .arg("pkcs12")
+            .arg("-export")
+            .arg("-out")
+            .arg(&p12)
+            .arg("-inkey")
+            .arg(&key)
+            .arg("-in")
+            .arg(&certificate)
+            .arg("-passout")
+            .arg("pass:"),
+    )?;
+
+    run_command(
+        Command::new("security")
+            .arg("import")
+            .arg(&p12)
+            .arg("-P")
+            .arg("")
+            .arg("-A")
+            .arg("-t")
+            .arg("cert")
+            .arg("-f")
+            .arg("pkcs12")
+            .arg("-k")
+            .arg("login.keychain-db"),
+    )?;
+
+    run_command(
+        Command::new("security")
+            .arg("add-trusted-cert")
+            .arg("-d")
+            .arg("-r")
+            .arg("trustRoot")
+            .arg("-p")
+            .arg("codeSign")
+            .arg("-k")
+            .arg("login.keychain-db")
+            .arg(&certificate),
+    )
 }
 
 fn sign_macos_release_binary(binary: &Path) -> Result<()> {
