@@ -1611,21 +1611,26 @@ fn handle_comment_editor_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         app.save_comment_editor();
         return true;
     }
+    if stroke.key == KeyCode::Char('p') && stroke.modifiers.ctrl {
+        if let Some(editor) = &mut app.comment_editor {
+            editor.preview = !editor.preview;
+            app.status_message = Some(if editor.preview {
+                "showing Markdown preview".to_string()
+            } else {
+                "editing Markdown comment".to_string()
+            });
+        }
+        return true;
+    }
     if stroke.key == KeyCode::Enter && !stroke.modifiers.ctrl && !stroke.modifiers.alt {
         app.save_comment_editor();
         return true;
     }
-    if stroke.key == KeyCode::Tab
-        && stroke.modifiers.is_empty()
-        && let Some(editor) = &mut app.comment_editor
-    {
-        editor.preview = !editor.preview;
-        app.status_message = Some(if editor.preview {
-            "showing Markdown preview".to_string()
-        } else {
-            "editing Markdown comment".to_string()
-        });
-        return true;
+    if matches!(stroke.key, KeyCode::Tab | KeyCode::Right) && stroke.modifiers.is_empty() {
+        return app.select_next_comment_action();
+    }
+    if stroke.key == KeyCode::Left && stroke.modifiers.is_empty() {
+        return app.select_previous_comment_action();
     }
     if let Some(editor) = &mut app.comment_editor {
         if editor.preview {
@@ -2974,6 +2979,44 @@ pub enum ReviewCommentEditorMode {
     },
 }
 
+/// Comment composer submit action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewCommentAction {
+    /// Save the text as a local draft review comment.
+    SaveDraft,
+    /// Ask Bcode using the text as the review question.
+    AskBcode,
+}
+
+impl ReviewCommentAction {
+    /// Return the next selectable composer action.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::SaveDraft => Self::AskBcode,
+            Self::AskBcode => Self::SaveDraft,
+        }
+    }
+
+    /// Return the previous selectable composer action.
+    #[must_use]
+    pub const fn previous(self) -> Self {
+        match self {
+            Self::SaveDraft => Self::AskBcode,
+            Self::AskBcode => Self::SaveDraft,
+        }
+    }
+
+    /// Return a user-facing action label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::SaveDraft => "save draft",
+            Self::AskBcode => "ask Bcode",
+        }
+    }
+}
+
 /// Active draft comment editor.
 #[derive(Debug, Clone)]
 pub struct ReviewCommentEditor {
@@ -2983,6 +3026,8 @@ pub struct ReviewCommentEditor {
     pub buffer: TextEditBuffer,
     /// Whether the editor is showing Markdown preview.
     pub preview: bool,
+    /// Selected submit action.
+    pub action: ReviewCommentAction,
     /// Editor mode.
     pub mode: ReviewCommentEditorMode,
 }
@@ -2990,11 +3035,12 @@ pub struct ReviewCommentEditor {
 impl ReviewCommentEditor {
     /// Create an editor for an anchor.
     #[must_use]
-    pub const fn new(anchor: ReviewCommentAnchor) -> Self {
+    pub const fn new(anchor: ReviewCommentAnchor, action: ReviewCommentAction) -> Self {
         Self {
             anchor,
             buffer: TextEditBuffer::new(),
             preview: false,
+            action,
             mode: ReviewCommentEditorMode::Create,
         }
     }
@@ -3006,6 +3052,7 @@ impl ReviewCommentEditor {
             anchor,
             buffer: TextEditBuffer::from_text(&body),
             preview: false,
+            action: ReviewCommentAction::SaveDraft,
             mode: ReviewCommentEditorMode::Edit {
                 comment_id,
                 previous_body: body,
@@ -6708,9 +6755,11 @@ impl ReviewApp {
     /// Open the draft comment editor for a whole-review thread.
     pub fn open_review_comment_editor(&mut self) -> bool {
         let anchor = self.review_comment_anchor();
-        self.comment_editor = Some(ReviewCommentEditor::new(anchor));
-        self.status_message =
-            Some("editing review-level comment; enter/ctrl+s saves, esc cancels".to_string());
+        self.comment_editor = Some(ReviewCommentEditor::new(
+            anchor,
+            ReviewCommentAction::SaveDraft,
+        ));
+        self.status_message = Some("compose review-level note".to_string());
         true
     }
 
@@ -6740,10 +6789,11 @@ impl ReviewApp {
             return true;
         };
         let path = anchor.path.clone();
-        self.comment_editor = Some(ReviewCommentEditor::new(anchor));
-        self.status_message = Some(format!(
-            "editing file-level comment on {path}; enter/ctrl+s saves, esc cancels"
+        self.comment_editor = Some(ReviewCommentEditor::new(
+            anchor,
+            ReviewCommentAction::SaveDraft,
         ));
+        self.status_message = Some(format!("compose file-level note on {path}"));
         true
     }
 
@@ -6770,15 +6820,55 @@ impl ReviewApp {
 
     /// Open the draft comment editor for the selected diff line.
     pub fn open_comment_editor(&mut self) -> bool {
+        self.open_comment_editor_with_action(ReviewCommentAction::SaveDraft)
+    }
+
+    fn open_comment_editor_with_action(&mut self, action: ReviewCommentAction) -> bool {
         let Some(anchor) = self.selected_comment_anchor() else {
-            self.status_message =
-                Some("select an added, removed, or context line to comment".to_string());
+            self.status_message = Some(match action {
+                ReviewCommentAction::SaveDraft => {
+                    "select an added, removed, or context line to comment".to_string()
+                }
+                ReviewCommentAction::AskBcode => "select a diff line to ask Bcode".to_string(),
+            });
             return true;
         };
-        self.comment_editor = Some(ReviewCommentEditor::new(anchor));
+        self.comment_editor = Some(ReviewCommentEditor::new(anchor, action));
         self.sync_selected_thread_to_anchor();
-        self.status_message =
-            Some("editing draft comment; enter/ctrl+s saves, esc cancels".to_string());
+        self.status_message = Some(format!(
+            "compose review note; selected action: {}",
+            action.label()
+        ));
+        true
+    }
+
+    /// Select the next submit action in the active composer.
+    pub fn select_next_comment_action(&mut self) -> bool {
+        let Some(editor) = &mut self.comment_editor else {
+            return false;
+        };
+        if !matches!(editor.mode, ReviewCommentEditorMode::Create) {
+            self.status_message =
+                Some("editing an existing draft; enter saves changes".to_string());
+            return true;
+        }
+        editor.action = editor.action.next();
+        self.status_message = Some(format!("comment action: {}", editor.action.label()));
+        true
+    }
+
+    /// Select the previous submit action in the active composer.
+    pub fn select_previous_comment_action(&mut self) -> bool {
+        let Some(editor) = &mut self.comment_editor else {
+            return false;
+        };
+        if !matches!(editor.mode, ReviewCommentEditorMode::Create) {
+            self.status_message =
+                Some("editing an existing draft; enter saves changes".to_string());
+            return true;
+        }
+        editor.action = editor.action.previous();
+        self.status_message = Some(format!("comment action: {}", editor.action.label()));
         true
     }
 
@@ -6828,25 +6918,29 @@ impl ReviewApp {
         }
         let anchor = editor.anchor;
         match editor.mode {
-            ReviewCommentEditorMode::Create => {
-                self.draft_comments
-                    .entry(anchor.clone())
-                    .or_default()
-                    .push(ReviewDraftComment {
-                        id: None,
-                        body: text.clone(),
-                        persisted: false,
-                        created_at_ms: None,
-                        updated_at_ms: None,
-                        session_id: None,
-                        thread_kind: ReviewThreadKind::Note,
-                        severity: ReviewThreadSeverity::Info,
-                    });
-                self.pending_draft_save = Some(PendingDraftSave { anchor, body: text });
-                self.sync_selected_thread_to_anchor();
-                let count = self.draft_comment_count();
-                self.status_message = Some(format!("saved draft comment ({count} total)"));
-            }
+            ReviewCommentEditorMode::Create => match editor.action {
+                ReviewCommentAction::SaveDraft => {
+                    self.draft_comments.entry(anchor.clone()).or_default().push(
+                        ReviewDraftComment {
+                            id: None,
+                            body: text.clone(),
+                            persisted: false,
+                            created_at_ms: None,
+                            updated_at_ms: None,
+                            session_id: None,
+                            thread_kind: ReviewThreadKind::Note,
+                            severity: ReviewThreadSeverity::Info,
+                        },
+                    );
+                    self.pending_draft_save = Some(PendingDraftSave { anchor, body: text });
+                    self.sync_selected_thread_to_anchor();
+                    let count = self.draft_comment_count();
+                    self.status_message = Some(format!("saved draft comment ({count} total)"));
+                }
+                ReviewCommentAction::AskBcode => {
+                    self.queue_bcode_question(&anchor, text);
+                }
+            },
             ReviewCommentEditorMode::Edit {
                 comment_id,
                 previous_body,
@@ -7505,35 +7599,39 @@ impl ReviewApp {
 
     /// Ask Bcode about the selected review line/thread.
     pub fn ask_bcode_about_selection(&mut self) -> bool {
-        let Some(anchor) = self.selected_comment_anchor() else {
-            self.status_message = Some("select a diff line to ask Bcode".to_string());
-            return true;
-        };
-        let existing_session = self.session_id_for_anchor(&anchor).map(ToString::to_string);
-        let draft_body = self
-            .draft_comments
-            .get(&anchor)
-            .and_then(|comments| comments.last())
-            .map(|comment| comment.body.clone());
-        self.pending_agent_session = Some(PendingAgentSession { anchor, draft_body });
-        if let Some(pending_anchor) = self
-            .pending_agent_session
-            .as_ref()
-            .map(|pending| pending.anchor.clone())
-        {
-            self.set_agent_status(
-                &pending_anchor,
-                existing_session.as_ref().map_or(
-                    "queued Bcode session creation",
-                    |_| "queued Bcode follow-up",
-                ),
-            );
-        }
+        self.open_comment_editor_with_action(ReviewCommentAction::AskBcode)
+    }
+
+    fn queue_bcode_question(&mut self, anchor: &ReviewCommentAnchor, question: String) {
+        let existing_session = self.session_id_for_anchor(anchor).map(ToString::to_string);
+        self.draft_comments
+            .entry(anchor.clone())
+            .or_default()
+            .push(ReviewDraftComment {
+                id: None,
+                body: question.clone(),
+                persisted: false,
+                created_at_ms: None,
+                updated_at_ms: None,
+                session_id: existing_session.clone(),
+                thread_kind: ReviewThreadKind::Question,
+                severity: ReviewThreadSeverity::Info,
+            });
+        self.pending_agent_session = Some(PendingAgentSession {
+            anchor: anchor.clone(),
+            draft_body: Some(question),
+        });
+        self.set_agent_status(
+            anchor,
+            existing_session
+                .as_ref()
+                .map_or("Bcode: looking into this…", |_| "Bcode: sending follow-up…"),
+        );
+        self.sync_selected_thread_to_anchor();
         self.status_message = Some(existing_session.map_or_else(
-            || "creating Bcode session for review thread".to_string(),
-            |session_id| format!("sending review follow-up to linked session {session_id}"),
+            || "asked Bcode; creating linked review session".to_string(),
+            |session_id| format!("asked Bcode in linked session {session_id}"),
         ));
-        true
     }
 
     /// Expand all inline review threads.

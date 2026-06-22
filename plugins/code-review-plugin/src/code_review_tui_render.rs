@@ -2259,14 +2259,15 @@ fn render_comment_editor(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         .saturating_add(area.height.saturating_sub(height) / 2);
     let popup = Rect::new(x, y, width, height);
     frame.fill(popup, " ", Style::new().fg(Color::White).bg(Color::Black));
+    let title = if editor.preview {
+        " Review comment preview "
+    } else {
+        " Review comment "
+    };
     frame.write_line(
         Rect::new(popup.x, popup.y, popup.width, 1),
         &Line::from_spans(vec![Span::styled(
-            if editor.preview {
-                " Draft comment preview "
-            } else {
-                " Draft comment "
-            },
+            title,
             Style::new()
                 .fg(Color::Black)
                 .bg(Color::Yellow)
@@ -2310,11 +2311,12 @@ fn render_comment_editor(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                 1,
             ),
             &Line::from_spans(vec![Span::styled(
-                "write a draft comment...",
+                "write a review comment or question...",
                 Style::new().fg(Color::BrightBlack).bg(Color::Black),
             )]),
         );
     }
+    let footer = comment_editor_footer(editor);
     frame.write_line(
         Rect::new(
             popup.x.saturating_add(1),
@@ -2323,14 +2325,37 @@ fn render_comment_editor(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             1,
         ),
         &Line::from_spans(vec![Span::styled(
-            if editor.preview {
-                " tab edit  enter/ctrl+s save  esc cancel "
-            } else {
-                " tab preview  enter/ctrl+s save  esc cancel "
-            },
+            truncate_to_display_width(&footer, usize::from(popup.width.saturating_sub(2))),
             Style::new().fg(Color::Black).bg(Color::Yellow),
         )]),
     );
+}
+
+fn comment_editor_footer(editor: &crate::code_review_tui::ReviewCommentEditor) -> String {
+    if matches!(
+        editor.mode,
+        crate::code_review_tui::ReviewCommentEditorMode::Create
+    ) {
+        let save = if editor.action == crate::code_review_tui::ReviewCommentAction::SaveDraft {
+            "[save draft]"
+        } else {
+            " save draft "
+        };
+        let ask = if editor.action == crate::code_review_tui::ReviewCommentAction::AskBcode {
+            "[ask Bcode]"
+        } else {
+            " ask Bcode "
+        };
+        if editor.preview {
+            format!(" ←/→ action  ctrl+p edit  enter {save}/{ask}  esc cancel ")
+        } else {
+            format!(" tab/←/→ action  ctrl+p preview  enter {save}/{ask}  esc cancel ")
+        }
+    } else if editor.preview {
+        " ctrl+p edit  enter/ctrl+s save edit  esc cancel ".to_string()
+    } else {
+        " ctrl+p preview  enter/ctrl+s save edit  esc cancel ".to_string()
+    }
 }
 
 fn render_comment_editor_body(
