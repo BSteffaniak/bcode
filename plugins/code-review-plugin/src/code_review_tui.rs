@@ -6199,15 +6199,18 @@ impl ReviewApp {
 
     /// Store a lazily loaded repository file.
     pub fn store_loaded_file(&mut self, file: CachedReviewFile) {
+        let viewport_target = self.top_visible_target();
         self.pending_context_file_load = self
             .pending_context_file_load
             .take()
             .filter(|path| path != &file.path);
         self.file_cache.insert(file);
+        self.restore_top_visible_target(viewport_target.as_ref());
     }
 
     /// Store a repository file load failure.
     pub fn store_file_load_error(&mut self, path: String, error: String) {
+        let viewport_target = self.top_visible_target();
         self.pending_context_file_load = self
             .pending_context_file_load
             .take()
@@ -6221,6 +6224,7 @@ impl ReviewApp {
             is_binary: false,
             unavailable_reason: Some(error),
         });
+        self.restore_top_visible_target(viewport_target.as_ref());
     }
 
     /// Sync selected tree row to selected file.
@@ -6436,31 +6440,39 @@ impl ReviewApp {
             return false;
         }
         self.diff_scroll = next;
-        self.keep_selection_inside_visible_diff();
         true
     }
 
     /// Scroll diff up.
-    pub fn scroll_up(&mut self, rows: usize) -> bool {
+    pub const fn scroll_up(&mut self, rows: usize) -> bool {
         let next = self.diff_scroll.saturating_sub(rows);
         if next == self.diff_scroll {
             return false;
         }
         self.diff_scroll = next;
-        self.keep_selection_inside_visible_diff();
         true
     }
 
-    fn keep_selection_inside_visible_diff(&mut self) {
-        let height = self
-            .last_diff_area
-            .map_or(1, |area| usize::from(area.height).max(1));
-        let selected_visual_row = self.selected_diff_visual_row();
-        if selected_visual_row < self.diff_scroll {
-            let _ = self.select_view_visual_row(self.diff_scroll);
-        } else if selected_visual_row >= self.diff_scroll.saturating_add(height) {
-            let bottom = self.diff_scroll.saturating_add(height.saturating_sub(1));
-            let _ = self.select_view_visual_row(bottom);
+    fn top_visible_target(&self) -> Option<ReviewViewTarget> {
+        self.current_review_view_document()
+            .and_then(|document| document.target_for_visual_row(self.diff_scroll).cloned())
+    }
+
+    fn restore_top_visible_target(&mut self, target: Option<&ReviewViewTarget>) {
+        let Some(target) = target else {
+            self.diff_scroll = self.diff_scroll.min(self.max_diff_scroll());
+            return;
+        };
+        if let Some(visual_row) = self.current_review_view_document().and_then(|document| {
+            document
+                .rows
+                .iter()
+                .find(|row| &row.target == target)
+                .map(|row| row.visual_row)
+        }) {
+            self.diff_scroll = visual_row.min(self.max_diff_scroll());
+        } else {
+            self.diff_scroll = self.diff_scroll.min(self.max_diff_scroll());
         }
     }
 
@@ -6471,7 +6483,7 @@ impl ReviewApp {
         }
         self.selected_view_target = None;
         self.diff_scroll = 0;
-        self.ensure_selected_diff_line_visible();
+        self.selected_diff_line = 0;
         true
     }
 
@@ -6483,8 +6495,10 @@ impl ReviewApp {
         }
         self.selected_view_target = None;
         self.diff_scroll = max;
+        self.selected_view_target = self
+            .current_review_view_document()
+            .and_then(|document| document.target_for_visual_row(max).cloned());
         self.selected_diff_line = self.source_rendered_diff_len().saturating_sub(1);
-        self.ensure_selected_diff_line_visible();
         true
     }
 
@@ -6552,7 +6566,9 @@ impl ReviewApp {
             ReviewViewTarget::ThreadAction { .. } => {
                 self.activate_selected_inline_action() || selected
             }
-            ReviewViewTarget::Comment { .. } => selected,
+            ReviewViewTarget::ExpandedContextLine { .. } | ReviewViewTarget::Comment { .. } => {
+                selected
+            }
         }
     }
 
@@ -7198,7 +7214,8 @@ impl ReviewApp {
             }
             ReviewViewTarget::HunkHeader { .. }
             | ReviewViewTarget::SourceLine { .. }
-            | ReviewViewTarget::OmittedContext { .. } => None,
+            | ReviewViewTarget::OmittedContext { .. }
+            | ReviewViewTarget::ExpandedContextLine { .. } => None,
         }
     }
 
@@ -7914,7 +7931,8 @@ impl ReviewApp {
             | ReviewViewTarget::ThreadAction { thread_key, .. } => Some(thread_key.clone()),
             ReviewViewTarget::HunkHeader { .. }
             | ReviewViewTarget::SourceLine { .. }
-            | ReviewViewTarget::OmittedContext { .. } => self
+            | ReviewViewTarget::OmittedContext { .. }
+            | ReviewViewTarget::ExpandedContextLine { .. } => self
                 .selected_comment_anchor()
                 .map(|anchor| Self::thread_key_for_anchor(&anchor)),
         }
@@ -8205,7 +8223,8 @@ impl ReviewApp {
                 .map(|anchor| (anchor, Some(*comment_index))),
             ReviewViewTarget::HunkHeader { .. }
             | ReviewViewTarget::SourceLine { .. }
-            | ReviewViewTarget::OmittedContext { .. } => None,
+            | ReviewViewTarget::OmittedContext { .. }
+            | ReviewViewTarget::ExpandedContextLine { .. } => None,
         }
     }
 

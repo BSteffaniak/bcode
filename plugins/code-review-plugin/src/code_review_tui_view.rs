@@ -57,7 +57,7 @@ impl ReviewViewDocument {
                         }
                         Some(file) => {
                             push_expanded_context_rows(
-                                file_index, file, start_line, end_line, &mut rows,
+                                file_index, &key, file, start_line, end_line, &mut rows,
                             );
                         }
                         None => rows.push(context_status_row(
@@ -486,6 +486,8 @@ pub enum ReviewViewTarget {
     },
     /// Omitted diff context expansion row.
     OmittedContext { key: String },
+    /// Expanded hidden context source row.
+    ExpandedContextLine { key: String, line_number: u32 },
     /// Inline review thread row.
     Thread { thread_key: String },
     /// Inline review comment row.
@@ -609,7 +611,8 @@ fn context_status_row(
 }
 
 fn push_expanded_context_rows(
-    file_index: usize,
+    _file_index: usize,
+    context_key: &str,
     cached_file: &CachedReviewFile,
     start_line: u32,
     end_line: u32,
@@ -634,11 +637,9 @@ fn push_expanded_context_rows(
         rows.push(ReviewViewRow {
             visual_row: 0,
             source_row: None,
-            target: ReviewViewTarget::SourceLine {
-                file_index,
-                source_row: rows.len(),
-                old_line: Some(line_number),
-                new_line: Some(line_number),
+            target: ReviewViewTarget::ExpandedContextLine {
+                key: context_key.to_string(),
+                line_number,
             },
             block: ReviewViewBlock::DisplayRow(display_row),
         });
