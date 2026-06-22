@@ -546,7 +546,10 @@ fn ensure_selected_repository_file_load(
     app: &mut ReviewApp,
     file_store: &mut AsyncValueStore<String, CachedReviewFile>,
 ) -> bool {
-    let Some(path) = app.take_pending_file_load() else {
+    let path = app
+        .take_pending_file_load()
+        .or_else(|| app.take_pending_context_file_load());
+    let Some(path) = path else {
         return false;
     };
     let client = client.clone();
@@ -570,7 +573,11 @@ fn sync_repository_file_store(
     match file_store.get(&path) {
         AsyncValue::Ready(file) => app.store_loaded_file(file.clone()),
         AsyncValue::Error(error) => app.store_file_load_error(path, error),
-        AsyncValue::Missing | AsyncValue::Loading => {}
+        AsyncValue::Missing | AsyncValue::Loading => {
+            if app.pending_context_file_load.as_deref() == Some(&path) {
+                app.status_message = Some("loading hidden diff context".to_string());
+            }
+        }
     }
 }
 
@@ -3502,6 +3509,8 @@ pub struct ReviewApp {
     file_viewports: BTreeMap<String, ReviewViewportState>,
     /// Repository file path awaiting lazy load.
     pub pending_file_load: Option<String>,
+    /// Review file path queued for hidden diff context loading.
+    pub pending_context_file_load: Option<String>,
     /// Selected publisher index.
     pub selected_publisher: usize,
     /// Active publish UI state.
@@ -3586,6 +3595,7 @@ impl ReviewApp {
             file_cache: ReviewFileCache::default(),
             file_viewports: BTreeMap::new(),
             pending_file_load: None,
+            pending_context_file_load: None,
             selected_publisher: 0,
             publish_state: None,
             publish_readiness_ack: false,
@@ -6182,13 +6192,26 @@ impl ReviewApp {
         self.pending_file_load.take()
     }
 
+    /// Take pending hidden-context file load request.
+    pub const fn take_pending_context_file_load(&mut self) -> Option<String> {
+        self.pending_context_file_load.take()
+    }
+
     /// Store a lazily loaded repository file.
     pub fn store_loaded_file(&mut self, file: CachedReviewFile) {
+        self.pending_context_file_load = self
+            .pending_context_file_load
+            .take()
+            .filter(|path| path != &file.path);
         self.file_cache.insert(file);
     }
 
     /// Store a repository file load failure.
     pub fn store_file_load_error(&mut self, path: String, error: String) {
+        self.pending_context_file_load = self
+            .pending_context_file_load
+            .take()
+            .filter(|pending_path| pending_path != &path);
         self.file_cache.insert(CachedReviewFile {
             path,
             content: String::new(),
@@ -7758,6 +7781,11 @@ impl ReviewApp {
         if !self.expanded_diff_contexts.insert(key.to_string()) {
             return false;
         }
+        if let Some(path) = self.selected_file_path()
+            && self.file_cache.get(&path).is_none()
+        {
+            self.pending_context_file_load = Some(path);
+        }
         self.selected_view_target = None;
         self.status_message = Some("expanded hidden diff context".to_string());
         true
@@ -8477,15 +8505,33 @@ impl ReviewApp {
             )
         } else {
             let file = self.selected_file_data()?;
+            let path = file.display_path();
+            let cache_state = self.file_cache.get(path).map_or_else(
+                || {
+                    if self.pending_context_file_load.as_deref() == Some(path) {
+                        "loading".to_string()
+                    } else {
+                        "missing".to_string()
+                    }
+                },
+                |cached| {
+                    format!(
+                        "loaded:{}:{}",
+                        cached.line_spans.len(),
+                        cached.unavailable_reason.as_deref().unwrap_or_default()
+                    )
+                },
+            );
             format!(
-                "diff:{}:{}:{}:{}",
-                file.display_path(),
+                "diff:{}:{}:{}:{}:{}",
+                path,
                 file.additions,
                 file.deletions,
                 file.hunks
                     .iter()
                     .map(|hunk| hunk.lines.len().saturating_add(1))
-                    .sum::<usize>()
+                    .sum::<usize>(),
+                cache_state
             )
         };
         let mut draft_signature = String::new();
@@ -9401,7 +9447,7 @@ mod tests {
         assert!(app.select_next_hunk());
 
         assert_eq!(app.selected_diff_line, 3);
-        assert_eq!(app.diff_scroll, 2);
+        assert_eq!(app.diff_scroll, 3);
         assert_eq!(app.hunk_position(), (2, 2));
     }
 

@@ -45,13 +45,29 @@ impl ReviewViewDocument {
                 let end_line = hunk.new_start.saturating_sub(1);
                 let key = diff_context_key(file_index, hunk_index, start_line, end_line);
                 if expanded_contexts.contains(&key) {
-                    push_expanded_context_rows(
-                        file_index,
-                        cached_file,
-                        start_line,
-                        end_line,
-                        &mut rows,
-                    );
+                    match cached_file {
+                        Some(file) if file.unavailable_reason.is_some() => {
+                            rows.push(context_status_row(
+                                key,
+                                hidden_line_count(start_line, end_line),
+                                start_line,
+                                end_line,
+                                file.unavailable_reason.clone(),
+                            ));
+                        }
+                        Some(file) => {
+                            push_expanded_context_rows(
+                                file_index, file, start_line, end_line, &mut rows,
+                            );
+                        }
+                        None => rows.push(context_status_row(
+                            key,
+                            hidden_line_count(start_line, end_line),
+                            start_line,
+                            end_line,
+                            None,
+                        )),
+                    }
                 } else {
                     rows.push(ReviewViewRow {
                         visual_row: 0,
@@ -59,10 +75,7 @@ impl ReviewViewDocument {
                         target: ReviewViewTarget::OmittedContext { key: key.clone() },
                         block: ReviewViewBlock::OmittedContext {
                             key,
-                            hidden_line_count: usize::try_from(
-                                end_line.saturating_sub(start_line).saturating_add(1),
-                            )
-                            .unwrap_or(usize::MAX),
+                            hidden_line_count: hidden_line_count(start_line, end_line),
                             start_line,
                             end_line,
                         },
@@ -293,6 +306,30 @@ pub enum ReviewViewBlock {
         start_line: u32,
         /// One-based final hidden new-file line.
         end_line: u32,
+    },
+    /// Hidden context is expanded but waiting for full-file content.
+    LoadingContext {
+        /// Stable expansion key.
+        key: String,
+        /// Number of hidden lines.
+        hidden_line_count: usize,
+        /// One-based first hidden new-file line.
+        start_line: u32,
+        /// One-based final hidden new-file line.
+        end_line: u32,
+    },
+    /// Hidden context expansion failed because full-file content is unavailable.
+    UnavailableContext {
+        /// Stable expansion key.
+        key: String,
+        /// Number of hidden lines.
+        hidden_line_count: usize,
+        /// One-based first hidden new-file line.
+        start_line: u32,
+        /// One-based final hidden new-file line.
+        end_line: u32,
+        /// Failure reason.
+        reason: String,
     },
     /// Existing source/hunk display row.
     DisplayRow(ReviewDisplayRow),
@@ -535,16 +572,49 @@ fn hunk_start_rows(file: &ReviewFile) -> Vec<usize> {
     rows
 }
 
+fn hidden_line_count(start_line: u32, end_line: u32) -> usize {
+    usize::try_from(end_line.saturating_sub(start_line).saturating_add(1)).unwrap_or(usize::MAX)
+}
+
+fn context_status_row(
+    key: String,
+    hidden_line_count: usize,
+    start_line: u32,
+    end_line: u32,
+    reason: Option<String>,
+) -> ReviewViewRow {
+    let target = ReviewViewTarget::OmittedContext { key: key.clone() };
+    let block = if let Some(reason) = reason {
+        ReviewViewBlock::UnavailableContext {
+            key,
+            hidden_line_count,
+            start_line,
+            end_line,
+            reason,
+        }
+    } else {
+        ReviewViewBlock::LoadingContext {
+            key,
+            hidden_line_count,
+            start_line,
+            end_line,
+        }
+    };
+    ReviewViewRow {
+        visual_row: 0,
+        source_row: None,
+        target,
+        block,
+    }
+}
+
 fn push_expanded_context_rows(
     file_index: usize,
-    cached_file: Option<&CachedReviewFile>,
+    cached_file: &CachedReviewFile,
     start_line: u32,
     end_line: u32,
     rows: &mut Vec<ReviewViewRow>,
 ) {
-    let Some(cached_file) = cached_file else {
-        return;
-    };
     for line_number in start_line..=end_line {
         let Some(source_index) = usize::try_from(line_number.saturating_sub(1)).ok() else {
             continue;

@@ -1467,17 +1467,65 @@ fn render_omitted_context_row(
     hidden_line_count: usize,
     start_line: u32,
     end_line: u32,
+    reason: Option<&str>,
+) -> RenderedRow {
+    let (style, text) = reason.map_or_else(
+        || {
+            (
+                Style::new()
+                    .fg(Color::BrightBlack)
+                    .bg(Color::Rgb(18, 18, 18)),
+                format!(" ⋯ loading {hidden_line_count} hidden lines ({start_line}-{end_line})… "),
+            )
+        },
+        |reason| {
+            (
+                Style::new().fg(Color::Red).bg(Color::Rgb(18, 18, 18)),
+                format!(
+                    " ⋯ {hidden_line_count} hidden lines unavailable ({start_line}-{end_line}): {reason}  [retry] "
+                ),
+            )
+        },
+    );
+    RenderedRow {
+        line: Line::from_spans(vec![Span::styled(text, style)]),
+        style,
+    }
+}
+
+fn render_inline_thread_header(
+    anchor: &crate::code_review_tui_view::ReviewThreadAnchor,
+    comment_count: usize,
+    collapsed: bool,
+    resolved: bool,
 ) -> RenderedRow {
     let style = Style::new()
-        .fg(Color::BrightBlack)
-        .bg(Color::Rgb(18, 18, 18));
+        .fg(Color::Yellow)
+        .bg(Color::Rgb(30, 28, 12))
+        .add_modifier(Modifier::BOLD);
+    let status = if resolved { "resolved" } else { "open" };
+    let status_style = if resolved {
+        Style::new().fg(Color::Green).bg(Color::Rgb(30, 28, 12))
+    } else {
+        Style::new().fg(Color::Yellow).bg(Color::Rgb(30, 28, 12))
+    };
     RenderedRow {
-        line: Line::from_spans(vec![Span::styled(
-            format!(
-                " ⋯ {hidden_line_count} unchanged lines hidden ({start_line}-{end_line})  [expand] "
+        line: Line::from_spans(vec![
+            Span::styled(
+                format!(
+                    "   {}─ draft thread on rows {}-{} ({comment_count} comment{}) ",
+                    if collapsed { "▸" } else { "▾" },
+                    anchor.source_row,
+                    anchor.end_source_row(),
+                    if comment_count == 1 { "" } else { "s" }
+                ),
+                style,
             ),
-            style,
-        )]),
+            Span::styled(
+                format!("[{status}]"),
+                status_style.add_modifier(Modifier::BOLD),
+            ),
+        ]),
         style,
     }
 }
@@ -1496,7 +1544,20 @@ fn render_view_row(
             start_line,
             end_line,
             ..
-        } => render_omitted_context_row(*hidden_line_count, *start_line, *end_line),
+        }
+        | ReviewViewBlock::LoadingContext {
+            hidden_line_count,
+            start_line,
+            end_line,
+            ..
+        } => render_omitted_context_row(*hidden_line_count, *start_line, *end_line, None),
+        ReviewViewBlock::UnavailableContext {
+            hidden_line_count,
+            start_line,
+            end_line,
+            reason,
+            ..
+        } => render_omitted_context_row(*hidden_line_count, *start_line, *end_line, Some(reason)),
         ReviewViewBlock::DisplayRow(display_row) => {
             render_source_view_row(app, view_row, display_row)
         }
@@ -1518,37 +1579,7 @@ fn render_view_row(
             collapsed,
             resolved,
             ..
-        } => {
-            let style = Style::new()
-                .fg(Color::Yellow)
-                .bg(Color::Rgb(30, 28, 12))
-                .add_modifier(Modifier::BOLD);
-            let status = if *resolved { "resolved" } else { "open" };
-            let status_style = if *resolved {
-                Style::new().fg(Color::Green).bg(Color::Rgb(30, 28, 12))
-            } else {
-                Style::new().fg(Color::Yellow).bg(Color::Rgb(30, 28, 12))
-            };
-            RenderedRow {
-                line: Line::from_spans(vec![
-                    Span::styled(
-                        format!(
-                            "   {}─ draft thread on rows {}-{} ({comment_count} comment{}) ",
-                            if *collapsed { "▸" } else { "▾" },
-                            anchor.source_row,
-                            anchor.end_source_row(),
-                            if *comment_count == 1 { "" } else { "s" }
-                        ),
-                        style,
-                    ),
-                    Span::styled(
-                        format!("[{status}]"),
-                        status_style.add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-                style,
-            }
-        }
+        } => render_inline_thread_header(anchor, *comment_count, *collapsed, *resolved),
         ReviewViewBlock::InlineComment {
             comment,
             body_line_index,
