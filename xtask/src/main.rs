@@ -295,19 +295,49 @@ fn ensure_dev_codesign_identity(
     identity: &str,
     allow_create: bool,
 ) -> Result<(String, Option<PathBuf>)> {
+    if allow_create && identity == DEFAULT_DEV_CODESIGN_IDENTITY {
+        return ensure_default_dev_codesign_identity(identity);
+    }
+
     if let Some(identity_hash) = codesign_identity_hash(identity)? {
         return Ok((identity_hash, None));
     }
 
-    if !allow_create || identity != DEFAULT_DEV_CODESIGN_IDENTITY {
-        return Err(format_error(format!(
-            "code-signing identity `{identity}` was not found; create it or choose another with --identity"
-        )));
+    Err(format_error(format!(
+        "code-signing identity `{identity}` was not found; create it or choose another with --identity"
+    )))
+}
+
+fn ensure_default_dev_codesign_identity(identity: &str) -> Result<(String, Option<PathBuf>)> {
+    if let Some(signing_identity) = existing_default_dev_codesign_identity(identity)? {
+        return Ok(signing_identity);
     }
 
     println!("creating local development code-signing identity `{identity}`");
     create_and_verify_default_dev_codesign_identity(identity)?
         .map_or_else(|| recreate_unusable_dev_codesign_identity(identity), Ok)
+}
+
+fn existing_default_dev_codesign_identity(
+    identity: &str,
+) -> Result<Option<(String, Option<PathBuf>)>> {
+    let keychain = dev_codesign_keychain_dir()?.join(DEV_CODESIGN_KEYCHAIN_NAME);
+    let password_path = dev_codesign_keychain_dir()?.join(DEV_CODESIGN_PASSWORD_FILE);
+    if !keychain.exists() || !password_path.exists() {
+        return Ok(None);
+    }
+
+    let password = fs::read_to_string(password_path)?.trim().to_owned();
+    configure_dev_codesign_keychain(&keychain, &password)?;
+    let Some(identity_hash) = codesign_identity_hash_in_keychain(identity, &keychain)? else {
+        return Ok(None);
+    };
+
+    if dev_codesign_identity_can_sign(&identity_hash, &keychain)? {
+        Ok(Some((identity_hash, Some(keychain))))
+    } else {
+        Ok(None)
+    }
 }
 
 fn recreate_unusable_dev_codesign_identity(identity: &str) -> Result<(String, Option<PathBuf>)> {
@@ -316,11 +346,77 @@ fn recreate_unusable_dev_codesign_identity(identity: &str) -> Result<(String, Op
     if keychain_dir.exists() {
         fs::remove_dir_all(&keychain_dir)?;
     }
-    create_and_verify_default_dev_codesign_identity(identity)?.ok_or_else(|| {
-        format_error(format!(
-            "created `{identity}`, but codesign cannot use it to sign"
+    create_and_verify_default_dev_codesign_identity(identity)?.map_or_else(
+        || import_default_dev_identity_into_user_keychain(identity),
+        Ok,
+    )
+}
+
+fn import_default_dev_identity_into_user_keychain(
+    identity: &str,
+) -> Result<(String, Option<PathBuf>)> {
+    println!("importing local development code-signing identity `{identity}` into user keychain");
+    let keychain = default_user_keychain()?;
+    if let Some(identity_hash) = codesign_identity_hash_in_keychain(identity, &keychain)?
+        && dev_codesign_identity_can_sign(&identity_hash, &keychain)?
+    {
+        return Ok((identity_hash, Some(keychain)));
+    }
+
+    let certificate = PathBuf::from("target/xtask/dev-codesign/bcode-dev.cert.pem");
+    let p12 = PathBuf::from("target/xtask/dev-codesign/bcode-dev.p12");
+
+    ensure_file(&certificate)?;
+    ensure_file(&p12)?;
+
+    run_command(
+        Command::new("security")
+            .arg("import")
+            .arg(&p12)
+            .arg("-P")
+            .arg(DEV_CODESIGN_P12_PASSWORD)
+            .arg("-A")
+            .arg("-f")
+            .arg("pkcs12")
+            .arg("-k")
+            .arg(&keychain)
+            .arg("-T")
+            .arg("/usr/bin/codesign")
+            .arg("-T")
+            .arg("/usr/bin/security"),
+    )?;
+    trust_dev_codesign_certificate(&keychain, &certificate)?;
+
+    let Some(identity_hash) = codesign_identity_hash_in_keychain(identity, &keychain)? else {
+        return Err(format_error(format!(
+            "imported `{identity}`, but codesign still cannot find it in the user keychain"
+        )));
+    };
+
+    if dev_codesign_identity_can_sign(&identity_hash, &keychain)? {
+        Ok((identity_hash, Some(keychain)))
+    } else {
+        Err(format_error(format!(
+            "imported `{identity}`, but codesign cannot use it to sign"
+        )))
+    }
+}
+
+fn default_user_keychain() -> Result<PathBuf> {
+    let output = command_output(
+        Command::new("security")
+            .arg("default-keychain")
+            .arg("-d")
+            .arg("user"),
+    )?;
+    let keychain = output.trim().trim_matches('"');
+    if keychain.is_empty() {
+        Err(format_error(
+            "security default-keychain returned an empty path",
         ))
-    })
+    } else {
+        Ok(PathBuf::from(keychain))
+    }
 }
 
 fn create_and_verify_default_dev_codesign_identity(
@@ -389,23 +485,7 @@ fn create_default_dev_codesign_identity(identity: &str) -> Result<PathBuf> {
         )?;
     }
 
-    run_sensitive_command(
-        Command::new("security")
-            .arg("unlock-keychain")
-            .arg("-p")
-            .arg(&password)
-            .arg(&keychain),
-        "security unlock-keychain <bcode dev keychain>",
-    )?;
-
-    run_command(
-        Command::new("security")
-            .arg("set-keychain-settings")
-            .arg("-lut")
-            .arg("21600")
-            .arg(&keychain),
-    )?;
-    add_keychain_to_user_search_list(&keychain)?;
+    configure_dev_codesign_keychain(&keychain, &password)?;
 
     let dir = PathBuf::from("target/xtask/dev-codesign");
     recreate_dir(&dir)?;
@@ -425,6 +505,10 @@ fn create_default_dev_codesign_identity(identity: &str) -> Result<PathBuf> {
             .arg("-nodes")
             .arg("-subj")
             .arg(format!("/CN={identity}/"))
+            .arg("-addext")
+            .arg("basicConstraints=critical,CA:FALSE")
+            .arg("-addext")
+            .arg("keyUsage=critical,digitalSignature")
             .arg("-addext")
             .arg("extendedKeyUsage=codeSigning")
             .arg("-keyout")
@@ -478,6 +562,26 @@ fn create_default_dev_codesign_identity(identity: &str) -> Result<PathBuf> {
     )?;
 
     Ok(keychain)
+}
+
+fn configure_dev_codesign_keychain(keychain: &Path, password: &str) -> Result<()> {
+    run_sensitive_command(
+        Command::new("security")
+            .arg("unlock-keychain")
+            .arg("-p")
+            .arg(password)
+            .arg(keychain),
+        "security unlock-keychain <bcode dev keychain>",
+    )?;
+
+    run_command(
+        Command::new("security")
+            .arg("set-keychain-settings")
+            .arg("-lut")
+            .arg("21600")
+            .arg(keychain),
+    )?;
+    add_keychain_to_user_search_list(keychain)
 }
 
 fn dev_codesign_identity_can_sign(identity_hash: &str, keychain: &Path) -> Result<bool> {
