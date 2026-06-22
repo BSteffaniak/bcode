@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as FmtWrite;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use crate::async_values::{AsyncValue, AsyncValueStore};
 use bcode_client::BcodeClient;
@@ -3369,6 +3370,25 @@ struct ReviewViewportState {
     selected_diff_line: usize,
 }
 
+#[derive(Debug, Clone)]
+struct ReviewViewDocumentCache {
+    key: ReviewViewDocumentCacheKey,
+    document: ReviewViewDocument,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewViewDocumentCacheKey {
+    selected_file: usize,
+    selected_path: Option<String>,
+    surface_kind: Option<ReviewSurfaceKind>,
+    repository_review: bool,
+    file_signature: String,
+    draft_signature: String,
+    collapsed_threads: Vec<String>,
+    resolved_threads: Vec<String>,
+    show_resolved_threads: bool,
+}
+
 /// Stateful review app model.
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
@@ -3474,6 +3494,7 @@ pub struct ReviewApp {
     last_file_area: Option<Rect>,
     last_diff_area: Option<Rect>,
     mouse_regions: Vec<ReviewMouseRegion>,
+    view_document_cache: Arc<RwLock<Option<ReviewViewDocumentCache>>>,
 }
 
 impl ReviewApp {
@@ -3536,6 +3557,7 @@ impl ReviewApp {
             last_file_area: None,
             last_diff_area: None,
             mouse_regions: Vec::new(),
+            view_document_cache: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -8188,6 +8210,14 @@ impl ReviewApp {
     /// Build the semantic view document for the current main review pane.
     #[must_use]
     pub fn current_review_view_document(&self) -> Option<ReviewViewDocument> {
+        let cache_key = self.review_view_document_cache_key()?;
+        if let Ok(cache) = self.view_document_cache.read()
+            && let Some(cached) = cache.as_ref()
+            && cached.key == cache_key
+        {
+            return Some(cached.document.clone());
+        }
+
         let mut document = if self.review.is_repository_review() {
             let path = self.selected_file_path()?;
             let cached = self.file_cache.get(&path)?;
@@ -8226,7 +8256,78 @@ impl ReviewApp {
             &self.resolved_review_threads,
             self.show_resolved_threads,
         );
+        if let Ok(mut cache) = self.view_document_cache.write() {
+            *cache = Some(ReviewViewDocumentCache {
+                key: cache_key,
+                document: document.clone(),
+            });
+        }
         Some(document)
+    }
+
+    fn review_view_document_cache_key(&self) -> Option<ReviewViewDocumentCacheKey> {
+        let selected_path = self.selected_file_path();
+        let surface_kind = self.selected_surface().map(|surface| surface.kind);
+        let file_signature = if self.review.is_repository_review() {
+            let path = selected_path.as_ref()?;
+            let cached = self.file_cache.get(path)?;
+            format!(
+                "repo:{}:{}",
+                cached.line_spans.len(),
+                cached.unavailable_reason.as_deref().unwrap_or_default()
+            )
+        } else {
+            let file = self.selected_file_data()?;
+            format!(
+                "diff:{}:{}:{}:{}",
+                file.display_path(),
+                file.additions,
+                file.deletions,
+                file.hunks
+                    .iter()
+                    .map(|hunk| hunk.lines.len().saturating_add(1))
+                    .sum::<usize>()
+            )
+        };
+        let mut draft_signature = String::new();
+        for (anchor, comments) in self
+            .draft_comments
+            .iter()
+            .filter(|(anchor, _)| anchor.file_index == self.selected_file)
+        {
+            write!(
+                draft_signature,
+                "{}:{}-{:?}:",
+                anchor.path, anchor.diff_row, anchor.end_diff_row
+            )
+            .expect("writing to String cannot fail");
+            for (index, comment) in comments.iter().enumerate() {
+                if index > 0 {
+                    draft_signature.push(',');
+                }
+                write!(
+                    draft_signature,
+                    "{:?}:{}:{}:{}",
+                    comment.id,
+                    comment.body.len(),
+                    comment.persisted,
+                    comment.session_id.as_deref().unwrap_or_default()
+                )
+                .expect("writing to String cannot fail");
+            }
+            draft_signature.push(';');
+        }
+        Some(ReviewViewDocumentCacheKey {
+            selected_file: self.selected_file,
+            selected_path,
+            surface_kind,
+            repository_review: self.review.is_repository_review(),
+            file_signature,
+            draft_signature,
+            collapsed_threads: self.collapsed_review_threads.iter().cloned().collect(),
+            resolved_threads: self.resolved_review_threads.iter().cloned().collect(),
+            show_resolved_threads: self.show_resolved_threads,
+        })
     }
 
     fn hunk_render_rows(&self) -> Vec<usize> {
