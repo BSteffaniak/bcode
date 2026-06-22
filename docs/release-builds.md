@@ -68,8 +68,15 @@ cargo xtask dev-sign --target aarch64-apple-darwin
 
 By default, `dev-release` and `dev-sign` use a local code-signing identity
 named `Bcode Dev`. If that identity does not exist yet and no override was
-provided, xtask creates and trusts a self-signed local code-signing certificate
-in your login keychain.
+provided, xtask creates a dedicated Bcode development-signing keychain at:
+
+```text
+~/Library/Application Support/bcode/dev-signing/
+```
+
+The keychain password is generated locally, stored next to that keychain with
+user-only file permissions, and used only to unlock the dedicated signing
+keychain. The login keychain password is not required.
 Override the identity with either:
 
 ```sh

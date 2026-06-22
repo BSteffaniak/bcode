@@ -16,6 +16,10 @@ const PACKAGE_NAME: &str = "bcode";
 const BINARY_NAME: &str = "bcode";
 const DIST_DIR: &str = "target/dist";
 const DEFAULT_DEV_CODESIGN_IDENTITY: &str = "Bcode Dev";
+const DEV_CODESIGN_KEYCHAIN_RELATIVE_DIR: &str = "Library/Application Support/bcode/dev-signing";
+const DEV_CODESIGN_KEYCHAIN_NAME: &str = "bcode-dev-signing.keychain-db";
+const DEV_CODESIGN_PASSWORD_FILE: &str = "password";
+const DEV_CODESIGN_P12_PASSWORD: &str = "bcode-dev-signing";
 
 #[derive(Debug)]
 struct XtaskError(String);
@@ -221,8 +225,11 @@ fn dev_release(options: &Options) -> Result<()> {
 
     match target_kind {
         TargetKind::Macos => {
-            ensure_dev_codesign_identity(&options.dev_identity, options.allow_create_dev_identity)?;
-            sign_macos_binary(&binary, &options.dev_identity, false)?;
+            let keychain = ensure_dev_codesign_identity(
+                &options.dev_identity,
+                options.allow_create_dev_identity,
+            )?;
+            sign_macos_dev_binary(&binary, &options.dev_identity, keychain.as_deref())?;
             verify_macos_signature(&binary)?;
             println!(
                 "dev release ready: {} signed with identity `{}`",
@@ -252,8 +259,9 @@ fn dev_sign(options: &Options) -> Result<()> {
         .clone()
         .unwrap_or_else(|| built_binary(&options.target));
     ensure_file(&binary)?;
-    ensure_dev_codesign_identity(&options.dev_identity, options.allow_create_dev_identity)?;
-    sign_macos_binary(&binary, &options.dev_identity, false)?;
+    let keychain =
+        ensure_dev_codesign_identity(&options.dev_identity, options.allow_create_dev_identity)?;
+    sign_macos_dev_binary(&binary, &options.dev_identity, keychain.as_deref())?;
     verify_macos_signature(&binary)?;
     println!(
         "dev-signed {} with identity `{}`",
@@ -283,9 +291,9 @@ impl TargetKind {
     }
 }
 
-fn ensure_dev_codesign_identity(identity: &str, allow_create: bool) -> Result<()> {
+fn ensure_dev_codesign_identity(identity: &str, allow_create: bool) -> Result<Option<PathBuf>> {
     if codesign_identity_exists(identity)? {
-        return Ok(());
+        return Ok(None);
     }
 
     if !allow_create || identity != DEFAULT_DEV_CODESIGN_IDENTITY {
@@ -295,10 +303,10 @@ fn ensure_dev_codesign_identity(identity: &str, allow_create: bool) -> Result<()
     }
 
     println!("creating local development code-signing identity `{identity}`");
-    create_default_dev_codesign_identity(identity)?;
+    let keychain = create_default_dev_codesign_identity(identity)?;
 
-    if codesign_identity_exists(identity)? {
-        Ok(())
+    if codesign_identity_exists_in_keychain(identity, &keychain)? {
+        Ok(Some(keychain))
     } else {
         Err(format_error(format!(
             "created `{identity}`, but codesign still cannot find it"
@@ -314,10 +322,60 @@ fn codesign_identity_exists(identity: &str) -> Result<bool> {
             .arg("-p")
             .arg("codesigning"),
     )?;
-    Ok(output.lines().any(|line| line.contains(identity)))
+    Ok(output_has_identity(&output, identity))
 }
 
-fn create_default_dev_codesign_identity(identity: &str) -> Result<()> {
+fn codesign_identity_exists_in_keychain(identity: &str, keychain: &Path) -> Result<bool> {
+    let output = command_output(
+        Command::new("security")
+            .arg("find-identity")
+            .arg("-v")
+            .arg("-p")
+            .arg("codesigning")
+            .arg(keychain),
+    )?;
+    Ok(output_has_identity(&output, identity))
+}
+
+fn output_has_identity(output: &str, identity: &str) -> bool {
+    output.lines().any(|line| line.contains(identity))
+}
+
+fn create_default_dev_codesign_identity(identity: &str) -> Result<PathBuf> {
+    let keychain_dir = dev_codesign_keychain_dir()?;
+    fs::create_dir_all(&keychain_dir)?;
+    let keychain = keychain_dir.join(DEV_CODESIGN_KEYCHAIN_NAME);
+    let password_path = keychain_dir.join(DEV_CODESIGN_PASSWORD_FILE);
+    let password = ensure_dev_codesign_password(&password_path)?;
+
+    if !keychain.exists() {
+        run_sensitive_command(
+            Command::new("security")
+                .arg("create-keychain")
+                .arg("-p")
+                .arg(&password)
+                .arg(&keychain),
+            "security create-keychain <bcode dev keychain>",
+        )?;
+    }
+
+    run_sensitive_command(
+        Command::new("security")
+            .arg("unlock-keychain")
+            .arg("-p")
+            .arg(&password)
+            .arg(&keychain),
+        "security unlock-keychain <bcode dev keychain>",
+    )?;
+
+    run_command(
+        Command::new("security")
+            .arg("set-keychain-settings")
+            .arg("-lut")
+            .arg("21600")
+            .arg(&keychain),
+    )?;
+
     let dir = PathBuf::from("target/xtask/dev-codesign");
     recreate_dir(&dir)?;
     let key = dir.join("bcode-dev.key.pem");
@@ -355,7 +413,7 @@ fn create_default_dev_codesign_identity(identity: &str) -> Result<()> {
             .arg("-in")
             .arg(&certificate)
             .arg("-passout")
-            .arg("pass:"),
+            .arg(format!("pass:{DEV_CODESIGN_P12_PASSWORD}")),
     )?;
 
     run_command(
@@ -363,28 +421,65 @@ fn create_default_dev_codesign_identity(identity: &str) -> Result<()> {
             .arg("import")
             .arg(&p12)
             .arg("-P")
-            .arg("")
+            .arg(DEV_CODESIGN_P12_PASSWORD)
             .arg("-A")
             .arg("-t")
             .arg("cert")
             .arg("-f")
             .arg("pkcs12")
             .arg("-k")
-            .arg("login.keychain-db"),
+            .arg(&keychain),
     )?;
 
-    run_command(
+    run_sensitive_command(
         Command::new("security")
-            .arg("add-trusted-cert")
-            .arg("-d")
-            .arg("-r")
-            .arg("trustRoot")
-            .arg("-p")
-            .arg("codeSign")
+            .arg("set-key-partition-list")
+            .arg("-S")
+            .arg("apple-tool:,apple:,codesign:")
+            .arg("-s")
             .arg("-k")
-            .arg("login.keychain-db")
-            .arg(&certificate),
-    )
+            .arg(&password)
+            .arg(&keychain),
+        "security set-key-partition-list <bcode dev keychain>",
+    )?;
+
+    Ok(keychain)
+}
+
+fn dev_codesign_keychain_dir() -> Result<PathBuf> {
+    let home = env::var("HOME").map_err(|_| format_error("HOME is required for dev signing"))?;
+    Ok(PathBuf::from(home).join(DEV_CODESIGN_KEYCHAIN_RELATIVE_DIR))
+}
+
+fn ensure_dev_codesign_password(path: &Path) -> Result<String> {
+    if path.exists() {
+        return fs::read_to_string(path)
+            .map(|password| password.trim().to_owned())
+            .map_err(Into::into);
+    }
+
+    let password = command_output(Command::new("openssl").arg("rand").arg("-hex").arg("32"))?
+        .trim()
+        .to_owned();
+    fs::write(path, format!("{password}\n"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok(password)
+}
+
+fn sign_macos_dev_binary(binary: &Path, identity: &str, keychain: Option<&Path>) -> Result<()> {
+    let mut command = Command::new("codesign");
+    command.arg("--force");
+    if let Some(keychain) = keychain {
+        command.arg("--keychain").arg(keychain);
+    }
+    command.arg("--sign").arg(identity).arg(binary);
+    run_command(&mut command)
 }
 
 fn sign_macos_release_binary(binary: &Path) -> Result<()> {
@@ -575,6 +670,20 @@ fn run_command(command: &mut Command) -> Result<()> {
         Err(format_error(format!(
             "command failed with {status}: {}",
             display_command(command)
+        )))
+    }
+}
+
+fn run_sensitive_command(command: &mut Command, display: &str) -> Result<()> {
+    println!("running: {display}");
+    let status = command
+        .status()
+        .map_err(|error| format_error(format!("failed to run {display}: {error}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format_error(format!(
+            "command failed with {status}: {display}"
         )))
     }
 }
