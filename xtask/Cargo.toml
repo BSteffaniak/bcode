@@ -1,0 +1,15 @@
+[package]
+authors     = { workspace = true }
+description = "Release automation for Bcode"
+edition     = { workspace = true }
+license     = { workspace = true }
+name        = "xtask"
+publish     = false
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+
+[features]
+default = []
+fail-on-warnings = []

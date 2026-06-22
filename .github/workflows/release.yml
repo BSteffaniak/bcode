@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version/tag, e.g. v0.1.0"
+        required: true
+        type: string
+      publish:
+        description: "Create or update the GitHub release"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux cross-linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Configure Linux cross-linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+
+      - name: Import macOS signing certificate
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CODESIGN_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CODESIGN_CERTIFICATE_P12_BASE64 }}
+          APPLE_CODESIGN_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CODESIGN_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$APPLE_CODESIGN_CERTIFICATE_P12_BASE64"
+          test -n "$APPLE_CODESIGN_CERTIFICATE_PASSWORD"
+          CERTIFICATE_PATH="$RUNNER_TEMP/bcode-release-signing.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/bcode-release-signing.keychain-db"
+          echo "$APPLE_CODESIGN_CERTIFICATE_P12_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
+          security create-keychain -p "$APPLE_CODESIGN_CERTIFICATE_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$APPLE_CODESIGN_CERTIFICATE_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$APPLE_CODESIGN_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed s/\"//g)
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$APPLE_CODESIGN_CERTIFICATE_PASSWORD" "$KEYCHAIN_PATH"
+
+      - name: Build release artifact
+        env:
+          APPLE_CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: cargo xtask release --target ${{ matrix.target }} --version ${{ inputs.version }}
+
+      - name: Verify release artifact
+        run: cargo xtask verify-release --target ${{ matrix.target }} --version ${{ inputs.version }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bcode-${{ inputs.version }}-${{ matrix.target }}
+          path: |
+            target/dist/bcode-${{ inputs.version }}-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: target/dist
+          merge-multiple: true
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: Bcode ${{ inputs.version }}
+          files: target/dist/*
+          fail_on_unmatched_files: true
