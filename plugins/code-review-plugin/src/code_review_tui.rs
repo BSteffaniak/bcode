@@ -35,7 +35,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::code_review_tui_render::materialized_file_surface_rows;
 use crate::code_review_tui_view::{
-    ReviewThreadAction, ReviewThreadAnchor, ReviewViewBlock, ReviewViewDocument, ReviewViewTarget,
+    DiffContextKey, ReviewThreadAction, ReviewThreadAnchor, ReviewViewBlock, ReviewViewDocument,
+    ReviewViewTarget,
 };
 use crate::tui_host_types::{TuiError, helpers};
 
@@ -3445,7 +3446,7 @@ struct ReviewViewDocumentCacheKey {
     draft_signature: String,
     collapsed_threads: Vec<String>,
     resolved_threads: Vec<String>,
-    expanded_contexts: Vec<String>,
+    expanded_contexts: Vec<DiffContextKey>,
     show_resolved_threads: bool,
 }
 
@@ -3551,7 +3552,7 @@ pub struct ReviewApp {
     pub show_resolved_threads: bool,
     /// Whether viewed files are hidden from the file sidebar.
     pub hide_viewed_files: bool,
-    pub expanded_diff_contexts: BTreeSet<String>,
+    pub expanded_diff_contexts: BTreeSet<DiffContextKey>,
     /// Session id to open after leaving review mode.
     pub session_to_open: Option<SessionId>,
     last_file_area: Option<Rect>,
@@ -7836,9 +7837,9 @@ impl ReviewApp {
     }
 
     /// Expand a collapsed unchanged diff context block.
-    pub fn expand_diff_context(&mut self, key: &str) -> bool {
+    pub fn expand_diff_context(&mut self, key: &DiffContextKey) -> bool {
         self.preserve_viewport_while(|app| {
-            if !app.expanded_diff_contexts.insert(key.to_string()) {
+            if !app.expanded_diff_contexts.insert(key.clone()) {
                 return false;
             }
             if let Some(path) = app.selected_file_path()

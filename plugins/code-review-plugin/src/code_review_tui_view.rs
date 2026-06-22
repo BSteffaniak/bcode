@@ -1,6 +1,9 @@
 //! Transcript-like semantic view document construction for code review panes.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use crate::code_review_tui::{CachedReviewFile, ReviewDraftComment, ReviewFile};
 use crate::code_review_tui_display::{
@@ -23,7 +26,7 @@ impl ReviewViewDocument {
         file: &ReviewFile,
         syntax_highlighting: bool,
         cached_file: Option<&CachedReviewFile>,
-        expanded_contexts: &BTreeSet<String>,
+        expanded_contexts: &BTreeSet<DiffContextKey>,
     ) -> Self {
         let display = ReviewDisplayBuilder::new()
             .syntax_highlighting(syntax_highlighting)
@@ -43,12 +46,12 @@ impl ReviewViewDocument {
             {
                 let start_line = previous_new_line.saturating_add(1);
                 let end_line = hunk.new_start.saturating_sub(1);
-                let key = diff_context_key(file_index, hunk_index, start_line, end_line);
+                let key = DiffContextKey::new(file_index, hunk_index, start_line, end_line);
                 if expanded_contexts.contains(&key) {
                     match cached_file {
                         Some(file) if file.unavailable_reason.is_some() => {
                             rows.push(context_status_row(
-                                key,
+                                key.clone(),
                                 hidden_line_count(start_line, end_line),
                                 start_line,
                                 end_line,
@@ -74,7 +77,7 @@ impl ReviewViewDocument {
                         source_row: None,
                         target: ReviewViewTarget::OmittedContext { key: key.clone() },
                         block: ReviewViewBlock::OmittedContext {
-                            key,
+                            key: key.clone(),
                             hidden_line_count: hidden_line_count(start_line, end_line),
                             start_line,
                             end_line,
@@ -358,7 +361,7 @@ pub enum ReviewViewBlock {
     /// Collapsed unchanged diff context row.
     OmittedContext {
         /// Stable expansion key.
-        key: String,
+        key: DiffContextKey,
         /// Number of hidden lines.
         hidden_line_count: usize,
         /// One-based first hidden new-file line.
@@ -369,7 +372,7 @@ pub enum ReviewViewBlock {
     /// Hidden context is expanded but waiting for full-file content.
     LoadingContext {
         /// Stable expansion key.
-        key: String,
+        key: DiffContextKey,
         /// Number of hidden lines.
         hidden_line_count: usize,
         /// One-based first hidden new-file line.
@@ -380,7 +383,7 @@ pub enum ReviewViewBlock {
     /// Hidden context expansion failed because full-file content is unavailable.
     UnavailableContext {
         /// Stable expansion key.
-        key: String,
+        key: DiffContextKey,
         /// Number of hidden lines.
         hidden_line_count: usize,
         /// One-based first hidden new-file line.
@@ -528,6 +531,42 @@ impl ReviewThreadAction {
     }
 }
 
+/// Typed identity for an expandable hidden diff context block.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DiffContextKey {
+    /// File index in the current review.
+    pub file_index: usize,
+    /// Hunk index after the hidden context block.
+    pub hunk_index: usize,
+    /// One-based first hidden new-file line.
+    pub start_line: u32,
+    /// One-based final hidden new-file line.
+    pub end_line: u32,
+}
+
+impl DiffContextKey {
+    /// Create a diff context key.
+    #[must_use]
+    pub const fn new(file_index: usize, hunk_index: usize, start_line: u32, end_line: u32) -> Self {
+        Self {
+            file_index,
+            hunk_index,
+            start_line,
+            end_line,
+        }
+    }
+}
+
+impl fmt::Display for DiffContextKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}:{}:{}-{}",
+            self.file_index, self.hunk_index, self.start_line, self.end_line
+        )
+    }
+}
+
 /// Stable semantic target for selection, mouse, and actions.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ReviewViewTarget {
@@ -544,9 +583,12 @@ pub enum ReviewViewTarget {
         new_line: Option<u32>,
     },
     /// Omitted diff context expansion row.
-    OmittedContext { key: String },
+    OmittedContext { key: DiffContextKey },
     /// Expanded hidden context source row.
-    ExpandedContextLine { key: String, line_number: u32 },
+    ExpandedContextLine {
+        key: DiffContextKey,
+        line_number: u32,
+    },
     /// Inline review thread row.
     Thread { thread_key: String },
     /// Inline review comment row.
@@ -614,15 +656,6 @@ fn renumber_rows(rows: &mut [ReviewViewRow]) {
     }
 }
 
-fn diff_context_key(
-    file_index: usize,
-    hunk_index: usize,
-    start_line: u32,
-    end_line: u32,
-) -> String {
-    format!("{file_index}:{hunk_index}:{start_line}-{end_line}")
-}
-
 fn hunk_start_rows(file: &ReviewFile) -> Vec<usize> {
     let mut rows = Vec::with_capacity(file.hunks.len());
     let mut row = 0usize;
@@ -638,7 +671,7 @@ fn hidden_line_count(start_line: u32, end_line: u32) -> usize {
 }
 
 fn context_status_row(
-    key: String,
+    key: DiffContextKey,
     hidden_line_count: usize,
     start_line: u32,
     end_line: u32,
@@ -671,7 +704,7 @@ fn context_status_row(
 
 fn push_expanded_context_rows(
     _file_index: usize,
-    context_key: &str,
+    context_key: &DiffContextKey,
     cached_file: &CachedReviewFile,
     start_line: u32,
     end_line: u32,
@@ -697,7 +730,7 @@ fn push_expanded_context_rows(
             visual_row: 0,
             source_row: None,
             target: ReviewViewTarget::ExpandedContextLine {
-                key: context_key.to_string(),
+                key: context_key.clone(),
                 line_number,
             },
             block: ReviewViewBlock::DisplayRow(display_row),
