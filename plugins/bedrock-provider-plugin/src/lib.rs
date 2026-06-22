@@ -9,6 +9,7 @@ use aws_credential_types::Credentials;
 use aws_sdk_bedrock as bedrock;
 use aws_sdk_bedrockruntime::Client;
 use aws_sdk_bedrockruntime::error::DisplayErrorContext;
+use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
 use aws_sdk_bedrockruntime::types::{
     CachePointBlock, CachePointType, ContentBlock as BedrockContentBlock, ContentBlockDelta,
     ContentBlockStart, ConversationRole, ConverseStreamOutput, ImageBlock, ImageFormat,
@@ -2154,12 +2155,49 @@ fn build_error(error: &(impl ToString + ?Sized)) -> ProviderError {
 }
 
 fn bedrock_sdk_error(
-    error: &aws_sdk_bedrockruntime::error::SdkError<
-        aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError,
-    >,
+    error: &aws_sdk_bedrockruntime::error::SdkError<ConverseStreamError>,
 ) -> ProviderError {
     let message = DisplayErrorContext(error).to_string();
-    let category = if message.contains("UnrecognizedClient")
+    let category = error.as_service_error().map_or_else(
+        || bedrock_error_category_from_message(&message),
+        bedrock_converse_stream_error_category,
+    );
+    let mut error = provider_error("bedrock_request_failed", category, message.clone());
+    if category == ProviderErrorCategory::RateLimit || category == ProviderErrorCategory::Overloaded
+    {
+        error.retry = retry_hint_from_body(&message).map(Box::new);
+    }
+    error
+}
+
+fn bedrock_converse_stream_error_category(error: &ConverseStreamError) -> ProviderErrorCategory {
+    if error.is_service_unavailable_exception() {
+        ProviderErrorCategory::Overloaded
+    } else if error.is_throttling_exception() {
+        ProviderErrorCategory::RateLimit
+    } else if error.is_access_denied_exception() {
+        ProviderErrorCategory::Auth
+    } else if is_context_length_error(error.to_string().as_str()) {
+        ProviderErrorCategory::ContextLength
+    } else if error.is_validation_exception() {
+        ProviderErrorCategory::InvalidRequest
+    } else if error.is_resource_not_found_exception() {
+        ProviderErrorCategory::ModelNotFound
+    } else if error.is_model_timeout_exception() {
+        ProviderErrorCategory::Timeout
+    } else {
+        ProviderErrorCategory::ProviderInternal
+    }
+}
+
+fn bedrock_error_category_from_message(message: &str) -> ProviderErrorCategory {
+    if message.contains("ServiceUnavailableException")
+        || message.contains("ServiceUnavailable")
+        || message.contains("status code: 503")
+        || message.contains("status: 503")
+    {
+        ProviderErrorCategory::Overloaded
+    } else if message.contains("UnrecognizedClient")
         || message.contains("AccessDenied")
         || message.contains("ExpiredToken")
         || message.contains("credentials")
@@ -2167,7 +2205,7 @@ fn bedrock_sdk_error(
         ProviderErrorCategory::Auth
     } else if message.contains("Throttl") || message.contains("TooManyRequests") {
         ProviderErrorCategory::RateLimit
-    } else if is_context_length_error(&message) {
+    } else if is_context_length_error(message) {
         ProviderErrorCategory::ContextLength
     } else if message.contains("ValidationException") {
         ProviderErrorCategory::InvalidRequest
@@ -2175,29 +2213,15 @@ fn bedrock_sdk_error(
         ProviderErrorCategory::ModelNotFound
     } else {
         ProviderErrorCategory::ProviderInternal
-    };
-    let mut error = provider_error("bedrock_request_failed", category, message.clone());
-    if category == ProviderErrorCategory::RateLimit {
-        error.retry = retry_hint_from_body(&message).map(Box::new);
     }
-    error
 }
 
 fn bedrock_discovery_error(error: &(impl std::fmt::Debug + ToString + ?Sized)) -> ProviderError {
     let message = format!("{} ({error:?})", error.to_string());
-    let category = if message.contains("AccessDenied") || message.contains("credentials") {
-        ProviderErrorCategory::Auth
-    } else if message.contains("Throttl") || message.contains("TooManyRequests") {
-        ProviderErrorCategory::RateLimit
-    } else if is_context_length_error(&message) {
-        ProviderErrorCategory::ContextLength
-    } else if message.contains("ValidationException") {
-        ProviderErrorCategory::InvalidRequest
-    } else {
-        ProviderErrorCategory::ProviderInternal
-    };
+    let category = bedrock_error_category_from_message(&message);
     let mut error = provider_error("bedrock_model_discovery_failed", category, message.clone());
-    if category == ProviderErrorCategory::RateLimit {
+    if category == ProviderErrorCategory::RateLimit || category == ProviderErrorCategory::Overloaded
+    {
         error.retry = retry_hint_from_body(&message).map(Box::new);
     }
     error
@@ -2241,6 +2265,46 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bedrock_service_unavailable_is_overload_from_sdk_error() {
+        let error = ConverseStreamError::ServiceUnavailableException(
+            aws_sdk_bedrockruntime::types::error::ServiceUnavailableException::builder()
+                .message("service unavailable")
+                .build(),
+        );
+
+        assert_eq!(
+            bedrock_converse_stream_error_category(&error),
+            ProviderErrorCategory::Overloaded
+        );
+    }
+
+    #[test]
+    fn bedrock_throttling_remains_rate_limit_from_sdk_error() {
+        let error = ConverseStreamError::ThrottlingException(
+            aws_sdk_bedrockruntime::types::error::ThrottlingException::builder()
+                .message("too many requests")
+                .build(),
+        );
+
+        assert_eq!(
+            bedrock_converse_stream_error_category(&error),
+            ProviderErrorCategory::RateLimit
+        );
+    }
+
+    #[test]
+    fn bedrock_overload_message_fallback_is_conservative() {
+        assert_eq!(
+            bedrock_error_category_from_message("ServiceUnavailableException: service unavailable"),
+            ProviderErrorCategory::Overloaded
+        );
+        assert_eq!(
+            bedrock_error_category_from_message("ThrottlingException: too many requests"),
+            ProviderErrorCategory::RateLimit
+        );
+    }
 
     #[test]
     fn json_document_round_trip_preserves_objects() {

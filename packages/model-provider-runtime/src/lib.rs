@@ -125,6 +125,7 @@ pub fn provider_error(
                 | ProviderErrorCategory::Timeout
                 | ProviderErrorCategory::RateLimit
                 | ProviderErrorCategory::ProviderInternal
+                | ProviderErrorCategory::Overloaded
         ),
         provider_message: None,
         retry: None,
