@@ -6571,13 +6571,16 @@ impl ReviewApp {
                 self.begin_mouse_range_selection(*source_row) || selected
             }
             ReviewViewTarget::OmittedContext { key } => self.expand_diff_context(key) || selected,
+            ReviewViewTarget::ExpandedContextLine { .. } => {
+                self.status_message =
+                    Some("expanded context lines are not commentable".to_string());
+                selected
+            }
             ReviewViewTarget::Thread { .. } => self.toggle_selected_inline_thread() || selected,
             ReviewViewTarget::ThreadAction { .. } => {
                 self.activate_selected_inline_action() || selected
             }
-            ReviewViewTarget::ExpandedContextLine { .. } | ReviewViewTarget::Comment { .. } => {
-                selected
-            }
+            ReviewViewTarget::Comment { .. } => selected,
         }
     }
 
@@ -8215,7 +8218,25 @@ impl ReviewApp {
     pub fn selected_comment_anchor(&self) -> Option<ReviewCommentAnchor> {
         self.selected_draft_anchor_and_comment_index()
             .map(|(anchor, _)| anchor)
-            .or_else(|| self.comment_anchor_for_row(self.selected_diff_line))
+            .or_else(|| {
+                self.selected_review_view_target()
+                    .as_ref()
+                    .and_then(|target| self.comment_anchor_for_target(target))
+            })
+    }
+
+    fn comment_anchor_for_target(&self, target: &ReviewViewTarget) -> Option<ReviewCommentAnchor> {
+        match target {
+            ReviewViewTarget::SourceLine { source_row, .. } => {
+                self.comment_anchor_for_row(*source_row)
+            }
+            ReviewViewTarget::HunkHeader { .. }
+            | ReviewViewTarget::OmittedContext { .. }
+            | ReviewViewTarget::ExpandedContextLine { .. }
+            | ReviewViewTarget::Thread { .. }
+            | ReviewViewTarget::Comment { .. }
+            | ReviewViewTarget::ThreadAction { .. } => None,
+        }
     }
 
     fn selected_draft_anchor_and_comment_index(
