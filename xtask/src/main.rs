@@ -306,16 +306,36 @@ fn ensure_dev_codesign_identity(
     }
 
     println!("creating local development code-signing identity `{identity}`");
-    let keychain = create_default_dev_codesign_identity(identity)?;
+    create_and_verify_default_dev_codesign_identity(identity)?
+        .map_or_else(|| recreate_unusable_dev_codesign_identity(identity), Ok)
+}
 
-    codesign_identity_hash_in_keychain(identity, &keychain)?.map_or_else(
-        || {
-            Err(format_error(format!(
-                "created `{identity}`, but codesign still cannot find it"
-            )))
-        },
-        |identity_hash| Ok((identity_hash, Some(keychain))),
-    )
+fn recreate_unusable_dev_codesign_identity(identity: &str) -> Result<(String, Option<PathBuf>)> {
+    println!("recreating unusable local development code-signing identity `{identity}`");
+    let keychain_dir = dev_codesign_keychain_dir()?;
+    if keychain_dir.exists() {
+        fs::remove_dir_all(&keychain_dir)?;
+    }
+    create_and_verify_default_dev_codesign_identity(identity)?.ok_or_else(|| {
+        format_error(format!(
+            "created `{identity}`, but codesign cannot use it to sign"
+        ))
+    })
+}
+
+fn create_and_verify_default_dev_codesign_identity(
+    identity: &str,
+) -> Result<Option<(String, Option<PathBuf>)>> {
+    let keychain = create_default_dev_codesign_identity(identity)?;
+    let Some(identity_hash) = codesign_identity_hash_in_keychain(identity, &keychain)? else {
+        return Ok(None);
+    };
+
+    if dev_codesign_identity_can_sign(&identity_hash, &keychain)? {
+        Ok(Some((identity_hash, Some(keychain))))
+    } else {
+        Ok(None)
+    }
 }
 
 fn codesign_identity_hash(identity: &str) -> Result<Option<String>> {
@@ -433,13 +453,14 @@ fn create_default_dev_codesign_identity(identity: &str) -> Result<PathBuf> {
             .arg(&p12)
             .arg("-P")
             .arg(DEV_CODESIGN_P12_PASSWORD)
-            .arg("-A")
-            .arg("-t")
-            .arg("cert")
             .arg("-f")
             .arg("pkcs12")
             .arg("-k")
-            .arg(&keychain),
+            .arg(&keychain)
+            .arg("-T")
+            .arg("/usr/bin/codesign")
+            .arg("-T")
+            .arg("/usr/bin/security"),
     )?;
 
     trust_dev_codesign_certificate(&keychain, &certificate)?;
@@ -457,6 +478,28 @@ fn create_default_dev_codesign_identity(identity: &str) -> Result<PathBuf> {
     )?;
 
     Ok(keychain)
+}
+
+fn dev_codesign_identity_can_sign(identity_hash: &str, keychain: &Path) -> Result<bool> {
+    let probe = PathBuf::from("target/xtask/dev-codesign/codesign-probe");
+    fs::copy("/usr/bin/true", &probe).map_err(|error| {
+        format_error(format!(
+            "failed to create codesign probe {}: {error}",
+            probe.display()
+        ))
+    })?;
+
+    let status = Command::new("codesign")
+        .arg("--force")
+        .arg("--keychain")
+        .arg(keychain)
+        .arg("--sign")
+        .arg(identity_hash)
+        .arg(&probe)
+        .status()
+        .map_err(|error| format_error(format!("failed to run codesign probe: {error}")))?;
+
+    Ok(status.success())
 }
 
 fn add_keychain_to_user_search_list(keychain: &Path) -> Result<()> {
