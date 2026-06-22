@@ -6504,30 +6504,38 @@ impl ReviewApp {
 
     /// Select next hunk.
     pub fn select_next_hunk(&mut self) -> bool {
-        let Some(next) = self
-            .hunk_render_rows()
-            .into_iter()
-            .find(|row| *row > self.selected_diff_line)
-        else {
+        let Some(document) = self.current_review_view_document() else {
             return false;
         };
-        self.selected_diff_line = next;
-        self.ensure_selected_diff_line_visible();
-        true
+        let current_visual_row = self.selected_diff_visual_row();
+        let Some(target) = document.next_hunk_target_after_visual_row(current_visual_row) else {
+            return false;
+        };
+        self.select_target_and_scroll(target)
     }
 
     /// Select previous hunk.
     pub fn select_previous_hunk(&mut self) -> bool {
-        let Some(previous) = self
-            .hunk_render_rows()
-            .into_iter()
-            .rev()
-            .find(|row| *row < self.selected_diff_line)
+        let Some(document) = self.current_review_view_document() else {
+            return false;
+        };
+        let current_visual_row = self.selected_diff_visual_row();
+        let Some(target) = document.previous_hunk_target_before_visual_row(current_visual_row)
         else {
             return false;
         };
-        self.selected_diff_line = previous;
-        self.ensure_selected_diff_line_visible();
+        self.select_target_and_scroll(target)
+    }
+
+    fn select_target_and_scroll(&mut self, target: ReviewViewTarget) -> bool {
+        let source_row = self
+            .current_review_view_document()
+            .and_then(|document| document.source_row_for_target(&target));
+        self.selected_view_target = Some(target);
+        if let Some(source_row) = source_row {
+            self.selected_diff_line = source_row;
+        }
+        self.scroll_selected_target_into_view();
         true
     }
 
@@ -8346,17 +8354,25 @@ impl ReviewApp {
     /// Return current hunk position as one-based `(current, total)`.
     #[must_use]
     pub fn hunk_position(&self) -> (usize, usize) {
-        let rows = self.hunk_render_rows();
-        let total = rows.len();
-        let current = rows
+        let Some(document) = self.current_review_view_document() else {
+            return (1, 0);
+        };
+        let targets = document.hunk_targets();
+        let total = targets.len();
+        let selected_visual_row = self.selected_diff_visual_row();
+        let current = targets
             .iter()
-            .position(|row| *row > self.selected_diff_line)
+            .position(|target| {
+                document
+                    .visual_row_for_target(target)
+                    .is_some_and(|row| row > selected_visual_row)
+            })
             .unwrap_or(total)
             .max(1);
         (current, total)
     }
 
-    fn ensure_selected_diff_line_visible(&mut self) {
+    fn scroll_selected_target_into_view(&mut self) {
         let height = self
             .last_diff_area
             .map_or(1, |area| usize::from(area.height).max(1));
@@ -8369,16 +8385,16 @@ impl ReviewApp {
         self.diff_scroll = self.diff_scroll.min(self.max_diff_scroll());
     }
 
+    fn ensure_selected_diff_line_visible(&mut self) {
+        self.scroll_selected_target_into_view();
+    }
+
     fn selected_diff_visual_row(&self) -> usize {
         let document = self.current_review_view_document();
         if let Some(target) = &self.selected_view_target
-            && let Some(visual_row) = document.as_ref().and_then(|document| {
-                document
-                    .rows
-                    .iter()
-                    .find(|row| &row.target == target)
-                    .map(|row| row.visual_row)
-            })
+            && let Some(visual_row) = document
+                .as_ref()
+                .and_then(|document| document.visual_row_for_target(target))
         {
             return visual_row;
         }
@@ -8593,33 +8609,6 @@ impl ReviewApp {
             expanded_contexts: self.expanded_diff_contexts.iter().cloned().collect(),
             show_resolved_threads: self.show_resolved_threads,
         })
-    }
-
-    fn hunk_render_rows(&self) -> Vec<usize> {
-        let Some(file) = self.selected_file_data() else {
-            return Vec::new();
-        };
-        let mut rows = Vec::new();
-        if self
-            .selected_surface()
-            .is_some_and(|surface| surface.kind == ReviewSurfaceKind::File)
-        {
-            let mut row = 0usize;
-            for hunk in &file.hunks {
-                if hunk.heading.is_some() {
-                    rows.push(row);
-                    row = row.saturating_add(1);
-                }
-                row = row.saturating_add(hunk.lines.len());
-            }
-            return rows;
-        }
-        let mut row = 0usize;
-        for hunk in &file.hunks {
-            rows.push(row);
-            row = row.saturating_add(hunk.lines.len()).saturating_add(1);
-        }
-        rows
     }
 }
 

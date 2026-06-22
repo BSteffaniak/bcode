@@ -278,6 +278,58 @@ impl ReviewViewDocument {
             .find(|row| row.source_row == Some(source_row))
             .map(|row| row.visual_row)
     }
+    /// Return the visual row for a semantic target.
+    #[must_use]
+    pub fn visual_row_for_target(&self, target: &ReviewViewTarget) -> Option<usize> {
+        self.rows
+            .iter()
+            .find(|row| &row.target == target)
+            .map(|row| row.visual_row)
+    }
+
+    /// Return hunk header targets in document order.
+    #[must_use]
+    pub fn hunk_targets(&self) -> Vec<ReviewViewTarget> {
+        self.rows
+            .iter()
+            .filter_map(|row| match &row.target {
+                ReviewViewTarget::HunkHeader { .. } => Some(row.target.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Return the next hunk target after a visual row.
+    #[must_use]
+    pub fn next_hunk_target_after_visual_row(&self, visual_row: usize) -> Option<ReviewViewTarget> {
+        self.rows.iter().find_map(|row| {
+            (row.visual_row > visual_row
+                && matches!(row.target, ReviewViewTarget::HunkHeader { .. }))
+            .then(|| row.target.clone())
+        })
+    }
+
+    /// Return the previous hunk target before a visual row.
+    #[must_use]
+    pub fn previous_hunk_target_before_visual_row(
+        &self,
+        visual_row: usize,
+    ) -> Option<ReviewViewTarget> {
+        self.rows.iter().rev().find_map(|row| {
+            (row.visual_row < visual_row
+                && matches!(row.target, ReviewViewTarget::HunkHeader { .. }))
+            .then(|| row.target.clone())
+        })
+    }
+
+    /// Return the source row for a semantic target, when applicable.
+    #[must_use]
+    pub fn source_row_for_target(&self, target: &ReviewViewTarget) -> Option<usize> {
+        self.rows
+            .iter()
+            .find(|row| &row.target == target)
+            .and_then(|row| row.source_row)
+    }
 }
 
 /// One semantic row in a review view document.
