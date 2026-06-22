@@ -225,11 +225,11 @@ fn dev_release(options: &Options) -> Result<()> {
 
     match target_kind {
         TargetKind::Macos => {
-            let keychain = ensure_dev_codesign_identity(
+            let (signing_identity, keychain) = ensure_dev_codesign_identity(
                 &options.dev_identity,
                 options.allow_create_dev_identity,
             )?;
-            sign_macos_dev_binary(&binary, &options.dev_identity, keychain.as_deref())?;
+            sign_macos_dev_binary(&binary, &signing_identity, keychain.as_deref())?;
             verify_macos_signature(&binary)?;
             println!(
                 "dev release ready: {} signed with identity `{}`",
@@ -259,9 +259,9 @@ fn dev_sign(options: &Options) -> Result<()> {
         .clone()
         .unwrap_or_else(|| built_binary(&options.target));
     ensure_file(&binary)?;
-    let keychain =
+    let (signing_identity, keychain) =
         ensure_dev_codesign_identity(&options.dev_identity, options.allow_create_dev_identity)?;
-    sign_macos_dev_binary(&binary, &options.dev_identity, keychain.as_deref())?;
+    sign_macos_dev_binary(&binary, &signing_identity, keychain.as_deref())?;
     verify_macos_signature(&binary)?;
     println!(
         "dev-signed {} with identity `{}`",
@@ -291,9 +291,12 @@ impl TargetKind {
     }
 }
 
-fn ensure_dev_codesign_identity(identity: &str, allow_create: bool) -> Result<Option<PathBuf>> {
-    if codesign_identity_exists(identity)? {
-        return Ok(None);
+fn ensure_dev_codesign_identity(
+    identity: &str,
+    allow_create: bool,
+) -> Result<(String, Option<PathBuf>)> {
+    if let Some(identity_hash) = codesign_identity_hash(identity)? {
+        return Ok((identity_hash, None));
     }
 
     if !allow_create || identity != DEFAULT_DEV_CODESIGN_IDENTITY {
@@ -305,16 +308,17 @@ fn ensure_dev_codesign_identity(identity: &str, allow_create: bool) -> Result<Op
     println!("creating local development code-signing identity `{identity}`");
     let keychain = create_default_dev_codesign_identity(identity)?;
 
-    if codesign_identity_exists_in_keychain(identity, &keychain)? {
-        Ok(Some(keychain))
-    } else {
-        Err(format_error(format!(
-            "created `{identity}`, but codesign still cannot find it"
-        )))
-    }
+    codesign_identity_hash_in_keychain(identity, &keychain)?.map_or_else(
+        || {
+            Err(format_error(format!(
+                "created `{identity}`, but codesign still cannot find it"
+            )))
+        },
+        |identity_hash| Ok((identity_hash, Some(keychain))),
+    )
 }
 
-fn codesign_identity_exists(identity: &str) -> Result<bool> {
+fn codesign_identity_hash(identity: &str) -> Result<Option<String>> {
     let output = command_output(
         Command::new("security")
             .arg("find-identity")
@@ -322,10 +326,10 @@ fn codesign_identity_exists(identity: &str) -> Result<bool> {
             .arg("-p")
             .arg("codesigning"),
     )?;
-    Ok(output_has_identity(&output, identity))
+    Ok(find_identity_hash(&output, identity))
 }
 
-fn codesign_identity_exists_in_keychain(identity: &str, keychain: &Path) -> Result<bool> {
+fn codesign_identity_hash_in_keychain(identity: &str, keychain: &Path) -> Result<Option<String>> {
     let output = command_output(
         Command::new("security")
             .arg("find-identity")
@@ -334,11 +338,17 @@ fn codesign_identity_exists_in_keychain(identity: &str, keychain: &Path) -> Resu
             .arg("codesigning")
             .arg(keychain),
     )?;
-    Ok(output_has_identity(&output, identity))
+    Ok(find_identity_hash(&output, identity))
 }
 
-fn output_has_identity(output: &str, identity: &str) -> bool {
-    output.lines().any(|line| line.contains(identity))
+fn find_identity_hash(output: &str, identity: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        if line.contains(identity) {
+            line.split_whitespace().nth(1).map(str::to_owned)
+        } else {
+            None
+        }
+    })
 }
 
 fn create_default_dev_codesign_identity(identity: &str) -> Result<PathBuf> {
