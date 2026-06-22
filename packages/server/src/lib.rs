@@ -280,6 +280,14 @@ impl SessionRuntimePhase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SteeringWindow {
+    Idle,
+    BeforeNextProviderRequest,
+    ProviderInFlight,
+    Finishing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MessageQueueStatus {
     queued: bool,
     queue_position: Option<u32>,
@@ -326,6 +334,12 @@ enum FollowupCommand {
         runtime_context: Option<ClientRuntimeContext>,
         text: String,
         placement: bcode_ipc::PromptPlacement,
+        completion: Option<oneshot::Sender<ModelTurnCompletion>>,
+    },
+    ContinueFromUserEvent {
+        client_id: ClientId,
+        runtime_context: Option<ClientRuntimeContext>,
+        user_event: Box<bcode_session_models::SessionEvent>,
         completion: Option<oneshot::Sender<ModelTurnCompletion>>,
     },
     SkillInvocation {
@@ -5195,53 +5209,46 @@ async fn enqueue_user_message_command(
 ) -> Result<MessageQueueStatus, ServerError> {
     state.sessions.session_summary(session_id).await?;
     let handle = session_runtime_handle(state, session_id).await;
-    let mut phase = handle.phase.lock().await;
-    let steering_now =
-        placement == bcode_ipc::PromptPlacement::Steering && phase.accepts_inline_steering();
-    let pending_before = if steering_now {
-        0
+    let phase_snapshot = *handle.phase.lock().await;
+    let steering_window = if placement == bcode_ipc::PromptPlacement::Steering {
+        Some(steering_window(phase_snapshot, &handle.current_turn).await)
     } else {
-        handle.queued_followups.fetch_add(1, Ordering::AcqRel)
+        None
     };
-    let queued = !steering_now && (pending_before > 0 || phase.has_active_work());
-    let queue_position = queued.then(|| usize_to_u32_saturating(pending_before.saturating_add(1)));
-    let disposition = if steering_now {
-        bcode_ipc::MessageAcceptanceDisposition::AppliedSteering
-    } else if queued
-        && matches!(
-            placement,
-            bcode_ipc::PromptPlacement::FollowUp | bcode_ipc::PromptPlacement::Steering
+    if let Some(window) = steering_window {
+        return enqueue_steering_message_command(
+            state,
+            &handle,
+            session_id,
+            client_id,
+            runtime_context,
+            text,
+            window,
         )
-    {
+        .await;
+    }
+
+    let pending_before = handle.queued_followups.fetch_add(1, Ordering::AcqRel);
+    let queued = pending_before > 0 || phase_snapshot.has_active_work();
+    let queue_position = queued.then(|| usize_to_u32_saturating(pending_before.saturating_add(1)));
+    let disposition = if queued && placement == bcode_ipc::PromptPlacement::FollowUp {
         bcode_ipc::MessageAcceptanceDisposition::QueuedFollowUp
     } else if queued {
         bcode_ipc::MessageAcceptanceDisposition::QueuedTurn
     } else {
         bcode_ipc::MessageAcceptanceDisposition::StartedTurn
     };
-    let send_result = if steering_now {
-        handle
-            .steering_commands
-            .send(SteeringCommand {
-                client_id,
-                text,
-                completion: None,
-            })
-            .await
-            .map_err(|error| error.to_string())
-    } else {
-        handle
-            .followup_commands
-            .send(FollowupCommand::UserMessage {
-                client_id,
-                runtime_context,
-                text,
-                placement,
-                completion: None,
-            })
-            .await
-            .map_err(|error| error.to_string())
-    };
+    let send_result = handle
+        .followup_commands
+        .send(FollowupCommand::UserMessage {
+            client_id,
+            runtime_context,
+            text,
+            placement,
+            completion: None,
+        })
+        .await
+        .map_err(|error| error.to_string());
     if send_result.is_ok() {
         return Ok(MessageQueueStatus {
             queued,
@@ -5249,14 +5256,121 @@ async fn enqueue_user_message_command(
             disposition,
         });
     }
-    if !steering_now {
-        handle.queued_followups.fetch_sub(1, Ordering::AcqRel);
-    }
-    *phase = SessionRuntimePhase::Idle;
-    drop(phase);
+    handle.queued_followups.fetch_sub(1, Ordering::AcqRel);
+    *handle.phase.lock().await = SessionRuntimePhase::Idle;
 
     state.session_runtimes.lock().await.remove(&session_id);
     Err(bcode_session::SessionError::NotFound(session_id).into())
+}
+
+async fn enqueue_steering_message_command(
+    state: &Arc<ServerState>,
+    handle: &SessionRuntimeHandle,
+    session_id: SessionId,
+    client_id: ClientId,
+    runtime_context: Option<ClientRuntimeContext>,
+    text: String,
+    window: SteeringWindow,
+) -> Result<MessageQueueStatus, ServerError> {
+    match window {
+        SteeringWindow::Idle => {
+            let pending_before = handle.queued_followups.fetch_add(1, Ordering::AcqRel);
+            let send_result = handle
+                .followup_commands
+                .send(FollowupCommand::UserMessage {
+                    client_id,
+                    runtime_context,
+                    text,
+                    placement: bcode_ipc::PromptPlacement::Steering,
+                    completion: None,
+                })
+                .await
+                .map_err(|error| error.to_string());
+            if send_result.is_ok() {
+                return Ok(MessageQueueStatus {
+                    queued: false,
+                    queue_position: None,
+                    disposition: bcode_ipc::MessageAcceptanceDisposition::StartedTurn,
+                });
+            }
+            handle.queued_followups.fetch_sub(1, Ordering::AcqRel);
+            debug_assert_eq!(pending_before, 0);
+        }
+        SteeringWindow::BeforeNextProviderRequest => {
+            if handle
+                .steering_commands
+                .send(SteeringCommand {
+                    client_id,
+                    text,
+                    completion: None,
+                })
+                .await
+                .is_ok()
+            {
+                return Ok(MessageQueueStatus {
+                    queued: false,
+                    queue_position: None,
+                    disposition: bcode_ipc::MessageAcceptanceDisposition::AppliedSteering,
+                });
+            }
+        }
+        SteeringWindow::ProviderInFlight | SteeringWindow::Finishing => {
+            let user_event = append_steering_user_message(state, session_id, client_id, text)
+                .await?
+                .ok_or_else(|| bcode_session::SessionError::NotFound(session_id))?;
+            let pending_before = handle.queued_followups.fetch_add(1, Ordering::AcqRel);
+            let queue_position = Some(usize_to_u32_saturating(pending_before.saturating_add(1)));
+            let send_result = handle
+                .followup_commands
+                .send(FollowupCommand::ContinueFromUserEvent {
+                    client_id,
+                    runtime_context,
+                    user_event: Box::new(user_event),
+                    completion: None,
+                })
+                .await
+                .map_err(|error| error.to_string());
+            if send_result.is_ok() {
+                return Ok(MessageQueueStatus {
+                    queued: true,
+                    queue_position,
+                    disposition: bcode_ipc::MessageAcceptanceDisposition::QueuedFollowUp,
+                });
+            }
+            handle.queued_followups.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    *handle.phase.lock().await = SessionRuntimePhase::Idle;
+    state.session_runtimes.lock().await.remove(&session_id);
+    Err(bcode_session::SessionError::NotFound(session_id).into())
+}
+
+async fn steering_window(
+    phase: SessionRuntimePhase,
+    current_turn: &Arc<Mutex<Option<RuntimeCurrentTurn>>>,
+) -> SteeringWindow {
+    match phase {
+        SessionRuntimePhase::Idle => SteeringWindow::Idle,
+        SessionRuntimePhase::AppendingUser | SessionRuntimePhase::PreparingModelRequest => {
+            SteeringWindow::BeforeNextProviderRequest
+        }
+        SessionRuntimePhase::ProviderActive => {
+            if current_turn
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|turn| turn.model.is_some())
+            {
+                SteeringWindow::ProviderInFlight
+            } else {
+                SteeringWindow::BeforeNextProviderRequest
+            }
+        }
+        SessionRuntimePhase::Compacting | SessionRuntimePhase::FinishingTurn => {
+            SteeringWindow::Finishing
+        }
+    }
 }
 
 async fn enqueue_cancel_turn_command(
@@ -5459,6 +5573,28 @@ async fn run_session_runtime(
                 ))
                 .await;
             }
+            FollowupCommand::ContinueFromUserEvent {
+                client_id,
+                runtime_context,
+                user_event,
+                completion,
+            } => {
+                Box::pin(process_existing_user_event_command(
+                    &state,
+                    &mut permit,
+                    Arc::clone(&phase),
+                    &mut followup_commands,
+                    &mut steering_commands,
+                    &mut cancel_commands,
+                    queued_followups.as_ref(),
+                    Arc::clone(&current_turn),
+                    client_id,
+                    runtime_context,
+                    *user_event,
+                    completion,
+                ))
+                .await;
+            }
             FollowupCommand::SkillInvocation {
                 client_id,
                 runtime_context,
@@ -5572,7 +5708,12 @@ async fn process_steering_message_command(
     completion_sender: Option<oneshot::Sender<ModelTurnCompletion>>,
 ) {
     let completion = match append_steering_user_message(state, session_id, client_id, text).await {
-        Ok(()) => ModelTurnCompletion::completed(),
+        Ok(Some(_event)) => ModelTurnCompletion::completed(),
+        Ok(None) => {
+            let message = "no steering user message event was appended".to_string();
+            append_system_event(state, session_id, message.clone()).await;
+            ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message)
+        }
         Err(error) => {
             let message = format!("failed to append steering user message: {error}");
             append_system_event(state, session_id, message.clone()).await;
@@ -5797,6 +5938,46 @@ async fn process_user_message_command(
             ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message)
         }
     };
+    set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
+    if let Some(sender) = completion_sender {
+        let _sent = sender.send(completion);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_existing_user_event_command(
+    state: &ServerState,
+    permit: &mut SessionTurnPermit,
+    phase: Arc<Mutex<SessionRuntimePhase>>,
+    followup_commands: &mut mpsc::Receiver<FollowupCommand>,
+    steering_commands: &mut mpsc::Receiver<SteeringCommand>,
+    cancel_commands: &mut mpsc::Receiver<CancelCommand>,
+    queued_followups: &AtomicUsize,
+    current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
+    client_id: ClientId,
+    runtime_context: Option<ClientRuntimeContext>,
+    user_event: bcode_session_models::SessionEvent,
+    completion_sender: Option<oneshot::Sender<ModelTurnCompletion>>,
+) {
+    set_runtime_phase(&phase, SessionRuntimePhase::PreparingModelRequest).await;
+    suggest_skills_for_prompt(state, permit.session_id(), &user_event).await;
+    let mut command_context = RuntimeCommandContext::new(
+        followup_commands,
+        steering_commands,
+        cancel_commands,
+        queued_followups,
+        Arc::clone(&current_turn),
+    );
+    let completion = run_model_turn(
+        state,
+        permit,
+        &user_event,
+        client_id,
+        runtime_context,
+        &mut command_context,
+        &phase,
+    )
+    .await;
     set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
     if let Some(sender) = completion_sender {
         let _sent = sender.send(completion);
@@ -6094,11 +6275,12 @@ async fn append_steering_user_message(
     session_id: SessionId,
     client_id: ClientId,
     text: String,
-) -> Result<(), bcode_session::SessionError> {
+) -> Result<Option<bcode_session_models::SessionEvent>, bcode_session::SessionError> {
     let events = state
         .sessions
         .append_user_message(session_id, client_id, text)
         .await?;
+    let user_event = events.last().cloned();
     for event in &events {
         publish_session_event(state, event).await;
     }
@@ -6107,7 +6289,7 @@ async fn append_steering_user_message(
     {
         state.session_catalog.upsert_native_session(session).await;
     }
-    Ok(())
+    Ok(user_event)
 }
 
 fn reasoning_capabilities_from_config(
