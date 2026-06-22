@@ -3438,6 +3438,7 @@ struct ReviewViewDocumentCacheKey {
     draft_signature: String,
     collapsed_threads: Vec<String>,
     resolved_threads: Vec<String>,
+    expanded_contexts: Vec<String>,
     show_resolved_threads: bool,
 }
 
@@ -3541,6 +3542,7 @@ pub struct ReviewApp {
     pub show_resolved_threads: bool,
     /// Whether viewed files are hidden from the file sidebar.
     pub hide_viewed_files: bool,
+    pub expanded_diff_contexts: BTreeSet<String>,
     /// Session id to open after leaving review mode.
     pub session_to_open: Option<SessionId>,
     last_file_area: Option<Rect>,
@@ -3605,6 +3607,7 @@ impl ReviewApp {
             resolved_review_threads: BTreeSet::new(),
             show_resolved_threads: true,
             hide_viewed_files: false,
+            expanded_diff_contexts: BTreeSet::new(),
             session_to_open: None,
             last_file_area: None,
             last_diff_area: None,
@@ -6521,6 +6524,7 @@ impl ReviewApp {
             | ReviewViewTarget::HunkHeader { source_row, .. } => {
                 self.begin_mouse_range_selection(*source_row) || selected
             }
+            ReviewViewTarget::OmittedContext { key } => self.expand_diff_context(key) || selected,
             ReviewViewTarget::Thread { .. } => self.toggle_selected_inline_thread() || selected,
             ReviewViewTarget::ThreadAction { .. } => {
                 self.activate_selected_inline_action() || selected
@@ -6552,6 +6556,14 @@ impl ReviewApp {
         match &row.target {
             ReviewViewTarget::SourceLine { source_row, .. }
             | ReviewViewTarget::HunkHeader { source_row, .. } => self.select_diff_line(*source_row),
+            target @ ReviewViewTarget::OmittedContext { .. } => {
+                if self.selected_view_target.as_ref() == Some(target) {
+                    return false;
+                }
+                self.selected_view_target = Some(target.clone());
+                self.ensure_selected_diff_line_visible();
+                true
+            }
             target => {
                 if self.selected_view_target.as_ref() == Some(target) {
                     return false;
@@ -7161,7 +7173,9 @@ impl ReviewApp {
             | ReviewViewTarget::ThreadAction { thread_key, .. } => {
                 self.draft_anchor_for_thread_key(thread_key)
             }
-            ReviewViewTarget::HunkHeader { .. } | ReviewViewTarget::SourceLine { .. } => None,
+            ReviewViewTarget::HunkHeader { .. }
+            | ReviewViewTarget::SourceLine { .. }
+            | ReviewViewTarget::OmittedContext { .. } => None,
         }
     }
 
@@ -7739,8 +7753,21 @@ impl ReviewApp {
         true
     }
 
+    /// Expand a collapsed unchanged diff context block.
+    pub fn expand_diff_context(&mut self, key: &str) -> bool {
+        if !self.expanded_diff_contexts.insert(key.to_string()) {
+            return false;
+        }
+        self.selected_view_target = None;
+        self.status_message = Some("expanded hidden diff context".to_string());
+        true
+    }
+
     /// Activate the currently selected inline action, if any.
     pub fn activate_selected_inline_action(&mut self) -> bool {
+        if let Some(ReviewViewTarget::OmittedContext { key }) = self.selected_view_target.clone() {
+            return self.expand_diff_context(&key);
+        }
         let Some(ReviewViewTarget::ThreadAction { action, .. }) = self.selected_view_target.clone()
         else {
             return false;
@@ -7857,7 +7884,9 @@ impl ReviewApp {
             ReviewViewTarget::Thread { thread_key }
             | ReviewViewTarget::Comment { thread_key, .. }
             | ReviewViewTarget::ThreadAction { thread_key, .. } => Some(thread_key.clone()),
-            ReviewViewTarget::HunkHeader { .. } | ReviewViewTarget::SourceLine { .. } => self
+            ReviewViewTarget::HunkHeader { .. }
+            | ReviewViewTarget::SourceLine { .. }
+            | ReviewViewTarget::OmittedContext { .. } => self
                 .selected_comment_anchor()
                 .map(|anchor| Self::thread_key_for_anchor(&anchor)),
         }
@@ -8146,7 +8175,9 @@ impl ReviewApp {
             } => self
                 .draft_anchor_for_thread_key(thread_key)
                 .map(|anchor| (anchor, Some(*comment_index))),
-            ReviewViewTarget::HunkHeader { .. } | ReviewViewTarget::SourceLine { .. } => None,
+            ReviewViewTarget::HunkHeader { .. }
+            | ReviewViewTarget::SourceLine { .. }
+            | ReviewViewTarget::OmittedContext { .. } => None,
         }
     }
 
@@ -8396,7 +8427,15 @@ impl ReviewApp {
             {
                 ReviewViewDocument::build_materialized_file_surface(self.selected_file, file)
             } else {
-                ReviewViewDocument::build_diff_file(self.selected_file, file, true)
+                ReviewViewDocument::build_diff_file(
+                    self.selected_file,
+                    file,
+                    true,
+                    self.selected_file_path()
+                        .as_ref()
+                        .and_then(|path| self.file_cache.get(path)),
+                    &self.expanded_diff_contexts,
+                )
             }
         };
         document = document.with_inline_draft_threads(
@@ -8486,6 +8525,7 @@ impl ReviewApp {
             draft_signature,
             collapsed_threads: self.collapsed_review_threads.iter().cloned().collect(),
             resolved_threads: self.resolved_review_threads.iter().cloned().collect(),
+            expanded_contexts: self.expanded_diff_contexts.iter().cloned().collect(),
             show_resolved_threads: self.show_resolved_threads,
         })
     }

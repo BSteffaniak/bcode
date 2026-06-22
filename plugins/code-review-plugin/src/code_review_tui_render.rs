@@ -1463,6 +1463,25 @@ fn render_view_document(
     }
 }
 
+fn render_omitted_context_row(
+    hidden_line_count: usize,
+    start_line: u32,
+    end_line: u32,
+) -> RenderedRow {
+    let style = Style::new()
+        .fg(Color::BrightBlack)
+        .bg(Color::Rgb(18, 18, 18));
+    RenderedRow {
+        line: Line::from_spans(vec![Span::styled(
+            format!(
+                " ⋯ {hidden_line_count} unchanged lines hidden ({start_line}-{end_line})  [expand] "
+            ),
+            style,
+        )]),
+        style,
+    }
+}
+
 fn render_view_row(
     app: &ReviewApp,
     view_row: &ReviewViewRow,
@@ -1472,6 +1491,12 @@ fn render_view_row(
     width: u16,
 ) -> RenderedRow {
     match &view_row.block {
+        ReviewViewBlock::OmittedContext {
+            hidden_line_count,
+            start_line,
+            end_line,
+            ..
+        } => render_omitted_context_row(*hidden_line_count, *start_line, *end_line),
         ReviewViewBlock::DisplayRow(display_row) => {
             render_source_view_row(app, view_row, display_row)
         }

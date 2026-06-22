@@ -1,10 +1,11 @@
 //! Transcript-like semantic view document construction for code review panes.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::code_review_tui::{CachedReviewFile, ReviewDraftComment, ReviewFile};
 use crate::code_review_tui_display::{
-    ReviewDisplayBuilder, ReviewDisplayRow, ReviewDisplayRowSource,
+    ReviewDisplayBuilder, ReviewDisplayRow, ReviewDisplayRowSource, ReviewDisplaySegment,
+    ReviewDisplayTextRole,
 };
 
 /// Semantic document rendered in the main code review pane.
@@ -21,24 +22,76 @@ impl ReviewViewDocument {
         file_index: usize,
         file: &ReviewFile,
         syntax_highlighting: bool,
+        cached_file: Option<&CachedReviewFile>,
+        expanded_contexts: &BTreeSet<String>,
     ) -> Self {
         let display = ReviewDisplayBuilder::new()
             .syntax_highlighting(syntax_highlighting)
             .build_file(file);
-        let rows = display
+        let hunk_start_rows = hunk_start_rows(file);
+        let display_by_source = display
             .rows
             .into_iter()
             .enumerate()
-            .map(|(source_row, display_row)| {
-                let target = display_row_target(file_index, source_row, &display_row);
-                ReviewViewRow {
-                    visual_row: source_row,
-                    source_row: Some(source_row),
-                    target,
-                    block: ReviewViewBlock::DisplayRow(display_row),
+            .collect::<BTreeMap<_, _>>();
+        let mut rows = Vec::with_capacity(display_by_source.len());
+        let mut source_row;
+        let mut previous_hunk_end_new_line: Option<u32> = None;
+        for (hunk_index, hunk) in file.hunks.iter().enumerate() {
+            if let Some(previous_new_line) = previous_hunk_end_new_line
+                && hunk.new_start > previous_new_line.saturating_add(1)
+            {
+                let start_line = previous_new_line.saturating_add(1);
+                let end_line = hunk.new_start.saturating_sub(1);
+                let key = diff_context_key(file_index, hunk_index, start_line, end_line);
+                if expanded_contexts.contains(&key) {
+                    push_expanded_context_rows(
+                        file_index,
+                        cached_file,
+                        start_line,
+                        end_line,
+                        &mut rows,
+                    );
+                } else {
+                    rows.push(ReviewViewRow {
+                        visual_row: 0,
+                        source_row: None,
+                        target: ReviewViewTarget::OmittedContext { key: key.clone() },
+                        block: ReviewViewBlock::OmittedContext {
+                            key,
+                            hidden_line_count: usize::try_from(
+                                end_line.saturating_sub(start_line).saturating_add(1),
+                            )
+                            .unwrap_or(usize::MAX),
+                            start_line,
+                            end_line,
+                        },
+                    });
                 }
-            })
-            .collect();
+            }
+
+            let hunk_source_row = hunk_start_rows[hunk_index];
+            if let Some(display_row) = display_by_source.get(&hunk_source_row).cloned() {
+                rows.push(view_row_for_display(
+                    file_index,
+                    hunk_source_row,
+                    display_row,
+                ));
+            }
+            source_row = hunk_source_row.saturating_add(1);
+            for _line in &hunk.lines {
+                if let Some(display_row) = display_by_source.get(&source_row).cloned() {
+                    rows.push(view_row_for_display(file_index, source_row, display_row));
+                }
+                source_row = source_row.saturating_add(1);
+            }
+            previous_hunk_end_new_line = Some(
+                hunk.new_start
+                    .saturating_add(hunk.new_count)
+                    .saturating_sub(1),
+            );
+        }
+        renumber_rows(&mut rows);
         Self { rows }
     }
 
@@ -230,6 +283,17 @@ pub struct ReviewViewRow {
 /// Semantic row block rendered by the review pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewViewBlock {
+    /// Collapsed unchanged diff context row.
+    OmittedContext {
+        /// Stable expansion key.
+        key: String,
+        /// Number of hidden lines.
+        hidden_line_count: usize,
+        /// One-based first hidden new-file line.
+        start_line: u32,
+        /// One-based final hidden new-file line.
+        end_line: u32,
+    },
     /// Existing source/hunk display row.
     DisplayRow(ReviewDisplayRow),
     /// Full-file source line row.
@@ -383,6 +447,8 @@ pub enum ReviewViewTarget {
         old_line: Option<u32>,
         new_line: Option<u32>,
     },
+    /// Omitted diff context expansion row.
+    OmittedContext { key: String },
     /// Inline review thread row.
     Thread { thread_key: String },
     /// Inline review comment row.
@@ -430,6 +496,84 @@ impl ReviewThreadAnchor {
     }
 }
 
+const fn view_row_for_display(
+    file_index: usize,
+    source_row: usize,
+    display_row: ReviewDisplayRow,
+) -> ReviewViewRow {
+    let target = display_row_target(file_index, source_row, &display_row);
+    ReviewViewRow {
+        visual_row: source_row,
+        source_row: Some(source_row),
+        target,
+        block: ReviewViewBlock::DisplayRow(display_row),
+    }
+}
+
+fn renumber_rows(rows: &mut [ReviewViewRow]) {
+    for (index, row) in rows.iter_mut().enumerate() {
+        row.visual_row = index;
+    }
+}
+
+fn diff_context_key(
+    file_index: usize,
+    hunk_index: usize,
+    start_line: u32,
+    end_line: u32,
+) -> String {
+    format!("{file_index}:{hunk_index}:{start_line}-{end_line}")
+}
+
+fn hunk_start_rows(file: &ReviewFile) -> Vec<usize> {
+    let mut rows = Vec::with_capacity(file.hunks.len());
+    let mut row = 0usize;
+    for hunk in &file.hunks {
+        rows.push(row);
+        row = row.saturating_add(hunk.lines.len()).saturating_add(1);
+    }
+    rows
+}
+
+fn push_expanded_context_rows(
+    file_index: usize,
+    cached_file: Option<&CachedReviewFile>,
+    start_line: u32,
+    end_line: u32,
+    rows: &mut Vec<ReviewViewRow>,
+) {
+    let Some(cached_file) = cached_file else {
+        return;
+    };
+    for line_number in start_line..=end_line {
+        let Some(source_index) = usize::try_from(line_number.saturating_sub(1)).ok() else {
+            continue;
+        };
+        let Some(content) = cached_file.line(source_index) else {
+            continue;
+        };
+        let display_row = ReviewDisplayRow {
+            source: ReviewDisplayRowSource::Context,
+            old_line: Some(line_number),
+            new_line: Some(line_number),
+            segments: vec![ReviewDisplaySegment::new(
+                content.to_string(),
+                vec![ReviewDisplayTextRole::Code],
+            )],
+        };
+        rows.push(ReviewViewRow {
+            visual_row: 0,
+            source_row: None,
+            target: ReviewViewTarget::SourceLine {
+                file_index,
+                source_row: rows.len(),
+                old_line: Some(line_number),
+                new_line: Some(line_number),
+            },
+            block: ReviewViewBlock::DisplayRow(display_row),
+        });
+    }
+}
 const fn display_row_target(
     file_index: usize,
     source_row: usize,
@@ -482,7 +626,7 @@ mod tests {
     fn diff_file_document_maps_visual_rows_to_semantic_targets() {
         let file = test_file();
 
-        let document = ReviewViewDocument::build_diff_file(7, &file, true);
+        let document = ReviewViewDocument::build_diff_file(7, &file, true, None, &BTreeSet::new());
 
         assert_eq!(document.rows.len(), 2);
         assert_eq!(
@@ -527,7 +671,7 @@ mod tests {
             severity: ReviewThreadSeverity::Info,
         };
 
-        let document = ReviewViewDocument::build_diff_file(7, &file, false)
+        let document = ReviewViewDocument::build_diff_file(7, &file, false, None, &BTreeSet::new())
             .with_inline_draft_threads(
                 7,
                 std::iter::once((anchor.clone(), vec![comment])),
@@ -578,7 +722,7 @@ mod tests {
             severity: ReviewThreadSeverity::Info,
         };
 
-        let document = ReviewViewDocument::build_diff_file(7, &file, false)
+        let document = ReviewViewDocument::build_diff_file(7, &file, false, None, &BTreeSet::new())
             .with_inline_draft_threads(
                 7,
                 std::iter::once((anchor, vec![comment])),
