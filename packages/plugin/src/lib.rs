@@ -118,6 +118,67 @@ pub struct PluginManifestConfig {
     pub schema_version: Option<u16>,
     #[serde(default)]
     pub schema_file: Option<PathBuf>,
+    /// Additional top-level config sections that should be treated as aliases for this plugin.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<PluginConfigAlias>,
+    /// Lightweight ownership labels for plugin-owned config categories.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<String>,
+}
+
+/// Plugin-owned config alias declaration from a plugin manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginConfigAlias {
+    /// User-facing top-level config section or dotted path.
+    pub section: String,
+    /// Optional reason, normally `legacy`, `compatibility`, or `short_name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl PluginManifestConfig {
+    /// Return the primary config section plus manifest-declared aliases.
+    #[must_use]
+    pub fn sections(&self) -> Vec<&str> {
+        self.section
+            .iter()
+            .map(String::as_str)
+            .chain(self.aliases.iter().map(|alias| alias.section.as_str()))
+            .collect()
+    }
+
+    /// Validate the manifest-declared config metadata without loading plugin code.
+    #[must_use]
+    pub fn validation_errors(&self) -> Vec<PluginConfigMetadataError> {
+        let mut errors = Vec::new();
+        let mut seen = BTreeSet::new();
+        for section in self.sections() {
+            if section.trim().is_empty() {
+                errors.push(PluginConfigMetadataError::EmptySection);
+            } else if !seen.insert(section.to_string()) {
+                errors.push(PluginConfigMetadataError::DuplicateSection(
+                    section.to_string(),
+                ));
+            }
+        }
+        for category in &self.categories {
+            if category.trim().is_empty() {
+                errors.push(PluginConfigMetadataError::EmptyCategory);
+            }
+        }
+        errors
+    }
+}
+
+/// Manifest-declared config metadata validation error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginConfigMetadataError {
+    /// A section or alias section was blank.
+    EmptySection,
+    /// A section was declared more than once.
+    DuplicateSection(String),
+    /// A config category was blank.
+    EmptyCategory,
 }
 
 /// Event subscription declared by a plugin manifest.
@@ -2793,6 +2854,70 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::OnceLock;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn manifest_config_supports_aliases_and_categories() {
+        let manifest = toml::from_str::<PluginManifest>(
+            r#"
+id = "bcode.example"
+name = "Example"
+version = "0.0.1"
+
+[config]
+section = "example"
+schema_version = 2
+aliases = [
+    { section = "legacy_example", reason = "legacy" },
+    { section = "tools.example" },
+]
+categories = ["tool", "example"]
+
+[runtime]
+type = "native"
+abi_version = 1
+library = "libexample.dylib"
+"#,
+        )
+        .expect("manifest should parse");
+        let config = manifest.config.expect("config should be present");
+
+        assert_eq!(
+            config.sections(),
+            vec!["example", "legacy_example", "tools.example"]
+        );
+        assert_eq!(config.categories, vec!["tool", "example"]);
+        assert_eq!(config.aliases[0].reason.as_deref(), Some("legacy"));
+        assert!(config.validation_errors().is_empty());
+    }
+
+    #[test]
+    fn manifest_config_validation_reports_invalid_metadata() {
+        let config = PluginManifestConfig {
+            section: Some("example".to_string()),
+            schema_version: None,
+            schema_file: None,
+            aliases: vec![
+                PluginConfigAlias {
+                    section: "example".to_string(),
+                    reason: None,
+                },
+                PluginConfigAlias {
+                    section: " ".to_string(),
+                    reason: None,
+                },
+            ],
+            categories: vec![String::new()],
+        };
+
+        assert_eq!(
+            config.validation_errors(),
+            vec![
+                PluginConfigMetadataError::DuplicateSection("example".to_string()),
+                PluginConfigMetadataError::EmptySection,
+                PluginConfigMetadataError::EmptyCategory,
+            ]
+        );
+    }
 
     #[test]
     fn per_session_resource_limit_prevents_one_session_from_exhausting_global_slots() {

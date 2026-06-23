@@ -9,7 +9,9 @@ interface_id = "bcode.tool/v1"
 name         = "Web Search Tools"
 
 [config]
-section = "web_search"
+aliases    = [{ section = "tools.web_search", reason = "legacy" }]
+categories = ["web"]
+section    = "web_search"
 
 [concurrency]
 max  = 4
