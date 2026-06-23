@@ -77,6 +77,8 @@ pub struct PluginManifest {
     #[serde(default)]
     pub tui_surfaces: Vec<PluginTuiSurfaceDeclaration>,
     #[serde(default)]
+    pub command_contributions: Vec<PluginCommandContribution>,
+    #[serde(default)]
     pub event_subscriptions: Vec<PluginEventSubscription>,
     #[serde(default)]
     pub config: Option<PluginManifestConfig>,
@@ -93,6 +95,19 @@ pub struct PluginTuiSurfaceDeclaration {
     pub title: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+}
+
+/// Command palette/action contribution declared by a plugin manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginCommandContribution {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub surface: Option<String>,
 }
 
 /// Service interface declared by a plugin manifest.
@@ -252,6 +267,45 @@ pub struct RegisteredPlugin {
     pub manifest: PluginManifest,
 }
 
+/// Resolved plugin config extension metadata with plugin ownership attached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginConfigExtension {
+    pub plugin_id: String,
+    pub section: Option<String>,
+    pub aliases: Vec<PluginConfigAlias>,
+    pub categories: Vec<String>,
+    pub schema_version: Option<u16>,
+    pub schema_file: Option<PathBuf>,
+}
+
+impl PluginConfigExtension {
+    /// Return the primary config section plus manifest-declared aliases.
+    #[must_use]
+    pub fn sections(&self) -> Vec<&str> {
+        self.section
+            .iter()
+            .map(String::as_str)
+            .chain(self.aliases.iter().map(|alias| alias.section.as_str()))
+            .collect()
+    }
+}
+
+impl RegisteredPlugin {
+    /// Return this plugin's manifest-declared config extension metadata, if any.
+    #[must_use]
+    pub fn config_extension(&self) -> Option<PluginConfigExtension> {
+        let config = self.manifest.config.as_ref()?;
+        Some(PluginConfigExtension {
+            plugin_id: self.manifest.id.clone(),
+            section: config.section.clone(),
+            aliases: config.aliases.clone(),
+            categories: config.categories.clone(),
+            schema_version: config.schema_version,
+            schema_file: config.schema_file.clone(),
+        })
+    }
+}
+
 /// Resolved per-plugin host configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedPluginConfig {
@@ -268,6 +322,76 @@ impl ResolvedPluginConfig {
             redacted_config,
         }
     }
+}
+
+/// Return manifest-declared plugin command contributions with plugin ownership.
+#[must_use]
+pub fn plugin_command_contributions(
+    plugins: &[RegisteredPlugin],
+) -> Vec<PluginOwnedCommandContribution> {
+    plugins
+        .iter()
+        .flat_map(|plugin| {
+            plugin
+                .manifest
+                .command_contributions
+                .iter()
+                .cloned()
+                .map(|command| PluginOwnedCommandContribution {
+                    plugin_id: plugin.manifest.id.clone(),
+                    command,
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Command contribution with plugin ownership attached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginOwnedCommandContribution {
+    pub plugin_id: String,
+    pub command: PluginCommandContribution,
+}
+
+/// Return manifest-declared plugin config extension metadata for registered plugins.
+#[must_use]
+pub fn plugin_config_extensions(plugins: &[RegisteredPlugin]) -> Vec<PluginConfigExtension> {
+    plugins
+        .iter()
+        .filter_map(RegisteredPlugin::config_extension)
+        .collect()
+}
+
+/// Return manifest-declared plugin config metadata validation errors with plugin IDs attached.
+#[must_use]
+pub fn plugin_config_metadata_errors(
+    plugins: &[RegisteredPlugin],
+) -> Vec<PluginConfigMetadataDiagnostic> {
+    plugins
+        .iter()
+        .filter_map(|plugin| {
+            let config = plugin.manifest.config.as_ref()?;
+            Some((plugin, config.validation_errors()))
+        })
+        .flat_map(|(plugin, errors)| {
+            errors
+                .into_iter()
+                .map(|error| PluginConfigMetadataDiagnostic {
+                    plugin_id: plugin.manifest.id.clone(),
+                    manifest_path: plugin.manifest_path.clone(),
+                    error,
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Manifest-declared config metadata validation error with plugin ownership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginConfigMetadataDiagnostic {
+    pub plugin_id: String,
+    pub manifest_path: PathBuf,
+    pub error: PluginConfigMetadataError,
 }
 
 /// Statically bundled plugin registration.
@@ -2920,6 +3044,130 @@ library = "libexample.dylib"
     }
 
     #[test]
+    fn registered_plugins_expose_command_contributions() {
+        let manifest = toml::from_str::<PluginManifest>(
+            r#"
+id = "bcode.commands"
+name = "Commands"
+version = "0.0.1"
+
+[[command_contributions]]
+id = "example.run"
+title = "Run Example"
+description = "Run an example command"
+category = "example"
+surface = "palette"
+
+[runtime]
+type = "native"
+abi_version = 1
+library = "libcommands.dylib"
+"#,
+        )
+        .expect("manifest should parse");
+        let plugin = RegisteredPlugin {
+            manifest_path: PathBuf::from("plugins/commands/bcode-plugin.toml"),
+            manifest,
+        };
+
+        let commands = plugin_command_contributions(&[plugin]);
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].plugin_id, "bcode.commands");
+        assert_eq!(commands[0].command.id, "example.run");
+        assert_eq!(commands[0].command.surface.as_deref(), Some("palette"));
+    }
+
+    #[test]
+    fn registered_plugins_expose_config_extension_catalog() {
+        let manifest = PluginManifest {
+            id: "bcode.example".to_string(),
+            name: "Example".to_string(),
+            version: Version::new(0, 1, 0),
+            services: Vec::new(),
+            tui_surfaces: Vec::new(),
+            command_contributions: Vec::new(),
+            event_subscriptions: Vec::new(),
+            config: Some(PluginManifestConfig {
+                section: Some("example".to_string()),
+                schema_version: Some(1),
+                schema_file: Some(PathBuf::from("schema.toml")),
+                aliases: vec![PluginConfigAlias {
+                    section: "legacy_example".to_string(),
+                    reason: Some("legacy".to_string()),
+                }],
+                categories: vec!["example".to_string()],
+            }),
+            concurrency: PluginConcurrencyConfig::default(),
+            runtime: PluginRuntime::Native(NativePluginRuntime {
+                abi_version: 1,
+                library: PathBuf::from("libexample.dylib"),
+                manifest_symbol: default_manifest_symbol(),
+                activate_symbol: default_activate_symbol(),
+                deactivate_symbol: default_deactivate_symbol(),
+                service_symbol: default_service_symbol(),
+                streaming_service_symbol: default_streaming_service_symbol(),
+                event_symbol: default_event_symbol(),
+            }),
+        };
+        let plugin = RegisteredPlugin {
+            manifest_path: PathBuf::from("plugins/example/bcode-plugin.toml"),
+            manifest,
+        };
+
+        let extensions = plugin_config_extensions(&[plugin]);
+
+        assert_eq!(extensions.len(), 1);
+        assert_eq!(extensions[0].plugin_id, "bcode.example");
+        assert_eq!(extensions[0].sections(), vec!["example", "legacy_example"]);
+        assert_eq!(extensions[0].schema_version, Some(1));
+    }
+
+    #[test]
+    fn config_metadata_diagnostics_include_plugin_ownership() {
+        let manifest = PluginManifest {
+            id: "bcode.invalid".to_string(),
+            name: "Invalid".to_string(),
+            version: Version::new(0, 1, 0),
+            services: Vec::new(),
+            tui_surfaces: Vec::new(),
+            command_contributions: Vec::new(),
+            event_subscriptions: Vec::new(),
+            config: Some(PluginManifestConfig {
+                section: Some(" ".to_string()),
+                schema_version: None,
+                schema_file: None,
+                aliases: Vec::new(),
+                categories: Vec::new(),
+            }),
+            concurrency: PluginConcurrencyConfig::default(),
+            runtime: PluginRuntime::Native(NativePluginRuntime {
+                abi_version: 1,
+                library: PathBuf::from("libinvalid.dylib"),
+                manifest_symbol: default_manifest_symbol(),
+                activate_symbol: default_activate_symbol(),
+                deactivate_symbol: default_deactivate_symbol(),
+                service_symbol: default_service_symbol(),
+                streaming_service_symbol: default_streaming_service_symbol(),
+                event_symbol: default_event_symbol(),
+            }),
+        };
+        let plugin = RegisteredPlugin {
+            manifest_path: PathBuf::from("plugins/invalid/bcode-plugin.toml"),
+            manifest,
+        };
+
+        let diagnostics = plugin_config_metadata_errors(&[plugin]);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].plugin_id, "bcode.invalid");
+        assert_eq!(
+            diagnostics[0].error,
+            PluginConfigMetadataError::EmptySection
+        );
+    }
+
+    #[test]
     fn per_session_resource_limit_prevents_one_session_from_exhausting_global_slots() {
         let tokio = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3389,6 +3637,7 @@ library = "libexample_plugin.dylib"
                     class: None,
                 }],
                 tui_surfaces: Vec::new(),
+                command_contributions: Vec::new(),
                 event_subscriptions: Vec::new(),
                 concurrency: PluginConcurrencyConfig::Exclusive,
                 runtime: PluginRuntime::Native(NativePluginRuntime {
@@ -3924,6 +4173,7 @@ library = "libexample_plugin.dylib"
                 class: None,
             }],
             tui_surfaces: Vec::new(),
+            command_contributions: Vec::new(),
             event_subscriptions: Vec::new(),
             concurrency: PluginConcurrencyConfig::Exclusive,
             runtime: PluginRuntime::Native(NativePluginRuntime {

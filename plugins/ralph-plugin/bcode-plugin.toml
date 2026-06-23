@@ -5,6 +5,8 @@ version = "0.0.1"
 [config]
 section = "ralph"
 
+categories = ["automation", "ralph"]
+
 [[tui_surfaces]]
 description = "Full-screen Ralph loop status and command home UI"
 kind        = "ralph-home"

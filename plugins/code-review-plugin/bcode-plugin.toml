@@ -5,6 +5,8 @@ version = "0.0.1"
 [config]
 section = "code_review"
 
+categories = ["review"]
+
 [[services]]
 class        = "service"
 description  = "Local Git code review services"
