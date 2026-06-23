@@ -284,7 +284,14 @@ mod tests {
             agent_id: PLAN_AGENT.to_string(),
             tool_name: "shell.run".to_string(),
             side_effect: ToolSideEffect::ExecuteProcess,
-            policy: bcode_tool::ToolPolicyMetadata::default(),
+            policy: bcode_tool::ToolPolicyMetadata {
+                aliases: vec!["bash".to_string()],
+                permission_category: Some("bash".to_string()),
+                argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
+                    kind: bcode_tool::ToolArgumentKind::Command,
+                    argument: "command".to_string(),
+                }],
+            },
             arguments: json!({ "command": "git diff && git commit -m nope" }),
             cwd: Some("/tmp/project".to_string()),
         };

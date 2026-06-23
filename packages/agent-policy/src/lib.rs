@@ -219,21 +219,7 @@ fn evaluate_after_path(
     if has_argument_kind(request, ToolArgumentKind::ReadPath) {
         return evaluate_filesystem_path(config, request, &config.permission.read);
     }
-    match request.tool_name.as_str() {
-        "shell.run" => evaluate_shell(config, request),
-        "filesystem.read" | "filesystem.list" | "filesystem.find" | "filesystem.grep"
-        | "filesystem.stat" | "filesystem.exists" => {
-            evaluate_filesystem_path(config, request, &config.permission.read)
-        }
-        "filesystem.write" => evaluate_filesystem_path(config, request, &config.permission.write),
-        "filesystem.edit" => evaluate_filesystem_path(config, request, &config.permission.edit),
-        "web.search" | "web.status" | "web.inspect" => {
-            evaluation(AgentDecision::Allow, String::new(), None, None)
-        }
-        "web.fetch" => evaluate_web_url(config, request),
-        "worktree.list" => evaluation(AgentDecision::Allow, String::new(), None, None),
-        _ => evaluate_side_effect_fallback(config, request),
-    }
+    evaluate_side_effect_fallback(config, request)
 }
 
 fn write_path_rules<'a>(
@@ -871,13 +857,35 @@ mod tests {
     use bcode_agent_profile::EvaluateToolCallRequest;
     use serde_json::json;
 
+    fn command_policy() -> bcode_tool::ToolPolicyMetadata {
+        bcode_tool::ToolPolicyMetadata {
+            aliases: vec!["bash".to_string()],
+            permission_category: Some("bash".to_string()),
+            argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
+                kind: ToolArgumentKind::Command,
+                argument: "command".to_string(),
+            }],
+        }
+    }
+
+    fn path_policy(category: &str, kind: ToolArgumentKind) -> bcode_tool::ToolPolicyMetadata {
+        bcode_tool::ToolPolicyMetadata {
+            aliases: vec![category.to_string()],
+            permission_category: Some(category.to_string()),
+            argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
+                kind,
+                argument: "path".to_string(),
+            }],
+        }
+    }
+
     fn request(agent_id: &str, command: &str) -> EvaluateToolCallRequest {
         EvaluateToolCallRequest {
             session_id: bcode_session_models::SessionId::new(),
             agent_id: agent_id.to_string(),
             tool_name: "shell.run".to_string(),
             side_effect: ToolSideEffect::ExecuteProcess,
-            policy: bcode_tool::ToolPolicyMetadata::default(),
+            policy: command_policy(),
             arguments: json!({ "command": command }),
             cwd: Some("/tmp/project".to_string()),
         }
@@ -1105,7 +1113,7 @@ mod tests {
             agent_id: BUILD_AGENT.to_string(),
             tool_name: "filesystem.write".to_string(),
             side_effect: ToolSideEffect::WriteFiles,
-            policy: bcode_tool::ToolPolicyMetadata::default(),
+            policy: path_policy("write", ToolArgumentKind::WritePath),
             arguments: json!({ "path": "../outside.txt" }),
             cwd: Some("/tmp/project".to_string()),
         };
@@ -1124,7 +1132,11 @@ mod tests {
                 "filesystem.write" | "filesystem.edit" => ToolSideEffect::WriteFiles,
                 _ => ToolSideEffect::ReadOnly,
             },
-            policy: bcode_tool::ToolPolicyMetadata::default(),
+            policy: match tool_name {
+                "filesystem.write" => path_policy("write", ToolArgumentKind::WritePath),
+                "filesystem.edit" => path_policy("edit", ToolArgumentKind::WritePath),
+                _ => path_policy("read", ToolArgumentKind::ReadPath),
+            },
             arguments: json!({ "path": path }),
             cwd: Some("/tmp/project".to_string()),
         }
@@ -1254,6 +1266,199 @@ mod tests {
         );
 
         assert_eq!(result.response.decision, AgentDecision::Deny);
+    }
+
+    #[test]
+    fn metadata_command_tool_uses_declared_argument_and_alias_rules() {
+        let config = AgentConfig {
+            accent: None,
+            tools: BTreeMap::from([("bash".to_string(), true)]),
+            permission: PermissionConfig {
+                bash: BTreeMap::from([("cargo check".to_string(), Action::Allow)]),
+                ..PermissionConfig::default()
+            },
+        };
+        let request = EvaluateToolCallRequest {
+            session_id: bcode_session_models::SessionId::new(),
+            agent_id: BUILD_AGENT.to_string(),
+            tool_name: "custom.exec".to_string(),
+            side_effect: ToolSideEffect::ExecuteProcess,
+            policy: bcode_tool::ToolPolicyMetadata {
+                aliases: vec!["bash".to_string()],
+                permission_category: Some("bash".to_string()),
+                argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
+                    kind: ToolArgumentKind::Command,
+                    argument: "cmd".to_string(),
+                }],
+            },
+            arguments: json!({ "cmd": "cargo check" }),
+            cwd: Some("/tmp/project".to_string()),
+        };
+
+        let result = evaluate_tool_call(&config, &request, Path::new("/tmp/project"));
+
+        assert_eq!(result.response.decision, AgentDecision::Allow);
+        assert!(result.matched_rule.is_none());
+    }
+
+    #[test]
+    fn metadata_url_tool_uses_declared_argument_and_web_rules() {
+        let config = AgentConfig {
+            accent: None,
+            tools: BTreeMap::new(),
+            permission: PermissionConfig {
+                web: BTreeMap::from([("https://example.com/*".to_string(), Action::Allow)]),
+                ..PermissionConfig::default()
+            },
+        };
+        let request = EvaluateToolCallRequest {
+            session_id: bcode_session_models::SessionId::new(),
+            agent_id: PLAN_AGENT.to_string(),
+            tool_name: "custom.fetch".to_string(),
+            side_effect: ToolSideEffect::ReadOnly,
+            policy: bcode_tool::ToolPolicyMetadata {
+                aliases: vec!["web".to_string()],
+                permission_category: Some("web".to_string()),
+                argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
+                    kind: ToolArgumentKind::Url,
+                    argument: "target".to_string(),
+                }],
+            },
+            arguments: json!({ "target": "https://example.com/docs" }),
+            cwd: Some("/tmp/project".to_string()),
+        };
+
+        let result = evaluate_tool_call(&config, &request, Path::new("/tmp/project"));
+
+        assert_eq!(result.response.decision, AgentDecision::Allow);
+        assert_eq!(
+            result.matched_rule.as_deref(),
+            Some("https://example.com/*")
+        );
+    }
+
+    #[test]
+    fn metadata_write_path_tool_uses_declared_argument_and_category_rules() {
+        let config = AgentConfig {
+            accent: None,
+            tools: BTreeMap::from([("write".to_string(), true)]),
+            permission: PermissionConfig {
+                write: BTreeMap::from([("generated/**".to_string(), Action::Deny)]),
+                ..PermissionConfig::default()
+            },
+        };
+        let request = EvaluateToolCallRequest {
+            session_id: bcode_session_models::SessionId::new(),
+            agent_id: BUILD_AGENT.to_string(),
+            tool_name: "custom.write".to_string(),
+            side_effect: ToolSideEffect::WriteFiles,
+            policy: bcode_tool::ToolPolicyMetadata {
+                aliases: vec!["write".to_string()],
+                permission_category: Some("write".to_string()),
+                argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
+                    kind: ToolArgumentKind::WritePath,
+                    argument: "target_path".to_string(),
+                }],
+            },
+            arguments: json!({ "target_path": "generated/out.rs" }),
+            cwd: Some("/tmp/project".to_string()),
+        };
+
+        let result = evaluate_tool_call(&config, &request, Path::new("/tmp/project"));
+
+        assert_eq!(result.response.decision, AgentDecision::Deny);
+        assert_eq!(result.matched_rule.as_deref(), Some("generated/**"));
+    }
+
+    #[test]
+    fn metadata_edit_category_uses_edit_rules_for_write_paths() {
+        let config = AgentConfig {
+            accent: None,
+            tools: BTreeMap::from([("edit".to_string(), true)]),
+            permission: PermissionConfig {
+                edit: BTreeMap::from([("src/**".to_string(), Action::Allow)]),
+                ..PermissionConfig::default()
+            },
+        };
+        let request = EvaluateToolCallRequest {
+            session_id: bcode_session_models::SessionId::new(),
+            agent_id: BUILD_AGENT.to_string(),
+            tool_name: "custom.patch".to_string(),
+            side_effect: ToolSideEffect::WriteFiles,
+            policy: bcode_tool::ToolPolicyMetadata {
+                aliases: vec!["edit".to_string()],
+                permission_category: Some("edit".to_string()),
+                argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
+                    kind: ToolArgumentKind::WritePath,
+                    argument: "file".to_string(),
+                }],
+            },
+            arguments: json!({ "file": "src/lib.rs" }),
+            cwd: Some("/tmp/project".to_string()),
+        };
+
+        let result = evaluate_tool_call(&config, &request, Path::new("/tmp/project"));
+
+        assert_eq!(result.response.decision, AgentDecision::Allow);
+        assert_eq!(result.matched_rule.as_deref(), Some("src/**"));
+    }
+
+    #[test]
+    fn external_directory_uses_metadata_path_arguments() {
+        let config = AgentConfig {
+            accent: None,
+            tools: BTreeMap::from([("write".to_string(), true)]),
+            permission: PermissionConfig {
+                external_directory: Action::Deny,
+                ..PermissionConfig::default()
+            },
+        };
+        let request = EvaluateToolCallRequest {
+            session_id: bcode_session_models::SessionId::new(),
+            agent_id: BUILD_AGENT.to_string(),
+            tool_name: "custom.write".to_string(),
+            side_effect: ToolSideEffect::WriteFiles,
+            policy: bcode_tool::ToolPolicyMetadata {
+                aliases: vec!["write".to_string()],
+                permission_category: Some("write".to_string()),
+                argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
+                    kind: ToolArgumentKind::WritePath,
+                    argument: "output".to_string(),
+                }],
+            },
+            arguments: json!({ "output": "../outside.txt" }),
+            cwd: Some("/tmp/project".to_string()),
+        };
+
+        let result = evaluate_tool_call(&config, &request, Path::new("/tmp/project"));
+
+        assert_eq!(result.response.decision, AgentDecision::Deny);
+    }
+
+    #[test]
+    fn metadata_alias_can_enable_unknown_mutating_tool_fallback() {
+        let config = AgentConfig {
+            accent: None,
+            tools: BTreeMap::from([("custom-category".to_string(), true)]),
+            permission: PermissionConfig::default(),
+        };
+        let request = EvaluateToolCallRequest {
+            session_id: bcode_session_models::SessionId::new(),
+            agent_id: BUILD_AGENT.to_string(),
+            tool_name: "custom.side-effect".to_string(),
+            side_effect: ToolSideEffect::WriteFiles,
+            policy: bcode_tool::ToolPolicyMetadata {
+                aliases: Vec::new(),
+                permission_category: Some("custom-category".to_string()),
+                argument_extractors: Vec::new(),
+            },
+            arguments: json!({}),
+            cwd: Some("/tmp/project".to_string()),
+        };
+
+        let result = evaluate_tool_call(&config, &request, Path::new("/tmp/project"));
+
+        assert_eq!(result.response.decision, AgentDecision::Ask);
     }
 
     #[test]

@@ -3887,7 +3887,7 @@ fn context_window_percentage(input_tokens: u32, context_window: u32) -> u32 {
 }
 
 fn terminal_shell_presentation(result: &str) -> Option<ShellResultPresentation> {
-    match tool_result_presentation(Some("shell.run"), result)? {
+    match tool_result_presentation(None, result)? {
         ToolResultPresentation::Shell(shell @ ShellResultPresentation::Terminal { .. }) => {
             Some(shell)
         }
