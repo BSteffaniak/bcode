@@ -48,8 +48,142 @@ pub struct ProviderCapabilities {
     /// Provider-supported auth scheme identifiers, for example `api_key` or `chatgpt`.
     #[serde(default)]
     pub auth_schemes: BTreeSet<String>,
+    /// Provider-supplied default retry rules for known ephemeral errors.
+    #[serde(default)]
+    pub retry_rules: Vec<ProviderRetryRule>,
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
+}
+
+/// Provider-supplied or user-configured provider error retry rule.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRetryRule {
+    /// Stable retry rule identifier.
+    pub id: String,
+    /// Enable this retry rule. `None` inherits from provider defaults or final defaults.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Exact provider plugin id scope.
+    #[serde(default)]
+    pub provider_plugin_id: Option<String>,
+    /// Provider plugin id substring scope.
+    #[serde(default)]
+    pub provider_plugin_id_contains: Option<String>,
+    /// Exact model id scope.
+    #[serde(default)]
+    pub model_id: Option<String>,
+    /// Model id substring scope.
+    #[serde(default)]
+    pub model_id_contains: Option<String>,
+    /// Maximum retry attempts when this rule matches.
+    #[serde(default)]
+    pub max_retries: Option<u8>,
+    /// Initial retry delay in milliseconds.
+    #[serde(default)]
+    pub initial_delay_ms: Option<u64>,
+    /// Maximum retry delay in milliseconds.
+    #[serde(default)]
+    pub max_delay_ms: Option<u64>,
+    /// Use provider retry hints when present.
+    #[serde(default)]
+    pub use_provider_retry_hint: Option<bool>,
+    /// Error match conditions.
+    #[serde(default)]
+    pub r#match: ProviderRetryRuleMatch,
+}
+
+/// Provider error retry rule match conditions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRetryRuleMatch {
+    /// Provider error category to match.
+    #[serde(default)]
+    pub category: Option<ProviderErrorCategory>,
+    /// Provider error code to match exactly.
+    #[serde(default)]
+    pub code: Option<String>,
+    /// Provider error message to match exactly.
+    #[serde(default)]
+    pub message_equals: Option<String>,
+    /// Provider error message substring to match.
+    #[serde(default)]
+    pub message_contains: Option<String>,
+    /// Provider-native error message to match exactly.
+    #[serde(default)]
+    pub provider_message_equals: Option<String>,
+    /// Provider-native error message substring to match.
+    #[serde(default)]
+    pub provider_message_contains: Option<String>,
+}
+
+impl ProviderRetryRuleMatch {
+    /// Return whether this matcher has at least one configured condition.
+    #[must_use]
+    pub const fn has_conditions(&self) -> bool {
+        self.category.is_some()
+            || self.code.is_some()
+            || self.message_equals.is_some()
+            || self.message_contains.is_some()
+            || self.provider_message_equals.is_some()
+            || self.provider_message_contains.is_some()
+    }
+}
+
+impl ProviderRetryRule {
+    /// Deep-merge another rule with field-level override precedence.
+    pub fn merge_override(&mut self, override_rule: Self) {
+        if override_rule.enabled.is_some() {
+            self.enabled = override_rule.enabled;
+        }
+        if override_rule.provider_plugin_id.is_some() {
+            self.provider_plugin_id = override_rule.provider_plugin_id;
+        }
+        if override_rule.provider_plugin_id_contains.is_some() {
+            self.provider_plugin_id_contains = override_rule.provider_plugin_id_contains;
+        }
+        if override_rule.model_id.is_some() {
+            self.model_id = override_rule.model_id;
+        }
+        if override_rule.model_id_contains.is_some() {
+            self.model_id_contains = override_rule.model_id_contains;
+        }
+        if override_rule.max_retries.is_some() {
+            self.max_retries = override_rule.max_retries;
+        }
+        if override_rule.initial_delay_ms.is_some() {
+            self.initial_delay_ms = override_rule.initial_delay_ms;
+        }
+        if override_rule.max_delay_ms.is_some() {
+            self.max_delay_ms = override_rule.max_delay_ms;
+        }
+        if override_rule.use_provider_retry_hint.is_some() {
+            self.use_provider_retry_hint = override_rule.use_provider_retry_hint;
+        }
+        self.r#match.merge_override(override_rule.r#match);
+    }
+}
+
+impl ProviderRetryRuleMatch {
+    /// Deep-merge another matcher with field-level override precedence.
+    pub fn merge_override(&mut self, override_match: Self) {
+        if override_match.category.is_some() {
+            self.category = override_match.category;
+        }
+        if override_match.code.is_some() {
+            self.code = override_match.code;
+        }
+        if override_match.message_equals.is_some() {
+            self.message_equals = override_match.message_equals;
+        }
+        if override_match.message_contains.is_some() {
+            self.message_contains = override_match.message_contains;
+        }
+        if override_match.provider_message_equals.is_some() {
+            self.provider_message_equals = override_match.provider_message_equals;
+        }
+        if override_match.provider_message_contains.is_some() {
+            self.provider_message_contains = override_match.provider_message_contains;
+        }
+    }
 }
 
 /// Provider-level capability.

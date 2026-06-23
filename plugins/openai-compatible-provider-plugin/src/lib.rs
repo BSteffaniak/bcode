@@ -18,8 +18,9 @@ use bcode_model::{
     OP_FINISH_TURN, OP_MODELS, OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS, OP_START_TURN,
     OP_VALIDATE_CONFIG, OP_VERIFY_MODEL, PollTurnEventsRequest, PollTurnEventsResponse,
     ProviderAuthCandidate, ProviderCapabilities, ProviderCapability, ProviderError,
-    ProviderErrorCategory, ProviderRequestContext, ProviderRequestProjection, ProviderTurnEvent,
-    StartTurnResponse, StopReason, TokenUsage, ToolCall, ValidateConfigResponse,
+    ProviderErrorCategory, ProviderRequestContext, ProviderRequestProjection, ProviderRetryRule,
+    ProviderRetryRuleMatch, ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage, ToolCall,
+    ValidateConfigResponse,
 };
 use bcode_model_catalog_models::ModelSupportTarget;
 use bcode_model_provider_runtime::{
@@ -3133,7 +3134,26 @@ fn capabilities() -> ProviderCapabilities {
         auth_schemes: ["api_key".to_string(), "chatgpt".to_string()]
             .into_iter()
             .collect(),
+        retry_rules: vec![unsupported_content_type_retry_rule()],
         metadata: diagnostics_metadata(&settings, None),
+    }
+}
+
+fn unsupported_content_type_retry_rule() -> ProviderRetryRule {
+    ProviderRetryRule {
+        id: "bcode.openai-compatible.unsupported-content-type".to_string(),
+        enabled: Some(true),
+        provider_plugin_id: Some(PROVIDER_ID.to_string()),
+        max_retries: Some(3),
+        initial_delay_ms: Some(1_000),
+        max_delay_ms: Some(8_000),
+        use_provider_retry_hint: Some(true),
+        r#match: ProviderRetryRuleMatch {
+            code: Some("http_400".to_string()),
+            message_contains: Some("Unsupported content type".to_string()),
+            ..ProviderRetryRuleMatch::default()
+        },
+        ..ProviderRetryRule::default()
     }
 }
 
@@ -4923,6 +4943,17 @@ mod tests {
             model_ids_are_explicit: true,
             request_timeout: None,
         }
+    }
+
+    #[test]
+    fn capabilities_include_default_retry_rules() {
+        let capabilities = capabilities();
+
+        assert!(capabilities.retry_rules.iter().any(|rule| {
+            rule.id == "bcode.openai-compatible.unsupported-content-type"
+                && rule.r#match.code.as_deref() == Some("http_400")
+                && rule.r#match.message_contains.as_deref() == Some("Unsupported content type")
+        }));
     }
 
     #[test]

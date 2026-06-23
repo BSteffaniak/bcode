@@ -254,6 +254,7 @@ fn capabilities() -> ProviderCapabilities {
         .into_iter()
         .collect(),
         auth_schemes: BTreeSet::new(),
+        retry_rules: Vec::new(),
         metadata: BTreeMap::new(),
     }
 }

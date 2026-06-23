@@ -1126,6 +1126,7 @@ fn capabilities() -> ProviderCapabilities {
         ]
         .into_iter()
         .collect(),
+        retry_rules: Vec::new(),
         metadata: diagnostics_metadata(&settings),
     }
 }

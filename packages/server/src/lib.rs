@@ -7877,6 +7877,7 @@ struct ProviderErrorRetryContext<'a> {
     trigger_event_sequence: u64,
     turn_id: &'a str,
     selection: &'a SessionModelSelection,
+    provider_retry_rules: &'a [bcode_model::ProviderRetryRule],
     cancel_state: &'a TurnCancelState,
 }
 
@@ -8868,6 +8869,7 @@ async fn run_model_turn_inner(
     }
 
     let provider_plugin_id = selection.provider_plugin_id.clone();
+    let provider_retry_rules = provider_retry_rules(state, provider_plugin_id.as_deref()).await;
     let mut round = 0_u32;
     let mut recovery = ModelTurnRecoveryState::default();
     loop {
@@ -8927,6 +8929,7 @@ async fn run_model_turn_inner(
             trigger_event_sequence: trigger_event.sequence,
             turn_id: &request.turn_id,
             selection: &selection,
+            provider_retry_rules: &provider_retry_rules,
             cancel_state: cancel_state.as_ref(),
         };
         match maybe_retry_after_provider_error(
@@ -9020,7 +9023,12 @@ async fn maybe_retry_after_provider_error(
         };
     }
 
-    if let Some(policy) = matching_provider_retry_policy(state, error, context.selection) {
+    if let Some(policy) = matching_provider_retry_policy(
+        state,
+        error,
+        context.selection,
+        context.provider_retry_rules,
+    ) {
         let attempts = recovery
             .retry_attempts
             .entry(policy.id.clone())
@@ -9064,6 +9072,7 @@ fn matching_provider_retry_policy(
     state: &ServerState,
     error: &bcode_model::ProviderError,
     selection: &SessionModelSelection,
+    provider_rules: &[bcode_model::ProviderRetryRule],
 ) -> Option<ProviderRetryPolicy> {
     if !state.model_retry.enabled {
         return None;
@@ -9080,36 +9089,87 @@ fn matching_provider_retry_policy(
         });
     }
 
-    state
-        .model_retry
-        .rules
+    let rules = effective_provider_retry_rules(provider_rules, &state.model_retry.rules);
+    rules
         .iter()
         .find(|rule| custom_retry_rule_matches(rule, error, selection))
-        .map(|rule| ProviderRetryPolicy {
-            id: format!("custom.{}", rule.id),
-            display_name: rule.id.clone(),
-            max_retries: rule.max_retries,
-            initial_delay_ms: rule.initial_delay_ms,
-            max_delay_ms: rule.max_delay_ms,
-            use_provider_retry_hint: rule.use_provider_retry_hint,
-            kind: ProviderRetryPolicyKind::Custom,
-        })
+        .map(ProviderRetryPolicy::from_rule)
+}
+
+fn effective_provider_retry_rules(
+    provider_rules: &[bcode_model::ProviderRetryRule],
+    user_rules: &[bcode_config::ModelRetryRuleConfig],
+) -> Vec<bcode_model::ProviderRetryRule> {
+    let mut rules = BTreeMap::new();
+    for rule in provider_rules {
+        rules.insert(rule.id.clone(), rule.clone());
+    }
+    for rule in user_rules {
+        rules
+            .entry(rule.id.clone())
+            .and_modify(|existing: &mut bcode_model::ProviderRetryRule| {
+                existing.merge_override(rule.clone());
+            })
+            .or_insert_with(|| rule.clone());
+    }
+    rules.into_values().collect()
 }
 
 fn custom_retry_rule_matches(
-    rule: &bcode_config::ModelRetryRuleConfig,
+    rule: &bcode_model::ProviderRetryRule,
     error: &bcode_model::ProviderError,
     selection: &SessionModelSelection,
 ) -> bool {
-    rule.enabled
-        && rule.max_retries > 0
+    rule.enabled.unwrap_or(true)
+        && rule
+            .max_retries
+            .unwrap_or(default_provider_retry_max_retries())
+            > 0
         && rule.r#match.has_conditions()
         && retry_rule_scope_matches(rule, selection)
         && retry_rule_error_matches(&rule.r#match, error)
 }
 
+impl ProviderRetryPolicy {
+    fn from_rule(rule: &bcode_model::ProviderRetryRule) -> Self {
+        Self {
+            id: format!("custom.{}", rule.id),
+            display_name: rule.id.clone(),
+            max_retries: rule
+                .max_retries
+                .unwrap_or(default_provider_retry_max_retries()),
+            initial_delay_ms: rule
+                .initial_delay_ms
+                .unwrap_or(default_provider_retry_initial_delay_ms()),
+            max_delay_ms: rule
+                .max_delay_ms
+                .unwrap_or(default_provider_retry_max_delay_ms()),
+            use_provider_retry_hint: rule
+                .use_provider_retry_hint
+                .unwrap_or(default_provider_retry_use_provider_retry_hint()),
+            kind: ProviderRetryPolicyKind::Custom,
+        }
+    }
+}
+
+const fn default_provider_retry_max_retries() -> u8 {
+    3
+}
+
+const fn default_provider_retry_initial_delay_ms() -> u64 {
+    1_000
+}
+
+const fn default_provider_retry_max_delay_ms() -> u64 {
+    8_000
+}
+
+const fn default_provider_retry_use_provider_retry_hint() -> bool {
+    true
+}
+
 fn retry_rule_scope_matches(
-    rule: &bcode_config::ModelRetryRuleConfig,
+    rule: &bcode_model::ProviderRetryRule,
     selection: &SessionModelSelection,
 ) -> bool {
     optional_exact_matches(
@@ -9126,7 +9186,7 @@ fn retry_rule_scope_matches(
 }
 
 fn retry_rule_error_matches(
-    matcher: &bcode_config::ModelRetryRuleMatchConfig,
+    matcher: &bcode_model::ProviderRetryRuleMatch,
     error: &bcode_model::ProviderError,
 ) -> bool {
     matcher
@@ -9162,6 +9222,25 @@ fn optional_contains_matches(expected: Option<&str>, actual: Option<&str>) -> bo
 fn is_overloaded_provider_error(error: &bcode_model::ProviderError) -> bool {
     error.category == bcode_model::ProviderErrorCategory::Overloaded
         || error.code == "server_is_overloaded"
+}
+
+async fn provider_retry_rules(
+    state: &ServerState,
+    provider_plugin_id: Option<&str>,
+) -> Vec<bcode_model::ProviderRetryRule> {
+    let Some(provider_plugin_id) = provider_plugin_id else {
+        return Vec::new();
+    };
+    state
+        .plugins
+        .invoke_service_json::<(), bcode_model::ProviderCapabilities>(
+            provider_plugin_id,
+            bcode_model::MODEL_PROVIDER_INTERFACE_ID,
+            bcode_model::OP_CAPABILITIES,
+            &(),
+        )
+        .await
+        .map_or_else(|_| Vec::new(), |capabilities| capabilities.retry_rules)
 }
 
 async fn retry_after_provider_error(
@@ -9374,7 +9453,7 @@ fn should_defer_visible_provider_error(
         || is_tool_arguments_decode_provider_error(error)
         || is_overloaded_provider_error(error)
         || selection.is_some_and(|selection| {
-            matching_provider_retry_policy(state, error, selection).is_some()
+            matching_provider_retry_policy(state, error, selection, &[]).is_some()
         })
 }
 
@@ -15567,6 +15646,73 @@ mod tests {
     }
 
     #[test]
+    fn user_retry_rule_deep_merges_over_provider_rule() {
+        let provider_rule = bcode_model::ProviderRetryRule {
+            id: "provider.rule".to_string(),
+            enabled: Some(true),
+            provider_plugin_id: Some("bcode.openai-compatible".to_string()),
+            max_retries: Some(3),
+            initial_delay_ms: Some(1_000),
+            max_delay_ms: Some(8_000),
+            use_provider_retry_hint: Some(true),
+            r#match: bcode_model::ProviderRetryRuleMatch {
+                code: Some("http_400".to_string()),
+                message_contains: Some("Unsupported content type".to_string()),
+                ..bcode_model::ProviderRetryRuleMatch::default()
+            },
+            ..bcode_model::ProviderRetryRule::default()
+        };
+        let user_rule = bcode_config::ModelRetryRuleConfig {
+            id: "provider.rule".to_string(),
+            max_retries: Some(1),
+            ..bcode_config::ModelRetryRuleConfig::default()
+        };
+
+        let effective = effective_provider_retry_rules(&[provider_rule], &[user_rule]);
+
+        assert_eq!(effective.len(), 1);
+        let rule = &effective[0];
+        assert_eq!(rule.max_retries, Some(1));
+        assert_eq!(rule.initial_delay_ms, Some(1_000));
+        assert_eq!(rule.r#match.code.as_deref(), Some("http_400"));
+    }
+
+    #[test]
+    fn user_retry_rule_can_disable_provider_rule_without_redefining_matcher() {
+        let provider_rule = bcode_model::ProviderRetryRule {
+            id: "provider.rule".to_string(),
+            enabled: Some(true),
+            r#match: bcode_model::ProviderRetryRuleMatch {
+                code: Some("http_400".to_string()),
+                ..bcode_model::ProviderRetryRuleMatch::default()
+            },
+            ..bcode_model::ProviderRetryRule::default()
+        };
+        let user_rule = bcode_config::ModelRetryRuleConfig {
+            id: "provider.rule".to_string(),
+            enabled: Some(false),
+            ..bcode_config::ModelRetryRuleConfig::default()
+        };
+        let error = bcode_model::ProviderError {
+            code: "http_400".to_string(),
+            category: bcode_model::ProviderErrorCategory::InvalidRequest,
+            message: "bad request".to_string(),
+            retryable: false,
+            provider_message: None,
+            retry: None,
+        };
+        let selection = SessionModelSelection::default();
+
+        let effective = effective_provider_retry_rules(&[provider_rule], &[user_rule]);
+
+        assert!(!custom_retry_rule_matches(
+            &effective[0],
+            &error,
+            &selection
+        ));
+    }
+
+    #[test]
     fn custom_retry_rule_matches_error_and_scope() {
         let mut state = test_server_state(SessionManager::default());
         state
@@ -15576,9 +15722,9 @@ mod tests {
                 id: "unsupported-content-type".to_string(),
                 provider_plugin_id: Some("bcode.openai-compatible".to_string()),
                 model_id_contains: Some("claude".to_string()),
-                max_retries: 2,
-                initial_delay_ms: 500,
-                max_delay_ms: 4_000,
+                max_retries: Some(2),
+                initial_delay_ms: Some(500),
+                max_delay_ms: Some(4_000),
                 r#match: bcode_config::ModelRetryRuleMatchConfig {
                     code: Some("http_400".to_string()),
                     message_contains: Some("Unsupported content type".to_string()),
@@ -15600,7 +15746,7 @@ mod tests {
             ..SessionModelSelection::default()
         };
 
-        let policy = matching_provider_retry_policy(&state, &error, &selection)
+        let policy = matching_provider_retry_policy(&state, &error, &selection, &[])
             .expect("custom retry policy should match");
 
         assert_eq!(policy.id, "custom.unsupported-content-type");
@@ -15637,7 +15783,7 @@ mod tests {
             ..SessionModelSelection::default()
         };
 
-        assert!(matching_provider_retry_policy(&state, &error, &selection).is_none());
+        assert!(matching_provider_retry_policy(&state, &error, &selection, &[]).is_none());
     }
 
     #[test]

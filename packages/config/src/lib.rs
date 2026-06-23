@@ -1846,78 +1846,8 @@ pub struct ModelRetryConfig {
     pub rules: Vec<ModelRetryRuleConfig>,
 }
 
-/// Custom model provider retry rule.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelRetryRuleConfig {
-    /// Stable retry rule identifier.
-    pub id: String,
-    /// Enable this retry rule.
-    #[serde(default = "default_model_retry_rule_enabled")]
-    pub enabled: bool,
-    /// Exact provider plugin id scope.
-    #[serde(default)]
-    pub provider_plugin_id: Option<String>,
-    /// Provider plugin id substring scope.
-    #[serde(default)]
-    pub provider_plugin_id_contains: Option<String>,
-    /// Exact model id scope.
-    #[serde(default)]
-    pub model_id: Option<String>,
-    /// Model id substring scope.
-    #[serde(default)]
-    pub model_id_contains: Option<String>,
-    /// Maximum retry attempts when this rule matches.
-    #[serde(default = "default_model_retry_rule_max_retries")]
-    pub max_retries: u8,
-    /// Initial retry delay in milliseconds.
-    #[serde(default = "default_model_retry_rule_initial_delay_ms")]
-    pub initial_delay_ms: u64,
-    /// Maximum retry delay in milliseconds.
-    #[serde(default = "default_model_retry_rule_max_delay_ms")]
-    pub max_delay_ms: u64,
-    /// Use provider retry hints when present.
-    #[serde(default = "default_model_retry_rule_use_provider_retry_hint")]
-    pub use_provider_retry_hint: bool,
-    /// Error match conditions.
-    #[serde(default)]
-    pub r#match: ModelRetryRuleMatchConfig,
-}
-
-/// Custom model provider retry rule match conditions.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelRetryRuleMatchConfig {
-    /// Provider error category to match.
-    #[serde(default)]
-    pub category: Option<bcode_model::ProviderErrorCategory>,
-    /// Provider error code to match exactly.
-    #[serde(default)]
-    pub code: Option<String>,
-    /// Provider error message to match exactly.
-    #[serde(default)]
-    pub message_equals: Option<String>,
-    /// Provider error message substring to match.
-    #[serde(default)]
-    pub message_contains: Option<String>,
-    /// Provider-native error message to match exactly.
-    #[serde(default)]
-    pub provider_message_equals: Option<String>,
-    /// Provider-native error message substring to match.
-    #[serde(default)]
-    pub provider_message_contains: Option<String>,
-}
-
-impl ModelRetryRuleMatchConfig {
-    /// Return whether this matcher has at least one configured condition.
-    #[must_use]
-    pub const fn has_conditions(&self) -> bool {
-        self.category.is_some()
-            || self.code.is_some()
-            || self.message_equals.is_some()
-            || self.message_contains.is_some()
-            || self.provider_message_equals.is_some()
-            || self.provider_message_contains.is_some()
-    }
-}
+pub type ModelRetryRuleConfig = bcode_model::ProviderRetryRule;
+pub type ModelRetryRuleMatchConfig = bcode_model::ProviderRetryRuleMatch;
 
 impl Default for ModelRetryConfig {
     fn default() -> Self {
@@ -1938,44 +1868,6 @@ const fn default_model_retry_enabled() -> bool {
 
 const fn default_overload_retry_enabled() -> bool {
     true
-}
-
-const fn default_model_retry_rule_enabled() -> bool {
-    true
-}
-
-const fn default_model_retry_rule_max_retries() -> u8 {
-    3
-}
-
-const fn default_model_retry_rule_initial_delay_ms() -> u64 {
-    1_000
-}
-
-const fn default_model_retry_rule_max_delay_ms() -> u64 {
-    8_000
-}
-
-const fn default_model_retry_rule_use_provider_retry_hint() -> bool {
-    true
-}
-
-impl Default for ModelRetryRuleConfig {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            enabled: default_model_retry_rule_enabled(),
-            provider_plugin_id: None,
-            provider_plugin_id_contains: None,
-            model_id: None,
-            model_id_contains: None,
-            max_retries: default_model_retry_rule_max_retries(),
-            initial_delay_ms: default_model_retry_rule_initial_delay_ms(),
-            max_delay_ms: default_model_retry_rule_max_delay_ms(),
-            use_provider_retry_hint: default_model_retry_rule_use_provider_retry_hint(),
-            r#match: ModelRetryRuleMatchConfig::default(),
-        }
-    }
 }
 
 const fn default_max_overload_retries() -> u8 {
@@ -3200,72 +3092,78 @@ fn write_model_retry_toml(output: &mut String, retry: &ModelRetryConfig) {
     .expect("writing to string should not fail");
     output.push('\n');
     for rule in &retry.rules {
-        output.push_str("[[model.retry.rules]]\n");
-        writeln!(output, "id = {}", toml_string(&rule.id))
-            .expect("writing to string should not fail");
-        if rule.enabled != default_model_retry_rule_enabled() {
-            writeln!(output, "enabled = {}", rule.enabled)
-                .expect("writing to string should not fail");
-        }
-        write_optional_string(
-            output,
-            "provider_plugin_id",
-            rule.provider_plugin_id.as_ref(),
-        );
-        write_optional_string(
-            output,
-            "provider_plugin_id_contains",
-            rule.provider_plugin_id_contains.as_ref(),
-        );
-        write_optional_string(output, "model_id", rule.model_id.as_ref());
-        write_optional_string(output, "model_id_contains", rule.model_id_contains.as_ref());
-        writeln!(output, "max_retries = {}", rule.max_retries)
-            .expect("writing to string should not fail");
-        writeln!(output, "initial_delay_ms = {}", rule.initial_delay_ms)
-            .expect("writing to string should not fail");
-        writeln!(output, "max_delay_ms = {}", rule.max_delay_ms)
-            .expect("writing to string should not fail");
-        if rule.use_provider_retry_hint != default_model_retry_rule_use_provider_retry_hint() {
-            writeln!(
-                output,
-                "use_provider_retry_hint = {}",
-                rule.use_provider_retry_hint
-            )
-            .expect("writing to string should not fail");
-        }
-        output.push('\n');
-        output.push_str("[model.retry.rules.match]\n");
-        if let Some(category) = rule.r#match.category {
-            writeln!(
-                output,
-                "category = {}",
-                toml_string(provider_error_category_name(category))
-            )
-            .expect("writing to string should not fail");
-        }
-        write_optional_string(output, "code", rule.r#match.code.as_ref());
-        write_optional_string(
-            output,
-            "message_equals",
-            rule.r#match.message_equals.as_ref(),
-        );
-        write_optional_string(
-            output,
-            "message_contains",
-            rule.r#match.message_contains.as_ref(),
-        );
-        write_optional_string(
-            output,
-            "provider_message_equals",
-            rule.r#match.provider_message_equals.as_ref(),
-        );
-        write_optional_string(
-            output,
-            "provider_message_contains",
-            rule.r#match.provider_message_contains.as_ref(),
-        );
-        output.push('\n');
+        write_model_retry_rule_toml(output, rule);
     }
+}
+
+fn write_model_retry_rule_toml(output: &mut String, rule: &ModelRetryRuleConfig) {
+    output.push_str("[[model.retry.rules]]\n");
+    writeln!(output, "id = {}", toml_string(&rule.id)).expect("writing to string should not fail");
+    if let Some(enabled) = rule.enabled {
+        writeln!(output, "enabled = {enabled}").expect("writing to string should not fail");
+    }
+    write_optional_string(
+        output,
+        "provider_plugin_id",
+        rule.provider_plugin_id.as_ref(),
+    );
+    write_optional_string(
+        output,
+        "provider_plugin_id_contains",
+        rule.provider_plugin_id_contains.as_ref(),
+    );
+    write_optional_string(output, "model_id", rule.model_id.as_ref());
+    write_optional_string(output, "model_id_contains", rule.model_id_contains.as_ref());
+    if let Some(max_retries) = rule.max_retries {
+        writeln!(output, "max_retries = {max_retries}").expect("writing to string should not fail");
+    }
+    if let Some(initial_delay_ms) = rule.initial_delay_ms {
+        writeln!(output, "initial_delay_ms = {initial_delay_ms}")
+            .expect("writing to string should not fail");
+    }
+    if let Some(max_delay_ms) = rule.max_delay_ms {
+        writeln!(output, "max_delay_ms = {max_delay_ms}")
+            .expect("writing to string should not fail");
+    }
+    if let Some(use_provider_retry_hint) = rule.use_provider_retry_hint {
+        writeln!(
+            output,
+            "use_provider_retry_hint = {use_provider_retry_hint}"
+        )
+        .expect("writing to string should not fail");
+    }
+    output.push('\n');
+    output.push_str("[model.retry.rules.match]\n");
+    write_model_retry_rule_match_toml(output, &rule.r#match);
+    output.push('\n');
+}
+
+fn write_model_retry_rule_match_toml(output: &mut String, matcher: &ModelRetryRuleMatchConfig) {
+    if let Some(category) = matcher.category {
+        writeln!(
+            output,
+            "category = {}",
+            toml_string(provider_error_category_name(category))
+        )
+        .expect("writing to string should not fail");
+    }
+    write_optional_string(output, "code", matcher.code.as_ref());
+    write_optional_string(output, "message_equals", matcher.message_equals.as_ref());
+    write_optional_string(
+        output,
+        "message_contains",
+        matcher.message_contains.as_ref(),
+    );
+    write_optional_string(
+        output,
+        "provider_message_equals",
+        matcher.provider_message_equals.as_ref(),
+    );
+    write_optional_string(
+        output,
+        "provider_message_contains",
+        matcher.provider_message_contains.as_ref(),
+    );
 }
 
 const fn provider_error_category_name(
@@ -4520,10 +4418,10 @@ message_contains = "Unsupported content type"
             Some("bcode.openai-compatible")
         );
         assert_eq!(rule.model_id_contains.as_deref(), Some("claude"));
-        assert_eq!(rule.max_retries, 2);
-        assert_eq!(rule.initial_delay_ms, 500);
-        assert_eq!(rule.max_delay_ms, 4_000);
-        assert!(!rule.use_provider_retry_hint);
+        assert_eq!(rule.max_retries, Some(2));
+        assert_eq!(rule.initial_delay_ms, Some(500));
+        assert_eq!(rule.max_delay_ms, Some(4_000));
+        assert_eq!(rule.use_provider_retry_hint, Some(false));
         assert_eq!(rule.r#match.code.as_deref(), Some("http_400"));
         assert_eq!(
             rule.r#match.message_contains.as_deref(),
