@@ -24,32 +24,8 @@ pub const BCODE_MODEL_PROFILE_ENV: &str = "BCODE_MODEL_PROFILE";
 /// Environment variable selecting the active auth profile for this client.
 pub const BCODE_AUTH_PROFILE_ENV: &str = "BCODE_AUTH_PROFILE";
 
-const DEFAULT_AGENT_PROFILE_PLUGIN_ID: &str = "bcode.default-agents";
-const DEFAULT_BLIMS_PLUGIN_ID: &str = "bcode.blims";
-const DEFAULT_CODE_REVIEW_PLUGIN_ID: &str = "bcode.code_review";
-const DEFAULT_DOCUMENT_PLUGIN_ID: &str = "bcode.document";
-const DEFAULT_FILESYSTEM_PLUGIN_ID: &str = "bcode.filesystem";
-const DEFAULT_GIT_PLUGIN_ID: &str = "bcode.git";
-const DEFAULT_SHELL_PLUGIN_ID: &str = "bcode.shell";
-const DEFAULT_WEB_SEARCH_PLUGIN_ID: &str = "bcode.web-search";
 const DEFAULT_MODEL_PROVIDER_PLUGIN_ID: &str = "bcode.openai-compatible";
 const DEFAULT_MODEL_PROVIDER_PLUGIN_IDS: &[&str] = &["bcode.openai-compatible", "bcode.bedrock"];
-const DEFAULT_WORKTREE_PLUGIN_ID: &str = "bcode.worktree";
-const DEFAULT_PI_SESSION_IMPORT_PLUGIN_ID: &str = "bcode.pi-session-import";
-const DEFAULT_OPENCODE_SESSION_IMPORT_PLUGIN_ID: &str = "bcode.opencode-session-import";
-const DEFAULT_CORE_PLUGIN_IDS: &[&str] = &[
-    DEFAULT_CODE_REVIEW_PLUGIN_ID,
-    DEFAULT_DOCUMENT_PLUGIN_ID,
-    DEFAULT_FILESYSTEM_PLUGIN_ID,
-    DEFAULT_GIT_PLUGIN_ID,
-    DEFAULT_SHELL_PLUGIN_ID,
-    DEFAULT_WEB_SEARCH_PLUGIN_ID,
-    DEFAULT_WORKTREE_PLUGIN_ID,
-    DEFAULT_BLIMS_PLUGIN_ID,
-    DEFAULT_AGENT_PROFILE_PLUGIN_ID,
-    DEFAULT_PI_SESSION_IMPORT_PLUGIN_ID,
-    DEFAULT_OPENCODE_SESSION_IMPORT_PLUGIN_ID,
-];
 
 struct ProviderEnvironmentSpec {
     plugin_id: &'static str,
@@ -2274,32 +2250,41 @@ impl From<&PluginConfig> for PluginSelection {
 
 impl From<&BcodeConfig> for PluginSelection {
     fn from(value: &BcodeConfig) -> Self {
-        let mut selection = Self::from(&value.plugins);
-        let had_explicit_enabled_plugins = !selection.enabled.is_empty();
-        let env_provider = provider_plugin_id_from_environment();
-        let resolved_provider = value.resolved_model_selection().provider_plugin_id;
-        let provider = env_provider
-            .clone()
-            .or_else(|| resolved_provider.clone())
-            .unwrap_or_else(|| DEFAULT_MODEL_PROVIDER_PLUGIN_ID.to_string());
-
-        enable_default_core_plugins(&mut selection);
-        enable_default_model_provider_plugins(&mut selection);
-        if !had_explicit_enabled_plugins {
-            enable_plugin_unless_disabled(&mut selection, &provider);
-        } else if let Some(env_provider) = env_provider {
-            enable_plugin_unless_disabled(&mut selection, &env_provider);
-        } else if let Some(resolved_provider) = resolved_provider {
-            enable_plugin_unless_disabled(&mut selection, &resolved_provider);
-        }
-        selection
+        plugin_selection_with_default_plugin_ids(value, std::iter::empty::<&str>())
     }
 }
 
-fn enable_default_core_plugins(selection: &mut PluginSelection) {
-    for plugin_id in DEFAULT_CORE_PLUGIN_IDS {
-        enable_plugin_unless_disabled(selection, plugin_id);
+/// Resolve plugin selection using caller-provided distribution/bundle default plugin IDs.
+#[must_use]
+pub fn plugin_selection_with_default_plugin_ids<I, S>(
+    value: &BcodeConfig,
+    default_plugin_ids: I,
+) -> PluginSelection
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut selection = PluginSelection::from(&value.plugins);
+    let had_explicit_enabled_plugins = !selection.enabled.is_empty();
+    let env_provider = provider_plugin_id_from_environment();
+    let resolved_provider = value.resolved_model_selection().provider_plugin_id;
+    let provider = env_provider
+        .clone()
+        .or_else(|| resolved_provider.clone())
+        .unwrap_or_else(|| DEFAULT_MODEL_PROVIDER_PLUGIN_ID.to_string());
+
+    for plugin_id in default_plugin_ids {
+        enable_plugin_unless_disabled(&mut selection, plugin_id.as_ref());
     }
+    enable_default_model_provider_plugins(&mut selection);
+    if !had_explicit_enabled_plugins {
+        enable_plugin_unless_disabled(&mut selection, &provider);
+    } else if let Some(env_provider) = env_provider {
+        enable_plugin_unless_disabled(&mut selection, &env_provider);
+    } else if let Some(resolved_provider) = resolved_provider {
+        enable_plugin_unless_disabled(&mut selection, &resolved_provider);
+    }
+    selection
 }
 
 fn enable_default_model_provider_plugins(selection: &mut PluginSelection) {
@@ -4419,17 +4404,36 @@ fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
 mod tests {
     use super::{
         BcodeConfig, CompactionMode, ConfigLoadOverrides, ContextStrategyMode,
-        DEFAULT_AGENT_PROFILE_PLUGIN_ID, DEFAULT_CODE_REVIEW_PLUGIN_ID, DEFAULT_DOCUMENT_PLUGIN_ID,
-        DEFAULT_FILESYSTEM_PLUGIN_ID, DEFAULT_GIT_PLUGIN_ID, DEFAULT_PI_SESSION_IMPORT_PLUGIN_ID,
-        DEFAULT_SHELL_PLUGIN_ID, DEFAULT_WEB_SEARCH_PLUGIN_ID, PluginSelection,
         TuiAccentTransitionCurve, TuiMouseConfig, default_config_paths_from,
         default_permissions_state_path, load_config_from_paths,
         load_config_from_paths_with_overrides, load_permissions_state_from, merge_config_values,
-        upsert_agent_permission_rule,
+        plugin_selection_with_default_plugin_ids, upsert_agent_permission_rule,
     };
     use bcode_agent_policy_models::Action;
+    use bcode_plugin::PluginSelection;
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    const TEST_CODE_REVIEW_PLUGIN_ID: &str = "bcode.code_review";
+    const TEST_AGENT_PROFILE_PLUGIN_ID: &str = "bcode.default-agents";
+    const TEST_PI_SESSION_IMPORT_PLUGIN_ID: &str = "bcode.pi-session-import";
+    const TEST_DOCUMENT_PLUGIN_ID: &str = "bcode.example-document";
+    const TEST_FILESYSTEM_PLUGIN_ID: &str = "bcode.example-filesystem";
+    const TEST_GIT_PLUGIN_ID: &str = "bcode.example-git";
+    const TEST_SHELL_PLUGIN_ID: &str = "bcode.example-shell";
+    const TEST_WEB_SEARCH_PLUGIN_ID: &str = "bcode.example-web-search";
+    const TEST_WORKTREE_PLUGIN_ID: &str = "bcode.example-worktree";
+    const TEST_DEFAULT_CORE_PLUGIN_IDS: &[&str] = &[
+        TEST_CODE_REVIEW_PLUGIN_ID,
+        TEST_DOCUMENT_PLUGIN_ID,
+        TEST_FILESYSTEM_PLUGIN_ID,
+        TEST_GIT_PLUGIN_ID,
+        TEST_SHELL_PLUGIN_ID,
+        TEST_WEB_SEARCH_PLUGIN_ID,
+        TEST_WORKTREE_PLUGIN_ID,
+        TEST_AGENT_PROFILE_PLUGIN_ID,
+        TEST_PI_SESSION_IMPORT_PLUGIN_ID,
+    ];
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -4599,34 +4603,22 @@ accent_transition_curve = "ease_in_out"
         assert!(
             plugin_selection
                 .enabled
-                .contains(DEFAULT_CODE_REVIEW_PLUGIN_ID)
+                .contains(TEST_CODE_REVIEW_PLUGIN_ID)
+        );
+        assert!(plugin_selection.enabled.contains(TEST_DOCUMENT_PLUGIN_ID));
+        assert!(plugin_selection.enabled.contains(TEST_FILESYSTEM_PLUGIN_ID));
+        assert!(plugin_selection.enabled.contains(TEST_GIT_PLUGIN_ID));
+        assert!(plugin_selection.enabled.contains(TEST_SHELL_PLUGIN_ID));
+        assert!(plugin_selection.enabled.contains(TEST_WEB_SEARCH_PLUGIN_ID));
+        assert!(
+            plugin_selection
+                .enabled
+                .contains(TEST_AGENT_PROFILE_PLUGIN_ID)
         );
         assert!(
             plugin_selection
                 .enabled
-                .contains(DEFAULT_DOCUMENT_PLUGIN_ID)
-        );
-        assert!(
-            plugin_selection
-                .enabled
-                .contains(DEFAULT_FILESYSTEM_PLUGIN_ID)
-        );
-        assert!(plugin_selection.enabled.contains(DEFAULT_GIT_PLUGIN_ID));
-        assert!(plugin_selection.enabled.contains(DEFAULT_SHELL_PLUGIN_ID));
-        assert!(
-            plugin_selection
-                .enabled
-                .contains(DEFAULT_WEB_SEARCH_PLUGIN_ID)
-        );
-        assert!(
-            plugin_selection
-                .enabled
-                .contains(DEFAULT_AGENT_PROFILE_PLUGIN_ID)
-        );
-        assert!(
-            plugin_selection
-                .enabled
-                .contains(DEFAULT_PI_SESSION_IMPORT_PLUGIN_ID)
+                .contains(TEST_PI_SESSION_IMPORT_PLUGIN_ID)
         );
     }
 
@@ -4988,7 +4980,8 @@ mode = "{mode}"
         let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
         let previous_env = clear_provider_env();
         let config = BcodeConfig::default();
-        let plugin_selection = PluginSelection::from(&config);
+        let plugin_selection =
+            plugin_selection_with_default_plugin_ids(&config, TEST_DEFAULT_CORE_PLUGIN_IDS);
 
         assert_default_core_plugins_enabled(&plugin_selection);
 
@@ -5006,7 +4999,8 @@ enabled = ["bcode.openai-compatible"]
 "#,
         )
         .expect("config should parse");
-        let plugin_selection = PluginSelection::from(&config);
+        let plugin_selection =
+            plugin_selection_with_default_plugin_ids(&config, TEST_DEFAULT_CORE_PLUGIN_IDS);
 
         assert!(plugin_selection.enabled.contains("bcode.openai-compatible"));
         assert_default_core_plugins_enabled(&plugin_selection);
@@ -5025,19 +5019,16 @@ disabled = ["bcode.default-agents"]
 "#,
         )
         .expect("config should parse");
-        let plugin_selection = PluginSelection::from(&config);
+        let plugin_selection =
+            plugin_selection_with_default_plugin_ids(&config, TEST_DEFAULT_CORE_PLUGIN_IDS);
 
         assert!(
             !plugin_selection
                 .enabled
-                .contains(DEFAULT_AGENT_PROFILE_PLUGIN_ID)
+                .contains(TEST_AGENT_PROFILE_PLUGIN_ID)
         );
-        assert!(
-            plugin_selection
-                .enabled
-                .contains(DEFAULT_FILESYSTEM_PLUGIN_ID)
-        );
-        assert!(plugin_selection.enabled.contains(DEFAULT_SHELL_PLUGIN_ID));
+        assert!(plugin_selection.enabled.contains(TEST_FILESYSTEM_PLUGIN_ID));
+        assert!(plugin_selection.enabled.contains(TEST_SHELL_PLUGIN_ID));
 
         restore_provider_env(previous_env);
     }
@@ -5053,18 +5044,15 @@ disabled = ["bcode.code_review"]
 "#,
         )
         .expect("config should parse");
-        let plugin_selection = PluginSelection::from(&config);
+        let plugin_selection =
+            plugin_selection_with_default_plugin_ids(&config, TEST_DEFAULT_CORE_PLUGIN_IDS);
 
         assert!(
             !plugin_selection
                 .enabled
-                .contains(DEFAULT_CODE_REVIEW_PLUGIN_ID)
+                .contains(TEST_CODE_REVIEW_PLUGIN_ID)
         );
-        assert!(
-            plugin_selection
-                .enabled
-                .contains(DEFAULT_FILESYSTEM_PLUGIN_ID)
-        );
+        assert!(plugin_selection.enabled.contains(TEST_FILESYSTEM_PLUGIN_ID));
 
         restore_provider_env(previous_env);
     }
@@ -5080,18 +5068,15 @@ disabled = ["bcode.pi-session-import"]
 "#,
         )
         .expect("config should parse");
-        let plugin_selection = PluginSelection::from(&config);
+        let plugin_selection =
+            plugin_selection_with_default_plugin_ids(&config, TEST_DEFAULT_CORE_PLUGIN_IDS);
 
         assert!(
             !plugin_selection
                 .enabled
-                .contains(DEFAULT_PI_SESSION_IMPORT_PLUGIN_ID)
+                .contains(TEST_PI_SESSION_IMPORT_PLUGIN_ID)
         );
-        assert!(
-            plugin_selection
-                .enabled
-                .contains(DEFAULT_FILESYSTEM_PLUGIN_ID)
-        );
+        assert!(plugin_selection.enabled.contains(TEST_FILESYSTEM_PLUGIN_ID));
 
         restore_provider_env(previous_env);
     }
@@ -5104,23 +5089,20 @@ disabled = ["bcode.pi-session-import"]
             r#"
 [plugins]
 enabled = ["bcode.openai-compatible"]
-disabled = ["bcode.shell"]
+disabled = ["bcode.example-shell"]
 "#,
         )
         .expect("config should parse");
-        let plugin_selection = PluginSelection::from(&config);
+        let plugin_selection =
+            plugin_selection_with_default_plugin_ids(&config, TEST_DEFAULT_CORE_PLUGIN_IDS);
 
+        assert!(plugin_selection.enabled.contains(TEST_FILESYSTEM_PLUGIN_ID));
         assert!(
             plugin_selection
                 .enabled
-                .contains(DEFAULT_FILESYSTEM_PLUGIN_ID)
+                .contains(TEST_AGENT_PROFILE_PLUGIN_ID)
         );
-        assert!(
-            plugin_selection
-                .enabled
-                .contains(DEFAULT_AGENT_PROFILE_PLUGIN_ID)
-        );
-        assert!(!plugin_selection.enabled.contains(DEFAULT_SHELL_PLUGIN_ID));
+        assert!(!plugin_selection.enabled.contains(TEST_SHELL_PLUGIN_ID));
 
         restore_provider_env(previous_env);
     }
@@ -5151,7 +5133,8 @@ model_id = "gpt-4.1-mini"
         );
         assert_eq!(selection.model_id, None);
 
-        let plugin_selection = PluginSelection::from(&config);
+        let plugin_selection =
+            plugin_selection_with_default_plugin_ids(&config, TEST_DEFAULT_CORE_PLUGIN_IDS);
         assert!(plugin_selection.enabled.contains("bcode.bedrock"));
         assert!(plugin_selection.enabled.contains("bcode.openai-compatible"));
         assert_default_core_plugins_enabled(&plugin_selection);
@@ -5185,7 +5168,8 @@ model_id = "anthropic.claude-test"
         );
         assert_eq!(selection.model_id, None);
 
-        let plugin_selection = PluginSelection::from(&config);
+        let plugin_selection =
+            plugin_selection_with_default_plugin_ids(&config, TEST_DEFAULT_CORE_PLUGIN_IDS);
         assert!(plugin_selection.enabled.contains("bcode.openai-compatible"));
         assert!(plugin_selection.enabled.contains("bcode.bedrock"));
         assert_default_core_plugins_enabled(&plugin_selection);

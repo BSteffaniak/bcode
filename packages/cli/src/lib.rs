@@ -96,6 +96,7 @@ pub enum CliError {
 use std::sync::OnceLock;
 
 static STATIC_BUNDLED_PLUGINS: OnceLock<Vec<bcode_plugin::StaticBundledPlugin>> = OnceLock::new();
+static STATIC_BUNDLED_PLUGIN_IDS: OnceLock<Vec<String>> = OnceLock::new();
 
 /// Parse CLI arguments and run the requested command.
 ///
@@ -114,7 +115,9 @@ pub async fn run() -> Result<(), CliError> {
 pub async fn run_with_static_bundled(
     static_plugins: Vec<bcode_plugin::StaticBundledPlugin>,
 ) -> Result<(), CliError> {
+    let static_plugin_ids = bcode_plugin::static_bundled_plugin_ids(&static_plugins)?;
     let _ = STATIC_BUNDLED_PLUGINS.set(static_plugins);
+    let _ = STATIC_BUNDLED_PLUGIN_IDS.set(static_plugin_ids);
     init_tracing();
     let cli = Cli::parse();
     Box::pin(handle_cli(cli)).await
@@ -3491,6 +3494,15 @@ fn hex_byte(high: u8, low: u8) -> Option<u8> {
     Some(digit(high)? << 4 | digit(low)?)
 }
 
+fn plugin_selection_for_config(
+    config: &bcode_config::BcodeConfig,
+) -> bcode_plugin::PluginSelection {
+    let static_plugin_ids = STATIC_BUNDLED_PLUGIN_IDS
+        .get()
+        .map_or_else(Vec::new, Clone::clone);
+    bcode_config::plugin_selection_with_default_plugin_ids(config, &static_plugin_ids)
+}
+
 fn open_browser(url: &str) {
     #[cfg(target_os = "macos")]
     let command = ("open", vec![url]);
@@ -3508,7 +3520,7 @@ fn open_browser(url: &str) {
 
 fn list_plugins(roots: &[std::path::PathBuf]) -> Result<(), CliError> {
     let config = bcode_config::load_config()?;
-    let selection = bcode_plugin::PluginSelection::from(&config);
+    let selection = plugin_selection_for_config(&config);
     let plugins =
         bcode_plugin::filter_selected_plugins(discover_plugins_for_cli(roots)?, &selection);
 
@@ -3548,7 +3560,7 @@ async fn list_plugin_services(roots: &[std::path::PathBuf], daemon: bool) -> Res
     }
 
     let config = bcode_config::load_config()?;
-    let selection = bcode_plugin::PluginSelection::from(&config);
+    let selection = plugin_selection_for_config(&config);
     let plugins =
         bcode_plugin::filter_selected_plugins(discover_plugins_for_cli(roots)?, &selection);
     let mut has_services = false;
@@ -3571,7 +3583,7 @@ async fn list_plugin_services(roots: &[std::path::PathBuf], daemon: bool) -> Res
 
 fn check_plugins(roots: &[std::path::PathBuf]) -> Result<(), CliError> {
     let config = bcode_config::load_config()?;
-    let selection = bcode_plugin::PluginSelection::from(&config);
+    let selection = plugin_selection_for_config(&config);
     let plugins =
         bcode_plugin::filter_selected_plugins(discover_plugins_for_cli(roots)?, &selection);
     if plugins.is_empty() {
@@ -3611,7 +3623,7 @@ async fn invoke_plugin_service(
     }
 
     let config = bcode_config::load_config()?;
-    let selection = bcode_plugin::PluginSelection::from(&config);
+    let selection = plugin_selection_for_config(&config);
     let plugins =
         bcode_plugin::filter_selected_plugins(discover_plugins_for_cli(roots)?, &selection);
     let mut host = bcode_plugin::PluginHost::load_registered_plugins(&plugins)?;
@@ -3638,7 +3650,7 @@ async fn call_plugin_service(
     }
 
     let config = bcode_config::load_config()?;
-    let selection = bcode_plugin::PluginSelection::from(&config);
+    let selection = plugin_selection_for_config(&config);
     let plugins =
         bcode_plugin::filter_selected_plugins(discover_plugins_for_cli(roots)?, &selection);
     let mut host = bcode_plugin::PluginHost::load_registered_plugins(&plugins)?;
@@ -3707,7 +3719,7 @@ async fn publish_plugin_event(
     }
 
     let config = bcode_config::load_config()?;
-    let selection = bcode_plugin::PluginSelection::from(&config);
+    let selection = plugin_selection_for_config(&config);
     let plugins =
         bcode_plugin::filter_selected_plugins(discover_plugins_for_cli(roots)?, &selection);
     let mut host = bcode_plugin::PluginHost::load_registered_plugins(&plugins)?;
@@ -4102,7 +4114,7 @@ fn plugin_service_call_error(error: bcode_plugin::PluginServiceCallError) -> Cli
 
 fn load_cli_plugin_host() -> Result<bcode_plugin::PluginHost, CliError> {
     let config = bcode_config::load_config()?;
-    let selection = bcode_plugin::PluginSelection::from(&config);
+    let selection = plugin_selection_for_config(&config);
     let static_plugins = static_bundled_plugins();
     bcode_plugin::PluginHost::load_defaults_with_static_bundled(&selection, &static_plugins)
         .map_err(CliError::Plugin)

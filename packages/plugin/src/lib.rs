@@ -868,6 +868,29 @@ pub fn discover_plugins_in_roots(
     Ok(plugins)
 }
 
+/// Return manifest IDs for statically bundled plugin registrations.
+///
+/// # Errors
+///
+/// Returns an error when a static plugin manifest cannot be parsed.
+pub fn static_bundled_plugin_ids(
+    plugins: &[StaticBundledPlugin],
+) -> Result<Vec<String>, PluginLoadError> {
+    plugins
+        .iter()
+        .map(|plugin| {
+            let manifest: PluginManifest =
+                toml::from_str(plugin.manifest_toml).map_err(|source| {
+                    PluginLoadError::ExportedManifestParse {
+                        library: PathBuf::from("<static>"),
+                        source,
+                    }
+                })?;
+            Ok(manifest.id)
+        })
+        .collect()
+}
+
 /// Filter static plugin registrations according to an enable/disable policy.
 ///
 /// # Errors
