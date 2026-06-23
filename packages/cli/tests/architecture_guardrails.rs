@@ -177,10 +177,19 @@ fn scan_file(path: &Path, offenders: &mut Vec<BoundaryOffender>) {
 
 fn is_temporary_boundary_allowlist(path: &Path, line: &str) -> bool {
     let path = path.to_string_lossy();
-    // Transitional allowlist: agent-policy keeps legacy tool-key normalization helpers
-    // so existing user config (`bash`, `read`, `write`, etc.) keeps working until
-    // plugin-owned config/schema metadata performs this normalization at load time.
-    if path.ends_with("packages/agent-policy/src/lib.rs") {
+    // Transitional allowlist: agent-policy keeps legacy bundled default tool enablement
+    // and compatibility fixture names while policy evaluation itself is metadata-driven.
+    if path.ends_with("packages/agent-policy/src/lib.rs")
+        && (line.contains(".to_string()")
+            || line.contains("tool_request(")
+            || line.contains("path_request(")
+            || line.contains("web.fetch")
+            || line.contains("filesystem.write")
+            || line.contains("filesystem.edit")
+            || line.contains("filesystem.read")
+            || line.contains("filesystem.exists")
+            || line.contains("filesystem.stat"))
+    {
         return true;
     }
     // Intentional allowlist: core config owns the default bundled plugin selection list;
@@ -196,14 +205,9 @@ fn is_temporary_boundary_allowlist(path: &Path, line: &str) -> bool {
     if path.ends_with("packages/agent-policy/models/src/lib.rs") {
         return true;
     }
-    // Transitional allowlist: TUI command IDs currently share names with worktree tools;
-    // command palette routing will move to plugin-owned command contributions.
-    if path.ends_with("packages/tui/src/command_palette.rs") {
-        return true;
-    }
-    // Transitional allowlist: diff extraction still parses legacy model-emitted tool names
-    // until edit/write diff previews are driven by plugin metadata.
-    if path.ends_with("packages/tui/src/diff_extract.rs") {
+    // Transitional allowlist: TUI command IDs still keep backwards-compatible parsing
+    // aliases for old worktree command contribution IDs.
+    if path.ends_with("packages/tui/src/command_palette.rs") && line.contains("| \"worktree.") {
         return true;
     }
     // Transitional allowlist: server tests construct service/session presentation fixtures.
@@ -212,13 +216,13 @@ fn is_temporary_boundary_allowlist(path: &Path, line: &str) -> bool {
     {
         return true;
     }
-    // Transitional allowlist: TUI tests intentionally assert legacy visible tool names
-    // until presentation snapshots are moved to plugin-owned metadata fixtures.
-    if path.ends_with("packages/tui/src/tests.rs") {
+    // Transitional allowlist: TUI tests intentionally assert legacy shell visible
+    // rendering because shell terminal formatting is tool-specific UX.
+    if path.ends_with("packages/tui/src/tests.rs") && line.contains("shell.run") {
         return true;
     }
-    // Transitional allowlist: terminal result presentation tests still exercise the
-    // shell-shaped semantic result path while plugin-owned presentation metadata lands.
+    // Transitional allowlist: TUI tests for permission/presentation semantics keep
+    // legacy visible tool names where those names are the behavior under test.
     if path.ends_with("packages/tui/src/permission_dialog_render.rs")
         || path.ends_with("packages/tui/src/permission_present.rs")
     {

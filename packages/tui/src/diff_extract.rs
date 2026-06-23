@@ -60,10 +60,7 @@ pub fn file_edit_from_tool_request(
     arguments_json: &str,
 ) -> Option<FileEditTranscript> {
     let normalized_tool = tool_name.replace(['-', '.'], "_").to_ascii_lowercase();
-    if !matches!(
-        normalized_tool.as_str(),
-        "filesystem_edit" | "filesystem_write"
-    ) {
+    if !normalized_tool.contains("edit") && !normalized_tool.contains("write") {
         return None;
     }
     let value = serde_json::from_str::<serde_json::Value>(arguments_json).ok()?;
@@ -525,7 +522,7 @@ mod tests {
     #[test]
     fn file_edit_diff_lines_include_syntax_spans_for_source_content() {
         let edit = file_edit_from_tool_request(
-            "filesystem.edit",
+            "example.edit",
             &serde_json::json!({
                 "path": "src/lib.rs",
                 "old_text": "fn answer() -> i32 {\n    41\n}\n",
@@ -555,7 +552,7 @@ mod tests {
     #[test]
     fn file_edit_diff_lines_include_changed_ranges_for_replacements() {
         let edit = file_edit_from_tool_request(
-            "filesystem.edit",
+            "example.edit",
             &serde_json::json!({
                 "path": "src/lib.rs",
                 "old_text": "let value = old_name;\n",
@@ -582,7 +579,7 @@ mod tests {
     #[test]
     fn file_edit_changed_ranges_are_unicode_boundary_safe() {
         let edit = file_edit_from_tool_request(
-            "filesystem.edit",
+            "example.edit",
             &serde_json::json!({
                 "path": "src/lib.rs",
                 "old_text": "let face = \"😀\";\n",
@@ -606,7 +603,7 @@ mod tests {
     #[test]
     fn diff_summary_keeps_change_counts_when_highlighted() {
         let (summary, lines) = diff_from_tool_request(
-            "filesystem.write",
+            "example.write",
             &serde_json::json!({
                 "path": "src/main.rs",
                 "contents": "fn main() {}\n",

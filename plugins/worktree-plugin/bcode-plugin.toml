@@ -11,25 +11,25 @@ name         = "Worktree Tools"
 [[command_contributions]]
 category    = "worktree"
 description = "List Git worktrees for the current repository"
-id          = "worktree.list"
+id          = "command.work-tree.list"
 title       = "List Worktrees"
 
 [[command_contributions]]
 category    = "worktree"
 description = "Create a worktree for the current session"
-id          = "worktree.createSession"
+id          = "command.work-tree.createSession"
 title       = "Create Session Worktree"
 
 [[command_contributions]]
 category    = "worktree"
 description = "Attach current session to an existing worktree"
-id          = "worktree.attach"
+id          = "command.work-tree.attach"
 title       = "Attach Worktree"
 
 [[command_contributions]]
 category    = "worktree"
 description = "Remove a Git worktree"
-id          = "worktree.remove"
+id          = "command.work-tree.remove"
 title       = "Remove Worktree"
 
 [concurrency]

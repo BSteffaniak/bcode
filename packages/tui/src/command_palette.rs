@@ -57,10 +57,10 @@ impl PaletteCommand {
         match self {
             Self::NewSession => "session.new",
             Self::SwitchSession => "session.switch",
-            Self::ListWorktrees => "worktree.list",
-            Self::CreateSessionWorktree => "worktree.createSession",
-            Self::AttachWorktree => "worktree.attach",
-            Self::RemoveWorktree => "worktree.remove",
+            Self::ListWorktrees => "command.work-tree.list",
+            Self::CreateSessionWorktree => "command.work-tree.createSession",
+            Self::AttachWorktree => "command.work-tree.attach",
+            Self::RemoveWorktree => "command.work-tree.remove",
             Self::ShowModelStatus => "model.status",
             Self::ShowServerModelStatus => "model.serverStatus",
             Self::ShowRuntimeStatus => "runtime.status",
@@ -82,10 +82,12 @@ impl PaletteCommand {
         match id {
             "session.new" => Some(Self::NewSession),
             "session.switch" => Some(Self::SwitchSession),
-            "worktree.list" => Some(Self::ListWorktrees),
-            "worktree.createSession" => Some(Self::CreateSessionWorktree),
-            "worktree.attach" => Some(Self::AttachWorktree),
-            "worktree.remove" => Some(Self::RemoveWorktree),
+            "command.work-tree.list" | "worktree.list" => Some(Self::ListWorktrees),
+            "command.work-tree.createSession" | "worktree.createSession" => {
+                Some(Self::CreateSessionWorktree)
+            }
+            "command.work-tree.attach" | "worktree.attach" => Some(Self::AttachWorktree),
+            "command.work-tree.remove" | "worktree.remove" => Some(Self::RemoveWorktree),
             "model.status" => Some(Self::ShowModelStatus),
             "model.serverStatus" => Some(Self::ShowServerModelStatus),
             "runtime.status" => Some(Self::ShowRuntimeStatus),
@@ -345,7 +347,7 @@ mod tests {
     #[test]
     fn plugin_command_contribution_replaces_known_palette_item() {
         let palette = BmuxCommandPalette::with_plugin_commands(&[PluginOwnedCommandContribution {
-            plugin_id: "bcode.worktree".to_string(),
+            plugin_id: "bcode.example".to_string(),
             command: bcode_plugin::PluginCommandContribution {
                 id: PaletteCommand::ListWorktrees.id().to_string(),
                 title: "Worktrees From Plugin".to_string(),

@@ -160,7 +160,7 @@ fn provider_tool_call_progress_status_formats_bytes() {
                 payload: SessionTracePayload::ProviderStreamEvent(
                     bcode_session_models::ProviderStreamEvent::ToolCallProgress {
                         tool_call_id: "call-1".to_owned(),
-                        tool_name: "filesystem.write".to_owned(),
+                        tool_name: "example.write".to_owned(),
                         argument_bytes: 1536,
                     },
                 ),
@@ -170,7 +170,7 @@ fn provider_tool_call_progress_status_formats_bytes() {
 
     assert_eq!(
         app.status(),
-        "assembling filesystem.write arguments (1.5 KiB received)"
+        "assembling example.write arguments (1.5 KiB received)"
     );
 }
 
@@ -184,7 +184,7 @@ fn live_provider_tool_call_progress_updates_status() {
             turn_id: "turn-1".to_owned(),
             event: bcode_session_models::ProviderStreamEvent::ToolCallProgress {
                 tool_call_id: "call-1".to_owned(),
-                tool_name: "filesystem.write".to_owned(),
+                tool_name: "example.write".to_owned(),
                 argument_bytes: 4096,
             },
         },
@@ -192,7 +192,7 @@ fn live_provider_tool_call_progress_updates_status() {
 
     assert_eq!(
         app.status(),
-        "assembling filesystem.write arguments (4.0 KiB received)"
+        "assembling example.write arguments (4.0 KiB received)"
     );
 }
 
@@ -1879,7 +1879,7 @@ fn transcript_renders_filesystem_edit_inline_diff_preview() {
         1,
         SessionEventKind::ToolCallRequested {
             tool_call_id: "call_edit".to_owned(),
-            tool_name: "filesystem.edit".to_owned(),
+            tool_name: "example.edit".to_owned(),
             arguments_json: serde_json::json!({
                 "path": "src/lib.rs",
                 "old_text": "fn answer() -> i32 {\n    41\n}\n",
@@ -3335,7 +3335,7 @@ fn file_change_presentation_events(
             1,
             SessionEventKind::ToolCallRequested {
                 tool_call_id: "call-file".to_owned(),
-                tool_name: "filesystem.write".to_owned(),
+                tool_name: "example.write".to_owned(),
                 arguments_json: r#"{"path":"file.txt","contents":"hi"}"#.to_owned(),
             },
         ));
@@ -3349,7 +3349,7 @@ fn file_change_presentation_events(
             finished_at_ms: Some(2),
             is_error: false,
             presentation: ToolInvocationPresentation::FileChange {
-                tool_name: "filesystem.write".to_owned(),
+                tool_name: "example.write".to_owned(),
                 summary: "wrote 2 bytes".to_owned(),
                 path: Some("file.txt".to_owned()),
             },
