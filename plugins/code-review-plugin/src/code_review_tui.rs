@@ -7877,7 +7877,7 @@ impl ReviewApp {
         self.preserve_viewport_while(|app| {
             if matches!(
                 app.diff_context_load_states.get(key),
-                Some(DiffContextLoadState::Loading | DiffContextLoadState::Loaded)
+                Some(DiffContextLoadState::Loading)
             ) {
                 return false;
             }

@@ -10,6 +10,8 @@ use crate::code_review_tui_display::{
     ReviewDisplayBuilder, ReviewDisplayRow, ReviewDisplayRowSource,
 };
 
+const CONTEXT_EXPAND_STEP: u32 = 20;
+
 /// Semantic document rendered in the main code review pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewViewDocument {
@@ -37,6 +39,19 @@ impl ReviewViewDocument {
             .enumerate()
             .collect::<BTreeMap<_, _>>();
         let mut rows = Vec::with_capacity(display_by_source.len());
+        if let Some(first_hunk) = file.hunks.first()
+            && first_hunk.new_start > 1
+        {
+            push_diff_context_rows(
+                file_index,
+                0,
+                cached_file,
+                context_load_states,
+                1,
+                first_hunk.new_start.saturating_sub(1),
+                &mut rows,
+            );
+        }
         let mut source_row;
         let mut previous_hunk_end_new_line: Option<u32> = None;
         for (hunk_index, hunk) in file.hunks.iter().enumerate() {
@@ -45,55 +60,15 @@ impl ReviewViewDocument {
             {
                 let start_line = previous_new_line.saturating_add(1);
                 let end_line = hunk.new_start.saturating_sub(1);
-                let key = DiffContextKey::new(file_index, hunk_index, start_line, end_line);
-                if let Some(load_state) = context_load_states.get(&key) {
-                    match (load_state, cached_file) {
-                        (DiffContextLoadState::Unavailable(reason), _) => {
-                            rows.push(context_status_row(
-                                key.clone(),
-                                hidden_line_count(start_line, end_line),
-                                start_line,
-                                end_line,
-                                Some(reason.clone()),
-                            ));
-                        }
-                        (DiffContextLoadState::Loaded, Some(file))
-                            if file.unavailable_reason.is_none() =>
-                        {
-                            push_expanded_context_rows(
-                                file_index, &key, file, start_line, end_line, &mut rows,
-                            );
-                        }
-                        (_, Some(file)) => rows.push(context_status_row(
-                            key.clone(),
-                            hidden_line_count(start_line, end_line),
-                            start_line,
-                            end_line,
-                            file.unavailable_reason.clone(),
-                        )),
-                        (DiffContextLoadState::Loading, _) | (_, None) => {
-                            rows.push(context_status_row(
-                                key.clone(),
-                                hidden_line_count(start_line, end_line),
-                                start_line,
-                                end_line,
-                                None,
-                            ));
-                        }
-                    }
-                } else {
-                    rows.push(ReviewViewRow {
-                        visual_row: 0,
-                        source_row: None,
-                        target: ReviewViewTarget::OmittedContext { key: key.clone() },
-                        block: ReviewViewBlock::OmittedContext {
-                            key: key.clone(),
-                            hidden_line_count: hidden_line_count(start_line, end_line),
-                            start_line,
-                            end_line,
-                        },
-                    });
-                }
+                push_diff_context_rows(
+                    file_index,
+                    hunk_index,
+                    cached_file,
+                    context_load_states,
+                    start_line,
+                    end_line,
+                    &mut rows,
+                );
             }
 
             let hunk_source_row = hunk_start_rows[hunk_index];
@@ -116,6 +91,22 @@ impl ReviewViewDocument {
                     .saturating_add(hunk.new_count)
                     .saturating_sub(1),
             );
+        }
+        if let (Some(previous_new_line), Some(cached_file)) =
+            (previous_hunk_end_new_line, cached_file)
+        {
+            let total_lines = u32::try_from(cached_file.line_spans.len()).unwrap_or(u32::MAX);
+            if total_lines > previous_new_line {
+                push_diff_context_rows(
+                    file_index,
+                    file.hunks.len(),
+                    Some(cached_file),
+                    context_load_states,
+                    previous_new_line.saturating_add(1),
+                    total_lines,
+                    &mut rows,
+                );
+            }
         }
         renumber_rows(&mut rows);
         Self { rows }
@@ -687,10 +678,104 @@ fn hunk_start_rows(file: &ReviewFile) -> Vec<usize> {
     rows
 }
 
+fn push_diff_context_rows(
+    file_index: usize,
+    hunk_index: usize,
+    cached_file: Option<&CachedReviewFile>,
+    context_load_states: &BTreeMap<DiffContextKey, DiffContextLoadState>,
+    start_line: u32,
+    end_line: u32,
+    rows: &mut Vec<ReviewViewRow>,
+) {
+    let key = DiffContextKey::new(file_index, hunk_index, start_line, end_line);
+    if let Some(load_state) = context_load_states.get(&key) {
+        match (load_state, cached_file) {
+            (DiffContextLoadState::Unavailable(reason), _) => {
+                rows.push(context_status_row(
+                    key,
+                    hidden_line_count(start_line, end_line),
+                    start_line,
+                    end_line,
+                    Some(reason.clone()),
+                ));
+            }
+            (DiffContextLoadState::Loaded, Some(file)) if file.unavailable_reason.is_none() => {
+                push_incremental_expanded_context_rows(
+                    &key,
+                    file,
+                    context_load_states,
+                    start_line,
+                    end_line,
+                    rows,
+                );
+            }
+            (_, Some(file)) => rows.push(context_status_row(
+                key,
+                hidden_line_count(start_line, end_line),
+                start_line,
+                end_line,
+                file.unavailable_reason.clone(),
+            )),
+            (DiffContextLoadState::Loading, _) | (_, None) => {
+                rows.push(context_status_row(
+                    key,
+                    hidden_line_count(start_line, end_line),
+                    start_line,
+                    end_line,
+                    None,
+                ));
+            }
+        }
+    } else {
+        rows.push(ReviewViewRow {
+            visual_row: 0,
+            source_row: None,
+            target: ReviewViewTarget::OmittedContext { key: key.clone() },
+            block: ReviewViewBlock::OmittedContext {
+                key,
+                hidden_line_count: hidden_line_count(start_line, end_line),
+                start_line,
+                end_line,
+            },
+        });
+    }
+}
+
+fn push_incremental_expanded_context_rows(
+    context_key: &DiffContextKey,
+    cached_file: &CachedReviewFile,
+    context_load_states: &BTreeMap<DiffContextKey, DiffContextLoadState>,
+    start_line: u32,
+    end_line: u32,
+    rows: &mut Vec<ReviewViewRow>,
+) {
+    let expanded_end_line = start_line
+        .saturating_add(CONTEXT_EXPAND_STEP.saturating_sub(1))
+        .min(end_line);
+    push_expanded_context_rows(
+        context_key,
+        cached_file,
+        start_line,
+        expanded_end_line,
+        rows,
+    );
+    let remaining_start_line = expanded_end_line.saturating_add(1);
+    if remaining_start_line <= end_line {
+        push_diff_context_rows(
+            context_key.file_index,
+            context_key.hunk_index,
+            Some(cached_file),
+            context_load_states,
+            remaining_start_line,
+            end_line,
+            rows,
+        );
+    }
+}
+
 fn hidden_line_count(start_line: u32, end_line: u32) -> usize {
     usize::try_from(end_line.saturating_sub(start_line).saturating_add(1)).unwrap_or(usize::MAX)
 }
-
 fn context_status_row(
     key: DiffContextKey,
     hidden_line_count: usize,
@@ -724,7 +809,6 @@ fn context_status_row(
 }
 
 fn push_expanded_context_rows(
-    _file_index: usize,
     context_key: &DiffContextKey,
     cached_file: &CachedReviewFile,
     start_line: u32,
@@ -932,7 +1016,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_context_rows_use_full_file_syntax_segments() {
+    fn expanded_context_rows_use_full_file_source_lines() {
         let file = ReviewFile {
             old_path: Some("src/lib.rs".to_string()),
             new_path: Some("src/lib.rs".to_string()),
@@ -1005,6 +1089,196 @@ mod tests {
         };
         assert_eq!(*line_number, Some(2));
         assert_eq!(content, "let expanded = true;");
+    }
+
+    #[test]
+    fn diff_file_document_includes_top_and_bottom_hidden_context() {
+        let file = ReviewFile {
+            old_path: Some("src/lib.rs".to_string()),
+            new_path: Some("src/lib.rs".to_string()),
+            status: ReviewFileStatus::Modified,
+            additions: 1,
+            deletions: 0,
+            hunks: vec![ReviewHunk {
+                old_start: 30,
+                old_count: 1,
+                new_start: 30,
+                new_count: 1,
+                heading: Some("middle".to_string()),
+                lines: vec![ReviewLine {
+                    kind: ReviewLineKind::Added,
+                    old_line: None,
+                    new_line: Some(30),
+                    content: "changed".to_string(),
+                }],
+            }],
+            is_binary: false,
+        };
+        let content = numbered_lines(60);
+        let cached_file = cached_review_file("src/lib.rs", content);
+
+        let document = ReviewViewDocument::build_diff_file(
+            7,
+            &file,
+            false,
+            Some(&cached_file),
+            &BTreeMap::new(),
+        );
+
+        assert!(document.rows.iter().any(|row| matches!(
+            &row.block,
+            ReviewViewBlock::OmittedContext {
+                start_line: 1,
+                end_line: 29,
+                ..
+            }
+        )));
+        assert!(document.rows.iter().any(|row| matches!(
+            &row.block,
+            ReviewViewBlock::OmittedContext {
+                start_line: 31,
+                end_line: 60,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn expanded_context_reveals_at_most_one_step_and_leaves_remainder() {
+        let file = two_hunk_file_with_gap(2, 52);
+        let content = numbered_lines(52);
+        let cached_file = cached_review_file("src/lib.rs", content);
+        let mut context_states = BTreeMap::new();
+        context_states.insert(
+            DiffContextKey::new(7, 1, 2, 51),
+            DiffContextLoadState::Loaded,
+        );
+
+        let document = ReviewViewDocument::build_diff_file(
+            7,
+            &file,
+            false,
+            Some(&cached_file),
+            &context_states,
+        );
+
+        let expanded_lines = document
+            .rows
+            .iter()
+            .filter(|row| matches!(row.target, ReviewViewTarget::ExpandedContextLine { .. }))
+            .count();
+        assert_eq!(expanded_lines, 20);
+        assert!(document.rows.iter().any(|row| matches!(
+            &row.block,
+            ReviewViewBlock::OmittedContext {
+                start_line: 22,
+                end_line: 51,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn repeated_context_expansion_reveals_next_step() {
+        let file = two_hunk_file_with_gap(2, 52);
+        let content = numbered_lines(52);
+        let cached_file = cached_review_file("src/lib.rs", content);
+        let mut context_states = BTreeMap::new();
+        context_states.insert(
+            DiffContextKey::new(7, 1, 2, 51),
+            DiffContextLoadState::Loaded,
+        );
+        context_states.insert(
+            DiffContextKey::new(7, 1, 22, 51),
+            DiffContextLoadState::Loaded,
+        );
+
+        let document = ReviewViewDocument::build_diff_file(
+            7,
+            &file,
+            false,
+            Some(&cached_file),
+            &context_states,
+        );
+
+        let expanded_lines = document
+            .rows
+            .iter()
+            .filter_map(|row| match row.target {
+                ReviewViewTarget::ExpandedContextLine { line_number, .. } => Some(line_number),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(expanded_lines.len(), 40);
+        assert!(expanded_lines.contains(&21));
+        assert!(expanded_lines.contains(&41));
+        assert!(document.rows.iter().any(|row| matches!(
+            &row.block,
+            ReviewViewBlock::OmittedContext {
+                start_line: 42,
+                end_line: 51,
+                ..
+            }
+        )));
+    }
+
+    fn numbered_lines(count: u32) -> String {
+        (1..=count).fold(String::new(), |mut lines, line| {
+            use std::fmt::Write as _;
+            writeln!(&mut lines, "line {line}").expect("writing to String cannot fail");
+            lines
+        })
+    }
+
+    fn cached_review_file(path: &str, content: String) -> CachedReviewFile {
+        CachedReviewFile {
+            path: path.to_string(),
+            line_spans: test_line_spans(&content),
+            size_bytes: u64::try_from(content.len()).expect("test content length fits u64"),
+            content,
+            mtime_ms: None,
+            is_binary: false,
+            unavailable_reason: None,
+        }
+    }
+
+    fn two_hunk_file_with_gap(start_line: u32, second_hunk_line: u32) -> ReviewFile {
+        ReviewFile {
+            old_path: Some("src/lib.rs".to_string()),
+            new_path: Some("src/lib.rs".to_string()),
+            status: ReviewFileStatus::Modified,
+            additions: 2,
+            deletions: 0,
+            hunks: vec![
+                ReviewHunk {
+                    old_start: 1,
+                    old_count: 1,
+                    new_start: start_line.saturating_sub(1),
+                    new_count: 1,
+                    heading: Some("first".to_string()),
+                    lines: vec![ReviewLine {
+                        kind: ReviewLineKind::Added,
+                        old_line: None,
+                        new_line: Some(start_line.saturating_sub(1)),
+                        content: "first".to_string(),
+                    }],
+                },
+                ReviewHunk {
+                    old_start: second_hunk_line,
+                    old_count: 1,
+                    new_start: second_hunk_line,
+                    new_count: 1,
+                    heading: Some("second".to_string()),
+                    lines: vec![ReviewLine {
+                        kind: ReviewLineKind::Added,
+                        old_line: None,
+                        new_line: Some(second_hunk_line),
+                        content: "second".to_string(),
+                    }],
+                },
+            ],
+            is_binary: false,
+        }
     }
 
     fn test_line_spans(content: &str) -> Vec<(usize, usize)> {
