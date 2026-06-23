@@ -11,7 +11,7 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
-use bmux_tui::text_width::truncate_to_display_width;
+use bmux_tui::text_width::{display_width, truncate_to_display_width};
 
 use crate::code_review_tui::{
     ReviewApp, ReviewFile, ReviewLineKind, ReviewMouseAction, ReviewPromptKind, ReviewPublishState,
@@ -341,11 +341,12 @@ fn register_header_thread_regions(app: &mut ReviewApp, area: Rect, text: &str) {
     if open_threads == 0 && resolved_threads == 0 {
         return;
     }
+    let total_threads = open_threads.saturating_add(resolved_threads);
     register_header_text_region(
         app,
         area,
         text,
-        "threads",
+        &format!("threads {total_threads}"),
         ReviewMouseAction::ShowAllThreads,
         "show all threads",
     );
@@ -353,14 +354,14 @@ fn register_header_thread_regions(app: &mut ReviewApp, area: Rect, text: &str) {
         app,
         area,
         text,
-        &format!("{open_threads} open"),
+        &format!("open {open_threads}"),
         ReviewMouseAction::ShowOpenThreads,
         "show open threads",
     );
     let resolved_label = if app.show_resolved_threads {
-        format!("{resolved_threads} resolved")
+        format!("resolved {resolved_threads}")
     } else {
-        format!("{resolved_threads} hidden")
+        format!("hidden {resolved_threads}")
     };
     register_header_text_region(
         app,
@@ -388,14 +389,15 @@ fn register_header_text_region(
     action: ReviewMouseAction,
     label: &'static str,
 ) {
-    let Some(byte_index) = text.find(needle) else {
+    let visible_text = truncate_to_display_width(text, usize::from(area.width));
+    let Some(byte_index) = visible_text.find(needle) else {
         return;
     };
-    let x_offset = u16::try_from(text[..byte_index].chars().count()).unwrap_or(u16::MAX);
+    let x_offset = u16::try_from(display_width(&visible_text[..byte_index])).unwrap_or(u16::MAX);
     if x_offset >= area.width {
         return;
     }
-    let width = u16::try_from(needle.chars().count()).unwrap_or(u16::MAX);
+    let width = u16::try_from(display_width(needle)).unwrap_or(u16::MAX);
     app.register_mouse_region(
         Rect::new(
             area.x.saturating_add(x_offset),
@@ -414,12 +416,14 @@ fn header_thread_label(app: &ReviewApp) -> String {
         String::new()
     } else if app.show_resolved_threads {
         format!(
-            "  threads {open_threads} open/{resolved_threads} resolved  filter:{}",
+            "  threads {}  open {open_threads}  resolved {resolved_threads}  filter:{}",
+            open_threads.saturating_add(resolved_threads),
             app.thread_filter.label()
         )
     } else {
         format!(
-            "  threads {open_threads} open/{resolved_threads} hidden  filter:{}",
+            "  threads {}  open {open_threads}  hidden {resolved_threads}  filter:{}",
+            open_threads.saturating_add(resolved_threads),
             app.thread_filter.label()
         )
     }

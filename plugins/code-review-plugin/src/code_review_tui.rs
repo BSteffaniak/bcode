@@ -4783,6 +4783,9 @@ impl ReviewApp {
 
     /// Set thread filter directly.
     pub fn set_thread_filter(&mut self, filter: ReviewThreadFilter) -> bool {
+        self.sidebar_visible = true;
+        self.sidebar_mode = ReviewSidebarMode::Threads;
+        self.show_resolved_threads = filter != ReviewThreadFilter::Open;
         if self.thread_filter == filter {
             return false;
         }
@@ -5725,6 +5728,7 @@ impl ReviewApp {
         self.sidebar_visible = true;
         self.sidebar_mode = ReviewSidebarMode::Threads;
         self.thread_filter = ReviewThreadFilter::All;
+        self.show_resolved_threads = true;
         self.selected_thread = 0;
         self.thread_scroll = 0;
         self.status_message = Some("showing draft review threads".to_string());
@@ -5735,6 +5739,7 @@ impl ReviewApp {
     pub fn show_all_threads(&mut self) -> bool {
         self.sidebar_visible = true;
         self.sidebar_mode = ReviewSidebarMode::Threads;
+        self.show_resolved_threads = true;
         self.set_thread_filter(ReviewThreadFilter::All);
         if self.visible_thread_summaries().is_empty() {
             self.status_message = Some("no review threads".to_string());
@@ -5751,6 +5756,7 @@ impl ReviewApp {
         }
         self.sidebar_visible = true;
         self.sidebar_mode = ReviewSidebarMode::Threads;
+        self.show_resolved_threads = false;
         self.set_thread_filter(ReviewThreadFilter::Open);
         true
     }
@@ -5770,7 +5776,10 @@ impl ReviewApp {
     }
     /// Cycle thread sidebar filter.
     pub fn cycle_thread_filter(&mut self) -> bool {
+        self.sidebar_visible = true;
+        self.sidebar_mode = ReviewSidebarMode::Threads;
         self.thread_filter = self.thread_filter.next();
+        self.show_resolved_threads = self.thread_filter != ReviewThreadFilter::Open;
         self.selected_thread = 0;
         self.thread_scroll = 0;
         self.status_message = Some(format!(
