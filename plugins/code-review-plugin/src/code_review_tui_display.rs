@@ -62,16 +62,19 @@ impl ReviewDisplayBuilder {
                 .map(|line| line.content.as_str())
                 .collect::<Vec<_>>();
             let highlighted = if can_highlight {
-                syntax_highlighter.highlight_lines_tokens(syntax_hint, &contents)
+                highlighted_code_segments_for_lines(syntax_hint, &contents)
             } else {
-                Vec::new()
+                contents
+                    .iter()
+                    .map(|content| plain_code_segments(content))
+                    .collect()
             };
 
             rows.extend(hunk.lines.iter().enumerate().map(|(index, line)| {
-                let syntax_segments = highlighted.get(index).map_or_else(
-                    || plain_code_segments(&line.content),
-                    |spans| syntax_code_segments(spans),
-                );
+                let syntax_segments = highlighted
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| plain_code_segments(&line.content));
                 display_row_for_review_line(line, syntax_segments)
             }));
         }
@@ -160,6 +163,30 @@ pub enum ReviewDisplayTextRole {
     HunkHeader,
 }
 
+/// Add a display role to every segment in a row.
+pub fn add_display_role(segments: &mut [ReviewDisplaySegment], role: &ReviewDisplayTextRole) {
+    for segment in segments {
+        segment.roles.push(role.clone());
+    }
+}
+
+/// Build syntax-highlighted code segments for multiple lines using one highlighter pass.
+#[must_use]
+pub fn highlighted_code_segments_for_lines(
+    syntax_hint: &str,
+    lines: &[&str],
+) -> Vec<Vec<ReviewDisplaySegment>> {
+    let syntax_highlighter = SyntaxHighlighter::new();
+    if !syntax_highlighter.can_highlight(syntax_hint) {
+        return lines.iter().map(|line| plain_code_segments(line)).collect();
+    }
+    syntax_highlighter
+        .highlight_lines_tokens(syntax_hint, lines)
+        .iter()
+        .map(|spans| syntax_code_segments(spans))
+        .collect()
+}
+
 fn display_row_for_review_line(
     line: &ReviewLine,
     mut segments: Vec<ReviewDisplaySegment>,
@@ -179,9 +206,7 @@ fn display_row_for_review_line(
         ),
     };
 
-    for segment in &mut segments {
-        segment.roles.push(diff_role.clone());
-    }
+    add_display_role(&mut segments, &diff_role);
 
     ReviewDisplayRow {
         source,

@@ -35,8 +35,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::code_review_tui_render::materialized_file_surface_rows;
 use crate::code_review_tui_view::{
-    DiffContextKey, DiffContextLoadState, ReviewThreadAction, ReviewThreadAnchor, ReviewViewBlock,
-    ReviewViewDocument, ReviewViewTarget,
+    DiffContextKey, DiffContextLoadState, HighlightedReviewFile, ReviewThreadAction,
+    ReviewThreadAnchor, ReviewViewBlock, ReviewViewDocument, ReviewViewTarget,
 };
 use crate::tui_host_types::{TuiError, helpers};
 
@@ -3571,6 +3571,7 @@ pub struct ReviewApp {
     last_diff_area: Option<Rect>,
     mouse_regions: Vec<ReviewMouseRegion>,
     view_document_cache: Arc<RwLock<Option<ReviewViewDocumentCache>>>,
+    highlighted_files: Arc<RwLock<BTreeMap<String, HighlightedReviewFile>>>,
 }
 
 impl ReviewApp {
@@ -3636,6 +3637,7 @@ impl ReviewApp {
             last_diff_area: None,
             mouse_regions: Vec::new(),
             view_document_cache: Arc::new(RwLock::new(None)),
+            highlighted_files: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -6230,6 +6232,27 @@ impl ReviewApp {
         }
     }
 
+    fn highlighted_file_for_path(&self, path: &str) -> Option<HighlightedReviewFile> {
+        if let Ok(cache) = self.highlighted_files.read()
+            && let Some(file) = cache.get(path)
+        {
+            return Some(file.clone());
+        }
+        self.cache_highlighted_file_for_path(path)
+    }
+
+    fn cache_highlighted_file_for_path(&self, path: &str) -> Option<HighlightedReviewFile> {
+        let cached_file = self.file_cache.get(path)?;
+        if cached_file.unavailable_reason.is_some() || cached_file.is_binary {
+            return None;
+        }
+        let highlighted = HighlightedReviewFile::new(cached_file);
+        if let Ok(mut cache) = self.highlighted_files.write() {
+            cache.insert(path.to_string(), highlighted.clone());
+        }
+        Some(highlighted)
+    }
+
     /// Store a lazily loaded repository file.
     pub fn store_loaded_file(&mut self, file: CachedReviewFile) {
         let viewport_target = self.top_visible_target();
@@ -6239,6 +6262,7 @@ impl ReviewApp {
             .take()
             .filter(|path| path != &loaded_path);
         self.file_cache.insert(file);
+        self.cache_highlighted_file_for_path(&loaded_path);
         self.mark_contexts_for_path(&loaded_path, &DiffContextLoadState::Loaded);
         self.restore_top_visible_target(viewport_target.as_ref());
     }
@@ -8594,14 +8618,20 @@ impl ReviewApp {
             {
                 ReviewViewDocument::build_materialized_file_surface(self.selected_file, file)
             } else {
+                let selected_path = self.selected_file_path();
+                let cached_file = selected_path
+                    .as_ref()
+                    .and_then(|path| self.file_cache.get(path));
+                let highlighted_file = selected_path
+                    .as_deref()
+                    .and_then(|path| self.highlighted_file_for_path(path));
                 ReviewViewDocument::build_diff_file(
                     self.selected_file,
                     file,
                     true,
-                    self.selected_file_path()
-                        .as_ref()
-                        .and_then(|path| self.file_cache.get(path)),
+                    cached_file,
                     &self.diff_context_load_states,
+                    highlighted_file.as_ref(),
                 )
             }
         };
