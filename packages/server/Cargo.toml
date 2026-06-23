@@ -13,38 +13,23 @@ version     = { workspace = true }
 [dependencies]
 base64 = { workspace = true }
 bcode_agent_profile = { workspace = true }
-bcode_bedrock_provider_plugin = { workspace = true, optional = true }
-bcode_blims_plugin = { workspace = true, optional = true }
-bcode_code_review_plugin = { workspace = true, optional = true }
 bcode_command = { workspace = true }
 bcode_config = { workspace = true }
 bcode_daemon_lifecycle = { workspace = true }
-bcode_default_agents_plugin = { workspace = true, optional = true }
-bcode_document_plugin = { workspace = true, optional = true }
-bcode_fake_provider_plugin = { workspace = true, optional = true }
-bcode_filesystem_plugin = { workspace = true, optional = true }
-bcode_git_plugin = { workspace = true, optional = true }
-bcode_github_review_publisher_plugin = { workspace = true, optional = true }
 bcode_ipc = { workspace = true }
 bcode_metrics = { workspace = true }
 bcode_model = { workspace = true }
-bcode_openai_compatible_provider_plugin = { workspace = true, optional = true }
-bcode_opencode_session_import_plugin = { workspace = true, optional = true }
-bcode_pi_session_import_plugin = { workspace = true, optional = true }
 bcode_plugin = { workspace = true }
 bcode_provider_auth = { workspace = true }
 bcode_ralph = { workspace = true }
 bcode_session = { workspace = true }
 bcode_session_import = { workspace = true }
 bcode_session_models = { workspace = true }
-bcode_shell_plugin = { workspace = true, optional = true }
 bcode_skill = { workspace = true }
 bcode_skill_models = { workspace = true }
 bcode_tool = { workspace = true }
-bcode_web_search_plugin = { workspace = true, optional = true }
 bcode_worktree = { workspace = true }
 bcode_worktree_models = { workspace = true }
-bcode_worktree_plugin = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -66,99 +51,5 @@ uuid = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
-_static-bundled = []
-default = ["static-bundled-plugins"]
+default          = []
 fail-on-warnings = []
-static-bundled-bedrock-provider-plugin = [
-    "_static-bundled",
-    "dep:bcode_bedrock_provider_plugin",
-    "bcode_bedrock_provider_plugin/static-bundled",
-]
-static-bundled-blims-plugin = [
-    "_static-bundled",
-    "dep:bcode_blims_plugin",
-    "bcode_blims_plugin/static-bundled",
-]
-static-bundled-code-review-plugin = [
-    "_static-bundled",
-    "dep:bcode_code_review_plugin",
-    "bcode_code_review_plugin/static-bundled",
-]
-static-bundled-default-agents-plugin = [
-    "_static-bundled",
-    "dep:bcode_default_agents_plugin",
-    "bcode_default_agents_plugin/static-bundled",
-]
-static-bundled-document-plugin = [
-    "_static-bundled",
-    "dep:bcode_document_plugin",
-    "bcode_document_plugin/static-bundled",
-]
-static-bundled-fake-provider-plugin = [
-    "_static-bundled",
-    "dep:bcode_fake_provider_plugin",
-    "bcode_fake_provider_plugin/static-bundled",
-]
-static-bundled-filesystem-plugin = [
-    "_static-bundled",
-    "dep:bcode_filesystem_plugin",
-    "bcode_filesystem_plugin/static-bundled",
-]
-static-bundled-git-plugin = [
-    "_static-bundled",
-    "dep:bcode_git_plugin",
-    "bcode_git_plugin/static-bundled",
-]
-static-bundled-github-review-publisher-plugin = [
-    "_static-bundled",
-    "dep:bcode_github_review_publisher_plugin",
-    "bcode_github_review_publisher_plugin/static-bundled",
-]
-static-bundled-openai-compatible-provider-plugin = [
-    "_static-bundled",
-    "dep:bcode_openai_compatible_provider_plugin",
-    "bcode_openai_compatible_provider_plugin/static-bundled",
-]
-static-bundled-opencode-session-import-plugin = [
-    "_static-bundled",
-    "dep:bcode_opencode_session_import_plugin",
-    "bcode_opencode_session_import_plugin/static-bundled",
-]
-static-bundled-pi-session-import-plugin = [
-    "_static-bundled",
-    "dep:bcode_pi_session_import_plugin",
-    "bcode_pi_session_import_plugin/static-bundled",
-]
-static-bundled-plugins = [
-    "_static-bundled",
-    "static-bundled-bedrock-provider-plugin",
-    "static-bundled-blims-plugin",
-    "static-bundled-code-review-plugin",
-    "static-bundled-default-agents-plugin",
-    "static-bundled-document-plugin",
-    "static-bundled-fake-provider-plugin",
-    "static-bundled-filesystem-plugin",
-    "static-bundled-git-plugin",
-    "static-bundled-github-review-publisher-plugin",
-    "static-bundled-openai-compatible-provider-plugin",
-    "static-bundled-opencode-session-import-plugin",
-    "static-bundled-pi-session-import-plugin",
-    "static-bundled-shell-plugin",
-    "static-bundled-web-search-plugin",
-    "static-bundled-worktree-plugin",
-]
-static-bundled-shell-plugin = [
-    "_static-bundled",
-    "dep:bcode_shell_plugin",
-    "bcode_shell_plugin/static-bundled",
-]
-static-bundled-web-search-plugin = [
-    "_static-bundled",
-    "dep:bcode_web_search_plugin",
-    "bcode_web_search_plugin/static-bundled",
-]
-static-bundled-worktree-plugin = [
-    "_static-bundled",
-    "dep:bcode_worktree_plugin",
-    "bcode_worktree_plugin/static-bundled",
-]

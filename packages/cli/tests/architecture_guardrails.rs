@@ -2,6 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 const CORE_SCAN_ROOTS: &[&str] = &[
@@ -76,9 +77,10 @@ fn core_crates_report_bundled_tool_plugin_references() {
     let report = format_offender_report(&workspace_root, &offenders);
     eprintln!("{report}");
 
-    if std::env::var_os("BCODE_ENFORCE_TOOL_PLUGIN_BOUNDARY").is_some() {
-        panic!("{report}");
-    }
+    assert!(
+        std::env::var_os("BCODE_ENFORCE_TOOL_PLUGIN_BOUNDARY").is_none(),
+        "{report}"
+    );
 }
 
 fn collect_boundary_offenders(workspace_root: &Path) -> Vec<BoundaryOffender> {
@@ -132,7 +134,11 @@ fn should_scan_file(path: &Path) -> bool {
     if name == "architecture_guardrails.rs" {
         return false;
     }
-    name == "Cargo.toml" || name.ends_with(".rs")
+    name == "Cargo.toml"
+        || path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"))
 }
 
 fn scan_file(path: &Path, offenders: &mut Vec<BoundaryOffender>) {
@@ -199,14 +205,15 @@ fn format_offender_report(workspace_root: &Path, offenders: &[BoundaryOffender])
             .path
             .strip_prefix(workspace_root)
             .unwrap_or(&offender.path);
-        report.push_str(&format!(
-            "{}:{} contains {} {:?}: {}\n",
+        let _ = writeln!(
+            report,
+            "{}:{} contains {} {:?}: {}",
             path.display(),
             offender.line_number,
             offender.category,
             offender.needle,
             offender.line,
-        ));
+        );
     }
     report
 }

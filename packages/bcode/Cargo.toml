@@ -15,8 +15,24 @@ name = "bcode"
 path = "src/main.rs"
 
 [dependencies]
-bcode_cli = { workspace = true }
-tokio     = { workspace = true, features = ["macros", "rt-multi-thread"] }
+bcode_bedrock_provider_plugin           = { workspace = true, optional = true }
+bcode_blims_plugin                      = { workspace = true, optional = true }
+bcode_cli                               = { workspace = true }
+bcode_code_review_plugin                = { workspace = true, optional = true }
+bcode_default_agents_plugin             = { workspace = true, optional = true }
+bcode_document_plugin                   = { workspace = true, optional = true }
+bcode_fake_provider_plugin              = { workspace = true, optional = true }
+bcode_filesystem_plugin                 = { workspace = true, optional = true }
+bcode_git_plugin                        = { workspace = true, optional = true }
+bcode_github_review_publisher_plugin    = { workspace = true, optional = true }
+bcode_openai_compatible_provider_plugin = { workspace = true, optional = true }
+bcode_opencode_session_import_plugin    = { workspace = true, optional = true }
+bcode_pi_session_import_plugin          = { workspace = true, optional = true }
+bcode_plugin                            = { workspace = true }
+bcode_shell_plugin                      = { workspace = true, optional = true }
+bcode_web_search_plugin                 = { workspace = true, optional = true }
+bcode_worktree_plugin                   = { workspace = true, optional = true }
+tokio                                   = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [features]
 _static-bundled = []
@@ -24,51 +40,64 @@ default = ["static-bundled-plugins"]
 fail-on-warnings = []
 static-bundled-bedrock-provider-plugin = [
     "_static-bundled",
-    "bcode_cli/static-bundled-bedrock-provider-plugin",
+    "dep:bcode_bedrock_provider_plugin",
+    "bcode_bedrock_provider_plugin/static-bundled",
 ]
 static-bundled-blims-plugin = [
     "_static-bundled",
-    "bcode_cli/static-bundled-blims-plugin",
+    "dep:bcode_blims_plugin",
+    "bcode_blims_plugin/static-bundled",
 ]
 static-bundled-code-review-plugin = [
     "_static-bundled",
+    "dep:bcode_code_review_plugin",
+    "bcode_code_review_plugin/static-bundled",
     "bcode_cli/static-bundled-code-review-plugin",
 ]
 static-bundled-default-agents-plugin = [
     "_static-bundled",
-    "bcode_cli/static-bundled-default-agents-plugin",
+    "dep:bcode_default_agents_plugin",
+    "bcode_default_agents_plugin/static-bundled",
 ]
 static-bundled-document-plugin = [
     "_static-bundled",
-    "bcode_cli/static-bundled-document-plugin",
+    "dep:bcode_document_plugin",
+    "bcode_document_plugin/static-bundled",
 ]
 static-bundled-fake-provider-plugin = [
     "_static-bundled",
-    "bcode_cli/static-bundled-fake-provider-plugin",
+    "dep:bcode_fake_provider_plugin",
+    "bcode_fake_provider_plugin/static-bundled",
 ]
 static-bundled-filesystem-plugin = [
     "_static-bundled",
-    "bcode_cli/static-bundled-filesystem-plugin",
+    "dep:bcode_filesystem_plugin",
+    "bcode_filesystem_plugin/static-bundled",
 ]
 static-bundled-git-plugin = [
     "_static-bundled",
-    "bcode_cli/static-bundled-git-plugin",
+    "dep:bcode_git_plugin",
+    "bcode_git_plugin/static-bundled",
 ]
 static-bundled-github-review-publisher-plugin = [
     "_static-bundled",
-    "bcode_cli/static-bundled-github-review-publisher-plugin",
+    "dep:bcode_github_review_publisher_plugin",
+    "bcode_github_review_publisher_plugin/static-bundled",
 ]
 static-bundled-openai-compatible-provider-plugin = [
     "_static-bundled",
-    "bcode_cli/static-bundled-openai-compatible-provider-plugin",
+    "dep:bcode_openai_compatible_provider_plugin",
+    "bcode_openai_compatible_provider_plugin/static-bundled",
 ]
 static-bundled-opencode-session-import-plugin = [
     "_static-bundled",
-    "bcode_cli/static-bundled-opencode-session-import-plugin",
+    "dep:bcode_opencode_session_import_plugin",
+    "bcode_opencode_session_import_plugin/static-bundled",
 ]
 static-bundled-pi-session-import-plugin = [
     "_static-bundled",
-    "bcode_cli/static-bundled-pi-session-import-plugin",
+    "dep:bcode_pi_session_import_plugin",
+    "bcode_pi_session_import_plugin/static-bundled",
 ]
 static-bundled-plugins = [
     "_static-bundled",
@@ -95,13 +124,16 @@ static-bundled-ralph-plugin = [
 ]
 static-bundled-shell-plugin = [
     "_static-bundled",
-    "bcode_cli/static-bundled-shell-plugin",
+    "dep:bcode_shell_plugin",
+    "bcode_shell_plugin/static-bundled",
 ]
 static-bundled-web-search-plugin = [
     "_static-bundled",
-    "bcode_cli/static-bundled-web-search-plugin",
+    "dep:bcode_web_search_plugin",
+    "bcode_web_search_plugin/static-bundled",
 ]
 static-bundled-worktree-plugin = [
     "_static-bundled",
-    "bcode_cli/static-bundled-worktree-plugin",
+    "dep:bcode_worktree_plugin",
+    "bcode_worktree_plugin/static-bundled",
 ]

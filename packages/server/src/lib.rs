@@ -1351,88 +1351,6 @@ fn daemon_log_path() -> PathBuf {
     )
 }
 
-/// Return statically bundled plugin registrations enabled at compile time.
-#[must_use]
-pub fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
-    vec![
-        #[cfg(feature = "static-bundled-bedrock-provider-plugin")]
-        bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/bedrock-provider-plugin/bcode-plugin.toml"),
-            bcode_bedrock_provider_plugin::static_plugin(),
-        ),
-        #[cfg(feature = "static-bundled-blims-plugin")]
-        bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/blims-plugin/bcode-plugin.toml"),
-            bcode_blims_plugin::static_plugin(),
-        ),
-        #[cfg(feature = "static-bundled-code-review-plugin")]
-        bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/code-review-plugin/bcode-plugin.toml"),
-            bcode_code_review_plugin::static_plugin(),
-        ),
-        #[cfg(feature = "static-bundled-default-agents-plugin")]
-        bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
-            bcode_default_agents_plugin::static_plugin(),
-        ),
-        #[cfg(feature = "static-bundled-document-plugin")]
-        bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/document-plugin/bcode-plugin.toml"),
-            bcode_document_plugin::static_plugin(),
-        ),
-        #[cfg(feature = "static-bundled-fake-provider-plugin")]
-        bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
-            bcode_fake_provider_plugin::static_plugin(),
-        ),
-        #[cfg(feature = "static-bundled-filesystem-plugin")]
-        bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
-            bcode_filesystem_plugin::static_plugin(),
-        ),
-        #[cfg(feature = "static-bundled-git-plugin")]
-        bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/git-plugin/bcode-plugin.toml"),
-            bcode_git_plugin::static_plugin(),
-        ),
-        #[cfg(feature = "static-bundled-github-review-publisher-plugin")]
-        bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/github-review-publisher-plugin/bcode-plugin.toml"),
-            bcode_github_review_publisher_plugin::static_plugin(),
-        ),
-        #[cfg(feature = "static-bundled-openai-compatible-provider-plugin")]
-        bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/openai-compatible-provider-plugin/bcode-plugin.toml"),
-            bcode_openai_compatible_provider_plugin::static_plugin(),
-        ),
-        #[cfg(feature = "static-bundled-opencode-session-import-plugin")]
-        bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/opencode-session-import-plugin/bcode-plugin.toml"),
-            bcode_opencode_session_import_plugin::static_plugin(),
-        ),
-        #[cfg(feature = "static-bundled-pi-session-import-plugin")]
-        bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/pi-session-import-plugin/bcode-plugin.toml"),
-            bcode_pi_session_import_plugin::static_plugin(),
-        ),
-        #[cfg(feature = "static-bundled-shell-plugin")]
-        bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
-            bcode_shell_plugin::static_plugin(),
-        ),
-        #[cfg(feature = "static-bundled-web-search-plugin")]
-        bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/web-search-plugin/bcode-plugin.toml"),
-            bcode_web_search_plugin::static_plugin(),
-        ),
-        #[cfg(feature = "static-bundled-worktree-plugin")]
-        bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/worktree-plugin/bcode-plugin.toml"),
-            bcode_worktree_plugin::static_plugin(),
-        ),
-    ]
-}
-
 fn resolve_plugin_configs(
     config: &bcode_config::BcodeConfig,
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
@@ -1584,8 +1502,20 @@ fn redact_plugin_config_value(value: &serde_json::Value) -> serde_json::Value {
 /// # Errors
 ///
 /// Returns an error when the server cannot bind or accept local IPC connections.
-#[allow(clippy::too_many_lines)]
 pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
+    run_with_static_bundled(endpoint, &[]).await
+}
+
+/// Run the local Bcode server with caller-provided static bundled plugins until interrupted.
+///
+/// # Errors
+///
+/// Returns an error when the server cannot bind or accept local IPC connections.
+#[allow(clippy::too_many_lines)]
+pub async fn run_with_static_bundled(
+    endpoint: IpcEndpoint,
+    static_plugins: &[bcode_plugin::StaticBundledPlugin],
+) -> Result<(), ServerError> {
     tracing::debug!(target: "bcode_server::startup", "loading config");
     let config = bcode_config::load_config()?;
     tracing::debug!(target: "bcode_server::startup", "config loaded");
@@ -1597,11 +1527,10 @@ pub async fn run(endpoint: IpcEndpoint) -> Result<(), ServerError> {
         "plugin selection resolved"
     );
     tracing::debug!(target: "bcode_server::startup", "loading plugins");
-    let static_plugins = static_bundled_plugins();
-    let plugin_configs = resolve_plugin_configs(&config, &static_plugins);
+    let plugin_configs = resolve_plugin_configs(&config, static_plugins);
     let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled_and_config(
         &plugin_selection,
-        &static_plugins,
+        static_plugins,
         plugin_configs,
     )?;
     tracing::debug!(target: "bcode_server::startup", "plugins loaded");

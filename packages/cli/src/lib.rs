@@ -93,12 +93,28 @@ pub enum CliError {
     SessionRepairUsage(String),
 }
 
+use std::sync::OnceLock;
+
+static STATIC_BUNDLED_PLUGINS: OnceLock<Vec<bcode_plugin::StaticBundledPlugin>> = OnceLock::new();
+
 /// Parse CLI arguments and run the requested command.
 ///
 /// # Errors
 ///
 /// Returns an error when the requested command fails.
 pub async fn run() -> Result<(), CliError> {
+    run_with_static_bundled(Vec::new()).await
+}
+
+/// Parse CLI arguments and run with caller-provided static bundled plugins.
+///
+/// # Errors
+///
+/// Returns an error when the requested command fails.
+pub async fn run_with_static_bundled(
+    static_plugins: Vec<bcode_plugin::StaticBundledPlugin>,
+) -> Result<(), CliError> {
+    let _ = STATIC_BUNDLED_PLUGINS.set(static_plugins);
     init_tracing();
     let cli = Cli::parse();
     Box::pin(handle_cli(cli)).await
@@ -4087,9 +4103,15 @@ fn plugin_service_call_error(error: bcode_plugin::PluginServiceCallError) -> Cli
 fn load_cli_plugin_host() -> Result<bcode_plugin::PluginHost, CliError> {
     let config = bcode_config::load_config()?;
     let selection = bcode_plugin::PluginSelection::from(&config);
-    let static_plugins = bcode_server::static_bundled_plugins();
+    let static_plugins = static_bundled_plugins();
     bcode_plugin::PluginHost::load_defaults_with_static_bundled(&selection, &static_plugins)
         .map_err(CliError::Plugin)
+}
+
+/// Return caller-provided statically bundled plugin registrations.
+#[must_use]
+fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
+    STATIC_BUNDLED_PLUGINS.get().cloned().unwrap_or_default()
 }
 
 fn configured_provider_context(
@@ -4142,315 +4164,13 @@ fn discover_plugins_for_cli(
     roots: &[std::path::PathBuf],
 ) -> Result<Vec<bcode_plugin::RegisteredPlugin>, CliError> {
     if roots.is_empty() {
-        ensure_bundled_plugins_installed()?;
         bcode_plugin::discover_plugins().map_err(CliError::Plugin)
     } else {
         bcode_plugin::discover_plugins_in_roots(roots).map_err(CliError::Plugin)
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct BundledPluginSpec {
-    id: &'static str,
-    package: &'static str,
-    library_stem: &'static str,
-    name: &'static str,
-    services: &'static [BundledPluginServiceSpec],
-}
-
-#[derive(Debug, Clone, Copy)]
-struct BundledPluginServiceSpec {
-    interface_id: &'static str,
-    name: &'static str,
-    description: &'static str,
-}
-
-const BUNDLED_FILESYSTEM_SERVICES: &[BundledPluginServiceSpec] = &[
-    BundledPluginServiceSpec {
-        interface_id: "bcode.filesystem/v1",
-        name: "Filesystem",
-        description: "Filesystem read/write utility service",
-    },
-    BundledPluginServiceSpec {
-        interface_id: "bcode.tool/v1",
-        name: "Filesystem Tools",
-        description: "Model-callable filesystem tools",
-    },
-];
-const BUNDLED_SHELL_SERVICES: &[BundledPluginServiceSpec] = &[BundledPluginServiceSpec {
-    interface_id: "bcode.tool/v1",
-    name: "Shell Tools",
-    description: "Permissioned model-callable shell execution tools",
-}];
-const BUNDLED_OPENAI_SERVICES: &[BundledPluginServiceSpec] = &[BundledPluginServiceSpec {
-    interface_id: "bcode.model-provider/v1",
-    name: "OpenAI-Compatible Model Provider",
-    description: "OpenAI-compatible chat-completions model provider",
-}];
-const BUNDLED_BEDROCK_SERVICES: &[BundledPluginServiceSpec] = &[BundledPluginServiceSpec {
-    interface_id: "bcode.model-provider/v1",
-    name: "Amazon Bedrock Model Provider",
-    description: "Amazon Bedrock ConverseStream model provider",
-}];
-const BUNDLED_DEFAULT_AGENT_SERVICES: &[BundledPluginServiceSpec] = &[BundledPluginServiceSpec {
-    interface_id: "bcode.agent-profile/v1",
-    name: "Default Agent Profiles",
-    description: "Default plan/build agent profile policy provider",
-}];
-const BUNDLED_PLUGIN_SPECS: &[BundledPluginSpec] = &[
-    BundledPluginSpec {
-        id: "bcode.filesystem",
-        package: "bcode_filesystem_plugin",
-        library_stem: "bcode_filesystem_plugin",
-        name: "Bcode Filesystem Plugin",
-        services: BUNDLED_FILESYSTEM_SERVICES,
-    },
-    BundledPluginSpec {
-        id: "bcode.shell",
-        package: "bcode_shell_plugin",
-        library_stem: "bcode_shell_plugin",
-        name: "Bcode Shell Plugin",
-        services: BUNDLED_SHELL_SERVICES,
-    },
-    BundledPluginSpec {
-        id: "bcode.openai-compatible",
-        package: "bcode_openai_compatible_provider_plugin",
-        library_stem: "bcode_openai_compatible_provider_plugin",
-        name: "Bcode OpenAI-Compatible Provider",
-        services: BUNDLED_OPENAI_SERVICES,
-    },
-    BundledPluginSpec {
-        id: "bcode.bedrock",
-        package: "bcode_bedrock_provider_plugin",
-        library_stem: "bcode_bedrock_provider_plugin",
-        name: "Bcode Bedrock Provider",
-        services: BUNDLED_BEDROCK_SERVICES,
-    },
-    BundledPluginSpec {
-        id: "bcode.default-agents",
-        package: "bcode_default_agents_plugin",
-        library_stem: "bcode_default_agents_plugin",
-        name: "Bcode Default Agents",
-        services: BUNDLED_DEFAULT_AGENT_SERVICES,
-    },
-];
-
-fn ensure_bundled_plugins_installed() -> Result<(), CliError> {
-    if cfg!(feature = "_static-bundled")
-        || std::env::var_os("BCODE_SKIP_BUNDLED_PLUGIN_INSTALL").is_some()
-    {
-        return Ok(());
-    }
-    let executable_dir = executable_dir()?;
-    if bundled_plugins_installed(&executable_dir) {
-        return Ok(());
-    }
-    build_missing_bundled_plugin_libraries(&executable_dir)?;
-    for spec in BUNDLED_PLUGIN_SPECS {
-        install_bundled_plugin(&executable_dir, spec)?;
-    }
-    Ok(())
-}
-
-fn executable_dir() -> Result<PathBuf, CliError> {
-    std::env::current_exe()?
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| {
-            CliError::BundledPluginInstallFailed(
-                "current executable has no parent directory".to_string(),
-            )
-        })
-}
-
-fn build_missing_bundled_plugin_libraries(executable_dir: &Path) -> Result<(), CliError> {
-    if bundled_plugin_libraries_current(executable_dir) {
-        return Ok(());
-    }
-    let Some(workspace_root) = workspace_root_from_executable_dir(executable_dir) else {
-        return Err(CliError::BundledPluginInstallFailed(format!(
-            "bundled plugin libraries are missing from {} and no workspace root was found",
-            executable_dir.display()
-        )));
-    };
-    let status = Command::new("cargo")
-        .arg("build")
-        .arg("--quiet")
-        .args(
-            BUNDLED_PLUGIN_SPECS
-                .iter()
-                .flat_map(|spec| ["-p", spec.package]),
-        )
-        .current_dir(&workspace_root)
-        .status()?;
-    if status.success() && bundled_plugin_libraries_exist(executable_dir) {
-        Ok(())
-    } else {
-        Err(CliError::BundledPluginInstallFailed(format!(
-            "cargo build did not produce all bundled plugin libraries in {}",
-            executable_dir.display()
-        )))
-    }
-}
-
-fn bundled_plugin_libraries_exist(executable_dir: &Path) -> bool {
-    BUNDLED_PLUGIN_SPECS.iter().all(|spec| {
-        executable_dir
-            .join(dynamic_library_name(spec.library_stem))
-            .exists()
-    })
-}
-
-fn bundled_plugin_libraries_current(executable_dir: &Path) -> bool {
-    let Some(workspace_root) = workspace_root_from_executable_dir(executable_dir) else {
-        return bundled_plugin_libraries_exist(executable_dir);
-    };
-    BUNDLED_PLUGIN_SPECS.iter().all(|spec| {
-        let library = executable_dir.join(dynamic_library_name(spec.library_stem));
-        library.exists() && library_is_newer_than_package_sources(&library, &workspace_root, spec)
-    })
-}
-
-fn bundled_plugins_installed(executable_dir: &Path) -> bool {
-    BUNDLED_PLUGIN_SPECS.iter().all(|spec| {
-        let library_name = dynamic_library_name(spec.library_stem);
-        let source_library = executable_dir.join(&library_name);
-        let manifest_path = executable_dir
-            .join("plugins")
-            .join(spec.id)
-            .join(bcode_plugin::DEFAULT_PLUGIN_MANIFEST_FILE);
-        source_library.exists()
-            && bundled_manifest_is_current(&manifest_path, spec, &library_name)
-            && workspace_root_from_executable_dir(executable_dir).is_none_or(|workspace_root| {
-                library_is_newer_than_package_sources(&source_library, &workspace_root, spec)
-            })
-    })
-}
-
-fn bundled_manifest_is_current(path: &Path, spec: &BundledPluginSpec, library_name: &str) -> bool {
-    let Ok(contents) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    contents == bundled_plugin_manifest(spec, &bundled_runtime_library_path(library_name))
-}
-
-fn library_is_newer_than_package_sources(
-    library: &Path,
-    workspace_root: &Path,
-    spec: &BundledPluginSpec,
-) -> bool {
-    let Ok(library_modified) = std::fs::metadata(library).and_then(|metadata| metadata.modified())
-    else {
-        return false;
-    };
-    let package_dir = workspace_root.join(package_relative_dir(spec));
-    newest_source_modified(&package_dir)
-        .is_none_or(|source_modified| library_modified >= source_modified)
-}
-
-fn package_relative_dir(spec: &BundledPluginSpec) -> &'static str {
-    match spec.id {
-        "bcode.filesystem" => "plugins/filesystem-plugin",
-        "bcode.shell" => "plugins/shell-plugin",
-        "bcode.openai-compatible" => "plugins/openai-compatible-provider-plugin",
-        "bcode.bedrock" => "plugins/bedrock-provider-plugin",
-        "bcode.default-agents" => "plugins/default-agents-plugin",
-        _ => ".",
-    }
-}
-
-fn newest_source_modified(path: &Path) -> Option<std::time::SystemTime> {
-    let mut newest = None;
-    newest_source_modified_inner(path, &mut newest);
-    newest
-}
-
-fn newest_source_modified_inner(path: &Path, newest: &mut Option<std::time::SystemTime>) {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return;
-    };
-    if metadata.is_file() {
-        if path
-            .extension()
-            .and_then(std::ffi::OsStr::to_str)
-            .is_some_and(|extension| matches!(extension, "rs" | "toml"))
-            && let Ok(modified) = metadata.modified()
-            && newest.is_none_or(|current| modified > current)
-        {
-            *newest = Some(modified);
-        }
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        newest_source_modified_inner(&entry.path(), newest);
-    }
-}
-
-fn workspace_root_from_executable_dir(executable_dir: &Path) -> Option<PathBuf> {
-    let target_dir = executable_dir.parent()?;
-    let workspace_root = target_dir.parent()?;
-    workspace_root
-        .join("Cargo.toml")
-        .exists()
-        .then(|| workspace_root.to_path_buf())
-}
-
-fn install_bundled_plugin(executable_dir: &Path, spec: &BundledPluginSpec) -> Result<(), CliError> {
-    let library_name = dynamic_library_name(spec.library_stem);
-    let source_library = executable_dir.join(&library_name);
-    if !source_library.exists() {
-        return Err(CliError::BundledPluginInstallFailed(format!(
-            "bundled plugin library is missing: {}",
-            source_library.display()
-        )));
-    }
-    let plugin_dir = executable_dir.join("plugins").join(spec.id);
-    std::fs::create_dir_all(&plugin_dir)?;
-    std::fs::write(
-        plugin_dir.join(bcode_plugin::DEFAULT_PLUGIN_MANIFEST_FILE),
-        bundled_plugin_manifest(spec, &bundled_runtime_library_path(&library_name)),
-    )?;
-    Ok(())
-}
-
-fn bundled_runtime_library_path(library_name: &str) -> String {
-    format!("../../{library_name}")
-}
-
-fn bundled_plugin_manifest(spec: &BundledPluginSpec, library_name: &str) -> String {
-    let mut manifest = format!(
-        "id = \"{}\"\nname = \"{}\"\nversion = \"0.0.1\"\n\n",
-        spec.id, spec.name
-    );
-    for service in spec.services {
-        let _ = write!(
-            manifest,
-            "[[services]]\ndescription = \"{}\"\ninterface_id = \"{}\"\nname = \"{}\"\n\n",
-            service.description, service.interface_id, service.name
-        );
-    }
-    let _ = write!(
-        manifest,
-        "[runtime]\ntype = \"native\"\nabi_version = 1\nlibrary = \"{library_name}\"\nevent_symbol = \"bcode_plugin_handle_event_v1\"\nservice_symbol = \"bcode_plugin_invoke_service_v1\"\n"
-    );
-    manifest
-}
-
-fn dynamic_library_name(library_stem: &str) -> String {
-    if cfg!(target_os = "windows") {
-        format!("{library_stem}.dll")
-    } else if cfg!(target_os = "macos") {
-        format!("lib{library_stem}.dylib")
-    } else {
-        format!("lib{library_stem}.so")
-    }
-}
-
 async fn ensure_server_running() -> Result<(), CliError> {
-    ensure_bundled_plugins_installed()?;
     BcodeClient::default_endpoint()
         .ensure_daemon_available()
         .await?;
@@ -4458,13 +4178,11 @@ async fn ensure_server_running() -> Result<(), CliError> {
 }
 
 async fn run_server_foreground() -> Result<(), CliError> {
-    ensure_bundled_plugins_installed()?;
-    bcode_server::run(default_endpoint()).await?;
+    bcode_server::run_with_static_bundled(default_endpoint(), &static_bundled_plugins()).await?;
     Ok(())
 }
 
 async fn start_server_daemon(quiet: bool) -> Result<(), CliError> {
-    ensure_bundled_plugins_installed()?;
     bcode_daemon_lifecycle::ensure_daemon_running(&bcode_daemon_lifecycle::EnsureDaemonOptions {
         endpoint: default_endpoint(),
         quiet,
