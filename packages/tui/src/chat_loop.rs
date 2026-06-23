@@ -1752,7 +1752,16 @@ fn is_clipboard_image_paste_key(keymap: &BmuxKeyMap, stroke: KeyStroke) -> bool 
 }
 
 fn paste_clipboard_image(chat: &mut ActiveChat) {
-    match clipboard_image::save_clipboard_image(chat.app.session_id()) {
+    let launch_working_directory = chat
+        .app
+        .working_directory()
+        .map_or_else(std::env::current_dir, |path| Ok(path.to_path_buf()));
+    let Ok(launch_working_directory) = launch_working_directory else {
+        chat.app
+            .set_status("image paste failed: current directory unavailable".to_owned());
+        return;
+    };
+    match clipboard_image::save_clipboard_image(chat.app.session_id(), &launch_working_directory) {
         Ok(artifact) => {
             let text = clipboard_image::pasted_image_text(&artifact.model);
             chat.app.reset_input_history_navigation();

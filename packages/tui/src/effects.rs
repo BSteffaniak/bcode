@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 
 use super::{
-    TuiError, daemon_issue, history_flow,
+    TuiError, clipboard_image, daemon_issue, history_flow,
     session_flow::{self, AgentCatalog},
     slash_palette, thinking_flow,
 };
@@ -1208,6 +1208,7 @@ async fn submit_message(
         reasoning_summary,
         event_sender,
     } = request;
+    let mut message = message;
     let mut created_session = None;
     let mut event_task = None;
     let session_id = if let Some(session_id) = session_id {
@@ -1219,7 +1220,7 @@ async fn submit_message(
         let _ = client
             .set_composer_draft(
                 ComposerDraftScope::DraftSession {
-                    launch_working_directory,
+                    launch_working_directory: launch_working_directory.clone(),
                 },
                 String::new(),
             )
@@ -1235,6 +1236,15 @@ async fn submit_message(
                     },
                 })?;
         let session_id = session.id;
+        message = clipboard_image::promote_draft_clipboard_images(
+            &message,
+            &launch_working_directory,
+            session_id,
+        )
+        .map_err(|error| ClientError::Server {
+            code: "tui_clipboard_image_promotion_failed".to_owned(),
+            message: error.to_string(),
+        })?;
         created_session = Some(attached.session);
         event_task = Some(task);
         session_id

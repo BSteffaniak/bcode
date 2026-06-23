@@ -14,9 +14,6 @@ const MODEL_MAX_DIMENSION: u32 = 2_000;
 /// Errors returned while pasting clipboard images.
 #[derive(Debug, thiserror::Error)]
 pub enum ClipboardImageError {
-    /// No active session is available to scope the pasted image path.
-    #[error("no active session")]
-    NoActiveSession,
     /// The system clipboard could not be opened.
     #[error("clipboard unavailable: {0}")]
     ClipboardUnavailable(String),
@@ -32,9 +29,12 @@ pub enum ClipboardImageError {
     /// Artifact metadata could not be serialized.
     #[error("failed to serialize clipboard image metadata: {0}")]
     Serialize(#[from] serde_json::Error),
-    /// The image path could not be created or written.
+    /// The image path could not be created, moved, or written.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// A draft image path does not have the expected Bcode-managed shape.
+    #[error("invalid draft clipboard image path: {0}")]
+    InvalidDraftPath(String),
 }
 
 /// Files produced for a pasted clipboard image.
@@ -64,13 +64,16 @@ struct ImageFileMetadata {
     byte_len: u64,
 }
 
-/// Save the current clipboard image to Bcode-managed session artifacts.
+/// Save the current clipboard image to Bcode-managed artifacts.
+///
+/// Images pasted before a session exists are stored in draft-session artifacts
+/// scoped by the launch working directory. They can later be promoted into the
+/// newly-created session before the initial prompt is submitted.
 ///
 /// # Errors
 ///
 /// Returns an error when:
 ///
-/// * there is no active session;
 /// * the OS clipboard cannot be opened;
 /// * the clipboard does not contain an image;
 /// * the image cannot be encoded as PNG;
@@ -78,32 +81,28 @@ struct ImageFileMetadata {
 /// * artifact directories or files cannot be written.
 pub fn save_clipboard_image(
     session_id: Option<SessionId>,
+    launch_working_directory: impl AsRef<Path>,
 ) -> Result<ClipboardImageArtifact, ClipboardImageError> {
-    let session_id = session_id.ok_or(ClipboardImageError::NoActiveSession)?;
     let mut clipboard = arboard::Clipboard::new()
         .map_err(|error| ClipboardImageError::ClipboardUnavailable(error.to_string()))?;
     let image = clipboard
         .get_image()
         .map_err(|_| ClipboardImageError::NoImage)?;
-    save_rgba_image_artifact(
-        bcode_config::default_state_dir(),
-        session_id,
-        Uuid::new_v4(),
-        image.width,
-        image.height,
-        image.bytes.as_ref(),
-    )
+    let state_dir = bcode_config::default_state_dir();
+    let image_id = Uuid::new_v4();
+    let paths = session_id.map_or_else(
+        || draft_clipboard_image_artifact_paths(&state_dir, launch_working_directory, image_id),
+        |session_id| clipboard_image_artifact_paths(&state_dir, session_id, image_id),
+    );
+    save_rgba_image_artifact(paths, image.width, image.height, image.bytes.as_ref())
 }
 
 fn save_rgba_image_artifact(
-    state_dir: impl AsRef<Path>,
-    session_id: SessionId,
-    image_id: Uuid,
+    paths: ClipboardImageArtifact,
     width: usize,
     height: usize,
     rgba: &[u8],
 ) -> Result<ClipboardImageArtifact, ClipboardImageError> {
-    let paths = clipboard_image_artifact_paths(state_dir, session_id, image_id);
     if let Some(parent) = paths.source.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -157,6 +156,112 @@ pub fn clipboard_image_artifact_paths(
         source: root.join("source.png"),
         model: root.join("model.png"),
         metadata: root.join("metadata.json"),
+    }
+}
+
+/// Return artifact paths used for a pasted draft-session clipboard image.
+#[must_use]
+pub fn draft_clipboard_image_artifact_paths(
+    state_dir: impl AsRef<Path>,
+    launch_working_directory: impl AsRef<Path>,
+    image_id: Uuid,
+) -> ClipboardImageArtifact {
+    let root =
+        draft_clipboard_images_root(state_dir, launch_working_directory).join(image_id.to_string());
+    ClipboardImageArtifact {
+        source: root.join("source.png"),
+        model: root.join("model.png"),
+        metadata: root.join("metadata.json"),
+    }
+}
+
+/// Promote referenced draft clipboard images into session artifacts and rewrite their paths.
+///
+/// # Errors
+///
+/// Returns an error when referenced draft artifact files cannot be inspected,
+/// copied, or rewritten into session-scoped artifacts.
+pub fn promote_draft_clipboard_images(
+    message: &str,
+    launch_working_directory: impl AsRef<Path>,
+    session_id: SessionId,
+) -> Result<String, ClipboardImageError> {
+    promote_draft_clipboard_images_in_state(
+        bcode_config::default_state_dir(),
+        message,
+        launch_working_directory,
+        session_id,
+    )
+}
+
+fn promote_draft_clipboard_images_in_state(
+    state_dir: impl AsRef<Path>,
+    message: &str,
+    launch_working_directory: impl AsRef<Path>,
+    session_id: SessionId,
+) -> Result<String, ClipboardImageError> {
+    let state_dir = state_dir.as_ref();
+    let draft_root = draft_clipboard_images_root(state_dir, launch_working_directory);
+    if !draft_root.exists() {
+        return Ok(message.to_owned());
+    }
+    let mut rewritten = message.to_owned();
+    for entry in fs::read_dir(draft_root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let image_id = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .ok_or_else(|| {
+                ClipboardImageError::InvalidDraftPath(entry.path().display().to_string())
+            })?;
+        let draft = ClipboardImageArtifact {
+            source: entry.path().join("source.png"),
+            model: entry.path().join("model.png"),
+            metadata: entry.path().join("metadata.json"),
+        };
+        let draft_model = draft.model.to_string_lossy();
+        if !rewritten.contains(draft_model.as_ref()) {
+            continue;
+        }
+        let session = clipboard_image_artifact_paths(state_dir, session_id, image_id);
+        if let Some(parent) = session.source.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&draft.source, &session.source)?;
+        fs::copy(&draft.model, &session.model)?;
+        fs::copy(&draft.metadata, &session.metadata)?;
+        rewritten = rewritten.replace(draft_model.as_ref(), &session.model.to_string_lossy());
+    }
+    Ok(rewritten)
+}
+
+fn draft_clipboard_images_root(
+    state_dir: impl AsRef<Path>,
+    launch_working_directory: impl AsRef<Path>,
+) -> PathBuf {
+    state_dir
+        .as_ref()
+        .join("drafts")
+        .join("sessions")
+        .join(working_directory_key(launch_working_directory.as_ref()))
+        .join("artifacts")
+        .join("clipboard-images")
+}
+
+fn working_directory_key(path: &Path) -> String {
+    let mut key = String::new();
+    for byte in path.to_string_lossy().as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut key, "{byte:02x}");
+    }
+    if key.is_empty() {
+        "root".to_owned()
+    } else {
+        key
     }
 }
 
@@ -236,7 +341,8 @@ fn current_time_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        MODEL_MAX_DIMENSION, clipboard_image_artifact_paths, pasted_image_text, resized_model_rgba,
+        MODEL_MAX_DIMENSION, clipboard_image_artifact_paths, draft_clipboard_image_artifact_paths,
+        pasted_image_text, promote_draft_clipboard_images_in_state, resized_model_rgba,
     };
     use bcode_session_models::SessionId;
     use uuid::Uuid;
@@ -260,6 +366,50 @@ mod tests {
         assert_eq!(
             paths.metadata.to_string_lossy(),
             "/state/sessions/11111111-1111-1111-1111-111111111111/artifacts/clipboard-images/22222222-2222-2222-2222-222222222222/metadata.json"
+        );
+    }
+
+    #[test]
+    fn draft_clipboard_image_artifact_paths_are_working_directory_scoped() {
+        let image_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+
+        let paths = draft_clipboard_image_artifact_paths("/state", "/tmp/project", image_id);
+
+        assert_eq!(
+            paths.model.to_string_lossy(),
+            "/state/drafts/sessions/2f746d702f70726f6a656374/artifacts/clipboard-images/22222222-2222-2222-2222-222222222222/model.png"
+        );
+    }
+
+    #[test]
+    fn promote_draft_clipboard_images_copies_referenced_artifacts_and_rewrites_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_id =
+            SessionId(Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap());
+        let image_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let draft_paths =
+            draft_clipboard_image_artifact_paths(temp.path(), "/tmp/project", image_id);
+        std::fs::create_dir_all(draft_paths.source.parent().unwrap()).unwrap();
+        std::fs::write(&draft_paths.source, b"source").unwrap();
+        std::fs::write(&draft_paths.model, b"model").unwrap();
+        std::fs::write(&draft_paths.metadata, b"metadata").unwrap();
+        let message = format!("look at {}", draft_paths.model.display());
+
+        let rewritten = promote_draft_clipboard_images_in_state(
+            temp.path(),
+            &message,
+            "/tmp/project",
+            session_id,
+        )
+        .unwrap();
+
+        let session_paths = clipboard_image_artifact_paths(temp.path(), session_id, image_id);
+        assert_eq!(std::fs::read(&session_paths.source).unwrap(), b"source");
+        assert_eq!(std::fs::read(&session_paths.model).unwrap(), b"model");
+        assert_eq!(std::fs::read(&session_paths.metadata).unwrap(), b"metadata");
+        assert_eq!(
+            rewritten,
+            format!("look at {}", session_paths.model.display())
         );
     }
 
