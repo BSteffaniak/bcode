@@ -352,6 +352,17 @@ fn clone_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::WriteFiles,
         requires_permission: true,
+        policy: bcode_tool::ToolPolicyMetadata {
+            aliases: Vec::new(),
+            permission_category: Some("write".to_string()),
+            argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
+                kind: bcode_tool::ToolArgumentKind::WritePath,
+                argument: "destination".to_string(),
+            }],
+        },
+        ui: bcode_tool::ToolUiMetadata {
+            activity_label: Some("cloning".to_string()),
+        },
     }
 }
 

@@ -141,6 +141,14 @@ fn list_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
+        policy: bcode_tool::ToolPolicyMetadata {
+            aliases: vec!["worktree.read".to_string()],
+            permission_category: Some("worktree.read".to_string()),
+            argument_extractors: Vec::new(),
+        },
+        ui: bcode_tool::ToolUiMetadata {
+            activity_label: Some("listing worktrees".to_string()),
+        },
     }
 }
 
@@ -165,6 +173,14 @@ fn create_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::ExecuteProcess,
         requires_permission: true,
+        policy: bcode_tool::ToolPolicyMetadata {
+            aliases: vec!["worktree.create".to_string()],
+            permission_category: Some("worktree.create".to_string()),
+            argument_extractors: Vec::new(),
+        },
+        ui: bcode_tool::ToolUiMetadata {
+            activity_label: Some("creating worktree".to_string()),
+        },
     }
 }
 
@@ -183,6 +199,17 @@ fn remove_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::ExecuteProcess,
         requires_permission: true,
+        policy: bcode_tool::ToolPolicyMetadata {
+            aliases: vec!["worktree.remove".to_string()],
+            permission_category: Some("worktree.remove".to_string()),
+            argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
+                kind: bcode_tool::ToolArgumentKind::WritePath,
+                argument: "path".to_string(),
+            }],
+        },
+        ui: bcode_tool::ToolUiMetadata {
+            activity_label: Some("removing worktree".to_string()),
+        },
     }
 }
 

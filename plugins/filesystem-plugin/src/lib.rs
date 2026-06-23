@@ -340,6 +340,27 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
     })
 }
 
+fn path_policy(
+    aliases: &[&str],
+    category: &str,
+    kind: bcode_tool::ToolArgumentKind,
+) -> bcode_tool::ToolPolicyMetadata {
+    bcode_tool::ToolPolicyMetadata {
+        aliases: aliases.iter().map(ToString::to_string).collect(),
+        permission_category: Some(category.to_string()),
+        argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
+            kind,
+            argument: "path".to_string(),
+        }],
+    }
+}
+
+fn tool_ui(activity_label: &str) -> bcode_tool::ToolUiMetadata {
+    bcode_tool::ToolUiMetadata {
+        activity_label: Some(activity_label.to_string()),
+    }
+}
+
 fn read_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "filesystem.read".to_string(),
@@ -355,6 +376,8 @@ fn read_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
+        policy: path_policy(&["read"], "read", bcode_tool::ToolArgumentKind::ReadPath),
+        ui: tool_ui("reading"),
     }
 }
 
@@ -372,6 +395,8 @@ fn write_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::WriteFiles,
         requires_permission: true,
+        policy: path_policy(&["write"], "write", bcode_tool::ToolArgumentKind::WritePath),
+        ui: tool_ui("writing"),
     }
 }
 
@@ -390,6 +415,8 @@ fn edit_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::WriteFiles,
         requires_permission: true,
+        policy: path_policy(&["edit"], "edit", bcode_tool::ToolArgumentKind::WritePath),
+        ui: tool_ui("editing"),
     }
 }
 
@@ -404,6 +431,8 @@ fn exists_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
+        policy: path_policy(&["read"], "read", bcode_tool::ToolArgumentKind::ReadPath),
+        ui: tool_ui("checking"),
     }
 }
 
@@ -423,6 +452,12 @@ fn list_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
+        policy: path_policy(
+            &["ls", "read"],
+            "read",
+            bcode_tool::ToolArgumentKind::ReadPath,
+        ),
+        ui: tool_ui("listing"),
     }
 }
 
@@ -442,6 +477,12 @@ fn find_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
+        policy: path_policy(
+            &["find", "read"],
+            "read",
+            bcode_tool::ToolArgumentKind::ReadPath,
+        ),
+        ui: tool_ui("finding"),
     }
 }
 
@@ -463,6 +504,12 @@ fn grep_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
+        policy: path_policy(
+            &["grep", "read"],
+            "read",
+            bcode_tool::ToolArgumentKind::ReadPath,
+        ),
+        ui: tool_ui("searching"),
     }
 }
 
@@ -477,6 +524,12 @@ fn stat_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
+        policy: path_policy(
+            &["stat", "read"],
+            "read",
+            bcode_tool::ToolArgumentKind::ReadPath,
+        ),
+        ui: tool_ui("stat"),
     }
 }
 
@@ -491,6 +544,8 @@ fn artifact_metadata_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
+        policy: bcode_tool::ToolPolicyMetadata::default(),
+        ui: bcode_tool::ToolUiMetadata::default(),
     }
 }
 
@@ -510,6 +565,8 @@ fn artifact_read_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
+        policy: bcode_tool::ToolPolicyMetadata::default(),
+        ui: bcode_tool::ToolUiMetadata::default(),
     }
 }
 
@@ -530,6 +587,8 @@ fn artifact_grep_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
+        policy: bcode_tool::ToolPolicyMetadata::default(),
+        ui: bcode_tool::ToolUiMetadata::default(),
     }
 }
 

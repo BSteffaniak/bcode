@@ -9,7 +9,7 @@ pub use bcode_agent_policy_models::{
 };
 
 use bcode_agent_profile::{AgentDecision, EvaluateToolCallRequest, EvaluateToolCallResponse};
-use bcode_tool::ToolSideEffect;
+use bcode_tool::{ToolArgumentKind, ToolSideEffect};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -207,6 +207,18 @@ fn evaluate_after_path(
     config: &AgentConfig,
     request: &EvaluateToolCallRequest,
 ) -> PolicyEvaluation {
+    if has_argument_kind(request, ToolArgumentKind::Command) {
+        return evaluate_shell(config, request);
+    }
+    if has_argument_kind(request, ToolArgumentKind::Url) {
+        return evaluate_web_url(config, request);
+    }
+    if has_argument_kind(request, ToolArgumentKind::WritePath) {
+        return evaluate_filesystem_path(config, request, write_path_rules(config, request));
+    }
+    if has_argument_kind(request, ToolArgumentKind::ReadPath) {
+        return evaluate_filesystem_path(config, request, &config.permission.read);
+    }
     match request.tool_name.as_str() {
         "shell.run" => evaluate_shell(config, request),
         "filesystem.read" | "filesystem.list" | "filesystem.find" | "filesystem.grep"
@@ -224,8 +236,18 @@ fn evaluate_after_path(
     }
 }
 
+fn write_path_rules<'a>(
+    config: &'a AgentConfig,
+    request: &EvaluateToolCallRequest,
+) -> &'a BTreeMap<String, Action> {
+    match request.policy.permission_category.as_deref() {
+        Some("edit") => &config.permission.edit,
+        _ => &config.permission.write,
+    }
+}
+
 fn evaluate_web_url(config: &AgentConfig, request: &EvaluateToolCallRequest) -> PolicyEvaluation {
-    let url = string_argument(&request.arguments, "url").unwrap_or("*");
+    let url = url_argument(request).unwrap_or("*");
     let rules = compile_path_rules(&config.permission.web);
     if let Some(rule) = matching_path_rule(&rules, url) {
         return match rule.action {
@@ -309,7 +331,7 @@ fn evaluate_filesystem_path(
     request: &EvaluateToolCallRequest,
     rules: &BTreeMap<String, Action>,
 ) -> PolicyEvaluation {
-    let candidates = candidate_paths(&request.tool_name, &request.arguments);
+    let candidates = candidate_paths(request);
     let path = candidates.first().cloned();
     let compiled = compile_path_rules(rules);
 
@@ -346,8 +368,18 @@ fn evaluate_filesystem_path(
     evaluate_side_effect_fallback(config, request)
 }
 
+fn url_argument(request: &EvaluateToolCallRequest) -> Option<&str> {
+    request
+        .policy
+        .argument_extractors
+        .iter()
+        .filter(|extractor| extractor.kind == ToolArgumentKind::Url)
+        .find_map(|extractor| string_argument(&request.arguments, &extractor.argument))
+        .or_else(|| string_argument(&request.arguments, "url"))
+}
+
 fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> PolicyEvaluation {
-    let Some(command) = string_argument(&request.arguments, "command") else {
+    let Some(command) = command_argument(request) else {
         return evaluation(
             AgentDecision::Deny,
             format!(
@@ -404,6 +436,16 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
     evaluation(AgentDecision::Allow, String::new(), None, None)
 }
 
+fn command_argument(request: &EvaluateToolCallRequest) -> Option<&str> {
+    request
+        .policy
+        .argument_extractors
+        .iter()
+        .filter(|extractor| extractor.kind == ToolArgumentKind::Command)
+        .find_map(|extractor| string_argument(&request.arguments, &extractor.argument))
+        .or_else(|| string_argument(&request.arguments, "command"))
+}
+
 fn evaluation(
     decision: AgentDecision,
     reason: String,
@@ -428,18 +470,42 @@ fn external_path(
     if config.permission.external_directory == Action::Allow {
         return None;
     }
-    candidate_paths(&request.tool_name, &request.arguments)
+    candidate_paths(request)
         .into_iter()
         .find(|path| is_external_path(path, cwd))
 }
 
+fn has_argument_kind(request: &EvaluateToolCallRequest, kind: ToolArgumentKind) -> bool {
+    request
+        .policy
+        .argument_extractors
+        .iter()
+        .any(|extractor| extractor.kind == kind)
+}
+
 /// Return candidate path arguments for tool policy checks.
 #[must_use]
-pub fn candidate_paths(tool_name: &str, arguments: &serde_json::Value) -> Vec<String> {
-    let _ = tool_name;
-    let keys: &[&str] = &["path", "filePath"];
-    keys.iter()
-        .filter_map(|key| string_argument(arguments, key).map(ToString::to_string))
+pub fn candidate_paths(request: &EvaluateToolCallRequest) -> Vec<String> {
+    let metadata_paths = request
+        .policy
+        .argument_extractors
+        .iter()
+        .filter(|extractor| {
+            matches!(
+                extractor.kind,
+                ToolArgumentKind::ReadPath | ToolArgumentKind::WritePath
+            )
+        })
+        .filter_map(|extractor| {
+            string_argument(&request.arguments, &extractor.argument).map(ToString::to_string)
+        });
+    let legacy_paths = ["path", "filePath"]
+        .iter()
+        .filter_map(|key| string_argument(&request.arguments, key).map(ToString::to_string));
+    metadata_paths
+        .chain(legacy_paths)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect()
 }
 
@@ -475,7 +541,7 @@ fn normalize_path(path: &Path) -> PathBuf {
 }
 
 fn tool_enabled(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Option<bool> {
-    tool_aliases(&request.tool_name)
+    tool_aliases(request)
         .iter()
         .find_map(|name| config.tools.get(name).copied())
 }
@@ -554,9 +620,13 @@ fn first_command_word(part: &str) -> Option<&str> {
         .find(|word| !word.contains('=') && *word != "env")
 }
 
-fn tool_aliases(tool_name: &str) -> Vec<String> {
-    let mut aliases = vec![tool_name.to_string()];
-    match tool_name {
+fn tool_aliases(request: &EvaluateToolCallRequest) -> Vec<String> {
+    let mut aliases = vec![request.tool_name.clone()];
+    if let Some(category) = &request.policy.permission_category {
+        aliases.push(category.clone());
+    }
+    aliases.extend(request.policy.aliases.iter().cloned());
+    match request.tool_name.as_str() {
         "shell.run" => aliases.push("bash".to_string()),
         "filesystem.write" => aliases.push("write".to_string()),
         "filesystem.edit" => aliases.push("edit".to_string()),
@@ -807,6 +877,7 @@ mod tests {
             agent_id: agent_id.to_string(),
             tool_name: "shell.run".to_string(),
             side_effect: ToolSideEffect::ExecuteProcess,
+            policy: bcode_tool::ToolPolicyMetadata::default(),
             arguments: json!({ "command": command }),
             cwd: Some("/tmp/project".to_string()),
         }
@@ -1034,6 +1105,7 @@ mod tests {
             agent_id: BUILD_AGENT.to_string(),
             tool_name: "filesystem.write".to_string(),
             side_effect: ToolSideEffect::WriteFiles,
+            policy: bcode_tool::ToolPolicyMetadata::default(),
             arguments: json!({ "path": "../outside.txt" }),
             cwd: Some("/tmp/project".to_string()),
         };
@@ -1052,6 +1124,7 @@ mod tests {
                 "filesystem.write" | "filesystem.edit" => ToolSideEffect::WriteFiles,
                 _ => ToolSideEffect::ReadOnly,
             },
+            policy: bcode_tool::ToolPolicyMetadata::default(),
             arguments: json!({ "path": path }),
             cwd: Some("/tmp/project".to_string()),
         }

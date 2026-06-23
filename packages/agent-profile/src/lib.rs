@@ -9,7 +9,7 @@
 //! agents, along with prompt context and tool-call policy decisions.
 
 use bcode_session_models::SessionId;
-use bcode_tool::ToolSideEffect;
+use bcode_tool::{ToolPolicyMetadata, ToolSideEffect};
 use serde::{Deserialize, Serialize};
 
 /// Plugin service interface for agent profile providers.
@@ -88,6 +88,9 @@ pub struct EvaluateToolCallRequest {
     pub tool_name: String,
     /// Declared side-effect category for the tool.
     pub side_effect: ToolSideEffect,
+    /// Declared plugin-owned policy metadata for the tool.
+    #[serde(default)]
+    pub policy: ToolPolicyMetadata,
     /// Tool arguments.
     pub arguments: serde_json::Value,
     /// Host current working directory for path-boundary policy checks.

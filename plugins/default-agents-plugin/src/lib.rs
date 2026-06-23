@@ -284,6 +284,7 @@ mod tests {
             agent_id: PLAN_AGENT.to_string(),
             tool_name: "shell.run".to_string(),
             side_effect: ToolSideEffect::ExecuteProcess,
+            policy: bcode_tool::ToolPolicyMetadata::default(),
             arguments: json!({ "command": "git diff && git commit -m nope" }),
             cwd: Some("/tmp/project".to_string()),
         };

@@ -12249,6 +12249,7 @@ async fn evaluate_agent_tool_policy(
         agent_id,
         tool_name: definition.name.clone(),
         side_effect: definition.side_effect,
+        policy: definition.policy.clone(),
         arguments: call.arguments.clone(),
         cwd,
     };

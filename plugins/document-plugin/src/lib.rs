@@ -512,6 +512,23 @@ fn extract_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::WriteFiles,
         requires_permission: true,
+        policy: bcode_tool::ToolPolicyMetadata {
+            aliases: vec!["read".to_string()],
+            permission_category: Some("read".to_string()),
+            argument_extractors: vec![
+                bcode_tool::ToolArgumentExtractor {
+                    kind: bcode_tool::ToolArgumentKind::ReadPath,
+                    argument: "path".to_string(),
+                },
+                bcode_tool::ToolArgumentExtractor {
+                    kind: bcode_tool::ToolArgumentKind::Url,
+                    argument: "url".to_string(),
+                },
+            ],
+        },
+        ui: bcode_tool::ToolUiMetadata {
+            activity_label: Some("extracting".to_string()),
+        },
     }
 }
 
@@ -525,6 +542,8 @@ fn status_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
+        policy: bcode_tool::ToolPolicyMetadata::default(),
+        ui: bcode_tool::ToolUiMetadata::default(),
     }
 }
 

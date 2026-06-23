@@ -1492,6 +1492,8 @@ fn search_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
+        policy: bcode_tool::ToolPolicyMetadata::default(),
+        ui: bcode_tool::ToolUiMetadata::default(),
     }
 }
 
@@ -1515,6 +1517,17 @@ fn fetch_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: true,
+        policy: bcode_tool::ToolPolicyMetadata {
+            aliases: vec!["web".to_string()],
+            permission_category: Some("web".to_string()),
+            argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
+                kind: bcode_tool::ToolArgumentKind::Url,
+                argument: "url".to_string(),
+            }],
+        },
+        ui: bcode_tool::ToolUiMetadata {
+            activity_label: Some("fetching".to_string()),
+        },
     }
 }
 
@@ -1528,6 +1541,8 @@ fn status_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
+        policy: bcode_tool::ToolPolicyMetadata::default(),
+        ui: bcode_tool::ToolUiMetadata::default(),
     }
 }
 
@@ -1544,6 +1559,8 @@ fn inspect_tool_definition() -> ToolDefinition {
         }),
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
+        policy: bcode_tool::ToolPolicyMetadata::default(),
+        ui: bcode_tool::ToolUiMetadata::default(),
     }
 }
 

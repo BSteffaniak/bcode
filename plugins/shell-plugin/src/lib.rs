@@ -119,6 +119,17 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
             }),
             side_effect: ToolSideEffect::ExecuteProcess,
             requires_permission: true,
+            policy: bcode_tool::ToolPolicyMetadata {
+                aliases: vec!["bash".to_string()],
+                permission_category: Some("bash".to_string()),
+                argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
+                    kind: bcode_tool::ToolArgumentKind::Command,
+                    argument: "command".to_string(),
+                }],
+            },
+            ui: bcode_tool::ToolUiMetadata {
+                activity_label: Some("running".to_string()),
+            },
         }],
     })
 }
