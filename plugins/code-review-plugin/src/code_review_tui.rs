@@ -1811,7 +1811,7 @@ fn handle_review_navigation_key(app: &mut ReviewApp, key: KeyCode) -> bool {
                 app.publish_review()
             }
         }
-        KeyCode::Char('a') => app.ask_bcode_about_selection(),
+        KeyCode::Char('a') => app.open_comment_editor_with_action(ReviewCommentAction::AskBcode),
         KeyCode::Char('o') => app.open_linked_session_at_selection(),
         KeyCode::Char('?') => {
             app.help_visible = !app.help_visible;
@@ -4719,7 +4719,9 @@ impl ReviewApp {
             ReviewMouseAction::NewReviewComment => self.open_review_comment_editor(),
             ReviewMouseAction::FileComment => self.open_file_comment_editor(),
             ReviewMouseAction::Publish => self.publish_review(),
-            ReviewMouseAction::AskBcode => self.ask_bcode_about_selection(),
+            ReviewMouseAction::AskBcode => {
+                self.open_comment_editor_with_action(ReviewCommentAction::AskBcode)
+            }
             ReviewMouseAction::ReplyThread => self.open_comment_editor(),
             ReviewMouseAction::ToggleThreadResolved => self.toggle_selected_thread_resolved(),
             ReviewMouseAction::EditThread => self.open_latest_draft_editor(),
@@ -7009,7 +7011,7 @@ impl ReviewApp {
         })
     }
 
-    /// Open the draft comment editor for the selected diff line.
+    /// Open the comment composer for the selected diff line.
     pub fn open_comment_editor(&mut self) -> bool {
         self.open_comment_editor_with_action(ReviewCommentAction::SaveDraft)
     }
@@ -7018,16 +7020,18 @@ impl ReviewApp {
         let Some(anchor) = self.selected_comment_anchor() else {
             self.status_message = Some(match action {
                 ReviewCommentAction::SaveDraft => {
-                    "select an added, removed, or context line to comment".to_string()
+                    "select a diff line or range to comment".to_string()
                 }
-                ReviewCommentAction::AskBcode => "select a diff line to ask Bcode".to_string(),
+                ReviewCommentAction::AskBcode => {
+                    "select a diff line or range to ask Bcode".to_string()
+                }
             });
             return true;
         };
         self.comment_editor = Some(ReviewCommentEditor::new(anchor, action));
         self.sync_selected_thread_to_anchor();
         self.status_message = Some(format!(
-            "compose review note; selected action: {}",
+            "compose review comment; tab switches action, enter submits {}",
             action.label()
         ));
         true
@@ -9590,6 +9594,81 @@ mod tests {
         let app = sample_app();
 
         assert_eq!(app.comment_anchor_for_row(0), None);
+    }
+
+    #[test]
+    fn comment_composer_opens_for_selected_diff_line() {
+        let mut app = sample_app();
+        app.selected_diff_line = 2;
+
+        assert!(app.open_comment_editor());
+
+        let editor = app.comment_editor.expect("comment composer should open");
+        assert_eq!(editor.anchor.diff_row, 2);
+        assert_eq!(editor.anchor.end_diff_row, None);
+        assert_eq!(editor.action, ReviewCommentAction::SaveDraft);
+    }
+
+    #[test]
+    fn comment_composer_uses_selected_range_anchor() {
+        let mut app = sample_app();
+        app.selected_diff_line = 1;
+        assert!(app.toggle_range_selection());
+        app.selected_diff_line = 2;
+
+        assert!(app.open_comment_editor());
+
+        let editor = app.comment_editor.expect("comment composer should open");
+        assert_eq!(editor.anchor.diff_row, 1);
+        assert_eq!(editor.anchor.end_diff_row, Some(2));
+        assert_eq!(editor.anchor.new_start, Some(1));
+        assert_eq!(editor.anchor.new_end, Some(1));
+    }
+
+    #[test]
+    fn comment_composer_cancel_does_not_create_draft() {
+        let mut app = sample_app();
+        app.selected_diff_line = 2;
+        assert!(app.open_comment_editor());
+        app.comment_editor
+            .as_mut()
+            .expect("comment composer should open")
+            .buffer
+            .insert_str("Never mind");
+
+        assert!(handle_comment_editor_key(
+            &mut app,
+            KeyStroke {
+                key: KeyCode::Escape,
+                modifiers: bmux_keyboard::Modifiers::NONE,
+            },
+        ));
+
+        assert!(app.comment_editor.is_none());
+        assert_eq!(app.draft_comment_count(), 0);
+        assert!(app.take_pending_draft_save().is_none());
+    }
+
+    #[test]
+    fn comment_composer_ask_action_queues_bcode_question() {
+        let mut app = sample_app();
+        app.selected_diff_line = 2;
+        assert!(app.open_comment_editor());
+        let editor = app
+            .comment_editor
+            .as_mut()
+            .expect("comment composer should open");
+        editor.buffer.insert_str("Why this change?");
+        editor.action = ReviewCommentAction::AskBcode;
+
+        assert!(app.save_comment_editor());
+
+        assert_eq!(app.draft_comment_count(), 1);
+        let pending = app
+            .take_pending_agent_session()
+            .expect("ask action should queue an agent session");
+        assert_eq!(pending.anchor.diff_row, 2);
+        assert_eq!(pending.draft_body.as_deref(), Some("Why this change?"));
     }
 
     #[test]
