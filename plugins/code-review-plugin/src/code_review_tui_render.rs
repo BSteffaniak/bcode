@@ -1624,6 +1624,13 @@ fn render_view_row(
                 style,
             }
         }
+        ReviewViewBlock::InlineAgentThread { state, .. } => {
+            let style = Style::new().fg(Color::Cyan).bg(Color::Rgb(18, 18, 18));
+            RenderedRow {
+                line: render_inline_agent_thread_line(state, width, style),
+                style,
+            }
+        }
         ReviewViewBlock::InlineThreadAction { action, .. } => render_inline_thread_action(*action),
     }
 }
@@ -1653,6 +1660,32 @@ fn render_inline_comment_line(
         spans.extend(markdown_line.spans);
     }
     Line::from_spans(spans)
+}
+
+fn render_inline_agent_thread_line(
+    state: &crate::code_review_tui::ReviewAgentThreadState,
+    width: u16,
+    style: Style,
+) -> Line {
+    let prefix_style = Style::new().fg(Color::Cyan).bg(Color::Rgb(18, 18, 18));
+    let prefix = format!("   │ 🤖 Bcode · {} ", state.phase.label());
+    let detail = state.error.as_ref().map_or_else(
+        || {
+            if state.answer.is_empty() {
+                state.status.as_str()
+            } else {
+                state.answer.lines().next().unwrap_or_default()
+            }
+        },
+        String::as_str,
+    );
+    let available = usize::from(
+        width.saturating_sub(u16::try_from(prefix.chars().count()).unwrap_or(u16::MAX)),
+    );
+    Line::from_spans(vec![
+        Span::styled(prefix, prefix_style),
+        Span::styled(truncate_to_display_width(detail, available), style),
+    ])
 }
 
 fn render_inline_thread_action(action: ReviewThreadAction) -> RenderedRow {

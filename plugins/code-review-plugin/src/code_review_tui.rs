@@ -23,7 +23,10 @@ use bcode_code_review_models::{
 };
 use bcode_ipc::PluginServiceResponse;
 use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface};
-use bcode_session_models::SessionId;
+use bcode_session_models::{
+    ModelTurnOutcome, SessionEvent, SessionEventKind, SessionHistoryDirection, SessionHistoryQuery,
+    SessionId,
+};
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::event::{Event, FocusEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -123,6 +126,7 @@ pub struct CodeReviewSurface {
     review_target: ReviewOpenTarget,
     app: ReviewApp,
     file_store: AsyncValueStore<String, CachedReviewFile>,
+    agent_history_store: AsyncValueStore<String, ReviewAgentHistorySnapshot>,
 }
 
 impl CodeReviewSurface {
@@ -152,6 +156,7 @@ impl CodeReviewSurface {
             review_target,
             app,
             file_store: AsyncValueStore::new(),
+            agent_history_store: AsyncValueStore::new(),
         };
         surface.app.queue_selected_file_load();
         Ok(surface)
@@ -178,7 +183,20 @@ impl CodeReviewSurface {
         )
     }
 
-    /// Drain pending effectful work.
+    fn ensure_linked_agent_history_loads(&mut self, host: &dyn PluginTuiHost) -> bool {
+        let session_ids = self.app.linked_agent_session_ids();
+        let client = self.client.clone();
+        session_ids.into_iter().fold(false, |loaded, session_id| {
+            let client = client.clone();
+            loaded
+                | self
+                    .agent_history_store
+                    .ensure(host, session_id, move |session_id| async move {
+                        load_agent_history_snapshot(client, session_id).await
+                    })
+        })
+    }
+
     pub async fn drain_inline_effects(&mut self) -> bool {
         let mut needs_redraw = false;
         match drain_pending_workspace_changes(
@@ -305,7 +323,15 @@ impl PluginTuiSurface for CodeReviewSurface {
     }
 
     fn poll(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
-        let mut needs_redraw = self.ensure_selected_repository_file_load(host);
+        let linked_loaded = self.ensure_linked_agent_history_loads(host);
+        let mut needs_redraw = self.ensure_selected_repository_file_load(host) || linked_loaded;
+        while let Ok(update) = self.agent_history_store.try_recv() {
+            let session_id = update.key().clone();
+            self.agent_history_store.apply(update);
+            sync_agent_history_store(&mut self.app, &self.agent_history_store);
+            self.agent_history_store.remove(&session_id);
+            needs_redraw = true;
+        }
         while let Ok(update) = self.file_store.try_recv() {
             self.file_store.apply(update);
             sync_repository_file_store(&mut self.app, &self.file_store);
@@ -655,6 +681,39 @@ async fn save_workspace(client: &BcodeClient, workspace: ReviewWorkspace) -> Res
     Ok(())
 }
 
+async fn load_agent_history_snapshot(
+    client: BcodeClient,
+    session_id: String,
+) -> Result<ReviewAgentHistorySnapshot, String> {
+    let session_id = session_id
+        .parse::<SessionId>()
+        .map_err(|error| format!("invalid session id: {error}"))?;
+    let page = client
+        .session_history_page(
+            session_id,
+            SessionHistoryQuery {
+                cursor: None,
+                limit: 200,
+                direction: SessionHistoryDirection::Backward,
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(ReviewAgentHistorySnapshot::from_events(page.events))
+}
+
+fn sync_agent_history_store(
+    app: &mut ReviewApp,
+    store: &AsyncValueStore<String, ReviewAgentHistorySnapshot>,
+) {
+    for session_id in app.linked_agent_session_ids() {
+        match store.get(&session_id) {
+            AsyncValue::Ready(snapshot) => app.apply_agent_history_snapshot(&session_id, snapshot),
+            AsyncValue::Error(error) => app.mark_agent_session_failed(&session_id, &error),
+            AsyncValue::Missing | AsyncValue::Loading => {}
+        }
+    }
+}
 async fn handle_pending_agent_session(
     client: &BcodeClient,
     repo_path: PathBuf,
@@ -662,6 +721,7 @@ async fn handle_pending_agent_session(
     app: &mut ReviewApp,
     ask: PendingAgentSession,
 ) {
+    app.set_agent_phase(&ask.anchor, ReviewAgentThreadPhase::Running);
     app.set_agent_status(&ask.anchor, "sending follow-up to linked session");
     if let Some(session_id) = app.session_id_for_anchor(&ask.anchor) {
         if let Ok(session_id) = session_id.parse::<SessionId>() {
@@ -677,24 +737,25 @@ async fn handle_pending_agent_session(
                     ));
                 }
                 Err(error) => {
-                    app.set_agent_status(&ask.anchor, format!("follow-up failed: {error}"));
+                    app.fail_agent_thread(&ask.anchor, format!("follow-up failed: {error}"));
                     app.status_message = Some(format!("failed to send review follow-up: {error}"));
                 }
             }
         } else {
-            app.set_agent_status(&ask.anchor, "linked session id is invalid");
+            app.fail_agent_thread(&ask.anchor, "linked session id is invalid");
             app.status_message = Some("linked session id is invalid".to_string());
         }
     } else {
+        app.set_agent_phase(&ask.anchor, ReviewAgentThreadPhase::CreatingSession);
         app.set_agent_status(&ask.anchor, "creating Bcode session");
         match create_agent_session(client, repo_path, review_target, app, ask.clone()).await {
             Ok(session_id) => {
-                app.mark_thread_session(&ask.anchor, session_id.to_string());
+                app.mark_thread_session(&ask.anchor, &session_id.to_string());
                 app.set_agent_status(&ask.anchor, format!("session linked: {session_id}"));
                 app.status_message = Some(format!("created Bcode session {session_id}"));
             }
             Err(error) => {
-                app.set_agent_status(&ask.anchor, format!("session failed: {error}"));
+                app.fail_agent_thread(&ask.anchor, format!("session failed: {error}"));
                 app.status_message = Some(format!("failed to create Bcode session: {error}"));
             }
         }
@@ -2991,6 +3052,148 @@ pub struct PendingAgentSession {
     pub draft_body: Option<String>,
 }
 
+/// Lifecycle phase for a linked Bcode review thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewAgentThreadPhase {
+    /// Question was queued locally but no session work has started yet.
+    Pending,
+    /// A Bcode session is being created.
+    CreatingSession,
+    /// Prompt was sent and the assistant may be working.
+    Running,
+    /// Assistant produced a completed answer.
+    Complete,
+    /// Session creation, follow-up, or history loading failed.
+    Failed,
+}
+
+impl ReviewAgentThreadPhase {
+    /// Return a user-facing phase label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::CreatingSession => "creating session",
+            Self::Running => "running",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Inline Bcode state for a review thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewAgentThreadState {
+    /// Current lifecycle phase.
+    pub phase: ReviewAgentThreadPhase,
+    /// Linked Bcode session id, when known.
+    pub session_id: Option<String>,
+    /// User question that started or continued the session.
+    pub question: String,
+    /// Latest short status message.
+    pub status: String,
+    /// Latest assistant answer preview.
+    pub answer: String,
+    /// Last failure message.
+    pub error: Option<String>,
+}
+
+impl ReviewAgentThreadState {
+    /// Create pending Bcode state for a question.
+    #[must_use]
+    pub fn pending(question: String) -> Self {
+        Self {
+            phase: ReviewAgentThreadPhase::Pending,
+            session_id: None,
+            question,
+            status: "looking into this…".to_string(),
+            answer: String::new(),
+            error: None,
+        }
+    }
+
+    /// Return a concise display status.
+    #[must_use]
+    pub fn display_status(&self) -> String {
+        if let Some(error) = &self.error {
+            return format!("{}: {error}", self.phase.label());
+        }
+        if self.answer.is_empty() {
+            self.status.clone()
+        } else {
+            format!(
+                "{} · {}",
+                self.phase.label(),
+                self.answer.lines().next().unwrap_or_default()
+            )
+        }
+    }
+}
+
+/// Bounded projection of a linked Bcode session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewAgentHistorySnapshot {
+    /// Latest assistant answer text.
+    pub answer: String,
+    /// Latest lifecycle phase inferred from history.
+    pub phase: ReviewAgentThreadPhase,
+    /// Latest status message inferred from history.
+    pub status: String,
+}
+
+impl ReviewAgentHistorySnapshot {
+    #[must_use]
+    fn from_events(mut events: Vec<SessionEvent>) -> Self {
+        events.sort_by_key(|event| event.sequence);
+        let mut answer = String::new();
+        let mut phase = ReviewAgentThreadPhase::Running;
+        let mut status = "running".to_string();
+        for event in events {
+            match event.kind {
+                SessionEventKind::AssistantDelta { text }
+                | SessionEventKind::AssistantMessage { text } => {
+                    if !answer.is_empty() {
+                        answer.push('\n');
+                    }
+                    answer.push_str(&text);
+                    phase = ReviewAgentThreadPhase::Complete;
+                    status = "answered".to_string();
+                }
+                SessionEventKind::ModelTurnStarted { .. } => {
+                    phase = ReviewAgentThreadPhase::Running;
+                    status = "Bcode is working…".to_string();
+                }
+                SessionEventKind::ModelTurnFinished {
+                    outcome, message, ..
+                } => {
+                    if matches!(
+                        outcome,
+                        ModelTurnOutcome::Cancelled
+                            | ModelTurnOutcome::Error
+                            | ModelTurnOutcome::IdleTimeout
+                            | ModelTurnOutcome::ProviderUnavailable
+                    ) {
+                        phase = ReviewAgentThreadPhase::Failed;
+                        status = message.unwrap_or_else(|| format!("turn {outcome:?}"));
+                    } else if !answer.is_empty() {
+                        phase = ReviewAgentThreadPhase::Complete;
+                        status = "answered".to_string();
+                    }
+                }
+                SessionEventKind::RuntimeWorkProgress { message, .. } => {
+                    status = message;
+                }
+                _ => {}
+            }
+        }
+        Self {
+            answer,
+            phase,
+            status,
+        }
+    }
+}
+
 /// Draft comment editor mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewCommentEditorMode {
@@ -3466,6 +3669,7 @@ struct ReviewViewDocumentCacheKey {
     resolved_threads: Vec<String>,
     expanded_contexts: Vec<(DiffContextKey, DiffContextLoadState)>,
     show_resolved_threads: bool,
+    agent_state_revision: u64,
 }
 
 /// Stateful review app model.
@@ -3556,8 +3760,10 @@ pub struct ReviewApp {
     pub pending_workspace_reload: bool,
     /// Review thread awaiting Bcode session creation.
     pub pending_agent_session: Option<PendingAgentSession>,
-    /// Latest visible Bcode agent/session status by review thread key.
-    pub agent_thread_statuses: BTreeMap<String, String>,
+    /// Structured Bcode agent/session state by review thread key.
+    pub agent_thread_states: BTreeMap<String, ReviewAgentThreadState>,
+    /// Revision bump for linked Bcode agent state.
+    pub agent_state_revision: u64,
     /// Active range selection start row, if any.
     pub range_selection_start: Option<usize>,
     mouse_range_selection_start: Option<usize>,
@@ -3629,7 +3835,8 @@ impl ReviewApp {
             pending_workspace_save: false,
             pending_workspace_reload: false,
             pending_agent_session: None,
-            agent_thread_statuses: BTreeMap::new(),
+            agent_thread_states: BTreeMap::new(),
+            agent_state_revision: 0,
             range_selection_start: None,
             mouse_range_selection_start: None,
             mouse_range_selection_dragged: false,
@@ -6667,10 +6874,10 @@ impl ReviewApp {
                 selected
             }
             ReviewViewTarget::Thread { .. } => self.toggle_selected_inline_thread() || selected,
+            ReviewViewTarget::AgentThread { .. } | ReviewViewTarget::Comment { .. } => selected,
             ReviewViewTarget::ThreadAction { .. } => {
                 self.activate_selected_inline_action() || selected
             }
-            ReviewViewTarget::Comment { .. } => selected,
         }
     }
 
@@ -6840,6 +7047,7 @@ impl ReviewApp {
             | ReviewViewTarget::OmittedContext { .. }
             | ReviewViewTarget::ExpandedContextLine { .. }
             | ReviewViewTarget::Thread { .. }
+            | ReviewViewTarget::AgentThread { .. }
             | ReviewViewTarget::Comment { .. }
             | ReviewViewTarget::ThreadAction { .. } => None,
         }
@@ -7265,17 +7473,61 @@ impl ReviewApp {
         self.pending_agent_session.take()
     }
 
+    const fn touch_agent_state(&mut self) {
+        self.agent_state_revision = self.agent_state_revision.saturating_add(1);
+    }
+
     /// Latest visible Bcode agent/session status for an anchor.
     #[must_use]
-    pub fn agent_status_for_anchor(&self, anchor: &ReviewCommentAnchor) -> Option<&str> {
+    pub fn agent_status_for_anchor(&self, anchor: &ReviewCommentAnchor) -> Option<String> {
+        self.agent_state_for_anchor(anchor)
+            .map(ReviewAgentThreadState::display_status)
+    }
+
+    /// Latest structured Bcode agent/session state for an anchor.
+    #[must_use]
+    pub fn agent_state_for_anchor(
+        &self,
+        anchor: &ReviewCommentAnchor,
+    ) -> Option<&ReviewAgentThreadState> {
         let key = Self::thread_key_for_anchor(anchor);
-        self.agent_thread_statuses.get(&key).map(String::as_str)
+        self.agent_thread_states.get(&key)
     }
 
     /// Set latest visible Bcode agent/session status for an anchor.
     pub fn set_agent_status(&mut self, anchor: &ReviewCommentAnchor, status: impl Into<String>) {
         let key = Self::thread_key_for_anchor(anchor);
-        self.agent_thread_statuses.insert(key, status.into());
+        let state = self
+            .agent_thread_states
+            .entry(key)
+            .or_insert_with(|| ReviewAgentThreadState::pending(String::new()));
+        state.status = status.into();
+        state.error = None;
+        self.touch_agent_state();
+    }
+
+    fn set_agent_phase(&mut self, anchor: &ReviewCommentAnchor, phase: ReviewAgentThreadPhase) {
+        let key = Self::thread_key_for_anchor(anchor);
+        let state = self
+            .agent_thread_states
+            .entry(key)
+            .or_insert_with(|| ReviewAgentThreadState::pending(String::new()));
+        state.phase = phase;
+        state.error = None;
+        self.touch_agent_state();
+    }
+
+    fn fail_agent_thread(&mut self, anchor: &ReviewCommentAnchor, error: impl Into<String>) {
+        let key = Self::thread_key_for_anchor(anchor);
+        let state = self
+            .agent_thread_states
+            .entry(key)
+            .or_insert_with(|| ReviewAgentThreadState::pending(String::new()));
+        let error = error.into();
+        state.phase = ReviewAgentThreadPhase::Failed;
+        state.status.clone_from(&error);
+        state.error = Some(error);
+        self.touch_agent_state();
     }
 
     /// Return linked session id for an anchor.
@@ -7289,13 +7541,13 @@ impl ReviewApp {
     }
 
     /// Mark the latest draft at an anchor as linked to a Bcode session.
-    pub fn mark_thread_session(&mut self, anchor: &ReviewCommentAnchor, session_id: String) {
+    pub fn mark_thread_session(&mut self, anchor: &ReviewCommentAnchor, session_id: &str) {
         if let Some(comment) = self
             .draft_comments
             .get_mut(anchor)
             .and_then(|comments| comments.last_mut())
         {
-            comment.session_id = Some(session_id);
+            comment.session_id = Some(session_id.to_string());
         } else {
             self.draft_comments
                 .entry(anchor.clone())
@@ -7306,10 +7558,81 @@ impl ReviewApp {
                     persisted: false,
                     created_at_ms: None,
                     updated_at_ms: None,
-                    session_id: Some(session_id),
-                    thread_kind: ReviewThreadKind::Note,
+                    session_id: Some(session_id.to_string()),
+                    thread_kind: ReviewThreadKind::Question,
                     severity: ReviewThreadSeverity::Info,
                 });
+        }
+        let key = Self::thread_key_for_anchor(anchor);
+        let state = self
+            .agent_thread_states
+            .entry(key)
+            .or_insert_with(|| ReviewAgentThreadState::pending(String::new()));
+        state.session_id = Some(session_id.to_string());
+        state.phase = ReviewAgentThreadPhase::Running;
+        state.status = format!("session linked: {session_id}");
+        self.touch_agent_state();
+    }
+
+    /// Return linked Bcode session ids used by review threads.
+    #[must_use]
+    pub fn linked_agent_session_ids(&self) -> Vec<String> {
+        let mut ids = BTreeSet::new();
+        for comments in self.draft_comments.values() {
+            for comment in comments {
+                if let Some(session_id) = &comment.session_id {
+                    ids.insert(session_id.clone());
+                }
+            }
+        }
+        ids.into_iter().collect()
+    }
+
+    /// Apply a bounded linked-session history snapshot.
+    pub fn apply_agent_history_snapshot(
+        &mut self,
+        session_id: &str,
+        snapshot: &ReviewAgentHistorySnapshot,
+    ) {
+        let mut changed = false;
+        for (anchor, comments) in &self.draft_comments {
+            if !comments
+                .iter()
+                .any(|comment| comment.session_id.as_deref() == Some(session_id))
+            {
+                continue;
+            }
+            let key = Self::thread_key_for_anchor(anchor);
+            let state = self
+                .agent_thread_states
+                .entry(key)
+                .or_insert_with(|| ReviewAgentThreadState::pending(String::new()));
+            state.session_id = Some(session_id.to_string());
+            state.phase = snapshot.phase;
+            state.status.clone_from(&snapshot.status);
+            state.answer.clone_from(&snapshot.answer);
+            state.error = None;
+            changed = true;
+        }
+        if changed {
+            self.touch_agent_state();
+        }
+    }
+
+    /// Mark every thread for a linked session as failed.
+    pub fn mark_agent_session_failed(&mut self, session_id: &str, error: &str) {
+        let anchors = self
+            .draft_comments
+            .iter()
+            .filter(|(_, comments)| {
+                comments
+                    .iter()
+                    .any(|comment| comment.session_id.as_deref() == Some(session_id))
+            })
+            .map(|(anchor, _)| anchor.clone())
+            .collect::<Vec<_>>();
+        for anchor in anchors {
+            self.fail_agent_thread(&anchor, error.to_string());
         }
     }
 
@@ -7375,6 +7698,7 @@ impl ReviewApp {
     fn anchor_for_view_target(&self, target: &ReviewViewTarget) -> Option<ReviewCommentAnchor> {
         match target {
             ReviewViewTarget::Thread { thread_key }
+            | ReviewViewTarget::AgentThread { thread_key }
             | ReviewViewTarget::Comment { thread_key, .. }
             | ReviewViewTarget::ThreadAction { thread_key, .. } => {
                 self.draft_anchor_for_thread_key(thread_key)
@@ -7902,14 +8226,17 @@ impl ReviewApp {
             });
         self.pending_agent_session = Some(PendingAgentSession {
             anchor: anchor.clone(),
-            draft_body: Some(question),
+            draft_body: Some(question.clone()),
         });
-        self.set_agent_status(
-            anchor,
-            existing_session
-                .as_ref()
-                .map_or("Bcode: looking into this…", |_| "Bcode: sending follow-up…"),
-        );
+        let mut state = ReviewAgentThreadState::pending(question);
+        if let Some(session_id) = &existing_session {
+            state.session_id = Some(session_id.clone());
+            state.phase = ReviewAgentThreadPhase::Running;
+            state.status = "sending follow-up…".to_string();
+        }
+        self.agent_thread_states
+            .insert(Self::thread_key_for_anchor(anchor), state);
+        self.touch_agent_state();
         self.sync_selected_thread_to_anchor();
         self.status_message = Some(existing_session.map_or_else(
             || "asked Bcode; creating linked review session".to_string(),
@@ -8110,6 +8437,7 @@ impl ReviewApp {
     fn selected_thread_key(&self) -> Option<String> {
         match self.selected_view_target.as_ref()? {
             ReviewViewTarget::Thread { thread_key }
+            | ReviewViewTarget::AgentThread { thread_key }
             | ReviewViewTarget::Comment { thread_key, .. }
             | ReviewViewTarget::ThreadAction { thread_key, .. } => Some(thread_key.clone()),
             ReviewViewTarget::HunkHeader { .. }
@@ -8403,6 +8731,7 @@ impl ReviewApp {
             | ReviewViewTarget::OmittedContext { .. }
             | ReviewViewTarget::ExpandedContextLine { .. }
             | ReviewViewTarget::Thread { .. }
+            | ReviewViewTarget::AgentThread { .. }
             | ReviewViewTarget::Comment { .. }
             | ReviewViewTarget::ThreadAction { .. } => None,
         }
@@ -8413,6 +8742,7 @@ impl ReviewApp {
     ) -> Option<(ReviewCommentAnchor, Option<usize>)> {
         match self.selected_view_target.as_ref()? {
             ReviewViewTarget::Thread { thread_key }
+            | ReviewViewTarget::AgentThread { thread_key }
             | ReviewViewTarget::ThreadAction { thread_key, .. } => self
                 .draft_anchor_for_thread_key(thread_key)
                 .map(|anchor| (anchor, None)),
@@ -8709,6 +9039,7 @@ impl ReviewApp {
                     comments.clone(),
                 )
             }),
+            &self.agent_thread_states,
             &self.collapsed_review_threads,
             &self.resolved_review_threads,
             self.show_resolved_threads,
@@ -8807,6 +9138,7 @@ impl ReviewApp {
                 .map(|(key, state)| (key.clone(), state.clone()))
                 .collect(),
             show_resolved_threads: self.show_resolved_threads,
+            agent_state_revision: self.agent_state_revision,
         })
     }
 }
@@ -10260,7 +10592,7 @@ mod tests {
             .insert_str("Needs a test");
         assert!(app.save_comment_editor());
         let anchor = app.selected_comment_anchor().expect("anchor");
-        app.mark_thread_session(&anchor, SessionId::new().to_string());
+        app.mark_thread_session(&anchor, &SessionId::new().to_string());
         app.toggle_sidebar_mode();
 
         let preview = app.selected_thread_preview().expect("thread preview");

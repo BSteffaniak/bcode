@@ -5,7 +5,9 @@ use std::{
     fmt,
 };
 
-use crate::code_review_tui::{CachedReviewFile, ReviewDraftComment, ReviewFile};
+use crate::code_review_tui::{
+    CachedReviewFile, ReviewAgentThreadState, ReviewDraftComment, ReviewFile,
+};
 use crate::code_review_tui_display::{
     ReviewDisplayBuilder, ReviewDisplayRow, ReviewDisplayRowSource,
 };
@@ -186,6 +188,7 @@ impl ReviewViewDocument {
         mut self,
         file_index: usize,
         drafts: impl Iterator<Item = (ReviewThreadAnchor, Vec<ReviewDraftComment>)>,
+        agent_states: &BTreeMap<String, ReviewAgentThreadState>,
         collapsed_threads: &BTreeSet<String>,
         resolved_threads: &BTreeSet<String>,
         show_resolved_threads: bool,
@@ -248,6 +251,19 @@ impl ReviewViewDocument {
                             },
                         });
                     }
+                }
+                if let Some(agent_state) = agent_states.get(&thread_key) {
+                    rows.push(ReviewViewRow {
+                        visual_row: 0,
+                        source_row: None,
+                        target: ReviewViewTarget::AgentThread {
+                            thread_key: thread_key.clone(),
+                        },
+                        block: ReviewViewBlock::InlineAgentThread {
+                            thread_key: thread_key.clone(),
+                            state: agent_state.clone(),
+                        },
+                    });
                 }
                 for action in ReviewThreadAction::all_for_state(resolved) {
                     rows.push(ReviewViewRow {
@@ -437,6 +453,13 @@ pub enum ReviewViewBlock {
         body_line_count: usize,
         /// Draft comment body and metadata.
         comment: ReviewDraftComment,
+    },
+    /// Inline Bcode agent state row.
+    InlineAgentThread {
+        /// Stable thread key.
+        thread_key: String,
+        /// Agent state for this thread.
+        state: ReviewAgentThreadState,
     },
     /// Inline thread action row.
     InlineThreadAction {
@@ -647,6 +670,8 @@ pub enum ReviewViewTarget {
         thread_key: String,
         comment_index: usize,
     },
+    /// Inline Bcode agent state row.
+    AgentThread { thread_key: String },
     /// Inline thread action row.
     ThreadAction { thread_key: String, action: String },
 }
@@ -1058,6 +1083,7 @@ mod tests {
             .with_inline_draft_threads(
                 7,
                 std::iter::once((anchor.clone(), vec![comment])),
+                &BTreeMap::new(),
                 &BTreeSet::new(),
                 &BTreeSet::new(),
                 true,
@@ -1109,6 +1135,7 @@ mod tests {
             .with_inline_draft_threads(
                 7,
                 std::iter::once((anchor, vec![comment])),
+                &BTreeMap::new(),
                 &BTreeSet::new(),
                 &BTreeSet::new(),
                 true,

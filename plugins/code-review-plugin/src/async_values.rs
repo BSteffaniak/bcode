@@ -26,6 +26,14 @@ pub struct AsyncValueUpdate<K, V> {
     result: Result<V, String>,
 }
 
+impl<K, V> AsyncValueUpdate<K, V> {
+    /// Return this update key.
+    #[must_use]
+    pub const fn key(&self) -> &K {
+        &self.key
+    }
+}
+
 /// Deduplicating async value cache for TUI data.
 #[derive(Debug)]
 pub struct AsyncValueStore<K, V> {
