@@ -7932,6 +7932,13 @@ struct ModelTurnRecoveryState {
     retry_instruction: Option<&'static str>,
 }
 
+impl ModelTurnRecoveryState {
+    const fn record_successful_provider_round(&mut self) {
+        self.overload_retry_attempts = 0;
+        self.retry_instruction = None;
+    }
+}
+
 struct ProviderErrorRetryContext<'a> {
     trigger_event_sequence: u64,
     turn_id: &'a str,
@@ -9002,7 +9009,7 @@ async fn run_model_turn_inner(
             ModelTurnRetry::None => {}
         }
         if outcome.provider_error.is_none() {
-            recovery.retry_instruction = None;
+            recovery.record_successful_provider_round();
         }
         if let Some(completion) = outcome.completion.clone() {
             append_deferred_provider_error_if_needed(state, session_id, &outcome).await;
@@ -15436,6 +15443,20 @@ mod tests {
         assert!(should_retry_after_overload_error(&state, &error, 0));
         assert!(should_retry_after_overload_error(&state, &error, 1));
         assert!(!should_retry_after_overload_error(&state, &error, 2));
+    }
+
+    #[test]
+    fn successful_provider_round_resets_overload_retry_attempts() {
+        let mut recovery = ModelTurnRecoveryState {
+            overload_retry_attempts: 3,
+            retry_instruction: Some(MALFORMED_TOOL_ARGUMENTS_RETRY_INSTRUCTION),
+            ..ModelTurnRecoveryState::default()
+        };
+
+        recovery.record_successful_provider_round();
+
+        assert_eq!(recovery.overload_retry_attempts, 0);
+        assert_eq!(recovery.retry_instruction, None);
     }
 
     #[test]
