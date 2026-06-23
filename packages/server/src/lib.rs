@@ -11594,46 +11594,22 @@ async fn collect_model_tools(
     tools
 }
 
-async fn invoke_model_native_web_search_tool(
+async fn invoke_host_model_native_web_search(
     state: &ServerState,
     session_id: SessionId,
-    call: &bcode_model::ToolCall,
+    tool_call_id: &str,
+    bridge_request: bcode_tool::HostModelNativeWebSearchRequest,
 ) -> Result<ToolInvocationResponse, String> {
     let selection = session_model_selection(state, session_id).await;
     let request = NativeWebSearchRequest {
-        query: call
-            .arguments
-            .get("query")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        max_results: call
-            .arguments
-            .get("max_results")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok()),
-        site: call
-            .arguments
-            .get("site")
-            .and_then(serde_json::Value::as_str)
-            .map(ToString::to_string),
-        freshness: call
-            .arguments
-            .get("freshness")
-            .and_then(serde_json::Value::as_str)
-            .map(ToString::to_string),
-        region: call
-            .arguments
-            .get("region")
-            .and_then(serde_json::Value::as_str)
-            .map(ToString::to_string),
-        safe_search: call
-            .arguments
-            .get("safe_search")
-            .and_then(serde_json::Value::as_str)
-            .map(ToString::to_string),
+        query: bridge_request.query,
+        max_results: bridge_request.max_results,
+        site: bridge_request.site,
+        freshness: bridge_request.freshness,
+        region: bridge_request.region,
+        safe_search: bridge_request.safe_search,
         provider_context: selection.provider_context,
-        metadata: BTreeMap::from([("tool_call_id".to_string(), call.id.clone())]),
+        metadata: BTreeMap::from([("tool_call_id".to_string(), tool_call_id.to_string())]),
     };
     let response = invoke_model_provider_json_blocking::<_, NativeWebSearchResponse>(
         state,
@@ -11782,15 +11758,6 @@ async fn invoke_model_tool(
             presentation: None,
             result: None,
         });
-    }
-    if call.name == "web.search"
-        && call
-            .arguments
-            .get("provider")
-            .and_then(serde_json::Value::as_str)
-            == Some("model_native")
-    {
-        return invoke_model_native_web_search_tool(state, session_id, call).await;
     }
     let argument_blob = (state.observability.persist_tool_io
         || state.observability.debug_enabled())
@@ -12020,7 +11987,13 @@ async fn invoke_model_tool(
         }
     }
     flush_tool_output_stream(state, session_id, &mut pending_tool_output).await;
-    bcode_plugin::decode_service_response(response).map_err(|error| error.to_string())
+    let response: ToolInvocationResponse =
+        bcode_plugin::decode_service_response(response).map_err(|error| error.to_string())?;
+    if let Some(ServiceToolInvocationResult::HostModelNativeWebSearch { request }) = response.result
+    {
+        return invoke_host_model_native_web_search(state, session_id, &call.id, request).await;
+    }
+    Ok(response)
 }
 
 /// Append durable tool stream lifecycle events or publish ephemeral output deltas.
@@ -12967,6 +12940,11 @@ fn service_tool_result_to_session(result: ServiceToolInvocationResult) -> ToolIn
                 path: result.path,
             },
         },
+        ServiceToolInvocationResult::HostModelNativeWebSearch { request } => {
+            ToolInvocationResult::Json {
+                value: serde_json::to_string(&request).unwrap_or_default(),
+            }
+        }
     }
 }
 

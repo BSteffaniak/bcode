@@ -192,6 +192,26 @@ pub enum ToolInvocationResult {
     ShellRun { result: ShellRunResult },
     /// Filesystem write/edit result.
     FileChange { result: FileChangeResult },
+    /// Request that the host perform model-provider-native web search.
+    HostModelNativeWebSearch {
+        request: HostModelNativeWebSearchRequest,
+    },
+}
+
+/// Host-mediated model-provider-native web search request from a tool plugin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostModelNativeWebSearchRequest {
+    pub query: String,
+    #[serde(default)]
+    pub max_results: Option<usize>,
+    #[serde(default)]
+    pub site: Option<String>,
+    #[serde(default)]
+    pub freshness: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub safe_search: Option<String>,
 }
 
 /// Semantic shell command execution result.

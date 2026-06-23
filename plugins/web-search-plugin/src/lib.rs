@@ -8,8 +8,8 @@ use bcode_model_provider_runtime::ProviderRuntime;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
-    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationStreamEvent, ToolList,
-    ToolSideEffect,
+    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolInvocationStreamEvent,
+    ToolList, ToolSideEffect,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -153,7 +153,7 @@ impl WebSearchPlugin {
             search_async(request, plugin_config, Some(progress)),
             cancellation.clone(),
         )) {
-            Ok(Ok(response)) => json_tool_response(&response),
+            Ok(Ok(response)) => search_tool_response(&response),
             Ok(Err(error)) => tool_error(error.to_string()),
             Err(error) => tool_error(error.to_string()),
         }
@@ -364,6 +364,8 @@ struct SearchResponse {
     results: Vec<SearchResult>,
     partial: bool,
     message: Option<String>,
+    #[serde(skip)]
+    host_result: Option<ToolInvocationResult>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -631,14 +633,23 @@ async fn search_async(
         "serper" => search_serper(request, &config).await,
         "serpapi" | "serp_api" => search_serpapi(request, &config).await,
         "model_native" => Ok(SearchResponse {
-            query: request.query,
+            query: request.query.clone(),
             provider: "model_native".to_string(),
             results: Vec::new(),
             partial: true,
             message: Some(
-                "model-native search is routed by the Bcode host when requested by the agent"
-                    .to_string(),
+                "model-native web search requested through host provider bridge".to_string(),
             ),
+            host_result: Some(ToolInvocationResult::HostModelNativeWebSearch {
+                request: bcode_tool::HostModelNativeWebSearchRequest {
+                    query: request.query,
+                    max_results: request.max_results,
+                    site: request.site,
+                    freshness: request.freshness,
+                    region: request.region,
+                    safe_search: request.safe_search,
+                },
+            }),
         }),
         "duckduckgo_html" | "duckduckgo" | "ddg" => search_duckduckgo_html(request, &config).await,
         _ => Err(WebError::InvalidRequest(format!(
@@ -1801,6 +1812,7 @@ fn search_response(query: String, provider: &str, results: Vec<SearchResult>) ->
         results,
         partial: false,
         message: None,
+        host_result: None,
     }
 }
 
@@ -2249,6 +2261,20 @@ fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
 
 fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
     ServiceResponse::error("invalid_request", error.to_string())
+}
+
+fn search_tool_response(value: &SearchResponse) -> ToolInvocationResponse {
+    match serde_json::to_string_pretty(value) {
+        Ok(output) => ToolInvocationResponse {
+            output,
+            is_error: false,
+            content: Vec::new(),
+            full_output: None,
+            presentation: None,
+            result: value.host_result.clone(),
+        },
+        Err(error) => tool_error(error.to_string()),
+    }
 }
 
 fn json_tool_response<T: Serialize>(value: &T) -> ToolInvocationResponse {
