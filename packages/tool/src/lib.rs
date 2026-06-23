@@ -175,25 +175,21 @@ pub struct ToolInvocationResponse {
     pub full_output: Option<String>,
     #[serde(default)]
     pub presentation: Option<ToolInvocationPresentation>,
+    /// Optional host action requested by the plugin. Host actions are transport semantics
+    /// and should be consumed before durable session history is appended.
+    #[serde(default)]
+    pub host_action: Option<ToolInvocationHostAction>,
     /// Optional typed semantic result for consumers to render in their own UI.
     #[serde(default)]
     pub result: Option<ToolInvocationResult>,
 }
 
-/// Typed semantic data returned by a tool invocation.
+/// Host action requested by a tool plugin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ToolInvocationResult {
-    /// Plain textual result.
-    Text { text: String },
-    /// Structured JSON result encoded as a JSON string for transport stability.
-    Json { value: String },
-    /// Shell command execution result.
-    ShellRun { result: ShellRunResult },
-    /// Filesystem write/edit result.
-    FileChange { result: FileChangeResult },
+pub enum ToolInvocationHostAction {
     /// Request that the host perform model-provider-native web search.
-    HostModelNativeWebSearch {
+    ModelNativeWebSearch {
         request: HostModelNativeWebSearchRequest,
     },
 }
@@ -212,6 +208,20 @@ pub struct HostModelNativeWebSearchRequest {
     pub region: Option<String>,
     #[serde(default)]
     pub safe_search: Option<String>,
+}
+
+/// Typed semantic data returned by a tool invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolInvocationResult {
+    /// Plain textual result.
+    Text { text: String },
+    /// Structured JSON result encoded as a JSON string for transport stability.
+    Json { value: String },
+    /// Shell command execution result.
+    ShellRun { result: ShellRunResult },
+    /// Filesystem write/edit result.
+    FileChange { result: FileChangeResult },
 }
 
 /// Semantic shell command execution result.

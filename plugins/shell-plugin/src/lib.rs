@@ -155,6 +155,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             content: Vec::new(),
             full_output: None,
             presentation: None,
+            host_action: None,
             result: None,
         },
     };
@@ -179,6 +180,7 @@ fn run_shell_tool(
                 content: Vec::new(),
                 full_output: None,
                 presentation: None,
+                host_action: None,
                 result: None,
             };
         }
@@ -190,6 +192,7 @@ fn run_shell_tool(
             content: Vec::new(),
             full_output: None,
             presentation: None,
+            host_action: None,
             result: None,
         };
     }
@@ -237,6 +240,7 @@ fn run_shell_tool(
                 content: Vec::new(),
                 full_output: None,
                 presentation: None,
+                host_action: None,
                 result: None,
             },
         }
@@ -407,6 +411,7 @@ fn run_terminal_shell_command(
             content: Vec::new(),
             full_output: None,
             presentation: None,
+            host_action: None,
             result: None,
         },
     }
@@ -582,6 +587,7 @@ fn run_terminal_shell_command_inner(
             columns,
             rows,
         }),
+        host_action: None,
         result: Some(ToolInvocationResult::ShellRun {
             result: ShellRunResult::Terminal {
                 exit_code: Some(status.exit_code),
@@ -663,6 +669,7 @@ fn build_process_tool_response(
         content: Vec::new(),
         full_output: Some(full_output),
         presentation: None,
+        host_action: None,
         result: Some(ToolInvocationResult::ShellRun {
             result: ShellRunResult::Captured {
                 exit_code: result.exit_code,
@@ -1298,6 +1305,7 @@ mod tests {
                 columns: 80,
                 rows: 24,
             }),
+            host_action: None,
             result: None,
         };
 

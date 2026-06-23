@@ -605,6 +605,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             content: Vec::new(),
             full_output: None,
             presentation: None,
+            host_action: None,
             result: None,
         });
     }
@@ -645,6 +646,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             content: Vec::new(),
             full_output: None,
             presentation: None,
+            host_action: None,
             result: None,
         },
     };
@@ -681,6 +683,7 @@ fn text_tool_response(path: &Path, request: &ReadRequest, bytes: &[u8]) -> ToolI
             content: Vec::new(),
             full_output: None,
             presentation: None,
+            host_action: None,
             result: None,
         };
     };
@@ -720,6 +723,7 @@ fn text_tool_response(path: &Path, request: &ReadRequest, bytes: &[u8]) -> ToolI
         content: Vec::new(),
         full_output: None,
         presentation: None,
+        host_action: None,
         result: None,
     }
 }
@@ -782,6 +786,7 @@ fn tool_artifact_read(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolI
                 content: Vec::new(),
                 full_output: None,
                 presentation: None,
+                host_action: None,
                 result: None,
             },
         },
@@ -829,6 +834,7 @@ fn tool_artifact_grep(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolI
                 content: Vec::new(),
                 full_output: None,
                 presentation: None,
+                host_action: None,
                 result: None,
             },
         },
@@ -927,6 +933,7 @@ fn image_tool_response(path: &Path, image: ImageFileMetadata) -> ToolInvocationR
         }],
         full_output: None,
         presentation: None,
+        host_action: None,
         result: None,
     }
 }
@@ -987,6 +994,7 @@ fn tool_write(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocatio
                             summary: summary.clone(),
                             path: Some(request.path.display().to_string()),
                         }),
+                        host_action: None,
                         result: Some(ToolInvocationResult::FileChange {
                             result: FileChangeResult {
                                 tool_name: "filesystem.write".to_owned(),
@@ -1013,6 +1021,7 @@ fn tool_edit(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocation
                     content: Vec::new(),
                     full_output: None,
                     presentation: None,
+                    host_action: None,
                     result: None,
                 },
                 |replacements| {
@@ -1027,6 +1036,7 @@ fn tool_edit(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocation
                             summary: summary.clone(),
                             path: Some(request.path.display().to_string()),
                         }),
+                        host_action: None,
                         result: Some(ToolInvocationResult::FileChange {
                             result: FileChangeResult {
                                 tool_name: "filesystem.edit".to_owned(),
@@ -1052,6 +1062,7 @@ fn tool_exists(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocati
             content: Vec::new(),
             full_output: None,
             presentation: None,
+            host_action: None,
             result: None,
         },
         Err(error) => tool_json_error(&error),
@@ -2021,6 +2032,7 @@ fn tool_io_error(error: &std::io::Error) -> ToolInvocationResponse {
         content: Vec::new(),
         full_output: None,
         presentation: None,
+        host_action: None,
         result: None,
     }
 }
@@ -2032,6 +2044,7 @@ fn tool_json_error(error: &serde_json::Error) -> ToolInvocationResponse {
         content: Vec::new(),
         full_output: None,
         presentation: None,
+        host_action: None,
         result: None,
     }
 }
@@ -2047,6 +2060,7 @@ where
             content: Vec::new(),
             full_output: None,
             presentation: None,
+            host_action: None,
             result: None,
         },
         Err(error) => ToolInvocationResponse {
@@ -2055,6 +2069,7 @@ where
             content: Vec::new(),
             full_output: None,
             presentation: None,
+            host_action: None,
             result: None,
         },
     }

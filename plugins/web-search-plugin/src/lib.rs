@@ -8,8 +8,8 @@ use bcode_model_provider_runtime::ProviderRuntime;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
-    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolInvocationStreamEvent,
-    ToolList, ToolSideEffect,
+    ToolInvocationHostAction, ToolInvocationRequest, ToolInvocationResponse,
+    ToolInvocationStreamEvent, ToolList, ToolSideEffect,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -122,6 +122,7 @@ impl WebSearchPlugin {
                 content: Vec::new(),
                 full_output: None,
                 presentation: None,
+                host_action: None,
                 result: None,
             },
         };
@@ -365,7 +366,7 @@ struct SearchResponse {
     partial: bool,
     message: Option<String>,
     #[serde(skip)]
-    host_result: Option<ToolInvocationResult>,
+    host_action: Option<ToolInvocationHostAction>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -640,7 +641,7 @@ async fn search_async(
             message: Some(
                 "model-native web search requested through host provider bridge".to_string(),
             ),
-            host_result: Some(ToolInvocationResult::HostModelNativeWebSearch {
+            host_action: Some(ToolInvocationHostAction::ModelNativeWebSearch {
                 request: bcode_tool::HostModelNativeWebSearchRequest {
                     query: request.query,
                     max_results: request.max_results,
@@ -1812,7 +1813,7 @@ fn search_response(query: String, provider: &str, results: Vec<SearchResult>) ->
         results,
         partial: false,
         message: None,
-        host_result: None,
+        host_action: None,
     }
 }
 
@@ -2271,7 +2272,8 @@ fn search_tool_response(value: &SearchResponse) -> ToolInvocationResponse {
             content: Vec::new(),
             full_output: None,
             presentation: None,
-            result: value.host_result.clone(),
+            host_action: value.host_action.clone(),
+            result: None,
         },
         Err(error) => tool_error(error.to_string()),
     }
@@ -2285,6 +2287,7 @@ fn json_tool_response<T: Serialize>(value: &T) -> ToolInvocationResponse {
             content: Vec::new(),
             full_output: None,
             presentation: None,
+            host_action: None,
             result: None,
         },
         Err(error) => tool_error(error.to_string()),
@@ -2298,6 +2301,7 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
         content: Vec::new(),
         full_output: None,
         presentation: None,
+        host_action: None,
         result: None,
     }
 }

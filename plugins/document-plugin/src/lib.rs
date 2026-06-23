@@ -113,6 +113,7 @@ impl DocumentPlugin {
                 content: Vec::new(),
                 full_output: None,
                 presentation: None,
+                host_action: None,
                 result: None,
             },
         };
@@ -592,6 +593,7 @@ fn json_tool_response<T: Serialize>(value: &T) -> ToolInvocationResponse {
             content: Vec::new(),
             full_output: None,
             presentation: None,
+            host_action: None,
             result: None,
         },
         Err(error) => tool_error(error.to_string()),
@@ -605,6 +607,7 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
         content: Vec::new(),
         full_output: None,
         presentation: None,
+        host_action: None,
         result: None,
     }
 }

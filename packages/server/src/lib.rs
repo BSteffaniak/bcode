@@ -11624,6 +11624,7 @@ async fn invoke_host_model_native_web_search(
         content: Vec::new(),
         full_output: None,
         presentation: None,
+        host_action: None,
         result: None,
     })
 }
@@ -11682,12 +11683,10 @@ async fn execute_model_tool(
         content: Vec::new(),
         full_output: None,
         presentation: None,
+        host_action: None,
         result: None,
     });
-    let semantic_result = result
-        .result
-        .clone()
-        .and_then(service_tool_result_to_session);
+    let semantic_result = result.result.clone().map(service_tool_result_to_session);
     let presentation = legacy_tool_presentation_for_session(&result);
     let artifact_output = result.full_output.as_deref().unwrap_or(&result.output);
     let output_blob = (state.observability.persist_tool_io || state.observability.debug_enabled())
@@ -11759,6 +11758,7 @@ async fn invoke_model_tool(
             content: Vec::new(),
             full_output: None,
             presentation: None,
+            host_action: None,
             result: None,
         });
     }
@@ -11812,6 +11812,7 @@ async fn invoke_model_tool(
                 content: Vec::new(),
                 full_output: None,
                 presentation: None,
+                host_action: None,
                 result: None,
             });
         }
@@ -11823,6 +11824,7 @@ async fn invoke_model_tool(
                     content: Vec::new(),
                     full_output: None,
                     presentation: None,
+                    host_action: None,
                     result: None,
                 });
             }
@@ -11904,6 +11906,7 @@ async fn invoke_model_tool(
                         content: Vec::new(),
                         full_output: None,
                         presentation: None,
+                        host_action: None,
                         result: None,
                     });
                 }
@@ -11935,6 +11938,7 @@ async fn invoke_model_tool(
                         content: Vec::new(),
                         full_output: None,
                         presentation: None,
+                        host_action: None,
                         result: None,
                     });
                 }
@@ -11955,6 +11959,7 @@ async fn invoke_model_tool(
                     content: Vec::new(),
                     full_output: None,
                     presentation: None,
+            host_action: None,
             result: None,
                 });
             }
@@ -11992,7 +11997,8 @@ async fn invoke_model_tool(
     flush_tool_output_stream(state, session_id, &mut pending_tool_output).await;
     let response: ToolInvocationResponse =
         bcode_plugin::decode_service_response(response).map_err(|error| error.to_string())?;
-    if let Some(ServiceToolInvocationResult::HostModelNativeWebSearch { request }) = response.result
+    if let Some(bcode_tool::ToolInvocationHostAction::ModelNativeWebSearch { request }) =
+        response.host_action
     {
         return invoke_host_model_native_web_search(state, session_id, &call.id, request).await;
     }
@@ -12929,25 +12935,20 @@ fn service_tool_presentation_to_session(
     }
 }
 
-fn service_tool_result_to_session(
-    result: ServiceToolInvocationResult,
-) -> Option<ToolInvocationResult> {
+fn service_tool_result_to_session(result: ServiceToolInvocationResult) -> ToolInvocationResult {
     match result {
-        ServiceToolInvocationResult::Text { text } => Some(ToolInvocationResult::Text { text }),
-        ServiceToolInvocationResult::Json { value } => Some(ToolInvocationResult::Json { value }),
-        ServiceToolInvocationResult::ShellRun { result } => Some(ToolInvocationResult::ShellRun {
+        ServiceToolInvocationResult::Text { text } => ToolInvocationResult::Text { text },
+        ServiceToolInvocationResult::Json { value } => ToolInvocationResult::Json { value },
+        ServiceToolInvocationResult::ShellRun { result } => ToolInvocationResult::ShellRun {
             result: service_shell_result_to_session(result),
-        }),
-        ServiceToolInvocationResult::FileChange { result } => {
-            Some(ToolInvocationResult::FileChange {
-                result: bcode_session_models::FileChangeResult {
-                    tool_name: result.tool_name,
-                    summary: result.summary,
-                    path: result.path,
-                },
-            })
-        }
-        ServiceToolInvocationResult::HostModelNativeWebSearch { .. } => None,
+        },
+        ServiceToolInvocationResult::FileChange { result } => ToolInvocationResult::FileChange {
+            result: bcode_session_models::FileChangeResult {
+                tool_name: result.tool_name,
+                summary: result.summary,
+                path: result.path,
+            },
+        },
     }
 }
 
@@ -14177,6 +14178,7 @@ mod tests {
                 columns: 80,
                 rows: 24,
             }),
+            host_action: None,
             result: Some(ServiceToolInvocationResult::ShellRun {
                 result: ServiceShellRunResult::Terminal {
                     exit_code: Some(0),
@@ -14207,6 +14209,7 @@ mod tests {
                 summary: "wrote 1 byte".to_owned(),
                 path: Some("file.txt".to_owned()),
             }),
+            host_action: None,
             result: None,
         };
 
