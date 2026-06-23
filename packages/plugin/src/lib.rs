@@ -268,7 +268,7 @@ pub struct RegisteredPlugin {
 }
 
 /// Resolved plugin config extension metadata with plugin ownership attached.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginConfigExtension {
     pub plugin_id: String,
     pub section: Option<String>,
@@ -347,7 +347,7 @@ pub fn plugin_command_contributions(
 }
 
 /// Command contribution with plugin ownership attached.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginOwnedCommandContribution {
     pub plugin_id: String,
     pub command: PluginCommandContribution,
@@ -1835,6 +1835,46 @@ impl PluginRuntimeHost {
                     .iter()
                     .cloned()
                     .map(|service| (manifest.id.clone(), service))
+            })
+            .collect()
+    }
+
+    /// Return plugin command contributions without waiting for plugin execution.
+    #[must_use]
+    pub fn command_contributions(&self) -> Vec<PluginOwnedCommandContribution> {
+        self.registry
+            .manifests
+            .values()
+            .flat_map(|manifest| {
+                manifest
+                    .command_contributions
+                    .iter()
+                    .cloned()
+                    .map(|command| PluginOwnedCommandContribution {
+                        plugin_id: manifest.id.clone(),
+                        command,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Return plugin config extensions without waiting for plugin execution.
+    #[must_use]
+    pub fn config_extensions(&self) -> Vec<PluginConfigExtension> {
+        self.registry
+            .manifests
+            .values()
+            .filter_map(|manifest| {
+                let config = manifest.config.as_ref()?;
+                Some(PluginConfigExtension {
+                    plugin_id: manifest.id.clone(),
+                    section: config.section.clone(),
+                    aliases: config.aliases.clone(),
+                    categories: config.categories.clone(),
+                    schema_version: config.schema_version,
+                    schema_file: config.schema_file.clone(),
+                })
             })
             .collect()
     }

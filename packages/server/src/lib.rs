@@ -16,16 +16,16 @@ use bcode_agent_profile::{
 };
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, DaemonStatus, EnvelopeKind, ErrorResponse, Event,
-    IpcEndpoint, LocalIpcListener, LocalIpcStream, PermissionSummary, PluginServiceError,
-    PluginServiceResponse, PluginServiceSummary, RalphApproveRequest, RalphCancelRequest,
-    RalphCancelResponse, RalphIterationSummary, RalphLifecycleRequest, RalphListIterationsRequest,
-    RalphListIterationsResponse, RalphListRunsRequest, RalphListRunsResponse, RalphResumeRequest,
-    RalphResumeResponse, RalphRunRequest, RalphRunResponse, RalphRunStatusRequest,
-    RalphRunStatusResponse, RalphRunSummary, RalphStatusRequest, RalphStatusResponse,
-    RalphStatusSummary, RalphValidationSummary, Request, Response, ResponsePayload, ServerStatus,
-    ServerStopMode, SessionCatalogSourceStatus, SessionCatalogStatus, WorktreeCreateRequest,
-    WorktreeListRequest, WorktreeRemoveRequest, decode, event_envelope, recv_envelope,
-    response_envelope, send_envelope,
+    IpcEndpoint, LocalIpcListener, LocalIpcStream, PermissionSummary, PluginContributions,
+    PluginServiceError, PluginServiceResponse, PluginServiceSummary, RalphApproveRequest,
+    RalphCancelRequest, RalphCancelResponse, RalphIterationSummary, RalphLifecycleRequest,
+    RalphListIterationsRequest, RalphListIterationsResponse, RalphListRunsRequest,
+    RalphListRunsResponse, RalphResumeRequest, RalphResumeResponse, RalphRunRequest,
+    RalphRunResponse, RalphRunStatusRequest, RalphRunStatusResponse, RalphRunSummary,
+    RalphStatusRequest, RalphStatusResponse, RalphStatusSummary, RalphValidationSummary, Request,
+    Response, ResponsePayload, ServerStatus, ServerStopMode, SessionCatalogSourceStatus,
+    SessionCatalogStatus, WorktreeCreateRequest, WorktreeListRequest, WorktreeRemoveRequest,
+    decode, event_envelope, recv_envelope, response_envelope, send_envelope,
 };
 use bcode_metrics::{MetricLabels, MetricsRegistry};
 use bcode_model::{
@@ -2132,6 +2132,9 @@ async fn handle_agent_permission_plugin_request(
             .await
         }
         Request::ListPluginServices => handle_list_plugin_services(request_id, state, writer).await,
+        Request::ListPluginContributions => {
+            handle_list_plugin_contributions(request_id, state, writer).await
+        }
         Request::InvokePluginService {
             plugin_id,
             interface_id,
@@ -13388,6 +13391,23 @@ async fn handle_list_plugin_services(
         writer,
         request_id,
         Response::Ok(ResponsePayload::PluginServices { services }),
+    )
+    .await
+}
+
+async fn handle_list_plugin_contributions(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    let contributions = PluginContributions {
+        commands: state.plugins.command_contributions(),
+        config_extensions: state.plugins.config_extensions(),
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::PluginContributions { contributions }),
     )
     .await
 }

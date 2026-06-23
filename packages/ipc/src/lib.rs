@@ -322,6 +322,7 @@ pub enum Request {
         action: String,
     },
     ListPluginServices,
+    ListPluginContributions,
     InvokePluginService {
         plugin_id: String,
         interface_id: String,
@@ -546,6 +547,15 @@ pub struct SessionModelStatus {
     pub metadata_source: Option<bcode_model::ModelMetadataSource>,
     #[serde(default)]
     pub pricing: Option<bcode_model::ModelPricingInfo>,
+}
+
+/// Manifest-declared plugin contributions available without executing plugin code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginContributions {
+    #[serde(default)]
+    pub commands: Vec<bcode_plugin::PluginOwnedCommandContribution>,
+    #[serde(default)]
+    pub config_extensions: Vec<bcode_plugin::PluginConfigExtension>,
 }
 
 /// Service interface provided by a loaded plugin.
@@ -1068,6 +1078,9 @@ pub enum ResponsePayload {
         draft: Option<String>,
     },
     ComposerDraftSet,
+    PluginContributions {
+        contributions: PluginContributions,
+    },
 }
 
 /// Structured error response.
@@ -1275,6 +1288,9 @@ enum IpcResponsePayload {
         draft: Option<String>,
     },
     ComposerDraftSet,
+    PluginContributions {
+        contributions: PluginContributions,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1413,6 +1429,9 @@ impl From<&ResponsePayload> for IpcResponsePayload {
             },
             ResponsePayload::PluginServices { services } => Self::PluginServices {
                 services: services.clone(),
+            },
+            ResponsePayload::PluginContributions { contributions } => Self::PluginContributions {
+                contributions: contributions.clone(),
             },
             ResponsePayload::PluginServiceResult { response } => Self::PluginServiceResult {
                 response: response.clone(),
@@ -1593,6 +1612,9 @@ impl TryFrom<IpcResponsePayload> for ResponsePayload {
             }
             IpcResponsePayload::PluginServices { services } => {
                 Ok(Self::PluginServices { services })
+            }
+            IpcResponsePayload::PluginContributions { contributions } => {
+                Ok(Self::PluginContributions { contributions })
             }
             IpcResponsePayload::PluginServiceResult { response } => {
                 Ok(Self::PluginServiceResult { response })

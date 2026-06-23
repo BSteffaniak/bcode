@@ -8,12 +8,12 @@ use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_daemon_lifecycle::{DaemonStartError, EnsureDaemonOptions, ensure_daemon_running};
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint,
-    LocalIpcStream, PermissionSummary, PluginServiceResponse, PluginServiceSummary,
-    RalphApproveRequest, RalphCancelRequest, RalphCancelResponse, RalphLifecycleRequest,
-    RalphListIterationsRequest, RalphListIterationsResponse, RalphListRunsRequest,
-    RalphListRunsResponse, RalphResumeRequest, RalphResumeResponse, RalphRunRequest,
-    RalphRunResponse, RalphRunStatusRequest, RalphRunStatusResponse, RalphStatusRequest,
-    RalphStatusResponse, Request, Response, ResponsePayload, ServerStopMode,
+    LocalIpcStream, PermissionSummary, PluginContributions, PluginServiceResponse,
+    PluginServiceSummary, RalphApproveRequest, RalphCancelRequest, RalphCancelResponse,
+    RalphLifecycleRequest, RalphListIterationsRequest, RalphListIterationsResponse,
+    RalphListRunsRequest, RalphListRunsResponse, RalphResumeRequest, RalphResumeResponse,
+    RalphRunRequest, RalphRunResponse, RalphRunStatusRequest, RalphRunStatusResponse,
+    RalphStatusRequest, RalphStatusResponse, Request, Response, ResponsePayload, ServerStopMode,
     SessionCatalogSourceStatus, SessionCatalogStatus, SessionImportWarning, WorktreeCreateRequest,
     WorktreeCreateResponse, WorktreeListRequest, WorktreeListResponse, WorktreeRemoveRequest,
     WorktreeRemoveResponse, current_working_directory, decode_event, decode_response,
@@ -1716,6 +1716,18 @@ impl BcodeClient {
     pub async fn plugin_services(&self) -> Result<Vec<PluginServiceSummary>, ClientError> {
         match self.send_request(Request::ListPluginServices).await? {
             ResponsePayload::PluginServices { services } => Ok(services),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// List manifest-declared plugin contributions without executing plugin code.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn plugin_contributions(&self) -> Result<PluginContributions, ClientError> {
+        match self.send_request(Request::ListPluginContributions).await? {
+            ResponsePayload::PluginContributions { contributions } => Ok(contributions),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
