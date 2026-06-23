@@ -8887,7 +8887,7 @@ mod tests {
     }
 
     #[test]
-    fn scrolling_keeps_selection_on_visible_semantic_rows() {
+    fn selecting_next_view_row_keeps_selection_on_visible_semantic_rows() {
         let mut app = sample_app();
         app.last_diff_area = Some(Rect::new(0, 0, 80, 2));
         let anchor = ReviewCommentAnchor {
@@ -8920,7 +8920,7 @@ mod tests {
             }],
         );
 
-        assert!(app.scroll_down(3));
+        assert!(app.select_next_view_row(3));
 
         assert!(app.selected_diff_visual_row() >= app.diff_scroll);
         assert!(app.selected_diff_visual_row() < app.diff_scroll + 2);
