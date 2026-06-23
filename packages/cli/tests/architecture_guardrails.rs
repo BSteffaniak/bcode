@@ -183,14 +183,13 @@ fn is_temporary_boundary_allowlist(path: &Path, line: &str) -> bool {
     if path.ends_with("packages/agent-policy/src/lib.rs") {
         return true;
     }
-    // Transitional allowlist: config tests/docs preserve legacy user-facing tool keys
-    // until plugin-owned config metadata and schema validation own these examples.
-    if path.ends_with("packages/config/src/lib.rs") {
+    // Intentional allowlist: core config owns the default bundled plugin selection list;
+    // concrete plugin implementations still live outside core and remain disableable.
+    if path.ends_with("packages/config/src/lib.rs") && line.contains("DEFAULT_") {
         return true;
     }
-    // Transitional allowlist: server still bridges model-native web search for provider
-    // integration; this should move behind a plugin-owned provider/tool bridge next.
-    if path.ends_with("packages/server/src/lib.rs") && line.contains("web.search") {
+    // Intentional allowlist: config tests verify default bundled plugin IDs can be disabled.
+    if path.ends_with("packages/config/src/lib.rs") && line.contains("bcode.shell") {
         return true;
     }
     // Transitional allowlist: agent-policy model docs describe legacy config keys.

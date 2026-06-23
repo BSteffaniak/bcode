@@ -11684,7 +11684,10 @@ async fn execute_model_tool(
         presentation: None,
         result: None,
     });
-    let semantic_result = result.result.clone().map(service_tool_result_to_session);
+    let semantic_result = result
+        .result
+        .clone()
+        .and_then(service_tool_result_to_session);
     let presentation = legacy_tool_presentation_for_session(&result);
     let artifact_output = result.full_output.as_deref().unwrap_or(&result.output);
     let output_blob = (state.observability.persist_tool_io || state.observability.debug_enabled())
@@ -12926,25 +12929,25 @@ fn service_tool_presentation_to_session(
     }
 }
 
-fn service_tool_result_to_session(result: ServiceToolInvocationResult) -> ToolInvocationResult {
+fn service_tool_result_to_session(
+    result: ServiceToolInvocationResult,
+) -> Option<ToolInvocationResult> {
     match result {
-        ServiceToolInvocationResult::Text { text } => ToolInvocationResult::Text { text },
-        ServiceToolInvocationResult::Json { value } => ToolInvocationResult::Json { value },
-        ServiceToolInvocationResult::ShellRun { result } => ToolInvocationResult::ShellRun {
+        ServiceToolInvocationResult::Text { text } => Some(ToolInvocationResult::Text { text }),
+        ServiceToolInvocationResult::Json { value } => Some(ToolInvocationResult::Json { value }),
+        ServiceToolInvocationResult::ShellRun { result } => Some(ToolInvocationResult::ShellRun {
             result: service_shell_result_to_session(result),
-        },
-        ServiceToolInvocationResult::FileChange { result } => ToolInvocationResult::FileChange {
-            result: bcode_session_models::FileChangeResult {
-                tool_name: result.tool_name,
-                summary: result.summary,
-                path: result.path,
-            },
-        },
-        ServiceToolInvocationResult::HostModelNativeWebSearch { request } => {
-            ToolInvocationResult::Json {
-                value: serde_json::to_string(&request).unwrap_or_default(),
-            }
+        }),
+        ServiceToolInvocationResult::FileChange { result } => {
+            Some(ToolInvocationResult::FileChange {
+                result: bcode_session_models::FileChangeResult {
+                    tool_name: result.tool_name,
+                    summary: result.summary,
+                    path: result.path,
+                },
+            })
         }
+        ServiceToolInvocationResult::HostModelNativeWebSearch { .. } => None,
     }
 }
 

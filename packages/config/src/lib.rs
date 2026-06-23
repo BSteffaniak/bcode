@@ -4387,7 +4387,7 @@ enabled = ["example.c"]
 disabled = ["example.d"]
 
 [agent.build.tools]
-"shell.run" = true
+"example.tool" = true
 
 [agent.build.permission]
 external_directory = "ask"
@@ -4421,9 +4421,9 @@ edit = { "src/**" = "ask" }
             .get("build")
             .expect("build agent config should be loaded");
         assert_eq!(
-            build.tools.get("shell.run").copied(),
+            build.tools.get("example.tool").copied(),
             Some(true),
-            "build agent should enable shell.run"
+            "build agent should enable example.tool"
         );
         assert_eq!(
             build.permission.external_directory,
@@ -5086,8 +5086,8 @@ bash = { "cargo *" = "allow" }
 accent = "#22d3ee"
 
 [agent.build.tools]
-"filesystem.read" = true
-"filesystem.write" = true
+"example.read" = true
+"example.write" = true
 
 [agent.build.permission.bash]
 "cargo *" = "allow"
@@ -5101,8 +5101,8 @@ accent = "#22d3ee"
 accent = "#6b7280"
 
 [agent.build.tools]
-"filesystem.write" = false
-"shell.run" = true
+"example.write" = false
+"example.run" = true
 
 [agent.build.permission.bash]
 "cargo *" = "deny"
@@ -5134,15 +5134,15 @@ accent = "#6b7280"
             Some("#6b7280")
         );
         assert_eq!(
-            tools.get("filesystem.read").and_then(toml::Value::as_bool),
+            tools.get("example.read").and_then(toml::Value::as_bool),
             Some(true)
         );
         assert_eq!(
-            tools.get("filesystem.write").and_then(toml::Value::as_bool),
+            tools.get("example.write").and_then(toml::Value::as_bool),
             Some(false)
         );
         assert_eq!(
-            tools.get("shell.run").and_then(toml::Value::as_bool),
+            tools.get("example.run").and_then(toml::Value::as_bool),
             Some(true)
         );
         assert_eq!(
@@ -5168,7 +5168,7 @@ accent = "#6b7280"
 accent = "#abcdef"
 
 [agent.scratch.tools]
-"shell.run" = true
+"example.run" = true
 
 [agent.scratch.permission.bash]
 "*" = "ask"
@@ -5192,7 +5192,7 @@ accent = "#abcdef"
             scratch
                 .get("tools")
                 .and_then(toml::Value::as_table)
-                .and_then(|tools| tools.get("shell.run"))
+                .and_then(|tools| tools.get("example.run"))
                 .and_then(toml::Value::as_bool),
             Some(true)
         );
@@ -5293,8 +5293,8 @@ active_profile = "dev"
 enabled = ["base"]
 
 [composition.profiles.base.patch.agent.build.tools]
-"shell.run" = false
-"filesystem.read" = true
+"example.run" = false
+"example.read" = true
 
 [composition.profiles.dev]
 extends = ["base"]
@@ -5303,7 +5303,7 @@ extends = ["base"]
 enabled = ["dev"]
 
 [composition.profiles.dev.patch.agent.build.tools]
-"shell.run" = true
+"example.run" = true
 
 [agent.build.permission]
 read = { "**" = "allow" }
@@ -5318,8 +5318,8 @@ read = { "**" = "allow" }
             "arrays replace rather than concatenate"
         );
         let build = config.agent.get("build").expect("build agent should exist");
-        assert_eq!(build.tools.get("shell.run"), Some(&true));
-        assert_eq!(build.tools.get("filesystem.read"), Some(&true));
+        assert_eq!(build.tools.get("example.run"), Some(&true));
+        assert_eq!(build.tools.get("example.read"), Some(&true));
         assert_eq!(
             build.permission.read.get("**"),
             Some(&bcode_agent_policy_models::Action::Allow)
