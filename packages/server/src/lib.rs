@@ -7878,6 +7878,7 @@ struct ProviderErrorRetryContext<'a> {
     turn_id: &'a str,
     selection: &'a SessionModelSelection,
     provider_retry_rules: &'a [bcode_model::ProviderRetryRule],
+    remote_catalog_retry_rules: &'a [bcode_model::ProviderRetryRule],
     cancel_state: &'a TurnCancelState,
 }
 
@@ -8870,6 +8871,8 @@ async fn run_model_turn_inner(
 
     let provider_plugin_id = selection.provider_plugin_id.clone();
     let provider_retry_rules = provider_retry_rules(state, provider_plugin_id.as_deref()).await;
+    let remote_catalog_retry_rules =
+        remote_catalog_retry_rules(state, provider_plugin_id.as_deref()).await;
     let mut round = 0_u32;
     let mut recovery = ModelTurnRecoveryState::default();
     loop {
@@ -8930,6 +8933,7 @@ async fn run_model_turn_inner(
             turn_id: &request.turn_id,
             selection: &selection,
             provider_retry_rules: &provider_retry_rules,
+            remote_catalog_retry_rules: &remote_catalog_retry_rules,
             cancel_state: cancel_state.as_ref(),
         };
         match maybe_retry_after_provider_error(
@@ -9028,6 +9032,7 @@ async fn maybe_retry_after_provider_error(
         error,
         context.selection,
         context.provider_retry_rules,
+        context.remote_catalog_retry_rules,
     ) {
         let attempts = recovery
             .retry_attempts
@@ -9073,6 +9078,7 @@ fn matching_provider_retry_policy(
     error: &bcode_model::ProviderError,
     selection: &SessionModelSelection,
     provider_rules: &[bcode_model::ProviderRetryRule],
+    remote_catalog_rules: &[bcode_model::ProviderRetryRule],
 ) -> Option<ProviderRetryPolicy> {
     if !state.model_retry.enabled {
         return None;
@@ -9089,7 +9095,11 @@ fn matching_provider_retry_policy(
         });
     }
 
-    let rules = effective_provider_retry_rules(provider_rules, &state.model_retry.rules);
+    let rules = effective_provider_retry_rules(
+        provider_rules,
+        remote_catalog_rules,
+        &state.model_retry.rules,
+    );
     rules
         .iter()
         .find(|rule| custom_retry_rule_matches(rule, error, selection))
@@ -9098,11 +9108,20 @@ fn matching_provider_retry_policy(
 
 fn effective_provider_retry_rules(
     provider_rules: &[bcode_model::ProviderRetryRule],
+    remote_catalog_rules: &[bcode_model::ProviderRetryRule],
     user_rules: &[bcode_config::ModelRetryRuleConfig],
 ) -> Vec<bcode_model::ProviderRetryRule> {
     let mut rules = BTreeMap::new();
     for rule in provider_rules {
         rules.insert(rule.id.clone(), rule.clone());
+    }
+    for rule in remote_catalog_rules {
+        rules
+            .entry(rule.id.clone())
+            .and_modify(|existing: &mut bcode_model::ProviderRetryRule| {
+                existing.merge_override(rule.clone());
+            })
+            .or_insert_with(|| rule.clone());
     }
     for rule in user_rules {
         rules
@@ -9241,6 +9260,113 @@ async fn provider_retry_rules(
         )
         .await
         .map_or_else(|_| Vec::new(), |capabilities| capabilities.retry_rules)
+}
+
+async fn remote_catalog_retry_rules(
+    state: &ServerState,
+    provider_plugin_id: Option<&str>,
+) -> Vec<bcode_model::ProviderRetryRule> {
+    if !state.model_retry.remote_catalog_rules_enabled {
+        return Vec::new();
+    }
+    let Some(provider_plugin_id) = provider_plugin_id else {
+        return Vec::new();
+    };
+    let Ok(catalog) = bcode_model_catalog::ModelCatalog::load_bundled_with_remote_overlay().await
+    else {
+        return Vec::new();
+    };
+    catalog
+        .document()
+        .providers
+        .values()
+        .flat_map(remote_provider_retry_rules)
+        .filter(|rule| remote_rule_scope_could_match(rule, provider_plugin_id))
+        .collect()
+}
+
+fn remote_rule_scope_could_match(
+    rule: &bcode_model::ProviderRetryRule,
+    provider_plugin_id: &str,
+) -> bool {
+    optional_exact_matches(rule.provider_plugin_id.as_deref(), Some(provider_plugin_id))
+        && optional_contains_matches(
+            rule.provider_plugin_id_contains.as_deref(),
+            Some(provider_plugin_id),
+        )
+}
+
+fn remote_provider_retry_rules(
+    provider: &bcode_model_catalog_models::ProviderCatalog,
+) -> Vec<bcode_model::ProviderRetryRule> {
+    provider
+        .error_handling
+        .recoverable_error_patterns
+        .iter()
+        .filter_map(remote_pattern_retry_rule)
+        .collect()
+}
+
+fn remote_pattern_retry_rule(
+    pattern: &bcode_model_catalog_models::RecoverableErrorPattern,
+) -> Option<bcode_model::ProviderRetryRule> {
+    if pattern.id.trim().is_empty() || !remote_pattern_has_scope(pattern) {
+        return None;
+    }
+    Some(bcode_model::ProviderRetryRule {
+        id: pattern.id.clone(),
+        enabled: Some(pattern.enabled_by_default),
+        provider_plugin_id: pattern.scope.provider_plugin_id.clone(),
+        provider_plugin_id_contains: pattern.scope.provider_plugin_id_contains.clone(),
+        model_id: pattern.scope.model_id.clone(),
+        model_id_contains: pattern.scope.model_id_contains.clone(),
+        r#match: remote_pattern_match(&pattern.r#match)?,
+        ..bcode_model::ProviderRetryRule::default()
+    })
+}
+
+const fn remote_pattern_has_scope(
+    pattern: &bcode_model_catalog_models::RecoverableErrorPattern,
+) -> bool {
+    pattern.scope.provider_plugin_id.is_some()
+        || pattern.scope.provider_plugin_id_contains.is_some()
+        || pattern.scope.model_id.is_some()
+        || pattern.scope.model_id_contains.is_some()
+}
+
+fn remote_pattern_match(
+    matcher: &bcode_model_catalog_models::RecoverableErrorPatternMatch,
+) -> Option<bcode_model::ProviderRetryRuleMatch> {
+    let rule_match = bcode_model::ProviderRetryRuleMatch {
+        category: matcher
+            .category
+            .as_deref()
+            .and_then(provider_error_category),
+        code: matcher.code.clone(),
+        message_equals: matcher.message_equals.clone(),
+        message_contains: matcher.message_contains.clone(),
+        provider_message_equals: matcher.provider_message_equals.clone(),
+        provider_message_contains: matcher.provider_message_contains.clone(),
+    };
+    rule_match.has_conditions().then_some(rule_match)
+}
+
+fn provider_error_category(category: &str) -> Option<bcode_model::ProviderErrorCategory> {
+    match category {
+        "config" => Some(bcode_model::ProviderErrorCategory::Config),
+        "auth" => Some(bcode_model::ProviderErrorCategory::Auth),
+        "rate_limit" => Some(bcode_model::ProviderErrorCategory::RateLimit),
+        "network" => Some(bcode_model::ProviderErrorCategory::Network),
+        "timeout" => Some(bcode_model::ProviderErrorCategory::Timeout),
+        "model_not_found" => Some(bcode_model::ProviderErrorCategory::ModelNotFound),
+        "context_length" => Some(bcode_model::ProviderErrorCategory::ContextLength),
+        "invalid_request" => Some(bcode_model::ProviderErrorCategory::InvalidRequest),
+        "unsupported_feature" => Some(bcode_model::ProviderErrorCategory::UnsupportedFeature),
+        "provider_internal" => Some(bcode_model::ProviderErrorCategory::ProviderInternal),
+        "overloaded" => Some(bcode_model::ProviderErrorCategory::Overloaded),
+        "cancelled" => Some(bcode_model::ProviderErrorCategory::Cancelled),
+        _ => None,
+    }
 }
 
 async fn retry_after_provider_error(
@@ -9453,7 +9579,7 @@ fn should_defer_visible_provider_error(
         || is_tool_arguments_decode_provider_error(error)
         || is_overloaded_provider_error(error)
         || selection.is_some_and(|selection| {
-            matching_provider_retry_policy(state, error, selection, &[]).is_some()
+            matching_provider_retry_policy(state, error, selection, &[], &[]).is_some()
         })
 }
 
@@ -15646,6 +15772,72 @@ mod tests {
     }
 
     #[test]
+    fn remote_catalog_rule_merges_between_provider_and_user_rules() {
+        let provider_rule = bcode_model::ProviderRetryRule {
+            id: "provider.rule".to_string(),
+            max_retries: Some(3),
+            r#match: bcode_model::ProviderRetryRuleMatch {
+                code: Some("provider_code".to_string()),
+                ..bcode_model::ProviderRetryRuleMatch::default()
+            },
+            ..bcode_model::ProviderRetryRule::default()
+        };
+        let remote_rule = bcode_model::ProviderRetryRule {
+            id: "provider.rule".to_string(),
+            r#match: bcode_model::ProviderRetryRuleMatch {
+                message_contains: Some("remote message".to_string()),
+                ..bcode_model::ProviderRetryRuleMatch::default()
+            },
+            ..bcode_model::ProviderRetryRule::default()
+        };
+        let user_rule = bcode_config::ModelRetryRuleConfig {
+            id: "provider.rule".to_string(),
+            max_retries: Some(1),
+            ..bcode_config::ModelRetryRuleConfig::default()
+        };
+
+        let effective =
+            effective_provider_retry_rules(&[provider_rule], &[remote_rule], &[user_rule]);
+
+        assert_eq!(effective.len(), 1);
+        let rule = &effective[0];
+        assert_eq!(rule.max_retries, Some(1));
+        assert_eq!(rule.r#match.code.as_deref(), Some("provider_code"));
+        assert_eq!(
+            rule.r#match.message_contains.as_deref(),
+            Some("remote message")
+        );
+    }
+
+    #[test]
+    fn remote_catalog_pattern_converts_to_sparse_retry_rule() {
+        let pattern = bcode_model_catalog_models::RecoverableErrorPattern {
+            id: "remote.pattern".to_string(),
+            enabled_by_default: true,
+            scope: bcode_model_catalog_models::RecoverableErrorPatternScope {
+                provider_plugin_id: Some("bcode.openai-compatible".to_string()),
+                ..bcode_model_catalog_models::RecoverableErrorPatternScope::default()
+            },
+            r#match: bcode_model_catalog_models::RecoverableErrorPatternMatch {
+                code: Some("http_400".to_string()),
+                message_contains: Some("Unsupported content type".to_string()),
+                ..bcode_model_catalog_models::RecoverableErrorPatternMatch::default()
+            },
+        };
+
+        let rule = remote_pattern_retry_rule(&pattern).expect("pattern should convert");
+
+        assert_eq!(rule.id, "remote.pattern");
+        assert_eq!(rule.enabled, Some(true));
+        assert_eq!(rule.max_retries, None);
+        assert_eq!(
+            rule.provider_plugin_id.as_deref(),
+            Some("bcode.openai-compatible")
+        );
+        assert_eq!(rule.r#match.code.as_deref(), Some("http_400"));
+    }
+
+    #[test]
     fn user_retry_rule_deep_merges_over_provider_rule() {
         let provider_rule = bcode_model::ProviderRetryRule {
             id: "provider.rule".to_string(),
@@ -15668,7 +15860,7 @@ mod tests {
             ..bcode_config::ModelRetryRuleConfig::default()
         };
 
-        let effective = effective_provider_retry_rules(&[provider_rule], &[user_rule]);
+        let effective = effective_provider_retry_rules(&[provider_rule], &[], &[user_rule]);
 
         assert_eq!(effective.len(), 1);
         let rule = &effective[0];
@@ -15703,7 +15895,7 @@ mod tests {
         };
         let selection = SessionModelSelection::default();
 
-        let effective = effective_provider_retry_rules(&[provider_rule], &[user_rule]);
+        let effective = effective_provider_retry_rules(&[provider_rule], &[], &[user_rule]);
 
         assert!(!custom_retry_rule_matches(
             &effective[0],
@@ -15746,7 +15938,7 @@ mod tests {
             ..SessionModelSelection::default()
         };
 
-        let policy = matching_provider_retry_policy(&state, &error, &selection, &[])
+        let policy = matching_provider_retry_policy(&state, &error, &selection, &[], &[])
             .expect("custom retry policy should match");
 
         assert_eq!(policy.id, "custom.unsupported-content-type");
@@ -15783,7 +15975,7 @@ mod tests {
             ..SessionModelSelection::default()
         };
 
-        assert!(matching_provider_retry_policy(&state, &error, &selection, &[]).is_none());
+        assert!(matching_provider_retry_policy(&state, &error, &selection, &[], &[]).is_none());
     }
 
     #[test]

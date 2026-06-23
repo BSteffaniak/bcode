@@ -1841,9 +1841,16 @@ pub struct ModelRetryConfig {
     /// Maximum overload retry delay in milliseconds.
     #[serde(default = "default_overload_max_delay_ms")]
     pub overload_max_delay_ms: u64,
+    /// Enable recoverable error patterns imported from the remote model catalog.
+    #[serde(default = "default_remote_catalog_retry_rules_enabled")]
+    pub remote_catalog_rules_enabled: bool,
     /// Custom provider-error retry rules.
     #[serde(default)]
     pub rules: Vec<ModelRetryRuleConfig>,
+}
+
+const fn default_remote_catalog_retry_rules_enabled() -> bool {
+    true
 }
 
 pub type ModelRetryRuleConfig = bcode_model::ProviderRetryRule;
@@ -1857,6 +1864,7 @@ impl Default for ModelRetryConfig {
             max_overload_retries: default_max_overload_retries(),
             overload_initial_delay_ms: default_overload_initial_delay_ms(),
             overload_max_delay_ms: default_overload_max_delay_ms(),
+            remote_catalog_rules_enabled: default_remote_catalog_retry_rules_enabled(),
             rules: Vec::new(),
         }
     }
@@ -3090,6 +3098,14 @@ fn write_model_retry_toml(output: &mut String, retry: &ModelRetryConfig) {
         retry.overload_max_delay_ms
     )
     .expect("writing to string should not fail");
+    if retry.remote_catalog_rules_enabled != default_remote_catalog_retry_rules_enabled() {
+        writeln!(
+            output,
+            "remote_catalog_rules_enabled = {}",
+            retry.remote_catalog_rules_enabled
+        )
+        .expect("writing to string should not fail");
+    }
     output.push('\n');
     for rule in &retry.rules {
         write_model_retry_rule_toml(output, rule);
@@ -4386,6 +4402,7 @@ auth_pool = "openai"
 max_overload_retries = 3
 overload_initial_delay_ms = 1000
 overload_max_delay_ms = 10000
+remote_catalog_rules_enabled = false
 
 [[model.retry.rules]]
 id = "unsupported-content-type"
@@ -4406,6 +4423,7 @@ message_contains = "Unsupported content type"
         assert_eq!(config.model.retry.max_overload_retries, 3);
         assert_eq!(config.model.retry.overload_initial_delay_ms, 1_000);
         assert_eq!(config.model.retry.overload_max_delay_ms, 10_000);
+        assert!(!config.model.retry.remote_catalog_rules_enabled);
         let rule = config
             .model
             .retry

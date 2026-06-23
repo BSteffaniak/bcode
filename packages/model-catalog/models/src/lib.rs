@@ -65,9 +65,76 @@ pub struct ProviderCatalog {
     /// Provider defaults used for discovered models without exact catalog metadata.
     #[serde(default)]
     pub defaults: Option<ModelCatalogDefaults>,
+    /// Descriptive provider error-handling metadata.
+    #[serde(default)]
+    pub error_handling: ProviderErrorHandlingMetadata,
     /// Models keyed by provider-native model id.
     #[serde(default)]
     pub models: BTreeMap<String, ModelCatalogEntry>,
+}
+
+/// Descriptive provider error-handling metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderErrorHandlingMetadata {
+    /// Provider-declared recoverable error patterns.
+    #[serde(default)]
+    pub recoverable_error_patterns: Vec<RecoverableErrorPattern>,
+}
+
+/// Provider-declared recoverable error pattern.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoverableErrorPattern {
+    /// Stable pattern identifier.
+    pub id: String,
+    /// Whether this pattern is enabled by default.
+    #[serde(default)]
+    pub enabled_by_default: bool,
+    /// Provider/model scope for this pattern.
+    #[serde(default)]
+    pub scope: RecoverableErrorPatternScope,
+    /// Error match conditions.
+    #[serde(default)]
+    pub r#match: RecoverableErrorPatternMatch,
+}
+
+/// Provider/model scope for a recoverable error pattern.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoverableErrorPatternScope {
+    /// Exact provider plugin id scope.
+    #[serde(default)]
+    pub provider_plugin_id: Option<String>,
+    /// Provider plugin id substring scope.
+    #[serde(default)]
+    pub provider_plugin_id_contains: Option<String>,
+    /// Exact model id scope.
+    #[serde(default)]
+    pub model_id: Option<String>,
+    /// Model id substring scope.
+    #[serde(default)]
+    pub model_id_contains: Option<String>,
+}
+
+/// Error match conditions for a recoverable error pattern.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoverableErrorPatternMatch {
+    /// Provider error category to match.
+    #[serde(default)]
+    pub category: Option<String>,
+    /// Provider error code to match exactly.
+    #[serde(default)]
+    pub code: Option<String>,
+    /// Provider error message to match exactly.
+    #[serde(default)]
+    pub message_equals: Option<String>,
+    /// Provider error message substring to match.
+    #[serde(default)]
+    pub message_contains: Option<String>,
+    /// Provider-native error message to match exactly.
+    #[serde(default)]
+    pub provider_message_equals: Option<String>,
+    /// Provider-native error message substring to match.
+    #[serde(default)]
+    pub provider_message_contains: Option<String>,
 }
 
 /// Default metadata for provider-discovered models without exact catalog entries.

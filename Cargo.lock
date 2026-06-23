@@ -1771,6 +1771,8 @@ dependencies = [
  "bcode_ipc",
  "bcode_metrics",
  "bcode_model",
+ "bcode_model_catalog",
+ "bcode_model_catalog_models",
  "bcode_plugin",
  "bcode_provider_auth",
  "bcode_ralph",

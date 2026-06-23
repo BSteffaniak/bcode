@@ -797,6 +797,25 @@ mod tests {
     use bcode_model::{ModelCacheInfo, ModelCapability, ModelVisibility};
 
     #[test]
+    fn catalog_loads_provider_error_handling_metadata() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let provider = catalog.provider("openai").expect("openai provider exists");
+
+        assert!(
+            provider
+                .error_handling
+                .recoverable_error_patterns
+                .iter()
+                .any(|pattern| {
+                    pattern.id == "bcode.openai-compatible.unsupported-content-type"
+                        && pattern.scope.provider_plugin_id.as_deref()
+                            == Some("bcode.openai-compatible")
+                        && pattern.r#match.code.as_deref() == Some("http_400")
+                })
+        );
+    }
+
+    #[test]
     fn catalog_enriches_exact_model_metadata_and_pricing() {
         let catalog = ModelCatalog::load_bundled().expect("catalog should load");
         let model = ModelInfo {

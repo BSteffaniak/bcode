@@ -22,6 +22,17 @@ tool_use = true
 structured_outputs = true
 prompt_cache = true
 
+[[error_handling.recoverable_error_patterns]]
+id = "bcode.openai-compatible.unsupported-content-type"
+enabled_by_default = true
+
+[error_handling.recoverable_error_patterns.scope]
+provider_plugin_id = "bcode.openai-compatible"
+
+[error_handling.recoverable_error_patterns.match]
+code = "http_400"
+message_contains = "Unsupported content type"
+
 [models."gpt-5"]
 model_id = "gpt-5"
 display_name = "GPT-5"
