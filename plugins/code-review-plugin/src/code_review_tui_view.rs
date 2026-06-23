@@ -7,8 +7,7 @@ use std::{
 
 use crate::code_review_tui::{CachedReviewFile, ReviewDraftComment, ReviewFile};
 use crate::code_review_tui_display::{
-    ReviewDisplayBuilder, ReviewDisplayRow, ReviewDisplayRowSource, ReviewDisplaySegment,
-    highlighted_code_segments_for_lines,
+    ReviewDisplayBuilder, ReviewDisplayRow, ReviewDisplayRowSource,
 };
 
 /// Semantic document rendered in the main code review pane.
@@ -27,7 +26,6 @@ impl ReviewViewDocument {
         syntax_highlighting: bool,
         cached_file: Option<&CachedReviewFile>,
         context_load_states: &BTreeMap<DiffContextKey, DiffContextLoadState>,
-        highlighted_file: Option<&HighlightedReviewFile>,
     ) -> Self {
         let display = ReviewDisplayBuilder::new()
             .syntax_highlighting(syntax_highlighting)
@@ -63,13 +61,7 @@ impl ReviewViewDocument {
                             if file.unavailable_reason.is_none() =>
                         {
                             push_expanded_context_rows(
-                                file_index,
-                                &key,
-                                file,
-                                highlighted_file,
-                                start_line,
-                                end_line,
-                                &mut rows,
+                                file_index, &key, file, start_line, end_line, &mut rows,
                             );
                         }
                         (_, Some(file)) => rows.push(context_status_row(
@@ -93,7 +85,6 @@ impl ReviewViewDocument {
                     rows.push(ReviewViewRow {
                         visual_row: 0,
                         source_row: None,
-                        file_line_number: None,
                         target: ReviewViewTarget::OmittedContext { key: key.clone() },
                         block: ReviewViewBlock::OmittedContext {
                             key: key.clone(),
@@ -139,7 +130,6 @@ impl ReviewViewDocument {
             .map(|(source_row, (line_number, content))| ReviewViewRow {
                 visual_row: source_row,
                 source_row: Some(source_row),
-                file_line_number: line_number,
                 target: line_number.map_or(
                     ReviewViewTarget::HunkHeader {
                         file_index,
@@ -174,7 +164,6 @@ impl ReviewViewDocument {
                 Some(ReviewViewRow {
                     visual_row: source_row,
                     source_row: Some(source_row),
-                    file_line_number: line_number,
                     target: ReviewViewTarget::SourceLine {
                         file_index,
                         source_row,
@@ -226,7 +215,6 @@ impl ReviewViewDocument {
                 rows.push(ReviewViewRow {
                     visual_row: 0,
                     source_row: None,
-                    file_line_number: None,
                     target: ReviewViewTarget::Thread {
                         thread_key: thread_key.clone(),
                     },
@@ -247,7 +235,6 @@ impl ReviewViewDocument {
                         rows.push(ReviewViewRow {
                             visual_row: 0,
                             source_row: None,
-                            file_line_number: None,
                             target: ReviewViewTarget::Comment {
                                 thread_key: thread_key.clone(),
                                 comment_index,
@@ -266,7 +253,6 @@ impl ReviewViewDocument {
                     rows.push(ReviewViewRow {
                         visual_row: 0,
                         source_row: None,
-                        file_line_number: None,
                         target: ReviewViewTarget::ThreadAction {
                             thread_key: thread_key.clone(),
                             action: action.id().to_string(),
@@ -373,8 +359,6 @@ pub struct ReviewViewRow {
     pub visual_row: usize,
     /// Commentable source/diff row represented by this row, if any.
     pub source_row: Option<usize>,
-    /// One-based source-code line rendered by this row, if any.
-    pub file_line_number: Option<u32>,
     /// Semantic selection/action target represented by this row.
     pub target: ReviewViewTarget,
     /// Renderable semantic block for this row.
@@ -557,36 +541,6 @@ impl ReviewThreadAction {
     }
 }
 
-/// Full-file syntax-highlighted display cache for a cached review file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HighlightedReviewFile {
-    /// File path used as syntax hint.
-    pub path: String,
-    /// Per-line syntax-highlighted segments.
-    pub line_segments: Vec<Vec<ReviewDisplaySegment>>,
-}
-
-impl HighlightedReviewFile {
-    /// Build full-file syntax highlighting from cached file contents.
-    #[must_use]
-    pub fn new(file: &CachedReviewFile) -> Self {
-        let lines = (0..file.line_spans.len())
-            .map(|index| file.line(index).unwrap_or_default())
-            .collect::<Vec<_>>();
-        Self {
-            path: file.path.clone(),
-            line_segments: highlighted_code_segments_for_lines(&file.path, &lines),
-        }
-    }
-
-    /// Return highlighted segments for a one-based source line.
-    #[must_use]
-    pub fn segments_for_line(&self, line_number: u32) -> Option<Vec<ReviewDisplaySegment>> {
-        let index = usize::try_from(line_number.checked_sub(1)?).ok()?;
-        self.line_segments.get(index).cloned()
-    }
-}
-
 /// Typed identity for an expandable hidden diff context block.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DiffContextKey {
@@ -703,7 +657,7 @@ impl ReviewThreadAnchor {
     }
 }
 
-fn view_row_for_display(
+const fn view_row_for_display(
     file_index: usize,
     source_row: usize,
     display_row: ReviewDisplayRow,
@@ -712,7 +666,6 @@ fn view_row_for_display(
     ReviewViewRow {
         visual_row: source_row,
         source_row: Some(source_row),
-        file_line_number: display_row.new_line.or(display_row.old_line),
         target,
         block: ReviewViewBlock::DisplayRow(display_row),
     }
@@ -765,7 +718,6 @@ fn context_status_row(
     ReviewViewRow {
         visual_row: 0,
         source_row: None,
-        file_line_number: None,
         target,
         block,
     }
@@ -775,7 +727,6 @@ fn push_expanded_context_rows(
     _file_index: usize,
     context_key: &DiffContextKey,
     cached_file: &CachedReviewFile,
-    _highlighted_file: Option<&HighlightedReviewFile>,
     start_line: u32,
     end_line: u32,
     rows: &mut Vec<ReviewViewRow>,
@@ -790,7 +741,6 @@ fn push_expanded_context_rows(
         rows.push(ReviewViewRow {
             visual_row: 0,
             source_row: None,
-            file_line_number: Some(line_number),
             target: ReviewViewTarget::ExpandedContextLine {
                 key: context_key.clone(),
                 line_number,
@@ -845,8 +795,8 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
-        DiffContextKey, DiffContextLoadState, HighlightedReviewFile, ReviewThreadAnchor,
-        ReviewViewBlock, ReviewViewDocument, ReviewViewTarget,
+        DiffContextKey, DiffContextLoadState, ReviewThreadAnchor, ReviewViewBlock,
+        ReviewViewDocument, ReviewViewTarget,
     };
     use crate::code_review_tui::{
         CachedReviewFile, ReviewDraftComment, ReviewFile, ReviewFileStatus, ReviewHunk, ReviewLine,
@@ -858,8 +808,7 @@ mod tests {
     fn diff_file_document_maps_visual_rows_to_semantic_targets() {
         let file = test_file();
 
-        let document =
-            ReviewViewDocument::build_diff_file(7, &file, true, None, &BTreeMap::new(), None);
+        let document = ReviewViewDocument::build_diff_file(7, &file, true, None, &BTreeMap::new());
 
         assert_eq!(document.rows.len(), 2);
         assert_eq!(
@@ -904,15 +853,14 @@ mod tests {
             severity: ReviewThreadSeverity::Info,
         };
 
-        let document =
-            ReviewViewDocument::build_diff_file(7, &file, false, None, &BTreeMap::new(), None)
-                .with_inline_draft_threads(
-                    7,
-                    std::iter::once((anchor.clone(), vec![comment])),
-                    &BTreeSet::new(),
-                    &BTreeSet::new(),
-                    true,
-                );
+        let document = ReviewViewDocument::build_diff_file(7, &file, false, None, &BTreeMap::new())
+            .with_inline_draft_threads(
+                7,
+                std::iter::once((anchor.clone(), vec![comment])),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                true,
+            );
 
         assert_eq!(document.rows.len(), 10);
         assert_eq!(document.rows[1].source_row, Some(1));
@@ -956,15 +904,14 @@ mod tests {
             severity: ReviewThreadSeverity::Info,
         };
 
-        let document =
-            ReviewViewDocument::build_diff_file(7, &file, false, None, &BTreeMap::new(), None)
-                .with_inline_draft_threads(
-                    7,
-                    std::iter::once((anchor, vec![comment])),
-                    &BTreeSet::new(),
-                    &BTreeSet::new(),
-                    true,
-                );
+        let document = ReviewViewDocument::build_diff_file(7, &file, false, None, &BTreeMap::new())
+            .with_inline_draft_threads(
+                7,
+                std::iter::once((anchor, vec![comment])),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                true,
+            );
 
         assert!(matches!(
             document.rows[3].block,
@@ -1032,7 +979,6 @@ mod tests {
             is_binary: false,
             unavailable_reason: None,
         };
-        let highlighted_file = HighlightedReviewFile::new(&cached_file);
         let context_key = DiffContextKey::new(7, 1, 2, 3);
         let mut context_states = BTreeMap::new();
         context_states.insert(context_key, DiffContextLoadState::Loaded);
@@ -1043,7 +989,6 @@ mod tests {
             true,
             Some(&cached_file),
             &context_states,
-            Some(&highlighted_file),
         );
 
         let expanded_row = document

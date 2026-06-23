@@ -1558,14 +1558,9 @@ fn render_view_row(
             reason,
             ..
         } => render_omitted_context_row(*hidden_line_count, *start_line, *end_line, Some(reason)),
-        ReviewViewBlock::DisplayRow(display_row) => render_source_view_row(
-            app,
-            view_row,
-            display_row,
-            syntax_highlighter,
-            can_highlight,
-            syntax_hint,
-        ),
+        ReviewViewBlock::DisplayRow(display_row) => {
+            render_source_view_row(app, view_row, display_row)
+        }
         ReviewViewBlock::FileLine {
             line_number,
             content,
@@ -1683,21 +1678,9 @@ fn render_source_view_row(
     app: &ReviewApp,
     view_row: &ReviewViewRow,
     display_row: &ReviewDisplayRow,
-    syntax_highlighter: SyntaxHighlighter,
-    can_highlight: bool,
-    syntax_hint: &str,
 ) -> RenderedRow {
     let Some(source_row) = view_row.source_row else {
-        return if view_row.file_line_number.is_some() {
-            render_display_row_as_source_code(
-                display_row,
-                syntax_highlighter,
-                can_highlight,
-                syntax_hint,
-            )
-        } else {
-            render_display_row(display_row)
-        };
+        return render_display_row(display_row);
     };
     let show_comment_affordance = source_row == app.selected_diff_line
         && matches!(
@@ -1939,48 +1922,6 @@ fn render_display_row_with_affordance(
         );
     }
     rendered
-}
-
-fn render_display_row_as_source_code(
-    row: &ReviewDisplayRow,
-    syntax_highlighter: SyntaxHighlighter,
-    can_highlight: bool,
-    syntax_hint: &str,
-) -> RenderedRow {
-    let old = row
-        .old_line
-        .map_or_else(|| "    ".to_string(), |line| format!("{line:>4}"));
-    let new = row
-        .new_line
-        .map_or_else(|| "    ".to_string(), |line| format!("{line:>4}"));
-    let row_style = row_style(row.source);
-    let marker = row.source.diff_marker().unwrap_or(' ');
-    let content = row
-        .segments
-        .iter()
-        .map(|segment| segment.text.as_str())
-        .collect::<String>();
-    let mut spans = vec![
-        Span::styled(
-            format!(" {old} {new} "),
-            row_style.patch(Style::new().fg(Color::BrightBlack)),
-        ),
-        Span::styled(
-            marker.to_string(),
-            row_style.patch(marker_style(row.source).add_modifier(Modifier::BOLD)),
-        ),
-    ];
-    spans.extend(highlighted_source_spans(
-        syntax_highlighter,
-        can_highlight,
-        syntax_hint,
-        &content,
-        row_style,
-    ));
-    RenderedRow {
-        line: Line::from_spans(spans),
-        style: row_style,
-    }
 }
 
 fn render_display_row(row: &ReviewDisplayRow) -> RenderedRow {
