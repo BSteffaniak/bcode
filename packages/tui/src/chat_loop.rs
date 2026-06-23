@@ -1629,7 +1629,7 @@ async fn handle_chat_key<W: Write>(
         .await;
     }
     if is_palette_open_key(context.services.keymap, stroke) {
-        loop_state.palette = Some(BmuxCommandPalette::new());
+        loop_state.palette = Some(palette_flow::open_palette(&context.services, chat).await);
         chat.app
             .set_status("command palette: type to filter, enter to run, esc close".to_owned());
         return Ok(true);

@@ -3084,6 +3084,65 @@ library = "libexample.dylib"
     }
 
     #[test]
+    fn static_bundled_plugins_can_be_disabled_by_selection() {
+        fn manifest(
+            _storage: &'static OnceLock<Option<std::ffi::CString>>,
+        ) -> *const std::ffi::c_char {
+            std::ptr::null()
+        }
+        fn lifecycle(_instance: *const std::ffi::c_void) -> i32 {
+            SERVICE_STATUS_OK
+        }
+        fn service(
+            _instance: *const std::ffi::c_void,
+            _input: *const u8,
+            _input_len: usize,
+            _output: *mut u8,
+            _cap: usize,
+            _len: *mut usize,
+        ) -> i32 {
+            SERVICE_STATUS_OK
+        }
+        fn event(_instance: *const std::ffi::c_void, _input: *const u8, _input_len: usize) -> i32 {
+            SERVICE_STATUS_OK
+        }
+        let static_plugins = [StaticBundledPlugin::new(
+            r#"
+id = "bcode.disabled"
+name = "Disabled"
+version = "0.0.1"
+
+[[services]]
+interface_id = "bcode.disabled/v1"
+
+[runtime]
+type = "native"
+abi_version = 1
+library = "libdisabled.dylib"
+"#,
+            StaticPluginVtable {
+                instance: std::ptr::null(),
+                manifest,
+                activate: lifecycle,
+                deactivate: lifecycle,
+                invoke_service: service,
+                invoke_service_streaming: test_streaming_service,
+                tui_registry: None,
+                handle_event: event,
+            },
+        )];
+        let selection = PluginSelection {
+            enabled: BTreeSet::new(),
+            disabled: BTreeSet::from(["bcode.disabled".to_string()]),
+        };
+
+        let selected = filter_selected_static_plugins(&static_plugins, &selection)
+            .expect("static manifest should parse");
+
+        assert!(selected.is_empty());
+    }
+
+    #[test]
     fn registered_plugins_expose_command_contributions() {
         let manifest = toml::from_str::<PluginManifest>(
             r#"

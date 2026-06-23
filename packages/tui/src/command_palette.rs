@@ -1,5 +1,6 @@
 //! TUI command palette state and actions.
 
+use bcode_plugin::PluginOwnedCommandContribution;
 use bmux_tui::palette::{CommandPaletteState, PaletteItem};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
@@ -50,7 +51,9 @@ pub enum PaletteCommand {
 }
 
 impl PaletteCommand {
-    const fn id(self) -> &'static str {
+    /// Return this command's stable ID.
+    #[must_use]
+    pub const fn id(self) -> &'static str {
         match self {
             Self::NewSession => "session.new",
             Self::SwitchSession => "session.switch",
@@ -113,8 +116,14 @@ impl BmuxCommandPalette {
     /// Create a command palette.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_plugin_commands(&[])
+    }
+
+    /// Create a command palette using manifest-declared plugin commands where available.
+    #[must_use]
+    pub fn with_plugin_commands(commands: &[PluginOwnedCommandContribution]) -> Self {
         Self {
-            items: palette_items(),
+            items: palette_items(commands),
             state: CommandPaletteState::default(),
         }
     }
@@ -140,7 +149,55 @@ impl BmuxCommandPalette {
 }
 
 #[allow(clippy::too_many_lines)]
-fn palette_items() -> Vec<PaletteItem> {
+fn palette_items(plugin_commands: &[PluginOwnedCommandContribution]) -> Vec<PaletteItem> {
+    let mut items = default_palette_items();
+    apply_plugin_command_contributions(&mut items, plugin_commands);
+    items
+}
+
+fn apply_plugin_command_contributions(
+    items: &mut Vec<PaletteItem>,
+    plugin_commands: &[PluginOwnedCommandContribution],
+) {
+    for contribution in plugin_commands {
+        let command = &contribution.command;
+        if PaletteCommand::from_id(&command.id).is_none() {
+            continue;
+        }
+        let description = command.description.as_deref().unwrap_or_default();
+        let replacement = raw_item(
+            &command.id,
+            &command.title,
+            description,
+            &plugin_command_search_text(&contribution.plugin_id, command),
+        );
+        if let Some(existing) = items.iter_mut().find(|item| item.id == command.id) {
+            *existing = replacement;
+        } else {
+            items.push(replacement);
+        }
+    }
+}
+
+fn plugin_command_search_text(
+    plugin_id: &str,
+    command: &bcode_plugin::PluginCommandContribution,
+) -> String {
+    [
+        command.id.as_str(),
+        command.title.as_str(),
+        command.description.as_deref().unwrap_or_default(),
+        command.category.as_deref().unwrap_or_default(),
+        plugin_id,
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
+#[allow(clippy::too_many_lines)]
+fn default_palette_items() -> Vec<PaletteItem> {
     vec![
         item(
             PaletteCommand::NewSession,
@@ -266,8 +323,12 @@ fn palette_items() -> Vec<PaletteItem> {
 }
 
 fn item(command: PaletteCommand, title: &str, description: &str, search_text: &str) -> PaletteItem {
+    raw_item(command.id(), title, description, search_text)
+}
+
+fn raw_item(id: &str, title: &str, description: &str, search_text: &str) -> PaletteItem {
     PaletteItem::new(
-        command.id(),
+        id,
         Line::from_spans(vec![
             Span::styled(title.to_owned(), Style::new().add_modifier(Modifier::BOLD)),
             Span::raw("  "),
@@ -275,4 +336,53 @@ fn item(command: PaletteCommand, title: &str, description: &str, search_text: &s
         ]),
     )
     .search_text(search_text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugin_command_contribution_replaces_known_palette_item() {
+        let palette = BmuxCommandPalette::with_plugin_commands(&[PluginOwnedCommandContribution {
+            plugin_id: "bcode.worktree".to_string(),
+            command: bcode_plugin::PluginCommandContribution {
+                id: PaletteCommand::ListWorktrees.id().to_string(),
+                title: "Worktrees From Plugin".to_string(),
+                description: Some("Plugin-owned command".to_string()),
+                category: Some("worktree".to_string()),
+                surface: Some("palette".to_string()),
+            },
+        }]);
+        let items = palette.cloned_items();
+        let item = items
+            .iter()
+            .find(|item| item.id == PaletteCommand::ListWorktrees.id())
+            .expect("worktree item should exist");
+
+        let rendered = format!("{:?}", item.label);
+        assert!(rendered.contains("Worktrees From Plugin"));
+        assert_eq!(palette.command_at(0), Some(PaletteCommand::NewSession));
+    }
+
+    #[test]
+    fn unknown_plugin_command_is_ignored_by_core_palette_until_handler_exists() {
+        let palette = BmuxCommandPalette::with_plugin_commands(&[PluginOwnedCommandContribution {
+            plugin_id: "bcode.example".to_string(),
+            command: bcode_plugin::PluginCommandContribution {
+                id: "example.dynamic".to_string(),
+                title: "Dynamic".to_string(),
+                description: None,
+                category: None,
+                surface: Some("palette".to_string()),
+            },
+        }]);
+
+        assert!(
+            palette
+                .cloned_items()
+                .iter()
+                .all(|item| item.id != "example.dynamic")
+        );
+    }
 }
