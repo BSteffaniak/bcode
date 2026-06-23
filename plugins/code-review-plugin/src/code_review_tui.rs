@@ -1906,6 +1906,8 @@ pub enum ReviewMouseAction {
     EditThread,
     DeleteThread,
     OpenThreadSession,
+    CommentAction(ReviewCommentAction),
+    CancelComment,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3010,6 +3012,8 @@ pub enum ReviewCommentAction {
     SaveDraft,
     /// Ask Bcode using the text as the review question.
     AskBcode,
+    /// Publish the text as a review comment when a publisher supports it.
+    Publish,
 }
 
 impl ReviewCommentAction {
@@ -3018,7 +3022,8 @@ impl ReviewCommentAction {
     pub const fn next(self) -> Self {
         match self {
             Self::SaveDraft => Self::AskBcode,
-            Self::AskBcode => Self::SaveDraft,
+            Self::AskBcode => Self::Publish,
+            Self::Publish => Self::SaveDraft,
         }
     }
 
@@ -3026,8 +3031,9 @@ impl ReviewCommentAction {
     #[must_use]
     pub const fn previous(self) -> Self {
         match self {
-            Self::SaveDraft => Self::AskBcode,
+            Self::SaveDraft => Self::Publish,
             Self::AskBcode => Self::SaveDraft,
+            Self::Publish => Self::AskBcode,
         }
     }
 
@@ -3037,6 +3043,7 @@ impl ReviewCommentAction {
         match self {
             Self::SaveDraft => "save draft",
             Self::AskBcode => "ask Bcode",
+            Self::Publish => "publish",
         }
     }
 }
@@ -4727,7 +4734,39 @@ impl ReviewApp {
             ReviewMouseAction::EditThread => self.open_latest_draft_editor(),
             ReviewMouseAction::DeleteThread => self.delete_latest_draft_at_selection(),
             ReviewMouseAction::OpenThreadSession => self.open_linked_session_at_selection(),
+            ReviewMouseAction::CommentAction(action) => self.submit_comment_editor_action(action),
+            ReviewMouseAction::CancelComment => {
+                self.comment_editor = None;
+                self.status_message = Some("comment draft canceled".to_string());
+                true
+            }
         }
+    }
+
+    /// Return the last rendered diff area, if known.
+    #[must_use]
+    pub const fn diff_area(&self) -> Option<Rect> {
+        self.last_diff_area
+    }
+
+    /// Return the visual row for the selected review target.
+    #[must_use]
+    pub fn selected_visual_row(&self) -> usize {
+        if let Some(target) = &self.selected_view_target
+            && let Some(document) = self.current_review_view_document()
+            && let Some(row) = document.rows.iter().find(|row| &row.target == target)
+        {
+            return row.visual_row;
+        }
+        self.selected_diff_line
+    }
+
+    /// Return true when an inline-review publisher is currently available.
+    #[must_use]
+    pub fn has_inline_comment_publisher(&self) -> bool {
+        self.publishers
+            .iter()
+            .any(|publisher| publisher.capabilities.supports_inline_comments)
     }
 
     /// Set sidebar mode directly.
@@ -7025,6 +7064,9 @@ impl ReviewApp {
                 ReviewCommentAction::AskBcode => {
                     "select a diff line or range to ask Bcode".to_string()
                 }
+                ReviewCommentAction::Publish => {
+                    "select a diff line or range to publish".to_string()
+                }
             });
             return true;
         };
@@ -7101,6 +7143,20 @@ impl ReviewApp {
         true
     }
 
+    /// Submit the active comment composer with an explicit action.
+    pub fn submit_comment_editor_action(&mut self, action: ReviewCommentAction) -> bool {
+        let Some(editor) = &mut self.comment_editor else {
+            return false;
+        };
+        if !matches!(editor.mode, ReviewCommentEditorMode::Create) {
+            self.status_message =
+                Some("editing an existing draft; enter saves changes".to_string());
+            return true;
+        }
+        editor.action = action;
+        self.save_comment_editor()
+    }
+
     /// Save the active draft comment editor.
     pub fn save_comment_editor(&mut self) -> bool {
         let Some(editor) = self.comment_editor.take() else {
@@ -7134,6 +7190,26 @@ impl ReviewApp {
                 }
                 ReviewCommentAction::AskBcode => {
                     self.queue_bcode_question(&anchor, text);
+                }
+                ReviewCommentAction::Publish => {
+                    self.draft_comments.entry(anchor.clone()).or_default().push(
+                        ReviewDraftComment {
+                            id: None,
+                            body: text.clone(),
+                            persisted: false,
+                            created_at_ms: None,
+                            updated_at_ms: None,
+                            session_id: None,
+                            thread_kind: ReviewThreadKind::Note,
+                            severity: ReviewThreadSeverity::Info,
+                        },
+                    );
+                    self.pending_draft_save = Some(PendingDraftSave { anchor, body: text });
+                    self.sync_selected_thread_to_anchor();
+                    self.publish_readiness_ack = true;
+                    self.publish_state = Some(ReviewPublishState::Checklist);
+                    self.status_message =
+                        Some("saved draft comment; ready to publish review".to_string());
                 }
             },
             ReviewCommentEditorMode::Edit {

@@ -185,7 +185,7 @@ fn render_main_content(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     }
 }
 
-fn render_overlays(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_overlays(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if app.help_visible {
         render_help(app, area, frame);
     }
@@ -2465,8 +2465,9 @@ fn render_publish_preview(
     }
 }
 
-fn render_comment_editor(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
-    let Some(editor) = &app.comment_editor else {
+fn render_comment_editor(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+    let editor = app.comment_editor.clone();
+    let Some(editor) = editor.as_ref() else {
         return;
     };
     let width = area.width.min(72);
@@ -2474,12 +2475,44 @@ fn render_comment_editor(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if width < 20 || height < 5 {
         return;
     }
-    let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
-    let y = area
-        .y
-        .saturating_add(area.height.saturating_sub(height) / 2);
+    let diff_area = app.diff_area();
+    let x = diff_area.map_or_else(
+        || area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        |diff_area| {
+            diff_area
+                .x
+                .saturating_add(2)
+                .min(area.right().saturating_sub(width))
+        },
+    );
+    let y = comment_editor_y(app, area, height);
     let popup = Rect::new(x, y, width, height);
     frame.fill(popup, " ", Style::new().fg(Color::White).bg(Color::Black));
+    render_comment_editor_header(editor, popup, frame);
+    let text_height = usize::from(height.saturating_sub(4));
+    render_comment_editor_body(editor, popup, text_height, frame);
+    if editor.buffer.text().is_empty() {
+        frame.write_line(
+            Rect::new(
+                popup.x.saturating_add(1),
+                popup.y.saturating_add(2),
+                popup.width.saturating_sub(2),
+                1,
+            ),
+            &Line::from_spans(vec![Span::styled(
+                "write a review comment or question...",
+                Style::new().fg(Color::BrightBlack).bg(Color::Black),
+            )]),
+        );
+    }
+    render_comment_editor_footer(app, editor, popup, frame);
+}
+
+fn render_comment_editor_header(
+    editor: &crate::code_review_tui::ReviewCommentEditor,
+    popup: Rect,
+    frame: &mut Frame<'_>,
+) {
     let title = if editor.preview {
         " Review comment preview "
     } else {
@@ -2521,22 +2554,14 @@ fn render_comment_editor(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             Style::new().fg(Color::BrightBlack).bg(Color::Black),
         )]),
     );
-    let text_height = usize::from(height.saturating_sub(4));
-    render_comment_editor_body(editor, popup, text_height, frame);
-    if editor.buffer.text().is_empty() {
-        frame.write_line(
-            Rect::new(
-                popup.x.saturating_add(1),
-                popup.y.saturating_add(2),
-                popup.width.saturating_sub(2),
-                1,
-            ),
-            &Line::from_spans(vec![Span::styled(
-                "write a review comment or question...",
-                Style::new().fg(Color::BrightBlack).bg(Color::Black),
-            )]),
-        );
-    }
+}
+
+fn render_comment_editor_footer(
+    app: &mut ReviewApp,
+    editor: &crate::code_review_tui::ReviewCommentEditor,
+    popup: Rect,
+    frame: &mut Frame<'_>,
+) {
     let footer = comment_editor_footer(editor);
     frame.write_line(
         Rect::new(
@@ -2550,6 +2575,74 @@ fn render_comment_editor(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             Style::new().fg(Color::Black).bg(Color::Yellow),
         )]),
     );
+    let mut footer_x = popup.x.saturating_add(1);
+    if matches!(
+        editor.mode,
+        crate::code_review_tui::ReviewCommentEditorMode::Create
+    ) {
+        footer_x = register_comment_action_region(
+            app,
+            footer_x,
+            popup.bottom().saturating_sub(1),
+            "save draft",
+            crate::code_review_tui::ReviewMouseAction::CommentAction(
+                crate::code_review_tui::ReviewCommentAction::SaveDraft,
+            ),
+        );
+        footer_x = register_comment_action_region(
+            app,
+            footer_x,
+            popup.bottom().saturating_sub(1),
+            "ask Bcode",
+            crate::code_review_tui::ReviewMouseAction::CommentAction(
+                crate::code_review_tui::ReviewCommentAction::AskBcode,
+            ),
+        );
+        footer_x = register_comment_action_region(
+            app,
+            footer_x,
+            popup.bottom().saturating_sub(1),
+            "publish",
+            crate::code_review_tui::ReviewMouseAction::CommentAction(
+                crate::code_review_tui::ReviewCommentAction::Publish,
+            ),
+        );
+    }
+    let _ = register_comment_action_region(
+        app,
+        footer_x,
+        popup.bottom().saturating_sub(1),
+        "cancel",
+        crate::code_review_tui::ReviewMouseAction::CancelComment,
+    );
+}
+
+fn comment_editor_y(app: &ReviewApp, area: Rect, height: u16) -> u16 {
+    let Some(diff_area) = app.diff_area() else {
+        return area
+            .y
+            .saturating_add(area.height.saturating_sub(height) / 2);
+    };
+    let selected_visual_row = app.selected_visual_row();
+    let visible_offset = selected_visual_row.saturating_sub(app.diff_scroll);
+    let anchor_y = diff_area
+        .y
+        .saturating_add(u16::try_from(visible_offset).unwrap_or(u16::MAX))
+        .saturating_add(1);
+    let max_y = area.bottom().saturating_sub(height);
+    anchor_y.min(max_y).max(area.y)
+}
+
+fn register_comment_action_region(
+    app: &mut ReviewApp,
+    x: u16,
+    y: u16,
+    label: &'static str,
+    action: crate::code_review_tui::ReviewMouseAction,
+) -> u16 {
+    let width = u16::try_from(label.len().saturating_add(2)).unwrap_or(u16::MAX);
+    app.register_mouse_region(Rect::new(x, y, width, 1), action, label);
+    x.saturating_add(width).saturating_add(1)
 }
 
 fn comment_editor_footer(editor: &crate::code_review_tui::ReviewCommentEditor) -> String {
@@ -2567,10 +2660,15 @@ fn comment_editor_footer(editor: &crate::code_review_tui::ReviewCommentEditor) -
         } else {
             " ask Bcode "
         };
-        if editor.preview {
-            format!(" ←/→ action  ctrl+p edit  enter {save}/{ask}  esc cancel ")
+        let publish = if editor.action == crate::code_review_tui::ReviewCommentAction::Publish {
+            "[publish]"
         } else {
-            format!(" tab/←/→ action  ctrl+p preview  enter {save}/{ask}  esc cancel ")
+            " publish "
+        };
+        if editor.preview {
+            format!(" ←/→ action  ctrl+p edit  enter {save}/{ask}/{publish}  esc cancel ")
+        } else {
+            format!(" tab/←/→ action  ctrl+p preview  enter {save}/{ask}/{publish}  esc cancel ")
         }
     } else if editor.preview {
         " ctrl+p edit  enter/ctrl+s save edit  esc cancel ".to_string()
