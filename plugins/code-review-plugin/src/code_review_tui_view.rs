@@ -43,12 +43,15 @@ impl ReviewViewDocument {
             && first_hunk.new_start > 1
         {
             push_diff_context_rows(
-                file_index,
-                0,
+                DiffContextRange {
+                    file_index,
+                    hunk_index: 0,
+                    placement: DiffContextPlacement::Top,
+                    start_line: 1,
+                    end_line: first_hunk.new_start.saturating_sub(1),
+                },
                 cached_file,
                 context_load_states,
-                1,
-                first_hunk.new_start.saturating_sub(1),
                 &mut rows,
             );
         }
@@ -61,12 +64,15 @@ impl ReviewViewDocument {
                 let start_line = previous_new_line.saturating_add(1);
                 let end_line = hunk.new_start.saturating_sub(1);
                 push_diff_context_rows(
-                    file_index,
-                    hunk_index,
+                    DiffContextRange {
+                        file_index,
+                        hunk_index,
+                        placement: DiffContextPlacement::Middle,
+                        start_line,
+                        end_line,
+                    },
                     cached_file,
                     context_load_states,
-                    start_line,
-                    end_line,
                     &mut rows,
                 );
             }
@@ -98,12 +104,15 @@ impl ReviewViewDocument {
             let total_lines = u32::try_from(cached_file.line_spans.len()).unwrap_or(u32::MAX);
             if total_lines > previous_new_line {
                 push_diff_context_rows(
-                    file_index,
-                    file.hunks.len(),
+                    DiffContextRange {
+                        file_index,
+                        hunk_index: file.hunks.len(),
+                        placement: DiffContextPlacement::Bottom,
+                        start_line: previous_new_line.saturating_add(1),
+                        end_line: total_lines,
+                    },
                     Some(cached_file),
                     context_load_states,
-                    previous_new_line.saturating_add(1),
-                    total_lines,
                     &mut rows,
                 );
             }
@@ -532,6 +541,15 @@ impl ReviewThreadAction {
     }
 }
 
+/// Direction to reveal source lines from a hidden diff context range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DiffContextDirection {
+    /// Reveal from the start of the hidden range toward later lines.
+    Down,
+    /// Reveal from the end of the hidden range toward earlier lines.
+    Up,
+}
+
 /// Typed identity for an expandable hidden diff context block.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DiffContextKey {
@@ -543,17 +561,38 @@ pub struct DiffContextKey {
     pub start_line: u32,
     /// One-based final hidden new-file line.
     pub end_line: u32,
+    /// Direction to reveal lines from this hidden range.
+    pub direction: DiffContextDirection,
 }
 
 impl DiffContextKey {
     /// Create a diff context key.
     #[must_use]
     pub const fn new(file_index: usize, hunk_index: usize, start_line: u32, end_line: u32) -> Self {
+        Self::with_direction(
+            file_index,
+            hunk_index,
+            start_line,
+            end_line,
+            DiffContextDirection::Down,
+        )
+    }
+
+    /// Create a diff context key with an explicit expansion direction.
+    #[must_use]
+    pub const fn with_direction(
+        file_index: usize,
+        hunk_index: usize,
+        start_line: u32,
+        end_line: u32,
+        direction: DiffContextDirection,
+    ) -> Self {
         Self {
             file_index,
             hunk_index,
             start_line,
             end_line,
+            direction,
         }
     }
 }
@@ -562,8 +601,8 @@ impl fmt::Display for DiffContextKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "{}:{}:{}-{}",
-            self.file_index, self.hunk_index, self.start_line, self.end_line
+            "{}:{}:{}-{}:{:?}",
+            self.file_index, self.hunk_index, self.start_line, self.end_line, self.direction
         )
     }
 }
@@ -678,98 +717,176 @@ fn hunk_start_rows(file: &ReviewFile) -> Vec<usize> {
     rows
 }
 
-fn push_diff_context_rows(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffContextPlacement {
+    Top,
+    Middle,
+    Bottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiffContextRange {
     file_index: usize,
     hunk_index: usize,
-    cached_file: Option<&CachedReviewFile>,
-    context_load_states: &BTreeMap<DiffContextKey, DiffContextLoadState>,
+    placement: DiffContextPlacement,
     start_line: u32,
     end_line: u32,
+}
+
+impl DiffContextRange {
+    const fn key(self, direction: DiffContextDirection) -> DiffContextKey {
+        DiffContextKey::with_direction(
+            self.file_index,
+            self.hunk_index,
+            self.start_line,
+            self.end_line,
+            direction,
+        )
+    }
+}
+
+fn push_diff_context_rows(
+    range: DiffContextRange,
+    cached_file: Option<&CachedReviewFile>,
+    context_load_states: &BTreeMap<DiffContextKey, DiffContextLoadState>,
     rows: &mut Vec<ReviewViewRow>,
 ) {
-    let key = DiffContextKey::new(file_index, hunk_index, start_line, end_line);
+    let directions = match range.placement {
+        DiffContextPlacement::Top => &[DiffContextDirection::Up][..],
+        DiffContextPlacement::Middle => {
+            if hidden_line_count(range.start_line, range.end_line)
+                > usize::try_from(CONTEXT_EXPAND_STEP).unwrap_or(usize::MAX)
+            {
+                &[DiffContextDirection::Down, DiffContextDirection::Up][..]
+            } else {
+                &[DiffContextDirection::Down][..]
+            }
+        }
+        DiffContextPlacement::Bottom => &[DiffContextDirection::Down][..],
+    };
+    for direction in directions {
+        push_directed_diff_context_row(range, *direction, cached_file, context_load_states, rows);
+    }
+}
+
+fn push_directed_diff_context_row(
+    range: DiffContextRange,
+    direction: DiffContextDirection,
+    cached_file: Option<&CachedReviewFile>,
+    context_load_states: &BTreeMap<DiffContextKey, DiffContextLoadState>,
+    rows: &mut Vec<ReviewViewRow>,
+) {
+    let key = range.key(direction);
     if let Some(load_state) = context_load_states.get(&key) {
         match (load_state, cached_file) {
-            (DiffContextLoadState::Unavailable(reason), _) => {
-                rows.push(context_status_row(
-                    key,
-                    hidden_line_count(start_line, end_line),
-                    start_line,
-                    end_line,
-                    Some(reason.clone()),
-                ));
-            }
+            (DiffContextLoadState::Unavailable(reason), _) => rows.push(context_status_row(
+                key,
+                hidden_line_count(range.start_line, range.end_line),
+                range.start_line,
+                range.end_line,
+                Some(reason.clone()),
+            )),
             (DiffContextLoadState::Loaded, Some(file)) if file.unavailable_reason.is_none() => {
                 push_incremental_expanded_context_rows(
                     &key,
+                    range,
                     file,
                     context_load_states,
-                    start_line,
-                    end_line,
                     rows,
                 );
             }
             (_, Some(file)) => rows.push(context_status_row(
                 key,
-                hidden_line_count(start_line, end_line),
-                start_line,
-                end_line,
+                hidden_line_count(range.start_line, range.end_line),
+                range.start_line,
+                range.end_line,
                 file.unavailable_reason.clone(),
             )),
-            (DiffContextLoadState::Loading, _) | (_, None) => {
-                rows.push(context_status_row(
-                    key,
-                    hidden_line_count(start_line, end_line),
-                    start_line,
-                    end_line,
-                    None,
-                ));
-            }
+            (DiffContextLoadState::Loading, _) | (_, None) => rows.push(context_status_row(
+                key,
+                hidden_line_count(range.start_line, range.end_line),
+                range.start_line,
+                range.end_line,
+                None,
+            )),
         }
     } else {
-        rows.push(ReviewViewRow {
-            visual_row: 0,
-            source_row: None,
-            target: ReviewViewTarget::OmittedContext { key: key.clone() },
-            block: ReviewViewBlock::OmittedContext {
-                key,
-                hidden_line_count: hidden_line_count(start_line, end_line),
-                start_line,
-                end_line,
-            },
-        });
+        rows.push(omitted_context_row(key, range));
     }
 }
 
 fn push_incremental_expanded_context_rows(
     context_key: &DiffContextKey,
+    range: DiffContextRange,
     cached_file: &CachedReviewFile,
     context_load_states: &BTreeMap<DiffContextKey, DiffContextLoadState>,
-    start_line: u32,
-    end_line: u32,
     rows: &mut Vec<ReviewViewRow>,
 ) {
-    let expanded_end_line = start_line
-        .saturating_add(CONTEXT_EXPAND_STEP.saturating_sub(1))
-        .min(end_line);
-    push_expanded_context_rows(
-        context_key,
-        cached_file,
-        start_line,
-        expanded_end_line,
-        rows,
-    );
-    let remaining_start_line = expanded_end_line.saturating_add(1);
-    if remaining_start_line <= end_line {
-        push_diff_context_rows(
-            context_key.file_index,
-            context_key.hunk_index,
-            Some(cached_file),
-            context_load_states,
-            remaining_start_line,
-            end_line,
-            rows,
-        );
+    match context_key.direction {
+        DiffContextDirection::Down => {
+            let expanded_end_line = range
+                .start_line
+                .saturating_add(CONTEXT_EXPAND_STEP.saturating_sub(1))
+                .min(range.end_line);
+            push_expanded_context_rows(
+                context_key,
+                cached_file,
+                range.start_line,
+                expanded_end_line,
+                rows,
+            );
+            let remaining_start_line = expanded_end_line.saturating_add(1);
+            if remaining_start_line <= range.end_line {
+                push_diff_context_rows(
+                    DiffContextRange {
+                        start_line: remaining_start_line,
+                        ..range
+                    },
+                    Some(cached_file),
+                    context_load_states,
+                    rows,
+                );
+            }
+        }
+        DiffContextDirection::Up => {
+            let expanded_start_line = range
+                .end_line
+                .saturating_sub(CONTEXT_EXPAND_STEP.saturating_sub(1))
+                .max(range.start_line);
+            let remaining_end_line = expanded_start_line.saturating_sub(1);
+            if range.start_line <= remaining_end_line {
+                push_diff_context_rows(
+                    DiffContextRange {
+                        end_line: remaining_end_line,
+                        ..range
+                    },
+                    Some(cached_file),
+                    context_load_states,
+                    rows,
+                );
+            }
+            push_expanded_context_rows(
+                context_key,
+                cached_file,
+                expanded_start_line,
+                range.end_line,
+                rows,
+            );
+        }
+    }
+}
+
+fn omitted_context_row(key: DiffContextKey, range: DiffContextRange) -> ReviewViewRow {
+    ReviewViewRow {
+        visual_row: 0,
+        source_row: None,
+        target: ReviewViewTarget::OmittedContext { key: key.clone() },
+        block: ReviewViewBlock::OmittedContext {
+            key,
+            hidden_line_count: hidden_line_count(range.start_line, range.end_line),
+            start_line: range.start_line,
+            end_line: range.end_line,
+        },
     }
 }
 
@@ -879,8 +996,8 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
-        DiffContextKey, DiffContextLoadState, ReviewThreadAnchor, ReviewViewBlock,
-        ReviewViewDocument, ReviewViewTarget,
+        DiffContextDirection, DiffContextKey, DiffContextLoadState, ReviewThreadAnchor,
+        ReviewViewBlock, ReviewViewDocument, ReviewViewTarget,
     };
     use crate::code_review_tui::{
         CachedReviewFile, ReviewDraftComment, ReviewFile, ReviewFileStatus, ReviewHunk, ReviewLine,
@@ -1150,7 +1267,7 @@ mod tests {
         let cached_file = cached_review_file("src/lib.rs", content);
         let mut context_states = BTreeMap::new();
         context_states.insert(
-            DiffContextKey::new(7, 1, 2, 51),
+            DiffContextKey::with_direction(7, 1, 2, 51, DiffContextDirection::Down),
             DiffContextLoadState::Loaded,
         );
 
@@ -1185,11 +1302,11 @@ mod tests {
         let cached_file = cached_review_file("src/lib.rs", content);
         let mut context_states = BTreeMap::new();
         context_states.insert(
-            DiffContextKey::new(7, 1, 2, 51),
+            DiffContextKey::with_direction(7, 1, 2, 51, DiffContextDirection::Down),
             DiffContextLoadState::Loaded,
         );
         context_states.insert(
-            DiffContextKey::new(7, 1, 22, 51),
+            DiffContextKey::with_direction(7, 1, 22, 51, DiffContextDirection::Down),
             DiffContextLoadState::Loaded,
         );
 

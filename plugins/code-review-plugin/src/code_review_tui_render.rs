@@ -22,7 +22,8 @@ use crate::code_review_tui_display::{
     ReviewDisplayRow, ReviewDisplayRowSource, ReviewDisplaySegment, ReviewDisplayTextRole,
 };
 use crate::code_review_tui_view::{
-    ReviewThreadAction, ReviewViewBlock, ReviewViewDocument, ReviewViewRow, ReviewViewTarget,
+    DiffContextDirection, ReviewThreadAction, ReviewViewBlock, ReviewViewDocument, ReviewViewRow,
+    ReviewViewTarget,
 };
 use bcode_code_review_models::ReviewSource;
 
@@ -1464,18 +1465,26 @@ fn render_view_document(
 }
 
 fn render_omitted_context_row(
+    direction: DiffContextDirection,
     hidden_line_count: usize,
     start_line: u32,
     end_line: u32,
     reason: Option<&str>,
 ) -> RenderedRow {
+    let step = hidden_line_count.min(20);
+    let action = match direction {
+        DiffContextDirection::Down => format!("expand next {step}"),
+        DiffContextDirection::Up => format!("expand previous {step}"),
+    };
     let (style, text) = reason.map_or_else(
         || {
             (
                 Style::new()
                     .fg(Color::BrightBlack)
                     .bg(Color::Rgb(18, 18, 18)),
-                format!(" ⋯ loading {hidden_line_count} hidden lines ({start_line}-{end_line})… "),
+                format!(
+                    " ⋯ {hidden_line_count} hidden lines ({start_line}-{end_line})  [{action}] "
+                ),
             )
         },
         |reason| {
@@ -1539,25 +1548,11 @@ fn render_view_row(
     width: u16,
 ) -> RenderedRow {
     match &view_row.block {
-        ReviewViewBlock::OmittedContext {
-            hidden_line_count,
-            start_line,
-            end_line,
-            ..
+        ReviewViewBlock::OmittedContext { .. }
+        | ReviewViewBlock::LoadingContext { .. }
+        | ReviewViewBlock::UnavailableContext { .. } => {
+            render_context_status_view_row(&view_row.block)
         }
-        | ReviewViewBlock::LoadingContext {
-            hidden_line_count,
-            start_line,
-            end_line,
-            ..
-        } => render_omitted_context_row(*hidden_line_count, *start_line, *end_line, None),
-        ReviewViewBlock::UnavailableContext {
-            hidden_line_count,
-            start_line,
-            end_line,
-            reason,
-            ..
-        } => render_omitted_context_row(*hidden_line_count, *start_line, *end_line, Some(reason)),
         ReviewViewBlock::DisplayRow(display_row) => {
             render_source_view_row(app, view_row, display_row)
         }
@@ -1671,6 +1666,43 @@ fn render_inline_thread_action(action: ReviewThreadAction) -> RenderedRow {
             Span::styled(format!("] {}", action.label()), style),
         ]),
         style,
+    }
+}
+
+fn render_context_status_view_row(block: &ReviewViewBlock) -> RenderedRow {
+    match block {
+        ReviewViewBlock::OmittedContext {
+            key,
+            hidden_line_count,
+            start_line,
+            end_line,
+        }
+        | ReviewViewBlock::LoadingContext {
+            key,
+            hidden_line_count,
+            start_line,
+            end_line,
+        } => render_omitted_context_row(
+            key.direction,
+            *hidden_line_count,
+            *start_line,
+            *end_line,
+            None,
+        ),
+        ReviewViewBlock::UnavailableContext {
+            key,
+            hidden_line_count,
+            start_line,
+            end_line,
+            reason,
+        } => render_omitted_context_row(
+            key.direction,
+            *hidden_line_count,
+            *start_line,
+            *end_line,
+            Some(reason),
+        ),
+        _ => unreachable!("context status renderer only accepts context status blocks"),
     }
 }
 
