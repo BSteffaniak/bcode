@@ -7860,13 +7860,13 @@ fn decode_partial_json_string_from_value(value: &str, max_chars: usize) -> Parti
 struct ModelTurnRecoveryState {
     retried_after_context_overflow: bool,
     retried_after_malformed_tool_arguments: bool,
-    overload_retry_attempts: u8,
+    retry_attempts: BTreeMap<String, u8>,
     retry_instruction: Option<&'static str>,
 }
 
 impl ModelTurnRecoveryState {
-    const fn record_successful_provider_round(&mut self) {
-        self.overload_retry_attempts = 0;
+    fn record_successful_provider_round(&mut self) {
+        self.retry_attempts.clear();
         self.retry_instruction = None;
     }
 }
@@ -8944,7 +8944,7 @@ async fn run_model_turn_inner(
             recovery.record_successful_provider_round();
         }
         if let Some(completion) = outcome.completion.clone() {
-            append_deferred_provider_error_if_needed(state, session_id, &outcome).await;
+            append_deferred_provider_error_if_needed(state, session_id, &outcome, &selection).await;
             return completion;
         }
         match outcome.stop_reason {
@@ -9002,19 +9002,6 @@ async fn maybe_retry_after_provider_error(
         return ModelTurnRetry::Continue;
     }
 
-    if should_retry_after_overload_error(state, error, recovery.overload_retry_attempts) {
-        recovery.overload_retry_attempts = recovery.overload_retry_attempts.saturating_add(1);
-        return retry_after_overload_error(
-            state,
-            session_id,
-            context.turn_id,
-            error,
-            recovery.overload_retry_attempts,
-            context.cancel_state,
-        )
-        .await;
-    }
-
     if should_retry_after_context_overflow(state, error, recovery.retried_after_context_overflow) {
         recovery.retried_after_context_overflow = true;
         return match compact_session_after_context_overflow(
@@ -9031,15 +9018,143 @@ async fn maybe_retry_after_provider_error(
         };
     }
 
+    if let Some(policy) = matching_provider_retry_policy(state, error, context.selection) {
+        let attempts = recovery
+            .retry_attempts
+            .entry(policy.id.clone())
+            .or_default();
+        if *attempts < policy.max_retries {
+            *attempts = attempts.saturating_add(1);
+            return retry_after_provider_error(
+                state,
+                session_id,
+                context.turn_id,
+                error,
+                &policy,
+                *attempts,
+                context.cancel_state,
+            )
+            .await;
+        }
+    }
+
     ModelTurnRetry::None
 }
 
-fn should_retry_after_overload_error(
+#[derive(Debug, Clone)]
+struct ProviderRetryPolicy {
+    id: String,
+    display_name: String,
+    max_retries: u8,
+    initial_delay_ms: u64,
+    max_delay_ms: u64,
+    use_provider_retry_hint: bool,
+    kind: ProviderRetryPolicyKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderRetryPolicyKind {
+    Overload,
+    Custom,
+}
+
+fn matching_provider_retry_policy(
     state: &ServerState,
     error: &bcode_model::ProviderError,
-    attempts: u8,
+    selection: &SessionModelSelection,
+) -> Option<ProviderRetryPolicy> {
+    if !state.model_retry.enabled {
+        return None;
+    }
+    if state.model_retry.overload_enabled && is_overloaded_provider_error(error) {
+        return Some(ProviderRetryPolicy {
+            id: "builtin.overload".to_string(),
+            display_name: "overload".to_string(),
+            max_retries: state.model_retry.max_overload_retries,
+            initial_delay_ms: state.model_retry.overload_initial_delay_ms,
+            max_delay_ms: state.model_retry.overload_max_delay_ms,
+            use_provider_retry_hint: true,
+            kind: ProviderRetryPolicyKind::Overload,
+        });
+    }
+
+    state
+        .model_retry
+        .rules
+        .iter()
+        .find(|rule| custom_retry_rule_matches(rule, error, selection))
+        .map(|rule| ProviderRetryPolicy {
+            id: format!("custom.{}", rule.id),
+            display_name: rule.id.clone(),
+            max_retries: rule.max_retries,
+            initial_delay_ms: rule.initial_delay_ms,
+            max_delay_ms: rule.max_delay_ms,
+            use_provider_retry_hint: rule.use_provider_retry_hint,
+            kind: ProviderRetryPolicyKind::Custom,
+        })
+}
+
+fn custom_retry_rule_matches(
+    rule: &bcode_config::ModelRetryRuleConfig,
+    error: &bcode_model::ProviderError,
+    selection: &SessionModelSelection,
 ) -> bool {
-    attempts < state.model_retry.max_overload_retries && is_overloaded_provider_error(error)
+    rule.enabled
+        && rule.max_retries > 0
+        && rule.r#match.has_conditions()
+        && retry_rule_scope_matches(rule, selection)
+        && retry_rule_error_matches(&rule.r#match, error)
+}
+
+fn retry_rule_scope_matches(
+    rule: &bcode_config::ModelRetryRuleConfig,
+    selection: &SessionModelSelection,
+) -> bool {
+    optional_exact_matches(
+        rule.provider_plugin_id.as_deref(),
+        selection.provider_plugin_id.as_deref(),
+    ) && optional_contains_matches(
+        rule.provider_plugin_id_contains.as_deref(),
+        selection.provider_plugin_id.as_deref(),
+    ) && optional_exact_matches(rule.model_id.as_deref(), selection.model_id.as_deref())
+        && optional_contains_matches(
+            rule.model_id_contains.as_deref(),
+            selection.model_id.as_deref(),
+        )
+}
+
+fn retry_rule_error_matches(
+    matcher: &bcode_config::ModelRetryRuleMatchConfig,
+    error: &bcode_model::ProviderError,
+) -> bool {
+    matcher
+        .category
+        .is_none_or(|category| category == error.category)
+        && optional_exact_matches(matcher.code.as_deref(), Some(error.code.as_str()))
+        && optional_exact_matches(
+            matcher.message_equals.as_deref(),
+            Some(error.message.as_str()),
+        )
+        && optional_contains_matches(
+            matcher.message_contains.as_deref(),
+            Some(error.message.as_str()),
+        )
+        && optional_exact_matches(
+            matcher.provider_message_equals.as_deref(),
+            error.provider_message.as_deref(),
+        )
+        && optional_contains_matches(
+            matcher.provider_message_contains.as_deref(),
+            error.provider_message.as_deref(),
+        )
+}
+
+fn optional_exact_matches(expected: Option<&str>, actual: Option<&str>) -> bool {
+    expected.is_none_or(|expected| actual == Some(expected))
+}
+
+fn optional_contains_matches(expected: Option<&str>, actual: Option<&str>) -> bool {
+    expected.is_none_or(|expected| actual.is_some_and(|actual| actual.contains(expected)))
 }
 
 fn is_overloaded_provider_error(error: &bcode_model::ProviderError) -> bool {
@@ -9047,26 +9162,28 @@ fn is_overloaded_provider_error(error: &bcode_model::ProviderError) -> bool {
         || error.code == "server_is_overloaded"
 }
 
-async fn retry_after_overload_error(
+async fn retry_after_provider_error(
     state: &ServerState,
     session_id: SessionId,
     turn_id: &str,
     error: &bcode_model::ProviderError,
+    policy: &ProviderRetryPolicy,
     attempt: u8,
     cancel_state: &TurnCancelState,
 ) -> ModelTurnRetry {
-    let delay = overload_retry_delay(&state.model_retry, error, attempt);
+    let delay = provider_retry_delay(policy, error, attempt);
     append_provider_event_trace(
         state,
         session_id,
         turn_id,
         "recoverable_error_retry",
         Some(format!(
-            "model provider overloaded ({}: {}); retrying attempt {}/{} in {}ms",
+            "model provider error matched retry policy {} ({}: {}); retrying attempt {}/{} in {}ms",
+            policy.id,
             error.code,
             error.message,
             attempt,
-            state.model_retry.max_overload_retries,
+            policy.max_retries,
             delay.as_millis()
         )),
     )
@@ -9074,12 +9191,7 @@ async fn retry_after_overload_error(
     append_system_event(
         state,
         session_id,
-        format!(
-            "Model provider is overloaded. Retrying automatically in {} (attempt {}/{}).",
-            format_retry_delay(delay),
-            attempt,
-            state.model_retry.max_overload_retries
-        ),
+        provider_retry_message(policy, delay, attempt),
     )
     .await;
 
@@ -9092,13 +9204,33 @@ async fn retry_after_overload_error(
     }
 }
 
-fn overload_retry_delay(
-    config: &bcode_config::ModelRetryConfig,
+fn provider_retry_message(policy: &ProviderRetryPolicy, delay: Duration, attempt: u8) -> String {
+    if policy.kind == ProviderRetryPolicyKind::Overload {
+        return format!(
+            "Model provider is overloaded. Retrying automatically in {} (attempt {}/{}).",
+            format_retry_delay(delay),
+            attempt,
+            policy.max_retries
+        );
+    }
+    format!(
+        "Model provider error matched retry rule {:?}. Retrying automatically in {} (attempt {}/{}).",
+        policy.display_name,
+        format_retry_delay(delay),
+        attempt,
+        policy.max_retries
+    )
+}
+
+fn provider_retry_delay(
+    policy: &ProviderRetryPolicy,
     error: &bcode_model::ProviderError,
     attempt: u8,
 ) -> Duration {
-    let max_delay = Duration::from_millis(config.overload_max_delay_ms);
-    if let Some(retry) = error.retry.as_deref() {
+    let max_delay = Duration::from_millis(policy.max_delay_ms);
+    if policy.use_provider_retry_hint
+        && let Some(retry) = error.retry.as_deref()
+    {
         if let Some(retry_after_ms) = retry.retry_after_ms {
             return Duration::from_millis(retry_after_ms).min(max_delay);
         }
@@ -9113,8 +9245,37 @@ fn overload_retry_delay(
     let multiplier = 1_u64
         .checked_shl(u32::from(attempt.saturating_sub(1)))
         .unwrap_or(u64::MAX);
-    Duration::from_millis(config.overload_initial_delay_ms.saturating_mul(multiplier))
-        .min(max_delay)
+    Duration::from_millis(policy.initial_delay_ms.saturating_mul(multiplier)).min(max_delay)
+}
+
+#[cfg(test)]
+fn overload_retry_delay(
+    config: &bcode_config::ModelRetryConfig,
+    error: &bcode_model::ProviderError,
+    attempt: u8,
+) -> Duration {
+    let policy = ProviderRetryPolicy {
+        id: "builtin.overload".to_string(),
+        display_name: "overload".to_string(),
+        max_retries: config.max_overload_retries,
+        initial_delay_ms: config.overload_initial_delay_ms,
+        max_delay_ms: config.overload_max_delay_ms,
+        use_provider_retry_hint: true,
+        kind: ProviderRetryPolicyKind::Overload,
+    };
+    provider_retry_delay(&policy, error, attempt)
+}
+
+#[cfg(test)]
+fn should_retry_after_overload_error(
+    state: &ServerState,
+    error: &bcode_model::ProviderError,
+    attempts: u8,
+) -> bool {
+    state.model_retry.enabled
+        && state.model_retry.overload_enabled
+        && attempts < state.model_retry.max_overload_retries
+        && is_overloaded_provider_error(error)
 }
 
 fn format_retry_delay(delay: Duration) -> String {
@@ -9193,18 +9354,26 @@ async fn append_deferred_provider_error_if_needed(
     state: &ServerState,
     session_id: SessionId,
     outcome: &ModelPollOutcome,
+    selection: &SessionModelSelection,
 ) {
     if let Some(error) = outcome.provider_error.as_ref()
-        && should_defer_visible_provider_error(error)
+        && should_defer_visible_provider_error(state, error, Some(selection))
     {
         append_system_event(state, session_id, provider_error_message(error)).await;
     }
 }
 
-fn should_defer_visible_provider_error(error: &bcode_model::ProviderError) -> bool {
+fn should_defer_visible_provider_error(
+    state: &ServerState,
+    error: &bcode_model::ProviderError,
+    selection: Option<&SessionModelSelection>,
+) -> bool {
     is_context_length_provider_error(error)
         || is_tool_arguments_decode_provider_error(error)
         || is_overloaded_provider_error(error)
+        || selection.is_some_and(|selection| {
+            matching_provider_retry_policy(state, error, selection).is_some()
+        })
 }
 
 fn is_context_length_provider_error(error: &bcode_model::ProviderError) -> bool {
@@ -9953,7 +10122,9 @@ async fn handle_provider_error_event(
     outcome: &mut ModelPollOutcome,
 ) {
     let message = provider_error_message(&error);
-    let defer_visible_message = should_defer_visible_provider_error(&error);
+    let selection = session_model_selection_with_runtime_context(state, session_id, None).await;
+    let defer_visible_message =
+        should_defer_visible_provider_error(state, &error, Some(&selection));
     append_provider_event_trace(state, session_id, turn_id, "error", Some(message.clone())).await;
     if !defer_visible_message {
         append_system_event(state, session_id, message.clone()).await;
@@ -15380,17 +15551,121 @@ mod tests {
     }
 
     #[test]
-    fn successful_provider_round_resets_overload_retry_attempts() {
+    fn successful_provider_round_resets_retry_attempts() {
         let mut recovery = ModelTurnRecoveryState {
-            overload_retry_attempts: 3,
+            retry_attempts: BTreeMap::from([("builtin.overload".to_string(), 3)]),
             retry_instruction: Some(MALFORMED_TOOL_ARGUMENTS_RETRY_INSTRUCTION),
             ..ModelTurnRecoveryState::default()
         };
 
         recovery.record_successful_provider_round();
 
-        assert_eq!(recovery.overload_retry_attempts, 0);
+        assert!(recovery.retry_attempts.is_empty());
         assert_eq!(recovery.retry_instruction, None);
+    }
+
+    #[test]
+    fn custom_retry_rule_matches_error_and_scope() {
+        let mut state = test_server_state(SessionManager::default());
+        state
+            .model_retry
+            .rules
+            .push(bcode_config::ModelRetryRuleConfig {
+                id: "unsupported-content-type".to_string(),
+                provider_plugin_id: Some("bcode.openai-compatible".to_string()),
+                model_id_contains: Some("claude".to_string()),
+                max_retries: 2,
+                initial_delay_ms: 500,
+                max_delay_ms: 4_000,
+                r#match: bcode_config::ModelRetryRuleMatchConfig {
+                    code: Some("http_400".to_string()),
+                    message_contains: Some("Unsupported content type".to_string()),
+                    ..bcode_config::ModelRetryRuleMatchConfig::default()
+                },
+                ..bcode_config::ModelRetryRuleConfig::default()
+            });
+        let error = bcode_model::ProviderError {
+            code: "http_400".to_string(),
+            category: bcode_model::ProviderErrorCategory::InvalidRequest,
+            message: r#"{"detail":"Unsupported content type"}"#.to_string(),
+            retryable: false,
+            provider_message: None,
+            retry: None,
+        };
+        let selection = SessionModelSelection {
+            provider_plugin_id: Some("bcode.openai-compatible".to_string()),
+            model_id: Some("anthropic.claude-test".to_string()),
+            ..SessionModelSelection::default()
+        };
+
+        let policy = matching_provider_retry_policy(&state, &error, &selection)
+            .expect("custom retry policy should match");
+
+        assert_eq!(policy.id, "custom.unsupported-content-type");
+        assert_eq!(policy.max_retries, 2);
+        assert_eq!(policy.initial_delay_ms, 500);
+    }
+
+    #[test]
+    fn custom_retry_rule_does_not_match_unscoped_provider() {
+        let mut state = test_server_state(SessionManager::default());
+        state
+            .model_retry
+            .rules
+            .push(bcode_config::ModelRetryRuleConfig {
+                id: "unsupported-content-type".to_string(),
+                provider_plugin_id: Some("bcode.openai-compatible".to_string()),
+                r#match: bcode_config::ModelRetryRuleMatchConfig {
+                    code: Some("http_400".to_string()),
+                    message_contains: Some("Unsupported content type".to_string()),
+                    ..bcode_config::ModelRetryRuleMatchConfig::default()
+                },
+                ..bcode_config::ModelRetryRuleConfig::default()
+            });
+        let error = bcode_model::ProviderError {
+            code: "http_400".to_string(),
+            category: bcode_model::ProviderErrorCategory::InvalidRequest,
+            message: r#"{"detail":"Unsupported content type"}"#.to_string(),
+            retryable: false,
+            provider_message: None,
+            retry: None,
+        };
+        let selection = SessionModelSelection {
+            provider_plugin_id: Some("bcode.bedrock".to_string()),
+            ..SessionModelSelection::default()
+        };
+
+        assert!(matching_provider_retry_policy(&state, &error, &selection).is_none());
+    }
+
+    #[test]
+    fn custom_retry_delay_can_ignore_provider_hint() {
+        let error = bcode_model::ProviderError {
+            code: "http_400".to_string(),
+            category: bcode_model::ProviderErrorCategory::InvalidRequest,
+            message: "Unsupported content type".to_string(),
+            retryable: false,
+            provider_message: None,
+            retry: Some(Box::new(bcode_model::ProviderRetryHint {
+                retry_after_ms: Some(60_000),
+                retry_at_unix: None,
+                source: Some("header".to_string()),
+            })),
+        };
+        let policy = ProviderRetryPolicy {
+            id: "custom.unsupported-content-type".to_string(),
+            display_name: "unsupported-content-type".to_string(),
+            max_retries: 3,
+            initial_delay_ms: 1_000,
+            max_delay_ms: 8_000,
+            use_provider_retry_hint: false,
+            kind: ProviderRetryPolicyKind::Custom,
+        };
+
+        assert_eq!(
+            provider_retry_delay(&policy, &error, 2),
+            Duration::from_secs(2)
+        );
     }
 
     #[test]
@@ -15411,6 +15686,7 @@ mod tests {
             max_overload_retries: 5,
             overload_initial_delay_ms: 1_000,
             overload_max_delay_ms: 10_000,
+            ..bcode_config::ModelRetryConfig::default()
         };
 
         assert_eq!(
@@ -15433,6 +15709,7 @@ mod tests {
             max_overload_retries: 5,
             overload_initial_delay_ms: 1_000,
             overload_max_delay_ms: 10_000,
+            ..bcode_config::ModelRetryConfig::default()
         };
 
         assert_eq!(
@@ -15468,7 +15745,12 @@ mod tests {
             retry: None,
         };
 
-        assert!(should_defer_visible_provider_error(&malformed_tool_error));
+        let state = test_server_state(SessionManager::default());
+        assert!(should_defer_visible_provider_error(
+            &state,
+            &malformed_tool_error,
+            None
+        ));
         let overload_error = bcode_model::ProviderError {
             code: "server_is_overloaded".to_string(),
             category: bcode_model::ProviderErrorCategory::Overloaded,
@@ -15477,8 +15759,16 @@ mod tests {
             provider_message: None,
             retry: None,
         };
-        assert!(should_defer_visible_provider_error(&overload_error));
-        assert!(!should_defer_visible_provider_error(&invalid_request_error));
+        assert!(should_defer_visible_provider_error(
+            &state,
+            &overload_error,
+            None
+        ));
+        assert!(!should_defer_visible_provider_error(
+            &state,
+            &invalid_request_error,
+            None
+        ));
     }
 
     #[test]
