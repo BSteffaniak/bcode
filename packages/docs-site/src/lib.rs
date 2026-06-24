@@ -86,3 +86,26 @@ pub fn build_app(builder: AppBuilder) -> Result<App<DefaultRenderer>, hyperchad:
 pub fn viewport() -> serde_json::Value {
     json!({ "viewport": &*VIEWPORT })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn docs_site_registers_expected_routes() {
+        let routes: std::collections::HashSet<_> = bcode_docs_site_ui::doc_pages::DOC_PAGES
+            .iter()
+            .map(|page| page.route)
+            .collect();
+
+        assert!(routes.contains("/docs"));
+        assert!(routes.contains("/docs/cli"));
+        assert!(routes.contains("/docs/config"));
+    }
+
+    #[test]
+    fn docs_site_init_smoke_test() {
+        let builder = init();
+        drop(builder);
+    }
+}

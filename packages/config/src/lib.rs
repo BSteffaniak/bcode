@@ -190,20 +190,17 @@ impl ConfigDocSchema for BcodeConfig {
                 "Provider authentication profiles, pools, and runtime subscription behavior.",
                 auth_field_docs(),
             ),
-            section_doc(
+            schema_section_doc::<ObservabilityConfig>(
                 "observability",
                 "Logging, tracing, and telemetry controls.",
-                observability_field_docs(),
             ),
-            section_doc(
+            schema_section_doc::<SkillsConfig>(
                 "skills",
                 "Skill discovery, activation, source, disabled-skill, and prompt catalog settings.",
-                skills_field_docs(),
             ),
-            section_doc(
+            schema_section_doc::<SystemPromptConfig>(
                 "system_prompt",
                 "System prompt mode and section controls.",
-                system_prompt_field_docs(),
             ),
             section_doc(
                 "tui",
@@ -215,20 +212,17 @@ impl ConfigDocSchema for BcodeConfig {
                 "External session import plugin settings.",
                 session_import_field_docs(),
             ),
-            section_doc(
+            schema_section_doc::<DaemonConfig>(
                 "daemon",
                 "Daemon lifecycle and connection settings.",
-                daemon_field_docs(),
             ),
-            section_doc(
+            schema_section_doc::<WorktreeConfig>(
                 "worktree",
                 "Worktree creation and naming defaults.",
-                worktree_field_docs(),
             ),
-            section_doc(
+            schema_section_doc::<ToolsConfig>(
                 "tools",
                 "Built-in tool behavior and environment controls.",
-                tools_field_docs(),
             ),
             section_doc(
                 "web_search",
@@ -258,6 +252,13 @@ const fn section_doc(
             defaults: BTreeMap::new(),
         }),
     }
+}
+
+fn schema_section_doc<T: ConfigDocSchema>(
+    toml_key: &'static str,
+    description: &'static str,
+) -> FieldDoc {
+    section_doc(toml_key, description, T::field_docs())
 }
 
 const fn config_field(
@@ -757,127 +758,6 @@ fn auth_field_docs() -> Vec<FieldDoc> {
     ]
 }
 
-fn observability_field_docs() -> Vec<FieldDoc> {
-    vec![
-        enum_field(
-            "level",
-            "enum",
-            "Default observability level.",
-            &["off", "error", "warn", "info", "debug", "trace"],
-        ),
-        config_field(
-            "log_file",
-            "string",
-            "Optional path for structured log output.",
-        ),
-        config_field("trace_file", "string", "Optional path for trace output."),
-    ]
-}
-
-fn skills_field_docs() -> Vec<FieldDoc> {
-    vec![
-        enum_field(
-            "auto_activate",
-            "enum",
-            "Skill auto-activation behavior.",
-            &["off", "suggest", "on"],
-        ),
-        config_field(
-            "roots",
-            "array<string>",
-            "Additional directories scanned for skills.",
-        ),
-        nested_field(
-            "prompt",
-            "Skill prompt catalog configuration.",
-            vec![
-                enum_field(
-                    "catalog",
-                    "enum",
-                    "Catalog rendering mode.",
-                    &["off", "names_only", "summary"],
-                ),
-                config_field(
-                    "max_bytes",
-                    "integer",
-                    "Maximum skill catalog bytes included in prompts.",
-                ),
-                config_field(
-                    "max_description_chars",
-                    "integer",
-                    "Maximum skill description characters.",
-                ),
-                config_field(
-                    "include_sources",
-                    "bool",
-                    "Whether source paths are included in the catalog.",
-                ),
-                config_field(
-                    "include_keywords",
-                    "bool",
-                    "Whether keywords are included in the catalog.",
-                ),
-            ],
-        ),
-        nested_field(
-            "source",
-            "Skill source discovery controls.",
-            vec![config_field(
-                "allow_user_config",
-                "bool",
-                "Whether user-configured skill roots are loaded.",
-            )],
-        ),
-        nested_field(
-            "disabled",
-            "Disabled skill controls.",
-            vec![config_field(
-                "ids",
-                "array<string>",
-                "Skill ids disabled by config.",
-            )],
-        ),
-    ]
-}
-
-fn system_prompt_field_docs() -> Vec<FieldDoc> {
-    vec![
-        enum_field(
-            "mode",
-            "enum",
-            "Base system prompt mode.",
-            &["default", "replace"],
-        ),
-        config_field(
-            "text",
-            "string",
-            "Replacement system prompt text when replacement mode is active.",
-        ),
-        nested_field(
-            "sections",
-            "Toggleable built-in system prompt sections.",
-            vec![
-                config_field(
-                    "repository_context",
-                    "bool",
-                    "Include static repository context.",
-                ),
-                config_field(
-                    "dynamic_repository_context",
-                    "bool",
-                    "Include dynamic repository context.",
-                ),
-                config_field(
-                    "agent_suffix",
-                    "bool",
-                    "Include agent-specific suffix text.",
-                ),
-                config_field("skill_catalog", "bool", "Include the skill catalog."),
-            ],
-        ),
-    ]
-}
-
 fn tui_field_docs() -> Vec<FieldDoc> {
     vec![
         enum_field(
@@ -945,69 +825,6 @@ fn session_import_field_docs() -> Vec<FieldDoc> {
             ],
         ),
     ]
-}
-
-fn daemon_field_docs() -> Vec<FieldDoc> {
-    vec![
-        config_field(
-            "enabled",
-            "bool",
-            "Whether the daemon lifecycle is enabled.",
-        ),
-        config_field("socket_path", "string", "Explicit daemon socket path."),
-        config_field(
-            "startup_timeout_ms",
-            "integer",
-            "Maximum daemon startup wait time in milliseconds.",
-        ),
-    ]
-}
-
-fn worktree_field_docs() -> Vec<FieldDoc> {
-    vec![
-        enum_field(
-            "base_ref",
-            "enum",
-            "Default base ref selection for worktree creation.",
-            &["auto", "default_branch", "head"],
-        ),
-        config_field(
-            "path",
-            "string",
-            "Default parent path for created worktrees.",
-        ),
-        config_field(
-            "branch_prefix",
-            "string",
-            "Branch name prefix for new worktree branches.",
-        ),
-    ]
-}
-
-fn tools_field_docs() -> Vec<FieldDoc> {
-    vec![nested_field(
-        "shell",
-        "Shell tool behavior.",
-        vec![
-            enum_field(
-                "env_mode",
-                "enum",
-                "How environment variables are passed to shell tools.",
-                &["inherit", "clean", "explicit"],
-            ),
-            enum_field(
-                "env_auto_fallback",
-                "enum",
-                "Fallback behavior when shell env setup fails.",
-                &["off", "safe", "inherit"],
-            ),
-            config_field(
-                "timeout_ms",
-                "integer",
-                "Default shell command timeout in milliseconds.",
-            ),
-        ],
-    )]
 }
 
 fn web_search_field_docs() -> Vec<FieldDoc> {
@@ -1620,33 +1437,50 @@ impl Default for SystemPromptSectionsConfig {
 }
 
 /// Skill discovery and activation configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[allow(clippy::struct_excessive_bools)]
+#[config_doc(section = "skills")]
 pub struct SkillsConfig {
+    /// Whether skill discovery and activation are enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Skill auto-activation behavior.
     #[serde(default)]
     pub auto_activate: SkillAutoActivateMode,
+    /// Whether repository-local skills are discovered.
     #[serde(default = "default_true")]
     pub include_repo_skills: bool,
+    /// Whether generic repository skills are discovered.
     #[serde(default = "default_true")]
     pub include_generic_repo_skills: bool,
+    /// Whether skills from user configuration roots are discovered.
     #[serde(default = "default_true")]
     pub include_user_skills: bool,
+    /// Whether Claude-compatible skill layouts are discovered.
     #[serde(default = "default_true")]
     pub include_compat_claude_skills: bool,
+    /// Maximum bytes of skill context that may be included in prompts.
     #[serde(default = "default_skill_context_bytes")]
     pub max_context_bytes: usize,
+    /// Maximum bytes read from a single skill definition file.
     #[serde(default = "default_skill_file_bytes")]
     pub max_skill_file_bytes: u64,
+    /// Maximum bytes read from a single skill resource file.
     #[serde(default = "default_skill_resource_file_bytes")]
     pub max_resource_file_bytes: u64,
+    /// Whether symlinks are followed while discovering skill files.
     #[serde(default)]
     pub follow_symlinks: bool,
+    /// Additional skill source paths.
+    #[config_doc(nested)]
     #[serde(default)]
     pub sources: SkillSourceConfig,
+    /// Disabled skill IDs.
+    #[config_doc(nested)]
     #[serde(default)]
     pub disabled: DisabledSkillsConfig,
+    /// Skill prompt catalog configuration.
+    #[config_doc(nested)]
     #[serde(default)]
     pub prompt: SkillPromptConfig,
 }
@@ -1685,7 +1519,7 @@ impl SkillsConfig {
 }
 
 /// Skill auto-activation behavior.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillAutoActivateMode {
     Off,
@@ -1695,16 +1529,22 @@ pub enum SkillAutoActivateMode {
 }
 
 /// Skill prompt catalog configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "prompt")]
 pub struct SkillPromptConfig {
+    /// Catalog rendering mode.
     #[serde(default)]
     pub catalog: SkillPromptCatalogMode,
+    /// Maximum skill catalog bytes included in prompts.
     #[serde(default = "default_skill_prompt_catalog_bytes")]
     pub max_bytes: usize,
+    /// Maximum skill description characters included in prompts.
     #[serde(default = "default_skill_prompt_description_chars")]
     pub max_description_chars: usize,
+    /// Whether skill source paths are included in the prompt catalog.
     #[serde(default = "default_true")]
     pub include_sources: bool,
+    /// Whether skill keywords are included in the prompt catalog.
     #[serde(default)]
     pub include_keywords: bool,
 }
@@ -1722,7 +1562,7 @@ impl Default for SkillPromptConfig {
 }
 
 /// Skill prompt catalog rendering mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillPromptCatalogMode {
     Off,
@@ -1740,15 +1580,19 @@ const fn default_skill_prompt_description_chars() -> usize {
 }
 
 /// Additional skill source paths.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "sources")]
 pub struct SkillSourceConfig {
+    /// Additional filesystem roots scanned for skills.
     #[serde(default)]
     pub paths: Vec<PathBuf>,
 }
 
 /// Disabled skill IDs.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "disabled")]
 pub struct DisabledSkillsConfig {
+    /// Skill IDs disabled by configuration.
     #[serde(default)]
     pub ids: BTreeSet<String>,
 }
@@ -1770,7 +1614,8 @@ const fn default_true() -> bool {
 }
 
 /// Session observability configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "observability")]
 pub struct ObservabilityConfig {
     /// Trace detail level.
     #[serde(default)]
@@ -1815,7 +1660,7 @@ impl ObservabilityConfig {
 }
 
 /// Session observability detail level.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservabilityLevel {
     Off,
@@ -1857,7 +1702,8 @@ impl Default for SessionImportConfig {
 }
 
 /// Daemon lifecycle configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "daemon")]
 pub struct DaemonConfig {
     /// Shut down background daemon processes after they have been idle.
     #[serde(default = "default_true")]
@@ -1933,7 +1779,8 @@ pub enum SessionImportPathMode {
 }
 
 /// Worktree configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "worktree")]
 pub struct WorktreeConfig {
     /// Root directory for Bcode-created worktrees. Relative paths resolve from the repository's
     /// main worktree root.
@@ -1946,6 +1793,7 @@ pub struct WorktreeConfig {
     #[serde(default)]
     pub base_ref: WorktreeBaseRefConfig,
     /// Automatic worktree setup configuration.
+    #[config_doc(nested)]
     #[serde(default)]
     pub setup: WorktreeSetupConfig,
 }
@@ -1962,7 +1810,7 @@ impl Default for WorktreeConfig {
 }
 
 /// Configured strategy for choosing the base ref for newly-created worktrees.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum WorktreeBaseRefConfig {
     /// Use context-sensitive defaults.
@@ -1975,7 +1823,8 @@ pub enum WorktreeBaseRefConfig {
 }
 
 /// Automatic worktree setup configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "setup")]
 pub struct WorktreeSetupConfig {
     /// Whether setup should run automatically after creating a worktree.
     #[serde(default = "default_worktree_setup_enabled")]
@@ -2027,7 +1876,7 @@ pub struct TuiConfig {
 }
 
 /// Duration/easing curve for terminal UI accent color transitions.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum TuiAccentTransitionCurve {
     /// Constant-speed transition.
@@ -2042,7 +1891,8 @@ pub enum TuiAccentTransitionCurve {
 }
 
 /// Terminal UI theme rendering configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "theme")]
 pub struct TuiThemeConfig {
     /// How accent color changes should be applied.
     #[serde(default)]
@@ -2082,7 +1932,7 @@ const fn default_tui_accent_transition_ms() -> u64 {
 }
 
 /// Terminal UI accent color transition behavior.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum TuiAccentTransitionMode {
     /// Apply accent color changes immediately.
@@ -2093,7 +1943,8 @@ pub enum TuiAccentTransitionMode {
 }
 
 /// Terminal UI inline diff preview rendering configuration.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "inline_diff")]
 pub struct TuiInlineDiffConfig {
     /// Maximum inline diff card width in terminal columns.
     ///
@@ -2104,7 +1955,8 @@ pub struct TuiInlineDiffConfig {
 
 /// Terminal UI mouse interaction configuration.
 /// Terminal UI configuration for provider-exposed reasoning / thinking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "thinking")]
 pub struct TuiThinkingConfig {
     /// Whether provider-exposed reasoning should be shown in the TUI.
     #[serde(default)]
@@ -2124,17 +1976,21 @@ impl Default for TuiThinkingConfig {
 }
 
 /// Tool execution configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, ConfigDoc)]
+#[config_doc(section = "tools")]
 pub struct ToolsConfig {
     /// Shell tool configuration.
+    #[config_doc(nested)]
     #[serde(default)]
     pub shell: ShellToolConfig,
 }
 
 /// Shell tool configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "shell")]
 pub struct ShellToolConfig {
     /// Environment resolution configuration for shell commands.
+    #[config_doc(nested)]
     #[serde(default)]
     pub env: ShellToolEnvConfig,
     /// Maximum bytes retained per stdout/stderr stream from non-terminal shell commands.
@@ -2164,7 +2020,8 @@ const fn default_shell_inline_output_bytes() -> usize {
 }
 
 /// Shell tool environment resolution configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "env")]
 pub struct ShellToolEnvConfig {
     /// Environment resolver mode.
     #[serde(default)]
@@ -2184,7 +2041,7 @@ impl Default for ShellToolEnvConfig {
 }
 
 /// Shell tool environment resolver mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum ShellToolEnvMode {
     /// Automatically detect project environment managers.
@@ -2197,7 +2054,7 @@ pub enum ShellToolEnvMode {
 }
 
 /// Shell tool auto environment fallback behavior.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum ShellToolEnvAutoFallback {
     /// Return an actionable error when auto-detected environment setup cannot run.
@@ -2207,7 +2064,8 @@ pub enum ShellToolEnvAutoFallback {
     Inherit,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Terminal UI thinking display mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum TuiThinkingMode {
     /// Show provider reasoning summaries when available.
@@ -2217,7 +2075,9 @@ pub enum TuiThinkingMode {
     Raw,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Terminal UI mouse interaction configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "mouse")]
 pub struct TuiMouseConfig {
     /// Terminal rows to scroll for each terminal mouse-wheel event.
     #[serde(default = "default_tui_mouse_scroll_rows")]
@@ -2273,7 +2133,8 @@ const fn default_triple_click_select() -> TuiMouseClickSelection {
 }
 
 /// Selection behavior for a mouse click count.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Terminal UI click selection behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum TuiMouseClickSelection {
     /// Do not select on this click count.
@@ -5235,8 +5096,8 @@ fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
 mod tests {
     use super::{
         BcodeConfig, CompactionMode, ConfigDocSchema, ConfigError, ConfigLoadOverrides,
-        ContextStrategyMode, TuiAccentTransitionCurve, TuiMouseConfig, default_config_paths_from,
-        default_permissions_state_path, load_config_from_paths,
+        ContextStrategyMode, NestedFieldDoc, TuiAccentTransitionCurve, TuiMouseConfig,
+        default_config_paths_from, default_permissions_state_path, load_config_from_paths,
         load_config_from_paths_with_overrides, load_permissions_state_from, merge_config_values,
         plugin_selection_with_default_plugin_ids, upsert_agent_permission_rule,
     };
@@ -5269,15 +5130,46 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn system_prompt_config_doc_schema_is_derive_backed() {
-        let fields = super::SystemPromptConfig::field_docs();
+    fn stable_config_doc_sections_are_derive_backed() {
+        for (section, keys) in [
+            ("system_prompt", &["mode", "text", "sections"][..]),
+            ("skills", &["enabled", "auto_activate", "prompt"]),
+            (
+                "observability",
+                &["level", "persist_tool_io", "max_blob_bytes"],
+            ),
+            ("daemon", &["idle_shutdown", "idle_shutdown_after_secs"]),
+            ("worktree", &["root", "branch_prefix", "setup"]),
+            ("tools", &["shell"]),
+        ] {
+            let root_fields = BcodeConfig::field_docs();
+            let field = root_fields
+                .iter()
+                .find(|field| field.toml_key == section)
+                .unwrap_or_else(|| panic!("missing root config doc section: {section}"));
+            let Some(NestedFieldDoc::Inline { fields, .. }) = &field.nested else {
+                panic!("root config doc section {section} is not inline nested");
+            };
 
-        assert!(fields.iter().any(|field| field.toml_key == "mode"));
-        assert!(fields.iter().any(|field| field.toml_key == "text"));
-        assert!(fields.iter().any(|field| field.toml_key == "sections"));
+            for key in keys {
+                assert!(
+                    fields.iter().any(|field| field.toml_key == *key),
+                    "missing derived key {section}.{key}"
+                );
+            }
+        }
+
         assert_eq!(
             super::SystemPromptMode::config_doc_values(),
             &["default", "replace"]
+        );
+        assert_eq!(
+            super::SkillAutoActivateMode::config_doc_values(),
+            &["off", "suggest", "on"]
+        );
+        assert_eq!(
+            super::ShellToolEnvMode::config_doc_values(),
+            &["auto", "inherit", "direnv"]
         );
     }
 

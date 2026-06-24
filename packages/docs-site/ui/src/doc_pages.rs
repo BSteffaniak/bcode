@@ -121,6 +121,7 @@ pub static DOC_PAGES: &[DocPage] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperchad_docs_site::PageKind;
     use std::collections::HashSet;
 
     #[test]
@@ -139,6 +140,41 @@ mod tests {
                 "missing nav label: {}",
                 page.route
             );
+        }
+    }
+
+    #[test]
+    fn docs_pages_have_non_empty_content() {
+        for page in DOC_PAGES {
+            match page.kind {
+                PageKind::Markdown { contents } => assert!(
+                    !contents.trim().is_empty(),
+                    "markdown page is empty: {}",
+                    page.route
+                ),
+                PageKind::GeneratedMarkdown { generate } => {
+                    let contents = generate();
+                    assert!(
+                        !contents.trim().is_empty(),
+                        "generated page is empty: {}",
+                        page.route
+                    );
+                }
+                PageKind::Custom { .. } => {}
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_page_sources_are_workspace_docs_or_readme() {
+        for page in DOC_PAGES {
+            if let Some(source) = page.source {
+                assert!(
+                    source == "README.md" || source.starts_with("docs/"),
+                    "unexpected source for {}: {source}",
+                    page.route
+                );
+            }
         }
     }
 }

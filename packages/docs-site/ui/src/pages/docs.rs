@@ -62,6 +62,9 @@ pub(crate) fn generate_config_reference() -> String {
         .section_appendix("auth", auth_config_examples())
         .section_appendix("agent", agent_config_examples())
         .section_appendix("skills", skills_config_examples())
+        .section_appendix("worktree", worktree_config_examples())
+        .section_appendix("tools", tools_config_examples())
+        .section_appendix("session_import", session_import_config_examples())
         .render()
 }
 
@@ -92,7 +95,8 @@ const fn env_overrides() -> &'static [EnvOverrideDoc] {
 
 fn model_config_examples() -> String {
     String::from(
-        "### Model Profile Example\n\n\
+        "### Model Profile Examples\n\n\
+         OpenAI-compatible profile:\n\n\
          ```toml\n\
          [model]\n\
          profile = \"daily\"\n\
@@ -104,13 +108,21 @@ fn model_config_examples() -> String {
 \n\
          [model.profiles.daily.request]\n\
          temperature = 0.2\n\
+         ```\n\n\
+         Bedrock profile:\n\n\
+         ```toml\n\
+         [model.profiles.bedrock]\n\
+         provider_plugin_id = \"bcode.bedrock\"\n\
+         model_id = \"anthropic.claude-sonnet-4-5-20250929-v1:0\"\n\
+         auth_profile = \"aws\"\n\
          ```\n",
     )
 }
 
 fn auth_config_examples() -> String {
     String::from(
-        "### Auth Profile Example\n\n\
+        "### Auth Profile Examples\n\n\
+         API key auth profile:\n\n\
          ```toml\n\
          [auth]\n\
          active_profile = \"openai\"\n\
@@ -118,6 +130,12 @@ fn auth_config_examples() -> String {
          [auth.profiles.openai]\n\
          provider_plugin_id = \"bcode.openai-compatible\"\n\
          api_key_env = \"OPENAI_API_KEY\"\n\
+         ```\n\n\
+         Auth pool/failover profile set:\n\n\
+         ```toml\n\
+         [auth.pools.openai-failover]\n\
+         strategy = \"failover\"\n\
+         profiles = [\"openai-primary\", \"openai-secondary\"]\n\
          ```\n",
     )
 }
@@ -143,11 +161,59 @@ fn skills_config_examples() -> String {
          ```toml\n\
          [skills]\n\
          auto_activate = \"suggest\"\n\
-         roots = [\"~/.config/bcode/skills\"]\n\
+\n\
+         [skills.sources]\n\
+         paths = [\"~/.config/bcode/skills\"]\n\
 \n\
          [skills.prompt]\n\
          catalog = \"summary\"\n\
          include_sources = true\n\
+         ```\n",
+    )
+}
+
+fn worktree_config_examples() -> String {
+    String::from(
+        "### Worktree Defaults Example\n\n\
+         ```toml\n\
+         [worktree]\n\
+         root = \".bcode/worktrees\"\n\
+         branch_prefix = \"bcode/\"\n\
+         base_ref = \"default_branch\"\n\
+\n\
+         [worktree.setup]\n\
+         enabled = true\n\
+         profile = \"native\"\n\
+         ```\n",
+    )
+}
+
+fn tools_config_examples() -> String {
+    String::from(
+        "### Shell Environment Example\n\n\
+         ```toml\n\
+         [tools.shell]\n\
+         max_output_bytes = 10485760\n\
+         inline_output_bytes = 16384\n\
+\n\
+         [tools.shell.env]\n\
+         mode = \"auto\"\n\
+         auto_fallback = \"error\"\n\
+         ```\n",
+    )
+}
+
+fn session_import_config_examples() -> String {
+    String::from(
+        "### Session Import Example\n\n\
+         ```toml\n\
+         [session_import]\n\
+         enabled = true\n\
+         auto_discover_on_startup = true\n\
+\n\
+         [session_import.pi]\n\
+         enabled = true\n\
+         path_mode = \"defaults_and_custom\"\n\
          ```\n",
     )
 }
@@ -208,6 +274,30 @@ mod tests {
         assert!(doc.contains("pools.<pool>.strategy"));
         assert!(doc.contains("tools.<tool-name>.execute"));
         assert!(doc.contains("permissions.network"));
+    }
+
+    #[test]
+    fn config_reference_documents_derived_stable_sections() {
+        let doc = generate_config_reference();
+
+        assert!(doc.contains("enabled"));
+        assert!(doc.contains("prompt.catalog"));
+        assert!(doc.contains("persist_tool_io"));
+        assert!(doc.contains("idle_shutdown_after_secs"));
+        assert!(doc.contains("setup.profile"));
+        assert!(doc.contains("shell.env.mode"));
+        assert!(doc.contains("shell.env.auto_fallback"));
+    }
+
+    #[test]
+    fn config_reference_includes_practical_examples() {
+        let doc = generate_config_reference();
+
+        assert!(doc.contains("bcode.bedrock"));
+        assert!(doc.contains("openai-failover"));
+        assert!(doc.contains("[worktree.setup]"));
+        assert!(doc.contains("[tools.shell.env]"));
+        assert!(doc.contains("[session_import.pi]"));
     }
 
     #[test]
