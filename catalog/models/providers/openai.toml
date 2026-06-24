@@ -23,6 +23,17 @@ structured_outputs = true
 prompt_cache = true
 
 [[error_handling.recoverable_error_patterns]]
+id = "bcode.openai-compatible.server-overloaded"
+enabled_by_default = true
+
+[error_handling.recoverable_error_patterns.scope]
+provider_plugin_id = "bcode.openai-compatible"
+
+[error_handling.recoverable_error_patterns.match]
+category = "overloaded"
+code = "server_is_overloaded"
+
+[[error_handling.recoverable_error_patterns]]
 id = "bcode.openai-compatible.unsupported-content-type"
 enabled_by_default = true
 
