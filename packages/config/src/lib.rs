@@ -2944,6 +2944,14 @@ pub enum ConfigError {
         tool_id: String,
         replacement: &'static str,
     },
+    #[error(
+        "removed permission category at agent.{agent_id}.permission.{category}; use permission.{replacement} instead"
+    )]
+    RemovedPermissionCategory {
+        agent_id: String,
+        category: String,
+        replacement: &'static str,
+    },
 }
 
 fn validate_config(config: &BcodeConfig) -> Result<(), ConfigError> {
@@ -2963,7 +2971,7 @@ fn validate_config(config: &BcodeConfig) -> Result<(), ConfigError> {
 
 fn removed_shorthand_tool_replacement(tool_id: &str) -> Option<&'static str> {
     match tool_id {
-        "bash" => Some("shell.run"),
+        "bash" | "command" => Some("shell.run"),
         "read" => Some("filesystem.read"),
         "grep" => Some("filesystem.grep"),
         "find" => Some("filesystem.find"),
@@ -2976,7 +2984,27 @@ fn removed_shorthand_tool_replacement(tool_id: &str) -> Option<&'static str> {
     }
 }
 
+fn validate_removed_permission_categories(value: &toml::Value) -> Result<(), ConfigError> {
+    let Some(agents) = value.get("agent").and_then(toml::Value::as_table) else {
+        return Ok(());
+    };
+    for (agent_id, agent) in agents {
+        let Some(permission) = agent.get("permission").and_then(toml::Value::as_table) else {
+            continue;
+        };
+        if permission.contains_key("bash") {
+            return Err(ConfigError::RemovedPermissionCategory {
+                agent_id: agent_id.clone(),
+                category: "bash".to_string(),
+                replacement: "command",
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_config_value(value: toml::Value, context: &str) -> Result<BcodeConfig, ConfigError> {
+    validate_removed_permission_categories(&value)?;
     let config = value
         .try_into()
         .map_err(|source| ConfigError::Composition {
@@ -2995,7 +3023,7 @@ fn validate_config_value(value: toml::Value, context: &str) -> Result<BcodeConfi
 /// at load time, state-file rules win over same-pattern rules declared in
 /// `bcode.toml`.
 ///
-/// `category` must be one of `bash`, `read`, `write`, `edit`, or `web`.
+/// `category` must be one of `command`, `read`, `write`, `edit`, or `web`.
 /// `action` must be one of `allow`, `ask`, or `deny`.
 ///
 /// # Errors
@@ -3669,7 +3697,9 @@ pub fn load_permissions_state_value_from(path: &Path) -> Result<Option<toml::Val
     if !path.exists() {
         return Ok(None);
     }
-    Ok(Some(load_toml_file(path)?))
+    let value = load_toml_file(path)?;
+    validate_removed_permission_categories(&value)?;
+    Ok(Some(value))
 }
 
 /// Load the runtime permissions state file from an explicit path.
@@ -3683,18 +3713,9 @@ pub fn load_permissions_state_from(
     if !path.exists() {
         return Ok(BTreeMap::new());
     }
-    let contents = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    // Reuse the full config parser so the `[agent.<id>]` shape matches exactly.
-    let config: BcodeConfig =
-        toml::from_str(&contents).map_err(|source| ConfigError::Composition {
-            message: format!(
-                "failed to parse permissions state {}: {source}",
-                path.display()
-            ),
-        })?;
+    let value = load_toml_file(path)?;
+    let context = format!("permissions state {}", path.display());
+    let config = validate_config_value(value, &context)?;
     Ok(config.agent)
 }
 
@@ -3746,7 +3767,7 @@ fn insert_agent_permission_rule(
     let entry = agent.entry(agent_id.to_string()).or_default();
     let permission = &mut entry.permission;
     let map = match category {
-        "bash" => &mut permission.bash,
+        "command" => &mut permission.command,
         "read" => &mut permission.read,
         "write" => &mut permission.write,
         "edit" => &mut permission.edit,
@@ -4371,7 +4392,7 @@ fn write_agents_toml(
         }
 
         let permission = &agent.permission;
-        let has_permission = !permission.bash.is_empty()
+        let has_permission = !permission.command.is_empty()
             || !permission.read.is_empty()
             || !permission.write.is_empty()
             || !permission.edit.is_empty()
@@ -4394,7 +4415,7 @@ fn write_agents_toml(
             )
             .expect("writing to string should not fail");
         }
-        write_action_map(output, "bash", &permission.bash);
+        write_action_map(output, "command", &permission.command);
         write_action_map(output, "read", &permission.read);
         write_action_map(output, "write", &permission.write);
         write_action_map(output, "edit", &permission.edit);
@@ -5179,6 +5200,7 @@ mod tests {
     fn removed_shorthand_agent_tool_ids_are_rejected() {
         for (tool_id, replacement) in [
             ("bash", "shell.run"),
+            ("command", "shell.run"),
             ("read", "filesystem.read"),
             ("grep", "filesystem.grep"),
             ("find", "filesystem.find"),
@@ -5208,6 +5230,26 @@ mod tests {
                 "{tool_id} should be rejected with replacement {replacement}"
             );
         }
+    }
+
+    #[test]
+    fn removed_permission_bash_category_is_rejected() {
+        let result = load_config_from_paths_with_overrides(
+            &[],
+            &ConfigLoadOverrides::from_env_with_cli(
+                None,
+                Some("[agent.plan.permission]\nbash = { \"*\" = \"deny\" }\n".to_string()),
+            ),
+        );
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::RemovedPermissionCategory {
+                agent_id,
+                category,
+                replacement: "command"
+            }) if agent_id == "plan" && category == "bash"
+        ));
     }
 
     #[test]
@@ -5424,7 +5466,7 @@ disabled = ["example.d"]
 
 [agent.build.permission]
 external_directory = "ask"
-bash = { "cargo *" = "allow", "git push *" = "deny" }
+command = { "cargo *" = "allow", "git push *" = "deny" }
 read = { "**" = "allow" }
 write = { "target/**" = "allow" }
 edit = { "src/**" = "ask" }
@@ -5463,11 +5505,11 @@ edit = { "src/**" = "ask" }
             bcode_agent_policy_models::Action::Ask
         );
         assert_eq!(
-            build.permission.bash.get("cargo *").copied(),
+            build.permission.command.get("cargo *").copied(),
             Some(bcode_agent_policy_models::Action::Allow)
         );
         assert_eq!(
-            build.permission.bash.get("git push *").copied(),
+            build.permission.command.get("git push *").copied(),
             Some(bcode_agent_policy_models::Action::Deny)
         );
         assert_eq!(
@@ -6057,7 +6099,7 @@ mode = "chatgpt"
         std::fs::write(
             &config_path,
             r#"[agent.build.permission]
-bash = { "cargo *" = "allow" }
+command = { "cargo *" = "allow" }
 "#,
         )
         .expect("declarative config should be written");
@@ -6070,7 +6112,7 @@ bash = { "cargo *" = "allow" }
         }
 
         let written =
-            upsert_agent_permission_rule("build", "bash", "echo hello".to_string(), "allow")
+            upsert_agent_permission_rule("build", "command", "echo hello".to_string(), "allow")
                 .expect("state write should succeed");
 
         assert_eq!(written, state_path);
@@ -6093,9 +6135,11 @@ bash = { "cargo *" = "allow" }
 
         let loaded = load_permissions_state_from(&state_path).expect("state file should load");
         assert_eq!(
-            loaded
-                .get("build")
-                .and_then(|agent| agent.permission.bash.get("echo hello").copied()),
+            loaded.get("build").and_then(|agent| agent
+                .permission
+                .command
+                .get("echo hello")
+                .copied()),
             Some(Action::Allow)
         );
 
@@ -6114,7 +6158,7 @@ accent = "#22d3ee"
 "example.read" = true
 "example.write" = true
 
-[agent.build.permission.bash]
+[agent.build.permission.command]
 "cargo *" = "allow"
 "git push *" = "deny"
 "##,
@@ -6129,7 +6173,7 @@ accent = "#6b7280"
 "example.write" = false
 "example.run" = true
 
-[agent.build.permission.bash]
+[agent.build.permission.command]
 "cargo *" = "deny"
 "echo *" = "allow"
 "##,
@@ -6147,12 +6191,12 @@ accent = "#6b7280"
             .get("tools")
             .and_then(toml::Value::as_table)
             .expect("tools table should exist");
-        let bash_rules = build
+        let command_rules = build
             .get("permission")
             .and_then(toml::Value::as_table)
-            .and_then(|permission| permission.get("bash"))
+            .and_then(|permission| permission.get("command"))
             .and_then(toml::Value::as_table)
-            .expect("bash permission table should exist");
+            .expect("command permission table should exist");
 
         assert_eq!(
             build.get("accent").and_then(toml::Value::as_str),
@@ -6171,15 +6215,17 @@ accent = "#6b7280"
             Some(true)
         );
         assert_eq!(
-            bash_rules.get("cargo *").and_then(toml::Value::as_str),
+            command_rules.get("cargo *").and_then(toml::Value::as_str),
             Some("deny")
         );
         assert_eq!(
-            bash_rules.get("git push *").and_then(toml::Value::as_str),
+            command_rules
+                .get("git push *")
+                .and_then(toml::Value::as_str),
             Some("deny")
         );
         assert_eq!(
-            bash_rules.get("echo *").and_then(toml::Value::as_str),
+            command_rules.get("echo *").and_then(toml::Value::as_str),
             Some("allow")
         );
     }
@@ -6195,7 +6241,7 @@ accent = "#abcdef"
 [agent.scratch.tools]
 "example.run" = true
 
-[agent.scratch.permission.bash]
+[agent.scratch.permission.command]
 "*" = "ask"
 "##,
         )
@@ -6225,9 +6271,9 @@ accent = "#abcdef"
             scratch
                 .get("permission")
                 .and_then(toml::Value::as_table)
-                .and_then(|permission| permission.get("bash"))
+                .and_then(|permission| permission.get("command"))
                 .and_then(toml::Value::as_table)
-                .and_then(|bash| bash.get("*"))
+                .and_then(|command| command.get("*"))
                 .and_then(toml::Value::as_str),
             Some("ask")
         );

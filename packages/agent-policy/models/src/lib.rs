@@ -40,7 +40,7 @@ pub struct AgentConfig {
 /// `shell.run` or plugin-defined IDs. Permission categories are separate rule
 /// buckets used by plugin policy metadata:
 ///
-/// * `bash` — patterns matched against command arguments for tools categorized as shell commands.
+/// * `command` — patterns matched against command arguments for tools categorized as shell commands.
 /// * `read` — patterns matched against path arguments for tools categorized as read-only path tools.
 /// * `write` — patterns matched against path arguments for tools categorized as file writes.
 /// * `edit` — patterns matched against path arguments for tools categorized as file edits.
@@ -51,7 +51,7 @@ pub struct AgentConfig {
 pub struct PermissionConfig {
     /// Shell command rules.
     #[serde(default)]
-    pub bash: BTreeMap<String, Action>,
+    pub command: BTreeMap<String, Action>,
     /// Read-only filesystem tool rules keyed by path glob.
     #[serde(default)]
     pub read: BTreeMap<String, Action>,
@@ -72,7 +72,7 @@ pub struct PermissionConfig {
 impl Default for PermissionConfig {
     fn default() -> Self {
         Self {
-            bash: BTreeMap::new(),
+            command: BTreeMap::new(),
             read: BTreeMap::new(),
             write: BTreeMap::new(),
             edit: BTreeMap::new(),

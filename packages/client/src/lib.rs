@@ -1681,7 +1681,7 @@ impl BcodeClient {
 
     /// Persist and activate a permission policy rule under `[agent.<agent_id>.permission.<category>]`.
     ///
-    /// `category` must be one of `bash`, `read`, `write`, or `edit`.
+    /// `category` must be one of `command`, `read`, `write`, `edit`, or `web`.
     /// `action` must be one of `allow`, `ask`, or `deny`.
     ///
     /// # Errors

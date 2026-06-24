@@ -75,7 +75,7 @@ pub enum BlimsCommand {
         #[arg(long)]
         bcode_agent_id: Option<String>,
         #[arg(long)]
-        bash: Option<String>,
+        command: Option<String>,
         #[arg(long)]
         read: Option<String>,
         #[arg(long)]
@@ -394,7 +394,7 @@ struct BlimsAgentSnapshot {
 struct BlimsAgentPermission {
     agent_id: String,
     bcode_agent_id: String,
-    bash: String,
+    command: String,
     read: String,
     write: String,
     edit: String,
@@ -837,7 +837,7 @@ async fn handle_blims_agent_command(command: BlimsCommand) -> Result<(), CliErro
         BlimsCommand::SetPermission {
             agent_id,
             bcode_agent_id,
-            bash,
+            command,
             read,
             write,
             edit,
@@ -847,7 +847,7 @@ async fn handle_blims_agent_command(command: BlimsCommand) -> Result<(), CliErro
             set_agent_permission(
                 agent_id,
                 bcode_agent_id,
-                bash,
+                command,
                 read,
                 write,
                 edit,
@@ -3672,7 +3672,7 @@ async fn print_agent_permission(agent_id: &str, json: bool) -> Result<(), CliErr
         let permission = decode_blims_response::<BlimsAgentPermission>(response)?;
         println!("agent: {}", permission.agent_id);
         println!("bcode agent: {}", permission.bcode_agent_id);
-        println!("bash: {}", permission.bash);
+        println!("command: {}", permission.command);
         println!("read: {}", permission.read);
         println!("write: {}", permission.write);
         println!("edit: {}", permission.edit);
@@ -3684,7 +3684,7 @@ async fn print_agent_permission(agent_id: &str, json: bool) -> Result<(), CliErr
 async fn set_agent_permission(
     agent_id: String,
     bcode_agent_id: Option<String>,
-    bash: Option<String>,
+    command: Option<String>,
     read: Option<String>,
     write: Option<String>,
     edit: Option<String>,
@@ -3695,7 +3695,7 @@ async fn set_agent_permission(
     let request = BlimsAgentPermission {
         agent_id,
         bcode_agent_id: bcode_agent_id.unwrap_or(current.bcode_agent_id),
-        bash: bash.unwrap_or(current.bash),
+        command: command.unwrap_or(current.command),
         read: read.unwrap_or(current.read),
         write: write.unwrap_or(current.write),
         edit: edit.unwrap_or(current.edit),
@@ -3705,7 +3705,7 @@ async fn set_agent_permission(
         "working_directory": std::env::current_dir()?,
         "agent_id": request.agent_id,
         "bcode_agent_id": request.bcode_agent_id,
-        "bash": request.bash,
+        "command": request.command,
         "read": request.read,
         "write": request.write,
         "edit": request.edit,
@@ -3718,9 +3718,9 @@ async fn set_agent_permission(
     } else {
         let permission = decode_blims_response::<BlimsAgentPermission>(response)?;
         println!(
-            "permission updated: {} -> bash {}, read {}, write {}, edit {}, external {}",
+            "permission updated: {} -> command {}, read {}, write {}, edit {}, external {}",
             permission.agent_id,
-            permission.bash,
+            permission.command,
             permission.read,
             permission.write,
             permission.edit,

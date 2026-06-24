@@ -14,7 +14,7 @@ Bcode uses an agent-scoped permission model with three verbs: `allow`, `ask`, an
 
 [agent.build.permission]
 external_directory = "ask"
-bash  = { "*" = "ask", "cargo *" = "allow", "git push *" = "deny" }
+command  = { "*" = "ask", "cargo *" = "allow", "git push *" = "deny" }
 read  = { "**" = "allow" }
 write = { "**" = "ask", "target/**" = "allow" }
 edit  = { "**" = "ask" }
@@ -25,7 +25,7 @@ edit  = { "**" = "ask" }
 
 [agent.plan.permission]
 external_directory = "allow"
-bash  = { "*" = "deny", "cargo check *" = "allow", "git diff *" = "allow", "ls *" = "allow", "rg *" = "allow" }
+command  = { "*" = "deny", "cargo check *" = "allow", "git diff *" = "allow", "ls *" = "allow", "rg *" = "allow" }
 read  = { "**" = "allow" }
 write = { "**" = "deny" }
 edit  = { "**" = "deny" }
@@ -33,7 +33,7 @@ edit  = { "**" = "deny" }
 
 ## Categories
 
-* `bash` — patterns matched against `shell.run` command strings. Pi/OpenCode-style command globs.
+* `command` — patterns matched against `shell.run` command strings. Pi/OpenCode-style command globs.
 * `read` — path globs for read-only filesystem tools (`filesystem.read`, `filesystem.list`, `filesystem.find`, `filesystem.grep`, `filesystem.stat`, `filesystem.exists`).
 * `write` — path globs for `filesystem.write`.
 * `edit` — path globs for `filesystem.edit`.
@@ -62,15 +62,15 @@ Path globs use the same syntax as ripgrep (`globset`): `**` matches any number o
 
 ## Tool enablement
 
-`[agent.<id>.tools]` maps exact model-callable tool IDs to booleans. Disabling a tool short-circuits the category rules with a hard `deny`. Enabling a tool only lets it run if the category rules also permit it. Removed shorthand IDs such as `bash`, `read`, `write`, or `edit` are rejected; use exact IDs like `shell.run`, `filesystem.read`, `filesystem.write`, and `filesystem.edit`.
+`[agent.<id>.tools]` maps exact model-callable tool IDs to booleans. Disabling a tool short-circuits the category rules with a hard `deny`. Enabling a tool only lets it run if the category rules also permit it. Removed shorthand IDs such as `bash`, `command`, `read`, `write`, or `edit` are rejected; use exact IDs like `shell.run`, `filesystem.read`, `filesystem.write`, and `filesystem.edit`.
 
-Setting `tools = { "filesystem.write" = false, "filesystem.edit" = false }` additionally triggers the shell hard-deny for common file-writing commands (`>`, `tee`, `touch`, `cp`, `mv`, `rm`, `mkdir`, `sed -i`, etc.) in `shell.run`, so plan-style agents can't bypass the write restriction through bash.
+Setting `tools = { "filesystem.write" = false, "filesystem.edit" = false }` additionally triggers the shell hard-deny for common file-writing commands (`>`, `tee`, `touch`, `cp`, `mv`, `rm`, `mkdir`, `sed -i`, etc.) in `shell.run`, so plan-style agents can't bypass the write restriction through shell commands.
 
 ## Built-in defaults
 
 When no `[agent.*]` sections exist in `bcode.toml`, Bcode falls back to built-in defaults:
 
-| Agent   | `bash` permission rules                                                                                    | `read` | `write`           | `edit`            | `external_directory` |
+| Agent   | `command` permission rules                                                                                    | `read` | `write`           | `edit`            | `external_directory` |
 |---------|-------------------------------------------------------------------------------------------------------------|--------|-------------------|-------------------|----------------------|
 | `plan`  | `* = deny`, plus `allow`: `cargo check *`, `cargo test *`, `git diff *`, `git status *`, `ls *`, `rg *`     | allow  | deny (tool off)   | deny (tool off)   | allow                |
 | `build` | `* = ask`                                                                                                   | allow  | unmatched → ask   | unmatched → ask   | allow                |
@@ -91,7 +91,7 @@ At load time, the state file is merged **on top of** `bcode.toml` per `(agent, c
 
 The rule is scoped to the currently selected agent, with category inferred from the tool:
 
-* `shell.run` → `bash`. Persists **two** rules: the literal command (so the exact same invocation is remembered) and a broadened `<first-word> *` glob (so variations like `echo hello` after approving `echo hi` don't prompt again). If the literal command already contains a trailing `*`, only the literal rule is persisted.
+* `shell.run` → `command`. Persists **two** rules: the literal command (so the exact same invocation is remembered) and a broadened `<first-word> *` glob (so variations like `echo hello` after approving `echo hi` don't prompt again). If the literal command already contains a trailing `*`, only the literal rule is persisted.
 * `filesystem.write` → `write` (literal path).
 * `filesystem.edit`  → `edit` (literal path).
 * `filesystem.{read,list,find,grep,stat,exists}` → `read` (literal path).
@@ -101,7 +101,7 @@ Filesystem paths are persisted literally by default because implicit directory g
 The CLI equivalent also writes to the state file:
 
 ```sh
-bcode permission add --agent build --category bash --pattern 'cargo *' --action allow
+bcode permission add --agent build --category command --pattern 'cargo *' --action allow
 ```
 
 ### Promoting runtime rules to declarative config

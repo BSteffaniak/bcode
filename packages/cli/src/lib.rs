@@ -1182,7 +1182,7 @@ enum PermissionCommand {
         /// Agent ID that owns the rule (for example `build` or `plan`).
         #[arg(long)]
         agent: String,
-        /// Permission category: `bash`, `read`, `write`, or `edit`.
+        /// Permission category: `command`, `read`, `write`, `edit`, or `web`.
         #[arg(long)]
         category: String,
         /// Glob pattern to match.

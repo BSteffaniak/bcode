@@ -347,8 +347,8 @@ mod tests {
             tool_name: "shell.run".to_string(),
             side_effect: ToolSideEffect::ExecuteProcess,
             policy: bcode_tool::ToolPolicyMetadata {
-                aliases: vec!["bash".to_string()],
-                permission_category: Some("bash".to_string()),
+                aliases: Vec::new(),
+                permission_category: Some("command".to_string()),
                 argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
                     kind: bcode_tool::ToolArgumentKind::Command,
                     argument: "command".to_string(),
@@ -397,7 +397,7 @@ accent = "#22d3ee"
             &state_path,
             r#"
 [agent.build.permission]
-bash = { "python3 *" = "allow" }
+command = { "python3 *" = "allow" }
 "#,
         )
         .expect("state should be written");
@@ -416,7 +416,10 @@ bash = { "python3 *" = "allow" }
         assert!(tools.contains(&"filesystem.edit".to_string()));
         assert!(tools.contains(&"shell.run".to_string()));
         assert_eq!(build.accent.as_deref(), Some("#22d3ee"));
-        assert_eq!(build.permission.bash.get("python3 *"), Some(&Action::Allow));
+        assert_eq!(
+            build.permission.command.get("python3 *"),
+            Some(&Action::Allow)
+        );
         assert!(matches!(
             source.label.as_str(),
             "built-in default agent policy + runtime permissions state"

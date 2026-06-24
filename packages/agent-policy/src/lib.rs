@@ -18,7 +18,7 @@ pub const BUILD_AGENT: &str = "build";
 /// Built-in plan agent ID.
 pub const PLAN_AGENT: &str = "plan";
 
-/// Compiled bash permission rule.
+/// Compiled command permission rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rule {
     pub pattern: String,
@@ -44,7 +44,7 @@ pub fn default_config() -> AgentPermissionConfig {
             accent: None,
             tools: BTreeMap::new(),
             permission: PermissionConfig {
-                bash: BTreeMap::from([("*".to_string(), Action::Ask)]),
+                command: BTreeMap::from([("*".to_string(), Action::Ask)]),
                 external_directory: Action::Allow,
                 web: BTreeMap::from([("*".to_string(), Action::Ask)]),
                 ..PermissionConfig::default()
@@ -57,7 +57,7 @@ pub fn default_config() -> AgentPermissionConfig {
             accent: None,
             tools: BTreeMap::new(),
             permission: PermissionConfig {
-                bash: BTreeMap::from([
+                command: BTreeMap::from([
                     ("*".to_string(), Action::Deny),
                     ("cargo check".to_string(), Action::Allow),
                     ("cargo check *".to_string(), Action::Allow),
@@ -570,12 +570,12 @@ fn tool_aliases(request: &EvaluateToolCallRequest) -> Vec<String> {
     aliases
 }
 
-/// Compile bash glob rules.
+/// Compile command glob rules.
 #[must_use]
 pub fn compile_rules(config: &AgentConfig) -> Vec<Rule> {
     config
         .permission
-        .bash
+        .command
         .iter()
         .map(|(pattern, action)| Rule {
             pattern: pattern.clone(),
@@ -778,8 +778,8 @@ mod tests {
 
     fn command_policy() -> bcode_tool::ToolPolicyMetadata {
         bcode_tool::ToolPolicyMetadata {
-            aliases: vec!["bash".to_string()],
-            permission_category: Some("bash".to_string()),
+            aliases: Vec::new(),
+            permission_category: Some("command".to_string()),
             argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
                 kind: ToolArgumentKind::Command,
                 argument: "command".to_string(),
@@ -932,7 +932,7 @@ mod tests {
                         ("filesystem.edit".to_string(), false),
                     ]),
                     permission: PermissionConfig {
-                        bash: BTreeMap::from([
+                        command: BTreeMap::from([
                             ("*".to_string(), Action::Deny),
                             ("echo *".to_string(), Action::Allow),
                         ]),
@@ -983,7 +983,7 @@ mod tests {
                     accent: None,
                     tools: BTreeMap::from([("shell.run".to_string(), true)]),
                     permission: PermissionConfig {
-                        bash: BTreeMap::from([
+                        command: BTreeMap::from([
                             ("*".to_string(), Action::Allow),
                             ("git commit *".to_string(), Action::Deny),
                         ]),
@@ -1023,7 +1023,7 @@ mod tests {
             accent: None,
             tools: BTreeMap::from([("write".to_string(), true)]),
             permission: PermissionConfig {
-                bash: BTreeMap::new(),
+                command: BTreeMap::new(),
                 external_directory: Action::Deny,
                 ..PermissionConfig::default()
             },
@@ -1194,7 +1194,7 @@ mod tests {
             accent: None,
             tools: BTreeMap::from([("shell.run".to_string(), true)]),
             permission: PermissionConfig {
-                bash: BTreeMap::from([("cargo check".to_string(), Action::Allow)]),
+                command: BTreeMap::from([("cargo check".to_string(), Action::Allow)]),
                 ..PermissionConfig::default()
             },
         };
@@ -1204,8 +1204,8 @@ mod tests {
             tool_name: "custom.exec".to_string(),
             side_effect: ToolSideEffect::ExecuteProcess,
             policy: bcode_tool::ToolPolicyMetadata {
-                aliases: vec!["bash".to_string()],
-                permission_category: Some("bash".to_string()),
+                aliases: Vec::new(),
+                permission_category: Some("command".to_string()),
                 argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
                     kind: ToolArgumentKind::Command,
                     argument: "cmd".to_string(),

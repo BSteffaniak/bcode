@@ -585,8 +585,8 @@ pub struct AgentPermissionUpdateRequest {
     pub agent_id: String,
     /// Mapped Bcode agent id.
     pub bcode_agent_id: String,
-    /// Bash permission policy.
-    pub bash: String,
+    /// Command permission policy.
+    pub command: String,
     /// Read permission policy.
     pub read: String,
     /// Write permission policy.
@@ -1963,7 +1963,7 @@ struct ReportRecord {
 struct AgentPermissionRecord {
     agent_id: String,
     bcode_agent_id: String,
-    bash: String,
+    command: String,
     read: String,
     write: String,
     edit: String,
@@ -3438,7 +3438,7 @@ async fn create_agent_policy_tables(
         .if_not_exists(true)
         .column(text_column("agent_id"))
         .column(text_column("bcode_agent_id"))
-        .column(text_column("bash"))
+        .column(text_column("command"))
         .column(text_column("read"))
         .column(text_column("write"))
         .column(text_column("edit"))
@@ -3796,7 +3796,7 @@ async fn seed_default_config(
         ("starter_office", "cozy-startup-loft"),
         (
             "permissions.default",
-            "read=allow,bash=ask,write=ask,edit=ask,external_directory=deny",
+            "read=allow,command=ask,write=ask,edit=ask,external_directory=deny",
         ),
         (
             "contracts.default",
@@ -4123,7 +4123,7 @@ fn starter_agent_permission(agent_id: &str, role: &str) -> AgentPermissionRecord
     AgentPermissionRecord {
         agent_id: agent_id.to_string(),
         bcode_agent_id: format!("blims-{agent_id}"),
-        bash: if is_engineer { "ask" } else { "deny" }.to_string(),
+        command: if is_engineer { "ask" } else { "deny" }.to_string(),
         read: "allow".to_string(),
         write: if is_engineer { "ask" } else { "deny" }.to_string(),
         edit: if is_engineer { "ask" } else { "deny" }.to_string(),
@@ -5007,7 +5007,7 @@ fn set_agent_permission(
     request: &AgentPermissionUpdateRequest,
     event_context: &EventContext,
 ) -> Result<AgentPermissionRecord, BlimsStateError> {
-    validate_permission_policy("bash", &request.bash)?;
+    validate_permission_policy("command", &request.command)?;
     validate_permission_policy("read", &request.read)?;
     validate_permission_policy("write", &request.write)?;
     validate_permission_policy("edit", &request.edit)?;
@@ -5015,7 +5015,7 @@ fn set_agent_permission(
     let permission = AgentPermissionRecord {
         agent_id: request.agent_id.clone(),
         bcode_agent_id: request.bcode_agent_id.clone(),
-        bash: request.bash.clone(),
+        command: request.command.clone(),
         read: request.read.clone(),
         write: request.write.clone(),
         edit: request.edit.clone(),
@@ -8134,7 +8134,7 @@ async fn load_agent_permissions(
         .columns(&[
             "agent_id",
             "bcode_agent_id",
-            "bash",
+            "command",
             "read",
             "write",
             "edit",
@@ -8294,7 +8294,7 @@ fn agent_permission_record(row: &Row) -> Result<AgentPermissionRecord, BlimsStat
     Ok(AgentPermissionRecord {
         agent_id: required_text(row, "agent_id")?,
         bcode_agent_id: required_text(row, "bcode_agent_id")?,
-        bash: required_text(row, "bash")?,
+        command: required_text(row, "command")?,
         read: required_text(row, "read")?,
         write: required_text(row, "write")?,
         edit: required_text(row, "edit")?,
@@ -9257,7 +9257,7 @@ async fn replace_one_agent_permission_projection(
         .insert("agent_permissions")
         .value("agent_id", permission.agent_id.clone())
         .value("bcode_agent_id", permission.bcode_agent_id.clone())
-        .value("bash", permission.bash.clone())
+        .value("command", permission.command.clone())
         .value("read", permission.read.clone())
         .value("write", permission.write.clone())
         .value("edit", permission.edit.clone())
@@ -9782,9 +9782,9 @@ fn append_agent_context_bullets(
         .find(|permission| permission.agent_id == agent.id)
     {
         bullets.push(format!(
-            "Bcode policy {}: bash {}, read {}, write {}, edit {}, external {}",
+            "Bcode policy {}: command {}, read {}, write {}, edit {}, external {}",
             permission.bcode_agent_id,
-            permission.bash,
+            permission.command,
             permission.read,
             permission.write,
             permission.edit,
