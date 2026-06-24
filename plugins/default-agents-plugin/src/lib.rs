@@ -5,8 +5,8 @@
 //! Bundled default agent profile policy plugin.
 
 use bcode_agent_policy::{
-    AgentPermissionConfig, BUILD_AGENT, PLAN_AGENT, active_tools_for, agent_config, default_config,
-    evaluate_tool_call,
+    AgentConfig, AgentPermissionConfig, BUILD_AGENT, PLAN_AGENT, active_tools_for, agent_config,
+    default_config as policy_default_config, evaluate_tool_call,
 };
 use bcode_agent_profile::{
     AGENT_PROFILE_INTERFACE_ID, AgentContextRequest, AgentContextResponse, AgentInfo, AgentList,
@@ -18,6 +18,50 @@ use std::path::PathBuf;
 use toml::{Table, Value};
 
 const MANIFEST: &str = include_str!("../bcode-plugin.toml");
+const DEFAULT_BUILD_TOOL_IDS: &[&str] = &[
+    "shell.run",
+    "filesystem.read",
+    "filesystem.exists",
+    "filesystem.list",
+    "filesystem.find",
+    "filesystem.grep",
+    "filesystem.stat",
+    "filesystem.write",
+    "filesystem.edit",
+    "web.search",
+    "web.fetch",
+    "web.status",
+    "web.inspect",
+    "git.clone",
+    "github.clone",
+    "worktree.list",
+    "worktree.create",
+    "worktree.remove",
+    "document.extract",
+];
+const DEFAULT_PLAN_DISABLED_TOOL_IDS: &[&str] = &["filesystem.write", "filesystem.edit"];
+
+fn default_config() -> AgentPermissionConfig {
+    let mut config = policy_default_config();
+    if let Some(build) = config.agent.get_mut(BUILD_AGENT) {
+        set_default_tools(build, true);
+    }
+    if let Some(plan) = config.agent.get_mut(PLAN_AGENT) {
+        set_default_tools(plan, true);
+        for tool_id in DEFAULT_PLAN_DISABLED_TOOL_IDS {
+            plan.tools.insert((*tool_id).to_string(), false);
+        }
+    }
+    config
+}
+
+fn set_default_tools(agent: &mut AgentConfig, enabled: bool) {
+    agent.tools.extend(
+        DEFAULT_BUILD_TOOL_IDS
+            .iter()
+            .map(|tool_id| ((*tool_id).to_string(), enabled)),
+    );
+}
 
 /// Default plan/build agent profile plugin.
 #[derive(Default)]
@@ -299,6 +343,21 @@ mod tests {
         let result = evaluate_tool_call(&agent, &request, Path::new("/tmp/project"));
 
         assert_eq!(result.response.decision, AgentDecision::Deny);
+    }
+
+    #[test]
+    fn default_plan_tools_are_plugin_owned_and_disable_writes() {
+        let config = default_config();
+        let plan = agent_config(&config, PLAN_AGENT);
+        let tools = active_tools_for(&plan);
+
+        assert!(tools.contains(&"filesystem.read".to_string()));
+        assert!(tools.contains(&"filesystem.list".to_string()));
+        assert!(tools.contains(&"filesystem.find".to_string()));
+        assert!(tools.contains(&"filesystem.grep".to_string()));
+        assert!(tools.contains(&"filesystem.stat".to_string()));
+        assert!(!tools.contains(&"filesystem.write".to_string()));
+        assert!(!tools.contains(&"filesystem.edit".to_string()));
     }
 
     #[test]

@@ -42,27 +42,7 @@ pub fn default_config() -> AgentPermissionConfig {
         BUILD_AGENT.to_string(),
         AgentConfig {
             accent: None,
-            tools: BTreeMap::from([
-                ("shell.run".to_string(), true),
-                ("filesystem.read".to_string(), true),
-                ("filesystem.exists".to_string(), true),
-                ("filesystem.list".to_string(), true),
-                ("filesystem.find".to_string(), true),
-                ("filesystem.grep".to_string(), true),
-                ("filesystem.stat".to_string(), true),
-                ("filesystem.write".to_string(), true),
-                ("filesystem.edit".to_string(), true),
-                ("web.search".to_string(), true),
-                ("web.fetch".to_string(), true),
-                ("web.status".to_string(), true),
-                ("web.inspect".to_string(), true),
-                ("git.clone".to_string(), true),
-                ("github.clone".to_string(), true),
-                ("worktree.list".to_string(), true),
-                ("worktree.create".to_string(), true),
-                ("worktree.remove".to_string(), true),
-                ("document.extract".to_string(), true),
-            ]),
+            tools: BTreeMap::new(),
             permission: PermissionConfig {
                 bash: BTreeMap::from([("*".to_string(), Action::Ask)]),
                 external_directory: Action::Allow,
@@ -75,27 +55,7 @@ pub fn default_config() -> AgentPermissionConfig {
         PLAN_AGENT.to_string(),
         AgentConfig {
             accent: None,
-            tools: BTreeMap::from([
-                ("shell.run".to_string(), true),
-                ("filesystem.read".to_string(), true),
-                ("filesystem.exists".to_string(), true),
-                ("filesystem.list".to_string(), true),
-                ("filesystem.find".to_string(), true),
-                ("filesystem.grep".to_string(), true),
-                ("filesystem.stat".to_string(), true),
-                ("filesystem.write".to_string(), false),
-                ("filesystem.edit".to_string(), false),
-                ("web.search".to_string(), true),
-                ("web.fetch".to_string(), true),
-                ("web.status".to_string(), true),
-                ("web.inspect".to_string(), true),
-                ("git.clone".to_string(), true),
-                ("github.clone".to_string(), true),
-                ("worktree.list".to_string(), true),
-                ("worktree.create".to_string(), true),
-                ("worktree.remove".to_string(), true),
-                ("document.extract".to_string(), true),
-            ]),
+            tools: BTreeMap::new(),
             permission: PermissionConfig {
                 bash: BTreeMap::from([
                     ("*".to_string(), Action::Deny),
@@ -851,17 +811,18 @@ mod tests {
     }
 
     #[test]
-    fn active_tools_include_typed_read_only_tools_by_default() {
-        let config = default_config();
-        let plan = agent_config(&config, PLAN_AGENT);
-        let tools = active_tools_for(&plan);
+    fn active_tools_return_exact_enabled_tool_ids() {
+        let config = AgentConfig {
+            accent: None,
+            tools: BTreeMap::from([
+                ("example.read".to_string(), true),
+                ("example.write".to_string(), false),
+            ]),
+            permission: PermissionConfig::default(),
+        };
+        let tools = active_tools_for(&config);
 
-        assert!(tools.contains(&"filesystem.read".to_string()));
-        assert!(tools.contains(&"filesystem.list".to_string()));
-        assert!(tools.contains(&"filesystem.find".to_string()));
-        assert!(tools.contains(&"filesystem.grep".to_string()));
-        assert!(tools.contains(&"filesystem.stat".to_string()));
-        assert!(!tools.contains(&"filesystem.write".to_string()));
+        assert_eq!(tools, vec!["example.read".to_string()]);
     }
 
     #[test]
@@ -966,9 +927,9 @@ mod tests {
                 AgentConfig {
                     accent: None,
                     tools: BTreeMap::from([
-                        ("bash".to_string(), true),
-                        ("write".to_string(), false),
-                        ("edit".to_string(), false),
+                        ("shell.run".to_string(), true),
+                        ("filesystem.write".to_string(), false),
+                        ("filesystem.edit".to_string(), false),
                     ]),
                     permission: PermissionConfig {
                         bash: BTreeMap::from([
@@ -1020,7 +981,7 @@ mod tests {
                 BUILD_AGENT.to_string(),
                 AgentConfig {
                     accent: None,
-                    tools: BTreeMap::from([("bash".to_string(), true)]),
+                    tools: BTreeMap::from([("shell.run".to_string(), true)]),
                     permission: PermissionConfig {
                         bash: BTreeMap::from([
                             ("*".to_string(), Action::Allow),
@@ -1231,7 +1192,7 @@ mod tests {
     fn metadata_command_tool_uses_declared_argument_and_alias_rules() {
         let config = AgentConfig {
             accent: None,
-            tools: BTreeMap::from([("bash".to_string(), true)]),
+            tools: BTreeMap::from([("shell.run".to_string(), true)]),
             permission: PermissionConfig {
                 bash: BTreeMap::from([("cargo check".to_string(), Action::Allow)]),
                 ..PermissionConfig::default()
