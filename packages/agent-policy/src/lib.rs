@@ -45,6 +45,11 @@ pub fn default_config() -> AgentPermissionConfig {
             tools: BTreeMap::from([
                 ("shell.run".to_string(), true),
                 ("filesystem.read".to_string(), true),
+                ("filesystem.exists".to_string(), true),
+                ("filesystem.list".to_string(), true),
+                ("filesystem.find".to_string(), true),
+                ("filesystem.grep".to_string(), true),
+                ("filesystem.stat".to_string(), true),
                 ("filesystem.write".to_string(), true),
                 ("filesystem.edit".to_string(), true),
                 ("web.search".to_string(), true),
@@ -73,6 +78,11 @@ pub fn default_config() -> AgentPermissionConfig {
             tools: BTreeMap::from([
                 ("shell.run".to_string(), true),
                 ("filesystem.read".to_string(), true),
+                ("filesystem.exists".to_string(), true),
+                ("filesystem.list".to_string(), true),
+                ("filesystem.find".to_string(), true),
+                ("filesystem.grep".to_string(), true),
+                ("filesystem.stat".to_string(), true),
                 ("filesystem.write".to_string(), false),
                 ("filesystem.edit".to_string(), false),
                 ("web.search".to_string(), true),
@@ -126,27 +136,14 @@ pub fn agent_config(config: &AgentPermissionConfig, agent_id: &str) -> AgentConf
         })
 }
 
-/// Compute Bcode tool names visible for this agent.
+/// Compute exact model-callable tool IDs visible for this agent.
 #[must_use]
 pub fn active_tools_for(config: &AgentConfig) -> Vec<String> {
-    let mut tools = BTreeSet::from([
-        "filesystem.read".to_string(),
-        "filesystem.exists".to_string(),
-        "filesystem.list".to_string(),
-        "filesystem.find".to_string(),
-        "filesystem.grep".to_string(),
-        "filesystem.stat".to_string(),
-        "web.search".to_string(),
-        "web.fetch".to_string(),
-        "web.status".to_string(),
-        "web.inspect".to_string(),
-    ]);
-    for (tool, enabled) in &config.tools {
-        if *enabled {
-            tools.insert(tool.clone());
-        }
-    }
-    tools.into_iter().collect()
+    config
+        .tools
+        .iter()
+        .filter_map(|(tool, enabled)| enabled.then_some(tool.clone()))
+        .collect()
 }
 
 /// Evaluate a Bcode tool call against an agent policy.
@@ -255,7 +252,7 @@ fn evaluate_web_url(config: &AgentConfig, request: &EvaluateToolCallRequest) -> 
     if tool_enabled(config, request) == Some(true) {
         evaluation(
             AgentDecision::Ask,
-            format!("{} agent asks before web.fetch", request.agent_id),
+            format!("{} agent asks before web URL", request.agent_id),
             None,
             None,
         )
@@ -263,7 +260,7 @@ fn evaluate_web_url(config: &AgentConfig, request: &EvaluateToolCallRequest) -> 
         evaluation(
             AgentDecision::Deny,
             format!(
-                "{} agent denied web.fetch; enable the tool if web page reads are allowed",
+                "{} agent denied web URL access; enable the tool if web page reads are allowed",
                 request.agent_id
             ),
             None,
@@ -525,9 +522,15 @@ fn tool_enabled(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Opti
 }
 
 fn writes_disabled(config: &AgentConfig) -> bool {
-    ["write", "edit", "filesystem.write", "filesystem.edit"]
+    config
+        .tools
         .iter()
-        .any(|tool| config.tools.get(*tool) == Some(&false))
+        .any(|(tool, enabled)| !enabled && is_write_like_tool_id(tool))
+}
+
+fn is_write_like_tool_id(tool: &str) -> bool {
+    tool.rsplit_once('.')
+        .is_some_and(|(_, capability)| matches!(capability, "write" | "edit"))
 }
 
 fn mutating_shell_command_part<'a>(command: &'a str, rules: &[Rule]) -> Option<&'a str> {

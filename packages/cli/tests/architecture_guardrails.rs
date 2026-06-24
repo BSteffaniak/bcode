@@ -143,9 +143,12 @@ fn scan_file(path: &Path, offenders: &mut Vec<BoundaryOffender>) {
     let Ok(text) = std::fs::read_to_string(path) else {
         return;
     };
+    let test_ranges = test_module_ranges(&text);
     for (index, line) in text.lines().enumerate() {
         let line_number = index + 1;
-        if is_temporary_boundary_allowlist(path, line) {
+        if is_test_line(path, line_number, &test_ranges)
+            || is_temporary_boundary_allowlist(path, line)
+        {
             continue;
         }
         scan_line(
@@ -175,54 +178,77 @@ fn scan_file(path: &Path, offenders: &mut Vec<BoundaryOffender>) {
     }
 }
 
+fn is_test_line(path: &Path, line_number: usize, test_ranges: &[(usize, usize)]) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "tests.rs" || name.ends_with("_test.rs"))
+        || test_ranges
+            .iter()
+            .any(|(start, end)| line_number >= *start && line_number <= *end)
+}
+
+fn test_module_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let lines = text.lines().collect::<Vec<_>>();
+    let mut index = 0usize;
+    while index < lines.len() {
+        if lines[index].trim() == "#[cfg(test)]" {
+            let mut module_index = index + 1;
+            while module_index < lines.len() && lines[module_index].trim().is_empty() {
+                module_index = module_index.saturating_add(1);
+            }
+            if module_index < lines.len() && lines[module_index].contains("mod tests") {
+                let end = module_end_line(&lines, module_index).unwrap_or(lines.len());
+                ranges.push((index + 1, end));
+                index = end;
+                continue;
+            }
+        }
+        index = index.saturating_add(1);
+    }
+    ranges
+}
+
+fn module_end_line(lines: &[&str], module_index: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut opened = false;
+    for (index, line) in lines.iter().enumerate().skip(module_index) {
+        for character in line.chars() {
+            match character {
+                '{' => {
+                    depth = depth.saturating_add(1);
+                    opened = true;
+                }
+                '}' if opened => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(index + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
 fn is_temporary_boundary_allowlist(path: &Path, line: &str) -> bool {
     let path = path.to_string_lossy();
-    // Transitional allowlist: agent-policy keeps exact built-in default tool IDs and
-    // policy fixtures while runtime policy evaluation itself is metadata-driven.
-    if path.ends_with("packages/agent-policy/src/lib.rs")
-        && (line.contains(".to_string()")
-            || line.contains("tool_request(")
-            || line.contains("path_request(")
-            || line.contains("web.fetch")
-            || line.contains("filesystem.write")
-            || line.contains("filesystem.edit"))
-    {
+    // Transitional allowlist: agent-policy keeps exact built-in default tool IDs while
+    // runtime policy evaluation itself is metadata-driven.
+    if path.ends_with("packages/agent-policy/src/lib.rs") && line.contains(".to_string()") {
         return true;
     }
     // No core bundled plugin defaults remain in config; test fixtures use example IDs only.
-    // Transitional allowlist: agent-policy model docs describe legacy config keys.
+    // Transitional allowlist: agent-policy model docs describe policy categories, not
+    // production tool routing.
     if path.ends_with("packages/agent-policy/models/src/lib.rs") {
-        return true;
-    }
-    // Transitional allowlist: server tests construct service/session presentation fixtures.
-    if path.ends_with("packages/server/src/lib.rs")
-        && (line.contains("filesystem.write") || line.contains("filesystem.read"))
-    {
-        return true;
-    }
-    // Transitional allowlist: TUI tests intentionally assert legacy shell visible
-    // rendering because shell terminal formatting is tool-specific UX.
-    if path.ends_with("packages/tui/src/tests.rs") && line.contains("shell.run") {
-        return true;
-    }
-    // Transitional allowlist: TUI tests for permission/presentation semantics keep
-    // legacy visible tool names where those names are the behavior under test.
-    if path.ends_with("packages/tui/src/permission_dialog_render.rs")
-        || path.ends_with("packages/tui/src/permission_present.rs")
-    {
         return true;
     }
     // Transitional allowlist: model-context truncation text teaches agents to use
     // artifact/filesystem tools; this is product guidance, not tool routing.
-    if path.ends_with("packages/server/src/lib.rs")
-        && line.contains("tool output truncated for model context")
-    {
-        return true;
-    }
-    // Transitional allowlist: server tests construct semantic shell/read tool fixtures.
     path.ends_with("packages/server/src/lib.rs")
-        && (line.contains("tool_name: \"shell.run\"")
-            || line.contains("tool_name: \"filesystem.read\""))
+        && line.contains("tool output truncated for model context")
 }
 
 fn scan_line(
