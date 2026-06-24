@@ -241,7 +241,7 @@ fn is_temporary_boundary_allowlist(path: &Path, line: &str) -> bool {
     }
     // Transitional allowlist: config validation reports removed shorthand tool-ID replacements.
     if path.ends_with("packages/config/src/lib.rs")
-        && (line.contains("Some(\"") || line.contains("RemovedShorthandToolId"))
+        && (line.contains("=> Some(\"") || line.contains("RemovedShorthandToolId"))
     {
         return true;
     }

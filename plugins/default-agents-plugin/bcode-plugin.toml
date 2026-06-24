@@ -7,6 +7,30 @@ description  = "Default plan/build agent profiles and policy evaluation"
 interface_id = "bcode.agent-profile/v1"
 name         = "Default Agents"
 
+[agent_defaults]
+build_tools = [
+    "shell.run",
+    "filesystem.read",
+    "filesystem.exists",
+    "filesystem.list",
+    "filesystem.find",
+    "filesystem.grep",
+    "filesystem.stat",
+    "filesystem.write",
+    "filesystem.edit",
+    "web.search",
+    "web.fetch",
+    "web.status",
+    "web.inspect",
+    "git.clone",
+    "github.clone",
+    "worktree.list",
+    "worktree.create",
+    "worktree.remove",
+    "document.extract",
+]
+plan_disabled_tools = ["filesystem.write", "filesystem.edit"]
+
 [runtime]
 abi_version    = 1
 event_symbol   = "bcode_plugin_handle_event_v1"

@@ -5295,28 +5295,37 @@ mod tests {
 
     #[test]
     fn removed_shorthand_agent_tool_ids_are_rejected() {
-        let result = load_config_from_paths_with_overrides(
-            &[],
-            &ConfigLoadOverrides::from_env_with_cli(
-                None,
-                Some(
-                    "
-[agent.plan.tools]
-bash = true
-"
-                    .to_string(),
+        for (tool_id, replacement) in [
+            ("bash", "shell.run"),
+            ("read", "filesystem.read"),
+            ("grep", "filesystem.grep"),
+            ("find", "filesystem.find"),
+            ("ls", "filesystem.list"),
+            ("stat", "filesystem.stat"),
+            ("write", "filesystem.write"),
+            ("edit", "filesystem.edit"),
+            ("worktree.read", "worktree.list"),
+        ] {
+            let result = load_config_from_paths_with_overrides(
+                &[],
+                &ConfigLoadOverrides::from_env_with_cli(
+                    None,
+                    Some(format!("[agent.plan.tools]\n\"{tool_id}\" = true\n")),
                 ),
-            ),
-        );
+            );
 
-        assert!(matches!(
-            result,
-            Err(ConfigError::RemovedShorthandToolId {
-                agent_id,
-                tool_id,
-                replacement: "shell.run"
-            }) if agent_id == "plan" && tool_id == "bash"
-        ));
+            assert!(
+                matches!(
+                    result,
+                    Err(ConfigError::RemovedShorthandToolId {
+                        agent_id,
+                        tool_id: actual_tool_id,
+                        replacement: actual_replacement,
+                    }) if agent_id == "plan" && actual_tool_id == tool_id && actual_replacement == replacement
+                ),
+                "{tool_id} should be rejected with replacement {replacement}"
+            );
+        }
     }
 
     #[test]

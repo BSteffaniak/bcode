@@ -14,53 +14,48 @@ use bcode_agent_profile::{
     OP_POLICY_STATUS, PolicyStatusResponse,
 };
 use bcode_plugin_sdk::prelude::*;
+use serde::Deserialize;
 use std::path::PathBuf;
 use toml::{Table, Value};
 
 const MANIFEST: &str = include_str!("../bcode-plugin.toml");
-const DEFAULT_BUILD_TOOL_IDS: &[&str] = &[
-    "shell.run",
-    "filesystem.read",
-    "filesystem.exists",
-    "filesystem.list",
-    "filesystem.find",
-    "filesystem.grep",
-    "filesystem.stat",
-    "filesystem.write",
-    "filesystem.edit",
-    "web.search",
-    "web.fetch",
-    "web.status",
-    "web.inspect",
-    "git.clone",
-    "github.clone",
-    "worktree.list",
-    "worktree.create",
-    "worktree.remove",
-    "document.extract",
-];
-const DEFAULT_PLAN_DISABLED_TOOL_IDS: &[&str] = &["filesystem.write", "filesystem.edit"];
+
+#[derive(Debug, Deserialize)]
+struct DefaultAgentsManifestExtension {
+    agent_defaults: AgentDefaultsManifestExtension,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentDefaultsManifestExtension {
+    build_tools: Vec<String>,
+    plan_disabled_tools: Vec<String>,
+}
+
+fn manifest_defaults() -> AgentDefaultsManifestExtension {
+    toml::from_str::<DefaultAgentsManifestExtension>(MANIFEST)
+        .expect("default-agents manifest agent_defaults should parse")
+        .agent_defaults
+}
 
 fn default_config() -> AgentPermissionConfig {
+    let defaults = manifest_defaults();
     let mut config = policy_default_config();
     if let Some(build) = config.agent.get_mut(BUILD_AGENT) {
-        set_default_tools(build, true);
+        set_default_tools(build, &defaults.build_tools, true);
     }
     if let Some(plan) = config.agent.get_mut(PLAN_AGENT) {
-        set_default_tools(plan, true);
-        for tool_id in DEFAULT_PLAN_DISABLED_TOOL_IDS {
-            plan.tools.insert((*tool_id).to_string(), false);
+        set_default_tools(plan, &defaults.build_tools, true);
+        for tool_id in defaults.plan_disabled_tools {
+            plan.tools.insert(tool_id, false);
         }
     }
     config
 }
 
-fn set_default_tools(agent: &mut AgentConfig, enabled: bool) {
-    agent.tools.extend(
-        DEFAULT_BUILD_TOOL_IDS
-            .iter()
-            .map(|tool_id| ((*tool_id).to_string(), enabled)),
-    );
+fn set_default_tools(agent: &mut AgentConfig, tool_ids: &[String], enabled: bool) {
+    agent
+        .tools
+        .extend(tool_ids.iter().map(|tool_id| (tool_id.clone(), enabled)));
 }
 
 /// Default plan/build agent profile plugin.
