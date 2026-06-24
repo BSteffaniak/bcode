@@ -2213,6 +2213,54 @@ pub enum ConfigError {
     UnknownPermissionCategory(String),
     #[error("unknown permission action: {0}")]
     UnknownPermissionAction(String),
+    #[error(
+        "removed shorthand tool ID at agent.{agent_id}.tools.{tool_id}; use exact tool ID {replacement} instead"
+    )]
+    RemovedShorthandToolId {
+        agent_id: String,
+        tool_id: String,
+        replacement: &'static str,
+    },
+}
+
+fn validate_config(config: &BcodeConfig) -> Result<(), ConfigError> {
+    for (agent_id, agent) in &config.agent {
+        for tool_id in agent.tools.keys() {
+            if let Some(replacement) = removed_shorthand_tool_replacement(tool_id) {
+                return Err(ConfigError::RemovedShorthandToolId {
+                    agent_id: agent_id.clone(),
+                    tool_id: tool_id.clone(),
+                    replacement,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn removed_shorthand_tool_replacement(tool_id: &str) -> Option<&'static str> {
+    match tool_id {
+        "bash" => Some("shell.run"),
+        "read" => Some("filesystem.read"),
+        "grep" => Some("filesystem.grep"),
+        "find" => Some("filesystem.find"),
+        "ls" => Some("filesystem.list"),
+        "stat" => Some("filesystem.stat"),
+        "write" => Some("filesystem.write"),
+        "edit" => Some("filesystem.edit"),
+        "worktree.read" => Some("worktree.list"),
+        _ => None,
+    }
+}
+
+fn validate_config_value(value: toml::Value, context: &str) -> Result<BcodeConfig, ConfigError> {
+    let config = value
+        .try_into()
+        .map_err(|source| ConfigError::Composition {
+            message: format!("failed to deserialize {context}: {source}"),
+        })?;
+    validate_config(&config)?;
+    Ok(config)
 }
 
 /// Upsert a permission rule under `[agent.<agent_id>.permission.<category>]` in
@@ -4217,11 +4265,7 @@ pub fn load_config_from_paths_with_overrides(
 ) -> Result<BcodeConfig, ConfigError> {
     let raw = merged_raw_config_value_with_overrides(paths, overrides)?;
     let (resolved, _resolution) = resolve_composed_config_value(&raw)?;
-    resolved
-        .try_into()
-        .map_err(|source| ConfigError::Composition {
-            message: format!("failed to deserialize composed config: {source}"),
-        })
+    validate_config_value(resolved, "composed config")
 }
 
 fn merged_raw_config_value_with_overrides(
@@ -4307,17 +4351,14 @@ fn load_toml_file(path: &Path) -> Result<toml::Value, ConfigError> {
 fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
     let raw = load_toml_file(path)?;
     let (resolved, _resolution) = resolve_composed_config_value(&raw)?;
-    resolved
-        .try_into()
-        .map_err(|source| ConfigError::Composition {
-            message: format!("failed to deserialize config {}: {source}", path.display()),
-        })
+    let context = format!("config {}", path.display());
+    validate_config_value(resolved, &context)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BcodeConfig, CompactionMode, ConfigLoadOverrides, ContextStrategyMode,
+        BcodeConfig, CompactionMode, ConfigError, ConfigLoadOverrides, ContextStrategyMode,
         TuiAccentTransitionCurve, TuiMouseConfig, default_config_paths_from,
         default_permissions_state_path, load_config_from_paths,
         load_config_from_paths_with_overrides, load_permissions_state_from, merge_config_values,
@@ -4350,6 +4391,32 @@ mod tests {
     ];
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn removed_shorthand_agent_tool_ids_are_rejected() {
+        let result = load_config_from_paths_with_overrides(
+            &[],
+            &ConfigLoadOverrides::from_env_with_cli(
+                None,
+                Some(
+                    "
+[agent.plan.tools]
+bash = true
+"
+                    .to_string(),
+                ),
+            ),
+        );
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::RemovedShorthandToolId {
+                agent_id,
+                tool_id,
+                replacement: "shell.run"
+            }) if agent_id == "plan" && tool_id == "bash"
+        ));
+    }
 
     #[test]
     fn auth_pool_config_loads_from_toml_and_resolves_model_profile() {

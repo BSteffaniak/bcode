@@ -234,15 +234,15 @@ fn module_end_line(lines: &[&str], module_index: usize) -> Option<usize> {
 
 fn is_temporary_boundary_allowlist(path: &Path, line: &str) -> bool {
     let path = path.to_string_lossy();
-    // Transitional allowlist: agent-policy keeps exact built-in default tool IDs while
-    // runtime policy evaluation itself is metadata-driven.
-    if path.ends_with("packages/agent-policy/src/lib.rs") && line.contains(".to_string()") {
-        return true;
-    }
-    // No core bundled plugin defaults remain in config; test fixtures use example IDs only.
     // Transitional allowlist: agent-policy model docs describe policy categories, not
     // production tool routing.
     if path.ends_with("packages/agent-policy/models/src/lib.rs") {
+        return true;
+    }
+    // Transitional allowlist: config validation reports removed shorthand tool-ID replacements.
+    if path.ends_with("packages/config/src/lib.rs")
+        && (line.contains("Some(\"") || line.contains("RemovedShorthandToolId"))
+    {
         return true;
     }
     // Transitional allowlist: model-context truncation text teaches agents to use
