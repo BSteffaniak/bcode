@@ -31,7 +31,7 @@ use bcode_session_models::{
 use bcode_worktree_models::{
     WorktreeBaseRef, WorktreeCreateRequest, WorktreeListRequest, WorktreeRemoveRequest,
 };
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use rand::TryRngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -514,6 +514,15 @@ fn init_tracing() {
         .with_writer(std::io::stderr)
         .finish();
     let _ = subscriber.try_init();
+}
+
+/// Return the root `bcode` CLI command definition.
+///
+/// This keeps generated documentation, completions, and help snapshots in sync
+/// with the actual parser without exposing parser internals as public API.
+#[must_use]
+pub fn root_command() -> clap::Command {
+    Cli::command()
 }
 
 #[derive(Debug, Parser)]

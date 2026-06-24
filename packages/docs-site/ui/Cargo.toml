@@ -1,0 +1,59 @@
+[package]
+authors     = { workspace = true }
+categories  = ["web-programming"]
+description = "Bcode documentation website UI components"
+edition     = { workspace = true }
+keywords    = ["bcode", "documentation", "ui"]
+license     = { workspace = true }
+name        = "bcode_docs_site_ui"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_cli           = { workspace = true }
+bcode_config        = { workspace = true }
+hyperchad_docs_site = { workspace = true }
+
+clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
+
+hyperchad = { workspace = true, features = [
+    "actions",
+    "actions-logic",
+    "actions-serde",
+    "color",
+    "markdown",
+    "markdown-syntax-highlighting",
+    "markdown-xss-protection",
+    "renderer",
+    "router",
+    "template",
+    "transformer",
+    "transformer-models",
+] }
+
+# These are needed as direct dependencies because the `container!` proc macro
+# generates code with absolute paths like `::hyperchad_template::Container`.
+hyperchad_color              = { workspace = true }
+hyperchad_renderer           = { workspace = true }
+hyperchad_template           = { workspace = true }
+hyperchad_transformer        = { workspace = true }
+hyperchad_transformer_models = { workspace = true }
+
+[features]
+fail-on-warnings = [
+    "bcode_cli/fail-on-warnings",
+    "bcode_config/fail-on-warnings",
+]
+
+[dev-dependencies]
+toml = { workspace = true, features = ["parse"] }
+
+[package.metadata.cargo-machete]
+ignored = [
+    "hyperchad_color",              # Proc macro (container!) generates absolute ::hyperchad_color paths
+    "hyperchad_renderer",           # Proc macro (container!) generates absolute ::hyperchad_renderer paths
+    "hyperchad_template",           # Proc macro (container!) generates absolute ::hyperchad_template paths
+    "hyperchad_transformer",        # Proc macro (container!) generates absolute ::hyperchad_transformer paths
+    "hyperchad_transformer_models", # Proc macro (container!) generates absolute ::hyperchad_transformer_models paths
+]

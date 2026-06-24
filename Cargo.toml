@@ -26,6 +26,8 @@ members = [
     "packages/client",
     "packages/command",
     "packages/config",
+    "packages/docs-site",
+    "packages/docs-site/ui",
     "packages/daemon-lifecycle",
     "packages/ipc",
     "packages/model",
@@ -81,6 +83,7 @@ bcode_command                           = { version = "0.0.1-alpha.0", default-f
 bcode_config                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config" }
 bcode_daemon_lifecycle                  = { version = "0.0.1-alpha.0", default-features = false, path = "packages/daemon-lifecycle" }
 bcode_default_agents_plugin             = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/default-agents-plugin" }
+bcode_docs_site_ui                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/docs-site/ui" }
 bcode_document_plugin                   = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/document-plugin" }
 bcode_fake_provider_plugin              = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/fake-provider-plugin" }
 bcode_filesystem_plugin                 = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/filesystem-plugin" }
@@ -158,6 +161,9 @@ globset = { version = "0.4.18", default-features = false }
 httpdate = { version = "1.0.3", default-features = false }
 hyperchad = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
 hyperchad_color = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
+hyperchad_docs_config = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
+hyperchad_docs_config_derive = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
+hyperchad_docs_site = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
 hyperchad_markdown = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false, features = [
     "xss-protection",
 ] }

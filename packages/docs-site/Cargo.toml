@@ -1,0 +1,57 @@
+[package]
+authors     = { workspace = true }
+build       = "build.rs"
+categories  = ["web-programming"]
+description = "Bcode documentation website"
+edition     = { workspace = true }
+keywords    = ["bcode", "documentation", "site"]
+license     = { workspace = true }
+name        = "bcode_docs_site"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+test = false
+
+[[bin]]
+name = "bcode-docs-site"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+bcode_docs_site_ui = { workspace = true }
+hyperchad = { workspace = true, features = [
+    "actions",
+    "actions-logic",
+    "app",
+    "color",
+    "json",
+    "markdown",
+    "markdown-syntax-highlighting",
+    "markdown-xss-protection",
+    "renderer",
+    "router",
+] }
+hyperchad_docs_site = { workspace = true }
+
+serde_json = { workspace = true }
+switchy    = { workspace = true, features = ["async", "async-tokio"] }
+
+[features]
+default          = ["actix", "html", "vanilla-js", "assets", "static-routes"]
+fail-on-warnings = ["bcode_docs_site_ui/fail-on-warnings"]
+
+actix = ["hyperchad/renderer-html-actix"]
+assets = ["hyperchad/renderer-assets", "hyperchad_docs_site/assets"]
+html = ["hyperchad/renderer-html"]
+static-routes = ["hyperchad/router-static-routes"]
+vanilla-js = [
+    "html",
+    "hyperchad/renderer-vanilla-js",
+    "hyperchad/renderer-vanilla-js-plugin-actions-click",
+    "hyperchad/renderer-vanilla-js-plugin-actions-click-outside",
+    "hyperchad/renderer-vanilla-js-plugin-nav",
+    "hyperchad/renderer-vanilla-js-plugin-routing",
+    "hyperchad_docs_site/vanilla-js",
+]
