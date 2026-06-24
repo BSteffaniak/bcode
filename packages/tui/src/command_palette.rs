@@ -82,12 +82,10 @@ impl PaletteCommand {
         match id {
             "session.new" => Some(Self::NewSession),
             "session.switch" => Some(Self::SwitchSession),
-            "command.work-tree.list" | "worktree.list" => Some(Self::ListWorktrees),
-            "command.work-tree.createSession" | "worktree.createSession" => {
-                Some(Self::CreateSessionWorktree)
-            }
-            "command.work-tree.attach" | "worktree.attach" => Some(Self::AttachWorktree),
-            "command.work-tree.remove" | "worktree.remove" => Some(Self::RemoveWorktree),
+            "command.work-tree.list" => Some(Self::ListWorktrees),
+            "command.work-tree.createSession" => Some(Self::CreateSessionWorktree),
+            "command.work-tree.attach" => Some(Self::AttachWorktree),
+            "command.work-tree.remove" => Some(Self::RemoveWorktree),
             "model.status" => Some(Self::ShowModelStatus),
             "model.serverStatus" => Some(Self::ShowServerModelStatus),
             "runtime.status" => Some(Self::ShowRuntimeStatus),

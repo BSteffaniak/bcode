@@ -612,22 +612,28 @@ fn tool_aliases(request: &EvaluateToolCallRequest) -> Vec<String> {
         aliases.push(category.clone());
     }
     aliases.extend(request.policy.aliases.iter().cloned());
-    match request.tool_name.as_str() {
-        "shell.run" => aliases.push("bash".to_string()),
-        "filesystem.write" => aliases.push("write".to_string()),
-        "filesystem.edit" => aliases.push("edit".to_string()),
-        "filesystem.read" | "filesystem.exists" | "filesystem.stat" => {
-            aliases.push("read".to_string());
-        }
-        "filesystem.grep" => aliases.push("grep".to_string()),
-        "filesystem.find" => aliases.push("find".to_string()),
-        "filesystem.list" => aliases.push("ls".to_string()),
-        "worktree.list" => aliases.push("worktree.read".to_string()),
-        "worktree.create" => aliases.push("worktree.create".to_string()),
-        "worktree.remove" => aliases.push("worktree.remove".to_string()),
-        _ => {}
-    }
+    aliases.extend(
+        legacy_tool_aliases(&request.tool_name)
+            .iter()
+            .map(|alias| (*alias).to_string()),
+    );
     aliases
+}
+
+fn legacy_tool_aliases(tool_name: &str) -> &'static [&'static str] {
+    match tool_name {
+        "shell.run" => &["bash"],
+        "filesystem.write" => &["write"],
+        "filesystem.edit" => &["edit"],
+        "filesystem.read" | "filesystem.exists" | "filesystem.stat" => &["read"],
+        "filesystem.grep" => &["grep"],
+        "filesystem.find" => &["find"],
+        "filesystem.list" => &["ls"],
+        "worktree.list" => &["worktree.read"],
+        "worktree.create" => &["worktree.create"],
+        "worktree.remove" => &["worktree.remove"],
+        _ => &[],
+    }
 }
 
 /// Normalize Pi/OpenCode tool names to Bcode tool names.

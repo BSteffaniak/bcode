@@ -188,26 +188,15 @@ fn is_temporary_boundary_allowlist(path: &Path, line: &str) -> bool {
             || line.contains("filesystem.edit")
             || line.contains("filesystem.read")
             || line.contains("filesystem.exists")
-            || line.contains("filesystem.stat"))
+            || line.contains("filesystem.stat")
+            || line.contains("legacy_tool_aliases")
+            || line.contains("=> &["))
     {
         return true;
     }
-    // Intentional allowlist: core config owns the default bundled plugin selection list;
-    // concrete plugin implementations still live outside core and remain disableable.
-    if path.ends_with("packages/config/src/lib.rs") && line.contains("DEFAULT_") {
-        return true;
-    }
-    // Intentional allowlist: config tests verify default bundled plugin IDs can be disabled.
-    if path.ends_with("packages/config/src/lib.rs") && line.contains("bcode.shell") {
-        return true;
-    }
+    // No core bundled plugin defaults remain in config; test fixtures use example IDs only.
     // Transitional allowlist: agent-policy model docs describe legacy config keys.
     if path.ends_with("packages/agent-policy/models/src/lib.rs") {
-        return true;
-    }
-    // Transitional allowlist: TUI command IDs still keep backwards-compatible parsing
-    // aliases for old worktree command contribution IDs.
-    if path.ends_with("packages/tui/src/command_palette.rs") && line.contains("| \"worktree.") {
         return true;
     }
     // Transitional allowlist: server tests construct service/session presentation fixtures.

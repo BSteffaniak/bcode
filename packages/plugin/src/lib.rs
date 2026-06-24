@@ -3166,6 +3166,58 @@ library = "libdisabled.dylib"
     }
 
     #[test]
+    fn static_bundled_plugin_ids_are_derived_from_manifests() {
+        fn manifest(
+            _storage: &'static OnceLock<Option<std::ffi::CString>>,
+        ) -> *const std::ffi::c_char {
+            std::ptr::null()
+        }
+        fn lifecycle(_instance: *const std::ffi::c_void) -> i32 {
+            SERVICE_STATUS_OK
+        }
+        fn service(
+            _instance: *const std::ffi::c_void,
+            _input: *const u8,
+            _input_len: usize,
+            _output: *mut u8,
+            _cap: usize,
+            _len: *mut usize,
+        ) -> i32 {
+            SERVICE_STATUS_OK
+        }
+        fn event(_instance: *const std::ffi::c_void, _input: *const u8, _input_len: usize) -> i32 {
+            SERVICE_STATUS_OK
+        }
+        let static_plugins = [StaticBundledPlugin::new(
+            r#"
+id = "bcode.example-static"
+name = "Example Static"
+version = "0.0.1"
+
+[runtime]
+type = "native"
+abi_version = 1
+library = "libexample_static.dylib"
+"#,
+            StaticPluginVtable {
+                instance: std::ptr::null(),
+                manifest,
+                activate: lifecycle,
+                deactivate: lifecycle,
+                invoke_service: service,
+                invoke_service_streaming: test_streaming_service,
+                tui_registry: None,
+                handle_event: event,
+            },
+        )];
+
+        assert_eq!(
+            static_bundled_plugin_ids(&static_plugins).expect("manifest should parse"),
+            vec!["bcode.example-static".to_string()]
+        );
+    }
+
+    #[test]
     fn registered_plugins_expose_command_contributions() {
         let manifest = toml::from_str::<PluginManifest>(
             r#"
