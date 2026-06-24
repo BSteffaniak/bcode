@@ -40,7 +40,42 @@ pub(crate) fn extract_section_for(
 
 /// Generate the CLI reference markdown from the actual clap command tree.
 pub(crate) fn generate_cli_reference() -> String {
-    hyperchad_docs_site::CliReference::new("bcode", bcode_cli::root_command()).render()
+    let mut doc =
+        hyperchad_docs_site::CliReference::new("bcode", bcode_cli::root_command()).render();
+    doc.push_str(cli_examples());
+    doc
+}
+
+const fn cli_examples() -> &'static str {
+    "\n## Examples\n\n\
+     ### Start the TUI\n\n\
+     ```bash\n\
+     bcode tui\n\
+     ```\n\n\
+     ### Attach to a recent session\n\n\
+     ```bash\n\
+     bcode attach --recent\n\
+     ```\n\n\
+     ### Send a prompt from the shell\n\n\
+     ```bash\n\
+     bcode send \"Summarize the current repository\"\n\
+     ```\n\n\
+     ### Select a model profile\n\n\
+     ```bash\n\
+     bcode --profile daily tui\n\
+     ```\n\n\
+     ### Inspect configured plugins\n\n\
+     ```bash\n\
+     bcode plugin list\n\
+     ```\n\n\
+     ### Manage provider authentication\n\n\
+     ```bash\n\
+     bcode auth status\n\
+     ```\n\n\
+     ### Cancel active work\n\n\
+     ```bash\n\
+     bcode cancel\n\
+     ```\n"
 }
 
 /// Generate the full configuration reference markdown from `BcodeConfig`'s
@@ -231,6 +266,9 @@ mod tests {
         assert!(doc.contains("TUI-first coding agent"));
         assert!(doc.contains("## `bcode plugin`"));
         assert!(doc.contains("## `bcode model`"));
+        assert!(doc.contains("## Examples"));
+        assert!(doc.contains("bcode --profile daily tui"));
+        assert!(doc.contains("bcode auth status"));
     }
 
     #[test]

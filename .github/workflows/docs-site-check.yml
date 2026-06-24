@@ -1,0 +1,35 @@
+name: Docs Site Check
+
+on:
+  pull_request:
+    branches: ["master"]
+    paths:
+      - ".github/workflows/docs-site-check.yml"
+      - "docs/**"
+      - "README.md"
+      - "packages/config/**"
+      - "packages/cli/**"
+      - "packages/docs-site/**"
+  push:
+    branches: ["master"]
+    paths:
+      - ".github/workflows/docs-site-check.yml"
+      - "docs/**"
+      - "README.md"
+      - "packages/config/**"
+      - "packages/cli/**"
+      - "packages/docs-site/**"
+  workflow_dispatch:
+
+jobs:
+  docs-site-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test docs site crates
+        run: cargo test -p bcode_docs_site_ui -p bcode_docs_site
+      - name: Build static docs site
+        run: cargo run --release -p bcode_docs_site --bin bcode-docs-site -- gen --output dist

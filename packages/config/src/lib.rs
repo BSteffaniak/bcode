@@ -207,10 +207,9 @@ impl ConfigDocSchema for BcodeConfig {
                 "Terminal UI behavior and appearance.",
                 tui_field_docs(),
             ),
-            section_doc(
+            schema_section_doc::<SessionImportConfig>(
                 "session_import",
                 "External session import plugin settings.",
-                session_import_field_docs(),
             ),
             schema_section_doc::<DaemonConfig>(
                 "daemon",
@@ -793,35 +792,6 @@ fn tui_field_docs() -> Vec<FieldDoc> {
                     "integer",
                     "Transition duration in milliseconds.",
                 ),
-            ],
-        ),
-    ]
-}
-
-fn session_import_field_docs() -> Vec<FieldDoc> {
-    vec![
-        config_field(
-            "enabled",
-            "bool",
-            "Whether session import plugins are enabled.",
-        ),
-        enum_field(
-            "path_mode",
-            "enum",
-            "How external session paths are resolved.",
-            &["off", "auto", "explicit"],
-        ),
-        config_field(
-            "paths",
-            "array<string>",
-            "Explicit external session paths to import.",
-        ),
-        nested_field(
-            "pi",
-            "PI session import plugin settings.",
-            vec![
-                config_field("enabled", "bool", "Whether PI session import is enabled."),
-                config_field("paths", "array<string>", "PI session roots."),
             ],
         ),
     ]
@@ -1675,16 +1645,24 @@ const fn default_max_trace_blob_bytes() -> usize {
 }
 
 /// Session import configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "session_import")]
 pub struct SessionImportConfig {
+    /// Whether session import plugins are enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Whether import sources are discovered when the server starts.
     #[serde(default = "default_true")]
     pub auto_discover_on_startup: bool,
+    /// Whether already-imported external sessions are hidden from import candidates.
     #[serde(default = "default_true")]
     pub hide_already_imported: bool,
+    /// PI session import configuration.
+    #[config_doc(nested)]
     #[serde(default)]
     pub pi: PiSessionImportConfig,
+    /// `OpenCode` session import configuration.
+    #[config_doc(nested)]
     #[serde(default)]
     pub opencode: OpenCodeSessionImportConfig,
 }
@@ -1727,12 +1705,16 @@ const fn default_daemon_idle_shutdown_after_secs() -> u64 {
 }
 
 /// Pi session import configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "pi")]
 pub struct PiSessionImportConfig {
+    /// Whether PI session import is enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Additional PI session roots to scan.
     #[serde(default)]
     pub paths: Vec<PathBuf>,
+    /// Path selection mode for PI session import.
     #[serde(default)]
     pub path_mode: SessionImportPathMode,
 }
@@ -1748,12 +1730,16 @@ impl Default for PiSessionImportConfig {
 }
 
 /// `OpenCode` session import configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "opencode")]
 pub struct OpenCodeSessionImportConfig {
+    /// Whether `OpenCode` session import is enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Additional `OpenCode` session roots to scan.
     #[serde(default)]
     pub paths: Vec<PathBuf>,
+    /// Path selection mode for `OpenCode` session import.
     #[serde(default)]
     pub path_mode: SessionImportPathMode,
 }
@@ -1769,7 +1755,7 @@ impl Default for OpenCodeSessionImportConfig {
 }
 
 /// Path selection mode for a session import source.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionImportPathMode {
     DefaultsOnly,
@@ -5141,6 +5127,10 @@ mod tests {
             ("daemon", &["idle_shutdown", "idle_shutdown_after_secs"]),
             ("worktree", &["root", "branch_prefix", "setup"]),
             ("tools", &["shell"]),
+            (
+                "session_import",
+                &["enabled", "auto_discover_on_startup", "pi", "opencode"],
+            ),
         ] {
             let root_fields = BcodeConfig::field_docs();
             let field = root_fields
