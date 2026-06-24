@@ -5049,7 +5049,6 @@ mod tests {
     #[test]
     fn runtime_context_chatgpt_auth_uses_context_env() {
         let context = ProviderRequestContext {
-            auth_profile: Some("openai".to_string()),
             env: BTreeMap::from([
                 (
                     "BCODE_OPENAI_CODEX_ACCESS_TOKEN".to_string(),

@@ -1446,6 +1446,8 @@ dependencies = [
  "bcode_model",
  "bcode_plugin",
  "bcode_skill_models",
+ "hyperchad_docs_config",
+ "hyperchad_docs_config_derive",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -4358,6 +4360,16 @@ dependencies = [
 name = "hyperchad_docs_config"
 version = "0.3.0"
 source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#120942f5fbb9b23266c0bfc10d0ac95879fecf4d"
+
+[[package]]
+name = "hyperchad_docs_config_derive"
+version = "0.3.0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#120942f5fbb9b23266c0bfc10d0ac95879fecf4d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "hyperchad_docs_site"

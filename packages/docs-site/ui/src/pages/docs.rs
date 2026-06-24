@@ -1,10 +1,10 @@
 //! Generation helpers for documentation pages.
 
-use std::fmt::Write as _;
-
 use bcode_config::{
     BCODE_AUTH_PROFILE_ENV, BCODE_CONFIG_ENV, BCODE_CONFIG_TOML_ENV, BCODE_MODEL_PROFILE_ENV,
+    BcodeConfig,
 };
+use hyperchad_docs_site::EnvOverrideDoc;
 
 /// Extract a section from a markdown document by heading.
 pub(crate) fn extract_section_for(
@@ -43,106 +43,119 @@ pub(crate) fn generate_cli_reference() -> String {
     hyperchad_docs_site::CliReference::new("bcode", bcode_cli::root_command()).render()
 }
 
-/// Generate a code-sourced configuration reference.
-///
-/// This first-pass reference documents the real top-level config tables and
-/// process-level environment overlays from `bcode_config`. Nested field-level
-/// docs can be migrated to `hyperchad_docs_config` derives incrementally.
+/// Generate the full configuration reference markdown from `BcodeConfig`'s
+/// code-owned `ConfigDocSchema` implementation.
 pub(crate) fn generate_config_reference() -> String {
-    let mut doc = String::from(
-        "bcode is configured with `bcode.toml`. Configuration can be layered from \
-         files, raw TOML environment overlays, active model profiles, auth profiles, \
-         and plugin/provider defaults.\n\n",
-    );
-
-    doc.push_str("## Path & Env Overrides\n\n");
-    doc.push_str("| Variable | Scope | Behavior |\n|----------|-------|----------|\n");
-    for (variable, scope, behavior) in env_overrides() {
-        writeln!(doc, "| `{variable}` | {scope} | {behavior} |")
-            .expect("writing to string cannot fail");
-    }
-
-    doc.push_str("\n---\n\n");
-    doc.push_str("## Top-level Tables\n\n");
-    doc.push_str("| Table | Behavior |\n|-------|----------|\n");
-    for (table, behavior) in root_tables() {
-        writeln!(doc, "| `[{table}]` | {behavior} |").expect("writing to string cannot fail");
-    }
-
-    doc.push_str(
-        "\n## Next Steps\n\n\
-         This page is intentionally generated from code-owned config metadata. \
-         The current baseline documents stable root tables and environment \
-         overlays; nested field-level docs should be expanded by adding \
-         `ConfigDoc`/`ConfigDocEnum` derives and doc comments to the matching \
-         config structs.\n",
-    );
-
-    doc
+    hyperchad_docs_site::ConfigReference::<BcodeConfig>::new()
+        .intro(
+            "bcode is configured with `bcode.toml`. Configuration can be layered from \
+             files, raw TOML environment overlays, active model profiles, auth profiles, \
+             and plugin/provider defaults.\n\n\
+             Dynamic plugin/provider tables are documented at their stable boundaries; \
+             provider-specific keys remain owned by the relevant plugin.\n\n\
+             ---",
+        )
+        .env_overrides(env_overrides().iter().cloned())
+        .toml_table_headings()
+        .option_column_label("Option")
+        .section_appendix("model", model_config_examples())
+        .section_appendix("auth", auth_config_examples())
+        .section_appendix("agent", agent_config_examples())
+        .section_appendix("skills", skills_config_examples())
+        .render()
 }
 
-const fn env_overrides() -> &'static [(&'static str, &'static str, &'static str)] {
+const fn env_overrides() -> &'static [EnvOverrideDoc] {
     &[
-        (
-            BCODE_CONFIG_ENV,
-            "process",
-            "Path to a TOML config overlay file.",
-        ),
-        (
-            BCODE_CONFIG_TOML_ENV,
-            "process",
-            "Raw TOML config overlay data.",
-        ),
-        (
-            BCODE_MODEL_PROFILE_ENV,
-            "client",
-            "Selects the active model profile for this client connection.",
-        ),
-        (
-            BCODE_AUTH_PROFILE_ENV,
-            "client",
-            "Selects the active auth profile for this client connection.",
-        ),
+        EnvOverrideDoc {
+            variable: BCODE_CONFIG_ENV,
+            scope: "process",
+            description: "Path to a TOML config overlay file.",
+        },
+        EnvOverrideDoc {
+            variable: BCODE_CONFIG_TOML_ENV,
+            scope: "process",
+            description: "Raw TOML config overlay data.",
+        },
+        EnvOverrideDoc {
+            variable: BCODE_MODEL_PROFILE_ENV,
+            scope: "client",
+            description: "Selects the active model profile for this client connection.",
+        },
+        EnvOverrideDoc {
+            variable: BCODE_AUTH_PROFILE_ENV,
+            scope: "client",
+            description: "Selects the active auth profile for this client connection.",
+        },
     ]
 }
 
-const fn root_tables() -> &'static [(&'static str, &'static str)] {
-    &[
-        (
-            "composition",
-            "Config composition metadata and profile selection.",
-        ),
-        ("plugins", "Bundled and external plugin selection."),
-        (
-            "model",
-            "Model provider, profile, alias, and metadata settings.",
-        ),
-        (
-            "agent",
-            "Per-agent permission and tool policy configuration.",
-        ),
-        ("auth", "Provider authentication profiles and pools."),
-        ("observability", "Logging, tracing, and telemetry controls."),
-        (
-            "skills",
-            "Skill discovery, activation, and prompt catalog settings.",
-        ),
-        ("system_prompt", "System prompt mode and section controls."),
-        ("tui", "Terminal UI behavior and appearance."),
-        ("session_import", "External session import plugin settings."),
-        ("daemon", "Daemon lifecycle and connection settings."),
-        ("worktree", "Worktree creation and naming defaults."),
-        ("tools", "Built-in tool behavior and environment controls."),
-        (
-            "web_search",
-            "Provider-specific web search plugin configuration.",
-        ),
-    ]
+fn model_config_examples() -> String {
+    String::from(
+        "### Model Profile Example\n\n\
+         ```toml\n\
+         [model]\n\
+         profile = \"daily\"\n\
+\n\
+         [model.profiles.daily]\n\
+         provider_plugin_id = \"bcode.openai-compatible\"\n\
+         model_id = \"gpt-5-codex\"\n\
+         auth_profile = \"openai\"\n\
+\n\
+         [model.profiles.daily.request]\n\
+         temperature = 0.2\n\
+         ```\n",
+    )
+}
+
+fn auth_config_examples() -> String {
+    String::from(
+        "### Auth Profile Example\n\n\
+         ```toml\n\
+         [auth]\n\
+         active_profile = \"openai\"\n\
+\n\
+         [auth.profiles.openai]\n\
+         provider_plugin_id = \"bcode.openai-compatible\"\n\
+         api_key_env = \"OPENAI_API_KEY\"\n\
+         ```\n",
+    )
+}
+
+fn agent_config_examples() -> String {
+    String::from(
+        "### Agent Policy Example\n\n\
+         ```toml\n\
+         [agent.plan.permissions]\n\
+         read = \"allow\"\n\
+         write = \"ask\"\n\
+         execute = \"deny\"\n\
+\n\
+         [agent.build.tools.shell]\n\
+         execute = \"ask\"\n\
+         ```\n",
+    )
+}
+
+fn skills_config_examples() -> String {
+    String::from(
+        "### Skills Example\n\n\
+         ```toml\n\
+         [skills]\n\
+         auto_activate = \"suggest\"\n\
+         roots = [\"~/.config/bcode/skills\"]\n\
+\n\
+         [skills.prompt]\n\
+         catalog = \"summary\"\n\
+         include_sources = true\n\
+         ```\n",
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bcode_config::ConfigDocSchema;
 
     #[test]
     fn cli_reference_uses_real_root_command() {
@@ -155,18 +168,56 @@ mod tests {
     }
 
     #[test]
-    fn config_reference_documents_env_overrides_and_root_tables() {
+    fn config_reference_renders_all_root_sections() {
         let doc = generate_config_reference();
 
-        for (variable, _, _) in env_overrides() {
-            assert!(doc.contains(variable), "missing env override: {variable}");
+        for field in BcodeConfig::field_docs() {
+            let heading = format!("## `[{}]`", field.toml_key);
+            assert!(doc.contains(&heading), "missing heading: {heading}");
         }
-        for (table, _) in root_tables() {
+    }
+
+    #[test]
+    fn config_reference_documents_env_overrides() {
+        let doc = generate_config_reference();
+
+        for override_doc in env_overrides() {
             assert!(
-                doc.contains(&format!("`[{table}]`")),
-                "missing table: {table}"
+                doc.contains(override_doc.variable),
+                "missing env override: {}",
+                override_doc.variable
             );
         }
+    }
+
+    #[test]
+    fn config_reference_documents_nested_model_profiles() {
+        let doc = generate_config_reference();
+
+        assert!(doc.contains("profiles.<profile>.provider_plugin_id"));
+        assert!(doc.contains("profiles.<profile>.request.temperature"));
+        assert!(doc.contains("reasoning.effort"));
+        assert!(doc.contains("conversation_reuse.enabled"));
+    }
+
+    #[test]
+    fn config_reference_documents_auth_and_agent_policy() {
+        let doc = generate_config_reference();
+
+        assert!(doc.contains("profiles.<profile>.api_key_env"));
+        assert!(doc.contains("pools.<pool>.strategy"));
+        assert!(doc.contains("tools.<tool-name>.execute"));
+        assert!(doc.contains("permissions.network"));
+    }
+
+    #[test]
+    fn config_reference_documents_enum_values() {
+        let doc = generate_config_reference();
+
+        assert!(doc.contains("`off`"));
+        assert!(doc.contains("`suggest`"));
+        assert!(doc.contains("`round_robin`"));
+        assert!(doc.contains("`ask`"));
     }
 
     #[test]
