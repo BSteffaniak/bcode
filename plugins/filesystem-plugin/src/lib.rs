@@ -9,7 +9,8 @@ use bcode_tool::{
     FileChangeResult, ImageMetadata, ImageRefContent, ListToolsRequest, OP_INVOKE_TOOL,
     OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition, ToolInvocationPresentation,
     ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolInvocationStreamEvent,
-    ToolList, ToolResultContent, ToolSideEffect,
+    ToolList, ToolPresentationField, ToolPresentationFieldKind, ToolRequestPresentationMetadata,
+    ToolResultContent, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -355,9 +356,41 @@ fn path_policy(
     }
 }
 
-fn tool_ui(activity_label: &str) -> bcode_tool::ToolUiMetadata {
+fn path_tool_ui(activity_label: &str, title: &str) -> bcode_tool::ToolUiMetadata {
     bcode_tool::ToolUiMetadata {
         activity_label: Some(activity_label.to_string()),
+        request_presentation: Some(ToolRequestPresentationMetadata {
+            title: title.to_string(),
+            fields: vec![ToolPresentationField {
+                label: "Path".to_string(),
+                argument: "path".to_string(),
+                kind: ToolPresentationFieldKind::Path,
+                optional: false,
+            }],
+        }),
+    }
+}
+
+fn write_tool_ui(activity_label: &str, title: &str) -> bcode_tool::ToolUiMetadata {
+    bcode_tool::ToolUiMetadata {
+        activity_label: Some(activity_label.to_string()),
+        request_presentation: Some(ToolRequestPresentationMetadata {
+            title: title.to_string(),
+            fields: vec![
+                ToolPresentationField {
+                    label: "Path".to_string(),
+                    argument: "path".to_string(),
+                    kind: ToolPresentationFieldKind::Path,
+                    optional: false,
+                },
+                ToolPresentationField {
+                    label: "Contents".to_string(),
+                    argument: "contents".to_string(),
+                    kind: ToolPresentationFieldKind::Text,
+                    optional: false,
+                },
+            ],
+        }),
     }
 }
 
@@ -377,7 +410,7 @@ fn read_tool_definition() -> ToolDefinition {
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: path_policy(&["read"], "read", bcode_tool::ToolArgumentKind::ReadPath),
-        ui: tool_ui("reading"),
+        ui: path_tool_ui("reading", "Read file"),
     }
 }
 
@@ -396,7 +429,7 @@ fn write_tool_definition() -> ToolDefinition {
         side_effect: ToolSideEffect::WriteFiles,
         requires_permission: true,
         policy: path_policy(&["write"], "write", bcode_tool::ToolArgumentKind::WritePath),
-        ui: tool_ui("writing"),
+        ui: write_tool_ui("writing", "Write file"),
     }
 }
 
@@ -416,7 +449,7 @@ fn edit_tool_definition() -> ToolDefinition {
         side_effect: ToolSideEffect::WriteFiles,
         requires_permission: true,
         policy: path_policy(&["edit"], "edit", bcode_tool::ToolArgumentKind::WritePath),
-        ui: tool_ui("editing"),
+        ui: write_tool_ui("editing", "Edit file"),
     }
 }
 
@@ -432,7 +465,7 @@ fn exists_tool_definition() -> ToolDefinition {
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: path_policy(&["read"], "read", bcode_tool::ToolArgumentKind::ReadPath),
-        ui: tool_ui("checking"),
+        ui: path_tool_ui("checking", "Check path"),
     }
 }
 
@@ -457,7 +490,7 @@ fn list_tool_definition() -> ToolDefinition {
             "read",
             bcode_tool::ToolArgumentKind::ReadPath,
         ),
-        ui: tool_ui("listing"),
+        ui: path_tool_ui("listing", "List directory"),
     }
 }
 
@@ -482,7 +515,7 @@ fn find_tool_definition() -> ToolDefinition {
             "read",
             bcode_tool::ToolArgumentKind::ReadPath,
         ),
-        ui: tool_ui("finding"),
+        ui: path_tool_ui("finding", "Find paths"),
     }
 }
 
@@ -509,7 +542,7 @@ fn grep_tool_definition() -> ToolDefinition {
             "read",
             bcode_tool::ToolArgumentKind::ReadPath,
         ),
-        ui: tool_ui("searching"),
+        ui: path_tool_ui("searching", "Search files"),
     }
 }
 
@@ -529,7 +562,7 @@ fn stat_tool_definition() -> ToolDefinition {
             "read",
             bcode_tool::ToolArgumentKind::ReadPath,
         ),
-        ui: tool_ui("stat"),
+        ui: path_tool_ui("stat", "Inspect path"),
     }
 }
 

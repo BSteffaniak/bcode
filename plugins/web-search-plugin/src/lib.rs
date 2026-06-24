@@ -9,7 +9,8 @@ use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
     ToolInvocationHostAction, ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationStreamEvent, ToolList, ToolSideEffect,
+    ToolInvocationStreamEvent, ToolList, ToolPresentationField, ToolPresentationFieldKind,
+    ToolRequestPresentationMetadata, ToolSideEffect,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -641,8 +642,8 @@ async fn search_async(
             message: Some(
                 "model-native web search requested through host provider bridge".to_string(),
             ),
-            host_action: Some(ToolInvocationHostAction::ModelNativeWebSearch {
-                request: bcode_tool::HostModelNativeWebSearchRequest {
+            host_action: Some(ToolInvocationHostAction::HostModelNativeWebSearch(
+                bcode_tool::HostModelNativeWebSearchRequest {
                     query: request.query,
                     max_results: request.max_results,
                     site: request.site,
@@ -650,7 +651,7 @@ async fn search_async(
                     region: request.region,
                     safe_search: request.safe_search,
                 },
-            }),
+            )),
         }),
         "duckduckgo_html" | "duckduckgo" | "ddg" => search_duckduckgo_html(request, &config).await,
         _ => Err(WebError::InvalidRequest(format!(
@@ -1505,7 +1506,32 @@ fn search_tool_definition() -> ToolDefinition {
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: bcode_tool::ToolPolicyMetadata::default(),
-        ui: bcode_tool::ToolUiMetadata::default(),
+        ui: bcode_tool::ToolUiMetadata {
+            activity_label: Some("searching".to_string()),
+            request_presentation: Some(ToolRequestPresentationMetadata {
+                title: "Search web".to_string(),
+                fields: vec![
+                    ToolPresentationField {
+                        label: "Query".to_string(),
+                        argument: "query".to_string(),
+                        kind: ToolPresentationFieldKind::Text,
+                        optional: false,
+                    },
+                    ToolPresentationField {
+                        label: "Provider".to_string(),
+                        argument: "provider".to_string(),
+                        kind: ToolPresentationFieldKind::Text,
+                        optional: true,
+                    },
+                    ToolPresentationField {
+                        label: "Max results".to_string(),
+                        argument: "max_results".to_string(),
+                        kind: ToolPresentationFieldKind::Count,
+                        optional: true,
+                    },
+                ],
+            }),
+        },
     }
 }
 
@@ -1539,6 +1565,29 @@ fn fetch_tool_definition() -> ToolDefinition {
         },
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("fetching".to_string()),
+            request_presentation: Some(ToolRequestPresentationMetadata {
+                title: "Fetch URL".to_string(),
+                fields: vec![
+                    ToolPresentationField {
+                        label: "URL".to_string(),
+                        argument: "url".to_string(),
+                        kind: ToolPresentationFieldKind::Url,
+                        optional: false,
+                    },
+                    ToolPresentationField {
+                        label: "Max bytes".to_string(),
+                        argument: "max_bytes".to_string(),
+                        kind: ToolPresentationFieldKind::Count,
+                        optional: true,
+                    },
+                    ToolPresentationField {
+                        label: "Rendered".to_string(),
+                        argument: "render".to_string(),
+                        kind: ToolPresentationFieldKind::Boolean,
+                        optional: true,
+                    },
+                ],
+            }),
         },
     }
 }

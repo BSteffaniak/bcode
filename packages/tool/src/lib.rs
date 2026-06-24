@@ -81,6 +81,55 @@ pub struct ToolUiMetadata {
     /// Short activity label suitable for progress/status displays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity_label: Option<String>,
+    /// Declarative request presentation metadata for permission prompts and transcripts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_presentation: Option<ToolRequestPresentationMetadata>,
+}
+
+/// Declarative request presentation metadata owned by a tool provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolRequestPresentationMetadata {
+    /// Human-readable request title.
+    pub title: String,
+    /// Ordered argument fields that should be shown in request summaries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<ToolPresentationField>,
+}
+
+/// Declarative presentation metadata for one request argument field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolPresentationField {
+    /// Human-readable field label.
+    pub label: String,
+    /// Top-level JSON argument name to display.
+    pub argument: String,
+    /// Field rendering hint for generic UI presentation.
+    pub kind: ToolPresentationFieldKind,
+    /// Whether the field may be omitted from the request arguments.
+    #[serde(default)]
+    pub optional: bool,
+}
+
+/// Generic UI presentation hint for request argument fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPresentationFieldKind {
+    /// Plain text value.
+    Text,
+    /// File or directory path value.
+    Path,
+    /// URL value.
+    Url,
+    /// Shell or process command value.
+    Command,
+    /// Boolean value.
+    Boolean,
+    /// Integer count or limit value.
+    Count,
+    /// Millisecond duration value.
+    DurationMs,
+    /// JSON value with no more specific semantic hint.
+    Json,
 }
 
 /// Side-effect category for a model-callable tool.
@@ -138,16 +187,19 @@ pub enum ToolInvocationStreamEvent {
         #[serde(default)]
         byte_len: usize,
     },
-    /// Human-readable progress status from a long-running tool.
+    /// A user-visible status line or progress update.
     Status {
         tool_call_id: String,
+        #[serde(default)]
         sequence: u64,
         message: String,
     },
-    /// Tool execution has finished inside the provider plugin.
+    /// Tool has finished; full result follows through normal invoke response.
     Finished {
         tool_call_id: String,
+        #[serde(default)]
         sequence: u64,
+        #[serde(default)]
         is_error: bool,
         #[serde(default)]
         finished_at_ms: Option<u64>,
@@ -163,72 +215,65 @@ pub enum ToolOutputStream {
     Pty,
 }
 
+/// Optional stream event sink callback supplied by the host for long-running tools.
+pub type ToolStreamEventSink<'a> =
+    &'a mut dyn FnMut(ToolInvocationStreamEvent) -> Result<(), String>;
+
 /// Tool invocation response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolInvocationResponse {
     pub output: String,
-    #[serde(default)]
     pub is_error: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub content: Vec<ToolResultContent>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_output: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presentation: Option<ToolInvocationPresentation>,
-    /// Optional host action requested by the plugin. Host actions are transport semantics
-    /// and should be consumed before durable session history is appended.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_action: Option<ToolInvocationHostAction>,
-    /// Optional typed semantic result for consumers to render in their own UI.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<ToolInvocationResult>,
 }
 
-/// Host action requested by a tool plugin.
+/// Typed host action requested by a tool plugin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolInvocationHostAction {
-    /// Request that the host perform model-provider-native web search.
-    ModelNativeWebSearch {
-        request: HostModelNativeWebSearchRequest,
-    },
+    HostModelNativeWebSearch(HostModelNativeWebSearchRequest),
 }
 
-/// Host-mediated model-provider-native web search request from a tool plugin.
+/// Host-side model-native web search request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostModelNativeWebSearchRequest {
     pub query: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_results: Option<usize>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub site: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freshness: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub safe_search: Option<String>,
 }
 
-/// Typed semantic data returned by a tool invocation.
+/// Semantic tool result values that UI layers can render without parsing text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolInvocationResult {
-    /// Plain textual result.
     Text { text: String },
-    /// Structured JSON result encoded as a JSON string for transport stability.
     Json { value: String },
-    /// Shell command execution result.
     ShellRun { result: ShellRunResult },
-    /// Filesystem write/edit result.
     FileChange { result: FileChangeResult },
 }
 
-/// Semantic shell command execution result.
+/// Semantic shell execution result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum ShellRunResult {
-    /// Pseudo-terminal execution with ANSI-capable output.
+    /// Terminal-backed execution with a single bounded output stream.
     Terminal {
         exit_code: Option<i32>,
         timed_out: bool,
@@ -324,4 +369,33 @@ pub struct ImageMetadata {
     pub byte_len: Option<u64>,
     #[serde(default)]
     pub source_path: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ToolPresentationField, ToolPresentationFieldKind, ToolRequestPresentationMetadata,
+        ToolUiMetadata,
+    };
+
+    #[test]
+    fn request_presentation_metadata_round_trips() {
+        let metadata = ToolUiMetadata {
+            activity_label: Some("running".to_string()),
+            request_presentation: Some(ToolRequestPresentationMetadata {
+                title: "Run command".to_string(),
+                fields: vec![ToolPresentationField {
+                    label: "Command".to_string(),
+                    argument: "command".to_string(),
+                    kind: ToolPresentationFieldKind::Command,
+                    optional: false,
+                }],
+            }),
+        };
+
+        let encoded = serde_json::to_string(&metadata).expect("metadata encodes");
+        let decoded = serde_json::from_str::<ToolUiMetadata>(&encoded).expect("metadata decodes");
+
+        assert_eq!(decoded, metadata);
+    }
 }

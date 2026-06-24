@@ -12,7 +12,9 @@ use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, ShellRunResult, TOOL_SERVICE_INTERFACE_ID,
     ToolDefinition, ToolInvocationPresentation, ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationResult, ToolInvocationStreamEvent, ToolList, ToolOutputStream, ToolSideEffect,
+    ToolInvocationResult, ToolInvocationStreamEvent, ToolList, ToolOutputStream,
+    ToolPresentationField, ToolPresentationFieldKind, ToolRequestPresentationMetadata,
+    ToolSideEffect,
 };
 use bcode_tool_runtime::{ProcessExecutionRequest, ToolExecutionRuntime};
 use serde::{Deserialize, Serialize};
@@ -129,6 +131,29 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
             },
             ui: bcode_tool::ToolUiMetadata {
                 activity_label: Some("running".to_string()),
+                request_presentation: Some(ToolRequestPresentationMetadata {
+                    title: "Shell command".to_string(),
+                    fields: vec![
+                        ToolPresentationField {
+                            label: "Command".to_string(),
+                            argument: "command".to_string(),
+                            kind: ToolPresentationFieldKind::Command,
+                            optional: false,
+                        },
+                        ToolPresentationField {
+                            label: "Working directory".to_string(),
+                            argument: "cwd".to_string(),
+                            kind: ToolPresentationFieldKind::Path,
+                            optional: true,
+                        },
+                        ToolPresentationField {
+                            label: "Timeout".to_string(),
+                            argument: "timeout_ms".to_string(),
+                            kind: ToolPresentationFieldKind::DurationMs,
+                            optional: true,
+                        },
+                    ],
+                }),
             },
         }],
     })

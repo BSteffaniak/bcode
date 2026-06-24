@@ -12375,7 +12375,7 @@ async fn invoke_model_tool(
     flush_tool_output_stream(state, session_id, &mut pending_tool_output).await;
     let response: ToolInvocationResponse =
         bcode_plugin::decode_service_response(response).map_err(|error| error.to_string())?;
-    if let Some(bcode_tool::ToolInvocationHostAction::ModelNativeWebSearch { request }) =
+    if let Some(bcode_tool::ToolInvocationHostAction::HostModelNativeWebSearch(request)) =
         response.host_action
     {
         return invoke_host_model_native_web_search(state, session_id, &call.id, request).await;

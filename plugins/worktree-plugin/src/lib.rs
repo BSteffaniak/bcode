@@ -7,7 +7,8 @@
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
-    ToolInvocationRequest, ToolInvocationResponse, ToolList, ToolSideEffect,
+    ToolInvocationRequest, ToolInvocationResponse, ToolList, ToolPresentationField,
+    ToolPresentationFieldKind, ToolRequestPresentationMetadata, ToolSideEffect,
 };
 use bcode_worktree_models::{WorktreeCreateRequest, WorktreeListRequest, WorktreeRemoveRequest};
 use serde::Serialize;
@@ -130,6 +131,34 @@ fn invoke_remove(invocation: &ToolInvocationRequest) -> ToolInvocationResponse {
     }
 }
 
+fn tool_ui(
+    activity_label: &str,
+    title: &str,
+    fields: Vec<ToolPresentationField>,
+) -> bcode_tool::ToolUiMetadata {
+    bcode_tool::ToolUiMetadata {
+        activity_label: Some(activity_label.to_string()),
+        request_presentation: Some(ToolRequestPresentationMetadata {
+            title: title.to_string(),
+            fields,
+        }),
+    }
+}
+
+fn field(
+    label: &str,
+    argument: &str,
+    kind: ToolPresentationFieldKind,
+    optional: bool,
+) -> ToolPresentationField {
+    ToolPresentationField {
+        label: label.to_string(),
+        argument: argument.to_string(),
+        kind,
+        optional,
+    }
+}
+
 fn list_definition() -> ToolDefinition {
     ToolDefinition {
         name: "worktree.list".to_string(),
@@ -147,9 +176,16 @@ fn list_definition() -> ToolDefinition {
             permission_category: Some("worktree.read".to_string()),
             argument_extractors: Vec::new(),
         },
-        ui: bcode_tool::ToolUiMetadata {
-            activity_label: Some("listing worktrees".to_string()),
-        },
+        ui: tool_ui(
+            "listing worktrees",
+            "List worktrees",
+            vec![field(
+                "Working directory",
+                "cwd",
+                ToolPresentationFieldKind::Path,
+                true,
+            )],
+        ),
     }
 }
 
@@ -179,9 +215,21 @@ fn create_definition() -> ToolDefinition {
             permission_category: Some("worktree.create".to_string()),
             argument_extractors: Vec::new(),
         },
-        ui: bcode_tool::ToolUiMetadata {
-            activity_label: Some("creating worktree".to_string()),
-        },
+        ui: tool_ui(
+            "creating worktree",
+            "Create worktree",
+            vec![
+                field("Name", "name", ToolPresentationFieldKind::Text, false),
+                field("Path", "path", ToolPresentationFieldKind::Path, true),
+                field("Branch", "branch", ToolPresentationFieldKind::Text, true),
+                field(
+                    "New branch",
+                    "new_branch",
+                    ToolPresentationFieldKind::Text,
+                    true,
+                ),
+            ],
+        ),
     }
 }
 
@@ -208,9 +256,14 @@ fn remove_definition() -> ToolDefinition {
                 argument: "path".to_string(),
             }],
         },
-        ui: bcode_tool::ToolUiMetadata {
-            activity_label: Some("removing worktree".to_string()),
-        },
+        ui: tool_ui(
+            "removing worktree",
+            "Remove worktree",
+            vec![
+                field("Path", "path", ToolPresentationFieldKind::Path, false),
+                field("Force", "force", ToolPresentationFieldKind::Boolean, true),
+            ],
+        ),
     }
 }
 
