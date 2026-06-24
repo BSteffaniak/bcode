@@ -36,14 +36,14 @@ pub struct AgentConfig {
 
 /// Permission configuration for an agent.
 ///
-/// Each category maps a glob pattern to an `Action`. Category semantics:
+/// Agent `tools` maps must use exact model-callable tool IDs such as
+/// `shell.run` or plugin-defined IDs. Permission categories are separate rule
+/// buckets used by plugin policy metadata:
 ///
-/// * `bash` — patterns matched against `shell.run` command strings.
-/// * `read` — patterns matched against path arguments for read-only filesystem tools
-///   (`filesystem.read`, `filesystem.list`, `filesystem.find`, `filesystem.grep`,
-///   `filesystem.stat`, `filesystem.exists`).
-/// * `write` — patterns matched against the `path` argument of `filesystem.write`.
-/// * `edit` — patterns matched against the `path` argument of `filesystem.edit`.
+/// * `bash` — patterns matched against command arguments for tools categorized as shell commands.
+/// * `read` — patterns matched against path arguments for tools categorized as read-only path tools.
+/// * `write` — patterns matched against path arguments for tools categorized as file writes.
+/// * `edit` — patterns matched against path arguments for tools categorized as file edits.
 /// * `web` — patterns matched against URL arguments for web/network tools.
 /// * `external_directory` — single action governing any tool argument resolving outside
 ///   the session working directory.

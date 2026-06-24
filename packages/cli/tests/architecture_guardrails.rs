@@ -177,18 +177,15 @@ fn scan_file(path: &Path, offenders: &mut Vec<BoundaryOffender>) {
 
 fn is_temporary_boundary_allowlist(path: &Path, line: &str) -> bool {
     let path = path.to_string_lossy();
-    // Transitional allowlist: agent-policy keeps default bundled tool enablement and
-    // policy compatibility fixtures while policy evaluation itself is metadata-driven.
+    // Transitional allowlist: agent-policy keeps exact built-in default tool IDs and
+    // policy fixtures while runtime policy evaluation itself is metadata-driven.
     if path.ends_with("packages/agent-policy/src/lib.rs")
         && (line.contains(".to_string()")
             || line.contains("tool_request(")
             || line.contains("path_request(")
             || line.contains("web.fetch")
             || line.contains("filesystem.write")
-            || line.contains("filesystem.edit")
-            || line.contains("filesystem.read")
-            || line.contains("filesystem.exists")
-            || line.contains("filesystem.stat"))
+            || line.contains("filesystem.edit"))
     {
         return true;
     }

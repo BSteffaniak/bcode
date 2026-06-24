@@ -143,7 +143,7 @@ pub fn active_tools_for(config: &AgentConfig) -> Vec<String> {
     ]);
     for (tool, enabled) in &config.tools {
         if *enabled {
-            tools.extend(normalize_tool_names(tool));
+            tools.insert(tool.clone());
         }
     }
     tools.into_iter().collect()
@@ -605,12 +605,6 @@ fn tool_aliases(request: &EvaluateToolCallRequest) -> Vec<String> {
     }
     aliases.extend(request.policy.aliases.iter().cloned());
     aliases
-}
-
-/// Normalize tool names from config to model-callable tool names.
-#[must_use]
-pub fn normalize_tool_names(tool: &str) -> Vec<String> {
-    vec![tool.to_string()]
 }
 
 /// Compile bash glob rules.
