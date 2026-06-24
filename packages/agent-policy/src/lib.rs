@@ -43,10 +43,6 @@ pub fn default_config() -> AgentPermissionConfig {
         AgentConfig {
             accent: None,
             tools: BTreeMap::from([
-                ("bash".to_string(), true),
-                ("read".to_string(), true),
-                ("write".to_string(), true),
-                ("edit".to_string(), true),
                 ("shell.run".to_string(), true),
                 ("filesystem.read".to_string(), true),
                 ("filesystem.write".to_string(), true),
@@ -75,10 +71,6 @@ pub fn default_config() -> AgentPermissionConfig {
         AgentConfig {
             accent: None,
             tools: BTreeMap::from([
-                ("bash".to_string(), true),
-                ("read".to_string(), true),
-                ("write".to_string(), false),
-                ("edit".to_string(), false),
                 ("shell.run".to_string(), true),
                 ("filesystem.read".to_string(), true),
                 ("filesystem.write".to_string(), false),
@@ -612,49 +604,13 @@ fn tool_aliases(request: &EvaluateToolCallRequest) -> Vec<String> {
         aliases.push(category.clone());
     }
     aliases.extend(request.policy.aliases.iter().cloned());
-    aliases.extend(
-        legacy_tool_aliases(&request.tool_name)
-            .iter()
-            .map(|alias| (*alias).to_string()),
-    );
     aliases
 }
 
-fn legacy_tool_aliases(tool_name: &str) -> &'static [&'static str] {
-    match tool_name {
-        "shell.run" => &["bash"],
-        "filesystem.write" => &["write"],
-        "filesystem.edit" => &["edit"],
-        "filesystem.read" | "filesystem.exists" | "filesystem.stat" => &["read"],
-        "filesystem.grep" => &["grep"],
-        "filesystem.find" => &["find"],
-        "filesystem.list" => &["ls"],
-        "worktree.list" => &["worktree.read"],
-        "worktree.create" => &["worktree.create"],
-        "worktree.remove" => &["worktree.remove"],
-        _ => &[],
-    }
-}
-
-/// Normalize Pi/OpenCode tool names to Bcode tool names.
+/// Normalize tool names from config to model-callable tool names.
 #[must_use]
 pub fn normalize_tool_names(tool: &str) -> Vec<String> {
-    match tool {
-        "bash" => vec!["shell.run".to_string()],
-        "read" => vec![
-            "filesystem.read".to_string(),
-            "filesystem.exists".to_string(),
-            "filesystem.stat".to_string(),
-        ],
-        "grep" => vec!["filesystem.grep".to_string()],
-        "find" => vec!["filesystem.find".to_string()],
-        "ls" => vec!["filesystem.list".to_string()],
-        "stat" => vec!["filesystem.stat".to_string()],
-        "write" => vec!["filesystem.write".to_string()],
-        "edit" => vec!["filesystem.edit".to_string()],
-        "worktree.read" => vec!["worktree.list".to_string()],
-        other => vec![other.to_string()],
-    }
+    vec![tool.to_string()]
 }
 
 /// Compile bash glob rules.
