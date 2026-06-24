@@ -62,18 +62,18 @@ Path globs use the same syntax as ripgrep (`globset`): `**` matches any number o
 
 ## Tool enablement
 
-`[agent.<id>.tools]` maps tool names to booleans. Disabling a tool short-circuits the category rules with a hard `deny`. Enabling a tool only lets it run if the category rules also permit it.
+`[agent.<id>.tools]` maps exact model-callable tool IDs to booleans. Disabling a tool short-circuits the category rules with a hard `deny`. Enabling a tool only lets it run if the category rules also permit it. Removed shorthand IDs such as `bash`, `read`, `write`, or `edit` are rejected; use exact IDs like `shell.run`, `filesystem.read`, `filesystem.write`, and `filesystem.edit`.
 
-Setting `tools = { write = false }` additionally triggers the shell hard-deny for common file-writing commands (`>`, `tee`, `touch`, `cp`, `mv`, `rm`, `mkdir`, `sed -i`, etc.) in `shell.run`, so plan-style agents can't bypass the write restriction through bash.
+Setting `tools = { "filesystem.write" = false, "filesystem.edit" = false }` additionally triggers the shell hard-deny for common file-writing commands (`>`, `tee`, `touch`, `cp`, `mv`, `rm`, `mkdir`, `sed -i`, etc.) in `shell.run`, so plan-style agents can't bypass the write restriction through bash.
 
 ## Built-in defaults
 
 When no `[agent.*]` sections exist in `bcode.toml`, Bcode falls back to built-in defaults:
 
-| Agent   | `bash`                                                                                                       | `read` | `write`           | `edit`            | `external_directory` |
-|---------|--------------------------------------------------------------------------------------------------------------|--------|-------------------|-------------------|----------------------|
-| `plan`  | `* = deny`, plus `allow`: `cargo check *`, `cargo test *`, `git diff *`, `git status *`, `ls *`, `rg *`      | allow  | deny (tool off)   | deny (tool off)   | allow                |
-| `build` | `* = ask`                                                                                                    | allow  | unmatched → ask   | unmatched → ask   | allow                |
+| Agent   | `bash` permission rules                                                                                    | `read` | `write`           | `edit`            | `external_directory` |
+|---------|-------------------------------------------------------------------------------------------------------------|--------|-------------------|-------------------|----------------------|
+| `plan`  | `* = deny`, plus `allow`: `cargo check *`, `cargo test *`, `git diff *`, `git status *`, `ls *`, `rg *`     | allow  | deny (tool off)   | deny (tool off)   | allow                |
+| `build` | `* = ask`                                                                                                   | allow  | unmatched → ask   | unmatched → ask   | allow                |
 
 Any single `[agent.<id>]` section in `bcode.toml` replaces the full built-in set: define both plan and build explicitly if you want to customize one without losing the other.
 

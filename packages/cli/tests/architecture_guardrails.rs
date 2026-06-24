@@ -144,9 +144,11 @@ fn scan_file(path: &Path, offenders: &mut Vec<BoundaryOffender>) {
         return;
     };
     let test_ranges = test_module_ranges(&text);
+    let function_ranges = allowlisted_function_ranges(path, &text);
     for (index, line) in text.lines().enumerate() {
         let line_number = index + 1;
         if is_test_line(path, line_number, &test_ranges)
+            || is_allowlisted_function_line(line_number, &function_ranges)
             || is_temporary_boundary_allowlist(path, line)
         {
             continue;
@@ -232,17 +234,40 @@ fn module_end_line(lines: &[&str], module_index: usize) -> Option<usize> {
     None
 }
 
+fn is_allowlisted_function_line(line_number: usize, function_ranges: &[(usize, usize)]) -> bool {
+    function_ranges
+        .iter()
+        .any(|(start, end)| line_number >= *start && line_number <= *end)
+}
+
+fn allowlisted_function_ranges(path: &Path, text: &str) -> Vec<(usize, usize)> {
+    if !path.ends_with("packages/config/src/lib.rs") {
+        return Vec::new();
+    }
+    function_ranges(text, &["removed_shorthand_tool_replacement"])
+}
+
+fn function_ranges(text: &str, names: &[&str]) -> Vec<(usize, usize)> {
+    let lines = text.lines().collect::<Vec<_>>();
+    let mut ranges = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if names
+            .iter()
+            .any(|name| trimmed.starts_with(&format!("fn {name}")))
+        {
+            let end = module_end_line(&lines, index).unwrap_or(index + 1);
+            ranges.push((index + 1, end));
+        }
+    }
+    ranges
+}
+
 fn is_temporary_boundary_allowlist(path: &Path, line: &str) -> bool {
     let path = path.to_string_lossy();
     // Transitional allowlist: agent-policy model docs describe policy categories, not
     // production tool routing.
     if path.ends_with("packages/agent-policy/models/src/lib.rs") {
-        return true;
-    }
-    // Transitional allowlist: config validation reports removed shorthand tool-ID replacements.
-    if path.ends_with("packages/config/src/lib.rs")
-        && (line.contains("=> Some(\"") || line.contains("RemovedShorthandToolId"))
-    {
         return true;
     }
     // Transitional allowlist: model-context truncation text teaches agents to use

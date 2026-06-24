@@ -315,6 +315,19 @@ mod tests {
     }
 
     #[test]
+    fn manifest_agent_defaults_are_valid() {
+        let defaults = manifest_defaults();
+
+        assert!(!defaults.build_tools.is_empty());
+        for disabled_tool in &defaults.plan_disabled_tools {
+            assert!(
+                defaults.build_tools.contains(disabled_tool),
+                "plan-disabled tool {disabled_tool} should be declared in build defaults"
+            );
+        }
+    }
+
+    #[test]
     fn plan_denies_unlisted_shell_command_parts() {
         let (config, _) = load_config();
         let agent = agent_config(&config, PLAN_AGENT);
