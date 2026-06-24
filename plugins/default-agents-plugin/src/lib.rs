@@ -31,14 +31,24 @@ struct AgentDefaultsManifestExtension {
     plan_disabled_tools: Vec<String>,
 }
 
-fn manifest_defaults() -> AgentDefaultsManifestExtension {
+fn manifest_defaults() -> Result<AgentDefaultsManifestExtension, toml::de::Error> {
     toml::from_str::<DefaultAgentsManifestExtension>(MANIFEST)
-        .expect("default-agents manifest agent_defaults should parse")
-        .agent_defaults
+        .map(|extension| extension.agent_defaults)
 }
 
 fn default_config() -> AgentPermissionConfig {
-    let defaults = manifest_defaults();
+    match manifest_defaults() {
+        Ok(defaults) => default_config_with_defaults(defaults),
+        Err(error) => {
+            eprintln!(
+                "bcode.default-agents: failed to parse bundled agent_defaults ({error}); using policy defaults without bundled tool enablement"
+            );
+            policy_default_config()
+        }
+    }
+}
+
+fn default_config_with_defaults(defaults: AgentDefaultsManifestExtension) -> AgentPermissionConfig {
     let mut config = policy_default_config();
     if let Some(build) = config.agent.get_mut(BUILD_AGENT) {
         set_default_tools(build, &defaults.build_tools, true);
@@ -316,7 +326,7 @@ mod tests {
 
     #[test]
     fn manifest_agent_defaults_are_valid() {
-        let defaults = manifest_defaults();
+        let defaults = manifest_defaults().expect("bundled manifest defaults should parse");
 
         assert!(!defaults.build_tools.is_empty());
         for disabled_tool in &defaults.plan_disabled_tools {

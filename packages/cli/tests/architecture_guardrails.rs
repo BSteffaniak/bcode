@@ -147,7 +147,8 @@ fn scan_file(path: &Path, offenders: &mut Vec<BoundaryOffender>) {
     let function_ranges = allowlisted_function_ranges(path, &text);
     for (index, line) in text.lines().enumerate() {
         let line_number = index + 1;
-        if is_test_line(path, line_number, &test_ranges)
+        if is_comment_line(line)
+            || is_test_line(path, line_number, &test_ranges)
             || is_allowlisted_function_line(line_number, &function_ranges)
             || is_temporary_boundary_allowlist(path, line)
         {
@@ -234,6 +235,11 @@ fn module_end_line(lines: &[&str], module_index: usize) -> Option<usize> {
     None
 }
 
+fn is_comment_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("//")
+}
+
 fn is_allowlisted_function_line(line_number: usize, function_ranges: &[(usize, usize)]) -> bool {
     function_ranges
         .iter()
@@ -265,11 +271,6 @@ fn function_ranges(text: &str, names: &[&str]) -> Vec<(usize, usize)> {
 
 fn is_temporary_boundary_allowlist(path: &Path, line: &str) -> bool {
     let path = path.to_string_lossy();
-    // Transitional allowlist: agent-policy model docs describe policy categories, not
-    // production tool routing.
-    if path.ends_with("packages/agent-policy/models/src/lib.rs") {
-        return true;
-    }
     // Transitional allowlist: model-context truncation text teaches agents to use
     // artifact/filesystem tools; this is product guidance, not tool routing.
     path.ends_with("packages/server/src/lib.rs")
