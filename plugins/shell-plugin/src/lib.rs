@@ -6,7 +6,7 @@
 
 use bcode_config::{
     ShellToolConfig, ShellToolEnvAutoFallback, ShellToolEnvConfig, ShellToolEnvMode,
-    default_config_paths_from, load_config_from_paths,
+    default_config_paths_from_with_environment, load_config_from_paths_with_environment,
 };
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
@@ -297,18 +297,17 @@ fn resolve_effective_cwd(
     )
 }
 
-fn shell_config(cwd: Option<&Path>) -> Result<ShellToolConfig, String> {
+fn shell_config_with_environment(
+    cwd: Option<&Path>,
+    environment: &impl bcode_config::ConfigEnvironment,
+) -> Result<ShellToolConfig, String> {
     let paths = cwd.map_or_else(
-        bcode_config::default_config_paths,
-        default_config_paths_from,
+        || bcode_config::default_config_paths_with_environment(environment),
+        |cwd| default_config_paths_from_with_environment(cwd, environment),
     );
-    load_config_from_paths(&paths)
+    load_config_from_paths_with_environment(&paths, environment)
         .map(|config| config.tools.shell)
         .map_err(|error| error.to_string())
-}
-
-fn shell_env_config(cwd: Option<&Path>) -> Result<ShellToolEnvConfig, String> {
-    shell_config(cwd).map(|config| config.env)
 }
 
 fn direnv_file_for(cwd: &Path) -> Option<PathBuf> {
@@ -396,6 +395,26 @@ fn run_terminal_shell_command(
     session_cwd: Option<&Path>,
     cancellation_path: Option<&Path>,
 ) -> ToolInvocationResponse {
+    run_terminal_shell_command_with_environment(
+        events,
+        cancellation,
+        tool_call_id,
+        arguments,
+        session_cwd,
+        cancellation_path,
+        &bcode_config::ProcessConfigEnvironment,
+    )
+}
+
+fn run_terminal_shell_command_with_environment(
+    events: ServiceEventEmitter,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+    tool_call_id: &str,
+    arguments: &ShellRunArguments,
+    session_cwd: Option<&Path>,
+    cancellation_path: Option<&Path>,
+    environment: &impl bcode_config::ConfigEnvironment,
+) -> ToolInvocationResponse {
     match run_terminal_shell_command_inner(
         events,
         cancellation,
@@ -403,6 +422,7 @@ fn run_terminal_shell_command(
         arguments,
         session_cwd,
         cancellation_path,
+        environment,
     ) {
         Ok(response) => response,
         Err(error) => ToolInvocationResponse {
@@ -516,10 +536,11 @@ fn run_terminal_shell_command_inner(
     arguments: &ShellRunArguments,
     session_cwd: Option<&Path>,
     cancellation_path: Option<&Path>,
+    environment: &impl bcode_config::ConfigEnvironment,
 ) -> Result<ToolInvocationResponse, String> {
     let timeout = Duration::from_millis(arguments.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
     let cwd = resolve_effective_cwd(arguments, session_cwd);
-    let env_config = shell_env_config(cwd.as_deref())?;
+    let env_config = shell_config_with_environment(cwd.as_deref(), environment)?.env;
     let columns = arguments.terminal_columns();
     let rows = arguments.terminal_rows();
     let pty_system = portable_pty::native_pty_system();
@@ -694,9 +715,29 @@ fn run_shell_command(
     session_cwd: Option<&std::path::Path>,
     cancellation_path: Option<&std::path::Path>,
 ) -> Result<ToolInvocationResponse, String> {
+    run_shell_command_with_environment(
+        events,
+        cancellation,
+        tool_call_id,
+        arguments,
+        session_cwd,
+        cancellation_path,
+        &bcode_config::ProcessConfigEnvironment,
+    )
+}
+
+fn run_shell_command_with_environment(
+    events: ServiceEventEmitter,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+    tool_call_id: &str,
+    arguments: &ShellRunArguments,
+    session_cwd: Option<&std::path::Path>,
+    cancellation_path: Option<&std::path::Path>,
+    environment: &impl bcode_config::ConfigEnvironment,
+) -> Result<ToolInvocationResponse, String> {
     let timeout = Duration::from_millis(arguments.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
     let cwd = resolve_effective_cwd(arguments, session_cwd);
-    let config = shell_config(cwd.as_deref())?;
+    let config = shell_config_with_environment(cwd.as_deref(), environment)?;
     let env_config = config.env;
     let max_output_bytes = config.max_output_bytes;
     let inline_output_bytes = config.inline_output_bytes;
@@ -1029,11 +1070,23 @@ bcode_plugin_sdk::export_concurrent_plugin!(ShellPlugin, include_str!("../bcode-
 mod tests {
     use super::*;
 
+    fn isolated_config_environment(name: &str) -> bcode_config::ConfigEnvironmentSnapshot {
+        let root = std::env::temp_dir().join(format!(
+            "bcode-shell-plugin-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        bcode_config::ConfigEnvironmentSnapshot::isolated(root)
+    }
+
     #[cfg(unix)]
     #[test]
     fn timeout_terminates_shell_process_group() {
+        let environment = isolated_config_environment("timeout");
         let started = Instant::now();
-        let response = run_shell_command(
+        let response = run_shell_command_with_environment(
             ServiceEventEmitter::default(),
             &bcode_plugin_sdk::ServiceCancellation::default(),
             "test",
@@ -1047,6 +1100,7 @@ mod tests {
             },
             None,
             None,
+            &environment,
         )
         .expect("shell command should return timeout output");
 
@@ -1123,7 +1177,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shell_pipeline_preserves_failing_left_side_status() {
-        let response = run_shell_command(
+        let environment = isolated_config_environment("pipeline");
+        let response = run_shell_command_with_environment(
             ServiceEventEmitter::default(),
             &bcode_plugin_sdk::ServiceCancellation::default(),
             "test",
@@ -1137,6 +1192,7 @@ mod tests {
             },
             None,
             None,
+            &environment,
         )
         .expect("shell command should run");
 
@@ -1152,7 +1208,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn terminal_mode_returns_semantic_terminal_result() {
-        let response = run_terminal_shell_command(
+        let environment = isolated_config_environment("terminal");
+        let response = run_terminal_shell_command_with_environment(
             ServiceEventEmitter::default(),
             &bcode_plugin_sdk::ServiceCancellation::default(),
             "test-terminal-semantic",
@@ -1166,6 +1223,7 @@ mod tests {
             },
             None,
             None,
+            &environment,
         );
 
         assert!(!response.is_error, "{}", response.output);
@@ -1195,7 +1253,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn captured_mode_returns_semantic_captured_result() {
-        let response = run_shell_command(
+        let environment = isolated_config_environment("captured");
+        let response = run_shell_command_with_environment(
             ServiceEventEmitter::default(),
             &bcode_plugin_sdk::ServiceCancellation::default(),
             "test-captured-semantic",
@@ -1209,6 +1268,7 @@ mod tests {
             },
             None,
             None,
+            &environment,
         )
         .expect("shell command should complete");
 

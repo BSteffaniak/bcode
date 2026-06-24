@@ -10,6 +10,7 @@ pub use hyperchad_docs_config::{ConfigDocSchema, FieldDoc, NestedFieldDoc};
 use hyperchad_docs_config_derive::{ConfigDoc, ConfigDocEnum};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::{env, fs};
@@ -25,6 +26,111 @@ pub const BCODE_CONFIG_TOML_ENV: &str = "BCODE_CONFIG_TOML";
 pub const BCODE_MODEL_PROFILE_ENV: &str = "BCODE_MODEL_PROFILE";
 /// Environment variable selecting the active auth profile for this client.
 pub const BCODE_AUTH_PROFILE_ENV: &str = "BCODE_AUTH_PROFILE";
+
+/// Source of environment-dependent config inputs.
+pub trait ConfigEnvironment {
+    /// Return an environment variable value as UTF-8 text.
+    fn var(&self, name: &str) -> Option<String>;
+    /// Return an environment variable value as OS-native text.
+    fn var_os(&self, name: &str) -> Option<OsString>;
+    /// Return the current working directory used for default config discovery.
+    fn current_dir(&self) -> PathBuf;
+}
+
+/// Config environment backed by the current process.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProcessConfigEnvironment;
+
+impl ConfigEnvironment for ProcessConfigEnvironment {
+    fn var(&self, name: &str) -> Option<String> {
+        env::var(name).ok()
+    }
+
+    fn var_os(&self, name: &str) -> Option<OsString> {
+        env::var_os(name)
+    }
+
+    fn current_dir(&self) -> PathBuf {
+        env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    }
+}
+
+/// Owned config environment useful for deterministic callers and tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigEnvironmentSnapshot {
+    vars: BTreeMap<String, OsString>,
+    current_dir: PathBuf,
+}
+
+impl ConfigEnvironmentSnapshot {
+    /// Create a snapshot from explicit variables and current directory.
+    #[must_use]
+    pub const fn new(vars: BTreeMap<String, OsString>, current_dir: PathBuf) -> Self {
+        Self { vars, current_dir }
+    }
+
+    /// Create a snapshot of the current process environment.
+    #[must_use]
+    pub fn from_process() -> Self {
+        Self {
+            vars: env::vars_os()
+                .map(|(name, value)| (name.to_string_lossy().into_owned(), value))
+                .collect(),
+            current_dir: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        }
+    }
+
+    /// Create an isolated snapshot rooted at `root`.
+    #[must_use]
+    pub fn isolated(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        let config_home = root.join("config");
+        let state_home = root.join("state");
+        let mut vars = BTreeMap::new();
+        vars.insert("HOME".to_string(), root.join("home").into_os_string());
+        vars.insert("XDG_CONFIG_HOME".to_string(), config_home.into_os_string());
+        vars.insert("XDG_STATE_HOME".to_string(), state_home.into_os_string());
+        vars.insert(
+            BCODE_CONFIG_TOML_ENV.to_string(),
+            "[tools.shell.env]\nmode = \"inherit\"\n".into(),
+        );
+        Self {
+            vars,
+            current_dir: root,
+        }
+    }
+
+    /// Set or replace an environment variable in this snapshot.
+    pub fn set_var(&mut self, name: impl Into<String>, value: impl Into<OsString>) {
+        self.vars.insert(name.into(), value.into());
+    }
+
+    /// Remove an environment variable from this snapshot.
+    pub fn remove_var(&mut self, name: &str) {
+        self.vars.remove(name);
+    }
+
+    /// Set the current directory used by default config discovery.
+    pub fn set_current_dir(&mut self, current_dir: impl Into<PathBuf>) {
+        self.current_dir = current_dir.into();
+    }
+}
+
+impl ConfigEnvironment for ConfigEnvironmentSnapshot {
+    fn var(&self, name: &str) -> Option<String> {
+        self.vars
+            .get(name)
+            .and_then(|value| value.clone().into_string().ok())
+    }
+
+    fn var_os(&self, name: &str) -> Option<OsString> {
+        self.vars.get(name).cloned()
+    }
+
+    fn current_dir(&self) -> PathBuf {
+        self.current_dir.clone()
+    }
+}
 
 const DEFAULT_MODEL_PROVIDER_PLUGIN_ID: &str = "bcode.openai-compatible";
 const DEFAULT_MODEL_PROVIDER_PLUGIN_IDS: &[&str] = &["bcode.openai-compatible", "bcode.bedrock"];
@@ -813,6 +919,15 @@ impl BcodeConfig {
     /// Resolve the active model profile to a concrete provider/model selection.
     #[must_use]
     pub fn resolved_model_selection(&self) -> ResolvedModelSelection {
+        self.resolved_model_selection_with_environment(&ProcessConfigEnvironment)
+    }
+
+    /// Resolve effective model/provider selection using an explicit environment.
+    #[must_use]
+    pub fn resolved_model_selection_with_environment(
+        &self,
+        environment: &impl ConfigEnvironment,
+    ) -> ResolvedModelSelection {
         let mut selection = ResolvedModelSelection {
             provider_plugin_id: self.model.provider_plugin_id.clone(),
             model_id: self.model.model_id.clone(),
@@ -843,11 +958,11 @@ impl BcodeConfig {
         {
             selection.provider_plugin_id = Some(config_provider);
         }
-        if let Some(env_provider) = provider_plugin_id_from_environment() {
+        if let Some(env_provider) = provider_plugin_id_from_config_environment(environment) {
             let provider_changed =
                 selection.provider_plugin_id.as_deref() != Some(env_provider.as_str());
             selection.provider_plugin_id = Some(env_provider.clone());
-            if let Some(model_id) = model_id_from_environment(&env_provider) {
+            if let Some(model_id) = model_id_from_config_environment(environment, &env_provider) {
                 selection.model_id = Some(model_id);
             } else if provider_changed {
                 // Do not pass a persisted model ID for a different provider. Let the selected
@@ -862,7 +977,8 @@ impl BcodeConfig {
             }
         }
         if let Some(provider_plugin_id) = &selection.provider_plugin_id
-            && let Some(model_id) = model_id_from_environment(provider_plugin_id)
+            && let Some(model_id) =
+                model_id_from_config_environment(environment, provider_plugin_id)
         {
             selection.model_id = Some(model_id);
         }
@@ -954,14 +1070,25 @@ fn provider_request_values_from_json(
 /// Return a provider plugin ID explicitly or implicitly selected by environment variables.
 #[must_use]
 pub fn provider_plugin_id_from_environment() -> Option<String> {
-    first_env_value(["BCODE_MODEL_PROVIDER", "BCODE_PROVIDER"])
-        .and_then(|value| normalize_provider_plugin_id(&value))
-        .or_else(implicit_provider_plugin_id_from_environment)
+    provider_plugin_id_from_config_environment(&ProcessConfigEnvironment)
 }
 
-fn implicit_provider_plugin_id_from_environment() -> Option<String> {
+/// Return a provider plugin ID selected by an explicit config environment.
+#[must_use]
+pub fn provider_plugin_id_from_config_environment(
+    environment: &impl ConfigEnvironment,
+) -> Option<String> {
+    first_env_value(environment, ["BCODE_MODEL_PROVIDER", "BCODE_PROVIDER"])
+        .and_then(|value| normalize_provider_plugin_id(&value))
+        .or_else(|| implicit_provider_plugin_id_from_environment(environment))
+}
+
+fn implicit_provider_plugin_id_from_environment(
+    environment: &impl ConfigEnvironment,
+) -> Option<String> {
     PROVIDER_ENVIRONMENT_SPECS.iter().find_map(|spec| {
-        first_env_value_from_slice(spec.signal_env_vars).map(|_| spec.plugin_id.to_string())
+        first_env_value_from_slice(environment, spec.signal_env_vars)
+            .map(|_| spec.plugin_id.to_string())
     })
 }
 
@@ -973,20 +1100,29 @@ fn normalize_provider_plugin_id(value: &str) -> Option<String> {
         .map(|spec| spec.plugin_id.to_string())
 }
 
-fn model_id_from_environment(provider_plugin_id: &str) -> Option<String> {
+fn model_id_from_config_environment(
+    environment: &impl ConfigEnvironment,
+    provider_plugin_id: &str,
+) -> Option<String> {
     PROVIDER_ENVIRONMENT_SPECS
         .iter()
         .find(|spec| spec.plugin_id == provider_plugin_id)
-        .and_then(|spec| first_env_value_from_slice(spec.model_env_vars))
+        .and_then(|spec| first_env_value_from_slice(environment, spec.model_env_vars))
 }
 
-fn first_env_value<const N: usize>(names: [&str; N]) -> Option<String> {
-    first_env_value_from_slice(&names)
+fn first_env_value<const N: usize>(
+    environment: &impl ConfigEnvironment,
+    names: [&str; N],
+) -> Option<String> {
+    first_env_value_from_slice(environment, &names)
 }
 
-fn first_env_value_from_slice(names: &[&str]) -> Option<String> {
-    names.iter().find_map(|name| match env::var(name) {
-        Ok(value) if !value.trim().is_empty() => Some(value),
+fn first_env_value_from_slice(
+    environment: &impl ConfigEnvironment,
+    names: &[&str],
+) -> Option<String> {
+    names.iter().find_map(|name| match environment.var(name) {
+        Some(value) if !value.trim().is_empty() => Some(value),
         _ => None,
     })
 }
@@ -1047,13 +1183,27 @@ impl ConfigLoadOverrides {
         cli_config_path: Option<PathBuf>,
         cli_config_toml: Option<String>,
     ) -> Self {
+        Self::from_config_environment_with_cli(
+            &ProcessConfigEnvironment,
+            cli_config_path,
+            cli_config_toml,
+        )
+    }
+
+    /// Build overrides from an explicit config environment and optional CLI values.
+    #[must_use]
+    pub fn from_config_environment_with_cli(
+        environment: &impl ConfigEnvironment,
+        cli_config_path: Option<PathBuf>,
+        cli_config_toml: Option<String>,
+    ) -> Self {
         Self {
             base_config_path: None,
-            env_config_path: env::var_os(BCODE_CONFIG_ENV).map(PathBuf::from),
+            env_config_path: environment.var_os(BCODE_CONFIG_ENV).map(PathBuf::from),
             env_config_toml: merge_config_toml_overrides(
-                env::var(BCODE_CONFIG_TOML_ENV).ok(),
-                env::var(BCODE_MODEL_PROFILE_ENV)
-                    .ok()
+                environment.var(BCODE_CONFIG_TOML_ENV),
+                environment
+                    .var(BCODE_MODEL_PROFILE_ENV)
                     .filter(|profile| !profile.trim().is_empty())
                     .map(|profile| model_profile_override_toml(&profile)),
             ),
@@ -1335,10 +1485,18 @@ fn resolve_composed_config_value(
 /// Return true when environment variables imply Bedrock should be selected.
 #[must_use]
 pub fn bedrock_environment_is_configured() -> bool {
+    bedrock_environment_is_configured_with_environment(&ProcessConfigEnvironment)
+}
+
+/// Return true when explicit environment variables imply Bedrock should be selected.
+#[must_use]
+pub fn bedrock_environment_is_configured_with_environment(
+    environment: &impl ConfigEnvironment,
+) -> bool {
     PROVIDER_ENVIRONMENT_SPECS
         .iter()
         .find(|spec| spec.plugin_id == "bcode.bedrock")
-        .is_some_and(|spec| first_env_value_from_slice(spec.signal_env_vars).is_some())
+        .is_some_and(|spec| first_env_value_from_slice(environment, spec.signal_env_vars).is_some())
 }
 
 /// System prompt assembly configuration.
@@ -3455,13 +3613,19 @@ pub fn register_runtime_auth_subscription(
 /// Return the default Bcode state directory.
 #[must_use]
 pub fn default_state_dir() -> PathBuf {
-    if let Ok(path) = env::var("BCODE_STATE_DIR") {
+    default_state_dir_with_environment(&ProcessConfigEnvironment)
+}
+
+/// Return the default Bcode state directory for an explicit environment.
+#[must_use]
+pub fn default_state_dir_with_environment(environment: &impl ConfigEnvironment) -> PathBuf {
+    if let Some(path) = environment.var("BCODE_STATE_DIR") {
         return PathBuf::from(path);
     }
-    if let Ok(state_home) = env::var("XDG_STATE_HOME") {
+    if let Some(state_home) = environment.var("XDG_STATE_HOME") {
         return PathBuf::from(state_home).join("bcode");
     }
-    if let Ok(home) = env::var("HOME") {
+    if let Some(home) = environment.var("HOME") {
         return PathBuf::from(home)
             .join(".local")
             .join("state")
@@ -3473,10 +3637,18 @@ pub fn default_state_dir() -> PathBuf {
 /// Return the default Bcode auth vault path.
 #[must_use]
 pub fn default_auth_vault_path() -> PathBuf {
-    if let Ok(path) = env::var("BCODE_AUTH_VAULT") {
+    default_auth_vault_path_with_environment(&ProcessConfigEnvironment)
+}
+
+/// Return the default Bcode auth vault path for an explicit environment.
+#[must_use]
+pub fn default_auth_vault_path_with_environment(environment: &impl ConfigEnvironment) -> PathBuf {
+    if let Some(path) = environment.var("BCODE_AUTH_VAULT") {
         return PathBuf::from(path);
     }
-    default_state_dir().join("auth").join("vault")
+    default_state_dir_with_environment(environment)
+        .join("auth")
+        .join("vault")
 }
 
 /// Return the default runtime permissions state file path.
@@ -3492,10 +3664,18 @@ pub fn default_auth_vault_path() -> PathBuf {
 /// * Otherwise `<default_state_dir>/permissions.toml`.
 #[must_use]
 pub fn default_permissions_state_path() -> PathBuf {
-    if let Ok(path) = env::var("BCODE_PERMISSIONS_STATE") {
+    default_permissions_state_path_with_environment(&ProcessConfigEnvironment)
+}
+
+/// Return the default runtime permissions state file path for an explicit environment.
+#[must_use]
+pub fn default_permissions_state_path_with_environment(
+    environment: &impl ConfigEnvironment,
+) -> PathBuf {
+    if let Some(path) = environment.var("BCODE_PERMISSIONS_STATE") {
         return PathBuf::from(path);
     }
-    default_state_dir().join("permissions.toml")
+    default_state_dir_with_environment(environment).join("permissions.toml")
 }
 
 /// Return the default runtime model ignores state file path.
@@ -3790,10 +3970,16 @@ fn parse_action(action: &str) -> Result<bcode_agent_policy_models::Action, Confi
 /// Return the default Bcode config directory.
 #[must_use]
 pub fn default_config_dir() -> PathBuf {
-    if let Ok(config_home) = env::var("XDG_CONFIG_HOME") {
+    default_config_dir_with_environment(&ProcessConfigEnvironment)
+}
+
+/// Return the default Bcode config directory for an explicit environment.
+#[must_use]
+pub fn default_config_dir_with_environment(environment: &impl ConfigEnvironment) -> PathBuf {
+    if let Some(config_home) = environment.var("XDG_CONFIG_HOME") {
         return PathBuf::from(config_home).join("bcode");
     }
-    if let Ok(home) = env::var("HOME") {
+    if let Some(home) = environment.var("HOME") {
         return PathBuf::from(home).join(".config").join("bcode");
     }
     env::temp_dir().join("bcode")
@@ -4888,20 +5074,35 @@ fn toml_string(value: &str) -> String {
 /// Return default config paths in merge order.
 #[must_use]
 pub fn default_config_paths() -> Vec<PathBuf> {
-    default_config_paths_from(&env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    default_config_paths_with_environment(&ProcessConfigEnvironment)
+}
+
+/// Return default config paths in merge order for an explicit environment.
+#[must_use]
+pub fn default_config_paths_with_environment(environment: &impl ConfigEnvironment) -> Vec<PathBuf> {
+    default_config_paths_from_with_environment(&environment.current_dir(), environment)
 }
 
 /// Return default config paths in merge order for a starting directory.
 #[must_use]
 pub fn default_config_paths_from(start: &Path) -> Vec<PathBuf> {
+    default_config_paths_from_with_environment(start, &ProcessConfigEnvironment)
+}
+
+/// Return default config paths in merge order for a starting directory and environment.
+#[must_use]
+pub fn default_config_paths_from_with_environment(
+    start: &Path,
+    environment: &impl ConfigEnvironment,
+) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Ok(config_home) = env::var("XDG_CONFIG_HOME") {
+    if let Some(config_home) = environment.var("XDG_CONFIG_HOME") {
         paths.push(
             PathBuf::from(config_home)
                 .join("bcode")
                 .join(DEFAULT_CONFIG_FILE_NAME),
         );
-    } else if let Ok(home) = env::var("HOME") {
+    } else if let Some(home) = environment.var("HOME") {
         paths.push(
             PathBuf::from(home)
                 .join(".config")
@@ -4937,9 +5138,20 @@ fn discover_config_root(start: &Path) -> Option<PathBuf> {
 ///
 /// Returns an error if an existing config layer cannot be read, parsed, or composed.
 pub fn load_config() -> Result<BcodeConfig, ConfigError> {
+    load_config_with_environment(&ProcessConfigEnvironment)
+}
+
+/// Load configuration from default paths for an explicit environment.
+///
+/// # Errors
+///
+/// Returns an error if an existing config layer cannot be read, parsed, or composed.
+pub fn load_config_with_environment(
+    environment: &impl ConfigEnvironment,
+) -> Result<BcodeConfig, ConfigError> {
     load_config_from_paths_with_overrides(
-        &default_config_paths(),
-        &ConfigLoadOverrides::from_env_with_cli(None, None),
+        &default_config_paths_with_environment(environment),
+        &ConfigLoadOverrides::from_config_environment_with_cli(environment, None, None),
     )
 }
 
@@ -4951,7 +5163,22 @@ pub fn load_config() -> Result<BcodeConfig, ConfigError> {
 pub fn load_config_with_overrides(
     overrides: &ConfigLoadOverrides,
 ) -> Result<BcodeConfig, ConfigError> {
-    load_config_from_paths_with_overrides(&default_config_paths(), overrides)
+    load_config_with_environment_and_overrides(&ProcessConfigEnvironment, overrides)
+}
+
+/// Load configuration from default paths with explicit environment and overrides.
+///
+/// # Errors
+///
+/// Returns an error if an existing config layer cannot be read, parsed, or composed.
+pub fn load_config_with_environment_and_overrides(
+    environment: &impl ConfigEnvironment,
+    overrides: &ConfigLoadOverrides,
+) -> Result<BcodeConfig, ConfigError> {
+    load_config_from_paths_with_overrides(
+        &default_config_paths_with_environment(environment),
+        overrides,
+    )
 }
 
 /// Load and merge configuration from the provided paths.
@@ -4963,6 +5190,21 @@ pub fn load_config_with_overrides(
 ///
 /// Returns an error if an existing config layer cannot be read, parsed, or composed.
 pub fn load_config_from_paths(paths: &[PathBuf]) -> Result<BcodeConfig, ConfigError> {
+    load_config_from_paths_with_environment(paths, &ProcessConfigEnvironment)
+}
+
+/// Load and merge configuration from paths with an explicit environment.
+///
+/// Missing paths are ignored. Existing files are merged in the order provided.
+/// Process-scoped overrides are honored when present.
+///
+/// # Errors
+///
+/// Returns an error if an existing config layer cannot be read, parsed, or composed.
+pub fn load_config_from_paths_with_environment(
+    paths: &[PathBuf],
+    _environment: &impl ConfigEnvironment,
+) -> Result<BcodeConfig, ConfigError> {
     let process_overrides = process_config_overrides()
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5102,11 +5344,12 @@ fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BcodeConfig, CompactionMode, ConfigDocSchema, ConfigError, ConfigLoadOverrides,
-        ContextStrategyMode, NestedFieldDoc, TuiAccentTransitionCurve, TuiMouseConfig,
-        default_config_paths_from, default_permissions_state_path, load_config_from_paths,
-        load_config_from_paths_with_overrides, load_permissions_state_from, merge_config_values,
-        plugin_selection_with_default_plugin_ids, upsert_agent_permission_rule,
+        BcodeConfig, CompactionMode, ConfigDocSchema, ConfigEnvironmentSnapshot, ConfigError,
+        ConfigLoadOverrides, ContextStrategyMode, NestedFieldDoc, TuiAccentTransitionCurve,
+        TuiMouseConfig, default_config_paths_from, default_permissions_state_path,
+        load_config_from_paths, load_config_from_paths_with_overrides, load_permissions_state_from,
+        merge_config_values, plugin_selection_with_default_plugin_ids,
+        upsert_agent_permission_rule,
     };
     use bcode_agent_policy_models::Action;
     use bcode_plugin::PluginSelection;
@@ -5290,7 +5533,8 @@ auth_pool = "openai"
 
         let mut config = config;
         config.model.profile = Some("openai".to_string());
-        let selection = config.resolved_model_selection();
+        let environment = ConfigEnvironmentSnapshot::isolated(unique_temp_dir());
+        let selection = config.resolved_model_selection_with_environment(&environment);
         assert_eq!(selection.auth_pool.as_deref(), Some("openai"));
         assert_eq!(selection.auth_profile, None);
     }
