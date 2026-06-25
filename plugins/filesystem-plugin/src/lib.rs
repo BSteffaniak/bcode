@@ -1087,14 +1087,34 @@ fn tool_write(
                     target: ToolPresentationTarget::Preview,
                     title: "Write preview".to_string(),
                     subtitle: Some("Applying".to_string()),
-                    sections: vec![file_change_fields(
-                        &request.path,
-                        &format!("{} bytes", request.contents.len()),
-                    )],
+                    sections: vec![
+                        file_change_fields(
+                            &request.path,
+                            &format!("{} bytes", request.contents.len()),
+                        ),
+                        ToolPresentationSection::Diff {
+                            path: Some(request.path.display().to_string()),
+                            old_text: String::new(),
+                            new_text: request.contents.clone(),
+                        },
+                    ],
                 }),
             );
             write_file_inner(&request.path, &request.contents).map_or_else(
-                |error| tool_io_error(&error),
+                |error| {
+                    emit_presentation(
+                        events,
+                        tool_call_id,
+                        3,
+                        ToolPresentationEvent::Card(bcode_tool::ToolCardPresentation {
+                            target: ToolPresentationTarget::Result,
+                            title: "File change failed".to_string(),
+                            subtitle: None,
+                            sections: vec![file_change_fields(&request.path, &error.to_string())],
+                        }),
+                    );
+                    tool_io_error(&error)
+                },
                 |bytes_written| {
                     let summary = format!("wrote {bytes_written} bytes");
                     emit_presentation(
@@ -1156,17 +1176,37 @@ fn tool_edit(
                     target: ToolPresentationTarget::Preview,
                     title: "Edit preview".to_string(),
                     subtitle: Some("Applying".to_string()),
-                    sections: vec![file_change_fields(&request.path, "replacement")],
+                    sections: vec![
+                        file_change_fields(&request.path, "replacement"),
+                        ToolPresentationSection::Diff {
+                            path: Some(request.path.display().to_string()),
+                            old_text: request.old_text.clone(),
+                            new_text: request.new_text.clone(),
+                        },
+                    ],
                 }),
             );
             edit_file_inner(&request).map_or_else(
-                |error| ToolInvocationResponse {
-                    output: error,
-                    is_error: true,
-                    content: Vec::new(),
-                    full_output: None,
-                    host_action: None,
-                    result: None,
+                |error| {
+                    emit_presentation(
+                        events,
+                        tool_call_id,
+                        3,
+                        ToolPresentationEvent::Card(bcode_tool::ToolCardPresentation {
+                            target: ToolPresentationTarget::Result,
+                            title: "File change failed".to_string(),
+                            subtitle: None,
+                            sections: vec![file_change_fields(&request.path, &error)],
+                        }),
+                    );
+                    ToolInvocationResponse {
+                        output: error,
+                        is_error: true,
+                        content: Vec::new(),
+                        full_output: None,
+                        host_action: None,
+                        result: None,
+                    }
                 },
                 |replacements| {
                     let summary = format!("applied {replacements} replacement");

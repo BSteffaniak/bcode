@@ -7,9 +7,10 @@
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
-    ToolInvocationRequest, ToolInvocationResponse, ToolList, ToolLiveArgumentPreviewMetadata,
-    ToolPresentationField, ToolPresentationFieldKind, ToolRequestPresentationMetadata,
-    ToolSideEffect,
+    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationStreamEvent, ToolList,
+    ToolLiveArgumentPreviewMetadata, ToolPresentationEvent, ToolPresentationField,
+    ToolPresentationFieldKind, ToolPresentationFieldValue, ToolPresentationSection,
+    ToolPresentationTarget, ToolRequestPresentationMetadata, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -31,6 +32,61 @@ impl RustPlugin for GitPlugin {
                 "unsupported Git plugin service interface",
             ),
         }
+    }
+}
+
+fn emit_presentation(
+    events: ServiceEventEmitter,
+    tool_call_id: &str,
+    sequence: u64,
+    presentation: ToolPresentationEvent,
+) {
+    let event = ToolInvocationStreamEvent::Presentation {
+        tool_call_id: tool_call_id.to_owned(),
+        sequence,
+        presentation,
+    };
+    if let Ok(payload) = serde_json::to_vec(&event) {
+        events.emit(&payload);
+    }
+}
+
+fn git_field(label: &str, value: &impl ToString) -> ToolPresentationFieldValue {
+    ToolPresentationFieldValue {
+        label: label.to_string(),
+        value: value.to_string(),
+    }
+}
+
+fn clone_preview_card(request: &CloneRequest) -> bcode_tool::ToolCardPresentation {
+    let mut fields = vec![git_field("URL", &request.url)];
+    if let Some(destination) = &request.destination {
+        fields.push(git_field("Destination", &destination.display()));
+    }
+    if let Some(git_ref) = &request.git_ref {
+        fields.push(git_field("Ref", git_ref));
+    }
+    bcode_tool::ToolCardPresentation {
+        target: ToolPresentationTarget::Preview,
+        title: "Clone repository".to_string(),
+        subtitle: None,
+        sections: vec![ToolPresentationSection::Fields { fields }],
+    }
+}
+
+fn clone_result_card(response: &CloneResponse) -> bcode_tool::ToolCardPresentation {
+    bcode_tool::ToolCardPresentation {
+        target: ToolPresentationTarget::Result,
+        title: "Repository cloned".to_string(),
+        subtitle: None,
+        sections: vec![ToolPresentationSection::Fields {
+            fields: vec![
+                git_field("URL", &response.url),
+                git_field("Destination", &response.path.display()),
+                git_field("Ref", &response.git_ref.as_deref().unwrap_or("default")),
+                git_field("Already exists", &response.already_exists),
+            ],
+        }],
     }
 }
 
@@ -65,7 +121,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
         return json_response(&tool_error("git tool cancelled".to_string()));
     }
     let response = match invocation.name.as_str() {
-        "git.clone" | "github.clone" => invoke_clone(&invocation),
+        "git.clone" | "github.clone" => invoke_clone(&invocation, context.events),
         _ => ToolInvocationResponse {
             output: format!("unsupported Git tool: {}", invocation.name),
             is_error: true,
@@ -78,13 +134,30 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
     json_response(&response)
 }
 
-fn invoke_clone(invocation: &ToolInvocationRequest) -> ToolInvocationResponse {
+fn invoke_clone(
+    invocation: &ToolInvocationRequest,
+    events: ServiceEventEmitter,
+) -> ToolInvocationResponse {
     let request = match serde_json::from_value::<CloneRequest>(invocation.arguments.clone()) {
         Ok(request) => request,
         Err(error) => return tool_error(error.to_string()),
     };
+    emit_presentation(
+        events,
+        &invocation.tool_call_id,
+        0,
+        ToolPresentationEvent::Card(clone_preview_card(&request)),
+    );
     match clone_repository(&request, invocation.artifact_dir.as_deref()) {
-        Ok(response) => json_tool_response(&response),
+        Ok(response) => {
+            emit_presentation(
+                events,
+                &invocation.tool_call_id,
+                1,
+                ToolPresentationEvent::Card(clone_result_card(&response)),
+            );
+            json_tool_response(&response)
+        }
         Err(error) => tool_error(error.to_string()),
     }
 }
