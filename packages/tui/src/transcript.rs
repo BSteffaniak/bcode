@@ -3,8 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use bcode_session_models::{
-    SessionEvent, SessionEventKind, SessionTokenUsage, ShellRunResult, ToolInvocationResult,
-    ToolInvocationStreamEvent, ToolOutputStream, ToolRequestPresentationMetadata,
+    SessionEvent, SessionEventKind, SessionTokenUsage, ShellRunResult, ToolCardPresentation,
+    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream, ToolPresentationTarget,
+    ToolRequestPresentationMetadata,
 };
 
 use super::diff_extract::{FileEditTranscript, file_edit_from_tool_request};
@@ -96,6 +97,15 @@ pub enum TranscriptItemKind {
         path: Option<String>,
         /// Whether the tool failed.
         is_error: bool,
+    },
+    /// Plugin-owned generic tool presentation card.
+    ToolPresentationCard {
+        /// Provider tool call identifier.
+        tool_call_id: String,
+        /// Tool name, when known.
+        tool_name: Option<String>,
+        /// Structured plugin-owned card.
+        card: ToolCardPresentation,
     },
     /// Live or replayed terminal output from a tool.
     TerminalOutput {
@@ -393,6 +403,36 @@ impl TranscriptItem {
         true
     }
 
+    /// Replace a generic tool presentation card.
+    pub fn set_tool_presentation_card(&mut self, card: ToolCardPresentation) {
+        if let TranscriptItemKind::ToolPresentationCard {
+            card: existing_card,
+            ..
+        } = &mut self.kind
+        {
+            self.text.clone_from(&card.title);
+            *existing_card = card;
+            self.bump_revision();
+        }
+    }
+
+    /// Return whether this item is a generic presentation card for `tool_call_id` and `target`.
+    #[must_use]
+    pub fn is_tool_presentation_card_for(
+        &self,
+        tool_call_id: &str,
+        target: ToolPresentationTarget,
+    ) -> bool {
+        matches!(
+            &self.kind,
+            TranscriptItemKind::ToolPresentationCard {
+                tool_call_id: item_tool_call_id,
+                card,
+                ..
+            } if item_tool_call_id == tool_call_id && card.target == target
+        )
+    }
+
     /// Return whether this item is a live preview anchor for `tool_call_id`.
     #[must_use]
     pub fn is_live_preview_anchor_for(&self, tool_call_id: &str) -> bool {
@@ -532,6 +572,25 @@ pub fn live_tool_preview_anchor_item(tool_call_id: &str, tool_name: &str) -> Tra
         TranscriptItemKind::LiveToolPreviewAnchor {
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.to_owned(),
+        },
+    )
+}
+
+/// Build a generic plugin-owned tool presentation card item.
+#[must_use]
+pub fn tool_presentation_card_item(
+    tool_call_id: &str,
+    tool_name: Option<&str>,
+    card: ToolCardPresentation,
+) -> TranscriptItem {
+    TranscriptItem::with_kind(
+        "Tool",
+        card.title.clone(),
+        card.target == ToolPresentationTarget::Preview,
+        TranscriptItemKind::ToolPresentationCard {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: tool_name.map(ToOwned::to_owned),
+            card,
         },
     )
 }

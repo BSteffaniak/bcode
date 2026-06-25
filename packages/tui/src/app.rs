@@ -54,7 +54,8 @@ use super::transcript::{
     FileEditPhase, TranscriptItem, TranscriptItemKind, file_change_presentation_item,
     live_tool_preview_anchor_item, model_usage_item, permission_request_item,
     permission_result_item, streaming_terminal_output_item, streaming_tool_output_item,
-    tool_request_item, tool_result_item, transcript_items_from_events_with_reasoning,
+    tool_presentation_card_item, tool_request_item, tool_result_item,
+    transcript_items_from_events_with_reasoning,
 };
 use super::transcript_document::TranscriptDocument;
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
@@ -2795,14 +2796,12 @@ impl BmuxApp {
                     }
                 }
             }
-            ToolInvocationStreamEvent::Presentation { presentation, .. } => {
-                if application.live_activity()
-                    && let bcode_session_models::ToolPresentationEvent::Status(status) =
-                        presentation
-                    && status.target == bcode_session_models::ToolPresentationTarget::Activity
-                {
-                    status.text.clone_into(&mut self.status);
-                }
+            ToolInvocationStreamEvent::Presentation {
+                tool_call_id,
+                presentation,
+                ..
+            } => {
+                self.apply_tool_presentation_event(tool_call_id, presentation, application);
             }
             ToolInvocationStreamEvent::Finished {
                 tool_call_id,
@@ -2837,6 +2836,74 @@ impl BmuxApp {
                 }
             }
         }
+    }
+
+    fn apply_tool_presentation_event(
+        &mut self,
+        tool_call_id: &str,
+        presentation: &bcode_session_models::ToolPresentationEvent,
+        application: SessionEventApplication,
+    ) {
+        use bcode_session_models::{ToolPresentationEvent, ToolPresentationTarget};
+
+        match presentation {
+            ToolPresentationEvent::Status(status) => {
+                if application.live_activity() && status.target == ToolPresentationTarget::Activity
+                {
+                    status.text.clone_into(&mut self.status);
+                    self.set_activity(ActivityState::ProviderStream {
+                        detail: status.text.clone(),
+                    });
+                }
+            }
+            ToolPresentationEvent::Progress(progress) => {
+                if application.live_activity()
+                    && progress.target == ToolPresentationTarget::Activity
+                {
+                    progress.text.clone_into(&mut self.status);
+                }
+            }
+            ToolPresentationEvent::Card(card) => {
+                self.upsert_tool_presentation_card(tool_call_id, card.clone());
+            }
+            ToolPresentationEvent::Clear { target } => {
+                self.clear_tool_presentation_card(tool_call_id, *target);
+            }
+        }
+    }
+
+    fn upsert_tool_presentation_card(
+        &mut self,
+        tool_call_id: &str,
+        card: bcode_session_models::ToolCardPresentation,
+    ) {
+        let tool_name = self
+            .tool_call_contexts
+            .get(tool_call_id)
+            .map(|context| context.tool_name.as_str());
+        let updated = self.transcript.mutate_rev_find(
+            |item| item.is_tool_presentation_card_for(tool_call_id, card.target),
+            |item| item.set_tool_presentation_card(card.clone()),
+        );
+        if updated.is_none() {
+            self.transcript
+                .push(tool_presentation_card_item(tool_call_id, tool_name, card));
+        }
+    }
+
+    fn clear_tool_presentation_card(
+        &mut self,
+        tool_call_id: &str,
+        target: bcode_session_models::ToolPresentationTarget,
+    ) {
+        let replacement = self
+            .transcript
+            .items()
+            .iter()
+            .filter(|item| !item.is_tool_presentation_card_for(tool_call_id, target))
+            .cloned()
+            .collect();
+        self.transcript.replace(replacement);
     }
 
     fn push_tool_output_delta(&mut self, tool_call_id: &str, stream: ToolOutputStream, text: &str) {
@@ -3938,6 +4005,7 @@ fn referenced_tool_call_ids(items: &[TranscriptItem]) -> BTreeSet<String> {
             | TranscriptItemKind::LiveToolPreviewAnchor { tool_call_id, .. }
             | TranscriptItemKind::ToolResult { tool_call_id, .. }
             | TranscriptItemKind::FileChangePresentation { tool_call_id, .. }
+            | TranscriptItemKind::ToolPresentationCard { tool_call_id, .. }
             | TranscriptItemKind::TerminalOutput { tool_call_id, .. }
             | TranscriptItemKind::PermissionRequest { tool_call_id, .. } => {
                 ids.insert(tool_call_id.clone());

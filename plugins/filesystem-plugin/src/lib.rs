@@ -9,8 +9,9 @@ use bcode_tool::{
     FileChangeResult, ImageMetadata, ImageRefContent, ListToolsRequest, OP_INVOKE_TOOL,
     OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition, ToolInvocationRequest,
     ToolInvocationResponse, ToolInvocationResult, ToolInvocationStreamEvent, ToolList,
-    ToolLiveArgumentPreviewMetadata, ToolPresentationField, ToolPresentationFieldKind,
-    ToolRequestPresentationMetadata, ToolResultContent, ToolSideEffect,
+    ToolLiveArgumentPreviewMetadata, ToolPresentationEvent, ToolPresentationField,
+    ToolPresentationFieldKind, ToolPresentationFieldValue, ToolPresentationSection,
+    ToolPresentationTarget, ToolRequestPresentationMetadata, ToolResultContent, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -658,8 +659,18 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
     let cwd = request.cwd.clone();
     let response = match request.name.as_str() {
         "filesystem.read" => tool_read(request.arguments, cwd.as_deref()),
-        "filesystem.write" => tool_write(request.arguments, cwd.as_deref()),
-        "filesystem.edit" => tool_edit(request.arguments, cwd.as_deref()),
+        "filesystem.write" => tool_write(
+            request.arguments,
+            cwd.as_deref(),
+            Some(context.events),
+            &request.tool_call_id,
+        ),
+        "filesystem.edit" => tool_edit(
+            request.arguments,
+            cwd.as_deref(),
+            Some(context.events),
+            &request.tool_call_id,
+        ),
         "filesystem.exists" => tool_exists(request.arguments, cwd.as_deref()),
         "filesystem.list" => tool_list(
             request.arguments,
@@ -1016,14 +1027,87 @@ fn sniff_supported_image_mime(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-fn tool_write(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocationResponse {
+fn emit_presentation(
+    events: Option<ServiceEventEmitter>,
+    tool_call_id: &str,
+    sequence: u64,
+    presentation: ToolPresentationEvent,
+) {
+    let event = ToolInvocationStreamEvent::Presentation {
+        tool_call_id: tool_call_id.to_string(),
+        sequence,
+        presentation,
+    };
+    if let Ok(payload) = serde_json::to_vec(&event)
+        && let Some(events) = events
+    {
+        events.emit(&payload);
+    }
+}
+
+fn file_change_fields(path: &Path, summary: &str) -> ToolPresentationSection {
+    ToolPresentationSection::Fields {
+        fields: vec![
+            ToolPresentationFieldValue {
+                label: "Path".to_string(),
+                value: path.display().to_string(),
+            },
+            ToolPresentationFieldValue {
+                label: "Summary".to_string(),
+                value: summary.to_string(),
+            },
+        ],
+    }
+}
+
+fn tool_write(
+    arguments: serde_json::Value,
+    cwd: Option<&Path>,
+    events: Option<ServiceEventEmitter>,
+    tool_call_id: &str,
+) -> ToolInvocationResponse {
     match serde_json::from_value::<WriteRequest>(arguments) {
         Ok(mut request) => {
             request.path = resolve_session_path(cwd, &request.path);
+            emit_presentation(
+                events,
+                tool_call_id,
+                1,
+                ToolPresentationEvent::Status(bcode_tool::ToolStatusPresentation {
+                    target: ToolPresentationTarget::Activity,
+                    text: format!("applying file change {}", request.path.display()),
+                    level: bcode_tool::ToolPresentationLevel::Info,
+                }),
+            );
+            emit_presentation(
+                events,
+                tool_call_id,
+                2,
+                ToolPresentationEvent::Card(bcode_tool::ToolCardPresentation {
+                    target: ToolPresentationTarget::Preview,
+                    title: "Write preview".to_string(),
+                    subtitle: Some("Applying".to_string()),
+                    sections: vec![file_change_fields(
+                        &request.path,
+                        &format!("{} bytes", request.contents.len()),
+                    )],
+                }),
+            );
             write_file_inner(&request.path, &request.contents).map_or_else(
                 |error| tool_io_error(&error),
                 |bytes_written| {
                     let summary = format!("wrote {bytes_written} bytes");
+                    emit_presentation(
+                        events,
+                        tool_call_id,
+                        3,
+                        ToolPresentationEvent::Card(bcode_tool::ToolCardPresentation {
+                            target: ToolPresentationTarget::Result,
+                            title: "Applied file change".to_string(),
+                            subtitle: None,
+                            sections: vec![file_change_fields(&request.path, &summary)],
+                        }),
+                    );
                     ToolInvocationResponse {
                         output: summary.clone(),
                         is_error: false,
@@ -1045,10 +1129,36 @@ fn tool_write(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocatio
     }
 }
 
-fn tool_edit(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocationResponse {
+fn tool_edit(
+    arguments: serde_json::Value,
+    cwd: Option<&Path>,
+    events: Option<ServiceEventEmitter>,
+    tool_call_id: &str,
+) -> ToolInvocationResponse {
     match serde_json::from_value::<EditRequest>(arguments) {
         Ok(mut request) => {
             request.path = resolve_session_path(cwd, &request.path);
+            emit_presentation(
+                events,
+                tool_call_id,
+                1,
+                ToolPresentationEvent::Status(bcode_tool::ToolStatusPresentation {
+                    target: ToolPresentationTarget::Activity,
+                    text: format!("applying file change {}", request.path.display()),
+                    level: bcode_tool::ToolPresentationLevel::Info,
+                }),
+            );
+            emit_presentation(
+                events,
+                tool_call_id,
+                2,
+                ToolPresentationEvent::Card(bcode_tool::ToolCardPresentation {
+                    target: ToolPresentationTarget::Preview,
+                    title: "Edit preview".to_string(),
+                    subtitle: Some("Applying".to_string()),
+                    sections: vec![file_change_fields(&request.path, "replacement")],
+                }),
+            );
             edit_file_inner(&request).map_or_else(
                 |error| ToolInvocationResponse {
                     output: error,
@@ -1060,6 +1170,17 @@ fn tool_edit(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocation
                 },
                 |replacements| {
                     let summary = format!("applied {replacements} replacement");
+                    emit_presentation(
+                        events,
+                        tool_call_id,
+                        3,
+                        ToolPresentationEvent::Card(bcode_tool::ToolCardPresentation {
+                            target: ToolPresentationTarget::Result,
+                            title: "Applied file change".to_string(),
+                            subtitle: None,
+                            sections: vec![file_change_fields(&request.path, &summary)],
+                        }),
+                    );
                     ToolInvocationResponse {
                         output: summary.clone(),
                         is_error: false,
@@ -2130,6 +2251,8 @@ mod tests {
                 "contents": "hello",
             }),
             None,
+            None,
+            "test",
         );
         assert!(matches!(
             write_response.result,
@@ -2149,6 +2272,8 @@ mod tests {
                 "new_text": "hello world",
             }),
             None,
+            None,
+            "test",
         );
         assert!(matches!(
             edit_response.result,

@@ -5,7 +5,10 @@ use std::time::{Duration, Instant};
 
 use bcode_config::TuiInlineDiffConfig;
 use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
-use bcode_session_models::{LiveFileEditPreview, LiveToolArgumentPreview};
+use bcode_session_models::{
+    LiveFileEditPreview, LiveToolArgumentPreview, ToolCardPresentation, ToolPresentationLevel,
+    ToolPresentationSection,
+};
 use bcode_syntax_render::{SyntaxHighlighter, SyntaxStyle};
 use bmux_terminal_grid::{
     Color as GridColor, GridLimits, PhysicalRow, Style as GridStyle, TerminalGrid,
@@ -773,6 +776,17 @@ fn push_transcript_item_rows(
                 width,
             );
         }
+        TranscriptItemKind::ToolPresentationCard {
+            tool_name, card, ..
+        } => {
+            push_tool_presentation_card_rows(
+                rows,
+                tool_name.as_deref(),
+                card,
+                width,
+                inline_diff_config,
+            );
+        }
         TranscriptItemKind::TerminalOutput { .. } => {
             push_terminal_transcript_item_rows(rows, item, width);
         }
@@ -811,6 +825,130 @@ fn push_transcript_item_rows(
         TranscriptItemKind::Generic => {
             push_detail_block(rows, item.role(), item.text(), Color::BrightBlack, width);
         }
+    }
+}
+
+fn push_tool_presentation_card_rows(
+    rows: &mut Vec<Line>,
+    tool_name: Option<&str>,
+    card: &ToolCardPresentation,
+    width: u16,
+    inline_diff_config: TuiInlineDiffConfig,
+) {
+    let color = presentation_level_color(card_level(card));
+    let heading = tool_name.map_or_else(
+        || card.title.clone(),
+        |tool_name| format!("{} · {}", card.title, tool_name),
+    );
+    push_wrapped_styled_text(
+        rows,
+        Vec::new(),
+        &heading,
+        width,
+        Style::new().fg(color),
+        Style::new().fg(color),
+    );
+    if let Some(subtitle) = &card.subtitle {
+        push_wrapped_styled_text(
+            rows,
+            vec![Span::styled("  ", muted_style())],
+            subtitle,
+            width,
+            muted_style(),
+            muted_style(),
+        );
+    }
+    for section in &card.sections {
+        match section {
+            ToolPresentationSection::Fields { fields } => {
+                for field in fields {
+                    push_kv_row(rows, &field.label, &field.value, width);
+                }
+            }
+            ToolPresentationSection::Text { label, text } => {
+                if let Some(label) = label {
+                    push_wrapped_styled_text(
+                        rows,
+                        vec![Span::styled("  ", muted_style())],
+                        label,
+                        width,
+                        Style::new().fg(color),
+                        Style::new().fg(color),
+                    );
+                }
+                push_wrapped_styled_text(
+                    rows,
+                    vec![Span::styled("  ", muted_style())],
+                    text,
+                    width,
+                    Style::new(),
+                    Style::new(),
+                );
+            }
+            ToolPresentationSection::Diff {
+                path,
+                old_text,
+                new_text,
+            } => {
+                let edit = FileEditTranscript::new(
+                    path.clone().unwrap_or_else(|| "<diff>".to_owned()),
+                    old_text.clone(),
+                    new_text.clone(),
+                );
+                push_file_edit_preview_rows(
+                    rows,
+                    &edit,
+                    width,
+                    inline_diff_config,
+                    None,
+                    false,
+                    tool_name.unwrap_or("tool"),
+                );
+            }
+            ToolPresentationSection::Terminal {
+                output,
+                columns,
+                rows: terminal_rows,
+            } => {
+                push_terminal_tool_result_rows(
+                    rows,
+                    TerminalToolRenderContext {
+                        tool_call_id: "presentation",
+                        tool_name,
+                        output,
+                        columns: *columns,
+                        rows: *terminal_rows,
+                        started_at_ms: None,
+                        finished_at_ms: None,
+                        exit_code: None,
+                        timed_out: None,
+                        is_error: card_level(card) == ToolPresentationLevel::Error,
+                        streaming: false,
+                    },
+                    width,
+                );
+            }
+        }
+    }
+    rows.push(Line::default());
+}
+
+fn card_level(card: &ToolCardPresentation) -> ToolPresentationLevel {
+    if card.title.to_ascii_lowercase().contains("failed") {
+        ToolPresentationLevel::Error
+    } else if card.target == bcode_session_models::ToolPresentationTarget::Result {
+        ToolPresentationLevel::Success
+    } else {
+        ToolPresentationLevel::Info
+    }
+}
+
+const fn presentation_level_color(level: ToolPresentationLevel) -> Color {
+    match level {
+        ToolPresentationLevel::Info => Color::Cyan,
+        ToolPresentationLevel::Success => Color::Green,
+        ToolPresentationLevel::Warning => Color::Yellow,
+        ToolPresentationLevel::Error => Color::Red,
     }
 }
 

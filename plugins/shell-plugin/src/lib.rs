@@ -13,7 +13,8 @@ use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, ShellRunResult, TOOL_SERVICE_INTERFACE_ID,
     ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult,
     ToolInvocationStreamEvent, ToolList, ToolLiveArgumentPreviewMetadata, ToolOutputStream,
-    ToolPresentationEvent, ToolPresentationField, ToolPresentationFieldKind, ToolPresentationLevel,
+    ToolPresentationEvent, ToolPresentationField, ToolPresentationFieldKind,
+    ToolPresentationFieldValue, ToolPresentationLevel, ToolPresentationSection,
     ToolPresentationTarget, ToolRequestPresentationMetadata, ToolSideEffect,
     ToolStatusPresentation,
 };
@@ -239,18 +240,7 @@ fn run_shell_tool(
             started_at_ms: Some(now_ms),
         },
     );
-    emit_tool_stream_event(
-        events,
-        &ToolInvocationStreamEvent::Presentation {
-            tool_call_id: tool_call_id.to_owned(),
-            sequence: 0,
-            presentation: ToolPresentationEvent::Status(ToolStatusPresentation {
-                target: ToolPresentationTarget::Activity,
-                text: format!("running {}", arguments.command),
-                level: ToolPresentationLevel::Info,
-            }),
-        },
-    );
+    emit_shell_start_presentation(events, tool_call_id, &arguments);
     emit_tool_status(
         events,
         tool_call_id,
@@ -286,6 +276,7 @@ fn run_shell_tool(
             },
         }
     };
+    emit_shell_result_presentation(events, tool_call_id, &arguments, &response);
     emit_tool_stream_event(
         events,
         &ToolInvocationStreamEvent::Finished {
@@ -336,6 +327,106 @@ fn resolve_effective_cwd(
             }
         },
     )
+}
+
+fn emit_shell_start_presentation(
+    events: ServiceEventEmitter,
+    tool_call_id: &str,
+    arguments: &ShellRunArguments,
+) {
+    emit_tool_stream_event(
+        events,
+        &ToolInvocationStreamEvent::Presentation {
+            tool_call_id: tool_call_id.to_owned(),
+            sequence: 0,
+            presentation: ToolPresentationEvent::Card(bcode_tool::ToolCardPresentation {
+                target: ToolPresentationTarget::Preview,
+                title: "Shell command".to_string(),
+                subtitle: None,
+                sections: vec![ToolPresentationSection::Fields {
+                    fields: shell_presentation_fields(arguments),
+                }],
+            }),
+        },
+    );
+    emit_tool_stream_event(
+        events,
+        &ToolInvocationStreamEvent::Presentation {
+            tool_call_id: tool_call_id.to_owned(),
+            sequence: 0,
+            presentation: ToolPresentationEvent::Status(ToolStatusPresentation {
+                target: ToolPresentationTarget::Activity,
+                text: format!("running {}", arguments.command),
+                level: ToolPresentationLevel::Info,
+            }),
+        },
+    );
+}
+
+fn emit_shell_result_presentation(
+    events: ServiceEventEmitter,
+    tool_call_id: &str,
+    arguments: &ShellRunArguments,
+    response: &ToolInvocationResponse,
+) {
+    emit_tool_stream_event(
+        events,
+        &ToolInvocationStreamEvent::Presentation {
+            tool_call_id: tool_call_id.to_owned(),
+            sequence: 1,
+            presentation: ToolPresentationEvent::Card(shell_result_card(arguments, response)),
+        },
+    );
+}
+
+fn shell_presentation_fields(arguments: &ShellRunArguments) -> Vec<ToolPresentationFieldValue> {
+    let mut fields = vec![ToolPresentationFieldValue {
+        label: "Command".to_string(),
+        value: arguments.command.clone(),
+    }];
+    if let Some(cwd) = &arguments.cwd {
+        fields.push(ToolPresentationFieldValue {
+            label: "CWD".to_string(),
+            value: cwd.display().to_string(),
+        });
+    }
+    if let Some(timeout_ms) = arguments.timeout_ms {
+        fields.push(ToolPresentationFieldValue {
+            label: "Timeout".to_string(),
+            value: format!("{timeout_ms} ms"),
+        });
+    }
+    fields.push(ToolPresentationFieldValue {
+        label: "Terminal".to_string(),
+        value: arguments.terminal.to_string(),
+    });
+    fields
+}
+
+fn shell_result_card(
+    arguments: &ShellRunArguments,
+    response: &ToolInvocationResponse,
+) -> bcode_tool::ToolCardPresentation {
+    let mut fields = shell_presentation_fields(arguments);
+    fields.push(ToolPresentationFieldValue {
+        label: "Status".to_string(),
+        value: if response.is_error {
+            "failed"
+        } else {
+            "completed"
+        }
+        .to_string(),
+    });
+    bcode_tool::ToolCardPresentation {
+        target: ToolPresentationTarget::Result,
+        title: if response.is_error {
+            "Shell command failed".to_string()
+        } else {
+            "Shell command completed".to_string()
+        },
+        subtitle: None,
+        sections: vec![ToolPresentationSection::Fields { fields }],
+    }
 }
 
 fn shell_config_with_environment(
