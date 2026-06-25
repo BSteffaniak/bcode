@@ -303,8 +303,45 @@ fn is_temporary_boundary_allowlist(path: &Path, line: &str) -> bool {
     let path = path.to_string_lossy();
     // Transitional allowlist: model-context truncation text teaches agents to use
     // artifact/filesystem tools; this is product guidance, not tool routing.
-    path.ends_with("packages/server/src/lib.rs")
+    if path.ends_with("packages/server/src/lib.rs")
         && line.contains("tool output truncated for model context")
+    {
+        return true;
+    }
+    // Host-side provider action bridge and streamed argument preview heuristics still
+    // normalize known provider/tool-shaped fields until a plugin-owned preview descriptor lands.
+    if path.ends_with("packages/server/src/lib.rs") {
+        return line.contains("worktree_list_failed")
+            || line.contains("worktree_create_failed")
+            || line.contains("worktree_remove_failed")
+            || line.contains("filesystem_write")
+            || line.contains("filesystem_edit")
+            || line.contains("shell_run")
+            || line.contains("filesystem_shell_run")
+            || line.contains("web_search")
+            || line.contains("web_fetch")
+            || line.contains("filesystem_grep")
+            || line.contains("git_clone")
+            || line.contains("github_clone")
+            || line.contains("invoke_host_model_native_web_search");
+    }
+    // CLI worktree commands are product commands, not model-callable tool IDs.
+    if path.ends_with("packages/cli/src/lib.rs") {
+        return line.contains("worktree_list_command")
+            || line.contains("worktree_create_command")
+            || line.contains("worktree_remove_command");
+    }
+    // Worktree TUI modules own a command/dialog flow separate from model-callable tools.
+    if path.contains("packages/tui/src/wt_create_dialog")
+        || path.ends_with("packages/tui/src/worktree_flow.rs")
+    {
+        return line.contains("wt_create_dialog");
+    }
+    // Legacy config schema exposes provider-side web search settings; this is not tool routing.
+    if path.ends_with("packages/config/src/lib.rs") && line.contains("web_search") {
+        return true;
+    }
+    false
 }
 
 fn scan_line(

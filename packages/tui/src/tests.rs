@@ -1770,7 +1770,7 @@ fn live_file_write_statusline_is_not_duplicated_and_truncates_path() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("writing"));
+    assert!(output.contains("tool filesystem_write"));
     assert!(output.contains("packages/tui/src/render.rs"), "{output}");
     assert!(output.contains("Ready to apply · Writing file"));
     assert!(!output.contains("running tool filesystem_write"));
@@ -1899,7 +1899,7 @@ fn denied_file_permission_marks_preview_failed() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("Edit preview · filesystem_edit"));
+    assert!(output.contains("File change preview · filesystem_edit"));
     assert!(output.contains("failed"));
     assert!(output.contains("Failed") && output.contains("Editing file"));
 }

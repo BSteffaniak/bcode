@@ -31,10 +31,6 @@ pub enum ActivityState {
         /// Unix timestamp when retry should occur.
         retry_at_unix: u64,
     },
-    /// Writing a file through a filesystem tool.
-    WritingFile,
-    /// Editing a file through a filesystem tool.
-    EditingFile,
     /// Running a tool.
     RunningTool {
         /// Tool name.

@@ -4838,7 +4838,7 @@ fn server_is_unreachable(error: &ClientError) -> bool {
 
 async fn handle_worktree_command(command: WorktreeCommand) -> Result<(), CliError> {
     match command {
-        WorktreeCommand::List { repo, json } => worktree_list(repo, json).await,
+        WorktreeCommand::List { repo, json } => worktree_list_command(repo, json).await,
         WorktreeCommand::Create {
             name,
             repo,
@@ -4863,7 +4863,7 @@ async fn handle_worktree_command(command: WorktreeCommand) -> Result<(), CliErro
                     ),
                 )
             });
-            worktree_create(WorktreeCreateCliArgs {
+            worktree_create_command(WorktreeCreateCliArgs {
                 name,
                 repo,
                 path,
@@ -4892,7 +4892,7 @@ async fn handle_worktree_command(command: WorktreeCommand) -> Result<(), CliErro
             repo,
             force,
             json,
-        } => worktree_remove(path, repo, force, json).await,
+        } => worktree_remove_command(path, repo, force, json).await,
     }
 }
 
@@ -4912,7 +4912,7 @@ struct WorktreeCreateCliArgs {
     json: bool,
 }
 
-async fn worktree_list(repo: Option<PathBuf>, json: bool) -> Result<(), CliError> {
+async fn worktree_list_command(repo: Option<PathBuf>, json: bool) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     let response = client
         .list_worktrees(WorktreeListRequest { cwd: repo })
@@ -4937,7 +4937,7 @@ async fn worktree_list(repo: Option<PathBuf>, json: bool) -> Result<(), CliError
     Ok(())
 }
 
-async fn worktree_create(args: WorktreeCreateCliArgs) -> Result<(), CliError> {
+async fn worktree_create_command(args: WorktreeCreateCliArgs) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     let response = client
         .create_worktree(WorktreeCreateRequest {
@@ -4974,7 +4974,7 @@ async fn worktree_create(args: WorktreeCreateCliArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn worktree_remove(
+async fn worktree_remove_command(
     path: PathBuf,
     repo: Option<PathBuf>,
     force: bool,

@@ -2966,16 +2966,9 @@ impl BmuxApp {
     }
 
     fn set_file_activity(&mut self, tool_name: &str) {
-        let normalized = normalized_tool_name(tool_name);
-        if matches!(normalized.as_str(), "filesystem_write" | "write") {
-            self.set_activity(ActivityState::WritingFile);
-        } else if matches!(normalized.as_str(), "filesystem_edit" | "edit") {
-            self.set_activity(ActivityState::EditingFile);
-        } else {
-            self.set_activity(ActivityState::RunningTool {
-                name: tool_name.to_owned(),
-            });
-        }
+        self.set_activity(ActivityState::RunningTool {
+            name: tool_name.to_owned(),
+        });
     }
 
     fn set_activity_for_tool_call(&mut self, tool_call_id: &str, fallback_tool_name: &str) {
@@ -3586,40 +3579,13 @@ const fn color_rgb(color: Color) -> [u8; 3] {
     }
 }
 
-fn normalized_tool_name(tool_name: &str) -> String {
-    tool_name.replace(['-', '.'], "_").to_ascii_lowercase()
-}
-
-fn is_shell_tool_name(tool_name: &str) -> bool {
-    matches!(
-        normalized_tool_name(tool_name).as_str(),
-        "shell" | "shell_run" | "filesystem_shell_run" | "bash"
-    )
-}
-
-fn tool_request_status(tool_name: &str, arguments_json: &str) -> Option<String> {
+fn tool_request_status(_tool_name: &str, arguments_json: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(arguments_json).ok()?;
-    let normalized = normalized_tool_name(tool_name);
-    if is_shell_tool_name(tool_name) {
-        return value
-            .get("cwd")
-            .and_then(serde_json::Value::as_str)
-            .map(|cwd| format!("cwd {cwd}"));
-    }
-    match normalized.as_str() {
-        "filesystem_read" | "read" | "filesystem_exists" | "exists" | "filesystem_stat"
-        | "stat" => value
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned),
-        "filesystem_list" | "list" | "filesystem_find" | "find" | "filesystem_grep" | "grep" => {
-            value
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
-        }
-        _ => None,
-    }
+    value
+        .get("path")
+        .or_else(|| value.get("cwd"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

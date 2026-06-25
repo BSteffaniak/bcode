@@ -999,15 +999,11 @@ fn push_tool_request_rows(
     rows.push(Line::default());
 }
 
-fn file_tool_action(tool_name: &str, streaming: bool) -> &'static str {
-    let normalized = normalized_tool_name_for_render(tool_name);
-    match (normalized.as_str(), streaming) {
-        ("filesystem_write" | "write", true) => "Writing …",
-        ("filesystem_write" | "write", false) => "Write preview",
-        ("filesystem_edit" | "edit", true) => "Editing …",
-        ("filesystem_edit" | "edit", false) => "Edit preview",
-        (_, true) => "File change …",
-        (_, false) => "File change preview",
+const fn file_tool_action(_tool_name: &str, streaming: bool) -> &'static str {
+    if streaming {
+        "File change …"
+    } else {
+        "File change preview"
     }
 }
 
@@ -1549,14 +1545,9 @@ const fn file_edit_phase_style(phase: FileEditPhase) -> Style {
     }
 }
 
-fn file_write_mode_label(tool_name: &str, old_text_is_empty: bool) -> &'static str {
-    let normalized = tool_name.replace(['-', '.'], "_").to_ascii_lowercase();
-    if matches!(normalized.as_str(), "filesystem_write" | "write") {
-        if old_text_is_empty {
-            "Writing file"
-        } else {
-            "Replacing file"
-        }
+const fn file_write_mode_label(_tool_name: &str, old_text_is_empty: bool) -> &'static str {
+    if old_text_is_empty {
+        "Writing file"
     } else {
         "Editing file"
     }
@@ -2661,8 +2652,6 @@ fn activity_label(activity: &ActivityState, daemon_connection: DaemonConnectionS
             spinner_frame(),
             format_retry_remaining(*retry_at_unix)
         ),
-        ActivityState::WritingFile => format!("{} writing", spinner_frame()),
-        ActivityState::EditingFile => format!("{} editing", spinner_frame()),
         ActivityState::RunningTool { name } => {
             format!("{} {}", spinner_frame(), tool_activity_label(name))
         }
@@ -2693,22 +2682,7 @@ fn format_retry_remaining(retry_at_unix: u64) -> String {
 }
 
 fn tool_activity_label(tool_name: &str) -> String {
-    match normalized_tool_name_for_render(tool_name).as_str() {
-        "shell_run" | "shell" | "filesystem_shell_run" | "bash" => "shell".to_owned(),
-        "filesystem_read" | "read" => "reading".to_owned(),
-        "filesystem_write" | "write" => "writing".to_owned(),
-        "filesystem_edit" | "edit" => "editing".to_owned(),
-        "filesystem_exists" | "exists" => "checking path".to_owned(),
-        "filesystem_list" | "list" => "listing".to_owned(),
-        "filesystem_find" | "find" => "finding".to_owned(),
-        "filesystem_grep" | "grep" => "searching".to_owned(),
-        "filesystem_stat" | "stat" => "stat".to_owned(),
-        other => format!("tool {other}"),
-    }
-}
-
-fn normalized_tool_name_for_render(tool_name: &str) -> String {
-    tool_name.replace(['-', '.'], "_").to_ascii_lowercase()
+    format!("tool {tool_name}")
 }
 
 fn spinner_frame() -> &'static str {

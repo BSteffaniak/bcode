@@ -16,8 +16,8 @@ use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::picker_mouse::picker_row_from_mouse;
 use super::session_flow::ActiveChat;
 use super::{
-    TuiError, text_input_flow, worktree_create_dialog, worktree_create_dialog_render,
-    worktree_picker, worktree_picker_render,
+    TuiError, text_input_flow, worktree_picker, worktree_picker_render, wt_create_dialog,
+    wt_create_dialog_render,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,24 +52,20 @@ async fn create_with_dialog<W: Write>(
                 .map_or_else(|| format!("session-{session_id}"), ToString::to_string)
         },
     );
-    let mut dialog = worktree_create_dialog::WorktreeCreateDialog::new(
-        &default_name,
-        current_session_id.is_some(),
-    );
+    let mut dialog =
+        wt_create_dialog::WorktreeCreateDialog::new(&default_name, current_session_id.is_some());
     loop {
         io.terminal.resize(helpers::terminal_area()?);
         io.terminal.draw(|frame| {
-            worktree_create_dialog_render::render_dialog(&mut dialog, frame, services.theme);
+            wt_create_dialog_render::render_dialog(&mut dialog, frame, services.theme);
         })?;
         let Some(event) = io.input.recv().await? else {
             continue;
         };
         match event {
             Event::Resize(size) => io.terminal.resize(Rect::new(0, 0, size.width, size.height)),
-            Event::Paste(text)
-                if dialog.focus() == worktree_create_dialog::WorktreeCreateFocus::Name =>
-            {
-                let _ = TextInputControl::new(&worktree_create_dialog::name_input_policy())
+            Event::Paste(text) if dialog.focus() == wt_create_dialog::WorktreeCreateFocus::Name => {
+                let _ = TextInputControl::new(&wt_create_dialog::name_input_policy())
                     .handle_paste(dialog.name_mut(), &text);
             }
             Event::Key(stroke) => match stroke.key {
@@ -83,13 +79,12 @@ async fn create_with_dialog<W: Write>(
                     }
                     let target = dialog.target();
                     let attach_session_id = match target {
-                        worktree_create_dialog::WorktreeCreateTarget::CurrentSession => {
+                        wt_create_dialog::WorktreeCreateTarget::CurrentSession => {
                             current_session_id
                         }
-                        worktree_create_dialog::WorktreeCreateTarget::NewSession => None,
+                        wt_create_dialog::WorktreeCreateTarget::NewSession => None,
                     };
-                    let new_session =
-                        target == worktree_create_dialog::WorktreeCreateTarget::NewSession;
+                    let new_session = target == wt_create_dialog::WorktreeCreateTarget::NewSession;
                     chat.start_effect(TuiEffect::CreateWorktree {
                         request: bcode_worktree_models::WorktreeCreateRequest {
                             name,
@@ -111,17 +106,13 @@ async fn create_with_dialog<W: Write>(
                     chat.app.set_status("creating worktree…".to_owned());
                     return Ok(());
                 }
-                KeyCode::Left
-                    if dialog.focus() != worktree_create_dialog::WorktreeCreateFocus::Name =>
-                {
+                KeyCode::Left if dialog.focus() != wt_create_dialog::WorktreeCreateFocus::Name => {
                     dialog.previous_choice();
                 }
-                KeyCode::Right
-                    if dialog.focus() != worktree_create_dialog::WorktreeCreateFocus::Name =>
-                {
+                KeyCode::Right if dialog.focus() != wt_create_dialog::WorktreeCreateFocus::Name => {
                     dialog.next_choice();
                 }
-                _ if dialog.focus() == worktree_create_dialog::WorktreeCreateFocus::Name => {
+                _ if dialog.focus() == wt_create_dialog::WorktreeCreateFocus::Name => {
                     handle_dialog_name_key(&mut dialog, services.keymap, stroke);
                 }
                 _ => {}
@@ -138,7 +129,7 @@ async fn create_with_dialog<W: Write>(
 }
 
 fn handle_dialog_name_key(
-    dialog: &mut worktree_create_dialog::WorktreeCreateDialog,
+    dialog: &mut wt_create_dialog::WorktreeCreateDialog,
     keymap: &BmuxKeyMap,
     stroke: KeyStroke,
 ) {
@@ -149,28 +140,25 @@ fn handle_dialog_name_key(
             .move_cursor_with_selection(motion, SelectionMode::Extend);
         dialog
             .name_mut()
-            .sync_scroll_to_cursor(&worktree_create_dialog::name_input_policy());
+            .sync_scroll_to_cursor(&wt_create_dialog::name_input_policy());
         return;
     }
     if let Some(command) = keymap.editor_command_for_key(stroke) {
         dialog.name_mut().buffer_mut().apply_command(command);
         dialog
             .name_mut()
-            .sync_scroll_to_cursor(&worktree_create_dialog::name_input_policy());
+            .sync_scroll_to_cursor(&wt_create_dialog::name_input_policy());
         return;
     }
-    let _ = TextInputControl::new(&worktree_create_dialog::name_input_policy())
+    let _ = TextInputControl::new(&wt_create_dialog::name_input_policy())
         .handle_key(dialog.name_mut(), stroke);
 }
 
-fn handle_dialog_mouse(
-    dialog: &mut worktree_create_dialog::WorktreeCreateDialog,
-    mouse: MouseEvent,
-) {
-    if dialog.focus() != worktree_create_dialog::WorktreeCreateFocus::Name {
+fn handle_dialog_mouse(dialog: &mut wt_create_dialog::WorktreeCreateDialog, mouse: MouseEvent) {
+    if dialog.focus() != wt_create_dialog::WorktreeCreateFocus::Name {
         return;
     }
-    let _ = TextInputControl::new(&worktree_create_dialog::name_input_policy())
+    let _ = TextInputControl::new(&wt_create_dialog::name_input_policy())
         .handle_mouse(dialog.name_mut(), mouse);
 }
 

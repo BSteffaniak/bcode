@@ -8,7 +8,7 @@ use bmux_tui::style::{Color, Modifier};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
 
 use super::render::TuiTheme;
-use super::worktree_create_dialog::{WorktreeCreateDialog, WorktreeCreateFocus};
+use super::wt_create_dialog::{WorktreeCreateDialog, WorktreeCreateFocus};
 
 const MODAL_BG: Color = Color::Black;
 

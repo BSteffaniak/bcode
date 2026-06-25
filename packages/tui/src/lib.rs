@@ -89,11 +89,11 @@ pub(crate) mod transcript_layout;
 pub(crate) mod transcript_projection;
 pub(crate) mod transcript_resident_window;
 pub(crate) mod transcript_viewport;
-pub(crate) mod worktree_create_dialog;
-pub(crate) mod worktree_create_dialog_render;
 pub(crate) mod worktree_flow;
 pub(crate) mod worktree_picker;
 pub(crate) mod worktree_picker_render;
+pub(crate) mod wt_create_dialog;
+pub(crate) mod wt_create_dialog_render;
 
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
