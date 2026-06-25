@@ -444,6 +444,7 @@ fn extend_shell_result_presentation(
             exit_code,
             timed_out,
             cancelled,
+            duration_ms,
             output_tail: _,
             output_truncated,
             output_bytes,
@@ -452,7 +453,13 @@ fn extend_shell_result_presentation(
             rows,
             ..
         } => {
-            push_shell_common_result_fields(fields, *exit_code, *timed_out, *cancelled);
+            push_shell_common_result_fields(
+                fields,
+                *exit_code,
+                *timed_out,
+                *cancelled,
+                *duration_ms,
+            );
             fields.push(ToolPresentationFieldValue {
                 label: "Output truncated".to_string(),
                 value: output_truncated.to_string(),
@@ -482,6 +489,7 @@ fn extend_shell_result_presentation(
             exit_code,
             timed_out,
             cancelled,
+            duration_ms,
             stdout,
             stderr,
             stdout_truncated,
@@ -490,7 +498,13 @@ fn extend_shell_result_presentation(
             stderr_bytes,
             ..
         } => {
-            push_shell_common_result_fields(fields, *exit_code, *timed_out, *cancelled);
+            push_shell_common_result_fields(
+                fields,
+                *exit_code,
+                *timed_out,
+                *cancelled,
+                *duration_ms,
+            );
             fields.push(ToolPresentationFieldValue {
                 label: "Stdout truncated".to_string(),
                 value: stdout_truncated.to_string(),
@@ -511,28 +525,29 @@ fn extend_shell_result_presentation(
                     value: stderr_bytes.to_string(),
                 });
             }
-            if !stdout.is_empty() {
-                sections.push(ToolPresentationSection::Text {
-                    label: Some(if *stdout_truncated {
-                        "stdout (truncated)".to_string()
-                    } else {
-                        "stdout".to_string()
-                    }),
-                    text: stdout.clone(),
-                });
-            }
-            if !stderr.is_empty() {
-                sections.push(ToolPresentationSection::Text {
-                    label: Some(if *stderr_truncated {
-                        "stderr (truncated)".to_string()
-                    } else {
-                        "stderr".to_string()
-                    }),
-                    text: stderr.clone(),
-                });
-            }
+            push_shell_text_section(sections, "stdout", stdout, *stdout_truncated);
+            push_shell_text_section(sections, "stderr", stderr, *stderr_truncated);
         }
     }
+}
+
+fn push_shell_text_section(
+    sections: &mut Vec<ToolPresentationSection>,
+    label: &str,
+    text: &str,
+    truncated: bool,
+) {
+    if text.is_empty() {
+        return;
+    }
+    sections.push(ToolPresentationSection::Text {
+        label: Some(if truncated {
+            format!("{label} (truncated)")
+        } else {
+            label.to_string()
+        }),
+        text: text.to_string(),
+    });
 }
 
 fn push_shell_common_result_fields(
@@ -540,6 +555,7 @@ fn push_shell_common_result_fields(
     exit_code: Option<i32>,
     timed_out: bool,
     cancelled: bool,
+    duration_ms: Option<u64>,
 ) {
     fields.push(ToolPresentationFieldValue {
         label: "Exit code".to_string(),
@@ -552,6 +568,13 @@ fn push_shell_common_result_fields(
     fields.push(ToolPresentationFieldValue {
         label: "Cancelled".to_string(),
         value: cancelled.to_string(),
+    });
+    fields.push(ToolPresentationFieldValue {
+        label: "Duration".to_string(),
+        value: duration_ms.map_or_else(
+            || "unknown".to_string(),
+            |duration_ms| format!("{duration_ms} ms"),
+        ),
     });
 }
 
@@ -835,6 +858,7 @@ fn run_terminal_shell_command_inner(
         move || read_limited_streaming(&mut reader, events, &tool_call_id, ToolOutputStream::Pty)
     });
 
+    let started = Instant::now();
     let status = wait_for_terminal_shell_status(
         &mut child,
         cancellation,
@@ -858,7 +882,7 @@ fn run_terminal_shell_command_inner(
                 exit_code: Some(status.exit_code),
                 timed_out: status.timed_out,
                 cancelled: status.cancelled,
-                duration_ms: Some(0),
+                duration_ms: Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
                 output_tail: inline_output.text,
                 output_truncated: inline_output.truncated,
                 output_bytes: Some(u64::try_from(inline_output.original_bytes).unwrap_or(u64::MAX)),
