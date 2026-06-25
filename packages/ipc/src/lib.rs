@@ -86,7 +86,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// enum layouts or envelope payload shapes change incompatibly so stale
 /// client/daemon pairs fail explicitly during envelope decode instead of
 /// interpreting payloads with mismatched positional layouts.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 4;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 5;
 
 /// Build-scoped daemon fingerprint generated at compile time.
 pub const BUILD_FINGERPRINT: &str = env!("BCODE_BUILD_FINGERPRINT");
@@ -1128,11 +1128,10 @@ pub enum Event {
     },
 }
 
-// IPC DTOs intentionally do not reuse session-event domain enums directly.
-// `bmux_codec` is non-self-describing, so DTOs that carry session events must
-// stay positional-codec-safe and avoid JSON-only serde patterns such as
-// tagged/untagged enum assumptions, flattened fields, custom visitors, and
-// `serde_json::Value` payloads.
+// IPC DTOs intentionally keep a protocol-bound shape separate from session-event
+// domain enums. Logical IPC payloads now use typed-stable bmux_codec encoding so
+// dynamic serde paths and frequently evolving schemas are supported without
+// making the outer frame/chunk protocol less compact.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -3279,13 +3278,58 @@ pub enum CodecError {
     UnsupportedVersion { actual: u16, expected: u16 },
 }
 
-/// Encode a serializable value with the Bcode wire codec.
+/// Encode a value with the positional Bcode wire codec.
+///
+/// Positional encoding is intended for fixed, hot-path IPC framing structures.
+/// Prefer [`encode_typed_stable`] for logical IPC payloads with evolving schemas.
+///
+/// # Errors
+///
+/// Returns an error when serialization fails.
+pub fn encode_positional<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
+    bmux_codec::to_positional_vec(value).map_err(CodecError::Serialize)
+}
+
+/// Decode a value with the positional Bcode wire codec.
+///
+/// # Errors
+///
+/// Returns an error when deserialization fails.
+pub fn decode_positional<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
+    bmux_codec::from_positional_bytes(bytes).map_err(CodecError::Deserialize)
+}
+
+/// Encode a value with the typed-stable Bcode wire codec.
+///
+/// Typed-stable encoding is intended for logical IPC payloads whose schemas
+/// evolve more frequently than the outer frame protocol.
+///
+/// # Errors
+///
+/// Returns an error when serialization fails.
+pub fn encode_typed_stable<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
+    bmux_codec::to_typed_vec(value).map_err(CodecError::Serialize)
+}
+
+/// Decode a value with the typed-stable Bcode wire codec.
+///
+/// # Errors
+///
+/// Returns an error when deserialization fails.
+pub fn decode_typed_stable<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
+    bmux_codec::from_typed_bytes(bytes).map_err(CodecError::Deserialize)
+}
+
+/// Encode a serializable value with the fixed-frame Bcode wire codec.
+///
+/// This compatibility helper remains positional for envelope and chunk framing.
+/// New logical IPC payload code should use the explicit typed-stable helpers.
 ///
 /// # Errors
 ///
 /// Returns an error when serialization fails.
 pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
-    bmux_codec::to_positional_vec(value).map_err(CodecError::Serialize)
+    encode_positional(value)
 }
 
 /// Encode a server event with the Bcode wire codec.
@@ -3295,16 +3339,19 @@ pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
 /// Returns an error when serialization fails.
 pub fn encode_event(event: &Event) -> Result<Vec<u8>, CodecError> {
     let event = IpcEvent::from(event);
-    encode(&event)
+    encode_typed_stable(&event)
 }
 
-/// Decode a deserializable value with the Bcode wire codec.
+/// Decode a deserializable value with the fixed-frame Bcode wire codec.
+///
+/// This compatibility helper remains positional for envelope and chunk framing.
+/// New logical IPC payload code should use the explicit typed-stable helpers.
 ///
 /// # Errors
 ///
 /// Returns an error when deserialization fails.
 pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
-    bmux_codec::from_positional_bytes(bytes).map_err(CodecError::Deserialize)
+    decode_positional(bytes)
 }
 
 /// Encode a response with the Bcode wire codec.
@@ -3314,7 +3361,7 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
 /// Returns an error when serialization fails.
 pub fn encode_response(response: &Response) -> Result<Vec<u8>, CodecError> {
     let response = IpcResponse::from(response);
-    encode(&response)
+    encode_typed_stable(&response)
 }
 
 /// Decode a response with the Bcode wire codec.
@@ -3323,7 +3370,7 @@ pub fn encode_response(response: &Response) -> Result<Vec<u8>, CodecError> {
 ///
 /// Returns an error when deserialization or domain conversion fails.
 pub fn decode_response(bytes: &[u8]) -> Result<Response, CodecError> {
-    let response = decode::<IpcResponse>(bytes)?;
+    let response = decode_typed_stable::<IpcResponse>(bytes)?;
     response.try_into()
 }
 
@@ -3333,7 +3380,7 @@ pub fn decode_response(bytes: &[u8]) -> Result<Response, CodecError> {
 ///
 /// Returns an error when deserialization or domain conversion fails.
 pub fn decode_event(bytes: &[u8]) -> Result<Event, CodecError> {
-    let event = decode::<IpcEvent>(bytes)?;
+    let event = decode_typed_stable::<IpcEvent>(bytes)?;
     event.try_into()
 }
 
@@ -3579,7 +3626,7 @@ pub fn request_envelope(request_id: u64, request: &Request) -> Result<Envelope, 
     Ok(Envelope::new(
         request_id,
         EnvelopeKind::Request,
-        encode(request)?,
+        encode_typed_stable(request)?,
     ))
 }
 

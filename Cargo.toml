@@ -125,12 +125,16 @@ bcode_worktree_models                   = { version = "0.0.1-alpha.0", default-f
 bcode_worktree_plugin                   = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/worktree-plugin" }
 
 # BMUX reuse
-bmux_codec          = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
-bmux_ipc            = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
-bmux_keyboard       = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
-bmux_terminal_grid  = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
-bmux_text_edit      = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
-bmux_tui            = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+bmux_codec = { default-features = false, features = [
+    "serde",
+    "positional",
+    "typed-stable",
+], git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+bmux_ipc = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+bmux_keyboard = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+bmux_terminal_grid = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+bmux_text_edit = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+bmux_tui = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 bmux_tui_components = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 
 # External dependencies

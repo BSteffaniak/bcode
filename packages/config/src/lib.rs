@@ -363,7 +363,7 @@ fn schema_section_doc<T: ConfigDocSchema>(
     toml_key: &'static str,
     description: &'static str,
 ) -> FieldDoc {
-    section_doc(toml_key, description, T::field_docs())
+    section_doc_with_defaults(toml_key, description, T::field_docs(), T::default_values())
 }
 
 const fn config_field(
