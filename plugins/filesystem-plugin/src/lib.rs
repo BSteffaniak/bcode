@@ -9,8 +9,8 @@ use bcode_tool::{
     FileChangeResult, ImageMetadata, ImageRefContent, ListToolsRequest, OP_INVOKE_TOOL,
     OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition, ToolInvocationRequest,
     ToolInvocationResponse, ToolInvocationResult, ToolInvocationStreamEvent, ToolList,
-    ToolPresentationField, ToolPresentationFieldKind, ToolRequestPresentationMetadata,
-    ToolResultContent, ToolSideEffect,
+    ToolLiveArgumentPreviewMetadata, ToolPresentationField, ToolPresentationFieldKind,
+    ToolRequestPresentationMetadata, ToolResultContent, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -359,6 +359,8 @@ fn path_policy(
 fn path_tool_ui(activity_label: &str, title: &str) -> bcode_tool::ToolUiMetadata {
     bcode_tool::ToolUiMetadata {
         activity_label: Some(activity_label.to_string()),
+        live_argument_preview: None,
+
         request_presentation: Some(ToolRequestPresentationMetadata {
             title: title.to_string(),
             fields: vec![ToolPresentationField {
@@ -374,6 +376,12 @@ fn path_tool_ui(activity_label: &str, title: &str) -> bcode_tool::ToolUiMetadata
 fn write_tool_ui(activity_label: &str, title: &str) -> bcode_tool::ToolUiMetadata {
     bcode_tool::ToolUiMetadata {
         activity_label: Some(activity_label.to_string()),
+        live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::FileEdit {
+            path_fields: vec!["path".to_string()],
+            old_text_fields: Vec::new(),
+            new_text_fields: vec!["contents".to_string(), "new_text".to_string()],
+        }),
+
         request_presentation: Some(ToolRequestPresentationMetadata {
             title: title.to_string(),
             fields: vec![

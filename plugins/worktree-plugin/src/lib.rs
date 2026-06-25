@@ -137,6 +137,8 @@ fn tool_ui(
 ) -> bcode_tool::ToolUiMetadata {
     bcode_tool::ToolUiMetadata {
         activity_label: Some(activity_label.to_string()),
+        live_argument_preview: None,
+
         request_presentation: Some(ToolRequestPresentationMetadata {
             title: title.to_string(),
             fields,

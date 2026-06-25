@@ -84,6 +84,39 @@ pub struct ToolUiMetadata {
     /// Declarative request presentation metadata for permission prompts and transcripts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_presentation: Option<ToolRequestPresentationMetadata>,
+    /// Declarative live argument preview metadata for streamed tool arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_argument_preview: Option<ToolLiveArgumentPreviewMetadata>,
+}
+
+/// Declarative live argument preview metadata owned by a tool provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolLiveArgumentPreviewMetadata {
+    /// File edit/write style preview.
+    FileEdit {
+        /// Candidate path fields.
+        #[serde(default)]
+        path_fields: Vec<String>,
+        /// Candidate old-text fields.
+        #[serde(default)]
+        old_text_fields: Vec<String>,
+        /// Candidate new-text/content fields.
+        new_text_fields: Vec<String>,
+    },
+    /// Shell command style preview.
+    ShellCommand {
+        /// Command field.
+        command_field: String,
+        /// Optional cwd field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd_field: Option<String>,
+    },
+    /// Query/key-value style preview.
+    Query {
+        /// Candidate display fields.
+        fields: Vec<String>,
+    },
 }
 
 /// Declarative request presentation metadata owned by a tool provider.
@@ -356,6 +389,7 @@ mod tests {
     fn request_presentation_metadata_round_trips() {
         let metadata = ToolUiMetadata {
             activity_label: Some("running".to_string()),
+            live_argument_preview: None,
             request_presentation: Some(ToolRequestPresentationMetadata {
                 title: "Run command".to_string(),
                 fields: vec![ToolPresentationField {

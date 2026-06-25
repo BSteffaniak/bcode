@@ -7,8 +7,9 @@
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
-    ToolInvocationRequest, ToolInvocationResponse, ToolList, ToolPresentationField,
-    ToolPresentationFieldKind, ToolRequestPresentationMetadata, ToolSideEffect,
+    ToolInvocationRequest, ToolInvocationResponse, ToolList, ToolLiveArgumentPreviewMetadata,
+    ToolPresentationField, ToolPresentationFieldKind, ToolRequestPresentationMetadata,
+    ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -363,6 +364,15 @@ fn clone_tool_definition() -> ToolDefinition {
         },
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("cloning".to_string()),
+            live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::Query {
+                fields: vec![
+                    "url".to_string(),
+                    "destination".to_string(),
+                    "ref".to_string(),
+                    "branch".to_string(),
+                ],
+            }),
+
             request_presentation: Some(ToolRequestPresentationMetadata {
                 title: "Clone repository".to_string(),
                 fields: vec![

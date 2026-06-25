@@ -12,8 +12,9 @@ use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, ShellRunResult, TOOL_SERVICE_INTERFACE_ID,
     ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult,
-    ToolInvocationStreamEvent, ToolList, ToolOutputStream, ToolPresentationField,
-    ToolPresentationFieldKind, ToolRequestPresentationMetadata, ToolSideEffect,
+    ToolInvocationStreamEvent, ToolList, ToolLiveArgumentPreviewMetadata, ToolOutputStream,
+    ToolPresentationField, ToolPresentationFieldKind, ToolRequestPresentationMetadata,
+    ToolSideEffect,
 };
 use bcode_tool_runtime::{ProcessExecutionRequest, ToolExecutionRuntime};
 use serde::{Deserialize, Serialize};
@@ -130,6 +131,11 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
             },
             ui: bcode_tool::ToolUiMetadata {
                 activity_label: Some("running".to_string()),
+                live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::ShellCommand {
+                    command_field: "command".to_string(),
+                    cwd_field: Some("cwd".to_string()),
+                }),
+
                 request_presentation: Some(ToolRequestPresentationMetadata {
                     title: "Shell command".to_string(),
                     fields: vec![

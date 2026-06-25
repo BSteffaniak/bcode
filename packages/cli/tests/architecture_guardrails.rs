@@ -308,22 +308,13 @@ fn is_temporary_boundary_allowlist(path: &Path, line: &str) -> bool {
     {
         return true;
     }
-    // Host-side provider action bridge and streamed argument preview heuristics still
-    // normalize known provider/tool-shaped fields until a plugin-owned preview descriptor lands.
+    // Server keeps product command error codes and a provider-native host action bridge.
     if path.ends_with("packages/server/src/lib.rs") {
-        return line.contains("worktree_list_failed")
-            || line.contains("worktree_create_failed")
-            || line.contains("worktree_remove_failed")
-            || line.contains("filesystem_write")
-            || line.contains("filesystem_edit")
-            || line.contains("shell_run")
-            || line.contains("filesystem_shell_run")
-            || line.contains("web_search")
-            || line.contains("web_fetch")
-            || line.contains("filesystem_grep")
-            || line.contains("git_clone")
-            || line.contains("github_clone")
-            || line.contains("invoke_host_model_native_web_search");
+        return line.contains("worktree_list_command_failed")
+            || line.contains("worktree_create_command_failed")
+            || line.contains("worktree_remove_command_failed")
+            || line.contains("invoke_host_provider_native_search")
+            || line.contains("web_search");
     }
     // CLI worktree commands are product commands, not model-callable tool IDs.
     if path.ends_with("packages/cli/src/lib.rs") {

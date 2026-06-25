@@ -9,8 +9,8 @@ use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
     ToolInvocationHostAction, ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationStreamEvent, ToolList, ToolPresentationField, ToolPresentationFieldKind,
-    ToolRequestPresentationMetadata, ToolSideEffect,
+    ToolInvocationStreamEvent, ToolList, ToolLiveArgumentPreviewMetadata, ToolPresentationField,
+    ToolPresentationFieldKind, ToolRequestPresentationMetadata, ToolSideEffect,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -1507,6 +1507,10 @@ fn search_tool_definition() -> ToolDefinition {
         policy: bcode_tool::ToolPolicyMetadata::default(),
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("searching".to_string()),
+            live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::Query {
+                fields: vec!["query".to_string(), "provider".to_string()],
+            }),
+
             request_presentation: Some(ToolRequestPresentationMetadata {
                 title: "Search web".to_string(),
                 fields: vec![
@@ -1564,6 +1568,10 @@ fn fetch_tool_definition() -> ToolDefinition {
         },
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("fetching".to_string()),
+            live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::Query {
+                fields: vec!["url".to_string()],
+            }),
+
             request_presentation: Some(ToolRequestPresentationMetadata {
                 title: "Fetch URL".to_string(),
                 fields: vec![
