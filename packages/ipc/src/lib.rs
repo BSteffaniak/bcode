@@ -11,8 +11,9 @@ use bcode_session_models::{
     RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionForkKind,
     SessionHistoryPage, SessionHistoryQuery, SessionId, SessionInputHistoryEntry, SessionLiveEvent,
     SessionSummary, SessionTokenUsage, SessionTraceEvent, ShellRunResult, ToolInvocationResult,
-    ToolInvocationStreamEvent, ToolPresentationField, ToolPresentationFieldKind,
-    ToolRequestPresentationMetadata, TraceBlobRef,
+    ToolInvocationStreamEvent, ToolOutputStream, ToolPresentationEvent, ToolPresentationField,
+    ToolPresentationFieldKind, ToolPresentationFieldValue, ToolPresentationLevel,
+    ToolPresentationSection, ToolPresentationTarget, ToolRequestPresentationMetadata, TraceBlobRef,
 };
 use bcode_skill_models::{
     SkillActivationMode, SkillContextResponse, SkillId, SkillList, SkillManifest, SkillSource,
@@ -1909,7 +1910,7 @@ enum IpcSessionEventKind {
         client_id: Option<ClientId>,
     },
     ToolInvocationStream {
-        event: ToolInvocationStreamEvent,
+        event: IpcToolInvocationStreamEvent,
     },
     WorkingDirectoryChanged {
         old_working_directory: PathBuf,
@@ -1939,6 +1940,90 @@ enum IpcSessionEventKind {
     ReasoningChanged {
         effort: Option<String>,
         summary: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IpcToolInvocationStreamEvent {
+    Started {
+        tool_call_id: String,
+        tool_name: String,
+        sequence: u64,
+        terminal: bool,
+        columns: Option<u16>,
+        rows: Option<u16>,
+        started_at_ms: Option<u64>,
+    },
+    OutputDelta {
+        tool_call_id: String,
+        stream: ToolOutputStream,
+        sequence: u64,
+        text: String,
+        byte_len: usize,
+    },
+    Status {
+        tool_call_id: String,
+        sequence: u64,
+        message: String,
+    },
+    Presentation {
+        tool_call_id: String,
+        sequence: u64,
+        presentation: IpcToolPresentationEvent,
+    },
+    Finished {
+        tool_call_id: String,
+        sequence: u64,
+        is_error: bool,
+        finished_at_ms: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IpcToolPresentationEvent {
+    Status {
+        target: ToolPresentationTarget,
+        text: String,
+        level: ToolPresentationLevel,
+    },
+    Card {
+        target: ToolPresentationTarget,
+        title: String,
+        subtitle: Option<String>,
+        sections: Vec<IpcToolPresentationSection>,
+    },
+    Progress {
+        target: ToolPresentationTarget,
+        text: String,
+        percent: Option<u8>,
+        level: ToolPresentationLevel,
+    },
+    Clear {
+        target: ToolPresentationTarget,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IpcToolPresentationSection {
+    Text {
+        label: Option<String>,
+        text: String,
+    },
+    Fields {
+        fields: Vec<ToolPresentationFieldValue>,
+    },
+    Diff {
+        path: Option<String>,
+        old_text: String,
+        new_text: String,
+    },
+    Terminal {
+        output: String,
+        columns: u16,
+        rows: u16,
     },
 }
 
@@ -2333,7 +2418,7 @@ impl From<&SessionEventKind> for IpcSessionEventKind {
                 client_id: client_id.clone(),
             },
             SessionEventKind::ToolInvocationStream { event } => Self::ToolInvocationStream {
-                event: event.clone(),
+                event: IpcToolInvocationStreamEvent::from(event),
             },
             SessionEventKind::WorkingDirectoryChanged {
                 old_working_directory,
@@ -2619,9 +2704,9 @@ impl TryFrom<IpcSessionEventKind> for SessionEventKind {
                 requested_at_ms,
                 client_id,
             }),
-            IpcSessionEventKind::ToolInvocationStream { event } => {
-                Ok(Self::ToolInvocationStream { event })
-            }
+            IpcSessionEventKind::ToolInvocationStream { event } => Ok(Self::ToolInvocationStream {
+                event: event.into(),
+            }),
             IpcSessionEventKind::WorkingDirectoryChanged {
                 old_working_directory,
                 new_working_directory,
@@ -2693,6 +2778,265 @@ impl From<IpcToolRequestPresentationMetadata> for ToolRequestPresentationMetadat
         Self {
             title: value.title,
             fields: value.fields.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<&ToolInvocationStreamEvent> for IpcToolInvocationStreamEvent {
+    fn from(value: &ToolInvocationStreamEvent) -> Self {
+        match value {
+            ToolInvocationStreamEvent::Started {
+                tool_call_id,
+                tool_name,
+                sequence,
+                terminal,
+                columns,
+                rows,
+                started_at_ms,
+            } => Self::Started {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                sequence: *sequence,
+                terminal: *terminal,
+                columns: *columns,
+                rows: *rows,
+                started_at_ms: *started_at_ms,
+            },
+            ToolInvocationStreamEvent::OutputDelta {
+                tool_call_id,
+                stream,
+                sequence,
+                text,
+                byte_len,
+            } => Self::OutputDelta {
+                tool_call_id: tool_call_id.clone(),
+                stream: *stream,
+                sequence: *sequence,
+                text: text.clone(),
+                byte_len: *byte_len,
+            },
+            ToolInvocationStreamEvent::Status {
+                tool_call_id,
+                sequence,
+                message,
+            } => Self::Status {
+                tool_call_id: tool_call_id.clone(),
+                sequence: *sequence,
+                message: message.clone(),
+            },
+            ToolInvocationStreamEvent::Presentation {
+                tool_call_id,
+                sequence,
+                presentation,
+            } => Self::Presentation {
+                tool_call_id: tool_call_id.clone(),
+                sequence: *sequence,
+                presentation: IpcToolPresentationEvent::from(presentation),
+            },
+            ToolInvocationStreamEvent::Finished {
+                tool_call_id,
+                sequence,
+                is_error,
+                finished_at_ms,
+            } => Self::Finished {
+                tool_call_id: tool_call_id.clone(),
+                sequence: *sequence,
+                is_error: *is_error,
+                finished_at_ms: *finished_at_ms,
+            },
+        }
+    }
+}
+
+impl From<IpcToolInvocationStreamEvent> for ToolInvocationStreamEvent {
+    fn from(value: IpcToolInvocationStreamEvent) -> Self {
+        match value {
+            IpcToolInvocationStreamEvent::Started {
+                tool_call_id,
+                tool_name,
+                sequence,
+                terminal,
+                columns,
+                rows,
+                started_at_ms,
+            } => Self::Started {
+                tool_call_id,
+                tool_name,
+                sequence,
+                terminal,
+                columns,
+                rows,
+                started_at_ms,
+            },
+            IpcToolInvocationStreamEvent::OutputDelta {
+                tool_call_id,
+                stream,
+                sequence,
+                text,
+                byte_len,
+            } => Self::OutputDelta {
+                tool_call_id,
+                stream,
+                sequence,
+                text,
+                byte_len,
+            },
+            IpcToolInvocationStreamEvent::Status {
+                tool_call_id,
+                sequence,
+                message,
+            } => Self::Status {
+                tool_call_id,
+                sequence,
+                message,
+            },
+            IpcToolInvocationStreamEvent::Presentation {
+                tool_call_id,
+                sequence,
+                presentation,
+            } => Self::Presentation {
+                tool_call_id,
+                sequence,
+                presentation: presentation.into(),
+            },
+            IpcToolInvocationStreamEvent::Finished {
+                tool_call_id,
+                sequence,
+                is_error,
+                finished_at_ms,
+            } => Self::Finished {
+                tool_call_id,
+                sequence,
+                is_error,
+                finished_at_ms,
+            },
+        }
+    }
+}
+
+impl From<&ToolPresentationEvent> for IpcToolPresentationEvent {
+    fn from(value: &ToolPresentationEvent) -> Self {
+        match value {
+            ToolPresentationEvent::Status(status) => Self::Status {
+                target: status.target,
+                text: status.text.clone(),
+                level: status.level,
+            },
+            ToolPresentationEvent::Card(card) => Self::Card {
+                target: card.target,
+                title: card.title.clone(),
+                subtitle: card.subtitle.clone(),
+                sections: card
+                    .sections
+                    .iter()
+                    .map(IpcToolPresentationSection::from)
+                    .collect(),
+            },
+            ToolPresentationEvent::Progress(progress) => Self::Progress {
+                target: progress.target,
+                text: progress.text.clone(),
+                percent: progress.percent,
+                level: progress.level,
+            },
+            ToolPresentationEvent::Clear { target } => Self::Clear { target: *target },
+        }
+    }
+}
+
+impl From<IpcToolPresentationEvent> for ToolPresentationEvent {
+    fn from(value: IpcToolPresentationEvent) -> Self {
+        match value {
+            IpcToolPresentationEvent::Status {
+                target,
+                text,
+                level,
+            } => Self::Status(bcode_session_models::ToolStatusPresentation {
+                target,
+                text,
+                level,
+            }),
+            IpcToolPresentationEvent::Card {
+                target,
+                title,
+                subtitle,
+                sections,
+            } => Self::Card(bcode_session_models::ToolCardPresentation {
+                target,
+                title,
+                subtitle,
+                sections: sections.into_iter().map(Into::into).collect(),
+            }),
+            IpcToolPresentationEvent::Progress {
+                target,
+                text,
+                percent,
+                level,
+            } => Self::Progress(bcode_session_models::ToolProgressPresentation {
+                target,
+                text,
+                percent,
+                level,
+            }),
+            IpcToolPresentationEvent::Clear { target } => Self::Clear { target },
+        }
+    }
+}
+
+impl From<&ToolPresentationSection> for IpcToolPresentationSection {
+    fn from(value: &ToolPresentationSection) -> Self {
+        match value {
+            ToolPresentationSection::Text { label, text } => Self::Text {
+                label: label.clone(),
+                text: text.clone(),
+            },
+            ToolPresentationSection::Fields { fields } => Self::Fields {
+                fields: fields.clone(),
+            },
+            ToolPresentationSection::Diff {
+                path,
+                old_text,
+                new_text,
+            } => Self::Diff {
+                path: path.clone(),
+                old_text: old_text.clone(),
+                new_text: new_text.clone(),
+            },
+            ToolPresentationSection::Terminal {
+                output,
+                columns,
+                rows,
+            } => Self::Terminal {
+                output: output.clone(),
+                columns: *columns,
+                rows: *rows,
+            },
+        }
+    }
+}
+
+impl From<IpcToolPresentationSection> for ToolPresentationSection {
+    fn from(value: IpcToolPresentationSection) -> Self {
+        match value {
+            IpcToolPresentationSection::Text { label, text } => Self::Text { label, text },
+            IpcToolPresentationSection::Fields { fields } => Self::Fields { fields },
+            IpcToolPresentationSection::Diff {
+                path,
+                old_text,
+                new_text,
+            } => Self::Diff {
+                path,
+                old_text,
+                new_text,
+            },
+            IpcToolPresentationSection::Terminal {
+                output,
+                columns,
+                rows,
+            } => Self::Terminal {
+                output,
+                columns,
+                rows,
+            },
         }
     }
 }
