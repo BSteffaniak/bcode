@@ -112,6 +112,75 @@ pub struct SkillPermissionHints {
     pub unresolved_tools: Vec<UnresolvedToolReference>,
 }
 
+/// Canonical permission policy requested by a skill.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillPermissionPolicy {
+    #[serde(default)]
+    pub mode: SkillPermissionMode,
+    #[serde(default)]
+    pub tools: Vec<UnresolvedToolReference>,
+    #[serde(default)]
+    pub categories: Vec<String>,
+}
+
+/// Skill-requested permission enforcement mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillPermissionMode {
+    /// Use configured global/per-skill defaults.
+    #[default]
+    Inherit,
+    /// Enforce declared skill permissions.
+    Enforce,
+    /// Ask before undeclared tool use.
+    Ask,
+    /// Warn but continue when undeclared tools are requested.
+    Warn,
+    /// Block undeclared tool use and do not allow user override unless config explicitly permits it.
+    Strict,
+    /// Disable skill permission enforcement for this skill.
+    Disabled,
+}
+
+/// Canonical model policy requested by a skill.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillModelPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred: Option<SkillModelRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<SkillModelRequest>,
+}
+
+/// Skill-requested model selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillModelRequest {
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_effort: Option<SkillThinkingEffort>,
+}
+
+/// Skill-requested thinking/reasoning effort.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillThinkingEffort {
+    pub source_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_level: Option<GenericThinkingEffort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_value: Option<String>,
+}
+
+/// Provider-independent thinking effort labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenericThinkingEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
 /// Compact skill metadata used for listing and matching.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillSummary {
@@ -136,6 +205,10 @@ pub struct SkillManifest {
     pub summary: SkillSummary,
     #[serde(default)]
     pub permissions: SkillPermissionHints,
+    #[serde(default)]
+    pub permission_policy: SkillPermissionPolicy,
+    #[serde(default)]
+    pub model_policy: SkillModelPolicy,
     pub instructions: String,
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,

@@ -5,8 +5,10 @@
 //! Skill discovery, parsing, and registry support for Bcode.
 
 use bcode_skill_models::{
-    SkillActivation, SkillDiagnostic, SkillDiagnosticSeverity, SkillError, SkillId, SkillList,
-    SkillManifest, SkillPermissionHints, SkillSource, SkillSourceKind, SkillSummary,
+    GenericThinkingEffort, SkillActivation, SkillDiagnostic, SkillDiagnosticSeverity, SkillError,
+    SkillId, SkillList, SkillManifest, SkillModelPolicy, SkillModelRequest, SkillPermissionHints,
+    SkillPermissionMode, SkillPermissionPolicy, SkillSource, SkillSourceKind, SkillSummary,
+    SkillThinkingEffort,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -539,9 +541,13 @@ fn parse_skill_markdown(
             || raw.disable_model_invocation_compat,
     };
     let permissions = normalize_permission_hints(&raw, source);
+    let permission_policy = normalize_permission_policy(&raw, source);
+    let model_policy = normalize_model_policy(&raw);
     Ok(SkillManifest {
         summary,
         permissions,
+        permission_policy,
+        model_policy,
         instructions: instructions.trim().to_string(),
         metadata: BTreeMap::new(),
     })
@@ -668,53 +674,193 @@ struct RawSkillFrontmatter {
     description: Option<String>,
     version: Option<String>,
     activation: Option<SkillActivation>,
-    permissions: Option<SkillPermissionHints>,
+    permissions: Option<RawSkillPermissions>,
     #[serde(default, rename = "allowed-tools")]
     allowed_tools_kebab: Vec<String>,
     #[serde(default, rename = "allowed_tools")]
     allowed_tools_snake: Vec<String>,
     #[serde(default)]
     tools: Vec<String>,
+    model: Option<RawSkillModelField>,
+    #[serde(default)]
+    models: RawSkillModels,
+    preferred_model: Option<String>,
+    required_model: Option<String>,
+    thinking_effort: Option<String>,
+    reasoning_effort: Option<String>,
+    #[serde(default)]
+    reasoning: RawSkillReasoning,
     #[serde(default)]
     disable_model_invocation: bool,
     #[serde(default, rename = "disable-model-invocation")]
     disable_model_invocation_compat: bool,
 }
 
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+struct RawSkillPermissions {
+    #[serde(default)]
+    tools: Vec<String>,
+    #[serde(default)]
+    categories: Vec<String>,
+    mode: Option<SkillPermissionMode>,
+}
+
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+struct RawSkillModels {
+    preferred: Option<RawSkillModelField>,
+    required: Option<RawSkillModelField>,
+}
+
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+struct RawSkillReasoning {
+    effort: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(untagged)]
+enum RawSkillModelField {
+    Name(String),
+    Request(RawSkillModelRequest),
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RawSkillModelRequest {
+    model: String,
+    provider: Option<String>,
+    thinking_effort: Option<String>,
+    reasoning_effort: Option<String>,
+}
+
+impl RawSkillPermissions {
+    fn to_hints(&self) -> SkillPermissionHints {
+        SkillPermissionHints {
+            tools: self.tools.clone(),
+            categories: self.categories.clone(),
+            unresolved_tools: Vec::new(),
+        }
+    }
+}
+
 fn normalize_permission_hints(
     raw: &RawSkillFrontmatter,
     source: &SkillSource,
 ) -> SkillPermissionHints {
-    let mut hints = raw.permissions.clone().unwrap_or_default();
+    let mut hints = raw
+        .permissions
+        .as_ref()
+        .map_or_else(SkillPermissionHints::default, RawSkillPermissions::to_hints);
     hints.tools.extend(raw.allowed_tools_kebab.clone());
     hints.tools.extend(raw.allowed_tools_snake.clone());
     hints.tools.extend(raw.tools.clone());
-    if let Some(ecosystem) = source_default_ecosystem(source) {
-        hints.unresolved_tools = hints
-            .tools
-            .iter()
-            .map(|tool| {
-                if let Some((prefix, value)) = tool.split_once(':') {
-                    match prefix {
-                        "category" | "capability" => {
-                            bcode_tool::UnresolvedToolReference::raw(tool.clone())
-                        }
-                        _ => {
-                            bcode_tool::UnresolvedToolReference::compatibility_alias(prefix, value)
-                        }
-                    }
-                } else if tool.contains('.') {
-                    bcode_tool::UnresolvedToolReference::raw(tool.clone())
-                } else {
-                    bcode_tool::UnresolvedToolReference::compatibility_alias(
-                        ecosystem,
-                        tool.clone(),
-                    )
-                }
-            })
-            .collect();
-    }
+    hints.unresolved_tools = hints
+        .tools
+        .iter()
+        .map(|tool| unresolved_tool_reference(tool, source_default_ecosystem(source)))
+        .collect();
     hints
+}
+
+fn normalize_permission_policy(
+    raw: &RawSkillFrontmatter,
+    source: &SkillSource,
+) -> SkillPermissionPolicy {
+    let hints = normalize_permission_hints(raw, source);
+    SkillPermissionPolicy {
+        mode: raw
+            .permissions
+            .as_ref()
+            .and_then(|permissions| permissions.mode)
+            .unwrap_or_default(),
+        tools: hints.unresolved_tools,
+        categories: hints.categories,
+    }
+}
+
+fn unresolved_tool_reference(
+    tool: &str,
+    default_ecosystem: Option<&'static str>,
+) -> bcode_tool::UnresolvedToolReference {
+    if let Some((prefix, value)) = tool.split_once(':') {
+        match prefix {
+            "category" | "capability" => bcode_tool::UnresolvedToolReference::raw(tool),
+            _ => bcode_tool::UnresolvedToolReference::compatibility_alias(prefix, value),
+        }
+    } else if let Some(ecosystem) = default_ecosystem {
+        bcode_tool::UnresolvedToolReference::compatibility_alias(ecosystem, tool)
+    } else {
+        bcode_tool::UnresolvedToolReference::raw(tool)
+    }
+}
+
+fn normalize_model_policy(raw: &RawSkillFrontmatter) -> SkillModelPolicy {
+    let top_level_effort = raw
+        .thinking_effort
+        .as_deref()
+        .or(raw.reasoning_effort.as_deref())
+        .or(raw.reasoning.effort.as_deref());
+    let preferred = raw
+        .models
+        .preferred
+        .clone()
+        .or_else(|| raw.preferred_model.clone().map(RawSkillModelField::Name))
+        .or_else(|| {
+            raw.model
+                .clone()
+                .filter(|_| raw.required_model.is_none() && raw.models.required.is_none())
+        });
+    let required = raw
+        .models
+        .required
+        .clone()
+        .or_else(|| raw.required_model.clone().map(RawSkillModelField::Name));
+    SkillModelPolicy {
+        preferred: preferred
+            .as_ref()
+            .map(|request| normalize_model_request(request, top_level_effort)),
+        required: required
+            .as_ref()
+            .map(|request| normalize_model_request(request, top_level_effort)),
+    }
+}
+
+fn normalize_model_request(
+    request: &RawSkillModelField,
+    top_level_effort: Option<&str>,
+) -> SkillModelRequest {
+    match request {
+        RawSkillModelField::Name(model) => SkillModelRequest {
+            model: model.clone(),
+            provider: None,
+            thinking_effort: top_level_effort.map(normalize_thinking_effort),
+        },
+        RawSkillModelField::Request(request) => {
+            let effort = request
+                .thinking_effort
+                .as_deref()
+                .or(request.reasoning_effort.as_deref())
+                .or(top_level_effort);
+            SkillModelRequest {
+                model: request.model.clone(),
+                provider: request.provider.clone(),
+                thinking_effort: effort.map(normalize_thinking_effort),
+            }
+        }
+    }
+}
+
+fn normalize_thinking_effort(value: &str) -> SkillThinkingEffort {
+    let normalized_level = match value {
+        "minimal" => Some(GenericThinkingEffort::Minimal),
+        "low" => Some(GenericThinkingEffort::Low),
+        "medium" => Some(GenericThinkingEffort::Medium),
+        "high" => Some(GenericThinkingEffort::High),
+        _ => None,
+    };
+    SkillThinkingEffort {
+        source_label: value.to_string(),
+        normalized_level,
+        provider_value: normalized_level.is_none().then(|| value.to_string()),
+    }
 }
 
 fn source_default_ecosystem(source: &SkillSource) -> Option<&'static str> {
