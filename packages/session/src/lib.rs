@@ -2824,8 +2824,8 @@ mod tests {
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProviderStreamEvent, RuntimeWorkId,
         RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance,
         SessionForkKind, SessionId, SessionLiveEvent, SessionLiveEventKind, SessionTraceEvent,
-        SessionTracePayload, SessionTracePhase, ShellRunResult, ToolInvocationPresentation,
-        ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream, TraceBlobRef,
+        SessionTracePayload, SessionTracePhase, ShellRunResult, ToolInvocationResult,
+        ToolInvocationStreamEvent, ToolOutputStream, TraceBlobRef,
     };
     use bcode_skill_models::{SkillActivationMode, SkillId};
     use serde::Serialize;
@@ -4725,27 +4725,6 @@ mod tests {
             ),
             (
                 35,
-                "ToolInvocationPresentation",
-                SessionEventKind::ToolInvocationPresentation {
-                    tool_call_id: "call".to_string(),
-                    started_at_ms: Some(1),
-                    finished_at_ms: Some(2),
-                    is_error: false,
-                    presentation: ToolInvocationPresentation::Terminal {
-                        exit_code: Some(0),
-                        timed_out: false,
-                        cancelled: false,
-                        output: "ok".to_string(),
-                        output_truncated: false,
-                        output_bytes: Some(2),
-                        retained_output_bytes: Some(2),
-                        columns: 80,
-                        rows: 24,
-                    },
-                },
-            ),
-            (
-                36,
                 "SessionForked",
                 SessionEventKind::SessionForked {
                     source_session_id: SessionId::new(),

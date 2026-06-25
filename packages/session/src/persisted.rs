@@ -9,8 +9,8 @@ use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, FileChangeResult, ModelTurnOutcome,
     RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
     SessionEventProvenance, SessionForkKind, SessionId, SessionTokenUsage, SessionTraceEvent,
-    ShellRunResult, ToolInvocationPresentation, ToolInvocationResult, ToolInvocationStreamEvent,
-    TraceBlobRef, current_unix_timestamp_ms,
+    ShellRunResult, ToolInvocationResult, ToolInvocationStreamEvent, TraceBlobRef,
+    current_unix_timestamp_ms,
 };
 use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
 use serde::{Deserialize, Serialize};
@@ -363,7 +363,7 @@ enum PersistedSessionEventKind {
         #[serde(default)]
         finished_at_ms: Option<u64>,
         is_error: bool,
-        presentation: ToolInvocationPresentation,
+        presentation: PersistedToolInvocationPresentation,
     },
     /// Durable provenance marker for sessions forked or cloned from another session.
     SessionForked {
@@ -654,19 +654,6 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 external_session_id: external_session_id.clone(),
                 imported_at_ms: *imported_at_ms,
             },
-            SessionEventKind::ToolInvocationPresentation {
-                tool_call_id,
-                started_at_ms,
-                finished_at_ms,
-                is_error,
-                presentation,
-            } => Self::ToolInvocationPresentation {
-                tool_call_id: tool_call_id.clone(),
-                started_at_ms: *started_at_ms,
-                finished_at_ms: *finished_at_ms,
-                is_error: *is_error,
-                presentation: presentation.clone(),
-            },
             SessionEventKind::SessionForked {
                 source_session_id,
                 source_title,
@@ -942,16 +929,15 @@ impl PersistedSessionEventKind {
             },
             Self::ToolInvocationPresentation {
                 tool_call_id,
-                started_at_ms,
-                finished_at_ms,
                 is_error,
                 presentation,
-            } => SessionEventKind::ToolInvocationPresentation {
+                ..
+            } => SessionEventKind::ToolCallFinished {
                 tool_call_id,
-                started_at_ms,
-                finished_at_ms,
+                result: legacy_presentation_result_text(&presentation),
                 is_error,
-                presentation,
+                output: None,
+                semantic_result: Some(semantic_from_legacy_presentation(&presentation)),
             },
             Self::SessionForked {
                 source_session_id,
@@ -988,7 +974,86 @@ impl PersistedSessionEventKind {
     }
 }
 
-/// Persisted semantic tool result DTO.
+/// Persisted legacy presentation DTO retained only to decode old session logs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PersistedToolInvocationPresentation {
+    Terminal {
+        #[serde(default)]
+        exit_code: Option<i32>,
+        #[serde(default)]
+        timed_out: bool,
+        #[serde(default)]
+        cancelled: bool,
+        #[serde(default)]
+        output: String,
+        #[serde(default)]
+        output_truncated: bool,
+        #[serde(default)]
+        output_bytes: Option<u64>,
+        #[serde(default)]
+        retained_output_bytes: Option<u64>,
+        #[serde(default = "default_terminal_columns")]
+        columns: u16,
+        #[serde(default = "default_terminal_rows")]
+        rows: u16,
+    },
+    FileChange {
+        tool_name: String,
+        summary: String,
+        #[serde(default)]
+        path: Option<String>,
+    },
+}
+
+fn semantic_from_legacy_presentation(
+    presentation: &PersistedToolInvocationPresentation,
+) -> ToolInvocationResult {
+    match presentation {
+        PersistedToolInvocationPresentation::Terminal {
+            exit_code,
+            timed_out,
+            cancelled,
+            output,
+            output_truncated,
+            output_bytes,
+            retained_output_bytes,
+            columns,
+            rows,
+        } => ToolInvocationResult::ShellRun {
+            result: ShellRunResult::Terminal {
+                exit_code: *exit_code,
+                timed_out: *timed_out,
+                cancelled: *cancelled,
+                output_tail: output.clone(),
+                output_truncated: *output_truncated,
+                output_bytes: *output_bytes,
+                retained_output_bytes: *retained_output_bytes,
+                columns: (*columns).max(1),
+                rows: (*rows).max(1),
+            },
+        },
+        PersistedToolInvocationPresentation::FileChange {
+            tool_name,
+            summary,
+            path,
+        } => ToolInvocationResult::FileChange {
+            result: FileChangeResult {
+                tool_name: tool_name.clone(),
+                summary: summary.clone(),
+                path: path.clone(),
+            },
+        },
+    }
+}
+
+fn legacy_presentation_result_text(presentation: &PersistedToolInvocationPresentation) -> String {
+    match presentation {
+        PersistedToolInvocationPresentation::Terminal { output, .. } => output.clone(),
+        PersistedToolInvocationPresentation::FileChange { summary, .. } => summary.clone(),
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum PersistedToolInvocationResult {
@@ -1415,17 +1480,6 @@ mod tests {
                 source_display_name: "Source".to_string(),
                 external_session_id: "external".to_string(),
                 imported_at_ms: 12,
-            },
-            SessionEventKind::ToolInvocationPresentation {
-                tool_call_id: "call".to_string(),
-                started_at_ms: Some(13),
-                finished_at_ms: Some(14),
-                is_error: false,
-                presentation: ToolInvocationPresentation::FileChange {
-                    tool_name: "filesystem.write".to_string(),
-                    summary: "present".to_string(),
-                    path: Some("present.txt".to_string()),
-                },
             },
             SessionEventKind::SessionForked {
                 source_session_id: session_id,

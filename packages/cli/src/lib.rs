@@ -5526,7 +5526,6 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ToolInvocationStream { .. } => "tool_invocation_stream",
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
-        SessionEventKind::ToolInvocationPresentation { .. } => "tool_invocation_presentation",
         SessionEventKind::SessionForked { .. } => "session_forked",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
     }
@@ -5839,17 +5838,6 @@ fn print_non_trace_session_event(event: &SessionEvent) {
         } => {
             println!("#{} tool stream: {stream_event:?}", event.sequence);
         }
-        SessionEventKind::ToolInvocationPresentation {
-            tool_call_id,
-            is_error,
-            presentation,
-            ..
-        } => {
-            println!(
-                "#{} tool presentation: {tool_call_id} error={is_error} {presentation:?}",
-                event.sequence
-            );
-        }
         SessionEventKind::PermissionRequested {
             permission_id,
             tool_call_id,
@@ -6068,14 +6056,6 @@ fn print_timeline_event(event: &SessionEvent, first_trace_time: Option<u64>) {
         } => {
             let status = if *is_error { "error" } else { "ok" };
             println!("{prefix} tool finished: {tool_call_id} {status}");
-        }
-        SessionEventKind::ToolInvocationPresentation {
-            tool_call_id,
-            is_error,
-            ..
-        } => {
-            let status = if *is_error { "error" } else { "ok" };
-            println!("{prefix} tool presentation: {tool_call_id} {status}");
         }
         SessionEventKind::ModelTurnStarted { turn_id } => {
             println!("{prefix} model turn started: {turn_id}");

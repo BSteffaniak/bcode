@@ -1,12 +1,9 @@
 //! Read-only semantic tool-result migration audit helpers.
 
 use crate::db;
-use bcode_session_models::{
-    FileChangeResult, SessionEvent, SessionEventKind, SessionId, ShellRunResult,
-    ToolInvocationPresentation, ToolInvocationResult,
-};
+use bcode_session_models::{SessionEvent, SessionEventKind, SessionId, ToolInvocationResult};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -144,18 +141,6 @@ pub enum SemanticMigrationAuditIssueKind {
     ConflictingPresentation,
 }
 
-#[derive(Debug, Clone)]
-struct CompletionAuditRecord {
-    event_sequence: u64,
-    semantic_result: Option<ToolInvocationResult>,
-}
-
-#[derive(Debug, Clone)]
-struct PresentationAuditRecord {
-    event_sequence: u64,
-    presentation: ToolInvocationPresentation,
-}
-
 /// Audit all per-session databases under `root` without mutating them.
 ///
 /// # Errors
@@ -235,11 +220,8 @@ fn audit_session_events(
     report: &mut SemanticMigrationAuditReport,
 ) {
     let mut session_report = collect_session_audit_records(session_id, path, events, report);
-    let (completions, presentations) =
-        collect_tool_audit_records(events, &mut session_report, report);
-    let requires_review =
-        audit_presentation_matches(session_id, path, &completions, &presentations, report);
-    session_report.requires_review = requires_review;
+    let _completions = collect_tool_audit_records(events, &mut session_report, report);
+    session_report.requires_review = false;
     report.sessions.push(session_report);
 }
 
@@ -262,38 +244,28 @@ fn collect_tool_audit_records(
     events: &[SessionEvent],
     session_report: &mut SessionSemanticMigrationAudit,
     report: &mut SemanticMigrationAuditReport,
-) -> (
-    BTreeMap<String, CompletionAuditRecord>,
-    BTreeMap<String, Vec<PresentationAuditRecord>>,
-) {
-    let mut completions = BTreeMap::<String, CompletionAuditRecord>::new();
-    let mut presentations = BTreeMap::<String, Vec<PresentationAuditRecord>>::new();
+) -> BTreeSet<String> {
+    let mut completions = BTreeSet::<String>::new();
     for event in events {
-        collect_tool_audit_record(
-            event,
-            session_report,
-            report,
-            &mut completions,
-            &mut presentations,
-        );
+        collect_tool_audit_record(event, session_report, report, &mut completions);
     }
-    (completions, presentations)
+    completions
 }
 
 fn collect_tool_audit_record(
     event: &SessionEvent,
     session_report: &mut SessionSemanticMigrationAudit,
     report: &mut SemanticMigrationAuditReport,
-    completions: &mut BTreeMap<String, CompletionAuditRecord>,
-    presentations: &mut BTreeMap<String, Vec<PresentationAuditRecord>>,
+    completions: &mut BTreeSet<String>,
 ) {
-    match &event.kind {
-        SessionEventKind::ToolCallFinished {
-            tool_call_id,
-            result,
-            semantic_result,
-            ..
-        } => collect_completion_record(
+    if let SessionEventKind::ToolCallFinished {
+        tool_call_id,
+        result,
+        semantic_result,
+        ..
+    } = &event.kind
+    {
+        collect_completion_record(
             event.sequence,
             tool_call_id,
             result,
@@ -301,20 +273,7 @@ fn collect_tool_audit_record(
             session_report,
             report,
             completions,
-        ),
-        SessionEventKind::ToolInvocationPresentation {
-            tool_call_id,
-            presentation,
-            ..
-        } => collect_presentation_record(
-            event.sequence,
-            tool_call_id,
-            presentation,
-            session_report,
-            report,
-            presentations,
-        ),
-        _ => {}
+        );
     }
 }
 
@@ -325,7 +284,7 @@ fn collect_completion_record(
     semantic_result: Option<&ToolInvocationResult>,
     session_report: &mut SessionSemanticMigrationAudit,
     report: &mut SemanticMigrationAuditReport,
-    completions: &mut BTreeMap<String, CompletionAuditRecord>,
+    completions: &mut BTreeSet<String>,
 ) {
     session_report.tool_call_finished += 1;
     report.tool_call_finished.total += 1;
@@ -335,181 +294,8 @@ fn collect_completion_record(
         report.tool_call_finished.without_semantic_result += 1;
     }
     classify_legacy_result(result, &mut report.tool_call_finished);
-    completions.insert(
-        tool_call_id.to_string(),
-        CompletionAuditRecord {
-            event_sequence,
-            semantic_result: semantic_result.cloned(),
-        },
-    );
-}
-
-fn collect_presentation_record(
-    event_sequence: u64,
-    tool_call_id: &str,
-    presentation: &ToolInvocationPresentation,
-    session_report: &mut SessionSemanticMigrationAudit,
-    report: &mut SemanticMigrationAuditReport,
-    presentations: &mut BTreeMap<String, Vec<PresentationAuditRecord>>,
-) {
-    session_report.presentations += 1;
-    report.presentations.total += 1;
-    match presentation {
-        ToolInvocationPresentation::Terminal { .. } => {
-            report.presentations.terminal += 1;
-        }
-        ToolInvocationPresentation::FileChange { .. } => {
-            report.presentations.file_change += 1;
-        }
-    }
-    presentations
-        .entry(tool_call_id.to_string())
-        .or_default()
-        .push(PresentationAuditRecord {
-            event_sequence,
-            presentation: presentation.clone(),
-        });
-}
-
-fn audit_presentation_matches(
-    session_id: SessionId,
-    path: &Path,
-    completions: &BTreeMap<String, CompletionAuditRecord>,
-    presentations: &BTreeMap<String, Vec<PresentationAuditRecord>>,
-    report: &mut SemanticMigrationAuditReport,
-) -> bool {
-    let mut requires_review = false;
-    for (tool_call_id, records) in presentations {
-        requires_review |= audit_tool_call_presentations(
-            session_id,
-            path,
-            tool_call_id,
-            records,
-            completions.get(tool_call_id),
-            report,
-        );
-    }
-    requires_review
-}
-
-fn audit_tool_call_presentations(
-    session_id: SessionId,
-    path: &Path,
-    tool_call_id: &str,
-    records: &[PresentationAuditRecord],
-    completion: Option<&CompletionAuditRecord>,
-    report: &mut SemanticMigrationAuditReport,
-) -> bool {
-    let Some(completion) = completion else {
-        report_orphan_presentations(session_id, path, tool_call_id, records, report);
-        return true;
-    };
-    report.presentations.matched_to_completion += records.len();
-    if records.len() > 1 {
-        report_duplicate_presentations(session_id, path, tool_call_id, records, report);
-        return true;
-    }
-    audit_single_presentation(
-        session_id,
-        path,
-        tool_call_id,
-        &records[0],
-        completion,
-        report,
-    )
-}
-
-fn report_orphan_presentations(
-    session_id: SessionId,
-    path: &Path,
-    tool_call_id: &str,
-    records: &[PresentationAuditRecord],
-    report: &mut SemanticMigrationAuditReport,
-) {
-    report.presentations.orphan += records.len();
-    for record in records {
-        push_issue(
-            report,
-            session_id,
-            path,
-            Some(record.event_sequence),
-            Some(tool_call_id),
-            SemanticMigrationAuditIssueKind::OrphanPresentation,
-            "presentation has no matching ToolCallFinished event",
-        );
-    }
-}
-
-fn report_duplicate_presentations(
-    session_id: SessionId,
-    path: &Path,
-    tool_call_id: &str,
-    records: &[PresentationAuditRecord],
-    report: &mut SemanticMigrationAuditReport,
-) {
-    report.presentations.duplicate += records.len();
-    for record in records {
-        push_issue(
-            report,
-            session_id,
-            path,
-            Some(record.event_sequence),
-            Some(tool_call_id),
-            SemanticMigrationAuditIssueKind::DuplicatePresentation,
-            "multiple presentation events exist for this tool call",
-        );
-    }
-}
-
-fn audit_single_presentation(
-    session_id: SessionId,
-    path: &Path,
-    tool_call_id: &str,
-    record: &PresentationAuditRecord,
-    completion: &CompletionAuditRecord,
-    report: &mut SemanticMigrationAuditReport,
-) -> bool {
-    let semantic = semantic_from_presentation(&record.presentation);
-    match &completion.semantic_result {
-        Some(existing) if existing != &semantic => {
-            report.presentations.conflict += 1;
-            push_issue(
-                report,
-                session_id,
-                path,
-                Some(record.event_sequence),
-                Some(tool_call_id),
-                SemanticMigrationAuditIssueKind::ConflictingPresentation,
-                "presentation does not match existing semantic_result",
-            );
-            true
-        }
-        Some(_) => {
-            report.readiness.removable_presentations += 1;
-            false
-        }
-        None => {
-            report.readiness.removable_presentations += 1;
-            count_addable_semantic_result(&semantic, report);
-            let _ = completion.event_sequence;
-            false
-        }
-    }
-}
-
-const fn count_addable_semantic_result(
-    semantic: &ToolInvocationResult,
-    report: &mut SemanticMigrationAuditReport,
-) {
-    match semantic {
-        ToolInvocationResult::ShellRun { .. } => {
-            report.readiness.addable_terminal_results += 1;
-        }
-        ToolInvocationResult::FileChange { .. } => {
-            report.readiness.addable_file_change_results += 1;
-        }
-        ToolInvocationResult::Text { .. } | ToolInvocationResult::Json { .. } => {}
-    }
+    let _ = (event_sequence, semantic_result);
+    completions.insert(tool_call_id.to_string());
 }
 
 fn classify_legacy_result(result: &str, counts: &mut ToolCallFinishedAuditCounts) {
@@ -526,62 +312,4 @@ fn classify_legacy_result(result: &str, counts: &mut ToolCallFinishedAuditCounts
     } else {
         counts.non_terminal_json += 1;
     }
-}
-
-fn semantic_from_presentation(presentation: &ToolInvocationPresentation) -> ToolInvocationResult {
-    match presentation {
-        ToolInvocationPresentation::Terminal {
-            exit_code,
-            timed_out,
-            cancelled,
-            output,
-            output_truncated,
-            output_bytes,
-            retained_output_bytes,
-            columns,
-            rows,
-        } => ToolInvocationResult::ShellRun {
-            result: ShellRunResult::Terminal {
-                exit_code: *exit_code,
-                timed_out: *timed_out,
-                cancelled: *cancelled,
-                output_tail: output.clone(),
-                output_truncated: *output_truncated,
-                output_bytes: *output_bytes,
-                retained_output_bytes: *retained_output_bytes,
-                columns: *columns,
-                rows: *rows,
-            },
-        },
-        ToolInvocationPresentation::FileChange {
-            tool_name,
-            summary,
-            path,
-        } => ToolInvocationResult::FileChange {
-            result: FileChangeResult {
-                tool_name: tool_name.clone(),
-                summary: summary.clone(),
-                path: path.clone(),
-            },
-        },
-    }
-}
-
-fn push_issue(
-    report: &mut SemanticMigrationAuditReport,
-    session_id: SessionId,
-    path: &Path,
-    event_sequence: Option<u64>,
-    tool_call_id: Option<&str>,
-    issue: SemanticMigrationAuditIssueKind,
-    detail: &str,
-) {
-    report.issues.push(SemanticMigrationAuditIssue {
-        session_id: Some(session_id),
-        path: path.to_path_buf(),
-        event_sequence,
-        tool_call_id: tool_call_id.map(ToOwned::to_owned),
-        issue,
-        detail: detail.to_string(),
-    });
 }

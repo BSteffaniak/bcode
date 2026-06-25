@@ -229,8 +229,6 @@ pub struct ToolInvocationResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_output: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub presentation: Option<ToolInvocationPresentation>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_action: Option<ToolInvocationHostAction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<ToolInvocationResult>,
@@ -305,30 +303,6 @@ pub struct FileChangeResult {
     pub tool_name: String,
     pub summary: String,
     pub path: Option<String>,
-}
-
-/// Bounded UI presentation metadata returned by a tool invocation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolInvocationPresentation {
-    /// Pseudo-terminal execution result.
-    Terminal {
-        exit_code: Option<i32>,
-        timed_out: bool,
-        cancelled: bool,
-        output: String,
-        output_truncated: bool,
-        output_bytes: Option<u64>,
-        retained_output_bytes: Option<u64>,
-        columns: u16,
-        rows: u16,
-    },
-    /// Filesystem write/edit result.
-    FileChange {
-        tool_name: String,
-        summary: String,
-        path: Option<String>,
-    },
 }
 
 /// Structured model-visible tool result content.

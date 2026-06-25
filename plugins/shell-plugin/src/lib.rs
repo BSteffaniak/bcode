@@ -11,10 +11,9 @@ use bcode_config::{
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, ShellRunResult, TOOL_SERVICE_INTERFACE_ID,
-    ToolDefinition, ToolInvocationPresentation, ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationResult, ToolInvocationStreamEvent, ToolList, ToolOutputStream,
-    ToolPresentationField, ToolPresentationFieldKind, ToolRequestPresentationMetadata,
-    ToolSideEffect,
+    ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult,
+    ToolInvocationStreamEvent, ToolList, ToolOutputStream, ToolPresentationField,
+    ToolPresentationFieldKind, ToolRequestPresentationMetadata, ToolSideEffect,
 };
 use bcode_tool_runtime::{ProcessExecutionRequest, ToolExecutionRuntime};
 use serde::{Deserialize, Serialize};
@@ -179,7 +178,6 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             is_error: true,
             content: Vec::new(),
             full_output: None,
-            presentation: None,
             host_action: None,
             result: None,
         },
@@ -204,7 +202,6 @@ fn run_shell_tool(
                 is_error: true,
                 content: Vec::new(),
                 full_output: None,
-                presentation: None,
                 host_action: None,
                 result: None,
             };
@@ -216,7 +213,6 @@ fn run_shell_tool(
             is_error: true,
             content: Vec::new(),
             full_output: None,
-            presentation: None,
             host_action: None,
             result: None,
         };
@@ -264,7 +260,6 @@ fn run_shell_tool(
                 is_error: true,
                 content: Vec::new(),
                 full_output: None,
-                presentation: None,
                 host_action: None,
                 result: None,
             },
@@ -455,7 +450,6 @@ fn run_terminal_shell_command_with_environment(
             is_error: true,
             content: Vec::new(),
             full_output: None,
-            presentation: None,
             host_action: None,
             result: None,
         },
@@ -620,19 +614,6 @@ fn run_terminal_shell_command_inner(
         is_error: status.timed_out || status.cancelled || !status.success,
         content: Vec::new(),
         full_output: Some(full_encoded),
-        presentation: Some(ToolInvocationPresentation::Terminal {
-            exit_code: Some(status.exit_code),
-            timed_out: status.timed_out,
-            cancelled: status.cancelled,
-            output: inline_output.text.clone(),
-            output_truncated: inline_output.truncated,
-            output_bytes: Some(u64::try_from(inline_output.original_bytes).unwrap_or(u64::MAX)),
-            retained_output_bytes: Some(
-                u64::try_from(inline_output.retained_bytes).unwrap_or(u64::MAX),
-            ),
-            columns,
-            rows,
-        }),
         host_action: None,
         result: Some(ToolInvocationResult::ShellRun {
             result: ShellRunResult::Terminal {
@@ -714,7 +695,6 @@ fn build_process_tool_response(
             || result.exit_code.is_none_or(|code| code != 0),
         content: Vec::new(),
         full_output: Some(full_output),
-        presentation: None,
         host_action: None,
         result: Some(ToolInvocationResult::ShellRun {
             result: ShellRunResult::Captured {
@@ -1353,14 +1333,14 @@ mod tests {
     }
 
     #[test]
-    fn process_response_includes_structured_terminal_presentation() {
+    fn terminal_output_encoding_returns_inline_tail() {
         let output = LimitedOutput {
             text: "hello".to_string(),
             original_bytes: 5,
             retained_bytes: 5,
             truncated: false,
         };
-        let (encoded, full_encoded, inline_output) = encode_terminal_output(
+        let (_encoded, full_encoded, inline_output) = encode_terminal_output(
             TerminalShellStatus {
                 exit_code: 0,
                 success: true,
@@ -1372,38 +1352,12 @@ mod tests {
             24,
         )
         .expect("terminal output encodes");
-        let response = ToolInvocationResponse {
-            output: encoded,
-            is_error: false,
-            content: Vec::new(),
-            full_output: Some(full_encoded),
-            presentation: Some(ToolInvocationPresentation::Terminal {
-                exit_code: Some(0),
-                timed_out: false,
-                cancelled: false,
-                output: inline_output.text,
-                output_truncated: inline_output.truncated,
-                output_bytes: Some(u64::try_from(inline_output.original_bytes).unwrap_or(u64::MAX)),
-                retained_output_bytes: Some(
-                    u64::try_from(inline_output.retained_bytes).unwrap_or(u64::MAX),
-                ),
-                columns: 80,
-                rows: 24,
-            }),
-            host_action: None,
-            result: None,
-        };
 
-        assert!(matches!(
-            response.presentation,
-            Some(ToolInvocationPresentation::Terminal {
-                exit_code: Some(0),
-                output,
-                columns: 80,
-                rows: 24,
-                ..
-            }) if output == "hello"
-        ));
+        assert_eq!(inline_output.text, "hello");
+        assert_eq!(inline_output.original_bytes, 5);
+        assert_eq!(inline_output.retained_bytes, 5);
+        assert!(!inline_output.truncated);
+        assert!(full_encoded.contains("hello"));
     }
 
     #[test]

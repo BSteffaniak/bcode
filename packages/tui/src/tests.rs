@@ -15,7 +15,7 @@ use bcode_session_models::{
     RuntimeWorkKind, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
     SessionProjectionKind, SessionSummary, SessionTitleSource, SessionTokenUsage,
     SessionTraceEvent, SessionTracePayload, SessionTracePhase, ShellRunResult,
-    ToolInvocationPresentation, ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
+    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::TextMotion;
@@ -2300,19 +2300,22 @@ fn streamed_terminal_output_updates_header_after_final_result() {
         4,
         SessionEventKind::ToolCallFinished {
             tool_call_id: "call-final".to_owned(),
-            result: serde_json::json!({
-                "mode": "terminal",
-                "exit_code": 2,
-                "timed_out": false,
-                "output": "done\n",
-                "output_truncated": false,
-                "columns": 80,
-                "rows": 24,
-            })
-            .to_string(),
+            result: "done\n".to_string(),
             is_error: true,
             output: None,
-            semantic_result: None,
+            semantic_result: Some(ToolInvocationResult::ShellRun {
+                result: ShellRunResult::Terminal {
+                    exit_code: Some(2),
+                    timed_out: false,
+                    cancelled: false,
+                    output_tail: "done\n".to_owned(),
+                    output_truncated: false,
+                    output_bytes: Some(5),
+                    retained_output_bytes: Some(5),
+                    columns: 80,
+                    rows: 24,
+                },
+            }),
         },
     ));
 
@@ -3265,7 +3268,7 @@ fn streamed_terminal_live_suppresses_final_tool_result_tail() {
 #[test]
 fn file_change_presentation_history_suppresses_final_tool_result_without_request() {
     let session_id = SessionId::new();
-    let events = file_change_presentation_events(session_id, false);
+    let events = file_change_semantic_result_events(session_id, false);
 
     let transcript = transcript_items_from_events_with_reasoning(&events, true);
 
@@ -3283,7 +3286,7 @@ fn file_change_presentation_history_suppresses_final_tool_result_without_request
 #[test]
 fn file_change_presentation_history_uses_request_preview_when_present() {
     let session_id = SessionId::new();
-    let events = file_change_presentation_events(session_id, true);
+    let events = file_change_semantic_result_events(session_id, true);
 
     let transcript = transcript_items_from_events_with_reasoning(&events, true);
 
@@ -3309,7 +3312,7 @@ fn file_change_presentation_history_uses_request_preview_when_present() {
 fn file_change_presentation_live_suppresses_final_tool_result() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-    for event in file_change_presentation_events(session_id, false) {
+    for event in file_change_semantic_result_events(session_id, false) {
         app.absorb_session_event(&event);
     }
 
@@ -3324,7 +3327,7 @@ fn file_change_presentation_live_suppresses_final_tool_result() {
     }));
 }
 
-fn file_change_presentation_events(
+fn file_change_semantic_result_events(
     session_id: SessionId,
     include_request: bool,
 ) -> Vec<SessionEvent> {
@@ -3343,27 +3346,18 @@ fn file_change_presentation_events(
     events.push(event(
         session_id,
         2,
-        SessionEventKind::ToolInvocationPresentation {
-            tool_call_id: "call-file".to_owned(),
-            started_at_ms: Some(1),
-            finished_at_ms: Some(2),
-            is_error: false,
-            presentation: ToolInvocationPresentation::FileChange {
-                tool_name: "example.write".to_owned(),
-                summary: "wrote 2 bytes".to_owned(),
-                path: Some("file.txt".to_owned()),
-            },
-        },
-    ));
-    events.push(event(
-        session_id,
-        3,
         SessionEventKind::ToolCallFinished {
             tool_call_id: "call-file".to_owned(),
-            result: "duplicate write result".to_owned(),
+            result: "wrote 2 bytes".to_owned(),
             is_error: false,
             output: None,
-            semantic_result: None,
+            semantic_result: Some(ToolInvocationResult::FileChange {
+                result: bcode_session_models::FileChangeResult {
+                    tool_name: "example.write".to_owned(),
+                    summary: "wrote 2 bytes".to_owned(),
+                    path: Some("file.txt".to_owned()),
+                },
+            }),
         },
     ));
     events
@@ -3490,49 +3484,31 @@ fn streamed_terminal_tool_events(session_id: SessionId) -> Vec<SessionEvent> {
         event(
             session_id,
             5,
-            SessionEventKind::ToolInvocationPresentation {
-                tool_call_id: "call-stream".to_owned(),
-                started_at_ms: Some(1_000),
-                finished_at_ms: Some(2_500),
-                is_error: false,
-                presentation: ToolInvocationPresentation::Terminal {
-                    exit_code: Some(7),
-                    timed_out: true,
-                    cancelled: false,
-                    output: "final duplicate tail".to_owned(),
-                    output_truncated: false,
-                    output_bytes: Some("final duplicate tail".len() as u64),
-                    retained_output_bytes: Some("final duplicate tail".len() as u64),
-                    columns: 120,
-                    rows: 40,
-                },
-            },
-        ),
-        event(
-            session_id,
-            6,
             SessionEventKind::ToolCallFinished {
                 tool_call_id: "call-stream".to_owned(),
-                result: serde_json::json!({
-                    "mode": "terminal",
-                    "exit_code": 7,
-                    "timed_out": true,
-                    "output": "final duplicate tail",
-                    "output_truncated": false,
-                    "columns": 120,
-                    "rows": 40,
-                })
-                .to_string(),
+                result: "final duplicate tail".to_owned(),
                 is_error: false,
                 output: None,
-                semantic_result: None,
+                semantic_result: Some(ToolInvocationResult::ShellRun {
+                    result: ShellRunResult::Terminal {
+                        exit_code: Some(7),
+                        timed_out: true,
+                        cancelled: false,
+                        output_tail: "final duplicate tail".to_owned(),
+                        output_truncated: false,
+                        output_bytes: Some("final duplicate tail".len() as u64),
+                        retained_output_bytes: Some("final duplicate tail".len() as u64),
+                        columns: 120,
+                        rows: 40,
+                    },
+                }),
             },
         ),
     ]
 }
 
 #[test]
-fn terminal_presentation_without_live_delta_renders_terminal_history() {
+fn semantic_terminal_result_without_live_delta_renders_terminal_history() {
     let session_id = SessionId::new();
     let events = vec![
         event(
@@ -3562,42 +3538,24 @@ fn terminal_presentation_without_live_delta_renders_terminal_history() {
         event(
             session_id,
             3,
-            SessionEventKind::ToolInvocationPresentation {
-                tool_call_id: "call-no-live".to_owned(),
-                started_at_ms: Some(1_000),
-                finished_at_ms: Some(1_250),
-                is_error: false,
-                presentation: ToolInvocationPresentation::Terminal {
-                    exit_code: Some(0),
-                    timed_out: false,
-                    cancelled: false,
-                    output: String::new(),
-                    output_truncated: false,
-                    output_bytes: Some(0),
-                    retained_output_bytes: Some(0),
-                    columns: 80,
-                    rows: 24,
-                },
-            },
-        ),
-        event(
-            session_id,
-            4,
             SessionEventKind::ToolCallFinished {
                 tool_call_id: "call-no-live".to_owned(),
-                result: serde_json::json!({
-                    "mode": "terminal",
-                    "exit_code": 0,
-                    "timed_out": false,
-                    "output": "",
-                    "output_truncated": false,
-                    "columns": 80,
-                    "rows": 24,
-                })
-                .to_string(),
+                result: String::new(),
                 is_error: false,
                 output: None,
-                semantic_result: None,
+                semantic_result: Some(ToolInvocationResult::ShellRun {
+                    result: ShellRunResult::Terminal {
+                        exit_code: Some(0),
+                        timed_out: false,
+                        cancelled: false,
+                        output_tail: String::new(),
+                        output_truncated: false,
+                        output_bytes: Some(0),
+                        retained_output_bytes: Some(0),
+                        columns: 80,
+                        rows: 24,
+                    },
+                }),
             },
         ),
     ];
@@ -3793,7 +3751,7 @@ fn semantic_captured_shell_result_renders_captured_text_not_terminal() {
 }
 
 #[test]
-fn old_out_of_order_result_then_presentation_does_not_leave_raw_terminal_json() {
+fn legacy_terminal_result_does_not_leave_raw_terminal_json() {
     let session_id = SessionId::new();
     let events = vec![
         event(
@@ -3822,27 +3780,6 @@ fn old_out_of_order_result_then_presentation_does_not_leave_raw_terminal_json() 
                 is_error: false,
                 output: None,
                 semantic_result: None,
-            },
-        ),
-        event(
-            session_id,
-            3,
-            SessionEventKind::ToolInvocationPresentation {
-                tool_call_id: "call-old-order".to_owned(),
-                started_at_ms: None,
-                finished_at_ms: None,
-                is_error: false,
-                presentation: ToolInvocationPresentation::Terminal {
-                    exit_code: Some(0),
-                    timed_out: false,
-                    cancelled: false,
-                    output: "presentation tail\n".to_owned(),
-                    output_truncated: false,
-                    output_bytes: Some(18),
-                    retained_output_bytes: Some(18),
-                    columns: 80,
-                    rows: 24,
-                },
             },
         ),
     ];

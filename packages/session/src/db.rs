@@ -1733,7 +1733,6 @@ const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ToolInvocationStream { .. } => "tool_invocation_stream",
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
-        SessionEventKind::ToolInvocationPresentation { .. } => "tool_invocation_presentation",
         SessionEventKind::SessionForked { .. } => "session_forked",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
     }

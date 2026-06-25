@@ -82,7 +82,6 @@ pub(crate) mod time_format;
 pub(crate) mod timeline_dialog;
 pub(crate) mod timeline_dialog_render;
 pub(crate) mod timeline_flow;
-pub(crate) mod tool_invocation_view;
 pub(crate) mod tool_present;
 pub(crate) mod transcript;
 pub(crate) mod transcript_document;

@@ -645,52 +645,6 @@ const fn default_terminal_rows() -> u16 {
     24
 }
 
-/// Bounded durable presentation state for a completed tool invocation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolInvocationPresentation {
-    /// Pseudo-terminal execution result.
-    Terminal {
-        /// Process exit code, or `None` when the process was terminated by signal.
-        #[serde(default)]
-        exit_code: Option<i32>,
-        /// Whether execution timed out.
-        #[serde(default)]
-        timed_out: bool,
-        /// Whether execution was cancelled.
-        #[serde(default)]
-        cancelled: bool,
-        /// Bounded terminal byte stream decoded as UTF-8.
-        #[serde(default)]
-        output: String,
-        /// Whether the terminal stream was truncated before serialization.
-        #[serde(default)]
-        output_truncated: bool,
-        /// Original terminal stream byte count before truncation.
-        #[serde(default)]
-        output_bytes: Option<u64>,
-        /// Retained terminal stream byte count after truncation.
-        #[serde(default)]
-        retained_output_bytes: Option<u64>,
-        /// Terminal columns used for execution.
-        #[serde(default = "default_terminal_columns")]
-        columns: u16,
-        /// Terminal rows used for execution.
-        #[serde(default = "default_terminal_rows")]
-        rows: u16,
-    },
-    /// Filesystem write/edit result.
-    FileChange {
-        /// Tool name that produced the change.
-        tool_name: String,
-        /// Human-readable plugin output.
-        summary: String,
-        /// Best-effort target path extracted from tool arguments.
-        #[serde(default)]
-        path: Option<String>,
-    },
-}
-
 /// Incremental event emitted while a tool invocation is running.
 ///
 /// This enum is persisted inside [`SessionEventKind`]. Keep the default
@@ -1220,16 +1174,6 @@ pub enum SessionEventKind {
         source_display_name: String,
         external_session_id: String,
         imported_at_ms: u64,
-    },
-    /// Durable bounded presentation state for a completed tool invocation.
-    ToolInvocationPresentation {
-        tool_call_id: String,
-        #[serde(default)]
-        started_at_ms: Option<u64>,
-        #[serde(default)]
-        finished_at_ms: Option<u64>,
-        is_error: bool,
-        presentation: ToolInvocationPresentation,
     },
     /// Durable provenance marker for sessions forked or cloned from another session.
     SessionForked {

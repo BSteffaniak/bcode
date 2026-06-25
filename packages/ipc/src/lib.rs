@@ -10,8 +10,8 @@ use bcode_session_models::{
     ClientId, FileChangeResult, ModelTurnOutcome, ProjectionWindowRequest, RuntimeWorkId,
     RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionForkKind,
     SessionHistoryPage, SessionHistoryQuery, SessionId, SessionInputHistoryEntry, SessionLiveEvent,
-    SessionSummary, SessionTokenUsage, SessionTraceEvent, ShellRunResult,
-    ToolInvocationPresentation, ToolInvocationResult, ToolInvocationStreamEvent, TraceBlobRef,
+    SessionSummary, SessionTokenUsage, SessionTraceEvent, ShellRunResult, ToolInvocationResult,
+    ToolInvocationStreamEvent, TraceBlobRef,
 };
 use bcode_skill_models::{
     SkillActivationMode, SkillContextResponse, SkillId, SkillList, SkillManifest, SkillSource,
@@ -1916,13 +1916,6 @@ enum IpcSessionEventKind {
         external_session_id: String,
         imported_at_ms: u64,
     },
-    ToolInvocationPresentation {
-        tool_call_id: String,
-        started_at_ms: Option<u64>,
-        finished_at_ms: Option<u64>,
-        is_error: bool,
-        presentation: ToolInvocationPresentation,
-    },
     SessionForked {
         source_session_id: SessionId,
         source_title: Option<String>,
@@ -2317,19 +2310,6 @@ impl From<&SessionEventKind> for IpcSessionEventKind {
                 external_session_id: external_session_id.clone(),
                 imported_at_ms: imported_at_ms.clone(),
             },
-            SessionEventKind::ToolInvocationPresentation {
-                tool_call_id,
-                started_at_ms,
-                finished_at_ms,
-                is_error,
-                presentation,
-            } => Self::ToolInvocationPresentation {
-                tool_call_id: tool_call_id.clone(),
-                started_at_ms: started_at_ms.clone(),
-                finished_at_ms: finished_at_ms.clone(),
-                is_error: is_error.clone(),
-                presentation: presentation.clone(),
-            },
             SessionEventKind::SessionForked {
                 source_session_id,
                 source_title,
@@ -2612,19 +2592,6 @@ impl TryFrom<IpcSessionEventKind> for SessionEventKind {
                 source_display_name,
                 external_session_id,
                 imported_at_ms,
-            }),
-            IpcSessionEventKind::ToolInvocationPresentation {
-                tool_call_id,
-                started_at_ms,
-                finished_at_ms,
-                is_error,
-                presentation,
-            } => Ok(Self::ToolInvocationPresentation {
-                tool_call_id,
-                started_at_ms,
-                finished_at_ms,
-                is_error,
-                presentation,
             }),
             IpcSessionEventKind::SessionForked {
                 source_session_id,
@@ -3910,23 +3877,6 @@ mod tests {
                 source_display_name: "Source".to_string(),
                 external_session_id: "external".to_string(),
                 imported_at_ms: 1,
-            },
-            SessionEventKind::ToolInvocationPresentation {
-                tool_call_id: "call-1".to_string(),
-                started_at_ms: Some(1),
-                finished_at_ms: Some(2),
-                is_error: false,
-                presentation: ToolInvocationPresentation::Terminal {
-                    exit_code: Some(0),
-                    timed_out: false,
-                    cancelled: false,
-                    output: "output".to_string(),
-                    output_truncated: false,
-                    output_bytes: Some(6),
-                    retained_output_bytes: Some(6),
-                    columns: 80,
-                    rows: 24,
-                },
             },
             SessionEventKind::SessionForked {
                 source_session_id: session_id,

@@ -43,9 +43,8 @@ use bcode_session_models::{
     LiveShellCommandPreview, LiveToolArgumentPreview, ModelTurnOutcome, ProviderStreamEvent,
     ProviderToolCallProgress, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind,
     SessionId, SessionLiveEventKind, SessionTokenUsage, SessionTraceEvent, SessionTracePayload,
-    SessionTracePhase, ShellRunResult, ToolInvocationPresentation, ToolInvocationResult,
-    ToolInvocationStreamEvent, ToolOutputStream as SessionToolOutputStream, TraceBlobRef,
-    TraceRedaction,
+    SessionTracePhase, ShellRunResult, ToolInvocationResult, ToolInvocationStreamEvent,
+    ToolOutputStream as SessionToolOutputStream, TraceBlobRef, TraceRedaction,
 };
 use bcode_skill::{
     SkillPromptCatalogMode, SkillPromptCatalogOptions, SkillRegistry, SkillRegistryOptions,
@@ -56,8 +55,7 @@ use bcode_skill_models::{
 };
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, ShellRunResult as ServiceShellRunResult,
-    TOOL_SERVICE_INTERFACE_ID, ToolDefinition as ServiceToolDefinition,
-    ToolInvocationPresentation as ServiceToolInvocationPresentation, ToolInvocationRequest,
+    TOOL_SERVICE_INTERFACE_ID, ToolDefinition as ServiceToolDefinition, ToolInvocationRequest,
     ToolInvocationResponse, ToolInvocationResult as ServiceToolInvocationResult,
     ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent, ToolList, ToolOutputStream,
     ToolResultContent,
@@ -12001,7 +11999,6 @@ async fn invoke_host_model_native_web_search(
         is_error: false,
         content: Vec::new(),
         full_output: None,
-        presentation: None,
         host_action: None,
         result: None,
     })
@@ -12060,12 +12057,10 @@ async fn execute_model_tool(
         is_error: true,
         content: Vec::new(),
         full_output: None,
-        presentation: None,
         host_action: None,
         result: None,
     });
     let semantic_result = result.result.clone().map(service_tool_result_to_session);
-    let presentation = legacy_tool_presentation_for_session(&result);
     let artifact_output = result.full_output.as_deref().unwrap_or(&result.output);
     let output_blob = (state.observability.persist_tool_io || state.observability.debug_enabled())
         .then(|| {
@@ -12091,18 +12086,6 @@ async fn execute_model_tool(
         },
     )
     .await;
-    if let Some(presentation) = presentation {
-        append_tool_presentation_event(
-            state,
-            session_id,
-            call.id.clone(),
-            None,
-            Some(current_unix_millis()),
-            result.is_error,
-            presentation,
-        )
-        .await;
-    }
     append_tool_finished_event(
         state,
         session_id,
@@ -12135,7 +12118,6 @@ async fn invoke_model_tool(
             is_error: true,
             content: Vec::new(),
             full_output: None,
-            presentation: None,
             host_action: None,
             result: None,
         });
@@ -12189,7 +12171,6 @@ async fn invoke_model_tool(
                 is_error: true,
                 content: Vec::new(),
                 full_output: None,
-                presentation: None,
                 host_action: None,
                 result: None,
             });
@@ -12201,7 +12182,6 @@ async fn invoke_model_tool(
                     is_error: true,
                     content: Vec::new(),
                     full_output: None,
-                    presentation: None,
                     host_action: None,
                     result: None,
                 });
@@ -12283,7 +12263,6 @@ async fn invoke_model_tool(
                         is_error: true,
                         content: Vec::new(),
                         full_output: None,
-                        presentation: None,
                         host_action: None,
                         result: None,
                     });
@@ -12315,7 +12294,6 @@ async fn invoke_model_tool(
                         is_error: true,
                         content: Vec::new(),
                         full_output: None,
-                        presentation: None,
                         host_action: None,
                         result: None,
                     });
@@ -12336,7 +12314,6 @@ async fn invoke_model_tool(
                     is_error: true,
                     content: Vec::new(),
                     full_output: None,
-                    presentation: None,
             host_action: None,
             result: None,
                 });
@@ -13248,71 +13225,6 @@ async fn append_runtime_work_cancel_requested_event(
     }
 }
 
-async fn append_tool_presentation_event(
-    state: &ServerState,
-    session_id: SessionId,
-    tool_call_id: String,
-    started_at_ms: Option<u64>,
-    finished_at_ms: Option<u64>,
-    is_error: bool,
-    presentation: ToolInvocationPresentation,
-) {
-    match state
-        .sessions
-        .append_event(
-            session_id,
-            SessionEventKind::ToolInvocationPresentation {
-                tool_call_id,
-                started_at_ms,
-                finished_at_ms,
-                is_error,
-                presentation,
-            },
-        )
-        .await
-    {
-        Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => eprintln!("failed to append tool presentation: {error}"),
-    }
-}
-
-fn service_tool_presentation_to_session(
-    presentation: &ServiceToolInvocationPresentation,
-) -> ToolInvocationPresentation {
-    match presentation {
-        ServiceToolInvocationPresentation::Terminal {
-            exit_code,
-            timed_out,
-            cancelled,
-            output,
-            output_truncated,
-            output_bytes,
-            retained_output_bytes,
-            columns,
-            rows,
-        } => ToolInvocationPresentation::Terminal {
-            exit_code: *exit_code,
-            timed_out: *timed_out,
-            cancelled: *cancelled,
-            output: output.clone(),
-            output_truncated: *output_truncated,
-            output_bytes: *output_bytes,
-            retained_output_bytes: *retained_output_bytes,
-            columns: (*columns).max(1),
-            rows: (*rows).max(1),
-        },
-        ServiceToolInvocationPresentation::FileChange {
-            tool_name,
-            summary,
-            path,
-        } => ToolInvocationPresentation::FileChange {
-            tool_name: tool_name.clone(),
-            summary: summary.clone(),
-            path: path.clone(),
-        },
-    }
-}
-
 fn service_tool_result_to_session(result: ServiceToolInvocationResult) -> ToolInvocationResult {
     match result {
         ServiceToolInvocationResult::Text { text } => ToolInvocationResult::Text { text },
@@ -13374,19 +13286,6 @@ fn service_shell_result_to_session(result: ServiceShellRunResult) -> ShellRunRes
             stdout_bytes,
             stderr_bytes,
         },
-    }
-}
-
-fn legacy_tool_presentation_for_session(
-    result: &ToolInvocationResponse,
-) -> Option<ToolInvocationPresentation> {
-    if result.result.is_some() {
-        None
-    } else {
-        result
-            .presentation
-            .as_ref()
-            .map(service_tool_presentation_to_session)
     }
 }
 
@@ -13941,7 +13840,6 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ToolInvocationStream { .. } => "tool_invocation_stream",
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
-        SessionEventKind::ToolInvocationPresentation { .. } => "tool_invocation_presentation",
         SessionEventKind::SessionForked { .. } => "session_forked",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
     }
@@ -14539,23 +14437,12 @@ mod tests {
     }
 
     #[test]
-    fn semantic_tool_response_does_not_emit_legacy_presentation() {
+    fn semantic_tool_response_carries_only_semantic_result() {
         let response = ToolInvocationResponse {
             output: "legacy".to_owned(),
             is_error: false,
             content: Vec::new(),
             full_output: None,
-            presentation: Some(ServiceToolInvocationPresentation::Terminal {
-                exit_code: Some(0),
-                timed_out: false,
-                cancelled: false,
-                output: "terminal".to_owned(),
-                output_truncated: false,
-                output_bytes: Some(8),
-                retained_output_bytes: Some(8),
-                columns: 80,
-                rows: 24,
-            }),
             host_action: None,
             result: Some(ServiceToolInvocationResult::ShellRun {
                 result: ServiceShellRunResult::Terminal {
@@ -14572,28 +14459,9 @@ mod tests {
             }),
         };
 
-        assert!(legacy_tool_presentation_for_session(&response).is_none());
-    }
-
-    #[test]
-    fn nonsemantic_tool_response_still_emits_legacy_presentation() {
-        let response = ToolInvocationResponse {
-            output: "legacy".to_owned(),
-            is_error: false,
-            content: Vec::new(),
-            full_output: None,
-            presentation: Some(ServiceToolInvocationPresentation::FileChange {
-                tool_name: "filesystem.write".to_owned(),
-                summary: "wrote 1 byte".to_owned(),
-                path: Some("file.txt".to_owned()),
-            }),
-            host_action: None,
-            result: None,
-        };
-
         assert!(matches!(
-            legacy_tool_presentation_for_session(&response),
-            Some(ToolInvocationPresentation::FileChange { .. })
+            response.result,
+            Some(ServiceToolInvocationResult::ShellRun { .. })
         ));
     }
 
@@ -15196,51 +15064,6 @@ mod tests {
             other_call,
             ToolInvocationStreamEvent::Finished { sequence: 1, .. }
         ));
-    }
-
-    #[test]
-    fn service_tool_presentation_maps_to_session_presentation() {
-        let terminal =
-            service_tool_presentation_to_session(&ServiceToolInvocationPresentation::Terminal {
-                exit_code: Some(0),
-                timed_out: false,
-                cancelled: false,
-                output: "ok".to_string(),
-                output_truncated: false,
-                output_bytes: Some(2),
-                retained_output_bytes: Some(2),
-                columns: 0,
-                rows: 0,
-            });
-        assert_eq!(
-            terminal,
-            ToolInvocationPresentation::Terminal {
-                exit_code: Some(0),
-                timed_out: false,
-                cancelled: false,
-                output: "ok".to_string(),
-                output_truncated: false,
-                output_bytes: Some(2),
-                retained_output_bytes: Some(2),
-                columns: 1,
-                rows: 1,
-            }
-        );
-
-        let file_change =
-            service_tool_presentation_to_session(&ServiceToolInvocationPresentation::FileChange {
-                tool_name: "filesystem.write".to_string(),
-                summary: "wrote 2 bytes".to_string(),
-                path: Some("file.txt".to_string()),
-            });
-        assert_eq!(
-            file_change,
-            ToolInvocationPresentation::FileChange {
-                tool_name: "filesystem.write".to_string(),
-                summary: "wrote 2 bytes".to_string(),
-                path: Some("file.txt".to_string()),
-            }
-        );
     }
 
     #[test]

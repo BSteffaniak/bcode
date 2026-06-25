@@ -70,7 +70,6 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             is_error: true,
             content: Vec::new(),
             full_output: None,
-            presentation: None,
             host_action: None,
             result: None,
         },
@@ -289,7 +288,6 @@ fn json_tool_response<T: Serialize>(value: &T) -> ToolInvocationResponse {
             is_error: false,
             content: Vec::new(),
             full_output: None,
-            presentation: None,
             host_action: None,
             result: None,
         },
@@ -303,7 +301,6 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
         is_error: true,
         content: Vec::new(),
         full_output: None,
-        presentation: None,
         host_action: None,
         result: None,
     }

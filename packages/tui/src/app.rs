@@ -10,8 +10,7 @@ use bcode_session_models::{
     LiveToolArgumentPreview, ModelTurnOutcome, ProviderStreamEvent, RuntimeWorkStatus,
     SessionEvent, SessionEventKind, SessionHistoryCursor, SessionId, SessionInputHistoryEntry,
     SessionLiveEvent, SessionLiveEventKind, SessionTraceEvent, SessionTracePayload,
-    SessionTracePhase, ToolInvocationPresentation, ToolInvocationResult, ToolInvocationStreamEvent,
-    ToolOutputStream,
+    SessionTracePhase, ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,18 +48,12 @@ use super::runtime_work_view::RuntimeWorkViewState;
 use super::temporal::next_elapsed_invalidation_capped;
 use super::theme::{PresentedTheme, ResolvedTheme};
 use super::timeline_dialog::TimelineEntry;
-use super::tool_invocation_view::{
-    TerminalInvocationItemContext, ToolInvocationPresentationInput, ToolInvocationRequestContext,
-    apply_tool_invocation_presentation,
-};
-use super::tool_present::{
-    ShellResultPresentation, ToolResultPresentation, tool_result_presentation,
-};
+use super::tool_present::ShellResultPresentation;
 use super::transcript::{
-    FileEditPhase, TranscriptItem, TranscriptItemKind, live_tool_preview_anchor_item,
-    model_usage_item, permission_request_item, permission_result_item,
-    streaming_terminal_output_item, streaming_tool_output_item, tool_request_item,
-    tool_result_item, transcript_items_from_events_with_reasoning,
+    FileEditPhase, TranscriptItem, TranscriptItemKind, file_change_presentation_item,
+    live_tool_preview_anchor_item, model_usage_item, permission_request_item,
+    permission_result_item, streaming_terminal_output_item, streaming_tool_output_item,
+    tool_request_item, tool_result_item, transcript_items_from_events_with_reasoning,
 };
 use super::transcript_document::TranscriptDocument;
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
@@ -287,7 +280,6 @@ pub struct BmuxApp {
     latest_history_sequence: Option<u64>,
     tool_call_contexts: BTreeMap<String, ToolCallContext>,
     streamed_tool_results: BTreeMap<String, StreamedToolResultContext>,
-    presented_tool_results: BTreeSet<String>,
     live_tool_previews: BTreeMap<String, LiveToolPreviewState>,
     live_preview_revision: u64,
     live_preview_frames_requested: u64,
@@ -433,15 +425,6 @@ impl SessionEventApplication {
     }
 }
 
-fn terminal_dimensions(presentation: &ToolInvocationPresentation) -> Option<(u16, u16)> {
-    match presentation {
-        ToolInvocationPresentation::Terminal { columns, rows, .. } => {
-            Some(((*columns).max(1), (*rows).max(1)))
-        }
-        ToolInvocationPresentation::FileChange { .. } => None,
-    }
-}
-
 impl BmuxApp {
     /// Create TUI state with replayed session data.
     #[must_use]
@@ -484,7 +467,6 @@ impl BmuxApp {
             latest_history_sequence: None,
             tool_call_contexts: BTreeMap::new(),
             streamed_tool_results: BTreeMap::new(),
-            presented_tool_results: BTreeSet::new(),
             live_tool_previews: BTreeMap::new(),
             live_preview_revision: 0,
             live_preview_frames_requested: 0,
@@ -1922,8 +1904,6 @@ impl BmuxApp {
         let referenced = referenced_tool_call_ids(self.transcript.items());
         self.tool_call_contexts
             .retain(|tool_call_id, _| referenced.contains(tool_call_id));
-        self.presented_tool_results
-            .retain(|tool_call_id| referenced.contains(tool_call_id));
         self.live_tool_previews
             .retain(|tool_call_id, _| referenced.contains(tool_call_id));
         self.streamed_tool_results.clear();
@@ -2134,19 +2114,6 @@ impl BmuxApp {
                     application,
                 );
             }
-            SessionEventKind::ToolInvocationPresentation {
-                tool_call_id,
-                started_at_ms,
-                finished_at_ms,
-                is_error,
-                presentation,
-            } => self.apply_tool_invocation_presentation(
-                tool_call_id,
-                *started_at_ms,
-                *finished_at_ms,
-                *is_error,
-                presentation,
-            ),
             SessionEventKind::ToolInvocationStream { event } => {
                 self.apply_tool_stream_event(event, application);
             }
@@ -2670,7 +2637,7 @@ impl BmuxApp {
         &mut self,
         tool_call_id: &str,
         is_error: Option<bool>,
-        result: Option<&str>,
+        _result: Option<&str>,
         semantic_result: Option<&ToolInvocationResult>,
     ) -> bool {
         let Some(context) = self.streamed_tool_results.get(tool_call_id) else {
@@ -2684,9 +2651,7 @@ impl BmuxApp {
                 exit_code,
                 timed_out,
                 ..
-            }) = semantic_result
-                .and_then(semantic_terminal_presentation)
-                .or_else(|| result.and_then(terminal_shell_presentation))
+            }) = semantic_result.and_then(semantic_terminal_presentation)
             {
                 item.finish_terminal(exit_code, timed_out, is_error.unwrap_or(false), None);
             } else {
@@ -2727,15 +2692,15 @@ impl BmuxApp {
             return;
         }
         let tool_context = self.tool_call_contexts.get(tool_call_id);
-        let presentation_known = self.presentation_known_for_tool_call(tool_call_id);
-        if !presentation_known {
-            self.transcript.push(tool_result_item(
-                tool_call_id,
-                tool_context.map(|context| context.tool_name.as_str()),
-                tool_context.map(|context| context.arguments_json.as_str()),
-                result,
-                is_error,
-            ));
+        if let Some(item) = semantic_tool_result_item_for_app(
+            tool_call_id,
+            tool_context.map(|context| context.tool_name.as_str()),
+            tool_context.map(|context| context.arguments_json.as_str()),
+            semantic_result,
+            result,
+            is_error,
+        ) {
+            self.transcript.push(item);
         }
         if is_error {
             if application.live_activity() {
@@ -2754,75 +2719,6 @@ impl BmuxApp {
             }
         }
         self.finish_tool_request_preview(tool_call_id);
-    }
-
-    fn presentation_known_for_tool_call(&self, tool_call_id: &str) -> bool {
-        self.presented_tool_results.contains(tool_call_id)
-            || self.streamed_tool_results.contains_key(tool_call_id)
-    }
-
-    fn apply_tool_invocation_presentation(
-        &mut self,
-        tool_call_id: &str,
-        started_at_ms: Option<u64>,
-        finished_at_ms: Option<u64>,
-        is_error: bool,
-        presentation: &ToolInvocationPresentation,
-    ) {
-        let request_context =
-            self.tool_call_contexts
-                .get(tool_call_id)
-                .map(|context| ToolInvocationRequestContext {
-                    tool_name: context.tool_name.as_str(),
-                });
-        let terminal_context = self.streamed_tool_results.get(tool_call_id).map(|context| {
-            TerminalInvocationItemContext {
-                index: context.index,
-            }
-        });
-        if let ToolInvocationPresentation::Terminal {
-            exit_code,
-            timed_out,
-            ..
-        } = presentation
-            && let Some(streamed) = self.streamed_tool_results.get(tool_call_id)
-            && streamed.saw_output
-        {
-            if let Some(index) = streamed.index
-                && let Some(item) = self.transcript.get_mut(index)
-            {
-                item.finish_terminal(*exit_code, *timed_out, is_error, finished_at_ms);
-            }
-            self.presented_tool_results.insert(tool_call_id.to_owned());
-            return;
-        }
-        let effects = apply_tool_invocation_presentation(
-            &mut self.transcript,
-            ToolInvocationPresentationInput {
-                tool_call_id,
-                started_at_ms,
-                finished_at_ms,
-                is_error,
-                presentation,
-                request_context,
-                terminal_context,
-            },
-        );
-        if effects.suppress_final_result {
-            self.presented_tool_results.insert(tool_call_id.to_owned());
-        }
-        if effects.terminal_saw_output {
-            self.streamed_tool_results.insert(
-                tool_call_id.to_owned(),
-                StreamedToolResultContext {
-                    index: effects.terminal_index,
-                    columns: terminal_dimensions(presentation).map_or(120, |(columns, _)| columns),
-                    rows: terminal_dimensions(presentation).map_or(24, |(_, rows)| rows),
-                    started_at_ms,
-                    saw_output: true,
-                },
-            );
-        }
     }
 
     fn apply_tool_stream_event(
@@ -3886,12 +3782,74 @@ fn context_window_percentage(input_tokens: u32, context_window: u32) -> u32 {
     u32::try_from(numerator / denominator).unwrap_or(u32::MAX)
 }
 
-fn terminal_shell_presentation(result: &str) -> Option<ShellResultPresentation> {
-    match tool_result_presentation(None, result)? {
-        ToolResultPresentation::Shell(shell @ ShellResultPresentation::Terminal { .. }) => {
-            Some(shell)
+fn semantic_tool_result_item_for_app(
+    tool_call_id: &str,
+    tool_name: Option<&str>,
+    arguments_json: Option<&str>,
+    semantic_result: Option<&ToolInvocationResult>,
+    fallback_result: &str,
+    is_error: bool,
+) -> Option<TranscriptItem> {
+    match semantic_result {
+        Some(ToolInvocationResult::ShellRun {
+            result:
+                bcode_session_models::ShellRunResult::Terminal {
+                    exit_code,
+                    timed_out,
+                    output_tail,
+                    columns,
+                    rows,
+                    ..
+                },
+        }) => {
+            let mut item = streaming_terminal_output_item(
+                tool_call_id,
+                tool_name,
+                output_tail,
+                (*columns).max(1),
+                (*rows).max(1),
+                None,
+            );
+            item.apply_terminal_presentation(
+                output_tail.clone(),
+                *exit_code,
+                *timed_out,
+                is_error,
+                None,
+            );
+            Some(item)
         }
-        _ => None,
+        Some(ToolInvocationResult::FileChange { result }) if tool_name.is_none() => {
+            Some(file_change_presentation_item(
+                tool_call_id,
+                &result.tool_name,
+                &result.summary,
+                result.path.as_deref(),
+                is_error,
+            ))
+        }
+        Some(ToolInvocationResult::FileChange { .. }) => None,
+        Some(ToolInvocationResult::Text { text }) => Some(tool_result_item(
+            tool_call_id,
+            tool_name,
+            arguments_json,
+            text,
+            is_error,
+        )),
+        Some(ToolInvocationResult::Json { value }) => Some(tool_result_item(
+            tool_call_id,
+            tool_name,
+            arguments_json,
+            value,
+            is_error,
+        )),
+        Some(ToolInvocationResult::ShellRun { .. }) | None => Some(tool_result_item(
+            tool_call_id,
+            tool_name,
+            arguments_json,
+            fallback_result,
+            is_error,
+        )),
     }
 }
 
@@ -3951,7 +3909,6 @@ const fn event_breaks_sticky_entry_anchor(event: &SessionEvent) -> bool {
         &event.kind,
         SessionEventKind::ToolCallRequested { .. }
             | SessionEventKind::ToolInvocationStream { .. }
-            | SessionEventKind::ToolInvocationPresentation { .. }
             | SessionEventKind::PermissionRequested { .. }
     )
 }
@@ -4003,7 +3960,6 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::RuntimeWorkProgress { .. }
         | SessionEventKind::RuntimeWorkFinished { .. }
         | SessionEventKind::ToolInvocationStream { .. }
-        | SessionEventKind::ToolInvocationPresentation { .. }
         | SessionEventKind::RalphLifecycle { .. }
         | SessionEventKind::AssistantReasoningDelta { .. }
         | SessionEventKind::AssistantReasoningMessage { .. }

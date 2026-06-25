@@ -3,15 +3,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use bcode_session_models::{
-    SessionEvent, SessionEventKind, SessionTokenUsage, ShellRunResult, ToolInvocationPresentation,
-    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
+    SessionEvent, SessionEventKind, SessionTokenUsage, ShellRunResult, ToolInvocationResult,
+    ToolInvocationStreamEvent, ToolOutputStream,
 };
 
 use super::diff_extract::{FileEditTranscript, file_edit_from_tool_request};
-use super::tool_invocation_view::{
-    TerminalInvocationItemContext, ToolInvocationPresentationInput, ToolInvocationRequestContext,
-    apply_tool_invocation_presentation,
-};
 
 /// Lifecycle phase for a file edit/write preview.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -813,30 +809,6 @@ fn push_transcript_item_from_event(
                 items.push(item);
             }
         }
-        SessionEventKind::ToolInvocationPresentation {
-            tool_call_id,
-            started_at_ms,
-            finished_at_ms,
-            is_error,
-            presentation,
-        } => {
-            if presented_tool_results.contains(tool_call_id) {
-                return;
-            }
-            apply_tool_invocation_presentation_event(
-                items,
-                tool_calls,
-                streamed_tool_results,
-                presented_tool_results,
-                ToolPresentationEventRef {
-                    tool_call_id,
-                    started_at_ms: *started_at_ms,
-                    finished_at_ms: *finished_at_ms,
-                    is_error: *is_error,
-                    presentation,
-                },
-            );
-        }
         SessionEventKind::ToolInvocationStream { event } => {
             apply_tool_invocation_stream_event(items, tool_calls, streamed_tool_results, event);
         }
@@ -1131,80 +1103,6 @@ fn terminal_shell_result_metadata(result: &str) -> Option<(Option<i32>, bool)> {
     Some((exit_code, timed_out))
 }
 
-#[derive(Clone, Copy)]
-struct ToolPresentationEventRef<'a> {
-    tool_call_id: &'a str,
-    started_at_ms: Option<u64>,
-    finished_at_ms: Option<u64>,
-    is_error: bool,
-    presentation: &'a ToolInvocationPresentation,
-}
-
-fn apply_tool_invocation_presentation_event(
-    items: &mut Vec<TranscriptItem>,
-    tool_calls: &BTreeMap<String, ToolCallContext>,
-    streamed_tool_results: &mut BTreeMap<String, StreamedToolReplayContext>,
-    presented_tool_results: &mut BTreeSet<String>,
-    event: ToolPresentationEventRef<'_>,
-) {
-    let request_context =
-        tool_calls
-            .get(event.tool_call_id)
-            .map(|context| ToolInvocationRequestContext {
-                tool_name: context.tool_name.as_str(),
-            });
-    let terminal_context = streamed_tool_results
-        .get(event.tool_call_id)
-        .map(|context| TerminalInvocationItemContext {
-            index: context.index,
-        });
-    if let ToolInvocationPresentation::Terminal {
-        exit_code,
-        timed_out,
-        ..
-    } = event.presentation
-        && let Some(streamed) = streamed_tool_results.get(event.tool_call_id)
-        && streamed.saw_output
-    {
-        if let Some(index) = streamed.index
-            && let Some(item) = items.get_mut(index)
-        {
-            item.finish_terminal(*exit_code, *timed_out, event.is_error, event.finished_at_ms);
-        }
-        presented_tool_results.insert(event.tool_call_id.to_owned());
-        return;
-    }
-    let effects = apply_tool_invocation_presentation(
-        items,
-        ToolInvocationPresentationInput {
-            tool_call_id: event.tool_call_id,
-            started_at_ms: event.started_at_ms,
-            finished_at_ms: event.finished_at_ms,
-            is_error: event.is_error,
-            presentation: event.presentation,
-            request_context,
-            terminal_context,
-        },
-    );
-    if effects.suppress_final_result {
-        presented_tool_results.insert(event.tool_call_id.to_owned());
-    }
-    if effects.terminal_saw_output {
-        streamed_tool_results.insert(
-            event.tool_call_id.to_owned(),
-            StreamedToolReplayContext {
-                index: effects.terminal_index,
-                columns: terminal_dimensions(event.presentation)
-                    .map_or(120, |(columns, _)| columns),
-                rows: terminal_dimensions(event.presentation).map_or(24, |(_, rows)| rows),
-                started_at_ms: event.started_at_ms,
-                finished_at_ms: event.finished_at_ms,
-                saw_output: true,
-            },
-        );
-    }
-}
-
 #[allow(clippy::single_match_else, clippy::needless_pass_by_ref_mut)]
 fn apply_semantic_tool_result(
     items: &mut Vec<TranscriptItem>,
@@ -1401,15 +1299,6 @@ fn captured_shell_result_text(result: &ShellRunResult) -> String {
         text.push_str("\n[stderr truncated]");
     }
     text
-}
-
-fn terminal_dimensions(presentation: &ToolInvocationPresentation) -> Option<(u16, u16)> {
-    match presentation {
-        ToolInvocationPresentation::Terminal { columns, rows, .. } => {
-            Some(((*columns).max(1), (*rows).max(1)))
-        }
-        ToolInvocationPresentation::FileChange { .. } => None,
-    }
 }
 
 fn apply_tool_invocation_stream_event(
