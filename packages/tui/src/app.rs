@@ -2795,6 +2795,15 @@ impl BmuxApp {
                     }
                 }
             }
+            ToolInvocationStreamEvent::Presentation { presentation, .. } => {
+                if application.live_activity()
+                    && let bcode_session_models::ToolPresentationEvent::Status(status) =
+                        presentation
+                    && status.target == bcode_session_models::ToolPresentationTarget::Activity
+                {
+                    status.text.clone_into(&mut self.status);
+                }
+            }
             ToolInvocationStreamEvent::Finished {
                 tool_call_id,
                 is_error,

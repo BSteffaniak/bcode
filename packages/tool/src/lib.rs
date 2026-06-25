@@ -227,6 +227,13 @@ pub enum ToolInvocationStreamEvent {
         sequence: u64,
         message: String,
     },
+    /// Plugin-owned presentation update.
+    Presentation {
+        tool_call_id: String,
+        #[serde(default)]
+        sequence: u64,
+        presentation: ToolPresentationEvent,
+    },
     /// Tool has finished; full result follows through normal invoke response.
     Finished {
         tool_call_id: String,
@@ -237,6 +244,104 @@ pub enum ToolInvocationStreamEvent {
         #[serde(default)]
         finished_at_ms: Option<u64>,
     },
+}
+
+/// Plugin-owned presentation update for a running tool invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolPresentationEvent {
+    /// Status text for an activity, preview, or result target.
+    Status(ToolStatusPresentation),
+    /// Card-style structured presentation.
+    Card(ToolCardPresentation),
+    /// Progress update.
+    Progress(ToolProgressPresentation),
+    /// Clear a previous presentation target.
+    Clear { target: ToolPresentationTarget },
+}
+
+/// Tool presentation target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPresentationTarget {
+    Activity,
+    Preview,
+    Result,
+}
+
+/// Presentation severity/level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPresentationLevel {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+/// Tool status presentation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolStatusPresentation {
+    pub target: ToolPresentationTarget,
+    pub text: String,
+    #[serde(default = "default_presentation_level")]
+    pub level: ToolPresentationLevel,
+}
+
+/// Tool progress presentation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolProgressPresentation {
+    pub target: ToolPresentationTarget,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent: Option<u8>,
+    #[serde(default = "default_presentation_level")]
+    pub level: ToolPresentationLevel,
+}
+
+/// Tool card presentation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCardPresentation {
+    pub target: ToolPresentationTarget,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sections: Vec<ToolPresentationSection>,
+}
+
+/// Generic section in a tool presentation card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolPresentationSection {
+    Text {
+        label: Option<String>,
+        text: String,
+    },
+    Fields {
+        fields: Vec<ToolPresentationFieldValue>,
+    },
+    Diff {
+        path: Option<String>,
+        old_text: String,
+        new_text: String,
+    },
+    Terminal {
+        output: String,
+        columns: u16,
+        rows: u16,
+    },
+}
+
+/// Label/value field for a presentation section.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolPresentationFieldValue {
+    pub label: String,
+    pub value: String,
+}
+
+const fn default_presentation_level() -> ToolPresentationLevel {
+    ToolPresentationLevel::Info
 }
 
 /// Logical output stream for an incremental tool output chunk.

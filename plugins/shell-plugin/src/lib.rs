@@ -13,8 +13,9 @@ use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, ShellRunResult, TOOL_SERVICE_INTERFACE_ID,
     ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult,
     ToolInvocationStreamEvent, ToolList, ToolLiveArgumentPreviewMetadata, ToolOutputStream,
-    ToolPresentationField, ToolPresentationFieldKind, ToolRequestPresentationMetadata,
-    ToolSideEffect,
+    ToolPresentationEvent, ToolPresentationField, ToolPresentationFieldKind, ToolPresentationLevel,
+    ToolPresentationTarget, ToolRequestPresentationMetadata, ToolSideEffect,
+    ToolStatusPresentation,
 };
 use bcode_tool_runtime::{ProcessExecutionRequest, ToolExecutionRuntime};
 use serde::{Deserialize, Serialize};
@@ -234,6 +235,18 @@ fn run_shell_tool(
             columns: arguments.terminal.then_some(arguments.terminal_columns()),
             rows: arguments.terminal.then_some(arguments.terminal_rows()),
             started_at_ms: Some(now_ms),
+        },
+    );
+    emit_tool_stream_event(
+        events,
+        &ToolInvocationStreamEvent::Presentation {
+            tool_call_id: tool_call_id.to_owned(),
+            sequence: 0,
+            presentation: ToolPresentationEvent::Status(ToolStatusPresentation {
+                target: ToolPresentationTarget::Activity,
+                text: format!("running {}", arguments.command),
+                level: ToolPresentationLevel::Info,
+            }),
         },
     );
     emit_tool_status(

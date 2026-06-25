@@ -43,9 +43,11 @@ use bcode_session_models::{
     LiveShellCommandPreview, LiveToolArgumentPreview, ModelTurnOutcome, ProviderStreamEvent,
     ProviderToolCallProgress, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind,
     SessionId, SessionLiveEventKind, SessionTokenUsage, SessionTraceEvent, SessionTracePayload,
-    SessionTracePhase, ShellRunResult, ToolInvocationResult, ToolInvocationStreamEvent,
-    ToolOutputStream as SessionToolOutputStream, ToolPresentationField, ToolPresentationFieldKind,
-    ToolRequestPresentationMetadata, TraceBlobRef, TraceRedaction,
+    SessionTracePhase, ShellRunResult, ToolCardPresentation, ToolInvocationResult,
+    ToolInvocationStreamEvent, ToolOutputStream as SessionToolOutputStream, ToolPresentationEvent,
+    ToolPresentationField, ToolPresentationFieldKind, ToolPresentationFieldValue,
+    ToolPresentationLevel, ToolPresentationSection, ToolPresentationTarget,
+    ToolProgressPresentation, ToolRequestPresentationMetadata, TraceBlobRef, TraceRedaction,
 };
 use bcode_skill::{
     SkillPromptCatalogMode, SkillPromptCatalogOptions, SkillRegistry, SkillRegistryOptions,
@@ -59,7 +61,11 @@ use bcode_tool::{
     TOOL_SERVICE_INTERFACE_ID, ToolDefinition as ServiceToolDefinition, ToolInvocationRequest,
     ToolInvocationResponse, ToolInvocationResult as ServiceToolInvocationResult,
     ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent, ToolList, ToolOutputStream,
+    ToolPresentationEvent as ServiceToolPresentationEvent,
     ToolPresentationFieldKind as ServiceToolPresentationFieldKind,
+    ToolPresentationLevel as ServiceToolPresentationLevel,
+    ToolPresentationSection as ServiceToolPresentationSection,
+    ToolPresentationTarget as ServiceToolPresentationTarget,
     ToolRequestPresentationMetadata as ServiceToolRequestPresentationMetadata, ToolResultContent,
 };
 use runtime_work::{CancellationHandle, RuntimeWorkManager, RuntimeWorkSpec};
@@ -12450,7 +12456,8 @@ fn runtime_work_progress_from_tool_stream_event(
             }
             .to_string(),
         )),
-        ToolInvocationStreamEvent::OutputDelta { .. } => None,
+        ToolInvocationStreamEvent::OutputDelta { .. }
+        | ToolInvocationStreamEvent::Presentation { .. } => None,
     }
 }
 
@@ -12463,6 +12470,7 @@ fn normalize_tool_stream_event_sequence(
         ToolInvocationStreamEvent::Started { tool_call_id, .. }
         | ToolInvocationStreamEvent::OutputDelta { tool_call_id, .. }
         | ToolInvocationStreamEvent::Status { tool_call_id, .. }
+        | ToolInvocationStreamEvent::Presentation { tool_call_id, .. }
         | ToolInvocationStreamEvent::Finished { tool_call_id, .. } => tool_call_id.clone(),
     };
     let next = stream_sequences
@@ -12516,6 +12524,15 @@ fn set_tool_stream_event_sequence(
             tool_call_id,
             sequence,
             message,
+        },
+        ToolInvocationStreamEvent::Presentation {
+            tool_call_id,
+            presentation,
+            ..
+        } => ToolInvocationStreamEvent::Presentation {
+            tool_call_id,
+            sequence,
+            presentation,
         },
         ToolInvocationStreamEvent::Finished {
             tool_call_id,
@@ -12572,6 +12589,15 @@ fn convert_tool_stream_event(event: ServiceToolInvocationStreamEvent) -> ToolInv
             sequence,
             message,
         },
+        ServiceToolInvocationStreamEvent::Presentation {
+            tool_call_id,
+            sequence,
+            presentation,
+        } => ToolInvocationStreamEvent::Presentation {
+            tool_call_id,
+            sequence,
+            presentation: convert_tool_presentation_event(presentation),
+        },
         ServiceToolInvocationStreamEvent::Finished {
             tool_call_id,
             sequence,
@@ -12582,6 +12608,99 @@ fn convert_tool_stream_event(event: ServiceToolInvocationStreamEvent) -> ToolInv
             sequence,
             is_error,
             finished_at_ms: finished_at_ms.or_else(|| Some(current_unix_millis())),
+        },
+    }
+}
+
+fn convert_tool_presentation_event(event: ServiceToolPresentationEvent) -> ToolPresentationEvent {
+    match event {
+        ServiceToolPresentationEvent::Status(status) => {
+            ToolPresentationEvent::Status(bcode_session_models::ToolStatusPresentation {
+                target: convert_tool_presentation_target(status.target),
+                text: status.text,
+                level: convert_tool_presentation_level(status.level),
+            })
+        }
+        ServiceToolPresentationEvent::Card(card) => {
+            ToolPresentationEvent::Card(ToolCardPresentation {
+                target: convert_tool_presentation_target(card.target),
+                title: card.title,
+                subtitle: card.subtitle,
+                sections: card
+                    .sections
+                    .into_iter()
+                    .map(convert_tool_presentation_section)
+                    .collect(),
+            })
+        }
+        ServiceToolPresentationEvent::Progress(progress) => {
+            ToolPresentationEvent::Progress(ToolProgressPresentation {
+                target: convert_tool_presentation_target(progress.target),
+                text: progress.text,
+                percent: progress.percent,
+                level: convert_tool_presentation_level(progress.level),
+            })
+        }
+        ServiceToolPresentationEvent::Clear { target } => ToolPresentationEvent::Clear {
+            target: convert_tool_presentation_target(target),
+        },
+    }
+}
+
+const fn convert_tool_presentation_target(
+    target: ServiceToolPresentationTarget,
+) -> ToolPresentationTarget {
+    match target {
+        ServiceToolPresentationTarget::Activity => ToolPresentationTarget::Activity,
+        ServiceToolPresentationTarget::Preview => ToolPresentationTarget::Preview,
+        ServiceToolPresentationTarget::Result => ToolPresentationTarget::Result,
+    }
+}
+
+const fn convert_tool_presentation_level(
+    level: ServiceToolPresentationLevel,
+) -> ToolPresentationLevel {
+    match level {
+        ServiceToolPresentationLevel::Info => ToolPresentationLevel::Info,
+        ServiceToolPresentationLevel::Success => ToolPresentationLevel::Success,
+        ServiceToolPresentationLevel::Warning => ToolPresentationLevel::Warning,
+        ServiceToolPresentationLevel::Error => ToolPresentationLevel::Error,
+    }
+}
+
+fn convert_tool_presentation_section(
+    section: ServiceToolPresentationSection,
+) -> ToolPresentationSection {
+    match section {
+        ServiceToolPresentationSection::Text { label, text } => {
+            ToolPresentationSection::Text { label, text }
+        }
+        ServiceToolPresentationSection::Fields { fields } => ToolPresentationSection::Fields {
+            fields: fields
+                .into_iter()
+                .map(|field| ToolPresentationFieldValue {
+                    label: field.label,
+                    value: field.value,
+                })
+                .collect(),
+        },
+        ServiceToolPresentationSection::Diff {
+            path,
+            old_text,
+            new_text,
+        } => ToolPresentationSection::Diff {
+            path,
+            old_text,
+            new_text,
+        },
+        ServiceToolPresentationSection::Terminal {
+            output,
+            columns,
+            rows,
+        } => ToolPresentationSection::Terminal {
+            output,
+            columns,
+            rows,
         },
     }
 }
