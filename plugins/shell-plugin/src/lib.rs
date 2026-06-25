@@ -125,6 +125,8 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
             requires_permission: true,
             policy: bcode_tool::ToolPolicyMetadata {
                 aliases: Vec::new(),
+                compatibility_aliases: vec![bcode_tool::ToolCompatibilityAlias::new("claude", "Bash")],
+                capabilities: vec!["shell.run".to_string(), "process.execute".to_string()],
                 permission_category: Some("command".to_string()),
                 argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
                     kind: bcode_tool::ToolArgumentKind::Command,

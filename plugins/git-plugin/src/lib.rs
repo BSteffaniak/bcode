@@ -429,7 +429,9 @@ fn clone_tool_definition() -> ToolDefinition {
         requires_permission: true,
         policy: bcode_tool::ToolPolicyMetadata {
             aliases: Vec::new(),
-            permission_category: Some("write".to_string()),
+            compatibility_aliases: Vec::new(),
+                capabilities: Vec::new(),
+                permission_category: Some("write".to_string()),
             argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
                 kind: bcode_tool::ToolArgumentKind::WritePath,
                 argument: "destination".to_string(),

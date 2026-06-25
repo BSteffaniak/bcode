@@ -779,6 +779,8 @@ mod tests {
     fn command_policy() -> bcode_tool::ToolPolicyMetadata {
         bcode_tool::ToolPolicyMetadata {
             aliases: Vec::new(),
+            compatibility_aliases: Vec::new(),
+            capabilities: Vec::new(),
             permission_category: Some("command".to_string()),
             argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
                 kind: ToolArgumentKind::Command,
@@ -790,6 +792,8 @@ mod tests {
     fn path_policy(category: &str, kind: ToolArgumentKind) -> bcode_tool::ToolPolicyMetadata {
         bcode_tool::ToolPolicyMetadata {
             aliases: vec![category.to_string()],
+            compatibility_aliases: Vec::new(),
+            capabilities: Vec::new(),
             permission_category: Some(category.to_string()),
             argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
                 kind,
@@ -1205,6 +1209,8 @@ mod tests {
             side_effect: ToolSideEffect::ExecuteProcess,
             policy: bcode_tool::ToolPolicyMetadata {
                 aliases: Vec::new(),
+                compatibility_aliases: Vec::new(),
+                capabilities: Vec::new(),
                 permission_category: Some("command".to_string()),
                 argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
                     kind: ToolArgumentKind::Command,
@@ -1238,6 +1244,8 @@ mod tests {
             side_effect: ToolSideEffect::ReadOnly,
             policy: bcode_tool::ToolPolicyMetadata {
                 aliases: vec!["web".to_string()],
+                compatibility_aliases: Vec::new(),
+                capabilities: Vec::new(),
                 permission_category: Some("web".to_string()),
                 argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
                     kind: ToolArgumentKind::Url,
@@ -1274,6 +1282,8 @@ mod tests {
             side_effect: ToolSideEffect::WriteFiles,
             policy: bcode_tool::ToolPolicyMetadata {
                 aliases: vec!["write".to_string()],
+                compatibility_aliases: Vec::new(),
+                capabilities: Vec::new(),
                 permission_category: Some("write".to_string()),
                 argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
                     kind: ToolArgumentKind::WritePath,
@@ -1307,6 +1317,8 @@ mod tests {
             side_effect: ToolSideEffect::WriteFiles,
             policy: bcode_tool::ToolPolicyMetadata {
                 aliases: vec!["edit".to_string()],
+                compatibility_aliases: Vec::new(),
+                capabilities: Vec::new(),
                 permission_category: Some("edit".to_string()),
                 argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
                     kind: ToolArgumentKind::WritePath,
@@ -1340,6 +1352,8 @@ mod tests {
             side_effect: ToolSideEffect::WriteFiles,
             policy: bcode_tool::ToolPolicyMetadata {
                 aliases: vec!["write".to_string()],
+                compatibility_aliases: Vec::new(),
+                capabilities: Vec::new(),
                 permission_category: Some("write".to_string()),
                 argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
                     kind: ToolArgumentKind::WritePath,
@@ -1369,6 +1383,8 @@ mod tests {
             side_effect: ToolSideEffect::WriteFiles,
             policy: bcode_tool::ToolPolicyMetadata {
                 aliases: Vec::new(),
+                compatibility_aliases: Vec::new(),
+                capabilities: Vec::new(),
                 permission_category: Some("custom-category".to_string()),
                 argument_extractors: Vec::new(),
             },

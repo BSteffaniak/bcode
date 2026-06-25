@@ -11,8 +11,9 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-serde     = { workspace = true, features = ["derive", "std"] }
-thiserror = { workspace = true }
+bcode_tool = { workspace = true }
+serde      = { workspace = true, features = ["derive", "std"] }
+thiserror  = { workspace = true }
 
 [features]
 default          = []

@@ -6,6 +6,7 @@
 //!
 //! This crate intentionally contains only leaf data types for the skill domain.
 
+use bcode_tool::UnresolvedToolReference;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
@@ -107,6 +108,8 @@ pub struct SkillPermissionHints {
     pub tools: Vec<String>,
     #[serde(default)]
     pub categories: Vec<String>,
+    #[serde(default)]
+    pub unresolved_tools: Vec<UnresolvedToolReference>,
 }
 
 /// Compact skill metadata used for listing and matching.

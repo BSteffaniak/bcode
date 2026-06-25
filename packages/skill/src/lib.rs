@@ -523,23 +523,25 @@ fn parse_skill_markdown(
         .map_err(|error| SkillError::InvalidMetadata(error.to_string()))?;
     let id = raw
         .id
+        .clone()
         .or_else(|| fallback_id.map(ToString::to_string))
         .ok_or_else(|| SkillError::InvalidMetadata("missing skill id".to_string()))?;
     let name = raw.name.clone().unwrap_or_else(|| id.clone());
     let summary = SkillSummary {
         id: SkillId::from_str(&id)?,
         name,
-        description: raw.description,
-        version: raw.version,
+        description: raw.description.clone(),
+        version: raw.version.clone(),
         source: source.clone(),
-        activation: raw.activation.unwrap_or_default(),
+        activation: raw.activation.clone().unwrap_or_default(),
         diagnostics: Vec::new(),
         disable_model_invocation: raw.disable_model_invocation
             || raw.disable_model_invocation_compat,
     };
+    let permissions = normalize_permission_hints(&raw, source);
     Ok(SkillManifest {
         summary,
-        permissions: raw.permissions.unwrap_or_default(),
+        permissions,
         instructions: instructions.trim().to_string(),
         metadata: BTreeMap::new(),
     })
@@ -667,10 +669,61 @@ struct RawSkillFrontmatter {
     version: Option<String>,
     activation: Option<SkillActivation>,
     permissions: Option<SkillPermissionHints>,
+    #[serde(default, rename = "allowed-tools")]
+    allowed_tools_kebab: Vec<String>,
+    #[serde(default, rename = "allowed_tools")]
+    allowed_tools_snake: Vec<String>,
+    #[serde(default)]
+    tools: Vec<String>,
     #[serde(default)]
     disable_model_invocation: bool,
     #[serde(default, rename = "disable-model-invocation")]
     disable_model_invocation_compat: bool,
+}
+
+fn normalize_permission_hints(
+    raw: &RawSkillFrontmatter,
+    source: &SkillSource,
+) -> SkillPermissionHints {
+    let mut hints = raw.permissions.clone().unwrap_or_default();
+    hints.tools.extend(raw.allowed_tools_kebab.clone());
+    hints.tools.extend(raw.allowed_tools_snake.clone());
+    hints.tools.extend(raw.tools.clone());
+    if let Some(ecosystem) = source_default_ecosystem(source) {
+        hints.unresolved_tools = hints
+            .tools
+            .iter()
+            .map(|tool| {
+                if let Some((prefix, value)) = tool.split_once(':') {
+                    match prefix {
+                        "category" | "capability" => {
+                            bcode_tool::UnresolvedToolReference::raw(tool.clone())
+                        }
+                        _ => {
+                            bcode_tool::UnresolvedToolReference::compatibility_alias(prefix, value)
+                        }
+                    }
+                } else if tool.contains('.') {
+                    bcode_tool::UnresolvedToolReference::raw(tool.clone())
+                } else {
+                    bcode_tool::UnresolvedToolReference::compatibility_alias(
+                        ecosystem,
+                        tool.clone(),
+                    )
+                }
+            })
+            .collect();
+    }
+    hints
+}
+
+fn source_default_ecosystem(source: &SkillSource) -> Option<&'static str> {
+    let path = source.path.as_deref()?;
+    if path.contains(".claude") {
+        Some("claude")
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

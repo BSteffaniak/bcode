@@ -174,6 +174,8 @@ fn list_definition() -> ToolDefinition {
         requires_permission: false,
         policy: bcode_tool::ToolPolicyMetadata {
             aliases: vec!["worktree.read".to_string()],
+            compatibility_aliases: Vec::new(),
+            capabilities: Vec::new(),
             permission_category: Some("worktree.read".to_string()),
             argument_extractors: Vec::new(),
         },
@@ -213,6 +215,8 @@ fn create_definition() -> ToolDefinition {
         requires_permission: true,
         policy: bcode_tool::ToolPolicyMetadata {
             aliases: vec!["worktree.create".to_string()],
+            compatibility_aliases: Vec::new(),
+            capabilities: Vec::new(),
             permission_category: Some("worktree.create".to_string()),
             argument_extractors: Vec::new(),
         },
@@ -251,6 +255,8 @@ fn remove_definition() -> ToolDefinition {
         requires_permission: true,
         policy: bcode_tool::ToolPolicyMetadata {
             aliases: vec!["worktree.remove".to_string()],
+            compatibility_aliases: Vec::new(),
+            capabilities: Vec::new(),
             permission_category: Some("worktree.remove".to_string()),
             argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
                 kind: bcode_tool::ToolArgumentKind::WritePath,

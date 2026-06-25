@@ -348,6 +348,8 @@ mod tests {
             side_effect: ToolSideEffect::ExecuteProcess,
             policy: bcode_tool::ToolPolicyMetadata {
                 aliases: Vec::new(),
+                compatibility_aliases: Vec::new(),
+                capabilities: Vec::new(),
                 permission_category: Some("command".to_string()),
                 argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
                     kind: bcode_tool::ToolArgumentKind::Command,

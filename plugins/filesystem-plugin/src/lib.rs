@@ -349,12 +349,33 @@ fn path_policy(
 ) -> bcode_tool::ToolPolicyMetadata {
     bcode_tool::ToolPolicyMetadata {
         aliases: aliases.iter().map(ToString::to_string).collect(),
+        compatibility_aliases: compatibility_aliases_for(aliases),
+        capabilities: aliases
+            .iter()
+            .map(|alias| format!("filesystem.{alias}"))
+            .collect(),
         permission_category: Some(category.to_string()),
         argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
             kind,
             argument: "path".to_string(),
         }],
     }
+}
+
+fn compatibility_aliases_for(aliases: &[&str]) -> Vec<bcode_tool::ToolCompatibilityAlias> {
+    aliases
+        .iter()
+        .filter_map(|alias| match *alias {
+            "read" => Some("Read"),
+            "write" => Some("Write"),
+            "edit" => Some("Edit"),
+            "grep" => Some("Grep"),
+            "find" => Some("Glob"),
+            "ls" => Some("LS"),
+            _ => None,
+        })
+        .map(|name| bcode_tool::ToolCompatibilityAlias::new("claude", name))
+        .collect()
 }
 
 fn path_tool_ui(activity_label: &str, title: &str) -> bcode_tool::ToolUiMetadata {

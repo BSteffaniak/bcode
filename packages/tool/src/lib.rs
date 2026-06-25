@@ -5,6 +5,7 @@
 //! Model-callable tool contract types for Bcode.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Plugin service interface for model-callable tools.
@@ -48,12 +49,239 @@ pub struct ToolPolicyMetadata {
     /// Backward-compatible or user-facing aliases that may enable this tool.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub aliases: Vec<String>,
+    /// Source-ecosystem aliases this tool provider declares it can satisfy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compatibility_aliases: Vec<ToolCompatibilityAlias>,
+    /// Declarative capabilities this tool provides for policy matching.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
     /// Permission category used by policy providers for grouped rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_category: Option<String>,
     /// Argument paths that policy providers may inspect without knowing tool-specific schemas.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub argument_extractors: Vec<ToolArgumentExtractor>,
+}
+
+/// Compatibility alias declared by the tool provider that owns the real tool.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ToolCompatibilityAlias {
+    /// Source ecosystem that defined the alias, such as `claude` or `opencode`.
+    pub ecosystem: String,
+    /// Tool name used by that ecosystem.
+    pub name: String,
+}
+
+impl ToolCompatibilityAlias {
+    /// Create a compatibility alias.
+    #[must_use]
+    pub fn new(ecosystem: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            ecosystem: ecosystem.into(),
+            name: name.into(),
+        }
+    }
+}
+
+/// Unresolved tool reference from a policy source such as skill frontmatter.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UnresolvedToolReference {
+    /// Raw tool reference without source-ecosystem context.
+    Raw { value: String },
+    /// Compatibility alias scoped to a source ecosystem.
+    CompatibilityAlias { ecosystem: String, name: String },
+}
+
+impl UnresolvedToolReference {
+    /// Create a raw unresolved reference.
+    #[must_use]
+    pub fn raw(value: impl Into<String>) -> Self {
+        Self::Raw {
+            value: value.into(),
+        }
+    }
+
+    /// Create an ecosystem-scoped compatibility alias.
+    #[must_use]
+    pub fn compatibility_alias(ecosystem: impl Into<String>, name: impl Into<String>) -> Self {
+        Self::CompatibilityAlias {
+            ecosystem: ecosystem.into(),
+            name: name.into(),
+        }
+    }
+}
+
+/// Strict selector produced by resolving an unresolved tool reference.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ResolvedToolSelector {
+    /// Exact model-callable tool name.
+    ToolName { name: String },
+    /// Policy alias declared by exactly one tool provider.
+    Alias { alias: String },
+    /// Compatibility alias declared by exactly one tool provider.
+    CompatibilityAlias { ecosystem: String, name: String },
+    /// Permission category.
+    PermissionCategory { category: String },
+    /// Declarative tool capability.
+    Capability { capability: String },
+}
+
+/// Candidate returned for ambiguous tool reference resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResolutionCandidate {
+    /// Candidate model-callable tool name.
+    pub tool_name: String,
+    /// Human-readable reason this candidate matched.
+    pub matched_by: String,
+}
+
+/// Resolution result for a tool reference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ToolReferenceResolution {
+    /// The reference resolved to a strict selector.
+    Resolved { selector: ResolvedToolSelector },
+    /// The reference matched multiple possible tools.
+    Ambiguous {
+        reference: UnresolvedToolReference,
+        candidates: Vec<ToolResolutionCandidate>,
+    },
+    /// The reference did not match any known tool metadata.
+    Unknown { reference: UnresolvedToolReference },
+}
+
+/// Resolve an unresolved tool reference against available tool definitions.
+#[must_use]
+pub fn resolve_tool_reference(
+    reference: &UnresolvedToolReference,
+    tools: &[ToolDefinition],
+) -> ToolReferenceResolution {
+    if let Some(selector) = explicit_selector(reference) {
+        return ToolReferenceResolution::Resolved { selector };
+    }
+
+    let candidates = candidates_for_reference(reference, tools);
+    match candidates.as_slice() {
+        [] => ToolReferenceResolution::Unknown {
+            reference: reference.clone(),
+        },
+        [candidate] => ToolReferenceResolution::Resolved {
+            selector: selector_for_candidate(reference, candidate),
+        },
+        _ => ToolReferenceResolution::Ambiguous {
+            reference: reference.clone(),
+            candidates,
+        },
+    }
+}
+
+fn explicit_selector(reference: &UnresolvedToolReference) -> Option<ResolvedToolSelector> {
+    let value = match reference {
+        UnresolvedToolReference::Raw { value } => value,
+        UnresolvedToolReference::CompatibilityAlias { .. } => return None,
+    };
+    value
+        .strip_prefix("category:")
+        .map(|category| ResolvedToolSelector::PermissionCategory {
+            category: category.to_string(),
+        })
+        .or_else(|| {
+            value
+                .strip_prefix("capability:")
+                .map(|capability| ResolvedToolSelector::Capability {
+                    capability: capability.to_string(),
+                })
+        })
+}
+
+fn candidates_for_reference(
+    reference: &UnresolvedToolReference,
+    tools: &[ToolDefinition],
+) -> Vec<ToolResolutionCandidate> {
+    let mut candidates = BTreeMap::<String, ToolResolutionCandidate>::new();
+    match reference {
+        UnresolvedToolReference::Raw { value } => {
+            for tool in tools {
+                if tool.name == *value {
+                    candidates.insert(
+                        tool.name.clone(),
+                        ToolResolutionCandidate {
+                            tool_name: tool.name.clone(),
+                            matched_by: "tool_name".to_string(),
+                        },
+                    );
+                }
+                if tool.policy.aliases.iter().any(|alias| alias == value) {
+                    candidates.insert(
+                        tool.name.clone(),
+                        ToolResolutionCandidate {
+                            tool_name: tool.name.clone(),
+                            matched_by: format!("alias:{value}"),
+                        },
+                    );
+                }
+                if tool
+                    .policy
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == value)
+                {
+                    candidates.insert(
+                        tool.name.clone(),
+                        ToolResolutionCandidate {
+                            tool_name: tool.name.clone(),
+                            matched_by: format!("capability:{value}"),
+                        },
+                    );
+                }
+            }
+        }
+        UnresolvedToolReference::CompatibilityAlias { ecosystem, name } => {
+            for tool in tools {
+                if tool.policy.compatibility_aliases.iter().any(|alias| {
+                    alias.ecosystem.eq_ignore_ascii_case(ecosystem) && alias.name == *name
+                }) {
+                    candidates.insert(
+                        tool.name.clone(),
+                        ToolResolutionCandidate {
+                            tool_name: tool.name.clone(),
+                            matched_by: format!("compatibility_alias:{ecosystem}:{name}"),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    candidates.into_values().collect()
+}
+
+fn selector_for_candidate(
+    reference: &UnresolvedToolReference,
+    candidate: &ToolResolutionCandidate,
+) -> ResolvedToolSelector {
+    match reference {
+        UnresolvedToolReference::Raw { value } if candidate.matched_by == "tool_name" => {
+            ResolvedToolSelector::ToolName {
+                name: value.clone(),
+            }
+        }
+        UnresolvedToolReference::Raw { value } if candidate.matched_by.starts_with("alias:") => {
+            ResolvedToolSelector::Alias {
+                alias: value.clone(),
+            }
+        }
+        UnresolvedToolReference::Raw { value } => ResolvedToolSelector::Capability {
+            capability: value.clone(),
+        },
+        UnresolvedToolReference::CompatibilityAlias { ecosystem, name } => {
+            ResolvedToolSelector::CompatibilityAlias {
+                ecosystem: ecosystem.clone(),
+                name: name.clone(),
+            }
+        }
+    }
 }
 
 /// Plugin-owned argument extraction metadata for policy providers.

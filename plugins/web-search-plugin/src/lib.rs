@@ -1686,6 +1686,8 @@ fn fetch_tool_definition() -> ToolDefinition {
         requires_permission: true,
         policy: bcode_tool::ToolPolicyMetadata {
             aliases: vec!["web".to_string()],
+            compatibility_aliases: Vec::new(),
+            capabilities: Vec::new(),
             permission_category: Some("web".to_string()),
             argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
                 kind: bcode_tool::ToolArgumentKind::Url,
