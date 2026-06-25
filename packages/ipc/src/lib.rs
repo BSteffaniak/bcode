@@ -3332,6 +3332,24 @@ pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
     encode_positional(value)
 }
 
+/// Encode a request with the Bcode wire codec.
+///
+/// # Errors
+///
+/// Returns an error when serialization fails.
+pub fn encode_request(request: &Request) -> Result<Vec<u8>, CodecError> {
+    encode_typed_stable(request)
+}
+
+/// Decode a request with the Bcode wire codec.
+///
+/// # Errors
+///
+/// Returns an error when deserialization fails.
+pub fn decode_request(bytes: &[u8]) -> Result<Request, CodecError> {
+    decode_typed_stable(bytes)
+}
+
 /// Encode a server event with the Bcode wire codec.
 ///
 /// # Errors
@@ -3626,7 +3644,7 @@ pub fn request_envelope(request_id: u64, request: &Request) -> Result<Envelope, 
     Ok(Envelope::new(
         request_id,
         EnvelopeKind::Request,
-        encode_typed_stable(request)?,
+        encode_request(request)?,
     ))
 }
 
@@ -3962,6 +3980,30 @@ mod tests {
 
         assert_eq!(envelope.version, ProtocolVersion::current());
         assert_eq!(ProtocolVersion::current().0, CURRENT_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn request_envelope_payload_decodes_with_request_codec() {
+        let request = Request::Ping;
+        let envelope = request_envelope(7, &request).expect("request envelope should encode");
+
+        assert_eq!(envelope.kind, EnvelopeKind::Request);
+        assert_eq!(
+            decode_request(&envelope.payload).expect("request should decode"),
+            request
+        );
+    }
+
+    #[test]
+    fn response_envelope_payload_decodes_with_response_codec() {
+        let response = Response::Ok(ResponsePayload::Pong);
+        let envelope = response_envelope(7, &response).expect("response envelope should encode");
+
+        assert_eq!(envelope.kind, EnvelopeKind::Response);
+        assert_eq!(
+            decode_response(&envelope.payload).expect("response should decode"),
+            response
+        );
     }
 
     #[tokio::test]

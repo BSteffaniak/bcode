@@ -25,7 +25,7 @@ use bcode_ipc::{
     RalphStatusRequest, RalphStatusResponse, RalphStatusSummary, RalphValidationSummary, Request,
     Response, ResponsePayload, ServerStatus, ServerStopMode, SessionCatalogSourceStatus,
     SessionCatalogStatus, WorktreeCreateRequest, WorktreeListRequest, WorktreeRemoveRequest,
-    decode, event_envelope, recv_envelope, response_envelope, send_envelope,
+    decode_request, event_envelope, recv_envelope, response_envelope, send_envelope,
 };
 use bcode_metrics::{MetricLabels, MetricsRegistry};
 use bcode_model::{
@@ -1753,7 +1753,7 @@ async fn handle_registered_client(
             continue;
         }
 
-        let request = decode(&envelope.payload)?;
+        let request = decode_request(&envelope.payload)?;
         handle_request(
             request,
             envelope.request_id,

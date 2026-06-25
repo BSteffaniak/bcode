@@ -620,7 +620,7 @@ async fn ping_once(endpoint: &IpcEndpoint) -> Result<(), bcode_ipc::CodecError> 
         if envelope.kind != bcode_ipc::EnvelopeKind::Response || envelope.request_id != 1 {
             continue;
         }
-        let response: bcode_ipc::Response = bcode_ipc::decode(&envelope.payload)?;
+        let response = bcode_ipc::decode_response(&envelope.payload)?;
         return match response {
             bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Pong) => Ok(()),
             _ => Err(bcode_ipc::CodecError::Io(std::io::Error::other(
