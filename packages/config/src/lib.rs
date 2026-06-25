@@ -271,40 +271,23 @@ impl ConfigDocSchema for BcodeConfig {
 
     fn field_docs() -> Vec<FieldDoc> {
         vec![
-            section_doc_with_defaults(
+            schema_section_doc::<CompositionConfig>(
                 "composition",
                 "Config composition metadata and profile selection.",
-                composition_field_docs(),
-                typed_defaults::<CompositionConfig>(&["active_profile", "layer_order"]),
             ),
-            section_doc_with_defaults(
-                "plugins",
-                "Bundled and external plugin selection.",
-                plugin_field_docs(),
-                typed_defaults::<PluginConfig>(&["enabled", "disabled"]),
-            ),
-            section_doc_with_defaults(
+            schema_section_doc::<PluginConfig>("plugins", "Bundled and external plugin selection."),
+            schema_section_doc::<ModelConfig>(
                 "model",
                 "Model provider, profile, alias, metadata, retry, and compaction settings.",
-                model_field_docs(),
-                typed_defaults::<ModelConfig>(&[
-                    "provider_plugin_id",
-                    "model_id",
-                    "default_thinking_level",
-                    "max_tool_rounds",
-                    "profile",
-                ]),
             ),
-            section_doc(
+            dynamic_map_section_doc::<bcode_agent_policy_models::AgentConfig>(
                 "agent",
                 "Per-agent permission and tool policy configuration.",
-                agent_field_docs(),
+                "<agent-id>",
             ),
-            section_doc_with_defaults(
+            schema_section_doc::<AuthConfig>(
                 "auth",
                 "Provider authentication profiles, pools, and runtime subscription behavior.",
-                auth_field_docs(),
-                typed_defaults::<AuthConfig>(&["openai", "profiles", "pools"]),
             ),
             schema_section_doc::<ObservabilityConfig>(
                 "observability",
@@ -318,18 +301,7 @@ impl ConfigDocSchema for BcodeConfig {
                 "system_prompt",
                 "System prompt mode and section controls.",
             ),
-            section_doc_with_defaults(
-                "tui",
-                "Terminal UI behavior and appearance.",
-                tui_field_docs(),
-                typed_defaults::<TuiConfig>(&[
-                    "keybindings",
-                    "mouse",
-                    "thinking",
-                    "theme",
-                    "inline_diff",
-                ]),
-            ),
+            schema_section_doc::<TuiConfig>("tui", "Terminal UI behavior and appearance."),
             schema_section_doc::<SessionImportConfig>(
                 "session_import",
                 "External session import plugin settings.",
@@ -389,6 +361,28 @@ fn schema_section_doc<T: ConfigDocSchema>(
     section_doc_with_defaults(toml_key, description, T::field_docs(), T::default_values())
 }
 
+fn dynamic_map_section_doc<T: ConfigDocSchema>(
+    toml_key: &'static str,
+    description: &'static str,
+    key_placeholder: &'static str,
+) -> FieldDoc {
+    section_doc(
+        toml_key,
+        description,
+        vec![FieldDoc {
+            toml_key: "",
+            type_display: "map",
+            description,
+            enum_values: None,
+            nested: Some(NestedFieldDoc::Map {
+                key_placeholder,
+                value_fields: T::field_docs(),
+                value_defaults: T::default_values(),
+            }),
+        }],
+    )
+}
+
 const fn config_field(
     toml_key: &'static str,
     type_display: &'static str,
@@ -401,798 +395,6 @@ const fn config_field(
         enum_values: None,
         nested: None,
     }
-}
-
-const fn enum_field(
-    toml_key: &'static str,
-    type_display: &'static str,
-    description: &'static str,
-    values: &'static [&'static str],
-) -> FieldDoc {
-    FieldDoc {
-        toml_key,
-        type_display,
-        description,
-        enum_values: Some(values),
-        nested: None,
-    }
-}
-
-const fn nested_field(
-    toml_key: &'static str,
-    description: &'static str,
-    fields: Vec<FieldDoc>,
-) -> FieldDoc {
-    nested_field_with_defaults(toml_key, description, fields, BTreeMap::new())
-}
-
-const fn nested_field_with_defaults(
-    toml_key: &'static str,
-    description: &'static str,
-    fields: Vec<FieldDoc>,
-    defaults: BTreeMap<String, String>,
-) -> FieldDoc {
-    FieldDoc {
-        toml_key,
-        type_display: "table",
-        description,
-        enum_values: None,
-        nested: Some(NestedFieldDoc::Inline { fields, defaults }),
-    }
-}
-
-const fn map_field(
-    toml_key: &'static str,
-    description: &'static str,
-    key_placeholder: &'static str,
-    value_fields: Vec<FieldDoc>,
-) -> FieldDoc {
-    map_field_with_defaults(
-        toml_key,
-        description,
-        key_placeholder,
-        value_fields,
-        BTreeMap::new(),
-    )
-}
-
-const fn map_field_with_defaults(
-    toml_key: &'static str,
-    description: &'static str,
-    key_placeholder: &'static str,
-    value_fields: Vec<FieldDoc>,
-    value_defaults: BTreeMap<String, String>,
-) -> FieldDoc {
-    FieldDoc {
-        toml_key,
-        type_display: "map",
-        description,
-        enum_values: None,
-        nested: Some(NestedFieldDoc::Map {
-            key_placeholder,
-            value_fields,
-            value_defaults,
-        }),
-    }
-}
-
-fn typed_defaults<T>(keys: &[&str]) -> BTreeMap<String, String>
-where
-    T: Default + Serialize,
-{
-    let toml::Value::Table(table) = toml::Value::try_from(T::default())
-        .unwrap_or_else(|_| toml::Value::Table(toml::Table::new()))
-    else {
-        return BTreeMap::new();
-    };
-
-    keys.iter()
-        .filter_map(|key| {
-            table
-                .get(*key)
-                .map(|value| ((*key).to_string(), format_default_value(value)))
-        })
-        .collect()
-}
-
-fn format_default_value(value: &toml::Value) -> String {
-    if let toml::Value::Table(table) = value
-        && table.is_empty()
-    {
-        return "{}".to_string();
-    }
-
-    if value.is_table() {
-        toml::to_string_pretty(value)
-            .unwrap_or_default()
-            .trim()
-            .to_string()
-    } else {
-        value.to_string().trim_matches('"').to_string()
-    }
-}
-
-fn composition_field_docs() -> Vec<FieldDoc> {
-    vec![
-        config_field(
-            "active_profile",
-            "string",
-            "Active composition profile id used when `profile:active` appears in the layer order.",
-        ),
-        config_field(
-            "layer_order",
-            "array<string>",
-            "Explicit config layer precedence order. Supported entries include `defaults`, `config`, `profile:active`, and `profile:<id>`.",
-        ),
-        map_field(
-            "profiles",
-            "Named composition profiles that can override the base config.",
-            "<profile>",
-            vec![
-                config_field(
-                    "description",
-                    "string",
-                    "Human-readable profile description.",
-                ),
-                config_field("config", "table", "Profile-local config overlay."),
-            ],
-        ),
-    ]
-}
-
-fn plugin_field_docs() -> Vec<FieldDoc> {
-    vec![
-        config_field(
-            "enabled",
-            "array<string>",
-            "Plugin ids explicitly enabled in addition to bundled defaults.",
-        ),
-        config_field(
-            "disabled",
-            "array<string>",
-            "Plugin ids disabled even if bundled or discovered.",
-        ),
-        map_field(
-            "config",
-            "Provider/plugin-specific plugin configuration tables keyed by plugin id.",
-            "<plugin-id>",
-            vec![config_field(
-                "<setting>",
-                "any",
-                "Plugin-specific setting owned by the target plugin.",
-            )],
-        ),
-    ]
-}
-
-#[allow(clippy::too_many_lines)]
-fn model_field_docs() -> Vec<FieldDoc> {
-    vec![
-        config_field(
-            "provider_plugin_id",
-            "string",
-            "Default model provider plugin id.",
-        ),
-        config_field("model_id", "string", "Default provider-specific model id."),
-        config_field(
-            "default_thinking_level",
-            "string",
-            "Default provider reasoning effort/thinking level.",
-        ),
-        config_field(
-            "max_tool_rounds",
-            "integer",
-            "Maximum tool-call rounds allowed in one model turn.",
-        ),
-        config_field(
-            "profile",
-            "string",
-            "Active model profile name selected from `model.profiles`.",
-        ),
-        map_field(
-            "profiles",
-            "Named model profiles for provider/model/auth/request overrides.",
-            "<profile>",
-            model_profile_field_docs(),
-        ),
-        map_field(
-            "aliases",
-            "Named model aliases resolved before provider selection.",
-            "<alias>",
-            vec![
-                config_field(
-                    "provider_plugin_id",
-                    "string",
-                    "Provider plugin id selected by the alias.",
-                ),
-                config_field(
-                    "model_id",
-                    "string",
-                    "Provider-specific model id selected by the alias.",
-                ),
-                config_field(
-                    "profile",
-                    "string",
-                    "Optional model profile selected by the alias.",
-                ),
-            ],
-        ),
-        map_field(
-            "metadata",
-            "Provider/model metadata keyed by provider and model id.",
-            "<provider-or-model>",
-            vec![
-                config_field("label", "string", "Human-readable display label."),
-                config_field(
-                    "context_window",
-                    "integer",
-                    "Approximate context window token count.",
-                ),
-                config_field(
-                    "max_output_tokens",
-                    "integer",
-                    "Maximum output token count.",
-                ),
-            ],
-        ),
-        nested_field_with_defaults(
-            "reasoning",
-            "Default reasoning request controls.",
-            reasoning_field_docs(),
-            typed_defaults::<ReasoningConfig>(&[
-                "effort",
-                "summary",
-                "effort_values",
-                "summary_values",
-                "default_effort",
-                "default_summary",
-                "visible_summary_supported",
-                "raw_reasoning_supported",
-            ]),
-        ),
-        nested_field_with_defaults(
-            "context_strategy",
-            "Model context management strategy.",
-            context_strategy_field_docs(),
-            typed_defaults::<ContextStrategyConfig>(&["mode"]),
-        ),
-        nested_field_with_defaults(
-            "prompt_cache",
-            "Provider prompt cache behavior.",
-            prompt_cache_field_docs(),
-            typed_defaults::<PromptCacheConfig>(&["mode"]),
-        ),
-        nested_field_with_defaults(
-            "conversation_reuse",
-            "Conversation reuse behavior.",
-            conversation_reuse_field_docs(),
-            typed_defaults::<ConversationReuseConfig>(&["mode"]),
-        ),
-        nested_field_with_defaults(
-            "tool_output",
-            "Tool output context behavior.",
-            tool_output_field_docs(),
-            typed_defaults::<ToolOutputConfig>(&["context_chars"]),
-        ),
-        nested_field_with_defaults(
-            "streaming",
-            "Provider streaming progress and timeout behavior.",
-            streaming_field_docs(),
-            typed_defaults::<StreamingConfig>(&[
-                "no_progress_warning_secs",
-                "no_progress_timeout_secs",
-            ]),
-        ),
-        nested_field_with_defaults(
-            "retry",
-            "Provider retry behavior.",
-            retry_field_docs(),
-            typed_defaults::<ModelRetryConfig>(&[
-                "enabled",
-                "overload_enabled",
-                "max_overload_retries",
-                "overload_initial_delay_ms",
-                "overload_max_delay_ms",
-                "remote_catalog_rules_enabled",
-                "rules",
-            ]),
-        ),
-        nested_field_with_defaults(
-            "compaction",
-            "Conversation compaction behavior.",
-            compaction_field_docs(),
-            typed_defaults::<CompactionConfig>(&["mode", "context_chars"]),
-        ),
-    ]
-}
-
-fn model_profile_field_docs() -> Vec<FieldDoc> {
-    vec![
-        config_field(
-            "provider_plugin_id",
-            "string",
-            "Provider plugin id for this profile.",
-        ),
-        config_field(
-            "model_id",
-            "string",
-            "Provider-specific model id for this profile.",
-        ),
-        config_field(
-            "auth_profile",
-            "string",
-            "Auth profile name selected from `auth.profiles`.",
-        ),
-        config_field(
-            "auth_pool",
-            "string",
-            "Auth pool name selected from `auth.pools`.",
-        ),
-        config_field(
-            "settings",
-            "table",
-            "Provider-specific persistent settings.",
-        ),
-        config_field(
-            "request.temperature",
-            "number",
-            "Provider-specific sampling temperature override.",
-        ),
-        config_field(
-            "request.top_p",
-            "number",
-            "Provider-specific nucleus sampling probability override.",
-        ),
-        config_field(
-            "request.max_tokens",
-            "integer",
-            "Provider-specific maximum response token override.",
-        ),
-        config_field(
-            "reasoning.effort",
-            "string",
-            "Provider-specific reasoning effort value.",
-        ),
-        config_field(
-            "reasoning.summary",
-            "string",
-            "Provider-specific reasoning summary value.",
-        ),
-    ]
-}
-
-fn reasoning_field_docs() -> Vec<FieldDoc> {
-    vec![
-        config_field(
-            "effort",
-            "string",
-            "Provider-specific reasoning effort value.",
-        ),
-        config_field(
-            "summary",
-            "string",
-            "Provider-specific reasoning summary value.",
-        ),
-        config_field(
-            "effort_values",
-            "array<string>",
-            "Supported reasoning effort values for metadata overrides.",
-        ),
-        config_field(
-            "summary_values",
-            "array<string>",
-            "Supported reasoning summary values for metadata overrides.",
-        ),
-        config_field(
-            "default_effort",
-            "string",
-            "Default reasoning effort advertised for metadata overrides.",
-        ),
-        config_field(
-            "default_summary",
-            "string",
-            "Default reasoning summary advertised for metadata overrides.",
-        ),
-        config_field(
-            "visible_summary_supported",
-            "bool",
-            "Whether visible reasoning summaries are supported.",
-        ),
-        config_field(
-            "raw_reasoning_supported",
-            "bool",
-            "Whether raw reasoning output is supported.",
-        ),
-    ]
-}
-
-fn context_strategy_field_docs() -> Vec<FieldDoc> {
-    vec![enum_field(
-        "mode",
-        "enum",
-        "High-level model context management strategy.",
-        &["provider_reuse", "explicit_cached_transcript"],
-    )]
-}
-
-fn prompt_cache_field_docs() -> Vec<FieldDoc> {
-    vec![config_field("mode", "enum", "Provider prompt cache mode.")]
-}
-
-fn tool_output_field_docs() -> Vec<FieldDoc> {
-    vec![config_field(
-        "context_chars",
-        "integer",
-        "Maximum characters of each tool result included directly in model context.",
-    )]
-}
-
-fn streaming_field_docs() -> Vec<FieldDoc> {
-    vec![
-        config_field(
-            "no_progress_warning_secs",
-            "integer",
-            "Seconds without meaningful provider progress before showing a warning.",
-        ),
-        config_field(
-            "no_progress_timeout_secs",
-            "integer",
-            "Seconds without meaningful provider progress before timing out the turn.",
-        ),
-    ]
-}
-
-fn retry_field_docs() -> Vec<FieldDoc> {
-    vec![
-        config_field(
-            "enabled",
-            "bool",
-            "Enable automatic model-provider retries.",
-        ),
-        config_field(
-            "overload_enabled",
-            "bool",
-            "Enable built-in provider overload retries.",
-        ),
-        config_field(
-            "max_overload_retries",
-            "integer",
-            "Maximum automatic retry attempts for provider overload errors.",
-        ),
-        config_field(
-            "overload_initial_delay_ms",
-            "integer",
-            "Initial overload retry delay in milliseconds.",
-        ),
-        config_field(
-            "overload_max_delay_ms",
-            "integer",
-            "Maximum overload retry delay in milliseconds.",
-        ),
-        config_field(
-            "remote_catalog_rules_enabled",
-            "bool",
-            "Enable recoverable error patterns imported from the remote model catalog.",
-        ),
-        config_field(
-            "rules",
-            "array<table>",
-            "Custom provider-error retry rules.",
-        ),
-    ]
-}
-
-fn compaction_field_docs() -> Vec<FieldDoc> {
-    vec![
-        enum_field(
-            "mode",
-            "enum",
-            "Automatic conversation compaction mode.",
-            &[
-                "off",
-                "on_overflow",
-                "proactive",
-                "proactive_and_overflow",
-                "auto",
-            ],
-        ),
-        config_field(
-            "context_chars",
-            "integer",
-            "Projected conversation character count that triggers automatic compaction.",
-        ),
-    ]
-}
-
-fn conversation_reuse_field_docs() -> Vec<FieldDoc> {
-    vec![config_field(
-        "mode",
-        "enum",
-        "Provider-native conversation reuse mode.",
-    )]
-}
-
-#[allow(clippy::too_many_lines)]
-fn agent_field_docs() -> Vec<FieldDoc> {
-    vec![map_field_with_defaults(
-        "",
-        "Configuration for a named agent profile such as `build` or `plan`.",
-        "<agent-id>",
-        vec![
-            config_field(
-                "accent",
-                "string",
-                "Optional UI accent color encoded as `#RRGGBB`.",
-            ),
-            map_field(
-                "tools",
-                "Per-tool enablement keyed by model-callable tool id.",
-                "<tool-id>",
-                vec![config_field(
-                    "enabled",
-                    "bool",
-                    "Whether the tool is enabled for this agent.",
-                )],
-            ),
-            nested_field_with_defaults(
-                "permission",
-                "Permission rules applied to tool invocations for this agent.",
-                vec![
-                    map_field(
-                        "command",
-                        "Shell command rules keyed by command pattern.",
-                        "<pattern>",
-                        vec![enum_field(
-                            "action",
-                            "enum",
-                            "Action for matching commands.",
-                            &["allow", "ask", "deny"],
-                        )],
-                    ),
-                    map_field(
-                        "read",
-                        "Read-only filesystem rules keyed by path glob.",
-                        "<glob>",
-                        vec![enum_field(
-                            "action",
-                            "enum",
-                            "Action for matching read paths.",
-                            &["allow", "ask", "deny"],
-                        )],
-                    ),
-                    map_field(
-                        "write",
-                        "Filesystem write rules keyed by path glob.",
-                        "<glob>",
-                        vec![enum_field(
-                            "action",
-                            "enum",
-                            "Action for matching write paths.",
-                            &["allow", "ask", "deny"],
-                        )],
-                    ),
-                    map_field(
-                        "edit",
-                        "Filesystem edit rules keyed by path glob.",
-                        "<glob>",
-                        vec![enum_field(
-                            "action",
-                            "enum",
-                            "Action for matching edit paths.",
-                            &["allow", "ask", "deny"],
-                        )],
-                    ),
-                    map_field(
-                        "web",
-                        "Web/network rules keyed by URL glob.",
-                        "<glob>",
-                        vec![enum_field(
-                            "action",
-                            "enum",
-                            "Action for matching web URLs.",
-                            &["allow", "ask", "deny"],
-                        )],
-                    ),
-                    enum_field(
-                        "external_directory",
-                        "enum",
-                        "Action for paths resolving outside the session working directory.",
-                        &["allow", "ask", "deny"],
-                    ),
-                ],
-                typed_defaults::<bcode_agent_policy_models::PermissionConfig>(&[
-                    "command",
-                    "read",
-                    "write",
-                    "edit",
-                    "web",
-                    "external_directory",
-                ]),
-            ),
-        ],
-        typed_defaults::<bcode_agent_policy_models::AgentConfig>(&[
-            "accent",
-            "tools",
-            "permission",
-        ]),
-    )]
-}
-
-#[allow(clippy::too_many_lines)]
-fn auth_field_docs() -> Vec<FieldDoc> {
-    vec![
-        nested_field(
-            "openai",
-            "Legacy OpenAI provider authentication shortcut.",
-            vec![
-                config_field(
-                    "backend",
-                    "string",
-                    "Auth backend used for OpenAI credentials.",
-                ),
-                enum_field(
-                    "mode",
-                    "enum",
-                    "OpenAI authentication mode.",
-                    &["api_key", "chatgpt"],
-                ),
-                config_field(
-                    "profile",
-                    "string",
-                    "Auth profile name for OpenAI credentials.",
-                ),
-                config_field("vault", "path", "Optional credential vault path."),
-            ],
-        ),
-        map_field(
-            "profiles",
-            "Named provider auth profiles.",
-            "<profile>",
-            vec![
-                config_field("backend", "string", "Auth backend id for this profile."),
-                config_field(
-                    "scheme",
-                    "string",
-                    "Optional provider/plugin auth scheme, for example `api_key` or `chatgpt`.",
-                ),
-                map_field(
-                    "map",
-                    "Canonical credential-to-source mappings.",
-                    "<credential>",
-                    vec![
-                        config_field("env", "string", "Environment variable source."),
-                        config_field("key", "string", "Backend-specific credential key."),
-                    ],
-                ),
-                config_field(
-                    "settings",
-                    "table",
-                    "Provider/backend-specific additional auth settings.",
-                ),
-            ],
-        ),
-        map_field_with_defaults(
-            "pools",
-            "Named auth profile pools used for failover.",
-            "<pool>",
-            vec![
-                config_field(
-                    "provider_plugin_id",
-                    "string",
-                    "Provider plugin id this pool applies to.",
-                ),
-                enum_field(
-                    "strategy",
-                    "enum",
-                    "Pool selection strategy.",
-                    &["failover"],
-                ),
-                config_field(
-                    "profiles",
-                    "array<string>",
-                    "Auth profile names included in this pool.",
-                ),
-                nested_field_with_defaults(
-                    "quota",
-                    "Provider-specific quota/cooldown policy hints.",
-                    vec![
-                        config_field(
-                            "unknown_cooldown",
-                            "string",
-                            "Cooldown for unknown quota failures.",
-                        ),
-                        config_field(
-                            "rate_limit_cooldown",
-                            "string",
-                            "Cooldown for rate-limit failures.",
-                        ),
-                        config_field(
-                            "weekly_cooldown",
-                            "string",
-                            "Cooldown for weekly quota failures.",
-                        ),
-                    ],
-                    typed_defaults::<AuthPoolQuotaConfig>(&[
-                        "unknown_cooldown",
-                        "rate_limit_cooldown",
-                        "weekly_cooldown",
-                    ]),
-                ),
-            ],
-            typed_defaults::<AuthPoolConfig>(&[
-                "provider_plugin_id",
-                "strategy",
-                "profiles",
-                "quota",
-            ]),
-        ),
-    ]
-}
-
-fn tui_field_docs() -> Vec<FieldDoc> {
-    vec![
-        nested_field_with_defaults(
-            "keybindings",
-            "Scoped terminal UI keybindings.",
-            vec![
-                map_field(
-                    "chat",
-                    "Main chat view bindings keyed by key stroke.",
-                    "<key>",
-                    vec![config_field(
-                        "action",
-                        "string",
-                        "Action id executed for the key stroke.",
-                    )],
-                ),
-                map_field(
-                    "permission",
-                    "Permission prompt bindings keyed by key stroke.",
-                    "<key>",
-                    vec![config_field(
-                        "action",
-                        "string",
-                        "Action id executed for the key stroke.",
-                    )],
-                ),
-                map_field(
-                    "session_picker",
-                    "Session picker bindings keyed by key stroke.",
-                    "<key>",
-                    vec![config_field(
-                        "action",
-                        "string",
-                        "Action id executed for the key stroke.",
-                    )],
-                ),
-            ],
-            typed_defaults::<TuiKeyBindingConfig>(&["chat", "permission", "session_picker"]),
-        ),
-        nested_field_with_defaults(
-            "mouse",
-            "Mouse interaction behavior.",
-            TuiMouseConfig::field_docs(),
-            TuiMouseConfig::default_values(),
-        ),
-        nested_field_with_defaults(
-            "thinking",
-            "Provider-exposed reasoning/thinking display behavior.",
-            TuiThinkingConfig::field_docs(),
-            TuiThinkingConfig::default_values(),
-        ),
-        nested_field_with_defaults(
-            "theme",
-            "Terminal UI theme rendering behavior.",
-            TuiThemeConfig::field_docs(),
-            TuiThemeConfig::default_values(),
-        ),
-        nested_field_with_defaults(
-            "inline_diff",
-            "Inline diff preview rendering behavior.",
-            TuiInlineDiffConfig::field_docs(),
-            TuiInlineDiffConfig::default_values(),
-        ),
-    ]
 }
 
 fn web_search_field_docs() -> Vec<FieldDoc> {
@@ -1420,7 +622,8 @@ fn first_env_value_from_slice(
 }
 
 /// Config composition metadata and profile selection.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "composition")]
 #[serde(default)]
 pub struct CompositionConfig {
     /// Active profile id to apply when `profile:active` appears in the layer order.
@@ -2292,21 +1495,27 @@ const fn default_worktree_setup_enabled() -> bool {
 }
 
 /// Terminal UI configuration.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "tui")]
 pub struct TuiConfig {
     /// Scoped keybindings keyed by key stroke. Values are action IDs.
+    #[config_doc(nested)]
     #[serde(default)]
     pub keybindings: TuiKeyBindingConfig,
     /// Mouse interaction configuration.
+    #[config_doc(nested)]
     #[serde(default)]
     pub mouse: TuiMouseConfig,
     /// Provider-exposed reasoning / thinking display configuration.
+    #[config_doc(nested)]
     #[serde(default)]
     pub thinking: TuiThinkingConfig,
     /// Theme rendering configuration.
+    #[config_doc(nested)]
     #[serde(default)]
     pub theme: TuiThemeConfig,
     /// Inline diff preview rendering configuration.
+    #[config_doc(nested)]
     #[serde(default)]
     pub inline_diff: TuiInlineDiffConfig,
 }
@@ -2585,13 +1794,17 @@ pub enum TuiMouseClickSelection {
 }
 
 /// Scoped terminal UI keybindings.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, ConfigDoc)]
+#[config_doc(section = "keybindings")]
 pub struct TuiKeyBindingConfig {
     /// Main chat view bindings.
+    #[serde(default)]
     pub chat: BTreeMap<String, String>,
     /// Permission prompt bindings.
+    #[serde(default)]
     pub permission: BTreeMap<String, String>,
     /// Session picker bindings.
+    #[serde(default)]
     pub session_picker: BTreeMap<String, String>,
     /// Legacy `[tui.keybindings]` action-to-keys entries loaded for compatibility.
     #[serde(skip)]
@@ -2673,31 +1886,44 @@ where
 }
 
 /// Authentication configuration.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "auth")]
 pub struct AuthConfig {
+    /// Legacy `OpenAI` provider authentication shortcut.
+    #[config_doc(nested)]
     #[serde(default)]
     pub openai: Option<AuthProviderConfig>,
+    /// Named provider auth profiles.
+    #[config_doc(nested, map_key = "<profile>")]
     #[serde(default)]
     pub profiles: BTreeMap<String, AuthProfileConfig>,
+    /// Named auth profile pools used for failover.
+    #[config_doc(nested, map_key = "<pool>")]
     #[serde(default)]
     pub pools: BTreeMap<String, AuthPoolConfig>,
 }
 
 /// Ordered provider auth profiles that can satisfy the same model/provider request.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "auth_pool")]
 pub struct AuthPoolConfig {
+    /// Provider plugin id this pool applies to.
     #[serde(default)]
     pub provider_plugin_id: Option<String>,
+    /// Pool selection strategy.
     #[serde(default)]
     pub strategy: AuthPoolStrategy,
+    /// Auth profile names included in this pool.
     #[serde(default)]
     pub profiles: Vec<String>,
+    /// Provider-specific quota/cooldown policy hints.
+    #[config_doc(nested)]
     #[serde(default)]
     pub quota: AuthPoolQuotaConfig,
 }
 
 /// Auth pool selection strategy.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthPoolStrategy {
     /// Use the first healthy profile and fail over when provider-owned quota detection requires it.
@@ -2706,19 +1932,25 @@ pub enum AuthPoolStrategy {
 }
 
 /// Provider-specific quota/cooldown policy hints for an auth pool.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "quota")]
 pub struct AuthPoolQuotaConfig {
+    /// Cooldown for unknown quota failures.
     #[serde(default)]
     pub unknown_cooldown: Option<String>,
+    /// Cooldown for rate-limit failures.
     #[serde(default)]
     pub rate_limit_cooldown: Option<String>,
+    /// Cooldown for weekly quota failures.
     #[serde(default)]
     pub weekly_cooldown: Option<String>,
 }
 
 /// Generic authentication profile configuration.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "auth_profile")]
 pub struct AuthProfileConfig {
+    /// Auth backend id for this profile.
     pub backend: String,
     /// Optional provider/plugin auth scheme, for example `api_key` or `chatgpt`.
     #[serde(default)]
@@ -2727,34 +1959,44 @@ pub struct AuthProfileConfig {
     ///
     /// Example: `map.api_key.env = "OPENROUTER_API_KEY"` reads/stores the canonical
     /// `api_key` credential from `OPENROUTER_API_KEY` in the selected auth backend.
+    #[config_doc(nested, map_key = "<credential>")]
     #[serde(default)]
     pub map: BTreeMap<String, AuthCredentialMapping>,
+    /// Provider/backend-specific additional auth settings.
     #[serde(default)]
     pub settings: BTreeMap<String, String>,
 }
 
 /// Mapping from a canonical auth credential name to a backend/environment key.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "auth_credential_mapping")]
 pub struct AuthCredentialMapping {
+    /// Environment variable source.
     #[serde(default)]
     pub env: Option<String>,
+    /// Backend-specific credential key.
     #[serde(default)]
     pub key: Option<String>,
 }
 
 /// Per-provider authentication configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "auth_provider")]
 pub struct AuthProviderConfig {
+    /// Auth backend used for credentials.
     pub backend: String,
+    /// Provider authentication mode.
     #[serde(default)]
     pub mode: AuthMode,
+    /// Auth profile name.
     pub profile: String,
+    /// Optional credential vault path.
     #[serde(default)]
     pub vault: Option<PathBuf>,
 }
 
 /// Authentication mode for a provider.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMode {
     /// `OpenAI` platform API key authentication.
@@ -2766,49 +2008,83 @@ pub enum AuthMode {
 }
 
 /// Model selection configuration.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "model")]
 pub struct ModelConfig {
+    /// Default model provider plugin id.
     #[serde(default)]
     pub provider_plugin_id: Option<String>,
+    /// Default provider-specific model id.
     #[serde(default)]
     pub model_id: Option<String>,
+    /// Default provider reasoning effort/thinking level.
+    #[config_doc(values("low", "medium", "high"))]
     #[serde(default)]
     pub default_thinking_level: Option<bcode_model::ReasoningEffort>,
+    /// Default reasoning request controls.
+    #[config_doc(nested)]
     #[serde(default)]
     pub reasoning: ReasoningConfig,
+    /// Maximum tool-call rounds allowed in one model turn.
     #[serde(default)]
     pub max_tool_rounds: Option<u32>,
+    /// Model context management strategy.
+    #[config_doc(nested)]
     #[serde(default)]
     pub context_strategy: ContextStrategyConfig,
+    /// Provider prompt cache behavior.
+    #[config_doc(nested)]
     #[serde(default)]
     pub prompt_cache: PromptCacheConfig,
+    /// Conversation reuse behavior.
+    #[config_doc(nested)]
     #[serde(default)]
     pub conversation_reuse: ConversationReuseConfig,
+    /// Tool output context behavior.
+    #[config_doc(nested)]
     #[serde(default)]
     pub tool_output: ToolOutputConfig,
+    /// Provider streaming progress and timeout behavior.
+    #[config_doc(nested)]
     #[serde(default)]
     pub streaming: StreamingConfig,
+    /// Provider retry behavior.
+    #[config_doc(nested)]
     #[serde(default)]
     pub retry: ModelRetryConfig,
+    /// Conversation compaction behavior.
+    #[config_doc(nested)]
     #[serde(default)]
     pub compaction: CompactionConfig,
+    /// Active model profile name selected from `model.profiles`.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Named model profiles for provider/model/auth/request overrides.
+    #[config_doc(nested, map_key = "<profile>")]
     #[serde(default)]
     pub profiles: BTreeMap<String, ModelProfileConfig>,
+    /// Named model aliases resolved before provider selection.
+    #[config_doc(nested, map_key = "<alias>")]
     #[serde(default)]
     pub aliases: BTreeMap<String, ModelAliasConfig>,
+    /// Provider/model metadata keyed by provider and model id.
+    #[config_doc(nested, map_key = "<provider-or-model>")]
     #[serde(default)]
     pub metadata: BTreeMap<String, ModelMetadataConfig>,
+    /// Declarative model ignore rules keyed by provider id.
+    #[config_doc(nested, map_key = "<provider>")]
     #[serde(default)]
     pub ignored: BTreeMap<String, ModelIgnoreConfig>,
 }
 
 /// Declarative or state-backed model ignore rules for one provider.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "model_ignore")]
 pub struct ModelIgnoreConfig {
+    /// Exact provider model ids to hide.
     #[serde(default)]
     pub models: BTreeSet<String>,
+    /// Substring patterns used to hide matching provider model ids.
     #[serde(default)]
     pub patterns: Vec<String>,
 }
@@ -2897,7 +2173,8 @@ impl ModelConfig {
 }
 
 /// High-level model context management strategy.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "context_strategy")]
 pub struct ContextStrategyConfig {
     /// Context strategy mode. Defaults to provider-native continuation where available.
     #[serde(default)]
@@ -2913,7 +2190,7 @@ impl Default for ContextStrategyConfig {
 }
 
 /// High-level context strategy mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextStrategyMode {
     /// Prefer provider-native continuation/state reuse when supported.
@@ -2924,30 +2201,41 @@ pub enum ContextStrategyMode {
 }
 
 /// Reasoning / thinking request configuration.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "reasoning")]
 pub struct ReasoningConfig {
+    /// Provider-specific reasoning effort value.
     #[serde(default)]
     pub effort: Option<String>,
+    /// Provider-specific reasoning summary value.
     #[serde(default)]
     pub summary: Option<String>,
+    /// Supported reasoning effort values for metadata overrides.
     #[serde(default)]
     pub effort_values: Vec<String>,
+    /// Supported reasoning summary values for metadata overrides.
     #[serde(default)]
     pub summary_values: Vec<String>,
+    /// Default reasoning effort advertised for metadata overrides.
     #[serde(default)]
     pub default_effort: Option<String>,
+    /// Default reasoning summary advertised for metadata overrides.
     #[serde(default)]
     pub default_summary: Option<String>,
+    /// Whether visible reasoning summaries are supported.
     #[serde(default)]
     pub visible_summary_supported: Option<bool>,
+    /// Whether raw reasoning output is supported.
     #[serde(default)]
     pub raw_reasoning_supported: Option<bool>,
 }
 
 /// Prompt cache configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "prompt_cache")]
 pub struct PromptCacheConfig {
     /// Prompt cache mode. Defaults to `auto`.
+    #[config_doc(values("off", "auto", "aggressive"))]
     #[serde(default)]
     pub mode: bcode_model::PromptCacheMode,
 }
@@ -2961,7 +2249,8 @@ impl Default for PromptCacheConfig {
 }
 
 /// Tool output context policy for future model turns.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "tool_output")]
 pub struct ToolOutputConfig {
     /// Maximum characters of each tool result included directly in model context.
     #[serde(default = "default_tool_output_context_chars")]
@@ -2977,7 +2266,8 @@ impl Default for ToolOutputConfig {
 }
 
 /// Provider streaming progress and timeout configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "streaming")]
 pub struct StreamingConfig {
     /// Seconds without meaningful provider progress before Bcode shows a warning.
     #[serde(default = "default_streaming_no_progress_warning_secs")]
@@ -2997,7 +2287,8 @@ impl Default for StreamingConfig {
 }
 
 /// Model provider retry configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "retry")]
 pub struct ModelRetryConfig {
     /// Enable automatic model-provider retries.
     #[serde(default = "default_model_retry_enabled")]
@@ -3018,6 +2309,7 @@ pub struct ModelRetryConfig {
     #[serde(default = "default_remote_catalog_retry_rules_enabled")]
     pub remote_catalog_rules_enabled: bool,
     /// Custom provider-error retry rules.
+    #[config_doc(nested, list_index = "<index>")]
     #[serde(default)]
     pub rules: Vec<ModelRetryRuleConfig>,
 }
@@ -3064,7 +2356,8 @@ const fn default_overload_max_delay_ms() -> u64 {
 }
 
 /// Automatic context compaction configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "compaction")]
 pub struct CompactionConfig {
     /// Automatic compaction mode. Defaults to `auto`.
     #[serde(default)]
@@ -3084,7 +2377,7 @@ impl Default for CompactionConfig {
 }
 
 /// Automatic context compaction mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionMode {
     /// Disable automatic compaction entirely. Manual compaction remains available.
@@ -3137,9 +2430,11 @@ const fn default_auto_compaction_context_chars() -> usize {
 }
 
 /// Provider-native conversation reuse configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "conversation_reuse")]
 pub struct ConversationReuseConfig {
     /// Conversation reuse mode. Defaults to `auto` so providers can use native continuation when supported.
+    #[config_doc(values("off", "auto"))]
     #[serde(default = "default_conversation_reuse_mode")]
     pub mode: bcode_model::ConversationReuseMode,
 }
@@ -3157,42 +2452,61 @@ const fn default_conversation_reuse_mode() -> bcode_model::ConversationReuseMode
 }
 
 /// Generic model provider profile configuration.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "model_profile")]
 pub struct ModelProfileConfig {
+    /// Provider plugin id for this profile.
     pub provider_plugin_id: String,
+    /// Provider-specific model id for this profile.
     #[serde(default)]
     pub model_id: Option<String>,
+    /// Auth profile name selected from `auth.profiles`.
     #[serde(default)]
     pub auth_profile: Option<String>,
+    /// Auth pool name selected from `auth.pools`.
     #[serde(default)]
     pub auth_pool: Option<String>,
+    /// Provider-specific persistent settings.
     #[serde(default)]
     pub settings: BTreeMap<String, String>,
+    /// Profile-specific reasoning controls.
+    #[config_doc(nested)]
     #[serde(default)]
     pub reasoning: ReasoningConfig,
+    /// Provider-specific request overrides.
     #[serde(default)]
     pub request: BTreeMap<String, serde_json::Value>,
 }
 
 /// Generic model alias resolved before provider requests are built.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "model_alias")]
 pub struct ModelAliasConfig {
+    /// Provider plugin id selected by the alias.
     #[serde(default)]
     pub provider_plugin_id: Option<String>,
+    /// Provider-specific model id selected by the alias.
     pub model_id: String,
+    /// Provider-specific request overrides.
     #[serde(default)]
     pub request: BTreeMap<String, serde_json::Value>,
 }
 
 /// User-provided model metadata override.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "model_metadata")]
 pub struct ModelMetadataConfig {
+    /// Provider plugin id associated with this metadata override.
     #[serde(default)]
     pub provider_plugin_id: Option<String>,
+    /// Approximate context window token count.
     #[serde(default)]
     pub context_window: Option<u32>,
+    /// Maximum output token count.
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    /// Reasoning metadata overrides.
+    #[config_doc(nested)]
     #[serde(default)]
     pub reasoning: ReasoningConfig,
 }
@@ -3212,12 +2526,16 @@ pub struct ResolvedModelSelection {
 }
 
 /// Plugin configuration.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "plugins")]
 pub struct PluginConfig {
+    /// Plugin ids explicitly enabled in addition to bundled defaults.
     #[serde(default)]
     pub enabled: BTreeSet<String>,
+    /// Plugin ids disabled even if bundled or discovered.
     #[serde(default)]
     pub disabled: BTreeSet<String>,
+    /// Provider/plugin-specific plugin configuration tables keyed by plugin id.
     #[serde(default)]
     pub config: BTreeMap<String, toml::Value>,
 }

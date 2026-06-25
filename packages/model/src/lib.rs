@@ -5,6 +5,7 @@
 //! Model provider service contract types for Bcode.
 
 use bcode_session_models::SessionId;
+use hyperchad_docs_config_derive::{ConfigDoc, ConfigDocEnum};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -56,7 +57,8 @@ pub struct ProviderCapabilities {
 }
 
 /// Provider-supplied or user-configured provider error retry rule.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "retry_rule")]
 pub struct ProviderRetryRule {
     /// Stable retry rule identifier.
     pub id: String,
@@ -88,12 +90,14 @@ pub struct ProviderRetryRule {
     #[serde(default)]
     pub use_provider_retry_hint: Option<bool>,
     /// Error match conditions.
+    #[config_doc(nested)]
     #[serde(default)]
     pub r#match: ProviderRetryRuleMatch,
 }
 
 /// Provider error retry rule match conditions.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "retry_rule_match")]
 pub struct ProviderRetryRuleMatch {
     /// Provider error category to match.
     #[serde(default)]
@@ -1179,7 +1183,7 @@ pub struct ProviderRetryHint {
 }
 
 /// Provider error category.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderErrorCategory {
     Config,

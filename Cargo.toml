@@ -281,6 +281,10 @@ inherits  = "dev"
 opt-level = 0
 
 # HyperChad local development patches
+# [patch."https://github.com/MoosicBox/MoosicBox.git"]
+# hyperchad_docs_config        = { path = "../MoosicBox/packages/hyperchad/docs/config" }
+# hyperchad_docs_config_derive = { path = "../MoosicBox/packages/hyperchad/docs/config/derive" }
+
 # [patch.crates-io]
 # hyperchad_color              = { path = "../MoosicBox/packages/hyperchad/color" }
 # hyperchad_markdown           = { path = "../MoosicBox/packages/hyperchad/markdown" }

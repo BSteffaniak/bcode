@@ -4,11 +4,12 @@
 
 //! Agent permission policy models shared between the policy evaluator and configuration layer.
 
+use hyperchad_docs_config_derive::{ConfigDoc, ConfigDocEnum};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Agent action loaded from Pi/OpenCode-style permission config.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Action {
     /// Allow the operation without prompting.
@@ -21,7 +22,8 @@ pub enum Action {
 }
 
 /// Agent mode/profile configuration.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "agent")]
 pub struct AgentConfig {
     /// Optional UI accent color, encoded as `#RRGGBB`.
     #[serde(default)]
@@ -30,6 +32,7 @@ pub struct AgentConfig {
     #[serde(default)]
     pub tools: BTreeMap<String, bool>,
     /// Permission rules applied to tool invocations for this agent.
+    #[config_doc(nested)]
     #[serde(default)]
     pub permission: PermissionConfig,
 }
@@ -47,7 +50,8 @@ pub struct AgentConfig {
 /// * `web` — patterns matched against URL arguments for web/network tools.
 /// * `external_directory` — single action governing any tool argument resolving outside
 ///   the session working directory.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "permission")]
 pub struct PermissionConfig {
     /// Shell command rules.
     #[serde(default)]
@@ -89,9 +93,11 @@ pub const fn default_external_directory_action() -> Action {
 }
 
 /// Pi/OpenCode-style top-level permission config.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "agents")]
 pub struct AgentPermissionConfig {
     /// Per-agent configuration keyed by agent ID.
+    #[config_doc(nested, map_key = "<agent-id>")]
     #[serde(default)]
     pub agent: BTreeMap<String, AgentConfig>,
 }

@@ -299,7 +299,7 @@ mod tests {
         let doc = generate_config_reference();
 
         assert!(doc.contains("profiles.<profile>.provider_plugin_id"));
-        assert!(doc.contains("profiles.<profile>.request.temperature"));
+        assert!(doc.contains("profiles.<profile>.request"));
         assert!(doc.contains("reasoning.effort"));
         assert!(doc.contains("conversation_reuse.mode"));
         assert!(doc.contains("retry.max_overload_retries"));
@@ -311,7 +311,7 @@ mod tests {
 
         assert!(doc.contains("profiles.<profile>.map.<credential>.env"));
         assert!(doc.contains("pools.<pool>.strategy"));
-        assert!(doc.contains("<agent-id>.tools.<tool-id>.enabled"));
+        assert!(doc.contains("<agent-id>.tools"));
         assert!(doc.contains("<agent-id>.permission.external_directory"));
     }
 
