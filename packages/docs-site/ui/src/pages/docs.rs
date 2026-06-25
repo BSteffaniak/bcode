@@ -301,17 +301,18 @@ mod tests {
         assert!(doc.contains("profiles.<profile>.provider_plugin_id"));
         assert!(doc.contains("profiles.<profile>.request.temperature"));
         assert!(doc.contains("reasoning.effort"));
-        assert!(doc.contains("conversation_reuse.enabled"));
+        assert!(doc.contains("conversation_reuse.mode"));
+        assert!(doc.contains("retry.max_overload_retries"));
     }
 
     #[test]
     fn config_reference_documents_auth_and_agent_policy() {
         let doc = generate_config_reference();
 
-        assert!(doc.contains("profiles.<profile>.api_key_env"));
+        assert!(doc.contains("profiles.<profile>.map.<credential>.env"));
         assert!(doc.contains("pools.<pool>.strategy"));
-        assert!(doc.contains("tools.<tool-name>.execute"));
-        assert!(doc.contains("permissions.network"));
+        assert!(doc.contains("<agent-id>.tools.<tool-id>.enabled"));
+        assert!(doc.contains("<agent-id>.permission.external_directory"));
     }
 
     #[test]
@@ -344,8 +345,30 @@ mod tests {
 
         assert!(doc.contains("`off`"));
         assert!(doc.contains("`suggest`"));
-        assert!(doc.contains("`round_robin`"));
+        assert!(doc.contains("`failover`"));
         assert!(doc.contains("`ask`"));
+    }
+
+    #[test]
+    fn config_reference_renders_defaults() {
+        let doc = generate_config_reference();
+
+        assert_row_default(&doc, "level", "standard");
+        assert_row_default(&doc, "enabled", "true");
+        assert_row_default(&doc, "retry.max_overload_retries", "5");
+        assert_row_default(&doc, "compaction.mode", "on_overflow");
+        assert_row_default(&doc, "mouse.scroll_rows", "3");
+        assert_row_default(&doc, "pools.<pool>.strategy", "failover");
+    }
+
+    fn assert_row_default(doc: &str, key: &str, default: &str) {
+        let expected_key = format!("`{key}`");
+        let expected_default = format!("`{default}`");
+        assert!(
+            doc.lines()
+                .any(|line| line.contains(&expected_key) && line.contains(&expected_default)),
+            "missing default {default} for {key}"
+        );
     }
 
     #[test]
