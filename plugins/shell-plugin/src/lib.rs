@@ -417,6 +417,11 @@ fn shell_result_card(
         }
         .to_string(),
     });
+    let mut sections = Vec::new();
+    if let Some(ToolInvocationResult::ShellRun { result }) = &response.result {
+        extend_shell_result_presentation(result, &mut fields, &mut sections);
+    }
+    sections.insert(0, ToolPresentationSection::Fields { fields });
     bcode_tool::ToolCardPresentation {
         target: ToolPresentationTarget::Result,
         title: if response.is_error {
@@ -425,8 +430,127 @@ fn shell_result_card(
             "Shell command completed".to_string()
         },
         subtitle: None,
-        sections: vec![ToolPresentationSection::Fields { fields }],
+        sections,
     }
+}
+
+fn extend_shell_result_presentation(
+    result: &ShellRunResult,
+    fields: &mut Vec<ToolPresentationFieldValue>,
+    sections: &mut Vec<ToolPresentationSection>,
+) {
+    match result {
+        ShellRunResult::Terminal {
+            exit_code,
+            timed_out,
+            cancelled,
+            output_tail: _,
+            output_truncated,
+            output_bytes,
+            retained_output_bytes,
+            columns,
+            rows,
+        } => {
+            push_shell_common_result_fields(fields, *exit_code, *timed_out, *cancelled);
+            fields.push(ToolPresentationFieldValue {
+                label: "Output truncated".to_string(),
+                value: output_truncated.to_string(),
+            });
+            if let Some(output_bytes) = output_bytes {
+                fields.push(ToolPresentationFieldValue {
+                    label: "Output bytes".to_string(),
+                    value: output_bytes.to_string(),
+                });
+            }
+            if let Some(retained_output_bytes) = retained_output_bytes {
+                fields.push(ToolPresentationFieldValue {
+                    label: "Retained output bytes".to_string(),
+                    value: retained_output_bytes.to_string(),
+                });
+            }
+            fields.push(ToolPresentationFieldValue {
+                label: "Columns".to_string(),
+                value: columns.to_string(),
+            });
+            fields.push(ToolPresentationFieldValue {
+                label: "Rows".to_string(),
+                value: rows.to_string(),
+            });
+        }
+        ShellRunResult::Captured {
+            exit_code,
+            timed_out,
+            cancelled,
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+            stdout_bytes,
+            stderr_bytes,
+        } => {
+            push_shell_common_result_fields(fields, *exit_code, *timed_out, *cancelled);
+            fields.push(ToolPresentationFieldValue {
+                label: "Stdout truncated".to_string(),
+                value: stdout_truncated.to_string(),
+            });
+            fields.push(ToolPresentationFieldValue {
+                label: "Stderr truncated".to_string(),
+                value: stderr_truncated.to_string(),
+            });
+            if let Some(stdout_bytes) = stdout_bytes {
+                fields.push(ToolPresentationFieldValue {
+                    label: "Stdout bytes".to_string(),
+                    value: stdout_bytes.to_string(),
+                });
+            }
+            if let Some(stderr_bytes) = stderr_bytes {
+                fields.push(ToolPresentationFieldValue {
+                    label: "Stderr bytes".to_string(),
+                    value: stderr_bytes.to_string(),
+                });
+            }
+            if !stdout.is_empty() {
+                sections.push(ToolPresentationSection::Text {
+                    label: Some(if *stdout_truncated {
+                        "stdout (truncated)".to_string()
+                    } else {
+                        "stdout".to_string()
+                    }),
+                    text: stdout.clone(),
+                });
+            }
+            if !stderr.is_empty() {
+                sections.push(ToolPresentationSection::Text {
+                    label: Some(if *stderr_truncated {
+                        "stderr (truncated)".to_string()
+                    } else {
+                        "stderr".to_string()
+                    }),
+                    text: stderr.clone(),
+                });
+            }
+        }
+    }
+}
+
+fn push_shell_common_result_fields(
+    fields: &mut Vec<ToolPresentationFieldValue>,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    cancelled: bool,
+) {
+    fields.push(ToolPresentationFieldValue {
+        label: "Exit code".to_string(),
+        value: exit_code.map_or_else(|| "unknown".to_string(), |code| code.to_string()),
+    });
+    fields.push(ToolPresentationFieldValue {
+        label: "Timed out".to_string(),
+        value: timed_out.to_string(),
+    });
+    fields.push(ToolPresentationFieldValue {
+        label: "Cancelled".to_string(),
+        value: cancelled.to_string(),
+    });
 }
 
 fn shell_config_with_environment(
@@ -1534,6 +1658,101 @@ mod tests {
                 .get("output_truncated")
                 .and_then(serde_json::Value::as_bool),
             Some(true)
+        );
+    }
+    #[test]
+    fn captured_result_card_includes_process_metadata_and_stream_sections() {
+        let arguments = ShellRunArguments {
+            command: "printf ok".to_string(),
+            cwd: Some(PathBuf::from("/tmp")),
+            timeout_ms: Some(1_000),
+            terminal: false,
+            columns: None,
+            rows: None,
+        };
+        let response = ToolInvocationResponse {
+            output: String::new(),
+            is_error: false,
+            content: Vec::new(),
+            full_output: None,
+            host_action: None,
+            result: Some(ToolInvocationResult::ShellRun {
+                result: ShellRunResult::Captured {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    cancelled: false,
+                    stdout: "ok".to_string(),
+                    stderr: "warn".to_string(),
+                    stdout_truncated: false,
+                    stderr_truncated: true,
+                    stdout_bytes: Some(2),
+                    stderr_bytes: Some(4),
+                },
+            }),
+        };
+
+        let card = shell_result_card(&arguments, &response);
+
+        assert_eq!(card.title, "Shell command completed");
+        assert!(card.sections.iter().any(|section| matches!(section,
+            ToolPresentationSection::Fields { fields }
+            if fields.iter().any(|field| field.label == "Exit code" && field.value == "0")
+                && fields.iter().any(|field| field.label == "Stdout bytes" && field.value == "2")
+                && fields.iter().any(|field| field.label == "Stderr truncated" && field.value == "true")
+        )));
+        assert!(card.sections.iter().any(|section| matches!(section,
+            ToolPresentationSection::Text { label: Some(label), text }
+            if label == "stdout" && text == "ok"
+        )));
+        assert!(card.sections.iter().any(|section| matches!(section,
+            ToolPresentationSection::Text { label: Some(label), text }
+            if label == "stderr (truncated)" && text == "warn"
+        )));
+    }
+
+    #[test]
+    fn terminal_result_card_summarizes_without_duplicating_output() {
+        let arguments = ShellRunArguments {
+            command: "printf pty".to_string(),
+            cwd: None,
+            timeout_ms: Some(1_000),
+            terminal: true,
+            columns: Some(80),
+            rows: Some(24),
+        };
+        let response = ToolInvocationResponse {
+            output: String::new(),
+            is_error: false,
+            content: Vec::new(),
+            full_output: None,
+            host_action: None,
+            result: Some(ToolInvocationResult::ShellRun {
+                result: ShellRunResult::Terminal {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    cancelled: false,
+                    output_tail: "pty output".to_string(),
+                    output_truncated: false,
+                    output_bytes: Some(10),
+                    retained_output_bytes: Some(10),
+                    columns: 80,
+                    rows: 24,
+                },
+            }),
+        };
+
+        let card = shell_result_card(&arguments, &response);
+
+        assert!(card.sections.iter().any(|section| matches!(section,
+            ToolPresentationSection::Fields { fields }
+            if fields.iter().any(|field| field.label == "Output bytes" && field.value == "10")
+                && fields.iter().any(|field| field.label == "Columns" && field.value == "80")
+        )));
+        assert!(
+            !card
+                .sections
+                .iter()
+                .any(|section| matches!(section, ToolPresentationSection::Text { .. }))
         );
     }
 }
