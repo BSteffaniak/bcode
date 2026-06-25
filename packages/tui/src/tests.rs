@@ -15,7 +15,8 @@ use bcode_session_models::{
     RuntimeWorkKind, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
     SessionProjectionKind, SessionSummary, SessionTitleSource, SessionTokenUsage,
     SessionTraceEvent, SessionTracePayload, SessionTracePhase, ShellRunResult,
-    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
+    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream, ToolPresentationField,
+    ToolPresentationFieldKind, ToolRequestPresentationMetadata,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::TextMotion;
@@ -36,6 +37,32 @@ use super::{
     transcript::{TranscriptItem, TranscriptItemKind, transcript_items_from_events_with_reasoning},
     transcript_document::TranscriptDocument,
 };
+
+fn shell_request_presentation() -> ToolRequestPresentationMetadata {
+    ToolRequestPresentationMetadata {
+        title: "Shell command".to_owned(),
+        fields: vec![
+            ToolPresentationField {
+                label: "command".to_owned(),
+                argument: "command".to_owned(),
+                kind: ToolPresentationFieldKind::Command,
+                optional: false,
+            },
+            ToolPresentationField {
+                label: "cwd".to_owned(),
+                argument: "cwd".to_owned(),
+                kind: ToolPresentationFieldKind::Path,
+                optional: true,
+            },
+            ToolPresentationField {
+                label: "terminal".to_owned(),
+                argument: "terminal".to_owned(),
+                kind: ToolPresentationFieldKind::Boolean,
+                optional: true,
+            },
+        ],
+    }
+}
 
 fn theme_transition_config(curve: TuiAccentTransitionCurve) -> TuiConfig {
     TuiConfig {
@@ -1688,7 +1715,7 @@ fn transcript_renders_tool_blocks_with_structure_and_pretty_arguments() {
                 tool_call_id: full_call_id.to_owned(),
                 tool_name: "shell.run".to_owned(),
                 arguments_json: r#"{"command":"cargo check","cwd":"/tmp/project"}"#.to_owned(),
-                request_presentation: None,
+                request_presentation: Some(shell_request_presentation()),
             },
         ),
         event(
@@ -1983,9 +2010,10 @@ fn transcript_renders_shell_output_with_ansi_and_limits() {
                 arguments_json: serde_json::json!({
                     "command": "cargo test",
                     "cwd": "/tmp/project",
+                    "terminal": true,
                 })
                 .to_string(),
-                request_presentation: None,
+                request_presentation: Some(shell_request_presentation()),
             },
         ),
         event(
@@ -2010,7 +2038,6 @@ fn transcript_renders_shell_output_with_ansi_and_limits() {
     let output = rendered_text(&buffer);
 
     assert!(output.contains("Tool result · shell.run · ok"));
-    assert!(output.contains("terminal: yes"));
     assert!(output.contains("exit 0"));
     assert!(!output.contains("line 0"));
     assert!(output.contains("line 39"));
@@ -4360,7 +4387,7 @@ fn live_shell_command_preview_streams_before_final_request_and_is_replaced() {
                 "cwd": "/repo",
             })
             .to_string(),
-            request_presentation: None,
+            request_presentation: Some(shell_request_presentation()),
         },
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 20));

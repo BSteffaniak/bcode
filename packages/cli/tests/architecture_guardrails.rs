@@ -35,6 +35,28 @@ const DENIED_TOOL_NAME_NEEDLES: &[&str] = &[
     "document.extract",
 ];
 
+const DENIED_NORMALIZED_TOOL_NAME_NEEDLES: &[&str] = &[
+    "shell_run",
+    "filesystem_read",
+    "filesystem_write",
+    "filesystem_edit",
+    "filesystem_list",
+    "filesystem_find",
+    "filesystem_grep",
+    "filesystem_stat",
+    "filesystem_exists",
+    "web_search",
+    "web_fetch",
+    "web_status",
+    "web_inspect",
+    "git_clone",
+    "github_clone",
+    "worktree_list",
+    "worktree_create",
+    "worktree_remove",
+    "document_extract",
+];
+
 const DENIED_PLUGIN_ID_NEEDLES: &[&str] = &[
     "bcode.filesystem",
     "bcode.shell",
@@ -160,6 +182,14 @@ fn scan_file(path: &Path, offenders: &mut Vec<BoundaryOffender>) {
             line,
             DENIED_TOOL_NAME_NEEDLES,
             "tool name",
+            offenders,
+        );
+        scan_line(
+            path,
+            line_number,
+            line,
+            DENIED_NORMALIZED_TOOL_NAME_NEEDLES,
+            "normalized tool name",
             offenders,
         );
         scan_line(

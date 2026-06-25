@@ -1,120 +1,15 @@
 //! Bcode-specific tool-call presentation models for transcript rendering.
 
-use std::path::Path;
-
 use bcode_session_models::ToolRequestPresentationMetadata;
 use serde_json::Value;
 
-/// Human-readable presentation for a known tool request.
+/// Human-readable presentation for a tool request.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ToolRequestPresentation {
-    /// Shell command execution request.
-    ShellRun {
-        /// Command line that will run.
-        command: String,
-        /// Optional working directory.
-        cwd: Option<String>,
-        /// Optional timeout in milliseconds.
-        timeout_ms: Option<u64>,
-    },
-    /// Filesystem read request.
-    Read {
-        /// Path to read.
-        path: String,
-    },
-    /// Filesystem write request.
-    Write {
-        /// Path to write.
-        path: String,
-        /// Byte length of the requested contents.
-        bytes: usize,
-        /// Line count of the requested contents.
-        lines: usize,
-    },
-    /// Filesystem existence check request.
-    Exists {
-        /// Path to inspect.
-        path: String,
-    },
-    /// Filesystem list request.
-    List {
-        /// Directory path to list.
-        path: String,
-        /// Whether listing is recursive.
-        recursive: bool,
-        /// Optional maximum entry count.
-        max_entries: Option<u64>,
-    },
-    /// Filesystem find request.
-    Find {
-        /// Root path to search.
-        path: String,
-        /// Glob pattern.
-        pattern: String,
-        /// Optional maximum result count.
-        max_results: Option<u64>,
-    },
-    /// Filesystem grep request.
-    Grep {
-        /// Root path to search.
-        path: String,
-        /// Literal search pattern.
-        pattern: String,
-        /// Optional glob filter.
-        glob: Option<String>,
-        /// Whether matching ignores case.
-        ignore_case: bool,
-        /// Optional maximum match count.
-        max_matches: Option<u64>,
-    },
-    /// Filesystem stat request.
-    Stat {
-        /// Path to inspect.
-        path: String,
-    },
-    /// Web search request.
-    WebSearch {
-        /// Search query.
-        query: String,
-        /// Optional provider override.
-        provider: Option<String>,
-        /// Optional maximum result count.
-        max_results: Option<u64>,
-    },
-    /// Web fetch request.
-    WebFetch {
-        /// URL to fetch.
-        url: String,
-        /// Optional maximum byte count.
-        max_bytes: Option<u64>,
-        /// Whether rendered fetching was requested.
-        render: bool,
-    },
-    /// Git clone request.
-    GitClone {
-        /// Git remote or forge URL.
-        url: String,
-        /// Optional branch/tag/ref.
-        git_ref: Option<String>,
-        /// Explicit destination override.
-        destination: Option<String>,
-    },
-    /// Document extraction request.
-    DocumentExtract {
-        /// Source URL, if extracting from the network.
-        url: Option<String>,
-        /// Source path, if extracting from a local/artifact path.
-        path: Option<String>,
-        /// Optional maximum byte count.
-        max_bytes: Option<u64>,
-    },
-    /// Generic plugin-owned request presentation.
-    Generic {
-        /// Human-readable title.
-        title: String,
-        /// Labeled detail fields.
-        fields: Vec<(String, String)>,
-    },
+pub struct ToolRequestPresentation {
+    /// Human-readable title.
+    pub title: String,
+    /// Labeled detail fields.
+    pub fields: Vec<(String, String)>,
 }
 
 /// Human-readable presentation for a known tool result.
@@ -251,86 +146,13 @@ pub struct GrepMatchPresentation {
     pub line: String,
 }
 
-/// Build a known-tool request presentation from raw tool arguments.
+/// Build a metadata-driven request presentation from raw tool arguments.
 #[must_use]
 pub fn tool_request_presentation(
-    tool_name: &str,
     arguments_json: &str,
     metadata: Option<&ToolRequestPresentationMetadata>,
 ) -> Option<ToolRequestPresentation> {
-    if let Some(metadata) = metadata
-        && let Some(presentation) = metadata_request_presentation(arguments_json, metadata)
-    {
-        return Some(presentation);
-    }
-    let value = serde_json::from_str::<Value>(arguments_json).ok()?;
-    if is_shell_tool_name(tool_name) {
-        return Some(ToolRequestPresentation::ShellRun {
-            command: string_field(&value, "command")?,
-            cwd: string_field(&value, "cwd"),
-            timeout_ms: u64_field(&value, "timeout_ms"),
-        });
-    }
-    let normalized = normalized_tool_name(tool_name);
-    match normalized.as_str() {
-        "filesystem_read" | "read" => Some(ToolRequestPresentation::Read {
-            path: path_field(&value, "path")?,
-        }),
-        "filesystem_edit" | "edit" => Some(ToolRequestPresentation::Write {
-            path: path_field(&value, "path")?,
-            bytes: string_field(&value, "new_text").map_or(0, |contents| contents.len()),
-            lines: string_field(&value, "new_text").map_or(0, |contents| contents.lines().count()),
-        }),
-        "filesystem_write" | "write" => Some(ToolRequestPresentation::Write {
-            path: path_field(&value, "path")?,
-            bytes: string_field(&value, "contents").map_or(0, |contents| contents.len()),
-            lines: string_field(&value, "contents").map_or(0, |contents| contents.lines().count()),
-        }),
-        "filesystem_exists" | "exists" => Some(ToolRequestPresentation::Exists {
-            path: path_field(&value, "path")?,
-        }),
-        "filesystem_list" | "list" => Some(ToolRequestPresentation::List {
-            path: path_field(&value, "path")?,
-            recursive: bool_field(&value, "recursive"),
-            max_entries: u64_field(&value, "max_entries"),
-        }),
-        "filesystem_find" | "find" => Some(ToolRequestPresentation::Find {
-            path: path_field(&value, "path")?,
-            pattern: string_field(&value, "pattern")?,
-            max_results: u64_field(&value, "max_results"),
-        }),
-        "filesystem_grep" | "grep" => Some(ToolRequestPresentation::Grep {
-            path: path_field(&value, "path")?,
-            pattern: string_field(&value, "pattern")?,
-            glob: string_field(&value, "glob"),
-            ignore_case: bool_field(&value, "ignore_case"),
-            max_matches: u64_field(&value, "max_matches"),
-        }),
-        "filesystem_stat" | "stat" => Some(ToolRequestPresentation::Stat {
-            path: path_field(&value, "path")?,
-        }),
-        "web_search" => Some(ToolRequestPresentation::WebSearch {
-            query: string_field(&value, "query")?,
-            provider: string_field(&value, "provider"),
-            max_results: u64_field(&value, "max_results"),
-        }),
-        "web_fetch" => Some(ToolRequestPresentation::WebFetch {
-            url: string_field(&value, "url")?,
-            max_bytes: u64_field(&value, "max_bytes"),
-            render: bool_field(&value, "render"),
-        }),
-        "git_clone" | "github_clone" => Some(ToolRequestPresentation::GitClone {
-            url: string_field(&value, "url")?,
-            git_ref: string_field(&value, "ref").or_else(|| string_field(&value, "branch")),
-            destination: string_field(&value, "destination"),
-        }),
-        "document_extract" => Some(ToolRequestPresentation::DocumentExtract {
-            url: string_field(&value, "url"),
-            path: string_field(&value, "path"),
-            max_bytes: u64_field(&value, "max_bytes"),
-        }),
-        _ => None,
-    }
+    metadata.and_then(|metadata| metadata_request_presentation(arguments_json, metadata))
 }
 
 /// Build a known-tool result presentation from raw tool output.
@@ -376,7 +198,7 @@ fn metadata_request_presentation(
             (!rendered.is_empty()).then(|| (field.label.clone(), rendered))
         })
         .collect::<Vec<_>>();
-    Some(ToolRequestPresentation::Generic {
+    Some(ToolRequestPresentation {
         title: metadata.title.clone(),
         fields,
     })
@@ -567,17 +389,6 @@ fn string_field(value: &Value, field: &str) -> Option<String> {
         Value::Null => None,
         other => Some(other.to_string()),
     }
-}
-
-fn path_field(value: &Value, field: &str) -> Option<String> {
-    string_field(value, field).map(|path| path_display(&path))
-}
-
-fn path_display(path: &str) -> String {
-    Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map_or_else(|| path.to_owned(), |_| path.to_owned())
 }
 
 fn bool_field(value: &Value, field: &str) -> bool {

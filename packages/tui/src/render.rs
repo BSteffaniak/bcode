@@ -35,7 +35,7 @@ use super::tool_present::{
 };
 use super::transcript::{FileEditPhase, TranscriptItem, TranscriptItemKind};
 use super::transcript_layout::TranscriptLayoutSignature;
-use crate::time_format::{format_elapsed_millis, format_millis};
+use crate::time_format::format_elapsed_millis;
 use bmux_tui::text_width::{display_width as text_display_width, truncate_to_display_width};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -994,11 +994,9 @@ fn push_tool_request_rows(
             context.live_preview,
             context.tool_name,
         );
-    } else if let Some(presentation) = tool_request_presentation(
-        context.tool_name,
-        context.arguments_json,
-        context.request_presentation,
-    ) {
+    } else if let Some(presentation) =
+        tool_request_presentation(context.arguments_json, context.request_presentation)
+    {
         push_tool_request_presentation_rows(rows, &presentation, width);
     } else if !item.text().is_empty() {
         push_labeled_text_preview(rows, "arguments", item.text(), width, 16);
@@ -1478,141 +1476,8 @@ fn push_tool_request_presentation_rows(
     presentation: &ToolRequestPresentation,
     width: u16,
 ) {
-    match presentation {
-        ToolRequestPresentation::ShellRun {
-            command,
-            cwd,
-            timeout_ms,
-        } => {
-            push_kv_row(rows, "command", command, width);
-            if let Some(cwd) = cwd {
-                push_kv_row(rows, "cwd", cwd, width);
-            }
-            if let Some(timeout_ms) = timeout_ms {
-                push_kv_row(rows, "timeout", &format_millis(*timeout_ms), width);
-            }
-            push_kv_row(rows, "terminal", "yes", width);
-        }
-        ToolRequestPresentation::Read { path }
-        | ToolRequestPresentation::Exists { path }
-        | ToolRequestPresentation::Stat { path } => {
-            push_kv_row(rows, "path", path, width);
-        }
-        ToolRequestPresentation::Write { path, bytes, lines } => {
-            push_kv_row(rows, "path", path, width);
-            push_kv_row(
-                rows,
-                "contents",
-                &format!("{bytes} bytes · {lines} lines"),
-                width,
-            );
-        }
-        ToolRequestPresentation::List {
-            path,
-            recursive,
-            max_entries,
-        } => {
-            push_kv_row(rows, "path", path, width);
-            push_kv_row(
-                rows,
-                "mode",
-                if *recursive { "recursive" } else { "direct" },
-                width,
-            );
-            if let Some(max_entries) = max_entries {
-                push_kv_row(rows, "limit", &format!("{max_entries} entries"), width);
-            }
-        }
-        ToolRequestPresentation::Find {
-            path,
-            pattern,
-            max_results,
-        } => {
-            push_kv_row(rows, "path", path, width);
-            push_kv_row(rows, "pattern", pattern, width);
-            if let Some(max_results) = max_results {
-                push_kv_row(rows, "limit", &format!("{max_results} results"), width);
-            }
-        }
-        ToolRequestPresentation::Grep {
-            path,
-            pattern,
-            glob,
-            ignore_case,
-            max_matches,
-        } => {
-            push_kv_row(rows, "path", path, width);
-            push_kv_row(rows, "pattern", pattern, width);
-            if let Some(glob) = glob {
-                push_kv_row(rows, "glob", glob, width);
-            }
-            if *ignore_case {
-                push_kv_row(rows, "match", "ignore case", width);
-            }
-            if let Some(max_matches) = max_matches {
-                push_kv_row(rows, "limit", &format!("{max_matches} matches"), width);
-            }
-        }
-        ToolRequestPresentation::WebSearch {
-            query,
-            provider,
-            max_results,
-        } => {
-            push_kv_row(rows, "query", query, width);
-            if let Some(provider) = provider {
-                push_kv_row(rows, "provider", provider, width);
-            }
-            if let Some(max_results) = max_results {
-                push_kv_row(rows, "limit", &format!("{max_results} results"), width);
-            }
-        }
-        ToolRequestPresentation::WebFetch {
-            url,
-            max_bytes,
-            render,
-        } => {
-            push_kv_row(rows, "url", url, width);
-            if let Some(max_bytes) = max_bytes {
-                push_kv_row(rows, "limit", &format!("{max_bytes} bytes"), width);
-            }
-            push_kv_row(rows, "rendered", if *render { "yes" } else { "no" }, width);
-        }
-        ToolRequestPresentation::GitClone {
-            url,
-            git_ref,
-            destination,
-        } => {
-            push_kv_row(rows, "url", url, width);
-            if let Some(git_ref) = git_ref {
-                push_kv_row(rows, "ref", git_ref, width);
-            }
-            push_kv_row(
-                rows,
-                "destination",
-                destination.as_deref().unwrap_or("Bcode artifacts"),
-                width,
-            );
-        }
-        ToolRequestPresentation::DocumentExtract {
-            url,
-            path,
-            max_bytes,
-        } => {
-            if let Some(url) = url {
-                push_kv_row(rows, "url", url, width);
-            }
-            if let Some(path) = path {
-                push_kv_row(rows, "path", path, width);
-            }
-            if let Some(max_bytes) = max_bytes {
-                push_kv_row(rows, "limit", &format!("{max_bytes} bytes"), width);
-            }
-        }
-        ToolRequestPresentation::Generic { fields, .. } => {
-            for (label, value) in fields {
-                push_kv_row(rows, label, value, width);
-            }
-        }
+    for (label, value) in &presentation.fields {
+        push_kv_row(rows, label, value, width);
     }
 }
 
