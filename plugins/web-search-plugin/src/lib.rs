@@ -1509,6 +1509,8 @@ fn search_tool_definition() -> ToolDefinition {
             activity_label: Some("searching".to_string()),
             live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::Query {
                 fields: vec!["query".to_string(), "provider".to_string()],
+                preview_title: Some("Search web".to_string()),
+                streaming_status: Some("searching {primary} · {bytes}".to_string()),
             }),
 
             request_presentation: Some(ToolRequestPresentationMetadata {
@@ -1570,6 +1572,8 @@ fn fetch_tool_definition() -> ToolDefinition {
             activity_label: Some("fetching".to_string()),
             live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::Query {
                 fields: vec!["url".to_string()],
+                preview_title: Some("Fetch URL".to_string()),
+                streaming_status: Some("fetching {primary} · {bytes}".to_string()),
             }),
 
             request_presentation: Some(ToolRequestPresentationMetadata {

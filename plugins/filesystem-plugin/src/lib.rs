@@ -373,13 +373,19 @@ fn path_tool_ui(activity_label: &str, title: &str) -> bcode_tool::ToolUiMetadata
     }
 }
 
-fn write_tool_ui(activity_label: &str, title: &str) -> bcode_tool::ToolUiMetadata {
+fn write_tool_ui(
+    activity_label: &str,
+    title: &str,
+    preview_title: &str,
+) -> bcode_tool::ToolUiMetadata {
     bcode_tool::ToolUiMetadata {
         activity_label: Some(activity_label.to_string()),
         live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::FileEdit {
             path_fields: vec!["path".to_string()],
             old_text_fields: Vec::new(),
             new_text_fields: vec!["contents".to_string(), "new_text".to_string()],
+            preview_title: Some(preview_title.to_string()),
+            streaming_status: Some(format!("{activity_label} {{path}} · {{bytes}}")),
         }),
 
         request_presentation: Some(ToolRequestPresentationMetadata {
@@ -437,7 +443,7 @@ fn write_tool_definition() -> ToolDefinition {
         side_effect: ToolSideEffect::WriteFiles,
         requires_permission: true,
         policy: path_policy(&["write"], "write", bcode_tool::ToolArgumentKind::WritePath),
-        ui: write_tool_ui("writing", "Write file"),
+        ui: write_tool_ui("writing", "Write file", "Write preview"),
     }
 }
 
@@ -457,7 +463,7 @@ fn edit_tool_definition() -> ToolDefinition {
         side_effect: ToolSideEffect::WriteFiles,
         requires_permission: true,
         policy: path_policy(&["edit"], "edit", bcode_tool::ToolArgumentKind::WritePath),
-        ui: write_tool_ui("editing", "Edit file"),
+        ui: write_tool_ui("editing", "Edit file", "Edit preview"),
     }
 }
 

@@ -135,6 +135,8 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
                 live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::ShellCommand {
                     command_field: "command".to_string(),
                     cwd_field: Some("cwd".to_string()),
+                    preview_title: Some("Shell command".to_string()),
+                    streaming_status: Some("shell command · {bytes}".to_string()),
                 }),
 
                 request_presentation: Some(ToolRequestPresentationMetadata {

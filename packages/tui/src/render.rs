@@ -1039,6 +1039,10 @@ fn push_live_tool_preview_anchor_rows(
             rows,
             &LiveFileEditPreviewRenderContext {
                 tool_name: &state.tool_name,
+                title: file
+                    .preview_title
+                    .as_deref()
+                    .unwrap_or("File change preview"),
                 preview: file,
                 argument_bytes: state.argument_bytes,
                 inline_diff_config,
@@ -1047,7 +1051,7 @@ fn push_live_tool_preview_anchor_rows(
         ),
         LiveToolArgumentPreview::ShellCommand(shell) => push_shell_preview_rows(
             rows,
-            &state.tool_name,
+            shell.preview_title.as_deref().unwrap_or("Shell command"),
             &shell.command_prefix,
             shell.cwd.as_deref(),
             state.argument_bytes,
@@ -1056,7 +1060,7 @@ fn push_live_tool_preview_anchor_rows(
         ),
         LiveToolArgumentPreview::Query(query) => push_query_preview_rows(
             rows,
-            &state.tool_name,
+            query.preview_title.as_deref().unwrap_or(&state.tool_name),
             &query.fields,
             state.argument_bytes,
             query.truncated,
@@ -1067,6 +1071,7 @@ fn push_live_tool_preview_anchor_rows(
 
 struct LiveFileEditPreviewRenderContext<'a> {
     tool_name: &'a str,
+    title: &'a str,
     preview: &'a LiveFileEditPreview,
     argument_bytes: usize,
     inline_diff_config: TuiInlineDiffConfig,
@@ -1080,7 +1085,7 @@ fn push_live_file_edit_preview_rows(
     push_wrapped_styled_text(
         rows,
         Vec::new(),
-        &format!("Tool call · {} · streaming preview", context.tool_name),
+        &format!("{} · {}", context.title, context.tool_name),
         width,
         Style::new().fg(Color::Cyan),
         Style::new().fg(Color::Cyan),
@@ -1145,7 +1150,7 @@ fn format_preview_bytes(bytes: usize) -> String {
 
 fn push_shell_preview_rows(
     rows: &mut Vec<Line>,
-    tool_name: &str,
+    title: &str,
     command_prefix: &str,
     cwd: Option<&str>,
     argument_bytes: usize,
@@ -1155,7 +1160,7 @@ fn push_shell_preview_rows(
     push_wrapped_styled_text(
         rows,
         Vec::new(),
-        &format!("Tool call · {tool_name} · streaming preview"),
+        title,
         width,
         Style::new().fg(Color::Cyan),
         Style::new().fg(Color::Cyan),
@@ -1185,7 +1190,7 @@ fn push_shell_preview_rows(
 
 fn push_query_preview_rows(
     rows: &mut Vec<Line>,
-    tool_name: &str,
+    title: &str,
     fields: &std::collections::BTreeMap<String, String>,
     argument_bytes: usize,
     truncated: bool,
@@ -1194,7 +1199,7 @@ fn push_query_preview_rows(
     push_wrapped_styled_text(
         rows,
         Vec::new(),
-        &format!("Tool call · {tool_name} · streaming preview"),
+        title,
         width,
         Style::new().fg(Color::Cyan),
         Style::new().fg(Color::Cyan),

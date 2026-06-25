@@ -103,6 +103,12 @@ pub enum ToolLiveArgumentPreviewMetadata {
         old_text_fields: Vec<String>,
         /// Candidate new-text/content fields.
         new_text_fields: Vec<String>,
+        /// Plugin-owned live preview title.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preview_title: Option<String>,
+        /// Plugin-owned streaming status template.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        streaming_status: Option<String>,
     },
     /// Shell command style preview.
     ShellCommand {
@@ -111,11 +117,23 @@ pub enum ToolLiveArgumentPreviewMetadata {
         /// Optional cwd field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd_field: Option<String>,
+        /// Plugin-owned live preview title.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preview_title: Option<String>,
+        /// Plugin-owned streaming status template.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        streaming_status: Option<String>,
     },
     /// Query/key-value style preview.
     Query {
         /// Candidate display fields.
         fields: Vec<String>,
+        /// Plugin-owned live preview title.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preview_title: Option<String>,
+        /// Plugin-owned streaming status template.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        streaming_status: Option<String>,
     },
 }
 

@@ -371,6 +371,8 @@ fn clone_tool_definition() -> ToolDefinition {
                     "ref".to_string(),
                     "branch".to_string(),
                 ],
+                preview_title: Some("Clone repository".to_string()),
+                streaming_status: Some("cloning {primary} · {bytes}".to_string()),
             }),
 
             request_presentation: Some(ToolRequestPresentationMetadata {

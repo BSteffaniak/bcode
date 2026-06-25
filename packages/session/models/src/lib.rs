@@ -360,6 +360,12 @@ pub enum LiveToolArgumentPreview {
 /// Live-only query-like tool preview derived from partial tool-call arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveQueryPreview {
+    /// Plugin-owned live preview title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_title: Option<String>,
+    /// Plugin-owned streaming status text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streaming_status: Option<String>,
     /// Extracted string fields for display.
     pub fields: BTreeMap<String, String>,
     /// Total assembled argument bytes received so far.
@@ -371,6 +377,12 @@ pub struct LiveQueryPreview {
 /// Live-only file edit/write preview derived from partial tool-call arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveFileEditPreview {
+    /// Plugin-owned live preview title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_title: Option<String>,
+    /// Plugin-owned streaming status text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streaming_status: Option<String>,
     /// Best-effort file path extracted from partial arguments.
     pub path: Option<String>,
     /// Best-effort old text prefix extracted from partial arguments.
@@ -386,6 +398,12 @@ pub struct LiveFileEditPreview {
 /// Live-only shell command preview derived from partial tool-call arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveShellCommandPreview {
+    /// Plugin-owned live preview title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_title: Option<String>,
+    /// Plugin-owned streaming status text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streaming_status: Option<String>,
     /// Best-effort command prefix extracted from partial arguments.
     pub command_prefix: String,
     /// Best-effort working directory extracted from partial arguments.

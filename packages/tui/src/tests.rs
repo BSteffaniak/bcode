@@ -4364,6 +4364,8 @@ fn live_shell_command_preview_streams_before_final_request_and_is_replaced() {
             tool_name: "shell_run".to_owned(),
             argument_bytes: 36,
             preview: LiveToolArgumentPreview::ShellCommand(LiveShellCommandPreview {
+                preview_title: None,
+                streaming_status: None,
                 command_prefix: "cargo test -p bcode_tui".to_owned(),
                 cwd: Some("/repo".to_owned()),
                 argument_bytes: 36,
@@ -4376,10 +4378,7 @@ fn live_shell_command_preview_streams_before_final_request_and_is_replaced() {
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
-    assert!(
-        output.contains("Tool call · shell_run · streaming preview"),
-        "{output}"
-    );
+    assert!(output.contains("Shell command"), "{output}");
     assert!(
         output.contains("command: cargo test -p bcode_tui"),
         "{output}"
@@ -4425,6 +4424,8 @@ fn live_file_preview_updates_without_duplicates_and_final_replaces_it() {
                 tool_name: "filesystem_write".to_owned(),
                 argument_bytes: contents.len(),
                 preview: LiveToolArgumentPreview::FileEdit(LiveFileEditPreview {
+                    preview_title: None,
+                    streaming_status: None,
                     path: Some("src/main.rs".to_owned()),
                     old_text_prefix: None,
                     new_text_prefix: contents.to_owned(),
@@ -4439,7 +4440,7 @@ fn live_file_preview_updates_without_duplicates_and_final_replaces_it() {
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
-    assert_eq!(output.matches("streaming preview").count(), 1, "{output}");
+    assert_eq!(output.matches("File change preview").count(), 1, "{output}");
     assert!(
         output.contains("Streaming preview · Writing file"),
         "{output}"
@@ -4484,6 +4485,8 @@ fn live_file_preview_renders_truncation_note_and_received_bytes() {
             tool_name: "filesystem_write".to_owned(),
             argument_bytes: 2048,
             preview: LiveToolArgumentPreview::FileEdit(LiveFileEditPreview {
+                preview_title: None,
+                streaming_status: None,
                 path: Some("src/lib.rs".to_owned()),
                 old_text_prefix: None,
                 new_text_prefix: "pub fn demo() {}".to_owned(),
@@ -4516,6 +4519,8 @@ fn live_file_preview_uses_syntax_highlighted_inline_diff_renderer() {
             tool_name: "filesystem_write".to_owned(),
             argument_bytes: 36,
             preview: LiveToolArgumentPreview::FileEdit(LiveFileEditPreview {
+                preview_title: None,
+                streaming_status: None,
                 path: Some("src/lib.rs".to_owned()),
                 old_text_prefix: None,
                 new_text_prefix: "pub fn demo() {\n    println!(\"hi\");\n}".to_owned(),

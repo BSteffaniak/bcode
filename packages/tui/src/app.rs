@@ -3066,37 +3066,34 @@ impl BmuxApp {
             return;
         }
         self.ensure_live_tool_preview_anchor(tool_call_id, tool_name);
+        let bytes = format_provider_bytes(argument_bytes);
         match preview {
-            LiveToolArgumentPreview::FileEdit(_) => {
+            LiveToolArgumentPreview::FileEdit(file) => {
                 self.set_file_activity(tool_name);
-                self.status = format!(
-                    "streaming file change · {} received",
-                    format_provider_bytes(argument_bytes)
+                self.status = file.streaming_status.clone().map_or_else(
+                    || format!("streaming file change · {bytes} received"),
+                    |status| render_live_preview_template(&status, preview, &bytes),
                 );
             }
-            LiveToolArgumentPreview::ShellCommand(_) => {
-                self.set_activity(ActivityState::ProviderStream {
-                    detail: format!(
-                        "streaming {tool_name} command ({} received)",
-                        format_provider_bytes(argument_bytes)
-                    ),
-                });
-                self.status = format!(
-                    "streaming command · {} received",
-                    format_provider_bytes(argument_bytes)
+            LiveToolArgumentPreview::ShellCommand(shell) => {
+                let status = shell.streaming_status.clone().map_or_else(
+                    || format!("streaming command · {bytes} received"),
+                    |status| render_live_preview_template(&status, preview, &bytes),
                 );
+                self.set_activity(ActivityState::ProviderStream {
+                    detail: status.clone(),
+                });
+                self.status = status;
             }
-            LiveToolArgumentPreview::Query(_) => {
-                self.set_activity(ActivityState::ProviderStream {
-                    detail: format!(
-                        "streaming {tool_name} arguments ({} received)",
-                        format_provider_bytes(argument_bytes)
-                    ),
-                });
-                self.status = format!(
-                    "streaming {tool_name} · {} received",
-                    format_provider_bytes(argument_bytes)
+            LiveToolArgumentPreview::Query(query) => {
+                let status = query.streaming_status.clone().map_or_else(
+                    || format!("streaming {tool_name} · {bytes} received"),
+                    |status| render_live_preview_template(&status, preview, &bytes),
                 );
+                self.set_activity(ActivityState::ProviderStream {
+                    detail: status.clone(),
+                });
+                self.status = status;
             }
         }
         self.mark_live_preview_dirty();
@@ -3756,6 +3753,27 @@ fn format_usd_micros(micros: u64) -> String {
         "<$0.01".to_string()
     } else {
         format!("${dollars}.{cents:02}")
+    }
+}
+
+fn render_live_preview_template(
+    template: &str,
+    preview: &LiveToolArgumentPreview,
+    bytes: &str,
+) -> String {
+    let primary = live_preview_primary(preview).unwrap_or_default();
+    template
+        .replace(concat!("{", "bytes", "}"), bytes)
+        .replace(concat!("{", "primary", "}"), primary)
+        .replace(concat!("{", "path", "}"), primary)
+        .replace(concat!("{", "command", "}"), primary)
+}
+
+fn live_preview_primary(preview: &LiveToolArgumentPreview) -> Option<&str> {
+    match preview {
+        LiveToolArgumentPreview::FileEdit(file) => file.path.as_deref(),
+        LiveToolArgumentPreview::ShellCommand(shell) => Some(shell.command_prefix.as_str()),
+        LiveToolArgumentPreview::Query(query) => query.fields.values().next().map(String::as_str),
     }
 }
 
