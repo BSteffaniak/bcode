@@ -29,10 +29,7 @@ use super::activity::ActivityState;
 use super::app::{BmuxApp, DaemonConnectionState, LiveToolPreviewState, composer_policy};
 use super::diff_extract::FileEditTranscript;
 use super::pending_submission::{PendingSubmission, PendingSubmissionState};
-use super::tool_present::{
-    GrepMatchPresentation, ListEntryPresentation, ShellResultPresentation, ToolRequestPresentation,
-    ToolResultPresentation, tool_request_presentation, tool_result_presentation,
-};
+use super::tool_present::{ToolRequestPresentation, tool_request_presentation};
 use super::transcript::{FileEditPhase, TranscriptItem, TranscriptItemKind};
 use super::transcript_layout::TranscriptLayoutSignature;
 use crate::time_format::format_elapsed_millis;
@@ -45,8 +42,6 @@ const MAX_INLINE_DIFF_ROWS: usize = 28;
 const INLINE_DIFF_CARD_MIN_WIDTH: usize = 48;
 const INLINE_DIFF_CARD_CHROME_WIDTH: usize = 14;
 const INLINE_DIFF_BODY_CHROME_WIDTH: usize = 14;
-const MAX_INLINE_STDOUT_ROWS: usize = 24;
-const MAX_INLINE_STDERR_ROWS: usize = 24;
 const MAX_INLINE_TOOL_TEXT_ROWS: usize = 28;
 const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(420);
 #[derive(Debug, Clone, Copy)]
@@ -1381,27 +1376,11 @@ fn push_tool_result_rows(
     context: &ToolResultRenderContext<'_>,
     width: u16,
 ) {
-    let presentation = tool_result_presentation(context.tool_name, context.result);
     let status = if context.is_error { "failed" } else { "ok" };
-    let title = match &presentation {
-        Some(ToolResultPresentation::Shell(ShellResultPresentation::Terminal {
-            exit_code,
-            timed_out,
-            ..
-        })) => terminal_title(
-            context.tool_name,
-            *exit_code,
-            Some(*timed_out),
-            context.is_error,
-            false,
-            None,
-            None,
-        ),
-        _ => context.tool_name.map_or_else(
-            || format!("Tool result · {status}"),
-            |name| format!("Tool result · {name} · {status}"),
-        ),
-    };
+    let title = context.tool_name.map_or_else(
+        || format!("Tool result · {status}"),
+        |name| format!("Tool result · {name} · {status}"),
+    );
     push_wrapped_styled_text(
         rows,
         Vec::new(),
@@ -1414,17 +1393,15 @@ fn push_tool_result_rows(
         },
         muted_style(),
     );
-    if let Some(presentation) = presentation {
-        if context.has_file_preview
-            && matches!(
-                presentation,
-                ToolResultPresentation::Write { .. } | ToolResultPresentation::Edit { .. }
-            )
-        {
-            push_muted_confirmation_rows(rows, &presentation, width);
-        } else {
-            push_tool_result_presentation_rows(rows, &presentation, width);
-        }
+    if context.has_file_preview && !context.result.trim().is_empty() {
+        push_wrapped_styled_text(
+            rows,
+            vec![Span::styled("  ", muted_style())],
+            &format!("confirmation: {}", context.result.trim()),
+            width,
+            muted_style(),
+            muted_style(),
+        );
     } else {
         push_labeled_text_preview(
             rows,
@@ -1447,30 +1424,20 @@ fn push_tool_result_rows(
     rows.push(Line::default());
 }
 
-fn push_muted_confirmation_rows(
-    rows: &mut Vec<Line>,
-    presentation: &ToolResultPresentation,
-    width: u16,
-) {
-    let (ToolResultPresentation::Write { summary } | ToolResultPresentation::Edit { summary }) =
-        presentation
-    else {
-        return;
-    };
-    if summary.is_empty() {
-        return;
-    }
+fn push_kv_row(rows: &mut Vec<Line>, key: &str, value: &str, width: u16) {
     push_wrapped_styled_text(
         rows,
-        vec![Span::styled("  ", muted_style())],
-        &format!("confirmation: {summary}"),
+        vec![
+            Span::styled("  ", muted_style()),
+            Span::styled(format!("{key}: "), muted_style()),
+        ],
+        value,
         width,
-        muted_style(),
+        Style::new(),
         muted_style(),
     );
 }
 
-#[allow(clippy::too_many_lines)]
 fn push_tool_request_presentation_rows(
     rows: &mut Vec<Line>,
     presentation: &ToolRequestPresentation,
@@ -1478,242 +1445,6 @@ fn push_tool_request_presentation_rows(
 ) {
     for (label, value) in &presentation.fields {
         push_kv_row(rows, label, value, width);
-    }
-}
-
-fn push_tool_result_presentation_rows(
-    rows: &mut Vec<Line>,
-    presentation: &ToolResultPresentation,
-    width: u16,
-) {
-    match presentation {
-        ToolResultPresentation::Read {
-            contents,
-            bytes,
-            lines,
-        } => {
-            push_kv_row(
-                rows,
-                "read",
-                &format!("{bytes} bytes · {lines} lines"),
-                width,
-            );
-            push_labeled_text_preview(rows, "preview", contents, width, MAX_INLINE_TOOL_TEXT_ROWS);
-        }
-        ToolResultPresentation::Write { summary } | ToolResultPresentation::Edit { summary } => {
-            push_kv_row(rows, "result", summary, width);
-        }
-        ToolResultPresentation::Exists { exists } => {
-            push_kv_row(rows, "exists", if *exists { "yes" } else { "no" }, width);
-        }
-        ToolResultPresentation::List {
-            entries,
-            timed_out,
-            partial,
-            visited_entries,
-            message,
-        } => push_tool_collection_rows(
-            rows,
-            CollectionStatus {
-                count: entries.len(),
-                noun: "entries",
-                timed_out: *timed_out,
-                partial: *partial,
-                visited_entries: *visited_entries,
-                message: message.as_deref(),
-            },
-            width,
-            |rows| push_list_entries(rows, entries, width),
-        ),
-        ToolResultPresentation::Find {
-            paths,
-            timed_out,
-            partial,
-            visited_entries,
-            message,
-        } => push_tool_collection_rows(
-            rows,
-            CollectionStatus {
-                count: paths.len(),
-                noun: "paths",
-                timed_out: *timed_out,
-                partial: *partial,
-                visited_entries: *visited_entries,
-                message: message.as_deref(),
-            },
-            width,
-            |rows| push_path_results(rows, paths, width),
-        ),
-        ToolResultPresentation::Grep {
-            matches,
-            timed_out,
-            partial,
-            visited_entries,
-            message,
-        } => push_tool_collection_rows(
-            rows,
-            CollectionStatus {
-                count: matches.len(),
-                noun: "matches",
-                timed_out: *timed_out,
-                partial: *partial,
-                visited_entries: *visited_entries,
-                message: message.as_deref(),
-            },
-            width,
-            |rows| push_grep_matches(rows, matches, width),
-        ),
-        ToolResultPresentation::Shell(shell) => push_shell_result_rows(rows, shell, width),
-        ToolResultPresentation::Stat { exists, kind, len } => {
-            push_kv_row(rows, "exists", if *exists { "yes" } else { "no" }, width);
-            if let Some(kind) = kind {
-                push_kv_row(rows, "kind", kind, width);
-            }
-            if let Some(len) = len {
-                push_kv_row(rows, "size", &format!("{len} bytes"), width);
-            }
-        }
-    }
-}
-
-fn push_kv_row(rows: &mut Vec<Line>, label: &str, value: &str, width: u16) {
-    push_wrapped_styled_text(
-        rows,
-        vec![
-            Span::styled("  ", muted_style()),
-            Span::styled(
-                format!("{label}: "),
-                muted_style().add_modifier(Modifier::BOLD),
-            ),
-        ],
-        value,
-        width,
-        Style::new().fg(Color::BrightWhite),
-        muted_style(),
-    );
-}
-
-fn push_tool_collection_rows(
-    rows: &mut Vec<Line>,
-    status: CollectionStatus<'_>,
-    width: u16,
-    push_items: impl FnOnce(&mut Vec<Line>),
-) {
-    push_collection_status(rows, status, width);
-    push_items(rows);
-}
-
-fn push_path_results(rows: &mut Vec<Line>, paths: &[String], width: u16) {
-    for path in preview_values(paths, MAX_INLINE_TOOL_TEXT_ROWS) {
-        push_wrapped_styled_text(
-            rows,
-            vec![Span::styled("    ", muted_style())],
-            path,
-            width,
-            Style::new(),
-            muted_style(),
-        );
-    }
-    push_hidden_count(rows, paths.len(), MAX_INLINE_TOOL_TEXT_ROWS, "paths", width);
-}
-
-#[derive(Clone, Copy)]
-struct CollectionStatus<'a> {
-    count: usize,
-    noun: &'a str,
-    timed_out: bool,
-    partial: bool,
-    visited_entries: Option<u64>,
-    message: Option<&'a str>,
-}
-
-fn push_collection_status(rows: &mut Vec<Line>, status: CollectionStatus<'_>, width: u16) {
-    let mut text = format!("{} {}", status.count, status.noun);
-    if let Some(visited_entries) = status.visited_entries {
-        text.push_str(" · visited ");
-        text.push_str(&visited_entries.to_string());
-    }
-    if status.timed_out {
-        text.push_str(" · timed out");
-    }
-    if status.partial {
-        text.push_str(" · partial");
-    }
-    push_kv_row(rows, "result", &text, width);
-    if let Some(message) = status.message {
-        push_kv_row(rows, "note", message, width);
-    }
-}
-
-fn push_list_entries(rows: &mut Vec<Line>, entries: &[ListEntryPresentation], width: u16) {
-    for entry in preview_values(entries, MAX_INLINE_TOOL_TEXT_ROWS) {
-        let icon = match entry.kind.as_str() {
-            "directory" => "dir ",
-            "file" => "file",
-            other => other,
-        };
-        push_wrapped_styled_text(
-            rows,
-            vec![
-                Span::styled("    ", muted_style()),
-                Span::styled(format!("{icon} "), muted_style()),
-            ],
-            &entry.path,
-            width,
-            Style::new(),
-            muted_style(),
-        );
-    }
-    push_hidden_count(
-        rows,
-        entries.len(),
-        MAX_INLINE_TOOL_TEXT_ROWS,
-        "entries",
-        width,
-    );
-}
-
-fn push_grep_matches(rows: &mut Vec<Line>, matches: &[GrepMatchPresentation], width: u16) {
-    for grep_match in preview_values(matches, MAX_INLINE_TOOL_TEXT_ROWS) {
-        let location = grep_match.line_number.map_or_else(
-            || grep_match.path.clone(),
-            |line_number| format!("{}:{line_number}", grep_match.path),
-        );
-        push_wrapped_styled_text(
-            rows,
-            vec![
-                Span::styled("    ", muted_style()),
-                Span::styled(format!("{location}: "), muted_style()),
-            ],
-            &grep_match.line,
-            width,
-            Style::new(),
-            muted_style(),
-        );
-    }
-    push_hidden_count(
-        rows,
-        matches.len(),
-        MAX_INLINE_TOOL_TEXT_ROWS,
-        "matches",
-        width,
-    );
-}
-
-fn preview_values<T>(values: &[T], max_rows: usize) -> impl Iterator<Item = &T> {
-    values.iter().take(max_rows)
-}
-
-fn push_hidden_count(rows: &mut Vec<Line>, total: usize, shown: usize, noun: &str, width: u16) {
-    if total > shown {
-        push_wrapped_styled_text(
-            rows,
-            vec![Span::styled("    ", muted_style())],
-            &format!("… {} {noun} hidden …", total - shown),
-            width,
-            muted_style(),
-            muted_style(),
-        );
     }
 }
 
@@ -2228,84 +1959,6 @@ const fn diff_view_styles() -> DiffViewStyles {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CaptureShellOutput {
-    exit_code: Option<i32>,
-    timed_out: bool,
-    stdout: String,
-    stderr: String,
-}
-
-fn push_shell_result_rows(rows: &mut Vec<Line>, shell: &ShellResultPresentation, width: u16) {
-    match shell {
-        ShellResultPresentation::Terminal {
-            exit_code,
-            timed_out,
-            output,
-            output_truncated,
-            output_bytes,
-            retained_output_bytes,
-            columns,
-            rows: terminal_rows,
-        } => push_terminal_output_rows(
-            rows,
-            &TerminalOutputTranscript {
-                exit_code: *exit_code,
-                timed_out: Some(*timed_out),
-                elapsed: None,
-                output: output.clone(),
-                output_truncated: *output_truncated,
-                output_bytes: *output_bytes,
-                retained_output_bytes: *retained_output_bytes,
-                columns: *columns,
-                rows: *terminal_rows,
-            },
-            width,
-        ),
-        ShellResultPresentation::Capture {
-            exit_code,
-            timed_out,
-            stdout,
-            stderr,
-        } => push_shell_output_rows(
-            rows,
-            &CaptureShellOutput {
-                exit_code: *exit_code,
-                timed_out: *timed_out,
-                stdout: stdout.clone(),
-                stderr: stderr.clone(),
-            },
-            width,
-        ),
-    }
-}
-
-fn push_shell_output_rows(rows: &mut Vec<Line>, output: &CaptureShellOutput, width: u16) {
-    let status = shell_status(output);
-    push_wrapped_styled_text(
-        rows,
-        vec![Span::styled("  ", muted_style())],
-        &status,
-        width,
-        shell_status_style(output),
-        muted_style(),
-    );
-    push_ansi_output_preview(
-        rows,
-        "stdout",
-        &output.stdout,
-        width,
-        MAX_INLINE_STDOUT_ROWS,
-    );
-    push_ansi_output_preview(
-        rows,
-        "stderr",
-        &output.stderr,
-        width,
-        MAX_INLINE_STDERR_ROWS,
-    );
-}
-
 struct TerminalOutputTranscript {
     exit_code: Option<i32>,
     timed_out: Option<bool>,
@@ -2503,41 +2156,6 @@ fn terminal_status_style(output: &TerminalOutputTranscript) -> Style {
     }
 }
 
-fn push_ansi_output_preview(
-    rows: &mut Vec<Line>,
-    label: &str,
-    text: &str,
-    width: u16,
-    max_rows: usize,
-) {
-    if text.is_empty() {
-        return;
-    }
-    push_wrapped_styled_text(
-        rows,
-        vec![Span::styled("  ", muted_style())],
-        label,
-        width,
-        muted_style().add_modifier(Modifier::BOLD),
-        muted_style(),
-    );
-    let parsed = ansi_to_lines(text);
-    let total = parsed.len();
-    for line in preview_lines(&parsed, max_rows) {
-        rows.push(prefix_line(line.clone(), "    ", muted_style()));
-    }
-    if total > max_rows {
-        push_wrapped_styled_text(
-            rows,
-            vec![Span::styled("    ", muted_style())],
-            &format!("… {} {label} rows hidden …", total - max_rows),
-            width,
-            muted_style(),
-            muted_style(),
-        );
-    }
-}
-
 fn push_labeled_text_preview(
     rows: &mut Vec<Line>,
     label: &str,
@@ -2584,26 +2202,6 @@ fn prefix_line(mut line: Line, prefix: &str, prefix_style: Style) -> Line {
     let mut spans = vec![Span::styled(prefix.to_owned(), prefix_style)];
     spans.append(&mut line.spans);
     Line::from_spans(spans)
-}
-
-fn shell_status(output: &CaptureShellOutput) -> String {
-    let exit = output.exit_code.map_or_else(
-        || "exit unknown".to_owned(),
-        |exit_code| format!("exit {exit_code}"),
-    );
-    if output.timed_out {
-        format!("{exit} · timed out")
-    } else {
-        exit
-    }
-}
-
-fn shell_status_style(output: &CaptureShellOutput) -> Style {
-    if output.timed_out || output.exit_code.is_some_and(|exit_code| exit_code != 0) {
-        Style::new().fg(Color::Red)
-    } else {
-        Style::new().fg(Color::Green)
-    }
 }
 
 fn push_usage_rows(rows: &mut Vec<Line>, item: &TranscriptItem, turn_id: &str, width: u16) {

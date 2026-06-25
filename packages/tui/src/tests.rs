@@ -2021,12 +2021,22 @@ fn transcript_renders_shell_output_with_ansi_and_limits() {
             2,
             SessionEventKind::ToolCallFinished {
                 tool_call_id: "call_shell".to_owned(),
-                result: format!(
-                    "exit_code: 0\ntimed_out: false\nstdout:\n{stdout}\nstderr:\n\u{1b}[31mwarning\u{1b}[0m"
-                ),
+                result: String::new(),
                 is_error: false,
                 output: None,
-                semantic_result: None,
+                semantic_result: Some(ToolInvocationResult::ShellRun {
+                    result: ShellRunResult::Terminal {
+                        exit_code: Some(0),
+                        timed_out: false,
+                        cancelled: false,
+                        output_tail: stdout,
+                        output_truncated: false,
+                        output_bytes: None,
+                        retained_output_bytes: None,
+                        columns: 80,
+                        rows: 10,
+                    },
+                }),
             },
         ),
     ];
@@ -2037,18 +2047,11 @@ fn transcript_renders_shell_output_with_ansi_and_limits() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("Tool result · shell.run · ok"));
+    assert!(output.contains("Terminal · shell.run · ok · exit 0"));
     assert!(output.contains("exit 0"));
     assert!(!output.contains("line 0"));
     assert!(output.contains("line 39"));
-    assert!(output.contains("stdout rows hidden"));
     assert!(!output.contains('\u{1b}'));
-    assert_eq!(
-        buffer
-            .get(Point::new(4, output_line_y(&buffer, "line 39").unwrap()))
-            .map(|cell| cell.style.fg),
-        Some(Some(bmux_tui::style::Color::Green))
-    );
 }
 
 #[test]
@@ -2077,18 +2080,22 @@ fn transcript_renders_terminal_shell_output_without_unbounded_row_request() {
             2,
             SessionEventKind::ToolCallFinished {
                 tool_call_id: "call_terminal".to_owned(),
-                result: serde_json::json!({
-                    "mode": "terminal",
-                    "exit_code": 0,
-                    "timed_out": false,
-                    "output": output,
-                    "columns": 80,
-                    "rows": 10,
-                })
-                .to_string(),
+                result: String::new(),
                 is_error: false,
                 output: None,
-                semantic_result: None,
+                semantic_result: Some(ToolInvocationResult::ShellRun {
+                    result: ShellRunResult::Terminal {
+                        exit_code: Some(0),
+                        timed_out: false,
+                        cancelled: false,
+                        output_tail: output,
+                        output_truncated: false,
+                        output_bytes: None,
+                        retained_output_bytes: None,
+                        columns: 80,
+                        rows: 10,
+                    },
+                }),
             },
         ),
     ];
@@ -2115,18 +2122,22 @@ fn transcript_renders_terminal_shell_output_without_viewport_padding() {
         1,
         SessionEventKind::ToolCallFinished {
             tool_call_id: "call_terminal".to_owned(),
-            result: serde_json::json!({
-                "mode": "terminal",
-                "exit_code": 0,
-                "timed_out": false,
-                "output": "one\r\ntwo",
-                "columns": 80,
-                "rows": 10,
-            })
-            .to_string(),
+            result: String::new(),
             is_error: false,
             output: None,
-            semantic_result: None,
+            semantic_result: Some(ToolInvocationResult::ShellRun {
+                result: ShellRunResult::Terminal {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    cancelled: false,
+                    output_tail: "one\r\ntwo".to_owned(),
+                    output_truncated: false,
+                    output_bytes: None,
+                    retained_output_bytes: None,
+                    columns: 80,
+                    rows: 10,
+                },
+            }),
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
@@ -2149,21 +2160,22 @@ fn transcript_renders_truncated_terminal_shell_output_as_terminal() {
         1,
         SessionEventKind::ToolCallFinished {
             tool_call_id: "call_terminal".to_owned(),
-            result: serde_json::json!({
-                "mode": "terminal",
-                "exit_code": 0,
-                "timed_out": false,
-                "output": "one\r\ntwo",
-                "output_truncated": true,
-                "output_bytes": 70000,
-                "retained_output_bytes": 65536,
-                "columns": 80,
-                "rows": 10,
-            })
-            .to_string(),
+            result: String::new(),
             is_error: false,
             output: None,
-            semantic_result: None,
+            semantic_result: Some(ToolInvocationResult::ShellRun {
+                result: ShellRunResult::Terminal {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    cancelled: false,
+                    output_tail: "one\r\ntwo".to_owned(),
+                    output_truncated: true,
+                    output_bytes: Some(70000),
+                    retained_output_bytes: Some(65536),
+                    columns: 80,
+                    rows: 10,
+                },
+            }),
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
@@ -2173,8 +2185,6 @@ fn transcript_renders_truncated_terminal_shell_output_as_terminal() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("output truncated"));
-    assert!(output.contains("showing 65536 of 70000 bytes"));
     assert!(output.contains("one"));
     assert!(output.contains("two"));
     assert!(!output.contains("{\"mode\":\"terminal\""));
