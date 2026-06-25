@@ -5,11 +5,13 @@
 //! Skill discovery, parsing, and registry support for Bcode.
 
 use bcode_skill_models::{
-    GenericThinkingEffort, SkillActivation, SkillDiagnostic, SkillDiagnosticSeverity, SkillError,
-    SkillId, SkillList, SkillManifest, SkillModelPolicy, SkillModelRequest, SkillPermissionHints,
-    SkillPermissionMode, SkillPermissionPolicy, SkillSource, SkillSourceKind, SkillSummary,
-    SkillThinkingEffort,
+    GenericThinkingEffort, ResolvedSkillPermissionPolicy, SkillActivation, SkillDiagnostic,
+    SkillDiagnosticSeverity, SkillError, SkillId, SkillList, SkillManifest, SkillModelPolicy,
+    SkillModelRequest, SkillPermissionHints, SkillPermissionMode, SkillPermissionPolicy,
+    SkillSource, SkillSourceKind, SkillSummary, SkillThinkingEffort, SkillToolPolicyOutcome,
+    SkillToolPolicyRequest,
 };
+use bcode_tool::{ResolvedToolSelector, ToolDefinition, ToolReferenceResolution};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -664,6 +666,148 @@ fn diagnostic(
         severity,
         message,
         path: path.map(|path| path.to_string_lossy().into_owned()),
+    }
+}
+
+/// Resolve a canonical skill permission policy against the available tool catalog.
+#[must_use]
+pub fn resolve_skill_permission_policy(
+    policy: &SkillPermissionPolicy,
+    available_tools: &[ToolDefinition],
+) -> ResolvedSkillPermissionPolicy {
+    let mut selectors = Vec::new();
+    let mut unknown_references = Vec::new();
+    let mut ambiguous_references = Vec::new();
+
+    for reference in &policy.tools {
+        match bcode_tool::resolve_tool_reference(reference, available_tools) {
+            ToolReferenceResolution::Resolved { selector } => selectors.push(selector),
+            ToolReferenceResolution::Unknown { reference } => unknown_references.push(reference),
+            ambiguous @ ToolReferenceResolution::Ambiguous { .. } => {
+                ambiguous_references.push(ambiguous);
+            }
+        }
+    }
+
+    selectors.extend(
+        policy
+            .categories
+            .iter()
+            .cloned()
+            .map(|category| ResolvedToolSelector::PermissionCategory { category }),
+    );
+
+    ResolvedSkillPermissionPolicy {
+        mode: policy.mode,
+        selectors,
+        unknown_references,
+        ambiguous_references,
+    }
+}
+
+/// Evaluate one tool call against active resolved skill permission policies.
+#[must_use]
+pub fn evaluate_skill_tool_call(request: &SkillToolPolicyRequest) -> SkillToolPolicyOutcome {
+    if request.active_policies.is_empty() {
+        return SkillToolPolicyOutcome::NoOpinion;
+    }
+
+    let mut saw_allow = false;
+    let mut saw_warn = false;
+    let mut ask_reasons = Vec::new();
+
+    for policy in &request.active_policies {
+        match evaluate_single_skill_tool_policy(policy, &request.tool) {
+            SkillToolPolicyOutcome::NoOpinion => {}
+            SkillToolPolicyOutcome::Allow { .. } => saw_allow = true,
+            SkillToolPolicyOutcome::Warn { reason } => {
+                saw_warn = true;
+                ask_reasons.push(reason);
+            }
+            SkillToolPolicyOutcome::Ask { reason } => ask_reasons.push(reason),
+            SkillToolPolicyOutcome::Deny { reason } => {
+                return SkillToolPolicyOutcome::Deny { reason };
+            }
+        }
+    }
+
+    if !ask_reasons.is_empty() {
+        return SkillToolPolicyOutcome::Ask {
+            reason: ask_reasons.join("; "),
+        };
+    }
+    if saw_warn {
+        return SkillToolPolicyOutcome::Warn {
+            reason: "skill policy allows this tool call with a warning".to_string(),
+        };
+    }
+    if saw_allow {
+        return SkillToolPolicyOutcome::Allow {
+            reason: "tool call matches active skill policy".to_string(),
+        };
+    }
+    SkillToolPolicyOutcome::NoOpinion
+}
+
+fn evaluate_single_skill_tool_policy(
+    policy: &ResolvedSkillPermissionPolicy,
+    tool: &ToolDefinition,
+) -> SkillToolPolicyOutcome {
+    if policy.mode == SkillPermissionMode::Disabled {
+        return SkillToolPolicyOutcome::NoOpinion;
+    }
+    if !policy.unknown_references.is_empty() || !policy.ambiguous_references.is_empty() {
+        return SkillToolPolicyOutcome::Ask {
+            reason: "skill permission policy contains unresolved tool references".to_string(),
+        };
+    }
+    if policy
+        .selectors
+        .iter()
+        .any(|selector| selector_matches_tool(selector, tool))
+    {
+        return SkillToolPolicyOutcome::Allow {
+            reason: "tool call matches skill permission policy".to_string(),
+        };
+    }
+
+    match policy.mode {
+        SkillPermissionMode::Disabled => SkillToolPolicyOutcome::NoOpinion,
+        SkillPermissionMode::Strict => SkillToolPolicyOutcome::Deny {
+            reason: "tool call is not declared by strict skill permission policy".to_string(),
+        },
+        SkillPermissionMode::Warn => SkillToolPolicyOutcome::Warn {
+            reason: "tool call is not declared by skill permission policy".to_string(),
+        },
+        SkillPermissionMode::Inherit | SkillPermissionMode::Enforce | SkillPermissionMode::Ask => {
+            SkillToolPolicyOutcome::Ask {
+                reason: "tool call is not declared by skill permission policy".to_string(),
+            }
+        }
+    }
+}
+
+fn selector_matches_tool(selector: &ResolvedToolSelector, tool: &ToolDefinition) -> bool {
+    match selector {
+        ResolvedToolSelector::ToolName { name } => tool.name == *name,
+        ResolvedToolSelector::Alias { alias } => {
+            tool.policy.aliases.iter().any(|value| value == alias)
+        }
+        ResolvedToolSelector::CompatibilityAlias { ecosystem, name } => tool
+            .policy
+            .compatibility_aliases
+            .iter()
+            .any(|alias| alias.ecosystem.eq_ignore_ascii_case(ecosystem) && alias.name == *name),
+        ResolvedToolSelector::PermissionCategory { category } => tool
+            .policy
+            .permission_category
+            .as_ref()
+            .is_some_and(|tool_category| tool_category == category),
+        ResolvedToolSelector::Capability { capability } => tool
+            .policy
+            .capabilities
+            .iter()
+            .any(|value| value == capability),
     }
 }
 

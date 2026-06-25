@@ -142,6 +142,42 @@ pub enum SkillPermissionMode {
     Disabled,
 }
 
+/// Resolved skill permission policy ready for tool-call evaluation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedSkillPermissionPolicy {
+    pub mode: SkillPermissionMode,
+    #[serde(default)]
+    pub selectors: Vec<bcode_tool::ResolvedToolSelector>,
+    #[serde(default)]
+    pub unknown_references: Vec<UnresolvedToolReference>,
+    #[serde(default)]
+    pub ambiguous_references: Vec<bcode_tool::ToolReferenceResolution>,
+}
+
+/// Request to evaluate one tool call against active skill policies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillToolPolicyRequest {
+    pub tool: bcode_tool::ToolDefinition,
+    #[serde(default)]
+    pub active_policies: Vec<ResolvedSkillPermissionPolicy>,
+}
+
+/// Skill-owned tool policy outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum SkillToolPolicyOutcome {
+    /// Skills have no opinion about this call.
+    NoOpinion,
+    /// The tool call is allowed by skill policy.
+    Allow { reason: String },
+    /// The tool call should continue with a warning.
+    Warn { reason: String },
+    /// The host should ask the user before continuing.
+    Ask { reason: String },
+    /// The tool call is denied by skill policy.
+    Deny { reason: String },
+}
+
 /// Canonical model policy requested by a skill.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillModelPolicy {
