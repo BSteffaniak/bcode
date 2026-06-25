@@ -693,6 +693,38 @@ pub enum ToolInvocationStreamEvent {
     },
 }
 
+/// Declarative request presentation metadata persisted with tool request events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolRequestPresentationMetadata {
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<ToolPresentationField>,
+}
+
+/// Declarative presentation metadata for one request argument field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolPresentationField {
+    pub label: String,
+    pub argument: String,
+    pub kind: ToolPresentationFieldKind,
+    #[serde(default)]
+    pub optional: bool,
+}
+
+/// Generic UI presentation hint for request argument fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPresentationFieldKind {
+    Text,
+    Path,
+    Url,
+    Command,
+    Boolean,
+    Count,
+    DurationMs,
+    Json,
+}
+
 /// Logical output stream for an incremental tool output chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1002,6 +1034,8 @@ pub enum SessionEventKind {
         tool_call_id: String,
         tool_name: String,
         arguments_json: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_presentation: Option<ToolRequestPresentationMetadata>,
     },
     ToolCallFinished {
         tool_call_id: String,
@@ -1018,6 +1052,8 @@ pub enum SessionEventKind {
         tool_call_id: String,
         tool_name: String,
         arguments_json: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_presentation: Option<ToolRequestPresentationMetadata>,
     },
     PermissionResolved {
         permission_id: String,

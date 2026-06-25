@@ -1969,6 +1969,7 @@ impl SessionManager {
         tool_call_id: String,
         tool_name: String,
         arguments_json: String,
+        request_presentation: Option<bcode_session_models::ToolRequestPresentationMetadata>,
     ) -> Result<SessionEvent, SessionError> {
         self.append_event(
             session_id,
@@ -1976,6 +1977,7 @@ impl SessionManager {
                 tool_call_id,
                 tool_name,
                 arguments_json,
+                request_presentation,
             },
         )
         .await
@@ -2118,6 +2120,7 @@ impl SessionManager {
         tool_call_id: String,
         tool_name: String,
         arguments_json: String,
+        request_presentation: Option<bcode_session_models::ToolRequestPresentationMetadata>,
     ) -> Result<SessionEvent, SessionError> {
         self.append_event(
             session_id,
@@ -2126,6 +2129,7 @@ impl SessionManager {
                 tool_call_id,
                 tool_name,
                 arguments_json,
+                request_presentation,
             },
         )
         .await
@@ -3003,6 +3007,7 @@ mod tests {
                     "call-1".to_string(),
                     "shell.run".to_string(),
                     "{}".to_string(),
+                    None,
                 )
                 .await
                 .expect("request should append");
@@ -3418,6 +3423,7 @@ mod tests {
                 "tool-1".to_string(),
                 "read".to_string(),
                 r#"{"path":"README.md"}"#.to_string(),
+                None,
             )
             .await
             .expect("tool request should append");
@@ -4451,6 +4457,7 @@ mod tests {
                     tool_call_id: "call".to_string(),
                     tool_name: "tool".to_string(),
                     arguments_json: "{}".to_string(),
+                    request_presentation: None,
                 },
             ),
             (
@@ -4472,6 +4479,7 @@ mod tests {
                     tool_call_id: "call".to_string(),
                     tool_name: "tool".to_string(),
                     arguments_json: "{}".to_string(),
+                    request_presentation: None,
                 },
             ),
             (

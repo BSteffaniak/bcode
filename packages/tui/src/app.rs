@@ -11,6 +11,7 @@ use bcode_session_models::{
     SessionEvent, SessionEventKind, SessionHistoryCursor, SessionId, SessionInputHistoryEntry,
     SessionLiveEvent, SessionLiveEventKind, SessionTraceEvent, SessionTracePayload,
     SessionTracePhase, ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
+    ToolRequestPresentationMetadata,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -402,6 +403,7 @@ impl AssistantScrollAnchorState {
 struct ToolCallContext {
     tool_name: String,
     arguments_json: String,
+    request_presentation: Option<ToolRequestPresentationMetadata>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2090,10 +2092,16 @@ impl BmuxApp {
                 tool_call_id,
                 tool_name,
                 arguments_json,
+                request_presentation,
             } => {
                 self.active_tool_calls.insert(tool_call_id.clone());
                 self.tool_activity_seen = true;
-                self.push_tool_request(tool_call_id, tool_name, arguments_json);
+                self.push_tool_request(
+                    tool_call_id,
+                    tool_name,
+                    arguments_json,
+                    request_presentation.clone(),
+                );
             }
             SessionEventKind::ToolCallFinished {
                 tool_call_id,
@@ -2122,12 +2130,14 @@ impl BmuxApp {
                 tool_call_id,
                 tool_name,
                 arguments_json,
+                request_presentation,
             } => {
                 self.push_permission_request(
                     permission_id,
                     tool_call_id,
                     tool_name,
                     arguments_json,
+                    request_presentation.clone(),
                     application,
                 );
             }
@@ -2582,17 +2592,29 @@ impl BmuxApp {
         }
     }
 
-    fn push_tool_request(&mut self, tool_call_id: &str, tool_name: &str, arguments_json: &str) {
+    fn push_tool_request(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments_json: &str,
+        request_presentation: Option<ToolRequestPresentationMetadata>,
+    ) {
         let edit_summary = self.record_diff_summary(tool_name, arguments_json);
         self.tool_call_contexts.insert(
             tool_call_id.to_owned(),
             ToolCallContext {
                 tool_name: tool_name.to_owned(),
                 arguments_json: arguments_json.to_owned(),
+                request_presentation: request_presentation.clone(),
             },
         );
         self.live_tool_previews.remove(tool_call_id);
-        let item = tool_request_item(tool_call_id, tool_name, arguments_json);
+        let item = tool_request_item(
+            tool_call_id,
+            tool_name,
+            arguments_json,
+            request_presentation,
+        );
         let replaced = self.transcript.mutate_rev_find(
             |existing| {
                 matches!(
@@ -2901,6 +2923,7 @@ impl BmuxApp {
         tool_call_id: &str,
         tool_name: &str,
         arguments_json: &str,
+        request_presentation: Option<ToolRequestPresentationMetadata>,
         application: SessionEventApplication,
     ) {
         self.transcript.push(permission_request_item(
@@ -2908,6 +2931,7 @@ impl BmuxApp {
             tool_call_id,
             tool_name,
             arguments_json,
+            request_presentation,
         ));
         if application.live_activity() {
             self.set_activity(ActivityState::WaitingPermission {

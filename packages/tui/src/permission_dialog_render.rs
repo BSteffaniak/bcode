@@ -22,7 +22,11 @@ pub fn render_permission_dialog(state: &PermissionDialogState, frame: &mut Frame
     let modal = modal_frame();
     let area = modal.panel_area(frame.area());
     let permission = state.permission();
-    let presentation = permission_presentation(&permission.tool_name, &permission.arguments_json);
+    let presentation = permission_presentation(
+        &permission.tool_name,
+        &permission.arguments_json,
+        permission.request_presentation.as_ref(),
+    );
     let rows = permission_rows(
         state,
         &permission.tool_name,
@@ -277,6 +281,7 @@ mod tests {
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"cargo check --workspace","cwd":"/repo"}"#.to_owned(),
             agent_id: "build".to_owned(),
+            request_presentation: None,
         });
         let mut buffer = Buffer::empty(bmux_tui::geometry::Rect::new(0, 0, 100, 30));
         let mut frame = bmux_tui::frame::Frame::new(&mut buffer);

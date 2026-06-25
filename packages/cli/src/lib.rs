@@ -5811,6 +5811,7 @@ fn print_non_trace_session_event(event: &SessionEvent) {
             tool_call_id,
             tool_name,
             arguments_json,
+            ..
         } => {
             println!(
                 "#{} tool call requested: {tool_name} ({tool_call_id}) {}",
@@ -5843,6 +5844,7 @@ fn print_non_trace_session_event(event: &SessionEvent) {
             tool_call_id,
             tool_name,
             arguments_json,
+            ..
         } => {
             println!(
                 "#{} permission requested: {permission_id} {tool_name} ({tool_call_id}) {}",

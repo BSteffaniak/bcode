@@ -11,7 +11,8 @@ use bcode_session_models::{
     RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionForkKind,
     SessionHistoryPage, SessionHistoryQuery, SessionId, SessionInputHistoryEntry, SessionLiveEvent,
     SessionSummary, SessionTokenUsage, SessionTraceEvent, ShellRunResult, ToolInvocationResult,
-    ToolInvocationStreamEvent, TraceBlobRef,
+    ToolInvocationStreamEvent, ToolPresentationField, ToolPresentationFieldKind,
+    ToolRequestPresentationMetadata, TraceBlobRef,
 };
 use bcode_skill_models::{
     SkillActivationMode, SkillContextResponse, SkillId, SkillList, SkillManifest, SkillSource,
@@ -576,6 +577,8 @@ pub struct PermissionSummary {
     pub tool_name: String,
     pub arguments_json: String,
     pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_presentation: Option<ToolRequestPresentationMetadata>,
 }
 
 /// Plugin service invocation result.
@@ -1778,6 +1781,7 @@ enum IpcSessionEventKind {
         tool_call_id: String,
         tool_name: String,
         arguments_json: String,
+        request_presentation: Option<IpcToolRequestPresentationMetadata>,
     },
     ToolCallFinished {
         tool_call_id: String,
@@ -1791,6 +1795,7 @@ enum IpcSessionEventKind {
         tool_call_id: String,
         tool_name: String,
         arguments_json: String,
+        request_presentation: Option<IpcToolRequestPresentationMetadata>,
     },
     PermissionResolved {
         permission_id: String,
@@ -1938,6 +1943,32 @@ enum IpcSessionEventKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct IpcToolRequestPresentationMetadata {
+    title: String,
+    fields: Vec<IpcToolPresentationField>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct IpcToolPresentationField {
+    label: String,
+    argument: String,
+    kind: IpcToolPresentationFieldKind,
+    optional: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IpcToolPresentationFieldKind {
+    Text,
+    Path,
+    Url,
+    Command,
+    Boolean,
+    Count,
+    DurationMs,
+    Json,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct IpcToolInvocationResult {
     kind: IpcToolInvocationResultKind,
     text: Option<String>,
@@ -2083,10 +2114,14 @@ impl From<&SessionEventKind> for IpcSessionEventKind {
                 tool_call_id,
                 tool_name,
                 arguments_json,
+                request_presentation,
             } => Self::ToolCallRequested {
                 tool_call_id: tool_call_id.clone(),
                 tool_name: tool_name.clone(),
                 arguments_json: arguments_json.clone(),
+                request_presentation: request_presentation
+                    .as_ref()
+                    .map(IpcToolRequestPresentationMetadata::from),
             },
             SessionEventKind::ToolCallFinished {
                 tool_call_id,
@@ -2106,11 +2141,15 @@ impl From<&SessionEventKind> for IpcSessionEventKind {
                 tool_call_id,
                 tool_name,
                 arguments_json,
+                request_presentation,
             } => Self::PermissionRequested {
                 permission_id: permission_id.clone(),
                 tool_call_id: tool_call_id.clone(),
                 tool_name: tool_name.clone(),
                 arguments_json: arguments_json.clone(),
+                request_presentation: request_presentation
+                    .as_ref()
+                    .map(IpcToolRequestPresentationMetadata::from),
             },
             SessionEventKind::PermissionResolved {
                 permission_id,
@@ -2374,10 +2413,12 @@ impl TryFrom<IpcSessionEventKind> for SessionEventKind {
                 tool_call_id,
                 tool_name,
                 arguments_json,
+                request_presentation,
             } => Ok(Self::ToolCallRequested {
                 tool_call_id,
                 tool_name,
                 arguments_json,
+                request_presentation: request_presentation.map(Into::into),
             }),
             IpcSessionEventKind::ToolCallFinished {
                 tool_call_id,
@@ -2397,11 +2438,13 @@ impl TryFrom<IpcSessionEventKind> for SessionEventKind {
                 tool_call_id,
                 tool_name,
                 arguments_json,
+                request_presentation,
             } => Ok(Self::PermissionRequested {
                 permission_id,
                 tool_call_id,
                 tool_name,
                 arguments_json,
+                request_presentation: request_presentation.map(Into::into),
             }),
             IpcSessionEventKind::PermissionResolved {
                 permission_id,
@@ -2624,6 +2667,80 @@ impl TryFrom<IpcSessionEventKind> for SessionEventKind {
             IpcSessionEventKind::ReasoningChanged { effort, summary } => {
                 Ok(Self::ReasoningChanged { effort, summary })
             }
+        }
+    }
+}
+
+impl From<&ToolRequestPresentationMetadata> for IpcToolRequestPresentationMetadata {
+    fn from(value: &ToolRequestPresentationMetadata) -> Self {
+        Self {
+            title: value.title.clone(),
+            fields: value
+                .fields
+                .iter()
+                .map(IpcToolPresentationField::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<IpcToolRequestPresentationMetadata> for ToolRequestPresentationMetadata {
+    fn from(value: IpcToolRequestPresentationMetadata) -> Self {
+        Self {
+            title: value.title,
+            fields: value.fields.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<&ToolPresentationField> for IpcToolPresentationField {
+    fn from(value: &ToolPresentationField) -> Self {
+        Self {
+            label: value.label.clone(),
+            argument: value.argument.clone(),
+            kind: IpcToolPresentationFieldKind::from(value.kind),
+            optional: value.optional,
+        }
+    }
+}
+
+impl From<IpcToolPresentationField> for ToolPresentationField {
+    fn from(value: IpcToolPresentationField) -> Self {
+        Self {
+            label: value.label,
+            argument: value.argument,
+            kind: value.kind.into(),
+            optional: value.optional,
+        }
+    }
+}
+
+impl From<ToolPresentationFieldKind> for IpcToolPresentationFieldKind {
+    fn from(value: ToolPresentationFieldKind) -> Self {
+        match value {
+            ToolPresentationFieldKind::Text => Self::Text,
+            ToolPresentationFieldKind::Path => Self::Path,
+            ToolPresentationFieldKind::Url => Self::Url,
+            ToolPresentationFieldKind::Command => Self::Command,
+            ToolPresentationFieldKind::Boolean => Self::Boolean,
+            ToolPresentationFieldKind::Count => Self::Count,
+            ToolPresentationFieldKind::DurationMs => Self::DurationMs,
+            ToolPresentationFieldKind::Json => Self::Json,
+        }
+    }
+}
+
+impl From<IpcToolPresentationFieldKind> for ToolPresentationFieldKind {
+    fn from(value: IpcToolPresentationFieldKind) -> Self {
+        match value {
+            IpcToolPresentationFieldKind::Text => Self::Text,
+            IpcToolPresentationFieldKind::Path => Self::Path,
+            IpcToolPresentationFieldKind::Url => Self::Url,
+            IpcToolPresentationFieldKind::Command => Self::Command,
+            IpcToolPresentationFieldKind::Boolean => Self::Boolean,
+            IpcToolPresentationFieldKind::Count => Self::Count,
+            IpcToolPresentationFieldKind::DurationMs => Self::DurationMs,
+            IpcToolPresentationFieldKind::Json => Self::Json,
         }
     }
 }
@@ -3706,6 +3823,7 @@ mod tests {
                 tool_call_id: "call-1".to_string(),
                 tool_name: "shell.run".to_string(),
                 arguments_json: "{}".to_string(),
+                request_presentation: None,
             },
             SessionEventKind::ToolCallFinished {
                 tool_call_id: "call-1".to_string(),
@@ -3721,6 +3839,7 @@ mod tests {
                 tool_call_id: "call-1".to_string(),
                 tool_name: "shell.run".to_string(),
                 arguments_json: "{}".to_string(),
+                request_presentation: None,
             },
             SessionEventKind::PermissionResolved {
                 permission_id: "perm-1".to_string(),

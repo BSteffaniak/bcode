@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bcode_session_models::{
     SessionEvent, SessionEventKind, SessionTokenUsage, ShellRunResult, ToolInvocationResult,
-    ToolInvocationStreamEvent, ToolOutputStream,
+    ToolInvocationStreamEvent, ToolOutputStream, ToolRequestPresentationMetadata,
 };
 
 use super::diff_extract::{FileEditTranscript, file_edit_from_tool_request};
@@ -55,6 +55,8 @@ pub enum TranscriptItemKind {
         tool_name: String,
         /// Raw tool arguments JSON.
         arguments_json: String,
+        /// Declarative plugin-owned request presentation metadata.
+        request_presentation: Option<ToolRequestPresentationMetadata>,
         /// Optional semantic file edit extracted from filesystem tools.
         file_edit: Option<FileEditTranscript>,
         /// Lifecycle phase for file edit/write previews.
@@ -131,6 +133,10 @@ pub enum TranscriptItemKind {
         tool_call_id: String,
         /// Tool name.
         tool_name: String,
+        /// Raw tool arguments JSON.
+        arguments_json: String,
+        /// Declarative plugin-owned request presentation metadata.
+        request_presentation: Option<ToolRequestPresentationMetadata>,
     },
     /// Permission resolution.
     PermissionResult {
@@ -153,6 +159,7 @@ pub enum TranscriptItemKind {
 struct ToolCallContext {
     tool_name: String,
     arguments_json: String,
+    request_presentation: Option<ToolRequestPresentationMetadata>,
 }
 
 /// Stable identity for a rendered transcript item.
@@ -494,6 +501,7 @@ pub fn tool_request_item(
     tool_call_id: &str,
     tool_name: &str,
     arguments_json: &str,
+    request_presentation: Option<ToolRequestPresentationMetadata>,
 ) -> TranscriptItem {
     let file_edit = file_edit_from_tool_request(tool_name, arguments_json);
     let streaming = file_edit.is_some();
@@ -505,6 +513,7 @@ pub fn tool_request_item(
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.to_owned(),
             arguments_json: arguments_json.to_owned(),
+            request_presentation,
             file_edit,
             file_edit_phase: streaming.then_some(FileEditPhase::Pending),
             live_preview: false,
@@ -632,6 +641,7 @@ pub fn permission_request_item(
     tool_call_id: &str,
     tool_name: &str,
     arguments_json: &str,
+    request_presentation: Option<ToolRequestPresentationMetadata>,
 ) -> TranscriptItem {
     TranscriptItem::with_kind(
         "Permission",
@@ -641,6 +651,8 @@ pub fn permission_request_item(
             permission_id: permission_id.to_owned(),
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.to_owned(),
+            arguments_json: arguments_json.to_owned(),
+            request_presentation,
         },
     )
 }
@@ -889,15 +901,22 @@ fn non_streaming_transcript_item_from_event(
             tool_call_id,
             tool_name,
             arguments_json,
+            request_presentation,
         } => {
             tool_calls.insert(
                 tool_call_id.clone(),
                 ToolCallContext {
                     tool_name: tool_name.clone(),
                     arguments_json: arguments_json.clone(),
+                    request_presentation: request_presentation.clone(),
                 },
             );
-            Some(tool_request_item(tool_call_id, tool_name, arguments_json))
+            Some(tool_request_item(
+                tool_call_id,
+                tool_name,
+                arguments_json,
+                request_presentation.clone(),
+            ))
         }
         SessionEventKind::ToolCallFinished {
             tool_call_id,
@@ -951,11 +970,13 @@ fn non_streaming_transcript_item_from_event(
             tool_call_id,
             tool_name,
             arguments_json,
+            request_presentation,
         } => Some(permission_request_item(
             permission_id,
             tool_call_id,
             tool_name,
             arguments_json,
+            request_presentation.clone(),
         )),
         SessionEventKind::PermissionResolved {
             permission_id,

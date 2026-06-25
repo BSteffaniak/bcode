@@ -2195,6 +2195,7 @@ mod tests {
                 tool_call_id: "tool-1".to_string(),
                 tool_name: "shell".to_string(),
                 arguments_json: "{}".to_string(),
+                request_presentation: None,
             },
         ))
         .await

@@ -712,6 +712,7 @@ fn push_transcript_item_rows(
             tool_call_id,
             tool_name,
             arguments_json,
+            request_presentation,
             file_edit,
             file_edit_phase,
             live_preview,
@@ -720,6 +721,7 @@ fn push_transcript_item_rows(
                 tool_call_id,
                 tool_name,
                 arguments_json,
+                request_presentation: request_presentation.as_ref(),
                 file_edit: file_edit.as_ref(),
                 file_edit_phase: *file_edit_phase,
                 live_preview: *live_preview,
@@ -786,6 +788,7 @@ fn push_transcript_item_rows(
             permission_id,
             tool_call_id,
             tool_name,
+            ..
         } => {
             push_permission_request_rows(rows, item, permission_id, tool_call_id, tool_name, width);
         }
@@ -933,6 +936,7 @@ struct ToolRequestRenderContext<'a> {
     tool_call_id: &'a str,
     tool_name: &'a str,
     arguments_json: &'a str,
+    request_presentation: Option<&'a bcode_session_models::ToolRequestPresentationMetadata>,
     file_edit: Option<&'a FileEditTranscript>,
     file_edit_phase: Option<FileEditPhase>,
     live_preview: bool,
@@ -990,9 +994,11 @@ fn push_tool_request_rows(
             context.live_preview,
             context.tool_name,
         );
-    } else if let Some(presentation) =
-        tool_request_presentation(context.tool_name, context.arguments_json)
-    {
+    } else if let Some(presentation) = tool_request_presentation(
+        context.tool_name,
+        context.arguments_json,
+        context.request_presentation,
+    ) {
         push_tool_request_presentation_rows(rows, &presentation, width);
     } else if !item.text().is_empty() {
         push_labeled_text_preview(rows, "arguments", item.text(), width, 16);
@@ -1600,6 +1606,11 @@ fn push_tool_request_presentation_rows(
             }
             if let Some(max_bytes) = max_bytes {
                 push_kv_row(rows, "limit", &format!("{max_bytes} bytes"), width);
+            }
+        }
+        ToolRequestPresentation::Generic { fields, .. } => {
+            for (label, value) in fields {
+                push_kv_row(rows, label, value, width);
             }
         }
     }

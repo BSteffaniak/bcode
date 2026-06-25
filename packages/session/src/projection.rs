@@ -835,6 +835,7 @@ mod tests {
                     tool_call_id: "tool".to_owned(),
                     tool_name: "shell".to_owned(),
                     arguments_json: "{}".to_owned(),
+                    request_presentation: None,
                 },
             ),
             event(
@@ -898,6 +899,7 @@ mod tests {
                     tool_call_id: "tool".to_owned(),
                     tool_name: "read".to_owned(),
                     arguments_json: "{}".to_owned(),
+                    request_presentation: None,
                 },
             ),
             event(
@@ -1208,6 +1210,7 @@ mod tests {
                     tool_call_id: "z".to_owned(),
                     tool_name: "late".to_owned(),
                     arguments_json: "{}".to_owned(),
+                    request_presentation: None,
                 },
             ),
             event(
@@ -1217,6 +1220,7 @@ mod tests {
                     tool_call_id: "a".to_owned(),
                     tool_name: "early".to_owned(),
                     arguments_json: "{}".to_owned(),
+                    request_presentation: None,
                 },
             ),
             event(

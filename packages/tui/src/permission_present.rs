@@ -1,5 +1,6 @@
 //! Permission dialog presentation models.
 
+use bcode_session_models::ToolRequestPresentationMetadata;
 use serde_json::Value;
 
 use super::tool_present::{ToolRequestPresentation, tool_request_presentation};
@@ -42,8 +43,14 @@ pub struct PermissionPresentation {
 
 /// Build a structured permission presentation from a tool name and arguments.
 #[must_use]
-pub fn permission_presentation(tool_name: &str, arguments_json: &str) -> PermissionPresentation {
-    if let Some(presentation) = tool_request_presentation(tool_name, arguments_json) {
+pub fn permission_presentation(
+    tool_name: &str,
+    arguments_json: &str,
+    request_presentation: Option<&ToolRequestPresentationMetadata>,
+) -> PermissionPresentation {
+    if let Some(presentation) =
+        tool_request_presentation(tool_name, arguments_json, request_presentation)
+    {
         return presentation_from_tool(tool_name, &presentation);
     }
 
@@ -118,6 +125,15 @@ fn presentation_from_tool(
             path,
             max_bytes,
         } => document_extract_permission(tool_name, url.as_deref(), path.as_deref(), *max_bytes),
+        ToolRequestPresentation::Generic { title, fields } => PermissionPresentation {
+            title: title.clone(),
+            risk: "tool request".to_owned(),
+            details: fields
+                .iter()
+                .map(|(label, value)| PermissionDetail::new(label.clone(), value.clone()))
+                .collect(),
+            raw_details: None,
+        },
     }
 }
 
@@ -378,6 +394,7 @@ mod tests {
         let presentation = permission_presentation(
             "shell.run",
             r#"{"command":"cargo check --workspace","cwd":"/repo"}"#,
+            None,
         );
 
         assert_eq!(presentation.risk, "execute process");
@@ -387,7 +404,8 @@ mod tests {
 
     #[test]
     fn generic_json_string_values_are_unescaped() {
-        let presentation = permission_presentation("custom.tool", r#"{"text":"hello\nworld"}"#);
+        let presentation =
+            permission_presentation("custom.tool", r#"{"text":"hello\nworld"}"#, None);
 
         assert_eq!(presentation.details[0].value, "hello\nworld");
     }

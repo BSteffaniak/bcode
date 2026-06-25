@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use bcode_session_models::ToolRequestPresentationMetadata;
 use serde_json::Value;
 
 /// Human-readable presentation for a known tool request.
@@ -106,6 +107,13 @@ pub enum ToolRequestPresentation {
         path: Option<String>,
         /// Optional maximum byte count.
         max_bytes: Option<u64>,
+    },
+    /// Generic plugin-owned request presentation.
+    Generic {
+        /// Human-readable title.
+        title: String,
+        /// Labeled detail fields.
+        fields: Vec<(String, String)>,
     },
 }
 
@@ -248,7 +256,13 @@ pub struct GrepMatchPresentation {
 pub fn tool_request_presentation(
     tool_name: &str,
     arguments_json: &str,
+    metadata: Option<&ToolRequestPresentationMetadata>,
 ) -> Option<ToolRequestPresentation> {
+    if let Some(metadata) = metadata
+        && let Some(presentation) = metadata_request_presentation(arguments_json, metadata)
+    {
+        return Some(presentation);
+    }
     let value = serde_json::from_str::<Value>(arguments_json).ok()?;
     if is_shell_tool_name(tool_name) {
         return Some(ToolRequestPresentation::ShellRun {
@@ -345,6 +359,38 @@ pub fn tool_result_presentation(
         "filesystem_grep" | "grep" => filesystem_grep_result(result),
         "filesystem_stat" | "stat" => filesystem_stat_result(result),
         _ => None,
+    }
+}
+
+fn metadata_request_presentation(
+    arguments_json: &str,
+    metadata: &ToolRequestPresentationMetadata,
+) -> Option<ToolRequestPresentation> {
+    let value = serde_json::from_str::<Value>(arguments_json).ok()?;
+    let fields = metadata
+        .fields
+        .iter()
+        .filter_map(|field| {
+            let argument = value.get(&field.argument)?;
+            let rendered = render_metadata_value(argument);
+            (!rendered.is_empty()).then(|| (field.label.clone(), rendered))
+        })
+        .collect::<Vec<_>>();
+    Some(ToolRequestPresentation::Generic {
+        title: metadata.title.clone(),
+        fields,
+    })
+}
+
+fn render_metadata_value(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => value.clone(),
+        Value::Array(_) | Value::Object(_) => {
+            serde_json::to_string_pretty(value).unwrap_or_default()
+        }
     }
 }
 

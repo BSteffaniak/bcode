@@ -9,8 +9,8 @@ use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, FileChangeResult, ModelTurnOutcome,
     RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
     SessionEventProvenance, SessionForkKind, SessionId, SessionTokenUsage, SessionTraceEvent,
-    ShellRunResult, ToolInvocationResult, ToolInvocationStreamEvent, TraceBlobRef,
-    current_unix_timestamp_ms,
+    ShellRunResult, ToolInvocationResult, ToolInvocationStreamEvent,
+    ToolRequestPresentationMetadata, TraceBlobRef, current_unix_timestamp_ms,
 };
 use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
 use serde::{Deserialize, Serialize};
@@ -182,6 +182,8 @@ enum PersistedSessionEventKind {
         tool_call_id: String,
         tool_name: String,
         arguments_json: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_presentation: Option<ToolRequestPresentationMetadata>,
     },
     ToolCallFinished {
         tool_call_id: String,
@@ -198,6 +200,8 @@ enum PersistedSessionEventKind {
         tool_call_id: String,
         tool_name: String,
         arguments_json: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_presentation: Option<ToolRequestPresentationMetadata>,
     },
     PermissionResolved {
         permission_id: String,
@@ -425,10 +429,12 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 tool_call_id,
                 tool_name,
                 arguments_json,
+                request_presentation,
             } => Self::ToolCallRequested {
                 tool_call_id: tool_call_id.clone(),
                 tool_name: tool_name.clone(),
                 arguments_json: arguments_json.clone(),
+                request_presentation: request_presentation.clone(),
             },
             SessionEventKind::ToolCallFinished {
                 tool_call_id,
@@ -450,11 +456,13 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 tool_call_id,
                 tool_name,
                 arguments_json,
+                request_presentation,
             } => Self::PermissionRequested {
                 permission_id: permission_id.clone(),
                 tool_call_id: tool_call_id.clone(),
                 tool_name: tool_name.clone(),
                 arguments_json: arguments_json.clone(),
+                request_presentation: request_presentation.clone(),
             },
             SessionEventKind::PermissionResolved {
                 permission_id,
@@ -712,10 +720,12 @@ impl PersistedSessionEventKind {
                 tool_call_id,
                 tool_name,
                 arguments_json,
+                request_presentation,
             } => SessionEventKind::ToolCallRequested {
                 tool_call_id,
                 tool_name,
                 arguments_json,
+                request_presentation,
             },
             Self::ToolCallFinished {
                 tool_call_id,
@@ -735,11 +745,13 @@ impl PersistedSessionEventKind {
                 tool_call_id,
                 tool_name,
                 arguments_json,
+                request_presentation,
             } => SessionEventKind::PermissionRequested {
                 permission_id,
                 tool_call_id,
                 tool_name,
                 arguments_json,
+                request_presentation,
             },
             Self::PermissionResolved {
                 permission_id,
@@ -1321,6 +1333,7 @@ mod tests {
                 tool_call_id: "call".to_string(),
                 tool_name: "tool".to_string(),
                 arguments_json: "{}".to_string(),
+                request_presentation: None,
             },
             SessionEventKind::ToolCallFinished {
                 tool_call_id: "call".to_string(),
@@ -1336,6 +1349,7 @@ mod tests {
                 tool_call_id: "call".to_string(),
                 tool_name: "tool".to_string(),
                 arguments_json: "{}".to_string(),
+                request_presentation: None,
             },
             SessionEventKind::PermissionResolved {
                 permission_id: "perm".to_string(),

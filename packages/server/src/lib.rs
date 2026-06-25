@@ -44,7 +44,8 @@ use bcode_session_models::{
     ProviderToolCallProgress, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind,
     SessionId, SessionLiveEventKind, SessionTokenUsage, SessionTraceEvent, SessionTracePayload,
     SessionTracePhase, ShellRunResult, ToolInvocationResult, ToolInvocationStreamEvent,
-    ToolOutputStream as SessionToolOutputStream, TraceBlobRef, TraceRedaction,
+    ToolOutputStream as SessionToolOutputStream, ToolPresentationField, ToolPresentationFieldKind,
+    ToolRequestPresentationMetadata, TraceBlobRef, TraceRedaction,
 };
 use bcode_skill::{
     SkillPromptCatalogMode, SkillPromptCatalogOptions, SkillRegistry, SkillRegistryOptions,
@@ -58,7 +59,8 @@ use bcode_tool::{
     TOOL_SERVICE_INTERFACE_ID, ToolDefinition as ServiceToolDefinition, ToolInvocationRequest,
     ToolInvocationResponse, ToolInvocationResult as ServiceToolInvocationResult,
     ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent, ToolList, ToolOutputStream,
-    ToolResultContent,
+    ToolPresentationFieldKind as ServiceToolPresentationFieldKind,
+    ToolRequestPresentationMetadata as ServiceToolRequestPresentationMetadata, ToolResultContent,
 };
 use runtime_work::{CancellationHandle, RuntimeWorkManager, RuntimeWorkSpec};
 use serde::{Deserialize, Serialize};
@@ -8751,6 +8753,7 @@ fn session_event_compaction_line(
             tool_call_id,
             tool_name,
             arguments_json,
+            ..
         } => Some(format!(
             "#{} assistant tool call {tool_call_id} ({tool_name}):\n{}",
             event.sequence,
@@ -12012,12 +12015,20 @@ async fn execute_model_tool(
     cancel_state: Arc<TurnCancelState>,
     command_context: &mut RuntimeCommandContext<'_>,
 ) {
+    let request_presentation = find_tool_provider(state, &call.name)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|(_, definition)| definition.ui.request_presentation)
+        .as_ref()
+        .map(service_request_presentation_to_session);
     append_tool_request_event(
         state,
         session_id,
         call.id.clone(),
         call.name.clone(),
         serde_json::to_string(&call.arguments).unwrap_or_default(),
+        request_presentation,
     )
     .await;
     if cancel_state.is_cancelled() {
@@ -12634,6 +12645,39 @@ async fn find_tool_provider(
     Ok(None)
 }
 
+fn service_request_presentation_to_session(
+    value: &ServiceToolRequestPresentationMetadata,
+) -> ToolRequestPresentationMetadata {
+    ToolRequestPresentationMetadata {
+        title: value.title.clone(),
+        fields: value
+            .fields
+            .iter()
+            .map(|field| ToolPresentationField {
+                label: field.label.clone(),
+                argument: field.argument.clone(),
+                kind: service_presentation_field_kind_to_session(field.kind),
+                optional: field.optional,
+            })
+            .collect(),
+    }
+}
+
+const fn service_presentation_field_kind_to_session(
+    value: ServiceToolPresentationFieldKind,
+) -> ToolPresentationFieldKind {
+    match value {
+        ServiceToolPresentationFieldKind::Text => ToolPresentationFieldKind::Text,
+        ServiceToolPresentationFieldKind::Path => ToolPresentationFieldKind::Path,
+        ServiceToolPresentationFieldKind::Url => ToolPresentationFieldKind::Url,
+        ServiceToolPresentationFieldKind::Command => ToolPresentationFieldKind::Command,
+        ServiceToolPresentationFieldKind::Boolean => ToolPresentationFieldKind::Boolean,
+        ServiceToolPresentationFieldKind::Count => ToolPresentationFieldKind::Count,
+        ServiceToolPresentationFieldKind::DurationMs => ToolPresentationFieldKind::DurationMs,
+        ServiceToolPresentationFieldKind::Json => ToolPresentationFieldKind::Json,
+    }
+}
+
 fn tool_provider_plugin_ids(state: &ServerState) -> Vec<String> {
     state
         .plugins
@@ -12650,6 +12694,7 @@ fn tool_provider_plugin_ids(state: &ServerState) -> Vec<String> {
         .collect()
 }
 
+#[allow(clippy::too_many_lines)]
 async fn request_tool_permission(
     state: &ServerState,
     session_id: SessionId,
@@ -12667,6 +12712,11 @@ async fn request_tool_permission(
         call.id.clone(),
         definition.name.clone(),
         arguments_json.clone(),
+        definition
+            .ui
+            .request_presentation
+            .as_ref()
+            .map(service_request_presentation_to_session),
     )
     .await;
     append_trace_event(
@@ -12691,6 +12741,11 @@ async fn request_tool_permission(
             tool_name: definition.name.clone(),
             arguments_json,
             agent_id,
+            request_presentation: definition
+                .ui
+                .request_presentation
+                .as_ref()
+                .map(service_request_presentation_to_session),
         },
         decision: Arc::new(Mutex::new(None)),
         notify: Arc::new(Notify::new()),
@@ -12766,6 +12821,7 @@ async fn append_permission_requested_event(
     tool_call_id: String,
     tool_name: String,
     arguments_json: String,
+    request_presentation: Option<ToolRequestPresentationMetadata>,
 ) {
     match state
         .sessions
@@ -12775,6 +12831,7 @@ async fn append_permission_requested_event(
             tool_call_id,
             tool_name,
             arguments_json,
+            request_presentation,
         )
         .await
     {
@@ -12856,6 +12913,7 @@ fn session_events_to_sanitized_model_messages(
                 tool_call_id,
                 tool_name,
                 arguments_json,
+                ..
             } => {
                 if seen_tool_call_ids.contains(tool_call_id) {
                     append_missing_tool_results(&mut messages, &mut pending_tool_call_ids);
@@ -13168,13 +13226,20 @@ async fn append_tool_request_event(
     tool_call_id: String,
     tool_name: String,
     arguments_json: String,
+    request_presentation: Option<ToolRequestPresentationMetadata>,
 ) {
     let runtime_work_id = RuntimeWorkId::new(format!("tool_{tool_call_id}"));
     let runtime_label = tool_name.clone();
     let runtime_tool_call_id = tool_call_id.clone();
     match state
         .sessions
-        .append_tool_call_requested(session_id, tool_call_id, tool_name, arguments_json)
+        .append_tool_call_requested(
+            session_id,
+            tool_call_id,
+            tool_name,
+            arguments_json,
+            request_presentation,
+        )
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,
@@ -15297,6 +15362,7 @@ mod tests {
                     tool_call_id: "call-1".to_string(),
                     tool_name: "shell.run".to_string(),
                     arguments_json: r#"{"command":"true"}"#.to_string(),
+                    request_presentation: None,
                 },
             ),
             session_event(
@@ -15333,6 +15399,7 @@ mod tests {
                     tool_call_id: "call-1".to_string(),
                     tool_name: "shell.run".to_string(),
                     arguments_json: r#"{"command":"true"}"#.to_string(),
+                    request_presentation: None,
                 },
             ),
             session_event(
@@ -15397,6 +15464,7 @@ mod tests {
                 tool_call_id: "call-1".to_string(),
                 tool_name: "shell.run".to_string(),
                 arguments_json: "{not-json".to_string(),
+                request_presentation: None,
             },
         )];
 
@@ -16559,6 +16627,7 @@ mod tests {
                     tool_call_id: "call-1".to_string(),
                     tool_name: "filesystem.read".to_string(),
                     arguments_json: r#"{"path":"Cargo.toml"}"#.to_string(),
+                    request_presentation: None,
                 },
             },
             SessionEvent {
