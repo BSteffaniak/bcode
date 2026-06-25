@@ -53,6 +53,7 @@ pub struct ProcessExecutionResult {
     pub exit_code: Option<i32>,
     pub timed_out: bool,
     pub cancelled: bool,
+    pub duration_ms: u64,
     pub stdout: ProcessCapturedOutput,
     pub stderr: ProcessCapturedOutput,
 }
@@ -282,6 +283,7 @@ async fn run_process_inner(
         command.current_dir(cwd);
     }
     configure_command_for_timeout(&mut command);
+    let started = Instant::now();
     let mut child = command.kill_on_drop(true).spawn()?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -317,6 +319,7 @@ async fn run_process_inner(
         exit_code: status.code(),
         timed_out,
         cancelled,
+        duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         stdout: ProcessCapturedOutput {
             bytes: stdout,
             truncated: stdout_truncated,

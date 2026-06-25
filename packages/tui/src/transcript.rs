@@ -1115,6 +1115,7 @@ fn legacy_semantic_tool_result(
                 .get("cancelled")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or_default(),
+            duration_ms: None,
             output_tail: legacy_terminal_output_text(tool_name, &value, &output),
             output_truncated: value
                 .get("output_truncated")

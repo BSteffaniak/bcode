@@ -450,6 +450,7 @@ fn extend_shell_result_presentation(
             retained_output_bytes,
             columns,
             rows,
+            ..
         } => {
             push_shell_common_result_fields(fields, *exit_code, *timed_out, *cancelled);
             fields.push(ToolPresentationFieldValue {
@@ -487,6 +488,7 @@ fn extend_shell_result_presentation(
             stderr_truncated,
             stdout_bytes,
             stderr_bytes,
+            ..
         } => {
             push_shell_common_result_fields(fields, *exit_code, *timed_out, *cancelled);
             fields.push(ToolPresentationFieldValue {
@@ -856,6 +858,7 @@ fn run_terminal_shell_command_inner(
                 exit_code: Some(status.exit_code),
                 timed_out: status.timed_out,
                 cancelled: status.cancelled,
+                duration_ms: Some(0),
                 output_tail: inline_output.text,
                 output_truncated: inline_output.truncated,
                 output_bytes: Some(u64::try_from(inline_output.original_bytes).unwrap_or(u64::MAX)),
@@ -937,6 +940,7 @@ fn build_process_tool_response(
                 exit_code: result.exit_code,
                 timed_out: result.timed_out,
                 cancelled: result.cancelled,
+                duration_ms: Some(result.duration_ms),
                 stdout: inline_stdout.text,
                 stderr: inline_stderr.text,
                 stdout_truncated: inline_stdout.truncated,
@@ -1681,6 +1685,7 @@ mod tests {
                     exit_code: Some(0),
                     timed_out: false,
                     cancelled: false,
+                    duration_ms: Some(5),
                     stdout: "ok".to_string(),
                     stderr: "warn".to_string(),
                     stdout_truncated: false,
@@ -1731,6 +1736,7 @@ mod tests {
                     exit_code: Some(0),
                     timed_out: false,
                     cancelled: false,
+                    duration_ms: Some(5),
                     output_tail: "pty output".to_string(),
                     output_truncated: false,
                     output_bytes: Some(10),

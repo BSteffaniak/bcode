@@ -3952,6 +3952,7 @@ fn semantic_terminal_presentation(
                 retained_output_bytes,
                 columns,
                 rows,
+                ..
             },
     } = result
     else {

@@ -432,6 +432,8 @@ pub enum ShellRunResult {
         exit_code: Option<i32>,
         timed_out: bool,
         cancelled: bool,
+        #[serde(default)]
+        duration_ms: Option<u64>,
         output_tail: String,
         output_truncated: bool,
         output_bytes: Option<u64>,
@@ -444,6 +446,8 @@ pub enum ShellRunResult {
         exit_code: Option<i32>,
         timed_out: bool,
         cancelled: bool,
+        #[serde(default)]
+        duration_ms: Option<u64>,
         stdout: String,
         stderr: String,
         stdout_truncated: bool,

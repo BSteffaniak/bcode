@@ -3023,6 +3023,7 @@ mod tests {
                             exit_code: Some(0),
                             timed_out: false,
                             cancelled: false,
+                            duration_ms: None,
                             output_tail: "hello\n".to_string(),
                             output_truncated: false,
                             output_bytes: Some(6),

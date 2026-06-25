@@ -592,6 +592,9 @@ pub enum ShellRunResult {
         /// Whether execution was cancelled.
         #[serde(default)]
         cancelled: bool,
+        /// Execution duration in milliseconds.
+        #[serde(default)]
+        duration_ms: Option<u64>,
         /// Bounded tail of the PTY output stream.
         #[serde(default)]
         output_tail: String,
@@ -622,6 +625,9 @@ pub enum ShellRunResult {
         /// Whether execution was cancelled.
         #[serde(default)]
         cancelled: bool,
+        /// Execution duration in milliseconds.
+        #[serde(default)]
+        duration_ms: Option<u64>,
         /// Bounded stdout text.
         #[serde(default)]
         stdout: String,
@@ -1418,6 +1424,7 @@ mod tests {
                 exit_code: Some(0),
                 timed_out: false,
                 cancelled: false,
+                duration_ms: None,
                 output_tail: "hello\n".to_string(),
                 output_truncated: false,
                 output_bytes: Some(6),
@@ -1461,6 +1468,7 @@ mod tests {
                     exit_code: None,
                     timed_out: false,
                     cancelled: false,
+                    duration_ms: None,
                     output_tail: "minimal".to_string(),
                     output_truncated: false,
                     output_bytes: None,
@@ -1522,6 +1530,7 @@ mod tests {
                         exit_code: Some(0),
                         timed_out: false,
                         cancelled: false,
+                        duration_ms: None,
                         output_tail: "hello\n".to_string(),
                         output_truncated: false,
                         output_bytes: Some(6),
@@ -1538,6 +1547,7 @@ mod tests {
                         exit_code: Some(0),
                         timed_out: false,
                         cancelled: false,
+                        duration_ms: None,
                         stdout: "hello\n".to_string(),
                         stderr: String::new(),
                         stdout_truncated: false,

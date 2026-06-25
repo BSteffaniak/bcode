@@ -1037,6 +1037,7 @@ fn semantic_from_legacy_presentation(
                 exit_code: *exit_code,
                 timed_out: *timed_out,
                 cancelled: *cancelled,
+                duration_ms: None,
                 output_tail: output.clone(),
                 output_truncated: *output_truncated,
                 output_bytes: *output_bytes,
@@ -1116,6 +1117,8 @@ enum PersistedShellRunResult {
         timed_out: bool,
         #[serde(default)]
         cancelled: bool,
+        #[serde(default)]
+        duration_ms: Option<u64>,
         #[serde(default, alias = "output")]
         output_tail: String,
         #[serde(default)]
@@ -1136,6 +1139,8 @@ enum PersistedShellRunResult {
         timed_out: bool,
         #[serde(default)]
         cancelled: bool,
+        #[serde(default)]
+        duration_ms: Option<u64>,
         #[serde(default)]
         stdout: String,
         #[serde(default)]
@@ -1158,6 +1163,7 @@ impl From<&ShellRunResult> for PersistedShellRunResult {
                 exit_code,
                 timed_out,
                 cancelled,
+                duration_ms,
                 output_tail,
                 output_truncated,
                 output_bytes,
@@ -1168,6 +1174,7 @@ impl From<&ShellRunResult> for PersistedShellRunResult {
                 exit_code: *exit_code,
                 timed_out: *timed_out,
                 cancelled: *cancelled,
+                duration_ms: *duration_ms,
                 output_tail: output_tail.clone(),
                 output_truncated: *output_truncated,
                 output_bytes: *output_bytes,
@@ -1179,6 +1186,7 @@ impl From<&ShellRunResult> for PersistedShellRunResult {
                 exit_code,
                 timed_out,
                 cancelled,
+                duration_ms,
                 stdout,
                 stderr,
                 stdout_truncated,
@@ -1189,6 +1197,7 @@ impl From<&ShellRunResult> for PersistedShellRunResult {
                 exit_code: *exit_code,
                 timed_out: *timed_out,
                 cancelled: *cancelled,
+                duration_ms: *duration_ms,
                 stdout: stdout.clone(),
                 stderr: stderr.clone(),
                 stdout_truncated: *stdout_truncated,
@@ -1207,6 +1216,7 @@ impl PersistedShellRunResult {
                 exit_code,
                 timed_out,
                 cancelled,
+                duration_ms,
                 output_tail,
                 output_truncated,
                 output_bytes,
@@ -1217,6 +1227,7 @@ impl PersistedShellRunResult {
                 exit_code,
                 timed_out,
                 cancelled,
+                duration_ms,
                 output_tail,
                 output_truncated,
                 output_bytes,
@@ -1228,6 +1239,7 @@ impl PersistedShellRunResult {
                 exit_code,
                 timed_out,
                 cancelled,
+                duration_ms,
                 stdout,
                 stderr,
                 stdout_truncated,
@@ -1238,6 +1250,7 @@ impl PersistedShellRunResult {
                 exit_code,
                 timed_out,
                 cancelled,
+                duration_ms,
                 stdout,
                 stderr,
                 stdout_truncated,
@@ -1677,6 +1690,7 @@ mod tests {
                     exit_code: None,
                     timed_out: false,
                     cancelled: false,
+                    duration_ms: None,
                     output_tail: "legacy tail".to_string(),
                     output_truncated: false,
                     output_bytes: None,
@@ -1696,6 +1710,7 @@ mod tests {
                     exit_code: None,
                     timed_out: false,
                     cancelled: false,
+                    duration_ms: None,
                     stdout: "hello\n".to_string(),
                     stderr: String::new(),
                     stdout_truncated: false,
