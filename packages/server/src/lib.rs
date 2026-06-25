@@ -7189,6 +7189,116 @@ struct ModelStreamProgress {
 }
 
 #[derive(Debug)]
+enum ToolOutputLivePublisherEvent {
+    FlushDue { generation: u64 },
+}
+
+#[derive(Debug)]
+struct ToolOutputLivePublisher {
+    pending_output: Option<ToolOutputStreamAccumulator>,
+    flush_generation: u64,
+    flush_tx: mpsc::UnboundedSender<ToolOutputLivePublisherEvent>,
+    flush_rx: mpsc::UnboundedReceiver<ToolOutputLivePublisherEvent>,
+}
+
+impl ToolOutputLivePublisher {
+    fn new() -> Self {
+        let (flush_tx, flush_rx) = mpsc::unbounded_channel();
+        Self {
+            pending_output: None,
+            flush_generation: 0,
+            flush_tx,
+            flush_rx,
+        }
+    }
+
+    async fn next_event(&mut self) -> Option<ToolOutputLivePublisherEvent> {
+        self.flush_rx.recv().await
+    }
+
+    async fn push_stream_event(
+        &mut self,
+        state: &ServerState,
+        session_id: SessionId,
+        event: ToolInvocationStreamEvent,
+    ) {
+        let ToolInvocationStreamEvent::OutputDelta {
+            tool_call_id,
+            stream,
+            sequence,
+            text,
+            byte_len,
+        } = event
+        else {
+            self.flush(state, session_id).await;
+            append_tool_stream_event(state, session_id, event).await;
+            return;
+        };
+
+        let can_absorb = self
+            .pending_output
+            .as_ref()
+            .is_some_and(|output| output.can_absorb(&tool_call_id, stream));
+        if !can_absorb {
+            self.flush(state, session_id).await;
+            self.pending_output = Some(ToolOutputStreamAccumulator::new(
+                tool_call_id,
+                stream,
+                sequence,
+                text,
+                byte_len,
+            ));
+            self.schedule_flush();
+        } else if let Some(output) = self.pending_output.as_mut() {
+            output.push(&text, byte_len);
+        }
+
+        if self
+            .pending_output
+            .as_ref()
+            .is_some_and(ToolOutputStreamAccumulator::should_flush)
+        {
+            self.flush(state, session_id).await;
+        }
+    }
+
+    async fn handle_event(
+        &mut self,
+        state: &ServerState,
+        session_id: SessionId,
+        event: ToolOutputLivePublisherEvent,
+    ) {
+        match event {
+            ToolOutputLivePublisherEvent::FlushDue { generation }
+                if generation == self.flush_generation =>
+            {
+                self.flush(state, session_id).await;
+            }
+            ToolOutputLivePublisherEvent::FlushDue { .. } => {}
+        }
+    }
+
+    async fn finish(&mut self, state: &ServerState, session_id: SessionId) {
+        self.flush(state, session_id).await;
+    }
+
+    async fn flush(&mut self, state: &ServerState, session_id: SessionId) {
+        self.flush_generation = self.flush_generation.wrapping_add(1);
+        flush_tool_output_stream(state, session_id, &mut self.pending_output).await;
+    }
+
+    fn schedule_flush(&mut self) {
+        self.flush_generation = self.flush_generation.wrapping_add(1);
+        let generation = self.flush_generation;
+        let flush_tx = self.flush_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(TOOL_OUTPUT_FLUSH_INTERVAL).await;
+            let _ = flush_tx.send(ToolOutputLivePublisherEvent::FlushDue { generation });
+        });
+    }
+}
+
+#[derive(Debug)]
 struct ToolOutputStreamAccumulator {
     tool_call_id: String,
     stream: SessionToolOutputStream,
@@ -7259,6 +7369,7 @@ async fn flush_tool_output_stream(
     }
 }
 
+#[cfg(test)]
 async fn push_tool_output_stream(
     state: &ServerState,
     session_id: SessionId,
@@ -12290,7 +12401,7 @@ async fn invoke_model_tool(
             CancellationHandle::PluginInvocation(invocation.cancel.clone()),
         )
         .await;
-    let mut pending_tool_output: Option<ToolOutputStreamAccumulator> = None;
+    let mut tool_output_publisher = ToolOutputLivePublisher::new();
     let mut stream_sequences: BTreeMap<String, u64> = BTreeMap::new();
     let response = loop {
         tokio::select! {
@@ -12377,14 +12488,18 @@ async fn invoke_model_tool(
             result: None,
                 });
             }
+            publisher_event = tool_output_publisher.next_event() => {
+                if let Some(publisher_event) = publisher_event {
+                    tool_output_publisher.handle_event(state, session_id, publisher_event).await;
+                }
+            }
             event = invocation.next_event() => {
                 match event.map_err(|error| error.to_string())? {
                     StreamingServiceInvocationEvent::Event(payload) => {
                         if let Ok(event) = serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload) {
-                            push_tool_output_stream(
+                            tool_output_publisher.push_stream_event(
                                 state,
                                 session_id,
-                                &mut pending_tool_output,
                                 normalize_tool_stream_event_sequence(event, &mut stream_sequences),
                             )
                             .await;
@@ -12399,16 +12514,16 @@ async fn invoke_model_tool(
     };
     while let Some(payload) = invocation.try_recv_event() {
         if let Ok(event) = serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload) {
-            push_tool_output_stream(
-                state,
-                session_id,
-                &mut pending_tool_output,
-                normalize_tool_stream_event_sequence(event, &mut stream_sequences),
-            )
-            .await;
+            tool_output_publisher
+                .push_stream_event(
+                    state,
+                    session_id,
+                    normalize_tool_stream_event_sequence(event, &mut stream_sequences),
+                )
+                .await;
         }
     }
-    flush_tool_output_stream(state, session_id, &mut pending_tool_output).await;
+    tool_output_publisher.finish(state, session_id).await;
     let response: ToolInvocationResponse =
         bcode_plugin::decode_service_response(response).map_err(|error| error.to_string())?;
     if let Some(bcode_tool::ToolInvocationHostAction::HostModelNativeWebSearch(request)) =
