@@ -19,7 +19,9 @@ use super::{TuiError, model_flow, session_fork_flow, skill_flow, worktree_flow};
 /// Build a command palette from host and manifest-declared plugin command contributions.
 pub async fn open_palette(services: &TuiServices<'_>, chat: &mut ActiveChat) -> BmuxCommandPalette {
     match services.passive_client.plugin_contributions().await {
-        Ok(contributions) => BmuxCommandPalette::with_plugin_commands(&contributions.commands),
+        Ok(contributions) => {
+            BmuxCommandPalette::with_command_contributions(contributions.command_contributions)
+        }
         Err(error) => {
             chat.app.set_status(format!(
                 "plugin commands unavailable; using host commands: {error}"

@@ -14334,8 +14334,10 @@ async fn handle_list_plugin_contributions(
     state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
+    let commands = state.plugins.command_contributions();
     let contributions = PluginContributions {
-        commands: state.plugins.command_contributions(),
+        command_contributions: resolved_command_contributions(&commands),
+        commands,
         config_extensions: state.plugins.config_extensions(),
     };
     send_response(
@@ -14344,6 +14346,40 @@ async fn handle_list_plugin_contributions(
         Response::Ok(ResponsePayload::PluginContributions { contributions }),
     )
     .await
+}
+
+fn resolved_command_contributions(
+    plugin_commands: &[bcode_plugin::PluginOwnedCommandContribution],
+) -> Vec<bcode_command::CommandContribution> {
+    use std::collections::BTreeSet;
+
+    let mut registry = bcode_command::CommandRegistry::new();
+    registry.extend(bcode_command::bundled_host_palette_commands());
+    registry.extend(plugin_commands.iter().filter_map(|contribution| {
+        let command = &contribution.command;
+        let surface = command.surface.as_deref().map_or(
+            bcode_command::CommandSurface::Palette,
+            bcode_command::CommandSurface::parse,
+        );
+        if surface != bcode_command::CommandSurface::Palette {
+            return None;
+        }
+        Some(bcode_command::CommandContribution {
+            id: command.id.clone(),
+            title: command.title.clone(),
+            description: command.description.clone(),
+            category: command.category.clone(),
+            surfaces: BTreeSet::from([surface]),
+            owner: bcode_command::CommandOwner::Plugin {
+                plugin_id: contribution.plugin_id.clone(),
+            },
+            action: bcode_command::CommandAction::Plugin {
+                plugin_id: contribution.plugin_id.clone(),
+                command_id: command.id.clone(),
+            },
+        })
+    }));
+    registry.commands_for_surface(&bcode_command::CommandSurface::Palette)
 }
 
 async fn handle_invoke_plugin_service(

@@ -553,6 +553,8 @@ pub struct PluginContributions {
     #[serde(default)]
     pub commands: Vec<bcode_plugin::PluginOwnedCommandContribution>,
     #[serde(default)]
+    pub command_contributions: Vec<bcode_command::CommandContribution>,
+    #[serde(default)]
     pub config_extensions: Vec<bcode_plugin::PluginConfigExtension>,
 }
 

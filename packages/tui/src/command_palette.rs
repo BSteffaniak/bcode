@@ -1,11 +1,6 @@
 //! TUI command palette state and actions.
 
-use std::collections::BTreeSet;
-
-use bcode_command::{
-    CommandAction, CommandContribution, CommandOwner, CommandRegistry, CommandSurface,
-};
-use bcode_plugin::PluginOwnedCommandContribution;
+use bcode_command::{CommandAction, CommandContribution, CommandSurface};
 use bmux_tui::palette::{CommandPaletteState, PaletteItem};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
@@ -18,25 +13,22 @@ pub struct BmuxCommandPalette {
 }
 
 impl BmuxCommandPalette {
-    /// Create a command palette.
+    /// Create a command palette from bundled host commands.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_plugin_commands(&[])
+        Self::with_command_contributions(bcode_command::bundled_host_palette_commands())
     }
 
-    /// Create a command palette using manifest-declared plugin commands where available.
+    /// Create a command palette from registry-resolved command contributions.
     #[must_use]
-    pub fn with_plugin_commands(commands: &[PluginOwnedCommandContribution]) -> Self {
-        let mut registry = host_command_registry();
-        registry.extend(plugin_command_contributions(commands));
-        Self::from_registry(&registry, &CommandSurface::Palette)
-    }
-
-    /// Create a command palette from a command registry and surface.
-    #[must_use]
-    pub fn from_registry(registry: &CommandRegistry, surface: &CommandSurface) -> Self {
+    pub fn with_command_contributions(
+        contributions: impl IntoIterator<Item = CommandContribution>,
+    ) -> Self {
         Self {
-            contributions: registry.commands_for_surface(surface),
+            contributions: contributions
+                .into_iter()
+                .filter(|contribution| contribution.supports_surface(&CommandSurface::Palette))
+                .collect(),
             state: CommandPaletteState::default(),
         }
     }
@@ -65,41 +57,6 @@ impl Default for BmuxCommandPalette {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn plugin_command_contributions(
-    plugin_commands: &[PluginOwnedCommandContribution],
-) -> impl Iterator<Item = CommandContribution> + '_ {
-    plugin_commands.iter().filter_map(|contribution| {
-        let command = &contribution.command;
-        let surface = command
-            .surface
-            .as_deref()
-            .map_or(CommandSurface::Palette, CommandSurface::parse);
-        if surface != CommandSurface::Palette {
-            return None;
-        }
-        Some(CommandContribution {
-            id: command.id.clone(),
-            title: command.title.clone(),
-            description: command.description.clone(),
-            category: command.category.clone(),
-            surfaces: BTreeSet::from([surface]),
-            owner: CommandOwner::Plugin {
-                plugin_id: contribution.plugin_id.clone(),
-            },
-            action: CommandAction::Plugin {
-                plugin_id: contribution.plugin_id.clone(),
-                command_id: command.id.clone(),
-            },
-        })
-    })
-}
-
-fn host_command_registry() -> CommandRegistry {
-    let mut registry = CommandRegistry::new();
-    registry.extend(bcode_command::bundled_host_palette_commands());
-    registry
 }
 
 fn palette_item(contribution: &CommandContribution) -> PaletteItem {
@@ -138,62 +95,38 @@ fn raw_item(id: &str, title: &str, description: &str, search_text: &str) -> Pale
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use bcode_command::{CommandOwner, CommandRegistry};
+
     use super::*;
 
     #[test]
-    fn plugin_command_contribution_replaces_host_display_and_routes_to_plugin_owner() {
-        let palette = BmuxCommandPalette::with_plugin_commands(&[PluginOwnedCommandContribution {
-            plugin_id: "bcode.example".to_string(),
-            command: bcode_plugin::PluginCommandContribution {
-                id: "command.work-tree.list".to_string(),
-                title: "Worktrees From Plugin".to_string(),
-                description: Some("Plugin-owned command".to_string()),
-                category: Some("worktree".to_string()),
-                surface: Some("palette".to_string()),
-            },
-        }]);
-        let items = palette.cloned_items();
-        let index = items
-            .iter()
-            .position(|item| item.id == "command.work-tree.list")
-            .expect("worktree item should exist");
-
-        let rendered = format!("{:?}", items[index].label);
-        assert!(rendered.contains("Worktrees From Plugin"));
-        assert_eq!(
-            palette.command_at(index),
-            Some(CommandAction::Plugin {
+    fn palette_renders_registry_contributions_without_local_plugin_conversion() {
+        let mut registry = CommandRegistry::new();
+        registry.register(CommandContribution::host_palette(
+            "session.new",
+            "New Session",
+            "Create a new chat session",
+            "session",
+        ));
+        registry.register(CommandContribution {
+            id: "example.dynamic".to_string(),
+            title: "Dynamic".to_string(),
+            description: None,
+            category: None,
+            surfaces: BTreeSet::from([CommandSurface::Palette]),
+            owner: CommandOwner::Plugin {
                 plugin_id: "bcode.example".to_string(),
-                command_id: "command.work-tree.list".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn host_command_routes_through_registry_action_model() {
-        let palette = BmuxCommandPalette::new();
-
-        assert_eq!(
-            palette.command_at(0),
-            Some(CommandAction::Host {
-                route: "command.work-tree.attach".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn plugin_command_contribution_adds_unknown_palette_command() {
-        let palette = BmuxCommandPalette::with_plugin_commands(&[PluginOwnedCommandContribution {
-            plugin_id: "bcode.example".to_string(),
-            command: bcode_plugin::PluginCommandContribution {
-                id: "example.dynamic".to_string(),
-                title: "Dynamic".to_string(),
-                description: None,
-                category: None,
-                surface: Some("palette".to_string()),
             },
-        }]);
-
+            action: CommandAction::Plugin {
+                plugin_id: "bcode.example".to_string(),
+                command_id: "example.dynamic".to_string(),
+            },
+        });
+        let palette = BmuxCommandPalette::with_command_contributions(
+            registry.commands_for_surface(&CommandSurface::Palette),
+        );
         let items = palette.cloned_items();
         let index = items
             .iter()
@@ -210,15 +143,31 @@ mod tests {
     }
 
     #[test]
-    fn non_palette_plugin_command_is_ignored() {
-        let palette = BmuxCommandPalette::with_plugin_commands(&[PluginOwnedCommandContribution {
-            plugin_id: "bcode.example".to_string(),
-            command: bcode_plugin::PluginCommandContribution {
-                id: "example.hidden".to_string(),
-                title: "Hidden".to_string(),
-                description: None,
-                category: None,
-                surface: Some("other".to_string()),
+    fn host_command_routes_through_registry_action_model() {
+        let palette = BmuxCommandPalette::new();
+
+        assert_eq!(
+            palette.command_at(0),
+            Some(CommandAction::Host {
+                route: "session.new".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn non_palette_command_is_ignored() {
+        let palette = BmuxCommandPalette::with_command_contributions([CommandContribution {
+            id: "example.hidden".to_string(),
+            title: "Hidden".to_string(),
+            description: None,
+            category: None,
+            surfaces: BTreeSet::from([CommandSurface::Slash]),
+            owner: CommandOwner::Plugin {
+                plugin_id: "bcode.example".to_string(),
+            },
+            action: CommandAction::Plugin {
+                plugin_id: "bcode.example".to_string(),
+                command_id: "example.hidden".to_string(),
             },
         }]);
 
