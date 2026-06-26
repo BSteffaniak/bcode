@@ -12430,8 +12430,40 @@ async fn invoke_model_tool(
                     .as_ref()
                     .and_then(remembered_skill_tool_decision)
                 {
-                    Some(SkillToolDecision::Allow) => {}
+                    Some(SkillToolDecision::Allow) => {
+                        append_trace_event(
+                            state,
+                            session_id,
+                            None,
+                            SessionTracePhase::ToolPolicyEvaluated,
+                            SessionTracePayload::ToolPolicyEvaluated {
+                                tool_call_id: call.id.clone(),
+                                agent_id: session_agent_selection(state, session_id).await,
+                                decision: "remembered_skill_allow".to_string(),
+                                reason: Some(
+                                    "remembered skill tool decision allowed prompt skip"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .await;
+                    }
                     Some(SkillToolDecision::Deny) => {
+                        append_trace_event(
+                            state,
+                            session_id,
+                            None,
+                            SessionTracePhase::ToolPolicyEvaluated,
+                            SessionTracePayload::ToolPolicyEvaluated {
+                                tool_call_id: call.id.clone(),
+                                agent_id: session_agent_selection(state, session_id).await,
+                                decision: "remembered_skill_deny".to_string(),
+                                reason: Some(
+                                    "remembered skill tool decision denied tool call".to_string(),
+                                ),
+                            },
+                        )
+                        .await;
                         return Ok(ToolInvocationResponse {
                             output: "tool denied by remembered skill policy decision".to_string(),
                             is_error: true,
@@ -13051,13 +13083,53 @@ async fn skill_tool_decision_key(
         .session_working_directory(session_id)
         .await
         .ok()?;
-    Some(SkillToolDecisionKey {
+    Some(skill_tool_decision_key_for_working_directory(
+        skill_ids,
+        tool_name,
+        &working_directory,
+    ))
+}
+
+fn skill_tool_decision_key_for_working_directory(
+    skill_ids: BTreeSet<SkillId>,
+    tool_name: &str,
+    working_directory: &Path,
+) -> SkillToolDecisionKey {
+    SkillToolDecisionKey {
         skill_ids,
         tool_name: tool_name.to_string(),
         scope: SkillToolDecisionScope::Workspace {
-            workspace_id: working_directory.to_string_lossy().into_owned(),
+            workspace_id: workspace_identity(working_directory),
         },
-    })
+    }
+}
+
+fn workspace_identity(working_directory: &Path) -> String {
+    git_root_for_path(working_directory)
+        .or_else(|| working_directory.canonicalize().ok())
+        .unwrap_or_else(|| working_directory.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn git_root_for_path(path: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let root = stdout.trim();
+    if root.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(root))
+    }
 }
 
 async fn list_service_tools(state: &ServerState) -> Vec<ServiceToolDefinition> {
@@ -14931,6 +15003,46 @@ mod tests {
             provenance: None,
             kind,
         }
+    }
+
+    #[test]
+    fn skill_tool_decision_key_uses_sorted_skills_and_git_root_workspace() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        shell_git(&["init"], temp.path());
+        let nested = temp.path().join("src");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        let skill_ids = BTreeSet::from([SkillId::new("zeta"), SkillId::new("alpha")]);
+
+        let key = skill_tool_decision_key_for_working_directory(
+            skill_ids.clone(),
+            "filesystem_read",
+            &nested,
+        );
+
+        assert_eq!(key.skill_ids, skill_ids);
+        assert_eq!(key.tool_name, "filesystem_read");
+        let SkillToolDecisionScope::Workspace { workspace_id } = key.scope else {
+            panic!("expected workspace-scoped decision");
+        };
+        assert_eq!(
+            PathBuf::from(workspace_id)
+                .canonicalize()
+                .expect("workspace"),
+            temp.path().canonicalize().expect("repo")
+        );
+    }
+
+    fn shell_git(args: &[&str], cwd: &Path) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git should run");
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

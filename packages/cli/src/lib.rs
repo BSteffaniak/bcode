@@ -28,6 +28,8 @@ use bcode_session_models::{
     SessionEvent, SessionEventKind, SessionHistoryCursor, SessionHistoryDirection,
     SessionHistoryQuery, SessionId,
 };
+use bcode_settings::SettingsStore;
+use bcode_skill_models::{SkillToolDecision, SkillToolDecisionState};
 use bcode_worktree_models::{
     WorktreeBaseRef, WorktreeCreateRequest, WorktreeListRequest, WorktreeRemoveRequest,
 };
@@ -183,6 +185,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Auth { command } => handle_auth_command(command)?,
         Commands::Login { command } => handle_login_command(command).await?,
         Commands::Provider { command } => handle_provider_command(command)?,
+        Commands::Skill { command } => handle_skill_command(&command)?,
         Commands::Permission { command } => handle_permission_command(command).await?,
         Commands::RuntimeWork { command } => handle_runtime_work_command(command).await?,
         command => handle_session_io_command(command).await?,
@@ -466,10 +469,56 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
         | Commands::Auth { .. }
         | Commands::Login { .. }
         | Commands::Provider { .. }
+        | Commands::Skill { .. }
         | Commands::Permission { .. }
         | Commands::RuntimeWork { .. } => unreachable!("handled by handle_cli"),
     }
     Ok(())
+}
+
+fn handle_skill_command(command: &SkillCommand) -> Result<(), CliError> {
+    let store = SettingsStore::default();
+    match command {
+        SkillCommand::Decisions => {
+            let state = store.skill_tool_decisions()?;
+            if state.decisions.is_empty() {
+                println!("no remembered skill tool decisions");
+                return Ok(());
+            }
+            for entry in state.decisions {
+                let decision = match entry.decision {
+                    SkillToolDecision::Allow => "allow",
+                    SkillToolDecision::Deny => "deny",
+                };
+                let skills = entry
+                    .key
+                    .skill_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                println!(
+                    "{decision}\t{}\t{}\t{:?}\t{}",
+                    skills, entry.key.tool_name, entry.key.scope, entry.remembered_at_ms
+                );
+            }
+        }
+        SkillCommand::ClearDecisions => {
+            store.save_skill_tool_decisions(
+                &SkillToolDecisionState::default(),
+                cli_current_time_ms(),
+            )?;
+            println!("cleared remembered skill tool decisions");
+        }
+    }
+    Ok(())
+}
+
+fn cli_current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
 }
 
 async fn handle_permission_command(command: PermissionCommand) -> Result<(), CliError> {
@@ -613,6 +662,10 @@ enum Commands {
     Provider {
         #[command(subcommand)]
         command: ProviderCommand,
+    },
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
     },
     Permission {
         #[command(subcommand)]
@@ -1166,6 +1219,14 @@ struct OpenAiDeviceTokenResponse {
 enum OpenAiLoginFlow {
     Browser,
     DeviceCode,
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillCommand {
+    /// List remembered skill tool decisions.
+    Decisions,
+    /// Clear all remembered skill tool decisions.
+    ClearDecisions,
 }
 
 #[derive(Debug, Subcommand)]

@@ -34,7 +34,11 @@ impl PermissionDialogState {
     /// Return the currently focused action approval value.
     #[must_use]
     pub const fn focused_approval(&self) -> bool {
-        self.focused_action != 2
+        if self.permission.can_remember_policy {
+            self.focused_action != 2
+        } else {
+            self.focused_action == 0
+        }
     }
 
     /// Return the currently focused action label.
@@ -68,5 +72,59 @@ impl PermissionDialogState {
         } else {
             2
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bcode_ipc::PermissionSummary;
+    use bcode_session_models::SessionId;
+    use uuid::Uuid;
+
+    fn permission(can_remember_policy: bool) -> PermissionSummary {
+        PermissionSummary {
+            permission_id: "perm".to_string(),
+            session_id: SessionId(Uuid::nil()),
+            tool_call_id: "call".to_string(),
+            tool_name: "tool".to_string(),
+            arguments_json: "{}".to_string(),
+            agent_id: "build".to_string(),
+            request_presentation: None,
+            policy_source: can_remember_policy.then(|| "skill".to_string()),
+            policy_reason: can_remember_policy.then(|| "skill asks".to_string()),
+            can_remember_policy,
+        }
+    }
+
+    #[test]
+    fn action_cycle_without_remember_uses_two_actions() {
+        let mut dialog = PermissionDialogState::new(permission(false));
+
+        assert_eq!(dialog.focused_label(), "approve");
+        assert!(dialog.focused_approval());
+        assert!(!dialog.focused_remember());
+        dialog.focus_next();
+        assert_eq!(dialog.focused_label(), "deny");
+        assert!(!dialog.focused_approval());
+        dialog.focus_next();
+        assert_eq!(dialog.focused_label(), "approve");
+    }
+
+    #[test]
+    fn action_cycle_with_remember_uses_three_actions() {
+        let mut dialog = PermissionDialogState::new(permission(true));
+
+        assert_eq!(dialog.focused_label(), "approve once");
+        assert!(dialog.focused_approval());
+        assert!(!dialog.focused_remember());
+        dialog.focus_next();
+        assert_eq!(dialog.focused_label(), "remember allow");
+        assert!(dialog.focused_approval());
+        assert!(dialog.focused_remember());
+        dialog.focus_next();
+        assert_eq!(dialog.focused_label(), "deny");
+        assert!(!dialog.focused_approval());
+        assert!(!dialog.focused_remember());
     }
 }
