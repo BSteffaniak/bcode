@@ -2116,23 +2116,13 @@ impl SessionManager {
     pub async fn append_permission_requested(
         &self,
         session_id: SessionId,
-        permission_id: String,
-        tool_call_id: String,
-        tool_name: String,
-        arguments_json: String,
-        request_presentation: Option<bcode_session_models::ToolRequestPresentationMetadata>,
+        request: SessionEventKind,
     ) -> Result<SessionEvent, SessionError> {
-        self.append_event(
-            session_id,
-            SessionEventKind::PermissionRequested {
-                permission_id,
-                tool_call_id,
-                tool_name,
-                arguments_json,
-                request_presentation,
-            },
-        )
-        .await
+        debug_assert!(matches!(
+            request,
+            SessionEventKind::PermissionRequested { .. }
+        ));
+        self.append_event(session_id, request).await
     }
 
     /// Append a permission-resolved event to a session.
@@ -4481,6 +4471,8 @@ mod tests {
                     tool_name: "tool".to_string(),
                     arguments_json: "{}".to_string(),
                     request_presentation: None,
+                    policy_source: None,
+                    policy_reason: None,
                 },
             ),
             (

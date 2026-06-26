@@ -1182,6 +1182,10 @@ pub enum SessionEventKind {
         arguments_json: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_presentation: Option<ToolRequestPresentationMetadata>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy_source: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy_reason: Option<String>,
     },
     PermissionResolved {
         permission_id: String,

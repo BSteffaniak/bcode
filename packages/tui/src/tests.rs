@@ -1806,6 +1806,8 @@ fn live_file_edit_card_shows_permission_and_applied_phases() {
             tool_name: "filesystem_edit".to_owned(),
             arguments_json: args,
             request_presentation: None,
+            policy_source: None,
+            policy_reason: None,
         },
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 40));
@@ -1883,6 +1885,8 @@ fn denied_file_permission_marks_preview_failed() {
             tool_name: "filesystem_edit".to_owned(),
             arguments_json: args,
             request_presentation: None,
+            policy_source: None,
+            policy_reason: None,
         },
     ));
     app.absorb_session_event(&event(

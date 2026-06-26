@@ -27,15 +27,17 @@ pub fn render_permission_dialog(state: &PermissionDialogState, frame: &mut Frame
         &permission.arguments_json,
         permission.request_presentation.as_ref(),
     );
-    let rows = permission_rows(
+    let rows = permission_rows(&PermissionRowsInput {
         state,
-        &permission.tool_name,
-        &permission.agent_id,
-        &presentation.risk,
-        &presentation.details,
-        presentation.raw_details.as_deref(),
-        area.width.saturating_sub(4),
-    );
+        tool_name: &permission.tool_name,
+        agent_id: &permission.agent_id,
+        risk: &presentation.risk,
+        policy_source: permission.policy_source.as_deref(),
+        policy_reason: permission.policy_reason.as_deref(),
+        details: &presentation.details,
+        raw_details: presentation.raw_details.as_deref(),
+        width: area.width.saturating_sub(4),
+    });
 
     modal.render(frame.area(), frame);
 
@@ -102,27 +104,45 @@ pub fn action_areas(dialog: Rect) -> (Rect, Rect) {
     )
 }
 
-fn permission_rows(
-    state: &PermissionDialogState,
-    tool_name: &str,
-    agent_id: &str,
-    risk: &str,
-    details: &[PermissionDetail],
-    raw_details: Option<&str>,
+#[derive(Debug, Clone, Copy)]
+struct PermissionRowsInput<'a> {
+    state: &'a PermissionDialogState,
+    tool_name: &'a str,
+    agent_id: &'a str,
+    risk: &'a str,
+    policy_source: Option<&'a str>,
+    policy_reason: Option<&'a str>,
+    details: &'a [PermissionDetail],
+    raw_details: Option<&'a str>,
     width: u16,
-) -> Vec<Line> {
+}
+
+fn permission_rows(input: &PermissionRowsInput<'_>) -> Vec<Line> {
     let mut rows = Vec::new();
     rows.push(Line::from_spans(vec![Span::styled(
         "Review this tool request before it runs.",
         Style::new().fg(Color::BrightWhite),
     )]));
     rows.push(Line::default());
-    push_metadata_row(&mut rows, "tool", tool_name, width);
-    push_metadata_row(&mut rows, "agent", agent_id, width);
-    push_metadata_row(&mut rows, "risk", risk, width);
+    push_metadata_row(&mut rows, "tool", input.tool_name, input.width);
+    push_metadata_row(&mut rows, "agent", input.agent_id, input.width);
+    push_metadata_row(&mut rows, "risk", input.risk, input.width);
+    if let Some(source) = input
+        .policy_source
+        .filter(|source| !source.trim().is_empty())
+    {
+        push_metadata_row(&mut rows, "policy", source, input.width);
+    }
+    if let Some(reason) = input
+        .policy_reason
+        .filter(|reason| !reason.trim().is_empty())
+    {
+        push_metadata_row(&mut rows, "reason", reason, input.width);
+    }
     rows.push(Line::default());
 
-    let detail_items = details
+    let detail_items = input
+        .details
         .iter()
         .map(|detail| DetailItem::new(detail.label.clone(), detail.value.clone()))
         .collect::<Vec<_>>();
@@ -133,10 +153,10 @@ fn permission_rows(
                 value: Style::new().fg(Color::BrightWhite),
                 continuation: muted_style(),
             })
-            .lines(width),
+            .lines(input.width),
     );
 
-    if let Some(raw_details) = raw_details.filter(|raw| !raw.trim().is_empty()) {
+    if let Some(raw_details) = input.raw_details.filter(|raw| !raw.trim().is_empty()) {
         rows.push(Line::default());
         rows.push(Line::from_spans(vec![Span::styled(
             "raw details",
@@ -147,7 +167,7 @@ fn permission_rows(
                 &mut rows,
                 &[Span::styled("  ", muted_style())],
                 line,
-                width,
+                input.width,
                 muted_style(),
             );
         }
@@ -157,7 +177,7 @@ fn permission_rows(
     rows.push(Line::from_spans(vec![Span::styled(
         format!(
             "tab/←/→ choose · enter {} · esc deny",
-            state.focused_label()
+            input.state.focused_label()
         ),
         muted_style(),
     )]));
@@ -282,6 +302,8 @@ mod tests {
             arguments_json: r#"{"command":"cargo check --workspace","cwd":"/repo"}"#.to_owned(),
             agent_id: "build".to_owned(),
             request_presentation: None,
+            policy_source: None,
+            policy_reason: None,
         });
         let mut buffer = Buffer::empty(bmux_tui::geometry::Rect::new(0, 0, 100, 30));
         let mut frame = bmux_tui::frame::Frame::new(&mut buffer);

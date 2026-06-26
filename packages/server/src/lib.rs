@@ -12373,7 +12373,19 @@ async fn invoke_model_tool(
             });
         }
         AgentDecision::Ask => {
-            if !request_tool_permission(state, session_id, call, &definition, cancel_state).await {
+            if !request_tool_permission(
+                state,
+                session_id,
+                call,
+                &definition,
+                cancel_state,
+                PermissionPolicyContext {
+                    source: None,
+                    reason: agent_decision.reason.clone(),
+                },
+            )
+            .await
+            {
                 return Ok(ToolInvocationResponse {
                     output: "permission denied".to_string(),
                     is_error: true,
@@ -12386,8 +12398,18 @@ async fn invoke_model_tool(
         }
         AgentDecision::Allow => {
             if skill_requests_permission
-                && !request_tool_permission(state, session_id, call, &definition, cancel_state)
-                    .await
+                && !request_tool_permission(
+                    state,
+                    session_id,
+                    call,
+                    &definition,
+                    cancel_state,
+                    PermissionPolicyContext {
+                        source: Some("skill".to_string()),
+                        reason: skill_tool_policy_reason(&skill_decision),
+                    },
+                )
+                .await
             {
                 return Ok(ToolInvocationResponse {
                     output: "permission denied".to_string(),
@@ -13083,6 +13105,12 @@ fn tool_provider_plugin_ids(state: &ServerState) -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug, Clone, Default)]
+struct PermissionPolicyContext {
+    source: Option<String>,
+    reason: Option<String>,
+}
+
 #[allow(clippy::too_many_lines)]
 async fn request_tool_permission(
     state: &ServerState,
@@ -13090,6 +13118,7 @@ async fn request_tool_permission(
     call: &bcode_model::ToolCall,
     definition: &ServiceToolDefinition,
     cancel_state: &TurnCancelState,
+    policy_context: PermissionPolicyContext,
 ) -> bool {
     let permission_id = next_permission_id(state).await;
     let arguments_json = serde_json::to_string(&call.arguments).unwrap_or_default();
@@ -13097,15 +13126,19 @@ async fn request_tool_permission(
     append_permission_requested_event(
         state,
         session_id,
-        permission_id.clone(),
-        call.id.clone(),
-        definition.name.clone(),
-        arguments_json.clone(),
-        definition
-            .ui
-            .request_presentation
-            .as_ref()
-            .map(service_request_presentation_to_session),
+        SessionEventKind::PermissionRequested {
+            permission_id: permission_id.clone(),
+            tool_call_id: call.id.clone(),
+            tool_name: definition.name.clone(),
+            arguments_json: arguments_json.clone(),
+            request_presentation: definition
+                .ui
+                .request_presentation
+                .as_ref()
+                .map(service_request_presentation_to_session),
+            policy_source: policy_context.source.clone(),
+            policy_reason: policy_context.reason.clone(),
+        },
     )
     .await;
     append_trace_event(
@@ -13135,6 +13168,8 @@ async fn request_tool_permission(
                 .request_presentation
                 .as_ref()
                 .map(service_request_presentation_to_session),
+            policy_source: policy_context.source,
+            policy_reason: policy_context.reason,
         },
         decision: Arc::new(Mutex::new(None)),
         notify: Arc::new(Notify::new()),
@@ -13206,22 +13241,11 @@ async fn next_permission_id(state: &ServerState) -> String {
 async fn append_permission_requested_event(
     state: &ServerState,
     session_id: SessionId,
-    permission_id: String,
-    tool_call_id: String,
-    tool_name: String,
-    arguments_json: String,
-    request_presentation: Option<ToolRequestPresentationMetadata>,
+    request: SessionEventKind,
 ) {
     match state
         .sessions
-        .append_permission_requested(
-            session_id,
-            permission_id,
-            tool_call_id,
-            tool_name,
-            arguments_json,
-            request_presentation,
-        )
+        .append_permission_requested(session_id, request)
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,

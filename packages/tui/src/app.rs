@@ -408,6 +408,18 @@ struct ToolCallContext {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PermissionRequestInput<'a> {
+    permission_id: &'a str,
+    tool_call_id: &'a str,
+    tool_name: &'a str,
+    arguments_json: &'a str,
+    request_presentation: Option<&'a ToolRequestPresentationMetadata>,
+    policy_source: Option<&'a str>,
+    policy_reason: Option<&'a str>,
+    application: SessionEventApplication,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct StreamedToolResultContext {
     index: Option<usize>,
     columns: u16,
@@ -2132,15 +2144,19 @@ impl BmuxApp {
                 tool_name,
                 arguments_json,
                 request_presentation,
+                policy_source,
+                policy_reason,
             } => {
-                self.push_permission_request(
+                self.push_permission_request(PermissionRequestInput {
                     permission_id,
                     tool_call_id,
                     tool_name,
                     arguments_json,
-                    request_presentation.clone(),
+                    request_presentation: request_presentation.as_ref(),
+                    policy_source: policy_source.as_deref(),
+                    policy_reason: policy_reason.as_deref(),
                     application,
-                );
+                });
             }
             SessionEventKind::PermissionResolved {
                 permission_id,
@@ -2993,33 +3009,27 @@ impl BmuxApp {
         );
     }
 
-    fn push_permission_request(
-        &mut self,
-        permission_id: &str,
-        tool_call_id: &str,
-        tool_name: &str,
-        arguments_json: &str,
-        request_presentation: Option<ToolRequestPresentationMetadata>,
-        application: SessionEventApplication,
-    ) {
+    fn push_permission_request(&mut self, input: PermissionRequestInput<'_>) {
         self.transcript.push(permission_request_item(
-            permission_id,
-            tool_call_id,
-            tool_name,
-            arguments_json,
-            request_presentation,
+            input.permission_id,
+            input.tool_call_id,
+            input.tool_name,
+            input.arguments_json,
+            input.request_presentation.cloned(),
+            input.policy_source,
+            input.policy_reason,
         ));
-        if application.live_activity() {
+        if input.application.live_activity() {
             self.set_activity(ActivityState::WaitingPermission {
-                name: tool_name.to_owned(),
+                name: input.tool_name.to_owned(),
             });
         }
-        self.set_tool_request_file_phase(tool_call_id, FileEditPhase::WaitingPermission);
-        if application.live_activity() {
-            self.status = self.tool_call_file_status(tool_call_id).map_or_else(
+        self.set_tool_request_file_phase(input.tool_call_id, FileEditPhase::WaitingPermission);
+        if input.application.live_activity() {
+            self.status = self.tool_call_file_status(input.tool_call_id).map_or_else(
                 || {
-                    tool_request_status(tool_name, arguments_json)
-                        .unwrap_or_else(|| tool_name.to_owned())
+                    tool_request_status(input.tool_name, input.arguments_json)
+                        .unwrap_or_else(|| input.tool_name.to_owned())
                 },
                 |status| format!("waiting permission · {status}"),
             );

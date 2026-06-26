@@ -574,6 +574,10 @@ pub struct PermissionSummary {
     pub agent_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_presentation: Option<ToolRequestPresentationMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_reason: Option<String>,
 }
 
 /// Plugin service invocation result.
@@ -2144,6 +2148,8 @@ mod tests {
                 tool_name: "shell.run".to_string(),
                 arguments_json: "{}".to_string(),
                 request_presentation: None,
+                policy_source: None,
+                policy_reason: None,
             },
             SessionEventKind::PermissionResolved {
                 permission_id: "perm-1".to_string(),

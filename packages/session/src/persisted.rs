@@ -202,6 +202,10 @@ enum PersistedSessionEventKind {
         arguments_json: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_presentation: Option<ToolRequestPresentationMetadata>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy_source: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy_reason: Option<String>,
     },
     PermissionResolved {
         permission_id: String,
@@ -457,12 +461,16 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 tool_name,
                 arguments_json,
                 request_presentation,
+                policy_source,
+                policy_reason,
             } => Self::PermissionRequested {
                 permission_id: permission_id.clone(),
                 tool_call_id: tool_call_id.clone(),
                 tool_name: tool_name.clone(),
                 arguments_json: arguments_json.clone(),
                 request_presentation: request_presentation.clone(),
+                policy_source: policy_source.clone(),
+                policy_reason: policy_reason.clone(),
             },
             SessionEventKind::PermissionResolved {
                 permission_id,
@@ -746,12 +754,16 @@ impl PersistedSessionEventKind {
                 tool_name,
                 arguments_json,
                 request_presentation,
+                policy_source,
+                policy_reason,
             } => SessionEventKind::PermissionRequested {
                 permission_id,
                 tool_call_id,
                 tool_name,
                 arguments_json,
                 request_presentation,
+                policy_source,
+                policy_reason,
             },
             Self::PermissionResolved {
                 permission_id,
@@ -1363,6 +1375,8 @@ mod tests {
                 tool_name: "tool".to_string(),
                 arguments_json: "{}".to_string(),
                 request_presentation: None,
+                policy_source: None,
+                policy_reason: None,
             },
             SessionEventKind::PermissionResolved {
                 permission_id: "perm".to_string(),

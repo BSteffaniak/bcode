@@ -147,6 +147,10 @@ pub enum TranscriptItemKind {
         arguments_json: String,
         /// Declarative plugin-owned request presentation metadata.
         request_presentation: Option<ToolRequestPresentationMetadata>,
+        /// Policy source that requested approval.
+        policy_source: Option<String>,
+        /// Human-readable policy reason.
+        policy_reason: Option<String>,
     },
     /// Permission resolution.
     PermissionResult {
@@ -701,10 +705,19 @@ pub fn permission_request_item(
     tool_name: &str,
     arguments_json: &str,
     request_presentation: Option<ToolRequestPresentationMetadata>,
+    policy_source: Option<&str>,
+    policy_reason: Option<&str>,
 ) -> TranscriptItem {
+    let mut body = pretty_jsonish(arguments_json);
+    if let Some(reason) = policy_reason.filter(|reason| !reason.trim().is_empty()) {
+        body = format!(
+            "Policy: {}\nReason: {reason}\n\n{body}",
+            policy_source.unwrap_or("policy")
+        );
+    }
     TranscriptItem::with_kind(
         "Permission",
-        pretty_jsonish(arguments_json),
+        body,
         false,
         TranscriptItemKind::PermissionRequest {
             permission_id: permission_id.to_owned(),
@@ -712,6 +725,8 @@ pub fn permission_request_item(
             tool_name: tool_name.to_owned(),
             arguments_json: arguments_json.to_owned(),
             request_presentation,
+            policy_source: policy_source.map(str::to_owned),
+            policy_reason: policy_reason.map(str::to_owned),
         },
     )
 }
@@ -1030,12 +1045,16 @@ fn non_streaming_transcript_item_from_event(
             tool_name,
             arguments_json,
             request_presentation,
+            policy_source,
+            policy_reason,
         } => Some(permission_request_item(
             permission_id,
             tool_call_id,
             tool_name,
             arguments_json,
             request_presentation.clone(),
+            policy_source.as_deref(),
+            policy_reason.as_deref(),
         )),
         SessionEventKind::PermissionResolved {
             permission_id,
