@@ -51,10 +51,12 @@ use bcode_session_models::{
 };
 use bcode_skill::{
     SkillPromptCatalogMode, SkillPromptCatalogOptions, SkillRegistry, SkillRegistryOptions,
-    SkillSourceRoot, format_skill_catalog_for_prompt,
+    SkillSourceRoot, evaluate_skill_tool_call, format_skill_catalog_for_prompt,
+    resolve_skill_permission_policy,
 };
 use bcode_skill_models::{
     SkillActivationMode, SkillContextResponse, SkillId, SkillList, SkillSource, SkillSourceKind,
+    SkillToolPolicyOutcome, SkillToolPolicyRequest,
 };
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, ShellRunResult as ServiceShellRunResult,
@@ -12332,6 +12334,31 @@ async fn invoke_model_tool(
         },
     )
     .await;
+    let skill_decision = evaluate_active_skill_tool_policy(state, session_id, &definition).await;
+    append_trace_event(
+        state,
+        session_id,
+        None,
+        SessionTracePhase::ToolPolicyEvaluated,
+        SessionTracePayload::ToolPolicyEvaluated {
+            tool_call_id: call.id.clone(),
+            agent_id: session_agent_selection(state, session_id).await,
+            decision: skill_tool_policy_decision_name(&skill_decision).to_string(),
+            reason: skill_tool_policy_reason(&skill_decision),
+        },
+    )
+    .await;
+    if let SkillToolPolicyOutcome::Deny { reason } = skill_decision {
+        return Ok(ToolInvocationResponse {
+            output: reason,
+            is_error: true,
+            content: Vec::new(),
+            full_output: None,
+            host_action: None,
+            result: None,
+        });
+    }
+    let skill_requests_permission = matches!(skill_decision, SkillToolPolicyOutcome::Ask { .. });
     match agent_decision.decision {
         AgentDecision::Deny => {
             return Ok(ToolInvocationResponse {
@@ -12357,7 +12384,21 @@ async fn invoke_model_tool(
                 });
             }
         }
-        AgentDecision::Allow => {}
+        AgentDecision::Allow => {
+            if skill_requests_permission
+                && !request_tool_permission(state, session_id, call, &definition, cancel_state)
+                    .await
+            {
+                return Ok(ToolInvocationResponse {
+                    output: "permission denied".to_string(),
+                    is_error: true,
+                    content: Vec::new(),
+                    full_output: None,
+                    host_action: None,
+                    result: None,
+                });
+            }
+        }
     }
     let working_directory = state
         .sessions
@@ -12897,6 +12938,78 @@ async fn evaluate_agent_tool_policy(
             },
             reason: None,
         })
+}
+
+async fn list_service_tools(state: &ServerState) -> Vec<ServiceToolDefinition> {
+    let mut tools = Vec::new();
+    for plugin_id in tool_provider_plugin_ids(state) {
+        match state
+            .plugins
+            .invoke_service_json::<_, ToolList>(
+                &plugin_id,
+                TOOL_SERVICE_INTERFACE_ID,
+                OP_LIST_TOOLS,
+                &ListToolsRequest::default(),
+            )
+            .await
+        {
+            Ok(list) => tools.extend(list.tools),
+            Err(error) => eprintln!("failed to list tools from {plugin_id}: {error}"),
+        }
+    }
+    tools
+}
+
+async fn evaluate_active_skill_tool_policy(
+    state: &ServerState,
+    session_id: SessionId,
+    definition: &ServiceToolDefinition,
+) -> SkillToolPolicyOutcome {
+    let Some(registry) = &state.skills else {
+        return SkillToolPolicyOutcome::NoOpinion;
+    };
+    let skill_ids = state
+        .active_skills
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+        .unwrap_or_default();
+    if skill_ids.is_empty() {
+        return SkillToolPolicyOutcome::NoOpinion;
+    }
+    let available_tools = list_service_tools(state).await;
+    let active_policies = skill_ids
+        .into_iter()
+        .filter_map(|skill_id| registry.describe(&skill_id).ok())
+        .map(|manifest| {
+            resolve_skill_permission_policy(&manifest.permission_policy, &available_tools)
+        })
+        .collect();
+    evaluate_skill_tool_call(&SkillToolPolicyRequest {
+        tool: definition.clone(),
+        active_policies,
+    })
+}
+
+const fn skill_tool_policy_decision_name(outcome: &SkillToolPolicyOutcome) -> &'static str {
+    match outcome {
+        SkillToolPolicyOutcome::NoOpinion => "skill_no_opinion",
+        SkillToolPolicyOutcome::Allow { .. } => "skill_allow",
+        SkillToolPolicyOutcome::Warn { .. } => "skill_warn",
+        SkillToolPolicyOutcome::Ask { .. } => "skill_ask",
+        SkillToolPolicyOutcome::Deny { .. } => "skill_deny",
+    }
+}
+
+fn skill_tool_policy_reason(outcome: &SkillToolPolicyOutcome) -> Option<String> {
+    match outcome {
+        SkillToolPolicyOutcome::NoOpinion => None,
+        SkillToolPolicyOutcome::Allow { reason }
+        | SkillToolPolicyOutcome::Warn { reason }
+        | SkillToolPolicyOutcome::Ask { reason }
+        | SkillToolPolicyOutcome::Deny { reason } => Some(reason.clone()),
+    }
 }
 
 async fn find_tool_provider(

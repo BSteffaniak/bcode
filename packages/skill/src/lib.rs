@@ -753,6 +753,13 @@ fn evaluate_single_skill_tool_policy(
     if policy.mode == SkillPermissionMode::Disabled {
         return SkillToolPolicyOutcome::NoOpinion;
     }
+    if policy.mode == SkillPermissionMode::Inherit
+        && policy.selectors.is_empty()
+        && policy.unknown_references.is_empty()
+        && policy.ambiguous_references.is_empty()
+    {
+        return SkillToolPolicyOutcome::NoOpinion;
+    }
     if !policy.unknown_references.is_empty() || !policy.ambiguous_references.is_empty() {
         return SkillToolPolicyOutcome::Ask {
             reason: "skill permission policy contains unresolved tool references".to_string(),
