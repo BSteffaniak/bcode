@@ -15,6 +15,7 @@
 //! hand-edited. It intentionally does not store secrets; credential values
 //! belong in the configured secure auth store.
 
+use bcode_skill_models::SkillToolDecisionState;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -29,6 +30,7 @@ use switchy::schema::discovery::code::{CodeMigration, CodeMigrationSource};
 use switchy::schema::runner::MigrationRunner;
 
 const DATABASE_FILE_NAME: &str = "settings.db";
+const SKILL_TOOL_DECISIONS_KEY: &str = "skills.tool_decisions.v1";
 const MIGRATIONS_TABLE: &str = "settings_schema_migrations";
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DATABASE_OPEN_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(20);
@@ -89,6 +91,35 @@ impl SettingsStore {
         remove_file_if_exists(&sqlite_sidecar_path(&self.settings_db_path, "wal"))?;
         remove_file_if_exists(&sqlite_sidecar_path(&self.settings_db_path, "shm"))?;
         Ok(())
+    }
+
+    /// Return remembered skill tool policy decisions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persisted settings state cannot be read or decoded.
+    pub fn skill_tool_decisions(&self) -> SettingsResult<SkillToolDecisionState> {
+        self.control_state(SKILL_TOOL_DECISIONS_KEY)?
+            .map(|value| serde_json::from_value(value.value).map_err(Into::into))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
+    /// Persist remembered skill tool policy decisions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when decision state cannot be serialized or persisted.
+    pub fn save_skill_tool_decisions(
+        &self,
+        state: &SkillToolDecisionState,
+        updated_at_ms: u64,
+    ) -> SettingsResult<()> {
+        self.put_control_state(
+            SKILL_TOOL_DECISIONS_KEY,
+            &serde_json::to_value(state)?,
+            updated_at_ms,
+        )
     }
 
     /// Persist a setup readiness report into control state.
@@ -2944,6 +2975,44 @@ mod tests {
         assert!(!panel.available);
         assert!(panel.reset_available);
         assert!(panel.message.contains("degraded"));
+    }
+
+    #[test]
+    fn skill_tool_decisions_round_trip_through_control_state() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let store = SettingsStore::from_settings_db_path(temp.path().join("settings.db"));
+        let mut skill_ids = BTreeSet::new();
+        skill_ids.insert(bcode_skill_models::SkillId::new("code-review"));
+        let mut state = SkillToolDecisionState::default();
+        state.upsert(bcode_skill_models::SkillToolDecisionEntry {
+            key: bcode_skill_models::SkillToolDecisionKey {
+                skill_ids,
+                tool_name: "filesystem_read".to_string(),
+                scope: bcode_skill_models::SkillToolDecisionScope::Workspace {
+                    workspace_id: "repo".to_string(),
+                },
+            },
+            decision: bcode_skill_models::SkillToolDecision::Allow,
+            remembered_at_ms: 123,
+            reason: Some("approved by user".to_string()),
+        });
+
+        store
+            .save_skill_tool_decisions(&state, 456)
+            .expect("skill decisions should save");
+        let loaded = store
+            .skill_tool_decisions()
+            .expect("skill decisions should load");
+
+        assert_eq!(loaded, state);
+        assert_eq!(
+            store
+                .control_state(SKILL_TOOL_DECISIONS_KEY)
+                .expect("raw state should load")
+                .expect("raw state should exist")
+                .updated_at_ms,
+            456
+        );
     }
 
     #[test]

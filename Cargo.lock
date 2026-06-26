@@ -1892,6 +1892,7 @@ name = "bcode_settings"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_config",
+ "bcode_skill_models",
  "serde",
  "serde_json",
  "switchy",

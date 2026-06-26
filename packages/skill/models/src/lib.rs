@@ -8,7 +8,7 @@
 
 use bcode_tool::UnresolvedToolReference;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
@@ -347,4 +347,73 @@ pub enum SkillError {
     ContextBudgetExceeded(String),
     #[error("skill execution failed: {0}")]
     ExecutionFailed(String),
+}
+
+/// Remembered decision for a skill-governed tool permission check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillToolDecision {
+    /// Allow the matching skill/tool combination without another skill-policy prompt.
+    Allow,
+    /// Deny the matching skill/tool combination without another skill-policy prompt.
+    Deny,
+}
+
+/// Scope where a remembered skill tool decision applies.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillToolDecisionScope {
+    /// Applies across Bcode state.
+    Global,
+    /// Applies only for the identified workspace.
+    Workspace { workspace_id: String },
+}
+
+/// Stable lookup key for remembered skill tool decisions.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SkillToolDecisionKey {
+    /// Sorted set of active skills that produced the permission policy.
+    pub skill_ids: BTreeSet<SkillId>,
+    /// Canonical service tool name.
+    pub tool_name: String,
+    /// Decision applicability scope.
+    pub scope: SkillToolDecisionScope,
+}
+
+/// One remembered skill tool policy decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillToolDecisionEntry {
+    /// Lookup key.
+    pub key: SkillToolDecisionKey,
+    /// Remembered decision.
+    pub decision: SkillToolDecision,
+    /// Unix epoch milliseconds when the decision was remembered.
+    pub remembered_at_ms: u64,
+    /// Optional human-readable note explaining why this was remembered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Persisted skill tool decision state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillToolDecisionState {
+    /// Remembered decisions.
+    #[serde(default)]
+    pub decisions: Vec<SkillToolDecisionEntry>,
+}
+
+impl SkillToolDecisionState {
+    /// Return the remembered decision matching `key`, if any.
+    #[must_use]
+    pub fn decision_for(&self, key: &SkillToolDecisionKey) -> Option<&SkillToolDecisionEntry> {
+        self.decisions.iter().find(|entry| &entry.key == key)
+    }
+
+    /// Upsert one remembered decision, replacing any existing entry with the same key.
+    pub fn upsert(&mut self, entry: SkillToolDecisionEntry) {
+        self.decisions.retain(|existing| existing.key != entry.key);
+        self.decisions.push(entry);
+        self.decisions
+            .sort_by(|left, right| left.key.cmp(&right.key));
+    }
 }
