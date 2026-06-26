@@ -8,7 +8,7 @@ use bcode_session_models::{
     ToolRequestPresentationMetadata,
 };
 
-use super::diff_extract::{FileEditTranscript, file_edit_from_tool_request};
+use super::diff_extract::{FileEditTranscript, file_edit_from_request_preview};
 
 /// Lifecycle phase for a file edit/write preview.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -547,7 +547,10 @@ pub fn tool_request_item(
     arguments_json: &str,
     request_presentation: Option<ToolRequestPresentationMetadata>,
 ) -> TranscriptItem {
-    let file_edit = file_edit_from_tool_request(tool_name, arguments_json);
+    let file_edit = request_presentation
+        .as_ref()
+        .and_then(|metadata| metadata.preview.as_ref())
+        .and_then(|preview| file_edit_from_request_preview(preview, arguments_json));
     let streaming = file_edit.is_some();
     TranscriptItem::with_kind(
         "Tool",

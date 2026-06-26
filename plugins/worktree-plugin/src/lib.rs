@@ -142,6 +142,7 @@ fn tool_ui(
         request_presentation: Some(ToolRequestPresentationMetadata {
             title: title.to_string(),
             fields,
+            preview: None,
         }),
     }
 }

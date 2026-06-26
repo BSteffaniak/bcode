@@ -16,7 +16,7 @@ use bcode_session_models::{
     SessionProjectionKind, SessionSummary, SessionTitleSource, SessionTokenUsage,
     SessionTraceEvent, SessionTracePayload, SessionTracePhase, ShellRunResult,
     ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream, ToolPresentationField,
-    ToolPresentationFieldKind, ToolRequestPresentationMetadata,
+    ToolPresentationFieldKind, ToolRequestPresentationMetadata, ToolRequestPreviewMetadata,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::TextMotion;
@@ -61,6 +61,38 @@ fn shell_request_presentation() -> ToolRequestPresentationMetadata {
                 optional: true,
             },
         ],
+        preview: None,
+    }
+}
+
+fn file_edit_request_presentation() -> ToolRequestPresentationMetadata {
+    ToolRequestPresentationMetadata {
+        title: "Edit file".to_owned(),
+        fields: vec![
+            ToolPresentationField {
+                label: "Path".to_owned(),
+                argument: "path".to_owned(),
+                kind: ToolPresentationFieldKind::Path,
+                optional: false,
+            },
+            ToolPresentationField {
+                label: "Old text".to_owned(),
+                argument: "old_text".to_owned(),
+                kind: ToolPresentationFieldKind::Text,
+                optional: false,
+            },
+            ToolPresentationField {
+                label: "New text".to_owned(),
+                argument: "new_text".to_owned(),
+                kind: ToolPresentationFieldKind::Text,
+                optional: false,
+            },
+        ],
+        preview: Some(ToolRequestPreviewMetadata::FileEdit {
+            path_fields: vec!["path".to_owned()],
+            old_text_fields: vec!["old_text".to_owned()],
+            new_text_fields: vec!["new_text".to_owned(), "contents".to_owned()],
+        }),
     }
 }
 
@@ -1761,7 +1793,7 @@ fn live_file_write_statusline_is_not_duplicated_and_truncates_path() {
                 "contents": "fn main() {}\n",
             })
             .to_string(),
-            request_presentation: None,
+            request_presentation: Some(file_edit_request_presentation()),
         },
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 72, 16));
@@ -1794,7 +1826,7 @@ fn live_file_edit_card_shows_permission_and_applied_phases() {
             tool_call_id: "call_edit".to_owned(),
             tool_name: "filesystem_edit".to_owned(),
             arguments_json: args.clone(),
-            request_presentation: None,
+            request_presentation: Some(file_edit_request_presentation()),
         },
     ));
     app.absorb_session_event(&event(
@@ -1805,7 +1837,7 @@ fn live_file_edit_card_shows_permission_and_applied_phases() {
             tool_call_id: "call_edit".to_owned(),
             tool_name: "filesystem_edit".to_owned(),
             arguments_json: args,
-            request_presentation: None,
+            request_presentation: Some(file_edit_request_presentation()),
             policy_source: None,
             policy_reason: None,
         },
@@ -1873,7 +1905,7 @@ fn denied_file_permission_marks_preview_failed() {
             tool_call_id: "call_edit".to_owned(),
             tool_name: "filesystem_edit".to_owned(),
             arguments_json: args.clone(),
-            request_presentation: None,
+            request_presentation: Some(file_edit_request_presentation()),
         },
     ));
     app.absorb_session_event(&event(
@@ -1884,7 +1916,7 @@ fn denied_file_permission_marks_preview_failed() {
             tool_call_id: "call_edit".to_owned(),
             tool_name: "filesystem_edit".to_owned(),
             arguments_json: args,
-            request_presentation: None,
+            request_presentation: Some(file_edit_request_presentation()),
             policy_source: None,
             policy_reason: None,
         },
@@ -1923,7 +1955,7 @@ fn transcript_renders_filesystem_edit_inline_diff_preview() {
                 "new_text": "fn answer() -> i32 {\n    42\n}\n",
             })
             .to_string(),
-            request_presentation: None,
+            request_presentation: Some(file_edit_request_presentation()),
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
@@ -2017,7 +2049,7 @@ fn transcript_renders_shell_output_with_ansi_and_limits() {
                     "terminal": true,
                 })
                 .to_string(),
-                request_presentation: Some(shell_request_presentation()),
+                request_presentation: Some(file_edit_request_presentation()),
             },
         ),
         event(
@@ -2077,7 +2109,7 @@ fn transcript_renders_terminal_shell_output_without_unbounded_row_request() {
                     "command": "git status --short && ls",
                 })
                 .to_string(),
-                request_presentation: None,
+                request_presentation: Some(shell_request_presentation()),
             },
         ),
         event(
@@ -2210,7 +2242,7 @@ fn streamed_terminal_output_renders_running_until_final_result() {
             tool_call_id: "call-running".to_owned(),
             tool_name: "shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
-            request_presentation: None,
+            request_presentation: Some(shell_request_presentation()),
         },
     ));
     app.absorb_session_event(&event(
@@ -2265,7 +2297,7 @@ fn streamed_terminal_output_preserves_ansi_color() {
             tool_call_id: "call-color".to_owned(),
             tool_name: "shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
-            request_presentation: None,
+            request_presentation: Some(shell_request_presentation()),
         },
     ));
     app.absorb_session_event(&event(
@@ -2321,7 +2353,7 @@ fn streamed_terminal_output_updates_header_after_final_result() {
             tool_call_id: "call-final".to_owned(),
             tool_name: "shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
-            request_presentation: None,
+            request_presentation: Some(shell_request_presentation()),
         },
     ));
     app.absorb_session_event(&event(
@@ -2793,7 +2825,7 @@ fn tool_activity_after_submitted_user_message_resumes_following_latest_rows() {
             tool_call_id: "tool-1".to_owned(),
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
-            request_presentation: None,
+            request_presentation: Some(shell_request_presentation()),
         },
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
@@ -3049,7 +3081,7 @@ fn assistant_response_after_tool_loop_transitions_to_message_top() {
             tool_call_id: "tool-1".to_owned(),
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
-            request_presentation: None,
+            request_presentation: Some(shell_request_presentation()),
         },
     ));
     app.absorb_session_event(&event(
@@ -3211,7 +3243,7 @@ fn streamed_tool_output_is_not_duplicated_by_final_result() {
             tool_call_id: "call-1".to_owned(),
             tool_name: "filesystem.shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
-            request_presentation: None,
+            request_presentation: Some(file_edit_request_presentation()),
         },
     ));
     app.absorb_session_event(&event(
@@ -3402,7 +3434,7 @@ fn file_change_semantic_result_events(
                 tool_call_id: "call-file".to_owned(),
                 tool_name: "example.write".to_owned(),
                 arguments_json: r#"{"path":"file.txt","contents":"hi"}"#.to_owned(),
-                request_presentation: None,
+                request_presentation: Some(file_edit_request_presentation()),
             },
         ));
     }
@@ -3437,7 +3469,7 @@ fn streamed_tool_without_output_renders_final_result() {
                 tool_call_id: "call-empty".to_owned(),
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
-                request_presentation: None,
+                request_presentation: Some(shell_request_presentation()),
             },
         ),
         event(
@@ -3503,7 +3535,7 @@ fn streamed_terminal_tool_events(session_id: SessionId) -> Vec<SessionEvent> {
                 tool_call_id: "call-stream".to_owned(),
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
-                request_presentation: None,
+                request_presentation: Some(shell_request_presentation()),
             },
         ),
         event(
@@ -3584,7 +3616,7 @@ fn semantic_terminal_result_without_live_delta_renders_terminal_history() {
                 tool_call_id: "call-no-live".to_owned(),
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
-                request_presentation: None,
+                request_presentation: Some(shell_request_presentation()),
             },
         ),
         event(
@@ -3832,7 +3864,7 @@ fn legacy_terminal_result_does_not_leave_raw_terminal_json() {
                 tool_call_id: "call-old-order".to_owned(),
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
-                request_presentation: None,
+                request_presentation: Some(shell_request_presentation()),
             },
         ),
         event(
@@ -4070,7 +4102,7 @@ fn transcript_resident_window_does_not_trim_with_active_tool() {
             tool_call_id: "active-tool".to_owned(),
             tool_name: "shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
-            request_presentation: None,
+            request_presentation: Some(shell_request_presentation()),
         },
     ));
     for index in 0..50_u64 {
@@ -4109,7 +4141,7 @@ fn transcript_resident_window_prunes_old_tool_state_after_trim() {
                 tool_call_id: tool_call_id.clone(),
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
-                request_presentation: None,
+                request_presentation: Some(shell_request_presentation()),
             },
         ));
         app.absorb_session_event(&event(
@@ -4477,7 +4509,7 @@ fn live_file_preview_updates_without_duplicates_and_final_replaces_it() {
                 "contents": "fn main() {\n    println!(\"hi\");\n}",
             })
             .to_string(),
-            request_presentation: None,
+            request_presentation: Some(file_edit_request_presentation()),
         },
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 30));

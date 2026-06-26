@@ -107,6 +107,7 @@ mod tests {
                 kind: ToolPresentationFieldKind::Command,
                 optional: false,
             }],
+            preview: None,
         };
         let presentation = permission_presentation(
             "shell.run",

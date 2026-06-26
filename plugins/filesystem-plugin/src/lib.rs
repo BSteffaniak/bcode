@@ -391,6 +391,7 @@ fn path_tool_ui(activity_label: &str, title: &str) -> bcode_tool::ToolUiMetadata
                 kind: ToolPresentationFieldKind::Path,
                 optional: false,
             }],
+            preview: None,
         }),
     }
 }
@@ -426,6 +427,11 @@ fn write_tool_ui(
                     optional: false,
                 },
             ],
+            preview: Some(bcode_tool::ToolRequestPreviewMetadata::FileEdit {
+                path_fields: vec!["path".to_string()],
+                old_text_fields: Vec::new(),
+                new_text_fields: vec!["contents".to_string(), "new_text".to_string()],
+            }),
         }),
     }
 }

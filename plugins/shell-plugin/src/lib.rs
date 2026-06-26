@@ -164,6 +164,7 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
                             optional: true,
                         },
                     ],
+                    preview: None,
                 }),
             },
         }],

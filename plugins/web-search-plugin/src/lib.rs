@@ -1659,6 +1659,7 @@ fn search_tool_definition() -> ToolDefinition {
                         optional: true,
                     },
                 ],
+                preview: None,
             }),
         },
     }
@@ -1724,6 +1725,7 @@ fn fetch_tool_definition() -> ToolDefinition {
                         optional: true,
                     },
                 ],
+                preview: None,
             }),
         },
     }

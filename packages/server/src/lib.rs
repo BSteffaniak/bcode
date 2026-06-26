@@ -13241,6 +13241,26 @@ fn service_request_presentation_to_session(
                 optional: field.optional,
             })
             .collect(),
+        preview: value
+            .preview
+            .as_ref()
+            .map(service_request_preview_to_session),
+    }
+}
+
+fn service_request_preview_to_session(
+    value: &bcode_tool::ToolRequestPreviewMetadata,
+) -> bcode_session_models::ToolRequestPreviewMetadata {
+    match value {
+        bcode_tool::ToolRequestPreviewMetadata::FileEdit {
+            path_fields,
+            old_text_fields,
+            new_text_fields,
+        } => bcode_session_models::ToolRequestPreviewMetadata::FileEdit {
+            path_fields: path_fields.clone(),
+            old_text_fields: old_text_fields.clone(),
+            new_text_fields: new_text_fields.clone(),
+        },
     }
 }
 

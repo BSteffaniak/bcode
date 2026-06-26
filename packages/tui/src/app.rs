@@ -36,7 +36,7 @@ use bmux_tui_components::text_input::{
 
 use super::activity::{ActivityState, model_turn_outcome_label};
 use super::cursor_blink::CursorBlink;
-use super::diff_extract::diff_from_tool_request;
+use super::diff_extract::diff_from_request_preview;
 use super::diff_panel::DiffPanel;
 use super::exit_state::ExitState;
 use super::input_history::{InputHistory, InputHistoryOutcome};
@@ -2616,7 +2616,7 @@ impl BmuxApp {
         arguments_json: &str,
         request_presentation: Option<ToolRequestPresentationMetadata>,
     ) {
-        let edit_summary = self.record_diff_summary(tool_name, arguments_json);
+        let edit_summary = self.record_diff_summary(arguments_json, request_presentation.as_ref());
         self.tool_call_contexts.insert(
             tool_call_id.to_owned(),
             ToolCallContext {
@@ -2660,8 +2660,15 @@ impl BmuxApp {
         }
     }
 
-    fn record_diff_summary(&mut self, tool_name: &str, arguments_json: &str) -> Option<String> {
-        let (summary, lines) = diff_from_tool_request(tool_name, arguments_json)?;
+    fn record_diff_summary(
+        &mut self,
+        arguments_json: &str,
+        request_presentation: Option<&ToolRequestPresentationMetadata>,
+    ) -> Option<String> {
+        let preview = request_presentation
+            .as_ref()
+            .and_then(|metadata| metadata.preview.as_ref())?;
+        let (summary, lines) = diff_from_request_preview(preview, arguments_json)?;
         let status = format!(
             "{} · +{} -{}",
             summary.display_path(),
@@ -3068,7 +3075,11 @@ impl BmuxApp {
 
     fn tool_call_file_status(&self, tool_call_id: &str) -> Option<String> {
         let context = self.tool_call_contexts.get(tool_call_id)?;
-        let (summary, _) = diff_from_tool_request(&context.tool_name, &context.arguments_json)?;
+        let preview = context
+            .request_presentation
+            .as_ref()
+            .and_then(|metadata| metadata.preview.as_ref())?;
+        let (summary, _) = diff_from_request_preview(preview, &context.arguments_json)?;
         Some(format!(
             "{} · +{} -{}",
             summary.display_path(),

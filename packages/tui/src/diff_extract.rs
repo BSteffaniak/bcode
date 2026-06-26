@@ -54,45 +54,35 @@ impl FileEditTranscript {
     }
 }
 
-/// Extract a semantic file edit from a filesystem tool request.
-pub fn file_edit_from_tool_request(
-    tool_name: &str,
+/// Extract a semantic file edit from plugin-owned request preview metadata.
+pub fn file_edit_from_request_preview(
+    preview: &bcode_session_models::ToolRequestPreviewMetadata,
     arguments_json: &str,
 ) -> Option<FileEditTranscript> {
-    let normalized_tool = tool_name.replace(['-', '.'], "_").to_ascii_lowercase();
-    if !normalized_tool.contains("edit") && !normalized_tool.contains("write") {
-        return None;
-    }
+    let bcode_session_models::ToolRequestPreviewMetadata::FileEdit {
+        path_fields,
+        old_text_fields,
+        new_text_fields,
+    } = preview;
     let value = serde_json::from_str::<serde_json::Value>(arguments_json).ok()?;
-    let path = value
-        .get("path")
-        .or_else(|| value.get("file_path"))
-        .or_else(|| value.get("file"))?
-        .as_str()?;
-    let old_text = value
-        .get("old_text")
-        .or_else(|| value.get("old_string"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let new_text = value
-        .get("new_text")
-        .or_else(|| value.get("contents"))
-        .or_else(|| value.get("content"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    Some(FileEditTranscript::new(
-        path.to_owned(),
-        old_text.to_owned(),
-        new_text.to_owned(),
-    ))
+    let path = first_string_field(&value, path_fields)?;
+    let old_text = first_string_field(&value, old_text_fields).unwrap_or_default();
+    let new_text = first_string_field(&value, new_text_fields).unwrap_or_default();
+    Some(FileEditTranscript::new(path, old_text, new_text))
 }
 
-/// Extract a file diff preview from a filesystem tool request.
-pub fn diff_from_tool_request(
-    tool_name: &str,
+fn first_string_field(value: &serde_json::Value, fields: &[String]) -> Option<String> {
+    fields
+        .iter()
+        .find_map(|field| value.get(field)?.as_str().map(ToOwned::to_owned))
+}
+
+/// Extract a file diff preview from plugin-owned request preview metadata.
+pub fn diff_from_request_preview(
+    preview: &bcode_session_models::ToolRequestPreviewMetadata,
     arguments_json: &str,
 ) -> Option<(DiffFileSummary, Vec<DiffLine>)> {
-    let edit = file_edit_from_tool_request(tool_name, arguments_json)?;
+    let edit = file_edit_from_request_preview(preview, arguments_json)?;
     Some((edit.summary(), edit.diff_lines()))
 }
 
@@ -516,13 +506,23 @@ fn usize_to_u32(value: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{diff_from_tool_request, file_edit_from_tool_request};
+    use super::{diff_from_request_preview, file_edit_from_request_preview};
+    use bcode_session_models::ToolRequestPreviewMetadata;
     use bmux_tui::diff::{DiffChangedRange, DiffLineKind};
+
+    fn file_edit_preview() -> ToolRequestPreviewMetadata {
+        ToolRequestPreviewMetadata::FileEdit {
+            path_fields: vec!["path".to_string()],
+            old_text_fields: vec!["old_text".to_string()],
+            new_text_fields: vec!["new_text".to_string(), "contents".to_string()],
+        }
+    }
 
     #[test]
     fn file_edit_diff_lines_include_syntax_spans_for_source_content() {
-        let edit = file_edit_from_tool_request(
-            "example.edit",
+        let preview = file_edit_preview();
+        let edit = file_edit_from_request_preview(
+            &preview,
             &serde_json::json!({
                 "path": "src/lib.rs",
                 "old_text": "fn answer() -> i32 {\n    41\n}\n",
@@ -551,8 +551,9 @@ mod tests {
 
     #[test]
     fn file_edit_diff_lines_include_changed_ranges_for_replacements() {
-        let edit = file_edit_from_tool_request(
-            "example.edit",
+        let preview = file_edit_preview();
+        let edit = file_edit_from_request_preview(
+            &preview,
             &serde_json::json!({
                 "path": "src/lib.rs",
                 "old_text": "let value = old_name;\n",
@@ -578,8 +579,9 @@ mod tests {
 
     #[test]
     fn file_edit_changed_ranges_are_unicode_boundary_safe() {
-        let edit = file_edit_from_tool_request(
-            "example.edit",
+        let preview = file_edit_preview();
+        let edit = file_edit_from_request_preview(
+            &preview,
             &serde_json::json!({
                 "path": "src/lib.rs",
                 "old_text": "let face = \"😀\";\n",
@@ -602,8 +604,9 @@ mod tests {
 
     #[test]
     fn diff_summary_keeps_change_counts_when_highlighted() {
-        let (summary, lines) = diff_from_tool_request(
-            "example.write",
+        let preview = file_edit_preview();
+        let (summary, lines) = diff_from_request_preview(
+            &preview,
             &serde_json::json!({
                 "path": "src/main.rs",
                 "contents": "fn main() {}\n",

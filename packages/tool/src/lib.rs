@@ -365,6 +365,23 @@ pub enum ToolLiveArgumentPreviewMetadata {
     },
 }
 
+/// Declarative request preview metadata owned by a tool provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolRequestPreviewMetadata {
+    /// File edit/write style preview.
+    FileEdit {
+        /// Candidate path fields.
+        #[serde(default)]
+        path_fields: Vec<String>,
+        /// Candidate old-text fields.
+        #[serde(default)]
+        old_text_fields: Vec<String>,
+        /// Candidate new-text/content fields.
+        new_text_fields: Vec<String>,
+    },
+}
+
 /// Declarative request presentation metadata owned by a tool provider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRequestPresentationMetadata {
@@ -373,6 +390,9 @@ pub struct ToolRequestPresentationMetadata {
     /// Ordered argument fields that should be shown in request summaries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<ToolPresentationField>,
+    /// Optional structured preview metadata for rich generic request UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<ToolRequestPreviewMetadata>,
 }
 
 /// Declarative presentation metadata for one request argument field.
@@ -753,6 +773,7 @@ mod tests {
                     kind: ToolPresentationFieldKind::Command,
                     optional: false,
                 }],
+                preview: None,
             }),
         };
 

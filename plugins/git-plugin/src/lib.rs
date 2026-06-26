@@ -472,6 +472,7 @@ fn clone_tool_definition() -> ToolDefinition {
                         optional: true,
                     },
                 ],
+                preview: None,
             }),
         },
     }
