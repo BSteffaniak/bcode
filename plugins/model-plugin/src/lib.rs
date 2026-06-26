@@ -61,9 +61,8 @@ fn model_command(id: &str, title: &str, description: &str, category: &str) -> Co
         owner: CommandOwner::Plugin {
             plugin_id: "bcode.model".to_string(),
         },
-        action: CommandAction::Plugin {
-            plugin_id: "bcode.model".to_string(),
-            command_id: id.to_string(),
+        action: CommandAction::Host {
+            route: id.to_string(),
         },
     }
 }

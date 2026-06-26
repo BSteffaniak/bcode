@@ -184,9 +184,8 @@ fn diff_toggle_command() -> CommandContribution {
         owner: CommandOwner::Plugin {
             plugin_id: "bcode.code_review".to_string(),
         },
-        action: CommandAction::Plugin {
-            plugin_id: "bcode.code_review".to_string(),
-            command_id: "diff.toggle".to_string(),
+        action: CommandAction::Host {
+            route: "diff.toggle".to_string(),
         },
     }
 }
@@ -4204,9 +4203,8 @@ mod command_registration_tests {
         assert!(commands.iter().any(|command| {
             command.id == "diff.toggle"
                 && command.action
-                    == CommandAction::Plugin {
-                        plugin_id: "bcode.code_review".to_string(),
-                        command_id: "diff.toggle".to_string(),
+                    == CommandAction::Host {
+                        route: "diff.toggle".to_string(),
                     }
         }));
     }

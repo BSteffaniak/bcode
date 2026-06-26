@@ -76,9 +76,8 @@ fn worktree_command(id: &str, title: &str, description: &str) -> CommandContribu
         owner: CommandOwner::Plugin {
             plugin_id: "bcode.worktree".to_string(),
         },
-        action: CommandAction::Plugin {
-            plugin_id: "bcode.worktree".to_string(),
-            command_id: id.to_string(),
+        action: CommandAction::Host {
+            route: id.to_string(),
         },
     }
 }
@@ -409,9 +408,8 @@ mod tests {
         assert!(commands.iter().any(|command| {
             command.id == "command.work-tree.list"
                 && command.action
-                    == CommandAction::Plugin {
-                        plugin_id: "bcode.worktree".to_string(),
-                        command_id: "command.work-tree.list".to_string(),
+                    == CommandAction::Host {
+                        route: "command.work-tree.list".to_string(),
                     }
         }));
         assert!(

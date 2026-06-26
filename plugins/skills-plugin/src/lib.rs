@@ -43,9 +43,8 @@ fn skills_command(id: &str, title: &str, description: &str) -> CommandContributi
         owner: CommandOwner::Plugin {
             plugin_id: "bcode.skills".to_string(),
         },
-        action: CommandAction::Plugin {
-            plugin_id: "bcode.skills".to_string(),
-            command_id: id.to_string(),
+        action: CommandAction::Host {
+            route: id.to_string(),
         },
     }
 }
