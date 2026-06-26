@@ -9,7 +9,7 @@
 
 use bcode_model::ReasoningEffort;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Plugin service interface for command providers / core command registry.
 pub const COMMAND_INTERFACE_ID: &str = "bcode.command/v1";
@@ -61,6 +61,275 @@ pub struct InvokeCommandResponse {
     pub updated_thinking: Option<ReasoningEffort>,
 }
 
+/// Command owner identity.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommandOwner {
+    /// Host-owned command contribution.
+    Host,
+    /// Plugin-owned command contribution.
+    Plugin {
+        /// Owning plugin id.
+        plugin_id: String,
+    },
+}
+
+/// Command execution target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommandAction {
+    /// Host-routed command action.
+    Host {
+        /// Opaque host route.
+        route: String,
+    },
+    /// Plugin-routed command action.
+    Plugin {
+        /// Owning plugin id.
+        plugin_id: String,
+        /// Plugin-owned command id.
+        command_id: String,
+    },
+}
+
+/// Command contribution surface.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandSurface {
+    /// Command palette surface.
+    Palette,
+    /// Slash command surface.
+    Slash,
+    /// Named custom surface.
+    Custom(String),
+}
+
+impl CommandSurface {
+    /// Parse a manifest surface string.
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "palette" => Self::Palette,
+            "slash" => Self::Slash,
+            other => Self::Custom(other.to_owned()),
+        }
+    }
+}
+
+/// Registry contribution for a user-visible command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandContribution {
+    /// Stable command id.
+    pub id: String,
+    /// Display title.
+    pub title: String,
+    /// Optional display description.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Optional category.
+    #[serde(default)]
+    pub category: Option<String>,
+    /// Surfaces this command appears on.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub surfaces: BTreeSet<CommandSurface>,
+    /// Command owner.
+    pub owner: CommandOwner,
+    /// Command action.
+    pub action: CommandAction,
+}
+
+impl CommandContribution {
+    /// Build a host-owned command contribution.
+    #[must_use]
+    pub fn host_palette(id: &str, title: &str, description: &str, category: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            description: Some(description.to_owned()),
+            category: Some(category.to_owned()),
+            surfaces: BTreeSet::from([CommandSurface::Palette]),
+            owner: CommandOwner::Host,
+            action: CommandAction::Host {
+                route: id.to_owned(),
+            },
+        }
+    }
+
+    /// Return true when this command contributes to `surface`.
+    #[must_use]
+    pub fn supports_surface(&self, surface: &CommandSurface) -> bool {
+        self.surfaces.contains(surface)
+    }
+}
+
+/// In-memory command contribution registry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommandRegistry {
+    contributions: BTreeMap<String, CommandContribution>,
+}
+
+impl CommandRegistry {
+    /// Create an empty command registry.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            contributions: BTreeMap::new(),
+        }
+    }
+
+    /// Register or replace a command contribution by id.
+    pub fn register(&mut self, contribution: CommandContribution) {
+        self.contributions
+            .insert(contribution.id.clone(), contribution);
+    }
+
+    /// Extend this registry with command contributions.
+    pub fn extend(&mut self, contributions: impl IntoIterator<Item = CommandContribution>) {
+        for contribution in contributions {
+            self.register(contribution);
+        }
+    }
+
+    /// Return commands for a given surface in stable id order.
+    #[must_use]
+    pub fn commands_for_surface(&self, surface: &CommandSurface) -> Vec<CommandContribution> {
+        self.contributions
+            .values()
+            .filter(|contribution| contribution.supports_surface(surface))
+            .cloned()
+            .collect()
+    }
+
+    /// Return a command contribution by id.
+    #[must_use]
+    pub fn get(&self, id: &str) -> Option<&CommandContribution> {
+        self.contributions.get(id)
+    }
+}
+
+/// Return host-owned command contributions bundled with the default TUI distribution.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn bundled_host_palette_commands() -> Vec<CommandContribution> {
+    vec![
+        CommandContribution::host_palette(
+            "session.new",
+            "New Session",
+            "Create a new chat session",
+            "session",
+        ),
+        CommandContribution::host_palette(
+            "session.switch",
+            "Switch Session",
+            "Open the session picker",
+            "session",
+        ),
+        CommandContribution::host_palette(
+            "session.fork",
+            "Fork Session",
+            "Create a new session from an earlier prompt",
+            "session",
+        ),
+        CommandContribution::host_palette(
+            "session.clone",
+            "Clone Session",
+            "Copy the full current conversation into a new session",
+            "session",
+        ),
+        CommandContribution::host_palette(
+            "command.work-tree.list",
+            "Worktree: List",
+            "Show repository worktrees",
+            "worktree",
+        ),
+        CommandContribution::host_palette(
+            "command.work-tree.createSession",
+            "Worktree: Create for Session",
+            "Create a worktree branch for this session",
+            "worktree",
+        ),
+        CommandContribution::host_palette(
+            "command.work-tree.attach",
+            "Worktree: Attach Session",
+            "Attach this session to an existing worktree",
+            "worktree",
+        ),
+        CommandContribution::host_palette(
+            "command.work-tree.remove",
+            "Worktree: Remove",
+            "Remove a repository worktree",
+            "worktree",
+        ),
+        CommandContribution::host_palette(
+            "model.status",
+            "Model: Current Status",
+            "Show configured provider/model status",
+            "model",
+        ),
+        CommandContribution::host_palette(
+            "model.serverStatus",
+            "Model: Server Status",
+            "Show server default provider/model status",
+            "model",
+        ),
+        CommandContribution::host_palette(
+            "runtime.status",
+            "Runtime: Status",
+            "Show active runtime work",
+            "runtime",
+        ),
+        CommandContribution::host_palette(
+            "model.select",
+            "Model: Select",
+            "Pick a model for this session",
+            "model",
+        ),
+        CommandContribution::host_palette(
+            "skills.list",
+            "Skills: Available",
+            "List available skills",
+            "skills",
+        ),
+        CommandContribution::host_palette(
+            "skills.active",
+            "Skills: Active",
+            "Show active session skills",
+            "skills",
+        ),
+        CommandContribution::host_palette(
+            "diff.toggle",
+            "Diff: Toggle Panel",
+            "Show or hide the inline diff review panel",
+            "diff",
+        ),
+        CommandContribution::host_palette("help", "Help", "Show TUI help", "help"),
+        CommandContribution::host_palette(
+            "session.rename",
+            "Session: Rename",
+            "Rename an existing session",
+            "session",
+        ),
+        CommandContribution::host_palette(
+            "session.delete",
+            "Session: Delete",
+            "Delete an existing session",
+            "session",
+        ),
+        CommandContribution::host_palette(
+            "turn.cancel",
+            "Turn: Cancel",
+            "Cancel the active assistant turn",
+            "turn",
+        ),
+        CommandContribution::host_palette(
+            "context.compact",
+            "Context: Compact",
+            "Compact the current conversation context",
+            "context",
+        ),
+    ]
+}
+
 /// Errors returned by command operations.
 ///
 /// * Invalid command ID or arguments.
@@ -74,4 +343,41 @@ pub enum CommandError {
     InvalidArguments(String),
     #[error("execution failed: {0}")]
     ExecutionFailed(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_filters_commands_by_surface() {
+        let mut registry = CommandRegistry::new();
+        registry.register(CommandContribution {
+            id: "example.palette".to_owned(),
+            title: "Palette".to_owned(),
+            description: None,
+            category: None,
+            surfaces: BTreeSet::from([CommandSurface::Palette]),
+            owner: CommandOwner::Host,
+            action: CommandAction::Host {
+                route: "example.palette".to_owned(),
+            },
+        });
+        registry.register(CommandContribution {
+            id: "example.slash".to_owned(),
+            title: "Slash".to_owned(),
+            description: None,
+            category: None,
+            surfaces: BTreeSet::from([CommandSurface::Slash]),
+            owner: CommandOwner::Host,
+            action: CommandAction::Host {
+                route: "example.slash".to_owned(),
+            },
+        });
+
+        let palette = registry.commands_for_surface(&CommandSurface::Palette);
+
+        assert_eq!(palette.len(), 1);
+        assert_eq!(palette[0].id, "example.palette");
+    }
 }

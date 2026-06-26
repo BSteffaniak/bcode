@@ -6,7 +6,9 @@ use bcode_worktree_models::WorktreeListRequest;
 use bmux_keyboard::KeyStroke;
 use bmux_tui::palette::{CommandPalette, CommandPaletteKeyOutcome};
 
-use super::command_palette::{BmuxCommandPalette, PaletteCommandAction};
+use bcode_command::CommandAction;
+
+use super::command_palette::BmuxCommandPalette;
 use super::effects::TuiEffect;
 use super::helpers;
 use super::picker_mouse::command_palette_row_from_mouse;
@@ -91,13 +93,13 @@ async fn execute_palette_command<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
     chat: &mut ActiveChat,
-    command: PaletteCommandAction,
+    command: CommandAction,
 ) -> Result<(), TuiError> {
     match command {
-        PaletteCommandAction::Host { route } => {
+        CommandAction::Host { route } => {
             dispatch_host_palette_route(io, services, chat, &route).await
         }
-        PaletteCommandAction::Plugin {
+        CommandAction::Plugin {
             plugin_id,
             command_id,
         } => {
