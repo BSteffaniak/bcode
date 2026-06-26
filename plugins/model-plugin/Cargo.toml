@@ -1,0 +1,24 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Bundled model command palette plugin for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "model", "runtime", "command", "plugin"]
+license     = { workspace = true }
+name        = "bcode_model_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bcode_command    = { workspace = true }
+bcode_plugin_sdk = { workspace = true }
+serde_json       = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
+static-bundled   = []

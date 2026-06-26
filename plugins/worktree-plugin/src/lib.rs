@@ -4,6 +4,7 @@
 
 //! Bundled Git worktree tool plugin for Bcode.
 
+use bcode_command::{CommandAction, CommandContribution, CommandOwner, CommandSurface};
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
@@ -20,6 +21,15 @@ use std::path::PathBuf;
 pub struct WorktreePlugin;
 
 impl RustPlugin for WorktreePlugin {
+    fn register_commands(&mut self, registrar: CommandRegistrar) -> Result<(), PluginError> {
+        for command in worktree_command_contributions() {
+            registrar
+                .register(&command)
+                .map_err(|error| PluginError::failed(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         match context.request.interface_id.as_str() {
             TOOL_SERVICE_INTERFACE_ID => invoke_tool_service(&context),
@@ -28,6 +38,48 @@ impl RustPlugin for WorktreePlugin {
                 "unsupported worktree plugin service interface",
             ),
         }
+    }
+}
+
+fn worktree_command_contributions() -> Vec<CommandContribution> {
+    vec![
+        worktree_command(
+            "command.work-tree.list",
+            "List Worktrees",
+            "List Git worktrees for the current repository",
+        ),
+        worktree_command(
+            "command.work-tree.createSession",
+            "Create Session Worktree",
+            "Create a worktree for the current session",
+        ),
+        worktree_command(
+            "command.work-tree.attach",
+            "Attach Worktree",
+            "Attach current session to an existing worktree",
+        ),
+        worktree_command(
+            "command.work-tree.remove",
+            "Remove Worktree",
+            "Remove a Git worktree",
+        ),
+    ]
+}
+
+fn worktree_command(id: &str, title: &str, description: &str) -> CommandContribution {
+    CommandContribution {
+        id: id.to_string(),
+        title: title.to_string(),
+        description: Some(description.to_string()),
+        category: Some("worktree".to_string()),
+        surfaces: std::collections::BTreeSet::from([CommandSurface::Palette]),
+        owner: CommandOwner::Plugin {
+            plugin_id: "bcode.worktree".to_string(),
+        },
+        action: CommandAction::Plugin {
+            plugin_id: "bcode.worktree".to_string(),
+            command_id: id.to_string(),
+        },
     }
 }
 
@@ -322,3 +374,60 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 }
 
 bcode_plugin_sdk::export_plugin!(WorktreePlugin, include_str!("../bcode-plugin.toml"));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worktree_plugin_registers_palette_commands_from_plugin_code() {
+        extern "C" fn register_command(
+            payload: *const u8,
+            payload_len: usize,
+            user_data: *mut std::ffi::c_void,
+        ) {
+            assert!(!payload.is_null());
+            assert!(!user_data.is_null());
+            let bytes = unsafe { std::slice::from_raw_parts(payload, payload_len) };
+            let contribution = serde_json::from_slice::<CommandContribution>(bytes)
+                .expect("command contribution should decode");
+            let registry = unsafe { &mut *(user_data.cast::<bcode_command::CommandRegistry>()) };
+            registry.register(contribution);
+        }
+
+        let mut plugin = WorktreePlugin;
+        let mut registry = bcode_command::CommandRegistry::new();
+        plugin
+            .register_commands(CommandRegistrar::new(
+                Some(register_command),
+                std::ptr::from_mut(&mut registry).cast::<std::ffi::c_void>(),
+            ))
+            .expect("worktree plugin should register commands");
+
+        let commands = registry.commands_for_surface(&CommandSurface::Palette);
+
+        assert!(commands.iter().any(|command| {
+            command.id == "command.work-tree.list"
+                && command.action
+                    == CommandAction::Plugin {
+                        plugin_id: "bcode.worktree".to_string(),
+                        command_id: "command.work-tree.list".to_string(),
+                    }
+        }));
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.id == "command.work-tree.createSession")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.id == "command.work-tree.attach")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.id == "command.work-tree.remove")
+        );
+    }
+}

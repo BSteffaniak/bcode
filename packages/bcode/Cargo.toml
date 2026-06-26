@@ -25,11 +25,13 @@ bcode_fake_provider_plugin              = { workspace = true, optional = true }
 bcode_filesystem_plugin                 = { workspace = true, optional = true }
 bcode_git_plugin                        = { workspace = true, optional = true }
 bcode_github_review_publisher_plugin    = { workspace = true, optional = true }
+bcode_model_plugin                      = { workspace = true, optional = true }
 bcode_openai_compatible_provider_plugin = { workspace = true, optional = true }
 bcode_opencode_session_import_plugin    = { workspace = true, optional = true }
 bcode_pi_session_import_plugin          = { workspace = true, optional = true }
 bcode_plugin                            = { workspace = true }
 bcode_shell_plugin                      = { workspace = true, optional = true }
+bcode_skills_plugin                     = { workspace = true, optional = true }
 bcode_web_search_plugin                 = { workspace = true, optional = true }
 bcode_worktree_plugin                   = { workspace = true, optional = true }
 tokio                                   = { workspace = true, features = ["macros", "rt-multi-thread"] }
@@ -84,6 +86,11 @@ static-bundled-github-review-publisher-plugin = [
     "dep:bcode_github_review_publisher_plugin",
     "bcode_github_review_publisher_plugin/static-bundled",
 ]
+static-bundled-model-plugin = [
+    "_static-bundled",
+    "dep:bcode_model_plugin",
+    "bcode_model_plugin/static-bundled",
+]
 static-bundled-openai-compatible-provider-plugin = [
     "_static-bundled",
     "dep:bcode_openai_compatible_provider_plugin",
@@ -110,11 +117,13 @@ static-bundled-plugins = [
     "static-bundled-filesystem-plugin",
     "static-bundled-git-plugin",
     "static-bundled-github-review-publisher-plugin",
+    "static-bundled-model-plugin",
     "static-bundled-openai-compatible-provider-plugin",
     "static-bundled-opencode-session-import-plugin",
     "static-bundled-pi-session-import-plugin",
     "static-bundled-ralph-plugin",
     "static-bundled-shell-plugin",
+    "static-bundled-skills-plugin",
     "static-bundled-web-search-plugin",
     "static-bundled-worktree-plugin",
 ]
@@ -126,6 +135,11 @@ static-bundled-shell-plugin = [
     "_static-bundled",
     "dep:bcode_shell_plugin",
     "bcode_shell_plugin/static-bundled",
+]
+static-bundled-skills-plugin = [
+    "_static-bundled",
+    "dep:bcode_skills_plugin",
+    "bcode_skills_plugin/static-bundled",
 ]
 static-bundled-web-search-plugin = [
     "_static-bundled",

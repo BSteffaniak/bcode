@@ -17,6 +17,7 @@ crate-type = ["cdylib", "rlib"]
 arboard = { workspace = true }
 bcode_client = { workspace = true }
 bcode_code_review_models = { workspace = true }
+bcode_command = { workspace = true }
 bcode_config = { workspace = true }
 bcode_ipc = { workspace = true }
 bcode_markdown_render = { workspace = true }

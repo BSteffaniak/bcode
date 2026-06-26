@@ -104,12 +104,7 @@ async fn execute_palette_command<W: Write>(
         CommandAction::Plugin {
             plugin_id,
             command_id,
-        } => {
-            chat.app.set_status(format!(
-                "plugin command {command_id} from {plugin_id} selected"
-            ));
-            Ok(())
-        }
+        } => dispatch_plugin_palette_command(io, services, chat, &plugin_id, &command_id).await,
     }
 }
 
@@ -126,31 +121,56 @@ async fn dispatch_host_palette_route<W: Write>(
         "session.delete" => delete_session(io, services, chat).await?,
         "session.fork" => session_fork_flow::fork_current_session(io, services, chat).await?,
         "session.clone" => session_fork_flow::clone_current_session(io, services, chat).await?,
-        "command.work-tree.list" => show_worktrees(chat),
-        "command.work-tree.createSession" => {
-            worktree_flow::create_for_current_session(io, services, chat).await?;
-        }
-        "command.work-tree.attach" => {
-            worktree_flow::attach_current_session(io, services, chat).await?;
-        }
-        "command.work-tree.remove" => {
-            worktree_flow::remove_worktree(io, services, chat).await?;
-        }
-        "model.status" => model_flow::show_model_status(services.passive_client, chat).await?,
-        "model.serverStatus" => {
-            model_flow::show_server_model_status(services.passive_client, chat).await?;
-        }
-        "runtime.status" => model_flow::show_runtime_status(services.passive_client, chat).await?,
-        "model.select" => model_flow::pick_model_for_session(io, services, chat).await?,
-        "skills.list" => skill_flow::pick_skill_for_session(io, services, chat).await?,
-        "skills.active" => skill_flow::show_active_skills(services.passive_client, chat).await?,
-        "diff.toggle" => toggle_diff(chat),
         "help" => show_bmux_help(chat),
         "turn.cancel" => start_cancel_turn(chat),
         "context.compact" => start_compact_context(chat),
         unknown => chat
             .app
             .set_status(format!("unknown host command route: {unknown}")),
+    }
+    Ok(())
+}
+
+async fn dispatch_plugin_palette_command<W: Write>(
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
+    plugin_id: &str,
+    command_id: &str,
+) -> Result<(), TuiError> {
+    match (plugin_id, command_id) {
+        ("bcode.worktree", "command.work-tree.list") => show_worktrees(chat),
+        ("bcode.worktree", "command.work-tree.createSession") => {
+            worktree_flow::create_for_current_session(io, services, chat).await?;
+        }
+        ("bcode.worktree", "command.work-tree.attach") => {
+            worktree_flow::attach_current_session(io, services, chat).await?;
+        }
+        ("bcode.worktree", "command.work-tree.remove") => {
+            worktree_flow::remove_worktree(io, services, chat).await?;
+        }
+        ("bcode.model", "model.status") => {
+            model_flow::show_model_status(services.passive_client, chat).await?;
+        }
+        ("bcode.model", "model.serverStatus") => {
+            model_flow::show_server_model_status(services.passive_client, chat).await?;
+        }
+        ("bcode.model", "runtime.status") => {
+            model_flow::show_runtime_status(services.passive_client, chat).await?;
+        }
+        ("bcode.model", "model.select") => {
+            model_flow::pick_model_for_session(io, services, chat).await?;
+        }
+        ("bcode.skills", "skills.list") => {
+            skill_flow::pick_skill_for_session(io, services, chat).await?;
+        }
+        ("bcode.skills", "skills.active") => {
+            skill_flow::show_active_skills(services.passive_client, chat).await?;
+        }
+        ("bcode.code_review", "diff.toggle") => toggle_diff(chat),
+        _ => chat.app.set_status(format!(
+            "plugin command {command_id} from {plugin_id} selected"
+        )),
     }
     Ok(())
 }

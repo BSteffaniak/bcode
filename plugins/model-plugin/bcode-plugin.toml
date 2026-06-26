@@ -1,0 +1,10 @@
+id      = "bcode.model"
+name    = "Bcode Model Plugin"
+version = "0.0.1"
+
+[runtime]
+abi_version    = 1
+event_symbol   = "bcode_plugin_handle_event_v1"
+library        = "libbcode_model_plugin.dylib"
+service_symbol = "bcode_plugin_invoke_service_v1"
+type           = "native"

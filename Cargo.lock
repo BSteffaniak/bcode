@@ -1261,11 +1261,13 @@ dependencies = [
  "bcode_filesystem_plugin",
  "bcode_git_plugin",
  "bcode_github_review_publisher_plugin",
+ "bcode_model_plugin",
  "bcode_openai_compatible_provider_plugin",
  "bcode_opencode_session_import_plugin",
  "bcode_pi_session_import_plugin",
  "bcode_plugin",
  "bcode_shell_plugin",
+ "bcode_skills_plugin",
  "bcode_web_search_plugin",
  "bcode_worktree_plugin",
  "tokio",
@@ -1413,6 +1415,7 @@ dependencies = [
  "arboard",
  "bcode_client",
  "bcode_code_review_models",
+ "bcode_command",
  "bcode_config",
  "bcode_ipc",
  "bcode_markdown_render",
@@ -1667,6 +1670,15 @@ dependencies = [
  "clap",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "bcode_model_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_command",
+ "bcode_plugin_sdk",
+ "serde_json",
 ]
 
 [[package]]
@@ -1942,6 +1954,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_skills_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_command",
+ "bcode_plugin_sdk",
+ "serde_json",
+]
+
+[[package]]
 name = "bcode_syntax_render"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -2047,6 +2068,7 @@ dependencies = [
 name = "bcode_worktree_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_command",
  "bcode_config",
  "bcode_plugin_sdk",
  "bcode_tool",

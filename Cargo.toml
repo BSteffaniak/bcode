@@ -17,6 +17,9 @@ members = [
     "plugins/pi-session-import-plugin",
     "plugins/shell-plugin",
     "plugins/web-search-plugin",
+    "plugins/model-plugin",
+    "plugins/skills-plugin",
+    "plugins/worktree-plugin",
     "packages/agent-policy",
     "packages/agent-policy/models",
     "packages/code-review/models",
@@ -96,6 +99,7 @@ bcode_model                             = { version = "0.0.1-alpha.0", default-f
 bcode_model_catalog                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/model-catalog" }
 bcode_model_catalog_models              = { version = "0.0.1-alpha.0", default-features = false, path = "packages/model-catalog/models" }
 bcode_model_discovery                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/model-discovery" }
+bcode_model_plugin                      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/model-plugin" }
 bcode_model_provider_runtime            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/model-provider-runtime" }
 bcode_models_site                       = { version = "0.0.1-alpha.0", default-features = false, path = "packages/models-site" }
 bcode_models_site_ui                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/models-site/ui" }
@@ -115,6 +119,7 @@ bcode_settings                          = { version = "0.0.1-alpha.0", default-f
 bcode_shell_plugin                      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/shell-plugin" }
 bcode_skill                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/skill" }
 bcode_skill_models                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/skill/models" }
+bcode_skills_plugin                     = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/skills-plugin" }
 bcode_syntax_render                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/syntax-render" }
 bcode_tool                              = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tool" }
 bcode_tool_runtime                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tool-runtime" }

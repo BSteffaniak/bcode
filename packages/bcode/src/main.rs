@@ -60,6 +60,11 @@ fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
             include_str!("../../../plugins/github-review-publisher-plugin/bcode-plugin.toml"),
             bcode_github_review_publisher_plugin::static_plugin(),
         ),
+        #[cfg(feature = "static-bundled-model-plugin")]
+        bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/model-plugin/bcode-plugin.toml"),
+            bcode_model_plugin::static_plugin(),
+        ),
         #[cfg(feature = "static-bundled-openai-compatible-provider-plugin")]
         bcode_plugin::StaticBundledPlugin::new(
             include_str!("../../../plugins/openai-compatible-provider-plugin/bcode-plugin.toml"),
@@ -79,6 +84,11 @@ fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
         bcode_plugin::StaticBundledPlugin::new(
             include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
             bcode_shell_plugin::static_plugin(),
+        ),
+        #[cfg(feature = "static-bundled-skills-plugin")]
+        bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/skills-plugin/bcode-plugin.toml"),
+            bcode_skills_plugin::static_plugin(),
         ),
         #[cfg(feature = "static-bundled-web-search-plugin")]
         bcode_plugin::StaticBundledPlugin::new(

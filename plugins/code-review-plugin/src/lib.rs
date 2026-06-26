@@ -36,6 +36,7 @@ use bcode_code_review_models::{
     SavePublishRecordResponse, UpdateDraftRequest, UpdateDraftResponse,
     UpdateReviewWorkspaceRequest, UpdateReviewWorkspaceResponse,
 };
+use bcode_command::{CommandAction, CommandContribution, CommandOwner, CommandSurface};
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -127,6 +128,12 @@ pub struct CodeReviewPluginConfig {
 pub struct CodeReviewPlugin;
 
 impl RustPlugin for CodeReviewPlugin {
+    fn register_commands(&mut self, registrar: CommandRegistrar) -> Result<(), PluginError> {
+        registrar
+            .register(&diff_toggle_command())
+            .map_err(|error| PluginError::failed(error.to_string()))
+    }
+
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         if context.request.interface_id != CODE_REVIEW_SERVICE_INTERFACE_ID {
             return ServiceResponse::error(
@@ -164,6 +171,23 @@ impl RustPlugin for CodeReviewPlugin {
                 "unsupported code review service operation",
             ),
         }
+    }
+}
+
+fn diff_toggle_command() -> CommandContribution {
+    CommandContribution {
+        id: "diff.toggle".to_string(),
+        title: "Diff: Toggle Panel".to_string(),
+        description: Some("Show or hide the inline diff review panel".to_string()),
+        category: Some("diff".to_string()),
+        surfaces: std::collections::BTreeSet::from([CommandSurface::Palette]),
+        owner: CommandOwner::Plugin {
+            plugin_id: "bcode.code_review".to_string(),
+        },
+        action: CommandAction::Plugin {
+            plugin_id: "bcode.code_review".to_string(),
+            command_id: "diff.toggle".to_string(),
+        },
     }
 }
 
@@ -4143,5 +4167,47 @@ mod tests {
         );
 
         assert_eq!(path, PathBuf::from("custom/review.json"));
+    }
+}
+
+#[cfg(test)]
+mod command_registration_tests {
+    use super::*;
+
+    #[test]
+    fn code_review_plugin_registers_diff_toggle_from_plugin_code() {
+        extern "C" fn register_command(
+            payload: *const u8,
+            payload_len: usize,
+            user_data: *mut std::ffi::c_void,
+        ) {
+            assert!(!payload.is_null());
+            assert!(!user_data.is_null());
+            let bytes = unsafe { std::slice::from_raw_parts(payload, payload_len) };
+            let contribution = serde_json::from_slice::<CommandContribution>(bytes)
+                .expect("command contribution should decode");
+            let registry = unsafe { &mut *(user_data.cast::<bcode_command::CommandRegistry>()) };
+            registry.register(contribution);
+        }
+
+        let mut plugin = CodeReviewPlugin;
+        let mut registry = bcode_command::CommandRegistry::new();
+        plugin
+            .register_commands(CommandRegistrar::new(
+                Some(register_command),
+                std::ptr::from_mut(&mut registry).cast::<std::ffi::c_void>(),
+            ))
+            .expect("code review plugin should register commands");
+
+        let commands = registry.commands_for_surface(&CommandSurface::Palette);
+
+        assert!(commands.iter().any(|command| {
+            command.id == "diff.toggle"
+                && command.action
+                    == CommandAction::Plugin {
+                        plugin_id: "bcode.code_review".to_string(),
+                        command_id: "diff.toggle".to_string(),
+                    }
+        }));
     }
 }
