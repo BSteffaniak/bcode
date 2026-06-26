@@ -713,17 +713,14 @@ pub fn evaluate_skill_tool_call(request: &SkillToolPolicyRequest) -> SkillToolPo
     }
 
     let mut saw_allow = false;
-    let mut saw_warn = false;
+    let mut warn_reasons = Vec::new();
     let mut ask_reasons = Vec::new();
 
     for policy in &request.active_policies {
         match evaluate_single_skill_tool_policy(policy, &request.tool) {
             SkillToolPolicyOutcome::NoOpinion => {}
             SkillToolPolicyOutcome::Allow { .. } => saw_allow = true,
-            SkillToolPolicyOutcome::Warn { reason } => {
-                saw_warn = true;
-                ask_reasons.push(reason);
-            }
+            SkillToolPolicyOutcome::Warn { reason } => warn_reasons.push(reason),
             SkillToolPolicyOutcome::Ask { reason } => ask_reasons.push(reason),
             SkillToolPolicyOutcome::Deny { reason } => {
                 return SkillToolPolicyOutcome::Deny { reason };
@@ -736,9 +733,9 @@ pub fn evaluate_skill_tool_call(request: &SkillToolPolicyRequest) -> SkillToolPo
             reason: ask_reasons.join("; "),
         };
     }
-    if saw_warn {
+    if !warn_reasons.is_empty() {
         return SkillToolPolicyOutcome::Warn {
-            reason: "skill policy allows this tool call with a warning".to_string(),
+            reason: warn_reasons.join("; "),
         };
     }
     if saw_allow {
@@ -1019,6 +1016,337 @@ fn source_default_ecosystem(source: &SkillSource) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    fn tool_with_policy(name: &str, policy: bcode_tool::ToolPolicyMetadata) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: String::new(),
+            input_schema: serde_json::Value::default(),
+            side_effect: bcode_tool::ToolSideEffect::ReadOnly,
+            requires_permission: false,
+            policy,
+            ui: bcode_tool::ToolUiMetadata::default(),
+        }
+    }
+
+    fn basic_tool(name: &str) -> ToolDefinition {
+        tool_with_policy(name, bcode_tool::ToolPolicyMetadata::default())
+    }
+
+    fn policy_with_selector(
+        mode: SkillPermissionMode,
+        selector: ResolvedToolSelector,
+    ) -> ResolvedSkillPermissionPolicy {
+        ResolvedSkillPermissionPolicy {
+            mode,
+            selectors: vec![selector],
+            unknown_references: Vec::new(),
+            ambiguous_references: Vec::new(),
+        }
+    }
+
+    fn evaluate(
+        tool: ToolDefinition,
+        active_policies: Vec<ResolvedSkillPermissionPolicy>,
+    ) -> SkillToolPolicyOutcome {
+        evaluate_skill_tool_call(&SkillToolPolicyRequest {
+            tool,
+            active_policies,
+        })
+    }
+
+    fn simple_identifier() -> impl Strategy<Value = String> {
+        "[a-z][a-z0-9_]{0,12}".prop_map(String::from)
+    }
+
+    fn is_allow(outcome: &SkillToolPolicyOutcome) -> bool {
+        matches!(outcome, SkillToolPolicyOutcome::Allow { .. })
+    }
+
+    fn is_ask(outcome: &SkillToolPolicyOutcome) -> bool {
+        matches!(outcome, SkillToolPolicyOutcome::Ask { .. })
+    }
+
+    proptest! {
+        #[test]
+        fn tool_name_selector_allows_exact_tool_name_and_asks_otherwise(
+            tool_name in simple_identifier(),
+            requested_name in simple_identifier(),
+        ) {
+            let outcome = evaluate(
+                basic_tool(&tool_name),
+                vec![policy_with_selector(
+                    SkillPermissionMode::Ask,
+                    ResolvedToolSelector::ToolName { name: requested_name.clone() },
+                )],
+            );
+
+            if tool_name == requested_name {
+                prop_assert!(is_allow(&outcome));
+            } else {
+                prop_assert!(is_ask(&outcome));
+            }
+        }
+
+        #[test]
+        fn alias_selector_matches_only_declared_aliases(
+            alias in simple_identifier(),
+            requested_alias in simple_identifier(),
+        ) {
+            let tool = tool_with_policy(
+                "tool.run",
+                bcode_tool::ToolPolicyMetadata {
+                    aliases: vec![alias.clone()],
+                    compatibility_aliases: Vec::new(),
+                    capabilities: Vec::new(),
+                    permission_category: None,
+                    argument_extractors: Vec::new(),
+                },
+            );
+            let outcome = evaluate(
+                tool,
+                vec![policy_with_selector(
+                    SkillPermissionMode::Ask,
+                    ResolvedToolSelector::Alias { alias: requested_alias.clone() },
+                )],
+            );
+
+            if alias == requested_alias {
+                prop_assert!(is_allow(&outcome));
+            } else {
+                prop_assert!(is_ask(&outcome));
+            }
+        }
+
+        #[test]
+        fn category_selector_matches_only_tool_permission_category(
+            category in simple_identifier(),
+            requested_category in simple_identifier(),
+        ) {
+            let tool = tool_with_policy(
+                "tool.run",
+                bcode_tool::ToolPolicyMetadata {
+                    aliases: Vec::new(),
+                    compatibility_aliases: Vec::new(),
+                    capabilities: Vec::new(),
+                    permission_category: Some(category.clone()),
+                    argument_extractors: Vec::new(),
+                },
+            );
+            let outcome = evaluate(
+                tool,
+                vec![policy_with_selector(
+                    SkillPermissionMode::Ask,
+                    ResolvedToolSelector::PermissionCategory { category: requested_category.clone() },
+                )],
+            );
+
+            if category == requested_category {
+                prop_assert!(is_allow(&outcome));
+            } else {
+                prop_assert!(is_ask(&outcome));
+            }
+        }
+
+        #[test]
+        fn capability_selector_matches_only_declared_capabilities(
+            capability in simple_identifier(),
+            requested_capability in simple_identifier(),
+        ) {
+            let tool = tool_with_policy(
+                "tool.run",
+                bcode_tool::ToolPolicyMetadata {
+                    aliases: Vec::new(),
+                    compatibility_aliases: Vec::new(),
+                    capabilities: vec![capability.clone()],
+                    permission_category: None,
+                    argument_extractors: Vec::new(),
+                },
+            );
+            let outcome = evaluate(
+                tool,
+                vec![policy_with_selector(
+                    SkillPermissionMode::Ask,
+                    ResolvedToolSelector::Capability { capability: requested_capability.clone() },
+                )],
+            );
+
+            if capability == requested_capability {
+                prop_assert!(is_allow(&outcome));
+            } else {
+                prop_assert!(is_ask(&outcome));
+            }
+        }
+
+        #[test]
+        fn compatibility_alias_selector_matches_declared_alias_pair_case_insensitive_ecosystem(
+            ecosystem in simple_identifier(),
+            alias_name in simple_identifier(),
+            requested_name in simple_identifier(),
+        ) {
+            let requested_ecosystem = ecosystem.to_uppercase();
+            let tool = tool_with_policy(
+                "tool.run",
+                bcode_tool::ToolPolicyMetadata {
+                    aliases: Vec::new(),
+                    compatibility_aliases: vec![bcode_tool::ToolCompatibilityAlias::new(&ecosystem, &alias_name)],
+                    capabilities: Vec::new(),
+                    permission_category: None,
+                    argument_extractors: Vec::new(),
+                },
+            );
+            let outcome = evaluate(
+                tool,
+                vec![policy_with_selector(
+                    SkillPermissionMode::Ask,
+                    ResolvedToolSelector::CompatibilityAlias {
+                        ecosystem: requested_ecosystem,
+                        name: requested_name.clone(),
+                    },
+                )],
+            );
+
+            if alias_name == requested_name {
+                prop_assert!(is_allow(&outcome));
+            } else {
+                prop_assert!(is_ask(&outcome));
+            }
+        }
+
+        #[test]
+        fn explicit_category_references_resolve_without_catalog(category in simple_identifier()) {
+            let policy = SkillPermissionPolicy {
+                mode: SkillPermissionMode::Enforce,
+                tools: vec![bcode_tool::UnresolvedToolReference::raw(format!("category:{category}"))],
+                categories: Vec::new(),
+            };
+            let resolved = resolve_skill_permission_policy(&policy, &[]);
+
+            prop_assert_eq!(resolved.unknown_references, Vec::new());
+            prop_assert_eq!(resolved.ambiguous_references, Vec::new());
+            prop_assert_eq!(resolved.selectors, vec![ResolvedToolSelector::PermissionCategory { category }]);
+        }
+    }
+
+    #[test]
+    fn no_active_policies_have_no_opinion() {
+        let outcome = evaluate(basic_tool("tool.run"), Vec::new());
+        assert!(matches!(outcome, SkillToolPolicyOutcome::NoOpinion));
+    }
+
+    #[test]
+    fn disabled_policy_has_no_opinion_even_with_unresolved_references() {
+        let outcome = evaluate(
+            basic_tool("tool.run"),
+            vec![ResolvedSkillPermissionPolicy {
+                mode: SkillPermissionMode::Disabled,
+                selectors: Vec::new(),
+                unknown_references: vec![bcode_tool::UnresolvedToolReference::raw("missing")],
+                ambiguous_references: Vec::new(),
+            }],
+        );
+        assert!(matches!(outcome, SkillToolPolicyOutcome::NoOpinion));
+    }
+
+    #[test]
+    fn unknown_references_ask_before_matching() {
+        let outcome = evaluate(
+            basic_tool("tool.run"),
+            vec![ResolvedSkillPermissionPolicy {
+                mode: SkillPermissionMode::Ask,
+                selectors: vec![ResolvedToolSelector::ToolName {
+                    name: "tool.run".to_string(),
+                }],
+                unknown_references: vec![bcode_tool::UnresolvedToolReference::raw("missing")],
+                ambiguous_references: Vec::new(),
+            }],
+        );
+        assert!(matches!(outcome, SkillToolPolicyOutcome::Ask { .. }));
+    }
+
+    #[test]
+    fn strict_undeclared_tool_denies() {
+        let outcome = evaluate(
+            basic_tool("tool.run"),
+            vec![ResolvedSkillPermissionPolicy {
+                mode: SkillPermissionMode::Strict,
+                selectors: Vec::new(),
+                unknown_references: Vec::new(),
+                ambiguous_references: Vec::new(),
+            }],
+        );
+        assert!(matches!(outcome, SkillToolPolicyOutcome::Deny { .. }));
+    }
+
+    #[test]
+    fn warn_undeclared_tool_warns() {
+        let outcome = evaluate(
+            basic_tool("tool.run"),
+            vec![ResolvedSkillPermissionPolicy {
+                mode: SkillPermissionMode::Warn,
+                selectors: Vec::new(),
+                unknown_references: Vec::new(),
+                ambiguous_references: Vec::new(),
+            }],
+        );
+        assert!(matches!(outcome, SkillToolPolicyOutcome::Warn { .. }));
+    }
+
+    #[test]
+    fn deny_dominates_multiple_policies() {
+        let outcome = evaluate(
+            basic_tool("tool.run"),
+            vec![
+                policy_with_selector(
+                    SkillPermissionMode::Ask,
+                    ResolvedToolSelector::ToolName {
+                        name: "tool.run".to_string(),
+                    },
+                ),
+                ResolvedSkillPermissionPolicy {
+                    mode: SkillPermissionMode::Strict,
+                    selectors: Vec::new(),
+                    unknown_references: Vec::new(),
+                    ambiguous_references: Vec::new(),
+                },
+            ],
+        );
+        assert!(matches!(outcome, SkillToolPolicyOutcome::Deny { .. }));
+    }
+
+    #[test]
+    fn ambiguous_alias_resolution_is_not_silent_allow() {
+        let tool_a = tool_with_policy(
+            "tool.a",
+            bcode_tool::ToolPolicyMetadata {
+                aliases: vec!["same".to_string()],
+                compatibility_aliases: Vec::new(),
+                capabilities: Vec::new(),
+                permission_category: None,
+                argument_extractors: Vec::new(),
+            },
+        );
+        let tool_b = tool_with_policy(
+            "tool.b",
+            bcode_tool::ToolPolicyMetadata {
+                aliases: vec!["same".to_string()],
+                compatibility_aliases: Vec::new(),
+                capabilities: Vec::new(),
+                permission_category: None,
+                argument_extractors: Vec::new(),
+            },
+        );
+        let policy = SkillPermissionPolicy {
+            mode: SkillPermissionMode::Enforce,
+            tools: vec![bcode_tool::UnresolvedToolReference::raw("same")],
+            categories: Vec::new(),
+        };
+        let resolved = resolve_skill_permission_policy(&policy, &[tool_a.clone(), tool_b]);
+        let outcome = evaluate(tool_a, vec![resolved]);
+
+        assert!(matches!(outcome, SkillToolPolicyOutcome::Ask { .. }));
+    }
 
     #[test]
     fn parses_yamlish_skill_frontmatter() {

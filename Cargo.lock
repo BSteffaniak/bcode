@@ -1920,7 +1920,9 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_skill_models",
  "bcode_tool",
+ "proptest",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "toml 1.1.2+spec-1.1.0",
 ]
