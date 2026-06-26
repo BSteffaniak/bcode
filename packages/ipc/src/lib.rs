@@ -1631,7 +1631,8 @@ mod tests {
     use bcode_session_models::{
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, FileChangeResult, ModelTurnOutcome, SessionEventKind,
         SessionForkKind, SessionForkResult, SessionId, SessionSummary, SessionTraceEvent,
-        ShellRunResult, ToolInvocationResult, ToolInvocationStreamEvent,
+        ShellRunResult, ToolInvocationResult, ToolInvocationStreamEvent, ToolPresentationEvent,
+        ToolPresentationLevel, ToolPresentationTarget, ToolStatusPresentation,
     };
     use bcode_skill_models::SkillActivationMode;
     use std::collections::BTreeSet;
@@ -2305,13 +2306,11 @@ mod tests {
                 event: ToolInvocationStreamEvent::Presentation {
                     tool_call_id: "call-1".to_string(),
                     sequence: 1,
-                    presentation: bcode_session_models::ToolPresentationEvent::Status(
-                        bcode_session_models::ToolStatusPresentation {
-                            target: bcode_session_models::ToolPresentationTarget::Activity,
-                            text: "running".to_string(),
-                            level: bcode_session_models::ToolPresentationLevel::Info,
-                        },
-                    ),
+                    presentation: ToolPresentationEvent::Status(ToolStatusPresentation {
+                        target: ToolPresentationTarget::Activity,
+                        text: "running".to_string(),
+                        level: ToolPresentationLevel::Info,
+                    }),
                 },
             },
             SessionEventKind::WorkingDirectoryChanged {
@@ -2438,6 +2437,64 @@ mod tests {
                 let decoded = decode_response(&received.payload).expect("response should decode");
                 assert_eq!(decoded, response);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn presentation_event_response_histories_round_trip_across_ipc_frames() {
+        let session_id = SessionId::new();
+        let session = test_session_summary("presentation history");
+        let event = SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind: SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Presentation {
+                    tool_call_id: "call-1".to_string(),
+                    sequence: 1,
+                    presentation: ToolPresentationEvent::Status(ToolStatusPresentation {
+                        target: ToolPresentationTarget::Result,
+                        text: "completed".to_string(),
+                        level: ToolPresentationLevel::Success,
+                    }),
+                },
+            },
+        };
+
+        for response in [
+            Response::Ok(ResponsePayload::Attached {
+                session_id,
+                session: session.clone(),
+                history: vec![event.clone()],
+                input_history: Vec::new(),
+                import_warnings: Vec::new(),
+                draft: None,
+                runtime_selection: SessionRuntimeSelection::default(),
+            }),
+            Response::Ok(ResponsePayload::SessionHistory {
+                session_id,
+                history: vec![event.clone()],
+            }),
+            Response::Ok(ResponsePayload::SessionHistoryPage {
+                page: bcode_session_models::SessionHistoryPage {
+                    session_id,
+                    events: vec![event.clone()],
+                    next_cursor: None,
+                    has_more: false,
+                },
+            }),
+            Response::Ok(ResponsePayload::RuntimeWorkHistory {
+                events: vec![event.clone()],
+            }),
+        ] {
+            let envelope = response_envelope(42, &response).expect("response should encode");
+
+            let received = round_trip_envelope(envelope).await;
+
+            let decoded = decode_response(&received.payload).expect("response should decode");
+            assert_eq!(decoded, response);
         }
     }
 

@@ -756,6 +756,9 @@ pub enum ToolPresentationFieldKind {
 }
 
 /// Plugin-owned presentation update for a running tool invocation.
+///
+/// Keep the default externally tagged representation so direct typed-stable IPC
+/// can carry nested presentation payloads without codec-specific DTO shims.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolPresentationEvent {
