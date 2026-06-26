@@ -6,7 +6,7 @@ use bcode_worktree_models::WorktreeListRequest;
 use bmux_keyboard::KeyStroke;
 use bmux_tui::palette::{CommandPalette, CommandPaletteKeyOutcome};
 
-use super::command_palette::{BmuxCommandPalette, PaletteCommand};
+use super::command_palette::{BmuxCommandPalette, CorePaletteCommand, PaletteCommand};
 use super::effects::TuiEffect;
 use super::helpers;
 use super::picker_mouse::command_palette_row_from_mouse;
@@ -98,31 +98,53 @@ async fn execute_palette_command<W: Write>(
     command: PaletteCommand,
 ) -> Result<(), TuiError> {
     match command {
-        PaletteCommand::NewSession
-        | PaletteCommand::SwitchSession
-        | PaletteCommand::RenameSession
-        | PaletteCommand::DeleteSession
-        | PaletteCommand::ForkSession
-        | PaletteCommand::CloneSession => {
+        PaletteCommand::Core(command) => {
+            execute_core_palette_command(io, services, chat, command).await
+        }
+        PaletteCommand::Plugin(command) => {
+            chat.app.set_status(format!(
+                "plugin command {} from {} selected",
+                command.command_id, command.plugin_id
+            ));
+            Ok(())
+        }
+    }
+}
+
+async fn execute_core_palette_command<W: Write>(
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
+    command: CorePaletteCommand,
+) -> Result<(), TuiError> {
+    match command {
+        CorePaletteCommand::NewSession
+        | CorePaletteCommand::SwitchSession
+        | CorePaletteCommand::RenameSession
+        | CorePaletteCommand::DeleteSession
+        | CorePaletteCommand::ForkSession
+        | CorePaletteCommand::CloneSession => {
             execute_session_command(io, services, chat, command).await
         }
-        PaletteCommand::ListWorktrees
-        | PaletteCommand::CreateSessionWorktree
-        | PaletteCommand::AttachWorktree
-        | PaletteCommand::RemoveWorktree => {
+        CorePaletteCommand::ListWorktrees
+        | CorePaletteCommand::CreateSessionWorktree
+        | CorePaletteCommand::AttachWorktree
+        | CorePaletteCommand::RemoveWorktree => {
             execute_worktree_command(io, services, chat, command).await
         }
-        PaletteCommand::ShowModelStatus
-        | PaletteCommand::ShowServerModelStatus
-        | PaletteCommand::ShowRuntimeStatus
-        | PaletteCommand::SelectModel => execute_model_command(io, services, chat, command).await,
-        PaletteCommand::ListSkills | PaletteCommand::ActiveSkills => {
+        CorePaletteCommand::ShowModelStatus
+        | CorePaletteCommand::ShowServerModelStatus
+        | CorePaletteCommand::ShowRuntimeStatus
+        | CorePaletteCommand::SelectModel => {
+            execute_model_command(io, services, chat, command).await
+        }
+        CorePaletteCommand::ListSkills | CorePaletteCommand::ActiveSkills => {
             execute_skill_command(io, services, chat, command).await
         }
-        PaletteCommand::ToggleDiff
-        | PaletteCommand::Help
-        | PaletteCommand::CancelTurn
-        | PaletteCommand::CompactContext => {
+        CorePaletteCommand::ToggleDiff
+        | CorePaletteCommand::Help
+        | CorePaletteCommand::CancelTurn
+        | CorePaletteCommand::CompactContext => {
             execute_chat_command(services, chat, command);
             Ok(())
         }
@@ -133,16 +155,16 @@ async fn execute_session_command<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
     chat: &mut ActiveChat,
-    command: PaletteCommand,
+    command: CorePaletteCommand,
 ) -> Result<(), TuiError> {
     match command {
-        PaletteCommand::NewSession => {
+        CorePaletteCommand::NewSession => {
             session_flow::switch_to_draft_session(chat);
             chat.replace_effect(TuiEffect::LoadDraftStatus {
                 launch_working_directory: std::env::current_dir()?,
             });
         }
-        PaletteCommand::SwitchSession => {
+        CorePaletteCommand::SwitchSession => {
             match session_flow::pick_session(io, services, chat).await? {
                 session_flow::PickSessionOutcome::Existing(selected_session_id) => {
                     session_flow::switch_session(io.terminal, chat, selected_session_id)?;
@@ -155,7 +177,7 @@ async fn execute_session_command<W: Write>(
                 }
             }
         }
-        PaletteCommand::RenameSession => {
+        CorePaletteCommand::RenameSession => {
             session_flow::pick_session_for_mutation(
                 io,
                 services,
@@ -164,7 +186,7 @@ async fn execute_session_command<W: Write>(
             )
             .await?;
         }
-        PaletteCommand::DeleteSession => {
+        CorePaletteCommand::DeleteSession => {
             session_flow::pick_session_for_mutation(
                 io,
                 services,
@@ -173,10 +195,10 @@ async fn execute_session_command<W: Write>(
             )
             .await?;
         }
-        PaletteCommand::ForkSession => {
+        CorePaletteCommand::ForkSession => {
             session_fork_flow::fork_current_session(io, services, chat).await?;
         }
-        PaletteCommand::CloneSession => {
+        CorePaletteCommand::CloneSession => {
             session_fork_flow::clone_current_session(io, services, chat).await?;
         }
         _ => {}
@@ -188,17 +210,17 @@ async fn execute_worktree_command<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
     chat: &mut ActiveChat,
-    command: PaletteCommand,
+    command: CorePaletteCommand,
 ) -> Result<(), TuiError> {
     match command {
-        PaletteCommand::ListWorktrees => show_worktrees(chat),
-        PaletteCommand::CreateSessionWorktree => {
+        CorePaletteCommand::ListWorktrees => show_worktrees(chat),
+        CorePaletteCommand::CreateSessionWorktree => {
             worktree_flow::create_for_current_session(io, services, chat).await?;
         }
-        PaletteCommand::AttachWorktree => {
+        CorePaletteCommand::AttachWorktree => {
             worktree_flow::attach_current_session(io, services, chat).await?;
         }
-        PaletteCommand::RemoveWorktree => {
+        CorePaletteCommand::RemoveWorktree => {
             worktree_flow::remove_worktree(io, services, chat).await?;
         }
         _ => {}
@@ -210,19 +232,19 @@ async fn execute_model_command<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
     chat: &mut ActiveChat,
-    command: PaletteCommand,
+    command: CorePaletteCommand,
 ) -> Result<(), TuiError> {
     match command {
-        PaletteCommand::ShowModelStatus => {
+        CorePaletteCommand::ShowModelStatus => {
             model_flow::show_model_status(services.passive_client, chat).await?;
         }
-        PaletteCommand::ShowServerModelStatus => {
+        CorePaletteCommand::ShowServerModelStatus => {
             model_flow::show_server_model_status(services.passive_client, chat).await?;
         }
-        PaletteCommand::ShowRuntimeStatus => {
+        CorePaletteCommand::ShowRuntimeStatus => {
             model_flow::show_runtime_status(services.passive_client, chat).await?;
         }
-        PaletteCommand::SelectModel => {
+        CorePaletteCommand::SelectModel => {
             model_flow::pick_model_for_session(io, services, chat).await?;
         }
         _ => {}
@@ -234,13 +256,13 @@ async fn execute_skill_command<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
     services: &TuiServices<'_>,
     chat: &mut ActiveChat,
-    command: PaletteCommand,
+    command: CorePaletteCommand,
 ) -> Result<(), TuiError> {
     match command {
-        PaletteCommand::ListSkills => {
+        CorePaletteCommand::ListSkills => {
             skill_flow::pick_skill_for_session(io, services, chat).await?;
         }
-        PaletteCommand::ActiveSkills => {
+        CorePaletteCommand::ActiveSkills => {
             skill_flow::show_active_skills(services.passive_client, chat).await?;
         }
         _ => {}
@@ -251,10 +273,10 @@ async fn execute_skill_command<W: Write>(
 fn execute_chat_command(
     _services: &TuiServices<'_>,
     chat: &mut ActiveChat,
-    command: PaletteCommand,
+    command: CorePaletteCommand,
 ) {
     match command {
-        PaletteCommand::ToggleDiff => {
+        CorePaletteCommand::ToggleDiff => {
             let _changed = chat.app.toggle_diff_visible();
             chat.app.set_status(if chat.app.diff_visible() {
                 "diff panel shown".to_owned()
@@ -262,9 +284,9 @@ fn execute_chat_command(
                 "diff panel hidden".to_owned()
             });
         }
-        PaletteCommand::Help => show_bmux_help(chat),
-        PaletteCommand::CancelTurn => start_cancel_turn(chat),
-        PaletteCommand::CompactContext => start_compact_context(chat),
+        CorePaletteCommand::Help => show_bmux_help(chat),
+        CorePaletteCommand::CancelTurn => start_cancel_turn(chat),
+        CorePaletteCommand::CompactContext => start_compact_context(chat),
         _ => {}
     }
 }

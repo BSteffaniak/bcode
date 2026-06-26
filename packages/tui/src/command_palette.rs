@@ -1,13 +1,33 @@
 //! TUI command palette state and actions.
 
+use std::collections::BTreeMap;
+
 use bcode_plugin::PluginOwnedCommandContribution;
 use bmux_tui::palette::{CommandPaletteState, PaletteItem};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 
 /// Command identifiers supported by the TUI palette.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaletteCommand {
+    /// Core TUI command.
+    Core(CorePaletteCommand),
+    /// Plugin-owned contribution that is routed by contribution metadata.
+    Plugin(PluginPaletteCommand),
+}
+
+/// Plugin-owned palette command metadata needed to route execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginPaletteCommand {
+    /// Owning plugin id.
+    pub plugin_id: String,
+    /// Plugin-owned command id.
+    pub command_id: String,
+}
+
+/// Core command identifiers supported by the TUI palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorePaletteCommand {
     /// Create a new session and switch to it.
     NewSession,
     /// Open the session picker.
@@ -50,7 +70,7 @@ pub enum PaletteCommand {
     CompactContext,
 }
 
-impl PaletteCommand {
+impl CorePaletteCommand {
     /// Return this command's stable ID.
     #[must_use]
     pub const fn id(self) -> &'static str {
@@ -105,10 +125,17 @@ impl PaletteCommand {
     }
 }
 
+impl From<CorePaletteCommand> for PaletteCommand {
+    fn from(value: CorePaletteCommand) -> Self {
+        Self::Core(value)
+    }
+}
+
 /// Command palette state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BmuxCommandPalette {
     items: Vec<PaletteItem>,
+    plugin_commands: BTreeMap<String, PluginPaletteCommand>,
     state: CommandPaletteState,
 }
 
@@ -122,8 +149,10 @@ impl BmuxCommandPalette {
     /// Create a command palette using manifest-declared plugin commands where available.
     #[must_use]
     pub fn with_plugin_commands(commands: &[PluginOwnedCommandContribution]) -> Self {
+        let (items, plugin_commands) = palette_items(commands);
         Self {
-            items: palette_items(commands),
+            items,
+            plugin_commands,
             state: CommandPaletteState::default(),
         }
     }
@@ -142,26 +171,32 @@ impl BmuxCommandPalette {
     /// Resolve an item index to a command.
     #[must_use]
     pub fn command_at(&self, index: usize) -> Option<PaletteCommand> {
-        self.items
-            .get(index)
-            .and_then(|item| PaletteCommand::from_id(&item.id))
+        let item = self.items.get(index)?;
+        self.plugin_commands
+            .get(&item.id)
+            .cloned()
+            .map(PaletteCommand::Plugin)
+            .or_else(|| CorePaletteCommand::from_id(&item.id).map(PaletteCommand::Core))
     }
 }
 
 #[allow(clippy::too_many_lines)]
-fn palette_items(plugin_commands: &[PluginOwnedCommandContribution]) -> Vec<PaletteItem> {
+fn palette_items(
+    plugin_commands: &[PluginOwnedCommandContribution],
+) -> (Vec<PaletteItem>, BTreeMap<String, PluginPaletteCommand>) {
     let mut items = default_palette_items();
-    apply_plugin_command_contributions(&mut items, plugin_commands);
-    items
+    let plugin_commands = apply_plugin_command_contributions(&mut items, plugin_commands);
+    (items, plugin_commands)
 }
 
 fn apply_plugin_command_contributions(
     items: &mut Vec<PaletteItem>,
     plugin_commands: &[PluginOwnedCommandContribution],
-) {
+) -> BTreeMap<String, PluginPaletteCommand> {
+    let mut routed_commands = BTreeMap::new();
     for contribution in plugin_commands {
         let command = &contribution.command;
-        if PaletteCommand::from_id(&command.id).is_none() {
+        if command.surface.as_deref() != Some("palette") {
             continue;
         }
         let description = command.description.as_deref().unwrap_or_default();
@@ -171,12 +206,20 @@ fn apply_plugin_command_contributions(
             description,
             &plugin_command_search_text(&contribution.plugin_id, command),
         );
+        routed_commands.insert(
+            command.id.clone(),
+            PluginPaletteCommand {
+                plugin_id: contribution.plugin_id.clone(),
+                command_id: command.id.clone(),
+            },
+        );
         if let Some(existing) = items.iter_mut().find(|item| item.id == command.id) {
             *existing = replacement;
         } else {
             items.push(replacement);
         }
     }
+    routed_commands
 }
 
 fn plugin_command_search_text(
@@ -200,121 +243,121 @@ fn plugin_command_search_text(
 fn default_palette_items() -> Vec<PaletteItem> {
     vec![
         item(
-            PaletteCommand::NewSession,
+            CorePaletteCommand::NewSession,
             "New Session",
             "Create a new chat session",
             "new session create chat",
         ),
         item(
-            PaletteCommand::SwitchSession,
+            CorePaletteCommand::SwitchSession,
             "Switch Session",
             "Open the session picker",
             "switch session picker open",
         ),
         item(
-            PaletteCommand::ForkSession,
+            CorePaletteCommand::ForkSession,
             "Fork Session",
             "Create a new session from an earlier prompt",
             "fork session conversation branch prompt",
         ),
         item(
-            PaletteCommand::CloneSession,
+            CorePaletteCommand::CloneSession,
             "Clone Session",
             "Copy the full current conversation into a new session",
             "clone session conversation copy duplicate",
         ),
         item(
-            PaletteCommand::ListWorktrees,
+            CorePaletteCommand::ListWorktrees,
             "Worktree: List",
             "Show repository worktrees",
             "worktree list git branch repository",
         ),
         item(
-            PaletteCommand::CreateSessionWorktree,
+            CorePaletteCommand::CreateSessionWorktree,
             "Worktree: Create for Current Session",
             "Create and move this session into a worktree",
             "worktree create current session branch",
         ),
         item(
-            PaletteCommand::AttachWorktree,
+            CorePaletteCommand::AttachWorktree,
             "Worktree: Attach Current Session",
             "Choose an existing worktree for this session",
             "worktree attach switch current session picker",
         ),
         item(
-            PaletteCommand::RemoveWorktree,
+            CorePaletteCommand::RemoveWorktree,
             "Worktree: Remove",
             "Choose a linked worktree to remove",
             "worktree remove delete linked cleanup",
         ),
         item(
-            PaletteCommand::ShowModelStatus,
+            CorePaletteCommand::ShowModelStatus,
             "Show Model Status",
             "Show active session model metadata",
             "model provider status active current",
         ),
         item(
-            PaletteCommand::ShowServerModelStatus,
+            CorePaletteCommand::ShowServerModelStatus,
             "Show Server Model Defaults",
             "Show selected default provider/model",
             "server model provider default status",
         ),
         item(
-            PaletteCommand::ShowRuntimeStatus,
+            CorePaletteCommand::ShowRuntimeStatus,
             "Show Runtime Status",
             "Show active daemon/plugin work",
             "runtime daemon plugin tool status active work",
         ),
         item(
-            PaletteCommand::SelectModel,
+            CorePaletteCommand::SelectModel,
             "Select Model",
             "Choose a model for this session",
             "model select choose session provider",
         ),
         item(
-            PaletteCommand::ToggleDiff,
+            CorePaletteCommand::ToggleDiff,
             "Toggle Diff Panel",
             "Show or hide changed files and diff preview",
             "diff changed files toggle preview",
         ),
         item(
-            PaletteCommand::ListSkills,
+            CorePaletteCommand::ListSkills,
             "List Skills",
             "Show available skills",
             "skills list available",
         ),
         item(
-            PaletteCommand::ActiveSkills,
+            CorePaletteCommand::ActiveSkills,
             "Active Skills",
             "Show active session skills",
             "skills active context enabled",
         ),
         item(
-            PaletteCommand::Help,
+            CorePaletteCommand::Help,
             "Help",
             "Show TUI shortcuts",
             "help shortcuts keybindings",
         ),
         item(
-            PaletteCommand::RenameSession,
+            CorePaletteCommand::RenameSession,
             "Rename Session",
             "Rename a session from the picker",
             "rename session current selected",
         ),
         item(
-            PaletteCommand::DeleteSession,
+            CorePaletteCommand::DeleteSession,
             "Delete Session",
             "Delete a session with confirmation",
             "delete remove session current selected",
         ),
         item(
-            PaletteCommand::CancelTurn,
+            CorePaletteCommand::CancelTurn,
             "Cancel Turn",
             "Cancel the active model turn",
             "cancel stop interrupt turn generation",
         ),
         item(
-            PaletteCommand::CompactContext,
+            CorePaletteCommand::CompactContext,
             "Compact Context",
             "Summarize and compact model context",
             "compact summarize context history",
@@ -322,7 +365,12 @@ fn default_palette_items() -> Vec<PaletteItem> {
     ]
 }
 
-fn item(command: PaletteCommand, title: &str, description: &str, search_text: &str) -> PaletteItem {
+fn item(
+    command: CorePaletteCommand,
+    title: &str,
+    description: &str,
+    search_text: &str,
+) -> PaletteItem {
     raw_item(command.id(), title, description, search_text)
 }
 
@@ -343,11 +391,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plugin_command_contribution_replaces_known_palette_item() {
+    fn plugin_command_contribution_routes_known_palette_item_to_plugin_owner() {
         let palette = BmuxCommandPalette::with_plugin_commands(&[PluginOwnedCommandContribution {
             plugin_id: "bcode.example".to_string(),
             command: bcode_plugin::PluginCommandContribution {
-                id: PaletteCommand::ListWorktrees.id().to_string(),
+                id: CorePaletteCommand::ListWorktrees.id().to_string(),
                 title: "Worktrees From Plugin".to_string(),
                 description: Some("Plugin-owned command".to_string()),
                 category: Some("worktree".to_string()),
@@ -357,16 +405,31 @@ mod tests {
         let items = palette.cloned_items();
         let item = items
             .iter()
-            .find(|item| item.id == PaletteCommand::ListWorktrees.id())
+            .find(|item| item.id == CorePaletteCommand::ListWorktrees.id())
             .expect("worktree item should exist");
 
         let rendered = format!("{:?}", item.label);
         assert!(rendered.contains("Worktrees From Plugin"));
-        assert_eq!(palette.command_at(0), Some(PaletteCommand::NewSession));
+        assert_eq!(
+            palette.command_at(
+                items
+                    .iter()
+                    .position(|item| item.id == CorePaletteCommand::ListWorktrees.id())
+                    .expect("worktree item index")
+            ),
+            Some(PaletteCommand::Plugin(PluginPaletteCommand {
+                plugin_id: "bcode.example".to_string(),
+                command_id: CorePaletteCommand::ListWorktrees.id().to_string(),
+            }))
+        );
+        assert_eq!(
+            palette.command_at(0),
+            Some(PaletteCommand::Core(CorePaletteCommand::NewSession))
+        );
     }
 
     #[test]
-    fn unknown_plugin_command_is_ignored_by_core_palette_until_handler_exists() {
+    fn plugin_command_contribution_adds_unknown_palette_command() {
         let palette = BmuxCommandPalette::with_plugin_commands(&[PluginOwnedCommandContribution {
             plugin_id: "bcode.example".to_string(),
             command: bcode_plugin::PluginCommandContribution {
@@ -378,11 +441,18 @@ mod tests {
             },
         }]);
 
-        assert!(
-            palette
-                .cloned_items()
-                .iter()
-                .all(|item| item.id != "example.dynamic")
+        let items = palette.cloned_items();
+        let index = items
+            .iter()
+            .position(|item| item.id == "example.dynamic")
+            .expect("dynamic plugin command should be present");
+
+        assert_eq!(
+            palette.command_at(index),
+            Some(PaletteCommand::Plugin(PluginPaletteCommand {
+                plugin_id: "bcode.example".to_string(),
+                command_id: "example.dynamic".to_string(),
+            }))
         );
     }
 }
