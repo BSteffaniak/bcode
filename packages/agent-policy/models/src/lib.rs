@@ -28,7 +28,8 @@ pub struct AgentConfig {
     /// Optional UI accent color, encoded as `#RRGGBB`.
     #[serde(default)]
     pub accent: Option<String>,
-    /// Per-tool enablement map. Missing entries inherit the host default.
+    /// Per-tool enablement keyed by exact model-callable tool ID. Missing entries inherit the host default.
+    #[config_doc(map_key = "<tool-id>")]
     #[serde(default)]
     pub tools: BTreeMap<String, bool>,
     /// Permission rules applied to tool invocations for this agent.
@@ -54,18 +55,23 @@ pub struct AgentConfig {
 #[config_doc(section = "permission")]
 pub struct PermissionConfig {
     /// Shell command rules.
+    #[config_doc(map_key = "<pattern>")]
     #[serde(default)]
     pub command: BTreeMap<String, Action>,
     /// Read-only filesystem tool rules keyed by path glob.
+    #[config_doc(map_key = "<path-glob>")]
     #[serde(default)]
     pub read: BTreeMap<String, Action>,
     /// `filesystem.write` rules keyed by path glob.
+    #[config_doc(map_key = "<path-glob>")]
     #[serde(default)]
     pub write: BTreeMap<String, Action>,
     /// `filesystem.edit` rules keyed by path glob.
+    #[config_doc(map_key = "<path-glob>")]
     #[serde(default)]
     pub edit: BTreeMap<String, Action>,
     /// Web/network tool rules keyed by URL glob.
+    #[config_doc(map_key = "<url-glob>")]
     #[serde(default)]
     pub web: BTreeMap<String, Action>,
     /// Action governing any path resolving outside the session working directory.

@@ -282,8 +282,25 @@ opt-level = 0
 
 # HyperChad local development patches
 # [patch."https://github.com/MoosicBox/MoosicBox.git"]
-# hyperchad_docs_config        = { path = "../MoosicBox/packages/hyperchad/docs/config" }
-# hyperchad_docs_config_derive = { path = "../MoosicBox/packages/hyperchad/docs/config/derive" }
+# hyperchad                         = { path = "../MoosicBox/packages/hyperchad" }
+# hyperchad_actions                 = { path = "../MoosicBox/packages/hyperchad/actions" }
+# hyperchad_app                     = { path = "../MoosicBox/packages/hyperchad/app" }
+# hyperchad_color                   = { path = "../MoosicBox/packages/hyperchad/color" }
+# hyperchad_docs_config             = { path = "../MoosicBox/packages/hyperchad/docs/config" }
+# hyperchad_docs_config_derive      = { path = "../MoosicBox/packages/hyperchad/docs/config/derive" }
+# hyperchad_docs_site               = { path = "../MoosicBox/packages/hyperchad/docs/site" }
+# hyperchad_markdown                = { path = "../MoosicBox/packages/hyperchad/markdown" }
+# hyperchad_renderer                = { path = "../MoosicBox/packages/hyperchad/renderer" }
+# hyperchad_renderer_html           = { path = "../MoosicBox/packages/hyperchad/renderer/html" }
+# hyperchad_renderer_vanilla_js     = { path = "../MoosicBox/packages/hyperchad/renderer/vanilla_js" }
+# hyperchad_router                  = { path = "../MoosicBox/packages/hyperchad/router" }
+# hyperchad_template                = { path = "../MoosicBox/packages/hyperchad/template" }
+# hyperchad_template_actions_dsl    = { path = "../MoosicBox/packages/hyperchad/template/actions_dsl" }
+# hyperchad_template_macros         = { path = "../MoosicBox/packages/hyperchad/template/macros" }
+# hyperchad_transformer             = { path = "../MoosicBox/packages/hyperchad/transformer" }
+# hyperchad_transformer_models      = { path = "../MoosicBox/packages/hyperchad/transformer/models" }
+# switchy                          = { path = "../MoosicBox/packages/switchy" }
+# switchy_async                    = { path = "../MoosicBox/packages/switchy/async" }
 
 # [patch.crates-io]
 # hyperchad_color              = { path = "../MoosicBox/packages/hyperchad/color" }

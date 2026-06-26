@@ -632,16 +632,19 @@ pub struct CompositionConfig {
     /// `profile:active`, and `profile:<id>`.
     pub layer_order: Vec<String>,
     /// User-defined composition profiles keyed by profile id.
+    #[config_doc(nested, map_key = "<profile>")]
     pub profiles: BTreeMap<String, CompositionProfile>,
 }
 
 /// Reusable config profile patch.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "composition_profile")]
 #[serde(default)]
 pub struct CompositionProfile {
     /// Parent profiles applied left-to-right before this profile patch.
     pub extends: Vec<String>,
     /// Raw partial `BcodeConfig` TOML patch.
+    #[config_doc(value_type = "table")]
     pub patch: toml::Table,
 }
 
@@ -1797,16 +1800,20 @@ pub enum TuiMouseClickSelection {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, ConfigDoc)]
 #[config_doc(section = "keybindings")]
 pub struct TuiKeyBindingConfig {
-    /// Main chat view bindings.
+    /// Main chat view bindings keyed by key stroke.
+    #[config_doc(map_key = "<key-stroke>")]
     #[serde(default)]
     pub chat: BTreeMap<String, String>,
-    /// Permission prompt bindings.
+    /// Permission prompt bindings keyed by key stroke.
+    #[config_doc(map_key = "<key-stroke>")]
     #[serde(default)]
     pub permission: BTreeMap<String, String>,
-    /// Session picker bindings.
+    /// Session picker bindings keyed by key stroke.
+    #[config_doc(map_key = "<key-stroke>")]
     #[serde(default)]
     pub session_picker: BTreeMap<String, String>,
     /// Legacy `[tui.keybindings]` action-to-keys entries loaded for compatibility.
+    #[config_doc(skip)]
     #[serde(skip)]
     pub legacy_actions: BTreeMap<String, Vec<String>>,
 }
@@ -1914,6 +1921,7 @@ pub struct AuthPoolConfig {
     #[serde(default)]
     pub strategy: AuthPoolStrategy,
     /// Auth profile names included in this pool.
+    #[config_doc(list_index = "<index>")]
     #[serde(default)]
     pub profiles: Vec<String>,
     /// Provider-specific quota/cooldown policy hints.
@@ -2466,7 +2474,8 @@ pub struct ModelProfileConfig {
     /// Auth pool name selected from `auth.pools`.
     #[serde(default)]
     pub auth_pool: Option<String>,
-    /// Provider-specific persistent settings.
+    /// Provider-specific persistent settings keyed by provider setting name.
+    #[config_doc(map_key = "<setting>")]
     #[serde(default)]
     pub settings: BTreeMap<String, String>,
     /// Profile-specific reasoning controls.
@@ -2474,6 +2483,10 @@ pub struct ModelProfileConfig {
     #[serde(default)]
     pub reasoning: ReasoningConfig,
     /// Provider-specific request overrides.
+    ///
+    /// Common keys include `temperature`, `top_p`, and `max_tokens`, but supported keys depend on
+    /// the selected provider plugin.
+    #[config_doc(map_key = "<request-key>", value_type = "any")]
     #[serde(default)]
     pub request: BTreeMap<String, serde_json::Value>,
 }
@@ -2488,6 +2501,10 @@ pub struct ModelAliasConfig {
     /// Provider-specific model id selected by the alias.
     pub model_id: String,
     /// Provider-specific request overrides.
+    ///
+    /// Common keys include `temperature`, `top_p`, and `max_tokens`, but supported keys depend on
+    /// the selected provider plugin.
+    #[config_doc(map_key = "<request-key>", value_type = "any")]
     #[serde(default)]
     pub request: BTreeMap<String, serde_json::Value>,
 }
@@ -2536,6 +2553,11 @@ pub struct PluginConfig {
     #[serde(default)]
     pub disabled: BTreeSet<String>,
     /// Provider/plugin-specific plugin configuration tables keyed by plugin id.
+    #[config_doc(
+        map_key = "<plugin-id>.<setting>",
+        value_type = "any",
+        value_description = "Plugin-specific setting owned by the target plugin."
+    )]
     #[serde(default)]
     pub config: BTreeMap<String, toml::Value>,
 }
@@ -5152,6 +5174,114 @@ mod tests {
         assert_defaults(value_defaults, expected);
     }
 
+    fn assert_dynamic_map_value(
+        fields: &[FieldDoc],
+        section: &str,
+        map_field: &str,
+        key_placeholder: &str,
+        value_type: &str,
+    ) {
+        let section_fields = section_fields(fields, section);
+        let field = find_field_path(section_fields, map_field)
+            .unwrap_or_else(|| panic!("missing dynamic map field {section}.{map_field}"));
+        let Some(NestedFieldDoc::MapValue {
+            key_placeholder: actual_key,
+            value_type_display,
+            ..
+        }) = &field.nested
+        else {
+            panic!("field {section}.{map_field} is not a dynamic map value");
+        };
+        assert_eq!(
+            (*actual_key, *value_type_display),
+            (key_placeholder, value_type)
+        );
+    }
+
+    fn assert_nested_dynamic_map_value(
+        fields: &[FieldDoc],
+        section: &str,
+        map_field: &str,
+        nested_field: &str,
+        key_placeholder: &str,
+        value_type: &str,
+    ) {
+        let fields = nested_map_fields(fields, section, map_field);
+        let field = find_field_path(fields, nested_field).unwrap_or_else(|| {
+            panic!("missing nested dynamic map field {section}.{map_field}.{nested_field}")
+        });
+        let Some(NestedFieldDoc::MapValue {
+            key_placeholder: actual_key,
+            value_type_display,
+            ..
+        }) = &field.nested
+        else {
+            panic!("field {section}.{map_field}.{nested_field} is not a dynamic map value");
+        };
+        assert_eq!(
+            (*actual_key, *value_type_display),
+            (key_placeholder, value_type)
+        );
+    }
+
+    fn assert_nested_dynamic_list_value(
+        fields: &[FieldDoc],
+        section: &str,
+        map_field: &str,
+        nested_field: &str,
+        index_placeholder: &str,
+    ) {
+        let fields = nested_map_fields(fields, section, map_field);
+        let field = find_field_path(fields, nested_field).unwrap_or_else(|| {
+            panic!("missing nested dynamic list field {section}.{map_field}.{nested_field}")
+        });
+        let Some(NestedFieldDoc::ListValue {
+            index_placeholder: actual_index,
+            ..
+        }) = &field.nested
+        else {
+            panic!("field {section}.{map_field}.{nested_field} is not a dynamic list value");
+        };
+        assert_eq!(*actual_index, index_placeholder);
+    }
+
+    fn nested_map_fields<'a>(
+        fields: &'a [FieldDoc],
+        section: &str,
+        map_field: &str,
+    ) -> &'a [FieldDoc] {
+        let fields = section_fields(fields, section);
+        let map = find_field_path(fields, map_field)
+            .unwrap_or_else(|| panic!("missing map field {section}.{map_field}"));
+        let Some(NestedFieldDoc::Map { value_fields, .. }) = &map.nested else {
+            panic!("field {section}.{map_field} is not a nested map");
+        };
+        value_fields
+    }
+
+    fn section_fields<'a>(fields: &'a [FieldDoc], section: &str) -> &'a [FieldDoc] {
+        let section = fields
+            .iter()
+            .find(|field| field.toml_key == section)
+            .unwrap_or_else(|| panic!("missing section {section}"));
+        let Some(NestedFieldDoc::Inline { fields, .. }) = &section.nested else {
+            panic!("section {} is not inline nested", section.toml_key);
+        };
+        fields
+    }
+
+    fn find_field_path<'a>(fields: &'a [FieldDoc], path: &str) -> Option<&'a FieldDoc> {
+        let (head, tail) = path.split_once('.').unwrap_or((path, ""));
+        let field = fields.iter().find(|field| field.toml_key == head)?;
+        if tail.is_empty() {
+            return Some(field);
+        }
+        let NestedFieldDoc::Inline { fields, .. } = field.nested.as_ref()? else {
+            return None;
+        };
+        find_field_path(fields, tail)
+    }
+
     fn assert_defaults(defaults: &BTreeMap<String, String>, expected: &[(&str, &str)]) {
         for (key, value) in expected {
             assert_eq!(
@@ -5160,6 +5290,31 @@ mod tests {
                 "unexpected default for {key}"
             );
         }
+    }
+
+    #[test]
+    fn config_doc_schema_documents_dynamic_map_and_list_entries() {
+        let fields = BcodeConfig::field_docs();
+
+        assert_dynamic_map_value(&fields, "plugins", "config", "<plugin-id>.<setting>", "any");
+        assert_nested_dynamic_map_value(
+            &fields,
+            "model",
+            "profiles",
+            "request",
+            "<request-key>",
+            "any",
+        );
+        assert_nested_dynamic_list_value(&fields, "auth", "pools", "profiles", "<index>");
+        assert_nested_dynamic_map_value(&fields, "agent", "", "tools", "<tool-id>", "bool");
+        assert_nested_dynamic_map_value(
+            &fields,
+            "agent",
+            "",
+            "permission.command",
+            "<pattern>",
+            "string",
+        );
     }
 
     #[test]

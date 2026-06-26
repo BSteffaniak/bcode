@@ -299,10 +299,12 @@ mod tests {
         let doc = generate_config_reference();
 
         assert!(doc.contains("profiles.<profile>.provider_plugin_id"));
-        assert!(doc.contains("profiles.<profile>.request"));
+        assert!(doc.contains("profiles.<profile>.request.<request-key>"));
         assert!(doc.contains("reasoning.effort"));
         assert!(doc.contains("conversation_reuse.mode"));
         assert!(doc.contains("retry.max_overload_retries"));
+        assert!(doc.contains("profiles.<profile>.extends"));
+        assert!(doc.contains("profiles.<profile>.patch"));
     }
 
     #[test]
@@ -311,7 +313,9 @@ mod tests {
 
         assert!(doc.contains("profiles.<profile>.map.<credential>.env"));
         assert!(doc.contains("pools.<pool>.strategy"));
-        assert!(doc.contains("<agent-id>.tools"));
+        assert!(doc.contains("pools.<pool>.profiles.<index>"));
+        assert!(doc.contains("<agent-id>.tools.<tool-id>"));
+        assert!(doc.contains("<agent-id>.permission.command.<pattern>"));
         assert!(doc.contains("<agent-id>.permission.external_directory"));
     }
 
@@ -320,6 +324,7 @@ mod tests {
         let doc = generate_config_reference();
 
         assert!(doc.contains("enabled"));
+        assert!(doc.contains("config.<plugin-id>.<setting>"));
         assert!(doc.contains("prompt.catalog"));
         assert!(doc.contains("persist_tool_io"));
         assert!(doc.contains("idle_shutdown_after_secs"));
