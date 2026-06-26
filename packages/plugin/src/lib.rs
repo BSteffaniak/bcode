@@ -4,8 +4,9 @@
 
 use bcode_plugin_sdk::tui::PluginTuiRegistry;
 use bcode_plugin_sdk::{
-    CURRENT_PLUGIN_ABI_VERSION, DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_DEACTIVATE_SYMBOL,
-    DEFAULT_NATIVE_EVENT_SYMBOL, DEFAULT_NATIVE_MANIFEST_SYMBOL, DEFAULT_NATIVE_SERVICE_SYMBOL,
+    CURRENT_PLUGIN_ABI_VERSION, CommandRegistrationCallback, DEFAULT_NATIVE_ACTIVATE_SYMBOL,
+    DEFAULT_NATIVE_DEACTIVATE_SYMBOL, DEFAULT_NATIVE_EVENT_SYMBOL, DEFAULT_NATIVE_MANIFEST_SYMBOL,
+    DEFAULT_NATIVE_REGISTER_COMMANDS_SYMBOL, DEFAULT_NATIVE_SERVICE_SYMBOL,
     DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL, EVENT_STATUS_OK, NativeEventContext,
     NativeServiceContext, PluginConfigContext, PluginEvent, SERVICE_RESPONSE_CHUNK_PREFIX,
     SERVICE_STATUS_OK, ServiceEventCallback, ServiceRequest, StaticPluginVtable,
@@ -32,6 +33,8 @@ pub const DEFAULT_PLUGIN_MANIFEST_FILE: &str = "bcode-plugin.toml";
 
 type ManifestFn = unsafe extern "C" fn() -> *const std::ffi::c_char;
 type LifecycleFn = unsafe extern "C" fn() -> i32;
+type RegisterCommandsFn =
+    unsafe extern "C" fn(Option<CommandRegistrationCallback>, *mut std::ffi::c_void) -> i32;
 type ServiceFn = unsafe extern "C" fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32;
 type StreamingServiceFn = unsafe extern "C" fn(
     *const u8,
@@ -417,6 +420,7 @@ enum LoadedPluginBackend {
     Dynamic {
         _library: ManuallyDrop<Library>,
         activate: LifecycleFn,
+        register_commands: Option<RegisterCommandsFn>,
         deactivate: LifecycleFn,
         invoke_service: ServiceFn,
         invoke_service_streaming: Option<StreamingServiceFn>,
@@ -469,6 +473,68 @@ impl LoadedPlugin {
             Err(PluginLoadError::LifecycleFailed {
                 plugin_id: self.manifest.id.clone(),
                 hook: "activate",
+                code,
+            })
+        }
+    }
+
+    /// Register plugin-owned commands through the plugin activation registration hook.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the hook returns a non-zero code.
+    pub fn register_commands(
+        &self,
+        registry: &mut bcode_command::CommandRegistry,
+    ) -> Result<(), PluginLoadError> {
+        extern "C" fn register_command_callback(
+            payload: *const u8,
+            payload_len: usize,
+            user_data: *mut std::ffi::c_void,
+        ) {
+            if payload.is_null() || user_data.is_null() {
+                return;
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(payload, payload_len) };
+            let Ok(contribution) =
+                serde_json::from_slice::<bcode_command::CommandContribution>(bytes)
+            else {
+                return;
+            };
+            let registry = unsafe { &mut *(user_data.cast::<bcode_command::CommandRegistry>()) };
+            registry.register(contribution);
+        }
+
+        let code = match &self.backend {
+            LoadedPluginBackend::Dynamic {
+                register_commands: Some(register_commands),
+                ..
+            } => unsafe {
+                register_commands(
+                    Some(register_command_callback),
+                    std::ptr::from_mut(registry).cast::<std::ffi::c_void>(),
+                )
+            },
+            LoadedPluginBackend::Dynamic {
+                register_commands: None,
+                ..
+            } => 0,
+            LoadedPluginBackend::Static { vtable } => {
+                vtable.register_commands.map_or(0, |register_commands| {
+                    register_commands(
+                        vtable.instance,
+                        Some(register_command_callback),
+                        std::ptr::from_mut(registry).cast::<std::ffi::c_void>(),
+                    )
+                })
+            }
+        };
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(PluginLoadError::LifecycleFailed {
+                plugin_id: self.manifest.id.clone(),
+                hook: "register_commands",
                 code,
             })
         }
@@ -1767,6 +1833,7 @@ pub struct PluginRuntimeHost {
     registry: Arc<PluginRegistry>,
     executors: Arc<BTreeMap<String, Arc<PluginExecutorHandle>>>,
     configs: Arc<BTreeMap<String, ResolvedPluginConfig>>,
+    command_registry: Arc<bcode_command::CommandRegistry>,
     tui_registries: Arc<BTreeMap<String, PluginTuiRegistry>>,
     resources: Arc<PluginResourceLimiter>,
 }
@@ -1811,6 +1878,15 @@ impl PluginRuntimeHost {
     #[must_use]
     pub fn registry(&self) -> &PluginRegistry {
         &self.registry
+    }
+
+    /// Return command contributions registered by loaded plugins.
+    #[must_use]
+    pub fn registered_command_contributions(
+        &self,
+        surface: &bcode_command::CommandSurface,
+    ) -> Vec<bcode_command::CommandContribution> {
+        self.command_registry.commands_for_surface(surface)
     }
 
     /// Return loaded plugin executor handles keyed by plugin ID.
@@ -2258,6 +2334,7 @@ impl From<PluginHost> for PluginRuntimeHost {
             executors: Arc::new(executors),
             configs: Arc::new(configs),
             tui_registries: Arc::new(tui_registries),
+            command_registry: Arc::new(std::mem::take(&mut host.command_registry)),
             resources: Arc::default(),
         }
     }
@@ -2479,10 +2556,23 @@ fn manifest_subscribes_to(manifest: &PluginManifest, topic: &str) -> bool {
 }
 
 /// Loaded plugin host retaining activated plugins.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PluginHost {
     loaded: Vec<LoadedPlugin>,
     configs: BTreeMap<String, ResolvedPluginConfig>,
+    command_registry: bcode_command::CommandRegistry,
+}
+
+impl Default for PluginHost {
+    fn default() -> Self {
+        let mut command_registry = bcode_command::CommandRegistry::new();
+        command_registry.extend(bcode_command::bundled_host_palette_commands());
+        Self {
+            loaded: Vec::new(),
+            configs: BTreeMap::new(),
+            command_registry,
+        }
+    }
 }
 
 impl PluginHost {
@@ -2546,6 +2636,11 @@ impl PluginHost {
         let mut host = Self {
             loaded: Vec::new(),
             configs,
+            command_registry: {
+                let mut registry = bcode_command::CommandRegistry::new();
+                registry.extend(bcode_command::bundled_host_palette_commands());
+                registry
+            },
         };
         host.load_static_plugins_into(&static_plugins)?;
         host.load_registered_plugins_into(&plugins)?;
@@ -2588,6 +2683,7 @@ impl PluginHost {
             }
             tracing::debug!(target: "bcode_plugin::startup", plugin_id = %loaded.manifest().id, "activating plugin");
             loaded.activate()?;
+            loaded.register_commands(&mut self.command_registry)?;
             tracing::debug!(target: "bcode_plugin::startup", plugin_id = %loaded.manifest().id, "plugin activated");
             self.loaded.push(loaded);
         }
@@ -2606,6 +2702,7 @@ impl PluginHost {
             }
             tracing::debug!(target: "bcode_plugin::startup", plugin_id = %loaded.manifest().id, "activating plugin");
             loaded.activate()?;
+            loaded.register_commands(&mut self.command_registry)?;
             tracing::debug!(target: "bcode_plugin::startup", plugin_id = %loaded.manifest().id, "plugin activated");
             self.loaded.push(loaded);
         }
@@ -2616,6 +2713,15 @@ impl PluginHost {
     #[must_use]
     pub fn loaded_plugins(&self) -> &[LoadedPlugin] {
         &self.loaded
+    }
+
+    /// Return command contributions registered by the host and loaded plugins.
+    #[must_use]
+    pub fn registered_command_contributions(
+        &self,
+        surface: &bcode_command::CommandSurface,
+    ) -> Vec<bcode_command::CommandContribution> {
+        self.command_registry.commands_for_surface(surface)
     }
 
     /// Return the service registry for currently loaded plugins.
@@ -2796,6 +2902,7 @@ pub fn load_registered_plugin(plugin: &RegisteredPlugin) -> Result<LoadedPlugin,
 
     tracing::debug!(target: "bcode_plugin::startup", plugin_id = %plugin.manifest.id, "loading native symbols");
     let activate = load_lifecycle_symbol(&library, &library_path, &runtime.activate_symbol)?;
+    let register_commands = load_register_commands_symbol(&library);
     let deactivate = load_lifecycle_symbol(&library, &library_path, &runtime.deactivate_symbol)?;
     let invoke_service = load_service_symbol(&library, &library_path, &runtime.service_symbol)?;
     let invoke_service_streaming =
@@ -2808,6 +2915,7 @@ pub fn load_registered_plugin(plugin: &RegisteredPlugin) -> Result<LoadedPlugin,
         backend: LoadedPluginBackend::Dynamic {
             _library: ManuallyDrop::new(library),
             activate,
+            register_commands,
             deactivate,
             invoke_service,
             invoke_service_streaming,
@@ -2960,6 +3068,12 @@ fn load_lifecycle_symbol(
         }
     })?;
     Ok(*loaded)
+}
+
+fn load_register_commands_symbol(library: &Library) -> Option<RegisterCommandsFn> {
+    let mut symbol = DEFAULT_NATIVE_REGISTER_COMMANDS_SYMBOL.as_bytes().to_vec();
+    symbol.push(0);
+    unsafe { library.get::<RegisterCommandsFn>(&*symbol).ok().map(|s| *s) }
 }
 
 fn load_service_symbol(
@@ -3147,6 +3261,7 @@ library = "libdisabled.dylib"
                 instance: std::ptr::null(),
                 manifest,
                 activate: lifecycle,
+                register_commands: None,
                 deactivate: lifecycle,
                 invoke_service: service,
                 invoke_service_streaming: test_streaming_service,
@@ -3203,6 +3318,7 @@ library = "libexample_static.dylib"
                 instance: std::ptr::null(),
                 manifest,
                 activate: lifecycle,
+                register_commands: None,
                 deactivate: lifecycle,
                 invoke_service: service,
                 invoke_service_streaming: test_streaming_service,
@@ -3250,6 +3366,88 @@ library = "libcommands.dylib"
         assert_eq!(commands[0].plugin_id, "bcode.commands");
         assert_eq!(commands[0].command.id, "example.run");
         assert_eq!(commands[0].command.surface.as_deref(), Some("palette"));
+    }
+
+    #[test]
+    fn plugin_host_registers_plugin_commands_during_load() {
+        fn register_commands(
+            _instance: *const std::ffi::c_void,
+            callback: Option<CommandRegistrationCallback>,
+            user_data: *mut std::ffi::c_void,
+        ) -> i32 {
+            let contribution = bcode_command::CommandContribution {
+                id: "example.run".to_string(),
+                title: "Run Example".to_string(),
+                description: Some("Run an example command".to_string()),
+                category: Some("example".to_string()),
+                surfaces: BTreeSet::from([bcode_command::CommandSurface::Palette]),
+                owner: bcode_command::CommandOwner::Plugin {
+                    plugin_id: "bcode.commands".to_string(),
+                },
+                action: bcode_command::CommandAction::Plugin {
+                    plugin_id: "bcode.commands".to_string(),
+                    command_id: "example.run".to_string(),
+                },
+            };
+            let payload = serde_json::to_vec(&contribution).expect("contribution encodes");
+            callback.expect("registration callback")(payload.as_ptr(), payload.len(), user_data);
+            SERVICE_STATUS_OK
+        }
+
+        let manifest = toml::from_str::<PluginManifest>(
+            r#"
+id = "bcode.commands"
+name = "Commands"
+version = "0.0.1"
+
+[[command_contributions]]
+id = "example.run"
+title = "Run Example"
+description = "Run an example command"
+category = "example"
+surface = "palette"
+
+[runtime]
+type = "native"
+abi_version = 1
+library = "libcommands.dylib"
+"#,
+        )
+        .expect("manifest should parse");
+        let loaded = LoadedPlugin {
+            config: ResolvedPluginConfig::default(),
+            manifest,
+            backend: LoadedPluginBackend::Static {
+                vtable: StaticPluginVtable {
+                    instance: std::ptr::null(),
+                    manifest: |_: &'static std::sync::OnceLock<Option<std::ffi::CString>>| {
+                        std::ptr::null()
+                    },
+                    activate: test_activate,
+                    register_commands: Some(register_commands),
+                    deactivate: test_deactivate,
+                    invoke_service: test_service,
+                    invoke_service_streaming: test_streaming_service,
+                    tui_registry: None,
+                    handle_event: test_handle_event,
+                },
+            },
+        };
+        let mut registry = bcode_command::CommandRegistry::new();
+        loaded
+            .register_commands(&mut registry)
+            .expect("plugin registers commands");
+
+        let commands = registry.commands_for_surface(&bcode_command::CommandSurface::Palette);
+
+        assert!(commands.iter().any(|command| {
+            command.id == "example.run"
+                && command.action
+                    == bcode_command::CommandAction::Plugin {
+                        plugin_id: "bcode.commands".to_string(),
+                        command_id: "example.run".to_string(),
+                    }
+        }));
     }
 
     #[test]
@@ -3584,6 +3782,7 @@ library = "libexample_plugin.dylib"
         manifest.concurrency = PluginConcurrencyConfig::Limited { max: 1 };
         let runtime = PluginRuntimeHost::from(PluginHost {
             configs: BTreeMap::new(),
+            command_registry: bcode_command::CommandRegistry::new(),
             loaded: vec![LoadedPlugin {
                 config: ResolvedPluginConfig::default(),
                 manifest,
@@ -3834,6 +4033,7 @@ library = "libexample_plugin.dylib"
         tokio.block_on(async {
             let runtime = PluginRuntimeHost::from(PluginHost {
                 configs: BTreeMap::new(),
+                command_registry: bcode_command::CommandRegistry::new(),
                 loaded: vec![
                     LoadedPlugin {
                         config: ResolvedPluginConfig::default(),
@@ -3845,6 +4045,7 @@ library = "libexample_plugin.dylib"
                                     std::ptr::null()
                                 },
                                 activate,
+                                register_commands: None,
                                 deactivate,
                                 invoke_service: slow_service,
                                 invoke_service_streaming:
@@ -3880,6 +4081,7 @@ library = "libexample_plugin.dylib"
                                     std::ptr::null()
                                 },
                                 activate,
+                                register_commands: None,
                                 deactivate,
                                 invoke_service: fast_service,
                                 invoke_service_streaming:
@@ -4002,6 +4204,7 @@ library = "libexample_plugin.dylib"
         tokio.block_on(async {
             let runtime = PluginRuntimeHost::from(PluginHost {
                 configs: BTreeMap::new(),
+                command_registry: bcode_command::CommandRegistry::new(),
                 loaded: vec![LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest: manifest(),
@@ -4012,6 +4215,7 @@ library = "libexample_plugin.dylib"
                                 std::ptr::null()
                             },
                             activate: test_activate,
+                            register_commands: None,
                             deactivate: test_deactivate,
                             invoke_service: service,
                             invoke_service_streaming: service_streaming,
@@ -4128,6 +4332,7 @@ library = "libexample_plugin.dylib"
         tokio.block_on(async {
             let runtime = PluginRuntimeHost::from(PluginHost {
                 configs: BTreeMap::new(),
+                command_registry: bcode_command::CommandRegistry::new(),
                 loaded: vec![LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest: manifest(),
@@ -4138,6 +4343,7 @@ library = "libexample_plugin.dylib"
                                 std::ptr::null()
                             },
                             activate: test_activate,
+                            register_commands: None,
                             deactivate: test_deactivate,
                             invoke_service: service,
                             invoke_service_streaming: service_streaming,
@@ -4297,6 +4503,7 @@ library = "libexample_plugin.dylib"
             instance: std::ptr::null(),
             manifest: |_: &'static std::sync::OnceLock<Option<std::ffi::CString>>| std::ptr::null(),
             activate: test_activate,
+            register_commands: None,
             deactivate: test_deactivate,
             invoke_service: test_large_service,
             invoke_service_streaming: test_large_chunking_service,
@@ -4310,6 +4517,7 @@ library = "libexample_plugin.dylib"
             instance: std::ptr::null(),
             manifest: |_: &'static std::sync::OnceLock<Option<std::ffi::CString>>| std::ptr::null(),
             activate: test_activate,
+            register_commands: None,
             deactivate: test_deactivate,
             invoke_service: test_large_service,
             invoke_service_streaming: |instance, input_ptr, input_len, output, cap, len, _, _| {
@@ -4325,6 +4533,7 @@ library = "libexample_plugin.dylib"
             instance: std::ptr::null(),
             manifest: |_: &'static std::sync::OnceLock<Option<std::ffi::CString>>| std::ptr::null(),
             activate: test_activate,
+            register_commands: None,
             deactivate: test_deactivate,
             invoke_service: test_service,
             invoke_service_streaming: test_streaming_service,

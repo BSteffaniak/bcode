@@ -14,6 +14,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+/// ABI-safe callback used by plugins to register command contributions during activation.
+pub type CommandRegistrationCallback = extern "C" fn(*const u8, usize, *mut c_void);
+
 /// ABI-safe callback used by plugins to emit incremental service events.
 pub type ServiceEventCallback = extern "C" fn(*const u8, usize, *mut c_void);
 
@@ -56,6 +59,53 @@ impl ServiceCancellation {
             .is_some_and(|cancelled| cancelled.load(Ordering::SeqCst))
     }
 }
+
+/// Cloneable command registrar scoped to plugin activation.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CommandRegistrar {
+    callback: Option<CommandRegistrationCallback>,
+    user_data: usize,
+}
+
+impl CommandRegistrar {
+    /// Create a registrar from raw ABI callback parts.
+    #[must_use]
+    pub fn new(callback: Option<CommandRegistrationCallback>, user_data: *mut c_void) -> Self {
+        Self {
+            callback,
+            user_data: user_data as usize,
+        }
+    }
+
+    /// Return whether command registration is available.
+    #[must_use]
+    pub const fn is_available(self) -> bool {
+        self.callback.is_some()
+    }
+
+    /// Register a command contribution with the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the contribution cannot be serialized.
+    pub fn register(
+        self,
+        contribution: &bcode_command::CommandContribution,
+    ) -> Result<(), serde_json::Error> {
+        let payload = serde_json::to_vec(contribution)?;
+        if let Some(callback) = self.callback {
+            callback(
+                payload.as_ptr(),
+                payload.len(),
+                self.user_data as *mut c_void,
+            );
+        }
+        Ok(())
+    }
+}
+
+unsafe impl Send for CommandRegistrar {}
+unsafe impl Sync for CommandRegistrar {}
 
 /// Cloneable event emitter scoped to one service invocation.
 #[derive(Debug, Clone, Copy, Default)]
@@ -103,6 +153,9 @@ pub const DEFAULT_NATIVE_MANIFEST_SYMBOL: &str = "bcode_plugin_manifest_v1";
 
 /// Default activation hook export symbol for native plugins.
 pub const DEFAULT_NATIVE_ACTIVATE_SYMBOL: &str = "bcode_plugin_activate_v1";
+
+/// Default activation-time command registration export symbol for native plugins.
+pub const DEFAULT_NATIVE_REGISTER_COMMANDS_SYMBOL: &str = "bcode_plugin_register_commands_v1";
 
 /// Default deactivation hook export symbol for native plugins.
 pub const DEFAULT_NATIVE_DEACTIVATE_SYMBOL: &str = "bcode_plugin_deactivate_v1";
@@ -437,6 +490,15 @@ pub trait RustPlugin: Default + Send + 'static {
         Ok(())
     }
 
+    /// Called when the host provides activation-time command registration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when command registration fails.
+    fn register_commands(&mut self, _registrar: CommandRegistrar) -> Result<(), PluginError> {
+        Ok(())
+    }
+
     /// Called when the host deactivates the plugin.
     ///
     /// # Errors
@@ -499,6 +561,17 @@ pub fn result_to_exit_code(result: Result<(), PluginError>) -> i32 {
 pub fn activate_export<P: RustPlugin>(instance: &'static Mutex<P>) -> i32 {
     instance.lock().map_or(EXIT_UNAVAILABLE, |mut plugin| {
         result_to_exit_code(plugin.activate())
+    })
+}
+
+#[doc(hidden)]
+pub fn register_commands_export<P: RustPlugin>(
+    instance: &'static Mutex<P>,
+    callback: Option<CommandRegistrationCallback>,
+    user_data: *mut c_void,
+) -> i32 {
+    instance.lock().map_or(EXIT_UNAVAILABLE, |mut plugin| {
+        result_to_exit_code(plugin.register_commands(CommandRegistrar::new(callback, user_data)))
     })
 }
 
@@ -788,6 +861,9 @@ pub fn handle_event_export<P: RustPlugin>(
         })
 }
 
+pub type StaticCommandRegistrationFn =
+    fn(*const c_void, Option<CommandRegistrationCallback>, *mut c_void) -> i32;
+
 /// Statically linked native plugin ABI vtable.
 #[derive(Clone, Copy)]
 pub struct StaticPluginVtable {
@@ -797,6 +873,8 @@ pub struct StaticPluginVtable {
     pub manifest: fn(&'static OnceLock<Option<CString>>) -> *const c_char,
     /// Activation hook.
     pub activate: fn(*const c_void) -> i32,
+    /// Activation-time command registration hook.
+    pub register_commands: Option<StaticCommandRegistrationFn>,
     /// Deactivation hook.
     pub deactivate: fn(*const c_void) -> i32,
     /// Service invocation hook.
@@ -832,6 +910,18 @@ pub fn static_activate_export<P: RustPlugin>(instance: *const c_void) -> i32 {
     let instance = unsafe { &*(instance.cast::<OnceLock<Mutex<P>>>()) };
     let instance = plugin_instance::<P>(instance);
     activate_export(instance)
+}
+
+#[doc(hidden)]
+#[must_use]
+pub fn static_register_commands_export<P: RustPlugin>(
+    instance: *const c_void,
+    callback: Option<CommandRegistrationCallback>,
+    user_data: *mut c_void,
+) -> i32 {
+    let instance = unsafe { &*(instance.cast::<OnceLock<Mutex<P>>>()) };
+    let instance = plugin_instance::<P>(instance);
+    register_commands_export(instance, callback, user_data)
 }
 
 #[doc(hidden)]
@@ -922,6 +1012,15 @@ macro_rules! export_plugin {
         pub extern "C" fn bcode_plugin_activate_v1() -> i32 {
             let instance = $crate::plugin_instance::<$plugin>(&BCODE_PLUGIN_INSTANCE);
             $crate::activate_export(instance)
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn bcode_plugin_register_commands_v1(
+            callback: Option<$crate::CommandRegistrationCallback>,
+            user_data: *mut std::ffi::c_void,
+        ) -> i32 {
+            let instance = $crate::plugin_instance::<$plugin>(&BCODE_PLUGIN_INSTANCE);
+            $crate::register_commands_export(instance, callback, user_data)
         }
 
         #[unsafe(no_mangle)]
@@ -1075,6 +1174,7 @@ macro_rules! static_plugin_vtable {
             instance: (&BCODE_STATIC_PLUGIN_INSTANCE as *const _) as *const std::ffi::c_void,
             manifest,
             activate: $crate::static_activate_export::<$plugin>,
+            register_commands: Some($crate::static_register_commands_export::<$plugin>),
             deactivate: $crate::static_deactivate_export::<$plugin>,
             invoke_service: $crate::static_invoke_service_export::<$plugin>,
             invoke_service_streaming: $crate::static_invoke_service_streaming_export::<$plugin>,
@@ -1158,6 +1258,7 @@ macro_rules! static_concurrent_plugin_vtable {
             instance: (&BCODE_STATIC_PLUGIN_INSTANCE as *const _) as *const std::ffi::c_void,
             manifest,
             activate,
+            register_commands: None,
             deactivate,
             invoke_service,
             invoke_service_streaming,
@@ -1170,16 +1271,16 @@ macro_rules! static_concurrent_plugin_vtable {
 /// Common imports for plugin authors.
 pub mod prelude {
     pub use crate::{
-        CURRENT_PLUGIN_ABI_VERSION, ConcurrentRustPlugin, DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL,
-        EVENT_STATUS_DECODE_FAILED, EVENT_STATUS_INVALID_ARGUMENT, EVENT_STATUS_OK,
-        EVENT_STATUS_PLUGIN_UNAVAILABLE, EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, NativeEventContext,
-        NativeServiceContext, PluginError, PluginEvent, RustPlugin,
-        SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_DECODE_FAILED,
-        SERVICE_STATUS_ENCODE_FAILED, SERVICE_STATUS_INVALID_ARGUMENT, SERVICE_STATUS_OK,
-        SERVICE_STATUS_PLUGIN_UNAVAILABLE, ServiceError, ServiceEventCallback, ServiceEventEmitter,
-        ServiceRequest, ServiceResponse, StaticPluginVtable, StreamingServiceFn,
-        export_concurrent_plugin, export_plugin, static_concurrent_plugin_vtable,
-        static_plugin_vtable,
+        CURRENT_PLUGIN_ABI_VERSION, CommandRegistrar, ConcurrentRustPlugin,
+        DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL, EVENT_STATUS_DECODE_FAILED,
+        EVENT_STATUS_INVALID_ARGUMENT, EVENT_STATUS_OK, EVENT_STATUS_PLUGIN_UNAVAILABLE,
+        EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, NativeEventContext, NativeServiceContext,
+        PluginError, PluginEvent, RustPlugin, SERVICE_STATUS_BUFFER_TOO_SMALL,
+        SERVICE_STATUS_DECODE_FAILED, SERVICE_STATUS_ENCODE_FAILED,
+        SERVICE_STATUS_INVALID_ARGUMENT, SERVICE_STATUS_OK, SERVICE_STATUS_PLUGIN_UNAVAILABLE,
+        ServiceError, ServiceEventCallback, ServiceEventEmitter, ServiceRequest, ServiceResponse,
+        StaticPluginVtable, StreamingServiceFn, export_concurrent_plugin, export_plugin,
+        static_concurrent_plugin_vtable, static_plugin_vtable,
         tui::{
             PluginTuiAction, PluginTuiHost, PluginTuiRegistry, PluginTuiSurface,
             PluginTuiSurfaceFactory, PluginTuiSurfaceOpenRequest, TokioPluginTuiHost,
