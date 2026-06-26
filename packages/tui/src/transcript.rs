@@ -932,7 +932,13 @@ fn push_transcript_item_from_event(
             }
         }
         SessionEventKind::ToolInvocationStream { event } => {
-            apply_tool_invocation_stream_event(items, tool_calls, streamed_tool_results, event);
+            apply_tool_invocation_stream_event(
+                items,
+                tool_calls,
+                streamed_tool_results,
+                presented_tool_results,
+                event,
+            );
         }
         _ => {
             if let Some(item) =
@@ -1441,6 +1447,7 @@ fn apply_tool_invocation_stream_event(
     items: &mut Vec<TranscriptItem>,
     tool_calls: &BTreeMap<String, ToolCallContext>,
     streamed_tool_results: &mut BTreeMap<String, StreamedToolReplayContext>,
+    presented_tool_results: &mut BTreeSet<String>,
     event: &ToolInvocationStreamEvent,
 ) {
     match event {
@@ -1524,7 +1531,13 @@ fn apply_tool_invocation_stream_event(
             tool_call_id,
             presentation,
             ..
-        } => apply_tool_presentation_replay_event(items, tool_calls, tool_call_id, presentation),
+        } => apply_tool_presentation_replay_event(
+            items,
+            tool_calls,
+            presented_tool_results,
+            tool_call_id,
+            presentation,
+        ),
         _ => {}
     }
 }
@@ -1532,15 +1545,22 @@ fn apply_tool_invocation_stream_event(
 fn apply_tool_presentation_replay_event(
     items: &mut Vec<TranscriptItem>,
     tool_calls: &BTreeMap<String, ToolCallContext>,
+    presented_tool_results: &mut BTreeSet<String>,
     tool_call_id: &str,
     presentation: &ToolPresentationEvent,
 ) {
     match presentation {
         ToolPresentationEvent::Clear { target } => {
+            if *target == ToolPresentationTarget::Result {
+                presented_tool_results.remove(tool_call_id);
+            }
             items.retain(|item| !item.is_tool_presentation_card_for(tool_call_id, *target));
         }
         _ => {
             if let Some(card) = tool_presentation_card_from_event(presentation) {
+                if card.target == ToolPresentationTarget::Result {
+                    presented_tool_results.insert(tool_call_id.to_owned());
+                }
                 let tool_name = tool_calls
                     .get(tool_call_id)
                     .map(|context| context.tool_name.as_str());

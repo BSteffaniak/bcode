@@ -283,6 +283,7 @@ pub struct BmuxApp {
     tool_call_contexts: BTreeMap<String, ToolCallContext>,
     streamed_tool_results: BTreeMap<String, StreamedToolResultContext>,
     live_tool_previews: BTreeMap<String, LiveToolPreviewState>,
+    presented_tool_results: BTreeSet<String>,
     live_preview_revision: u64,
     live_preview_frames_requested: u64,
     live_preview_duplicates_skipped: u64,
@@ -483,6 +484,7 @@ impl BmuxApp {
             tool_call_contexts: BTreeMap::new(),
             streamed_tool_results: BTreeMap::new(),
             live_tool_previews: BTreeMap::new(),
+            presented_tool_results: BTreeSet::new(),
             live_preview_revision: 0,
             live_preview_frames_requested: 0,
             live_preview_duplicates_skipped: 0,
@@ -2737,6 +2739,10 @@ impl BmuxApp {
             self.finish_tool_request_preview(tool_call_id);
             return;
         }
+        if self.presented_tool_results.contains(tool_call_id) {
+            self.finish_tool_request_preview(tool_call_id);
+            return;
+        }
         let tool_context = self.tool_call_contexts.get(tool_call_id);
         if let Some(item) = semantic_tool_result_item_for_app(
             tool_call_id,
@@ -2904,6 +2910,9 @@ impl BmuxApp {
         tool_call_id: &str,
         card: bcode_session_models::ToolCardPresentation,
     ) {
+        if card.target == bcode_session_models::ToolPresentationTarget::Result {
+            self.presented_tool_results.insert(tool_call_id.to_owned());
+        }
         let tool_name = self
             .tool_call_contexts
             .get(tool_call_id)
@@ -2923,6 +2932,9 @@ impl BmuxApp {
         tool_call_id: &str,
         target: bcode_session_models::ToolPresentationTarget,
     ) {
+        if target == bcode_session_models::ToolPresentationTarget::Result {
+            self.presented_tool_results.remove(tool_call_id);
+        }
         let replacement = self
             .transcript
             .items()
