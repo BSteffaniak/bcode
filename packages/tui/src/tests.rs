@@ -15,8 +15,11 @@ use bcode_session_models::{
     RuntimeWorkKind, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
     SessionProjectionKind, SessionSummary, SessionTitleSource, SessionTokenUsage,
     SessionTraceEvent, SessionTracePayload, SessionTracePhase, ShellRunResult,
-    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream, ToolPresentationField,
-    ToolPresentationFieldKind, ToolRequestPresentationMetadata, ToolRequestPreviewMetadata,
+    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream, ToolPresentationEvent,
+    ToolPresentationField, ToolPresentationFieldKind, ToolPresentationFieldValue,
+    ToolPresentationLevel, ToolPresentationSection, ToolPresentationTarget,
+    ToolProgressPresentation, ToolRequestPresentationMetadata, ToolRequestPreviewMetadata,
+    ToolStatusPresentation,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::TextMotion;
@@ -3900,6 +3903,169 @@ fn legacy_terminal_result_does_not_leave_raw_terminal_json() {
 
     assert_eq!(terminal_count, 1);
     assert_eq!(raw_json_count, 0);
+}
+
+#[test]
+fn presentation_events_replay_as_generic_transcript_cards() {
+    let session_id = SessionId::new();
+    let events = vec![
+        event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-present".to_owned(),
+                tool_name: "third.party".to_owned(),
+                arguments_json: "{}".to_owned(),
+                request_presentation: None,
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Presentation {
+                    tool_call_id: "call-present".to_owned(),
+                    sequence: 1,
+                    presentation: ToolPresentationEvent::Status(ToolStatusPresentation {
+                        target: ToolPresentationTarget::Result,
+                        text: "custom status".to_owned(),
+                        level: ToolPresentationLevel::Success,
+                    }),
+                },
+            },
+        ),
+        event(
+            session_id,
+            3,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Presentation {
+                    tool_call_id: "call-present".to_owned(),
+                    sequence: 2,
+                    presentation: ToolPresentationEvent::Progress(ToolProgressPresentation {
+                        target: ToolPresentationTarget::Result,
+                        text: "custom progress".to_owned(),
+                        percent: Some(80),
+                        level: ToolPresentationLevel::Info,
+                    }),
+                },
+            },
+        ),
+    ];
+
+    let transcript = transcript_items_from_events_with_reasoning(&events, true);
+    let cards = transcript
+        .iter()
+        .filter_map(|item| match item.kind() {
+            TranscriptItemKind::ToolPresentationCard { card, .. } => Some(card),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0].title, "custom progress");
+    assert_eq!(cards[0].subtitle.as_deref(), Some("80%"));
+}
+
+#[test]
+fn presentation_clear_removes_replayed_transcript_card() {
+    let session_id = SessionId::new();
+    let events = vec![
+        event(
+            session_id,
+            1,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Presentation {
+                    tool_call_id: "call-present".to_owned(),
+                    sequence: 1,
+                    presentation: ToolPresentationEvent::Status(ToolStatusPresentation {
+                        target: ToolPresentationTarget::Result,
+                        text: "custom status".to_owned(),
+                        level: ToolPresentationLevel::Success,
+                    }),
+                },
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Presentation {
+                    tool_call_id: "call-present".to_owned(),
+                    sequence: 2,
+                    presentation: ToolPresentationEvent::Clear {
+                        target: ToolPresentationTarget::Result,
+                    },
+                },
+            },
+        ),
+    ];
+
+    let transcript = transcript_items_from_events_with_reasoning(&events, true);
+
+    assert!(
+        !transcript
+            .iter()
+            .any(|item| matches!(item.kind(), TranscriptItemKind::ToolPresentationCard { .. }))
+    );
+}
+
+#[test]
+fn presentation_card_sections_render_for_custom_tool_without_name_special_case() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call-present".to_owned(),
+            tool_name: "third.party".to_owned(),
+            arguments_json: "{}".to_owned(),
+            request_presentation: None,
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::ToolInvocationStream {
+            event: ToolInvocationStreamEvent::Presentation {
+                tool_call_id: "call-present".to_owned(),
+                sequence: 1,
+                presentation: ToolPresentationEvent::Card(
+                    bcode_session_models::ToolCardPresentation {
+                        target: ToolPresentationTarget::Result,
+                        title: "Custom result".to_owned(),
+                        subtitle: Some("plugin-owned".to_owned()),
+                        sections: vec![
+                            ToolPresentationSection::Text {
+                                label: Some("Summary".to_owned()),
+                                text: "Rendered from plugin presentation".to_owned(),
+                            },
+                            ToolPresentationSection::Fields {
+                                fields: vec![ToolPresentationFieldValue {
+                                    label: "Answer".to_owned(),
+                                    value: "42".to_owned(),
+                                }],
+                            },
+                        ],
+                    },
+                ),
+            },
+        },
+    ));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 24));
+    let mut frame = Frame::new(&mut buffer);
+
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+
+    assert!(output.contains("Custom result · third.party"), "{output}");
+    assert!(output.contains("plugin-owned"), "{output}");
+    assert!(output.contains("Summary"), "{output}");
+    assert!(
+        output.contains("Rendered from plugin presentation"),
+        "{output}"
+    );
+    assert!(output.contains("Answer: 42"), "{output}");
 }
 
 #[test]

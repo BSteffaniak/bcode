@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bcode_session_models::{
     SessionEvent, SessionEventKind, SessionTokenUsage, ShellRunResult, ToolCardPresentation,
-    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream, ToolPresentationTarget,
-    ToolRequestPresentationMetadata,
+    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream, ToolPresentationEvent,
+    ToolPresentationTarget, ToolRequestPresentationMetadata,
 };
 
 use super::diff_extract::{FileEditTranscript, file_edit_from_request_preview};
@@ -581,6 +581,39 @@ pub fn live_tool_preview_anchor_item(tool_call_id: &str, tool_name: &str) -> Tra
             tool_name: tool_name.to_owned(),
         },
     )
+}
+
+/// Convert a plugin-owned presentation event into a replayable transcript card.
+#[must_use]
+pub fn tool_presentation_card_from_event(
+    presentation: &ToolPresentationEvent,
+) -> Option<ToolCardPresentation> {
+    match presentation {
+        ToolPresentationEvent::Card(card) => Some(card.clone()),
+        ToolPresentationEvent::Status(status)
+            if status.target != ToolPresentationTarget::Activity =>
+        {
+            Some(ToolCardPresentation {
+                target: status.target,
+                title: status.text.clone(),
+                subtitle: None,
+                sections: Vec::new(),
+            })
+        }
+        ToolPresentationEvent::Progress(progress)
+            if progress.target != ToolPresentationTarget::Activity =>
+        {
+            Some(ToolCardPresentation {
+                target: progress.target,
+                title: progress.text.clone(),
+                subtitle: progress.percent.map(|percent| format!("{percent}%")),
+                sections: Vec::new(),
+            })
+        }
+        ToolPresentationEvent::Status(_)
+        | ToolPresentationEvent::Progress(_)
+        | ToolPresentationEvent::Clear { .. } => None,
+    }
 }
 
 /// Build a generic plugin-owned tool presentation card item.
@@ -1487,7 +1520,41 @@ fn apply_tool_invocation_stream_event(
                 replay.finished_at_ms = *finished_at_ms;
             }
         }
+        ToolInvocationStreamEvent::Presentation {
+            tool_call_id,
+            presentation,
+            ..
+        } => apply_tool_presentation_replay_event(items, tool_calls, tool_call_id, presentation),
         _ => {}
+    }
+}
+
+fn apply_tool_presentation_replay_event(
+    items: &mut Vec<TranscriptItem>,
+    tool_calls: &BTreeMap<String, ToolCallContext>,
+    tool_call_id: &str,
+    presentation: &ToolPresentationEvent,
+) {
+    match presentation {
+        ToolPresentationEvent::Clear { target } => {
+            items.retain(|item| !item.is_tool_presentation_card_for(tool_call_id, *target));
+        }
+        _ => {
+            if let Some(card) = tool_presentation_card_from_event(presentation) {
+                let tool_name = tool_calls
+                    .get(tool_call_id)
+                    .map(|context| context.tool_name.as_str());
+                if let Some(existing) = items
+                    .iter_mut()
+                    .rev()
+                    .find(|item| item.is_tool_presentation_card_for(tool_call_id, card.target))
+                {
+                    existing.set_tool_presentation_card(card);
+                } else {
+                    items.push(tool_presentation_card_item(tool_call_id, tool_name, card));
+                }
+            }
+        }
     }
 }
 

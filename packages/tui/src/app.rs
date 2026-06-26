@@ -54,8 +54,8 @@ use super::transcript::{
     FileEditPhase, TranscriptItem, TranscriptItemKind, file_change_presentation_item,
     live_tool_preview_anchor_item, model_usage_item, permission_request_item,
     permission_result_item, streaming_terminal_output_item, streaming_tool_output_item,
-    tool_presentation_card_item, tool_request_item, tool_result_item,
-    transcript_items_from_events_with_reasoning,
+    tool_presentation_card_from_event, tool_presentation_card_item, tool_request_item,
+    tool_result_item, transcript_items_from_events_with_reasoning,
 };
 use super::transcript_document::TranscriptDocument;
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
@@ -2877,6 +2877,8 @@ impl BmuxApp {
                     self.set_activity(ActivityState::ProviderStream {
                         detail: status.text.clone(),
                     });
+                } else if let Some(card) = tool_presentation_card_from_event(presentation) {
+                    self.upsert_tool_presentation_card(tool_call_id, card);
                 }
             }
             ToolPresentationEvent::Progress(progress) => {
@@ -2884,6 +2886,8 @@ impl BmuxApp {
                     && progress.target == ToolPresentationTarget::Activity
                 {
                     progress.text.clone_into(&mut self.status);
+                } else if let Some(card) = tool_presentation_card_from_event(presentation) {
+                    self.upsert_tool_presentation_card(tool_call_id, card);
                 }
             }
             ToolPresentationEvent::Card(card) => {
