@@ -448,7 +448,7 @@ fn extend_shell_result_presentation(
             timed_out,
             cancelled,
             duration_ms,
-            output_tail: _,
+            output_tail,
             output_truncated,
             output_bytes,
             retained_output_bytes,
@@ -487,6 +487,13 @@ fn extend_shell_result_presentation(
                 label: "Rows".to_string(),
                 value: rows.to_string(),
             });
+            if !output_tail.is_empty() {
+                sections.push(ToolPresentationSection::Terminal {
+                    output: output_tail.clone(),
+                    columns: (*columns).max(1),
+                    rows: (*rows).max(1),
+                });
+            }
         }
         ShellRunResult::Captured {
             exit_code,
@@ -1743,7 +1750,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_result_card_summarizes_without_duplicating_output() {
+    fn terminal_result_card_includes_terminal_output_section() {
         let arguments = ShellRunArguments {
             command: "printf pty".to_string(),
             cwd: None,
@@ -1781,11 +1788,9 @@ mod tests {
             if fields.iter().any(|field| field.label == "Output bytes" && field.value == "10")
                 && fields.iter().any(|field| field.label == "Columns" && field.value == "80")
         )));
-        assert!(
-            !card
-                .sections
-                .iter()
-                .any(|section| matches!(section, ToolPresentationSection::Text { .. }))
-        );
+        assert!(card.sections.iter().any(|section| matches!(section,
+            ToolPresentationSection::Terminal { output, columns, rows }
+            if output == "pty output" && *columns == 80 && *rows == 24
+        )));
     }
 }
