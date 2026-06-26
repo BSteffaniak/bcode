@@ -38,14 +38,15 @@ pub async fn handle_permission_key(
             Ok(true)
         }
         BmuxAction::PermissionApprove => {
-            resolve_permission_dialog(client, chat, permission_dialog, true).await
+            resolve_permission_dialog(client, chat, permission_dialog, true, false).await
         }
         BmuxAction::PermissionDeny | BmuxAction::SelectCancel => {
-            resolve_permission_dialog(client, chat, permission_dialog, false).await
+            resolve_permission_dialog(client, chat, permission_dialog, false, false).await
         }
         BmuxAction::SelectConfirm => {
             let approved = dialog.focused_approval();
-            resolve_permission_dialog(client, chat, permission_dialog, approved).await
+            let remember = dialog.focused_remember();
+            resolve_permission_dialog(client, chat, permission_dialog, approved, remember).await
         }
         BmuxAction::InputSubmitSteering
         | BmuxAction::InputSubmitFollowUp
@@ -100,7 +101,7 @@ pub async fn handle_permission_mouse(
     mouse: MouseEvent,
 ) -> Result<bool, TuiError> {
     if let Some(approve) = permission_click_approval(mouse) {
-        resolve_permission_dialog(client, chat, permission_dialog, approve).await
+        resolve_permission_dialog(client, chat, permission_dialog, approve, false).await
     } else {
         Ok(false)
     }
@@ -111,17 +112,24 @@ async fn resolve_permission_dialog(
     chat: &mut ActiveChat,
     permission_dialog: &mut Option<PermissionDialogState>,
     approved: bool,
+    remember: bool,
 ) -> Result<bool, TuiError> {
     let Some(dialog) = permission_dialog.take() else {
         return Ok(false);
     };
     let permission_id = dialog.permission().permission_id.clone();
     let resolved = client
-        .resolve_permission(permission_id.clone(), approved)
+        .resolve_permission_with_remember(permission_id.clone(), approved, remember)
         .await?;
     chat.app.set_status(if resolved {
         if approved {
-            format!("approved permission {permission_id}")
+            if remember {
+                format!("approved and remembered permission {permission_id}")
+            } else {
+                format!("approved permission {permission_id}")
+            }
+        } else if remember {
+            format!("denied and remembered permission {permission_id}")
         } else {
             format!("denied permission {permission_id}")
         }

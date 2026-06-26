@@ -87,7 +87,7 @@ fn modal_frame() -> ModalFrame {
 pub fn action_areas(dialog: Rect) -> (Rect, Rect) {
     let content = dialog.inset(Insets::new(2, 3, 2, 3));
     let y = content.bottom().saturating_sub(1);
-    let actions = action_buttons();
+    let actions = action_buttons(false);
     let areas =
         ActionRow::new(&actions)
             .spacing(2)
@@ -230,8 +230,18 @@ fn render_actions(state: &PermissionDialogState, content: Rect, frame: &mut Fram
         content.height.saturating_add(4),
     );
     let (approve_area, _) = action_areas(dialog);
-    ActionRow::new(&action_buttons())
-        .focused(usize::from(!state.focused_approval()))
+    let buttons = action_buttons(state.permission().can_remember_policy);
+    let focused = if state.permission().can_remember_policy {
+        match (state.focused_approval(), state.focused_remember()) {
+            (true, false) => 0,
+            (true, true) => 1,
+            (false, _) => 2,
+        }
+    } else {
+        usize::from(!state.focused_approval())
+    };
+    ActionRow::new(&buttons)
+        .focused(focused)
         .spacing(2)
         .styles(action_styles())
         .render_with_fallback_style(
@@ -241,11 +251,19 @@ fn render_actions(state: &PermissionDialogState, content: Rect, frame: &mut Fram
         );
 }
 
-fn action_buttons() -> [ActionButton; 2] {
-    [
-        ActionButton::new("approve", "Approve"),
-        ActionButton::new("deny", "Deny"),
-    ]
+fn action_buttons(can_remember_policy: bool) -> Vec<ActionButton> {
+    if can_remember_policy {
+        vec![
+            ActionButton::new("approve_once", "Approve once"),
+            ActionButton::new("remember_allow", "Remember allow"),
+            ActionButton::new("deny", "Deny"),
+        ]
+    } else {
+        vec![
+            ActionButton::new("approve", "Approve"),
+            ActionButton::new("deny", "Deny"),
+        ]
+    }
 }
 
 const fn action_styles() -> ActionRowStyles {
@@ -304,6 +322,7 @@ mod tests {
             request_presentation: None,
             policy_source: None,
             policy_reason: None,
+            can_remember_policy: false,
         });
         let mut buffer = Buffer::empty(bmux_tui::geometry::Rect::new(0, 0, 100, 30));
         let mut frame = bmux_tui::frame::Frame::new(&mut buffer);

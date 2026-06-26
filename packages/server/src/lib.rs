@@ -49,6 +49,7 @@ use bcode_session_models::{
     ToolPresentationLevel, ToolPresentationSection, ToolPresentationTarget,
     ToolProgressPresentation, ToolRequestPresentationMetadata, TraceBlobRef, TraceRedaction,
 };
+use bcode_settings::SettingsStore;
 use bcode_skill::{
     SkillPromptCatalogMode, SkillPromptCatalogOptions, SkillRegistry, SkillRegistryOptions,
     SkillSourceRoot, evaluate_skill_tool_call, format_skill_catalog_for_prompt,
@@ -56,6 +57,7 @@ use bcode_skill::{
 };
 use bcode_skill_models::{
     SkillActivationMode, SkillContextResponse, SkillId, SkillList, SkillSource, SkillSourceKind,
+    SkillToolDecision, SkillToolDecisionEntry, SkillToolDecisionKey, SkillToolDecisionScope,
     SkillToolPolicyOutcome, SkillToolPolicyRequest,
 };
 use bcode_tool::{
@@ -788,6 +790,7 @@ struct PendingPermission {
     summary: PermissionSummary,
     decision: Arc<Mutex<Option<bool>>>,
     notify: Arc<Notify>,
+    skill_decision_key: Option<SkillToolDecisionKey>,
 }
 
 struct ServerStateInit {
@@ -2129,7 +2132,18 @@ async fn handle_agent_permission_plugin_request(
         Request::ResolvePermission {
             permission_id,
             approved,
-        } => handle_resolve_permission(request_id, state, writer, &permission_id, approved).await,
+            remember,
+        } => {
+            handle_resolve_permission(
+                request_id,
+                state,
+                writer,
+                &permission_id,
+                approved,
+                remember,
+            )
+            .await
+        }
         Request::AddPermissionRule {
             agent_id,
             category,
@@ -7130,6 +7144,7 @@ async fn handle_resolve_permission(
     writer: &SharedWriter,
     permission_id: &str,
     approved: bool,
+    remember: bool,
 ) -> Result<(), ServerError> {
     let Some(permission) = state.pending_permissions.lock().await.remove(permission_id) else {
         return send_response(
@@ -7139,6 +7154,16 @@ async fn handle_resolve_permission(
         )
         .await;
     };
+    if remember && let Some(key) = permission.skill_decision_key.clone() {
+        remember_skill_tool_decision(
+            key,
+            if approved {
+                SkillToolDecision::Allow
+            } else {
+                SkillToolDecision::Deny
+            },
+        );
+    }
     *permission.decision.lock().await = Some(approved);
     permission.notify.notify_waiters();
     append_permission_resolved_event(
@@ -12382,6 +12407,7 @@ async fn invoke_model_tool(
                 PermissionPolicyContext {
                     source: None,
                     reason: agent_decision.reason.clone(),
+                    skill_decision_key: None,
                 },
             )
             .await
@@ -12397,28 +12423,50 @@ async fn invoke_model_tool(
             }
         }
         AgentDecision::Allow => {
-            if skill_requests_permission
-                && !request_tool_permission(
-                    state,
-                    session_id,
-                    call,
-                    &definition,
-                    cancel_state,
-                    PermissionPolicyContext {
-                        source: Some("skill".to_string()),
-                        reason: skill_tool_policy_reason(&skill_decision),
-                    },
-                )
-                .await
-            {
-                return Ok(ToolInvocationResponse {
-                    output: "permission denied".to_string(),
-                    is_error: true,
-                    content: Vec::new(),
-                    full_output: None,
-                    host_action: None,
-                    result: None,
-                });
+            if skill_requests_permission {
+                let skill_decision_key =
+                    skill_tool_decision_key(state, session_id, &definition.name).await;
+                match skill_decision_key
+                    .as_ref()
+                    .and_then(remembered_skill_tool_decision)
+                {
+                    Some(SkillToolDecision::Allow) => {}
+                    Some(SkillToolDecision::Deny) => {
+                        return Ok(ToolInvocationResponse {
+                            output: "tool denied by remembered skill policy decision".to_string(),
+                            is_error: true,
+                            content: Vec::new(),
+                            full_output: None,
+                            host_action: None,
+                            result: None,
+                        });
+                    }
+                    None => {
+                        if !request_tool_permission(
+                            state,
+                            session_id,
+                            call,
+                            &definition,
+                            cancel_state,
+                            PermissionPolicyContext {
+                                source: Some("skill".to_string()),
+                                reason: skill_tool_policy_reason(&skill_decision),
+                                skill_decision_key,
+                            },
+                        )
+                        .await
+                        {
+                            return Ok(ToolInvocationResponse {
+                                output: "permission denied".to_string(),
+                                is_error: true,
+                                content: Vec::new(),
+                                full_output: None,
+                                host_action: None,
+                                result: None,
+                            });
+                        }
+                    }
+                }
             }
         }
     }
@@ -12962,6 +13010,56 @@ async fn evaluate_agent_tool_policy(
         })
 }
 
+fn remembered_skill_tool_decision(key: &SkillToolDecisionKey) -> Option<SkillToolDecision> {
+    SettingsStore::default()
+        .skill_tool_decisions()
+        .ok()
+        .and_then(|state| state.decision_for(key).map(|entry| entry.decision))
+}
+
+fn remember_skill_tool_decision(key: SkillToolDecisionKey, decision: SkillToolDecision) {
+    let store = SettingsStore::default();
+    let Ok(mut state) = store.skill_tool_decisions() else {
+        return;
+    };
+    state.upsert(SkillToolDecisionEntry {
+        key,
+        decision,
+        remembered_at_ms: current_time_ms(),
+        reason: Some("remembered from permission dialog".to_string()),
+    });
+    let _ = store.save_skill_tool_decisions(&state, current_time_ms());
+}
+
+async fn skill_tool_decision_key(
+    state: &ServerState,
+    session_id: SessionId,
+    tool_name: &str,
+) -> Option<SkillToolDecisionKey> {
+    let skill_ids = state
+        .active_skills
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+        .unwrap_or_default();
+    if skill_ids.is_empty() {
+        return None;
+    }
+    let working_directory = state
+        .sessions
+        .session_working_directory(session_id)
+        .await
+        .ok()?;
+    Some(SkillToolDecisionKey {
+        skill_ids,
+        tool_name: tool_name.to_string(),
+        scope: SkillToolDecisionScope::Workspace {
+            workspace_id: working_directory.to_string_lossy().into_owned(),
+        },
+    })
+}
+
 async fn list_service_tools(state: &ServerState) -> Vec<ServiceToolDefinition> {
     let mut tools = Vec::new();
     for plugin_id in tool_provider_plugin_ids(state) {
@@ -13109,6 +13207,7 @@ fn tool_provider_plugin_ids(state: &ServerState) -> Vec<String> {
 struct PermissionPolicyContext {
     source: Option<String>,
     reason: Option<String>,
+    skill_decision_key: Option<SkillToolDecisionKey>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -13170,9 +13269,11 @@ async fn request_tool_permission(
                 .map(service_request_presentation_to_session),
             policy_source: policy_context.source,
             policy_reason: policy_context.reason,
+            can_remember_policy: policy_context.skill_decision_key.is_some(),
         },
         decision: Arc::new(Mutex::new(None)),
         notify: Arc::new(Notify::new()),
+        skill_decision_key: policy_context.skill_decision_key,
     };
     state
         .pending_permissions

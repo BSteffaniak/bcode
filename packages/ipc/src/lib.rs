@@ -310,6 +310,8 @@ pub enum Request {
     ResolvePermission {
         permission_id: String,
         approved: bool,
+        #[serde(default)]
+        remember: bool,
     },
     AddPermissionRule {
         agent_id: String,
@@ -578,6 +580,8 @@ pub struct PermissionSummary {
     pub policy_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_reason: Option<String>,
+    #[serde(default)]
+    pub can_remember_policy: bool,
 }
 
 /// Plugin service invocation result.

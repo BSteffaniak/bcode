@@ -1667,10 +1667,26 @@ impl BcodeClient {
         permission_id: String,
         approved: bool,
     ) -> Result<bool, ClientError> {
+        self.resolve_permission_with_remember(permission_id, approved, false)
+            .await
+    }
+
+    /// Resolve a pending permission checkpoint and optionally remember the policy decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn resolve_permission_with_remember(
+        &self,
+        permission_id: String,
+        approved: bool,
+        remember: bool,
+    ) -> Result<bool, ClientError> {
         match self
             .send_request(Request::ResolvePermission {
                 permission_id,
                 approved,
+                remember,
             })
             .await?
         {

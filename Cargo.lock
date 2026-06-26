@@ -1835,6 +1835,7 @@ dependencies = [
  "bcode_session",
  "bcode_session_import",
  "bcode_session_models",
+ "bcode_settings",
  "bcode_skill",
  "bcode_skill_models",
  "bcode_tool",
