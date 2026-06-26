@@ -757,7 +757,7 @@ pub enum ToolPresentationFieldKind {
 
 /// Plugin-owned presentation update for a running tool invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum ToolPresentationEvent {
     /// Status text for an activity, preview, or result target.
     Status(ToolStatusPresentation),
