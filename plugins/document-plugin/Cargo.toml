@@ -1,7 +1,7 @@
 [package]
 authors     = { workspace = true }
 categories  = ["development-tools"]
-description = "Bundled document extraction tool plugin for bcode"
+description = "document extraction tool plugin for bcode"
 edition     = { workspace = true }
 keywords    = ["bcode", "document", "pdf", "tool", "plugin"]
 license     = { workspace = true }

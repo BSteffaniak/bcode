@@ -2,7 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! Bundled document extraction tool plugin for Bcode.
+//! document extraction tool plugin for Bcode.
 
 use bcode_model_provider_runtime::ProviderRuntime;
 use bcode_plugin_sdk::prelude::*;
@@ -26,7 +26,7 @@ const DEFAULT_MAX_BYTES: usize = 20 * 1024 * 1024;
 const MAX_BYTES: usize = 100 * 1024 * 1024;
 const USER_AGENT: &str = concat!("Bcode/", env!("CARGO_PKG_VERSION"));
 
-/// Bundled document extraction plugin.
+/// document extraction plugin.
 pub struct DocumentPlugin {
     runtime: Result<ProviderRuntime, String>,
 }

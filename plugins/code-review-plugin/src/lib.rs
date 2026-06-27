@@ -2,7 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! Bundled local Git code review plugin for Bcode.
+//! local Git code review plugin for Bcode.
 
 pub mod async_values;
 pub mod code_review_home;
@@ -126,7 +126,7 @@ pub struct CodeReviewPluginConfig {
     pub state_dir: Option<PathBuf>,
 }
 
-/// Bundled local code review plugin.
+/// local code review plugin.
 #[derive(Default)]
 pub struct CodeReviewPlugin;
 

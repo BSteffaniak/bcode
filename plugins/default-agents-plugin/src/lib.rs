@@ -2,7 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! Bundled default agent profile policy plugin.
+//! default agent profile policy plugin.
 
 use bcode_agent_policy::{
     AgentConfig, AgentPermissionConfig, BUILD_AGENT, PLAN_AGENT, active_tools_for, agent_config,
@@ -48,7 +48,7 @@ fn default_config_with_diagnostics() -> (AgentPermissionConfig, Vec<String>) {
         Err(error) => (
             policy_default_config(),
             vec![format!(
-                "failed to parse bundled agent_defaults; using policy defaults without bundled tool enablement: {error}"
+                "failed to parse plugin agent_defaults; using policy defaults without plugin tool enablement: {error}"
             )],
         ),
     }
@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn manifest_agent_defaults_are_valid() {
-        let defaults = manifest_defaults().expect("bundled manifest defaults should parse");
+        let defaults = manifest_defaults().expect("plugin manifest defaults should parse");
 
         assert!(!defaults.build_tools.is_empty());
         for disabled_tool in &defaults.plan_disabled_tools {

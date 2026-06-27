@@ -2,7 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! Bundled filesystem service plugin for Bcode.
+//! filesystem service plugin for Bcode.
 
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
@@ -37,7 +37,7 @@ const DEFAULT_READ_MAX_BYTES: usize = 256 * 1024;
 const DEFAULT_ARTIFACT_READ_MAX_BYTES: usize = 64 * 1024;
 const DEFAULT_ARTIFACT_GREP_MAX_MATCHES: usize = 100;
 
-/// Bundled filesystem plugin.
+/// filesystem plugin.
 #[derive(Default)]
 pub struct FilesystemPlugin;
 

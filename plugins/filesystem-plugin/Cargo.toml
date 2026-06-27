@@ -1,7 +1,7 @@
 [package]
 authors     = { workspace = true }
 categories  = ["development-tools"]
-description = "Bundled filesystem service plugin for bcode"
+description = "filesystem service plugin for bcode"
 edition     = { workspace = true }
 keywords    = ["bcode", "filesystem", "plugin"]
 license     = { workspace = true }

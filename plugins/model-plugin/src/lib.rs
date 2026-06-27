@@ -2,7 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! Bundled model and runtime command palette plugin for Bcode.
+//! model and runtime command palette plugin for Bcode.
 
 use bcode_command::{
     COMMAND_INTERFACE_ID, CommandAction, CommandContribution, CommandEffect, CommandOwner,
@@ -17,7 +17,7 @@ use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text::{Line, Span};
 use serde::Serialize;
 
-/// Bundled model command plugin.
+/// model command plugin.
 #[derive(Default)]
 pub struct ModelPlugin;
 

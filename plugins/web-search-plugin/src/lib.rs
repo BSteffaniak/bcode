@@ -2,7 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! Bundled web search and page fetching tool plugin for Bcode.
+//! web search and page fetching tool plugin for Bcode.
 
 use bcode_model_provider_runtime::ProviderRuntime;
 use bcode_plugin_sdk::prelude::*;
@@ -59,7 +59,7 @@ impl ProgressReporter {
     }
 }
 
-/// Bundled web search plugin.
+/// web search plugin.
 pub struct WebSearchPlugin {
     runtime: Result<ProviderRuntime, String>,
 }

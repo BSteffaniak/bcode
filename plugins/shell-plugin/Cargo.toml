@@ -1,7 +1,7 @@
 [package]
 authors     = { workspace = true }
 categories  = ["development-tools"]
-description = "Bundled shell execution tool plugin for bcode"
+description = "shell execution tool plugin for bcode"
 edition     = { workspace = true }
 keywords    = ["bcode", "shell", "tool", "plugin"]
 license     = { workspace = true }

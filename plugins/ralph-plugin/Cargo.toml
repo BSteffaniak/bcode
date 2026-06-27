@@ -1,7 +1,7 @@
 [package]
 authors     = { workspace = true }
 categories  = ["development-tools"]
-description = "Bundled Ralph TUI plugin for bcode"
+description = "Ralph TUI plugin for bcode"
 edition     = { workspace = true }
 keywords    = ["bcode", "ralph", "tui", "plugin"]
 license     = { workspace = true }

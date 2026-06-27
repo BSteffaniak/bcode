@@ -2,7 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! Bundled Git repository access tool plugin for Bcode.
+//! Git repository access tool plugin for Bcode.
 
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use thiserror::Error;
 
-/// Bundled Git access plugin.
+/// Git access plugin.
 #[derive(Default)]
 pub struct GitPlugin;
 

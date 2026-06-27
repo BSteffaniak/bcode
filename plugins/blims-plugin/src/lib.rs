@@ -2,7 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! Bundled Blims AI company simulator plugin.
+//! Blims AI company simulator plugin.
 
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -235,7 +235,7 @@ const DEFAULT_STATE_ROOT: &str = ".bcode/blims";
 const DATABASE_FILE_NAME: &str = "blims.sqlite";
 const SCHEMA_VERSION: i64 = 1;
 
-/// Bundled Blims company simulator plugin.
+/// Blims company simulator plugin.
 #[derive(Default)]
 pub struct BlimsPlugin;
 
@@ -3197,8 +3197,7 @@ fn company_status_message(state: &CompanyLifecycleState) -> String {
             "Blims company is shut down but fully resurrectable from repo-local state.".to_string()
         }
         CompanyLifecycleState::NotStarted => {
-            "Blims is bundled and ready. Create a repo-local company to wake the office."
-                .to_string()
+            "Blims is ready. Create a repo-local company to wake the office.".to_string()
         }
     }
 }
@@ -4546,7 +4545,7 @@ fn fallback_morning_report() -> MorningReport {
     MorningReport {
         title: "Blims morning report".to_string(),
         bullets: vec![
-            "The Blims plugin is now available as a bundled service stub.".to_string(),
+            "The Blims plugin is now available as a service stub.".to_string(),
             "Repo-local SQLite state initialization is available through company.create."
                 .to_string(),
             "Starter office direction: Cozy Startup Loft, Hacker Garage, and Guild Hall."

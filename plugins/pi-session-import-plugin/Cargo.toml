@@ -1,7 +1,7 @@
 [package]
 authors     = { workspace = true }
 categories  = ["development-tools"]
-description = "Bundled Pi session import plugin for bcode"
+description = "Pi session import plugin for bcode"
 edition     = { workspace = true }
 keywords    = ["bcode", "pi", "session", "import", "plugin"]
 license     = { workspace = true }

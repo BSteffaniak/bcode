@@ -1,7 +1,7 @@
 [package]
 authors     = { workspace = true }
 categories  = ["development-tools"]
-description = "Bundled GitHub review publisher plugin for bcode"
+description = "GitHub review publisher plugin for bcode"
 edition     = { workspace = true }
 keywords    = ["bcode", "github", "code-review", "plugin"]
 license     = { workspace = true }

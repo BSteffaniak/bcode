@@ -2,7 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! Bundled Git worktree tool plugin for Bcode.
+//! Git worktree tool plugin for Bcode.
 
 use bcode_command::{
     COMMAND_INTERFACE_ID, CommandAction, CommandContribution, CommandEffect, CommandOwner,
@@ -28,7 +28,7 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-/// Bundled worktree plugin.
+/// worktree plugin.
 #[derive(Default)]
 pub struct WorktreePlugin;
 

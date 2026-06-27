@@ -2,7 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! Bundled shell execution tool plugin for Bcode.
+//! shell execution tool plugin for Bcode.
 
 use bcode_config::{
     ShellToolConfig, ShellToolEnvAutoFallback, ShellToolEnvConfig, ShellToolEnvMode,
@@ -32,7 +32,7 @@ const DEFAULT_TERMINAL_ROWS: u16 = 30;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_INLINE_TERMINAL_OUTPUT_BYTES: usize = 16 * 1024;
 
-/// Bundled shell plugin.
+/// shell plugin.
 #[derive(Default)]
 pub struct ShellPlugin;
 

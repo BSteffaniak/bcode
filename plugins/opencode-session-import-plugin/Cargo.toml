@@ -1,7 +1,7 @@
 [package]
 authors     = { workspace = true }
 categories  = ["development-tools"]
-description = "Bundled OpenCode session import plugin for bcode"
+description = "OpenCode session import plugin for bcode"
 edition     = { workspace = true }
 keywords    = ["bcode", "opencode", "session", "import", "plugin"]
 license     = { workspace = true }

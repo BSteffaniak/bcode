@@ -2,7 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! Bundled Ralph TUI plugin for Bcode.
+//! Ralph TUI plugin for Bcode.
 
 use std::path::PathBuf;
 
