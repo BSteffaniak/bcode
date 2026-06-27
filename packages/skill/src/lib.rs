@@ -523,8 +523,9 @@ fn parse_skill_markdown(
     fallback_id: Option<&str>,
 ) -> Result<SkillManifest, SkillRegistryError> {
     let (frontmatter, instructions) = split_frontmatter(contents)?;
-    let raw: RawSkillFrontmatter = toml::from_str(&yamlish_to_toml(frontmatter))
-        .map_err(|error| SkillError::InvalidMetadata(error.to_string()))?;
+    let toml_frontmatter = yamlish_to_toml(frontmatter);
+    let raw: RawSkillFrontmatter = toml::from_str(&toml_frontmatter)
+        .map_err(|error| SkillError::InvalidMetadata(format!("{error}: {toml_frontmatter}")))?;
     let id = raw
         .id
         .clone()
@@ -598,26 +599,30 @@ fn yamlish_to_toml(frontmatter: &str) -> String {
             .take_while(|character| character.is_whitespace())
             .count();
         if let Some((raw_key, raw_value)) = trimmed.split_once(':') {
-            let raw_key = raw_key.trim();
+            let raw_key = raw_key.trim().replace('-', "_");
             let value = raw_value.trim();
             if indent == 0 && value.is_empty() {
-                current_section = Some(raw_key.to_string());
+                current_section = Some(raw_key.clone());
                 continue;
             }
 
             let key = if indent > 0 {
-                current_section.as_ref().map_or_else(
-                    || raw_key.to_string(),
-                    |section| format!("{section}.{raw_key}"),
-                )
+                current_section
+                    .as_ref()
+                    .map_or_else(|| raw_key.clone(), |section| format!("{section}.{raw_key}"))
             } else {
                 current_section = None;
-                raw_key.to_string()
+                raw_key.clone()
             };
 
             if value.is_empty() {
                 current_array_key = Some(key);
-            } else if value.starts_with('[') || value == "true" || value == "false" {
+            } else if value.starts_with('[') {
+                output.push_str(&key);
+                output.push_str(" = ");
+                output.push_str(&toml_array(value));
+                output.push('\n');
+            } else if value == "true" || value == "false" {
                 output.push_str(&key);
                 output.push_str(" = ");
                 output.push_str(value);
@@ -651,6 +656,33 @@ fn flush_array(output: &mut String, key: &mut Option<String>, values: &mut Vec<S
         output.push_str("]\n");
         values.clear();
     }
+}
+
+fn toml_array(value: &str) -> String {
+    let trimmed = value.trim();
+    let Some(inner) = trimmed
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+    else {
+        return trimmed.to_string();
+    };
+    let items = split_compat_list_items(inner);
+    let mut output = String::from("[");
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            output.push_str(", ");
+        }
+        let item = item.trim();
+        if (item.starts_with('"') && item.ends_with('"'))
+            || (item.starts_with('\'') && item.ends_with('\''))
+        {
+            output.push_str(&toml_string(item.trim_matches('"').trim_matches('\'')));
+        } else {
+            output.push_str(&toml_string(item));
+        }
+    }
+    output.push(']');
+    output
 }
 
 fn toml_string(value: &str) -> String {
@@ -823,12 +855,10 @@ struct RawSkillFrontmatter {
     version: Option<String>,
     activation: Option<SkillActivation>,
     permissions: Option<RawSkillPermissions>,
-    #[serde(default, rename = "allowed-tools")]
-    allowed_tools_kebab: Vec<String>,
-    #[serde(default, rename = "allowed_tools")]
-    allowed_tools_snake: Vec<String>,
+    #[serde(default, alias = "allowed-tools", rename = "allowed_tools")]
+    allowed_tools: RawStringList,
     #[serde(default)]
-    tools: Vec<String>,
+    tools: RawStringList,
     model: Option<RawSkillModelField>,
     #[serde(default)]
     models: RawSkillModels,
@@ -847,10 +877,96 @@ struct RawSkillFrontmatter {
 #[derive(Debug, Default, Clone, serde::Deserialize)]
 struct RawSkillPermissions {
     #[serde(default)]
-    tools: Vec<String>,
+    tools: RawStringList,
     #[serde(default)]
-    categories: Vec<String>,
+    categories: RawStringList,
     mode: Option<SkillPermissionMode>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct RawStringList(Vec<String>);
+
+impl RawStringList {
+    fn values(&self) -> Vec<String> {
+        self.0.clone()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RawStringList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum StringListValue {
+            One(String),
+            Many(Vec<String>),
+        }
+
+        let value = StringListValue::deserialize(deserializer)?;
+        let values = match value {
+            StringListValue::One(value) => split_compat_string_list(&value),
+            StringListValue::Many(values) => values
+                .into_iter()
+                .flat_map(|value| split_compat_string_list(&value))
+                .collect(),
+        };
+        Ok(Self(values))
+    }
+}
+
+fn split_compat_string_list(value: &str) -> Vec<String> {
+    split_compat_list_items(value)
+        .into_iter()
+        .map(|item| item.trim().trim_matches('"').trim_matches('\'').to_string())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+fn split_compat_list_items(value: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut paren_depth = 0_u32;
+    let mut bracket_depth = 0_u32;
+    let mut quote: Option<char> = None;
+    for character in value.chars() {
+        match (character, quote) {
+            ('"' | '\'', None) => {
+                quote = Some(character);
+                current.push(character);
+            }
+            (value, Some(quote_character)) if value == quote_character => {
+                quote = None;
+                current.push(character);
+            }
+            ('(', None) => {
+                paren_depth = paren_depth.saturating_add(1);
+                current.push(character);
+            }
+            (')', None) => {
+                paren_depth = paren_depth.saturating_sub(1);
+                current.push(character);
+            }
+            ('[', None) => {
+                bracket_depth = bracket_depth.saturating_add(1);
+                current.push(character);
+            }
+            (']', None) => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                current.push(character);
+            }
+            (',', None) if paren_depth == 0 && bracket_depth == 0 => {
+                items.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(character),
+        }
+    }
+    if !current.trim().is_empty() {
+        items.push(current.trim().to_string());
+    }
+    items
 }
 
 #[derive(Debug, Default, Clone, serde::Deserialize)]
@@ -882,8 +998,8 @@ struct RawSkillModelRequest {
 impl RawSkillPermissions {
     fn to_hints(&self) -> SkillPermissionHints {
         SkillPermissionHints {
-            tools: self.tools.clone(),
-            categories: self.categories.clone(),
+            tools: self.tools.values(),
+            categories: self.categories.values(),
             unresolved_tools: Vec::new(),
         }
     }
@@ -897,9 +1013,8 @@ fn normalize_permission_hints(
         .permissions
         .as_ref()
         .map_or_else(SkillPermissionHints::default, RawSkillPermissions::to_hints);
-    hints.tools.extend(raw.allowed_tools_kebab.clone());
-    hints.tools.extend(raw.allowed_tools_snake.clone());
-    hints.tools.extend(raw.tools.clone());
+    hints.tools.extend(raw.allowed_tools.values());
+    hints.tools.extend(raw.tools.values());
     hints.unresolved_tools = hints
         .tools
         .iter()
@@ -1353,6 +1468,61 @@ mod tests {
         let outcome = evaluate(tool_a, vec![resolved]);
 
         assert!(matches!(outcome, SkillToolPolicyOutcome::Ask { .. }));
+    }
+
+    #[test]
+    fn parses_inline_compat_allowed_tools() {
+        let source = SkillSource {
+            kind: SkillSourceKind::User,
+            label: "user-config:skills".to_string(),
+            path: None,
+            precedence: 30,
+        };
+        let frontmatter = "name: commit-message-staged-write
+description: Generate a commit message from staged changes only
+allowed-tools: Bash(git:*), Read(*), Edit(*)";
+        let manifest = parse_skill_markdown(
+            &format!("---\n{frontmatter}\n---\n# Instructions\nDo things."),
+            &source,
+            Some("commit-message-staged-write"),
+        )
+        .expect("compat skill parses");
+
+        assert_eq!(
+            yamlish_to_toml(frontmatter),
+            "name = \"commit-message-staged-write\"\ndescription = \"Generate a commit message from staged changes only\"\nallowed_tools = \"Bash(git:*), Read(*), Edit(*)\"\n"
+        );
+        assert_eq!(manifest.summary.id.as_str(), "commit-message-staged-write");
+        assert_eq!(
+            manifest.permissions.tools,
+            vec!["Bash(git:*)", "Read(*)", "Edit(*)"]
+        );
+    }
+
+    #[test]
+    fn parses_json_style_compat_allowed_tools() {
+        let source = SkillSource {
+            kind: SkillSourceKind::User,
+            label: "user-config:skills".to_string(),
+            path: None,
+            precedence: 30,
+        };
+        let manifest = parse_skill_markdown(
+            "---
+name: compat-list
+allowed-tools: [Bash(git:*), Read(*), \"Edit(*)\"]
+---
+# Instructions
+Do things.",
+            &source,
+            Some("compat-list"),
+        )
+        .expect("compat skill parses");
+
+        assert_eq!(
+            manifest.permissions.tools,
+            vec!["Bash(git:*)", "Read(*)", "Edit(*)"]
+        );
     }
 
     #[test]
