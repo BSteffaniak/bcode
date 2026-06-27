@@ -492,10 +492,11 @@ pub enum ReviewViewBlock {
 }
 
 fn agent_thread_visible_line_count(state: &ReviewAgentThreadState) -> usize {
+    let activity_count = usize::from(state.activity.is_some());
     if state.answer.trim().is_empty() {
-        1
+        1 + activity_count
     } else {
-        1 + state.answer.lines().count().clamp(1, 4)
+        1 + activity_count + state.answer.lines().count().clamp(1, 4)
     }
 }
 

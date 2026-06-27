@@ -3049,6 +3049,8 @@ pub struct ReviewAgentThreadState {
     pub status: String,
     /// Latest assistant answer preview.
     pub answer: String,
+    /// Latest compact tool/progress activity.
+    pub activity: Option<String>,
     /// Last failure message.
     pub error: Option<String>,
 }
@@ -3063,6 +3065,7 @@ impl ReviewAgentThreadState {
             question,
             status: "looking into this…".to_string(),
             answer: String::new(),
+            activity: None,
             error: None,
         }
     }
@@ -3193,6 +3196,7 @@ pub struct ReviewAgentSessionStreamState {
     active_turn_id: Option<String>,
     phase: ReviewAgentThreadPhase,
     status: String,
+    activity: Option<String>,
     error: Option<String>,
 }
 
@@ -3205,6 +3209,7 @@ impl Default for ReviewAgentSessionStreamState {
             active_turn_id: None,
             phase: ReviewAgentThreadPhase::Running,
             status: "running".to_string(),
+            activity: None,
             error: None,
         }
     }
@@ -3224,11 +3229,13 @@ impl ReviewAgentSessionStreamState {
             PluginSessionEvent::SessionLive(event) => self.apply_live_event(event.kind),
             PluginSessionEvent::Lagged { dropped_count } => {
                 self.status = format!("live updates lagged; dropped {dropped_count} events");
+                self.activity = Some(format!("dropped {dropped_count} live updates"));
                 true
             }
             PluginSessionEvent::Disconnected { message } => {
                 self.phase = ReviewAgentThreadPhase::Failed;
                 self.status = "session event stream disconnected".to_string();
+                self.activity = Some("stream disconnected".to_string());
                 self.error = Some(message);
                 true
             }
@@ -3269,22 +3276,26 @@ impl ReviewAgentSessionStreamState {
             }
             SessionEventKind::RuntimeWorkProgress { message, .. } => {
                 self.phase = ReviewAgentThreadPhase::Running;
-                self.status = message;
+                self.status.clone_from(&message);
+                self.activity = Some(message);
             }
             SessionEventKind::ToolCallRequested { tool_name, .. } => {
                 self.phase = ReviewAgentThreadPhase::Running;
                 self.status = format!("running tool: {tool_name}");
+                self.activity = Some(format!("tool: {tool_name}"));
             }
             SessionEventKind::ToolCallFinished { is_error, .. } => {
-                self.status = if is_error {
+                self.activity = Some(if is_error {
                     "tool failed".to_string()
                 } else {
                     "tool finished".to_string()
-                };
+                });
+                self.status = self.activity.clone().unwrap_or_default();
             }
             SessionEventKind::ToolInvocationStream { .. } => {
                 self.phase = ReviewAgentThreadPhase::Running;
                 self.status = "running tool…".to_string();
+                self.activity = Some("tool output streaming…".to_string());
             }
             _ => {}
         }
@@ -3311,6 +3322,7 @@ impl ReviewAgentSessionStreamState {
             SessionLiveEventKind::ToolOutputDelta { .. } => {
                 self.phase = ReviewAgentThreadPhase::Running;
                 self.status = "running tool…".to_string();
+                self.activity = Some("tool output streaming…".to_string());
             }
             SessionLiveEventKind::ToolArgumentPreview {
                 turn_id,
@@ -3321,6 +3333,7 @@ impl ReviewAgentSessionStreamState {
                 self.active_turn_id = Some(turn_id);
                 self.phase = ReviewAgentThreadPhase::Running;
                 self.status = live_tool_preview_status(&tool_name, &preview);
+                self.activity = Some(format!("tool: {}", self.status));
             }
             SessionLiveEventKind::ProviderStreamProgress { turn_id, .. } => {
                 self.active_turn_id = Some(turn_id);
@@ -7872,12 +7885,14 @@ impl ReviewApp {
             if state.session_id.as_deref() != Some(session_id)
                 || state.phase != stream_state.phase
                 || state.status != stream_state.status
+                || state.activity != stream_state.activity
                 || state.answer != answer
                 || state.error != stream_state.error
             {
                 state.session_id = Some(session_id.to_string());
                 state.phase = stream_state.phase;
                 state.status.clone_from(&stream_state.status);
+                state.activity.clone_from(&stream_state.activity);
                 state.answer = answer;
                 state.error.clone_from(&stream_state.error);
                 changed = true;
@@ -10877,6 +10892,7 @@ mod tests {
                 question: "Can Bcode check this?".to_string(),
                 status: "answered".to_string(),
                 answer: "Use a clearer error message.".to_string(),
+                activity: None,
                 error: None,
             },
         );

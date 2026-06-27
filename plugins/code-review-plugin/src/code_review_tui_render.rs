@@ -1681,8 +1681,14 @@ fn render_inline_agent_thread_line(
     style: Style,
 ) -> Line {
     let prefix_style = Style::new().fg(Color::Cyan).bg(Color::Rgb(18, 18, 18));
+    let has_activity = state.activity.as_ref().is_some_and(|text| !text.is_empty());
+    let answer_line_index = body_line_index
+        .saturating_sub(1)
+        .saturating_sub(usize::from(has_activity));
     let prefix = if body_line_index == 0 {
         format!("   │ 🤖 Bcode · {} ", state.live_state_label())
+    } else if has_activity && body_line_index == 1 {
+        "   │  activity ".to_string()
     } else if body_line_index.saturating_add(1) == body_line_count {
         "   ╰─ answer ".to_string()
     } else {
@@ -1693,11 +1699,13 @@ fn render_inline_agent_thread_line(
             .error
             .as_ref()
             .map_or(state.status.as_str(), String::as_str)
+    } else if has_activity && body_line_index == 1 {
+        state.activity.as_deref().unwrap_or_default()
     } else {
         state
             .answer
             .lines()
-            .nth(body_line_index.saturating_sub(1))
+            .nth(answer_line_index)
             .unwrap_or_default()
     };
     let available = usize::from(
