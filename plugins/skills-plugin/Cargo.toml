@@ -14,12 +14,15 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bcode_command    = { workspace = true }
-bcode_plugin_sdk = { workspace = true }
-bmux_keyboard    = { workspace = true }
-bmux_tui         = { workspace = true }
-serde            = { workspace = true }
-serde_json       = { workspace = true }
+bcode_command      = { workspace = true }
+bcode_config       = { workspace = true }
+bcode_plugin_sdk   = { workspace = true }
+bcode_skill        = { workspace = true }
+bcode_skill_models = { workspace = true }
+bmux_keyboard      = { workspace = true }
+bmux_tui           = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
 
 [features]
 default          = []

@@ -9,6 +9,8 @@ use bcode_command::{
     CommandSurface, InvokeCommandRequest, InvokeCommandResponse, OP_INVOKE_COMMAND,
 };
 use bcode_plugin_sdk::prelude::*;
+use bcode_skill::{SkillRegistry, SkillRegistryOptions, SkillSourceRoot};
+use bcode_skill_models::SkillSourceKind;
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
@@ -220,10 +222,96 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for SkillsCommandSurface {
 
 fn skills_surface_lines(surface_kind: &str) -> Vec<String> {
     match surface_kind {
-        "skills.list" => vec!["Available skills are owned by the skills plugin.".to_string()],
-        "skills.active" => vec!["Active skills are owned by the skills plugin.".to_string()],
+        "skills.list" => available_skills_lines(),
+        "skills.active" => vec![
+            "Active skills require a session runtime query.".to_string(),
+            "The skills plugin owns this surface; host session-query plumbing is still generic."
+                .to_string(),
+        ],
         _ => vec!["Skills command surface".to_string()],
     }
+}
+
+fn available_skills_lines() -> Vec<String> {
+    let config = match bcode_config::load_config() {
+        Ok(config) => config,
+        Err(error) => return vec![format!("skills config unavailable: {error}")],
+    };
+    let Some(registry) = build_skill_registry(&config) else {
+        return vec!["skills are disabled".to_string()];
+    };
+    let list = registry.list();
+    if list.skills.is_empty() {
+        return vec!["No skills are available.".to_string()];
+    }
+    std::iter::once(format!("Available skills: {}", list.skills.len()))
+        .chain(list.skills.into_iter().map(|skill| {
+            let description = skill
+                .description
+                .unwrap_or_else(|| "no description".to_string());
+            format!("* {} — {description} ({})", skill.id, skill.source.label)
+        }))
+        .collect()
+}
+
+fn build_skill_registry(config: &bcode_config::BcodeConfig) -> Option<SkillRegistry> {
+    if !config.skills.enabled {
+        return None;
+    }
+    let mut roots = Vec::new();
+    if config.skills.include_repo_skills {
+        roots.push(SkillSourceRoot::new(
+            std::path::PathBuf::from(".bcode/skills"),
+            SkillSourceKind::Repository,
+            "repo:.bcode/skills",
+            10,
+        ));
+    }
+    if config.skills.include_generic_repo_skills {
+        roots.push(SkillSourceRoot::new(
+            std::path::PathBuf::from("skills"),
+            SkillSourceKind::Repository,
+            "repo:skills",
+            15,
+        ));
+    }
+    if config.skills.include_compat_claude_skills {
+        roots.push(SkillSourceRoot::new(
+            std::path::PathBuf::from(".claude/skills"),
+            SkillSourceKind::Compatibility,
+            "repo:.claude/skills",
+            20,
+        ));
+    }
+    if config.skills.include_user_skills {
+        roots.push(SkillSourceRoot::new(
+            bcode_config::default_config_dir().join("skills"),
+            SkillSourceKind::User,
+            "user-config:skills",
+            30,
+        ));
+        roots.push(SkillSourceRoot::new(
+            bcode_config::default_state_dir().join("skills"),
+            SkillSourceKind::User,
+            "user-state:skills",
+            35,
+        ));
+    }
+    for (index, path) in config.skills.sources.paths.iter().enumerate() {
+        roots.push(SkillSourceRoot::new(
+            path.clone(),
+            SkillSourceKind::Configured,
+            format!("configured:{index}"),
+            40 + u16::try_from(index).unwrap_or(u16::MAX - 40),
+        ));
+    }
+    let options = SkillRegistryOptions {
+        max_skill_file_bytes: config.skills.max_skill_file_bytes,
+        max_context_bytes: config.skills.max_context_bytes,
+        follow_symlinks: config.skills.follow_symlinks,
+        disabled_ids: config.skills.disabled_skill_ids(),
+    };
+    SkillRegistry::discover(&roots, options).ok()
 }
 
 fn write_line(frame: &mut Frame<'_>, area: Rect, y: u16, line: impl Into<Line>) {
