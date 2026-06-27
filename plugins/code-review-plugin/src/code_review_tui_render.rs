@@ -1035,26 +1035,52 @@ fn render_thread_detail(
         x = render_header_button(app, frame, x, action_y, label, action, false);
     }
     let body = thread.latest_body.lines().next().unwrap_or_default();
-    let body_y = if let Some(agent_status) = app.agent_status_for_anchor(&thread.anchor)
-        && area.height > 3
-    {
-        frame.write_line(
-            Rect::new(area.x, area.y.saturating_add(3), area.width, 1),
-            &Line::from_spans(vec![Span::styled(
-                truncate_to_display_width(&format!("🤖 {agent_status}"), usize::from(area.width)),
-                Style::new().fg(Color::Cyan).bg(Color::Black),
-            )]),
-        );
-        4
-    } else {
-        3
-    };
-    if area.height > body_y {
-        frame.write_line(
-            Rect::new(area.x, area.y.saturating_add(body_y), area.width, 1),
-            &Line::from_spans(vec![Span::styled(
-                truncate_to_display_width(body, usize::from(area.width)),
+    let mut detail_lines = Vec::new();
+    if let Some(agent_state) = app.agent_state_for_anchor(&thread.anchor) {
+        let warning = agent_state
+            .stream_warning
+            .as_ref()
+            .map_or(String::new(), |warning| format!(" ⚠ {warning}"));
+        detail_lines.push((
+            format!(
+                "🤖 Bcode: {} · {}{warning}",
+                agent_state.live_state_label(),
+                agent_state.status
+            ),
+            Style::new().fg(Color::Cyan).bg(Color::Black),
+        ));
+        if let Some(activity) = &agent_state.activity {
+            detail_lines.push((
+                format!("   activity: {activity}"),
+                Style::new().fg(Color::BrightBlack).bg(Color::Black),
+            ));
+        }
+        if let Some(answer) = agent_state.answer.lines().next()
+            && !answer.is_empty()
+        {
+            detail_lines.push((
+                format!("   answer: {answer}"),
                 Style::new().fg(Color::White).bg(Color::Black),
+            ));
+        }
+    }
+    detail_lines.push((
+        body.to_string(),
+        Style::new().fg(Color::White).bg(Color::Black),
+    ));
+    for (index, (line, style)) in detail_lines.into_iter().enumerate() {
+        let y = area
+            .y
+            .saturating_add(3)
+            .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
+        if y >= area.bottom() {
+            break;
+        }
+        frame.write_line(
+            Rect::new(area.x, y, area.width, 1),
+            &Line::from_spans(vec![Span::styled(
+                truncate_to_display_width(&line, usize::from(area.width)),
+                style,
             )]),
         );
     }
