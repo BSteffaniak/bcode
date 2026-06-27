@@ -510,6 +510,8 @@ pub enum ReviewThreadAction {
     Delete,
     /// Ask Bcode about this thread.
     AskBcode,
+    /// Ask a follow-up in the linked Bcode session.
+    FollowUp,
     /// Convert the latest Bcode answer into a draft comment.
     DraftAnswer,
     /// Open the linked Bcode session.
@@ -530,9 +532,12 @@ impl ReviewThreadAction {
         has_agent_answer: bool,
         has_linked_session: bool,
     ) -> Vec<Self> {
-        let mut actions = vec![Self::Reply, Self::Edit, Self::Delete, Self::AskBcode];
+        let mut actions = vec![Self::Reply, Self::Edit, Self::Delete];
         if has_linked_session {
+            actions.push(Self::FollowUp);
             actions.push(Self::OpenSession);
+        } else {
+            actions.push(Self::AskBcode);
         }
         if has_agent_answer {
             actions.push(Self::DraftAnswer);
@@ -554,6 +559,7 @@ impl ReviewThreadAction {
             Self::Edit => "edit",
             Self::Delete => "delete",
             Self::AskBcode => "ask",
+            Self::FollowUp => "follow-up",
             Self::OpenSession => "open-session",
             Self::DraftAnswer => "draft-answer",
             Self::Publish => "publish",
@@ -569,7 +575,7 @@ impl ReviewThreadAction {
             Self::Reply => "c",
             Self::Edit => "e",
             Self::Delete => "D",
-            Self::AskBcode => "a",
+            Self::AskBcode | Self::FollowUp => "a",
             Self::OpenSession => "o",
             Self::DraftAnswer => "m",
             Self::Publish => "x",
@@ -585,6 +591,7 @@ impl ReviewThreadAction {
             Self::Edit => "edit",
             Self::Delete => "delete",
             Self::AskBcode => "ask Bcode",
+            Self::FollowUp => "ask follow-up",
             Self::OpenSession => "open session",
             Self::DraftAnswer => "draft answer",
             Self::Publish => "publish",
@@ -601,6 +608,7 @@ impl ReviewThreadAction {
             b"edit" => Some(Self::Edit),
             b"delete" => Some(Self::Delete),
             b"ask" => Some(Self::AskBcode),
+            b"follow-up" => Some(Self::FollowUp),
             b"open-session" => Some(Self::OpenSession),
             b"draft-answer" => Some(Self::DraftAnswer),
             b"publish" => Some(Self::Publish),

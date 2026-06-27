@@ -3067,6 +3067,22 @@ impl ReviewAgentThreadState {
         }
     }
 
+    /// Return a review-oriented live state label.
+    #[must_use]
+    pub fn live_state_label(&self) -> &'static str {
+        if self.error.is_some() {
+            return "failed";
+        }
+        match self.phase {
+            ReviewAgentThreadPhase::Pending => "thinking",
+            ReviewAgentThreadPhase::CreatingSession => "creating session",
+            ReviewAgentThreadPhase::Running if self.answer.trim().is_empty() => "working",
+            ReviewAgentThreadPhase::Running => "writing answer",
+            ReviewAgentThreadPhase::Complete => "answered",
+            ReviewAgentThreadPhase::Failed => "failed",
+        }
+    }
+
     /// Return a concise display status.
     #[must_use]
     pub fn display_status(&self) -> String {
@@ -8584,7 +8600,9 @@ impl ReviewApp {
             Some(ReviewThreadAction::Reply) => self.open_comment_editor(),
             Some(ReviewThreadAction::Edit) => self.open_latest_draft_editor(),
             Some(ReviewThreadAction::Delete) => self.delete_latest_draft_at_selection(),
-            Some(ReviewThreadAction::AskBcode) => self.ask_bcode_about_selection(),
+            Some(ReviewThreadAction::AskBcode | ReviewThreadAction::FollowUp) => {
+                self.ask_bcode_about_selection()
+            }
             Some(ReviewThreadAction::OpenSession) => self.open_linked_session_at_selection(),
             Some(ReviewThreadAction::DraftAnswer) => {
                 self.convert_agent_answer_to_draft_at_selection()

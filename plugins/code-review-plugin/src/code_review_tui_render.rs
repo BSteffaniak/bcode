@@ -1682,7 +1682,7 @@ fn render_inline_agent_thread_line(
 ) -> Line {
     let prefix_style = Style::new().fg(Color::Cyan).bg(Color::Rgb(18, 18, 18));
     let prefix = if body_line_index == 0 {
-        format!("   │ 🤖 Bcode · {} ", state.phase.label())
+        format!("   │ 🤖 Bcode · {} ", state.live_state_label())
     } else if body_line_index.saturating_add(1) == body_line_count {
         "   ╰─ answer ".to_string()
     } else {
