@@ -189,6 +189,7 @@ impl ReviewViewDocument {
         file_index: usize,
         drafts: impl Iterator<Item = (ReviewThreadAnchor, Vec<ReviewDraftComment>)>,
         agent_states: &BTreeMap<String, ReviewAgentThreadState>,
+        expanded_agent_answers: &BTreeSet<String>,
         collapsed_threads: &BTreeSet<String>,
         resolved_threads: &BTreeSet<String>,
         show_resolved_threads: bool,
@@ -253,7 +254,10 @@ impl ReviewViewDocument {
                     }
                 }
                 if let Some(agent_state) = agent_states.get(&thread_key) {
-                    let body_line_count = agent_thread_visible_line_count(agent_state);
+                    let body_line_count = agent_thread_visible_line_count(
+                        agent_state,
+                        expanded_agent_answers.contains(&thread_key),
+                    );
                     for body_line_index in 0..body_line_count {
                         rows.push(ReviewViewRow {
                             visual_row: 0,
@@ -491,12 +495,18 @@ pub enum ReviewViewBlock {
     },
 }
 
-fn agent_thread_visible_line_count(state: &ReviewAgentThreadState) -> usize {
+fn agent_thread_visible_line_count(state: &ReviewAgentThreadState, expanded: bool) -> usize {
     let activity_count = usize::from(state.activity.is_some());
     if state.answer.trim().is_empty() {
         1 + activity_count
     } else {
-        1 + activity_count + state.answer.lines().count().clamp(1, 4)
+        let answer_lines = state.answer.lines().count();
+        1 + activity_count
+            + if expanded {
+                answer_lines.max(1)
+            } else {
+                answer_lines.clamp(1, 4)
+            }
     }
 }
 
@@ -513,6 +523,8 @@ pub enum ReviewThreadAction {
     AskBcode,
     /// Ask a follow-up in the linked Bcode session.
     FollowUp,
+    /// Toggle full/compact display for the selected linked Bcode answer.
+    ToggleAnswer,
     /// Convert the latest Bcode answer into a draft comment.
     DraftAnswer,
     /// Open the linked Bcode session.
@@ -541,6 +553,7 @@ impl ReviewThreadAction {
             actions.push(Self::AskBcode);
         }
         if has_agent_answer {
+            actions.push(Self::ToggleAnswer);
             actions.push(Self::DraftAnswer);
         }
         actions.push(Self::Publish);
@@ -562,6 +575,7 @@ impl ReviewThreadAction {
             Self::AskBcode => "ask",
             Self::FollowUp => "follow-up",
             Self::OpenSession => "open-session",
+            Self::ToggleAnswer => "toggle-answer",
             Self::DraftAnswer => "draft-answer",
             Self::Publish => "publish",
             Self::Resolve => "resolve",
@@ -578,6 +592,7 @@ impl ReviewThreadAction {
             Self::Delete => "D",
             Self::AskBcode | Self::FollowUp => "a",
             Self::OpenSession => "o",
+            Self::ToggleAnswer => "A",
             Self::DraftAnswer => "m",
             Self::Publish => "x",
             Self::Resolve | Self::Reopen => "r",
@@ -594,6 +609,7 @@ impl ReviewThreadAction {
             Self::AskBcode => "ask Bcode",
             Self::FollowUp => "ask follow-up",
             Self::OpenSession => "open session",
+            Self::ToggleAnswer => "expand answer",
             Self::DraftAnswer => "draft answer",
             Self::Publish => "publish",
             Self::Resolve => "resolve",
@@ -611,6 +627,7 @@ impl ReviewThreadAction {
             b"ask" => Some(Self::AskBcode),
             b"follow-up" => Some(Self::FollowUp),
             b"open-session" => Some(Self::OpenSession),
+            b"toggle-answer" => Some(Self::ToggleAnswer),
             b"draft-answer" => Some(Self::DraftAnswer),
             b"publish" => Some(Self::Publish),
             b"resolve" => Some(Self::Resolve),

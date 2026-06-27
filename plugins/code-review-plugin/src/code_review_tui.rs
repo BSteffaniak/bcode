@@ -1827,6 +1827,7 @@ fn handle_review_navigation_key(app: &mut ReviewApp, key: KeyCode) -> bool {
             }
         }
         KeyCode::Char('a') => app.open_comment_editor_with_action(ReviewCommentAction::AskBcode),
+        KeyCode::Char('A') => app.toggle_selected_agent_answer_expanded(),
         KeyCode::Char('m') => app.convert_agent_answer_to_draft_at_selection(),
         KeyCode::Char('o') => app.open_linked_session_at_selection(),
         KeyCode::Char('?') => {
@@ -3892,6 +3893,7 @@ struct ReviewViewDocumentCacheKey {
     repository_review: bool,
     file_signature: String,
     draft_signature: String,
+    expanded_agent_answers: Vec<String>,
     collapsed_threads: Vec<String>,
     resolved_threads: Vec<String>,
     expanded_contexts: Vec<(DiffContextKey, DiffContextLoadState)>,
@@ -3999,6 +4001,8 @@ pub struct ReviewApp {
     pub selected_view_target: Option<ReviewViewTarget>,
     /// Collapsed inline review thread keys.
     pub collapsed_review_threads: BTreeSet<String>,
+    /// Linked Bcode answer thread keys expanded beyond the compact preview.
+    pub expanded_agent_answers: BTreeSet<String>,
     /// Locally resolved inline review thread keys.
     pub resolved_review_threads: BTreeSet<String>,
     /// Whether resolved inline review threads are visible.
@@ -4069,6 +4073,7 @@ impl ReviewApp {
             mouse_range_selection_dragged: false,
             selected_view_target: None,
             collapsed_review_threads: BTreeSet::new(),
+            expanded_agent_answers: BTreeSet::new(),
             resolved_review_threads: BTreeSet::new(),
             show_resolved_threads: true,
             hide_viewed_files: false,
@@ -7767,6 +7772,31 @@ impl ReviewApp {
             .as_deref()
     }
 
+    /// Toggle full/compact rendering for the selected linked Bcode answer.
+    pub fn toggle_selected_agent_answer_expanded(&mut self) -> bool {
+        let Some(anchor) = self.selected_comment_anchor() else {
+            self.status_message = Some("select a linked Bcode answer to expand".to_string());
+            return true;
+        };
+        let Some(state) = self.agent_state_for_anchor(&anchor) else {
+            self.status_message = Some("selected thread has no Bcode answer".to_string());
+            return true;
+        };
+        if state.answer.trim().is_empty() {
+            self.status_message = Some("selected Bcode thread has no answer yet".to_string());
+            return true;
+        }
+        let thread_key = Self::thread_key_for_anchor(&anchor);
+        if self.expanded_agent_answers.remove(&thread_key) {
+            self.status_message = Some("collapsed Bcode answer preview".to_string());
+        } else {
+            self.expanded_agent_answers.insert(thread_key);
+            self.status_message = Some("expanded full Bcode answer".to_string());
+        }
+        self.ensure_selected_diff_line_visible();
+        true
+    }
+
     /// Convert the latest visible Bcode answer at the selected thread into a draft comment.
     pub fn convert_agent_answer_to_draft_at_selection(&mut self) -> bool {
         let Some(anchor) = self.selected_comment_anchor() else {
@@ -8619,6 +8649,7 @@ impl ReviewApp {
                 self.ask_bcode_about_selection()
             }
             Some(ReviewThreadAction::OpenSession) => self.open_linked_session_at_selection(),
+            Some(ReviewThreadAction::ToggleAnswer) => self.toggle_selected_agent_answer_expanded(),
             Some(ReviewThreadAction::DraftAnswer) => {
                 self.convert_agent_answer_to_draft_at_selection()
             }
@@ -9330,6 +9361,7 @@ impl ReviewApp {
                 )
             }),
             &self.agent_thread_states,
+            &self.expanded_agent_answers,
             &self.collapsed_review_threads,
             &self.resolved_review_threads,
             self.show_resolved_threads,
@@ -9420,6 +9452,7 @@ impl ReviewApp {
             repository_review: self.review.is_repository_review(),
             file_signature,
             draft_signature,
+            expanded_agent_answers: self.expanded_agent_answers.iter().cloned().collect(),
             collapsed_threads: self.collapsed_review_threads.iter().cloned().collect(),
             resolved_threads: self.resolved_review_threads.iter().cloned().collect(),
             expanded_contexts: self
