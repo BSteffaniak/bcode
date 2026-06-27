@@ -145,18 +145,18 @@ async fn dispatch_plugin_command<W: Write>(
         chat.app.set_status(message);
     }
     for effect in command_response.effects {
-        apply_command_effect(io, services, chat, &plugin_id, effect);
+        apply_command_effect(io, services, chat, &plugin_id, effect).await?;
     }
     Ok(())
 }
 
-fn apply_command_effect<W: Write>(
-    _io: &mut TuiIo<'_, '_, W>,
+async fn apply_command_effect<W: Write>(
+    io: &mut TuiIo<'_, '_, W>,
     _services: &TuiServices<'_>,
     chat: &mut ActiveChat,
     plugin_id: &str,
     effect: CommandEffect,
-) {
+) -> Result<(), TuiError> {
     match effect {
         CommandEffect::Status { message } => chat.app.set_status(message),
         CommandEffect::AppendText { text } => chat.app.push_system_note(text),
@@ -165,10 +165,56 @@ fn apply_command_effect<W: Write>(
             surface_kind,
             instance_id,
             options,
-        } => chat.app.set_status(format!(
-            "plugin surface {surface_kind} from {plugin_id} requested for {instance_id}: {options}"
-        )),
+        } => {
+            open_command_plugin_surface(io, chat, plugin_id, surface_kind, instance_id, options)
+                .await?;
+        }
     }
+    Ok(())
+}
+
+async fn open_command_plugin_surface<W: Write>(
+    io: &mut TuiIo<'_, '_, W>,
+    chat: &ActiveChat,
+    plugin_id: &str,
+    surface_kind: String,
+    instance_id: String,
+    options: serde_json::Value,
+) -> Result<(), TuiError> {
+    let runtime = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        &bcode_plugin::PluginSelection::all_enabled(),
+        &crate::static_bundled_plugins(),
+    )
+    .map_err(|error| TuiError::PluginService {
+        code: "plugin_runtime_load_failed".to_string(),
+        message: error.to_string(),
+    })?;
+    let mut surface = crate::plugin_tui::open_plugin_tui_surface(
+        &runtime,
+        plugin_id,
+        &surface_kind,
+        bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest {
+            instance_id,
+            repo_path: chat
+                .app
+                .working_directory()
+                .map(std::path::Path::to_path_buf),
+            target: None,
+            options,
+        },
+    )
+    .await
+    .map_err(|error| TuiError::PluginService {
+        code: "tui_surface_open_failed".to_string(),
+        message: error.to_string(),
+    })?;
+    let _outcome = crate::plugin_surface_host::run_plugin_surface_with_input(
+        io.terminal,
+        io.input,
+        surface.as_mut(),
+    )
+    .await?;
+    Ok(())
 }
 
 fn toggle_surface(chat: &mut ActiveChat, surface_id: &str) {
