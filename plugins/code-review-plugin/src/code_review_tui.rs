@@ -1827,6 +1827,7 @@ fn handle_review_navigation_key(app: &mut ReviewApp, key: KeyCode) -> bool {
             }
         }
         KeyCode::Char('a') => app.open_comment_editor_with_action(ReviewCommentAction::AskBcode),
+        KeyCode::Char('m') => app.convert_agent_answer_to_draft_at_selection(),
         KeyCode::Char('o') => app.open_linked_session_at_selection(),
         KeyCode::Char('?') => {
             app.help_visible = !app.help_visible;
@@ -7737,6 +7738,53 @@ impl ReviewApp {
             .as_deref()
     }
 
+    /// Convert the latest visible Bcode answer at the selected thread into a draft comment.
+    pub fn convert_agent_answer_to_draft_at_selection(&mut self) -> bool {
+        let Some(anchor) = self.selected_comment_anchor() else {
+            self.status_message = Some("select a linked Bcode thread with an answer".to_string());
+            return true;
+        };
+        let Some(state) = self.agent_state_for_anchor(&anchor) else {
+            self.status_message = Some("selected thread has no Bcode answer".to_string());
+            return true;
+        };
+        let answer = state.answer.trim().to_string();
+        let session_id = state.session_id.clone();
+        if answer.is_empty() {
+            self.status_message = Some("selected Bcode thread has no answer to draft".to_string());
+            return true;
+        }
+        if self
+            .draft_comments
+            .get(&anchor)
+            .is_some_and(|comments| comments.iter().any(|comment| comment.body.trim() == answer))
+        {
+            self.status_message = Some("Bcode answer is already a draft comment".to_string());
+            return true;
+        }
+        self.draft_comments
+            .entry(anchor.clone())
+            .or_default()
+            .push(ReviewDraftComment {
+                id: None,
+                body: answer.clone(),
+                persisted: false,
+                created_at_ms: None,
+                updated_at_ms: None,
+                session_id,
+                thread_kind: ReviewThreadKind::Note,
+                severity: ReviewThreadSeverity::Info,
+            });
+        self.pending_draft_save = Some(PendingDraftSave {
+            anchor,
+            body: answer,
+        });
+        self.sync_selected_thread_to_anchor();
+        let count = self.draft_comment_count();
+        self.status_message = Some(format!("drafted Bcode answer ({count} total)"));
+        true
+    }
+
     /// Mark the latest draft at an anchor as linked to a Bcode session.
     pub fn mark_thread_session(&mut self, anchor: &ReviewCommentAnchor, session_id: &str) {
         if let Some(comment) = self
@@ -8537,6 +8585,9 @@ impl ReviewApp {
             Some(ReviewThreadAction::Edit) => self.open_latest_draft_editor(),
             Some(ReviewThreadAction::Delete) => self.delete_latest_draft_at_selection(),
             Some(ReviewThreadAction::AskBcode) => self.ask_bcode_about_selection(),
+            Some(ReviewThreadAction::DraftAnswer) => {
+                self.convert_agent_answer_to_draft_at_selection()
+            }
             Some(ReviewThreadAction::Publish) => self.publish_review(),
             Some(ReviewThreadAction::Resolve) => self.resolve_selected_thread(),
             Some(ReviewThreadAction::Reopen) => self.reopen_selected_thread(),
@@ -10783,6 +10834,47 @@ mod tests {
         );
 
         assert_eq!(app.diagnostic_source_counts(), (1, 1, 1));
+    }
+
+    #[test]
+    fn converts_agent_answer_to_draft_comment() {
+        let mut app = sample_app();
+        app.selected_diff_line = 2;
+        assert!(app.open_comment_editor());
+        app.comment_editor
+            .as_mut()
+            .expect("editor should open")
+            .buffer
+            .insert_str("Can Bcode check this?");
+        assert!(app.save_comment_editor());
+        let anchor = app.selected_comment_anchor().expect("anchor");
+        app.mark_thread_session(&anchor, &SessionId::new().to_string());
+        let key = ReviewApp::thread_key_for_anchor(&anchor);
+        app.agent_thread_states.insert(
+            key,
+            ReviewAgentThreadState {
+                phase: ReviewAgentThreadPhase::Complete,
+                session_id: app.session_id_for_anchor(&anchor).map(ToString::to_string),
+                question: "Can Bcode check this?".to_string(),
+                status: "answered".to_string(),
+                answer: "Use a clearer error message.".to_string(),
+                error: None,
+            },
+        );
+
+        assert!(app.convert_agent_answer_to_draft_at_selection());
+
+        let comments = app.draft_comments.get(&anchor).expect("comments");
+        assert_eq!(
+            comments.last().map(|comment| comment.body.as_str()),
+            Some("Use a clearer error message.")
+        );
+        assert_eq!(
+            app.take_pending_draft_save()
+                .expect("draft save should be pending")
+                .body,
+            "Use a clearer error message."
+        );
     }
 
     #[test]
