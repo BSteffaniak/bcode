@@ -1163,6 +1163,9 @@ enum LoginCommand {
         vault: Option<PathBuf>,
         #[arg(long)]
         recipient_key: Option<String>,
+        /// Do not bind saved credentials to this device.
+        #[arg(long)]
+        no_device_seal: bool,
         #[arg(long)]
         model: Option<String>,
     },
@@ -1180,6 +1183,9 @@ enum LoginCommand {
         vault: Option<PathBuf>,
         #[arg(long)]
         recipient_key: Option<String>,
+        /// Do not bind saved credentials to this device.
+        #[arg(long)]
+        no_device_seal: bool,
         #[arg(long)]
         model: Option<String>,
     },
@@ -2284,6 +2290,7 @@ async fn handle_login_command(command: LoginCommand) -> Result<(), CliError> {
             profile,
             vault,
             recipient_key,
+            no_device_seal,
             model,
         } => {
             login_openai(OpenAiLoginOptions {
@@ -2306,6 +2313,7 @@ async fn handle_login_command(command: LoginCommand) -> Result<(), CliError> {
                 profile,
                 vault,
                 recipient_key,
+                no_device_seal,
                 model,
             })
             .await?;
@@ -2316,6 +2324,7 @@ async fn handle_login_command(command: LoginCommand) -> Result<(), CliError> {
             profile,
             vault,
             recipient_key,
+            no_device_seal,
             model,
         } => {
             login_xai(XaiLoginOptions {
@@ -2324,6 +2333,7 @@ async fn handle_login_command(command: LoginCommand) -> Result<(), CliError> {
                 profile,
                 vault,
                 recipient_key,
+                no_device_seal,
                 model,
             })?;
         }
@@ -2338,6 +2348,7 @@ struct OpenAiLoginOptions {
     profile: Option<String>,
     vault: Option<PathBuf>,
     recipient_key: Option<String>,
+    no_device_seal: bool,
     model: Option<String>,
 }
 
@@ -2370,6 +2381,7 @@ struct XaiLoginOptions {
     profile: Option<String>,
     vault: Option<PathBuf>,
     recipient_key: Option<String>,
+    no_device_seal: bool,
     model: Option<String>,
 }
 
@@ -2381,7 +2393,7 @@ async fn login_openai(options: OpenAiLoginOptions) -> Result<(), CliError> {
             "`bcode login openai --add-subscription` adds ChatGPT subscription OAuth accounts; API-key pooled auth is not supported yet. Remove --api-key/--base-url or omit --add-subscription.".to_string(),
         ));
     }
-    let target = if options.mode.auth.is_add_subscription() {
+    let mut target = if options.mode.auth.is_add_subscription() {
         resolve_add_subscription_login_target(options.profile.clone(), options.vault.clone())
     } else {
         resolve_login_target(
@@ -2391,6 +2403,9 @@ async fn login_openai(options: OpenAiLoginOptions) -> Result<(), CliError> {
             options.recipient_key.as_deref(),
         )?
     };
+    if options.no_device_seal {
+        target.device_seal_policy = bcode_provider_auth::security::AuthDeviceSealPolicy::Off;
+    }
     let store = open_auth_store(&target.vault_path)?;
     if options.api_key.is_some() || (options.base_url.is_some() && !options.mode.auth.is_chatgpt())
     {
@@ -2944,12 +2959,15 @@ fn login_openai_api_key(
 }
 
 fn login_xai(options: XaiLoginOptions) -> Result<(), CliError> {
-    let target = resolve_login_target(
+    let mut target = resolve_login_target(
         LoginProvider::Xai,
         options.profile,
         options.vault,
         options.recipient_key.as_deref(),
     )?;
+    if options.no_device_seal {
+        target.device_seal_policy = bcode_provider_auth::security::AuthDeviceSealPolicy::Off;
+    }
     let store = open_auth_store(&target.vault_path)?;
     login_compatible_api_key(
         &store,
