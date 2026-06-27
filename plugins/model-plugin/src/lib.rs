@@ -242,14 +242,70 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for ModelCommandSurface {
 
 fn model_surface_lines(surface_kind: &str) -> Vec<String> {
     match surface_kind {
-        "model.status" => vec!["Model status is owned by the model plugin.".to_string()],
-        "model.serverStatus" => {
-            vec!["Server model status is owned by the model plugin.".to_string()]
-        }
-        "runtime.status" => vec!["Runtime status is owned by the model plugin.".to_string()],
-        "model.select" => vec!["Model selection is owned by the model plugin.".to_string()],
+        "model.status" => model_status_lines(false),
+        "model.serverStatus" => model_status_lines(true),
+        "runtime.status" => vec![
+            "Runtime status requires live host runtime query plumbing.".to_string(),
+            "The model plugin owns this surface; host data access remains generic.".to_string(),
+        ],
+        "model.select" => model_select_lines(),
         _ => vec!["Model command surface".to_string()],
     }
+}
+
+fn model_status_lines(server_defaults: bool) -> Vec<String> {
+    let config = match bcode_config::load_config() {
+        Ok(config) => config,
+        Err(error) => return vec![format!("model config unavailable: {error}")],
+    };
+    let provider = config
+        .model
+        .provider_plugin_id
+        .as_deref()
+        .unwrap_or("default provider");
+    let model = config.model.model_id.as_deref().unwrap_or("default model");
+    let mut lines = vec![if server_defaults {
+        "Server default model configuration".to_string()
+    } else {
+        "Configured model status".to_string()
+    }];
+    lines.push(format!("Provider: {provider}"));
+    lines.push(format!("Model: {model}"));
+    if let Some(profile) = &config.model.profile {
+        lines.push(format!("Profile: {profile}"));
+    }
+    if let Some(thinking) = config.model.default_thinking_level {
+        lines.push(format!("Default thinking: {thinking:?}"));
+    }
+    lines.push(format!("Profiles: {}", config.model.profiles.len()));
+    lines.push(format!("Aliases: {}", config.model.aliases.len()));
+    lines
+}
+
+fn model_select_lines() -> Vec<String> {
+    let config = match bcode_config::load_config() {
+        Ok(config) => config,
+        Err(error) => return vec![format!("model config unavailable: {error}")],
+    };
+    let mut lines = vec!["Configured model choices".to_string()];
+    lines.extend(
+        config
+            .model
+            .aliases
+            .keys()
+            .map(|alias| format!("* alias: {alias}")),
+    );
+    lines.extend(
+        config
+            .model
+            .profiles
+            .keys()
+            .map(|profile| format!("* profile: {profile}")),
+    );
+    if lines.len() == 1 {
+        lines.push("No aliases or profiles configured.".to_string());
+    }
+    lines
 }
 
 fn write_line(frame: &mut Frame<'_>, area: Rect, y: u16, line: impl Into<Line>) {

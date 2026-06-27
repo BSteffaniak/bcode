@@ -1677,6 +1677,7 @@ name = "bcode_model_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_command",
+ "bcode_config",
  "bcode_plugin_sdk",
  "bmux_keyboard",
  "bmux_tui",
