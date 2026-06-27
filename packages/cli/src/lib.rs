@@ -29,7 +29,7 @@ use bcode_session_models::{
     SessionHistoryQuery, SessionId,
 };
 use bcode_settings::SettingsStore;
-use bcode_skill_models::{SkillToolDecision, SkillToolDecisionState};
+use bcode_skill_models::{SkillToolDecision, SkillToolDecisionEntry};
 use bcode_worktree_models::{
     WorktreeBaseRef, WorktreeCreateRequest, WorktreeListRequest, WorktreeRemoveRequest,
 };
@@ -479,13 +479,19 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
 fn handle_skill_command(command: &SkillCommand) -> Result<(), CliError> {
     let store = SettingsStore::default();
     match command {
-        SkillCommand::Decisions => {
+        SkillCommand::Decisions { json, skill, tool } => {
             let state = store.skill_tool_decisions()?;
-            if state.decisions.is_empty() {
+            let decisions =
+                filtered_skill_tool_decisions(state.decisions, skill.as_deref(), tool.as_deref());
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&decisions)?);
+                return Ok(());
+            }
+            if decisions.is_empty() {
                 println!("no remembered skill tool decisions");
                 return Ok(());
             }
-            for entry in state.decisions {
+            for entry in decisions {
                 let decision = match entry.decision {
                     SkillToolDecision::Allow => "allow",
                     SkillToolDecision::Deny => "deny",
@@ -503,15 +509,45 @@ fn handle_skill_command(command: &SkillCommand) -> Result<(), CliError> {
                 );
             }
         }
-        SkillCommand::ClearDecisions => {
-            store.save_skill_tool_decisions(
-                &SkillToolDecisionState::default(),
-                cli_current_time_ms(),
-            )?;
-            println!("cleared remembered skill tool decisions");
+        SkillCommand::ClearDecisions { skill, tool } => {
+            let mut state = store.skill_tool_decisions()?;
+            let before = state.decisions.len();
+            state.decisions.retain(|entry| {
+                !skill_tool_decision_matches(entry, skill.as_deref(), tool.as_deref())
+            });
+            let cleared = before.saturating_sub(state.decisions.len());
+            store.save_skill_tool_decisions(&state, cli_current_time_ms())?;
+            println!("cleared {cleared} remembered skill tool decisions");
         }
     }
     Ok(())
+}
+
+fn filtered_skill_tool_decisions(
+    decisions: Vec<SkillToolDecisionEntry>,
+    skill: Option<&str>,
+    tool: Option<&str>,
+) -> Vec<SkillToolDecisionEntry> {
+    decisions
+        .into_iter()
+        .filter(|entry| skill_tool_decision_matches(entry, skill, tool))
+        .collect()
+}
+
+fn skill_tool_decision_matches(
+    entry: &SkillToolDecisionEntry,
+    skill: Option<&str>,
+    tool: Option<&str>,
+) -> bool {
+    let skill_matches = skill.is_none_or(|skill| {
+        entry
+            .key
+            .skill_ids
+            .iter()
+            .any(|skill_id| skill_id.as_str() == skill)
+    });
+    let tool_matches = tool.is_none_or(|tool| entry.key.tool_name == tool);
+    skill_matches && tool_matches
 }
 
 fn cli_current_time_ms() -> u64 {
@@ -1230,9 +1266,26 @@ enum OpenAiLoginFlow {
 #[derive(Debug, Subcommand)]
 enum SkillCommand {
     /// List remembered skill tool decisions.
-    Decisions,
-    /// Clear all remembered skill tool decisions.
-    ClearDecisions,
+    Decisions {
+        /// Emit JSON instead of tab-separated text.
+        #[arg(long)]
+        json: bool,
+        /// Only include decisions matching this skill ID.
+        #[arg(long)]
+        skill: Option<String>,
+        /// Only include decisions matching this tool name.
+        #[arg(long)]
+        tool: Option<String>,
+    },
+    /// Clear remembered skill tool decisions.
+    ClearDecisions {
+        /// Only clear decisions matching this skill ID.
+        #[arg(long)]
+        skill: Option<String>,
+        /// Only clear decisions matching this tool name.
+        #[arg(long)]
+        tool: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

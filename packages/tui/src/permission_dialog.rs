@@ -28,14 +28,15 @@ impl PermissionDialogState {
     /// Return whether the focused action should remember the policy decision.
     #[must_use]
     pub const fn focused_remember(&self) -> bool {
-        self.permission.can_remember_policy && self.focused_action == 1
+        self.permission.can_remember_policy
+            && (self.focused_action == 1 || self.focused_action == 3)
     }
 
     /// Return the currently focused action approval value.
     #[must_use]
     pub const fn focused_approval(&self) -> bool {
         if self.permission.can_remember_policy {
-            self.focused_action != 2
+            self.focused_action < 2
         } else {
             self.focused_action == 0
         }
@@ -47,6 +48,8 @@ impl PermissionDialogState {
         match (self.permission.can_remember_policy, self.focused_action) {
             (true, 0) => "approve once",
             (true, 1) => "remember allow",
+            (true, 2) => "deny once",
+            (true, 3) => "remember deny",
             (false, 0) => "approve",
             (true | false, _) => "deny",
         }
@@ -68,7 +71,7 @@ impl PermissionDialogState {
 
     const fn action_count(&self) -> usize {
         if self.permission.can_remember_policy {
-            3
+            4
         } else {
             2
         }
@@ -112,7 +115,7 @@ mod tests {
     }
 
     #[test]
-    fn action_cycle_with_remember_uses_three_actions() {
+    fn action_cycle_with_remember_uses_four_actions() {
         let mut dialog = PermissionDialogState::new(permission(true));
 
         assert_eq!(dialog.focused_label(), "approve once");
@@ -123,8 +126,12 @@ mod tests {
         assert!(dialog.focused_approval());
         assert!(dialog.focused_remember());
         dialog.focus_next();
-        assert_eq!(dialog.focused_label(), "deny");
+        assert_eq!(dialog.focused_label(), "deny once");
         assert!(!dialog.focused_approval());
         assert!(!dialog.focused_remember());
+        dialog.focus_next();
+        assert_eq!(dialog.focused_label(), "remember deny");
+        assert!(!dialog.focused_approval());
+        assert!(dialog.focused_remember());
     }
 }

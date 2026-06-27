@@ -235,7 +235,8 @@ fn render_actions(state: &PermissionDialogState, content: Rect, frame: &mut Fram
         match (state.focused_approval(), state.focused_remember()) {
             (true, false) => 0,
             (true, true) => 1,
-            (false, _) => 2,
+            (false, false) => 2,
+            (false, true) => 3,
         }
     } else {
         usize::from(!state.focused_approval())
@@ -256,7 +257,8 @@ fn action_buttons(can_remember_policy: bool) -> Vec<ActionButton> {
         vec![
             ActionButton::new("approve_once", "Approve once"),
             ActionButton::new("remember_allow", "Remember allow"),
-            ActionButton::new("deny", "Deny"),
+            ActionButton::new("deny_once", "Deny once"),
+            ActionButton::new("remember_deny", "Remember deny"),
         ]
     } else {
         vec![
