@@ -3051,6 +3051,8 @@ pub struct ReviewAgentThreadState {
     pub status: String,
     /// Latest assistant answer preview.
     pub answer: String,
+    /// Latest stream warning, such as dropped live updates.
+    pub stream_warning: Option<String>,
     /// Latest compact tool/progress activity.
     pub activity: Option<String>,
     /// Last failure message.
@@ -3067,6 +3069,7 @@ impl ReviewAgentThreadState {
             question,
             status: "looking into this…".to_string(),
             answer: String::new(),
+            stream_warning: None,
             activity: None,
             error: None,
         }
@@ -3204,6 +3207,7 @@ pub struct ReviewAgentSessionStreamState {
     active_turn_id: Option<String>,
     phase: ReviewAgentThreadPhase,
     status: String,
+    stream_warning: Option<String>,
     activity: Option<String>,
     error: Option<String>,
 }
@@ -3217,6 +3221,7 @@ impl Default for ReviewAgentSessionStreamState {
             active_turn_id: None,
             phase: ReviewAgentThreadPhase::Running,
             status: "running".to_string(),
+            stream_warning: None,
             activity: None,
             error: None,
         }
@@ -3236,8 +3241,10 @@ impl ReviewAgentSessionStreamState {
             PluginSessionEvent::Session(event) => self.apply_durable_event(event),
             PluginSessionEvent::SessionLive(event) => self.apply_live_event(event.kind),
             PluginSessionEvent::Lagged { dropped_count } => {
-                self.status = format!("live updates lagged; dropped {dropped_count} events");
-                self.activity = Some(format!("dropped {dropped_count} live updates"));
+                let warning = format!("dropped {dropped_count} live updates");
+                self.status = format!("live updates lagged; {warning}");
+                self.stream_warning = Some(warning.clone());
+                self.activity = Some(warning);
                 true
             }
             PluginSessionEvent::Disconnected { message } => {
@@ -7812,6 +7819,7 @@ impl ReviewApp {
         state.session_id = Some(session_id.clone());
         state.phase = ReviewAgentThreadPhase::Running;
         state.status = "reconnecting linked session stream…".to_string();
+        state.stream_warning = None;
         state.activity = Some("reconnecting stream".to_string());
         state.error = None;
         self.touch_agent_state();
@@ -7962,6 +7970,7 @@ impl ReviewApp {
             if state.session_id.as_deref() != Some(session_id)
                 || state.phase != stream_state.phase
                 || state.status != stream_state.status
+                || state.stream_warning != stream_state.stream_warning
                 || state.activity != stream_state.activity
                 || state.answer != answer
                 || state.error != stream_state.error
@@ -7969,6 +7978,9 @@ impl ReviewApp {
                 state.session_id = Some(session_id.to_string());
                 state.phase = stream_state.phase;
                 state.status.clone_from(&stream_state.status);
+                state
+                    .stream_warning
+                    .clone_from(&stream_state.stream_warning);
                 state.activity.clone_from(&stream_state.activity);
                 state.answer = answer;
                 state.error.clone_from(&stream_state.error);
@@ -10975,6 +10987,7 @@ mod tests {
                 question: "Can Bcode check this?".to_string(),
                 status: "answered".to_string(),
                 answer: "Use a clearer error message.".to_string(),
+                stream_warning: None,
                 activity: None,
                 error: None,
             },

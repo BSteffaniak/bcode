@@ -945,9 +945,16 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             let kind = review_thread_kind_label(thread.thread_kind);
             let severity = review_thread_severity_label(thread.severity);
             let path_label = thread.anchor.scope_label();
-            let agent_status = app
-                .agent_status_for_anchor(&thread.anchor)
-                .map_or(String::new(), |status| format!("  🤖 {status}"));
+            let agent_status =
+                app.agent_state_for_anchor(&thread.anchor)
+                    .map_or_else(String::new, |state| {
+                        let warning = if state.stream_warning.is_some() {
+                            " ⚠"
+                        } else {
+                            ""
+                        };
+                        format!("  🤖 {}{warning}", state.live_state_label())
+                    });
             let text = format!(
                 " {marker} {status} {kind}/{severity} {path_label} {line_label} x{}  {body}{agent_status}",
                 thread.draft_count
@@ -1681,13 +1688,20 @@ fn render_inline_agent_thread_line(
     style: Style,
 ) -> Line {
     let prefix_style = Style::new().fg(Color::Cyan).bg(Color::Rgb(18, 18, 18));
+    let has_warning = state
+        .stream_warning
+        .as_ref()
+        .is_some_and(|text| !text.is_empty());
     let has_activity = state.activity.as_ref().is_some_and(|text| !text.is_empty());
     let answer_line_index = body_line_index
         .saturating_sub(1)
+        .saturating_sub(usize::from(has_warning))
         .saturating_sub(usize::from(has_activity));
     let prefix = if body_line_index == 0 {
         format!("   │ 🤖 Bcode · {} ", state.live_state_label())
-    } else if has_activity && body_line_index == 1 {
+    } else if has_warning && body_line_index == 1 {
+        "   │  ⚠ stream ".to_string()
+    } else if has_activity && body_line_index == 1 + usize::from(has_warning) {
         "   │  activity ".to_string()
     } else if body_line_index.saturating_add(1) == body_line_count {
         "   ╰─ answer ".to_string()
@@ -1699,7 +1713,9 @@ fn render_inline_agent_thread_line(
             .error
             .as_ref()
             .map_or(state.status.as_str(), String::as_str)
-    } else if has_activity && body_line_index == 1 {
+    } else if has_warning && body_line_index == 1 {
+        state.stream_warning.as_deref().unwrap_or_default()
+    } else if has_activity && body_line_index == 1 + usize::from(has_warning) {
         state.activity.as_deref().unwrap_or_default()
     } else {
         state
