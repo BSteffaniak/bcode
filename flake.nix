@@ -24,7 +24,8 @@
             cargo
             rustfmt
             clippy
-            nodePackages.markdownlint-cli
+            cmake
+            markdownlint-cli
             pkg-config
             openssl
             fish
