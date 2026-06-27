@@ -167,7 +167,7 @@ impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for ModelCommandSurfaceFacto
 
     fn open(
         &self,
-        _request: bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest,
+        request: bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest,
     ) -> bcode_plugin_sdk::tui::PluginTuiSurfaceFuture {
         let surface_kind = self.surface_kind;
         let title = self.title;
@@ -175,7 +175,7 @@ impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for ModelCommandSurfaceFacto
             Ok(Box::new(ModelCommandSurface {
                 id: surface_kind,
                 title,
-                lines: model_surface_lines(surface_kind),
+                lines: model_surface_lines(surface_kind, &request.options),
             })
                 as bcode_plugin_sdk::tui::BoxedPluginTuiSurface)
         })
@@ -240,20 +240,91 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for ModelCommandSurface {
     }
 }
 
-fn model_surface_lines(surface_kind: &str) -> Vec<String> {
+fn model_surface_lines(surface_kind: &str, options: &serde_json::Value) -> Vec<String> {
     match surface_kind {
-        "model.status" => model_status_lines(false),
-        "model.serverStatus" => model_status_lines(true),
-        "runtime.status" => vec![
-            "Runtime status requires live host runtime query plumbing.".to_string(),
-            "The model plugin owns this surface; host data access remains generic.".to_string(),
-        ],
+        "model.status" => model_status_lines(options, false),
+        "model.serverStatus" => model_status_lines(options, true),
+        "runtime.status" => runtime_status_lines(options),
         "model.select" => model_select_lines(),
         _ => vec!["Model command surface".to_string()],
     }
 }
 
-fn model_status_lines(server_defaults: bool) -> Vec<String> {
+fn runtime_status_lines(options: &serde_json::Value) -> Vec<String> {
+    let Some(status) = options.get("server_status") else {
+        return vec!["Runtime status unavailable.".to_string()];
+    };
+    let mut lines = vec!["Runtime status".to_string()];
+    if let Some(version) = status.get("version").and_then(serde_json::Value::as_str) {
+        lines.push(format!("Version: {version}"));
+    }
+    if let Some(uptime) = status.get("uptime_ms").and_then(serde_json::Value::as_u64) {
+        lines.push(format!("Uptime: {uptime} ms"));
+    }
+    if let Some(plugins) = status
+        .get("plugin_runtime")
+        .and_then(serde_json::Value::as_array)
+    {
+        let running = plugins
+            .iter()
+            .filter_map(|plugin| plugin.get("running").and_then(serde_json::Value::as_u64))
+            .sum::<u64>();
+        let queued = plugins
+            .iter()
+            .filter_map(|plugin| plugin.get("queued").and_then(serde_json::Value::as_u64))
+            .sum::<u64>();
+        lines.push(format!("Plugin work: {running} running, {queued} queued"));
+        lines.extend(plugins.iter().filter_map(|plugin| {
+            let plugin_id = plugin.get("plugin_id")?.as_str()?;
+            let running = plugin.get("running")?.as_u64()?;
+            let queued = plugin.get("queued")?.as_u64()?;
+            (running > 0 || queued > 0)
+                .then(|| format!("* {plugin_id}: {running} running, {queued} queued"))
+        }));
+    }
+    lines
+}
+
+fn model_status_lines(options: &serde_json::Value, server_defaults: bool) -> Vec<String> {
+    let hydrated = options
+        .get(if server_defaults {
+            "default_model_status"
+        } else {
+            "session_model_status"
+        })
+        .or_else(|| options.get("default_model_status"));
+    if let Some(status) = hydrated {
+        let provider = status
+            .get("provider_plugin_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("default provider");
+        let model = status
+            .get("model_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("default model");
+        let mut lines = vec![if server_defaults {
+            "Server default model status".to_string()
+        } else {
+            "Session model status".to_string()
+        }];
+        lines.push(format!("Provider: {provider}"));
+        lines.push(format!("Model: {model}"));
+        for key in [
+            "context_window",
+            "max_output_tokens",
+            "reasoning_effort",
+            "reasoning_summary",
+            "prompt_cache_mode",
+            "conversation_reuse_mode",
+            "compaction_mode",
+        ] {
+            if let Some(value) = status.get(key).filter(|value| !value.is_null()) {
+                lines.push(format!("{key}: {value}"));
+            }
+        }
+        return lines;
+    }
+
     let config = match bcode_config::load_config() {
         Ok(config) => config,
         Err(error) => return vec![format!("model config unavailable: {error}")],

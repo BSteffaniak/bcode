@@ -152,7 +152,7 @@ async fn dispatch_plugin_command<W: Write>(
 
 async fn apply_command_effect<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
-    _services: &TuiServices<'_>,
+    services: &TuiServices<'_>,
     chat: &mut ActiveChat,
     plugin_id: &str,
     effect: CommandEffect,
@@ -166,8 +166,16 @@ async fn apply_command_effect<W: Write>(
             instance_id,
             options,
         } => {
-            open_command_plugin_surface(io, chat, plugin_id, surface_kind, instance_id, options)
-                .await?;
+            open_command_plugin_surface(
+                io,
+                services,
+                chat,
+                plugin_id,
+                surface_kind,
+                instance_id,
+                options,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -175,12 +183,14 @@ async fn apply_command_effect<W: Write>(
 
 async fn open_command_plugin_surface<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
     chat: &mut ActiveChat,
     plugin_id: &str,
     surface_kind: String,
     instance_id: String,
     options: serde_json::Value,
 ) -> Result<(), TuiError> {
+    let options = hydrate_plugin_surface_options(services, chat, options).await;
     let runtime = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
         &bcode_plugin::PluginSelection::all_enabled(),
         &crate::static_bundled_plugins(),
@@ -216,6 +226,51 @@ async fn open_command_plugin_surface<W: Write>(
     .await?;
     apply_plugin_surface_outcome(chat, outcome);
     Ok(())
+}
+
+async fn hydrate_plugin_surface_options(
+    services: &TuiServices<'_>,
+    chat: &ActiveChat,
+    options: serde_json::Value,
+) -> serde_json::Value {
+    let mut map = match options {
+        serde_json::Value::Object(map) => map,
+        value => {
+            let mut map = serde_json::Map::new();
+            if !value.is_null() {
+                map.insert("command_options".to_string(), value);
+            }
+            map
+        }
+    };
+
+    if let Ok(status) = services.passive_client.default_model_status().await
+        && let Ok(value) = serde_json::to_value(status)
+    {
+        map.insert("default_model_status".to_string(), value);
+    }
+    if let Ok(status) = services.passive_client.server_status().await
+        && let Ok(value) = serde_json::to_value(status)
+    {
+        map.insert("server_status".to_string(), value);
+    }
+    if let Some(session_id) = chat.app.session_id() {
+        if let Ok(status) = services
+            .passive_client
+            .session_model_status(session_id)
+            .await
+            && let Ok(value) = serde_json::to_value(status)
+        {
+            map.insert("session_model_status".to_string(), value);
+        }
+        if let Ok(skills) = services.passive_client.active_skills(session_id).await
+            && let Ok(value) = serde_json::to_value(skills)
+        {
+            map.insert("active_skills".to_string(), value);
+        }
+    }
+
+    serde_json::Value::Object(map)
 }
 
 fn apply_plugin_surface_outcome(chat: &mut ActiveChat, outcome: Option<serde_json::Value>) {

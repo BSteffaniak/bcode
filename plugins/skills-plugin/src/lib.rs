@@ -147,7 +147,7 @@ impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for SkillsCommandSurfaceFact
 
     fn open(
         &self,
-        _request: bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest,
+        request: bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest,
     ) -> bcode_plugin_sdk::tui::PluginTuiSurfaceFuture {
         let surface_kind = self.surface_kind;
         let title = self.title;
@@ -155,7 +155,7 @@ impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for SkillsCommandSurfaceFact
             Ok(Box::new(SkillsCommandSurface {
                 id: surface_kind,
                 title,
-                lines: skills_surface_lines(surface_kind),
+                lines: skills_surface_lines(surface_kind, &request.options),
             })
                 as bcode_plugin_sdk::tui::BoxedPluginTuiSurface)
         })
@@ -220,16 +220,43 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for SkillsCommandSurface {
     }
 }
 
-fn skills_surface_lines(surface_kind: &str) -> Vec<String> {
+fn skills_surface_lines(surface_kind: &str, options: &serde_json::Value) -> Vec<String> {
     match surface_kind {
         "skills.list" => available_skills_lines(),
-        "skills.active" => vec![
-            "Active skills require a session runtime query.".to_string(),
-            "The skills plugin owns this surface; host session-query plumbing is still generic."
-                .to_string(),
-        ],
+        "skills.active" => active_skills_lines(options),
         _ => vec!["Skills command surface".to_string()],
     }
+}
+
+fn active_skills_lines(options: &serde_json::Value) -> Vec<String> {
+    let Some(skills) = options
+        .get("active_skills")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return vec!["No active session skills are available.".to_string()];
+    };
+    let mut lines = vec![format!("Active skills: {}", skills.len())];
+    lines.extend(skills.iter().filter_map(|skill| {
+        let skill_id = skill.get("skill_id")?.as_str()?;
+        let bytes_loaded = skill
+            .get("bytes_loaded")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        let source = skill
+            .get("source")
+            .and_then(|source| source.get("label"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown source");
+        let truncated = skill
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_default();
+        let suffix = if truncated { " truncated" } else { "" };
+        Some(format!(
+            "* {skill_id} — {bytes_loaded} bytes{suffix} from {source}"
+        ))
+    }));
+    lines
 }
 
 fn available_skills_lines() -> Vec<String> {
