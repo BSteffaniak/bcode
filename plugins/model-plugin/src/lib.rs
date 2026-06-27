@@ -4,8 +4,12 @@
 
 //! Bundled model and runtime command palette plugin for Bcode.
 
-use bcode_command::{CommandAction, CommandContribution, CommandOwner, CommandSurface};
+use bcode_command::{
+    COMMAND_INTERFACE_ID, CommandAction, CommandContribution, CommandEffect, CommandOwner,
+    CommandSurface, InvokeCommandRequest, InvokeCommandResponse, OP_INVOKE_COMMAND,
+};
 use bcode_plugin_sdk::prelude::*;
+use serde::Serialize;
 
 /// Bundled model command plugin.
 #[derive(Default)]
@@ -20,6 +24,52 @@ impl RustPlugin for ModelPlugin {
         }
         Ok(())
     }
+
+    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        if context.request.interface_id != COMMAND_INTERFACE_ID {
+            return ServiceResponse::error(
+                "unsupported_interface",
+                "unsupported model plugin service interface",
+            );
+        }
+        invoke_command_service(&context.request)
+    }
+}
+
+fn invoke_command_service(request: &ServiceRequest) -> ServiceResponse {
+    if request.operation != OP_INVOKE_COMMAND {
+        return ServiceResponse::error(
+            "unsupported_operation",
+            "unsupported model command operation",
+        );
+    }
+    let Ok(request) = serde_json::from_slice::<InvokeCommandRequest>(&request.payload) else {
+        return ServiceResponse::error(
+            "invalid_request",
+            "invalid model command invocation request",
+        );
+    };
+    match request.command_id.as_str() {
+        "model.status" | "model.serverStatus" | "runtime.status" | "model.select" => {
+            command_route_response(&request.command_id)
+        }
+        _ => ServiceResponse::error("unknown_command", "unknown model command"),
+    }
+}
+
+fn command_route_response(route: &str) -> ServiceResponse {
+    json_response(&InvokeCommandResponse {
+        success: true,
+        message: None,
+        updated_model: None,
+        updated_provider: None,
+        updated_thinking: None,
+        effects: vec![CommandEffect::OpenPluginSurface {
+            surface_kind: route.to_string(),
+            instance_id: route.to_string(),
+            options: serde_json::Value::Null,
+        }],
+    })
 }
 
 fn model_palette_command_contributions() -> Vec<CommandContribution> {
@@ -61,9 +111,17 @@ fn model_command(id: &str, title: &str, description: &str, category: &str) -> Co
         owner: CommandOwner::Plugin {
             plugin_id: "bcode.model".to_string(),
         },
-        action: CommandAction::Host {
-            route: id.to_string(),
+        action: CommandAction::Plugin {
+            plugin_id: "bcode.model".to_string(),
+            command_id: id.to_string(),
         },
+    }
+}
+
+fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
+    match ServiceResponse::json(value) {
+        Ok(response) => response,
+        Err(error) => ServiceResponse::error("encode_failed", error.to_string()),
     }
 }
 

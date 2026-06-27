@@ -4,7 +4,10 @@
 
 //! Bundled Git worktree tool plugin for Bcode.
 
-use bcode_command::{CommandAction, CommandContribution, CommandOwner, CommandSurface};
+use bcode_command::{
+    COMMAND_INTERFACE_ID, CommandAction, CommandContribution, CommandEffect, CommandOwner,
+    CommandSurface, InvokeCommandRequest, InvokeCommandResponse, OP_INVOKE_COMMAND,
+};
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
@@ -33,6 +36,7 @@ impl RustPlugin for WorktreePlugin {
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         match context.request.interface_id.as_str() {
             TOOL_SERVICE_INTERFACE_ID => invoke_tool_service(&context),
+            COMMAND_INTERFACE_ID => invoke_command_service(&context.request),
             _ => ServiceResponse::error(
                 "unsupported_interface",
                 "unsupported worktree plugin service interface",
@@ -76,8 +80,9 @@ fn worktree_command(id: &str, title: &str, description: &str) -> CommandContribu
         owner: CommandOwner::Plugin {
             plugin_id: "bcode.worktree".to_string(),
         },
-        action: CommandAction::Host {
-            route: id.to_string(),
+        action: CommandAction::Plugin {
+            plugin_id: "bcode.worktree".to_string(),
+            command_id: id.to_string(),
         },
     }
 }
@@ -92,6 +97,43 @@ fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
             "unsupported worktree tool service operation",
         ),
     }
+}
+
+fn invoke_command_service(request: &ServiceRequest) -> ServiceResponse {
+    if request.operation != OP_INVOKE_COMMAND {
+        return ServiceResponse::error(
+            "unsupported_operation",
+            "unsupported worktree command operation",
+        );
+    }
+    let Ok(request) = serde_json::from_slice::<InvokeCommandRequest>(&request.payload) else {
+        return ServiceResponse::error(
+            "invalid_request",
+            "invalid worktree command invocation request",
+        );
+    };
+    match request.command_id.as_str() {
+        "command.work-tree.list"
+        | "command.work-tree.createSession"
+        | "command.work-tree.attach"
+        | "command.work-tree.remove" => command_route_response(&request.command_id),
+        _ => ServiceResponse::error("unknown_command", "unknown worktree command"),
+    }
+}
+
+fn command_route_response(route: &str) -> ServiceResponse {
+    json_response(&InvokeCommandResponse {
+        success: true,
+        message: None,
+        updated_model: None,
+        updated_provider: None,
+        updated_thinking: None,
+        effects: vec![CommandEffect::OpenPluginSurface {
+            surface_kind: route.to_string(),
+            instance_id: route.to_string(),
+            options: serde_json::Value::Null,
+        }],
+    })
 }
 
 fn list_tools(request: &ServiceRequest) -> ServiceResponse {
@@ -408,8 +450,9 @@ mod tests {
         assert!(commands.iter().any(|command| {
             command.id == "command.work-tree.list"
                 && command.action
-                    == CommandAction::Host {
-                        route: "command.work-tree.list".to_string(),
+                    == CommandAction::Plugin {
+                        plugin_id: "bcode.worktree".to_string(),
+                        command_id: "command.work-tree.list".to_string(),
                     }
         }));
         assert!(

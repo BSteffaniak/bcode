@@ -618,17 +618,11 @@ fn apply_effect_result(
         TuiEffectResult::CompactContext { session_id, result } => {
             apply_compact_context_result(chat, session_id, result);
         }
-        TuiEffectResult::ListWorktrees { result } => {
-            apply_list_worktrees_result(chat, result);
-        }
         TuiEffectResult::AttachWorktree { path, result } => {
             apply_attach_worktree_result(chat, &path, result);
         }
         TuiEffectResult::CreateWorktree { result } => {
             apply_create_worktree_result(chat, result);
-        }
-        TuiEffectResult::RemoveWorktree { result } => {
-            apply_remove_worktree_result(chat, result);
         }
         TuiEffectResult::CancelRuntimeWork { work_id, result } => {
             apply_cancel_runtime_work_result(chat, &work_id, result);
@@ -1123,35 +1117,6 @@ fn apply_compact_context_result(
     }
 }
 
-fn apply_list_worktrees_result(
-    chat: &mut ActiveChat,
-    result: Result<bcode_worktree_models::WorktreeListResponse, ClientError>,
-) {
-    let response = match result {
-        Ok(response) => response,
-        Err(error) => {
-            daemon_issue::report_client_issue(&mut chat.app, "worktrees unavailable", &error);
-            return;
-        }
-    };
-    let lines = response
-        .worktrees
-        .into_iter()
-        .map(|worktree| {
-            let marker = if worktree.is_main { "main" } else { "linked" };
-            let branch = worktree.branch.unwrap_or_else(|| "<detached>".to_owned());
-            format!("* {marker} {branch} — {}", worktree.path.display())
-        })
-        .collect::<Vec<_>>();
-    chat.app.push_system_note(
-        std::iter::once(format!("Worktrees for {}", response.repo_root.display()))
-            .chain(lines)
-            .collect::<Vec<_>>()
-            .join("\n"),
-    );
-    chat.app.set_status("shown worktrees".to_owned());
-}
-
 fn apply_attach_worktree_result(
     chat: &mut ActiveChat,
     path: &std::path::Path,
@@ -1188,20 +1153,6 @@ fn apply_create_worktree_result(
     chat.app
         .push_system_note(format!("Created worktree\n* Path: {}", path.display()));
     chat.app.set_status("created worktree".to_owned());
-}
-
-fn apply_remove_worktree_result(
-    chat: &mut ActiveChat,
-    result: Result<bcode_worktree_models::WorktreeRemoveResponse, ClientError>,
-) {
-    match result {
-        Ok(removed) => chat
-            .app
-            .set_status(format!("removed worktree {}", removed.path.display())),
-        Err(error) => {
-            daemon_issue::report_client_issue(&mut chat.app, "worktree remove failed", &error);
-        }
-    }
 }
 
 fn apply_cancel_runtime_work_result(

@@ -59,6 +59,39 @@ pub struct InvokeCommandResponse {
     pub updated_provider: Option<String>,
     #[serde(default)]
     pub updated_thinking: Option<ReasoningEffort>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<CommandEffect>,
+}
+
+/// Generic effect requested by a plugin-owned command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CommandEffect {
+    /// Show a user-facing status message.
+    Status {
+        /// Message to show.
+        message: String,
+    },
+    /// Append a text note to the current transcript.
+    AppendText {
+        /// Text to append.
+        text: String,
+    },
+    /// Toggle a generic host surface by stable surface id.
+    ToggleSurface {
+        /// Surface id to toggle.
+        surface_id: String,
+    },
+    /// Open a plugin-contributed TUI surface.
+    OpenPluginSurface {
+        /// Surface kind declared by the owning plugin.
+        surface_kind: String,
+        /// Surface instance id.
+        instance_id: String,
+        /// Plugin-defined JSON options.
+        #[serde(default)]
+        options: serde_json::Value,
+    },
 }
 
 /// Command owner identity.

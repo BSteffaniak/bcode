@@ -36,7 +36,10 @@ use bcode_code_review_models::{
     SavePublishRecordResponse, UpdateDraftRequest, UpdateDraftResponse,
     UpdateReviewWorkspaceRequest, UpdateReviewWorkspaceResponse,
 };
-use bcode_command::{CommandAction, CommandContribution, CommandOwner, CommandSurface};
+use bcode_command::{
+    COMMAND_INTERFACE_ID, CommandAction, CommandContribution, CommandEffect, CommandOwner,
+    CommandSurface, InvokeCommandRequest, InvokeCommandResponse, OP_INVOKE_COMMAND,
+};
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -135,6 +138,9 @@ impl RustPlugin for CodeReviewPlugin {
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        if context.request.interface_id == COMMAND_INTERFACE_ID {
+            return invoke_command_service(&context.request);
+        }
         if context.request.interface_id != CODE_REVIEW_SERVICE_INTERFACE_ID {
             return ServiceResponse::error(
                 "unsupported_interface",
@@ -184,9 +190,38 @@ fn diff_toggle_command() -> CommandContribution {
         owner: CommandOwner::Plugin {
             plugin_id: "bcode.code_review".to_string(),
         },
-        action: CommandAction::Host {
-            route: "diff.toggle".to_string(),
+        action: CommandAction::Plugin {
+            plugin_id: "bcode.code_review".to_string(),
+            command_id: "diff.toggle".to_string(),
         },
+    }
+}
+
+fn invoke_command_service(request: &ServiceRequest) -> ServiceResponse {
+    if request.operation != OP_INVOKE_COMMAND {
+        return ServiceResponse::error(
+            "unsupported_operation",
+            "unsupported code review command operation",
+        );
+    }
+    let Ok(request) = serde_json::from_slice::<InvokeCommandRequest>(&request.payload) else {
+        return ServiceResponse::error(
+            "invalid_request",
+            "invalid code review command invocation request",
+        );
+    };
+    match request.command_id.as_str() {
+        "diff.toggle" => json_response(&InvokeCommandResponse {
+            success: true,
+            message: None,
+            updated_model: None,
+            updated_provider: None,
+            updated_thinking: None,
+            effects: vec![CommandEffect::ToggleSurface {
+                surface_id: "diff".to_string(),
+            }],
+        }),
+        _ => ServiceResponse::error("unknown_command", "unknown code review command"),
     }
 }
 
@@ -4203,8 +4238,9 @@ mod command_registration_tests {
         assert!(commands.iter().any(|command| {
             command.id == "diff.toggle"
                 && command.action
-                    == CommandAction::Host {
-                        route: "diff.toggle".to_string(),
+                    == CommandAction::Plugin {
+                        plugin_id: "bcode.code_review".to_string(),
+                        command_id: "diff.toggle".to_string(),
                     }
         }));
     }

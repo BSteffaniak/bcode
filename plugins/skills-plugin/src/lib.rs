@@ -4,8 +4,12 @@
 
 //! Bundled skills command palette plugin for Bcode.
 
-use bcode_command::{CommandAction, CommandContribution, CommandOwner, CommandSurface};
+use bcode_command::{
+    COMMAND_INTERFACE_ID, CommandAction, CommandContribution, CommandEffect, CommandOwner,
+    CommandSurface, InvokeCommandRequest, InvokeCommandResponse, OP_INVOKE_COMMAND,
+};
 use bcode_plugin_sdk::prelude::*;
+use serde::Serialize;
 
 /// Bundled skills command plugin.
 #[derive(Default)]
@@ -20,6 +24,50 @@ impl RustPlugin for SkillsPlugin {
         }
         Ok(())
     }
+
+    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        if context.request.interface_id != COMMAND_INTERFACE_ID {
+            return ServiceResponse::error(
+                "unsupported_interface",
+                "unsupported skills plugin service interface",
+            );
+        }
+        invoke_command_service(&context.request)
+    }
+}
+
+fn invoke_command_service(request: &ServiceRequest) -> ServiceResponse {
+    if request.operation != OP_INVOKE_COMMAND {
+        return ServiceResponse::error(
+            "unsupported_operation",
+            "unsupported skills command operation",
+        );
+    }
+    let Ok(request) = serde_json::from_slice::<InvokeCommandRequest>(&request.payload) else {
+        return ServiceResponse::error(
+            "invalid_request",
+            "invalid skills command invocation request",
+        );
+    };
+    match request.command_id.as_str() {
+        "skills.list" | "skills.active" => command_route_response(&request.command_id),
+        _ => ServiceResponse::error("unknown_command", "unknown skills command"),
+    }
+}
+
+fn command_route_response(route: &str) -> ServiceResponse {
+    json_response(&InvokeCommandResponse {
+        success: true,
+        message: None,
+        updated_model: None,
+        updated_provider: None,
+        updated_thinking: None,
+        effects: vec![CommandEffect::OpenPluginSurface {
+            surface_kind: route.to_string(),
+            instance_id: route.to_string(),
+            options: serde_json::Value::Null,
+        }],
+    })
 }
 
 fn skills_palette_command_contributions() -> Vec<CommandContribution> {
@@ -43,9 +91,17 @@ fn skills_command(id: &str, title: &str, description: &str) -> CommandContributi
         owner: CommandOwner::Plugin {
             plugin_id: "bcode.skills".to_string(),
         },
-        action: CommandAction::Host {
-            route: id.to_string(),
+        action: CommandAction::Plugin {
+            plugin_id: "bcode.skills".to_string(),
+            command_id: id.to_string(),
         },
+    }
+}
+
+fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
+    match ServiceResponse::json(value) {
+        Ok(response) => response,
+        Err(error) => ServiceResponse::error("encode_failed", error.to_string()),
     }
 }
 

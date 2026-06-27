@@ -112,36 +112,6 @@ pub async fn pick_skill_for_session<W: Write>(
     }
 }
 
-/// Show active skills in the transcript.
-pub async fn show_active_skills(
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-) -> Result<(), TuiError> {
-    let Some(session_id) = chat.app.session_id() else {
-        chat.app.set_status("No active session".to_owned());
-        return Ok(());
-    };
-    let skills = match client.active_skills(session_id).await {
-        Ok(skills) => skills,
-        Err(error) => {
-            helpers::report_client_issue(&mut chat.app, "active skills unavailable", &error);
-            return Ok(());
-        }
-    };
-    let mut lines = vec![format!("Active skills: {}", skills.len())];
-    lines.extend(skills.iter().map(|skill| {
-        let suffix = if skill.truncated { " truncated" } else { "" };
-        format!(
-            "* {} — {} bytes{} from {}",
-            skill.skill_id, skill.bytes_loaded, suffix, skill.source.label
-        )
-    }));
-    chat.app
-        .set_status(format!("active skills: {}", skills.len()));
-    chat.app.push_system_note(lines.join("\n"));
-    Ok(())
-}
-
 fn handle_skill_picker_key(
     picker: &mut skill_picker::SkillPickerApp,
     keymap: &BmuxKeyMap,

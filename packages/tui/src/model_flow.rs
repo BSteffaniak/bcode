@@ -2,7 +2,6 @@
 
 use std::io::Write;
 
-use bcode_client::BcodeClient;
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
@@ -16,114 +15,6 @@ use super::{
     TuiError, model_picker, model_picker_render, provider_picker, provider_picker_render,
     session_flow::ActiveChat, text_input_flow,
 };
-
-/// Show active model status in the transcript.
-pub async fn show_model_status(
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-) -> Result<(), TuiError> {
-    let Some(session_id) = chat.app.session_id() else {
-        chat.app.set_status("No active session".to_owned());
-        return Ok(());
-    };
-    let status = match client.session_model_status(session_id).await {
-        Ok(status) => status,
-        Err(error) => {
-            helpers::report_client_issue(&mut chat.app, "model status unavailable", &error);
-            return Ok(());
-        }
-    };
-    let provider = status
-        .provider_plugin_id
-        .as_deref()
-        .unwrap_or("default provider");
-    let model = status.model_id.as_deref().unwrap_or("default model");
-    let mut lines = vec![format!("Active model: {provider}/{model}")];
-    if let Some(reasoning) = status.reasoning {
-        lines.push(format!("Reasoning effort: {:?}", reasoning.effort_values));
-        lines.push(format!("Reasoning summary: {:?}", reasoning.summary_values));
-    }
-    let text = lines.join("\n");
-    chat.app.set_status(format!("model: {provider}/{model}"));
-    chat.app.push_system_note(text);
-    Ok(())
-}
-
-/// Show server default model status in the transcript.
-pub async fn show_server_model_status(
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-) -> Result<(), TuiError> {
-    let status = match client.server_status().await {
-        Ok(status) => status,
-        Err(error) => {
-            helpers::report_client_issue(&mut chat.app, "server model status unavailable", &error);
-            return Ok(());
-        }
-    };
-    let provider = status
-        .selected_provider_plugin_id
-        .as_deref()
-        .unwrap_or("default provider");
-    let model = status
-        .selected_model_id
-        .as_deref()
-        .unwrap_or("default model");
-    let text = format!("Server default model: {provider}/{model}");
-    chat.app.set_status(text.clone());
-    chat.app.push_system_note(text);
-    Ok(())
-}
-
-/// Show daemon runtime status in the transcript.
-pub async fn show_runtime_status(
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-) -> Result<(), TuiError> {
-    let status = match client.server_status().await {
-        Ok(status) => status,
-        Err(error) => {
-            helpers::report_client_issue(&mut chat.app, "runtime status unavailable", &error);
-            return Ok(());
-        }
-    };
-    let running = status
-        .plugin_runtime
-        .iter()
-        .map(|plugin| plugin.running)
-        .sum::<usize>();
-    let queued = status
-        .plugin_runtime
-        .iter()
-        .map(|plugin| plugin.queued)
-        .sum::<usize>();
-    let tool_queued = status
-        .plugin_runtime
-        .iter()
-        .map(|plugin| plugin.queued_tool_execution)
-        .sum::<usize>();
-    let mut lines = vec![format!(
-        "Runtime: {running} running, {queued} queued ({tool_queued} tool queued)"
-    )];
-    for plugin in status
-        .plugin_runtime
-        .iter()
-        .filter(|plugin| plugin.running > 0 || plugin.queued > 0)
-    {
-        lines.push(format!(
-            "{}: running {}, queued {}",
-            plugin.plugin_id, plugin.running, plugin.queued
-        ));
-    }
-    if lines.len() == 1 {
-        lines.push("No active plugin work.".to_string());
-    }
-    let text = lines.join("\n");
-    chat.app
-        .set_status(format!("runtime: {running} running, {queued} queued"));
-    chat.app.push_system_note(text);
-    Ok(())
-}
 
 enum ModelProviderPick {
     Selected(Option<String>),

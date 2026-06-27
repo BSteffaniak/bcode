@@ -1,12 +1,14 @@
 //! Command palette flow for the TUI.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 
-use bcode_worktree_models::WorktreeListRequest;
+use bcode_command::{
+    COMMAND_INTERFACE_ID, CommandAction, CommandEffect, InvokeCommandRequest,
+    InvokeCommandResponse, OP_INVOKE_COMMAND,
+};
 use bmux_keyboard::KeyStroke;
 use bmux_tui::palette::{CommandPalette, CommandPaletteKeyOutcome};
-
-use bcode_command::CommandAction;
 
 use super::command_palette::BmuxCommandPalette;
 use super::effects::TuiEffect;
@@ -14,7 +16,7 @@ use super::helpers;
 use super::picker_mouse::command_palette_row_from_mouse;
 use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::{self, ActiveChat};
-use super::{TuiError, model_flow, session_fork_flow, skill_flow, worktree_flow};
+use super::{TuiError, session_fork_flow};
 
 /// Build a command palette from host and manifest-declared plugin command contributions.
 pub async fn open_palette(services: &TuiServices<'_>, chat: &mut ActiveChat) -> BmuxCommandPalette {
@@ -104,12 +106,78 @@ async fn execute_palette_command<W: Write>(
         CommandAction::Plugin {
             plugin_id,
             command_id,
-        } => {
-            chat.app.set_status(format!(
-                "plugin command {command_id} from {plugin_id} selected"
-            ));
-            Ok(())
-        }
+        } => dispatch_plugin_command(io, services, chat, plugin_id, command_id).await,
+    }
+}
+
+async fn dispatch_plugin_command<W: Write>(
+    io: &mut TuiIo<'_, '_, W>,
+    services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
+    plugin_id: String,
+    command_id: String,
+) -> Result<(), TuiError> {
+    let payload = serde_json::to_vec(&InvokeCommandRequest {
+        command_id,
+        args: BTreeMap::new(),
+    })?;
+    let response = services
+        .passive_client
+        .invoke_plugin_service(
+            plugin_id.clone(),
+            COMMAND_INTERFACE_ID.to_string(),
+            OP_INVOKE_COMMAND.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let command_response = serde_json::from_slice::<InvokeCommandResponse>(&response.payload)?;
+    if let Some(message) = command_response.message {
+        chat.app.set_status(message);
+    }
+    for effect in command_response.effects {
+        apply_command_effect(io, services, chat, &plugin_id, effect);
+    }
+    Ok(())
+}
+
+fn apply_command_effect<W: Write>(
+    _io: &mut TuiIo<'_, '_, W>,
+    _services: &TuiServices<'_>,
+    chat: &mut ActiveChat,
+    plugin_id: &str,
+    effect: CommandEffect,
+) {
+    match effect {
+        CommandEffect::Status { message } => chat.app.set_status(message),
+        CommandEffect::AppendText { text } => chat.app.push_system_note(text),
+        CommandEffect::ToggleSurface { surface_id } => toggle_surface(chat, &surface_id),
+        CommandEffect::OpenPluginSurface {
+            surface_kind,
+            instance_id,
+            options,
+        } => chat.app.set_status(format!(
+            "plugin surface {surface_kind} from {plugin_id} requested for {instance_id}: {options}"
+        )),
+    }
+}
+
+fn toggle_surface(chat: &mut ActiveChat, surface_id: &str) {
+    if surface_id == "diff" {
+        let _changed = chat.app.toggle_diff_visible();
+        chat.app.set_status(if chat.app.diff_visible() {
+            "surface shown".to_owned()
+        } else {
+            "surface hidden".to_owned()
+        });
+    } else {
+        chat.app
+            .set_status(format!("surface toggle requested: {surface_id}"));
     }
 }
 
@@ -126,25 +194,6 @@ async fn dispatch_host_palette_route<W: Write>(
         "session.delete" => delete_session(io, services, chat).await?,
         "session.fork" => session_fork_flow::fork_current_session(io, services, chat).await?,
         "session.clone" => session_fork_flow::clone_current_session(io, services, chat).await?,
-        "command.work-tree.list" => show_worktrees(chat),
-        "command.work-tree.createSession" => {
-            worktree_flow::create_for_current_session(io, services, chat).await?;
-        }
-        "command.work-tree.attach" => {
-            worktree_flow::attach_current_session(io, services, chat).await?;
-        }
-        "command.work-tree.remove" => {
-            worktree_flow::remove_worktree(io, services, chat).await?;
-        }
-        "model.status" => model_flow::show_model_status(services.passive_client, chat).await?,
-        "model.serverStatus" => {
-            model_flow::show_server_model_status(services.passive_client, chat).await?;
-        }
-        "runtime.status" => model_flow::show_runtime_status(services.passive_client, chat).await?,
-        "model.select" => model_flow::pick_model_for_session(io, services, chat).await?,
-        "skills.list" => skill_flow::pick_skill_for_session(io, services, chat).await?,
-        "skills.active" => skill_flow::show_active_skills(services.passive_client, chat).await?,
-        "diff.toggle" => toggle_diff(chat),
         "help" => show_bmux_help(chat),
         "turn.cancel" => start_cancel_turn(chat),
         "context.compact" => start_compact_context(chat),
@@ -205,15 +254,6 @@ async fn delete_session<W: Write>(
     .await
 }
 
-fn toggle_diff(chat: &mut ActiveChat) {
-    let _changed = chat.app.toggle_diff_visible();
-    chat.app.set_status(if chat.app.diff_visible() {
-        "diff panel shown".to_owned()
-    } else {
-        "diff panel hidden".to_owned()
-    });
-}
-
 fn start_cancel_turn(chat: &mut ActiveChat) {
     let Some(session_id) = chat.app.session_id() else {
         chat.app.set_status("No active session".to_owned());
@@ -233,23 +273,11 @@ fn start_compact_context(chat: &mut ActiveChat) {
     chat.app.set_status("compacting context…".to_owned());
 }
 
-fn show_worktrees(chat: &mut ActiveChat) {
-    chat.start_effect(TuiEffect::ListWorktrees {
-        request: WorktreeListRequest {
-            cwd: chat
-                .app
-                .working_directory()
-                .map(std::path::Path::to_path_buf),
-        },
-    });
-    chat.app.set_status("loading worktrees…".to_owned());
-}
-
 fn show_bmux_help(chat: &mut ActiveChat) {
     chat.app.push_system_note(
         [
             "TUI help",
-            "* Use the command palette for sessions, model status, skills, cancel, and compact.",
+            "* Use the command palette for sessions, plugin commands, cancel, and compact.",
             "* Transcript scrolling, composer history, session picker, and permissions honor configured keybindings where wired.",
             "* Permission dialogs: approve/deny or move focus and confirm.",
         ]

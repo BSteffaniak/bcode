@@ -41,6 +41,8 @@ pub(crate) mod permission_flow;
 pub(crate) mod permission_present;
 pub(crate) mod picker_mouse;
 pub(crate) mod picker_render;
+#[cfg(test)]
+mod plugin_command_architecture_tests;
 pub(crate) mod plugin_surface_host;
 pub mod plugin_tui;
 pub(crate) mod provider_picker;
@@ -90,8 +92,6 @@ pub(crate) mod transcript_projection;
 pub(crate) mod transcript_resident_window;
 pub(crate) mod transcript_viewport;
 pub(crate) mod worktree_flow;
-pub(crate) mod worktree_picker;
-pub(crate) mod worktree_picker_render;
 pub(crate) mod wt_create_dialog;
 pub(crate) mod wt_create_dialog_render;
 
