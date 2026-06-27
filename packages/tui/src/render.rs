@@ -895,15 +895,7 @@ fn push_tool_presentation_card_rows(
                     old_text.clone(),
                     new_text.clone(),
                 );
-                push_file_edit_preview_rows(
-                    rows,
-                    &edit,
-                    width,
-                    inline_diff_config,
-                    None,
-                    false,
-                    tool_name.unwrap_or("tool"),
-                );
+                push_file_edit_preview_rows(rows, &edit, width, inline_diff_config, None, false);
             }
             ToolPresentationSection::Terminal {
                 output,
@@ -1085,7 +1077,7 @@ fn push_tool_request_rows(
     let mut title = if context.file_edit.is_some() {
         format!(
             "{} · {}",
-            file_tool_action(context.tool_name, item.streaming()),
+            file_tool_action(item.streaming()),
             context.tool_name
         )
     } else {
@@ -1125,7 +1117,6 @@ fn push_tool_request_rows(
             context.inline_diff_config,
             context.file_edit_phase,
             context.live_preview,
-            context.tool_name,
         );
     } else if let Some(presentation) =
         tool_request_presentation(context.arguments_json, context.request_presentation)
@@ -1137,7 +1128,7 @@ fn push_tool_request_rows(
     rows.push(Line::default());
 }
 
-const fn file_tool_action(_tool_name: &str, streaming: bool) -> &'static str {
+const fn file_tool_action(streaming: bool) -> &'static str {
     if streaming {
         "File change …"
     } else {
@@ -1243,7 +1234,6 @@ fn push_live_file_edit_preview_rows(
         context.inline_diff_config,
         Some(FileEditPhase::Pending),
         true,
-        context.tool_name,
     );
 
     if context.preview.truncated {
@@ -1594,7 +1584,6 @@ fn push_file_edit_preview_rows(
     inline_diff_config: TuiInlineDiffConfig,
     phase: Option<FileEditPhase>,
     live_preview: bool,
-    tool_name: &str,
 ) {
     let summary = edit.summary();
     let phase = phase.unwrap_or(FileEditPhase::Applied);
@@ -1610,7 +1599,7 @@ fn push_file_edit_preview_rows(
         &format!(
             "{} · {}",
             phase_label,
-            file_write_mode_label(tool_name, edit.old_text_is_empty())
+            file_write_mode_label(edit.old_text_is_empty())
         ),
         width,
         phase_style,
@@ -1688,7 +1677,7 @@ const fn file_edit_phase_style(phase: FileEditPhase) -> Style {
     }
 }
 
-const fn file_write_mode_label(_tool_name: &str, old_text_is_empty: bool) -> &'static str {
+const fn file_write_mode_label(old_text_is_empty: bool) -> &'static str {
     if old_text_is_empty {
         "Writing file"
     } else {

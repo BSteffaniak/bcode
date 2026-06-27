@@ -37,24 +37,43 @@ const DENIED_TOOL_NAME_NEEDLES: &[&str] = &[
 
 const DENIED_NORMALIZED_TOOL_NAME_NEEDLES: &[&str] = &[
     "shell_run",
+    "shellRun",
     "filesystem_read",
+    "filesystemRead",
     "filesystem_write",
+    "filesystemWrite",
     "filesystem_edit",
+    "filesystemEdit",
     "filesystem_list",
+    "filesystemList",
     "filesystem_find",
+    "filesystemFind",
     "filesystem_grep",
+    "filesystemGrep",
     "filesystem_stat",
+    "filesystemStat",
     "filesystem_exists",
+    "filesystemExists",
     "web_search",
+    "webSearch",
     "web_fetch",
+    "webFetch",
     "web_status",
+    "webStatus",
     "web_inspect",
+    "webInspect",
     "git_clone",
+    "gitClone",
     "github_clone",
+    "githubClone",
     "worktree_list",
+    "worktreeList",
     "worktree_create",
+    "worktreeCreate",
     "worktree_remove",
+    "worktreeRemove",
     "document_extract",
+    "documentExtract",
 ];
 
 const DENIED_PLUGIN_ID_NEEDLES: &[&str] = &[
@@ -73,6 +92,15 @@ const DENIED_PLUGIN_CRATE_NEEDLES: &[&str] = &[
     "bcode_git_plugin",
     "bcode_worktree_plugin",
     "bcode_document_plugin",
+];
+
+const DENIED_FILE_OPERATION_COUPLING_NEEDLES: &[&str] = &[
+    "arguments_json",
+    "old_text",
+    "new_text",
+    "contents",
+    "patch",
+    "diff",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,13 +236,44 @@ fn scan_file(path: &Path, offenders: &mut Vec<BoundaryOffender>) {
             "plugin crate",
             offenders,
         );
+        scan_file_operation_coupling(path, line_number, line, offenders);
+    }
+}
+
+fn scan_file_operation_coupling(
+    path: &Path,
+    line_number: usize,
+    line: &str,
+    offenders: &mut Vec<BoundaryOffender>,
+) {
+    if !path
+        .components()
+        .any(|component| component.as_os_str() == "tui")
+    {
+        return;
+    }
+    if !line.contains("tool_name") {
+        return;
+    }
+    for needle in DENIED_FILE_OPERATION_COUPLING_NEEDLES {
+        if line.contains(needle) {
+            offenders.push(BoundaryOffender {
+                path: path.to_path_buf(),
+                line_number,
+                needle,
+                category: "file-operation TUI coupling",
+                line: line.to_string(),
+            });
+        }
     }
 }
 
 fn is_test_line(path: &Path, line_number: usize, test_ranges: &[(usize, usize)]) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "tests.rs" || name.ends_with("_test.rs"))
+        .is_some_and(|name| {
+            name == "tests.rs" || name.ends_with("_test.rs") || name.ends_with("_tests.rs")
+        })
         || test_ranges
             .iter()
             .any(|(start, end)| line_number >= *start && line_number <= *end)

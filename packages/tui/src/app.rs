@@ -2657,8 +2657,8 @@ impl BmuxApp {
             self.set_activity(ActivityState::RunningTool {
                 name: tool_name.to_owned(),
             });
-            self.status = tool_request_status(tool_name, arguments_json)
-                .unwrap_or_else(|| "started".to_owned());
+            self.status =
+                tool_request_status(arguments_json).unwrap_or_else(|| "started".to_owned());
         }
     }
 
@@ -3051,7 +3051,7 @@ impl BmuxApp {
         if input.application.live_activity() {
             self.status = self.tool_call_file_status(input.tool_call_id).map_or_else(
                 || {
-                    tool_request_status(input.tool_name, input.arguments_json)
+                    tool_request_status(input.arguments_json)
                         .unwrap_or_else(|| input.tool_name.to_owned())
                 },
                 |status| format!("waiting permission · {status}"),
@@ -3689,7 +3689,7 @@ const fn color_rgb(color: Color) -> [u8; 3] {
     }
 }
 
-fn tool_request_status(_tool_name: &str, arguments_json: &str) -> Option<String> {
+fn tool_request_status(arguments_json: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(arguments_json).ok()?;
     value
         .get("path")
