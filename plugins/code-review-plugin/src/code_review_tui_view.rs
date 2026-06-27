@@ -273,7 +273,16 @@ impl ReviewViewDocument {
                 let has_agent_answer = agent_states
                     .get(&thread_key)
                     .is_some_and(|state| !state.answer.trim().is_empty());
-                for action in ReviewThreadAction::all_for_state(resolved, has_agent_answer) {
+                let has_linked_session =
+                    comments.iter().any(|comment| comment.session_id.is_some())
+                        || agent_states
+                            .get(&thread_key)
+                            .is_some_and(|state| state.session_id.is_some());
+                for action in ReviewThreadAction::all_for_state(
+                    resolved,
+                    has_agent_answer,
+                    has_linked_session,
+                ) {
                     rows.push(ReviewViewRow {
                         visual_row: 0,
                         source_row: None,
@@ -503,6 +512,8 @@ pub enum ReviewThreadAction {
     AskBcode,
     /// Convert the latest Bcode answer into a draft comment.
     DraftAnswer,
+    /// Open the linked Bcode session.
+    OpenSession,
     /// Publish review drafts.
     Publish,
     /// Resolve or reopen the thread locally.
@@ -514,8 +525,15 @@ pub enum ReviewThreadAction {
 impl ReviewThreadAction {
     /// Return inline thread actions in visual order.
     #[must_use]
-    pub fn all_for_state(resolved: bool, has_agent_answer: bool) -> Vec<Self> {
+    pub fn all_for_state(
+        resolved: bool,
+        has_agent_answer: bool,
+        has_linked_session: bool,
+    ) -> Vec<Self> {
         let mut actions = vec![Self::Reply, Self::Edit, Self::Delete, Self::AskBcode];
+        if has_linked_session {
+            actions.push(Self::OpenSession);
+        }
         if has_agent_answer {
             actions.push(Self::DraftAnswer);
         }
@@ -536,6 +554,7 @@ impl ReviewThreadAction {
             Self::Edit => "edit",
             Self::Delete => "delete",
             Self::AskBcode => "ask",
+            Self::OpenSession => "open-session",
             Self::DraftAnswer => "draft-answer",
             Self::Publish => "publish",
             Self::Resolve => "resolve",
@@ -551,6 +570,7 @@ impl ReviewThreadAction {
             Self::Edit => "e",
             Self::Delete => "D",
             Self::AskBcode => "a",
+            Self::OpenSession => "o",
             Self::DraftAnswer => "m",
             Self::Publish => "x",
             Self::Resolve | Self::Reopen => "r",
@@ -565,6 +585,7 @@ impl ReviewThreadAction {
             Self::Edit => "edit",
             Self::Delete => "delete",
             Self::AskBcode => "ask Bcode",
+            Self::OpenSession => "open session",
             Self::DraftAnswer => "draft answer",
             Self::Publish => "publish",
             Self::Resolve => "resolve",
@@ -580,6 +601,7 @@ impl ReviewThreadAction {
             b"edit" => Some(Self::Edit),
             b"delete" => Some(Self::Delete),
             b"ask" => Some(Self::AskBcode),
+            b"open-session" => Some(Self::OpenSession),
             b"draft-answer" => Some(Self::DraftAnswer),
             b"publish" => Some(Self::Publish),
             b"resolve" => Some(Self::Resolve),

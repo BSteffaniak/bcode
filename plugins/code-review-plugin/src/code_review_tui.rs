@@ -8585,6 +8585,7 @@ impl ReviewApp {
             Some(ReviewThreadAction::Edit) => self.open_latest_draft_editor(),
             Some(ReviewThreadAction::Delete) => self.delete_latest_draft_at_selection(),
             Some(ReviewThreadAction::AskBcode) => self.ask_bcode_about_selection(),
+            Some(ReviewThreadAction::OpenSession) => self.open_linked_session_at_selection(),
             Some(ReviewThreadAction::DraftAnswer) => {
                 self.convert_agent_answer_to_draft_at_selection()
             }
