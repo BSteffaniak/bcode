@@ -457,6 +457,9 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                     " general review comments  C new review note  j/k thread  Enter jump  a ask/follow up  e edit  D delete  t files  ? help ".to_string()
                 });
             }
+            if let Some(preview) = app.selected_suggestion_preview() {
+                return format!(" {preview}  ; accept  f refine  : reject  s suggest answer  m draft answer  a ask/follow up ");
+            }
             if let Some(preview) = app.selected_draft_preview() {
                 let linked = app
                     .selected_draft_session_id()

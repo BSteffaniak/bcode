@@ -9199,6 +9199,25 @@ impl ReviewApp {
         ))
     }
 
+    /// Return a short preview for the selected line's latest suggested comment.
+    #[must_use]
+    pub fn selected_suggestion_preview(&self) -> Option<String> {
+        let anchor = self.selected_comment_anchor()?;
+        let suggestions = self.suggested_comments.get(&anchor)?;
+        let suggestion = suggestions.last()?;
+        let status = match suggestion.status {
+            ReviewSuggestionStatus::Suggested => "suggested",
+            ReviewSuggestionStatus::Refining => "refining",
+            ReviewSuggestionStatus::Accepted => "accepted suggestion",
+            ReviewSuggestionStatus::Rejected => "rejected suggestion",
+        };
+        Some(format!(
+            "{} {status}: {}",
+            suggestions.len(),
+            suggestion.body
+        ))
+    }
+
     /// Return a short preview for the selected line's latest draft comment.
     #[must_use]
     pub fn selected_draft_preview(&self) -> Option<String> {
