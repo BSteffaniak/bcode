@@ -56,9 +56,9 @@ use bcode_skill::{
     skill_source_roots_from_config,
 };
 use bcode_skill_models::{
-    SkillActivationMode, SkillContextResponse, SkillId, SkillList, SkillSource, SkillToolDecision,
-    SkillToolDecisionEntry, SkillToolDecisionKey, SkillToolDecisionScope, SkillToolPolicyOutcome,
-    SkillToolPolicyRequest,
+    SkillActivationMode, SkillContextResponse, SkillDiagnosticSeverity, SkillId, SkillList,
+    SkillSource, SkillToolDecision, SkillToolDecisionEntry, SkillToolDecisionKey,
+    SkillToolDecisionScope, SkillToolPolicyOutcome, SkillToolPolicyRequest,
 };
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, ShellRunResult as ServiceShellRunResult,
@@ -14731,6 +14731,7 @@ fn build_skill_registry(config: &bcode_config::BcodeConfig) -> Option<SkillRegis
     };
     match SkillRegistry::discover(&roots, options) {
         Ok(mut registry) => {
+            log_skill_registry_diagnostics(&registry);
             add_plugin_skills(&mut registry);
             Some(registry)
         }
@@ -14738,6 +14739,49 @@ fn build_skill_registry(config: &bcode_config::BcodeConfig) -> Option<SkillRegis
             eprintln!("failed to build skill registry: {error}");
             None
         }
+    }
+}
+
+fn log_skill_registry_diagnostics(registry: &SkillRegistry) {
+    let list = registry.list();
+    let diagnostics = list.diagnostics;
+    if diagnostics.is_empty() {
+        return;
+    }
+    let warning_count = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == SkillDiagnosticSeverity::Warning)
+        .count();
+    let error_count = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == SkillDiagnosticSeverity::Error)
+        .count();
+    eprintln!(
+        "skill registry loaded with {} diagnostics ({warning_count} warnings, {error_count} errors); run `bcode skill check` for details",
+        diagnostics.len()
+    );
+    for diagnostic in diagnostics.iter().take(5) {
+        let path = diagnostic.path.as_deref().unwrap_or("<unknown>");
+        eprintln!(
+            "skill diagnostic: {}\t{}\t{}",
+            skill_diagnostic_severity_name(diagnostic.severity),
+            path,
+            diagnostic.message
+        );
+    }
+    if diagnostics.len() > 5 {
+        eprintln!(
+            "skill diagnostic: ... {} additional diagnostics omitted",
+            diagnostics.len().saturating_sub(5)
+        );
+    }
+}
+
+const fn skill_diagnostic_severity_name(severity: SkillDiagnosticSeverity) -> &'static str {
+    match severity {
+        SkillDiagnosticSeverity::Info => "info",
+        SkillDiagnosticSeverity::Warning => "warning",
+        SkillDiagnosticSeverity::Error => "error",
     }
 }
 

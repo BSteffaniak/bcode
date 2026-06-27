@@ -100,6 +100,11 @@ pub enum CliError {
     PluginService { code: String, message: String },
     #[error("session repair usage error: {0}")]
     SessionRepairUsage(String),
+    #[error("skill check failed: {warning_count} warnings, {error_count} errors")]
+    SkillCheckFailed {
+        warning_count: usize,
+        error_count: usize,
+    },
 }
 
 use std::sync::OnceLock;
@@ -486,7 +491,7 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
 async fn handle_skill_command(command: &SkillCommand) -> Result<(), CliError> {
     let store = SettingsStore::default();
     match command {
-        SkillCommand::Check { json } => check_skills(*json)?,
+        SkillCommand::Check { json, strict } => check_skills(*json, *strict)?,
         SkillCommand::List { json } => list_skills(*json)?,
         SkillCommand::Describe { skill_id, json } => describe_skill(skill_id, *json)?,
         SkillCommand::Active { session_id, json } => active_skills(*session_id, *json).await?,
@@ -648,6 +653,7 @@ struct SkillCheckReport {
     loaded_count: usize,
     diagnostic_count: usize,
     warning_count: usize,
+    error_count: usize,
     diagnostics: Vec<bcode_skill_models::SkillDiagnostic>,
 }
 
@@ -659,7 +665,7 @@ struct SkillCheckRoot {
     precedence: u16,
 }
 
-fn check_skills(json: bool) -> Result<(), CliError> {
+fn check_skills(json: bool, strict: bool) -> Result<(), CliError> {
     let config = bcode_config::load_config()?;
     let roots = skill_source_roots_from_config(&config);
     let options = SkillRegistryOptions {
@@ -687,11 +693,21 @@ fn check_skills(json: bool) -> Result<(), CliError> {
             .iter()
             .filter(|diagnostic| diagnostic.severity == SkillDiagnosticSeverity::Warning)
             .count(),
+        error_count: diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == SkillDiagnosticSeverity::Error)
+            .count(),
         diagnostics,
     };
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
+        if strict && (report.warning_count > 0 || report.error_count > 0) {
+            return Err(CliError::SkillCheckFailed {
+                warning_count: report.warning_count,
+                error_count: report.error_count,
+            });
+        }
         return Ok(());
     }
 
@@ -707,6 +723,8 @@ fn check_skills(json: bool) -> Result<(), CliError> {
     }
     println!("loaded skills: {}", report.loaded_count);
     println!("diagnostics: {}", report.diagnostic_count);
+    println!("warnings: {}", report.warning_count);
+    println!("errors: {}", report.error_count);
     for diagnostic in &report.diagnostics {
         let path = diagnostic.path.as_deref().unwrap_or("<unknown>");
         println!(
@@ -715,6 +733,12 @@ fn check_skills(json: bool) -> Result<(), CliError> {
             path,
             diagnostic.message
         );
+    }
+    if strict && (report.warning_count > 0 || report.error_count > 0) {
+        return Err(CliError::SkillCheckFailed {
+            warning_count: report.warning_count,
+            error_count: report.error_count,
+        });
     }
     Ok(())
 }
@@ -1485,6 +1509,9 @@ enum SkillCommand {
         /// Emit JSON instead of text.
         #[arg(long)]
         json: bool,
+        /// Exit nonzero when any warnings or errors are reported.
+        #[arg(long)]
+        strict: bool,
     },
     /// List loaded skills.
     List {
