@@ -253,17 +253,22 @@ impl ReviewViewDocument {
                     }
                 }
                 if let Some(agent_state) = agent_states.get(&thread_key) {
-                    rows.push(ReviewViewRow {
-                        visual_row: 0,
-                        source_row: None,
-                        target: ReviewViewTarget::AgentThread {
-                            thread_key: thread_key.clone(),
-                        },
-                        block: ReviewViewBlock::InlineAgentThread {
-                            thread_key: thread_key.clone(),
-                            state: agent_state.clone(),
-                        },
-                    });
+                    let body_line_count = agent_thread_visible_line_count(agent_state);
+                    for body_line_index in 0..body_line_count {
+                        rows.push(ReviewViewRow {
+                            visual_row: 0,
+                            source_row: None,
+                            target: ReviewViewTarget::AgentThread {
+                                thread_key: thread_key.clone(),
+                            },
+                            block: ReviewViewBlock::InlineAgentThread {
+                                thread_key: thread_key.clone(),
+                                state: agent_state.clone(),
+                                body_line_index,
+                                body_line_count,
+                            },
+                        });
+                    }
                 }
                 let has_agent_answer = agent_states
                     .get(&thread_key)
@@ -463,6 +468,10 @@ pub enum ReviewViewBlock {
         thread_key: String,
         /// Agent state for this thread.
         state: ReviewAgentThreadState,
+        /// Body/status line index inside this agent block.
+        body_line_index: usize,
+        /// Total visible body/status lines for this agent block.
+        body_line_count: usize,
     },
     /// Inline thread action row.
     InlineThreadAction {
@@ -471,6 +480,14 @@ pub enum ReviewViewBlock {
         /// Action represented by this row.
         action: ReviewThreadAction,
     },
+}
+
+fn agent_thread_visible_line_count(state: &ReviewAgentThreadState) -> usize {
+    if state.answer.trim().is_empty() {
+        1
+    } else {
+        1 + state.answer.lines().count().clamp(1, 4)
+    }
 }
 
 /// Inline action exposed for a review thread.

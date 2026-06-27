@@ -1624,10 +1624,21 @@ fn render_view_row(
                 style,
             }
         }
-        ReviewViewBlock::InlineAgentThread { state, .. } => {
+        ReviewViewBlock::InlineAgentThread {
+            state,
+            body_line_index,
+            body_line_count,
+            ..
+        } => {
             let style = Style::new().fg(Color::Cyan).bg(Color::Rgb(18, 18, 18));
             RenderedRow {
-                line: render_inline_agent_thread_line(state, width, style),
+                line: render_inline_agent_thread_line(
+                    state,
+                    *body_line_index,
+                    *body_line_count,
+                    width,
+                    style,
+                ),
                 style,
             }
         }
@@ -1664,28 +1675,43 @@ fn render_inline_comment_line(
 
 fn render_inline_agent_thread_line(
     state: &crate::code_review_tui::ReviewAgentThreadState,
+    body_line_index: usize,
+    body_line_count: usize,
     width: u16,
     style: Style,
 ) -> Line {
     let prefix_style = Style::new().fg(Color::Cyan).bg(Color::Rgb(18, 18, 18));
-    let prefix = format!("   │ 🤖 Bcode · {} ", state.phase.label());
-    let detail = state.error.as_ref().map_or_else(
-        || {
-            if state.answer.is_empty() {
-                state.status.as_str()
-            } else {
-                state.answer.lines().next().unwrap_or_default()
-            }
-        },
-        String::as_str,
-    );
+    let prefix = if body_line_index == 0 {
+        format!("   │ 🤖 Bcode · {} ", state.phase.label())
+    } else if body_line_index.saturating_add(1) == body_line_count {
+        "   ╰─ answer ".to_string()
+    } else {
+        "   │  answer ".to_string()
+    };
+    let detail = if body_line_index == 0 {
+        state
+            .error
+            .as_ref()
+            .map_or(state.status.as_str(), String::as_str)
+    } else {
+        state
+            .answer
+            .lines()
+            .nth(body_line_index.saturating_sub(1))
+            .unwrap_or_default()
+    };
     let available = usize::from(
         width.saturating_sub(u16::try_from(prefix.chars().count()).unwrap_or(u16::MAX)),
     );
-    Line::from_spans(vec![
-        Span::styled(prefix, prefix_style),
-        Span::styled(truncate_to_display_width(detail, available), style),
-    ])
+    let mut spans = vec![Span::styled(prefix, prefix_style)];
+    spans.push(Span::styled(
+        truncate_to_display_width(detail, available),
+        style,
+    ));
+    if body_line_index.saturating_add(1) == body_line_count && state.answer.lines().count() > 4 {
+        spans.push(Span::styled(" …", prefix_style));
+    }
+    Line::from_spans(spans)
 }
 
 fn render_inline_thread_action(action: ReviewThreadAction) -> RenderedRow {
