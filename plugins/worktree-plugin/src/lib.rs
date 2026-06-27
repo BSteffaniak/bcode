@@ -15,6 +15,12 @@ use bcode_tool::{
     ToolPresentationFieldKind, ToolRequestPresentationMetadata, ToolSideEffect,
 };
 use bcode_worktree_models::{WorktreeCreateRequest, WorktreeListRequest, WorktreeRemoveRequest};
+use bmux_keyboard::KeyCode;
+use bmux_tui::event::Event;
+use bmux_tui::frame::Frame;
+use bmux_tui::geometry::Rect;
+use bmux_tui::style::{Color, Modifier, Style};
+use bmux_tui::text::{Line, Span};
 use serde::Serialize;
 use serde_json::json;
 use std::path::PathBuf;
@@ -125,8 +131,7 @@ fn list_worktrees_command(request: &InvokeCommandRequest) -> ServiceResponse {
     let cwd = request
         .args
         .get("cwd")
-        .map(PathBuf::from)
-        .unwrap_or_else(current_dir);
+        .map_or_else(current_dir, PathBuf::from);
     match bcode_worktree::list_worktrees(&cwd) {
         Ok(response) => {
             let mut lines = vec![format!("Worktrees for {}", response.repo_root.display())];
@@ -437,10 +442,157 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
     }
 }
 
-#[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(WorktreePlugin, include_str!("../bcode-plugin.toml"))
+    let mut vtable = bcode_plugin_sdk::static_plugin_vtable!(
+        WorktreePlugin,
+        include_str!("../bcode-plugin.toml")
+    );
+    vtable.tui_registry = Some(worktree_tui_registry);
+    vtable
+}
+
+fn worktree_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
+    let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
+    registry.register_factory(Box::new(WorktreeCommandSurfaceFactory {
+        surface_kind: "command.work-tree.attach",
+        title: "Attach Worktree",
+    }));
+    registry.register_factory(Box::new(WorktreeCommandSurfaceFactory {
+        surface_kind: "command.work-tree.createSession",
+        title: "Create Worktree Session",
+    }));
+    registry.register_factory(Box::new(WorktreeCommandSurfaceFactory {
+        surface_kind: "command.work-tree.remove",
+        title: "Remove Worktree",
+    }));
+    registry
+}
+
+struct WorktreeCommandSurfaceFactory {
+    surface_kind: &'static str,
+    title: &'static str,
+}
+
+impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for WorktreeCommandSurfaceFactory {
+    fn surface_kind(&self) -> &'static str {
+        self.surface_kind
+    }
+
+    fn open(
+        &self,
+        request: bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest,
+    ) -> bcode_plugin_sdk::tui::PluginTuiSurfaceFuture {
+        let surface_kind = self.surface_kind;
+        let title = self.title;
+        Box::pin(async move {
+            let repo_path = request.repo_path.unwrap_or_else(current_dir);
+            let lines = worktree_surface_lines(surface_kind, &repo_path);
+            Ok(Box::new(WorktreeCommandSurface {
+                id: surface_kind,
+                title,
+                repo_path,
+                lines,
+            })
+                as bcode_plugin_sdk::tui::BoxedPluginTuiSurface)
+        })
+    }
+}
+
+struct WorktreeCommandSurface {
+    id: &'static str,
+    title: &'static str,
+    repo_path: PathBuf,
+    lines: Vec<String>,
+}
+
+impl bcode_plugin_sdk::tui::PluginTuiSurface for WorktreeCommandSurface {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+
+    fn title(&self) -> &'static str {
+        self.title
+    }
+
+    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+        frame.fill(area, " ", Style::new().fg(Color::White).bg(Color::Black));
+        write_line(
+            frame,
+            area,
+            area.y,
+            Line::from_spans(vec![Span::styled(
+                self.title,
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )]),
+        );
+        write_line(
+            frame,
+            area,
+            area.y.saturating_add(1),
+            Line::from(format!("Repo: {}", self.repo_path.display())),
+        );
+        let mut y = area.y.saturating_add(3);
+        for line in &self.lines {
+            write_line(frame, area, y, Line::from(line.clone()));
+            y = y.saturating_add(1);
+        }
+        write_line(
+            frame,
+            area,
+            area.y.saturating_add(area.height.saturating_sub(1)),
+            Line::from("Enter/Esc/q closes"),
+        );
+    }
+
+    fn handle_event(
+        &mut self,
+        event: &Event,
+        _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+        match event {
+            Event::Key(key)
+                if matches!(
+                    key.key,
+                    KeyCode::Enter | KeyCode::Escape | KeyCode::Char('q')
+                ) =>
+            {
+                bcode_plugin_sdk::tui::PluginTuiAction::Close { outcome: None }
+            }
+            _ => bcode_plugin_sdk::tui::PluginTuiAction::None,
+        }
+    }
+}
+
+fn worktree_surface_lines(surface_kind: &str, repo_path: &std::path::Path) -> Vec<String> {
+    match bcode_worktree::list_worktrees(repo_path) {
+        Ok(response) => {
+            let mut lines = match surface_kind {
+                "command.work-tree.attach" => vec!["Select a worktree to attach:".to_string()],
+                "command.work-tree.remove" => vec!["Select a worktree to remove:".to_string()],
+                "command.work-tree.createSession" => vec![
+                    "Create worktree flow is plugin-owned.".to_string(),
+                    "Use the worktree.create tool for execution while interactive fields migrate here."
+                        .to_string(),
+                ],
+                _ => vec!["Worktree command surface".to_string()],
+            };
+            lines.extend(response.worktrees.into_iter().map(|worktree| {
+                let marker = if worktree.is_main { "main" } else { "linked" };
+                let branch = worktree.branch.unwrap_or_else(|| "<detached>".to_owned());
+                format!("* {marker} {branch} — {}", worktree.path.display())
+            }));
+            lines
+        }
+        Err(error) => vec![format!("worktrees unavailable: {error}")],
+    }
+}
+
+fn write_line(frame: &mut Frame<'_>, area: Rect, y: u16, line: impl Into<Line>) {
+    if y >= area.y.saturating_add(area.height) {
+        return;
+    }
+    frame.write_line(Rect::new(area.x, y, area.width, 1), &line.into());
 }
 
 bcode_plugin_sdk::export_plugin!(WorktreePlugin, include_str!("../bcode-plugin.toml"));

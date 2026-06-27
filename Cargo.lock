@@ -2076,6 +2076,8 @@ dependencies = [
  "bcode_tool",
  "bcode_worktree",
  "bcode_worktree_models",
+ "bmux_keyboard",
+ "bmux_tui",
  "serde",
  "serde_json",
 ]

@@ -8,6 +8,21 @@ description  = "Model-callable Git worktree tools"
 interface_id = "bcode.tool/v1"
 name         = "Worktree Tools"
 
+[[tui_surfaces]]
+description = "Plugin-owned worktree attach UI"
+kind        = "command.work-tree.attach"
+title       = "Attach Worktree"
+
+[[tui_surfaces]]
+description = "Plugin-owned worktree creation UI"
+kind        = "command.work-tree.createSession"
+title       = "Create Worktree Session"
+
+[[tui_surfaces]]
+description = "Plugin-owned worktree removal UI"
+kind        = "command.work-tree.remove"
+title       = "Remove Worktree"
+
 [concurrency]
 max  = 2
 type = "limited"
