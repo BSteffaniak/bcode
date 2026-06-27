@@ -251,6 +251,12 @@ enum OcrError {
     Download(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[cfg(feature = "bundled-tesseract")]
+    #[error("image decoding failed: {0}")]
+    Image(#[from] image::ImageError),
+    #[cfg(feature = "bundled-tesseract")]
+    #[error("bundled tesseract failed: {0}")]
+    BundledTesseract(String),
 }
 
 async fn extract_async(
@@ -260,8 +266,8 @@ async fn extract_async(
 ) -> Result<ExtractResponse, OcrError> {
     validate_options(request.options.as_ref())?;
     let source = source(&request)?;
-    let engine = request.engine.unwrap_or_else(|| DEFAULT_ENGINE.to_string());
-    if engine != DEFAULT_ENGINE {
+    let engine = request.engine.unwrap_or_else(default_engine_name);
+    if !is_supported_engine(&engine) {
         return Err(OcrError::UnsupportedEngine(engine));
     }
     let language = request
@@ -287,10 +293,16 @@ async fn extract_async(
     };
     if let Some(progress) = &progress {
         progress.emit(format!("OCR source path: {}", input_path.display()));
-        progress.emit("tesseract OCR started");
+        progress.emit(format!("{engine} OCR started"));
     }
-    let full_text =
-        run_tesseract(&input_path, &language, request.options.as_ref(), timeout_ms).await?;
+    let full_text = run_ocr_engine(
+        &engine,
+        &input_path,
+        &language,
+        request.options.as_ref(),
+        timeout_ms,
+    )
+    .await?;
     let full_text_bytes = full_text.len();
     let truncated = full_text_bytes > max_bytes;
     let text = truncate_utf8(&full_text, max_bytes).to_string();
@@ -343,7 +355,38 @@ fn validate_options(options: Option<&OcrOptions>) -> Result<(), OcrError> {
     Ok(())
 }
 
-async fn run_tesseract(
+fn default_engine_name() -> String {
+    #[cfg(feature = "bundled-tesseract")]
+    {
+        "tesseract".to_string()
+    }
+    #[cfg(not(feature = "bundled-tesseract"))]
+    {
+        "tesseract-cli".to_string()
+    }
+}
+
+fn is_supported_engine(engine: &str) -> bool {
+    matches!(engine, "tesseract-cli")
+        || cfg!(feature = "bundled-tesseract") && engine == "tesseract"
+}
+
+async fn run_ocr_engine(
+    engine: &str,
+    path: &Path,
+    language: &str,
+    options: Option<&OcrOptions>,
+    timeout_ms: u64,
+) -> Result<String, OcrError> {
+    match engine {
+        "tesseract-cli" => run_tesseract_cli(path, language, options, timeout_ms).await,
+        #[cfg(feature = "bundled-tesseract")]
+        "tesseract" => run_bundled_tesseract(path, language, options),
+        _ => Err(OcrError::UnsupportedEngine(engine.to_string())),
+    }
+}
+
+async fn run_tesseract_cli(
     path: &Path,
     language: &str,
     options: Option<&OcrOptions>,
@@ -386,6 +429,51 @@ async fn run_tesseract(
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[cfg(feature = "bundled-tesseract")]
+fn run_bundled_tesseract(
+    path: &Path,
+    language: &str,
+    options: Option<&OcrOptions>,
+) -> Result<String, OcrError> {
+    let image = image::open(path)?.to_rgba8();
+    let (width, height) = image.dimensions();
+    let bytes_per_pixel = 4_i32;
+    let bytes_per_line = i32::try_from(width)
+        .map_err(|error| OcrError::BundledTesseract(error.to_string()))?
+        .saturating_mul(bytes_per_pixel);
+    let api = tesseract_rs::TesseractAPI::new();
+    let oem = options.and_then(|options| options.oem).map_or(3, i32::from);
+    api.init_2("", language, oem)
+        .map_err(|error| OcrError::BundledTesseract(error.to_string()))?;
+    if let Some(options) = options {
+        if let Some(psm) = options.psm {
+            api.set_page_seg_mode(tesseract_rs::TessPageSegMode::from_int(i32::from(psm)))
+                .map_err(|error| OcrError::BundledTesseract(error.to_string()))?;
+        }
+        for config in &options.config {
+            let Some((name, value)) = config.split_once('=') else {
+                return Err(OcrError::BundledTesseract(format!(
+                    "bundled tesseract config must use name=value syntax: {config}"
+                )));
+            };
+            api.set_variable(name, value)
+                .map_err(|error| OcrError::BundledTesseract(error.to_string()))?;
+        }
+    }
+    api.set_image(
+        image.as_raw(),
+        i32::try_from(width).map_err(|error| OcrError::BundledTesseract(error.to_string()))?,
+        i32::try_from(height).map_err(|error| OcrError::BundledTesseract(error.to_string()))?,
+        bytes_per_pixel,
+        bytes_per_line,
+    )
+    .map_err(|error| OcrError::BundledTesseract(error.to_string()))?;
+    api.recognize()
+        .map_err(|error| OcrError::BundledTesseract(error.to_string()))?;
+    api.get_utf8_text()
+        .map_err(|error| OcrError::BundledTesseract(error.to_string()))
 }
 
 async fn download_source(
@@ -509,17 +597,37 @@ fn invoke_status() -> ToolInvocationResponse {
 }
 
 fn status_response() -> StatusResponse {
-    let tesseract = tesseract_status();
+    let engines = ocr_engine_statuses();
     StatusResponse {
         extract: ExtractStatus {
-            available: tesseract.available,
-            default_engine: DEFAULT_ENGINE.to_string(),
-            engines: vec![tesseract],
+            available: engines.iter().any(|engine| engine.available),
+            default_engine: default_engine_name(),
+            engines,
         },
     }
 }
 
-fn tesseract_status() -> EngineStatus {
+#[cfg(feature = "bundled-tesseract")]
+fn ocr_engine_statuses() -> Vec<EngineStatus> {
+    vec![bundled_tesseract_status(), tesseract_cli_status()]
+}
+
+#[cfg(not(feature = "bundled-tesseract"))]
+fn ocr_engine_statuses() -> Vec<EngineStatus> {
+    vec![tesseract_cli_status()]
+}
+
+#[cfg(feature = "bundled-tesseract")]
+fn bundled_tesseract_status() -> EngineStatus {
+    EngineStatus {
+        name: "tesseract".to_string(),
+        available: true,
+        version: Some(tesseract_rs::TesseractAPI::version()),
+        quality: "bundled".to_string(),
+    }
+}
+
+fn tesseract_cli_status() -> EngineStatus {
     match std::process::Command::new(DEFAULT_ENGINE)
         .arg("--version")
         .stdin(Stdio::null())
@@ -528,7 +636,7 @@ fn tesseract_status() -> EngineStatus {
         .output()
     {
         Ok(output) if output.status.success() => EngineStatus {
-            name: DEFAULT_ENGINE.to_string(),
+            name: "tesseract-cli".to_string(),
             available: true,
             version: String::from_utf8_lossy(&output.stdout)
                 .lines()
@@ -537,7 +645,7 @@ fn tesseract_status() -> EngineStatus {
             quality: "external_optional".to_string(),
         },
         _ => EngineStatus {
-            name: DEFAULT_ENGINE.to_string(),
+            name: "tesseract-cli".to_string(),
             available: false,
             version: None,
             quality: "external_optional".to_string(),
@@ -680,13 +788,13 @@ mod tests {
     #[test]
     fn status_mentions_tesseract_engine() {
         let status = status_response();
-        assert_eq!(status.extract.default_engine, DEFAULT_ENGINE);
+        assert_eq!(status.extract.default_engine, default_engine_name());
         assert!(
             status
                 .extract
                 .engines
                 .iter()
-                .any(|engine| engine.name == DEFAULT_ENGINE)
+                .any(|engine| engine.name == status.extract.default_engine)
         );
     }
 }

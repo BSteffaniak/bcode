@@ -39,7 +39,11 @@ tokio                                   = { workspace = true, features = ["macro
 
 [features]
 _static-bundled = []
-default = ["static-bundled-plugins"]
+bundled-ocr-tesseract = [
+    "static-bundled-ocr-plugin",
+    "bcode_ocr_plugin/bundled-tesseract",
+]
+default = ["static-bundled-plugins", "bundled-ocr-tesseract"]
 fail-on-warnings = []
 static-bundled-bedrock-provider-plugin = [
     "_static-bundled",

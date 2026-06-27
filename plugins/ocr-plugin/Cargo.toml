@@ -17,13 +17,21 @@ crate-type = ["cdylib", "rlib"]
 bcode_model_provider_runtime = { workspace = true }
 bcode_plugin_sdk             = { workspace = true }
 bcode_tool                   = { workspace = true }
+image                        = { workspace = true, optional = true }
 reqwest                      = { workspace = true }
 serde                        = { workspace = true, features = ["derive", "std"] }
 serde_json                   = { workspace = true }
+tesseract-rs                 = { workspace = true, optional = true }
 thiserror                    = { workspace = true }
 tokio                        = { workspace = true, features = ["fs", "io-util", "process", "time"] }
 
 [features]
-default          = []
+bundled-tesseract = [
+    "dep:image",
+    "dep:tesseract-rs",
+    "tesseract-rs/build-tesseract",
+]
+default = []
+external-tesseract-cli = []
 fail-on-warnings = []
-static-bundled   = []
+static-bundled = []
