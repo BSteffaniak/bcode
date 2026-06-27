@@ -1828,6 +1828,9 @@ fn handle_review_navigation_key(app: &mut ReviewApp, key: KeyCode) -> bool {
         }
         KeyCode::Char('a') => app.open_comment_editor_with_action(ReviewCommentAction::AskBcode),
         KeyCode::Char('A') => app.toggle_selected_agent_answer_expanded(),
+        KeyCode::Char('s') => app.suggest_comment_from_agent_answer_at_selection(),
+        KeyCode::Char(';') => app.accept_suggestion_at_selection(),
+        KeyCode::Char(':') => app.reject_suggestion_at_selection(),
         KeyCode::Char('m') => app.convert_agent_answer_to_draft_at_selection(),
         KeyCode::Char('y') => app.retry_linked_session_stream_at_selection(),
         KeyCode::Char('o') => app.open_linked_session_at_selection(),
@@ -7825,6 +7828,68 @@ impl ReviewApp {
             .as_deref()
     }
 
+    fn latest_pending_suggestion_mut(
+        &mut self,
+        anchor: &ReviewCommentAnchor,
+    ) -> Option<&mut ReviewSuggestedComment> {
+        self.suggested_comments
+            .get_mut(anchor)
+            .and_then(|suggestions| {
+                suggestions
+                    .iter_mut()
+                    .rev()
+                    .find(|suggestion| suggestion.status == ReviewSuggestionStatus::Suggested)
+            })
+    }
+
+    /// Accept the latest suggested comment at the selected thread into normal drafts.
+    pub fn accept_suggestion_at_selection(&mut self) -> bool {
+        let Some(anchor) = self.selected_comment_anchor() else {
+            self.status_message = Some("select a suggested comment to accept".to_string());
+            return true;
+        };
+        let Some(suggestion) = self.latest_pending_suggestion_mut(&anchor) else {
+            self.status_message = Some("selected thread has no pending suggestion".to_string());
+            return true;
+        };
+        let body = suggestion.body.clone();
+        let session_id = suggestion.session_id.clone();
+        suggestion.status = ReviewSuggestionStatus::Accepted;
+        self.draft_comments
+            .entry(anchor.clone())
+            .or_default()
+            .push(ReviewDraftComment {
+                id: None,
+                body: body.clone(),
+                persisted: false,
+                created_at_ms: None,
+                updated_at_ms: None,
+                session_id,
+                thread_kind: ReviewThreadKind::Note,
+                severity: ReviewThreadSeverity::Info,
+            });
+        self.pending_draft_save = Some(PendingDraftSave { anchor, body });
+        self.sync_selected_thread_to_anchor();
+        self.status_message = Some("accepted suggestion as draft comment".to_string());
+        true
+    }
+
+    /// Reject the latest suggested comment at the selected thread.
+    pub fn reject_suggestion_at_selection(&mut self) -> bool {
+        let Some(anchor) = self.selected_comment_anchor() else {
+            self.status_message = Some("select a suggested comment to reject".to_string());
+            return true;
+        };
+        let Some(suggestion) = self.latest_pending_suggestion_mut(&anchor) else {
+            self.status_message = Some("selected thread has no pending suggestion".to_string());
+            return true;
+        };
+        suggestion.status = ReviewSuggestionStatus::Rejected;
+        self.sync_selected_thread_to_anchor();
+        self.status_message = Some("rejected suggested comment".to_string());
+        true
+    }
+
     /// Add a local suggested comment at the selected anchor from the latest Bcode answer.
     pub fn suggest_comment_from_agent_answer_at_selection(&mut self) -> bool {
         let Some(anchor) = self.selected_comment_anchor() else {
@@ -8785,6 +8850,8 @@ impl ReviewApp {
             Some(ReviewThreadAction::SuggestAnswer) => {
                 self.suggest_comment_from_agent_answer_at_selection()
             }
+            Some(ReviewThreadAction::AcceptSuggestion) => self.accept_suggestion_at_selection(),
+            Some(ReviewThreadAction::RejectSuggestion) => self.reject_suggestion_at_selection(),
             Some(ReviewThreadAction::DraftAnswer) => {
                 self.convert_agent_answer_to_draft_at_selection()
             }

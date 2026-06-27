@@ -7,7 +7,7 @@ use std::{
 
 use crate::code_review_tui::{
     CachedReviewFile, ReviewAgentThreadState, ReviewDraftComment, ReviewFile,
-    ReviewSuggestedComment,
+    ReviewSuggestedComment, ReviewSuggestionStatus,
 };
 use crate::code_review_tui_display::{
     ReviewDisplayBuilder, ReviewDisplayRow, ReviewDisplayRowSource,
@@ -260,12 +260,11 @@ impl ReviewViewDocument {
                         });
                     }
                 }
-                for (suggestion_index, suggestion) in suggestions
-                    .remove(anchor)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .enumerate()
-                {
+                let thread_suggestions = suggestions.remove(anchor).unwrap_or_default();
+                let has_pending_suggestion = thread_suggestions
+                    .iter()
+                    .any(|suggestion| suggestion.status == ReviewSuggestionStatus::Suggested);
+                for (suggestion_index, suggestion) in thread_suggestions.into_iter().enumerate() {
                     let body_line_count = suggestion.body.lines().count().max(1);
                     for body_line_index in 0..body_line_count {
                         rows.push(ReviewViewRow {
@@ -321,6 +320,7 @@ impl ReviewViewDocument {
                     has_agent_answer,
                     has_linked_session,
                     has_stream_error,
+                    has_pending_suggestion,
                 ) {
                     rows.push(ReviewViewRow {
                         visual_row: 0,
@@ -579,6 +579,10 @@ pub enum ReviewThreadAction {
     ToggleAnswer,
     /// Create a suggested comment from the latest Bcode answer.
     SuggestAnswer,
+    /// Accept the latest suggested comment into drafts.
+    AcceptSuggestion,
+    /// Reject the latest suggested comment.
+    RejectSuggestion,
     /// Convert the latest Bcode answer into a draft comment.
     DraftAnswer,
     /// Open the linked Bcode session.
@@ -599,6 +603,7 @@ impl ReviewThreadAction {
         has_agent_answer: bool,
         has_linked_session: bool,
         has_stream_error: bool,
+        has_pending_suggestion: bool,
     ) -> Vec<Self> {
         let mut actions = vec![Self::Reply, Self::Edit, Self::Delete];
         if has_linked_session {
@@ -614,6 +619,10 @@ impl ReviewThreadAction {
             actions.push(Self::ToggleAnswer);
             actions.push(Self::SuggestAnswer);
             actions.push(Self::DraftAnswer);
+        }
+        if has_pending_suggestion {
+            actions.push(Self::AcceptSuggestion);
+            actions.push(Self::RejectSuggestion);
         }
         actions.push(Self::Publish);
         actions.push(if resolved {
@@ -637,6 +646,8 @@ impl ReviewThreadAction {
             Self::RetrySession => "retry-session",
             Self::ToggleAnswer => "toggle-answer",
             Self::SuggestAnswer => "suggest-answer",
+            Self::AcceptSuggestion => "accept-suggestion",
+            Self::RejectSuggestion => "reject-suggestion",
             Self::DraftAnswer => "draft-answer",
             Self::Publish => "publish",
             Self::Resolve => "resolve",
@@ -656,6 +667,8 @@ impl ReviewThreadAction {
             Self::RetrySession => "y",
             Self::ToggleAnswer => "A",
             Self::SuggestAnswer => "s",
+            Self::AcceptSuggestion => ";",
+            Self::RejectSuggestion => ":",
             Self::DraftAnswer => "m",
             Self::Publish => "x",
             Self::Resolve | Self::Reopen => "r",
@@ -675,6 +688,8 @@ impl ReviewThreadAction {
             Self::RetrySession => "retry stream",
             Self::ToggleAnswer => "expand answer",
             Self::SuggestAnswer => "suggest comment",
+            Self::AcceptSuggestion => "accept suggestion",
+            Self::RejectSuggestion => "reject suggestion",
             Self::DraftAnswer => "draft answer",
             Self::Publish => "publish",
             Self::Resolve => "resolve",
@@ -695,6 +710,8 @@ impl ReviewThreadAction {
             b"retry-session" => Some(Self::RetrySession),
             b"toggle-answer" => Some(Self::ToggleAnswer),
             b"suggest-answer" => Some(Self::SuggestAnswer),
+            b"accept-suggestion" => Some(Self::AcceptSuggestion),
+            b"reject-suggestion" => Some(Self::RejectSuggestion),
             b"draft-answer" => Some(Self::DraftAnswer),
             b"publish" => Some(Self::Publish),
             b"resolve" => Some(Self::Resolve),
