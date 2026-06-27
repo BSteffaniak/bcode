@@ -57,8 +57,8 @@ use bcode_skill::{
 };
 use bcode_skill_models::{
     SkillActivationMode, SkillContextResponse, SkillDiagnosticSeverity, SkillId, SkillList,
-    SkillSource, SkillToolDecision, SkillToolDecisionEntry, SkillToolDecisionKey,
-    SkillToolDecisionScope, SkillToolPolicyOutcome, SkillToolPolicyRequest,
+    SkillModelRequest, SkillSource, SkillToolDecision, SkillToolDecisionEntry,
+    SkillToolDecisionKey, SkillToolDecisionScope, SkillToolPolicyOutcome, SkillToolPolicyRequest,
 };
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, ShellRunResult as ServiceShellRunResult,
@@ -6279,6 +6279,19 @@ async fn handle_set_session_model(
     provider_plugin_id: Option<String>,
     model_id: String,
 ) -> Result<(), ServerError> {
+    if let Some(blocking_skill_id) = required_model_active_skill(state, session_id).await {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(
+                "skill_required_model_active",
+                format!(
+                    "skill {blocking_skill_id} declares a required model; deactivate it before changing the session model"
+                ),
+            )),
+        )
+        .await;
+    }
     let provider = provider_plugin_id.unwrap_or_else(|| "<auto>".to_string());
     match state
         .sessions
@@ -6672,6 +6685,9 @@ async fn handle_activate_skill(
         )
         .await;
     };
+    if let Err(error) = apply_skill_model_policy(state, session_id, &skill_id).await {
+        return send_response(writer, request_id, Response::Err(error)).await;
+    }
     state
         .active_skills
         .lock()
@@ -6698,6 +6714,94 @@ async fn handle_activate_skill(
         Response::Ok(ResponsePayload::SessionAgentSet),
     )
     .await
+}
+
+async fn required_model_active_skill(
+    state: &ServerState,
+    session_id: SessionId,
+) -> Option<SkillId> {
+    let registry = state.skills.as_ref()?;
+    let active_skill_ids = state.active_skills.lock().await.get(&session_id)?.clone();
+    for skill_id in active_skill_ids {
+        if registry
+            .describe(&skill_id)
+            .is_ok_and(|manifest| manifest.model_policy.required.is_some())
+        {
+            return Some(skill_id);
+        }
+    }
+    None
+}
+
+async fn apply_skill_model_policy(
+    state: &ServerState,
+    session_id: SessionId,
+    skill_id: &SkillId,
+) -> Result<(), ErrorResponse> {
+    let Some(registry) = &state.skills else {
+        return Ok(());
+    };
+    let manifest = registry.describe(skill_id).map_err(|error| {
+        ErrorResponse::new(
+            "skill_describe_failed",
+            format!("failed to load skill model policy for {skill_id}: {error}"),
+        )
+    })?;
+    if let Some(required) = manifest.model_policy.required.as_ref() {
+        apply_skill_model_request(state, session_id, required, true).await?;
+    } else if let Some(preferred) = manifest.model_policy.preferred.as_ref() {
+        let selection = session_model_selection(state, session_id).await;
+        if selection.model_id.is_none() {
+            apply_skill_model_request(state, session_id, preferred, false).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn apply_skill_model_request(
+    state: &ServerState,
+    session_id: SessionId,
+    request: &SkillModelRequest,
+    required: bool,
+) -> Result<(), ErrorResponse> {
+    let provider = request
+        .provider
+        .clone()
+        .unwrap_or_else(|| "<auto>".to_string());
+    let event = state
+        .sessions
+        .append_model_changed(session_id, provider.clone(), request.model.clone())
+        .await
+        .map_err(|error| session_error_response(&error))?;
+    let mut selection = SessionModelSelection {
+        provider_plugin_id: provider_to_selection(&provider),
+        model_id: model_to_selection(&request.model),
+        thinking_level: None,
+        reasoning_effort: state.selected_reasoning.effort.clone(),
+        reasoning_summary: state.selected_reasoning.summary.clone(),
+        reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
+        provider_context: state.selected_provider_context.clone(),
+    };
+    if let Some(effort) = request.thinking_effort.as_ref() {
+        selection.reasoning_effort = effort.provider_value.clone().or_else(|| {
+            effort
+                .normalized_level
+                .map(|level| format!("{level:?}").to_lowercase())
+        });
+    }
+    state
+        .session_model_selections
+        .lock()
+        .await
+        .insert(session_id, selection);
+    publish_session_event(state, &event).await;
+    if required {
+        eprintln!(
+            "skill required model applied for session {session_id}: {} via {}",
+            request.model, provider
+        );
+    }
+    Ok(())
 }
 
 async fn handle_deactivate_skill(
