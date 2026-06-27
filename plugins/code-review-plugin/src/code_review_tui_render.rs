@@ -460,6 +460,9 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             if let Some(preview) = app.selected_suggestion_preview() {
                 return format!(" {preview}  ; accept  f refine  : reject  s suggest answer  m draft answer  a ask/follow up ");
             }
+            if let Some(preview) = app.selected_comment_target_preview() {
+                return format!(" {preview}  c comment  v range  a ask Bcode  F file-comment  C review-comment ");
+            }
             if let Some(preview) = app.selected_draft_preview() {
                 let linked = app
                     .selected_draft_session_id()
@@ -2154,7 +2157,7 @@ fn render_display_row_with_affordance(
         rendered.line.spans.insert(
             0,
             Span::styled(
-                "+",
+                "✎",
                 rendered
                     .style
                     .patch(Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),

@@ -9237,6 +9237,26 @@ impl ReviewApp {
         ))
     }
 
+    /// Return a short preview for the selected commentable source target.
+    #[must_use]
+    pub fn selected_comment_target_preview(&self) -> Option<String> {
+        if self.selected_draft_preview().is_some() || self.selected_suggestion_preview().is_some() {
+            return None;
+        }
+        let anchor = self.selected_comment_anchor()?;
+        if anchor.is_review_level() {
+            return Some("review-level target selected".to_string());
+        }
+        if anchor.kind() == ReviewAnchorKind::File {
+            return Some(format!("file target selected: {}", anchor.path));
+        }
+        let line = anchor.new_line.or(anchor.old_line).map_or_else(
+            || format!("row {}", anchor.diff_row.saturating_add(1)),
+            |line| format!("line {line}"),
+        );
+        Some(format!("comment target selected: {} {line}", anchor.path))
+    }
+
     /// Return a short preview for the selected line's latest suggested comment.
     #[must_use]
     pub fn selected_suggestion_preview(&self) -> Option<String> {
