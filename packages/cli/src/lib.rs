@@ -192,7 +192,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Auth { command } => handle_auth_command(command)?,
         Commands::Login { command } => handle_login_command(command).await?,
         Commands::Provider { command } => handle_provider_command(command)?,
-        Commands::Skill { command } => handle_skill_command(&command)?,
+        Commands::Skill { command } => handle_skill_command(&command).await?,
         Commands::Permission { command } => handle_permission_command(command).await?,
         Commands::RuntimeWork { command } => handle_runtime_work_command(command).await?,
         command => handle_session_io_command(command).await?,
@@ -483,12 +483,21 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
     Ok(())
 }
 
-fn handle_skill_command(command: &SkillCommand) -> Result<(), CliError> {
+async fn handle_skill_command(command: &SkillCommand) -> Result<(), CliError> {
     let store = SettingsStore::default();
     match command {
         SkillCommand::Check { json } => check_skills(*json)?,
         SkillCommand::List { json } => list_skills(*json)?,
         SkillCommand::Describe { skill_id, json } => describe_skill(skill_id, *json)?,
+        SkillCommand::Active { session_id, json } => active_skills(*session_id, *json).await?,
+        SkillCommand::Activate {
+            session_id,
+            skill_id,
+        } => activate_skill(*session_id, skill_id).await?,
+        SkillCommand::Deactivate {
+            session_id,
+            skill_id,
+        } => deactivate_skill(*session_id, skill_id).await?,
         SkillCommand::Decisions { json, skill, tool } => {
             let state = store.skill_tool_decisions()?;
             let decisions =
@@ -593,6 +602,43 @@ fn describe_skill(skill_id: &str, json: bool) -> Result<(), CliError> {
         println!("tools: {}", manifest.permissions.tools.join(", "));
     }
     println!("instructions:\n{}", manifest.instructions);
+    Ok(())
+}
+
+async fn active_skills(session_id: SessionId, json: bool) -> Result<(), CliError> {
+    let skills = BcodeClient::default_endpoint()
+        .active_skills(session_id)
+        .await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&skills)?);
+        return Ok(());
+    }
+    if skills.is_empty() {
+        println!("no active skills");
+        return Ok(());
+    }
+    for skill in skills {
+        println!(
+            "{}\t{}\t{}\t{}",
+            skill.skill_id, skill.source.label, skill.bytes_loaded, skill.truncated
+        );
+    }
+    Ok(())
+}
+
+async fn activate_skill(session_id: SessionId, skill_id: &str) -> Result<(), CliError> {
+    BcodeClient::default_endpoint()
+        .activate_skill(session_id, skill_id.parse()?)
+        .await?;
+    println!("activated skill {skill_id} for session {session_id}");
+    Ok(())
+}
+
+async fn deactivate_skill(session_id: SessionId, skill_id: &str) -> Result<(), CliError> {
+    BcodeClient::default_endpoint()
+        .deactivate_skill(session_id, skill_id.parse()?)
+        .await?;
+    println!("deactivated skill {skill_id} for session {session_id}");
     Ok(())
 }
 
@@ -1453,6 +1499,28 @@ enum SkillCommand {
         /// Emit JSON instead of text.
         #[arg(long)]
         json: bool,
+    },
+    /// List active skills for a live session.
+    Active {
+        /// Session ID.
+        session_id: SessionId,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Activate a skill for a live session.
+    Activate {
+        /// Session ID.
+        session_id: SessionId,
+        /// Skill ID.
+        skill_id: String,
+    },
+    /// Deactivate a skill for a live session.
+    Deactivate {
+        /// Session ID.
+        session_id: SessionId,
+        /// Skill ID.
+        skill_id: String,
     },
     /// List remembered skill tool decisions.
     Decisions {
