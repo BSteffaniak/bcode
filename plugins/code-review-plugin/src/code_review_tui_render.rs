@@ -2729,7 +2729,13 @@ fn render_comment_editor_header(
     frame: &mut Frame<'_>,
 ) {
     let title = if editor.preview {
-        " Review comment preview "
+        if editor.existing_comment_count > 0 {
+            " Reply preview "
+        } else {
+            " Review comment preview "
+        }
+    } else if editor.existing_comment_count > 0 {
+        " Reply to review thread "
     } else {
         " Review comment "
     };
@@ -2744,7 +2750,7 @@ fn render_comment_editor_header(
         )]),
     );
     let anchor = format!(
-        " {}:{}{} ",
+        " {}:{}{}{} ",
         editor.anchor.path,
         editor
             .anchor
@@ -2755,6 +2761,19 @@ fn render_comment_editor_header(
             ReviewLineKind::Added => " +",
             ReviewLineKind::Removed => " -",
             ReviewLineKind::Context => "",
+        },
+        if editor.existing_comment_count > 0 {
+            format!(
+                " · replying to {} draft{}",
+                editor.existing_comment_count,
+                if editor.existing_comment_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )
+        } else {
+            String::new()
         }
     );
     frame.write_line(

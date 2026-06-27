@@ -3538,6 +3538,8 @@ pub struct ReviewCommentEditor {
     pub preview: bool,
     /// Selected submit action.
     pub action: ReviewCommentAction,
+    /// Existing draft comments on the target thread when composer opened.
+    pub existing_comment_count: usize,
     /// Editor mode.
     pub mode: ReviewCommentEditorMode,
 }
@@ -3551,6 +3553,7 @@ impl ReviewCommentEditor {
             buffer: TextEditBuffer::new(),
             preview: false,
             action,
+            existing_comment_count: 0,
             mode: ReviewCommentEditorMode::Create,
         }
     }
@@ -3563,6 +3566,7 @@ impl ReviewCommentEditor {
             buffer: TextEditBuffer::from_text(&body),
             preview: false,
             action: ReviewCommentAction::SaveDraft,
+            existing_comment_count: 0,
             mode: ReviewCommentEditorMode::Edit {
                 comment_id,
                 previous_body: body,
@@ -7681,10 +7685,18 @@ impl ReviewApp {
             });
             return true;
         };
-        self.comment_editor = Some(ReviewCommentEditor::new(anchor, action));
+        let existing_comment_count = self.draft_comments.get(&anchor).map_or(0, Vec::len);
+        let mut editor = ReviewCommentEditor::new(anchor, action);
+        editor.existing_comment_count = existing_comment_count;
+        self.comment_editor = Some(editor);
         self.sync_selected_thread_to_anchor();
         self.status_message = Some(format!(
-            "compose review comment; tab switches action, enter submits {}",
+            "{}; tab switches action, enter submits {}",
+            if existing_comment_count > 0 {
+                "compose thread reply"
+            } else {
+                "compose review comment"
+            },
             action.label()
         ));
         true
