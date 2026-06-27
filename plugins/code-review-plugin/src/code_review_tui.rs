@@ -22,10 +22,13 @@ use bcode_code_review_models::{
     UpdateReviewWorkspaceRequest,
 };
 use bcode_ipc::PluginServiceResponse;
-use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface};
+use bcode_plugin_sdk::tui::{
+    PluginSessionEvent, PluginSessionEventReplay, PluginSessionEventSubscription,
+    PluginSessionEventSubscriptionRequest, PluginTuiAction, PluginTuiHost, PluginTuiSurface,
+};
 use bcode_session_models::{
-    ModelTurnOutcome, SessionEvent, SessionEventKind, SessionHistoryDirection, SessionHistoryQuery,
-    SessionId,
+    LiveToolArgumentPreview, ModelTurnOutcome, SessionEvent, SessionEventKind, SessionId,
+    SessionLiveEventKind,
 };
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_text_edit::TextEditBuffer;
@@ -126,7 +129,7 @@ pub struct CodeReviewSurface {
     review_target: ReviewOpenTarget,
     app: ReviewApp,
     file_store: AsyncValueStore<String, CachedReviewFile>,
-    agent_history_store: AsyncValueStore<String, ReviewAgentHistorySnapshot>,
+    agent_streams: ReviewAgentStreamStore,
 }
 
 impl CodeReviewSurface {
@@ -156,7 +159,7 @@ impl CodeReviewSurface {
             review_target,
             app,
             file_store: AsyncValueStore::new(),
-            agent_history_store: AsyncValueStore::new(),
+            agent_streams: ReviewAgentStreamStore::default(),
         };
         surface.app.queue_selected_file_load();
         Ok(surface)
@@ -183,18 +186,8 @@ impl CodeReviewSurface {
         )
     }
 
-    fn ensure_linked_agent_history_loads(&mut self, host: &dyn PluginTuiHost) -> bool {
-        let session_ids = self.app.linked_agent_session_ids();
-        let client = self.client.clone();
-        session_ids.into_iter().fold(false, |loaded, session_id| {
-            let client = client.clone();
-            loaded
-                | self
-                    .agent_history_store
-                    .ensure(host, session_id, move |session_id| async move {
-                        load_agent_history_snapshot(client, session_id).await
-                    })
-        })
+    fn ensure_linked_agent_streams(&mut self, host: &dyn PluginTuiHost) -> bool {
+        self.agent_streams.ensure_subscriptions(host, &mut self.app)
     }
 
     pub async fn drain_inline_effects(&mut self) -> bool {
@@ -323,15 +316,9 @@ impl PluginTuiSurface for CodeReviewSurface {
     }
 
     fn poll(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
-        let linked_loaded = self.ensure_linked_agent_history_loads(host);
+        let linked_loaded = self.ensure_linked_agent_streams(host);
         let mut needs_redraw = self.ensure_selected_repository_file_load(host) || linked_loaded;
-        while let Ok(update) = self.agent_history_store.try_recv() {
-            let session_id = update.key().clone();
-            self.agent_history_store.apply(update);
-            sync_agent_history_store(&mut self.app, &self.agent_history_store);
-            self.agent_history_store.remove(&session_id);
-            needs_redraw = true;
-        }
+        needs_redraw |= self.agent_streams.drain(&mut self.app);
         while let Ok(update) = self.file_store.try_recv() {
             self.file_store.apply(update);
             sync_repository_file_store(&mut self.app, &self.file_store);
@@ -681,39 +668,6 @@ async fn save_workspace(client: &BcodeClient, workspace: ReviewWorkspace) -> Res
     Ok(())
 }
 
-async fn load_agent_history_snapshot(
-    client: BcodeClient,
-    session_id: String,
-) -> Result<ReviewAgentHistorySnapshot, String> {
-    let session_id = session_id
-        .parse::<SessionId>()
-        .map_err(|error| format!("invalid session id: {error}"))?;
-    let page = client
-        .session_history_page(
-            session_id,
-            SessionHistoryQuery {
-                cursor: None,
-                limit: 200,
-                direction: SessionHistoryDirection::Backward,
-            },
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(ReviewAgentHistorySnapshot::from_events(page.events))
-}
-
-fn sync_agent_history_store(
-    app: &mut ReviewApp,
-    store: &AsyncValueStore<String, ReviewAgentHistorySnapshot>,
-) {
-    for session_id in app.linked_agent_session_ids() {
-        match store.get(&session_id) {
-            AsyncValue::Ready(snapshot) => app.apply_agent_history_snapshot(&session_id, snapshot),
-            AsyncValue::Error(error) => app.mark_agent_session_failed(&session_id, &error),
-            AsyncValue::Missing | AsyncValue::Loading => {}
-        }
-    }
-}
 async fn handle_pending_agent_session(
     client: &BcodeClient,
     repo_path: PathBuf,
@@ -3130,68 +3084,311 @@ impl ReviewAgentThreadState {
     }
 }
 
-/// Bounded projection of a linked Bcode session.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewAgentHistorySnapshot {
-    /// Latest assistant answer text.
-    pub answer: String,
-    /// Latest lifecycle phase inferred from history.
-    pub phase: ReviewAgentThreadPhase,
-    /// Latest status message inferred from history.
-    pub status: String,
+/// Live subscriptions for linked Bcode review-thread sessions.
+#[derive(Debug, Default)]
+struct ReviewAgentStreamStore {
+    subscriptions: BTreeMap<String, PluginSessionEventSubscription>,
+    session_states: BTreeMap<String, ReviewAgentSessionStreamState>,
+    failed_sessions: BTreeSet<String>,
 }
 
-impl ReviewAgentHistorySnapshot {
-    #[must_use]
-    fn from_events(mut events: Vec<SessionEvent>) -> Self {
-        events.sort_by_key(|event| event.sequence);
-        let mut answer = String::new();
-        let mut phase = ReviewAgentThreadPhase::Running;
-        let mut status = "running".to_string();
-        for event in events {
-            match event.kind {
-                SessionEventKind::AssistantDelta { text }
-                | SessionEventKind::AssistantMessage { text } => {
-                    if !answer.is_empty() {
-                        answer.push('\n');
-                    }
-                    answer.push_str(&text);
-                    phase = ReviewAgentThreadPhase::Complete;
-                    status = "answered".to_string();
+impl ReviewAgentStreamStore {
+    fn ensure_subscriptions(&mut self, host: &dyn PluginTuiHost, app: &mut ReviewApp) -> bool {
+        let mut changed = false;
+        for session_id in app.linked_agent_session_ids() {
+            if self.subscriptions.contains_key(&session_id)
+                || self.failed_sessions.contains(&session_id)
+            {
+                continue;
+            }
+            let Ok(parsed_session_id) = session_id.parse::<SessionId>() else {
+                app.mark_agent_session_failed(&session_id, "invalid linked Bcode session id");
+                self.failed_sessions.insert(session_id);
+                changed = true;
+                continue;
+            };
+            match host.subscribe_session_events(PluginSessionEventSubscriptionRequest {
+                session_id: parsed_session_id,
+                replay: PluginSessionEventReplay::Recent { limit: 200 },
+                buffer: 512,
+            }) {
+                Ok(subscription) => {
+                    self.subscriptions.insert(session_id.clone(), subscription);
+                    self.session_states
+                        .entry(session_id.clone())
+                        .or_default()
+                        .status = "listening to linked Bcode session…".to_string();
+                    changed = true;
                 }
-                SessionEventKind::ModelTurnStarted { .. } => {
-                    phase = ReviewAgentThreadPhase::Running;
-                    status = "Bcode is working…".to_string();
+                Err(error) => {
+                    app.mark_agent_session_failed(
+                        &session_id,
+                        &format!("live session events unavailable: {error}"),
+                    );
+                    self.failed_sessions.insert(session_id);
+                    changed = true;
                 }
-                SessionEventKind::ModelTurnFinished {
-                    outcome, message, ..
-                } => {
-                    if matches!(
-                        outcome,
-                        ModelTurnOutcome::Cancelled
-                            | ModelTurnOutcome::Error
-                            | ModelTurnOutcome::IdleTimeout
-                            | ModelTurnOutcome::ProviderUnavailable
-                    ) {
-                        phase = ReviewAgentThreadPhase::Failed;
-                        status = message.unwrap_or_else(|| format!("turn {outcome:?}"));
-                    } else if !answer.is_empty() {
-                        phase = ReviewAgentThreadPhase::Complete;
-                        status = "answered".to_string();
-                    }
-                }
-                SessionEventKind::RuntimeWorkProgress { message, .. } => {
-                    status = message;
-                }
-                _ => {}
             }
         }
+        changed
+    }
+
+    fn drain(&mut self, app: &mut ReviewApp) -> bool {
+        let mut changed = false;
+        let mut disconnected = Vec::new();
+        for (session_id, subscription) in &mut self.subscriptions {
+            loop {
+                match subscription.receiver.try_recv() {
+                    Ok(event) => {
+                        let state = self.session_states.entry(session_id.clone()).or_default();
+                        if state.apply_plugin_event(event) {
+                            app.apply_agent_stream_state(session_id, state);
+                            changed = true;
+                        }
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        disconnected.push(session_id.clone());
+                        app.mark_agent_session_failed(
+                            session_id,
+                            "session event stream disconnected",
+                        );
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        for session_id in disconnected {
+            self.subscriptions.remove(&session_id);
+            self.failed_sessions.insert(session_id);
+        }
+        changed
+    }
+}
+
+/// Incremental projection of a linked Bcode session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewAgentSessionStreamState {
+    last_sequence: u64,
+    durable_answer: String,
+    live_answer_by_turn: BTreeMap<String, String>,
+    active_turn_id: Option<String>,
+    phase: ReviewAgentThreadPhase,
+    status: String,
+    error: Option<String>,
+}
+
+impl Default for ReviewAgentSessionStreamState {
+    fn default() -> Self {
         Self {
-            answer,
-            phase,
-            status,
+            last_sequence: 0,
+            durable_answer: String::new(),
+            live_answer_by_turn: BTreeMap::new(),
+            active_turn_id: None,
+            phase: ReviewAgentThreadPhase::Running,
+            status: "running".to_string(),
+            error: None,
         }
     }
+}
+
+impl ReviewAgentSessionStreamState {
+    fn apply_plugin_event(&mut self, event: PluginSessionEvent) -> bool {
+        match event {
+            PluginSessionEvent::Attached { mut history, .. } => {
+                history.sort_by_key(|event| event.sequence);
+                for event in history {
+                    self.apply_durable_event(event);
+                }
+                true
+            }
+            PluginSessionEvent::Session(event) => self.apply_durable_event(event),
+            PluginSessionEvent::SessionLive(event) => self.apply_live_event(event.kind),
+            PluginSessionEvent::Lagged { dropped_count } => {
+                self.status = format!("live updates lagged; dropped {dropped_count} events");
+                true
+            }
+            PluginSessionEvent::Disconnected { message } => {
+                self.phase = ReviewAgentThreadPhase::Failed;
+                self.status = "session event stream disconnected".to_string();
+                self.error = Some(message);
+                true
+            }
+        }
+    }
+
+    fn apply_durable_event(&mut self, event: SessionEvent) -> bool {
+        if event.sequence <= self.last_sequence {
+            return false;
+        }
+        self.last_sequence = event.sequence;
+        match event.kind {
+            SessionEventKind::AssistantDelta { text } => {
+                self.append_durable_answer(&text, false);
+                self.phase = ReviewAgentThreadPhase::Complete;
+                self.status = "answered".to_string();
+                self.error = None;
+            }
+            SessionEventKind::AssistantMessage { text } => {
+                self.append_durable_answer(&text, true);
+                self.phase = ReviewAgentThreadPhase::Complete;
+                self.status = "answered".to_string();
+                self.error = None;
+                self.clear_matching_live_answer(&text);
+            }
+            SessionEventKind::ModelTurnStarted { turn_id } => {
+                self.active_turn_id = Some(turn_id);
+                self.phase = ReviewAgentThreadPhase::Running;
+                self.status = "Bcode is working…".to_string();
+                self.error = None;
+            }
+            SessionEventKind::ModelTurnFinished {
+                turn_id,
+                outcome,
+                message,
+            } => {
+                self.finish_turn(&turn_id, outcome, message);
+            }
+            SessionEventKind::RuntimeWorkProgress { message, .. } => {
+                self.phase = ReviewAgentThreadPhase::Running;
+                self.status = message;
+            }
+            SessionEventKind::ToolCallRequested { tool_name, .. } => {
+                self.phase = ReviewAgentThreadPhase::Running;
+                self.status = format!("running tool: {tool_name}");
+            }
+            SessionEventKind::ToolCallFinished { is_error, .. } => {
+                self.status = if is_error {
+                    "tool failed".to_string()
+                } else {
+                    "tool finished".to_string()
+                };
+            }
+            SessionEventKind::ToolInvocationStream { .. } => {
+                self.phase = ReviewAgentThreadPhase::Running;
+                self.status = "running tool…".to_string();
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn apply_live_event(&mut self, kind: SessionLiveEventKind) -> bool {
+        match kind {
+            SessionLiveEventKind::AssistantTextDelta { turn_id, text } => {
+                self.live_answer_by_turn
+                    .entry(turn_id.clone())
+                    .or_default()
+                    .push_str(&text);
+                self.active_turn_id = Some(turn_id);
+                self.phase = ReviewAgentThreadPhase::Running;
+                self.status = "receiving model response…".to_string();
+                self.error = None;
+            }
+            SessionLiveEventKind::AssistantReasoningDelta { turn_id, .. } => {
+                self.active_turn_id = Some(turn_id);
+                self.phase = ReviewAgentThreadPhase::Running;
+                self.status = "thinking…".to_string();
+            }
+            SessionLiveEventKind::ToolOutputDelta { .. } => {
+                self.phase = ReviewAgentThreadPhase::Running;
+                self.status = "running tool…".to_string();
+            }
+            SessionLiveEventKind::ToolArgumentPreview {
+                turn_id,
+                tool_name,
+                preview,
+                ..
+            } => {
+                self.active_turn_id = Some(turn_id);
+                self.phase = ReviewAgentThreadPhase::Running;
+                self.status = live_tool_preview_status(&tool_name, &preview);
+            }
+            SessionLiveEventKind::ProviderStreamProgress { turn_id, .. } => {
+                self.active_turn_id = Some(turn_id);
+                self.phase = ReviewAgentThreadPhase::Running;
+                self.status = "receiving model response…".to_string();
+            }
+        }
+        true
+    }
+
+    fn append_durable_answer(&mut self, text: &str, complete_message: bool) {
+        if text.is_empty() || self.durable_answer.contains(text) {
+            return;
+        }
+        if complete_message
+            && !self.durable_answer.is_empty()
+            && !self.durable_answer.ends_with('\n')
+        {
+            self.durable_answer.push('\n');
+        }
+        self.durable_answer.push_str(text);
+    }
+
+    fn clear_matching_live_answer(&mut self, text: &str) {
+        self.live_answer_by_turn
+            .retain(|_, live_text| !text.contains(live_text.as_str()));
+    }
+
+    fn finish_turn(&mut self, turn_id: &str, outcome: ModelTurnOutcome, message: Option<String>) {
+        if matches!(
+            outcome,
+            ModelTurnOutcome::Cancelled
+                | ModelTurnOutcome::Error
+                | ModelTurnOutcome::IdleTimeout
+                | ModelTurnOutcome::ProviderUnavailable
+        ) {
+            let error = message.unwrap_or_else(|| format!("turn {outcome:?}"));
+            self.phase = ReviewAgentThreadPhase::Failed;
+            self.status.clone_from(&error);
+            self.error = Some(error);
+        } else if self.display_answer().is_empty() {
+            self.phase = ReviewAgentThreadPhase::Complete;
+            self.status = "finished".to_string();
+            self.error = None;
+        } else {
+            self.phase = ReviewAgentThreadPhase::Complete;
+            self.status = "answered".to_string();
+            self.error = None;
+        }
+        if self.active_turn_id.as_deref() == Some(turn_id) {
+            self.active_turn_id = None;
+        }
+        self.live_answer_by_turn.remove(turn_id);
+    }
+
+    fn display_answer(&self) -> String {
+        let mut answer = self.durable_answer.clone();
+        for text in self.live_answer_by_turn.values() {
+            if text.is_empty() || answer.contains(text) {
+                continue;
+            }
+            answer.push_str(text);
+        }
+        answer
+    }
+}
+
+fn live_tool_preview_status(tool_name: &str, preview: &LiveToolArgumentPreview) -> String {
+    let (streaming_status, preview_title) = match preview {
+        LiveToolArgumentPreview::FileEdit(preview) => (
+            preview.streaming_status.as_deref(),
+            preview.preview_title.as_deref(),
+        ),
+        LiveToolArgumentPreview::ShellCommand(preview) => (
+            preview.streaming_status.as_deref(),
+            preview.preview_title.as_deref(),
+        ),
+        LiveToolArgumentPreview::Query(preview) => (
+            preview.streaming_status.as_deref(),
+            preview.preview_title.as_deref(),
+        ),
+    };
+    streaming_status
+        .or(preview_title)
+        .map_or_else(|| format!("preparing {tool_name}"), ToString::to_string)
 }
 
 /// Draft comment editor mode.
@@ -7588,11 +7785,11 @@ impl ReviewApp {
         ids.into_iter().collect()
     }
 
-    /// Apply a bounded linked-session history snapshot.
-    pub fn apply_agent_history_snapshot(
+    /// Apply a linked-session live stream projection.
+    pub fn apply_agent_stream_state(
         &mut self,
         session_id: &str,
-        snapshot: &ReviewAgentHistorySnapshot,
+        stream_state: &ReviewAgentSessionStreamState,
     ) {
         let mut changed = false;
         for (anchor, comments) in &self.draft_comments {
@@ -7607,12 +7804,20 @@ impl ReviewApp {
                 .agent_thread_states
                 .entry(key)
                 .or_insert_with(|| ReviewAgentThreadState::pending(String::new()));
-            state.session_id = Some(session_id.to_string());
-            state.phase = snapshot.phase;
-            state.status.clone_from(&snapshot.status);
-            state.answer.clone_from(&snapshot.answer);
-            state.error = None;
-            changed = true;
+            let answer = stream_state.display_answer();
+            if state.session_id.as_deref() != Some(session_id)
+                || state.phase != stream_state.phase
+                || state.status != stream_state.status
+                || state.answer != answer
+                || state.error != stream_state.error
+            {
+                state.session_id = Some(session_id.to_string());
+                state.phase = stream_state.phase;
+                state.status.clone_from(&stream_state.status);
+                state.answer = answer;
+                state.error.clone_from(&stream_state.error);
+                changed = true;
+            }
         }
         if changed {
             self.touch_agent_state();
@@ -11066,6 +11271,229 @@ mod tests {
         ));
         assert!(app.publish_state.is_none());
         assert_eq!(app.sidebar_mode, ReviewSidebarMode::NeedsAttention);
+    }
+
+    use bcode_session_models::{SessionSummary, SessionTitleSource};
+
+    fn linked_agent_app(session_id: &str) -> (ReviewApp, ReviewCommentAnchor) {
+        let mut app = sample_app();
+        let anchor = ReviewCommentAnchor {
+            file_index: 0,
+            path: "a.rs".to_string(),
+            diff_row: 2,
+            end_diff_row: None,
+            old_line: None,
+            new_line: Some(1),
+            old_start: None,
+            old_end: None,
+            new_start: Some(1),
+            new_end: Some(1),
+            line_kind: ReviewLineKind::Added,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        app.draft_comments.insert(
+            anchor.clone(),
+            vec![ReviewDraftComment {
+                id: Some("comment".to_string()),
+                body: "question".to_string(),
+                persisted: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                session_id: Some(session_id.to_string()),
+                thread_kind: ReviewThreadKind::Question,
+                severity: ReviewThreadSeverity::Info,
+            }],
+        );
+        (app, anchor)
+    }
+
+    fn session_event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> SessionEvent {
+        SessionEvent {
+            schema_version: 1,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind,
+        }
+    }
+
+    fn session_summary(session_id: SessionId) -> SessionSummary {
+        SessionSummary {
+            id: session_id,
+            name: None,
+            explicit_name: None,
+            derived_title: None,
+            title_source: SessionTitleSource::EmptyDraft,
+            client_count: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            working_directory: PathBuf::new(),
+            import: None,
+            fork: None,
+        }
+    }
+
+    #[test]
+    fn agent_stream_attached_history_populates_answer() {
+        let session_id = SessionId::new();
+        let session_key = session_id.to_string();
+        let (mut app, anchor) = linked_agent_app(&session_key);
+        let mut state = ReviewAgentSessionStreamState::default();
+
+        assert!(state.apply_plugin_event(PluginSessionEvent::Attached {
+            session: session_summary(session_id),
+            history: vec![
+                session_event(
+                    session_id,
+                    1,
+                    SessionEventKind::ModelTurnStarted {
+                        turn_id: "t1".to_string(),
+                    },
+                ),
+                session_event(
+                    session_id,
+                    2,
+                    SessionEventKind::AssistantMessage {
+                        text: "Looks good".to_string(),
+                    },
+                ),
+                session_event(
+                    session_id,
+                    3,
+                    SessionEventKind::ModelTurnFinished {
+                        turn_id: "t1".to_string(),
+                        outcome: ModelTurnOutcome::Completed,
+                        message: None,
+                    },
+                ),
+            ],
+        }));
+        app.apply_agent_stream_state(&session_key, &state);
+
+        let thread_state = app
+            .agent_state_for_anchor(&anchor)
+            .expect("thread should have agent state");
+        assert_eq!(thread_state.phase, ReviewAgentThreadPhase::Complete);
+        assert_eq!(thread_state.answer, "Looks good");
+        assert_eq!(thread_state.status, "answered");
+    }
+
+    #[test]
+    fn agent_stream_live_delta_updates_running_answer() {
+        let session_id = SessionId::new();
+        let session_key = session_id.to_string();
+        let (mut app, anchor) = linked_agent_app(&session_key);
+        let mut state = ReviewAgentSessionStreamState::default();
+
+        assert!(
+            state.apply_plugin_event(PluginSessionEvent::Session(session_event(
+                session_id,
+                1,
+                SessionEventKind::ModelTurnStarted {
+                    turn_id: "t1".to_string(),
+                },
+            )))
+        );
+        assert!(state.apply_plugin_event(PluginSessionEvent::SessionLive(
+            bcode_session_models::SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::AssistantTextDelta {
+                    turn_id: "t1".to_string(),
+                    text: "Hello".to_string(),
+                },
+            },
+        )));
+        assert!(state.apply_plugin_event(PluginSessionEvent::SessionLive(
+            bcode_session_models::SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::AssistantTextDelta {
+                    turn_id: "t1".to_string(),
+                    text: " world".to_string(),
+                },
+            },
+        )));
+        app.apply_agent_stream_state(&session_key, &state);
+
+        let thread_state = app
+            .agent_state_for_anchor(&anchor)
+            .expect("thread should have agent state");
+        assert_eq!(thread_state.phase, ReviewAgentThreadPhase::Running);
+        assert_eq!(thread_state.answer, "Hello world");
+        assert_eq!(thread_state.status, "receiving model response…");
+    }
+
+    #[test]
+    fn agent_stream_durable_event_dedupes_live_answer() {
+        let session_id = SessionId::new();
+        let mut state = ReviewAgentSessionStreamState::default();
+
+        assert!(state.apply_plugin_event(PluginSessionEvent::SessionLive(
+            bcode_session_models::SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::AssistantTextDelta {
+                    turn_id: "t1".to_string(),
+                    text: "Hello world".to_string(),
+                },
+            },
+        )));
+        assert!(
+            state.apply_plugin_event(PluginSessionEvent::Session(session_event(
+                session_id,
+                1,
+                SessionEventKind::AssistantMessage {
+                    text: "Hello world".to_string(),
+                },
+            )))
+        );
+
+        assert_eq!(state.display_answer(), "Hello world");
+    }
+
+    #[test]
+    fn agent_stream_failed_turn_marks_failed() {
+        let session_id = SessionId::new();
+        let session_key = session_id.to_string();
+        let (mut app, anchor) = linked_agent_app(&session_key);
+        let mut state = ReviewAgentSessionStreamState::default();
+
+        assert!(
+            state.apply_plugin_event(PluginSessionEvent::Session(session_event(
+                session_id,
+                1,
+                SessionEventKind::ModelTurnFinished {
+                    turn_id: "t1".to_string(),
+                    outcome: ModelTurnOutcome::ProviderUnavailable,
+                    message: Some("provider unavailable".to_string()),
+                },
+            )))
+        );
+        app.apply_agent_stream_state(&session_key, &state);
+
+        let thread_state = app
+            .agent_state_for_anchor(&anchor)
+            .expect("thread should have agent state");
+        assert_eq!(thread_state.phase, ReviewAgentThreadPhase::Failed);
+        assert_eq!(thread_state.error.as_deref(), Some("provider unavailable"));
+    }
+
+    #[test]
+    fn agent_stream_failed_session_marks_linked_thread_failed() {
+        let session_id = "not-a-session";
+        let (mut app, anchor) = linked_agent_app(session_id);
+
+        app.mark_agent_session_failed(session_id, "invalid linked Bcode session id");
+
+        let thread_state = app
+            .agent_state_for_anchor(&anchor)
+            .expect("thread should have agent state");
+        assert_eq!(thread_state.phase, ReviewAgentThreadPhase::Failed);
+        assert_eq!(
+            thread_state.error.as_deref(),
+            Some("invalid linked Bcode session id")
+        );
     }
 
     #[test]
