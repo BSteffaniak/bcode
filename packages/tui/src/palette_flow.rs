@@ -175,7 +175,7 @@ async fn apply_command_effect<W: Write>(
 
 async fn open_command_plugin_surface<W: Write>(
     io: &mut TuiIo<'_, '_, W>,
-    chat: &ActiveChat,
+    chat: &mut ActiveChat,
     plugin_id: &str,
     surface_kind: String,
     instance_id: String,
@@ -208,13 +208,29 @@ async fn open_command_plugin_surface<W: Write>(
         code: "tui_surface_open_failed".to_string(),
         message: error.to_string(),
     })?;
-    let _outcome = crate::plugin_surface_host::run_plugin_surface_with_input(
+    let outcome = crate::plugin_surface_host::run_plugin_surface_with_input(
         io.terminal,
         io.input,
         surface.as_mut(),
     )
     .await?;
+    apply_plugin_surface_outcome(chat, outcome);
     Ok(())
+}
+
+fn apply_plugin_surface_outcome(chat: &mut ActiveChat, outcome: Option<serde_json::Value>) {
+    let Some(outcome) = outcome else {
+        return;
+    };
+    if let Some(status) = outcome.get("status").and_then(serde_json::Value::as_str) {
+        chat.app.set_status(status.to_string());
+    }
+    if let Some(text) = outcome
+        .get("append_text")
+        .and_then(serde_json::Value::as_str)
+    {
+        chat.app.push_system_note(text.to_string());
+    }
 }
 
 fn toggle_surface(chat: &mut ActiveChat, surface_id: &str) {

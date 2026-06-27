@@ -57,13 +57,13 @@ fn invoke_command_service(request: &ServiceRequest) -> ServiceResponse {
     };
     match request.command_id.as_str() {
         "model.status" | "model.serverStatus" | "runtime.status" | "model.select" => {
-            command_route_response(&request.command_id)
+            command_route_response(&request)
         }
         _ => ServiceResponse::error("unknown_command", "unknown model command"),
     }
 }
 
-fn command_route_response(route: &str) -> ServiceResponse {
+fn command_route_response(request: &InvokeCommandRequest) -> ServiceResponse {
     json_response(&InvokeCommandResponse {
         success: true,
         message: None,
@@ -71,9 +71,9 @@ fn command_route_response(route: &str) -> ServiceResponse {
         updated_provider: None,
         updated_thinking: None,
         effects: vec![CommandEffect::OpenPluginSurface {
-            surface_kind: route.to_string(),
-            instance_id: route.to_string(),
-            options: serde_json::Value::Null,
+            surface_kind: request.command_id.clone(),
+            instance_id: request.command_id.clone(),
+            options: serde_json::to_value(&request.args).unwrap_or(serde_json::Value::Null),
         }],
     })
 }
