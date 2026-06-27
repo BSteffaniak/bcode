@@ -2,6 +2,16 @@ id      = "bcode.skills"
 name    = "Bcode Skills Plugin"
 version = "0.0.1"
 
+[[tui_surfaces]]
+description = "Plugin-owned available skills UI"
+kind        = "skills.list"
+title       = "Available Skills"
+
+[[tui_surfaces]]
+description = "Plugin-owned active skills UI"
+kind        = "skills.active"
+title       = "Active Skills"
+
 [runtime]
 abi_version    = 1
 event_symbol   = "bcode_plugin_handle_event_v1"

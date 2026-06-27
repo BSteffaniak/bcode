@@ -9,6 +9,12 @@ use bcode_command::{
     CommandSurface, InvokeCommandRequest, InvokeCommandResponse, OP_INVOKE_COMMAND,
 };
 use bcode_plugin_sdk::prelude::*;
+use bmux_keyboard::KeyCode;
+use bmux_tui::event::Event;
+use bmux_tui::frame::Frame;
+use bmux_tui::geometry::Rect;
+use bmux_tui::style::{Color, Modifier, Style};
+use bmux_tui::text::{Line, Span};
 use serde::Serialize;
 
 /// Bundled skills command plugin.
@@ -105,10 +111,126 @@ fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
     }
 }
 
-#[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(SkillsPlugin, include_str!("../bcode-plugin.toml"))
+    let mut vtable =
+        bcode_plugin_sdk::static_plugin_vtable!(SkillsPlugin, include_str!("../bcode-plugin.toml"));
+    vtable.tui_registry = Some(skills_tui_registry);
+    vtable
+}
+
+fn skills_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
+    let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
+    for (surface_kind, title) in [
+        ("skills.list", "Available Skills"),
+        ("skills.active", "Active Skills"),
+    ] {
+        registry.register_factory(Box::new(SkillsCommandSurfaceFactory {
+            surface_kind,
+            title,
+        }));
+    }
+    registry
+}
+
+struct SkillsCommandSurfaceFactory {
+    surface_kind: &'static str,
+    title: &'static str,
+}
+
+impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for SkillsCommandSurfaceFactory {
+    fn surface_kind(&self) -> &'static str {
+        self.surface_kind
+    }
+
+    fn open(
+        &self,
+        _request: bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest,
+    ) -> bcode_plugin_sdk::tui::PluginTuiSurfaceFuture {
+        let surface_kind = self.surface_kind;
+        let title = self.title;
+        Box::pin(async move {
+            Ok(Box::new(SkillsCommandSurface {
+                id: surface_kind,
+                title,
+                lines: skills_surface_lines(surface_kind),
+            })
+                as bcode_plugin_sdk::tui::BoxedPluginTuiSurface)
+        })
+    }
+}
+
+struct SkillsCommandSurface {
+    id: &'static str,
+    title: &'static str,
+    lines: Vec<String>,
+}
+
+impl bcode_plugin_sdk::tui::PluginTuiSurface for SkillsCommandSurface {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+
+    fn title(&self) -> &'static str {
+        self.title
+    }
+
+    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+        frame.fill(area, " ", Style::new().fg(Color::White).bg(Color::Black));
+        write_line(
+            frame,
+            area,
+            area.y,
+            Line::from_spans(vec![Span::styled(
+                self.title,
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )]),
+        );
+        let mut y = area.y.saturating_add(2);
+        for line in &self.lines {
+            write_line(frame, area, y, Line::from(line.clone()));
+            y = y.saturating_add(1);
+        }
+        write_line(
+            frame,
+            area,
+            area.y.saturating_add(area.height.saturating_sub(1)),
+            Line::from("Enter/Esc/q closes"),
+        );
+    }
+
+    fn handle_event(
+        &mut self,
+        event: &Event,
+        _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+        match event {
+            Event::Key(key)
+                if matches!(
+                    key.key,
+                    KeyCode::Enter | KeyCode::Escape | KeyCode::Char('q')
+                ) =>
+            {
+                bcode_plugin_sdk::tui::PluginTuiAction::Close { outcome: None }
+            }
+            _ => bcode_plugin_sdk::tui::PluginTuiAction::None,
+        }
+    }
+}
+
+fn skills_surface_lines(surface_kind: &str) -> Vec<String> {
+    match surface_kind {
+        "skills.list" => vec!["Available skills are owned by the skills plugin.".to_string()],
+        "skills.active" => vec!["Active skills are owned by the skills plugin.".to_string()],
+        _ => vec!["Skills command surface".to_string()],
+    }
+}
+
+fn write_line(frame: &mut Frame<'_>, area: Rect, y: u16, line: impl Into<Line>) {
+    if y >= area.y.saturating_add(area.height) {
+        return;
+    }
+    frame.write_line(Rect::new(area.x, y, area.width, 1), &line.into());
 }
 
 bcode_plugin_sdk::export_plugin!(SkillsPlugin, include_str!("../bcode-plugin.toml"));
