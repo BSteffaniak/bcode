@@ -14,7 +14,9 @@ use bcode_tool::{
     ToolInvocationRequest, ToolInvocationResponse, ToolList, ToolPresentationField,
     ToolPresentationFieldKind, ToolRequestPresentationMetadata, ToolSideEffect,
 };
-use bcode_worktree_models::{WorktreeCreateRequest, WorktreeListRequest, WorktreeRemoveRequest};
+use bcode_worktree_models::{
+    WorktreeCreateRequest, WorktreeInfo, WorktreeListRequest, WorktreeRemoveRequest,
+};
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
@@ -487,12 +489,15 @@ impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for WorktreeCommandSurfaceFa
         let title = self.title;
         Box::pin(async move {
             let repo_path = request.repo_path.unwrap_or_else(current_dir);
-            let lines = worktree_surface_lines(surface_kind, &repo_path);
+            let (lines, worktrees) = worktree_surface_state(surface_kind, &repo_path);
             Ok(Box::new(WorktreeCommandSurface {
                 id: surface_kind,
                 title,
                 repo_path,
                 lines,
+                worktrees,
+                selected: 0,
+                status: None,
             })
                 as bcode_plugin_sdk::tui::BoxedPluginTuiSurface)
         })
@@ -504,6 +509,9 @@ struct WorktreeCommandSurface {
     title: &'static str,
     repo_path: PathBuf,
     lines: Vec<String>,
+    worktrees: Vec<WorktreeInfo>,
+    selected: usize,
+    status: Option<String>,
 }
 
 impl bcode_plugin_sdk::tui::PluginTuiSurface for WorktreeCommandSurface {
@@ -533,9 +541,27 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for WorktreeCommandSurface {
             Line::from(format!("Repo: {}", self.repo_path.display())),
         );
         let mut y = area.y.saturating_add(3);
-        for line in &self.lines {
-            write_line(frame, area, y, Line::from(line.clone()));
+        for (index, line) in self.lines.iter().enumerate() {
+            let display_line = if self.is_selectable() && index > 0 {
+                let marker = if self.selected == index.saturating_sub(1) {
+                    "› "
+                } else {
+                    "  "
+                };
+                format!("{marker}{line}")
+            } else {
+                line.clone()
+            };
+            write_line(frame, area, y, Line::from(display_line));
             y = y.saturating_add(1);
+        }
+        if let Some(status) = &self.status {
+            write_line(
+                frame,
+                area,
+                area.y.saturating_add(area.height.saturating_sub(2)),
+                Line::from(status.clone()),
+            );
         }
         write_line(
             frame,
@@ -551,22 +577,95 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for WorktreeCommandSurface {
         _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
     ) -> bcode_plugin_sdk::tui::PluginTuiAction {
         match event {
-            Event::Key(key)
-                if matches!(
-                    key.key,
-                    KeyCode::Enter | KeyCode::Escape | KeyCode::Char('q')
-                ) =>
-            {
+            Event::Key(key) if matches!(key.key, KeyCode::Escape | KeyCode::Char('q')) => {
                 bcode_plugin_sdk::tui::PluginTuiAction::Close { outcome: None }
             }
+            Event::Key(key) if matches!(key.key, KeyCode::Up | KeyCode::Char('k')) => {
+                self.select_previous();
+                bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+            }
+            Event::Key(key) if matches!(key.key, KeyCode::Down | KeyCode::Char('j')) => {
+                self.select_next();
+                bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+            }
+            Event::Key(key) if key.key == KeyCode::Enter => self.activate_selected(),
             _ => bcode_plugin_sdk::tui::PluginTuiAction::None,
         }
     }
 }
 
-fn worktree_surface_lines(surface_kind: &str, repo_path: &std::path::Path) -> Vec<String> {
+impl WorktreeCommandSurface {
+    fn is_selectable(&self) -> bool {
+        matches!(
+            self.id,
+            "command.work-tree.attach" | "command.work-tree.remove"
+        ) && !self.worktrees.is_empty()
+    }
+
+    fn select_previous(&mut self) {
+        if !self.is_selectable() {
+            return;
+        }
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    fn select_next(&mut self) {
+        if !self.is_selectable() {
+            return;
+        }
+        self.selected = (self.selected + 1).min(self.worktrees.len().saturating_sub(1));
+    }
+
+    fn activate_selected(&mut self) -> bcode_plugin_sdk::tui::PluginTuiAction {
+        match self.id {
+            "command.work-tree.remove" => self.remove_selected(),
+            "command.work-tree.attach" => self.attach_selected(),
+            _ => bcode_plugin_sdk::tui::PluginTuiAction::Close { outcome: None },
+        }
+    }
+
+    fn attach_selected(&self) -> bcode_plugin_sdk::tui::PluginTuiAction {
+        let Some(worktree) = self.worktrees.get(self.selected) else {
+            return bcode_plugin_sdk::tui::PluginTuiAction::None;
+        };
+        bcode_plugin_sdk::tui::PluginTuiAction::Close {
+            outcome: Some(serde_json::json!({
+                "status": format!("selected worktree {}", worktree.path.display()),
+                "append_text": format!("Selected worktree for attach: {}", worktree.path.display()),
+            })),
+        }
+    }
+
+    fn remove_selected(&mut self) -> bcode_plugin_sdk::tui::PluginTuiAction {
+        let Some(worktree) = self.worktrees.get(self.selected) else {
+            return bcode_plugin_sdk::tui::PluginTuiAction::None;
+        };
+        if worktree.is_main {
+            self.status = Some("refusing to remove main worktree".to_string());
+            return bcode_plugin_sdk::tui::PluginTuiAction::Redraw;
+        }
+        match bcode_worktree::remove_worktree(&self.repo_path, &worktree.path, false) {
+            Ok(response) => bcode_plugin_sdk::tui::PluginTuiAction::Close {
+                outcome: Some(serde_json::json!({
+                    "status": format!("removed worktree {}", response.path.display()),
+                    "append_text": format!("Removed worktree: {}", response.path.display()),
+                })),
+            },
+            Err(error) => {
+                self.status = Some(format!("worktree remove failed: {error}"));
+                bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+            }
+        }
+    }
+}
+
+fn worktree_surface_state(
+    surface_kind: &str,
+    repo_path: &std::path::Path,
+) -> (Vec<String>, Vec<WorktreeInfo>) {
     match bcode_worktree::list_worktrees(repo_path) {
         Ok(response) => {
+            let worktrees = response.worktrees;
             let mut lines = match surface_kind {
                 "command.work-tree.attach" => vec!["Select a worktree to attach:".to_string()],
                 "command.work-tree.remove" => vec!["Select a worktree to remove:".to_string()],
@@ -577,14 +676,14 @@ fn worktree_surface_lines(surface_kind: &str, repo_path: &std::path::Path) -> Ve
                 ],
                 _ => vec!["Worktree command surface".to_string()],
             };
-            lines.extend(response.worktrees.into_iter().map(|worktree| {
+            lines.extend(worktrees.iter().map(|worktree| {
                 let marker = if worktree.is_main { "main" } else { "linked" };
-                let branch = worktree.branch.unwrap_or_else(|| "<detached>".to_owned());
+                let branch = worktree.branch.as_deref().unwrap_or("<detached>");
                 format!("* {marker} {branch} — {}", worktree.path.display())
             }));
-            lines
+            (lines, worktrees)
         }
-        Err(error) => vec![format!("worktrees unavailable: {error}")],
+        Err(error) => (vec![format!("worktrees unavailable: {error}")], Vec::new()),
     }
 }
 
