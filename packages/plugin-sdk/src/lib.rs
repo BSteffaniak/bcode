@@ -1282,8 +1282,10 @@ pub mod prelude {
         StaticPluginVtable, StreamingServiceFn, export_concurrent_plugin, export_plugin,
         static_concurrent_plugin_vtable, static_plugin_vtable,
         tui::{
-            PluginTuiAction, PluginTuiHost, PluginTuiRegistry, PluginTuiSurface,
-            PluginTuiSurfaceFactory, PluginTuiSurfaceOpenRequest, TokioPluginTuiHost,
+            PluginSessionEvent, PluginSessionEventReplay, PluginSessionEventSubscription,
+            PluginSessionEventSubscriptionRequest, PluginTuiAction, PluginTuiHost,
+            PluginTuiHostError, PluginTuiRegistry, PluginTuiSurface, PluginTuiSurfaceFactory,
+            PluginTuiSurfaceOpenRequest, TokioPluginTuiHost,
         },
     };
 }

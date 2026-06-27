@@ -2,10 +2,14 @@
 
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 
+use bcode_session_models::{
+    ProjectionWindowRequest, SessionEvent, SessionId, SessionLiveEvent, SessionSummary,
+};
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
@@ -25,6 +29,87 @@ pub type PluginTuiSurfaceFuture =
 /// Boxed asynchronous task accepted by a plugin host.
 pub type PluginTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
+/// Errors returned by TUI host capabilities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginTuiHostError {
+    /// This host does not support the requested capability.
+    Unsupported(String),
+    /// The plugin is not permitted to use the requested capability.
+    PermissionDenied(String),
+    /// The plugin requested an invalid host operation.
+    InvalidRequest(String),
+    /// The host failed while preparing the operation.
+    Internal(String),
+}
+
+impl fmt::Display for PluginTuiHostError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unsupported(message)
+            | Self::PermissionDenied(message)
+            | Self::InvalidRequest(message)
+            | Self::Internal(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl Error for PluginTuiHostError {}
+
+/// Session history replay requested when subscribing to session events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginSessionEventReplay {
+    /// Do not replay persisted history before streaming live events.
+    None,
+    /// Replay a bounded number of recent session events before streaming live events.
+    Recent { limit: usize },
+    /// Replay a projection-sized history window before streaming live events.
+    ProjectionWindow { request: ProjectionWindowRequest },
+}
+
+/// Request to subscribe to events for one explicit Bcode session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginSessionEventSubscriptionRequest {
+    /// Session to observe.
+    pub session_id: SessionId,
+    /// Optional persisted history replay to send before live events.
+    pub replay: PluginSessionEventReplay,
+    /// Requested event channel buffer size. Hosts may clamp this value.
+    pub buffer: usize,
+}
+
+/// Session events delivered to plugin-owned TUI surfaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginSessionEvent {
+    /// The session was attached and optional persisted history is available.
+    Attached {
+        /// Attached session summary.
+        session: SessionSummary,
+        /// Replayed persisted history, according to the subscription request.
+        history: Vec<SessionEvent>,
+    },
+    /// Durable session event.
+    Session(SessionEvent),
+    /// Ephemeral live session event.
+    SessionLive(SessionLiveEvent),
+    /// Events were dropped because the subscriber could not keep up.
+    Lagged {
+        /// Number of events dropped since the previous lag notification.
+        dropped_count: u64,
+    },
+    /// The subscription stopped because the host disconnected or failed.
+    Disconnected {
+        /// Human-readable failure message.
+        message: String,
+    },
+}
+
+/// Active subscription to session events.
+#[derive(Debug)]
+pub struct PluginSessionEventSubscription {
+    /// Receiver for generic session events.
+    pub receiver: mpsc::Receiver<PluginSessionEvent>,
+}
+
 /// Host services available to native TUI plugin surfaces.
 pub trait PluginTuiHost: Send + Sync {
     /// Spawn an async task on Bcode's native Tokio runtime.
@@ -35,6 +120,21 @@ pub trait PluginTuiHost: Send + Sync {
 
     /// Request another terminal redraw.
     fn request_redraw(&self);
+
+    /// Subscribe to events for one explicit Bcode session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the host does not support session subscriptions, permission is
+    /// denied, or the request is invalid.
+    fn subscribe_session_events(
+        &self,
+        _request: PluginSessionEventSubscriptionRequest,
+    ) -> Result<PluginSessionEventSubscription, PluginTuiHostError> {
+        Err(PluginTuiHostError::Unsupported(
+            "session event subscriptions are not available from this host".to_string(),
+        ))
+    }
 }
 
 /// Actions a native TUI surface can return to the host.

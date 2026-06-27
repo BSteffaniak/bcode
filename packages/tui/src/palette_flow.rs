@@ -218,10 +218,11 @@ async fn open_command_plugin_surface<W: Write>(
         code: "tui_surface_open_failed".to_string(),
         message: error.to_string(),
     })?;
-    let outcome = crate::plugin_surface_host::run_plugin_surface_with_input(
+    let outcome = crate::plugin_surface_host::run_plugin_surface_with_input_and_client(
         io.terminal,
         io.input,
         surface.as_mut(),
+        services.client.clone(),
     )
     .await?;
     apply_plugin_surface_outcome(chat, outcome);
