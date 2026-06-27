@@ -113,11 +113,40 @@ fn invoke_command_service(request: &ServiceRequest) -> ServiceResponse {
         );
     };
     match request.command_id.as_str() {
-        "command.work-tree.list"
-        | "command.work-tree.createSession"
+        "command.work-tree.list" => list_worktrees_command(&request),
+        "command.work-tree.createSession"
         | "command.work-tree.attach"
         | "command.work-tree.remove" => command_route_response(&request.command_id),
         _ => ServiceResponse::error("unknown_command", "unknown worktree command"),
+    }
+}
+
+fn list_worktrees_command(request: &InvokeCommandRequest) -> ServiceResponse {
+    let cwd = request
+        .args
+        .get("cwd")
+        .map(PathBuf::from)
+        .unwrap_or_else(current_dir);
+    match bcode_worktree::list_worktrees(&cwd) {
+        Ok(response) => {
+            let mut lines = vec![format!("Worktrees for {}", response.repo_root.display())];
+            lines.extend(response.worktrees.into_iter().map(|worktree| {
+                let marker = if worktree.is_main { "main" } else { "linked" };
+                let branch = worktree.branch.unwrap_or_else(|| "<detached>".to_owned());
+                format!("* {marker} {branch} — {}", worktree.path.display())
+            }));
+            json_response(&InvokeCommandResponse {
+                success: true,
+                message: Some("shown worktrees".to_string()),
+                updated_model: None,
+                updated_provider: None,
+                updated_thinking: None,
+                effects: vec![CommandEffect::AppendText {
+                    text: lines.join("\n"),
+                }],
+            })
+        }
+        Err(error) => ServiceResponse::error("worktree_list_failed", error.to_string()),
     }
 }
 

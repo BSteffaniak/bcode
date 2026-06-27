@@ -117,10 +117,14 @@ async fn dispatch_plugin_command<W: Write>(
     plugin_id: String,
     command_id: String,
 ) -> Result<(), TuiError> {
-    let payload = serde_json::to_vec(&InvokeCommandRequest {
-        command_id,
-        args: BTreeMap::new(),
-    })?;
+    let mut args = BTreeMap::new();
+    if let Some(cwd) = chat.app.working_directory() {
+        args.insert("cwd".to_string(), cwd.display().to_string());
+    }
+    if let Some(session_id) = chat.app.session_id() {
+        args.insert("session_id".to_string(), session_id.to_string());
+    }
+    let payload = serde_json::to_vec(&InvokeCommandRequest { command_id, args })?;
     let response = services
         .passive_client
         .invoke_plugin_service(
