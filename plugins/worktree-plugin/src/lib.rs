@@ -630,8 +630,9 @@ impl WorktreeCommandSurface {
         };
         bcode_plugin_sdk::tui::PluginTuiAction::Close {
             outcome: Some(serde_json::json!({
-                "status": format!("selected worktree {}", worktree.path.display()),
-                "append_text": format!("Selected worktree for attach: {}", worktree.path.display()),
+                "status": format!("attaching worktree {}", worktree.path.display()),
+                "append_text": format!("Attaching session to worktree: {}", worktree.path.display()),
+                "set_session_working_directory": worktree.path.display().to_string(),
             })),
         }
     }

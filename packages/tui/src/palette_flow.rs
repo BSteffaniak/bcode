@@ -231,6 +231,21 @@ fn apply_plugin_surface_outcome(chat: &mut ActiveChat, outcome: Option<serde_jso
     {
         chat.app.push_system_note(text.to_string());
     }
+    if let Some(path) = outcome
+        .get("set_session_working_directory")
+        .and_then(serde_json::Value::as_str)
+    {
+        if let Some(session_id) = chat.app.session_id() {
+            chat.start_effect(TuiEffect::AttachWorktree {
+                session_id,
+                path: std::path::PathBuf::from(path),
+            });
+            chat.app.set_status(format!("attaching worktree {path}"));
+        } else {
+            chat.app
+                .set_status("no active session for worktree attach".to_string());
+        }
+    }
 }
 
 fn toggle_surface(chat: &mut ActiveChat, surface_id: &str) {
