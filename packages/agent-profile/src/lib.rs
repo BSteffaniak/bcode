@@ -127,4 +127,7 @@ pub struct PolicyStatusResponse {
     pub source: String,
     /// True when the provider is using built-in fallback policy.
     pub using_default: bool,
+    /// Non-fatal degradation diagnostics surfaced by the policy provider.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<String>,
 }

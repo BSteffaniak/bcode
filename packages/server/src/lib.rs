@@ -6755,6 +6755,7 @@ async fn handle_agent_policy_status(
         .unwrap_or_else(|| PolicyStatusResponse {
             source: "agent profile provider not loaded".to_string(),
             using_default: true,
+            diagnostics: vec!["agent profile provider not loaded".to_string()],
         });
     send_response(
         writer,

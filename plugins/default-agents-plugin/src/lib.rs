@@ -36,15 +36,21 @@ fn manifest_defaults() -> Result<AgentDefaultsManifestExtension, toml::de::Error
         .map(|extension| extension.agent_defaults)
 }
 
-fn default_config() -> AgentPermissionConfig {
+#[must_use]
+pub fn default_config() -> AgentPermissionConfig {
+    let (config, _) = default_config_with_diagnostics();
+    config
+}
+
+fn default_config_with_diagnostics() -> (AgentPermissionConfig, Vec<String>) {
     match manifest_defaults() {
-        Ok(defaults) => default_config_with_defaults(defaults),
-        Err(error) => {
-            eprintln!(
-                "bcode.default-agents: failed to parse bundled agent_defaults ({error}); using policy defaults without bundled tool enablement"
-            );
-            policy_default_config()
-        }
+        Ok(defaults) => (default_config_with_defaults(defaults), Vec::new()),
+        Err(error) => (
+            policy_default_config(),
+            vec![format!(
+                "failed to parse bundled agent_defaults; using policy defaults without bundled tool enablement: {error}"
+            )],
+        ),
     }
 }
 
@@ -162,6 +168,7 @@ fn policy_status() -> PolicyStatusResponse {
     PolicyStatusResponse {
         using_default: source.using_default,
         source: source.label,
+        diagnostics: source.diagnostics,
     }
 }
 
@@ -169,9 +176,11 @@ fn policy_status() -> PolicyStatusResponse {
 struct PolicySource {
     label: String,
     using_default: bool,
+    diagnostics: Vec<String>,
 }
 
 fn load_config() -> (AgentPermissionConfig, PolicySource) {
+    let (base_config, diagnostics) = default_config_with_diagnostics();
     let declarative = match bcode_config::load_composed_config_value() {
         Ok(value) => value,
         Err(error) => {
@@ -179,10 +188,11 @@ fn load_config() -> (AgentPermissionConfig, PolicySource) {
                 "bcode.default-agents: failed to load declarative config ({error}); using built-in defaults"
             );
             return (
-                default_config(),
+                base_config,
                 PolicySource {
                     label: "built-in default agent policy".to_string(),
                     using_default: true,
+                    diagnostics,
                 },
             );
         }
@@ -203,25 +213,27 @@ fn load_config() -> (AgentPermissionConfig, PolicySource) {
 
     if declarative_empty && state_empty {
         return (
-            default_config(),
+            base_config,
             PolicySource {
                 label: "built-in default agent policy".to_string(),
                 using_default: true,
+                diagnostics,
             },
         );
     }
 
-    let mut merged = match Value::try_from(default_config()) {
+    let mut merged = match Value::try_from(base_config.clone()) {
         Ok(value) => value,
         Err(error) => {
             eprintln!(
                 "bcode.default-agents: failed to encode built-in agent policy ({error}); using built-in defaults"
             );
             return (
-                default_config(),
+                base_config,
                 PolicySource {
                     label: "built-in default agent policy".to_string(),
                     using_default: true,
+                    diagnostics,
                 },
             );
         }
@@ -238,10 +250,11 @@ fn load_config() -> (AgentPermissionConfig, PolicySource) {
                 "bcode.default-agents: failed to decode composed agent policy ({error}); using built-in defaults"
             );
             return (
-                default_config(),
+                base_config,
                 PolicySource {
                     label: "built-in default agent policy".to_string(),
                     using_default: true,
+                    diagnostics,
                 },
             );
         }
@@ -262,6 +275,7 @@ fn load_config() -> (AgentPermissionConfig, PolicySource) {
         PolicySource {
             label,
             using_default: false,
+            diagnostics,
         },
     )
 }
