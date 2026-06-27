@@ -8,6 +8,7 @@ members = [
     "plugins/ralph-plugin",
     "plugins/github-review-publisher-plugin",
     "plugins/document-plugin",
+    "plugins/ocr-plugin",
     "plugins/bedrock-provider-plugin",
     "plugins/blims-plugin",
     "plugins/default-agents-plugin",
@@ -103,6 +104,7 @@ bcode_model_plugin                      = { version = "0.0.1-alpha.0", default-f
 bcode_model_provider_runtime            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/model-provider-runtime" }
 bcode_models_site                       = { version = "0.0.1-alpha.0", default-features = false, path = "packages/models-site" }
 bcode_models_site_ui                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/models-site/ui" }
+bcode_ocr_plugin                        = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/ocr-plugin" }
 bcode_openai_compatible_provider_plugin = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/openai-compatible-provider-plugin" }
 bcode_opencode_session_import_plugin    = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/opencode-session-import-plugin" }
 bcode_pi_session_import_plugin          = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/pi-session-import-plugin" }

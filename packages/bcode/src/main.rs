@@ -40,6 +40,11 @@ fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
             include_str!("../../../plugins/document-plugin/bcode-plugin.toml"),
             bcode_document_plugin::static_plugin(),
         ),
+        #[cfg(feature = "static-bundled-ocr-plugin")]
+        bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/ocr-plugin/bcode-plugin.toml"),
+            bcode_ocr_plugin::static_plugin(),
+        ),
         #[cfg(feature = "static-bundled-fake-provider-plugin")]
         bcode_plugin::StaticBundledPlugin::new(
             include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),

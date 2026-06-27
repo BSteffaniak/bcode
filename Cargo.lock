@@ -1262,6 +1262,7 @@ dependencies = [
  "bcode_git_plugin",
  "bcode_github_review_publisher_plugin",
  "bcode_model_plugin",
+ "bcode_ocr_plugin",
  "bcode_openai_compatible_provider_plugin",
  "bcode_opencode_session_import_plugin",
  "bcode_pi_session_import_plugin",
@@ -1720,6 +1721,20 @@ dependencies = [
  "hyperchad_template",
  "hyperchad_transformer",
  "hyperchad_transformer_models",
+]
+
+[[package]]
+name = "bcode_ocr_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_model_provider_runtime",
+ "bcode_plugin_sdk",
+ "bcode_tool",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

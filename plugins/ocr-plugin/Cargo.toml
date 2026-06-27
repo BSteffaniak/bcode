@@ -1,0 +1,29 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Bundled OCR tool plugin for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "ocr", "tesseract", "tool", "plugin"]
+license     = { workspace = true }
+name        = "bcode_ocr_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bcode_model_provider_runtime = { workspace = true }
+bcode_plugin_sdk             = { workspace = true }
+bcode_tool                   = { workspace = true }
+reqwest                      = { workspace = true }
+serde                        = { workspace = true, features = ["derive", "std"] }
+serde_json                   = { workspace = true }
+thiserror                    = { workspace = true }
+tokio                        = { workspace = true, features = ["fs", "io-util", "process", "time"] }
+
+[features]
+default          = []
+fail-on-warnings = []
+static-bundled   = []
