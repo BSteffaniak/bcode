@@ -2080,6 +2080,7 @@ dependencies = [
  "bcode_command",
  "bcode_config",
  "bcode_plugin_sdk",
+ "bcode_session_models",
  "bcode_tool",
  "bcode_worktree",
  "bcode_worktree_models",

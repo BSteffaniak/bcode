@@ -26,6 +26,7 @@ use bmux_tui::text::{Line, Span};
 use serde::Serialize;
 use serde_json::json;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 /// Bundled worktree plugin.
 #[derive(Default)]
@@ -490,6 +491,11 @@ impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for WorktreeCommandSurfaceFa
         Box::pin(async move {
             let repo_path = request.repo_path.unwrap_or_else(current_dir);
             let (lines, worktrees) = worktree_surface_state(surface_kind, &repo_path);
+            let session_id = request
+                .options
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| bcode_session_models::SessionId::from_str(value).ok());
             Ok(Box::new(WorktreeCommandSurface {
                 id: surface_kind,
                 title,
@@ -498,6 +504,8 @@ impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for WorktreeCommandSurfaceFa
                 worktrees,
                 selected: 0,
                 status: None,
+                create_name: "new-session".to_string(),
+                session_id,
             })
                 as bcode_plugin_sdk::tui::BoxedPluginTuiSurface)
         })
@@ -512,6 +520,8 @@ struct WorktreeCommandSurface {
     worktrees: Vec<WorktreeInfo>,
     selected: usize,
     status: Option<String>,
+    create_name: String,
+    session_id: Option<bcode_session_models::SessionId>,
 }
 
 impl bcode_plugin_sdk::tui::PluginTuiSurface for WorktreeCommandSurface {
@@ -555,6 +565,14 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for WorktreeCommandSurface {
             write_line(frame, area, y, Line::from(display_line));
             y = y.saturating_add(1);
         }
+        if self.id == "command.work-tree.createSession" {
+            write_line(
+                frame,
+                area,
+                y,
+                Line::from(format!("Name: {}", self.create_name)),
+            );
+        }
         if let Some(status) = &self.status {
             write_line(
                 frame,
@@ -580,6 +598,9 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for WorktreeCommandSurface {
             Event::Key(key) if matches!(key.key, KeyCode::Escape | KeyCode::Char('q')) => {
                 bcode_plugin_sdk::tui::PluginTuiAction::Close { outcome: None }
             }
+            Event::Key(key) if self.id == "command.work-tree.createSession" => {
+                self.handle_create_key(key.key)
+            }
             Event::Key(key) if matches!(key.key, KeyCode::Up | KeyCode::Char('k')) => {
                 self.select_previous();
                 bcode_plugin_sdk::tui::PluginTuiAction::Redraw
@@ -595,6 +616,62 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for WorktreeCommandSurface {
 }
 
 impl WorktreeCommandSurface {
+    fn handle_create_key(&mut self, key: KeyCode) -> bcode_plugin_sdk::tui::PluginTuiAction {
+        match key {
+            KeyCode::Enter => self.create_worktree(),
+            KeyCode::Backspace => {
+                self.create_name.pop();
+                bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+            }
+            KeyCode::Char(value) => {
+                self.create_name.push(value);
+                bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+            }
+            _ => bcode_plugin_sdk::tui::PluginTuiAction::None,
+        }
+    }
+
+    fn create_worktree(&mut self) -> bcode_plugin_sdk::tui::PluginTuiAction {
+        let name = self.create_name.trim().to_string();
+        if name.is_empty() {
+            self.status = Some("worktree name is required".to_string());
+            return bcode_plugin_sdk::tui::PluginTuiAction::Redraw;
+        }
+        let request = WorktreeCreateRequest {
+            name,
+            cwd: Some(self.repo_path.clone()),
+            path: None,
+            branch: None,
+            new_branch: None,
+            base_ref: Some(bcode_worktree_models::WorktreeBaseRef::Head),
+            detach: false,
+            force: false,
+            attach_session_id: self.session_id,
+            new_session: self.session_id.is_none(),
+            no_setup: false,
+        };
+        let config = match bcode_config::load_config() {
+            Ok(config) => config,
+            Err(error) => {
+                self.status = Some(format!("worktree config unavailable: {error}"));
+                return bcode_plugin_sdk::tui::PluginTuiAction::Redraw;
+            }
+        };
+        match bcode_worktree::create_worktree(&config, &request, &self.repo_path) {
+            Ok(response) => bcode_plugin_sdk::tui::PluginTuiAction::Close {
+                outcome: Some(serde_json::json!({
+                    "status": format!("created worktree {}", response.path.display()),
+                    "append_text": format!("Created worktree: {}", response.path.display()),
+                    "set_session_working_directory": response.path.display().to_string(),
+                })),
+            },
+            Err(error) => {
+                self.status = Some(format!("worktree create failed: {error}"));
+                bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+            }
+        }
+    }
+
     fn is_selectable(&self) -> bool {
         matches!(
             self.id,
@@ -671,9 +748,8 @@ fn worktree_surface_state(
                 "command.work-tree.attach" => vec!["Select a worktree to attach:".to_string()],
                 "command.work-tree.remove" => vec!["Select a worktree to remove:".to_string()],
                 "command.work-tree.createSession" => vec![
-                    "Create worktree flow is plugin-owned.".to_string(),
-                    "Use the worktree.create tool for execution while interactive fields migrate here."
-                        .to_string(),
+                    "Enter worktree name, then press Enter to create.".to_string(),
+                    "Backspace edits · Esc/q cancels".to_string(),
                 ],
                 _ => vec!["Worktree command surface".to_string()],
             };
