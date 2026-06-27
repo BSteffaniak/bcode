@@ -2769,6 +2769,32 @@ impl ReviewCommentAnchor {
     }
 }
 
+/// Suggested review comment lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewSuggestionStatus {
+    /// Suggested but not yet accepted or rejected.
+    Suggested,
+    /// Accepted into a normal draft comment.
+    Accepted,
+    /// Rejected by the reviewer.
+    Rejected,
+}
+
+/// Local AI-suggested review comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewSuggestedComment {
+    /// Local suggestion id.
+    pub id: String,
+    /// Suggested comment body.
+    pub body: String,
+    /// Linked Bcode session id that produced the suggestion.
+    pub session_id: Option<String>,
+    /// Suggestion lifecycle status.
+    pub status: ReviewSuggestionStatus,
+    /// Optional short rationale or provenance.
+    pub rationale: Option<String>,
+}
+
 /// Review draft comment metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewDraftComment {
@@ -3953,6 +3979,8 @@ pub struct ReviewApp {
     pub status_message: Option<String>,
     /// Draft comments keyed by anchor.
     pub draft_comments: BTreeMap<ReviewCommentAnchor, Vec<ReviewDraftComment>>,
+    /// Local AI-suggested comments keyed by anchor.
+    pub suggested_comments: BTreeMap<ReviewCommentAnchor, Vec<ReviewSuggestedComment>>,
     /// Active draft editor, if open.
     pub comment_editor: Option<ReviewCommentEditor>,
     /// Draft comment awaiting persistence.
@@ -4057,6 +4085,7 @@ impl ReviewApp {
             should_exit: false,
             status_message: None,
             draft_comments: BTreeMap::new(),
+            suggested_comments: BTreeMap::new(),
             comment_editor: None,
             pending_draft_save: None,
             pending_draft_delete: None,
@@ -7796,6 +7825,47 @@ impl ReviewApp {
             .as_deref()
     }
 
+    /// Add a local suggested comment at the selected anchor from the latest Bcode answer.
+    pub fn suggest_comment_from_agent_answer_at_selection(&mut self) -> bool {
+        let Some(anchor) = self.selected_comment_anchor() else {
+            self.status_message = Some("select a linked Bcode answer to suggest".to_string());
+            return true;
+        };
+        let Some(state) = self.agent_state_for_anchor(&anchor) else {
+            self.status_message = Some("selected thread has no Bcode answer".to_string());
+            return true;
+        };
+        let body = state.answer.trim().to_string();
+        if body.is_empty() {
+            self.status_message =
+                Some("selected Bcode thread has no answer to suggest".to_string());
+            return true;
+        }
+        let session_id = state.session_id.clone();
+        let suggestions = self.suggested_comments.entry(anchor.clone()).or_default();
+        if suggestions.iter().any(|suggestion| {
+            suggestion.body.trim() == body && suggestion.status == ReviewSuggestionStatus::Suggested
+        }) {
+            self.status_message = Some("Bcode answer is already suggested".to_string());
+            return true;
+        }
+        let id = format!(
+            "suggestion-{}-{}",
+            Self::thread_key_for_anchor(&anchor),
+            suggestions.len().saturating_add(1)
+        );
+        suggestions.push(ReviewSuggestedComment {
+            id,
+            body,
+            session_id,
+            status: ReviewSuggestionStatus::Suggested,
+            rationale: Some("from linked Bcode answer".to_string()),
+        });
+        self.sync_selected_thread_to_anchor();
+        self.status_message = Some("added suggested review comment".to_string());
+        true
+    }
+
     /// Retry the linked Bcode event stream for the selected thread.
     pub fn retry_linked_session_stream_at_selection(&mut self) -> bool {
         let Some(anchor) = self.selected_comment_anchor() else {
@@ -8712,6 +8782,9 @@ impl ReviewApp {
                 self.retry_linked_session_stream_at_selection()
             }
             Some(ReviewThreadAction::ToggleAnswer) => self.toggle_selected_agent_answer_expanded(),
+            Some(ReviewThreadAction::SuggestAnswer) => {
+                self.suggest_comment_from_agent_answer_at_selection()
+            }
             Some(ReviewThreadAction::DraftAnswer) => {
                 self.convert_agent_answer_to_draft_at_selection()
             }
@@ -9422,6 +9495,17 @@ impl ReviewApp {
                     comments.clone(),
                 )
             }),
+            self.suggested_comments.iter().map(|(anchor, suggestions)| {
+                (
+                    ReviewThreadAnchor {
+                        file_index: anchor.file_index,
+                        path: anchor.path.clone(),
+                        source_row: anchor.diff_row,
+                        end_source_row: anchor.end_diff_row,
+                    },
+                    suggestions.clone(),
+                )
+            }),
             &self.agent_thread_states,
             &self.expanded_agent_answers,
             &self.collapsed_review_threads,
@@ -9506,6 +9590,28 @@ impl ReviewApp {
                 .expect("writing to String cannot fail");
             }
             draft_signature.push(';');
+        }
+        for (anchor, suggestions) in self
+            .suggested_comments
+            .iter()
+            .filter(|(anchor, _)| anchor.file_index == self.selected_file)
+        {
+            write!(
+                draft_signature,
+                "suggest:{}:{}-{:?}:",
+                anchor.path, anchor.diff_row, anchor.end_diff_row
+            )
+            .expect("writing to String cannot fail");
+            for suggestion in suggestions {
+                write!(
+                    draft_signature,
+                    "{}:{}:{:?};",
+                    suggestion.id,
+                    suggestion.body.len(),
+                    suggestion.status
+                )
+                .expect("writing to String cannot fail");
+            }
         }
         Some(ReviewViewDocumentCacheKey {
             selected_file: self.selected_file,

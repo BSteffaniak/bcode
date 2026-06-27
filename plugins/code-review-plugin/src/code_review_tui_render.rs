@@ -1657,6 +1657,39 @@ fn render_view_row(
                 style,
             }
         }
+        ReviewViewBlock::InlineSuggestion {
+            suggestion,
+            body_line_index,
+            body_line_count,
+            ..
+        } => {
+            let style = match suggestion.status {
+                crate::code_review_tui::ReviewSuggestionStatus::Suggested => {
+                    Style::new().fg(Color::Green).bg(Color::Rgb(16, 24, 16))
+                }
+                crate::code_review_tui::ReviewSuggestionStatus::Accepted => Style::new()
+                    .fg(Color::BrightBlack)
+                    .bg(Color::Rgb(16, 24, 16)),
+                crate::code_review_tui::ReviewSuggestionStatus::Rejected => Style::new()
+                    .fg(Color::BrightBlack)
+                    .bg(Color::Rgb(24, 16, 16)),
+            };
+            let branch = if body_line_index.saturating_add(1) == *body_line_count {
+                "╰"
+            } else {
+                "│"
+            };
+            RenderedRow {
+                line: render_inline_suggestion_line(
+                    branch,
+                    suggestion,
+                    *body_line_index,
+                    width,
+                    style,
+                ),
+                style,
+            }
+        }
         ReviewViewBlock::InlineAgentThread {
             state,
             body_line_index,
@@ -1704,6 +1737,38 @@ fn render_inline_comment_line(
         spans.extend(markdown_line.spans);
     }
     Line::from_spans(spans)
+}
+
+fn render_inline_suggestion_line(
+    branch: &str,
+    suggestion: &crate::code_review_tui::ReviewSuggestedComment,
+    body_line_index: usize,
+    width: u16,
+    style: Style,
+) -> Line {
+    let prefix_style = Style::new()
+        .fg(Color::Green)
+        .bg(style.bg.unwrap_or(Color::Black));
+    let status = match suggestion.status {
+        crate::code_review_tui::ReviewSuggestionStatus::Suggested => "suggest",
+        crate::code_review_tui::ReviewSuggestionStatus::Accepted => "accepted",
+        crate::code_review_tui::ReviewSuggestionStatus::Rejected => "rejected",
+    };
+    let label = if body_line_index == 0 { status } else { "" };
+    let prefix = format!("   {branch} {label:<8} ");
+    let available = width.saturating_sub(u16::try_from(prefix.chars().count()).unwrap_or(u16::MAX));
+    let line = suggestion
+        .body
+        .lines()
+        .nth(body_line_index)
+        .unwrap_or_default();
+    Line::from_spans(vec![
+        Span::styled(prefix, prefix_style),
+        Span::styled(
+            truncate_to_display_width(line, usize::from(available)),
+            style,
+        ),
+    ])
 }
 
 fn render_inline_agent_thread_line(

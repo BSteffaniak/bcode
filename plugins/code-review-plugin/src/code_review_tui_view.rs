@@ -7,6 +7,7 @@ use std::{
 
 use crate::code_review_tui::{
     CachedReviewFile, ReviewAgentThreadState, ReviewDraftComment, ReviewFile,
+    ReviewSuggestedComment,
 };
 use crate::code_review_tui_display::{
     ReviewDisplayBuilder, ReviewDisplayRow, ReviewDisplayRowSource,
@@ -188,6 +189,7 @@ impl ReviewViewDocument {
         mut self,
         file_index: usize,
         drafts: impl Iterator<Item = (ReviewThreadAnchor, Vec<ReviewDraftComment>)>,
+        suggestions: impl Iterator<Item = (ReviewThreadAnchor, Vec<ReviewSuggestedComment>)>,
         agent_states: &BTreeMap<String, ReviewAgentThreadState>,
         expanded_agent_answers: &BTreeSet<String>,
         collapsed_threads: &BTreeSet<String>,
@@ -197,6 +199,11 @@ impl ReviewViewDocument {
         let mut threads = drafts
             .filter(|(anchor, comments)| anchor.file_index == file_index && !comments.is_empty())
             .collect::<Vec<_>>();
+        let mut suggestions = suggestions
+            .filter(|(anchor, suggestions)| {
+                anchor.file_index == file_index && !suggestions.is_empty()
+            })
+            .collect::<BTreeMap<_, _>>();
         threads.sort_by_key(|(anchor, _)| anchor.end_source_row());
 
         let mut rows = Vec::with_capacity(self.rows.len().saturating_add(threads.len()));
@@ -249,6 +256,30 @@ impl ReviewViewDocument {
                                 body_line_index,
                                 body_line_count,
                                 comment: comment.clone(),
+                            },
+                        });
+                    }
+                }
+                for (suggestion_index, suggestion) in suggestions
+                    .remove(anchor)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .enumerate()
+                {
+                    let body_line_count = suggestion.body.lines().count().max(1);
+                    for body_line_index in 0..body_line_count {
+                        rows.push(ReviewViewRow {
+                            visual_row: 0,
+                            source_row: None,
+                            target: ReviewViewTarget::Thread {
+                                thread_key: thread_key.clone(),
+                            },
+                            block: ReviewViewBlock::InlineSuggestion {
+                                thread_key: thread_key.clone(),
+                                suggestion_index,
+                                body_line_index,
+                                body_line_count,
+                                suggestion: suggestion.clone(),
                             },
                         });
                     }
@@ -479,6 +510,19 @@ pub enum ReviewViewBlock {
         /// Draft comment body and metadata.
         comment: ReviewDraftComment,
     },
+    /// Inline suggested comment row.
+    InlineSuggestion {
+        /// Stable thread key.
+        thread_key: String,
+        /// Suggestion index inside the thread.
+        suggestion_index: usize,
+        /// Body line index inside this suggestion.
+        body_line_index: usize,
+        /// Total source body lines for this suggestion.
+        body_line_count: usize,
+        /// Suggested comment body and metadata.
+        suggestion: ReviewSuggestedComment,
+    },
     /// Inline Bcode agent state row.
     InlineAgentThread {
         /// Stable thread key.
@@ -533,6 +577,8 @@ pub enum ReviewThreadAction {
     RetrySession,
     /// Toggle full/compact display for the selected linked Bcode answer.
     ToggleAnswer,
+    /// Create a suggested comment from the latest Bcode answer.
+    SuggestAnswer,
     /// Convert the latest Bcode answer into a draft comment.
     DraftAnswer,
     /// Open the linked Bcode session.
@@ -566,6 +612,7 @@ impl ReviewThreadAction {
         }
         if has_agent_answer {
             actions.push(Self::ToggleAnswer);
+            actions.push(Self::SuggestAnswer);
             actions.push(Self::DraftAnswer);
         }
         actions.push(Self::Publish);
@@ -589,6 +636,7 @@ impl ReviewThreadAction {
             Self::OpenSession => "open-session",
             Self::RetrySession => "retry-session",
             Self::ToggleAnswer => "toggle-answer",
+            Self::SuggestAnswer => "suggest-answer",
             Self::DraftAnswer => "draft-answer",
             Self::Publish => "publish",
             Self::Resolve => "resolve",
@@ -607,6 +655,7 @@ impl ReviewThreadAction {
             Self::OpenSession => "o",
             Self::RetrySession => "y",
             Self::ToggleAnswer => "A",
+            Self::SuggestAnswer => "s",
             Self::DraftAnswer => "m",
             Self::Publish => "x",
             Self::Resolve | Self::Reopen => "r",
@@ -625,6 +674,7 @@ impl ReviewThreadAction {
             Self::OpenSession => "open session",
             Self::RetrySession => "retry stream",
             Self::ToggleAnswer => "expand answer",
+            Self::SuggestAnswer => "suggest comment",
             Self::DraftAnswer => "draft answer",
             Self::Publish => "publish",
             Self::Resolve => "resolve",
@@ -644,6 +694,7 @@ impl ReviewThreadAction {
             b"open-session" => Some(Self::OpenSession),
             b"retry-session" => Some(Self::RetrySession),
             b"toggle-answer" => Some(Self::ToggleAnswer),
+            b"suggest-answer" => Some(Self::SuggestAnswer),
             b"draft-answer" => Some(Self::DraftAnswer),
             b"publish" => Some(Self::Publish),
             b"resolve" => Some(Self::Resolve),
