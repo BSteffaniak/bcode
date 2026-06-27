@@ -2,6 +2,26 @@ id      = "bcode.model"
 name    = "Bcode Model Plugin"
 version = "0.0.1"
 
+[[tui_surfaces]]
+description = "Plugin-owned model status UI"
+kind        = "model.status"
+title       = "Model Status"
+
+[[tui_surfaces]]
+description = "Plugin-owned server model status UI"
+kind        = "model.serverStatus"
+title       = "Server Model Status"
+
+[[tui_surfaces]]
+description = "Plugin-owned runtime status UI"
+kind        = "runtime.status"
+title       = "Runtime Status"
+
+[[tui_surfaces]]
+description = "Plugin-owned model selection UI"
+kind        = "model.select"
+title       = "Select Model"
+
 [runtime]
 abi_version    = 1
 event_symbol   = "bcode_plugin_handle_event_v1"

@@ -16,6 +16,8 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 bcode_command    = { workspace = true }
 bcode_plugin_sdk = { workspace = true }
+bmux_keyboard    = { workspace = true }
+bmux_tui         = { workspace = true }
 serde            = { workspace = true }
 serde_json       = { workspace = true }
 
