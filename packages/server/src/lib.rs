@@ -154,6 +154,7 @@ pub struct ServerState {
     skills: Option<SkillRegistry>,
     skill_context_bytes: usize,
     skill_prompt_options: SkillPromptCatalogOptions,
+    skill_model_policy: bcode_config::SkillModelPolicyConfig,
     active_skills: Mutex<BTreeMap<SessionId, BTreeSet<SkillId>>>,
     turn_skills: Mutex<BTreeMap<(SessionId, u64), SkillTurnInvocation>>,
     session_runtimes: Mutex<BTreeMap<SessionId, SessionRuntimeHandle>>,
@@ -814,6 +815,7 @@ struct ServerStateInit {
     skills: Option<SkillRegistry>,
     skill_context_bytes: usize,
     skill_prompt_options: SkillPromptCatalogOptions,
+    skill_model_policy: bcode_config::SkillModelPolicyConfig,
     daemon_status: DaemonStatus,
     daemon_record_path: Option<PathBuf>,
     metrics: MetricsRegistry,
@@ -850,6 +852,7 @@ impl ServerState {
             skills: init.skills,
             skill_context_bytes: init.skill_context_bytes,
             skill_prompt_options: init.skill_prompt_options,
+            skill_model_policy: init.skill_model_policy,
             active_skills: Mutex::default(),
             turn_skills: Mutex::default(),
             session_runtimes: Mutex::default(),
@@ -1612,6 +1615,7 @@ pub async fn run_with_static_bundled(
             system_prompt: config.system_prompt,
             skill_context_bytes: config.skills.max_context_bytes,
             skill_prompt_options: skill_prompt_options_from_config(&config.skills.prompt),
+            skill_model_policy: config.skills.model_policy,
             skills,
             daemon_status,
             daemon_record_path: Some(bcode_daemon_lifecycle::record_path(
@@ -6281,18 +6285,21 @@ async fn handle_set_session_model(
     provider_plugin_id: Option<String>,
     model_id: String,
 ) -> Result<(), ServerError> {
-    if let Some(blocking_skill_id) = required_model_active_skill(state, session_id).await {
+    if let Some(blocking_skill_id) = required_model_active_skill(state, session_id).await
+        && required_model_override_behavior(state, &blocking_skill_id)
+            == bcode_config::SkillRequiredModelOverride::Deny
+    {
         return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new(
-                "skill_required_model_active",
-                format!(
-                    "skill {blocking_skill_id} declares a required model; deactivate it before changing the session model"
-                ),
-            )),
-        )
-        .await;
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "skill_required_model_active",
+                    format!(
+                        "skill {blocking_skill_id} declares a required model; deactivate it before changing the session model"
+                    ),
+                )),
+            )
+            .await;
     }
     let provider = provider_plugin_id.unwrap_or_else(|| "<auto>".to_string());
     match state
@@ -6767,20 +6774,43 @@ async fn apply_skill_model_request(
     request: &SkillModelRequest,
     required: bool,
 ) -> Result<(), ErrorResponse> {
-    let Some((provider, model_id)) = resolve_skill_model_request(state, request).await else {
+    let Some((provider, model_id)) = resolve_skill_model_request(state, skill_id, request).await
+    else {
         if required {
-            return Err(ErrorResponse::new(
-                "skill_model_unresolved",
-                format!(
-                    "required model '{}' for skill {skill_id} could not be resolved",
+            match unresolved_model_behavior(state, skill_id, true) {
+                bcode_config::SkillUnresolvedModelBehavior::Deny => {
+                    return Err(ErrorResponse::new(
+                        "skill_model_unresolved",
+                        format!(
+                            "required model '{}' for skill {skill_id} could not be resolved",
+                            request.model
+                        ),
+                    ));
+                }
+                bcode_config::SkillUnresolvedModelBehavior::Warn => eprintln!(
+                    "required model '{}' for skill {skill_id} could not be resolved; continuing by configuration",
                     request.model
                 ),
-            ));
+                bcode_config::SkillUnresolvedModelBehavior::Ignore => {}
+            }
+            return Ok(());
         }
-        eprintln!(
-            "preferred model '{}' for skill {skill_id} could not be resolved; keeping current session model",
-            request.model
-        );
+        match unresolved_model_behavior(state, skill_id, false) {
+            bcode_config::SkillUnresolvedModelBehavior::Deny => {
+                return Err(ErrorResponse::new(
+                    "skill_model_unresolved",
+                    format!(
+                        "preferred model '{}' for skill {skill_id} could not be resolved",
+                        request.model
+                    ),
+                ));
+            }
+            bcode_config::SkillUnresolvedModelBehavior::Warn => eprintln!(
+                "preferred model '{}' for skill {skill_id} could not be resolved; keeping current session model",
+                request.model
+            ),
+            bcode_config::SkillUnresolvedModelBehavior::Ignore => {}
+        }
         return Ok(());
     };
     if required {
@@ -6830,9 +6860,10 @@ async fn apply_skill_model_request(
 
 async fn resolve_skill_model_request(
     state: &ServerState,
+    skill_id: &SkillId,
     request: &SkillModelRequest,
 ) -> Option<(String, String)> {
-    let provider_candidates = skill_model_provider_candidates(state, request);
+    let provider_candidates = skill_model_provider_candidates(state, skill_id, request);
     for provider in provider_candidates {
         if skill_model_exists(state, provider.as_deref(), &request.model).await {
             return Some((
@@ -6846,17 +6877,68 @@ async fn resolve_skill_model_request(
 
 fn skill_model_provider_candidates(
     state: &ServerState,
+    skill_id: &SkillId,
     request: &SkillModelRequest,
 ) -> Vec<Option<String>> {
     if let Some(provider) = request.provider.clone() {
         return vec![Some(provider)];
     }
     let mut providers = Vec::new();
-    if let Some(provider) = state.selected_provider_plugin_id.clone() {
-        providers.push(Some(provider));
+    for provider in provider_fallback_for_skill(state, skill_id) {
+        push_unique_provider(&mut providers, Some(provider));
     }
-    providers.push(None);
+    if let Some(provider) = state.selected_provider_plugin_id.clone() {
+        push_unique_provider(&mut providers, Some(provider));
+    }
+    push_unique_provider(&mut providers, None);
     providers
+}
+
+fn push_unique_provider(providers: &mut Vec<Option<String>>, provider: Option<String>) {
+    if !providers.contains(&provider) {
+        providers.push(provider);
+    }
+}
+
+fn provider_fallback_for_skill(state: &ServerState, skill_id: &SkillId) -> Vec<String> {
+    state
+        .skill_model_policy
+        .skill
+        .get(skill_id.as_str())
+        .filter(|policy| !policy.provider_fallback.is_empty())
+        .map_or_else(
+            || state.skill_model_policy.provider_fallback.clone(),
+            |policy| policy.provider_fallback.clone(),
+        )
+}
+
+fn required_model_override_behavior(
+    state: &ServerState,
+    skill_id: &SkillId,
+) -> bcode_config::SkillRequiredModelOverride {
+    state
+        .skill_model_policy
+        .skill
+        .get(skill_id.as_str())
+        .and_then(|policy| policy.required_override)
+        .unwrap_or(state.skill_model_policy.required_override)
+}
+
+fn unresolved_model_behavior(
+    state: &ServerState,
+    skill_id: &SkillId,
+    required: bool,
+) -> bcode_config::SkillUnresolvedModelBehavior {
+    let skill_policy = state.skill_model_policy.skill.get(skill_id.as_str());
+    if required {
+        skill_policy
+            .and_then(|policy| policy.required_unresolved)
+            .unwrap_or(state.skill_model_policy.required_unresolved)
+    } else {
+        skill_policy
+            .and_then(|policy| policy.preferred_unresolved)
+            .unwrap_or(state.skill_model_policy.preferred_unresolved)
+    }
 }
 
 async fn skill_model_exists(
@@ -17157,6 +17239,7 @@ mod tests {
                 skills: None,
                 skill_context_bytes: 0,
                 skill_prompt_options: SkillPromptCatalogOptions::default(),
+                skill_model_policy: bcode_config::SkillModelPolicyConfig::default(),
                 system_prompt: bcode_config::SystemPromptConfig::default(),
                 daemon_status: DaemonStatus::default(),
                 daemon_record_path: None,
@@ -17476,6 +17559,7 @@ mod tests {
                 skills: None,
                 skill_context_bytes: 0,
                 skill_prompt_options: SkillPromptCatalogOptions::default(),
+                skill_model_policy: bcode_config::SkillModelPolicyConfig::default(),
                 system_prompt: bcode_config::SystemPromptConfig::default(),
                 daemon_status: DaemonStatus::default(),
                 daemon_record_path: None,
@@ -17578,6 +17662,7 @@ mod tests {
                 skills: None,
                 skill_context_bytes: 0,
                 skill_prompt_options: SkillPromptCatalogOptions::default(),
+                skill_model_policy: bcode_config::SkillModelPolicyConfig::default(),
                 system_prompt: bcode_config::SystemPromptConfig::default(),
                 daemon_status: DaemonStatus::default(),
                 daemon_record_path: None,

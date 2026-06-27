@@ -1109,6 +1109,10 @@ pub struct SkillsConfig {
     #[config_doc(nested)]
     #[serde(default)]
     pub prompt: SkillPromptConfig,
+    /// Skill model policy enforcement configuration.
+    #[config_doc(nested)]
+    #[serde(default)]
+    pub model_policy: SkillModelPolicyConfig,
 }
 
 impl Default for SkillsConfig {
@@ -1127,6 +1131,7 @@ impl Default for SkillsConfig {
             sources: SkillSourceConfig::default(),
             disabled: DisabledSkillsConfig::default(),
             prompt: SkillPromptConfig::default(),
+            model_policy: SkillModelPolicyConfig::default(),
         }
     }
 }
@@ -1152,6 +1157,73 @@ pub enum SkillAutoActivateMode {
     #[default]
     Suggest,
     On,
+}
+
+/// Skill model policy enforcement configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "model_policy")]
+pub struct SkillModelPolicyConfig {
+    /// Whether manual model changes may override active required-skill models.
+    #[serde(default)]
+    pub required_override: SkillRequiredModelOverride,
+    /// Behavior when a required skill model cannot be resolved.
+    #[serde(default)]
+    pub required_unresolved: SkillUnresolvedModelBehavior,
+    /// Behavior when a preferred skill model cannot be resolved.
+    #[serde(default = "default_preferred_unresolved_model_behavior")]
+    pub preferred_unresolved: SkillUnresolvedModelBehavior,
+    /// Provider fallback order used when a skill model omits provider.
+    #[serde(default)]
+    pub provider_fallback: Vec<String>,
+    /// Per-skill model policy overrides by skill ID.
+    #[serde(default)]
+    pub skill: BTreeMap<String, SkillModelPolicyOverrideConfig>,
+}
+
+/// Per-skill model policy override configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "skill")]
+pub struct SkillModelPolicyOverrideConfig {
+    /// Whether manual model changes may override this skill's required model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_override: Option<SkillRequiredModelOverride>,
+    /// Behavior when this skill's required model cannot be resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_unresolved: Option<SkillUnresolvedModelBehavior>,
+    /// Behavior when this skill's preferred model cannot be resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_unresolved: Option<SkillUnresolvedModelBehavior>,
+    /// Provider fallback order used when this skill model omits provider.
+    #[serde(default)]
+    pub provider_fallback: Vec<String>,
+}
+
+/// Required skill model manual override behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillRequiredModelOverride {
+    /// Deny manual model changes while the required-model skill is active.
+    #[default]
+    Deny,
+    /// Allow manual model changes even while the required-model skill is active.
+    Allow,
+}
+
+/// Behavior for unresolved skill-declared models.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillUnresolvedModelBehavior {
+    /// Fail the operation.
+    #[default]
+    Deny,
+    /// Log a warning and continue without applying the skill model.
+    Warn,
+    /// Continue without applying the skill model.
+    Ignore,
+}
+
+const fn default_preferred_unresolved_model_behavior() -> SkillUnresolvedModelBehavior {
+    SkillUnresolvedModelBehavior::Warn
 }
 
 /// Skill prompt catalog configuration.
