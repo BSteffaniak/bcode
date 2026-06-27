@@ -445,7 +445,8 @@ fn run_bundled_tesseract(
         .saturating_mul(bytes_per_pixel);
     let api = tesseract_rs::TesseractAPI::new();
     let oem = options.and_then(|options| options.oem).map_or(3, i32::from);
-    api.init_2("", language, oem)
+    let tessdata_dir = tessdata_dir();
+    api.init_2(tessdata_dir.to_str().unwrap_or_default(), language, oem)
         .map_err(|error| OcrError::BundledTesseract(error.to_string()))?;
     if let Some(options) = options {
         if let Some(psm) = options.psm {
@@ -474,6 +475,31 @@ fn run_bundled_tesseract(
         .map_err(|error| OcrError::BundledTesseract(error.to_string()))?;
     api.get_utf8_text()
         .map_err(|error| OcrError::BundledTesseract(error.to_string()))
+}
+
+#[cfg(feature = "bundled-tesseract")]
+fn tessdata_dir() -> PathBuf {
+    if let Ok(prefix) = env::var("TESSDATA_PREFIX") {
+        return PathBuf::from(prefix);
+    }
+    if cfg!(target_os = "macos")
+        && let Ok(home) = env::var("HOME")
+    {
+        return PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("tesseract-rs")
+            .join("tessdata");
+    }
+    if cfg!(target_os = "windows")
+        && let Ok(appdata) = env::var("APPDATA")
+    {
+        return PathBuf::from(appdata).join("tesseract-rs").join("tessdata");
+    }
+    env::var("HOME").map_or_else(
+        |_| PathBuf::from("tessdata"),
+        |home| PathBuf::from(home).join(".tesseract-rs").join("tessdata"),
+    )
 }
 
 async fn download_source(
@@ -619,9 +645,10 @@ fn ocr_engine_statuses() -> Vec<EngineStatus> {
 
 #[cfg(feature = "bundled-tesseract")]
 fn bundled_tesseract_status() -> EngineStatus {
+    let tessdata = tessdata_dir();
     EngineStatus {
         name: "tesseract".to_string(),
-        available: true,
+        available: tessdata.is_dir(),
         version: Some(tesseract_rs::TesseractAPI::version()),
         quality: "bundled".to_string(),
     }
