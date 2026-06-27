@@ -1806,6 +1806,8 @@ fn handle_review_navigation_key(app: &mut ReviewApp, key: KeyCode) -> bool {
         KeyCode::Char('i') => app.select_previous_open_thread(),
         KeyCode::Char('O') => app.select_previous_open_thread_global(),
         KeyCode::Char('P') => app.select_next_open_thread_global(),
+        KeyCode::Char('L') => app.select_next_ai_linked_thread(),
+        KeyCode::Char('B') => app.select_previous_ai_linked_thread(),
         KeyCode::Char('R') => app.toggle_show_resolved_threads(),
         KeyCode::Char('r') => app.toggle_selected_thread_resolved(),
         KeyCode::Char('H') => app.toggle_hide_viewed_files(),
@@ -6471,6 +6473,30 @@ impl ReviewApp {
         self.jump_to_thread_summary(&summaries[next_index])
     }
 
+    /// Select next AI-linked review thread across all files.
+    pub fn select_next_ai_linked_thread(&mut self) -> bool {
+        self.select_relative_ai_linked_thread(1)
+    }
+
+    /// Select previous AI-linked review thread across all files.
+    pub fn select_previous_ai_linked_thread(&mut self) -> bool {
+        self.select_relative_ai_linked_thread(-1)
+    }
+
+    fn select_relative_ai_linked_thread(&mut self, offset: isize) -> bool {
+        let summaries = self.ai_linked_thread_summaries();
+        if summaries.is_empty() {
+            self.status_message = Some("no AI-linked review threads".to_string());
+            return true;
+        }
+        let current_anchor = self.selected_comment_anchor();
+        let current_index = current_anchor
+            .as_ref()
+            .and_then(|anchor| summaries.iter().position(|thread| &thread.anchor == anchor));
+        let next_index = relative_index(current_index, summaries.len(), offset);
+        self.jump_to_thread_summary(&summaries[next_index])
+    }
+
     /// Select next review thread in the main pane.
     pub fn select_next_inline_thread(&mut self) -> bool {
         let Some(current_anchor) = self.selected_comment_anchor() else {
@@ -6540,6 +6566,18 @@ impl ReviewApp {
         self.thread_summaries()
             .into_iter()
             .filter(|thread| !thread.resolved)
+            .collect()
+    }
+
+    fn ai_linked_thread_summaries(&self) -> Vec<ReviewThreadSummary> {
+        self.thread_summaries()
+            .into_iter()
+            .filter(|thread| {
+                thread.session_id.is_some()
+                    || self
+                        .agent_state_for_anchor(&thread.anchor)
+                        .is_some_and(|state| state.session_id.is_some())
+            })
             .collect()
     }
 
