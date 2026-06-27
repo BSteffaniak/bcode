@@ -955,8 +955,9 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                         };
                         format!("  🤖 {}{warning}", state.live_state_label())
                     });
+            let suggestion_status = suggestion_sidebar_label(thread);
             let text = format!(
-                " {marker} {status} {kind}/{severity} {path_label} {line_label} x{}  {body}{agent_status}",
+                " {marker} {status} {kind}/{severity} {path_label} {line_label} x{} {suggestion_status} {body}{agent_status}",
                 thread.draft_count
             );
             frame.write_line_with_fallback_style(
@@ -986,6 +987,24 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     }
 }
 
+fn suggestion_sidebar_label(thread: &crate::code_review_tui::ReviewThreadSummary) -> String {
+    let mut parts = Vec::new();
+    if thread.pending_suggestion_count > 0 {
+        parts.push(format!("suggest:{}", thread.pending_suggestion_count));
+    }
+    if thread.accepted_suggestion_count > 0 {
+        parts.push(format!("accepted:{}", thread.accepted_suggestion_count));
+    }
+    if thread.rejected_suggestion_count > 0 {
+        parts.push(format!("rejected:{}", thread.rejected_suggestion_count));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("[{}]", parts.join("/"))
+    }
+}
+
 fn render_thread_detail(
     app: &mut ReviewApp,
     area: Rect,
@@ -1005,11 +1024,12 @@ fn render_thread_detail(
     );
     let status = if thread.resolved { "resolved" } else { "open" };
     let title = format!(
-        " {} {} {} {}",
+        " {} {} {} {} {}",
         status,
         review_thread_kind_label(thread.thread_kind),
         thread.anchor.scope_label(),
-        thread.line_label()
+        thread.line_label(),
+        suggestion_sidebar_label(thread)
     );
     frame.write_line(
         Rect::new(area.x, area.y.saturating_add(1), area.width, 1),

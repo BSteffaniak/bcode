@@ -3651,6 +3651,12 @@ pub struct ReviewThreadSummary {
     pub thread_kind: ReviewThreadKind,
     /// Thread severity.
     pub severity: ReviewThreadSeverity,
+    /// Pending suggested comment count.
+    pub pending_suggestion_count: usize,
+    /// Accepted suggested comment count.
+    pub accepted_suggestion_count: usize,
+    /// Rejected suggested comment count.
+    pub rejected_suggestion_count: usize,
 }
 
 impl ReviewThreadSummary {
@@ -6164,6 +6170,25 @@ impl ReviewApp {
         self.local_review_thread_status_counts()
     }
 
+    /// Return suggestion lifecycle counts for an anchor.
+    #[must_use]
+    pub fn suggestion_status_counts_for_anchor(
+        &self,
+        anchor: &ReviewCommentAnchor,
+    ) -> (usize, usize, usize) {
+        let mut pending = 0usize;
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        for suggestion in self.suggested_comments.get(anchor).into_iter().flatten() {
+            match suggestion.status {
+                ReviewSuggestionStatus::Suggested => pending = pending.saturating_add(1),
+                ReviewSuggestionStatus::Accepted => accepted = accepted.saturating_add(1),
+                ReviewSuggestionStatus::Rejected => rejected = rejected.saturating_add(1),
+            }
+        }
+        (pending, accepted, rejected)
+    }
+
     /// Return review thread summaries in deterministic order.
     #[must_use]
     pub fn thread_summaries(&self) -> Vec<ReviewThreadSummary> {
@@ -6171,6 +6196,11 @@ impl ReviewApp {
             .into_iter()
             .filter_map(|thread| {
                 let latest_body = thread.latest_body()?.to_string();
+                let (
+                    pending_suggestion_count,
+                    accepted_suggestion_count,
+                    rejected_suggestion_count,
+                ) = self.suggestion_status_counts_for_anchor(&thread.anchor);
                 Some(ReviewThreadSummary {
                     anchor: thread.anchor,
                     draft_count: thread.comments.len(),
@@ -6179,6 +6209,9 @@ impl ReviewApp {
                     resolved: thread.status.is_resolved(),
                     thread_kind: thread.thread_kind,
                     severity: thread.severity,
+                    pending_suggestion_count,
+                    accepted_suggestion_count,
+                    rejected_suggestion_count,
                 })
             })
             .collect()
