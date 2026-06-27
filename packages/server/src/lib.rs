@@ -52,13 +52,13 @@ use bcode_session_models::{
 use bcode_settings::SettingsStore;
 use bcode_skill::{
     SkillPromptCatalogMode, SkillPromptCatalogOptions, SkillRegistry, SkillRegistryOptions,
-    SkillSourceRoot, evaluate_skill_tool_call, format_skill_catalog_for_prompt,
-    resolve_skill_permission_policy,
+    evaluate_skill_tool_call, format_skill_catalog_for_prompt, resolve_skill_permission_policy,
+    skill_source_roots_from_config,
 };
 use bcode_skill_models::{
-    SkillActivationMode, SkillContextResponse, SkillId, SkillList, SkillSource, SkillSourceKind,
-    SkillToolDecision, SkillToolDecisionEntry, SkillToolDecisionKey, SkillToolDecisionScope,
-    SkillToolPolicyOutcome, SkillToolPolicyRequest,
+    SkillActivationMode, SkillContextResponse, SkillId, SkillList, SkillSource, SkillToolDecision,
+    SkillToolDecisionEntry, SkillToolDecisionKey, SkillToolDecisionScope, SkillToolPolicyOutcome,
+    SkillToolPolicyRequest,
 };
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, ShellRunResult as ServiceShellRunResult,
@@ -14719,56 +14719,10 @@ pub(crate) async fn send_response(
 }
 
 fn build_skill_registry(config: &bcode_config::BcodeConfig) -> Option<SkillRegistry> {
-    let mut roots = Vec::new();
     if !config.skills.enabled {
         return None;
     }
-    if config.skills.include_repo_skills {
-        roots.push(SkillSourceRoot::new(
-            PathBuf::from(".bcode/skills"),
-            SkillSourceKind::Repository,
-            "repo:.bcode/skills",
-            10,
-        ));
-    }
-    if config.skills.include_generic_repo_skills {
-        roots.push(SkillSourceRoot::new(
-            PathBuf::from("skills"),
-            SkillSourceKind::Repository,
-            "repo:skills",
-            15,
-        ));
-    }
-    if config.skills.include_compat_claude_skills {
-        roots.push(SkillSourceRoot::new(
-            PathBuf::from(".claude/skills"),
-            SkillSourceKind::Compatibility,
-            "repo:.claude/skills",
-            20,
-        ));
-    }
-    if config.skills.include_user_skills {
-        roots.push(SkillSourceRoot::new(
-            bcode_config::default_config_dir().join("skills"),
-            SkillSourceKind::User,
-            "user-config:skills",
-            30,
-        ));
-        roots.push(SkillSourceRoot::new(
-            bcode_config::default_state_dir().join("skills"),
-            SkillSourceKind::User,
-            "user-state:skills",
-            35,
-        ));
-    }
-    for (index, path) in config.skills.sources.paths.iter().enumerate() {
-        roots.push(SkillSourceRoot::new(
-            path.clone(),
-            SkillSourceKind::Configured,
-            format!("configured:{index}"),
-            40 + u16::try_from(index).unwrap_or(u16::MAX - 40),
-        ));
-    }
+    let roots = skill_source_roots_from_config(config);
     let options = SkillRegistryOptions {
         max_skill_file_bytes: config.skills.max_skill_file_bytes,
         max_context_bytes: config.skills.max_context_bytes,

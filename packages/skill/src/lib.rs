@@ -104,6 +104,62 @@ impl SkillSourceRoot {
     }
 }
 
+/// Build configured skill source roots from the Bcode configuration.
+#[must_use]
+pub fn skill_source_roots_from_config(config: &bcode_config::BcodeConfig) -> Vec<SkillSourceRoot> {
+    let mut roots = Vec::new();
+    if !config.skills.enabled {
+        return roots;
+    }
+    if config.skills.include_repo_skills {
+        roots.push(SkillSourceRoot::new(
+            PathBuf::from(".bcode/skills"),
+            SkillSourceKind::Repository,
+            "repo:.bcode/skills",
+            10,
+        ));
+    }
+    if config.skills.include_generic_repo_skills {
+        roots.push(SkillSourceRoot::new(
+            PathBuf::from("skills"),
+            SkillSourceKind::Repository,
+            "repo:skills",
+            15,
+        ));
+    }
+    if config.skills.include_compat_claude_skills {
+        roots.push(SkillSourceRoot::new(
+            PathBuf::from(".claude/skills"),
+            SkillSourceKind::Compatibility,
+            "repo:.claude/skills",
+            20,
+        ));
+    }
+    if config.skills.include_user_skills {
+        roots.push(SkillSourceRoot::new(
+            bcode_config::default_config_dir().join("skills"),
+            SkillSourceKind::User,
+            "user-config:skills",
+            30,
+        ));
+        roots.push(SkillSourceRoot::new(
+            bcode_config::default_state_dir().join("skills"),
+            SkillSourceKind::User,
+            "user-state:skills",
+            35,
+        ));
+    }
+    for (index, path) in config.skills.sources.paths.iter().enumerate() {
+        roots.push(SkillSourceRoot::new(
+            path.clone(),
+            SkillSourceKind::Configured,
+            format!("configured:{index}"),
+            40 + u16::try_from(index).unwrap_or(u16::MAX - 40),
+        ));
+    }
+    roots
+}
+
 /// Registry build options.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillRegistryOptions {

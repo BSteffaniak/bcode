@@ -29,7 +29,7 @@ use bcode_session_models::{
     SessionHistoryQuery, SessionId,
 };
 use bcode_settings::SettingsStore;
-use bcode_skill::{SkillRegistry, SkillRegistryOptions, SkillSourceRoot};
+use bcode_skill::{SkillRegistry, SkillRegistryOptions, skill_source_roots_from_config};
 use bcode_skill_models::{
     SkillDiagnosticSeverity, SkillSourceKind, SkillToolDecision, SkillToolDecisionEntry,
 };
@@ -78,6 +78,8 @@ pub enum CliError {
     Settings(#[from] bcode_settings::SettingsError),
     #[error("skill error: {0}")]
     Skill(#[from] bcode_skill::SkillRegistryError),
+    #[error("skill model error: {0}")]
+    SkillModel(#[from] bcode_skill_models::SkillError),
     #[error("TUI error: {0}")]
     Tui(#[from] bcode_tui::TuiError),
     #[error("plugin error: {0}")]
@@ -485,6 +487,8 @@ fn handle_skill_command(command: &SkillCommand) -> Result<(), CliError> {
     let store = SettingsStore::default();
     match command {
         SkillCommand::Check { json } => check_skills(*json)?,
+        SkillCommand::List { json } => list_skills(*json)?,
+        SkillCommand::Describe { skill_id, json } => describe_skill(skill_id, *json)?,
         SkillCommand::Decisions { json, skill, tool } => {
             let state = store.skill_tool_decisions()?;
             let decisions =
@@ -529,6 +533,69 @@ fn handle_skill_command(command: &SkillCommand) -> Result<(), CliError> {
     Ok(())
 }
 
+fn skill_registry_from_config() -> Result<SkillRegistry, CliError> {
+    let config = bcode_config::load_config()?;
+    let roots = skill_source_roots_from_config(&config);
+    let options = SkillRegistryOptions {
+        max_skill_file_bytes: config.skills.max_skill_file_bytes,
+        max_context_bytes: config.skills.max_context_bytes,
+        follow_symlinks: config.skills.follow_symlinks,
+        disabled_ids: config.skills.disabled_skill_ids(),
+    };
+    Ok(SkillRegistry::discover(&roots, options)?)
+}
+
+fn list_skills(json: bool) -> Result<(), CliError> {
+    let list = skill_registry_from_config()?.list();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&list)?);
+        return Ok(());
+    }
+    if list.skills.is_empty() {
+        println!("no skills loaded");
+        return Ok(());
+    }
+    for skill in list.skills {
+        println!(
+            "{}\t{}\t{}\t{}",
+            skill.id,
+            skill.name,
+            skill.source.label,
+            skill.description.unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+fn describe_skill(skill_id: &str, json: bool) -> Result<(), CliError> {
+    let registry = skill_registry_from_config()?;
+    let manifest = registry.describe(&skill_id.parse()?)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&manifest)?);
+        return Ok(());
+    }
+    println!("id: {}", manifest.summary.id);
+    println!("name: {}", manifest.summary.name);
+    if let Some(description) = manifest.summary.description.as_deref() {
+        println!("description: {description}");
+    }
+    println!("source: {}", manifest.summary.source.label);
+    if let Some(path) = manifest.summary.source.path.as_deref() {
+        println!("path: {path}");
+    }
+    if !manifest.summary.activation.keywords.is_empty() {
+        println!(
+            "keywords: {}",
+            manifest.summary.activation.keywords.join(", ")
+        );
+    }
+    if !manifest.permissions.tools.is_empty() {
+        println!("tools: {}", manifest.permissions.tools.join(", "));
+    }
+    println!("instructions:\n{}", manifest.instructions);
+    Ok(())
+}
+
 #[derive(Debug, Serialize)]
 struct SkillCheckReport {
     roots: Vec<SkillCheckRoot>,
@@ -548,7 +615,7 @@ struct SkillCheckRoot {
 
 fn check_skills(json: bool) -> Result<(), CliError> {
     let config = bcode_config::load_config()?;
-    let roots = skill_source_roots(&config);
+    let roots = skill_source_roots_from_config(&config);
     let options = SkillRegistryOptions {
         max_skill_file_bytes: config.skills.max_skill_file_bytes,
         max_context_bytes: config.skills.max_context_bytes,
@@ -604,60 +671,6 @@ fn check_skills(json: bool) -> Result<(), CliError> {
         );
     }
     Ok(())
-}
-
-fn skill_source_roots(config: &bcode_config::BcodeConfig) -> Vec<SkillSourceRoot> {
-    let mut roots = Vec::new();
-    if !config.skills.enabled {
-        return roots;
-    }
-    if config.skills.include_repo_skills {
-        roots.push(SkillSourceRoot::new(
-            PathBuf::from(".bcode/skills"),
-            SkillSourceKind::Repository,
-            "repo:.bcode/skills",
-            10,
-        ));
-    }
-    if config.skills.include_generic_repo_skills {
-        roots.push(SkillSourceRoot::new(
-            PathBuf::from("skills"),
-            SkillSourceKind::Repository,
-            "repo:skills",
-            15,
-        ));
-    }
-    if config.skills.include_compat_claude_skills {
-        roots.push(SkillSourceRoot::new(
-            PathBuf::from(".claude/skills"),
-            SkillSourceKind::Compatibility,
-            "repo:.claude/skills",
-            20,
-        ));
-    }
-    if config.skills.include_user_skills {
-        roots.push(SkillSourceRoot::new(
-            bcode_config::default_config_dir().join("skills"),
-            SkillSourceKind::User,
-            "user-config:skills",
-            30,
-        ));
-        roots.push(SkillSourceRoot::new(
-            bcode_config::default_state_dir().join("skills"),
-            SkillSourceKind::User,
-            "user-state:skills",
-            35,
-        ));
-    }
-    for (index, path) in config.skills.sources.paths.iter().enumerate() {
-        roots.push(SkillSourceRoot::new(
-            path.clone(),
-            SkillSourceKind::Configured,
-            format!("configured:{index}"),
-            40 + u16::try_from(index).unwrap_or(u16::MAX - 40),
-        ));
-    }
-    roots
 }
 
 const fn skill_source_kind_name(kind: SkillSourceKind) -> &'static str {
@@ -1423,6 +1436,20 @@ enum OpenAiLoginFlow {
 enum SkillCommand {
     /// Check skill discovery and parsing diagnostics.
     Check {
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List loaded skills.
+    List {
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Describe one loaded skill.
+    Describe {
+        /// Skill ID to describe.
+        skill_id: String,
         /// Emit JSON instead of text.
         #[arg(long)]
         json: bool,
