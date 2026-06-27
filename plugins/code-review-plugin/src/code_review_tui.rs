@@ -1829,6 +1829,7 @@ fn handle_review_navigation_key(app: &mut ReviewApp, key: KeyCode) -> bool {
         KeyCode::Char('a') => app.open_comment_editor_with_action(ReviewCommentAction::AskBcode),
         KeyCode::Char('A') => app.toggle_selected_agent_answer_expanded(),
         KeyCode::Char('m') => app.convert_agent_answer_to_draft_at_selection(),
+        KeyCode::Char('y') => app.retry_linked_session_stream_at_selection(),
         KeyCode::Char('o') => app.open_linked_session_at_selection(),
         KeyCode::Char('?') => {
             app.help_visible = !app.help_visible;
@@ -3116,6 +3117,12 @@ struct ReviewAgentStreamStore {
 impl ReviewAgentStreamStore {
     fn ensure_subscriptions(&mut self, host: &dyn PluginTuiHost, app: &mut ReviewApp) -> bool {
         let mut changed = false;
+        for session_id in app.take_pending_agent_stream_retries() {
+            self.subscriptions.remove(&session_id);
+            self.session_states.remove(&session_id);
+            self.failed_sessions.remove(&session_id);
+            changed = true;
+        }
         for session_id in app.linked_agent_session_ids() {
             if self.subscriptions.contains_key(&session_id)
                 || self.failed_sessions.contains(&session_id)
@@ -3989,6 +3996,8 @@ pub struct ReviewApp {
     pub pending_workspace_reload: bool,
     /// Review thread awaiting Bcode session creation.
     pub pending_agent_session: Option<PendingAgentSession>,
+    /// Linked Bcode session ids that should be resubscribed.
+    pub pending_agent_stream_retries: BTreeSet<String>,
     /// Structured Bcode agent/session state by review thread key.
     pub agent_thread_states: BTreeMap<String, ReviewAgentThreadState>,
     /// Revision bump for linked Bcode agent state.
@@ -4066,6 +4075,7 @@ impl ReviewApp {
             pending_workspace_save: false,
             pending_workspace_reload: false,
             pending_agent_session: None,
+            pending_agent_stream_retries: BTreeSet::new(),
             agent_thread_states: BTreeMap::new(),
             agent_state_revision: 0,
             range_selection_start: None,
@@ -7705,6 +7715,13 @@ impl ReviewApp {
         self.pending_agent_session.take()
     }
 
+    /// Take pending linked-session stream retry ids.
+    pub fn take_pending_agent_stream_retries(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_agent_stream_retries)
+            .into_iter()
+            .collect()
+    }
+
     const fn touch_agent_state(&mut self) {
         self.agent_state_revision = self.agent_state_revision.saturating_add(1);
     }
@@ -7770,6 +7787,36 @@ impl ReviewApp {
             .last()?
             .session_id
             .as_deref()
+    }
+
+    /// Retry the linked Bcode event stream for the selected thread.
+    pub fn retry_linked_session_stream_at_selection(&mut self) -> bool {
+        let Some(anchor) = self.selected_comment_anchor() else {
+            self.status_message = Some("select a linked Bcode thread to retry".to_string());
+            return true;
+        };
+        let session_id = self
+            .agent_state_for_anchor(&anchor)
+            .and_then(|state| state.session_id.clone())
+            .or_else(|| self.session_id_for_anchor(&anchor).map(ToString::to_string));
+        let Some(session_id) = session_id else {
+            self.status_message = Some("selected thread has no linked Bcode session".to_string());
+            return true;
+        };
+        self.pending_agent_stream_retries.insert(session_id.clone());
+        let key = Self::thread_key_for_anchor(&anchor);
+        let state = self
+            .agent_thread_states
+            .entry(key)
+            .or_insert_with(|| ReviewAgentThreadState::pending(String::new()));
+        state.session_id = Some(session_id.clone());
+        state.phase = ReviewAgentThreadPhase::Running;
+        state.status = "reconnecting linked session stream…".to_string();
+        state.activity = Some("reconnecting stream".to_string());
+        state.error = None;
+        self.touch_agent_state();
+        self.status_message = Some(format!("retrying linked session stream {session_id}"));
+        true
     }
 
     /// Toggle full/compact rendering for the selected linked Bcode answer.
@@ -8649,6 +8696,9 @@ impl ReviewApp {
                 self.ask_bcode_about_selection()
             }
             Some(ReviewThreadAction::OpenSession) => self.open_linked_session_at_selection(),
+            Some(ReviewThreadAction::RetrySession) => {
+                self.retry_linked_session_stream_at_selection()
+            }
             Some(ReviewThreadAction::ToggleAnswer) => self.toggle_selected_agent_answer_expanded(),
             Some(ReviewThreadAction::DraftAnswer) => {
                 self.convert_agent_answer_to_draft_at_selection()

@@ -282,10 +282,14 @@ impl ReviewViewDocument {
                         || agent_states
                             .get(&thread_key)
                             .is_some_and(|state| state.session_id.is_some());
+                let has_stream_error = agent_states
+                    .get(&thread_key)
+                    .is_some_and(|state| state.error.is_some());
                 for action in ReviewThreadAction::all_for_state(
                     resolved,
                     has_agent_answer,
                     has_linked_session,
+                    has_stream_error,
                 ) {
                     rows.push(ReviewViewRow {
                         visual_row: 0,
@@ -523,6 +527,8 @@ pub enum ReviewThreadAction {
     AskBcode,
     /// Ask a follow-up in the linked Bcode session.
     FollowUp,
+    /// Retry a disconnected linked Bcode session stream.
+    RetrySession,
     /// Toggle full/compact display for the selected linked Bcode answer.
     ToggleAnswer,
     /// Convert the latest Bcode answer into a draft comment.
@@ -544,11 +550,15 @@ impl ReviewThreadAction {
         resolved: bool,
         has_agent_answer: bool,
         has_linked_session: bool,
+        has_stream_error: bool,
     ) -> Vec<Self> {
         let mut actions = vec![Self::Reply, Self::Edit, Self::Delete];
         if has_linked_session {
             actions.push(Self::FollowUp);
             actions.push(Self::OpenSession);
+            if has_stream_error {
+                actions.push(Self::RetrySession);
+            }
         } else {
             actions.push(Self::AskBcode);
         }
@@ -575,6 +585,7 @@ impl ReviewThreadAction {
             Self::AskBcode => "ask",
             Self::FollowUp => "follow-up",
             Self::OpenSession => "open-session",
+            Self::RetrySession => "retry-session",
             Self::ToggleAnswer => "toggle-answer",
             Self::DraftAnswer => "draft-answer",
             Self::Publish => "publish",
@@ -592,6 +603,7 @@ impl ReviewThreadAction {
             Self::Delete => "D",
             Self::AskBcode | Self::FollowUp => "a",
             Self::OpenSession => "o",
+            Self::RetrySession => "y",
             Self::ToggleAnswer => "A",
             Self::DraftAnswer => "m",
             Self::Publish => "x",
@@ -609,6 +621,7 @@ impl ReviewThreadAction {
             Self::AskBcode => "ask Bcode",
             Self::FollowUp => "ask follow-up",
             Self::OpenSession => "open session",
+            Self::RetrySession => "retry stream",
             Self::ToggleAnswer => "expand answer",
             Self::DraftAnswer => "draft answer",
             Self::Publish => "publish",
@@ -627,6 +640,7 @@ impl ReviewThreadAction {
             b"ask" => Some(Self::AskBcode),
             b"follow-up" => Some(Self::FollowUp),
             b"open-session" => Some(Self::OpenSession),
+            b"retry-session" => Some(Self::RetrySession),
             b"toggle-answer" => Some(Self::ToggleAnswer),
             b"draft-answer" => Some(Self::DraftAnswer),
             b"publish" => Some(Self::Publish),
