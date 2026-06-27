@@ -7482,8 +7482,10 @@ impl ReviewApp {
             return true;
         };
         self.range_selection_start = Some(source_row);
-        self.status_message =
-            Some("range selection started; move then c comment or a ask Bcode".to_string());
+        self.status_message = Some(
+            "range selection started; move to extend, c comment, a ask Bcode, esc clear"
+                .to_string(),
+        );
         true
     }
 
@@ -7519,7 +7521,38 @@ impl ReviewApp {
     #[must_use]
     pub fn range_selection_label(&self) -> Option<String> {
         let (start, end) = self.selected_range_bounds()?;
-        Some(format!("range {start}-{end} selected"))
+        let count = end.saturating_sub(start).saturating_add(1);
+        Some(format!(
+            "range rows {}-{} ({count} line{}) selected",
+            start.saturating_add(1),
+            end.saturating_add(1),
+            if count == 1 { "" } else { "s" }
+        ))
+    }
+
+    /// Return a visual marker for a row in the active range selection.
+    #[must_use]
+    pub fn range_selection_marker_at(
+        &self,
+        file_index: usize,
+        diff_row: usize,
+    ) -> Option<&'static str> {
+        if file_index != self.selected_file {
+            return None;
+        }
+        let (start, end) = self.selected_range_bounds()?;
+        if !(start..=end).contains(&diff_row) {
+            return None;
+        }
+        if start == end {
+            Some("◆")
+        } else if diff_row == start {
+            Some("╭")
+        } else if diff_row == end {
+            Some("╰")
+        } else {
+            Some("│")
+        }
     }
 
     /// Return true when a diff row has draft comments.

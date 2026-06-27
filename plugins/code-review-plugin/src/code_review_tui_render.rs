@@ -1934,6 +1934,10 @@ fn render_source_view_row(
         );
     let rendered = render_display_row_with_affordance(show_comment_affordance, display_row);
     let mut line = rendered.line;
+    if let Some(marker) = app.range_selection_marker_at(app.selected_file, source_row) {
+        line.spans
+            .insert(0, Span::styled(marker, Style::new().fg(Color::Blue)));
+    }
     if let Some(marker) = app.draft_marker_at(app.selected_file, source_row) {
         line.spans
             .insert(0, Span::styled(marker, Style::new().fg(Color::Yellow)));
