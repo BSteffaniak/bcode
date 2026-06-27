@@ -28,6 +28,8 @@ build_tools = [
     "worktree.create",
     "worktree.remove",
     "document.extract",
+    "ocr.extract",
+    "ocr.status",
 ]
 plan_disabled_tools = ["filesystem.write", "filesystem.edit"]
 
