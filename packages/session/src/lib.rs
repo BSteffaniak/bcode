@@ -169,7 +169,7 @@ impl SessionStore {
                 .then_with(|| right.updated_at_ms.cmp(&left.updated_at_ms))
         });
         summaries.dedup_by_key(|summary| summary.id);
-        summaries.sort_by(|left, right| right.updated_at_ms.cmp(&left.updated_at_ms));
+        summaries.sort_by_key(|summary| std::cmp::Reverse(summary.updated_at_ms));
         if summaries.is_empty() {
             return Ok(summaries);
         }

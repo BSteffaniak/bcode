@@ -880,6 +880,7 @@ fn render_review_summary(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
@@ -1605,6 +1606,7 @@ fn render_inline_thread_header(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_view_row(
     app: &ReviewApp,
     view_row: &ReviewViewRow,

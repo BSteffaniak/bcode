@@ -1458,20 +1458,18 @@ fn apply_tool_invocation_stream_event(
             rows,
             started_at_ms,
             ..
-        } => {
-            if *terminal {
-                streamed_tool_results.insert(
-                    tool_call_id.clone(),
-                    StreamedToolReplayContext {
-                        index: None,
-                        columns: columns.unwrap_or(120).max(1),
-                        rows: rows.unwrap_or(24).max(1),
-                        started_at_ms: *started_at_ms,
-                        finished_at_ms: None,
-                        saw_output: false,
-                    },
-                );
-            }
+        } if *terminal => {
+            streamed_tool_results.insert(
+                tool_call_id.clone(),
+                StreamedToolReplayContext {
+                    index: None,
+                    columns: columns.unwrap_or(120).max(1),
+                    rows: rows.unwrap_or(24).max(1),
+                    started_at_ms: *started_at_ms,
+                    finished_at_ms: None,
+                    saw_output: false,
+                },
+            );
         }
         ToolInvocationStreamEvent::OutputDelta {
             tool_call_id,

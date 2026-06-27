@@ -185,6 +185,7 @@ impl ReviewViewDocument {
 
     /// Return a copy with inline draft thread rows inserted after anchor end rows.
     #[must_use]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn with_inline_draft_threads(
         mut self,
         file_index: usize,
@@ -603,6 +604,7 @@ pub enum ReviewThreadAction {
 impl ReviewThreadAction {
     /// Return inline thread actions in visual order.
     #[must_use]
+    #[allow(clippy::fn_params_excessive_bools)]
     pub fn all_for_state(
         resolved: bool,
         has_agent_answer: bool,
@@ -1193,7 +1195,7 @@ mod tests {
     };
     use crate::code_review_tui::{
         CachedReviewFile, ReviewDraftComment, ReviewFile, ReviewFileStatus, ReviewHunk, ReviewLine,
-        ReviewLineKind,
+        ReviewLineKind, ReviewSuggestedComment,
     };
     use bcode_code_review_models::{ReviewThreadKind, ReviewThreadSeverity};
 
@@ -1250,7 +1252,9 @@ mod tests {
             .with_inline_draft_threads(
                 7,
                 std::iter::once((anchor.clone(), vec![comment])),
+                std::iter::empty::<(ReviewThreadAnchor, Vec<ReviewSuggestedComment>)>(),
                 &BTreeMap::new(),
+                &BTreeSet::new(),
                 &BTreeSet::new(),
                 &BTreeSet::new(),
                 true,
@@ -1302,7 +1306,9 @@ mod tests {
             .with_inline_draft_threads(
                 7,
                 std::iter::once((anchor, vec![comment])),
+                std::iter::empty::<(ReviewThreadAnchor, Vec<ReviewSuggestedComment>)>(),
                 &BTreeMap::new(),
+                &BTreeSet::new(),
                 &BTreeSet::new(),
                 &BTreeSet::new(),
                 true,

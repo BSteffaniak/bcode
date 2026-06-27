@@ -1069,10 +1069,7 @@ async fn try_auth_candidates_once(
     let mut last_error = None;
     let mut earliest_retry_at_unix = None;
     let mut warned_cooldown_profiles = BTreeSet::new();
-    for candidate in available_candidates
-        .into_iter()
-        .chain(cooldown_candidates.into_iter())
-    {
+    for candidate in available_candidates.into_iter().chain(cooldown_candidates) {
         if skipped_profiles
             .iter()
             .any(|profile| Some(profile) == candidate.profile.as_ref())
@@ -1227,11 +1224,14 @@ fn quota_error_reason(error: &ProviderError) -> &'static str {
     }
 }
 
+const WEEKLY_QUOTA_COOLDOWN_SECONDS: u64 = 604_800;
+const RATE_LIMIT_COOLDOWN_SECONDS: u64 = 18_000;
+
 fn quota_error_cooldown(error: &ProviderError) -> Duration {
     if quota_error_reason(error) == "weekly_quota" {
-        Duration::from_secs(7 * 24 * 60 * 60)
+        Duration::from_secs(WEEKLY_QUOTA_COOLDOWN_SECONDS)
     } else {
-        Duration::from_secs(5 * 60 * 60)
+        Duration::from_secs(RATE_LIMIT_COOLDOWN_SECONDS)
     }
 }
 

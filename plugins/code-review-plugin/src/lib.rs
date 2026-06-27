@@ -2314,7 +2314,7 @@ impl<'a> CodeReviewDb<'a> {
             }
             workspaces.push(workspace_from_row(&row)?);
         }
-        workspaces.sort_by(|left, right| right.updated_at_ms.cmp(&left.updated_at_ms));
+        workspaces.sort_by_key(|workspace| std::cmp::Reverse(workspace.updated_at_ms));
         Ok(workspaces)
     }
 

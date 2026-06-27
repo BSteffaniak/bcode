@@ -4705,11 +4705,7 @@ fn print_metrics_summary(metrics: &bcode_metrics::MetricsSnapshot) {
     if !metrics.histograms.is_empty() {
         println!("metric histograms:");
         for (key, histogram) in &metrics.histograms {
-            let avg = if histogram.count == 0 {
-                0
-            } else {
-                histogram.sum / histogram.count
-            };
+            let avg = histogram.sum.checked_div(histogram.count).unwrap_or(0);
             println!(
                 "  {key}\tcount={} avg={} min={} max={}",
                 histogram.count,

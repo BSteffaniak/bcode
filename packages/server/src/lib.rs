@@ -3812,12 +3812,11 @@ async fn run_ralph_runner_skeleton(
         let next_iteration_number = state
             .ralph_store
             .list_iterations_for_run(&run.run_id)
-            .map(|iterations| {
+            .map_or(1, |iterations| {
                 u64::try_from(iterations.len())
                     .unwrap_or(u64::MAX)
                     .saturating_add(1)
-            })
-            .unwrap_or(1);
+            });
         let active_run = state
             .ralph_store
             .active_run_for_loop(&run.state_dir)

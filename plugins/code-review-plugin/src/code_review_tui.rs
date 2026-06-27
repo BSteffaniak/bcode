@@ -9775,6 +9775,7 @@ impl ReviewApp {
         Some(document)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn review_view_document_cache_key(&self) -> Option<ReviewViewDocumentCacheKey> {
         let selected_path = self.selected_file_path();
         let surface_kind = self.selected_surface().map(|surface| surface.kind);

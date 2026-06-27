@@ -1437,7 +1437,7 @@ fn latest_loop_in_store(
                 .map(|row| summary_from_loop_row(&row))
                 .collect::<Result<Vec<_>, _>>()
                 .map(|mut summaries| {
-                    summaries.sort_by(|left, right| right.updated_at_ms.cmp(&left.updated_at_ms));
+                    summaries.sort_by_key(|summary| std::cmp::Reverse(summary.updated_at_ms));
                     summaries.into_iter().next()
                 })
         })
@@ -1830,7 +1830,7 @@ fn list_lifecycle_events_in_store(
                 .iter()
                 .map(event_record_from_row)
                 .collect::<Result<Vec<_>, _>>()?;
-            events.sort_by(|left, right| left.occurred_at_ms.cmp(&right.occurred_at_ms));
+            events.sort_by_key(|event| event.occurred_at_ms);
             Ok(events)
         })
     })
@@ -2050,7 +2050,7 @@ fn list_validation_commands_in_store(
                     })
                 })
                 .collect::<Result<Vec<_>, RalphStateError>>()?;
-            commands.sort_by(|left, right| left.position.cmp(&right.position));
+            commands.sort_by_key(|command| command.position);
             Ok(commands)
         })
     })
@@ -2159,7 +2159,7 @@ fn active_run_for_loop_in_store(
                 .map(run_record_from_row)
                 .collect::<Result<Vec<_>, _>>()?;
             runs.retain(|run| is_active_run_status(&run.status));
-            runs.sort_by(|left, right| right.started_at_ms.cmp(&left.started_at_ms));
+            runs.sort_by_key(|run| std::cmp::Reverse(run.started_at_ms));
             Ok(runs.into_iter().next())
         })
     })
@@ -2190,7 +2190,7 @@ fn list_runs_for_loop_in_store(
                 .iter()
                 .map(run_record_from_row)
                 .collect::<Result<Vec<_>, _>>()?;
-            runs.sort_by(|left, right| right.started_at_ms.cmp(&left.started_at_ms));
+            runs.sort_by_key(|run| std::cmp::Reverse(run.started_at_ms));
             Ok(runs)
         })
     })
@@ -2280,7 +2280,7 @@ fn interrupted_runs_for_loop_in_store(
                 .map(run_record_from_row)
                 .collect::<Result<Vec<_>, _>>()?;
             runs.retain(|run| run.status == "interrupted");
-            runs.sort_by(|left, right| right.started_at_ms.cmp(&left.started_at_ms));
+            runs.sort_by_key(|run| std::cmp::Reverse(run.started_at_ms));
             Ok(runs)
         })
     })
@@ -2461,7 +2461,7 @@ fn list_iterations_for_run_in_store(
                 .iter()
                 .map(iteration_record_from_row)
                 .collect::<Result<Vec<_>, _>>()?;
-            iterations.sort_by(|left, right| left.iteration_number.cmp(&right.iteration_number));
+            iterations.sort_by_key(|iteration| iteration.iteration_number);
             Ok(iterations)
         })
     })
@@ -2520,7 +2520,7 @@ fn list_validations_for_iteration_in_store(
                 .iter()
                 .map(validation_record_from_row)
                 .collect::<Result<Vec<_>, _>>()?;
-            validations.sort_by(|left, right| left.started_at_ms.cmp(&right.started_at_ms));
+            validations.sort_by_key(|validation| validation.started_at_ms);
             Ok(validations)
         })
     })

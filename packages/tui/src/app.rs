@@ -2172,17 +2172,13 @@ impl BmuxApp {
             SessionEventKind::ModelChanged { provider, model } => {
                 self.apply_model_changed(provider, model);
             }
-            SessionEventKind::ModelTurnStarted { .. } => {
-                if application.live_activity() {
-                    self.set_activity(ActivityState::Thinking);
-                    "thinking".clone_into(&mut self.status);
-                }
+            SessionEventKind::ModelTurnStarted { .. } if application.live_activity() => {
+                self.set_activity(ActivityState::Thinking);
+                "thinking".clone_into(&mut self.status);
             }
-            SessionEventKind::ModelTurnCancelRequested { .. } => {
-                if application.live_activity() {
-                    self.set_cancelling();
-                    "cancellation requested".clone_into(&mut self.status);
-                }
+            SessionEventKind::ModelTurnCancelRequested { .. } if application.live_activity() => {
+                self.set_cancelling();
+                "cancellation requested".clone_into(&mut self.status);
             }
             SessionEventKind::ModelTurnFinished {
                 outcome, message, ..
@@ -2242,30 +2238,26 @@ impl BmuxApp {
                     self.push_streaming_item("Reasoning", text);
                 }
             }
-            SessionEventKind::AssistantReasoningMessage { text } => {
-                if self.reasoning_visible() {
-                    self.finish_streaming_item("Reasoning", text, application);
-                }
+            SessionEventKind::AssistantReasoningMessage { text } if self.reasoning_visible() => {
+                self.finish_streaming_item("Reasoning", text, application);
             }
-            SessionEventKind::SessionCreated { name, .. } => {
-                if name.is_some() {
-                    self.session_title.clone_from(name);
-                }
+            SessionEventKind::SessionCreated {
+                name: Some(name), ..
+            } => {
+                self.session_title = Some(name.clone());
             }
             SessionEventKind::AgentChanged { agent_id } => {
                 self.set_current_agent_id(agent_id.clone());
             }
-            SessionEventKind::TraceEvent { trace } => {
-                if application.live_activity() {
-                    self.apply_trace_event(trace);
-                }
+            SessionEventKind::TraceEvent { trace } if application.live_activity() => {
+                self.apply_trace_event(trace);
             }
             SessionEventKind::RuntimeWorkStarted { .. }
             | SessionEventKind::RuntimeWorkCancelRequested { .. }
-            | SessionEventKind::RuntimeWorkProgress { .. } => {
-                if application.live_activity() {
-                    self.apply_runtime_work_event(event);
-                }
+            | SessionEventKind::RuntimeWorkProgress { .. }
+                if application.live_activity() =>
+            {
+                self.apply_runtime_work_event(event);
             }
             SessionEventKind::RuntimeWorkFinished {
                 work_id,
