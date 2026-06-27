@@ -162,7 +162,9 @@ pub struct ServerState {
     ralph_store: bcode_ralph::RalphStateStore,
     active_ralph_runs: Mutex<BTreeMap<PathBuf, JoinHandle<()>>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
-    required_skill_model_overrides: Mutex<BTreeMap<(SessionId, SkillId), SessionModelSelection>>,
+    session_model_selection_origins: Mutex<BTreeMap<SessionId, SessionModelSelectionOrigin>>,
+    required_skill_model_overrides:
+        Mutex<BTreeMap<(SessionId, SkillId), RequiredSkillModelOverride>>,
     session_agent_selections: Mutex<BTreeMap<SessionId, String>>,
     pending_permissions: Mutex<BTreeMap<String, PendingPermission>>,
     next_permission_id: Mutex<u64>,
@@ -555,6 +557,21 @@ struct SessionModelSelection {
     provider_context: bcode_model::ProviderRequestContext,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum SessionModelSelectionOrigin {
+    #[default]
+    Default,
+    User,
+    SkillPreferred(SkillId),
+    SkillRequired(SkillId),
+}
+
+#[derive(Debug, Clone, Default)]
+struct RequiredSkillModelOverride {
+    selection: SessionModelSelection,
+    origin: SessionModelSelectionOrigin,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct ModelMetadataOverride {
     context_window: Option<u32>,
@@ -860,6 +877,7 @@ impl ServerState {
             ralph_store: init.ralph_store,
             active_ralph_runs: Mutex::default(),
             session_model_selections: Mutex::default(),
+            session_model_selection_origins: Mutex::default(),
             required_skill_model_overrides: Mutex::default(),
             session_agent_selections: Mutex::default(),
             pending_permissions: Mutex::default(),
@@ -6322,6 +6340,11 @@ async fn handle_set_session_model(
                 .lock()
                 .await
                 .insert(session_id, selection);
+            state
+                .session_model_selection_origins
+                .lock()
+                .await
+                .insert(session_id, SessionModelSelectionOrigin::User);
             publish_session_event(state, &event).await;
             send_response(
                 writer,
@@ -6373,6 +6396,11 @@ async fn handle_set_session_reasoning(
                 selection.reasoning_effort = effort;
                 selection.reasoning_summary = summary;
             }
+            state
+                .session_model_selection_origins
+                .lock()
+                .await
+                .insert(session_id, SessionModelSelectionOrigin::User);
             publish_session_event(state, &event).await;
             send_response(
                 writer,
@@ -6758,13 +6786,25 @@ async fn apply_skill_model_policy(
     })?;
     if let Some(required) = manifest.model_policy.required.as_ref() {
         apply_skill_model_request(state, session_id, skill_id, required, true).await?;
-    } else if let Some(preferred) = manifest.model_policy.preferred.as_ref() {
-        let selection = session_model_selection(state, session_id).await;
-        if selection.model_id.is_none() {
-            apply_skill_model_request(state, session_id, skill_id, preferred, false).await?;
-        }
+    } else if let Some(preferred) = manifest.model_policy.preferred.as_ref()
+        && skill_preferred_model_can_apply(state, session_id).await
+    {
+        apply_skill_model_request(state, session_id, skill_id, preferred, false).await?;
     }
     Ok(())
+}
+
+async fn skill_preferred_model_can_apply(state: &ServerState, session_id: SessionId) -> bool {
+    matches!(
+        state
+            .session_model_selection_origins
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_default(),
+        SessionModelSelectionOrigin::Default
+    )
 }
 
 async fn apply_skill_model_request(
@@ -6776,51 +6816,27 @@ async fn apply_skill_model_request(
 ) -> Result<(), ErrorResponse> {
     let Some((provider, model_id)) = resolve_skill_model_request(state, skill_id, request).await
     else {
-        if required {
-            match unresolved_model_behavior(state, skill_id, true) {
-                bcode_config::SkillUnresolvedModelBehavior::Deny => {
-                    return Err(ErrorResponse::new(
-                        "skill_model_unresolved",
-                        format!(
-                            "required model '{}' for skill {skill_id} could not be resolved",
-                            request.model
-                        ),
-                    ));
-                }
-                bcode_config::SkillUnresolvedModelBehavior::Warn => eprintln!(
-                    "required model '{}' for skill {skill_id} could not be resolved; continuing by configuration",
-                    request.model
-                ),
-                bcode_config::SkillUnresolvedModelBehavior::Ignore => {}
-            }
-            return Ok(());
-        }
-        match unresolved_model_behavior(state, skill_id, false) {
-            bcode_config::SkillUnresolvedModelBehavior::Deny => {
-                return Err(ErrorResponse::new(
-                    "skill_model_unresolved",
-                    format!(
-                        "preferred model '{}' for skill {skill_id} could not be resolved",
-                        request.model
-                    ),
-                ));
-            }
-            bcode_config::SkillUnresolvedModelBehavior::Warn => eprintln!(
-                "preferred model '{}' for skill {skill_id} could not be resolved; keeping current session model",
-                request.model
-            ),
-            bcode_config::SkillUnresolvedModelBehavior::Ignore => {}
-        }
+        handle_unresolved_skill_model(state, skill_id, request, required)?;
         return Ok(());
     };
     if required {
         let previous_selection = session_model_selection(state, session_id).await;
+        let previous_origin = state
+            .session_model_selection_origins
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_default();
         state
             .required_skill_model_overrides
             .lock()
             .await
             .entry((session_id, skill_id.clone()))
-            .or_insert(previous_selection);
+            .or_insert(RequiredSkillModelOverride {
+                selection: previous_selection,
+                origin: previous_origin,
+            });
     }
     let event = state
         .sessions
@@ -6848,6 +6864,16 @@ async fn apply_skill_model_request(
         .lock()
         .await
         .insert(session_id, selection);
+    let origin = if required {
+        SessionModelSelectionOrigin::SkillRequired(skill_id.clone())
+    } else {
+        SessionModelSelectionOrigin::SkillPreferred(skill_id.clone())
+    };
+    state
+        .session_model_selection_origins
+        .lock()
+        .await
+        .insert(session_id, origin);
     publish_session_event(state, &event).await;
     if required {
         eprintln!(
@@ -6856,6 +6882,40 @@ async fn apply_skill_model_request(
         );
     }
     Ok(())
+}
+
+fn handle_unresolved_skill_model(
+    state: &ServerState,
+    skill_id: &SkillId,
+    request: &SkillModelRequest,
+    required: bool,
+) -> Result<(), ErrorResponse> {
+    match unresolved_model_behavior(state, skill_id, required) {
+        bcode_config::SkillUnresolvedModelBehavior::Deny => {
+            let kind = if required { "required" } else { "preferred" };
+            Err(ErrorResponse::new(
+                "skill_model_unresolved",
+                format!(
+                    "{kind} model '{}' for skill {skill_id} could not be resolved",
+                    request.model
+                ),
+            ))
+        }
+        bcode_config::SkillUnresolvedModelBehavior::Warn => {
+            let message = if required {
+                "continuing by configuration"
+            } else {
+                "keeping current session model"
+            };
+            eprintln!(
+                "{} model '{}' for skill {skill_id} could not be resolved; {message}",
+                if required { "required" } else { "preferred" },
+                request.model
+            );
+            Ok(())
+        }
+        bcode_config::SkillUnresolvedModelBehavior::Ignore => Ok(()),
+    }
 }
 
 async fn resolve_skill_model_request(
@@ -6969,7 +7029,7 @@ async fn handle_deactivate_skill(
     if let Some(skills) = state.active_skills.lock().await.get_mut(&session_id) {
         skills.remove(&skill_id);
     }
-    restore_required_skill_model_override(state, session_id, &skill_id).await?;
+    restore_skill_model_override(state, session_id, &skill_id).await?;
     let event = state
         .sessions
         .append_event(
@@ -6989,12 +7049,21 @@ async fn handle_deactivate_skill(
     .await
 }
 
+async fn restore_skill_model_override(
+    state: &ServerState,
+    session_id: SessionId,
+    skill_id: &SkillId,
+) -> Result<(), ServerError> {
+    restore_required_skill_model_override(state, session_id, skill_id).await?;
+    restore_preferred_skill_model_override(state, session_id, skill_id).await
+}
+
 async fn restore_required_skill_model_override(
     state: &ServerState,
     session_id: SessionId,
     skill_id: &SkillId,
 ) -> Result<(), ServerError> {
-    let Some(previous_selection) = state
+    let Some(previous_override) = state
         .required_skill_model_overrides
         .lock()
         .await
@@ -7002,11 +7071,13 @@ async fn restore_required_skill_model_override(
     else {
         return Ok(());
     };
-    let provider = previous_selection
+    let provider = previous_override
+        .selection
         .provider_plugin_id
         .clone()
         .unwrap_or_else(|| "<auto>".to_string());
-    let model = previous_selection
+    let model = previous_override
+        .selection
         .model_id
         .clone()
         .unwrap_or_else(|| "<default>".to_string());
@@ -7018,7 +7089,53 @@ async fn restore_required_skill_model_override(
         .session_model_selections
         .lock()
         .await
-        .insert(session_id, previous_selection);
+        .insert(session_id, previous_override.selection);
+    state
+        .session_model_selection_origins
+        .lock()
+        .await
+        .insert(session_id, previous_override.origin);
+    publish_session_event(state, &event).await;
+    Ok(())
+}
+
+async fn restore_preferred_skill_model_override(
+    state: &ServerState,
+    session_id: SessionId,
+    skill_id: &SkillId,
+) -> Result<(), ServerError> {
+    let origin = state
+        .session_model_selection_origins
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+        .unwrap_or_default();
+    if origin != SessionModelSelectionOrigin::SkillPreferred(skill_id.clone()) {
+        return Ok(());
+    }
+    let provider = state
+        .selected_provider_plugin_id
+        .clone()
+        .unwrap_or_else(|| "<auto>".to_string());
+    let model = state
+        .selected_model_id
+        .clone()
+        .unwrap_or_else(|| "<default>".to_string());
+    let event = state
+        .sessions
+        .append_model_changed(session_id, provider, model)
+        .await?;
+    state
+        .session_model_selections
+        .lock()
+        .await
+        .remove(&session_id);
+    state
+        .session_model_selection_origins
+        .lock()
+        .await
+        .insert(session_id, SessionModelSelectionOrigin::Default);
     publish_session_event(state, &event).await;
     Ok(())
 }
@@ -11354,11 +11471,32 @@ async fn session_model_selection(
         reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
         provider_context: state.selected_provider_context.clone(),
     };
+    let origin = if runtime_selection
+        .model_id
+        .as_deref()
+        .and_then(model_to_selection)
+        .is_some()
+        || runtime_selection
+            .provider_plugin_id
+            .as_deref()
+            .and_then(provider_to_selection)
+            .is_some()
+    {
+        SessionModelSelectionOrigin::User
+    } else {
+        SessionModelSelectionOrigin::Default
+    };
     state
         .session_model_selections
         .lock()
         .await
         .insert(session_id, selection.clone());
+    state
+        .session_model_selection_origins
+        .lock()
+        .await
+        .entry(session_id)
+        .or_insert(origin);
     selection
 }
 
