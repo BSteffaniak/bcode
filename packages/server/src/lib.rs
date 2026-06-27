@@ -6009,13 +6009,23 @@ async fn process_skill_invocation_command(
         }
     }
 
+    let skill_model_policy_applied = !is_skill_active(state, permit.session_id(), &skill_id).await;
+    if skill_model_policy_applied
+        && let Err(error) = apply_skill_model_policy(state, permit.session_id(), &skill_id).await
+    {
+        append_skill_invocation_failed_event(state, permit.session_id(), skill_id, error.message)
+            .await;
+        set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
+        return;
+    }
+
     set_runtime_phase(&phase, SessionRuntimePhase::AppendingUser).await;
     match append_turn_user_message(state, permit, client_id, display_text).await {
         Ok(Some(user_event)) => {
             state.turn_skills.lock().await.insert(
                 (permit.session_id(), user_event.sequence),
                 SkillTurnInvocation {
-                    skill_id,
+                    skill_id: skill_id.clone(),
                     arguments,
                 },
             );
@@ -6054,6 +6064,11 @@ async fn process_skill_invocation_command(
             )
             .await;
         }
+    }
+    if skill_model_policy_applied {
+        restore_skill_model_override(state, permit.session_id(), &skill_id)
+            .await
+            .ok();
     }
     set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
 }
@@ -6751,6 +6766,37 @@ async fn handle_activate_skill(
         Response::Ok(ResponsePayload::SessionAgentSet),
     )
     .await
+}
+
+async fn is_skill_active(state: &ServerState, session_id: SessionId, skill_id: &SkillId) -> bool {
+    state
+        .active_skills
+        .lock()
+        .await
+        .get(&session_id)
+        .is_some_and(|skills| skills.contains(skill_id))
+}
+
+async fn append_skill_invocation_failed_event(
+    state: &ServerState,
+    session_id: SessionId,
+    skill_id: SkillId,
+    error: String,
+) {
+    if let Ok(event) = state
+        .sessions
+        .append_event(
+            session_id,
+            SessionEventKind::SkillInvocationFailed {
+                skill_id,
+                error,
+                failed_at_ms: current_time_ms(),
+            },
+        )
+        .await
+    {
+        publish_session_event(state, &event).await;
+    }
 }
 
 async fn required_model_active_skill(
