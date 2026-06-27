@@ -29,7 +29,10 @@ use bcode_session_models::{
     SessionHistoryQuery, SessionId,
 };
 use bcode_settings::SettingsStore;
-use bcode_skill_models::{SkillToolDecision, SkillToolDecisionEntry};
+use bcode_skill::{SkillRegistry, SkillRegistryOptions, SkillSourceRoot};
+use bcode_skill_models::{
+    SkillDiagnosticSeverity, SkillSourceKind, SkillToolDecision, SkillToolDecisionEntry,
+};
 use bcode_worktree_models::{
     WorktreeBaseRef, WorktreeCreateRequest, WorktreeListRequest, WorktreeRemoveRequest,
 };
@@ -73,6 +76,8 @@ pub enum CliError {
     Json(#[from] serde_json::Error),
     #[error("settings error: {0}")]
     Settings(#[from] bcode_settings::SettingsError),
+    #[error("skill error: {0}")]
+    Skill(#[from] bcode_skill::SkillRegistryError),
     #[error("TUI error: {0}")]
     Tui(#[from] bcode_tui::TuiError),
     #[error("plugin error: {0}")]
@@ -479,6 +484,7 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
 fn handle_skill_command(command: &SkillCommand) -> Result<(), CliError> {
     let store = SettingsStore::default();
     match command {
+        SkillCommand::Check { json } => check_skills(*json)?,
         SkillCommand::Decisions { json, skill, tool } => {
             let state = store.skill_tool_decisions()?;
             let decisions =
@@ -521,6 +527,156 @@ fn handle_skill_command(command: &SkillCommand) -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct SkillCheckReport {
+    roots: Vec<SkillCheckRoot>,
+    loaded_count: usize,
+    diagnostic_count: usize,
+    warning_count: usize,
+    diagnostics: Vec<bcode_skill_models::SkillDiagnostic>,
+}
+
+#[derive(Debug, Serialize)]
+struct SkillCheckRoot {
+    path: String,
+    kind: SkillSourceKind,
+    label: String,
+    precedence: u16,
+}
+
+fn check_skills(json: bool) -> Result<(), CliError> {
+    let config = bcode_config::load_config()?;
+    let roots = skill_source_roots(&config);
+    let options = SkillRegistryOptions {
+        max_skill_file_bytes: config.skills.max_skill_file_bytes,
+        max_context_bytes: config.skills.max_context_bytes,
+        follow_symlinks: config.skills.follow_symlinks,
+        disabled_ids: config.skills.disabled_skill_ids(),
+    };
+    let registry = SkillRegistry::discover(&roots, options)?;
+    let list = registry.list();
+    let diagnostics = list.diagnostics;
+    let report = SkillCheckReport {
+        roots: roots
+            .iter()
+            .map(|root| SkillCheckRoot {
+                path: root.path.to_string_lossy().into_owned(),
+                kind: root.kind,
+                label: root.label.clone(),
+                precedence: root.precedence,
+            })
+            .collect(),
+        loaded_count: list.skills.len(),
+        diagnostic_count: diagnostics.len(),
+        warning_count: diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == SkillDiagnosticSeverity::Warning)
+            .count(),
+        diagnostics,
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!("skill roots: {}", report.roots.len());
+    for root in &report.roots {
+        println!(
+            "  {}\t{}\t{}\t{}",
+            root.label,
+            root.precedence,
+            skill_source_kind_name(root.kind),
+            root.path
+        );
+    }
+    println!("loaded skills: {}", report.loaded_count);
+    println!("diagnostics: {}", report.diagnostic_count);
+    for diagnostic in &report.diagnostics {
+        let path = diagnostic.path.as_deref().unwrap_or("<unknown>");
+        println!(
+            "  {}\t{}\t{}",
+            skill_diagnostic_severity_name(diagnostic.severity),
+            path,
+            diagnostic.message
+        );
+    }
+    Ok(())
+}
+
+fn skill_source_roots(config: &bcode_config::BcodeConfig) -> Vec<SkillSourceRoot> {
+    let mut roots = Vec::new();
+    if !config.skills.enabled {
+        return roots;
+    }
+    if config.skills.include_repo_skills {
+        roots.push(SkillSourceRoot::new(
+            PathBuf::from(".bcode/skills"),
+            SkillSourceKind::Repository,
+            "repo:.bcode/skills",
+            10,
+        ));
+    }
+    if config.skills.include_generic_repo_skills {
+        roots.push(SkillSourceRoot::new(
+            PathBuf::from("skills"),
+            SkillSourceKind::Repository,
+            "repo:skills",
+            15,
+        ));
+    }
+    if config.skills.include_compat_claude_skills {
+        roots.push(SkillSourceRoot::new(
+            PathBuf::from(".claude/skills"),
+            SkillSourceKind::Compatibility,
+            "repo:.claude/skills",
+            20,
+        ));
+    }
+    if config.skills.include_user_skills {
+        roots.push(SkillSourceRoot::new(
+            bcode_config::default_config_dir().join("skills"),
+            SkillSourceKind::User,
+            "user-config:skills",
+            30,
+        ));
+        roots.push(SkillSourceRoot::new(
+            bcode_config::default_state_dir().join("skills"),
+            SkillSourceKind::User,
+            "user-state:skills",
+            35,
+        ));
+    }
+    for (index, path) in config.skills.sources.paths.iter().enumerate() {
+        roots.push(SkillSourceRoot::new(
+            path.clone(),
+            SkillSourceKind::Configured,
+            format!("configured:{index}"),
+            40 + u16::try_from(index).unwrap_or(u16::MAX - 40),
+        ));
+    }
+    roots
+}
+
+const fn skill_source_kind_name(kind: SkillSourceKind) -> &'static str {
+    match kind {
+        SkillSourceKind::Repository => "repository",
+        SkillSourceKind::Compatibility => "compatibility",
+        SkillSourceKind::User => "user",
+        SkillSourceKind::Configured => "configured",
+        SkillSourceKind::Bundled => "bundled",
+        SkillSourceKind::Plugin => "plugin",
+    }
+}
+
+const fn skill_diagnostic_severity_name(severity: SkillDiagnosticSeverity) -> &'static str {
+    match severity {
+        SkillDiagnosticSeverity::Info => "info",
+        SkillDiagnosticSeverity::Warning => "warning",
+        SkillDiagnosticSeverity::Error => "error",
+    }
 }
 
 fn filtered_skill_tool_decisions(
@@ -1265,6 +1421,12 @@ enum OpenAiLoginFlow {
 
 #[derive(Debug, Subcommand)]
 enum SkillCommand {
+    /// Check skill discovery and parsing diagnostics.
+    Check {
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// List remembered skill tool decisions.
     Decisions {
         /// Emit JSON instead of tab-separated text.
