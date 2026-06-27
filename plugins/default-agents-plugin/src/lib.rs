@@ -136,7 +136,10 @@ fn agent_context(request: &ServiceRequest) -> ServiceResponse {
     };
     let (config, _) = load_config();
     let agent = agent_config(&config, &request.agent_id);
-    let enabled_tools = Some(active_tools_for(&agent));
+    let enabled_tools = Some(enabled_tools_from_available_metadata(
+        active_tools_for(&agent),
+        &request.available_tools,
+    ));
     let system_prompt_suffix = Some(match request.agent_id.as_str() {
         PLAN_AGENT => "[PLAN AGENT ACTIVE]\n\nInspect, analyze, and plan only. Do not edit source files or intentionally modify project state. You may run shell commands allowed by the active permission policy, including validation commands such as `cargo check` or `cargo test`, even if they create normal build/cache artifacts. If implementation changes are needed, ask the user to switch to the build agent.".to_string(),
         BUILD_AGENT => "[BUILD AGENT ACTIVE]\n\nImplementation is allowed subject to Bcode permissions, active agent policy, and project instructions. Use tools normally, keep changes focused, and report validation.".to_string(),
@@ -146,6 +149,23 @@ fn agent_context(request: &ServiceRequest) -> ServiceResponse {
         system_prompt_suffix,
         enabled_tools,
     })
+}
+
+fn enabled_tools_from_available_metadata(
+    configured_enabled_tools: Vec<String>,
+    available_tools: &[bcode_tool::ToolDefinition],
+) -> Vec<String> {
+    if available_tools.is_empty() {
+        return configured_enabled_tools;
+    }
+    let available_tool_names = available_tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    configured_enabled_tools
+        .into_iter()
+        .filter(|tool_id| available_tool_names.contains(tool_id.as_str()))
+        .collect()
 }
 
 fn evaluate_tool(request: &ServiceRequest) -> ServiceResponse {

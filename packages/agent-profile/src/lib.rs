@@ -9,7 +9,7 @@
 //! agents, along with prompt context and tool-call policy decisions.
 
 use bcode_session_models::SessionId;
-use bcode_tool::{ToolPolicyMetadata, ToolSideEffect};
+use bcode_tool::{ToolDefinition, ToolPolicyMetadata, ToolSideEffect};
 use serde::{Deserialize, Serialize};
 
 /// Plugin service interface for agent profile providers.
@@ -64,6 +64,9 @@ pub struct AgentContextRequest {
     pub session_id: SessionId,
     /// Active agent profile ID.
     pub agent_id: String,
+    /// Tool definitions discovered from currently loaded tool provider plugins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_tools: Vec<ToolDefinition>,
 }
 
 /// Response returned by [`OP_AGENT_CONTEXT`].

@@ -10844,22 +10844,11 @@ async fn agent_policy_status(state: &ServerState) -> Option<PolicyStatusResponse
 }
 
 async fn collect_available_tool_names(state: &ServerState) -> BTreeSet<String> {
-    let mut tools = BTreeSet::new();
-    for plugin_id in tool_provider_plugin_ids(state) {
-        let response = state
-            .plugins
-            .invoke_service_json::<_, ToolList>(
-                &plugin_id,
-                TOOL_SERVICE_INTERFACE_ID,
-                OP_LIST_TOOLS,
-                &ListToolsRequest::default(),
-            )
-            .await;
-        if let Ok(list) = response {
-            tools.extend(list.tools.into_iter().map(|tool| tool.name));
-        }
-    }
-    tools
+    collect_tool_definitions(state)
+        .await
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect()
 }
 
 fn append_missing_enabled_tool_diagnostics(
@@ -10969,6 +10958,7 @@ async fn agent_context(
     let request = AgentContextRequest {
         session_id,
         agent_id: agent_id.to_string(),
+        available_tools: collect_tool_definitions(state).await,
     };
     state
         .plugins
@@ -12156,6 +12146,31 @@ async fn collect_model_tools(
     enabled_tools: Option<Vec<String>>,
 ) -> Vec<bcode_model::ToolDefinition> {
     let enabled_tools = enabled_tools.map(|tools| tools.into_iter().collect::<BTreeSet<_>>());
+    collect_tool_definitions(state)
+        .await
+        .into_iter()
+        .filter(|tool| {
+            enabled_tools
+                .as_ref()
+                .is_none_or(|enabled| enabled.contains(&tool.name))
+        })
+        .map(|tool| bcode_model::ToolDefinition {
+            name: tool.name,
+            description: tool.description,
+            input_schema: tool.input_schema,
+            side_effect: match tool.side_effect {
+                bcode_tool::ToolSideEffect::ReadOnly => bcode_model::ToolSideEffect::ReadOnly,
+                bcode_tool::ToolSideEffect::WriteFiles => bcode_model::ToolSideEffect::WriteFiles,
+                bcode_tool::ToolSideEffect::ExecuteProcess => {
+                    bcode_model::ToolSideEffect::ExecuteProcess
+                }
+            },
+            requires_permission: tool.requires_permission,
+        })
+        .collect()
+}
+
+async fn collect_tool_definitions(state: &ServerState) -> Vec<ServiceToolDefinition> {
     let mut tools = Vec::new();
     for plugin_id in tool_provider_plugin_ids(state) {
         let response = state
@@ -12168,34 +12183,7 @@ async fn collect_model_tools(
             )
             .await;
         match response {
-            Ok(list) => {
-                tools.extend(
-                    list.tools
-                        .into_iter()
-                        .filter(|tool| {
-                            enabled_tools
-                                .as_ref()
-                                .is_none_or(|enabled| enabled.contains(&tool.name))
-                        })
-                        .map(|tool| bcode_model::ToolDefinition {
-                            name: tool.name,
-                            description: tool.description,
-                            input_schema: tool.input_schema,
-                            side_effect: match tool.side_effect {
-                                bcode_tool::ToolSideEffect::ReadOnly => {
-                                    bcode_model::ToolSideEffect::ReadOnly
-                                }
-                                bcode_tool::ToolSideEffect::WriteFiles => {
-                                    bcode_model::ToolSideEffect::WriteFiles
-                                }
-                                bcode_tool::ToolSideEffect::ExecuteProcess => {
-                                    bcode_model::ToolSideEffect::ExecuteProcess
-                                }
-                            },
-                            requires_permission: tool.requires_permission,
-                        }),
-                );
-            }
+            Ok(list) => tools.extend(list.tools),
             Err(error) => eprintln!("failed to list tools from {plugin_id}: {error}"),
         }
     }
