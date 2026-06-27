@@ -1830,6 +1830,7 @@ fn handle_review_navigation_key(app: &mut ReviewApp, key: KeyCode) -> bool {
         KeyCode::Char('A') => app.toggle_selected_agent_answer_expanded(),
         KeyCode::Char('s') => app.suggest_comment_from_agent_answer_at_selection(),
         KeyCode::Char(';') => app.accept_suggestion_at_selection(),
+        KeyCode::Char('f') => app.refine_suggestion_at_selection(),
         KeyCode::Char(':') => app.reject_suggestion_at_selection(),
         KeyCode::Char('m') => app.convert_agent_answer_to_draft_at_selection(),
         KeyCode::Char('y') => app.retry_linked_session_stream_at_selection(),
@@ -2777,6 +2778,8 @@ impl ReviewCommentAnchor {
 pub enum ReviewSuggestionStatus {
     /// Suggested but not yet accepted or rejected.
     Suggested,
+    /// Suggestion is being refined through the linked Bcode session.
+    Refining,
     /// Accepted into a normal draft comment.
     Accepted,
     /// Rejected by the reviewer.
@@ -3653,6 +3656,8 @@ pub struct ReviewThreadSummary {
     pub severity: ReviewThreadSeverity,
     /// Pending suggested comment count.
     pub pending_suggestion_count: usize,
+    /// Refining suggested comment count.
+    pub refining_suggestion_count: usize,
     /// Accepted suggested comment count.
     pub accepted_suggestion_count: usize,
     /// Rejected suggested comment count.
@@ -6175,18 +6180,20 @@ impl ReviewApp {
     pub fn suggestion_status_counts_for_anchor(
         &self,
         anchor: &ReviewCommentAnchor,
-    ) -> (usize, usize, usize) {
+    ) -> (usize, usize, usize, usize) {
         let mut pending = 0usize;
+        let mut refining = 0usize;
         let mut accepted = 0usize;
         let mut rejected = 0usize;
         for suggestion in self.suggested_comments.get(anchor).into_iter().flatten() {
             match suggestion.status {
                 ReviewSuggestionStatus::Suggested => pending = pending.saturating_add(1),
+                ReviewSuggestionStatus::Refining => refining = refining.saturating_add(1),
                 ReviewSuggestionStatus::Accepted => accepted = accepted.saturating_add(1),
                 ReviewSuggestionStatus::Rejected => rejected = rejected.saturating_add(1),
             }
         }
-        (pending, accepted, rejected)
+        (pending, refining, accepted, rejected)
     }
 
     /// Return review thread summaries in deterministic order.
@@ -6198,6 +6205,7 @@ impl ReviewApp {
                 let latest_body = thread.latest_body()?.to_string();
                 let (
                     pending_suggestion_count,
+                    refining_suggestion_count,
                     accepted_suggestion_count,
                     rejected_suggestion_count,
                 ) = self.suggestion_status_counts_for_anchor(&thread.anchor);
@@ -6210,6 +6218,7 @@ impl ReviewApp {
                     thread_kind: thread.thread_kind,
                     severity: thread.severity,
                     pending_suggestion_count,
+                    refining_suggestion_count,
                     accepted_suggestion_count,
                     rejected_suggestion_count,
                 })
@@ -7868,10 +7877,12 @@ impl ReviewApp {
         self.suggested_comments
             .get_mut(anchor)
             .and_then(|suggestions| {
-                suggestions
-                    .iter_mut()
-                    .rev()
-                    .find(|suggestion| suggestion.status == ReviewSuggestionStatus::Suggested)
+                suggestions.iter_mut().rev().find(|suggestion| {
+                    matches!(
+                        suggestion.status,
+                        ReviewSuggestionStatus::Suggested | ReviewSuggestionStatus::Refining
+                    )
+                })
             })
     }
 
@@ -7904,6 +7915,26 @@ impl ReviewApp {
         self.pending_draft_save = Some(PendingDraftSave { anchor, body });
         self.sync_selected_thread_to_anchor();
         self.status_message = Some("accepted suggestion as draft comment".to_string());
+        true
+    }
+
+    /// Refine the latest suggested comment through the linked Bcode session.
+    pub fn refine_suggestion_at_selection(&mut self) -> bool {
+        let Some(anchor) = self.selected_comment_anchor() else {
+            self.status_message = Some("select a suggested comment to refine".to_string());
+            return true;
+        };
+        let Some(suggestion) = self.latest_pending_suggestion_mut(&anchor) else {
+            self.status_message = Some("selected thread has no pending suggestion".to_string());
+            return true;
+        };
+        let body = suggestion.body.clone();
+        suggestion.status = ReviewSuggestionStatus::Refining;
+        let question = format!(
+            "Refine this suggested review comment. Keep it concise, actionable, and suitable for a code review comment.\n\n{body}"
+        );
+        self.queue_bcode_question(&anchor, question);
+        self.status_message = Some("asked Bcode to refine suggestion".to_string());
         true
     }
 
@@ -8884,6 +8915,7 @@ impl ReviewApp {
                 self.suggest_comment_from_agent_answer_at_selection()
             }
             Some(ReviewThreadAction::AcceptSuggestion) => self.accept_suggestion_at_selection(),
+            Some(ReviewThreadAction::RefineSuggestion) => self.refine_suggestion_at_selection(),
             Some(ReviewThreadAction::RejectSuggestion) => self.reject_suggestion_at_selection(),
             Some(ReviewThreadAction::DraftAnswer) => {
                 self.convert_agent_answer_to_draft_at_selection()

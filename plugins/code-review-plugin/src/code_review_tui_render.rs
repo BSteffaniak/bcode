@@ -992,6 +992,9 @@ fn suggestion_sidebar_label(thread: &crate::code_review_tui::ReviewThreadSummary
     if thread.pending_suggestion_count > 0 {
         parts.push(format!("suggest:{}", thread.pending_suggestion_count));
     }
+    if thread.refining_suggestion_count > 0 {
+        parts.push(format!("refining:{}", thread.refining_suggestion_count));
+    }
     if thread.accepted_suggestion_count > 0 {
         parts.push(format!("accepted:{}", thread.accepted_suggestion_count));
     }
@@ -1687,6 +1690,9 @@ fn render_view_row(
                 crate::code_review_tui::ReviewSuggestionStatus::Suggested => {
                     Style::new().fg(Color::Green).bg(Color::Rgb(16, 24, 16))
                 }
+                crate::code_review_tui::ReviewSuggestionStatus::Refining => {
+                    Style::new().fg(Color::Cyan).bg(Color::Rgb(16, 20, 24))
+                }
                 crate::code_review_tui::ReviewSuggestionStatus::Accepted => Style::new()
                     .fg(Color::BrightBlack)
                     .bg(Color::Rgb(16, 24, 16)),
@@ -1771,6 +1777,7 @@ fn render_inline_suggestion_line(
         .bg(style.bg.unwrap_or(Color::Black));
     let status = match suggestion.status {
         crate::code_review_tui::ReviewSuggestionStatus::Suggested => "suggest",
+        crate::code_review_tui::ReviewSuggestionStatus::Refining => "refining",
         crate::code_review_tui::ReviewSuggestionStatus::Accepted => "accepted",
         crate::code_review_tui::ReviewSuggestionStatus::Rejected => "rejected",
     };

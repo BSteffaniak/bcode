@@ -261,9 +261,12 @@ impl ReviewViewDocument {
                     }
                 }
                 let thread_suggestions = suggestions.remove(anchor).unwrap_or_default();
-                let has_pending_suggestion = thread_suggestions
-                    .iter()
-                    .any(|suggestion| suggestion.status == ReviewSuggestionStatus::Suggested);
+                let has_pending_suggestion = thread_suggestions.iter().any(|suggestion| {
+                    matches!(
+                        suggestion.status,
+                        ReviewSuggestionStatus::Suggested | ReviewSuggestionStatus::Refining
+                    )
+                });
                 for (suggestion_index, suggestion) in thread_suggestions.into_iter().enumerate() {
                     let body_line_count = suggestion.body.lines().count().max(1);
                     for body_line_index in 0..body_line_count {
@@ -581,6 +584,8 @@ pub enum ReviewThreadAction {
     SuggestAnswer,
     /// Accept the latest suggested comment into drafts.
     AcceptSuggestion,
+    /// Refine the latest suggested comment through Bcode.
+    RefineSuggestion,
     /// Reject the latest suggested comment.
     RejectSuggestion,
     /// Convert the latest Bcode answer into a draft comment.
@@ -622,6 +627,7 @@ impl ReviewThreadAction {
         }
         if has_pending_suggestion {
             actions.push(Self::AcceptSuggestion);
+            actions.push(Self::RefineSuggestion);
             actions.push(Self::RejectSuggestion);
         }
         actions.push(Self::Publish);
@@ -647,6 +653,7 @@ impl ReviewThreadAction {
             Self::ToggleAnswer => "toggle-answer",
             Self::SuggestAnswer => "suggest-answer",
             Self::AcceptSuggestion => "accept-suggestion",
+            Self::RefineSuggestion => "refine-suggestion",
             Self::RejectSuggestion => "reject-suggestion",
             Self::DraftAnswer => "draft-answer",
             Self::Publish => "publish",
@@ -668,6 +675,7 @@ impl ReviewThreadAction {
             Self::ToggleAnswer => "A",
             Self::SuggestAnswer => "s",
             Self::AcceptSuggestion => ";",
+            Self::RefineSuggestion => "f",
             Self::RejectSuggestion => ":",
             Self::DraftAnswer => "m",
             Self::Publish => "x",
@@ -689,6 +697,7 @@ impl ReviewThreadAction {
             Self::ToggleAnswer => "expand answer",
             Self::SuggestAnswer => "suggest comment",
             Self::AcceptSuggestion => "accept suggestion",
+            Self::RefineSuggestion => "refine suggestion",
             Self::RejectSuggestion => "reject suggestion",
             Self::DraftAnswer => "draft answer",
             Self::Publish => "publish",
@@ -711,6 +720,7 @@ impl ReviewThreadAction {
             b"toggle-answer" => Some(Self::ToggleAnswer),
             b"suggest-answer" => Some(Self::SuggestAnswer),
             b"accept-suggestion" => Some(Self::AcceptSuggestion),
+            b"refine-suggestion" => Some(Self::RefineSuggestion),
             b"reject-suggestion" => Some(Self::RejectSuggestion),
             b"draft-answer" => Some(Self::DraftAnswer),
             b"publish" => Some(Self::Publish),
