@@ -164,10 +164,14 @@ fn evaluate_tool(request: &ServiceRequest) -> ServiceResponse {
 }
 
 fn policy_status() -> PolicyStatusResponse {
-    let (_, source) = load_config();
+    let (config, source) = load_config();
+    let build = agent_config(&config, BUILD_AGENT);
+    let plan = agent_config(&config, PLAN_AGENT);
     PolicyStatusResponse {
         using_default: source.using_default,
         source: source.label,
+        build_enabled_tools: active_tools_for(&build),
+        plan_enabled_tools: active_tools_for(&plan),
         diagnostics: source.diagnostics,
     }
 }

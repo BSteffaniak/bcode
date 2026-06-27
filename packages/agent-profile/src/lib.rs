@@ -127,6 +127,12 @@ pub struct PolicyStatusResponse {
     pub source: String,
     /// True when the provider is using built-in fallback policy.
     pub using_default: bool,
+    /// Enabled tools for the implementation/build agent after policy composition.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub build_enabled_tools: Vec<String>,
+    /// Enabled tools for the planning/read-only agent after policy composition.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plan_enabled_tools: Vec<String>,
     /// Non-fatal degradation diagnostics surfaced by the policy provider.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<String>,

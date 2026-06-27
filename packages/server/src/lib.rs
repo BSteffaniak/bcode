@@ -6755,6 +6755,8 @@ async fn handle_agent_policy_status(
         .unwrap_or_else(|| PolicyStatusResponse {
             source: "agent profile provider not loaded".to_string(),
             using_default: true,
+            build_enabled_tools: Vec::new(),
+            plan_enabled_tools: Vec::new(),
             diagnostics: vec!["agent profile provider not loaded".to_string()],
         });
     send_response(
@@ -10827,7 +10829,7 @@ async fn update_provider_metadata_state(
 }
 
 async fn agent_policy_status(state: &ServerState) -> Option<PolicyStatusResponse> {
-    state
+    let mut status = state
         .plugins
         .invoke_service_by_interface_json::<_, PolicyStatusResponse>(
             AGENT_PROFILE_INTERFACE_ID,
@@ -10835,7 +10837,47 @@ async fn agent_policy_status(state: &ServerState) -> Option<PolicyStatusResponse
             &serde_json::json!({}),
         )
         .await
-        .ok()
+        .ok()?;
+    let discovered_tools = collect_available_tool_names(state).await;
+    append_missing_enabled_tool_diagnostics(&mut status, &discovered_tools);
+    Some(status)
+}
+
+async fn collect_available_tool_names(state: &ServerState) -> BTreeSet<String> {
+    let mut tools = BTreeSet::new();
+    for plugin_id in tool_provider_plugin_ids(state) {
+        let response = state
+            .plugins
+            .invoke_service_json::<_, ToolList>(
+                &plugin_id,
+                TOOL_SERVICE_INTERFACE_ID,
+                OP_LIST_TOOLS,
+                &ListToolsRequest::default(),
+            )
+            .await;
+        if let Ok(list) = response {
+            tools.extend(list.tools.into_iter().map(|tool| tool.name));
+        }
+    }
+    tools
+}
+
+fn append_missing_enabled_tool_diagnostics(
+    status: &mut PolicyStatusResponse,
+    discovered_tools: &BTreeSet<String>,
+) {
+    for (agent_id, enabled_tools) in [
+        ("build", &status.build_enabled_tools),
+        ("plan", &status.plan_enabled_tools),
+    ] {
+        for tool_id in enabled_tools {
+            if !discovered_tools.contains(tool_id) {
+                status.diagnostics.push(format!(
+                    "agent '{agent_id}' enables tool '{tool_id}' but no loaded tool plugin provides it"
+                ));
+            }
+        }
+    }
 }
 
 async fn list_agent_profiles(state: &ServerState) -> Vec<AgentInfo> {
