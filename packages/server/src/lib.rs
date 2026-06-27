@@ -161,6 +161,7 @@ pub struct ServerState {
     ralph_store: bcode_ralph::RalphStateStore,
     active_ralph_runs: Mutex<BTreeMap<PathBuf, JoinHandle<()>>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
+    required_skill_model_overrides: Mutex<BTreeMap<(SessionId, SkillId), SessionModelSelection>>,
     session_agent_selections: Mutex<BTreeMap<SessionId, String>>,
     pending_permissions: Mutex<BTreeMap<String, PendingPermission>>,
     next_permission_id: Mutex<u64>,
@@ -856,6 +857,7 @@ impl ServerState {
             ralph_store: init.ralph_store,
             active_ralph_runs: Mutex::default(),
             session_model_selections: Mutex::default(),
+            required_skill_model_overrides: Mutex::default(),
             session_agent_selections: Mutex::default(),
             pending_permissions: Mutex::default(),
             next_permission_id: Mutex::new(1),
@@ -6748,11 +6750,11 @@ async fn apply_skill_model_policy(
         )
     })?;
     if let Some(required) = manifest.model_policy.required.as_ref() {
-        apply_skill_model_request(state, session_id, required, true).await?;
+        apply_skill_model_request(state, session_id, skill_id, required, true).await?;
     } else if let Some(preferred) = manifest.model_policy.preferred.as_ref() {
         let selection = session_model_selection(state, session_id).await;
         if selection.model_id.is_none() {
-            apply_skill_model_request(state, session_id, preferred, false).await?;
+            apply_skill_model_request(state, session_id, skill_id, preferred, false).await?;
         }
     }
     Ok(())
@@ -6761,21 +6763,43 @@ async fn apply_skill_model_policy(
 async fn apply_skill_model_request(
     state: &ServerState,
     session_id: SessionId,
+    skill_id: &SkillId,
     request: &SkillModelRequest,
     required: bool,
 ) -> Result<(), ErrorResponse> {
-    let provider = request
-        .provider
-        .clone()
-        .unwrap_or_else(|| "<auto>".to_string());
+    let Some((provider, model_id)) = resolve_skill_model_request(state, request).await else {
+        if required {
+            return Err(ErrorResponse::new(
+                "skill_model_unresolved",
+                format!(
+                    "required model '{}' for skill {skill_id} could not be resolved",
+                    request.model
+                ),
+            ));
+        }
+        eprintln!(
+            "preferred model '{}' for skill {skill_id} could not be resolved; keeping current session model",
+            request.model
+        );
+        return Ok(());
+    };
+    if required {
+        let previous_selection = session_model_selection(state, session_id).await;
+        state
+            .required_skill_model_overrides
+            .lock()
+            .await
+            .entry((session_id, skill_id.clone()))
+            .or_insert(previous_selection);
+    }
     let event = state
         .sessions
-        .append_model_changed(session_id, provider.clone(), request.model.clone())
+        .append_model_changed(session_id, provider.clone(), model_id.clone())
         .await
         .map_err(|error| session_error_response(&error))?;
     let mut selection = SessionModelSelection {
         provider_plugin_id: provider_to_selection(&provider),
-        model_id: model_to_selection(&request.model),
+        model_id: model_to_selection(&model_id),
         thinking_level: None,
         reasoning_effort: state.selected_reasoning.effort.clone(),
         reasoning_summary: state.selected_reasoning.summary.clone(),
@@ -6804,6 +6828,55 @@ async fn apply_skill_model_request(
     Ok(())
 }
 
+async fn resolve_skill_model_request(
+    state: &ServerState,
+    request: &SkillModelRequest,
+) -> Option<(String, String)> {
+    let provider_candidates = skill_model_provider_candidates(state, request);
+    for provider in provider_candidates {
+        if skill_model_exists(state, provider.as_deref(), &request.model).await {
+            return Some((
+                provider.unwrap_or_else(|| "<auto>".to_string()),
+                request.model.clone(),
+            ));
+        }
+    }
+    None
+}
+
+fn skill_model_provider_candidates(
+    state: &ServerState,
+    request: &SkillModelRequest,
+) -> Vec<Option<String>> {
+    if let Some(provider) = request.provider.clone() {
+        return vec![Some(provider)];
+    }
+    let mut providers = Vec::new();
+    if let Some(provider) = state.selected_provider_plugin_id.clone() {
+        providers.push(Some(provider));
+    }
+    providers.push(None);
+    providers
+}
+
+async fn skill_model_exists(
+    state: &ServerState,
+    provider_plugin_id: Option<&str>,
+    model_id: &str,
+) -> bool {
+    invoke_model_provider_json_blocking::<_, ModelList>(
+        state,
+        provider_plugin_id.map(ToOwned::to_owned),
+        OP_MODELS,
+        bcode_model::ModelListRequest {
+            provider_context: state.selected_provider_context.clone(),
+            selected_model_id: Some(model_id.to_string()),
+        },
+    )
+    .await
+    .is_ok_and(|models| models.models.iter().any(|model| model.model_id == model_id))
+}
+
 async fn handle_deactivate_skill(
     request_id: u64,
     state: &ServerState,
@@ -6814,6 +6887,7 @@ async fn handle_deactivate_skill(
     if let Some(skills) = state.active_skills.lock().await.get_mut(&session_id) {
         skills.remove(&skill_id);
     }
+    restore_required_skill_model_override(state, session_id, &skill_id).await?;
     let event = state
         .sessions
         .append_event(
@@ -6831,6 +6905,40 @@ async fn handle_deactivate_skill(
         Response::Ok(ResponsePayload::SessionAgentSet),
     )
     .await
+}
+
+async fn restore_required_skill_model_override(
+    state: &ServerState,
+    session_id: SessionId,
+    skill_id: &SkillId,
+) -> Result<(), ServerError> {
+    let Some(previous_selection) = state
+        .required_skill_model_overrides
+        .lock()
+        .await
+        .remove(&(session_id, skill_id.clone()))
+    else {
+        return Ok(());
+    };
+    let provider = previous_selection
+        .provider_plugin_id
+        .clone()
+        .unwrap_or_else(|| "<auto>".to_string());
+    let model = previous_selection
+        .model_id
+        .clone()
+        .unwrap_or_else(|| "<default>".to_string());
+    let event = state
+        .sessions
+        .append_model_changed(session_id, provider, model)
+        .await?;
+    state
+        .session_model_selections
+        .lock()
+        .await
+        .insert(session_id, previous_selection);
+    publish_session_event(state, &event).await;
+    Ok(())
 }
 
 async fn handle_active_skills(
