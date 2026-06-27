@@ -439,7 +439,7 @@ fn write_tool_ui(
 fn read_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "filesystem.read".to_string(),
-        description: "Read a file. Supports UTF-8 text files and images (PNG, JPEG, GIF, WebP). Image files are returned as model-visible image attachments with metadata.".to_string(),
+        description: "Read a file. Supports UTF-8 text files and images (PNG, JPEG, GIF, WebP). Image files are returned as model-visible image attachments with metadata. If the user asks what text an image or screenshot says, use ocr.extract instead of this tool.".to_string(),
         input_schema: json!({
             "type": "object",
             "required": ["path"],

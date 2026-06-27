@@ -579,7 +579,7 @@ fn extract_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "ocr.extract".to_string(),
         description:
-            "Extract text from images or image-like documents using the configured OCR engine."
+            "Extract text from images or image-like documents using the configured OCR engine. Use this for screenshots, photos, scanned images, or when the user asks what text an image says. Prefer this over filesystem.read for text-in-image questions."
                 .to_string(),
         input_schema: json!({
             "type": "object",
@@ -593,8 +593,8 @@ fn extract_tool_definition() -> ToolDefinition {
                 "timeout_ms": { "type": "integer", "minimum": 1 }
             }
         }),
-        side_effect: ToolSideEffect::ExecuteProcess,
-        requires_permission: true,
+        side_effect: ToolSideEffect::ReadOnly,
+        requires_permission: false,
         policy: bcode_tool::ToolPolicyMetadata {
             aliases: vec!["read".to_string()],
             compatibility_aliases: Vec::new(),

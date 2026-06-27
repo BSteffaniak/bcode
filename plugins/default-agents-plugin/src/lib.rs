@@ -141,8 +141,8 @@ fn agent_context(request: &ServiceRequest) -> ServiceResponse {
         &request.available_tools,
     ));
     let system_prompt_suffix = Some(match request.agent_id.as_str() {
-        PLAN_AGENT => "[PLAN AGENT ACTIVE]\n\nInspect, analyze, and plan only. Do not edit source files or intentionally modify project state. You may run shell commands allowed by the active permission policy, including validation commands such as `cargo check` or `cargo test`, even if they create normal build/cache artifacts. If implementation changes are needed, ask the user to switch to the build agent.".to_string(),
-        BUILD_AGENT => "[BUILD AGENT ACTIVE]\n\nImplementation is allowed subject to Bcode permissions, active agent policy, and project instructions. Use tools normally, keep changes focused, and report validation.".to_string(),
+        PLAN_AGENT => "[PLAN AGENT ACTIVE]\n\nInspect, analyze, and plan only. Do not edit source files or intentionally modify project state. You may run shell commands allowed by the active permission policy, including validation commands such as `cargo check` or `cargo test`, even if they create normal build/cache artifacts. If implementation changes are needed, ask the user to switch to the build agent. When the user asks what text an image or screenshot says, use `ocr.extract` instead of `filesystem.read`.".to_string(),
+        BUILD_AGENT => "[BUILD AGENT ACTIVE]\n\nImplementation is allowed subject to Bcode permissions, active agent policy, and project instructions. Use tools normally, keep changes focused, and report validation. When the user asks what text an image or screenshot says, use `ocr.extract` instead of `filesystem.read`.".to_string(),
         other => format!("[AGENT ACTIVE: {other}]\n\nFollow this agent's configured tool and permission policy."),
     });
     json_response(&AgentContextResponse {
