@@ -15431,12 +15431,17 @@ async fn turn_skill_contexts(
     write!(context, "\n\nSkill invocation arguments:\n{arguments}").expect("write to string");
     let bytes_loaded = context.len();
     let truncated = bytes_loaded >= state.skill_context_bytes;
+    let model_policy = registry
+        .describe(&skill_id)
+        .ok()
+        .map(|manifest| manifest.model_policy);
     vec![SkillContextResponse {
         skill_id,
         context,
         source: summary.source.clone(),
         bytes_loaded,
         truncated,
+        model_policy,
     }]
 }
 
@@ -15481,12 +15486,17 @@ async fn active_skill_contexts(
         };
         let bytes_loaded = context.len();
         let truncated = per_skill_budget.is_some_and(|budget| bytes_loaded >= budget);
+        let model_policy = registry
+            .describe(&skill_id)
+            .ok()
+            .map(|manifest| manifest.model_policy);
         contexts.push(SkillContextResponse {
             skill_id,
             context,
             source: summary.source.clone(),
             bytes_loaded,
             truncated,
+            model_policy,
         });
     }
     contexts

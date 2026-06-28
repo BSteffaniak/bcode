@@ -298,6 +298,8 @@ pub struct SkillContextResponse {
     pub source: SkillSource,
     pub bytes_loaded: usize,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_policy: Option<SkillModelPolicy>,
 }
 
 /// Skill activation mode.

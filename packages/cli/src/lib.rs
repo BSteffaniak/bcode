@@ -606,8 +606,48 @@ fn describe_skill(skill_id: &str, json: bool) -> Result<(), CliError> {
     if !manifest.permissions.tools.is_empty() {
         println!("tools: {}", manifest.permissions.tools.join(", "));
     }
+    print_skill_model_policy(
+        manifest.model_policy.preferred.as_ref(),
+        manifest.model_policy.required.as_ref(),
+    );
     println!("instructions:\n{}", manifest.instructions);
     Ok(())
+}
+
+fn print_skill_model_policy(
+    preferred: Option<&bcode_skill_models::SkillModelRequest>,
+    required: Option<&bcode_skill_models::SkillModelRequest>,
+) {
+    let summary = skill_model_policy_summary(preferred, required);
+    if summary != "-" {
+        println!("model policy: {summary}");
+    }
+}
+
+fn skill_model_policy_summary(
+    preferred: Option<&bcode_skill_models::SkillModelRequest>,
+    required: Option<&bcode_skill_models::SkillModelRequest>,
+) -> String {
+    if let Some(request) = required {
+        return format_skill_model_request("required", request);
+    }
+    preferred.map_or_else(
+        || "-".to_string(),
+        |request| format_skill_model_request("preferred", request),
+    )
+}
+
+fn format_skill_model_request(
+    kind: &str,
+    request: &bcode_skill_models::SkillModelRequest,
+) -> String {
+    let provider = request.provider.as_deref().unwrap_or("auto");
+    let effort = request
+        .thinking_effort
+        .as_ref()
+        .map(|effort| format!(", effort={}", effort.source_label))
+        .unwrap_or_default();
+    format!("{kind}: {provider}/{}{effort}", request.model)
 }
 
 async fn active_skills(session_id: SessionId, json: bool) -> Result<(), CliError> {
@@ -623,9 +663,19 @@ async fn active_skills(session_id: SessionId, json: bool) -> Result<(), CliError
         return Ok(());
     }
     for skill in skills {
+        let policy = skill_model_policy_summary(
+            skill
+                .model_policy
+                .as_ref()
+                .and_then(|policy| policy.preferred.as_ref()),
+            skill
+                .model_policy
+                .as_ref()
+                .and_then(|policy| policy.required.as_ref()),
+        );
         println!(
-            "{}\t{}\t{}\t{}",
-            skill.skill_id, skill.source.label, skill.bytes_loaded, skill.truncated
+            "{}\t{}\t{}\t{}\t{}",
+            skill.skill_id, skill.source.label, skill.bytes_loaded, skill.truncated, policy
         );
     }
     Ok(())
