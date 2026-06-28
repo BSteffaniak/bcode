@@ -58,6 +58,12 @@ impl VisibleTranscriptLine {
         self.entry_index
     }
 
+    /// Return the cached row index within this row's entry.
+    #[must_use]
+    pub const fn row_in_entry(self) -> usize {
+        self.row_in_entry
+    }
+
     /// Return the cached entry source for this row.
     #[must_use]
     pub const fn source(self) -> VisibleTranscriptSource {

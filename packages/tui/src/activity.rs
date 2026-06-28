@@ -41,6 +41,11 @@ pub enum ActivityState {
         /// Tool name.
         name: String,
     },
+    /// Waiting for host interactive tool input.
+    WaitingInteraction {
+        /// Tool name.
+        name: String,
+    },
     /// Cancelling the active turn.
     Cancelling,
 }

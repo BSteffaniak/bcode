@@ -2257,8 +2257,9 @@ async fn handle_permission_interaction_request(
         }
         Request::ResolveInteractiveToolRequest {
             interaction_id,
-            resolution,
+            resolution_json,
         } => {
+            let resolution = serde_json::from_value(resolution_json)?;
             handle_resolve_interactive_tool_request(
                 request_id,
                 state,

@@ -21,9 +21,14 @@ use super::helpers;
 use super::invalidation::InvalidationQueue;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::permission_dialog::PermissionDialogState;
+use super::protocol_surface::{
+    BMUX_PROTOCOL_INLINE_SURFACE, INLINE_PROTOCOL_SURFACE_HEIGHT,
+    INLINE_PROTOCOL_SURFACE_ROW_OFFSET, ProtocolSurfaceState,
+};
 use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::{self, ActiveChat};
 use super::terminal_events::TuiInput;
+use super::transcript_layout::VisibleTranscriptSource;
 use super::{
     TuiError, command_palette_render, composer_flow, input, input::KeyRequest, mouse_flow,
     palette_flow, permission_dialog_render, permission_flow, render, slash_flow, slash_palette,
@@ -114,6 +119,7 @@ struct ChatLoopState {
     permission_poll: PermissionPollSchedule,
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
+    protocol_surface: Option<ProtocolSurfaceState>,
 }
 
 impl ChatLoopState {
@@ -127,6 +133,7 @@ impl ChatLoopState {
             permission_poll: PermissionPollSchedule::new(Instant::now()),
             thinking_dialog: None,
             timeline_dialog: None,
+            protocol_surface: None,
         }
     }
 
@@ -293,7 +300,7 @@ pub async fn run_with_client<W: Write>(
 
     while !chat.app.should_exit() {
         sync_chat_key_labels(chat, &settings.keymap);
-        if drain_bcode_events(chat) {
+        if drain_bcode_events(chat, &mut loop_state) {
             needs_redraw = true;
         }
 
@@ -390,7 +397,9 @@ pub async fn run_with_client<W: Write>(
                 }
             }
             ChatLoopEvent::Bcode(event) => {
-                if absorb_bcode_event(chat, *event) || drain_bcode_events(chat) {
+                if absorb_bcode_event(chat, &mut loop_state, *event)
+                    || drain_bcode_events(chat, &mut loop_state)
+                {
                     needs_redraw = true;
                 }
             }
@@ -1316,6 +1325,10 @@ fn draw_chat_frame<W: Write>(
 ) -> Result<(), TuiError> {
     let layout = render::prepare_frame(&mut chat.app, terminal.area());
     let theme = render::TuiTheme::for_app(&chat.app);
+    let transcript_area = layout.map_or_else(
+        || render::transcript_area_for_frame(&chat.app, terminal.area()),
+        |layout| layout.transcript_area(&chat.app),
+    );
     terminal.draw(|frame| {
         if let Some(layout) = layout {
             render::render_prepared(&mut chat.app, frame, layout);
@@ -1340,25 +1353,72 @@ fn draw_chat_frame<W: Write>(
         if let Some(dialog) = &mut loop_state.timeline_dialog {
             timeline_dialog_render::render_timeline_dialog(dialog, frame, theme);
         }
+        if let Some(surface) = &mut loop_state.protocol_surface
+            && let Some(surface_area) =
+                protocol_surface_area(chat, surface.interaction_id(), transcript_area)
+        {
+            surface.render(surface_area, frame);
+        }
     })?;
     Ok(())
 }
 
-fn drain_bcode_events(chat: &mut ActiveChat) -> bool {
+fn protocol_surface_area(chat: &ActiveChat, interaction_id: &str, viewport: Rect) -> Option<Rect> {
+    let layout = chat.app.transcript_layout();
+    for visible in layout.visible_lines_from_top(
+        chat.app.transcript_top_row(viewport.height),
+        viewport.height,
+    ) {
+        if visible.source() != VisibleTranscriptSource::Transcript
+            || visible.row_in_entry() != INLINE_PROTOCOL_SURFACE_ROW_OFFSET
+        {
+            continue;
+        }
+        let Some(item) = chat.app.transcript().get(visible.entry_index()) else {
+            continue;
+        };
+        let super::transcript::TranscriptItemKind::InteractiveToolRequest {
+            interaction_id: item_interaction_id,
+            surface_kind,
+            ..
+        } = item.kind()
+        else {
+            continue;
+        };
+        if item_interaction_id == interaction_id && surface_kind == BMUX_PROTOCOL_INLINE_SURFACE {
+            let viewport_row = visible
+                .row_index
+                .saturating_sub(chat.app.transcript_top_row(viewport.height));
+            let y = viewport
+                .y
+                .saturating_add(u16::try_from(viewport_row).unwrap_or(u16::MAX));
+            let height = INLINE_PROTOCOL_SURFACE_HEIGHT.min(viewport.bottom().saturating_sub(y));
+            return (height > 0).then_some(Rect::new(viewport.x, y, viewport.width, height));
+        }
+    }
+    None
+}
+
+fn drain_bcode_events(chat: &mut ActiveChat, loop_state: &mut ChatLoopState) -> bool {
     let mut needs_redraw = false;
     while let Ok(event) = chat.event_receiver.try_recv() {
-        needs_redraw |= absorb_bcode_event(chat, event);
+        needs_redraw |= absorb_bcode_event(chat, loop_state, event);
     }
     needs_redraw
 }
 
-fn absorb_bcode_event(chat: &mut ActiveChat, event: BcodeEvent) -> bool {
+fn absorb_bcode_event(
+    chat: &mut ActiveChat,
+    loop_state: &mut ChatLoopState,
+    event: BcodeEvent,
+) -> bool {
     match event {
         BcodeEvent::Session(event) if Some(event.session_id) == chat.session_id => {
             if let SessionEventKind::AgentChanged { agent_id } = &event.kind {
                 chat.agents
                     .apply_agent_to_app(&mut chat.app, agent_id.clone());
             } else {
+                maybe_open_protocol_surface(loop_state, &event.kind);
                 chat.app.absorb_session_event(&event);
             }
             true
@@ -1372,6 +1432,23 @@ fn absorb_bcode_event(chat: &mut ActiveChat, event: BcodeEvent) -> bool {
         | BcodeEvent::RuntimeWork(_)
         | BcodeEvent::SessionCatalogUpdated { .. } => false,
     }
+}
+
+fn maybe_open_protocol_surface(loop_state: &mut ChatLoopState, event: &SessionEventKind) {
+    let SessionEventKind::InteractiveToolRequestCreated {
+        interaction_id,
+        surface_kind,
+        request_json,
+        ..
+    } = event
+    else {
+        return;
+    };
+    if surface_kind != BMUX_PROTOCOL_INLINE_SURFACE {
+        return;
+    }
+    loop_state.protocol_surface =
+        ProtocolSurfaceState::from_request(interaction_id.clone(), request_json);
 }
 
 async fn next_chat_loop_event(
@@ -1458,6 +1535,15 @@ async fn handle_event<W: Write>(
                 .resize(Rect::new(0, 0, size.width, size.height));
             Ok(true)
         }
+        Event::Key(stroke)
+            if loop_state.protocol_surface.is_some()
+                && protocol_surface_host_key(context.services.keymap, stroke).is_some() =>
+        {
+            handle_protocol_surface_host_key(context, chat, loop_state, stroke).await
+        }
+        event if loop_state.protocol_surface.is_some() => {
+            handle_protocol_surface_event(context, chat, loop_state, event).await
+        }
         Event::Key(stroke) => {
             handle_chat_key(context, chat, loop_state, stroke, draft_autosave).await
         }
@@ -1506,6 +1592,83 @@ async fn handle_event<W: Write>(
         }
         Event::User(_) => Ok(false),
     }
+}
+
+async fn handle_protocol_surface_host_key<W: Write>(
+    context: &mut ChatEventContext<'_, '_, W>,
+    chat: &mut ActiveChat,
+    loop_state: &mut ChatLoopState,
+    stroke: KeyStroke,
+) -> Result<bool, TuiError> {
+    match protocol_surface_host_key(context.services.keymap, stroke) {
+        Some(BmuxAction::AppExit) => {
+            chat.app.request_exit();
+            Ok(true)
+        }
+        Some(BmuxAction::AppInterrupt) => {
+            resolve_protocol_surface_dismissed(context, chat, loop_state).await?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn protocol_surface_host_key(keymap: &BmuxKeyMap, stroke: KeyStroke) -> Option<BmuxAction> {
+    match keymap.action_for_key(BmuxScope::Chat, stroke)? {
+        BmuxAction::AppExit => Some(BmuxAction::AppExit),
+        BmuxAction::AppInterrupt => Some(BmuxAction::AppInterrupt),
+        _ => None,
+    }
+}
+
+async fn resolve_protocol_surface_dismissed<W: Write>(
+    context: &mut ChatEventContext<'_, '_, W>,
+    chat: &mut ActiveChat,
+    loop_state: &mut ChatLoopState,
+) -> Result<(), TuiError> {
+    let Some(surface) = loop_state.protocol_surface.take() else {
+        return Ok(());
+    };
+    let interaction_id = surface.interaction_id().to_owned();
+    context
+        .services
+        .client
+        .resolve_interactive_tool_request(
+            interaction_id,
+            ProtocolSurfaceState::dismissed_resolution(),
+        )
+        .await?;
+    chat.app
+        .set_status("interactive request dismissed".to_owned());
+    Ok(())
+}
+
+async fn handle_protocol_surface_event<W: Write>(
+    context: &mut ChatEventContext<'_, '_, W>,
+    chat: &ActiveChat,
+    loop_state: &mut ChatLoopState,
+    event: Event,
+) -> Result<bool, TuiError> {
+    let Some(surface) = &mut loop_state.protocol_surface else {
+        return Ok(false);
+    };
+    let Some(surface_area) = protocol_surface_area(
+        chat,
+        surface.interaction_id(),
+        render::transcript_area_for_frame(&chat.app, context.terminal.area()),
+    ) else {
+        return Ok(true);
+    };
+    if let Some(resolution) = surface.handle_event(surface_area, &event) {
+        let interaction_id = surface.interaction_id().to_owned();
+        loop_state.protocol_surface = None;
+        context
+            .services
+            .client
+            .resolve_interactive_tool_request(interaction_id, resolution)
+            .await?;
+    }
+    Ok(true)
 }
 
 async fn handle_chat_key<W: Write>(

@@ -11,6 +11,12 @@ use bcode_tool::{
     ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolList,
     ToolPolicyMetadata, ToolSideEffect,
 };
+use bmux_tui_component_protocol::model::ComponentNode;
+use bmux_tui_component_protocol::value::ComponentValue;
+use bmux_tui_components::protocol::{
+    ACTION_ROW_TYPE_ID, CheckboxGroupProps, ChoiceOptionProps, FormBuilder, RadioGroupProps,
+    TextInputProps,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::fmt::Write as _;
@@ -108,6 +114,12 @@ enum QuestionResolutionPayload {
     },
     Unanswered,
     Dismissed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct ProtocolResolutionPayload {
+    #[serde(default)]
+    values: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -257,8 +269,8 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             bcode_tool::ToolInvocationHostAction::InteractiveToolRequest(
                 bcode_tool::InteractiveToolRequest {
                     interaction_id: format!("{}-question", invocation.tool_call_id),
-                    surface_kind: "question.inline".to_string(),
-                    request: serde_json::to_value(&request).unwrap_or(Value::Null),
+                    surface_kind: "bmux.protocol.inline".to_string(),
+                    request: component_tree_request(&request),
                     required: request.questions.iter().any(|question| question.required),
                     turn_behavior: bcode_tool::InteractiveToolTurnBehavior::AwaitBeforeContinuing,
                     render_target: bcode_tool::InteractiveToolRenderTarget::TranscriptToolCall,
@@ -274,11 +286,9 @@ fn resume_interactive_tool(request: &ServiceRequest) -> ServiceResponse {
         Ok(resume) => resume,
         Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
     };
-    let question_request = match serde_json::from_value::<NormalizedQuestionRequest>(
-        resume.interactive_request.request.clone(),
-    ) {
+    let question_request = match parse_question_request(resume.original_arguments.clone()) {
         Ok(request) => request,
-        Err(error) => return json_response(&tool_error(error.to_string())),
+        Err(error) => return json_response(&tool_error(error)),
     };
     let outcome = match question_outcome_from_resolution(&question_request, resume.resolution) {
         Ok(outcome) => outcome,
@@ -293,15 +303,20 @@ fn question_outcome_from_resolution(
 ) -> Result<QuestionToolOutcome, String> {
     match resolution {
         InteractiveToolResolution::Submitted { payload } => {
-            let payload = serde_json::from_value::<QuestionResolutionPayload>(payload)
-                .map_err(|error| format!("invalid question response payload: {error}"))?;
-            Ok(match payload {
-                QuestionResolutionPayload::Answered { questions } => {
-                    answered_outcome(request, questions)?
-                }
-                QuestionResolutionPayload::Unanswered => unanswered_outcome(request),
-                QuestionResolutionPayload::Dismissed => dismissed_outcome(request),
-            })
+            if let Ok(payload) =
+                serde_json::from_value::<QuestionResolutionPayload>(payload.clone())
+            {
+                return Ok(match payload {
+                    QuestionResolutionPayload::Answered { questions } => {
+                        answered_outcome(request, questions)?
+                    }
+                    QuestionResolutionPayload::Unanswered => unanswered_outcome(request),
+                    QuestionResolutionPayload::Dismissed => dismissed_outcome(request),
+                });
+            }
+            let payload = serde_json::from_value::<ProtocolResolutionPayload>(payload)
+                .map_err(|error| format!("invalid protocol response payload: {error}"))?;
+            answered_outcome(request, protocol_answers(request, &payload.values))
         }
         InteractiveToolResolution::Aborted { reason, message } => {
             Ok(aborted_outcome(request, reason, message))
@@ -320,6 +335,70 @@ fn question_response(outcome: &QuestionToolOutcome) -> ToolInvocationResponse {
         full_output: Some(value.clone()),
         host_action: None,
         result: Some(ToolInvocationResult::Json { value }),
+    }
+}
+
+fn protocol_answers(
+    request: &NormalizedQuestionRequest,
+    values: &Map<String, Value>,
+) -> Vec<QuestionAnswerPayload> {
+    request
+        .questions
+        .iter()
+        .enumerate()
+        .map(|(question_index, question)| {
+            let value = values.get(&format!("question-{question_index}"));
+            let selected = match component_value_string(value) {
+                Some(value) if !question.options.is_empty() => vec![value],
+                _ => component_value_list(value),
+            };
+            let custom = if question.options.is_empty() {
+                component_value_string(value)
+            } else {
+                component_value_string(values.get(&format!("question-{question_index}-custom")))
+            };
+            QuestionAnswerPayload {
+                question_index,
+                selected,
+                custom,
+            }
+        })
+        .collect()
+}
+
+fn component_value_string(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(value) => Some(value.to_owned()),
+        Value::Object(map) => map.get("string").and_then(Value::as_str).map(str::to_owned),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) => None,
+    }
+}
+
+fn component_value_list(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::Array(values)) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        Some(Value::Object(map)) => {
+            map.get("list")
+                .and_then(Value::as_array)
+                .map_or_else(Vec::new, |values| {
+                    values
+                        .iter()
+                        .filter_map(|value| {
+                            value
+                                .as_str()
+                                .map(str::to_owned)
+                                .or_else(|| component_value_string(Some(value)))
+                        })
+                        .collect()
+                })
+        }
+        Some(Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)) | None => {
+            Vec::new()
+        }
     }
 }
 
@@ -487,6 +566,69 @@ fn format_question_outcome_output(outcome: &QuestionToolOutcome) -> String {
         );
     }
     output
+}
+
+fn component_tree_request(request: &NormalizedQuestionRequest) -> Value {
+    let mut builder = FormBuilder::new("question-form");
+    for (index, question) in request.questions.iter().enumerate() {
+        let prompt = question.header.as_ref().map_or_else(
+            || question.text.clone(),
+            |header| format!("{header}\n{}", question.text),
+        );
+        builder = builder.text(prompt);
+        let id = format!("question-{index}");
+        let options = question
+            .options
+            .iter()
+            .enumerate()
+            .map(|(option_index, option)| {
+                ChoiceOptionProps::new(
+                    option
+                        .value
+                        .clone()
+                        .unwrap_or_else(|| option_index.to_string()),
+                    option.label.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let field = if question.selection_mode == QuestionSelectionMode::Multiple {
+            CheckboxGroupProps::new(options).into_node(id)
+        } else if options.is_empty() {
+            TextInputProps::new()
+                .placeholder("Type your answer")
+                .into_box_node(id)
+        } else {
+            RadioGroupProps::new(options).into_node(id)
+        };
+        builder = builder.child(field);
+        if question.custom && !question.options.is_empty() {
+            builder = builder.child(
+                TextInputProps::new()
+                    .label("Custom answer")
+                    .placeholder("Type a custom answer")
+                    .into_box_node(format!("question-{index}-custom")),
+            );
+        }
+    }
+    builder = builder.child(action_row_node());
+    serde_json::to_value(builder.build()).unwrap_or(Value::Null)
+}
+
+fn action_row_node() -> ComponentNode {
+    let actions = vec![
+        action_value("submit", "Submit"),
+        action_value("cancel", "Cancel"),
+    ];
+    let mut map = std::collections::BTreeMap::new();
+    map.insert("actions".to_owned(), ComponentValue::List(actions));
+    ComponentNode::component(ACTION_ROW_TYPE_ID, ComponentValue::Map(map)).with_id("actions")
+}
+
+fn action_value(id: &str, label: &str) -> ComponentValue {
+    let mut map = std::collections::BTreeMap::new();
+    map.insert("id".to_owned(), ComponentValue::String(id.to_owned()));
+    map.insert("label".to_owned(), ComponentValue::String(label.to_owned()));
+    ComponentValue::Map(map)
 }
 
 fn format_unanswered_output(request: &NormalizedQuestionRequest, ask_aggressiveness: u8) -> String {

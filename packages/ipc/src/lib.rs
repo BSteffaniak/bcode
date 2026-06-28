@@ -400,7 +400,7 @@ pub enum Request {
     ListInteractiveToolRequests,
     ResolveInteractiveToolRequest {
         interaction_id: String,
-        resolution: bcode_session_models::InteractiveToolResolution,
+        resolution_json: serde_json::Value,
     },
 }
 

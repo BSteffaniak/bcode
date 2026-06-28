@@ -1725,7 +1725,13 @@ impl BcodeClient {
         match self
             .send_request(Request::ResolveInteractiveToolRequest {
                 interaction_id,
-                resolution,
+                resolution_json: serde_json::to_value(resolution).unwrap_or_else(|error| {
+                    serde_json::json!({
+                        "type": "aborted",
+                        "reason": "host_error",
+                        "message": error.to_string(),
+                    })
+                }),
             })
             .await?
         {

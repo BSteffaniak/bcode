@@ -45,6 +45,7 @@ pub(crate) mod picker_render;
 mod plugin_command_architecture_tests;
 pub(crate) mod plugin_surface_host;
 pub mod plugin_tui;
+pub(crate) mod protocol_surface;
 pub(crate) mod provider_picker;
 pub(crate) mod provider_picker_render;
 pub(crate) mod ralph_flow;

@@ -582,9 +582,9 @@ dependencies = [
 
 [[package]]
 name = "arc-swap"
-version = "1.9.1"
+version = "1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
 dependencies = [
  "rustversion",
 ]
@@ -1343,7 +1343,7 @@ name = "bcode_blims_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_plugin_sdk",
- "bmux_codec 0.0.1-alpha.1 (git+https://github.com/BSteffaniak/bmux.git?branch=master)",
+ "bmux_codec",
  "serde",
  "serde_json",
  "switchy_database",
@@ -1407,6 +1407,7 @@ dependencies = [
  "bcode_provider_auth",
  "bcode_session_models",
  "bcode_skill_models",
+ "serde_json",
  "sshenv_vault",
  "thiserror 2.0.18",
  "tokio",
@@ -1609,8 +1610,8 @@ dependencies = [
  "bcode_session_models",
  "bcode_skill_models",
  "bcode_worktree_models",
- "bmux_codec 0.0.1-alpha.1 (git+https://github.com/BSteffaniak/bmux.git?branch=master)",
- "bmux_ipc 0.0.1-alpha.1 (git+https://github.com/BSteffaniak/bmux.git?branch=master)",
+ "bmux_codec",
+ "bmux_ipc",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1846,6 +1847,8 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_plugin_sdk",
  "bcode_tool",
+ "bmux_tui_component_protocol",
+ "bmux_tui_components",
  "serde",
  "serde_json",
 ]
@@ -1922,7 +1925,7 @@ dependencies = [
  "bcode_metrics",
  "bcode_session_models",
  "bcode_skill_models",
- "bmux_codec 0.0.1-alpha.1 (git+https://github.com/BSteffaniak/bmux.git?branch=master)",
+ "bmux_codec",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2069,6 +2072,7 @@ dependencies = [
  "bmux_terminal_grid",
  "bmux_text_edit",
  "bmux_tui",
+ "bmux_tui_component_protocol",
  "bmux_tui_components",
  "crossterm",
  "image",
@@ -2280,17 +2284,7 @@ dependencies = [
 name = "bmux_attach_image_protocol"
 version = "0.0.1-alpha.1"
 dependencies = [
- "bmux_codec 0.0.1-alpha.1",
- "serde",
- "uuid",
-]
-
-[[package]]
-name = "bmux_attach_image_protocol"
-version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#50b9939f8fc06ed0a579c8b239dedc02cc882015"
-dependencies = [
- "bmux_codec 0.0.1-alpha.1 (git+https://github.com/BSteffaniak/bmux.git?branch=master)",
+ "bmux_codec",
  "serde",
  "uuid",
 ]
@@ -2303,33 +2297,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "bmux_codec"
-version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#50b9939f8fc06ed0a579c8b239dedc02cc882015"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "bmux_ipc"
 version = "0.0.1-alpha.1"
 dependencies = [
- "bmux_attach_image_protocol 0.0.1-alpha.1",
- "bmux_codec 0.0.1-alpha.1",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "bmux_ipc"
-version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#50b9939f8fc06ed0a579c8b239dedc02cc882015"
-dependencies = [
- "bmux_attach_image_protocol 0.0.1-alpha.1 (git+https://github.com/BSteffaniak/bmux.git?branch=master)",
- "bmux_codec 0.0.1-alpha.1 (git+https://github.com/BSteffaniak/bmux.git?branch=master)",
+ "bmux_attach_image_protocol",
+ "bmux_codec",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2340,7 +2312,6 @@ dependencies = [
 [[package]]
 name = "bmux_keyboard"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#50b9939f8fc06ed0a579c8b239dedc02cc882015"
 dependencies = [
  "crossterm",
 ]
@@ -2357,7 +2328,7 @@ dependencies = [
 name = "bmux_plugin"
 version = "0.0.1-alpha.1"
 dependencies = [
- "bmux_ipc 0.0.1-alpha.1",
+ "bmux_ipc",
  "bmux_perf_telemetry",
  "bmux_plugin_runtime",
  "bmux_plugin_sdk",
@@ -2394,8 +2365,8 @@ dependencies = [
 name = "bmux_plugin_sdk"
 version = "0.0.1-alpha.1"
 dependencies = [
- "bmux_codec 0.0.1-alpha.1",
- "bmux_ipc 0.0.1-alpha.1",
+ "bmux_codec",
+ "bmux_ipc",
  "bmux_perf_telemetry",
  "bmux_plugin_runtime",
  "nanoid",
@@ -2411,7 +2382,6 @@ dependencies = [
 [[package]]
 name = "bmux_terminal_grid"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#50b9939f8fc06ed0a579c8b239dedc02cc882015"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -2422,7 +2392,6 @@ dependencies = [
 [[package]]
 name = "bmux_text_edit"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#50b9939f8fc06ed0a579c8b239dedc02cc882015"
 dependencies = [
  "bmux_keyboard",
  "unicode-segmentation",
@@ -2432,7 +2401,6 @@ dependencies = [
 [[package]]
 name = "bmux_tui"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#50b9939f8fc06ed0a579c8b239dedc02cc882015"
 dependencies = [
  "bmux_keyboard",
  "bmux_text_edit",
@@ -2442,13 +2410,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_tui_component_protocol"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "bmux_tui_components"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#50b9939f8fc06ed0a579c8b239dedc02cc882015"
 dependencies = [
  "bmux_keyboard",
  "bmux_text_edit",
  "bmux_tui",
+ "bmux_tui_component_protocol",
  "unicode-segmentation",
 ]
 
@@ -4409,9 +4384,9 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "hybrid-array"
-version = "0.4.12"
+version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9155a582abd142abc056962c29e3ce5ff2ad5469f4246b537ed42c5deba857da"
+checksum = "818356c5132c1fede50f837ca96afbe78ff42413047f4abb886217845e1b6c8c"
 dependencies = [
  "typenum",
 ]
@@ -5286,9 +5261,9 @@ dependencies = [
 
 [[package]]
 name = "io-uring"
-version = "0.7.12"
+version = "0.7.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d09b98f7eace8982db770e4408e7470b028ce513ac28fecdc6bf4c30fe92b62"
+checksum = "9080b15e63775b9a2ac7dca720f7050a8b955e092ea0f6020a4a80f69998cdc0"
 dependencies = [
  "bitflags 2.13.0",
  "cfg-if",
@@ -7431,9 +7406,9 @@ checksum = "973443cf09a9c8656b574a866ab68dfa19f0867d0340648c7d2f6a71b8a8ea68"
 
 [[package]]
 name = "rapidhash"
-version = "4.4.1"
+version = "4.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5e48930979c155e2f33aa36ab3119b5ee81332beb6482199a8ecd6029b80b59"
+checksum = "32b266a82f4aa99bb5c25e28d11cc44ace63d91adbcbcee4d323e2ae3d49ef37"
 dependencies = [
  "rustversion",
 ]
@@ -10231,9 +10206,9 @@ checksum = "04a79e25382e2e852e8da874249358d382ebaf259d0d34e75d8db16a7efabbc7"
 
 [[package]]
 name = "triomphe"
-version = "0.1.15"
+version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd69c5aa8f924c7519d6372789a74eac5b94fb0f8fcf0d4a97eb0bfc3e785f39"
+checksum = "b40688ea6389c8171614b25491f71d4a27946e0c7ce2da1c6de27e25abf1a0ae"
 dependencies = [
  "serde",
  "stable_deref_trait",

@@ -85,6 +85,11 @@ fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
             include_str!("../../../plugins/pi-session-import-plugin/bcode-plugin.toml"),
             bcode_pi_session_import_plugin::static_plugin(),
         ),
+        #[cfg(feature = "static-bundled-question-plugin")]
+        bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
+            bcode_question_plugin::static_plugin(),
+        ),
         #[cfg(feature = "static-bundled-shell-plugin")]
         bcode_plugin::StaticBundledPlugin::new(
             include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),

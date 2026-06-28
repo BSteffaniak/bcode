@@ -134,6 +134,12 @@ pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>, layout: FrameLa
 }
 
 impl FrameLayout {
+    /// Return the transcript area for this prepared frame.
+    #[must_use]
+    pub fn transcript_area(self, app: &BmuxApp) -> Rect {
+        transcript_area_for_body(app, self.body)
+    }
+
     const fn body_without_latest_bar(self) -> Rect {
         let latest_bar_height = if self.latest_bar.is_some() { 1 } else { 0 };
         Rect::new(
@@ -790,6 +796,13 @@ fn push_transcript_item_rows(
         TranscriptItemKind::TerminalOutput { .. } => {
             push_terminal_transcript_item_rows(rows, item, width);
         }
+        TranscriptItemKind::InteractiveToolRequest {
+            surface_kind,
+            request_json,
+            ..
+        } if surface_kind == super::protocol_surface::BMUX_PROTOCOL_INLINE_SURFACE => {
+            push_interactive_protocol_placeholder_rows(rows, request_json, width);
+        }
         TranscriptItemKind::InteractiveToolRequest { .. } => {
             push_detail_block(rows, "Interactive tool", item.text(), Color::Cyan, width);
         }
@@ -832,6 +845,32 @@ fn push_transcript_item_rows(
             push_detail_block(rows, item.role(), item.text(), Color::BrightBlack, width);
         }
     }
+}
+
+fn push_interactive_protocol_placeholder_rows(
+    rows: &mut Vec<Line>,
+    request_json: &str,
+    width: u16,
+) {
+    push_wrapped_styled_text(
+        rows,
+        Vec::new(),
+        "Interactive tool",
+        width,
+        Style::new().fg(Color::Cyan),
+        Style::new().fg(Color::Cyan),
+    );
+    let _ = request_json;
+    let surface_width = width.saturating_sub(2);
+    for index in 0..super::protocol_surface::INLINE_PROTOCOL_SURFACE_HEIGHT {
+        let marker = if index == 0 { "┌" } else { "│" };
+        rows.push(Line::from_spans(vec![
+            Span::styled(marker, muted_style()),
+            Span::styled(" ", muted_style()),
+            Span::styled(" ".repeat(usize::from(surface_width)), Style::new()),
+        ]));
+    }
+    rows.push(Line::default());
 }
 
 fn push_tool_presentation_card_rows(
@@ -2828,6 +2867,9 @@ fn activity_label(activity: &ActivityState, daemon_connection: DaemonConnectionS
         }
         ActivityState::WaitingPermission { name } => {
             format!("permission {}", tool_activity_label(name))
+        }
+        ActivityState::WaitingInteraction { name } => {
+            format!("waiting for {}", tool_activity_label(name))
         }
         ActivityState::Cancelling => format!("{} cancelling", spinner_frame()),
     }

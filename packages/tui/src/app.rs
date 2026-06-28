@@ -2158,7 +2158,7 @@ impl BmuxApp {
                     *required,
                 ));
                 if application.live_activity() {
-                    self.set_activity(ActivityState::WaitingPermission {
+                    self.set_activity(ActivityState::WaitingInteraction {
                         name: tool_name.to_owned(),
                     });
                 }
