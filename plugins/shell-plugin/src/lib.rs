@@ -407,11 +407,6 @@ fn shell_presentation_fields(arguments: &ShellRunArguments) -> Vec<ToolPresentat
             kind: ToolPresentationFieldKind::DurationMs,
         });
     }
-    fields.push(ToolPresentationFieldValue {
-        label: "Terminal".to_string(),
-        value: arguments.terminal.to_string(),
-        kind: ToolPresentationFieldKind::Text,
-    });
     fields
 }
 
@@ -428,7 +423,7 @@ fn shell_result_card(response: &ToolInvocationResponse) -> bcode_tool::ToolCardP
     }];
     let mut sections = Vec::new();
     if let Some(ToolInvocationResult::ShellRun { result }) = &response.result {
-        extend_captured_shell_result_presentation(result, &mut fields, &mut sections);
+        extend_captured_shell_result_presentation(result, &mut fields);
     }
     sections.insert(0, ToolPresentationSection::Fields { fields });
     bcode_tool::ToolCardPresentation {
@@ -446,15 +441,12 @@ fn shell_result_card(response: &ToolInvocationResponse) -> bcode_tool::ToolCardP
 fn extend_captured_shell_result_presentation(
     result: &ShellRunResult,
     fields: &mut Vec<ToolPresentationFieldValue>,
-    sections: &mut Vec<ToolPresentationSection>,
 ) {
     let ShellRunResult::Captured {
         exit_code,
         timed_out,
         cancelled,
         duration_ms,
-        stdout,
-        stderr,
         stdout_truncated,
         stderr_truncated,
         ..
@@ -477,27 +469,6 @@ fn extend_captured_shell_result_presentation(
             kind: ToolPresentationFieldKind::Text,
         });
     }
-    push_shell_text_section(sections, "stdout", stdout, *stdout_truncated);
-    push_shell_text_section(sections, "stderr", stderr, *stderr_truncated);
-}
-
-fn push_shell_text_section(
-    sections: &mut Vec<ToolPresentationSection>,
-    label: &str,
-    text: &str,
-    truncated: bool,
-) {
-    if text.is_empty() {
-        return;
-    }
-    sections.push(ToolPresentationSection::Text {
-        label: Some(if truncated {
-            format!("{label} (truncated)")
-        } else {
-            label.to_string()
-        }),
-        text: text.to_string(),
-    });
 }
 
 fn push_shell_common_result_fields(
@@ -953,9 +924,9 @@ fn run_shell_command(
 }
 
 fn run_shell_command_with_environment(
-    events: ServiceEventEmitter,
+    _events: ServiceEventEmitter,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
-    tool_call_id: &str,
+    _tool_call_id: &str,
     arguments: &ShellRunArguments,
     session_cwd: Option<&std::path::Path>,
     cancellation_path: Option<&std::path::Path>,
@@ -972,7 +943,6 @@ fn run_shell_command_with_environment(
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
-    let tool_call_id = tool_call_id.to_owned();
     let cancellation_path = cancellation_path.map(Path::to_path_buf);
     let cancellation = cancellation.clone();
     let result = runtime
@@ -1009,23 +979,7 @@ fn run_shell_command_with_environment(
                         timeout: Some(timeout),
                         max_output_bytes,
                     },
-                    move |event| {
-                        let stream = match event.stream {
-                            bcode_tool_runtime::ProcessOutputStream::Stdout => {
-                                ToolOutputStream::Stdout
-                            }
-                            bcode_tool_runtime::ProcessOutputStream::Stderr => {
-                                ToolOutputStream::Stderr
-                            }
-                        };
-                        emit_tool_output_delta(
-                            events,
-                            &tool_call_id,
-                            stream,
-                            event.sequence,
-                            &event.bytes,
-                        );
-                    },
+                    move |_event| {},
                 )
                 .await;
             if let Some(cancel_task) = cancel_task {
@@ -1646,7 +1600,7 @@ mod tests {
         );
     }
     #[test]
-    fn captured_result_card_includes_relevant_process_metadata_and_stream_sections() {
+    fn captured_result_card_includes_relevant_process_metadata() {
         let response = ToolInvocationResponse {
             output: String::new(),
             is_error: false,
@@ -1681,13 +1635,9 @@ mod tests {
                 && !fields.iter().any(|field| field.label == "Cancelled")
                 && !fields.iter().any(|field| field.label == "Stdout bytes")
         )));
-        assert!(card.sections.iter().any(|section| matches!(section,
-            ToolPresentationSection::Text { label: Some(label), text }
-            if label == "stdout" && text == "ok"
-        )));
-        assert!(card.sections.iter().any(|section| matches!(section,
-            ToolPresentationSection::Text { label: Some(label), text }
-            if label == "stderr (truncated)" && text == "warn"
+        assert!(card.sections.iter().all(|section| !matches!(
+            section,
+            ToolPresentationSection::Text { .. } | ToolPresentationSection::Terminal { .. }
         )));
     }
 
