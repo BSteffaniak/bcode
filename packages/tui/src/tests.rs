@@ -1806,9 +1806,11 @@ fn live_file_write_statusline_is_not_duplicated_and_truncates_path() {
     let output = rendered_text(&buffer);
 
     assert!(output.contains("tool filesystem_write"));
-    assert!(output.contains("packages/tui/src/render.rs"), "{output}");
-    assert!(output.contains("Ready to apply · Writing file"));
-    assert!(!output.contains("running tool filesystem_write"));
+    assert!(
+        output.contains("Path: /Users/braden/projects/bcode/packages/tui/src/render.rs"),
+        "{output}"
+    );
+    assert!(!output.contains("File change preview"));
     assert!(!output.contains("tool filesystem_write · running tool filesystem_write"));
 }
 
@@ -1849,10 +1851,8 @@ fn live_file_edit_card_shows_permission_and_applied_phases() {
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
-    assert!(
-        output.contains("Waiting for permission") && output.contains("Editing file"),
-        "{output}"
-    );
+    assert!(output.contains("Permission required"), "{output}");
+    assert!(!output.contains("Editing file"), "{output}");
 
     app.absorb_session_event(&event(
         session_id,
@@ -1884,11 +1884,8 @@ fn live_file_edit_card_shows_permission_and_applied_phases() {
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
-    assert!(
-        output.contains("Applied") && output.contains("Editing file"),
-        "{output}"
-    );
-    assert!(output.contains("confirmation: edited src/lib.rs"));
+    assert!(output.contains("finished"), "{output}");
+    assert!(!output.contains("confirmation: edited src/lib.rs"));
 }
 
 #[test]
@@ -1938,13 +1935,11 @@ fn denied_file_permission_marks_preview_failed() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("File change preview · filesystem_edit"));
-    assert!(output.contains("failed"));
-    assert!(output.contains("Failed") && output.contains("Editing file"));
+    assert!(!output.contains("File change preview · filesystem_edit"));
 }
 
 #[test]
-fn transcript_renders_filesystem_edit_inline_diff_preview() {
+fn transcript_renders_filesystem_edit_request_without_core_inline_diff_preview() {
     let session_id = SessionId::new();
     let history = [event(
         session_id,
@@ -1968,68 +1963,12 @@ fn transcript_renders_filesystem_edit_inline_diff_preview() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("Editing file"), "{output}");
-    assert!(output.contains("Ready to apply · Editing file"));
-    assert!(output.contains("src/lib.rs  +1 -1"));
-    assert!(output.contains("replaced 1 line with 1 line"));
-    assert!(output.contains("live preview"));
-    assert!(output.contains("-   2 │     41"));
-    assert!(output.contains("+   2 │     42"));
-    assert!(!output.contains("\"old_text\""));
-    assert_eq!(
-        buffer
-            .get(Point::new(
-                6,
-                output_line_y(&buffer, "-   2 │     41").unwrap()
-            ))
-            .map(|cell| cell.style.fg),
-        Some(Some(bmux_tui::style::Color::BrightRed))
-    );
-    assert_eq!(
-        buffer
-            .get(Point::new(
-                6,
-                output_line_y(&buffer, "+   2 │     42").unwrap()
-            ))
-            .map(|cell| cell.style.fg),
-        Some(Some(bmux_tui::style::Color::BrightGreen))
-    );
-    assert_eq!(
-        buffer
-            .get(Point::new(
-                4,
-                output_line_y(&buffer, "-   2 │     41").unwrap()
-            ))
-            .map(|cell| cell.style.bg),
-        Some(Some(bmux_tui::style::Color::Rgb(32, 10, 10)))
-    );
-    assert_eq!(
-        buffer
-            .get(Point::new(
-                47,
-                output_line_y(&buffer, "+   2 │     42").unwrap()
-            ))
-            .map(|cell| cell.style.bg),
-        Some(Some(bmux_tui::style::Color::Rgb(0, 24, 16)))
-    );
-    assert_eq!(
-        buffer
-            .get(Point::new(
-                48,
-                output_line_y(&buffer, "+   2 │     42").unwrap()
-            ))
-            .map(|cell| cell.style.bg),
-        Some(None)
-    );
-    assert_eq!(
-        buffer
-            .get(Point::new(
-                99,
-                output_line_y(&buffer, "+   2 │     42").unwrap()
-            ))
-            .map(|cell| cell.style.bg),
-        Some(None)
-    );
+    assert!(output.contains("example.edit"), "{output}");
+    assert!(output.contains("Path: src/lib.rs"), "{output}");
+    assert!(output.contains("Old text:"), "{output}");
+    assert!(output.contains("New text:"), "{output}");
+    assert!(!output.contains("File change preview"), "{output}");
+    assert!(!output.contains("replaced 1 line with 1 line"), "{output}");
 }
 
 #[test]
@@ -3389,12 +3328,7 @@ fn file_change_presentation_history_uses_request_preview_when_present() {
 
     assert!(transcript.iter().any(|item| matches!(
         item.kind(),
-        TranscriptItemKind::ToolRequest {
-            tool_call_id,
-            file_edit: Some(_),
-            file_edit_phase: Some(_),
-            ..
-        } if tool_call_id == "call-file"
+        TranscriptItemKind::ToolRequest { tool_call_id, .. } if tool_call_id == "call-file"
     )));
     assert!(!transcript.iter().any(|item| {
         matches!(
@@ -4655,6 +4589,7 @@ fn live_file_preview_updates_without_duplicates_and_final_replaces_it() {
                     path: Some("src/main.rs".to_owned()),
                     old_text_prefix: None,
                     new_text_prefix: contents.to_owned(),
+                    old_text_required: false,
                     argument_bytes: contents.len(),
                     truncated: false,
                 }),
@@ -4695,7 +4630,7 @@ fn live_file_preview_updates_without_duplicates_and_final_replaces_it() {
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
-    assert!(output.contains("Ready to apply · Writing file"), "{output}");
+    assert!(output.contains("tool filesystem_write"), "{output}");
     assert!(!output.contains("streaming preview"), "{output}");
 }
 
@@ -4716,6 +4651,7 @@ fn live_file_preview_renders_truncation_note_and_received_bytes() {
                 path: Some("src/lib.rs".to_owned()),
                 old_text_prefix: None,
                 new_text_prefix: "pub fn demo() {}".to_owned(),
+                old_text_required: false,
                 argument_bytes: 2048,
                 truncated: true,
             }),
@@ -4750,6 +4686,7 @@ fn live_file_preview_uses_syntax_highlighted_inline_diff_renderer() {
                 path: Some("src/lib.rs".to_owned()),
                 old_text_prefix: None,
                 new_text_prefix: "pub fn demo() {\n    println!(\"hi\");\n}".to_owned(),
+                old_text_required: false,
                 argument_bytes: 36,
                 truncated: false,
             }),

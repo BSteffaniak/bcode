@@ -55,6 +55,7 @@ impl FileEditTranscript {
 }
 
 /// Extract a semantic file edit from plugin-owned request preview metadata.
+#[cfg(test)]
 pub fn file_edit_from_request_preview(
     preview: &bcode_session_models::ToolRequestPreviewMetadata,
     arguments_json: &str,
@@ -71,6 +72,7 @@ pub fn file_edit_from_request_preview(
     Some(FileEditTranscript::new(path, old_text, new_text))
 }
 
+#[cfg(test)]
 fn first_string_field(value: &serde_json::Value, fields: &[String]) -> Option<String> {
     fields
         .iter()
@@ -78,6 +80,7 @@ fn first_string_field(value: &serde_json::Value, fields: &[String]) -> Option<St
 }
 
 /// Extract a file diff preview from plugin-owned request preview metadata.
+#[cfg(test)]
 pub fn diff_from_request_preview(
     preview: &bcode_session_models::ToolRequestPreviewMetadata,
     arguments_json: &str,

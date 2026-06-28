@@ -8,7 +8,7 @@ use bcode_session_models::{
     ToolPresentationTarget, ToolRequestPresentationMetadata,
 };
 
-use super::diff_extract::{FileEditTranscript, file_edit_from_request_preview};
+use super::diff_extract::FileEditTranscript;
 
 /// Lifecycle phase for a file edit/write preview.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,12 +250,6 @@ impl TranscriptItem {
     #[must_use]
     pub const fn event_sequence(&self) -> Option<u64> {
         self.event_sequence
-    }
-
-    const fn with_streaming(mut self, streaming: bool) -> Self {
-        self.streaming = streaming;
-        self.bump_revision();
-        self
     }
 
     /// Return stable item identity.
@@ -547,11 +541,6 @@ pub fn tool_request_item(
     arguments_json: &str,
     request_presentation: Option<ToolRequestPresentationMetadata>,
 ) -> TranscriptItem {
-    let file_edit = request_presentation
-        .as_ref()
-        .and_then(|metadata| metadata.preview.as_ref())
-        .and_then(|preview| file_edit_from_request_preview(preview, arguments_json));
-    let streaming = file_edit.is_some();
     TranscriptItem::with_kind(
         "Tool",
         pretty_jsonish(arguments_json),
@@ -561,12 +550,11 @@ pub fn tool_request_item(
             tool_name: tool_name.to_owned(),
             arguments_json: arguments_json.to_owned(),
             request_presentation,
-            file_edit,
-            file_edit_phase: streaming.then_some(FileEditPhase::Pending),
+            file_edit: None,
+            file_edit_phase: None,
             live_preview: false,
         },
     )
-    .with_streaming(streaming)
 }
 
 /// Build a transcript item anchoring a live-only partial tool argument preview.

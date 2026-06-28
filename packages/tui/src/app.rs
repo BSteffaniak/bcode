@@ -36,7 +36,6 @@ use bmux_tui_components::text_input::{
 
 use super::activity::{ActivityState, model_turn_outcome_label};
 use super::cursor_blink::CursorBlink;
-use super::diff_extract::diff_from_request_preview;
 use super::diff_panel::DiffPanel;
 use super::exit_state::ExitState;
 use super::input_history::{InputHistory, InputHistoryOutcome};
@@ -2610,7 +2609,6 @@ impl BmuxApp {
         arguments_json: &str,
         request_presentation: Option<ToolRequestPresentationMetadata>,
     ) {
-        let edit_summary = self.record_diff_summary(arguments_json, request_presentation.as_ref());
         self.tool_call_contexts.insert(
             tool_call_id.to_owned(),
             ToolCallContext {
@@ -2641,36 +2639,10 @@ impl BmuxApp {
         if replaced.is_none() {
             self.transcript.push(item);
         }
-        if let Some(status) = edit_summary {
-            self.set_file_activity(tool_name);
-            self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Pending);
-            self.status = status;
-        } else {
-            self.set_activity(ActivityState::RunningTool {
-                name: tool_name.to_owned(),
-            });
-            self.status =
-                tool_request_status(arguments_json).unwrap_or_else(|| "started".to_owned());
-        }
-    }
-
-    fn record_diff_summary(
-        &mut self,
-        arguments_json: &str,
-        request_presentation: Option<&ToolRequestPresentationMetadata>,
-    ) -> Option<String> {
-        let preview = request_presentation
-            .as_ref()
-            .and_then(|metadata| metadata.preview.as_ref())?;
-        let (summary, lines) = diff_from_request_preview(preview, arguments_json)?;
-        let status = format!(
-            "{} · +{} -{}",
-            summary.display_path(),
-            summary.added,
-            summary.removed
-        );
-        self.diff_panel.record(summary, lines);
-        Some(status)
+        self.set_activity(ActivityState::RunningTool {
+            name: tool_name.to_owned(),
+        });
+        self.status = tool_request_status(arguments_json).unwrap_or_else(|| "started".to_owned());
     }
 
     fn finish_live_tool_output(
@@ -2717,7 +2689,7 @@ impl BmuxApp {
             if application.live_activity() {
                 if is_error {
                     "failed".clone_into(&mut self.status);
-                } else if let Some(status) = self.tool_call_file_status(tool_call_id) {
+                } else if let Some(status) = Self::tool_call_file_status(tool_call_id) {
                     self.status = format!("applied · {status}");
                 } else {
                     "finished".clone_into(&mut self.status);
@@ -2751,7 +2723,7 @@ impl BmuxApp {
                 "failed".clone_into(&mut self.status);
             }
             self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Failed);
-        } else if let Some(status) = self.tool_call_file_status(tool_call_id) {
+        } else if let Some(status) = Self::tool_call_file_status(tool_call_id) {
             self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Applied);
             if application.live_activity() {
                 self.status = format!("applied · {status}");
@@ -2810,7 +2782,7 @@ impl BmuxApp {
                 }
                 self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Applying);
                 if application.live_activity() {
-                    if let Some(status) = self.tool_call_file_status(tool_call_id) {
+                    if let Some(status) = Self::tool_call_file_status(tool_call_id) {
                         self.status = status;
                     } else {
                         tool_name.clone_into(&mut self.status);
@@ -2844,7 +2816,7 @@ impl BmuxApp {
                         "failed".clone_into(&mut self.status);
                     }
                     self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Failed);
-                } else if let Some(status) = self.tool_call_file_status(tool_call_id) {
+                } else if let Some(status) = Self::tool_call_file_status(tool_call_id) {
                     self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Applied);
                     if application.live_activity() {
                         self.status = format!("applied · {status}");
@@ -3041,7 +3013,7 @@ impl BmuxApp {
         }
         self.set_tool_request_file_phase(input.tool_call_id, FileEditPhase::WaitingPermission);
         if input.application.live_activity() {
-            self.status = self.tool_call_file_status(input.tool_call_id).map_or_else(
+            self.status = Self::tool_call_file_status(input.tool_call_id).map_or_else(
                 || {
                     tool_request_status(input.arguments_json)
                         .unwrap_or_else(|| input.tool_name.to_owned())
@@ -3081,19 +3053,8 @@ impl BmuxApp {
         }
     }
 
-    fn tool_call_file_status(&self, tool_call_id: &str) -> Option<String> {
-        let context = self.tool_call_contexts.get(tool_call_id)?;
-        let preview = context
-            .request_presentation
-            .as_ref()
-            .and_then(|metadata| metadata.preview.as_ref())?;
-        let (summary, _) = diff_from_request_preview(preview, &context.arguments_json)?;
-        Some(format!(
-            "{} · +{} -{}",
-            summary.display_path(),
-            summary.added,
-            summary.removed
-        ))
+    const fn tool_call_file_status(_tool_call_id: &str) -> Option<String> {
+        None
     }
 
     fn set_tool_request_file_phase(&mut self, tool_call_id: &str, phase: FileEditPhase) {

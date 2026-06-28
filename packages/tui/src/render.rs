@@ -1231,15 +1231,25 @@ fn push_live_file_edit_preview_rows(
         width,
     );
 
-    let edit = file_edit_from_live_preview(context.preview);
-    push_file_edit_preview_rows(
-        rows,
-        &edit,
-        width,
-        context.inline_diff_config,
-        Some(FileEditPhase::Pending),
-        true,
-    );
+    if let Some(edit) = file_edit_from_live_preview(context.preview) {
+        push_file_edit_preview_rows(
+            rows,
+            &edit,
+            width,
+            context.inline_diff_config,
+            Some(FileEditPhase::Pending),
+            true,
+        );
+    } else {
+        push_wrapped_styled_text(
+            rows,
+            vec![Span::styled("  ", muted_style())],
+            "waiting for original text before rendering diff",
+            width,
+            muted_style(),
+            muted_style(),
+        );
+    }
 
     if context.preview.truncated {
         push_wrapped_styled_text(
@@ -1254,15 +1264,18 @@ fn push_live_file_edit_preview_rows(
     rows.push(Line::default());
 }
 
-fn file_edit_from_live_preview(preview: &LiveFileEditPreview) -> FileEditTranscript {
-    FileEditTranscript::new(
+fn file_edit_from_live_preview(preview: &LiveFileEditPreview) -> Option<FileEditTranscript> {
+    if preview.old_text_required && preview.old_text_prefix.is_none() {
+        return None;
+    }
+    Some(FileEditTranscript::new(
         preview
             .path
             .clone()
             .unwrap_or_else(|| "<streaming file>".to_owned()),
         preview.old_text_prefix.clone().unwrap_or_default(),
         preview.new_text_prefix.clone(),
-    )
+    ))
 }
 
 fn format_preview_bytes(bytes: usize) -> String {

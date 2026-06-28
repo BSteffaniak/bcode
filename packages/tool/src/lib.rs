@@ -331,6 +331,9 @@ pub enum ToolLiveArgumentPreviewMetadata {
         old_text_fields: Vec<String>,
         /// Candidate new-text/content fields.
         new_text_fields: Vec<String>,
+        /// Whether missing old text should be treated as unknown instead of empty.
+        #[serde(default)]
+        old_text_required: bool,
         /// Plugin-owned live preview title.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         preview_title: Option<String>,

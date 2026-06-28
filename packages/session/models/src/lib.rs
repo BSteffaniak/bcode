@@ -389,6 +389,9 @@ pub struct LiveFileEditPreview {
     pub old_text_prefix: Option<String>,
     /// Best-effort new text prefix extracted from partial arguments.
     pub new_text_prefix: String,
+    /// Whether missing old text means unknown original text rather than empty original text.
+    #[serde(default)]
+    pub old_text_required: bool,
     /// Total assembled argument bytes received so far.
     pub argument_bytes: usize,
     /// Whether the preview content was truncated by live-preview limits.

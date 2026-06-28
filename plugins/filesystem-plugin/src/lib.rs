@@ -407,6 +407,7 @@ fn write_tool_ui(
             path_fields: vec!["path".to_string()],
             old_text_fields: Vec::new(),
             new_text_fields: vec!["contents".to_string(), "new_text".to_string()],
+            old_text_required: false,
             preview_title: Some(preview_title.to_string()),
             streaming_status: Some(format!("{activity_label} {{path}} · {{bytes}}")),
         }),
@@ -431,6 +432,53 @@ fn write_tool_ui(
                 path_fields: vec!["path".to_string()],
                 old_text_fields: Vec::new(),
                 new_text_fields: vec!["contents".to_string(), "new_text".to_string()],
+            }),
+        }),
+    }
+}
+
+fn edit_tool_ui(
+    activity_label: &str,
+    title: &str,
+    preview_title: &str,
+) -> bcode_tool::ToolUiMetadata {
+    bcode_tool::ToolUiMetadata {
+        activity_label: Some(activity_label.to_string()),
+        live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::FileEdit {
+            path_fields: vec!["path".to_string()],
+            old_text_fields: vec!["old_text".to_string()],
+            new_text_fields: vec!["new_text".to_string()],
+            old_text_required: true,
+            preview_title: Some(preview_title.to_string()),
+            streaming_status: Some(format!("{activity_label} {{path}} · {{bytes}}")),
+        }),
+
+        request_presentation: Some(ToolRequestPresentationMetadata {
+            title: title.to_string(),
+            fields: vec![
+                ToolPresentationField {
+                    label: "Path".to_string(),
+                    argument: "path".to_string(),
+                    kind: ToolPresentationFieldKind::Path,
+                    optional: false,
+                },
+                ToolPresentationField {
+                    label: "Old text".to_string(),
+                    argument: "old_text".to_string(),
+                    kind: ToolPresentationFieldKind::Text,
+                    optional: false,
+                },
+                ToolPresentationField {
+                    label: "New text".to_string(),
+                    argument: "new_text".to_string(),
+                    kind: ToolPresentationFieldKind::Text,
+                    optional: false,
+                },
+            ],
+            preview: Some(bcode_tool::ToolRequestPreviewMetadata::FileEdit {
+                path_fields: vec!["path".to_string()],
+                old_text_fields: vec!["old_text".to_string()],
+                new_text_fields: vec!["new_text".to_string()],
             }),
         }),
     }
@@ -491,7 +539,7 @@ fn edit_tool_definition() -> ToolDefinition {
         side_effect: ToolSideEffect::WriteFiles,
         requires_permission: true,
         policy: path_policy(&["edit"], "edit", bcode_tool::ToolArgumentKind::WritePath),
-        ui: write_tool_ui("editing", "Edit file", "Edit preview"),
+        ui: edit_tool_ui("editing", "Edit file", "Edit preview"),
     }
 }
 

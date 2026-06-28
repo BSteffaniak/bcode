@@ -115,6 +115,8 @@ impl DiffPanel {
     }
 
     /// Record or replace a diff summary and its detail lines.
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn record(&mut self, summary: DiffFileSummary, lines: Vec<DiffLine>) {
         let path = summary.display_path();
         if let Some(existing_index) = self

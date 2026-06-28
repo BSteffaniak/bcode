@@ -8120,6 +8120,7 @@ fn live_tool_argument_preview_from_fields(
             path_fields,
             old_text_fields,
             new_text_fields,
+            old_text_required,
             preview_title,
             streaming_status,
         } => live_file_edit_preview_from_fields(
@@ -8127,6 +8128,7 @@ fn live_tool_argument_preview_from_fields(
             path_fields,
             old_text_fields,
             new_text_fields,
+            *old_text_required,
             preview_title.clone(),
             streaming_status.clone(),
         )
@@ -8163,6 +8165,7 @@ fn live_file_edit_preview_from_fields(
     path_fields: &[String],
     old_text_fields: &[String],
     new_text_fields: &[String],
+    old_text_required: bool,
     preview_title: Option<String>,
     streaming_status: Option<String>,
 ) -> Option<LiveFileEditPreview> {
@@ -8175,6 +8178,7 @@ fn live_file_edit_preview_from_fields(
         path,
         old_text_prefix,
         new_text_prefix: new_text.value,
+        old_text_required,
         argument_bytes: fields.input_bytes,
         truncated: new_text.truncated,
     })
@@ -17929,6 +17933,7 @@ mod tests {
             path_fields: vec!["path".to_owned()],
             old_text_fields: Vec::new(),
             new_text_fields: vec!["contents".to_owned()],
+            old_text_required: false,
             preview_title: None,
             streaming_status: None,
         };
@@ -18001,6 +18006,7 @@ mod tests {
             path_fields: vec!["path".to_owned()],
             old_text_fields: Vec::new(),
             new_text_fields: vec!["contents".to_owned()],
+            old_text_required: false,
             preview_title: None,
             streaming_status: None,
         };
