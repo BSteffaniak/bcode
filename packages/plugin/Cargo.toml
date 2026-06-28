@@ -13,6 +13,8 @@ version     = { workspace = true }
 [dependencies]
 bcode_command    = { workspace = true }
 bcode_plugin_sdk = { workspace = true }
+bmux_plugin      = { workspace = true }
+bmux_plugin_sdk  = { workspace = true }
 libloading       = { workspace = true }
 semver           = { workspace = true, features = ["serde"] }
 serde            = { workspace = true, features = ["derive", "std"] }

@@ -1342,7 +1342,7 @@ name = "bcode_blims_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_plugin_sdk",
- "bmux_codec",
+ "bmux_codec 0.0.1-alpha.1 (git+https://github.com/BSteffaniak/bmux.git?branch=master)",
  "serde",
  "serde_json",
  "switchy_database",
@@ -1607,8 +1607,8 @@ dependencies = [
  "bcode_session_models",
  "bcode_skill_models",
  "bcode_worktree_models",
- "bmux_codec",
- "bmux_ipc",
+ "bmux_codec 0.0.1-alpha.1 (git+https://github.com/BSteffaniak/bmux.git?branch=master)",
+ "bmux_ipc 0.0.1-alpha.1 (git+https://github.com/BSteffaniak/bmux.git?branch=master)",
  "serde",
  "sha2 0.10.9",
  "thiserror 2.0.18",
@@ -1800,6 +1800,8 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_command",
  "bcode_plugin_sdk",
+ "bmux_plugin",
+ "bmux_plugin_sdk",
  "libloading 0.9.0",
  "semver",
  "serde",
@@ -1907,7 +1909,7 @@ dependencies = [
  "bcode_metrics",
  "bcode_session_models",
  "bcode_skill_models",
- "bmux_codec",
+ "bmux_codec 0.0.1-alpha.1 (git+https://github.com/BSteffaniak/bmux.git?branch=master)",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2264,11 +2266,27 @@ dependencies = [
 [[package]]
 name = "bmux_attach_image_protocol"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#50b9939f8fc06ed0a579c8b239dedc02cc882015"
 dependencies = [
- "bmux_codec",
+ "bmux_codec 0.0.1-alpha.1",
  "serde",
  "uuid",
+]
+
+[[package]]
+name = "bmux_attach_image_protocol"
+version = "0.0.1-alpha.1"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#50b9939f8fc06ed0a579c8b239dedc02cc882015"
+dependencies = [
+ "bmux_codec 0.0.1-alpha.1 (git+https://github.com/BSteffaniak/bmux.git?branch=master)",
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_codec"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -2282,10 +2300,23 @@ dependencies = [
 [[package]]
 name = "bmux_ipc"
 version = "0.0.1-alpha.1"
+dependencies = [
+ "bmux_attach_image_protocol 0.0.1-alpha.1",
+ "bmux_codec 0.0.1-alpha.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_ipc"
+version = "0.0.1-alpha.1"
 source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#50b9939f8fc06ed0a579c8b239dedc02cc882015"
 dependencies = [
- "bmux_attach_image_protocol",
- "bmux_codec",
+ "bmux_attach_image_protocol 0.0.1-alpha.1 (git+https://github.com/BSteffaniak/bmux.git?branch=master)",
+ "bmux_codec 0.0.1-alpha.1 (git+https://github.com/BSteffaniak/bmux.git?branch=master)",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2299,6 +2330,61 @@ version = "0.0.1-alpha.1"
 source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#50b9939f8fc06ed0a579c8b239dedc02cc882015"
 dependencies = [
  "crossterm",
+]
+
+[[package]]
+name = "bmux_perf_telemetry"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "bmux_plugin"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "bmux_ipc 0.0.1-alpha.1",
+ "bmux_perf_telemetry",
+ "bmux_plugin_runtime",
+ "bmux_plugin_sdk",
+ "libloading 0.9.0",
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+ "unicode-width 0.2.2",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_plugin_runtime"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "bmux_plugin_sdk"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "bmux_codec 0.0.1-alpha.1",
+ "bmux_ipc 0.0.1-alpha.1",
+ "bmux_perf_telemetry",
+ "bmux_plugin_runtime",
+ "nanoid",
+ "serde",
+ "serde_json",
+ "switchy",
+ "thiserror 2.0.18",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -5979,6 +6065,15 @@ checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
 dependencies = [
  "num-traits",
  "pxfm",
+]
+
+[[package]]
+name = "nanoid"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ffa00dec017b5b1a8b7cf5e2c008bfda1aa7e0697ac1508b491fdf2622fb4d8"
+dependencies = [
+ "rand 0.8.5",
 ]
 
 [[package]]

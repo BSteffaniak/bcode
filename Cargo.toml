@@ -139,6 +139,8 @@ bmux_codec = { default-features = false, features = [
 ], git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 bmux_ipc = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 bmux_keyboard = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+bmux_plugin = { default-features = false, path = "/Volumes/ehdd/GitHub/wt-bmux/bmux-plugin-refinement/packages/plugin" }
+bmux_plugin_sdk = { default-features = false, path = "/Volumes/ehdd/GitHub/wt-bmux/bmux-plugin-refinement/packages/plugin-sdk" }
 bmux_terminal_grid = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 bmux_text_edit = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 bmux_tui = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }

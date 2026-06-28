@@ -2,6 +2,8 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+mod bmux_host_adapter;
+
 use bcode_plugin_sdk::tui::PluginTuiRegistry;
 use bcode_plugin_sdk::{
     CURRENT_PLUGIN_ABI_VERSION, CommandRegistrationCallback, DEFAULT_NATIVE_ACTIVATE_SYMBOL,
@@ -12,6 +14,9 @@ use bcode_plugin_sdk::{
     SERVICE_STATUS_OK, ServiceEventCallback, ServiceRequest, StaticPluginVtable,
 };
 pub use bcode_plugin_sdk::{ServiceError, ServiceResponse};
+pub use bmux_host_adapter::{
+    BcodeHostCapabilityMap, BcodePluginRuntimeMode, BmuxHostPluginAdapter,
+};
 use libloading::Library;
 use semver::Version;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
