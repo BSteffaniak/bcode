@@ -761,8 +761,7 @@ pub struct ToolPresentationField {
 }
 
 /// Generic UI presentation hint for request argument fields.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ToolPresentationFieldKind {
     #[default]
     Text,
@@ -773,6 +772,70 @@ pub enum ToolPresentationFieldKind {
     Count,
     DurationMs,
     Json,
+}
+
+impl ToolPresentationFieldKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Path => "path",
+            Self::Url => "url",
+            Self::Command => "command",
+            Self::Boolean => "boolean",
+            Self::Count => "count",
+            Self::DurationMs => "duration_ms",
+            Self::Json => "json",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "text" => Some(Self::Text),
+            "path" => Some(Self::Path),
+            "url" => Some(Self::Url),
+            "command" => Some(Self::Command),
+            "boolean" => Some(Self::Boolean),
+            "count" => Some(Self::Count),
+            "duration_ms" => Some(Self::DurationMs),
+            "json" => Some(Self::Json),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for ToolPresentationFieldKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolPresentationFieldKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).ok_or_else(|| {
+            serde::de::Error::unknown_variant(
+                &value,
+                &[
+                    "text",
+                    "path",
+                    "url",
+                    "command",
+                    "boolean",
+                    "count",
+                    "duration_ms",
+                    "json",
+                ],
+            )
+        })
+    }
 }
 
 /// Plugin-owned presentation update for a running tool invocation.
