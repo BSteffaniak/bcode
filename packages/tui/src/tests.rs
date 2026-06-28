@@ -2087,7 +2087,7 @@ fn transcript_renders_shell_output_with_ansi_and_limits() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("Terminal · shell.run · ok · exit 0"));
+    assert!(output.contains("Terminal · shell.run · exit 0"));
     assert!(output.contains("exit 0"));
     assert!(!output.contains("line 0"));
     assert!(output.contains("line 39"));
@@ -2147,8 +2147,8 @@ fn transcript_renders_terminal_shell_output_without_unbounded_row_request() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("Terminal · shell.run · ok · exit 0"));
-    assert!(output.contains("terminal: 80x10"));
+    assert!(output.contains("Terminal · shell.run · exit 0"));
+    assert!(!output.contains("terminal: 80x10"));
     assert!(!output.contains("line 0"));
     assert!(output.contains("line 12"));
     assert!(output.contains("line 39"));
@@ -2283,9 +2283,9 @@ fn streamed_terminal_output_renders_running_until_final_result() {
     let output = rendered_text(&buffer);
 
     assert!(output.contains("Terminal · shell.run · running"));
-    assert!(output.contains("running ·"));
-    assert!(output.contains(" · terminal"));
-    assert!(!output.contains("exit code 0 · terminal"));
+    assert!(output.contains("running"));
+    assert!(!output.contains(" · terminal"));
+    assert!(!output.contains("exit 0"));
 }
 
 #[test]
@@ -2417,8 +2417,8 @@ fn streamed_terminal_output_updates_header_after_final_result() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("Terminal · shell.run · failed · exit 2"));
-    assert!(output.contains("exit code 2 · terminal"));
+    assert!(output.contains("Terminal · shell.run · exit 2"));
+    assert!(output.contains("exit 2"));
     assert!(!output.contains("Terminal · shell.run · running"));
 }
 
@@ -3520,13 +3520,11 @@ fn streamed_terminal_output_renders_finished_elapsed_duration() {
     let output = rendered_text(&buffer);
 
     assert!(
-        output.contains("Terminal · shell.run · ok · exit 7 · 1.5s · timed out"),
+        output.contains("Terminal · shell.run · timed out · duration 1.5s"),
         "{output}"
     );
-    assert!(
-        output.contains("exit code 7 · 1.5s · terminal · timed out"),
-        "{output}"
-    );
+    assert!(output.contains("timed out · duration 1.5s"), "{output}");
+    assert!(!output.contains("terminal: 120x40"), "{output}");
 }
 
 fn streamed_terminal_tool_events(session_id: SessionId) -> Vec<SessionEvent> {

@@ -1476,23 +1476,26 @@ fn terminal_title(
 ) -> String {
     let status = if streaming || timed_out.is_none() {
         "running".to_owned()
+    } else if timed_out == Some(true) {
+        "timed out".to_owned()
     } else if let Some(code) = exit_code {
-        let outcome = if is_error { "failed" } else { "ok" };
-        format!("{outcome} · exit {code}")
+        format!("exit {code}")
+    } else if is_error {
+        "signal".to_owned()
     } else {
-        let outcome = if is_error { "failed" } else { "ok" };
-        format!("{outcome} · signal")
+        "completed".to_owned()
     };
-    let elapsed = format_elapsed_millis(started_at_ms, finished_at_ms)
-        .map(|elapsed| format!(" · {elapsed}"))
-        .unwrap_or_default();
-    let timeout = timed_out
-        .filter(|timed_out| *timed_out)
-        .map(|_| " · timed out".to_owned())
+    let timing_label = if streaming || timed_out.is_none() {
+        "elapsed"
+    } else {
+        "duration"
+    };
+    let timing = format_elapsed_millis(started_at_ms, finished_at_ms)
+        .map(|elapsed| format!(" · {timing_label} {elapsed}"))
         .unwrap_or_default();
     tool_name.map_or_else(
-        || format!("Terminal · {status}{elapsed}{timeout}"),
-        |name| format!("Terminal · {name} · {status}{elapsed}{timeout}"),
+        || format!("Terminal · {status}{timing}"),
+        |name| format!("Terminal · {name} · {status}{timing}"),
     )
 }
 
@@ -2122,14 +2125,6 @@ fn push_terminal_output_rows(rows: &mut Vec<Line>, output: &TerminalOutputTransc
         terminal_status_style(output),
         muted_style(),
     );
-    push_wrapped_styled_text(
-        rows,
-        vec![Span::styled("  ", muted_style())],
-        &format!("terminal: {}x{}", output.columns, output.rows),
-        width,
-        muted_style(),
-        muted_style(),
-    );
     if output.output_truncated {
         push_wrapped_styled_text(
             rows,
@@ -2269,19 +2264,26 @@ const fn ansi_indexed_color(index: u8) -> Color {
 }
 
 fn terminal_status(output: &TerminalOutputTranscript) -> String {
-    let elapsed = output
+    let timing_label = if output.timed_out.is_some() {
+        "duration"
+    } else {
+        "elapsed"
+    };
+    let timing = output
         .elapsed
         .as_ref()
-        .map(|elapsed| format!(" · {elapsed}"))
+        .map(|elapsed| format!(" · {timing_label} {elapsed}"))
         .unwrap_or_default();
     let Some(timed_out) = output.timed_out else {
-        return format!("running{elapsed} · terminal");
+        return format!("running{timing}");
     };
+    if timed_out {
+        return format!("timed out{timing}");
+    }
     let exit_code = output
         .exit_code
-        .map_or_else(|| "signal".to_owned(), |code| code.to_string());
-    let timeout = if timed_out { " · timed out" } else { "" };
-    format!("exit code {exit_code}{elapsed} · terminal{timeout}")
+        .map_or_else(|| "signal".to_owned(), |code| format!("exit {code}"));
+    format!("{exit_code}{timing}")
 }
 
 fn terminal_status_style(output: &TerminalOutputTranscript) -> Style {
