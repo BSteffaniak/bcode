@@ -1703,6 +1703,39 @@ pub struct ToolsConfig {
     #[config_doc(nested)]
     #[serde(default)]
     pub shell: ShellToolConfig,
+    /// Question/ask tool configuration.
+    #[config_doc(nested)]
+    #[serde(default)]
+    pub question: QuestionToolConfig,
+}
+
+/// Question/ask tool configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "question")]
+pub struct QuestionToolConfig {
+    /// Whether the bundled question tool should be available.
+    #[serde(default = "default_question_enabled")]
+    pub enabled: bool,
+    /// Prompt steering level for asking questions, from 1 (rarely ask) to 10 (ask proactively).
+    #[serde(default = "default_question_ask_aggressiveness")]
+    pub ask_aggressiveness: u8,
+}
+
+impl Default for QuestionToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_question_enabled(),
+            ask_aggressiveness: default_question_ask_aggressiveness(),
+        }
+    }
+}
+
+const fn default_question_enabled() -> bool {
+    true
+}
+
+const fn default_question_ask_aggressiveness() -> u8 {
+    5
 }
 
 /// Shell tool configuration.

@@ -30,6 +30,8 @@ build_tools = [
     "document.extract",
     "ocr.extract",
     "ocr.status",
+    "question",
+    "ask",
 ]
 plan_disabled_tools = ["filesystem.write", "filesystem.edit"]
 

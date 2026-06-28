@@ -31,6 +31,7 @@ bcode_openai_compatible_provider_plugin = { workspace = true, optional = true }
 bcode_opencode_session_import_plugin    = { workspace = true, optional = true }
 bcode_pi_session_import_plugin          = { workspace = true, optional = true }
 bcode_plugin                            = { workspace = true }
+bcode_question_plugin                   = { workspace = true, optional = true }
 bcode_shell_plugin                      = { workspace = true, optional = true }
 bcode_skills_plugin                     = { workspace = true, optional = true }
 bcode_web_search_plugin                 = { workspace = true, optional = true }
@@ -132,11 +133,17 @@ static-bundled-plugins = [
     "static-bundled-openai-compatible-provider-plugin",
     "static-bundled-opencode-session-import-plugin",
     "static-bundled-pi-session-import-plugin",
+    "static-bundled-question-plugin",
     "static-bundled-ralph-plugin",
     "static-bundled-shell-plugin",
     "static-bundled-skills-plugin",
     "static-bundled-web-search-plugin",
     "static-bundled-worktree-plugin",
+]
+static-bundled-question-plugin = [
+    "_static-bundled",
+    "dep:bcode_question_plugin",
+    "bcode_question_plugin/static-bundled",
 ]
 static-bundled-ralph-plugin = [
     "_static-bundled",

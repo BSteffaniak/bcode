@@ -1,0 +1,15 @@
+id      = "bcode.question"
+name    = "Bcode Question Tool"
+version = "0.0.1"
+
+[[services]]
+description  = "Interactive read-only question/ask tool"
+interface_id = "bcode.tool/v1"
+name         = "Question Tool"
+
+[runtime]
+abi_version    = 1
+event_symbol   = "bcode_plugin_handle_event_v1"
+library        = "libbcode_question_plugin.dylib"
+service_symbol = "bcode_plugin_invoke_service_v1"
+type           = "native"

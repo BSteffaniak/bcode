@@ -1276,6 +1276,7 @@ dependencies = [
  "bcode_opencode_session_import_plugin",
  "bcode_pi_session_import_plugin",
  "bcode_plugin",
+ "bcode_question_plugin",
  "bcode_shell_plugin",
  "bcode_skills_plugin",
  "bcode_web_search_plugin",
@@ -1836,6 +1837,16 @@ dependencies = [
  "sha2 0.10.9",
  "ssh-key",
  "sshenv_vault",
+]
+
+[[package]]
+name = "bcode_question_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_plugin_sdk",
+ "bcode_tool",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

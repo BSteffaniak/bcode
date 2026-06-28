@@ -712,6 +712,27 @@ pub struct ToolInvocationResponse {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolInvocationHostAction {
     HostModelNativeWebSearch(HostModelNativeWebSearchRequest),
+    InteractiveToolRequest(InteractiveToolRequest),
+}
+
+/// Generic request for host-owned interactive tool UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractiveToolRequest {
+    pub surface_kind: String,
+    #[serde(default)]
+    pub request: serde_json::Value,
+    #[serde(default)]
+    pub await_outcome: bool,
+    #[serde(default)]
+    pub render_target: InteractiveToolRenderTarget,
+}
+
+/// Host render target for an interactive tool request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractiveToolRenderTarget {
+    #[default]
+    TranscriptToolCall,
 }
 
 /// Host-side model-native web search request.

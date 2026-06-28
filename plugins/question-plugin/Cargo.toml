@@ -1,0 +1,25 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "interactive question tool plugin for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "question", "tool", "plugin"]
+license     = { workspace = true }
+name        = "bcode_question_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bcode_plugin_sdk = { workspace = true }
+bcode_tool       = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
+static-bundled   = []

@@ -13181,10 +13181,14 @@ async fn invoke_model_tool(
     tool_output_publisher.finish(state, session_id).await;
     let response: ToolInvocationResponse =
         bcode_plugin::decode_service_response(response).map_err(|error| error.to_string())?;
-    if let Some(bcode_tool::ToolInvocationHostAction::HostModelNativeWebSearch(request)) =
-        response.host_action
-    {
-        return invoke_host_provider_native_search(state, session_id, &call.id, request).await;
+    if let Some(host_action) = response.host_action.clone() {
+        match host_action {
+            bcode_tool::ToolInvocationHostAction::HostModelNativeWebSearch(request) => {
+                return invoke_host_provider_native_search(state, session_id, &call.id, request)
+                    .await;
+            }
+            bcode_tool::ToolInvocationHostAction::InteractiveToolRequest(_) => {}
+        }
     }
     Ok(response)
 }

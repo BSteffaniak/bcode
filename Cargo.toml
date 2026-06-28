@@ -9,6 +9,7 @@ members = [
     "plugins/github-review-publisher-plugin",
     "plugins/document-plugin",
     "plugins/ocr-plugin",
+    "plugins/question-plugin",
     "plugins/bedrock-provider-plugin",
     "plugins/blims-plugin",
     "plugins/default-agents-plugin",
@@ -111,6 +112,7 @@ bcode_pi_session_import_plugin          = { version = "0.0.1-alpha.0", default-f
 bcode_plugin                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin" }
 bcode_plugin_sdk                        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-sdk" }
 bcode_provider_auth                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/provider-auth" }
+bcode_question_plugin                   = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/question-plugin" }
 bcode_ralph                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ralph" }
 bcode_ralph_plugin                      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/ralph-plugin" }
 bcode_server                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/server" }
