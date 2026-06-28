@@ -1,7 +1,9 @@
 //! Tool-call presentation models for transcript rendering.
 
-use bcode_session_models::ToolRequestPresentationMetadata;
+use bcode_session_models::{ToolPresentationFieldKind, ToolRequestPresentationMetadata};
 use serde_json::Value;
+
+use crate::time_format::format_millis;
 
 /// Human-readable presentation for a tool request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9,7 +11,18 @@ pub struct ToolRequestPresentation {
     /// Human-readable title.
     pub title: String,
     /// Labeled detail fields.
-    pub fields: Vec<(String, String)>,
+    pub fields: Vec<ToolRequestPresentationField>,
+}
+
+/// Human-readable presentation field for a tool request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolRequestPresentationField {
+    /// Human-readable field label.
+    pub label: String,
+    /// Human-readable field value.
+    pub value: String,
+    /// Semantic field kind used for generic formatting.
+    pub kind: ToolPresentationFieldKind,
 }
 
 /// Human-readable presentation for shell results that were already parsed into semantic data.
@@ -55,8 +68,12 @@ fn metadata_request_presentation(
         .iter()
         .filter_map(|field| {
             let argument = value.get(&field.argument)?;
-            let rendered = render_metadata_value(argument);
-            (!rendered.is_empty()).then(|| (field.label.clone(), rendered))
+            let rendered = render_metadata_value(argument, field.kind);
+            (!rendered.is_empty()).then(|| ToolRequestPresentationField {
+                label: field.label.clone(),
+                value: rendered,
+                kind: field.kind,
+            })
         })
         .collect::<Vec<_>>();
     Some(ToolRequestPresentation {
@@ -65,7 +82,12 @@ fn metadata_request_presentation(
     })
 }
 
-fn render_metadata_value(value: &Value) -> String {
+fn render_metadata_value(value: &Value, kind: ToolPresentationFieldKind) -> String {
+    if kind == ToolPresentationFieldKind::DurationMs
+        && let Some(ms) = duration_millis(value)
+    {
+        return format_millis(ms);
+    }
     match value {
         Value::Null => String::new(),
         Value::Bool(value) => value.to_string(),
@@ -74,5 +96,13 @@ fn render_metadata_value(value: &Value) -> String {
         Value::Array(_) | Value::Object(_) => {
             serde_json::to_string_pretty(value).unwrap_or_default()
         }
+    }
+}
+
+fn duration_millis(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(value) => value.trim().parse::<u64>().ok(),
+        Value::Null | Value::Bool(_) | Value::Array(_) | Value::Object(_) => None,
     }
 }

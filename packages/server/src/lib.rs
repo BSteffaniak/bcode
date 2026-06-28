@@ -13464,6 +13464,21 @@ const fn convert_tool_presentation_level(
     }
 }
 
+const fn convert_tool_presentation_field_kind(
+    kind: ServiceToolPresentationFieldKind,
+) -> ToolPresentationFieldKind {
+    match kind {
+        ServiceToolPresentationFieldKind::Text => ToolPresentationFieldKind::Text,
+        ServiceToolPresentationFieldKind::Path => ToolPresentationFieldKind::Path,
+        ServiceToolPresentationFieldKind::Url => ToolPresentationFieldKind::Url,
+        ServiceToolPresentationFieldKind::Command => ToolPresentationFieldKind::Command,
+        ServiceToolPresentationFieldKind::Boolean => ToolPresentationFieldKind::Boolean,
+        ServiceToolPresentationFieldKind::Count => ToolPresentationFieldKind::Count,
+        ServiceToolPresentationFieldKind::DurationMs => ToolPresentationFieldKind::DurationMs,
+        ServiceToolPresentationFieldKind::Json => ToolPresentationFieldKind::Json,
+    }
+}
+
 fn convert_tool_presentation_section(
     section: ServiceToolPresentationSection,
 ) -> ToolPresentationSection {
@@ -13477,6 +13492,7 @@ fn convert_tool_presentation_section(
                 .map(|field| ToolPresentationFieldValue {
                     label: field.label,
                     value: field.value,
+                    kind: convert_tool_presentation_field_kind(field.kind),
                 })
                 .collect(),
         },

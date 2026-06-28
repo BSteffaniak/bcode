@@ -410,10 +410,11 @@ pub struct ToolPresentationField {
 }
 
 /// Generic UI presentation hint for request argument fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolPresentationFieldKind {
     /// Plain text value.
+    #[default]
     Text,
     /// File or directory path value.
     Path,
@@ -604,6 +605,8 @@ pub enum ToolPresentationSection {
 pub struct ToolPresentationFieldValue {
     pub label: String,
     pub value: String,
+    #[serde(default)]
+    pub kind: ToolPresentationFieldKind,
 }
 
 const fn default_presentation_level() -> ToolPresentationLevel {

@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use bcode_config::TuiInlineDiffConfig;
 use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
 use bcode_session_models::{
-    LiveFileEditPreview, LiveToolArgumentPreview, ToolCardPresentation, ToolPresentationLevel,
-    ToolPresentationSection,
+    LiveFileEditPreview, LiveToolArgumentPreview, ToolCardPresentation, ToolPresentationFieldKind,
+    ToolPresentationLevel, ToolPresentationSection,
 };
 use bcode_syntax_render::{SyntaxHighlighter, SyntaxStyle};
 use bmux_terminal_grid::{
@@ -35,7 +35,7 @@ use super::pending_submission::{PendingSubmission, PendingSubmissionState};
 use super::tool_present::{ToolRequestPresentation, tool_request_presentation};
 use super::transcript::{FileEditPhase, TranscriptItem, TranscriptItemKind};
 use super::transcript_layout::TranscriptLayoutSignature;
-use crate::time_format::format_elapsed_millis;
+use crate::time_format::{format_elapsed_millis, format_millis};
 use bmux_tui::text_width::{display_width as text_display_width, truncate_to_display_width};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -862,7 +862,12 @@ fn push_tool_presentation_card_rows(
         match section {
             ToolPresentationSection::Fields { fields } => {
                 for field in fields {
-                    push_kv_row(rows, &field.label, &field.value, width);
+                    push_kv_row(
+                        rows,
+                        &field.label,
+                        &format_presentation_field_value(&field.value, field.kind),
+                        width,
+                    );
                 }
             }
             ToolPresentationSection::Text { label, text } => {
@@ -1572,9 +1577,22 @@ fn push_tool_request_presentation_rows(
     presentation: &ToolRequestPresentation,
     width: u16,
 ) {
-    for (label, value) in &presentation.fields {
-        push_kv_row(rows, label, value, width);
+    for field in &presentation.fields {
+        push_kv_row(rows, &field.label, &field.value, width);
     }
+}
+
+fn format_presentation_field_value(value: &str, kind: ToolPresentationFieldKind) -> String {
+    if kind == ToolPresentationFieldKind::DurationMs
+        && let Some(ms) = parse_duration_millis(value)
+    {
+        return format_millis(ms);
+    }
+    value.to_owned()
+}
+
+fn parse_duration_millis(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok()
 }
 
 fn push_file_edit_preview_rows(

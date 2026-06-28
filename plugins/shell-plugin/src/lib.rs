@@ -386,22 +386,26 @@ fn shell_presentation_fields(arguments: &ShellRunArguments) -> Vec<ToolPresentat
     let mut fields = vec![ToolPresentationFieldValue {
         label: "Command".to_string(),
         value: arguments.command.clone(),
+        kind: ToolPresentationFieldKind::Text,
     }];
     if let Some(cwd) = &arguments.cwd {
         fields.push(ToolPresentationFieldValue {
             label: "CWD".to_string(),
             value: cwd.display().to_string(),
+            kind: ToolPresentationFieldKind::Text,
         });
     }
     if let Some(timeout_ms) = arguments.timeout_ms {
         fields.push(ToolPresentationFieldValue {
             label: "Timeout".to_string(),
-            value: format!("{timeout_ms} ms"),
+            value: timeout_ms.to_string(),
+            kind: ToolPresentationFieldKind::DurationMs,
         });
     }
     fields.push(ToolPresentationFieldValue {
         label: "Terminal".to_string(),
         value: arguments.terminal.to_string(),
+        kind: ToolPresentationFieldKind::Text,
     });
     fields
 }
@@ -419,6 +423,7 @@ fn shell_result_card(
             "completed"
         }
         .to_string(),
+        kind: ToolPresentationFieldKind::Text,
     });
     let mut sections = Vec::new();
     if let Some(ToolInvocationResult::ShellRun { result }) = &response.result {
@@ -437,6 +442,10 @@ fn shell_result_card(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "shell result presentation mirrors the two shell result variants"
+)]
 fn extend_shell_result_presentation(
     result: &ShellRunResult,
     fields: &mut Vec<ToolPresentationFieldValue>,
@@ -466,26 +475,31 @@ fn extend_shell_result_presentation(
             fields.push(ToolPresentationFieldValue {
                 label: "Output truncated".to_string(),
                 value: output_truncated.to_string(),
+                kind: ToolPresentationFieldKind::Text,
             });
             if let Some(output_bytes) = output_bytes {
                 fields.push(ToolPresentationFieldValue {
                     label: "Output bytes".to_string(),
                     value: output_bytes.to_string(),
+                    kind: ToolPresentationFieldKind::Text,
                 });
             }
             if let Some(retained_output_bytes) = retained_output_bytes {
                 fields.push(ToolPresentationFieldValue {
                     label: "Retained output bytes".to_string(),
                     value: retained_output_bytes.to_string(),
+                    kind: ToolPresentationFieldKind::Text,
                 });
             }
             fields.push(ToolPresentationFieldValue {
                 label: "Columns".to_string(),
                 value: columns.to_string(),
+                kind: ToolPresentationFieldKind::Text,
             });
             fields.push(ToolPresentationFieldValue {
                 label: "Rows".to_string(),
                 value: rows.to_string(),
+                kind: ToolPresentationFieldKind::Text,
             });
             if !output_tail.is_empty() {
                 sections.push(ToolPresentationSection::Terminal {
@@ -518,21 +532,25 @@ fn extend_shell_result_presentation(
             fields.push(ToolPresentationFieldValue {
                 label: "Stdout truncated".to_string(),
                 value: stdout_truncated.to_string(),
+                kind: ToolPresentationFieldKind::Text,
             });
             fields.push(ToolPresentationFieldValue {
                 label: "Stderr truncated".to_string(),
                 value: stderr_truncated.to_string(),
+                kind: ToolPresentationFieldKind::Text,
             });
             if let Some(stdout_bytes) = stdout_bytes {
                 fields.push(ToolPresentationFieldValue {
                     label: "Stdout bytes".to_string(),
                     value: stdout_bytes.to_string(),
+                    kind: ToolPresentationFieldKind::Text,
                 });
             }
             if let Some(stderr_bytes) = stderr_bytes {
                 fields.push(ToolPresentationFieldValue {
                     label: "Stderr bytes".to_string(),
                     value: stderr_bytes.to_string(),
+                    kind: ToolPresentationFieldKind::Text,
                 });
             }
             push_shell_text_section(sections, "stdout", stdout, *stdout_truncated);
@@ -570,21 +588,25 @@ fn push_shell_common_result_fields(
     fields.push(ToolPresentationFieldValue {
         label: "Exit code".to_string(),
         value: exit_code.map_or_else(|| "unknown".to_string(), |code| code.to_string()),
+        kind: ToolPresentationFieldKind::Text,
     });
     fields.push(ToolPresentationFieldValue {
         label: "Timed out".to_string(),
         value: timed_out.to_string(),
+        kind: ToolPresentationFieldKind::Text,
     });
     fields.push(ToolPresentationFieldValue {
         label: "Cancelled".to_string(),
         value: cancelled.to_string(),
+        kind: ToolPresentationFieldKind::Text,
     });
     fields.push(ToolPresentationFieldValue {
         label: "Duration".to_string(),
         value: duration_ms.map_or_else(
             || "unknown".to_string(),
-            |duration_ms| format!("{duration_ms} ms"),
+            |duration_ms| duration_ms.to_string(),
         ),
+        kind: ToolPresentationFieldKind::DurationMs,
     });
 }
 

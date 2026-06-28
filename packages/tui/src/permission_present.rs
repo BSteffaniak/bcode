@@ -53,7 +53,7 @@ pub fn permission_presentation(
             details: presentation
                 .fields
                 .into_iter()
-                .map(|(label, value)| PermissionDetail::new(label, value))
+                .map(|field| PermissionDetail::new(field.label, field.value))
                 .collect(),
             raw_details: None,
         };
@@ -73,11 +73,18 @@ fn generic_json_details(arguments_json: &str) -> Vec<PermissionDetail> {
     };
     object
         .into_iter()
-        .map(|(label, value)| PermissionDetail::new(label, display_json_value(&value)))
+        .map(|(label, value)| {
+            PermissionDetail::new(label.clone(), display_json_value(&label, &value))
+        })
         .collect()
 }
 
-fn display_json_value(value: &Value) -> String {
+fn display_json_value(label: &str, value: &Value) -> String {
+    if is_duration_or_timeout_label(label)
+        && let Some(ms) = duration_millis(value)
+    {
+        return crate::time_format::format_millis(ms);
+    }
     match value {
         Value::Null => "null".to_owned(),
         Value::Bool(value) => value.to_string(),
@@ -87,6 +94,19 @@ fn display_json_value(value: &Value) -> String {
             serde_json::to_string_pretty(value).unwrap_or_default()
         }
     }
+}
+
+fn duration_millis(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(value) => value.trim().parse::<u64>().ok(),
+        Value::Null | Value::Bool(_) | Value::Array(_) | Value::Object(_) => None,
+    }
+}
+
+fn is_duration_or_timeout_label(label: &str) -> bool {
+    let label = label.to_ascii_lowercase();
+    label.contains("duration") || label.contains("timeout") || label.ends_with("_ms")
 }
 
 #[cfg(test)]
@@ -101,17 +121,25 @@ mod tests {
     fn metadata_permission_uses_declared_fields() {
         let metadata = ToolRequestPresentationMetadata {
             title: "Run command".to_string(),
-            fields: vec![ToolPresentationField {
-                label: "command".to_string(),
-                argument: "command".to_string(),
-                kind: ToolPresentationFieldKind::Command,
-                optional: false,
-            }],
+            fields: vec![
+                ToolPresentationField {
+                    label: "command".to_string(),
+                    argument: "command".to_string(),
+                    kind: ToolPresentationFieldKind::Command,
+                    optional: false,
+                },
+                ToolPresentationField {
+                    label: "timeout".to_string(),
+                    argument: "timeout_ms".to_string(),
+                    kind: ToolPresentationFieldKind::DurationMs,
+                    optional: false,
+                },
+            ],
             preview: None,
         };
         let presentation = permission_presentation(
             "shell.run",
-            r#"{"command":"cargo check --workspace","cwd":"/repo"}"#,
+            r#"{"command":"cargo check --workspace","cwd":"/repo","timeout_ms":300000}"#,
             Some(&metadata),
         );
 
@@ -119,6 +147,8 @@ mod tests {
         assert_eq!(presentation.risk, "tool request");
         assert_eq!(presentation.details[0].label, "command");
         assert_eq!(presentation.details[0].value, "cargo check --workspace");
+        assert_eq!(presentation.details[1].label, "timeout");
+        assert_eq!(presentation.details[1].value, "5m");
     }
 
     #[test]

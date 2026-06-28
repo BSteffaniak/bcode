@@ -1078,10 +1078,12 @@ fn file_change_fields(path: &Path, summary: &str) -> ToolPresentationSection {
             ToolPresentationFieldValue {
                 label: "Path".to_string(),
                 value: path.display().to_string(),
+                kind: ToolPresentationFieldKind::Path,
             },
             ToolPresentationFieldValue {
                 label: "Summary".to_string(),
                 value: summary.to_string(),
+                kind: ToolPresentationFieldKind::Text,
             },
         ],
     }

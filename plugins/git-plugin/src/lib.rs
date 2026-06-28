@@ -55,6 +55,7 @@ fn git_field(label: &str, value: &impl ToString) -> ToolPresentationFieldValue {
     ToolPresentationFieldValue {
         label: label.to_string(),
         value: value.to_string(),
+        kind: ToolPresentationFieldKind::Text,
     }
 }
 

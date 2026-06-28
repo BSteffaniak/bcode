@@ -4041,10 +4041,23 @@ fn presentation_card_sections_render_for_custom_tool_without_name_special_case()
                                 text: "Rendered from plugin presentation".to_owned(),
                             },
                             ToolPresentationSection::Fields {
-                                fields: vec![ToolPresentationFieldValue {
-                                    label: "Answer".to_owned(),
-                                    value: "42".to_owned(),
-                                }],
+                                fields: vec![
+                                    ToolPresentationFieldValue {
+                                        label: "Answer".to_owned(),
+                                        value: "42".to_owned(),
+                                        kind: ToolPresentationFieldKind::Text,
+                                    },
+                                    ToolPresentationFieldValue {
+                                        label: "Timeout".to_owned(),
+                                        value: "300000".to_owned(),
+                                        kind: ToolPresentationFieldKind::DurationMs,
+                                    },
+                                    ToolPresentationFieldValue {
+                                        label: "Malformed timeout".to_owned(),
+                                        value: "300000 ms".to_owned(),
+                                        kind: ToolPresentationFieldKind::DurationMs,
+                                    },
+                                ],
                             },
                         ],
                     },
@@ -4066,6 +4079,8 @@ fn presentation_card_sections_render_for_custom_tool_without_name_special_case()
         "{output}"
     );
     assert!(output.contains("Answer: 42"), "{output}");
+    assert!(output.contains("Timeout: 5m"), "{output}");
+    assert!(output.contains("Malformed timeout: 300000 ms"), "{output}");
 }
 
 #[test]
