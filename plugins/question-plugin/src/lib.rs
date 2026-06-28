@@ -6,9 +6,10 @@
 
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
-    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID,
-    ToolCompatibilityAlias, ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationResult, ToolList, ToolPolicyMetadata, ToolSideEffect,
+    InteractiveToolResolution, InteractiveToolResumeRequest, ListToolsRequest, OP_INVOKE_TOOL,
+    OP_LIST_TOOLS, OP_RESUME_INTERACTIVE_TOOL, TOOL_SERVICE_INTERFACE_ID, ToolCompatibilityAlias,
+    ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolList,
+    ToolPolicyMetadata, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -20,12 +21,12 @@ const DEFAULT_ASK_AGGRESSIVENESS: u8 = 5;
 #[derive(Debug, Default)]
 struct QuestionPlugin;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct NormalizedQuestionRequest {
     questions: Vec<Question>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Question {
     header: Option<String>,
     #[serde(rename = "question")]
@@ -38,7 +39,7 @@ struct Question {
     required: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct QuestionOption {
     label: String,
     value: Option<String>,
@@ -75,6 +76,7 @@ struct QuestionToolOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum QuestionRequestStatus {
+    Answered,
     Unanswered,
 }
 
@@ -92,7 +94,29 @@ struct QuestionOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum QuestionStatus {
+    Answered,
     Unanswered,
+    Dismissed,
+    Aborted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+enum QuestionResolutionPayload {
+    Answered {
+        questions: Vec<QuestionAnswerPayload>,
+    },
+    Unanswered,
+    Dismissed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct QuestionAnswerPayload {
+    question_index: usize,
+    #[serde(default)]
+    selected: Vec<String>,
+    #[serde(default)]
+    custom: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -117,6 +141,7 @@ fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
     match context.request.operation.as_str() {
         OP_LIST_TOOLS => list_tools(&context.request),
         OP_INVOKE_TOOL => invoke_tool(context),
+        OP_RESUME_INTERACTIVE_TOOL => resume_interactive_tool(&context.request),
         _ => ServiceResponse::error(
             "unsupported_operation",
             "unsupported question tool service operation",
@@ -244,24 +269,224 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
     })
 }
 
+fn resume_interactive_tool(request: &ServiceRequest) -> ServiceResponse {
+    let resume = match request.payload_json::<InteractiveToolResumeRequest>() {
+        Ok(resume) => resume,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    let question_request = match serde_json::from_value::<NormalizedQuestionRequest>(
+        resume.interactive_request.request.clone(),
+    ) {
+        Ok(request) => request,
+        Err(error) => return json_response(&tool_error(error.to_string())),
+    };
+    let outcome = match question_outcome_from_resolution(&question_request, resume.resolution) {
+        Ok(outcome) => outcome,
+        Err(error) => return json_response(&tool_error(error)),
+    };
+    json_response(&question_response(&outcome))
+}
+
+fn question_outcome_from_resolution(
+    request: &NormalizedQuestionRequest,
+    resolution: InteractiveToolResolution,
+) -> Result<QuestionToolOutcome, String> {
+    match resolution {
+        InteractiveToolResolution::Submitted { payload } => {
+            let payload = serde_json::from_value::<QuestionResolutionPayload>(payload)
+                .map_err(|error| format!("invalid question response payload: {error}"))?;
+            Ok(match payload {
+                QuestionResolutionPayload::Answered { questions } => {
+                    answered_outcome(request, questions)?
+                }
+                QuestionResolutionPayload::Unanswered => unanswered_outcome(request),
+                QuestionResolutionPayload::Dismissed => dismissed_outcome(request),
+            })
+        }
+        InteractiveToolResolution::Aborted { reason, message } => {
+            Ok(aborted_outcome(request, reason, message))
+        }
+    }
+}
+
+fn question_response(outcome: &QuestionToolOutcome) -> ToolInvocationResponse {
+    let output = format_question_outcome_output(outcome);
+    let value = serde_json::to_string(&outcome)
+        .unwrap_or_else(|error| json!({"status":"error","error":error.to_string()}).to_string());
+    ToolInvocationResponse {
+        output,
+        is_error: false,
+        content: Vec::new(),
+        full_output: Some(value.clone()),
+        host_action: None,
+        result: Some(ToolInvocationResult::Json { value }),
+    }
+}
+
+fn answered_outcome(
+    request: &NormalizedQuestionRequest,
+    answers: Vec<QuestionAnswerPayload>,
+) -> Result<QuestionToolOutcome, String> {
+    let answers = answers
+        .into_iter()
+        .map(|answer| (answer.question_index, answer))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut questions = Vec::new();
+    for (question_index, question) in request.questions.iter().enumerate() {
+        let Some(answer) = answers.get(&question_index) else {
+            if question.required {
+                return Err(format!(
+                    "required question {} was not answered",
+                    question_index.saturating_add(1)
+                ));
+            }
+            questions.push(question_outcome(
+                question_index,
+                question,
+                QuestionStatus::Unanswered,
+                Vec::new(),
+                None,
+            ));
+            continue;
+        };
+        let selected = selected_answers(question, &answer.selected);
+        let custom = answer
+            .custom
+            .clone()
+            .filter(|value| !value.trim().is_empty());
+        if question.required && selected.is_empty() && custom.is_none() {
+            return Err(format!(
+                "required question {} was not answered",
+                question_index.saturating_add(1)
+            ));
+        }
+        questions.push(question_outcome(
+            question_index,
+            question,
+            QuestionStatus::Answered,
+            selected,
+            custom,
+        ));
+    }
+    Ok(QuestionToolOutcome {
+        status: QuestionRequestStatus::Answered,
+        questions,
+    })
+}
+
+fn selected_answers(question: &Question, selected_values: &[String]) -> Vec<SelectedAnswer> {
+    selected_values
+        .iter()
+        .map(|selected| {
+            let option = question.options.iter().find(|option| {
+                option.value.as_ref().is_some_and(|value| value == selected)
+                    || option.label == *selected
+            });
+            SelectedAnswer {
+                label: option.map_or_else(|| selected.clone(), |option| option.label.clone()),
+                value: option
+                    .and_then(|option| option.value.clone())
+                    .unwrap_or_else(|| selected.clone()),
+            }
+        })
+        .collect()
+}
+
+fn dismissed_outcome(request: &NormalizedQuestionRequest) -> QuestionToolOutcome {
+    request_status_outcome(
+        request,
+        QuestionRequestStatus::Unanswered,
+        QuestionStatus::Dismissed,
+    )
+}
+
+fn aborted_outcome(
+    request: &NormalizedQuestionRequest,
+    _reason: bcode_tool::InteractiveToolAbortReason,
+    _message: Option<String>,
+) -> QuestionToolOutcome {
+    request_status_outcome(
+        request,
+        QuestionRequestStatus::Unanswered,
+        QuestionStatus::Aborted,
+    )
+}
+
+fn question_outcome(
+    question_index: usize,
+    question: &Question,
+    status: QuestionStatus,
+    selected: Vec<SelectedAnswer>,
+    custom: Option<String>,
+) -> QuestionOutcome {
+    QuestionOutcome {
+        question_index,
+        header: question.header.clone(),
+        question: question.text.clone(),
+        status,
+        selected,
+        custom,
+        required: question.required,
+    }
+}
+
 fn unanswered_outcome(request: &NormalizedQuestionRequest) -> QuestionToolOutcome {
+    request_status_outcome(
+        request,
+        QuestionRequestStatus::Unanswered,
+        QuestionStatus::Unanswered,
+    )
+}
+
+fn request_status_outcome(
+    request: &NormalizedQuestionRequest,
+    request_status: QuestionRequestStatus,
+    question_status: QuestionStatus,
+) -> QuestionToolOutcome {
     QuestionToolOutcome {
-        status: QuestionRequestStatus::Unanswered,
+        status: request_status,
         questions: request
             .questions
             .iter()
             .enumerate()
-            .map(|(question_index, question)| QuestionOutcome {
-                question_index,
-                header: question.header.clone(),
-                question: question.text.clone(),
-                status: QuestionStatus::Unanswered,
-                selected: Vec::new(),
-                custom: None,
-                required: question.required,
+            .map(|(question_index, question)| {
+                question_outcome(question_index, question, question_status, Vec::new(), None)
             })
             .collect(),
     }
+}
+
+fn format_question_outcome_output(outcome: &QuestionToolOutcome) -> String {
+    let mut output = format!("Question interaction completed: {:?}.", outcome.status);
+    for question in &outcome.questions {
+        let selected = if question.selected.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " selected=[{}]",
+                question
+                    .selected
+                    .iter()
+                    .map(|answer| answer.label.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let custom = question
+            .custom
+            .as_ref()
+            .map_or_else(String::new, |custom| format!(" custom={custom}"));
+        let _ = write!(
+            output,
+            "\n* {}. {:?}: {}{}{}",
+            question.question_index.saturating_add(1),
+            question.status,
+            question.question,
+            selected,
+            custom
+        );
+    }
+    output
 }
 
 fn format_unanswered_output(request: &NormalizedQuestionRequest, ask_aggressiveness: u8) -> String {

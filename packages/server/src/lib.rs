@@ -61,10 +61,10 @@ use bcode_skill_models::{
     SkillToolDecisionKey, SkillToolDecisionScope, SkillToolPolicyOutcome, SkillToolPolicyRequest,
 };
 use bcode_tool::{
-    InteractiveToolResolution, ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS,
-    ShellRunResult as ServiceShellRunResult, TOOL_SERVICE_INTERFACE_ID,
-    ToolDefinition as ServiceToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationResult as ServiceToolInvocationResult,
+    InteractiveToolResolution, InteractiveToolResumeRequest, ListToolsRequest, OP_INVOKE_TOOL,
+    OP_LIST_TOOLS, OP_RESUME_INTERACTIVE_TOOL, ShellRunResult as ServiceShellRunResult,
+    TOOL_SERVICE_INTERFACE_ID, ToolDefinition as ServiceToolDefinition, ToolInvocationRequest,
+    ToolInvocationResponse, ToolInvocationResult as ServiceToolInvocationResult,
     ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent, ToolList, ToolOutputStream,
     ToolPresentationEvent as ServiceToolPresentationEvent,
     ToolPresentationFieldKind as ServiceToolPresentationFieldKind,
@@ -12807,6 +12807,17 @@ async fn invoke_host_provider_native_search(
     })
 }
 
+fn tool_error(output: impl Into<String>) -> ToolInvocationResponse {
+    ToolInvocationResponse {
+        output: output.into(),
+        is_error: true,
+        content: Vec::new(),
+        full_output: None,
+        host_action: None,
+        result: None,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn execute_model_tool(
     state: &ServerState,
@@ -13289,10 +13300,104 @@ async fn invoke_model_tool(
                 return invoke_host_provider_native_search(state, session_id, &call.id, request)
                     .await;
             }
-            bcode_tool::ToolInvocationHostAction::InteractiveToolRequest(_) => {}
+            bcode_tool::ToolInvocationHostAction::InteractiveToolRequest(request) => {
+                return handle_interactive_tool_request(
+                    state,
+                    session_id,
+                    call,
+                    &plugin_id,
+                    request,
+                    cancel_state,
+                    command_context,
+                )
+                .await;
+            }
         }
     }
     Ok(response)
+}
+
+async fn handle_interactive_tool_request(
+    state: &ServerState,
+    session_id: SessionId,
+    call: &bcode_model::ToolCall,
+    plugin_id: &str,
+    request: bcode_tool::InteractiveToolRequest,
+    cancel_state: &TurnCancelState,
+    command_context: &mut RuntimeCommandContext<'_>,
+) -> Result<ToolInvocationResponse, String> {
+    if request.interaction_id.is_empty() {
+        return Ok(tool_error(
+            "interactive tool request missing interaction_id",
+        ));
+    }
+    if request.turn_behavior
+        == bcode_tool::InteractiveToolTurnBehavior::CompleteTurnWithPendingInteraction
+    {
+        return Ok(tool_error(
+            "interactive turn behavior not supported yet: complete_turn_with_pending_interaction",
+        ));
+    }
+
+    let pending = PendingInteractiveToolRequest {
+        summary: bcode_ipc::InteractiveToolRequestSummary {
+            interaction_id: request.interaction_id.clone(),
+            session_id,
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            surface_kind: request.surface_kind.clone(),
+            request: request.request.clone(),
+            required: request.required,
+            turn_behavior: interactive_turn_behavior_to_session(request.turn_behavior),
+            render_target: interactive_render_target_to_session(request.render_target),
+        },
+        resolution: Arc::new(Mutex::new(None)),
+        notify: Arc::new(Notify::new()),
+    };
+    let resolution_slot = pending.resolution.clone();
+    let notify = pending.notify.clone();
+    {
+        let mut pending_interactions = state.pending_interactive_tools.lock().await;
+        if pending_interactions.contains_key(&request.interaction_id) {
+            return Ok(tool_error(format!(
+                "duplicate interactive tool request id: {}",
+                request.interaction_id
+            )));
+        }
+        pending_interactions.insert(request.interaction_id.clone(), pending);
+    }
+    append_interactive_tool_request_created_event(state, session_id, call, &request).await;
+
+    let resolution = wait_for_interactive_tool_resolution(
+        state,
+        session_id,
+        call,
+        &request.interaction_id,
+        &resolution_slot,
+        &notify,
+        cancel_state,
+        command_context,
+    )
+    .await;
+    let resume = InteractiveToolResumeRequest {
+        tool_call_id: call.id.clone(),
+        tool_name: call.name.clone(),
+        interaction_id: request.interaction_id.clone(),
+        original_arguments: call.arguments.clone(),
+        interactive_request: request,
+        resolution,
+    };
+    state
+        .plugins
+        .invoke_service_json_scoped::<_, ToolInvocationResponse>(
+            plugin_id,
+            TOOL_SERVICE_INTERFACE_ID,
+            OP_RESUME_INTERACTIVE_TOOL,
+            &resume,
+            active_plugin_scope_for_tool_call(state, session_id, &call.id).await,
+        )
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Append durable tool stream lifecycle events or publish ephemeral output deltas.
@@ -14556,6 +14661,136 @@ async fn append_runtime_work_cancel_requested_event(
     }
 }
 
+async fn append_interactive_tool_request_created_event(
+    state: &ServerState,
+    session_id: SessionId,
+    call: &bcode_model::ToolCall,
+    request: &bcode_tool::InteractiveToolRequest,
+) {
+    let request_json = serde_json::to_string(&request.request).unwrap_or_default();
+    match state
+        .sessions
+        .append_interactive_tool_request_created(
+            session_id,
+            SessionEventKind::InteractiveToolRequestCreated {
+                interaction_id: request.interaction_id.clone(),
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                surface_kind: request.surface_kind.clone(),
+                request_json,
+                required: request.required,
+                turn_behavior: interactive_turn_behavior_to_session(request.turn_behavior),
+                render_target: interactive_render_target_to_session(request.render_target),
+            },
+        )
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => eprintln!("failed to append interactive tool request: {error}"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_interactive_tool_resolution(
+    state: &ServerState,
+    session_id: SessionId,
+    call: &bcode_model::ToolCall,
+    interaction_id: &str,
+    resolution_slot: &Arc<Mutex<Option<InteractiveToolResolution>>>,
+    notify: &Arc<Notify>,
+    cancel_state: &TurnCancelState,
+    command_context: &mut RuntimeCommandContext<'_>,
+) -> InteractiveToolResolution {
+    loop {
+        let value = resolution_slot.lock().await.clone();
+        if let Some(resolution) = value {
+            return resolution;
+        }
+        tokio::select! {
+            () = notify.notified() => {}
+            cancel_command = command_context.cancel_commands.recv() => {
+                if let Some(command) = cancel_command {
+                    let cancelled = process_cancel_turn_command(
+                        state,
+                        session_id,
+                        command_context.followup_commands,
+                        command_context.queued_followups,
+                        command.clear_queue,
+                        command.requested_by,
+                    ).await;
+                    let _sent = command.response.send(cancelled);
+                }
+                if cancel_state.is_cancelled() {
+                    return abort_interactive_tool_request(
+                        state,
+                        session_id,
+                        interaction_id,
+                        &call.id,
+                        bcode_tool::InteractiveToolAbortReason::TurnCancelled,
+                        Some("model turn cancelled".to_string()),
+                    ).await;
+                }
+            }
+            steering_command = command_context.steering_commands.recv() => {
+                if let Some(command) = steering_command {
+                    process_steering_message_command(
+                        state,
+                        session_id,
+                        command.client_id,
+                        command.text,
+                        command.completion,
+                    ).await;
+                }
+                if cancel_state.is_cancelled() {
+                    return abort_interactive_tool_request(
+                        state,
+                        session_id,
+                        interaction_id,
+                        &call.id,
+                        bcode_tool::InteractiveToolAbortReason::TurnCancelled,
+                        Some("model turn cancelled".to_string()),
+                    ).await;
+                }
+            }
+            () = cancel_state.cancelled() => {
+                return abort_interactive_tool_request(
+                    state,
+                    session_id,
+                    interaction_id,
+                    &call.id,
+                    bcode_tool::InteractiveToolAbortReason::TurnCancelled,
+                    Some("model turn cancelled".to_string()),
+                ).await;
+            }
+        }
+    }
+}
+
+async fn abort_interactive_tool_request(
+    state: &ServerState,
+    session_id: SessionId,
+    interaction_id: &str,
+    tool_call_id: &str,
+    reason: bcode_tool::InteractiveToolAbortReason,
+    message: Option<String>,
+) -> InteractiveToolResolution {
+    state
+        .pending_interactive_tools
+        .lock()
+        .await
+        .remove(interaction_id);
+    let resolution = InteractiveToolResolution::Aborted { reason, message };
+    append_interactive_tool_request_resolved_event(
+        state,
+        session_id,
+        interaction_id.to_string(),
+        tool_call_id.to_string(),
+        resolution.clone(),
+    )
+    .await;
+    resolution
+}
+
 fn interactive_resolution_to_session(
     value: &InteractiveToolResolution,
 ) -> bcode_session_models::InteractiveToolResolution {
@@ -14636,6 +14871,29 @@ const fn interactive_abort_reason_from_session(
         }
         bcode_session_models::InteractiveToolAbortReason::HostError => {
             bcode_tool::InteractiveToolAbortReason::HostError
+        }
+    }
+}
+
+const fn interactive_turn_behavior_to_session(
+    value: bcode_tool::InteractiveToolTurnBehavior,
+) -> bcode_session_models::InteractiveToolTurnBehavior {
+    match value {
+        bcode_tool::InteractiveToolTurnBehavior::AwaitBeforeContinuing => {
+            bcode_session_models::InteractiveToolTurnBehavior::AwaitBeforeContinuing
+        }
+        bcode_tool::InteractiveToolTurnBehavior::CompleteTurnWithPendingInteraction => {
+            bcode_session_models::InteractiveToolTurnBehavior::CompleteTurnWithPendingInteraction
+        }
+    }
+}
+
+const fn interactive_render_target_to_session(
+    value: bcode_tool::InteractiveToolRenderTarget,
+) -> bcode_session_models::InteractiveToolRenderTarget {
+    match value {
+        bcode_tool::InteractiveToolRenderTarget::TranscriptToolCall => {
+            bcode_session_models::InteractiveToolRenderTarget::TranscriptToolCall
         }
     }
 }

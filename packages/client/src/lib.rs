@@ -1695,6 +1695,45 @@ impl BcodeClient {
         }
     }
 
+    /// List pending interactive tool requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn list_interactive_tool_requests(
+        &self,
+    ) -> Result<Vec<bcode_ipc::InteractiveToolRequestSummary>, ClientError> {
+        match self
+            .send_request(Request::ListInteractiveToolRequests)
+            .await?
+        {
+            ResponsePayload::InteractiveToolRequestList { requests } => Ok(requests),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Resolve a pending interactive tool request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn resolve_interactive_tool_request(
+        &self,
+        interaction_id: String,
+        resolution: bcode_session_models::InteractiveToolResolution,
+    ) -> Result<bool, ClientError> {
+        match self
+            .send_request(Request::ResolveInteractiveToolRequest {
+                interaction_id,
+                resolution,
+            })
+            .await?
+        {
+            ResponsePayload::InteractiveToolRequestResolved { resolved } => Ok(resolved),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Persist and activate a permission policy rule under `[agent.<agent_id>.permission.<category>]`.
     ///
     /// `category` must be one of `command`, `read`, `write`, `edit`, or `web`.
