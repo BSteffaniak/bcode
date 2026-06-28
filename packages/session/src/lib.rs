@@ -2010,6 +2010,32 @@ impl SessionManager {
         .await
     }
 
+    /// Append an interactive tool request event to a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_interactive_tool_request_created(
+        &self,
+        session_id: SessionId,
+        event: SessionEventKind,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(session_id, event).await
+    }
+
+    /// Append an interactive tool resolution event to a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_interactive_tool_request_resolved(
+        &self,
+        session_id: SessionId,
+        event: SessionEventKind,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(session_id, event).await
+    }
+
     /// Publish a live-only event to currently attached session subscribers.
     ///
     /// Live events are not appended to durable history and may be coalesced or
@@ -4734,6 +4760,50 @@ mod tests {
                     source_prompt_sequence: Some(3),
                     forked_at_ms: 1,
                     kind: SessionForkKind::Fork,
+                },
+            ),
+            (
+                36,
+                "RalphLifecycle",
+                SessionEventKind::RalphLifecycle {
+                    loop_name: "loop".to_string(),
+                    state_dir: test_working_directory(),
+                    kind: "started".to_string(),
+                    message: "message".to_string(),
+                    occurred_at_ms: 1,
+                },
+            ),
+            (
+                37,
+                "ReasoningChanged",
+                SessionEventKind::ReasoningChanged {
+                    effort: Some("medium".to_string()),
+                    summary: Some("auto".to_string()),
+                },
+            ),
+            (
+                38,
+                "InteractiveToolRequestCreated",
+                SessionEventKind::InteractiveToolRequestCreated {
+                    interaction_id: "interaction".to_string(),
+                    tool_call_id: "call".to_string(),
+                    tool_name: "tool".to_string(),
+                    surface_kind: "form".to_string(),
+                    request_json: "{}".to_string(),
+                    required: true,
+                    turn_behavior:
+                        bcode_session_models::InteractiveToolTurnBehavior::AwaitBeforeContinuing,
+                    render_target:
+                        bcode_session_models::InteractiveToolRenderTarget::TranscriptToolCall,
+                },
+            ),
+            (
+                39,
+                "InteractiveToolRequestResolved",
+                SessionEventKind::InteractiveToolRequestResolved {
+                    interaction_id: "interaction".to_string(),
+                    tool_call_id: "call".to_string(),
+                    resolution_json: "{}".to_string(),
                 },
             ),
         ]

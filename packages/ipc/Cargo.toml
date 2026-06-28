@@ -22,6 +22,7 @@ bcode_worktree_models = { workspace = true }
 bmux_codec            = { workspace = true }
 bmux_ipc              = { workspace = true }
 serde                 = { workspace = true, features = ["derive", "std"] }
+serde_json            = { workspace = true, features = ["std"] }
 thiserror             = { workspace = true }
 tokio                 = { workspace = true, features = ["io-util"] }
 

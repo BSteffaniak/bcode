@@ -566,6 +566,58 @@ pub struct ProjectionWindow {
     pub scanned_events: usize,
 }
 
+/// Core-understood resolution for an interactive tool request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum InteractiveToolResolution {
+    /// Host submitted a surface/plugin-owned payload.
+    Submitted { payload: serde_json::Value },
+    /// Host/runtime could not complete the interaction.
+    Aborted {
+        reason: InteractiveToolAbortReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+}
+
+/// Infrastructure-level reason an interactive tool request could not be submitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractiveToolAbortReason {
+    /// User dismissed the host-owned interaction UI.
+    UserDismissed,
+    /// The model turn was cancelled before submission.
+    TurnCancelled,
+    /// The client that owned the interaction detached before submission.
+    ClientDetached,
+    /// The interaction timed out before submission.
+    Timeout,
+    /// No host surface could render this interaction kind.
+    UnsupportedSurface,
+    /// Host-side error prevented submission.
+    HostError,
+}
+
+/// How an interactive tool request affects the active model turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractiveToolTurnBehavior {
+    /// Suspend the tool call and model turn until the interaction is resolved.
+    #[default]
+    AwaitBeforeContinuing,
+    /// Finish the tool call while leaving the interaction answerable in the transcript.
+    CompleteTurnWithPendingInteraction,
+}
+
+/// Host render target for an interactive tool request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractiveToolRenderTarget {
+    /// Render inside the transcript tool-call block.
+    #[default]
+    TranscriptToolCall,
+}
+
 /// Typed semantic data returned by a tool invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1460,6 +1512,24 @@ pub enum SessionEventKind {
         effort: Option<String>,
         #[serde(default)]
         summary: Option<String>,
+    },
+    InteractiveToolRequestCreated {
+        interaction_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        surface_kind: String,
+        request_json: String,
+        #[serde(default)]
+        required: bool,
+        #[serde(default)]
+        turn_behavior: InteractiveToolTurnBehavior,
+        #[serde(default)]
+        render_target: InteractiveToolRenderTarget,
+    },
+    InteractiveToolRequestResolved {
+        interaction_id: String,
+        tool_call_id: String,
+        resolution_json: String,
     },
 }
 

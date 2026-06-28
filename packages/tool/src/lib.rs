@@ -17,6 +17,9 @@ pub const OP_LIST_TOOLS: &str = "list_tools";
 /// Operation for invoking a tool.
 pub const OP_INVOKE_TOOL: &str = "invoke_tool";
 
+/// Operation for resuming a suspended interactive tool invocation.
+pub const OP_RESUME_INTERACTIVE_TOOL: &str = "resume_interactive_tool";
+
 /// List tools request.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListToolsRequest {}
@@ -718,13 +721,62 @@ pub enum ToolInvocationHostAction {
 /// Generic request for host-owned interactive tool UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InteractiveToolRequest {
+    pub interaction_id: String,
     pub surface_kind: String,
     #[serde(default)]
     pub request: serde_json::Value,
     #[serde(default)]
-    pub await_outcome: bool,
+    pub required: bool,
+    #[serde(default)]
+    pub turn_behavior: InteractiveToolTurnBehavior,
     #[serde(default)]
     pub render_target: InteractiveToolRenderTarget,
+}
+
+/// How an interactive tool request affects the active model turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractiveToolTurnBehavior {
+    #[default]
+    AwaitBeforeContinuing,
+    CompleteTurnWithPendingInteraction,
+}
+
+/// Core-understood resolution for an interactive tool request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum InteractiveToolResolution {
+    Submitted {
+        payload: serde_json::Value,
+    },
+    Aborted {
+        reason: InteractiveToolAbortReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+}
+
+/// Infrastructure-level reason an interactive tool request could not be submitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractiveToolAbortReason {
+    UserDismissed,
+    TurnCancelled,
+    ClientDetached,
+    Timeout,
+    UnsupportedSurface,
+    HostError,
+}
+
+/// Request payload for resuming a suspended interactive tool invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractiveToolResumeRequest {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub interaction_id: String,
+    pub original_arguments: serde_json::Value,
+    pub interactive_request: InteractiveToolRequest,
+    pub resolution: InteractiveToolResolution,
 }
 
 /// Host render target for an interactive tool request.

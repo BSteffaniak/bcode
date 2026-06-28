@@ -195,6 +195,24 @@ enum PersistedSessionEventKind {
         #[serde(default)]
         semantic_result: Option<PersistedToolInvocationResult>,
     },
+    InteractiveToolRequestCreated {
+        interaction_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        surface_kind: String,
+        request_json: String,
+        #[serde(default)]
+        required: bool,
+        #[serde(default)]
+        turn_behavior: bcode_session_models::InteractiveToolTurnBehavior,
+        #[serde(default)]
+        render_target: bcode_session_models::InteractiveToolRenderTarget,
+    },
+    InteractiveToolRequestResolved {
+        interaction_id: String,
+        tool_call_id: String,
+        resolution_json: String,
+    },
     PermissionRequested {
         permission_id: String,
         tool_call_id: String,
@@ -454,6 +472,34 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 semantic_result: semantic_result
                     .as_ref()
                     .map(PersistedToolInvocationResult::from),
+            },
+            SessionEventKind::InteractiveToolRequestCreated {
+                interaction_id,
+                tool_call_id,
+                tool_name,
+                surface_kind,
+                request_json,
+                required,
+                turn_behavior,
+                render_target,
+            } => Self::InteractiveToolRequestCreated {
+                interaction_id: interaction_id.clone(),
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                surface_kind: surface_kind.clone(),
+                request_json: request_json.clone(),
+                required: *required,
+                turn_behavior: *turn_behavior,
+                render_target: *render_target,
+            },
+            SessionEventKind::InteractiveToolRequestResolved {
+                interaction_id,
+                tool_call_id,
+                resolution_json,
+            } => Self::InteractiveToolRequestResolved {
+                interaction_id: interaction_id.clone(),
+                tool_call_id: tool_call_id.clone(),
+                resolution_json: resolution_json.clone(),
             },
             SessionEventKind::PermissionRequested {
                 permission_id,
@@ -747,6 +793,34 @@ impl PersistedSessionEventKind {
                 is_error,
                 output,
                 semantic_result: semantic_result.map(PersistedToolInvocationResult::into_domain),
+            },
+            Self::InteractiveToolRequestCreated {
+                interaction_id,
+                tool_call_id,
+                tool_name,
+                surface_kind,
+                request_json,
+                required,
+                turn_behavior,
+                render_target,
+            } => SessionEventKind::InteractiveToolRequestCreated {
+                interaction_id,
+                tool_call_id,
+                tool_name,
+                surface_kind,
+                request_json,
+                required,
+                turn_behavior,
+                render_target,
+            },
+            Self::InteractiveToolRequestResolved {
+                interaction_id,
+                tool_call_id,
+                resolution_json,
+            } => SessionEventKind::InteractiveToolRequestResolved {
+                interaction_id,
+                tool_call_id,
+                resolution_json,
             },
             Self::PermissionRequested {
                 permission_id,

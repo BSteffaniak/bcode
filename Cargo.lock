@@ -1612,6 +1612,7 @@ dependencies = [
  "bmux_codec 0.0.1-alpha.1 (git+https://github.com/BSteffaniak/bmux.git?branch=master)",
  "bmux_ipc 0.0.1-alpha.1 (git+https://github.com/BSteffaniak/bmux.git?branch=master)",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",

@@ -61,9 +61,10 @@ use bcode_skill_models::{
     SkillToolDecisionKey, SkillToolDecisionScope, SkillToolPolicyOutcome, SkillToolPolicyRequest,
 };
 use bcode_tool::{
-    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, ShellRunResult as ServiceShellRunResult,
-    TOOL_SERVICE_INTERFACE_ID, ToolDefinition as ServiceToolDefinition, ToolInvocationRequest,
-    ToolInvocationResponse, ToolInvocationResult as ServiceToolInvocationResult,
+    InteractiveToolResolution, ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS,
+    ShellRunResult as ServiceShellRunResult, TOOL_SERVICE_INTERFACE_ID,
+    ToolDefinition as ServiceToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
+    ToolInvocationResult as ServiceToolInvocationResult,
     ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent, ToolList, ToolOutputStream,
     ToolPresentationEvent as ServiceToolPresentationEvent,
     ToolPresentationFieldKind as ServiceToolPresentationFieldKind,
@@ -167,6 +168,7 @@ pub struct ServerState {
         Mutex<BTreeMap<(SessionId, SkillId), RequiredSkillModelOverride>>,
     session_agent_selections: Mutex<BTreeMap<SessionId, String>>,
     pending_permissions: Mutex<BTreeMap<String, PendingPermission>>,
+    pending_interactive_tools: Mutex<BTreeMap<String, PendingInteractiveToolRequest>>,
     next_permission_id: Mutex<u64>,
     clients: Mutex<BTreeSet<ClientId>>,
     client_runtime_contexts: Mutex<BTreeMap<ClientId, ClientRuntimeContext>>,
@@ -812,6 +814,13 @@ struct PendingPermission {
     skill_decision_key: Option<SkillToolDecisionKey>,
 }
 
+#[derive(Debug, Clone)]
+struct PendingInteractiveToolRequest {
+    summary: bcode_ipc::InteractiveToolRequestSummary,
+    resolution: Arc<Mutex<Option<InteractiveToolResolution>>>,
+    notify: Arc<Notify>,
+}
+
 struct ServerStateInit {
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
@@ -881,6 +890,7 @@ impl ServerState {
             required_skill_model_overrides: Mutex::default(),
             session_agent_selections: Mutex::default(),
             pending_permissions: Mutex::default(),
+            pending_interactive_tools: Mutex::default(),
             next_permission_id: Mutex::new(1),
             clients: Mutex::default(),
             client_runtime_contexts: Mutex::default(),
@@ -2152,21 +2162,11 @@ async fn handle_agent_permission_plugin_request(
             session_id,
             agent_id,
         } => handle_set_session_agent(request_id, state, writer, session_id, agent_id).await,
-        Request::ListPermissions => handle_list_permissions(request_id, state, writer).await,
-        Request::ResolvePermission {
-            permission_id,
-            approved,
-            remember,
-        } => {
-            handle_resolve_permission(
-                request_id,
-                state,
-                writer,
-                &permission_id,
-                approved,
-                remember,
-            )
-            .await
+        Request::ListPermissions
+        | Request::ResolvePermission { .. }
+        | Request::ListInteractiveToolRequests
+        | Request::ResolveInteractiveToolRequest { .. } => {
+            handle_permission_interaction_request(request, request_id, state, writer).await
         }
         Request::AddPermissionRule {
             agent_id,
@@ -2226,6 +2226,49 @@ async fn handle_agent_permission_plugin_request(
             unreachable!("primary request routed to primary handler")
         }
         _ => unreachable!("primary request routed to agent/permission/plugin handler"),
+    }
+}
+
+async fn handle_permission_interaction_request(
+    request: Request,
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    match request {
+        Request::ListPermissions => handle_list_permissions(request_id, state, writer).await,
+        Request::ResolvePermission {
+            permission_id,
+            approved,
+            remember,
+        } => {
+            handle_resolve_permission(
+                request_id,
+                state,
+                writer,
+                &permission_id,
+                approved,
+                remember,
+            )
+            .await
+        }
+        Request::ListInteractiveToolRequests => {
+            handle_list_interactive_tool_requests(request_id, state, writer).await
+        }
+        Request::ResolveInteractiveToolRequest {
+            interaction_id,
+            resolution,
+        } => {
+            handle_resolve_interactive_tool_request(
+                request_id,
+                state,
+                writer,
+                &interaction_id,
+                resolution,
+            )
+            .await
+        }
+        _ => unreachable!("request routed to permission/interaction handler"),
     }
 }
 
@@ -7562,6 +7605,65 @@ async fn handle_list_permissions(
         writer,
         request_id,
         Response::Ok(ResponsePayload::PermissionList { permissions }),
+    )
+    .await
+}
+
+async fn handle_list_interactive_tool_requests(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    let requests = state
+        .pending_interactive_tools
+        .lock()
+        .await
+        .values()
+        .map(|request| request.summary.clone())
+        .collect();
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::InteractiveToolRequestList { requests }),
+    )
+    .await
+}
+
+async fn handle_resolve_interactive_tool_request(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    interaction_id: &str,
+    resolution: bcode_session_models::InteractiveToolResolution,
+) -> Result<(), ServerError> {
+    let Some(request) = state
+        .pending_interactive_tools
+        .lock()
+        .await
+        .remove(interaction_id)
+    else {
+        return send_response(
+            writer,
+            request_id,
+            Response::Ok(ResponsePayload::InteractiveToolRequestResolved { resolved: false }),
+        )
+        .await;
+    };
+    let resolution = interactive_resolution_from_session(resolution);
+    *request.resolution.lock().await = Some(resolution.clone());
+    request.notify.notify_waiters();
+    append_interactive_tool_request_resolved_event(
+        state,
+        request.summary.session_id,
+        request.summary.interaction_id,
+        request.summary.tool_call_id,
+        resolution,
+    )
+    .await;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::InteractiveToolRequestResolved { resolved: true }),
     )
     .await
 }
@@ -14358,6 +14460,32 @@ fn current_unix_millis() -> u64 {
         })
 }
 
+async fn append_interactive_tool_request_resolved_event(
+    state: &ServerState,
+    session_id: SessionId,
+    interaction_id: String,
+    tool_call_id: String,
+    resolution: InteractiveToolResolution,
+) {
+    let resolution = interactive_resolution_to_session(&resolution);
+    let resolution_json = serde_json::to_string(&resolution).unwrap_or_default();
+    match state
+        .sessions
+        .append_interactive_tool_request_resolved(
+            session_id,
+            SessionEventKind::InteractiveToolRequestResolved {
+                interaction_id,
+                tool_call_id,
+                resolution_json,
+            },
+        )
+        .await
+    {
+        Ok(event) => publish_session_event(state, &event).await,
+        Err(error) => eprintln!("failed to append interactive tool resolution: {error}"),
+    }
+}
+
 async fn append_tool_request_event(
     state: &ServerState,
     session_id: SessionId,
@@ -14425,6 +14553,90 @@ async fn append_runtime_work_cancel_requested_event(
     {
         Ok(event) => publish_session_event(state, &event).await,
         Err(error) => eprintln!("failed to append runtime work cancel request: {error}"),
+    }
+}
+
+fn interactive_resolution_to_session(
+    value: &InteractiveToolResolution,
+) -> bcode_session_models::InteractiveToolResolution {
+    match value {
+        InteractiveToolResolution::Submitted { payload } => {
+            bcode_session_models::InteractiveToolResolution::Submitted {
+                payload: payload.clone(),
+            }
+        }
+        InteractiveToolResolution::Aborted { reason, message } => {
+            bcode_session_models::InteractiveToolResolution::Aborted {
+                reason: interactive_abort_reason_to_session(*reason),
+                message: message.clone(),
+            }
+        }
+    }
+}
+
+fn interactive_resolution_from_session(
+    value: bcode_session_models::InteractiveToolResolution,
+) -> InteractiveToolResolution {
+    match value {
+        bcode_session_models::InteractiveToolResolution::Submitted { payload } => {
+            InteractiveToolResolution::Submitted { payload }
+        }
+        bcode_session_models::InteractiveToolResolution::Aborted { reason, message } => {
+            InteractiveToolResolution::Aborted {
+                reason: interactive_abort_reason_from_session(reason),
+                message,
+            }
+        }
+    }
+}
+
+const fn interactive_abort_reason_to_session(
+    value: bcode_tool::InteractiveToolAbortReason,
+) -> bcode_session_models::InteractiveToolAbortReason {
+    match value {
+        bcode_tool::InteractiveToolAbortReason::UserDismissed => {
+            bcode_session_models::InteractiveToolAbortReason::UserDismissed
+        }
+        bcode_tool::InteractiveToolAbortReason::TurnCancelled => {
+            bcode_session_models::InteractiveToolAbortReason::TurnCancelled
+        }
+        bcode_tool::InteractiveToolAbortReason::ClientDetached => {
+            bcode_session_models::InteractiveToolAbortReason::ClientDetached
+        }
+        bcode_tool::InteractiveToolAbortReason::Timeout => {
+            bcode_session_models::InteractiveToolAbortReason::Timeout
+        }
+        bcode_tool::InteractiveToolAbortReason::UnsupportedSurface => {
+            bcode_session_models::InteractiveToolAbortReason::UnsupportedSurface
+        }
+        bcode_tool::InteractiveToolAbortReason::HostError => {
+            bcode_session_models::InteractiveToolAbortReason::HostError
+        }
+    }
+}
+
+const fn interactive_abort_reason_from_session(
+    value: bcode_session_models::InteractiveToolAbortReason,
+) -> bcode_tool::InteractiveToolAbortReason {
+    match value {
+        bcode_session_models::InteractiveToolAbortReason::UserDismissed => {
+            bcode_tool::InteractiveToolAbortReason::UserDismissed
+        }
+        bcode_session_models::InteractiveToolAbortReason::TurnCancelled => {
+            bcode_tool::InteractiveToolAbortReason::TurnCancelled
+        }
+        bcode_session_models::InteractiveToolAbortReason::ClientDetached => {
+            bcode_tool::InteractiveToolAbortReason::ClientDetached
+        }
+        bcode_session_models::InteractiveToolAbortReason::Timeout => {
+            bcode_tool::InteractiveToolAbortReason::Timeout
+        }
+        bcode_session_models::InteractiveToolAbortReason::UnsupportedSurface => {
+            bcode_tool::InteractiveToolAbortReason::UnsupportedSurface
+        }
+        bcode_session_models::InteractiveToolAbortReason::HostError => {
+            bcode_tool::InteractiveToolAbortReason::HostError
+        }
     }
 }
 
@@ -15022,6 +15234,12 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::AssistantMessage { .. } => "assistant_message",
         SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
         SessionEventKind::ToolCallFinished { .. } => "tool_call_finished",
+        SessionEventKind::InteractiveToolRequestCreated { .. } => {
+            "interactive_tool_request_created"
+        }
+        SessionEventKind::InteractiveToolRequestResolved { .. } => {
+            "interactive_tool_request_resolved"
+        }
         SessionEventKind::PermissionRequested { .. } => "permission_requested",
         SessionEventKind::PermissionResolved { .. } => "permission_resolved",
         SessionEventKind::ModelChanged { .. } => "model_changed",

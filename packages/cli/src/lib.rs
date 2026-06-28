@@ -5960,6 +5960,12 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::AssistantMessage { .. } => "assistant_message",
         SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
         SessionEventKind::ToolCallFinished { .. } => "tool_call_finished",
+        SessionEventKind::InteractiveToolRequestCreated { .. } => {
+            "interactive_tool_request_created"
+        }
+        SessionEventKind::InteractiveToolRequestResolved { .. } => {
+            "interactive_tool_request_resolved"
+        }
         SessionEventKind::PermissionRequested { .. } => "permission_requested",
         SessionEventKind::PermissionResolved { .. } => "permission_resolved",
         SessionEventKind::ModelChanged { .. } => "model_changed",
@@ -6296,6 +6302,23 @@ fn print_non_trace_session_event(event: &SessionEvent) {
                 event.sequence
             );
         }
+        SessionEventKind::InteractiveToolRequestCreated {
+            interaction_id,
+            tool_call_id,
+            surface_kind,
+            ..
+        } => println!(
+            "#{} interactive tool request: {interaction_id} {surface_kind} ({tool_call_id})",
+            event.sequence
+        ),
+        SessionEventKind::InteractiveToolRequestResolved {
+            interaction_id,
+            tool_call_id,
+            ..
+        } => println!(
+            "#{} interactive tool resolved: {interaction_id} ({tool_call_id})",
+            event.sequence
+        ),
         SessionEventKind::ToolInvocationStream {
             event: stream_event,
         } => {

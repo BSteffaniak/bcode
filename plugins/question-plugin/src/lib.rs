@@ -231,9 +231,11 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
         host_action: Some(
             bcode_tool::ToolInvocationHostAction::InteractiveToolRequest(
                 bcode_tool::InteractiveToolRequest {
+                    interaction_id: format!("{}-question", invocation.tool_call_id),
                     surface_kind: "question.inline".to_string(),
                     request: serde_json::to_value(&request).unwrap_or(Value::Null),
-                    await_outcome: true,
+                    required: request.questions.iter().any(|question| question.required),
+                    turn_behavior: bcode_tool::InteractiveToolTurnBehavior::AwaitBeforeContinuing,
                     render_target: bcode_tool::InteractiveToolRenderTarget::TranscriptToolCall,
                 },
             ),

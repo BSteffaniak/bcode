@@ -397,6 +397,11 @@ pub enum Request {
     ComposerDraft {
         scope: ComposerDraftScope,
     },
+    ListInteractiveToolRequests,
+    ResolveInteractiveToolRequest {
+        interaction_id: String,
+        resolution: bcode_session_models::InteractiveToolResolution,
+    },
 }
 
 /// Server stop request policy.
@@ -584,6 +589,23 @@ pub struct PermissionSummary {
     pub policy_reason: Option<String>,
     #[serde(default)]
     pub can_remember_policy: bool,
+}
+
+/// Pending interactive tool request summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractiveToolRequestSummary {
+    pub interaction_id: String,
+    pub session_id: SessionId,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub surface_kind: String,
+    pub request: serde_json::Value,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub turn_behavior: bcode_session_models::InteractiveToolTurnBehavior,
+    #[serde(default)]
+    pub render_target: bcode_session_models::InteractiveToolRenderTarget,
 }
 
 /// Plugin service invocation result.
@@ -1088,6 +1110,12 @@ pub enum ResponsePayload {
     ComposerDraftSet,
     PluginContributions {
         contributions: PluginContributions,
+    },
+    InteractiveToolRequestList {
+        requests: Vec<InteractiveToolRequestSummary>,
+    },
+    InteractiveToolRequestResolved {
+        resolved: bool,
     },
 }
 

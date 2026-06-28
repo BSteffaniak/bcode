@@ -1705,6 +1705,12 @@ const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::AssistantMessage { .. } => "assistant_message",
         SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
         SessionEventKind::ToolCallFinished { .. } => "tool_call_finished",
+        SessionEventKind::InteractiveToolRequestCreated { .. } => {
+            "interactive_tool_request_created"
+        }
+        SessionEventKind::InteractiveToolRequestResolved { .. } => {
+            "interactive_tool_request_resolved"
+        }
         SessionEventKind::PermissionRequested { .. } => "permission_requested",
         SessionEventKind::PermissionResolved { .. } => "permission_resolved",
         SessionEventKind::ModelChanged { .. } => "model_changed",

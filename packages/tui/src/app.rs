@@ -4024,6 +4024,8 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::SystemMessage { .. }
         | SessionEventKind::ToolCallRequested { .. }
         | SessionEventKind::ToolCallFinished { .. }
+        | SessionEventKind::InteractiveToolRequestCreated { .. }
+        | SessionEventKind::InteractiveToolRequestResolved { .. }
         | SessionEventKind::PermissionRequested { .. }
         | SessionEventKind::PermissionResolved { .. }
         | SessionEventKind::ModelUsage { .. }
