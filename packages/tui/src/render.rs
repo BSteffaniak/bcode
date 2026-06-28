@@ -790,6 +790,12 @@ fn push_transcript_item_rows(
         TranscriptItemKind::TerminalOutput { .. } => {
             push_terminal_transcript_item_rows(rows, item, width);
         }
+        TranscriptItemKind::InteractiveToolRequest { .. } => {
+            push_detail_block(rows, "Interactive tool", item.text(), Color::Cyan, width);
+        }
+        TranscriptItemKind::InteractiveToolResolution { .. } => {
+            push_detail_block(rows, "Interactive tool", item.text(), Color::Green, width);
+        }
         TranscriptItemKind::Usage { turn_id } => {
             push_usage_rows(rows, item, turn_id, width);
         }

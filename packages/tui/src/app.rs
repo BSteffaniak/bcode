@@ -51,10 +51,11 @@ use super::timeline_dialog::TimelineEntry;
 use super::tool_present::ShellResultPresentation;
 use super::transcript::{
     FileEditPhase, TranscriptItem, TranscriptItemKind, file_change_presentation_item,
-    live_tool_preview_anchor_item, model_usage_item, permission_request_item,
-    permission_result_item, streaming_terminal_output_item, streaming_tool_output_item,
-    tool_presentation_card_from_event, tool_presentation_card_item, tool_request_item,
-    tool_result_item, transcript_items_from_events_with_reasoning,
+    interactive_tool_request_item, interactive_tool_resolution_item, live_tool_preview_anchor_item,
+    model_usage_item, permission_request_item, permission_result_item,
+    streaming_terminal_output_item, streaming_tool_output_item, tool_presentation_card_from_event,
+    tool_presentation_card_item, tool_request_item, tool_result_item,
+    transcript_items_from_events_with_reasoning,
 };
 use super::transcript_document::TranscriptDocument;
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
@@ -2139,6 +2140,40 @@ impl BmuxApp {
             SessionEventKind::ToolInvocationStream { event } => {
                 self.apply_tool_stream_event(event, application);
             }
+            SessionEventKind::InteractiveToolRequestCreated {
+                interaction_id,
+                tool_call_id,
+                tool_name,
+                surface_kind,
+                request_json,
+                required,
+                ..
+            } => {
+                self.transcript.push(interactive_tool_request_item(
+                    interaction_id,
+                    tool_call_id,
+                    tool_name,
+                    surface_kind,
+                    request_json,
+                    *required,
+                ));
+                if application.live_activity() {
+                    self.set_activity(ActivityState::WaitingPermission {
+                        name: tool_name.to_owned(),
+                    });
+                }
+            }
+            SessionEventKind::InteractiveToolRequestResolved {
+                interaction_id,
+                tool_call_id,
+                resolution_json,
+            } => {
+                self.transcript.push(interactive_tool_resolution_item(
+                    interaction_id,
+                    tool_call_id,
+                    resolution_json,
+                ));
+            }
             SessionEventKind::PermissionRequested {
                 permission_id,
                 tool_call_id,
@@ -3998,6 +4033,8 @@ fn referenced_tool_call_ids(items: &[TranscriptItem]) -> BTreeSet<String> {
             | TranscriptItemKind::FileChangePresentation { tool_call_id, .. }
             | TranscriptItemKind::ToolPresentationCard { tool_call_id, .. }
             | TranscriptItemKind::TerminalOutput { tool_call_id, .. }
+            | TranscriptItemKind::InteractiveToolRequest { tool_call_id, .. }
+            | TranscriptItemKind::InteractiveToolResolution { tool_call_id, .. }
             | TranscriptItemKind::PermissionRequest { tool_call_id, .. } => {
                 ids.insert(tool_call_id.clone());
             }

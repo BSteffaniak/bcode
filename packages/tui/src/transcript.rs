@@ -135,6 +135,30 @@ pub enum TranscriptItemKind {
         /// Model turn identifier.
         turn_id: String,
     },
+    /// Host-owned interactive tool request.
+    InteractiveToolRequest {
+        /// Interaction identifier.
+        interaction_id: String,
+        /// Provider tool call identifier.
+        tool_call_id: String,
+        /// Tool name.
+        tool_name: String,
+        /// Surface renderer key.
+        surface_kind: String,
+        /// Raw plugin-owned request JSON.
+        request_json: String,
+        /// Whether the interaction is required by the tool surface.
+        required: bool,
+    },
+    /// Host-owned interactive tool request resolution.
+    InteractiveToolResolution {
+        /// Interaction identifier.
+        interaction_id: String,
+        /// Provider tool call identifier.
+        tool_call_id: String,
+        /// Generic core resolution JSON.
+        resolution_json: String,
+    },
     /// Permission request for a tool call.
     PermissionRequest {
         /// Permission identifier.
@@ -721,6 +745,55 @@ pub fn tool_result_item(
     )
 }
 
+/// Build an interactive tool request item.
+#[must_use]
+pub fn interactive_tool_request_item(
+    interaction_id: &str,
+    tool_call_id: &str,
+    tool_name: &str,
+    surface_kind: &str,
+    request_json: &str,
+    required: bool,
+) -> TranscriptItem {
+    let label = if required { "required" } else { "optional" };
+    let text = format!(
+        "interactive request ({label}) via {surface_kind}:\n{}",
+        pretty_jsonish(request_json)
+    );
+    TranscriptItem::with_kind(
+        "Interactive tool",
+        text,
+        false,
+        TranscriptItemKind::InteractiveToolRequest {
+            interaction_id: interaction_id.to_owned(),
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: tool_name.to_owned(),
+            surface_kind: surface_kind.to_owned(),
+            request_json: request_json.to_owned(),
+            required,
+        },
+    )
+}
+
+/// Build an interactive tool resolution item.
+#[must_use]
+pub fn interactive_tool_resolution_item(
+    interaction_id: &str,
+    tool_call_id: &str,
+    resolution_json: &str,
+) -> TranscriptItem {
+    TranscriptItem::with_kind(
+        "Interactive tool",
+        format!("interactive request resolved: {interaction_id}"),
+        false,
+        TranscriptItemKind::InteractiveToolResolution {
+            interaction_id: interaction_id.to_owned(),
+            tool_call_id: tool_call_id.to_owned(),
+            resolution_json: resolution_json.to_owned(),
+        },
+    )
+}
+
 /// Build a transcript item for a permission request.
 #[must_use]
 pub fn permission_request_item(
@@ -1069,6 +1142,31 @@ fn non_streaming_transcript_item_from_event(
                 *is_error,
             ))
         }
+        SessionEventKind::InteractiveToolRequestCreated {
+            interaction_id,
+            tool_call_id,
+            tool_name,
+            surface_kind,
+            request_json,
+            required,
+            ..
+        } => Some(interactive_tool_request_item(
+            interaction_id,
+            tool_call_id,
+            tool_name,
+            surface_kind,
+            request_json,
+            *required,
+        )),
+        SessionEventKind::InteractiveToolRequestResolved {
+            interaction_id,
+            tool_call_id,
+            resolution_json,
+        } => Some(interactive_tool_resolution_item(
+            interaction_id,
+            tool_call_id,
+            resolution_json,
+        )),
         SessionEventKind::PermissionRequested {
             permission_id,
             tool_call_id,
