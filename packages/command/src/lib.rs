@@ -7,6 +7,9 @@
 //! Plugins declare this interface in their manifest to contribute commands
 //! discoverable via the control panel and slash commands.
 
+#[cfg(test)]
+mod bpdl_contract_tests;
+
 use bcode_model::ReasoningEffort;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};

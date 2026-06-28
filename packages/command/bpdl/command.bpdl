@@ -1,0 +1,90 @@
+// BPDL reference contract for Bcode command registry services.
+//
+// This is the first small Bcode service modeled in BPDL so future command
+// registry clients/providers can use generated request/response bindings
+// instead of handwritten envelopes.
+
+plugin bcode.cmd version 1;
+
+capability COMMAND_REGISTRY = bcode.cmd.registry;
+
+@capability(COMMAND_REGISTRY)
+interface command-registry-query {
+    enum command-surface {
+        palette,
+        slash,
+        keybinding,
+    }
+
+    enum command-owner-kind {
+        host,
+        plugin_owner,
+    }
+
+    record command-owner {
+        kind: command-owner-kind,
+        plugin_id: string?,
+    }
+
+    enum command-action-kind {
+        host,
+        plugin_action,
+        service,
+    }
+
+    record command-action {
+        kind: command-action-kind,
+        route: string?,
+        plugin_id: string?,
+        command_name: string?,
+        interface_id: string?,
+        operation: string?,
+        payload: bytes?,
+    }
+
+    record command-contribution {
+        id: string,
+        title: string,
+        description: string?,
+        category: string?,
+        surfaces: list<command-surface>,
+        owner: command-owner,
+        action: command-action,
+    }
+
+    record list-commands-request {
+        surface: command-surface?,
+    }
+
+    record list-commands-response {
+        commands: list<command-contribution>,
+    }
+
+    query list-commands(request: list-commands-request) -> list-commands-response;
+}
+
+@capability(COMMAND_REGISTRY)
+interface command-registry-command {
+    record command-contribution {
+        id: string,
+        title: string,
+        description: string?,
+        category: string?,
+    }
+
+    record register-command-request {
+        contribution: command-contribution,
+    }
+
+    record invoke-command-request {
+        command_id: string,
+        args_json: string?,
+    }
+
+    record invoke-command-response {
+        output_json: string?,
+    }
+
+    command register(request: register-command-request) -> unit;
+    command invoke(request: invoke-command-request) -> invoke-command-response;
+}

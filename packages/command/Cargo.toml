@@ -11,10 +11,11 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_model = { workspace = true }
-serde       = { workspace = true, features = ["derive", "std"] }
-serde_json  = { workspace = true }
-thiserror   = { workspace = true }
+bcode_model        = { workspace = true }
+bmux_plugin_schema = { workspace = true }
+serde              = { workspace = true, features = ["derive", "std"] }
+serde_json         = { workspace = true }
+thiserror          = { workspace = true }
 
 [features]
 default          = []
