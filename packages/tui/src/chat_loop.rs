@@ -1359,6 +1359,7 @@ fn draw_chat_frame<W: Write>(
         {
             surface.render(surface_area, frame);
         }
+        render_resolved_protocol_surfaces(chat, transcript_area, frame);
     })?;
     Ok(())
 }
@@ -1397,6 +1398,49 @@ fn protocol_surface_area(chat: &ActiveChat, interaction_id: &str, viewport: Rect
         }
     }
     None
+}
+
+fn render_resolved_protocol_surfaces(
+    chat: &ActiveChat,
+    viewport: Rect,
+    frame: &mut bmux_tui::frame::Frame<'_>,
+) {
+    let layout = chat.app.transcript_layout();
+    for visible in layout.visible_lines_from_top(
+        chat.app.transcript_top_row(viewport.height),
+        viewport.height,
+    ) {
+        if visible.source() != VisibleTranscriptSource::Transcript
+            || visible.row_in_entry() != INLINE_PROTOCOL_SURFACE_ROW_OFFSET
+        {
+            continue;
+        }
+        let Some(item) = chat.app.transcript().get(visible.entry_index()) else {
+            continue;
+        };
+        let super::transcript::TranscriptItemKind::InteractiveToolResolution {
+            resolution_json,
+            ..
+        } = item.kind()
+        else {
+            continue;
+        };
+        let Some(mut surface) =
+            super::protocol_surface::ResolvedProtocolSurface::from_resolution_json(resolution_json)
+        else {
+            continue;
+        };
+        let viewport_row = visible
+            .row_index
+            .saturating_sub(chat.app.transcript_top_row(viewport.height));
+        let y = viewport
+            .y
+            .saturating_add(u16::try_from(viewport_row).unwrap_or(u16::MAX));
+        let height = INLINE_PROTOCOL_SURFACE_HEIGHT.min(viewport.bottom().saturating_sub(y));
+        if height > 0 {
+            surface.render(Rect::new(viewport.x, y, viewport.width, height), frame);
+        }
+    }
 }
 
 fn drain_bcode_events(chat: &mut ActiveChat, loop_state: &mut ChatLoopState) -> bool {

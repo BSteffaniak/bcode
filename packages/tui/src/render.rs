@@ -806,6 +806,11 @@ fn push_transcript_item_rows(
         TranscriptItemKind::InteractiveToolRequest { .. } => {
             push_detail_block(rows, "Interactive tool", item.text(), Color::Cyan, width);
         }
+        TranscriptItemKind::InteractiveToolResolution {
+            resolution_json, ..
+        } if super::protocol_surface::has_readonly_protocol_presentation(resolution_json) => {
+            push_resolved_protocol_placeholder_rows(rows, width);
+        }
         TranscriptItemKind::InteractiveToolResolution { .. } => {
             push_detail_block(rows, "Interactive tool", item.text(), Color::Green, width);
         }
@@ -861,6 +866,27 @@ fn push_interactive_protocol_placeholder_rows(
         Style::new().fg(Color::Cyan),
     );
     let _ = request_json;
+    let surface_width = width.saturating_sub(2);
+    for index in 0..super::protocol_surface::INLINE_PROTOCOL_SURFACE_HEIGHT {
+        let marker = if index == 0 { "┌" } else { "│" };
+        rows.push(Line::from_spans(vec![
+            Span::styled(marker, muted_style()),
+            Span::styled(" ", muted_style()),
+            Span::styled(" ".repeat(usize::from(surface_width)), Style::new()),
+        ]));
+    }
+    rows.push(Line::default());
+}
+
+fn push_resolved_protocol_placeholder_rows(rows: &mut Vec<Line>, width: u16) {
+    push_wrapped_styled_text(
+        rows,
+        Vec::new(),
+        "Interactive tool · answered",
+        width,
+        Style::new().fg(Color::Green),
+        Style::new().fg(Color::Green),
+    );
     let surface_width = width.saturating_sub(2);
     for index in 0..super::protocol_surface::INLINE_PROTOCOL_SURFACE_HEIGHT {
         let marker = if index == 0 { "┌" } else { "│" };
