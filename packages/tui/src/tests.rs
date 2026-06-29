@@ -4635,6 +4635,49 @@ fn live_file_preview_updates_without_duplicates_and_final_replaces_it() {
 }
 
 #[test]
+fn live_file_preview_renders_available_new_text_before_original_text() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
+        session_id,
+        kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
+            turn_id: "turn-1".to_owned(),
+            tool_call_id: "call_edit".to_owned(),
+            tool_name: "filesystem_edit".to_owned(),
+            argument_bytes: 40,
+            preview: LiveToolArgumentPreview::FileEdit(LiveFileEditPreview {
+                preview_title: None,
+                streaming_status: None,
+                path: Some("src/lib.rs".to_owned()),
+                old_text_prefix: None,
+                new_text_prefix: "pub fn demo() {\n    println!(\"hi\");\n}".to_owned(),
+                old_text_required: true,
+                argument_bytes: 40,
+                truncated: false,
+            }),
+        },
+    });
+
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 30));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+
+    assert!(!output.contains("waiting for original text"), "{output}");
+    assert!(
+        output.contains("Streaming preview · Editing file"),
+        "{output}"
+    );
+    assert!(output.contains("src/lib.rs  +3 -0"), "{output}");
+    assert!(
+        output.contains("original text pending; showing available new text"),
+        "{output}"
+    );
+    assert!(output.contains("println!(\"hi\");"), "{output}");
+    assert!(!output.contains("+   2"), "{output}");
+}
+
+#[test]
 fn live_file_preview_renders_truncation_note_and_received_bytes() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);

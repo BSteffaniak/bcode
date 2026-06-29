@@ -949,7 +949,14 @@ fn push_tool_presentation_card_rows(
                     old_text.clone(),
                     new_text.clone(),
                 );
-                push_file_edit_preview_rows(rows, &edit, width, inline_diff_config, None, false);
+                push_file_edit_preview_rows(
+                    rows,
+                    &FileEditPreview::Known(edit),
+                    width,
+                    inline_diff_config,
+                    None,
+                    false,
+                );
             }
             ToolPresentationSection::Terminal {
                 output,
@@ -1166,7 +1173,7 @@ fn push_tool_request_rows(
     if let Some(edit) = context.file_edit {
         push_file_edit_preview_rows(
             rows,
-            edit,
+            &FileEditPreview::Known(edit.clone()),
             width,
             context.inline_diff_config,
             context.file_edit_phase,
@@ -1280,25 +1287,15 @@ fn push_live_file_edit_preview_rows(
         width,
     );
 
-    if let Some(edit) = file_edit_from_live_preview(context.preview) {
-        push_file_edit_preview_rows(
-            rows,
-            &edit,
-            width,
-            context.inline_diff_config,
-            Some(FileEditPhase::Pending),
-            true,
-        );
-    } else {
-        push_wrapped_styled_text(
-            rows,
-            vec![Span::styled("  ", muted_style())],
-            "waiting for original text before rendering diff",
-            width,
-            muted_style(),
-            muted_style(),
-        );
-    }
+    let edit = file_edit_from_live_preview(context.preview);
+    push_file_edit_preview_rows(
+        rows,
+        &edit,
+        width,
+        context.inline_diff_config,
+        Some(FileEditPhase::Pending),
+        true,
+    );
 
     if context.preview.truncated {
         push_wrapped_styled_text(
@@ -1313,18 +1310,118 @@ fn push_live_file_edit_preview_rows(
     rows.push(Line::default());
 }
 
-fn file_edit_from_live_preview(preview: &LiveFileEditPreview) -> Option<FileEditTranscript> {
-    if preview.old_text_required && preview.old_text_prefix.is_none() {
-        return None;
+fn file_edit_from_live_preview(preview: &LiveFileEditPreview) -> FileEditPreview {
+    let path = preview
+        .path
+        .clone()
+        .unwrap_or_else(|| "<streaming file>".to_owned());
+    if let Some(old_text) = preview.old_text_prefix.clone() {
+        return FileEditPreview::Known(FileEditTranscript::new(
+            path,
+            old_text,
+            preview.new_text_prefix.clone(),
+        ));
     }
-    Some(FileEditTranscript::new(
-        preview
-            .path
-            .clone()
-            .unwrap_or_else(|| "<streaming file>".to_owned()),
-        preview.old_text_prefix.clone().unwrap_or_default(),
-        preview.new_text_prefix.clone(),
-    ))
+    if !preview.old_text_required {
+        return FileEditPreview::Known(FileEditTranscript::new(
+            path,
+            String::new(),
+            preview.new_text_prefix.clone(),
+        ));
+    }
+
+    FileEditPreview::Streaming {
+        path,
+        new_text: preview.new_text_prefix.clone(),
+        original_pending: true,
+    }
+}
+
+#[derive(Debug, Clone)]
+enum FileEditPreview {
+    Known(FileEditTranscript),
+    Streaming {
+        path: String,
+        new_text: String,
+        original_pending: bool,
+    },
+}
+
+impl FileEditPreview {
+    fn path(&self) -> &str {
+        match self {
+            Self::Known(edit) => edit.path(),
+            Self::Streaming { path, .. } => path,
+        }
+    }
+
+    fn is_write(&self) -> bool {
+        match self {
+            Self::Known(edit) => edit.old_text_is_empty(),
+            Self::Streaming {
+                original_pending, ..
+            } => !original_pending,
+        }
+    }
+
+    fn summary_counts(&self) -> (u32, u32) {
+        match self {
+            Self::Known(edit) => {
+                let summary = edit.summary();
+                (summary.added, summary.removed)
+            }
+            Self::Streaming { new_text, .. } => (line_count(new_text), 0),
+        }
+    }
+
+    fn diff_lines(&self) -> Vec<DiffLine> {
+        match self {
+            Self::Known(edit) => edit.diff_lines(),
+            Self::Streaming { path, new_text, .. } => provisional_added_diff_lines(path, new_text),
+        }
+    }
+
+    const fn original_pending(&self) -> bool {
+        matches!(
+            self,
+            Self::Streaming {
+                original_pending: true,
+                ..
+            }
+        )
+    }
+}
+
+fn provisional_added_diff_lines(path: &str, new_text: &str) -> Vec<DiffLine> {
+    let mut lines = new_text
+        .lines()
+        .map(|line| DiffLine::new(DiffLineKind::Added, None, None, line.to_owned()))
+        .collect::<Vec<_>>();
+    apply_inline_syntax_highlighting(path, &mut lines);
+    lines
+}
+
+fn apply_inline_syntax_highlighting(path: &str, lines: &mut [DiffLine]) {
+    let highlighter = SyntaxHighlighter::new();
+    if !highlighter.can_highlight(path) {
+        return;
+    }
+    for line in lines.iter_mut().filter(|line| {
+        matches!(
+            line.kind,
+            DiffLineKind::Context | DiffLineKind::Added | DiffLineKind::Removed
+        )
+    }) {
+        line.inline_spans = highlighter
+            .highlight_line(path, &line.content)
+            .into_iter()
+            .map(|span| DiffInlineSpan::new(span.content, span.style))
+            .collect();
+    }
+}
+
+fn line_count(text: &str) -> u32 {
+    u32::try_from(text.lines().count()).unwrap_or(u32::MAX)
 }
 
 fn format_preview_bytes(bytes: usize) -> String {
@@ -1693,13 +1790,13 @@ fn parse_duration_millis(value: &str) -> Option<u64> {
 
 fn push_file_edit_preview_rows(
     rows: &mut Vec<Line>,
-    edit: &FileEditTranscript,
+    edit: &FileEditPreview,
     width: u16,
     inline_diff_config: TuiInlineDiffConfig,
     phase: Option<FileEditPhase>,
     live_preview: bool,
 ) {
-    let summary = edit.summary();
+    let (added, removed) = edit.summary_counts();
     let phase = phase.unwrap_or(FileEditPhase::Applied);
     let phase_label = if live_preview {
         "Streaming preview"
@@ -1713,7 +1810,7 @@ fn push_file_edit_preview_rows(
         &format!(
             "{} · {}",
             phase_label,
-            file_write_mode_label(edit.old_text_is_empty())
+            file_write_mode_label(edit.is_write())
         ),
         width,
         phase_style,
@@ -1722,12 +1819,7 @@ fn push_file_edit_preview_rows(
     push_wrapped_styled_text(
         rows,
         vec![Span::styled("  ", muted_style())],
-        &format!(
-            "{}  +{} -{}",
-            summary.display_path(),
-            summary.added,
-            summary.removed
-        ),
+        &format!("{}  +{} -{}", edit.path(), added, removed),
         width,
         Style::new()
             .fg(Color::BrightWhite)
@@ -1737,16 +1829,29 @@ fn push_file_edit_preview_rows(
     push_wrapped_styled_text(
         rows,
         vec![Span::styled("  ", muted_style())],
-        &edit_change_summary(summary.added, summary.removed),
+        &edit_change_summary(added, removed),
         width,
         muted_style(),
         muted_style(),
     );
 
+    if edit.original_pending() {
+        push_wrapped_styled_text(
+            rows,
+            vec![Span::styled("  ", muted_style())],
+            "original text pending; showing available new text",
+            width,
+            muted_style(),
+            muted_style(),
+        );
+    }
+
     let diff_lines = edit
         .diff_lines()
         .into_iter()
-        .filter(|line| line.kind != DiffLineKind::FileHeader)
+        .filter(|line| {
+            line.kind != DiffLineKind::FileHeader && line.kind != DiffLineKind::HunkHeader
+        })
         .collect::<Vec<_>>();
     let total_rows = diff_lines.len();
     let shown_rows = total_rows.min(MAX_INLINE_DIFF_ROWS);
@@ -2155,7 +2260,7 @@ const fn inline_diff_line_styles(kind: DiffLineKind) -> (&'static str, Style, St
 fn inline_diff_line_number(line: &DiffLine) -> String {
     line.new_line
         .or(line.old_line)
-        .map_or_else(|| "·".to_owned(), |line| line.to_string())
+        .map_or_else(String::new, |line| line.to_string())
 }
 
 fn edit_change_summary(added: u32, removed: u32) -> String {
