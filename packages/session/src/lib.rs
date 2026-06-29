@@ -3063,11 +3063,11 @@ mod tests {
         assert!(attachment.history.iter().any(|event| matches!(
             &event.kind,
             SessionEventKind::ToolCallFinished {
-                semantic_result: Some(ToolInvocationResult::ShellRun {
-                    result: ShellRunResult::Terminal { output_tail, .. },
-                }),
+                semantic_result: Some(ToolInvocationResult::Artifact { artifact }),
                 ..
-            } if output_tail == "hello\n"
+            } if artifact.schema == "bcode.shell.run"
+                && artifact.metadata["mode"] == "terminal"
+                && artifact.metadata["output_tail"] == "hello\n"
         )));
         std::fs::remove_dir_all(root).expect("temp session dir should be removed");
     }

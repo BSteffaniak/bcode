@@ -14,16 +14,16 @@ pub fn load_default_host_with_static_bundled(
     let selection = bcode_plugin::PluginSelection::all_enabled();
     let host = PluginHost::load_defaults_with_static_bundled(&selection, static_plugins);
     match host {
-        Ok(host) if host.tool_result_presenter_count() > 0 || static_plugins.is_empty() => Ok(host),
+        Ok(host) if host.visual_adapter_count() > 0 || static_plugins.is_empty() => Ok(host),
         Ok(_) | Err(_) => {
             let selected =
                 bcode_plugin::filter_selected_static_plugins(static_plugins, &selection)?;
-            let presenter_plugins = selected
+            let adapter_plugins = selected
                 .into_iter()
-                .filter(|(manifest, _)| !manifest.tool_result_presenters.is_empty())
+                .filter(|(manifest, _)| !manifest.visual_adapters.is_empty())
                 .collect::<Vec<_>>();
             Ok(PluginHost::load_static_plugins_best_effort(
-                &presenter_plugins,
+                &adapter_plugins,
             ))
         }
     }

@@ -7,12 +7,11 @@
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     InteractiveToolResolution, InteractiveToolResumeRequest, ListToolsRequest, OP_INVOKE_TOOL,
-    OP_LIST_TOOLS, OP_PRESENT_ARTIFACT, OP_PRESENT_TOOL_RESULT, OP_RESUME_INTERACTIVE_TOOL,
-    TOOL_SERVICE_INTERFACE_ID, ToolArtifactPresentationRequest, ToolArtifactPresentationResponse,
+    OP_LIST_TOOLS, OP_PRESENT_ARTIFACT, OP_RESUME_INTERACTIVE_TOOL, TOOL_SERVICE_INTERFACE_ID,
+    ToolArtifact, ToolArtifactPresentationRequest, ToolArtifactPresentationResponse,
     ToolCompatibilityAlias, ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
     ToolInvocationResult, ToolList, ToolPolicyMetadata, ToolPresentationEvent,
-    ToolPresentationTarget, ToolProtocolPresentation, ToolResultPresentationRequest,
-    ToolResultPresentationResponse, ToolSideEffect,
+    ToolPresentationTarget, ToolProtocolPresentation, ToolSideEffect,
 };
 use bmux_tui_component_protocol::model::{ComponentKind, ComponentNode};
 use bmux_tui_component_protocol::value::ComponentValue;
@@ -157,7 +156,6 @@ fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
         OP_LIST_TOOLS => list_tools(&context.request),
         OP_INVOKE_TOOL => invoke_tool(context),
         OP_RESUME_INTERACTIVE_TOOL => resume_interactive_tool(&context.request),
-        OP_PRESENT_TOOL_RESULT => present_tool_result_service(&context.request),
         OP_PRESENT_ARTIFACT => present_artifact_service(&context.request),
         _ => ServiceResponse::error(
             "unsupported_operation",
@@ -299,7 +297,7 @@ fn resume_interactive_tool(request: &ServiceRequest) -> ServiceResponse {
         Ok(outcome) => outcome,
         Err(error) => return json_response(&tool_error(error)),
     };
-    json_response(&question_response(&outcome))
+    json_response(&question_response(&resume.interaction_id, &outcome))
 }
 
 fn question_outcome_from_resolution(
@@ -329,7 +327,10 @@ fn question_outcome_from_resolution(
     }
 }
 
-fn question_response(outcome: &QuestionToolOutcome) -> ToolInvocationResponse {
+fn question_response(
+    interaction_id: &str,
+    outcome: &QuestionToolOutcome,
+) -> ToolInvocationResponse {
     let output = format_question_outcome_output(outcome);
     let value = serde_json::to_string(&outcome)
         .unwrap_or_else(|error| json!({"status":"error","error":error.to_string()}).to_string());
@@ -339,30 +340,19 @@ fn question_response(outcome: &QuestionToolOutcome) -> ToolInvocationResponse {
         content: Vec::new(),
         full_output: Some(value.clone()),
         host_action: None,
-        result: Some(ToolInvocationResult::Json { value }),
+        result: Some(ToolInvocationResult::Artifact {
+            artifact: Box::new(ToolArtifact {
+                artifact_id: format!("question-outcome-{interaction_id}"),
+                producer_plugin_id: "bcode.question".to_string(),
+                schema: "bcode.question.outcome".to_string(),
+                schema_version: 1,
+                tool_call_id: Some(interaction_id.to_string()),
+                title: Some("Question outcome".to_string()),
+                metadata: serde_json::from_str(&value).unwrap_or_else(|_| json!({})),
+                refs: Vec::new(),
+            }),
+        }),
     }
-}
-
-fn present_tool_result_service(
-    request: &bcode_plugin_sdk::prelude::ServiceRequest,
-) -> ServiceResponse {
-    let request = match serde_json::from_slice::<ToolResultPresentationRequest>(&request.payload) {
-        Ok(request) => request,
-        Err(error) => {
-            return ServiceResponse::error(
-                "invalid_request",
-                format!("invalid tool result presentation request: {error}"),
-            );
-        }
-    };
-    present_tool_result(&request).map_or_else(
-        || json_response(&ToolResultPresentationResponse::default()),
-        |presentation| {
-            json_response(&ToolResultPresentationResponse {
-                presentation: Some(presentation),
-            })
-        },
-    )
 }
 
 fn present_artifact_service(
@@ -394,27 +384,6 @@ fn question_outcome_from_artifact(
         return None;
     }
     serde_json::from_value(request.artifact.metadata.clone()).ok()
-}
-
-/// Present a semantic question tool result as a generic component protocol tree.
-#[must_use]
-pub fn present_tool_result(
-    request: &ToolResultPresentationRequest,
-) -> Option<ToolPresentationEvent> {
-    if request.tool_name != TOOL_NAME {
-        return None;
-    }
-    let outcome = match &request.semantic_result {
-        Some(ToolInvocationResult::Json { value }) => serde_json::from_str(value).ok(),
-        Some(ToolInvocationResult::Text { text }) => serde_json::from_str(text).ok(),
-        Some(
-            ToolInvocationResult::ShellRun { .. }
-            | ToolInvocationResult::FileChange { .. }
-            | ToolInvocationResult::Artifact { .. },
-        )
-        | None => serde_json::from_str(&request.fallback_result).ok(),
-    }?;
-    Some(question_result_presentation(&outcome))
 }
 
 fn question_result_presentation(outcome: &QuestionToolOutcome) -> ToolPresentationEvent {

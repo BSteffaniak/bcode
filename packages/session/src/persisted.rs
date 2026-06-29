@@ -1118,30 +1118,49 @@ fn semantic_from_legacy_presentation(
             retained_output_bytes,
             columns,
             rows,
-        } => ToolInvocationResult::ShellRun {
-            result: ShellRunResult::Terminal {
-                exit_code: *exit_code,
-                timed_out: *timed_out,
-                cancelled: *cancelled,
-                duration_ms: None,
-                output_tail: output.clone(),
-                output_truncated: *output_truncated,
-                output_bytes: *output_bytes,
-                retained_output_bytes: *retained_output_bytes,
-                columns: (*columns).max(1),
-                rows: (*rows).max(1),
-            },
+        } => ToolInvocationResult::Artifact {
+            artifact: Box::new(ToolArtifact {
+                artifact_id: "legacy-shell-run".to_string(),
+                producer_plugin_id: "bcode.shell".to_string(),
+                schema: "bcode.shell.run".to_string(),
+                schema_version: 1,
+                tool_call_id: None,
+                title: Some("Shell run".to_string()),
+                metadata: serde_json::json!({
+                    "mode": "terminal",
+                    "exit_code": exit_code,
+                    "timed_out": timed_out,
+                    "cancelled": cancelled,
+                    "duration_ms": null,
+                    "output_tail": output,
+                    "output_truncated": output_truncated,
+                    "output_bytes": output_bytes,
+                    "retained_output_bytes": retained_output_bytes,
+                    "columns": (*columns).max(1),
+                    "rows": (*rows).max(1),
+                }),
+                refs: Vec::new(),
+            }),
         },
         PersistedToolInvocationPresentation::FileChange {
             tool_name,
             summary,
             path,
-        } => ToolInvocationResult::FileChange {
-            result: FileChangeResult {
-                tool_name: tool_name.clone(),
-                summary: summary.clone(),
-                path: path.clone(),
-            },
+        } => ToolInvocationResult::Artifact {
+            artifact: Box::new(ToolArtifact {
+                artifact_id: format!("legacy-file-change-{tool_name}"),
+                producer_plugin_id: "bcode.filesystem".to_string(),
+                schema: "bcode.filesystem.change".to_string(),
+                schema_version: 1,
+                tool_call_id: None,
+                title: Some("File change".to_string()),
+                metadata: serde_json::json!({
+                    "tool_name": tool_name,
+                    "summary": summary,
+                    "path": path,
+                }),
+                refs: Vec::new(),
+            }),
         },
     }
 }
@@ -1189,10 +1208,8 @@ impl PersistedToolInvocationResult {
             Self::Text { text } => ToolInvocationResult::Text { text },
             Self::Json { value } => ToolInvocationResult::Json { value },
             Self::Artifact { artifact } => ToolInvocationResult::Artifact { artifact },
-            Self::ShellRun { result } => ToolInvocationResult::ShellRun {
-                result: result.into_domain(),
-            },
-            Self::FileChange { result } => ToolInvocationResult::FileChange { result },
+            Self::ShellRun { result } => shell_run_artifact(&result.into_domain()),
+            Self::FileChange { result } => file_change_artifact(&result),
         }
     }
 }
@@ -1350,6 +1367,37 @@ impl PersistedShellRunResult {
                 stderr_bytes,
             },
         }
+    }
+}
+
+fn shell_run_artifact(result: &ShellRunResult) -> ToolInvocationResult {
+    let metadata = serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({}));
+    ToolInvocationResult::Artifact {
+        artifact: Box::new(ToolArtifact {
+            artifact_id: "legacy-shell-run".to_string(),
+            producer_plugin_id: "bcode.shell".to_string(),
+            schema: "bcode.shell.run".to_string(),
+            schema_version: 1,
+            tool_call_id: None,
+            title: Some("Shell run".to_string()),
+            metadata,
+            refs: Vec::new(),
+        }),
+    }
+}
+
+fn file_change_artifact(result: &FileChangeResult) -> ToolInvocationResult {
+    ToolInvocationResult::Artifact {
+        artifact: Box::new(ToolArtifact {
+            artifact_id: format!("legacy-file-change-{}", result.tool_name),
+            producer_plugin_id: "bcode.filesystem".to_string(),
+            schema: "bcode.filesystem.change".to_string(),
+            schema_version: 1,
+            tool_call_id: None,
+            title: Some("File change".to_string()),
+            metadata: serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({})),
+            refs: Vec::new(),
+        }),
     }
 }
 
@@ -1763,55 +1811,44 @@ mod tests {
     }
 
     fn assert_file_change_result(event: SessionEvent) {
+        let ToolInvocationResult::Artifact { artifact } = tool_result(event) else {
+            panic!("expected file-change artifact");
+        };
+        assert_eq!(artifact.producer_plugin_id, "bcode.filesystem");
+        assert_eq!(artifact.schema, "bcode.filesystem.change");
+        assert_eq!(artifact.schema_version, 1);
         assert_eq!(
-            tool_result(event),
-            ToolInvocationResult::FileChange {
-                result: FileChangeResult {
-                    tool_name: "filesystem.write".to_string(),
-                    summary: "wrote bytes".to_string(),
-                    path: Some("file.txt".to_string()),
-                },
-            }
+            artifact.metadata,
+            serde_json::json!({
+                "tool_name": "filesystem.write",
+                "summary": "wrote bytes",
+                "path": "file.txt",
+            })
         );
     }
 
     fn assert_legacy_terminal_result(event: SessionEvent) {
-        assert_eq!(
-            tool_result(event),
-            ToolInvocationResult::ShellRun {
-                result: ShellRunResult::Terminal {
-                    exit_code: None,
-                    timed_out: false,
-                    cancelled: false,
-                    duration_ms: None,
-                    output_tail: "legacy tail".to_string(),
-                    output_truncated: false,
-                    output_bytes: None,
-                    retained_output_bytes: None,
-                    columns: 80,
-                    rows: 24,
-                },
-            }
-        );
+        let ToolInvocationResult::Artifact { artifact } = tool_result(event) else {
+            panic!("expected shell artifact");
+        };
+        assert_eq!(artifact.producer_plugin_id, "bcode.shell");
+        assert_eq!(artifact.schema, "bcode.shell.run");
+        assert_eq!(artifact.schema_version, 1);
+        assert_eq!(artifact.metadata["mode"], "terminal");
+        assert_eq!(artifact.metadata["output_tail"], "legacy tail");
+        assert_eq!(artifact.metadata["columns"], 80);
+        assert_eq!(artifact.metadata["rows"], 24);
     }
 
     fn assert_captured_result(event: SessionEvent) {
-        assert_eq!(
-            tool_result(event),
-            ToolInvocationResult::ShellRun {
-                result: ShellRunResult::Captured {
-                    exit_code: None,
-                    timed_out: false,
-                    cancelled: false,
-                    duration_ms: None,
-                    stdout: "hello\n".to_string(),
-                    stderr: String::new(),
-                    stdout_truncated: false,
-                    stderr_truncated: false,
-                    stdout_bytes: None,
-                    stderr_bytes: None,
-                },
-            }
-        );
+        let ToolInvocationResult::Artifact { artifact } = tool_result(event) else {
+            panic!("expected shell artifact");
+        };
+        assert_eq!(artifact.producer_plugin_id, "bcode.shell");
+        assert_eq!(artifact.schema, "bcode.shell.run");
+        assert_eq!(artifact.schema_version, 1);
+        assert_eq!(artifact.metadata["mode"], "captured");
+        assert_eq!(artifact.metadata["stdout"], "hello\n");
+        assert_eq!(artifact.metadata["stderr"], "");
     }
 }

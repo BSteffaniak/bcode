@@ -20,9 +20,6 @@ pub const OP_INVOKE_TOOL: &str = "invoke_tool";
 /// Operation for resuming a suspended interactive tool invocation.
 pub const OP_RESUME_INTERACTIVE_TOOL: &str = "resume_interactive_tool";
 
-/// Operation for presenting a semantic tool result in a client-local renderer.
-pub const OP_PRESENT_TOOL_RESULT: &str = "present_tool_result";
-
 /// Operation for presenting an opaque artifact in a client-local renderer.
 pub const OP_PRESENT_ARTIFACT: &str = "present_artifact";
 
@@ -786,27 +783,6 @@ pub struct ToolArtifactPresentationResponse {
     pub presentation: Option<ToolPresentationEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<serde_json::Value>,
-}
-
-/// Client-local presentation request for a semantic tool result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolResultPresentationRequest {
-    pub tool_call_id: String,
-    pub tool_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub arguments_json: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub semantic_result: Option<ToolInvocationResult>,
-    pub fallback_result: String,
-    #[serde(default)]
-    pub is_error: bool,
-}
-
-/// Client-local presentation response for a semantic tool result.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolResultPresentationResponse {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub presentation: Option<ToolPresentationEvent>,
 }
 
 /// Typed host action requested by a tool plugin.

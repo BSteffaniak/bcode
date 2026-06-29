@@ -2755,15 +2755,14 @@ impl BmuxApp {
             .tool_call_contexts
             .get(tool_call_id)
             .map(|context| context.arguments_json.clone());
-        if let Some(item) = present_tool_result_item_for_app(
-            self.plugin_host.as_deref(),
-            tool_call_id,
-            tool_name.as_deref(),
-            arguments_json.as_deref(),
-            semantic_result,
-            result,
-            is_error,
-        ) {
+        if let Some(ToolInvocationResult::Artifact { artifact }) = semantic_result
+            && let Some(item) = present_artifact_item_for_app(
+                self.plugin_host.as_deref(),
+                tool_call_id,
+                tool_name.as_deref(),
+                artifact,
+            )
+        {
             self.transcript.retain(|item| {
                 !item_is_replaceable_tool_transcript_for_tool_call(item, tool_call_id)
             });
@@ -4149,31 +4148,53 @@ fn protocol_presentation_item_from_plugin(
     ))
 }
 
-fn present_tool_result_item_for_app(
+fn present_artifact_item_for_app(
     runtime: Option<&bcode_plugin::PluginHost>,
     tool_call_id: &str,
     tool_name: Option<&str>,
-    arguments_json: Option<&str>,
-    semantic_result: Option<&ToolInvocationResult>,
-    fallback_result: &str,
-    is_error: bool,
+    artifact: &bcode_session_models::ToolArtifact,
 ) -> Option<TranscriptItem> {
     let runtime = runtime?;
-    let tool_name = tool_name?;
-    let request = bcode_tool::ToolResultPresentationRequest {
-        tool_call_id: tool_call_id.to_owned(),
-        tool_name: tool_name.to_owned(),
-        arguments_json: arguments_json.map(str::to_owned),
-        semantic_result: semantic_result
-            .and_then(|result| serde_json::to_value(result).ok())
-            .and_then(|value| serde_json::from_value(value).ok()),
-        fallback_result: fallback_result.to_owned(),
-        is_error,
+    let request = bcode_tool::ToolArtifactPresentationRequest {
+        artifact: tool_artifact_to_service(artifact),
+        surface: "tui".to_string(),
+        viewport: None,
+        capabilities: None,
+        state: None,
     };
-    let response = runtime.present_tool_result(&request).ok()??;
+    let response = runtime.present_artifact(&request).ok()??;
     response.presentation.and_then(|presentation| {
-        protocol_presentation_item_from_plugin(tool_call_id, tool_name, presentation)
+        protocol_presentation_item_from_plugin(
+            tool_call_id,
+            tool_name.unwrap_or(&artifact.producer_plugin_id),
+            presentation,
+        )
     })
+}
+
+fn tool_artifact_to_service(
+    artifact: &bcode_session_models::ToolArtifact,
+) -> bcode_tool::ToolArtifact {
+    bcode_tool::ToolArtifact {
+        artifact_id: artifact.artifact_id.clone(),
+        producer_plugin_id: artifact.producer_plugin_id.clone(),
+        schema: artifact.schema.clone(),
+        schema_version: artifact.schema_version,
+        tool_call_id: artifact.tool_call_id.clone(),
+        title: artifact.title.clone(),
+        metadata: artifact.metadata.clone(),
+        refs: artifact
+            .refs
+            .iter()
+            .map(|reference| bcode_tool::ToolArtifactRef {
+                key: reference.key.clone(),
+                content_type: reference.content_type.clone(),
+                storage_uri: reference.storage_uri.clone(),
+                byte_len: reference.byte_len,
+                metadata: reference.metadata.clone(),
+            })
+            .collect(),
+    }
 }
 
 fn item_is_replaceable_tool_transcript_for_tool_call(

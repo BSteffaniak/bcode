@@ -7,12 +7,6 @@ description  = "Interactive read-only question/ask tool"
 interface_id = "bcode.tool/v1"
 name         = "Question Tool"
 
-[[tool_result_presenters]]
-operation            = "present_tool_result"
-service_interface_id = "bcode.tool/v1"
-surface_protocols    = ["bmux.protocol.inline.result"]
-tool_name            = "question"
-
 [[visual_adapters]]
 artifact_schema      = "bcode.question.outcome"
 id                   = "question-outcome-component"

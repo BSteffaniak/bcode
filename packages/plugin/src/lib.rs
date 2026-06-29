@@ -85,8 +85,6 @@ pub struct PluginManifest {
     #[serde(default)]
     pub tui_surfaces: Vec<PluginTuiSurfaceDeclaration>,
     #[serde(default)]
-    pub tool_result_presenters: Vec<PluginToolResultPresenterDeclaration>,
-    #[serde(default)]
     pub visual_adapters: Vec<PluginVisualAdapterDeclaration>,
     #[serde(default)]
     pub command_contributions: Vec<PluginCommandContribution>,
@@ -99,24 +97,8 @@ pub struct PluginManifest {
     pub runtime: PluginRuntime,
 }
 
-/// Tool-result presentation capability declared by a plugin manifest.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginToolResultPresenterDeclaration {
-    pub tool_name: String,
-    #[serde(default = "default_tool_service_interface_id")]
-    pub service_interface_id: String,
-    #[serde(default = "default_present_tool_result_operation")]
-    pub operation: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub surface_protocols: Vec<String>,
-}
-
 fn default_tool_service_interface_id() -> String {
     bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned()
-}
-
-fn default_present_tool_result_operation() -> String {
-    bcode_tool::OP_PRESENT_TOOL_RESULT.to_owned()
 }
 
 /// Visual adapter capability declared by a plugin manifest.
@@ -1877,24 +1859,6 @@ impl PluginRegistry {
             .find(|surface| surface.kind == surface_kind)
     }
 
-    /// Return the manifest-declared presenter route for a tool result.
-    #[must_use]
-    pub fn tool_result_presenter(&self, tool_name: &str) -> Option<PluginToolResultPresenterRoute> {
-        self.manifests.iter().find_map(|(plugin_id, manifest)| {
-            manifest
-                .tool_result_presenters
-                .iter()
-                .find(|presenter| presenter.tool_name == tool_name)
-                .map(|presenter| PluginToolResultPresenterRoute {
-                    plugin_id: plugin_id.clone(),
-                    tool_name: presenter.tool_name.clone(),
-                    service_interface_id: presenter.service_interface_id.clone(),
-                    operation: presenter.operation.clone(),
-                    surface_protocols: presenter.surface_protocols.clone(),
-                })
-        })
-    }
-
     /// Return the highest-priority compatible visual adapter route for an artifact.
     #[must_use]
     pub fn visual_adapter(
@@ -1923,16 +1887,6 @@ impl PluginRegistry {
         self.service_policies
             .get(&(plugin_id.to_string(), interface_id.to_string()))
     }
-}
-
-/// Loaded route for a manifest-declared tool result presenter.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PluginToolResultPresenterRoute {
-    pub plugin_id: String,
-    pub tool_name: String,
-    pub service_interface_id: String,
-    pub operation: String,
-    pub surface_protocols: Vec<String>,
 }
 
 /// Loaded route for a manifest-declared visual adapter.
@@ -2444,29 +2398,6 @@ impl PluginRuntimeHost {
         Ok(delivered)
     }
 
-    /// Present a semantic tool result through the plugin that declared support for the tool name.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the selected presenter plugin cannot be invoked or its response cannot
-    /// be decoded.
-    pub async fn present_tool_result(
-        &self,
-        request: &bcode_tool::ToolResultPresentationRequest,
-    ) -> Result<Option<bcode_tool::ToolResultPresentationResponse>, PluginServiceCallError> {
-        let Some(route) = self.registry.tool_result_presenter(&request.tool_name) else {
-            return Ok(None);
-        };
-        self.invoke_service_json::<_, bcode_tool::ToolResultPresentationResponse>(
-            &route.plugin_id,
-            route.service_interface_id,
-            route.operation,
-            request,
-        )
-        .await
-        .map(Some)
-    }
-
     /// Deactivate all loaded plugins through their plugin-local executors.
     ///
     /// # Errors
@@ -2866,15 +2797,6 @@ impl PluginHost {
         Ok(host)
     }
 
-    /// Return the number of manifest-declared tool result presenters in loaded plugins.
-    #[must_use]
-    pub fn tool_result_presenter_count(&self) -> usize {
-        self.loaded
-            .iter()
-            .map(|plugin| plugin.manifest.tool_result_presenters.len())
-            .sum()
-    }
-
     /// Return the number of manifest-declared visual adapters in loaded plugins.
     #[must_use]
     pub fn visual_adapter_count(&self) -> usize {
@@ -2957,41 +2879,6 @@ impl PluginHost {
     #[must_use]
     pub fn service_registry(&self) -> PluginServiceRegistry {
         PluginServiceRegistry::from_loaded_plugins(&self.loaded)
-    }
-
-    /// Present a semantic tool result through the plugin that declared support for the tool name.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the selected presenter plugin cannot be invoked or its response cannot
-    /// be decoded.
-    pub fn present_tool_result(
-        &self,
-        request: &bcode_tool::ToolResultPresentationRequest,
-    ) -> Result<Option<bcode_tool::ToolResultPresentationResponse>, PluginServiceCallError> {
-        let Some(route) = self.loaded.iter().find_map(|plugin| {
-            plugin
-                .manifest
-                .tool_result_presenters
-                .iter()
-                .find(|presenter| presenter.tool_name == request.tool_name)
-                .map(|presenter| PluginToolResultPresenterRoute {
-                    plugin_id: plugin.manifest.id.clone(),
-                    tool_name: presenter.tool_name.clone(),
-                    service_interface_id: presenter.service_interface_id.clone(),
-                    operation: presenter.operation.clone(),
-                    surface_protocols: presenter.surface_protocols.clone(),
-                })
-        }) else {
-            return Ok(None);
-        };
-        self.invoke_service_json::<_, bcode_tool::ToolResultPresentationResponse>(
-            &route.plugin_id,
-            route.service_interface_id,
-            route.operation,
-            request,
-        )
-        .map(Some)
     }
 
     /// Present an opaque artifact through the highest-priority compatible visual adapter.
@@ -3752,7 +3639,6 @@ library = "libcommands.dylib"
             version: Version::new(0, 1, 0),
             services: Vec::new(),
             tui_surfaces: Vec::new(),
-            tool_result_presenters: Vec::new(),
             visual_adapters: Vec::new(),
             command_contributions: Vec::new(),
             event_subscriptions: Vec::new(),
@@ -3799,7 +3685,6 @@ library = "libcommands.dylib"
             version: Version::new(0, 1, 0),
             services: Vec::new(),
             tui_surfaces: Vec::new(),
-            tool_result_presenters: Vec::new(),
             visual_adapters: Vec::new(),
             command_contributions: Vec::new(),
             event_subscriptions: Vec::new(),
@@ -4308,7 +4193,6 @@ library = "libexample_plugin.dylib"
                     class: None,
                 }],
                 tui_surfaces: Vec::new(),
-                tool_result_presenters: Vec::new(),
                 visual_adapters: Vec::new(),
                 command_contributions: Vec::new(),
                 event_subscriptions: Vec::new(),
@@ -4856,7 +4740,6 @@ library = "libexample_plugin.dylib"
                 class: None,
             }],
             tui_surfaces: Vec::new(),
-            tool_result_presenters: Vec::new(),
             visual_adapters: Vec::new(),
             command_contributions: Vec::new(),
             event_subscriptions: Vec::new(),
