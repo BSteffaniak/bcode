@@ -23,6 +23,9 @@ pub const OP_RESUME_INTERACTIVE_TOOL: &str = "resume_interactive_tool";
 /// Operation for presenting a semantic tool result in a client-local renderer.
 pub const OP_PRESENT_TOOL_RESULT: &str = "present_tool_result";
 
+/// Operation for presenting an opaque artifact in a client-local renderer.
+pub const OP_PRESENT_ARTIFACT: &str = "present_artifact";
+
 /// List tools request.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListToolsRequest {}
@@ -725,6 +728,66 @@ pub struct ToolInvocationResponse {
     pub result: Option<ToolInvocationResult>,
 }
 
+/// Opaque artifact produced by a tool plugin and rendered by visual adapters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolArtifact {
+    pub artifact_id: String,
+    pub producer_plugin_id: String,
+    pub schema: String,
+    pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub metadata: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<ToolArtifactRef>,
+}
+
+/// Reference to plugin-owned artifact bytes or structured sidecar data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolArtifactRef {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Client-local presentation request for an opaque tool artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolArtifactPresentationRequest {
+    pub artifact: ToolArtifact,
+    pub surface: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewport: Option<ToolArtifactPresentationViewport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<serde_json::Value>,
+}
+
+/// Viewport information supplied by a client when asking a visual adapter to render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolArtifactPresentationViewport {
+    pub width: u16,
+    pub height: u16,
+}
+
+/// Client-local presentation response for an opaque tool artifact.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolArtifactPresentationResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<ToolPresentationEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<serde_json::Value>,
+}
+
 /// Client-local presentation request for a semantic tool result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResultPresentationRequest {
@@ -845,6 +908,7 @@ pub struct HostModelNativeWebSearchRequest {
 pub enum ToolInvocationResult {
     Text { text: String },
     Json { value: String },
+    Artifact { artifact: Box<ToolArtifact> },
     ShellRun { result: ShellRunResult },
     FileChange { result: FileChangeResult },
 }

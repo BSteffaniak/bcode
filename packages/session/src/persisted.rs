@@ -9,7 +9,7 @@ use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, FileChangeResult, ModelTurnOutcome,
     RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
     SessionEventProvenance, SessionForkKind, SessionId, SessionTokenUsage, SessionTraceEvent,
-    ShellRunResult, ToolInvocationResult, ToolInvocationStreamEvent,
+    ShellRunResult, ToolArtifact, ToolInvocationResult, ToolInvocationStreamEvent,
     ToolRequestPresentationMetadata, TraceBlobRef, current_unix_timestamp_ms,
 };
 use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
@@ -1158,6 +1158,7 @@ fn legacy_presentation_result_text(presentation: &PersistedToolInvocationPresent
 enum PersistedToolInvocationResult {
     Text { text: String },
     Json { value: String },
+    Artifact { artifact: Box<ToolArtifact> },
     ShellRun { result: PersistedShellRunResult },
     FileChange { result: FileChangeResult },
 }
@@ -1168,6 +1169,9 @@ impl From<&ToolInvocationResult> for PersistedToolInvocationResult {
             ToolInvocationResult::Text { text } => Self::Text { text: text.clone() },
             ToolInvocationResult::Json { value } => Self::Json {
                 value: value.clone(),
+            },
+            ToolInvocationResult::Artifact { artifact } => Self::Artifact {
+                artifact: artifact.clone(),
             },
             ToolInvocationResult::ShellRun { result } => Self::ShellRun {
                 result: PersistedShellRunResult::from(result),
@@ -1184,6 +1188,7 @@ impl PersistedToolInvocationResult {
         match self {
             Self::Text { text } => ToolInvocationResult::Text { text },
             Self::Json { value } => ToolInvocationResult::Json { value },
+            Self::Artifact { artifact } => ToolInvocationResult::Artifact { artifact },
             Self::ShellRun { result } => ToolInvocationResult::ShellRun {
                 result: result.into_domain(),
             },

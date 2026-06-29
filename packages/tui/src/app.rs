@@ -4060,6 +4060,13 @@ fn semantic_tool_result_item_for_app(
             value,
             is_error,
         )),
+        Some(ToolInvocationResult::Artifact { artifact }) => Some(tool_result_item(
+            tool_call_id,
+            tool_name,
+            arguments_json,
+            &serde_json::to_string(artifact).unwrap_or_else(|_| fallback_result.to_owned()),
+            is_error,
+        )),
         Some(ToolInvocationResult::ShellRun { .. }) | None => Some(tool_result_item(
             tool_call_id,
             tool_name,

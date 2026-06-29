@@ -1461,6 +1461,13 @@ fn semantic_tool_result_item(
             value,
             is_error,
         )),
+        ToolInvocationResult::Artifact { artifact } => Some(tool_result_item(
+            tool_call_id,
+            context.map(|context| context.tool_name.as_str()),
+            context.map(|context| context.arguments_json.as_str()),
+            &serde_json::to_string(artifact).unwrap_or_else(|_| "artifact".to_string()),
+            is_error,
+        )),
     }
 }
 

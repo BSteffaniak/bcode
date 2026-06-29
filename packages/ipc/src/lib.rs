@@ -2550,6 +2550,24 @@ mod tests {
 
     fn semantic_tool_results() -> Vec<ToolInvocationResult> {
         vec![
+            ToolInvocationResult::Artifact {
+                artifact: Box::new(bcode_session_models::ToolArtifact {
+                    artifact_id: "artifact-1".to_string(),
+                    producer_plugin_id: "bcode.test".to_string(),
+                    schema: "bcode.test.artifact".to_string(),
+                    schema_version: 1,
+                    tool_call_id: Some("call-1".to_string()),
+                    title: Some("Test artifact".to_string()),
+                    metadata: serde_json::json!({"ok": true}),
+                    refs: vec![bcode_session_models::ToolArtifactRef {
+                        key: "data".to_string(),
+                        content_type: Some("application/json".to_string()),
+                        storage_uri: None,
+                        byte_len: Some(11),
+                        metadata: None,
+                    }],
+                }),
+            },
             ToolInvocationResult::FileChange {
                 result: FileChangeResult {
                     tool_name: "filesystem.write".to_string(),

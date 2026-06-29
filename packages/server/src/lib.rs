@@ -14906,6 +14906,28 @@ fn service_tool_result_to_session(result: ServiceToolInvocationResult) -> ToolIn
     match result {
         ServiceToolInvocationResult::Text { text } => ToolInvocationResult::Text { text },
         ServiceToolInvocationResult::Json { value } => ToolInvocationResult::Json { value },
+        ServiceToolInvocationResult::Artifact { artifact } => ToolInvocationResult::Artifact {
+            artifact: Box::new(bcode_session_models::ToolArtifact {
+                artifact_id: artifact.artifact_id,
+                producer_plugin_id: artifact.producer_plugin_id,
+                schema: artifact.schema,
+                schema_version: artifact.schema_version,
+                tool_call_id: artifact.tool_call_id,
+                title: artifact.title,
+                metadata: artifact.metadata,
+                refs: artifact
+                    .refs
+                    .into_iter()
+                    .map(|reference| bcode_session_models::ToolArtifactRef {
+                        key: reference.key,
+                        content_type: reference.content_type,
+                        storage_uri: reference.storage_uri,
+                        byte_len: reference.byte_len,
+                        metadata: reference.metadata,
+                    })
+                    .collect(),
+            }),
+        },
         ServiceToolInvocationResult::ShellRun { result } => ToolInvocationResult::ShellRun {
             result: service_shell_result_to_session(result),
         },

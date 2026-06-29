@@ -87,6 +87,8 @@ pub struct PluginManifest {
     #[serde(default)]
     pub tool_result_presenters: Vec<PluginToolResultPresenterDeclaration>,
     #[serde(default)]
+    pub visual_adapters: Vec<PluginVisualAdapterDeclaration>,
+    #[serde(default)]
     pub command_contributions: Vec<PluginCommandContribution>,
     #[serde(default)]
     pub event_subscriptions: Vec<PluginEventSubscription>,
@@ -115,6 +117,46 @@ fn default_tool_service_interface_id() -> String {
 
 fn default_present_tool_result_operation() -> String {
     bcode_tool::OP_PRESENT_TOOL_RESULT.to_owned()
+}
+
+/// Visual adapter capability declared by a plugin manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginVisualAdapterDeclaration {
+    pub id: String,
+    pub artifact_schema: String,
+    #[serde(default)]
+    pub min_schema_version: Option<u32>,
+    #[serde(default)]
+    pub max_schema_version: Option<u32>,
+    #[serde(default = "default_tool_service_interface_id")]
+    pub service_interface_id: String,
+    #[serde(default = "default_present_artifact_operation")]
+    pub operation: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub surfaces: Vec<String>,
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default)]
+    pub producer_default: bool,
+}
+
+impl PluginVisualAdapterDeclaration {
+    /// Return whether this adapter can present the artifact schema/version on the requested surface.
+    #[must_use]
+    pub fn supports(&self, schema: &str, schema_version: u32, surface: &str) -> bool {
+        self.artifact_schema == schema
+            && self
+                .min_schema_version
+                .is_none_or(|minimum| schema_version >= minimum)
+            && self
+                .max_schema_version
+                .is_none_or(|maximum| schema_version <= maximum)
+            && (self.surfaces.is_empty() || self.surfaces.iter().any(|value| value == surface))
+    }
+}
+
+fn default_present_artifact_operation() -> String {
+    bcode_tool::OP_PRESENT_ARTIFACT.to_owned()
 }
 
 /// Native TUI surface declared by a plugin manifest.
@@ -1853,6 +1895,24 @@ impl PluginRegistry {
         })
     }
 
+    /// Return the highest-priority compatible visual adapter route for an artifact.
+    #[must_use]
+    pub fn visual_adapter(
+        &self,
+        schema: &str,
+        schema_version: u32,
+        surface: &str,
+        producer_plugin_id: Option<&str>,
+    ) -> Option<PluginVisualAdapterRoute> {
+        select_visual_adapter(
+            self.manifests.iter(),
+            schema,
+            schema_version,
+            surface,
+            producer_plugin_id,
+        )
+    }
+
     /// Return runtime policy metadata for a plugin service interface.
     #[must_use]
     pub fn service_policy(
@@ -1873,6 +1933,63 @@ pub struct PluginToolResultPresenterRoute {
     pub service_interface_id: String,
     pub operation: String,
     pub surface_protocols: Vec<String>,
+}
+
+/// Loaded route for a manifest-declared visual adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginVisualAdapterRoute {
+    pub plugin_id: String,
+    pub adapter_id: String,
+    pub artifact_schema: String,
+    pub service_interface_id: String,
+    pub operation: String,
+    pub surfaces: Vec<String>,
+    pub priority: i32,
+    pub producer_default: bool,
+}
+
+fn select_visual_adapter<'a, I>(
+    manifests: I,
+    schema: &str,
+    schema_version: u32,
+    surface: &str,
+    producer_plugin_id: Option<&str>,
+) -> Option<PluginVisualAdapterRoute>
+where
+    I: Iterator<Item = (&'a String, &'a PluginManifest)>,
+{
+    manifests
+        .flat_map(|(plugin_id, manifest)| {
+            manifest
+                .visual_adapters
+                .iter()
+                .filter(move |adapter| adapter.supports(schema, schema_version, surface))
+                .map(move |adapter| {
+                    let producer_bonus = i32::from(
+                        adapter.producer_default
+                            && producer_plugin_id.is_some_and(|producer| producer == plugin_id),
+                    );
+                    (plugin_id, adapter, producer_bonus)
+                })
+        })
+        .max_by_key(|(plugin_id, adapter, producer_bonus)| {
+            (
+                adapter.priority,
+                *producer_bonus,
+                plugin_id.as_str(),
+                adapter.id.as_str(),
+            )
+        })
+        .map(|(plugin_id, adapter, _)| PluginVisualAdapterRoute {
+            plugin_id: plugin_id.clone(),
+            adapter_id: adapter.id.clone(),
+            artifact_schema: adapter.artifact_schema.clone(),
+            service_interface_id: adapter.service_interface_id.clone(),
+            operation: adapter.operation.clone(),
+            surfaces: adapter.surfaces.clone(),
+            priority: adapter.priority,
+            producer_default: adapter.producer_default,
+        })
 }
 
 /// Runtime policy metadata for a declared plugin service.
@@ -2758,6 +2875,15 @@ impl PluginHost {
             .sum()
     }
 
+    /// Return the number of manifest-declared visual adapters in loaded plugins.
+    #[must_use]
+    pub fn visual_adapter_count(&self) -> usize {
+        self.loaded
+            .iter()
+            .map(|plugin| plugin.manifest.visual_adapters.len())
+            .sum()
+    }
+
     /// Load and activate statically bundled plugins best-effort.
     ///
     /// Plugins that fail to load or activate are skipped so independent client-side capabilities can
@@ -2860,6 +2986,36 @@ impl PluginHost {
             return Ok(None);
         };
         self.invoke_service_json::<_, bcode_tool::ToolResultPresentationResponse>(
+            &route.plugin_id,
+            route.service_interface_id,
+            route.operation,
+            request,
+        )
+        .map(Some)
+    }
+
+    /// Present an opaque artifact through the highest-priority compatible visual adapter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected visual adapter cannot be invoked or its response cannot be
+    /// decoded.
+    pub fn present_artifact(
+        &self,
+        request: &bcode_tool::ToolArtifactPresentationRequest,
+    ) -> Result<Option<bcode_tool::ToolArtifactPresentationResponse>, PluginServiceCallError> {
+        let Some(route) = select_visual_adapter(
+            self.loaded
+                .iter()
+                .map(|plugin| (&plugin.manifest.id, &plugin.manifest)),
+            &request.artifact.schema,
+            request.artifact.schema_version,
+            &request.surface,
+            Some(&request.artifact.producer_plugin_id),
+        ) else {
+            return Ok(None);
+        };
+        self.invoke_service_json::<_, bcode_tool::ToolArtifactPresentationResponse>(
             &route.plugin_id,
             route.service_interface_id,
             route.operation,
@@ -3597,6 +3753,7 @@ library = "libcommands.dylib"
             services: Vec::new(),
             tui_surfaces: Vec::new(),
             tool_result_presenters: Vec::new(),
+            visual_adapters: Vec::new(),
             command_contributions: Vec::new(),
             event_subscriptions: Vec::new(),
             config: Some(PluginManifestConfig {
@@ -3643,6 +3800,7 @@ library = "libcommands.dylib"
             services: Vec::new(),
             tui_surfaces: Vec::new(),
             tool_result_presenters: Vec::new(),
+            visual_adapters: Vec::new(),
             command_contributions: Vec::new(),
             event_subscriptions: Vec::new(),
             config: Some(PluginManifestConfig {
@@ -4151,6 +4309,7 @@ library = "libexample_plugin.dylib"
                 }],
                 tui_surfaces: Vec::new(),
                 tool_result_presenters: Vec::new(),
+                visual_adapters: Vec::new(),
                 command_contributions: Vec::new(),
                 event_subscriptions: Vec::new(),
                 concurrency: PluginConcurrencyConfig::Exclusive,
@@ -4698,6 +4857,7 @@ library = "libexample_plugin.dylib"
             }],
             tui_surfaces: Vec::new(),
             tool_result_presenters: Vec::new(),
+            visual_adapters: Vec::new(),
             command_contributions: Vec::new(),
             event_subscriptions: Vec::new(),
             concurrency: PluginConcurrencyConfig::Exclusive,

@@ -682,10 +682,56 @@ pub enum ToolInvocationResult {
     Text { text: String },
     /// Structured JSON result encoded as a JSON string for codec stability.
     Json { value: String },
+    /// Opaque plugin artifact rendered by visual adapters.
+    Artifact { artifact: Box<ToolArtifact> },
     /// Shell command result.
     ShellRun { result: ShellRunResult },
     /// Filesystem or file-edit result.
     FileChange { result: FileChangeResult },
+}
+
+/// Opaque artifact produced by a tool plugin and rendered by visual adapters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolArtifact {
+    /// Stable artifact identifier within the session/tool call.
+    pub artifact_id: String,
+    /// Plugin that produced the artifact data.
+    pub producer_plugin_id: String,
+    /// Plugin-owned artifact schema identifier.
+    pub schema: String,
+    /// Artifact schema version.
+    pub schema_version: u32,
+    /// Tool call that produced the artifact, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Optional display title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Plugin-owned artifact metadata.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub metadata: serde_json::Value,
+    /// Artifact byte/sidecar references.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<ToolArtifactRef>,
+}
+
+/// Reference to plugin-owned artifact bytes or structured sidecar data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolArtifactRef {
+    /// Plugin-owned reference key.
+    pub key: String,
+    /// Media type of the referenced data, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// Storage location for the referenced data, when externalized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_uri: Option<String>,
+    /// Referenced data length in bytes, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_len: Option<u64>,
+    /// Plugin-owned reference metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Semantic shell execution result.
@@ -1732,6 +1778,27 @@ mod tests {
                 r#"{"type":"json","value":"{\"ok\":true}"}"#,
                 ToolInvocationResult::Json {
                     value: r#"{"ok":true}"#.to_string(),
+                },
+            ),
+            (
+                r#"{"type":"artifact","artifact":{"artifact_id":"artifact-1","producer_plugin_id":"bcode.test","schema":"bcode.test.artifact","schema_version":1,"tool_call_id":"call-1","title":"Test artifact","metadata":{"ok":true},"refs":[{"key":"data","content_type":"application/json","byte_len":11}]}}"#,
+                ToolInvocationResult::Artifact {
+                    artifact: Box::new(ToolArtifact {
+                        artifact_id: "artifact-1".to_string(),
+                        producer_plugin_id: "bcode.test".to_string(),
+                        schema: "bcode.test.artifact".to_string(),
+                        schema_version: 1,
+                        tool_call_id: Some("call-1".to_string()),
+                        title: Some("Test artifact".to_string()),
+                        metadata: serde_json::json!({"ok": true}),
+                        refs: vec![ToolArtifactRef {
+                            key: "data".to_string(),
+                            content_type: Some("application/json".to_string()),
+                            storage_uri: None,
+                            byte_len: Some(11),
+                            metadata: None,
+                        }],
+                    }),
                 },
             ),
             (
