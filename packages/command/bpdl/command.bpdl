@@ -52,15 +52,15 @@ interface command-registry-query {
         action: command-action,
     }
 
-    record list-commands-request {
+    record list-commands-input {
         surface: command-surface?,
     }
 
-    record list-commands-response {
+    record list-commands-output {
         commands: list<command-contribution>,
     }
 
-    query list-commands(request: list-commands-request) -> list-commands-response;
+    query list-commands(request: list-commands-input) -> list-commands-output;
 }
 
 @capability(COMMAND_REGISTRY)
@@ -72,19 +72,19 @@ interface command-registry-command {
         category: string?,
     }
 
-    record register-command-request {
+    record register-command-input {
         contribution: command-contribution,
     }
 
-    record invoke-command-request {
+    record invoke-command-input {
         command_id: string,
         args_json: string?,
     }
 
-    record invoke-command-response {
+    record invoke-command-output {
         output_json: string?,
     }
 
-    command register(request: register-command-request) -> unit;
-    command invoke(request: invoke-command-request) -> invoke-command-response;
+    command register(request: register-command-input) -> unit;
+    command invoke(request: invoke-command-input) -> invoke-command-output;
 }
