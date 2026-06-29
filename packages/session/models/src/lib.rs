@@ -27,8 +27,7 @@ pub fn current_unix_timestamp_ms() -> u64 {
 }
 
 /// Unique session identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SessionId(pub Uuid);
 
 impl SessionId {
@@ -59,9 +58,37 @@ impl FromStr for SessionId {
     }
 }
 
+impl Serialize for SessionId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if serializer.is_human_readable() {
+            self.0.serialize(serializer)
+        } else {
+            serializer.serialize_str(&self.0.to_string())
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            Uuid::deserialize(deserializer).map(Self)
+        } else {
+            let value = String::deserialize(deserializer)?;
+            Uuid::parse_str(&value)
+                .map(Self)
+                .map_err(serde::de::Error::custom)
+        }
+    }
+}
+
 /// Unique connected-client identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ClientId(pub Uuid);
 
 impl ClientId {
@@ -81,6 +108,35 @@ impl Default for ClientId {
 impl Display for ClientId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.0, f)
+    }
+}
+
+impl Serialize for ClientId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if serializer.is_human_readable() {
+            self.0.serialize(serializer)
+        } else {
+            serializer.serialize_str(&self.0.to_string())
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            Uuid::deserialize(deserializer).map(Self)
+        } else {
+            let value = String::deserialize(deserializer)?;
+            Uuid::parse_str(&value)
+                .map(Self)
+                .map_err(serde::de::Error::custom)
+        }
     }
 }
 
