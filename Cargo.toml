@@ -329,15 +329,15 @@ opt-level = 0
 # switchy_time                 = { path = "../MoosicBox/packages/switchy/time" }
 
 # BMUX local development patches
-[patch."https://github.com/BSteffaniak/bmux.git"]
-bmux_codec                  = { path = "/Volumes/ehdd/GitHub/bmux/packages/codec" }
-bmux_ipc                    = { path = "/Volumes/ehdd/GitHub/bmux/packages/ipc" }
-bmux_keyboard               = { path = "/Volumes/ehdd/GitHub/bmux/packages/keyboard" }
-bmux_plugin                 = { path = "/Volumes/ehdd/GitHub/bmux/packages/plugin" }
-bmux_plugin_schema          = { path = "/Volumes/ehdd/GitHub/bmux/packages/plugin-schema" }
-bmux_plugin_sdk             = { path = "/Volumes/ehdd/GitHub/bmux/packages/plugin-sdk" }
-bmux_terminal_grid          = { path = "/Volumes/ehdd/GitHub/bmux/packages/terminal-grid" }
-bmux_text_edit              = { path = "/Volumes/ehdd/GitHub/bmux/packages/text-edit" }
-bmux_tui                    = { path = "/Volumes/ehdd/GitHub/bmux/packages/tui" }
-bmux_tui_component_protocol = { path = "/Volumes/ehdd/GitHub/bmux/packages/tui-component-protocol" }
-bmux_tui_components         = { path = "/Volumes/ehdd/GitHub/bmux/packages/tui-components" }
+# [patch."https://github.com/BSteffaniak/bmux.git"]
+# bmux_codec                  = { path = "/Volumes/ehdd/GitHub/bmux/packages/codec" }
+# bmux_ipc                    = { path = "/Volumes/ehdd/GitHub/bmux/packages/ipc" }
+# bmux_keyboard               = { path = "/Volumes/ehdd/GitHub/bmux/packages/keyboard" }
+# bmux_plugin                 = { path = "/Volumes/ehdd/GitHub/bmux/packages/plugin" }
+# bmux_plugin_schema          = { path = "/Volumes/ehdd/GitHub/bmux/packages/plugin-schema" }
+# bmux_plugin_sdk             = { path = "/Volumes/ehdd/GitHub/bmux/packages/plugin-sdk" }
+# bmux_terminal_grid          = { path = "/Volumes/ehdd/GitHub/bmux/packages/terminal-grid" }
+# bmux_text_edit              = { path = "/Volumes/ehdd/GitHub/bmux/packages/text-edit" }
+# bmux_tui                    = { path = "/Volumes/ehdd/GitHub/bmux/packages/tui" }
+# bmux_tui_component_protocol = { path = "/Volumes/ehdd/GitHub/bmux/packages/tui-component-protocol" }
+# bmux_tui_components         = { path = "/Volumes/ehdd/GitHub/bmux/packages/tui-components" }
