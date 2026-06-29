@@ -546,6 +546,8 @@ fn create_default_dev_codesign_identity(identity: &str) -> Result<PathBuf> {
             .arg("/usr/bin/security"),
     )?;
 
+    trust_dev_codesign_certificate(&certificate, &keychain)?;
+
     run_sensitive_command(
         Command::new("security")
             .arg("set-key-partition-list")
@@ -559,6 +561,20 @@ fn create_default_dev_codesign_identity(identity: &str) -> Result<PathBuf> {
     )?;
 
     Ok(keychain)
+}
+
+fn trust_dev_codesign_certificate(certificate: &Path, keychain: &Path) -> Result<()> {
+    run_command(
+        Command::new("security")
+            .arg("add-trusted-cert")
+            .arg("-r")
+            .arg("trustRoot")
+            .arg("-p")
+            .arg("codeSign")
+            .arg("-k")
+            .arg(keychain)
+            .arg(certificate),
+    )
 }
 
 fn configure_dev_codesign_keychain(keychain: &Path, password: &str) -> Result<()> {
