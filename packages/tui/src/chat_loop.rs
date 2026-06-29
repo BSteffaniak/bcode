@@ -22,8 +22,7 @@ use super::invalidation::InvalidationQueue;
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 use super::permission_dialog::PermissionDialogState;
 use super::protocol_surface::{
-    BMUX_PROTOCOL_INLINE_SURFACE, INLINE_PROTOCOL_SURFACE_HEIGHT,
-    INLINE_PROTOCOL_SURFACE_ROW_OFFSET, ProtocolSurfaceState,
+    BMUX_PROTOCOL_INLINE_SURFACE, INLINE_PROTOCOL_SURFACE_ROW_OFFSET, ProtocolSurfaceState,
 };
 use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::{self, ActiveChat};
@@ -270,6 +269,7 @@ impl<'a, 'b, W: Write> ChatEventContext<'a, 'b, W> {
 }
 
 /// Run the active chat UI loop.
+#[allow(clippy::future_not_send)]
 #[allow(clippy::too_many_lines)]
 pub async fn run_with_client<W: Write>(
     terminal: &mut Terminal<&mut W>,
@@ -1364,42 +1364,6 @@ fn draw_chat_frame<W: Write>(
     Ok(())
 }
 
-fn protocol_surface_area(chat: &ActiveChat, interaction_id: &str, viewport: Rect) -> Option<Rect> {
-    let layout = chat.app.transcript_layout();
-    for visible in layout.visible_lines_from_top(
-        chat.app.transcript_top_row(viewport.height),
-        viewport.height,
-    ) {
-        if visible.source() != VisibleTranscriptSource::Transcript
-            || visible.row_in_entry() != INLINE_PROTOCOL_SURFACE_ROW_OFFSET
-        {
-            continue;
-        }
-        let Some(item) = chat.app.transcript().get(visible.entry_index()) else {
-            continue;
-        };
-        let super::transcript::TranscriptItemKind::InteractiveToolRequest {
-            interaction_id: item_interaction_id,
-            surface_kind,
-            ..
-        } = item.kind()
-        else {
-            continue;
-        };
-        if item_interaction_id == interaction_id && surface_kind == BMUX_PROTOCOL_INLINE_SURFACE {
-            let viewport_row = visible
-                .row_index
-                .saturating_sub(chat.app.transcript_top_row(viewport.height));
-            let y = viewport
-                .y
-                .saturating_add(u16::try_from(viewport_row).unwrap_or(u16::MAX));
-            let height = INLINE_PROTOCOL_SURFACE_HEIGHT.min(viewport.bottom().saturating_sub(y));
-            return (height > 0).then_some(Rect::new(viewport.x, y, viewport.width, height));
-        }
-    }
-    None
-}
-
 fn render_resolved_protocol_surfaces(
     chat: &ActiveChat,
     viewport: Rect,
@@ -1418,16 +1382,18 @@ fn render_resolved_protocol_surfaces(
         let Some(item) = chat.app.transcript().get(visible.entry_index()) else {
             continue;
         };
-        let super::transcript::TranscriptItemKind::InteractiveToolResolution {
-            resolution_json,
+        let super::transcript::TranscriptItemKind::ToolProtocolPresentation {
+            tree_json,
+            state_json,
             ..
         } = item.kind()
         else {
             continue;
         };
-        let Some(mut surface) =
-            super::protocol_surface::ResolvedProtocolSurface::from_resolution_json(resolution_json)
-        else {
+        let Some(mut surface) = super::protocol_surface::ResolvedProtocolSurface::from_tree_json(
+            tree_json,
+            state_json.as_deref(),
+        ) else {
             continue;
         };
         let viewport_row = visible
@@ -1436,11 +1402,51 @@ fn render_resolved_protocol_surfaces(
         let y = viewport
             .y
             .saturating_add(u16::try_from(viewport_row).unwrap_or(u16::MAX));
-        let height = INLINE_PROTOCOL_SURFACE_HEIGHT.min(viewport.bottom().saturating_sub(y));
+        let height = super::protocol_surface::measure_tree_json_height(tree_json, viewport.width)
+            .min(viewport.bottom().saturating_sub(y));
         if height > 0 {
             surface.render(Rect::new(viewport.x, y, viewport.width, height), frame);
         }
     }
+}
+
+fn protocol_surface_area(chat: &ActiveChat, interaction_id: &str, viewport: Rect) -> Option<Rect> {
+    let layout = chat.app.transcript_layout();
+    for visible in layout.visible_lines_from_top(
+        chat.app.transcript_top_row(viewport.height),
+        viewport.height,
+    ) {
+        if visible.source() != VisibleTranscriptSource::Transcript
+            || visible.row_in_entry() != INLINE_PROTOCOL_SURFACE_ROW_OFFSET
+        {
+            continue;
+        }
+        let Some(item) = chat.app.transcript().get(visible.entry_index()) else {
+            continue;
+        };
+        let super::transcript::TranscriptItemKind::InteractiveToolRequest {
+            interaction_id: item_interaction_id,
+            surface_kind,
+            request_json,
+            ..
+        } = item.kind()
+        else {
+            continue;
+        };
+        if item_interaction_id == interaction_id && surface_kind == BMUX_PROTOCOL_INLINE_SURFACE {
+            let viewport_row = visible
+                .row_index
+                .saturating_sub(chat.app.transcript_top_row(viewport.height));
+            let y = viewport
+                .y
+                .saturating_add(u16::try_from(viewport_row).unwrap_or(u16::MAX));
+            let height =
+                super::protocol_surface::measure_tree_json_height(request_json, viewport.width)
+                    .min(viewport.bottom().saturating_sub(y));
+            return (height > 0).then_some(Rect::new(viewport.x, y, viewport.width, height));
+        }
+    }
+    None
 }
 
 fn drain_bcode_events(chat: &mut ActiveChat, loop_state: &mut ChatLoopState) -> bool {
@@ -1565,6 +1571,7 @@ fn refresh_invalidation_queue(chat: &ActiveChat, queue: &mut InvalidationQueue) 
     );
 }
 
+#[allow(clippy::future_not_send)]
 async fn handle_event<W: Write>(
     context: &mut ChatEventContext<'_, '_, W>,
     chat: &mut ActiveChat,
@@ -1585,7 +1592,12 @@ async fn handle_event<W: Write>(
         {
             handle_protocol_surface_host_key(context, chat, loop_state, stroke).await
         }
-        event if loop_state.protocol_surface.is_some() => {
+        event @ Event::Key(_) if loop_state.protocol_surface.is_some() => {
+            handle_protocol_surface_event(context, chat, loop_state, event).await
+        }
+        event @ (Event::Paste(_) | Event::Focus(_) | Event::Tick | Event::Mouse(_))
+            if loop_state.protocol_surface.is_some() =>
+        {
             handle_protocol_surface_event(context, chat, loop_state, event).await
         }
         Event::Key(stroke) => {
@@ -1638,8 +1650,9 @@ async fn handle_event<W: Write>(
     }
 }
 
+#[allow(clippy::future_not_send)]
 async fn handle_protocol_surface_host_key<W: Write>(
-    context: &mut ChatEventContext<'_, '_, W>,
+    context: &ChatEventContext<'_, '_, W>,
     chat: &mut ActiveChat,
     loop_state: &mut ChatLoopState,
     stroke: KeyStroke,
@@ -1665,8 +1678,9 @@ fn protocol_surface_host_key(keymap: &BmuxKeyMap, stroke: KeyStroke) -> Option<B
     }
 }
 
+#[allow(clippy::future_not_send)]
 async fn resolve_protocol_surface_dismissed<W: Write>(
-    context: &mut ChatEventContext<'_, '_, W>,
+    context: &ChatEventContext<'_, '_, W>,
     chat: &mut ActiveChat,
     loop_state: &mut ChatLoopState,
 ) -> Result<(), TuiError> {
@@ -1687,8 +1701,9 @@ async fn resolve_protocol_surface_dismissed<W: Write>(
     Ok(())
 }
 
+#[allow(clippy::future_not_send)]
 async fn handle_protocol_surface_event<W: Write>(
-    context: &mut ChatEventContext<'_, '_, W>,
+    context: &ChatEventContext<'_, '_, W>,
     chat: &ActiveChat,
     loop_state: &mut ChatLoopState,
     event: Event,

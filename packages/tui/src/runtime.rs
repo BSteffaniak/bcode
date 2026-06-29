@@ -1,6 +1,7 @@
 //! TUI startup flow.
 
 use std::io::Write;
+use std::sync::Arc;
 
 use bcode_client::BcodeClient;
 use bcode_session_models::SessionId;
@@ -14,6 +15,7 @@ use super::terminal_events::TuiInput;
 use super::{TuiError, chat_loop, session_flow};
 
 /// Attach to a session and run the active chat loop.
+#[allow(clippy::future_not_send, dead_code)]
 pub async fn run_event_loop<W: Write>(
     terminal: &mut Terminal<&mut W>,
     session_id: Option<SessionId>,
@@ -21,16 +23,47 @@ pub async fn run_event_loop<W: Write>(
     run_event_loop_with_startup(terminal, session_id, StartupTuiAction::None).await
 }
 
+/// Attach to a session and run the active chat loop with caller-provided static bundled plugins.
+#[allow(clippy::future_not_send)]
+pub async fn run_event_loop_with_static_bundled<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    session_id: Option<SessionId>,
+    static_plugins: &[bcode_plugin::StaticBundledPlugin],
+) -> Result<(), TuiError> {
+    run_event_loop_with_startup_and_static_bundled(
+        terminal,
+        session_id,
+        StartupTuiAction::None,
+        static_plugins,
+    )
+    .await
+}
+
 /// Attach to a session, run an optional startup action, and run the active chat loop.
+#[allow(clippy::future_not_send)]
 pub async fn run_event_loop_with_startup<W: Write>(
     terminal: &mut Terminal<&mut W>,
     session_id: Option<SessionId>,
     startup_action: StartupTuiAction,
 ) -> Result<(), TuiError> {
+    run_event_loop_with_startup_and_static_bundled(terminal, session_id, startup_action, &[]).await
+}
+
+/// Attach to a session, run an optional startup action, and run the active chat loop with caller-provided static bundled plugins.
+#[allow(clippy::future_not_send)]
+pub async fn run_event_loop_with_startup_and_static_bundled<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    session_id: Option<SessionId>,
+    startup_action: StartupTuiAction,
+    static_plugins: &[bcode_plugin::StaticBundledPlugin],
+) -> Result<(), TuiError> {
     let client = BcodeClient::default_endpoint();
     let mut terminal_events = TuiInput::start();
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
     let mut app = BmuxApp::new_with_history(session_id, &[], &[], false);
+    if let Ok(host) = super::plugin_tui::load_default_host_with_static_bundled(static_plugins) {
+        app.set_plugin_host(Arc::new(host));
+    }
     let agents = session_flow::AgentCatalog::default();
     agents.refresh_app_agent_metadata(&mut app);
     let launch_working_directory = std::env::current_dir().unwrap_or_else(|_| ".".into());

@@ -389,7 +389,22 @@ pub async fn run_ralph_home() -> Result<(), TuiError> {
 ///
 /// Returns I/O errors from terminal setup, event polling, drawing, or Bcode
 /// client operations.
+#[allow(clippy::future_not_send)]
 pub async fn run(session_id: Option<SessionId>) -> Result<(), TuiError> {
+    run_with_static_bundled(session_id, &[]).await
+}
+
+/// Run the terminal user interface with caller-provided static bundled plugins.
+///
+/// # Errors
+///
+/// Returns I/O errors from terminal setup, event polling, drawing, or Bcode
+/// client/plugin operations.
+#[allow(clippy::future_not_send)]
+pub async fn run_with_static_bundled(
+    session_id: Option<SessionId>,
+    static_plugins: &[bcode_plugin::StaticBundledPlugin],
+) -> Result<(), TuiError> {
     let stdout = io::stdout();
     let mut guard = CrosstermTerminalGuard::enter(stdout)?;
     let result = {
@@ -399,7 +414,7 @@ pub async fn run(session_id: Option<SessionId>) -> Result<(), TuiError> {
             })?,
             helpers::terminal_area()?,
         );
-        runtime::run_event_loop(&mut terminal, session_id).await
+        runtime::run_event_loop_with_static_bundled(&mut terminal, session_id, static_plugins).await
     };
 
     match result {
@@ -436,7 +451,7 @@ pub async fn run_code_review_home(repo_path: std::path::PathBuf) -> Result<(), T
             build_mode,
         }) => {
             let _writer = guard.leave()?;
-            run_code_review_workspace(workspace, build_mode).await
+            Box::pin(run_code_review_workspace(workspace, build_mode)).await
         }
         Ok(code_review_launcher::ReviewHomeOutcome::Exit) => {
             let _writer = guard.leave()?;

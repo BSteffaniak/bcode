@@ -7,6 +7,12 @@ description  = "Interactive read-only question/ask tool"
 interface_id = "bcode.tool/v1"
 name         = "Question Tool"
 
+[[tool_result_presenters]]
+operation            = "present_tool_result"
+service_interface_id = "bcode.tool/v1"
+surface_protocols    = ["bmux.protocol.inline.result"]
+tool_name            = "question"
+
 [runtime]
 abi_version    = 1
 event_symbol   = "bcode_plugin_handle_event_v1"

@@ -85,6 +85,8 @@ pub struct PluginManifest {
     #[serde(default)]
     pub tui_surfaces: Vec<PluginTuiSurfaceDeclaration>,
     #[serde(default)]
+    pub tool_result_presenters: Vec<PluginToolResultPresenterDeclaration>,
+    #[serde(default)]
     pub command_contributions: Vec<PluginCommandContribution>,
     #[serde(default)]
     pub event_subscriptions: Vec<PluginEventSubscription>,
@@ -93,6 +95,26 @@ pub struct PluginManifest {
     #[serde(default)]
     pub concurrency: PluginConcurrencyConfig,
     pub runtime: PluginRuntime,
+}
+
+/// Tool-result presentation capability declared by a plugin manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginToolResultPresenterDeclaration {
+    pub tool_name: String,
+    #[serde(default = "default_tool_service_interface_id")]
+    pub service_interface_id: String,
+    #[serde(default = "default_present_tool_result_operation")]
+    pub operation: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub surface_protocols: Vec<String>,
+}
+
+fn default_tool_service_interface_id() -> String {
+    bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned()
+}
+
+fn default_present_tool_result_operation() -> String {
+    bcode_tool::OP_PRESENT_TOOL_RESULT.to_owned()
 }
 
 /// Native TUI surface declared by a plugin manifest.
@@ -1813,6 +1835,24 @@ impl PluginRegistry {
             .find(|surface| surface.kind == surface_kind)
     }
 
+    /// Return the manifest-declared presenter route for a tool result.
+    #[must_use]
+    pub fn tool_result_presenter(&self, tool_name: &str) -> Option<PluginToolResultPresenterRoute> {
+        self.manifests.iter().find_map(|(plugin_id, manifest)| {
+            manifest
+                .tool_result_presenters
+                .iter()
+                .find(|presenter| presenter.tool_name == tool_name)
+                .map(|presenter| PluginToolResultPresenterRoute {
+                    plugin_id: plugin_id.clone(),
+                    tool_name: presenter.tool_name.clone(),
+                    service_interface_id: presenter.service_interface_id.clone(),
+                    operation: presenter.operation.clone(),
+                    surface_protocols: presenter.surface_protocols.clone(),
+                })
+        })
+    }
+
     /// Return runtime policy metadata for a plugin service interface.
     #[must_use]
     pub fn service_policy(
@@ -1823,6 +1863,16 @@ impl PluginRegistry {
         self.service_policies
             .get(&(plugin_id.to_string(), interface_id.to_string()))
     }
+}
+
+/// Loaded route for a manifest-declared tool result presenter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginToolResultPresenterRoute {
+    pub plugin_id: String,
+    pub tool_name: String,
+    pub service_interface_id: String,
+    pub operation: String,
+    pub surface_protocols: Vec<String>,
 }
 
 /// Runtime policy metadata for a declared plugin service.
@@ -2277,6 +2327,29 @@ impl PluginRuntimeHost {
         Ok(delivered)
     }
 
+    /// Present a semantic tool result through the plugin that declared support for the tool name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected presenter plugin cannot be invoked or its response cannot
+    /// be decoded.
+    pub async fn present_tool_result(
+        &self,
+        request: &bcode_tool::ToolResultPresentationRequest,
+    ) -> Result<Option<bcode_tool::ToolResultPresentationResponse>, PluginServiceCallError> {
+        let Some(route) = self.registry.tool_result_presenter(&request.tool_name) else {
+            return Ok(None);
+        };
+        self.invoke_service_json::<_, bcode_tool::ToolResultPresentationResponse>(
+            &route.plugin_id,
+            route.service_interface_id,
+            route.operation,
+            request,
+        )
+        .await
+        .map(Some)
+    }
+
     /// Deactivate all loaded plugins through their plugin-local executors.
     ///
     /// # Errors
@@ -2676,6 +2749,31 @@ impl PluginHost {
         Ok(host)
     }
 
+    /// Return the number of manifest-declared tool result presenters in loaded plugins.
+    #[must_use]
+    pub fn tool_result_presenter_count(&self) -> usize {
+        self.loaded
+            .iter()
+            .map(|plugin| plugin.manifest.tool_result_presenters.len())
+            .sum()
+    }
+
+    /// Load and activate statically bundled plugins best-effort.
+    ///
+    /// Plugins that fail to load or activate are skipped so independent client-side capabilities can
+    /// remain available.
+    #[must_use]
+    pub fn load_static_plugins_best_effort(
+        plugins: &[(PluginManifest, StaticPluginVtable)],
+    ) -> Self {
+        let mut host = Self::default();
+        for plugin in plugins {
+            let single = [plugin.clone()];
+            let _ = host.load_static_plugins_into(&single);
+        }
+        host
+    }
+
     fn load_static_plugins_into(
         &mut self,
         plugins: &[(PluginManifest, StaticPluginVtable)],
@@ -2733,6 +2831,41 @@ impl PluginHost {
     #[must_use]
     pub fn service_registry(&self) -> PluginServiceRegistry {
         PluginServiceRegistry::from_loaded_plugins(&self.loaded)
+    }
+
+    /// Present a semantic tool result through the plugin that declared support for the tool name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected presenter plugin cannot be invoked or its response cannot
+    /// be decoded.
+    pub fn present_tool_result(
+        &self,
+        request: &bcode_tool::ToolResultPresentationRequest,
+    ) -> Result<Option<bcode_tool::ToolResultPresentationResponse>, PluginServiceCallError> {
+        let Some(route) = self.loaded.iter().find_map(|plugin| {
+            plugin
+                .manifest
+                .tool_result_presenters
+                .iter()
+                .find(|presenter| presenter.tool_name == request.tool_name)
+                .map(|presenter| PluginToolResultPresenterRoute {
+                    plugin_id: plugin.manifest.id.clone(),
+                    tool_name: presenter.tool_name.clone(),
+                    service_interface_id: presenter.service_interface_id.clone(),
+                    operation: presenter.operation.clone(),
+                    surface_protocols: presenter.surface_protocols.clone(),
+                })
+        }) else {
+            return Ok(None);
+        };
+        self.invoke_service_json::<_, bcode_tool::ToolResultPresentationResponse>(
+            &route.plugin_id,
+            route.service_interface_id,
+            route.operation,
+            request,
+        )
+        .map(Some)
     }
 
     /// Invoke a service operation on a loaded plugin by ID.
@@ -3463,6 +3596,7 @@ library = "libcommands.dylib"
             version: Version::new(0, 1, 0),
             services: Vec::new(),
             tui_surfaces: Vec::new(),
+            tool_result_presenters: Vec::new(),
             command_contributions: Vec::new(),
             event_subscriptions: Vec::new(),
             config: Some(PluginManifestConfig {
@@ -3508,6 +3642,7 @@ library = "libcommands.dylib"
             version: Version::new(0, 1, 0),
             services: Vec::new(),
             tui_surfaces: Vec::new(),
+            tool_result_presenters: Vec::new(),
             command_contributions: Vec::new(),
             event_subscriptions: Vec::new(),
             config: Some(PluginManifestConfig {
@@ -4015,6 +4150,7 @@ library = "libexample_plugin.dylib"
                     class: None,
                 }],
                 tui_surfaces: Vec::new(),
+                tool_result_presenters: Vec::new(),
                 command_contributions: Vec::new(),
                 event_subscriptions: Vec::new(),
                 concurrency: PluginConcurrencyConfig::Exclusive,
@@ -4561,6 +4697,7 @@ library = "libexample_plugin.dylib"
                 class: None,
             }],
             tui_surfaces: Vec::new(),
+            tool_result_presenters: Vec::new(),
             command_contributions: Vec::new(),
             event_subscriptions: Vec::new(),
             concurrency: PluginConcurrencyConfig::Exclusive,

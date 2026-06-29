@@ -200,7 +200,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Skill { command } => handle_skill_command(&command).await?,
         Commands::Permission { command } => handle_permission_command(command).await?,
         Commands::RuntimeWork { command } => handle_runtime_work_command(command).await?,
-        command => handle_session_io_command(command).await?,
+        command => Box::pin(handle_session_io_command(command)).await?,
     }
     Ok(())
 }
@@ -463,7 +463,7 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
         } => cancel_session_turn(session_id, clear_queue).await?,
         Commands::Attach { session_id } => attach_session(session_id).await?,
         Commands::Tui { session_id } => {
-            bcode_tui::run(session_id).await?;
+            bcode_tui::run_with_static_bundled(session_id, &static_bundled_plugins()).await?;
         }
         Commands::Send {
             session_id,
@@ -1749,7 +1749,7 @@ async fn handle_review_command(command: Option<ReviewCommand>) -> Result<(), Cli
             return Ok(());
         }
     };
-    bcode_tui::run_code_review(repo, target).await?;
+    Box::pin(bcode_tui::run_code_review(repo, target)).await?;
     Ok(())
 }
 
@@ -5484,7 +5484,7 @@ async fn run_new_session_tui(worktree: Option<String>) -> Result<(), CliError> {
     } else {
         client.create_session(None).await?
     };
-    bcode_tui::run(Some(session.id)).await?;
+    bcode_tui::run_with_static_bundled(Some(session.id), &static_bundled_plugins()).await?;
     Ok(())
 }
 

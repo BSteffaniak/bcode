@@ -90,6 +90,15 @@ impl TranscriptDocument {
         self.bump_revision();
     }
 
+    /// Retain transcript items matching a predicate and bump the collection revision if any are removed.
+    pub fn retain(&mut self, mut predicate: impl FnMut(&TranscriptItem) -> bool) {
+        let before = self.items.len();
+        self.items.retain(|item| predicate(item));
+        if self.items.len() != before {
+            self.bump_revision();
+        }
+    }
+
     /// Replace all transcript items and bump the collection revision.
     pub fn replace(&mut self, items: Vec<TranscriptItem>) {
         self.items = items;

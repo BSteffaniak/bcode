@@ -1,7 +1,47 @@
 //! Native plugin TUI surface opening helpers.
 
-use bcode_plugin::{PluginLoadError, PluginRuntimeHost};
+use bcode_plugin::{PluginHost, PluginLoadError, PluginRuntimeHost, StaticBundledPlugin};
 use bcode_plugin_sdk::tui::{BoxedPluginTuiSurface, PluginTuiSurfaceOpenRequest};
+
+/// Load the default local plugin host for TUI client-side services.
+///
+/// # Errors
+///
+/// Returns plugin loading errors from discovery, loading, or activation.
+pub fn load_default_host_with_static_bundled(
+    static_plugins: &[StaticBundledPlugin],
+) -> Result<PluginHost, PluginLoadError> {
+    let selection = bcode_plugin::PluginSelection::all_enabled();
+    let host = PluginHost::load_defaults_with_static_bundled(&selection, static_plugins);
+    match host {
+        Ok(host) if host.tool_result_presenter_count() > 0 || static_plugins.is_empty() => Ok(host),
+        Ok(_) | Err(_) => {
+            let selected =
+                bcode_plugin::filter_selected_static_plugins(static_plugins, &selection)?;
+            let presenter_plugins = selected
+                .into_iter()
+                .filter(|(manifest, _)| !manifest.tool_result_presenters.is_empty())
+                .collect::<Vec<_>>();
+            Ok(PluginHost::load_static_plugins_best_effort(
+                &presenter_plugins,
+            ))
+        }
+    }
+}
+
+/// Load the default local plugin runtime for TUI client-side services.
+///
+/// # Errors
+///
+/// Returns plugin loading errors from discovery, loading, or activation.
+pub fn load_default_runtime_with_static_bundled(
+    static_plugins: &[StaticBundledPlugin],
+) -> Result<PluginRuntimeHost, PluginLoadError> {
+    PluginRuntimeHost::load_defaults_with_static_bundled(
+        &bcode_plugin::PluginSelection::all_enabled(),
+        static_plugins,
+    )
+}
 
 /// Open a native TUI surface from a loaded plugin registry.
 ///

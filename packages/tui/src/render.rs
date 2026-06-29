@@ -793,6 +793,9 @@ fn push_transcript_item_rows(
                 inline_diff_config,
             );
         }
+        TranscriptItemKind::ToolProtocolPresentation { .. } => {
+            push_protocol_presentation_placeholder_rows(rows, item, width);
+        }
         TranscriptItemKind::TerminalOutput { .. } => {
             push_terminal_transcript_item_rows(rows, item, width);
         }
@@ -805,11 +808,6 @@ fn push_transcript_item_rows(
         }
         TranscriptItemKind::InteractiveToolRequest { .. } => {
             push_detail_block(rows, "Interactive tool", item.text(), Color::Cyan, width);
-        }
-        TranscriptItemKind::InteractiveToolResolution {
-            resolution_json, ..
-        } if super::protocol_surface::has_readonly_protocol_presentation(resolution_json) => {
-            push_resolved_protocol_placeholder_rows(rows, width);
         }
         TranscriptItemKind::InteractiveToolResolution { .. } => {
             push_detail_block(rows, "Interactive tool", item.text(), Color::Green, width);
@@ -865,30 +863,10 @@ fn push_interactive_protocol_placeholder_rows(
         Style::new().fg(Color::Cyan),
         Style::new().fg(Color::Cyan),
     );
-    let _ = request_json;
     let surface_width = width.saturating_sub(2);
-    for index in 0..super::protocol_surface::INLINE_PROTOCOL_SURFACE_HEIGHT {
-        let marker = if index == 0 { "┌" } else { "│" };
-        rows.push(Line::from_spans(vec![
-            Span::styled(marker, muted_style()),
-            Span::styled(" ", muted_style()),
-            Span::styled(" ".repeat(usize::from(surface_width)), Style::new()),
-        ]));
-    }
-    rows.push(Line::default());
-}
-
-fn push_resolved_protocol_placeholder_rows(rows: &mut Vec<Line>, width: u16) {
-    push_wrapped_styled_text(
-        rows,
-        Vec::new(),
-        "Interactive tool · answered",
-        width,
-        Style::new().fg(Color::Green),
-        Style::new().fg(Color::Green),
-    );
-    let surface_width = width.saturating_sub(2);
-    for index in 0..super::protocol_surface::INLINE_PROTOCOL_SURFACE_HEIGHT {
+    let height =
+        super::protocol_surface::measure_tree_json_height(request_json, width.saturating_sub(2));
+    for index in 0..height {
         let marker = if index == 0 { "┌" } else { "│" };
         rows.push(Line::from_spans(vec![
             Span::styled(marker, muted_style()),
@@ -1439,6 +1417,37 @@ fn push_query_preview_rows(
             muted_style(),
             muted_style(),
         );
+    }
+    rows.push(Line::default());
+}
+
+fn push_protocol_presentation_placeholder_rows(
+    rows: &mut Vec<Line>,
+    item: &TranscriptItem,
+    width: u16,
+) {
+    push_wrapped_styled_text(
+        rows,
+        Vec::new(),
+        "Tool result",
+        width,
+        Style::new().fg(Color::Green),
+        Style::new().fg(Color::Green),
+    );
+    let surface_width = width.saturating_sub(2);
+    let height = match item.kind() {
+        TranscriptItemKind::ToolProtocolPresentation { tree_json, .. } => {
+            super::protocol_surface::measure_tree_json_height(tree_json, surface_width)
+        }
+        _ => 1,
+    };
+    for index in 0..height {
+        let marker = if index == 0 { "┌" } else { "│" };
+        rows.push(Line::from_spans(vec![
+            Span::styled(marker, muted_style()),
+            Span::styled(" ", muted_style()),
+            Span::styled(" ".repeat(usize::from(surface_width)), Style::new()),
+        ]));
     }
     rows.push(Line::default());
 }

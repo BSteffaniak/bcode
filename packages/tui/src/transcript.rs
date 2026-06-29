@@ -107,6 +107,19 @@ pub enum TranscriptItemKind {
         /// Structured plugin-owned card.
         card: ToolCardPresentation,
     },
+    /// Plugin-owned generic protocol presentation.
+    ToolProtocolPresentation {
+        /// Provider tool call identifier.
+        tool_call_id: String,
+        /// Tool name, when known.
+        tool_name: Option<String>,
+        /// Protocol surface kind.
+        surface_kind: String,
+        /// Serialized component tree.
+        tree_json: String,
+        /// Serialized component runtime state.
+        state_json: Option<String>,
+    },
     /// Live or replayed terminal output from a tool.
     TerminalOutput {
         /// Provider tool call identifier.
@@ -234,7 +247,7 @@ impl TranscriptItem {
         Self::with_identity(role, text, true, kind_for_role(role))
     }
 
-    fn with_kind(
+    pub(crate) fn with_kind(
         role: &'static str,
         text: String,
         streaming: bool,

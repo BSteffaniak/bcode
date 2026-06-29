@@ -1,6 +1,7 @@
 //! TUI app state.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use bcode_config::{
@@ -252,7 +253,7 @@ impl ReasoningSupport {
 }
 
 /// State owned by the terminal user interface.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct BmuxApp {
     session_id: Option<SessionId>,
     session_title: Option<String>,
@@ -317,6 +318,7 @@ pub struct BmuxApp {
     cursor: CursorBlink,
     live_preview_frame: LivePreviewFrameState,
     pending_key_activation: Option<PendingKeyActivation>,
+    plugin_host: Option<Arc<bcode_plugin::PluginHost>>,
 }
 
 /// Daemon connection state used to describe startup readiness in the status chrome.
@@ -518,9 +520,15 @@ impl BmuxApp {
             cursor: CursorBlink::new(),
             live_preview_frame: LivePreviewFrameState::new(),
             pending_key_activation: None,
+            plugin_host: None,
         };
         app.absorb_history(history);
         app
+    }
+
+    /// Set the local plugin runtime used for client-side presentation projection.
+    pub fn set_plugin_host(&mut self, host: Arc<bcode_plugin::PluginHost>) {
+        self.plugin_host = Some(host);
     }
 
     /// Return timeline entries for committed user messages.
@@ -1874,11 +1882,16 @@ impl BmuxApp {
     }
 
     fn rebuild_transcript_from_history(&mut self) {
-        self.transcript
-            .replace(transcript_items_from_events_with_reasoning(
-                self.transcript_window.events(),
-                self.reasoning_visible(),
-            ));
+        let events = self.transcript_window.events().to_vec();
+        self.transcript.replace(Vec::new());
+        self.tool_call_contexts.clear();
+        self.live_tool_previews.clear();
+        self.streamed_tool_results.clear();
+        self.presented_tool_results.clear();
+        self.active_tool_calls.clear();
+        for event in &events {
+            self.apply_session_event(event, SessionEventApplication::Replay);
+        }
     }
 
     fn trim_resident_transcript_window_if_needed(&mut self) {
@@ -1952,6 +1965,8 @@ impl BmuxApp {
         let mut older =
             transcript_items_from_events_with_reasoning(events, self.reasoning_visible());
         self.transcript.merge_prepend(&mut older);
+        self.rebuild_transcript_from_history();
+        self.reconcile_tool_state_with_resident_transcript();
         self.older_history.update_cursor(events, has_more);
         self.older_history.set_loading(false);
         if self.older_history.has_older_history() {
@@ -1975,6 +1990,8 @@ impl BmuxApp {
         let mut newer =
             transcript_items_from_events_with_reasoning(events, self.reasoning_visible());
         self.transcript.merge_append(&mut newer);
+        self.rebuild_transcript_from_history();
+        self.reconcile_tool_state_with_resident_transcript();
         self.older_history.update_newer_cursor(events, has_more);
         self.older_history.set_loading_newer(false);
         if self.older_history.has_newer_history() {
@@ -2168,6 +2185,13 @@ impl BmuxApp {
                 tool_call_id,
                 resolution_json,
             } => {
+                if self.resolve_interactive_protocol_tool_result(
+                    interaction_id,
+                    tool_call_id,
+                    resolution_json,
+                ) {
+                    return;
+                }
                 self.transcript.push(interactive_tool_resolution_item(
                     interaction_id,
                     tool_call_id,
@@ -2719,6 +2743,42 @@ impl BmuxApp {
         semantic_result: Option<&ToolInvocationResult>,
         application: SessionEventApplication,
     ) {
+        if self.presented_tool_results.contains(tool_call_id) {
+            self.finish_tool_request_preview(tool_call_id);
+            return;
+        }
+        let tool_name = self
+            .tool_call_contexts
+            .get(tool_call_id)
+            .map(|context| context.tool_name.clone());
+        let arguments_json = self
+            .tool_call_contexts
+            .get(tool_call_id)
+            .map(|context| context.arguments_json.clone());
+        if let Some(item) = present_tool_result_item_for_app(
+            self.plugin_host.as_deref(),
+            tool_call_id,
+            tool_name.as_deref(),
+            arguments_json.as_deref(),
+            semantic_result,
+            result,
+            is_error,
+        ) {
+            self.transcript.retain(|item| {
+                !item_is_replaceable_tool_transcript_for_tool_call(item, tool_call_id)
+            });
+            self.transcript.push(item);
+            self.presented_tool_results.insert(tool_call_id.to_owned());
+            self.finish_tool_request_preview(tool_call_id);
+            if application.live_activity() {
+                if is_error {
+                    "failed".clone_into(&mut self.status);
+                } else {
+                    "finished".clone_into(&mut self.status);
+                }
+            }
+            return;
+        }
         if self.finish_live_tool_output(tool_call_id, Some(is_error), Some(result), semantic_result)
         {
             if application.live_activity() {
@@ -2738,15 +2798,10 @@ impl BmuxApp {
             self.finish_tool_request_preview(tool_call_id);
             return;
         }
-        if self.presented_tool_results.contains(tool_call_id) {
-            self.finish_tool_request_preview(tool_call_id);
-            return;
-        }
-        let tool_context = self.tool_call_contexts.get(tool_call_id);
         if let Some(item) = semantic_tool_result_item_for_app(
             tool_call_id,
-            tool_context.map(|context| context.tool_name.as_str()),
-            tool_context.map(|context| context.arguments_json.as_str()),
+            tool_name.as_deref(),
+            arguments_json.as_deref(),
             semantic_result,
             result,
             is_error,
@@ -3029,6 +3084,59 @@ impl BmuxApp {
                 saw_output: true,
             },
         );
+    }
+
+    fn resolve_interactive_protocol_tool_result(
+        &mut self,
+        interaction_id: &str,
+        tool_call_id: &str,
+        resolution_json: &str,
+    ) -> bool {
+        let Some((tool_name, request_json, state_json)) =
+            self.transcript
+                .items()
+                .iter()
+                .find_map(|item| match item.kind() {
+                    TranscriptItemKind::InteractiveToolRequest {
+                        interaction_id: item_interaction_id,
+                        tool_call_id: item_tool_call_id,
+                        tool_name,
+                        surface_kind,
+                        request_json,
+                        ..
+                    } if item_interaction_id == interaction_id
+                        && item_tool_call_id == tool_call_id
+                        && surface_kind
+                            == super::protocol_surface::BMUX_PROTOCOL_INLINE_SURFACE =>
+                    {
+                        Some((
+                            tool_name.clone(),
+                            request_json.clone(),
+                            submitted_protocol_state_json(resolution_json)?,
+                        ))
+                    }
+                    _ => None,
+                })
+        else {
+            return false;
+        };
+        self.transcript
+            .retain(|item| !item_is_replaceable_tool_transcript_for_tool_call(item, tool_call_id));
+        self.transcript.push(TranscriptItem::with_kind(
+            "Tool",
+            "protocol presentation".to_owned(),
+            false,
+            TranscriptItemKind::ToolProtocolPresentation {
+                tool_call_id: tool_call_id.to_owned(),
+                tool_name: Some(tool_name),
+                surface_kind: "bmux.protocol.inline.result".to_owned(),
+                tree_json: request_json,
+                state_json: Some(state_json),
+            },
+        ));
+        self.presented_tool_results.insert(tool_call_id.to_owned());
+        self.finish_tool_request_preview(tool_call_id);
+        true
     }
 
     fn push_permission_request(&mut self, input: PermissionRequestInput<'_>) {
@@ -4006,6 +4114,114 @@ fn working_directory_changed_message(
     )
 }
 
+fn protocol_presentation_item_from_plugin(
+    tool_call_id: &str,
+    tool_name: &str,
+    presentation: bcode_tool::ToolPresentationEvent,
+) -> Option<TranscriptItem> {
+    let bcode_tool::ToolPresentationEvent::Protocol(protocol) = presentation else {
+        return None;
+    };
+    if protocol.target != bcode_tool::ToolPresentationTarget::Result {
+        return None;
+    }
+    Some(TranscriptItem::with_kind(
+        "Tool",
+        "protocol presentation".to_owned(),
+        false,
+        TranscriptItemKind::ToolProtocolPresentation {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: Some(tool_name.to_owned()),
+            surface_kind: protocol.surface_kind,
+            tree_json: serde_json::to_string(&protocol.tree).ok()?,
+            state_json: protocol
+                .state
+                .as_ref()
+                .and_then(|state| serde_json::to_string(state).ok()),
+        },
+    ))
+}
+
+fn present_tool_result_item_for_app(
+    runtime: Option<&bcode_plugin::PluginHost>,
+    tool_call_id: &str,
+    tool_name: Option<&str>,
+    arguments_json: Option<&str>,
+    semantic_result: Option<&ToolInvocationResult>,
+    fallback_result: &str,
+    is_error: bool,
+) -> Option<TranscriptItem> {
+    let runtime = runtime?;
+    let tool_name = tool_name?;
+    let request = bcode_tool::ToolResultPresentationRequest {
+        tool_call_id: tool_call_id.to_owned(),
+        tool_name: tool_name.to_owned(),
+        arguments_json: arguments_json.map(str::to_owned),
+        semantic_result: semantic_result
+            .and_then(|result| serde_json::to_value(result).ok())
+            .and_then(|value| serde_json::from_value(value).ok()),
+        fallback_result: fallback_result.to_owned(),
+        is_error,
+    };
+    let response = runtime.present_tool_result(&request).ok()??;
+    response.presentation.and_then(|presentation| {
+        protocol_presentation_item_from_plugin(tool_call_id, tool_name, presentation)
+    })
+}
+
+fn item_is_replaceable_tool_transcript_for_tool_call(
+    item: &TranscriptItem,
+    tool_call_id: &str,
+) -> bool {
+    matches!(
+        item.kind(),
+        TranscriptItemKind::ToolRequest {
+            tool_call_id: item_tool_call_id,
+            ..
+        } | TranscriptItemKind::LiveToolPreviewAnchor {
+            tool_call_id: item_tool_call_id,
+            ..
+        } | TranscriptItemKind::ToolResult {
+            tool_call_id: item_tool_call_id,
+            ..
+        } | TranscriptItemKind::ToolPresentationCard {
+            tool_call_id: item_tool_call_id,
+            ..
+        } | TranscriptItemKind::ToolProtocolPresentation {
+            tool_call_id: item_tool_call_id,
+            ..
+        } | TranscriptItemKind::TerminalOutput {
+            tool_call_id: item_tool_call_id,
+            ..
+        } | TranscriptItemKind::InteractiveToolRequest {
+            tool_call_id: item_tool_call_id,
+            ..
+        } | TranscriptItemKind::InteractiveToolResolution {
+            tool_call_id: item_tool_call_id,
+            ..
+        } if item_tool_call_id == tool_call_id
+    )
+}
+
+fn submitted_protocol_state_json(resolution_json: &str) -> Option<String> {
+    let resolution = serde_json::from_str::<serde_json::Value>(resolution_json).ok()?;
+    let values = resolution
+        .get("payload")
+        .and_then(|payload| payload.get("values"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    serde_json::to_string(&serde_json::json!({
+        "focus": {
+            "focused": null,
+            "traversal_order": [],
+        },
+        "values": values,
+        "expanded": [],
+        "selected": [],
+    }))
+    .ok()
+}
+
 const fn live_tool_preview_truncated(preview: &LiveToolArgumentPreview) -> bool {
     match preview {
         LiveToolArgumentPreview::FileEdit(file) => file.truncated,
@@ -4035,6 +4251,7 @@ fn referenced_tool_call_ids(items: &[TranscriptItem]) -> BTreeSet<String> {
             | TranscriptItemKind::TerminalOutput { tool_call_id, .. }
             | TranscriptItemKind::InteractiveToolRequest { tool_call_id, .. }
             | TranscriptItemKind::InteractiveToolResolution { tool_call_id, .. }
+            | TranscriptItemKind::ToolProtocolPresentation { tool_call_id, .. }
             | TranscriptItemKind::PermissionRequest { tool_call_id, .. } => {
                 ids.insert(tool_call_id.clone());
             }

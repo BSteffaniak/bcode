@@ -13265,13 +13265,13 @@ async fn invoke_model_tool(
             event = invocation.next_event() => {
                 match event.map_err(|error| error.to_string())? {
                     StreamingServiceInvocationEvent::Event(payload) => {
-                        if let Ok(event) = serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload) {
-                            tool_output_publisher.push_stream_event(
-                                state,
-                                session_id,
-                                normalize_tool_stream_event_sequence(event, &mut stream_sequences),
-                            )
-                            .await;
+                        if let Ok(event) = serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload)
+                            && let Some(event) =
+                                normalize_tool_stream_event_sequence(event, &mut stream_sequences)
+                        {
+                            tool_output_publisher
+                                .push_stream_event(state, session_id, event)
+                                .await;
                         }
                     }
                     StreamingServiceInvocationEvent::Response(response) => {
@@ -13282,13 +13282,11 @@ async fn invoke_model_tool(
         }
     };
     while let Some(payload) = invocation.try_recv_event() {
-        if let Ok(event) = serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload) {
+        if let Ok(event) = serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload)
+            && let Some(event) = normalize_tool_stream_event_sequence(event, &mut stream_sequences)
+        {
             tool_output_publisher
-                .push_stream_event(
-                    state,
-                    session_id,
-                    normalize_tool_stream_event_sequence(event, &mut stream_sequences),
-                )
+                .push_stream_event(state, session_id, event)
                 .await;
         }
     }
@@ -13476,8 +13474,8 @@ fn runtime_work_progress_from_tool_stream_event(
 fn normalize_tool_stream_event_sequence(
     event: ServiceToolInvocationStreamEvent,
     stream_sequences: &mut BTreeMap<String, u64>,
-) -> ToolInvocationStreamEvent {
-    let event = convert_tool_stream_event(event);
+) -> Option<ToolInvocationStreamEvent> {
+    let event = convert_tool_stream_event(event)?;
     let tool_call_id = match &event {
         ToolInvocationStreamEvent::Started { tool_call_id, .. }
         | ToolInvocationStreamEvent::OutputDelta { tool_call_id, .. }
@@ -13490,7 +13488,7 @@ fn normalize_tool_stream_event_sequence(
         .and_modify(|sequence| *sequence = sequence.saturating_add(1))
         .or_insert(1);
     let sequence = *next;
-    set_tool_stream_event_sequence(event, sequence)
+    Some(set_tool_stream_event_sequence(event, sequence))
 }
 
 fn set_tool_stream_event_sequence(
@@ -13560,7 +13558,9 @@ fn set_tool_stream_event_sequence(
     }
 }
 
-fn convert_tool_stream_event(event: ServiceToolInvocationStreamEvent) -> ToolInvocationStreamEvent {
+fn convert_tool_stream_event(
+    event: ServiceToolInvocationStreamEvent,
+) -> Option<ToolInvocationStreamEvent> {
     match event {
         ServiceToolInvocationStreamEvent::Started {
             tool_call_id,
@@ -13570,7 +13570,7 @@ fn convert_tool_stream_event(event: ServiceToolInvocationStreamEvent) -> ToolInv
             columns,
             rows,
             started_at_ms,
-        } => ToolInvocationStreamEvent::Started {
+        } => Some(ToolInvocationStreamEvent::Started {
             tool_call_id,
             tool_name,
             sequence,
@@ -13578,63 +13578,65 @@ fn convert_tool_stream_event(event: ServiceToolInvocationStreamEvent) -> ToolInv
             columns,
             rows,
             started_at_ms: started_at_ms.or_else(|| Some(current_unix_millis())),
-        },
+        }),
         ServiceToolInvocationStreamEvent::OutputDelta {
             tool_call_id,
             stream,
             sequence,
             text,
             byte_len,
-        } => ToolInvocationStreamEvent::OutputDelta {
+        } => Some(ToolInvocationStreamEvent::OutputDelta {
             tool_call_id,
             stream: convert_tool_output_stream(stream),
             sequence,
             text,
             byte_len,
-        },
+        }),
         ServiceToolInvocationStreamEvent::Status {
             tool_call_id,
             sequence,
             message,
-        } => ToolInvocationStreamEvent::Status {
+        } => Some(ToolInvocationStreamEvent::Status {
             tool_call_id,
             sequence,
             message,
-        },
+        }),
         ServiceToolInvocationStreamEvent::Presentation {
             tool_call_id,
             sequence,
             presentation,
-        } => ToolInvocationStreamEvent::Presentation {
+        } => Some(ToolInvocationStreamEvent::Presentation {
             tool_call_id,
             sequence,
-            presentation: convert_tool_presentation_event(presentation),
-        },
+            presentation: convert_tool_presentation_event(presentation)?,
+        }),
         ServiceToolInvocationStreamEvent::Finished {
             tool_call_id,
             sequence,
             is_error,
             finished_at_ms,
-        } => ToolInvocationStreamEvent::Finished {
+        } => Some(ToolInvocationStreamEvent::Finished {
             tool_call_id,
             sequence,
             is_error,
             finished_at_ms: finished_at_ms.or_else(|| Some(current_unix_millis())),
-        },
+        }),
     }
 }
 
-fn convert_tool_presentation_event(event: ServiceToolPresentationEvent) -> ToolPresentationEvent {
+fn convert_tool_presentation_event(
+    event: ServiceToolPresentationEvent,
+) -> Option<ToolPresentationEvent> {
     match event {
-        ServiceToolPresentationEvent::Status(status) => {
-            ToolPresentationEvent::Status(bcode_session_models::ToolStatusPresentation {
+        ServiceToolPresentationEvent::Status(status) => Some(ToolPresentationEvent::Status(
+            bcode_session_models::ToolStatusPresentation {
                 target: convert_tool_presentation_target(status.target),
                 text: status.text,
                 level: convert_tool_presentation_level(status.level),
-            })
-        }
+            },
+        )),
         ServiceToolPresentationEvent::Card(card) => {
-            ToolPresentationEvent::Card(ToolCardPresentation {
+            Some(ToolPresentationEvent::Card(ToolCardPresentation {
                 target: convert_tool_presentation_target(card.target),
                 title: card.title,
                 subtitle: card.subtitle,
@@ -13643,19 +13645,20 @@ fn convert_tool_presentation_event(event: ServiceToolPresentationEvent) -> ToolP
                     .into_iter()
                     .map(convert_tool_presentation_section)
                     .collect(),
-            })
+            }))
         }
         ServiceToolPresentationEvent::Progress(progress) => {
-            ToolPresentationEvent::Progress(ToolProgressPresentation {
+            Some(ToolPresentationEvent::Progress(ToolProgressPresentation {
                 target: convert_tool_presentation_target(progress.target),
                 text: progress.text,
                 percent: progress.percent,
                 level: convert_tool_presentation_level(progress.level),
-            })
+            }))
         }
-        ServiceToolPresentationEvent::Clear { target } => ToolPresentationEvent::Clear {
+        ServiceToolPresentationEvent::Protocol(_) => None,
+        ServiceToolPresentationEvent::Clear { target } => Some(ToolPresentationEvent::Clear {
             target: convert_tool_presentation_target(target),
-        },
+        }),
     }
 }
 
@@ -16790,15 +16793,15 @@ mod tests {
 
         assert!(matches!(
             first,
-            ToolInvocationStreamEvent::Started { sequence: 1, .. }
+            Some(ToolInvocationStreamEvent::Started { sequence: 1, .. })
         ));
         assert!(matches!(
             second,
-            ToolInvocationStreamEvent::Status { sequence: 2, .. }
+            Some(ToolInvocationStreamEvent::Status { sequence: 2, .. })
         ));
         assert!(matches!(
             other_call,
-            ToolInvocationStreamEvent::Finished { sequence: 1, .. }
+            Some(ToolInvocationStreamEvent::Finished { sequence: 1, .. })
         ));
     }
 

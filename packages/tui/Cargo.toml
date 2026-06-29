@@ -30,6 +30,7 @@ bcode_session_models = { workspace = true }
 bcode_settings = { workspace = true }
 bcode_skill_models = { workspace = true }
 bcode_syntax_render = { workspace = true }
+bcode_tool = { workspace = true }
 bcode_worktree_models = { workspace = true }
 bmux_keyboard = { workspace = true }
 bmux_terminal_grid = { workspace = true }

@@ -7,11 +7,13 @@
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     InteractiveToolResolution, InteractiveToolResumeRequest, ListToolsRequest, OP_INVOKE_TOOL,
-    OP_LIST_TOOLS, OP_RESUME_INTERACTIVE_TOOL, TOOL_SERVICE_INTERFACE_ID, ToolCompatibilityAlias,
-    ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolList,
-    ToolPolicyMetadata, ToolSideEffect,
+    OP_LIST_TOOLS, OP_PRESENT_TOOL_RESULT, OP_RESUME_INTERACTIVE_TOOL, TOOL_SERVICE_INTERFACE_ID,
+    ToolCompatibilityAlias, ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
+    ToolInvocationResult, ToolList, ToolPolicyMetadata, ToolPresentationEvent,
+    ToolPresentationTarget, ToolProtocolPresentation, ToolResultPresentationRequest,
+    ToolResultPresentationResponse, ToolSideEffect,
 };
-use bmux_tui_component_protocol::model::ComponentNode;
+use bmux_tui_component_protocol::model::{ComponentKind, ComponentNode};
 use bmux_tui_component_protocol::value::ComponentValue;
 use bmux_tui_components::protocol::{
     ACTION_ROW_TYPE_ID, CheckboxGroupProps, ChoiceOptionProps, FormBuilder, RadioGroupProps,
@@ -73,20 +75,20 @@ enum QuestionCustomMode {
     Additional,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct QuestionToolOutcome {
     status: QuestionRequestStatus,
     questions: Vec<QuestionOutcome>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum QuestionRequestStatus {
     Answered,
     Unanswered,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct QuestionOutcome {
     question_index: usize,
     header: Option<String>,
@@ -97,7 +99,7 @@ struct QuestionOutcome {
     required: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum QuestionStatus {
     Answered,
@@ -131,7 +133,7 @@ struct QuestionAnswerPayload {
     custom: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SelectedAnswer {
     label: String,
     value: String,
@@ -154,6 +156,7 @@ fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
         OP_LIST_TOOLS => list_tools(&context.request),
         OP_INVOKE_TOOL => invoke_tool(context),
         OP_RESUME_INTERACTIVE_TOOL => resume_interactive_tool(&context.request),
+        OP_PRESENT_TOOL_RESULT => present_tool_result_service(&context.request),
         _ => ServiceResponse::error(
             "unsupported_operation",
             "unsupported question tool service operation",
@@ -336,6 +339,109 @@ fn question_response(outcome: &QuestionToolOutcome) -> ToolInvocationResponse {
         host_action: None,
         result: Some(ToolInvocationResult::Json { value }),
     }
+}
+
+fn present_tool_result_service(
+    request: &bcode_plugin_sdk::prelude::ServiceRequest,
+) -> ServiceResponse {
+    let request = match serde_json::from_slice::<ToolResultPresentationRequest>(&request.payload) {
+        Ok(request) => request,
+        Err(error) => {
+            return ServiceResponse::error(
+                "invalid_request",
+                format!("invalid tool result presentation request: {error}"),
+            );
+        }
+    };
+    present_tool_result(&request).map_or_else(
+        || json_response(&ToolResultPresentationResponse::default()),
+        |presentation| {
+            json_response(&ToolResultPresentationResponse {
+                presentation: Some(presentation),
+            })
+        },
+    )
+}
+
+/// Present a semantic question tool result as a generic component protocol tree.
+#[must_use]
+pub fn present_tool_result(
+    request: &ToolResultPresentationRequest,
+) -> Option<ToolPresentationEvent> {
+    if request.tool_name != TOOL_NAME {
+        return None;
+    }
+    let outcome = match &request.semantic_result {
+        Some(ToolInvocationResult::Json { value }) => serde_json::from_str(value).ok(),
+        Some(ToolInvocationResult::Text { text }) => serde_json::from_str(text).ok(),
+        Some(ToolInvocationResult::ShellRun { .. } | ToolInvocationResult::FileChange { .. })
+        | None => serde_json::from_str(&request.fallback_result).ok(),
+    }?;
+    Some(question_result_presentation(&outcome))
+}
+
+fn question_result_presentation(outcome: &QuestionToolOutcome) -> ToolPresentationEvent {
+    ToolPresentationEvent::Protocol(ToolProtocolPresentation {
+        target: ToolPresentationTarget::Result,
+        surface_kind: "bmux.protocol.inline.result".to_owned(),
+        tree: question_result_component_tree(outcome),
+        state: None,
+    })
+}
+
+fn question_result_component_tree(outcome: &QuestionToolOutcome) -> Value {
+    let mut builder = FormBuilder::new("question-result-form");
+    for question in &outcome.questions {
+        let prompt = question.header.as_ref().map_or_else(
+            || question.question.clone(),
+            |header| format!("{header}\n{}", question.question),
+        );
+        builder = builder.text(prompt);
+        if question.selected.is_empty() {
+            builder = builder.child(
+                TextInputProps {
+                    value: question.custom.clone().unwrap_or_default(),
+                    placeholder: Some(String::new()),
+                    label: None,
+                    help: None,
+                    error: None,
+                    required: false,
+                    disabled: true,
+                }
+                .into_box_node(format!("question-{}-answer", question.question_index)),
+            );
+        } else {
+            builder = builder.child(answer_list_node(question));
+            if let Some(custom) = &question.custom {
+                builder = builder.child(
+                    TextInputProps {
+                        value: custom.clone(),
+                        placeholder: None,
+                        label: Some("Custom answer".to_owned()),
+                        help: None,
+                        error: None,
+                        required: false,
+                        disabled: true,
+                    }
+                    .into_box_node(format!(
+                        "question-{}-custom-answer",
+                        question.question_index
+                    )),
+                );
+            }
+        }
+    }
+    serde_json::to_value(builder.build()).unwrap_or(Value::Null)
+}
+
+fn answer_list_node(question: &QuestionOutcome) -> ComponentNode {
+    let text = question
+        .selected
+        .iter()
+        .map(|answer| format!("✓ {}", answer.label))
+        .collect::<Vec<_>>()
+        .join("\n");
+    ComponentNode::leaf(ComponentKind::Text { text, align: None })
 }
 
 fn protocol_answers(

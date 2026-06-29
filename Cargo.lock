@@ -1804,6 +1804,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_command",
  "bcode_plugin_sdk",
+ "bcode_tool",
  "bmux_plugin",
  "bmux_plugin_sdk",
  "libloading 0.9.0",
@@ -2067,6 +2068,7 @@ dependencies = [
  "bcode_settings",
  "bcode_skill_models",
  "bcode_syntax_render",
+ "bcode_tool",
  "bcode_worktree_models",
  "bmux_keyboard",
  "bmux_terminal_grid",
