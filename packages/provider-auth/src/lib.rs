@@ -104,7 +104,7 @@ pub fn resolve_auth_profile(
                 .map_or(auth_profile_name, String::as_str);
             storage_profile = profile.to_string();
             storage_vault = Some(vault.display().to_string());
-            let policy = security::device_seal_policy_for_auth_profile(auth_profile);
+            let options = security::device_seal_options_for_auth_profile(auth_profile);
             let recipient_key = auth_profile
                 .settings
                 .get("recipient_key")
@@ -113,10 +113,10 @@ pub fn resolve_auth_profile(
                     || security::ensure_vault_recipient_key(&vault).ok(),
                     |key| Some(key.to_string()),
                 );
-            let report = security::reconcile_auth_vault_security_report(
+            let report = security::reconcile_auth_vault_security_report_with_options(
                 &vault,
                 profile,
-                policy,
+                options,
                 recipient_key.as_deref(),
             );
             diagnostics.extend(report.diagnostics);

@@ -497,6 +497,40 @@ pub enum AuthDeviceSealPolicy {
     Required,
 }
 
+/// Complete device-seal configuration for an sshenv-backed auth profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthDeviceSealOptions {
+    /// Whether Bcode should reconcile a profile device seal.
+    pub policy: AuthDeviceSealPolicy,
+    /// Concrete sshenv device-seal selection and strictness.
+    pub seal: sshenv_vault::device::DeviceSealOptions,
+}
+
+impl AuthDeviceSealOptions {
+    /// Default Bcode auth-vault device-seal behavior.
+    #[must_use]
+    pub const fn preferred_transparent_device_only() -> Self {
+        Self {
+            policy: AuthDeviceSealPolicy::Preferred,
+            seal: sshenv_vault::device::DeviceSealOptions {
+                selection: sshenv_vault::device::DeviceSealSelection::Policy(
+                    sshenv_vault::device::DeviceSealPolicy::TransparentDeviceOnly,
+                ),
+                strict: true,
+            },
+        }
+    }
+
+    /// Build options from the legacy policy-only API.
+    #[must_use]
+    pub const fn from_policy(policy: AuthDeviceSealPolicy) -> Self {
+        Self {
+            policy,
+            ..Self::preferred_transparent_device_only()
+        }
+    }
+}
+
 /// Parse an auth profile's `settings.device_seal` value.
 #[must_use]
 pub fn device_seal_policy_for_auth_profile(
@@ -514,6 +548,85 @@ pub fn device_seal_policy_for_auth_profile(
         })
 }
 
+/// Parse an auth profile's device-seal settings.
+#[must_use]
+pub fn device_seal_options_for_auth_profile(
+    auth_profile: &bcode_config::AuthProfileConfig,
+) -> AuthDeviceSealOptions {
+    let policy = device_seal_policy_for_auth_profile(auth_profile);
+    let selection = auth_profile
+        .settings
+        .get("device_seal_backend")
+        .and_then(|value| parse_device_seal_backend(value))
+        .map_or_else(
+            || {
+                sshenv_vault::device::DeviceSealSelection::Policy(
+                    auth_profile
+                        .settings
+                        .get("device_seal_mode")
+                        .and_then(|value| parse_device_seal_policy(value))
+                        .unwrap_or(sshenv_vault::device::DeviceSealPolicy::TransparentDeviceOnly),
+                )
+            },
+            sshenv_vault::device::DeviceSealSelection::Backend,
+        );
+    let strict = auth_profile
+        .settings
+        .get("device_seal_strict")
+        .is_none_or(|value| parse_bool_setting(value, true));
+    AuthDeviceSealOptions {
+        policy,
+        seal: sshenv_vault::device::DeviceSealOptions { selection, strict },
+    }
+}
+
+fn parse_device_seal_policy(value: &str) -> Option<sshenv_vault::device::DeviceSealPolicy> {
+    match normalize_setting(value).as_str() {
+        "default" | "legacy" => Some(sshenv_vault::device::DeviceSealPolicy::Default),
+        "transparentdeviceonly" | "transparentlocaldevice" | "devicelocaltransparent" => {
+            Some(sshenv_vault::device::DeviceSealPolicy::TransparentDeviceOnly)
+        }
+        _ => None,
+    }
+}
+
+fn parse_device_seal_backend(
+    value: &str,
+) -> Option<sshenv_vault::device::DeviceSealBackendSelection> {
+    match normalize_setting(value).as_str() {
+        "macoskeychain" => Some(sshenv_vault::device::DeviceSealBackendSelection::MacosKeychain),
+        "macoskeychaindeviceonly" => {
+            Some(sshenv_vault::device::DeviceSealBackendSelection::MacosKeychainDeviceOnly)
+        }
+        "windowsdpapi" | "windowsdpapicurrentuser" => {
+            Some(sshenv_vault::device::DeviceSealBackendSelection::WindowsDpapiCurrentUser)
+        }
+        "linuxtpm" | "tpm" => Some(sshenv_vault::device::DeviceSealBackendSelection::LinuxTpm),
+        "linuxsecretservice" | "secretservice" => {
+            Some(sshenv_vault::device::DeviceSealBackendSelection::LinuxSecretService)
+        }
+        "secureenclave" => Some(sshenv_vault::device::DeviceSealBackendSelection::SecureEnclave),
+        "localfile" => Some(sshenv_vault::device::DeviceSealBackendSelection::LocalFile),
+        _ => None,
+    }
+}
+
+fn parse_bool_setting(value: &str, default: bool) -> bool {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" | "strict" => true,
+        "0" | "false" | "no" | "off" | "relaxed" => false,
+        _ => default,
+    }
+}
+
+fn normalize_setting(value: &str) -> String {
+    value
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 /// Safely reconcile an sshenv auth profile and return structured diagnostics.
 #[must_use]
 pub fn reconcile_auth_vault_security_report(
@@ -522,7 +635,29 @@ pub fn reconcile_auth_vault_security_report(
     policy: AuthDeviceSealPolicy,
     explicit_recipient_key: Option<&str>,
 ) -> AuthSecurityReconcileReport {
-    match reconcile_auth_vault_security(vault_path, profile, policy, explicit_recipient_key) {
+    reconcile_auth_vault_security_report_with_options(
+        vault_path,
+        profile,
+        AuthDeviceSealOptions::from_policy(policy),
+        explicit_recipient_key,
+    )
+}
+
+/// Safely reconcile an sshenv auth profile with explicit device-seal options and
+/// return structured diagnostics.
+#[must_use]
+pub fn reconcile_auth_vault_security_report_with_options(
+    vault_path: &Path,
+    profile: &str,
+    options: AuthDeviceSealOptions,
+    explicit_recipient_key: Option<&str>,
+) -> AuthSecurityReconcileReport {
+    match reconcile_auth_vault_security_with_options(
+        vault_path,
+        profile,
+        options,
+        explicit_recipient_key,
+    ) {
         Ok(actions) => AuthSecurityReconcileReport {
             diagnostics: actions
                 .into_iter()
@@ -530,7 +665,7 @@ pub fn reconcile_auth_vault_security_report(
                 .collect(),
         },
         Err(error) => {
-            let severity = if policy == AuthDeviceSealPolicy::Required {
+            let severity = if options.policy == AuthDeviceSealPolicy::Required {
                 AuthSecurityDiagnosticSeverity::Error
             } else {
                 AuthSecurityDiagnosticSeverity::Warning
@@ -577,6 +712,29 @@ pub fn reconcile_auth_vault_security(
     policy: AuthDeviceSealPolicy,
     explicit_recipient_key: Option<&str>,
 ) -> Result<Vec<String>, String> {
+    reconcile_auth_vault_security_with_options(
+        vault_path,
+        profile,
+        AuthDeviceSealOptions::from_policy(policy),
+        explicit_recipient_key,
+    )
+}
+
+/// Safely reconcile an sshenv auth profile with explicit device-seal options.
+///
+/// This only performs non-destructive upgrades. It may migrate a vault to v2,
+/// enable profile-key mode, and add a per-profile device seal. It will not
+/// remove an existing device seal when policy is [`AuthDeviceSealPolicy::Off`].
+///
+/// # Errors
+///
+/// Returns an error when the requested policy/options cannot be applied.
+pub fn reconcile_auth_vault_security_with_options(
+    vault_path: &Path,
+    profile: &str,
+    options: AuthDeviceSealOptions,
+    explicit_recipient_key: Option<&str>,
+) -> Result<Vec<String>, String> {
     if !vault_path.exists() {
         return Ok(Vec::new());
     }
@@ -585,7 +743,7 @@ pub fn reconcile_auth_vault_security(
         .map_err(|error| format!("failed to unlock auth vault metadata: {error}"))?;
 
     let mut actions = Vec::new();
-    if matches!(policy, AuthDeviceSealPolicy::Off) {
+    if matches!(options.policy, AuthDeviceSealPolicy::Off) {
         if profile_has_device_seal(&vault, profile) {
             actions.push(format!(
                 "auth profile {profile} is device-sealed even though config sets device_seal=off; leaving stronger vault policy unchanged"
@@ -627,7 +785,7 @@ pub fn reconcile_auth_vault_security(
     }
 
     vault
-        .require_profile_device_seal(profile)
+        .require_profile_device_seal_with_options(profile, options.seal)
         .map_err(|error| {
             format!("failed to bind auth profile {profile} to this device: {error}")
         })?;

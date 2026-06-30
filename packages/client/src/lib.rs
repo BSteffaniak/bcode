@@ -437,11 +437,13 @@ fn merge_legacy_openai_auth_profile_env(
         .vault
         .clone()
         .unwrap_or_else(bcode_config::default_auth_vault_path);
-    let policy = bcode_provider_auth::security::AuthDeviceSealPolicy::Preferred;
-    let _report = bcode_provider_auth::security::reconcile_auth_vault_security_report(
+    let options = bcode_provider_auth::security::AuthDeviceSealOptions::from_policy(
+        bcode_provider_auth::security::AuthDeviceSealPolicy::Preferred,
+    );
+    let _report = bcode_provider_auth::security::reconcile_auth_vault_security_report_with_options(
         &vault,
         &auth.profile,
-        policy,
+        options,
         None,
     );
     let store = sshenv_vault::SshenvStore::new(

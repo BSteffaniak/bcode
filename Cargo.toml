@@ -233,6 +233,7 @@ sshenv_vault = { git = "https://github.com/BSteffaniak/sshenv.git", branch = "ma
     "linux-secret-service",
     "macos-keychain",
     "profile-keys",
+    "tpm-device-seal",
     "windows-dpapi",
 ] }
 switchy = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }

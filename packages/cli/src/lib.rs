@@ -3108,10 +3108,11 @@ fn apply_auth_device_seal_policy(
     policy: bcode_provider_auth::security::AuthDeviceSealPolicy,
     recipient_key: Option<&str>,
 ) -> Result<(), CliError> {
-    match bcode_provider_auth::security::reconcile_auth_vault_security_report(
+    let options = bcode_provider_auth::security::AuthDeviceSealOptions::from_policy(policy);
+    match bcode_provider_auth::security::reconcile_auth_vault_security_report_with_options(
         vault_path,
         profile,
-        policy,
+        options,
         recipient_key,
     )
     .diagnostics

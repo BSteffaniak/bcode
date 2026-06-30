@@ -244,11 +244,11 @@ pub fn auth_security_status(config: &bcode_config::BcodeConfig) -> Option<String
         .settings
         .get("profile")
         .map_or(auth_profile_name.as_str(), String::as_str);
-    let policy = bcode_provider_auth::security::device_seal_policy_for_auth_profile(auth_profile);
-    let report = bcode_provider_auth::security::reconcile_auth_vault_security_report(
+    let options = bcode_provider_auth::security::device_seal_options_for_auth_profile(auth_profile);
+    let report = bcode_provider_auth::security::reconcile_auth_vault_security_report_with_options(
         &vault,
         profile,
-        policy,
+        options,
         auth_profile
             .settings
             .get("recipient_key")
