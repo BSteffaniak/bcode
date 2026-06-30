@@ -5,6 +5,7 @@
 //! OpenAI-compatible model provider plugin for Bcode.
 
 mod auth_pool_state;
+mod discovery;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -3330,14 +3331,28 @@ fn model_infos_from_items(
 async fn model_infos_from_items_with_remote(
     models: Vec<ModelResponseItem>,
     default_model: Option<&str>,
+    xai_api_key: Option<&str>,
 ) -> Vec<ModelInfo> {
     let discovered = model_infos_from_items(models, default_model);
-    if let Ok(catalog) = bcode_model_catalog::ModelCatalog::load_bundled_with_remote_overlay().await
+
+    // Load catalog with remote overlay
+    let Ok(mut catalog) =
+        bcode_model_catalog::ModelCatalog::load_bundled_with_remote_overlay().await
+    else {
+        return discovered;
+    };
+
+    // On-demand xAI live discovery using user's API key (if provided)
+    if let Some(key) = xai_api_key
+        && let Ok(snapshot) = bcode_model_discovery::xai::discover(Some(key.to_string())).await
     {
-        catalog.merge_provider_models("openai", discovered, true)
-    } else {
-        discovered
+        bcode_model_catalog::merge_live_snapshots(
+            catalog.document_mut(),
+            std::slice::from_ref(&snapshot),
+        );
     }
+
+    catalog.merge_provider_models("openai", discovered, true)
 }
 
 fn pricing_from_provider_api(
@@ -3646,7 +3661,18 @@ async fn discover_models_async(
         )
     })?;
     append_missing_model_items(&mut body.data, &settings.model_ids);
-    Ok(model_infos_from_items_with_remote(body.data, settings.default_model.as_deref()).await)
+    // Pass xAI key for on-demand live discovery if this is an xAI provider
+    let xai_key: Option<String> = if discovery::is_xai_provider(Some(&settings.base_url), None) {
+        Some(api_key.to_string())
+    } else {
+        None
+    };
+    Ok(model_infos_from_items_with_remote(
+        body.data,
+        settings.default_model.as_deref(),
+        xai_key.as_deref(),
+    )
+    .await)
 }
 
 impl OpenAiCompatibleProviderPlugin {

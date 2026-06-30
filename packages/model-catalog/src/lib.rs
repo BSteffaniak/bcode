@@ -19,7 +19,7 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Environment variable pointing to a directory of local live snapshots (Phase 3 dedicated path).
+/// Environment variable pointing to a directory of local live snapshots.
 const LOCAL_LIVE_DIR_ENV: &str = "BCODE_MODEL_CATALOG_LIVE_DIR";
 
 mod remote;
@@ -103,6 +103,12 @@ impl ModelCatalog {
         &self.document
     }
 
+    /// Access the underlying catalog document mutably (for live snapshot merging).
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn document_mut(&mut self) -> &mut CatalogDocument {
+        &mut self.document
+    }
+
     /// Load the checked-in bundled catalog source.
     ///
     /// # Errors
@@ -135,7 +141,7 @@ impl ModelCatalog {
     pub async fn load_bundled_with_remote_options(options: &RemoteCatalogOptions) -> Result<Self> {
         let mut document = load_catalog(&default_source_dir())?;
         apply_remote_overlay_best_effort(&mut document, options).await;
-        // Also apply any local live snapshots from the dedicated env var path (Phase 3)
+        // Also apply any local live snapshots from the dedicated env var path
         apply_local_live_overlay_best_effort(&mut document);
         Ok(Self::new(document))
     }
@@ -299,7 +305,7 @@ async fn apply_remote_overlay_best_effort(
     if !snapshots.is_empty() {
         overlay_remote_live(document, &snapshots);
     }
-    // Also apply local live snapshots (Phase 3 dedicated path)
+    // Also apply local live snapshots
     apply_local_live_overlay_best_effort(document);
 }
 
@@ -643,10 +649,11 @@ pub fn load_live_snapshots(live_dir: &Path) -> Result<Vec<LiveCatalogSnapshot>> 
 }
 
 /// Merge generated live snapshots into a catalog document.
-pub(crate) fn merge_live_snapshots(
-    catalog: &mut CatalogDocument,
-    snapshots: &[LiveCatalogSnapshot],
-) {
+///
+/// # Panics
+///
+/// Panics if a provider referenced by a snapshot does not exist after auto-creation logic.
+pub fn merge_live_snapshots(catalog: &mut CatalogDocument, snapshots: &[LiveCatalogSnapshot]) {
     for snapshot in snapshots {
         // Auto-create provider if it does not exist (live data is the source of truth for new providers)
         if !catalog.providers.contains_key(&snapshot.provider_id) {
