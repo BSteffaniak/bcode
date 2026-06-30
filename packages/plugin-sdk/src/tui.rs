@@ -13,6 +13,7 @@ use bcode_session_models::{
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::prelude::Line;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -160,6 +161,15 @@ impl PluginTuiAction {
     }
 }
 
+/// Native Rust plugin artifact/view renderer for inline transcript content.
+pub trait PluginTuiVisualAdapter: Send + Sync {
+    /// Return whether this adapter can render the artifact/view kind.
+    fn supports(&self, kind: &str) -> bool;
+
+    /// Build transcript rows for the artifact/view payload at the given width.
+    fn rows(&self, kind: &str, payload: &serde_json::Value, width: u16) -> Vec<Line>;
+}
+
 /// Native Rust plugin surface rendered directly with `bmux_tui`.
 pub trait PluginTuiSurface: Send {
     /// Stable surface identifier.
@@ -219,12 +229,14 @@ pub trait PluginTuiSurfaceFactory: Send + Sync {
 #[derive(Default)]
 pub struct PluginTuiRegistry {
     factories: BTreeMap<String, Box<dyn PluginTuiSurfaceFactory>>,
+    visual_adapters: Vec<Box<dyn PluginTuiVisualAdapter>>,
 }
 
 impl std::fmt::Debug for PluginTuiRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PluginTuiRegistry")
             .field("surface_kinds", &self.factories.keys().collect::<Vec<_>>())
+            .field("visual_adapters", &self.visual_adapters.len())
             .finish()
     }
 }
@@ -234,6 +246,25 @@ impl PluginTuiRegistry {
     pub fn register_factory(&mut self, factory: Box<dyn PluginTuiSurfaceFactory>) {
         self.factories
             .insert(factory.surface_kind().to_string(), factory);
+    }
+
+    /// Register a native TUI visual adapter.
+    pub fn register_visual_adapter(&mut self, adapter: Box<dyn PluginTuiVisualAdapter>) {
+        self.visual_adapters.push(adapter);
+    }
+
+    /// Build transcript rows for a plugin-owned artifact/view payload.
+    #[must_use]
+    pub fn visual_rows(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+        width: u16,
+    ) -> Option<Vec<Line>> {
+        self.visual_adapters
+            .iter()
+            .find(|adapter| adapter.supports(kind))
+            .map(|adapter| adapter.rows(kind, payload, width))
     }
 
     /// Open a registered surface.

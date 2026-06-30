@@ -4,6 +4,9 @@
 
 //! filesystem service plugin for Bcode.
 
+#[cfg(feature = "static-bundled")]
+mod file_change_tui;
+
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ImageMetadata, ImageRefContent, ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS,
@@ -2534,7 +2537,18 @@ where
 #[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(FilesystemPlugin, include_str!("../bcode-plugin.toml"))
+    let mut vtable = bcode_plugin_sdk::static_plugin_vtable!(
+        FilesystemPlugin,
+        include_str!("../bcode-plugin.toml")
+    );
+    vtable.tui_registry = Some(filesystem_tui_registry);
+    vtable
+}
+
+fn filesystem_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
+    let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
+    registry.register_visual_adapter(Box::new(file_change_tui::FileChangeTuiVisualAdapter));
+    registry
 }
 
 bcode_plugin_sdk::export_plugin!(FilesystemPlugin, include_str!("../bcode-plugin.toml"));

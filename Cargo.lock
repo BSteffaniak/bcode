@@ -1562,10 +1562,12 @@ dependencies = [
  "base64 0.22.1",
  "bcode_plugin_sdk",
  "bcode_tool",
+ "bmux_tui",
  "image",
  "png",
  "serde",
  "serde_json",
+ "unicode-segmentation",
 ]
 
 [[package]]

@@ -509,6 +509,17 @@ impl LoadedPlugin {
         self.config = config;
     }
 
+    /// Return a statically linked TUI registry for this plugin, when available.
+    #[must_use]
+    pub fn tui_registry(&self) -> Option<PluginTuiRegistry> {
+        match &self.backend {
+            LoadedPluginBackend::Dynamic { .. } => None,
+            LoadedPluginBackend::Static { vtable } => {
+                vtable.tui_registry.map(|registry| registry())
+            }
+        }
+    }
+
     /// Activate the plugin.
     ///
     /// # Errors
@@ -2703,6 +2714,15 @@ impl Default for PluginHost {
 }
 
 impl PluginHost {
+    /// Return a native TUI registry for a statically loaded plugin.
+    #[must_use]
+    pub fn tui_registry(&self, plugin_id: &str) -> Option<PluginTuiRegistry> {
+        self.loaded
+            .iter()
+            .find(|plugin| plugin.manifest.id == plugin_id)
+            .and_then(LoadedPlugin::tui_registry)
+    }
+
     /// Discover, load, and activate plugins from default roots.
     ///
     /// # Errors

@@ -7,6 +7,7 @@ use bcode_session_models::{
     ToolInvocationStreamEvent, ToolOutputStream, ToolPresentationEvent, ToolPresentationTarget,
     ToolRequestPresentationMetadata,
 };
+use bmux_tui::prelude::Line;
 
 /// Semantic transcript item type.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +73,15 @@ pub enum TranscriptItemKind {
         tool_name: Option<String>,
         /// Structured plugin-owned card.
         card: ToolCardPresentation,
+    },
+    /// Plugin-owned native TUI presentation rows.
+    ToolNativePresentationRows {
+        /// Provider tool call identifier.
+        tool_call_id: String,
+        /// Tool name, when known.
+        tool_name: Option<String>,
+        /// Renderer-built rows.
+        rows: Vec<Line>,
     },
     /// Plugin-owned generic protocol presentation.
     ToolProtocolPresentation {
@@ -385,6 +395,18 @@ impl TranscriptItem {
         )
     }
 
+    /// Return whether this item is a native plugin presentation for `tool_call_id`.
+    #[must_use]
+    pub fn is_tool_native_presentation_for(&self, tool_call_id: &str) -> bool {
+        matches!(
+            &self.kind,
+            TranscriptItemKind::ToolNativePresentationRows {
+                tool_call_id: item_tool_call_id,
+                ..
+            } if item_tool_call_id == tool_call_id
+        )
+    }
+
     /// Return whether this item is a generic request/result fallback for `tool_call_id`.
     #[must_use]
     pub fn is_generic_tool_fallback_for(&self, tool_call_id: &str) -> bool {
@@ -590,6 +612,27 @@ pub fn tool_presentation_card_item(
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.map(ToOwned::to_owned),
             card,
+        },
+    )
+}
+
+/// Build a plugin-owned native TUI row presentation item.
+#[must_use]
+pub fn tool_native_presentation_rows_item(
+    tool_call_id: &str,
+    tool_name: Option<&str>,
+    title: &str,
+    preview: bool,
+    rows: Vec<Line>,
+) -> TranscriptItem {
+    TranscriptItem::with_kind(
+        "Tool",
+        title.to_owned(),
+        preview,
+        TranscriptItemKind::ToolNativePresentationRows {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: tool_name.map(ToOwned::to_owned),
+            rows,
         },
     )
 }

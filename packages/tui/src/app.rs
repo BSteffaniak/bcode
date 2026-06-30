@@ -49,8 +49,9 @@ use super::transcript::{
     TranscriptItem, TranscriptItemKind, interactive_tool_request_item,
     interactive_tool_resolution_item, live_tool_preview_anchor_item, model_usage_item,
     permission_request_item, permission_result_item, streaming_terminal_output_item,
-    streaming_tool_output_item, tool_presentation_card_from_event, tool_presentation_card_item,
-    tool_request_item, tool_result_item, transcript_items_from_events_with_reasoning,
+    streaming_tool_output_item, tool_native_presentation_rows_item,
+    tool_presentation_card_from_event, tool_presentation_card_item, tool_request_item,
+    tool_result_item, transcript_items_from_events_with_reasoning,
 };
 use super::transcript_document::TranscriptDocument;
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
@@ -2869,6 +2870,12 @@ impl BmuxApp {
             }
             ToolPresentationEvent::PluginView(view) => {
                 if let Some(item) =
+                    native_view_item_for_app(self.plugin_host.as_deref(), tool_call_id, None, view)
+                {
+                    self.upsert_tool_presentation_item(tool_call_id, item);
+                    return;
+                }
+                if let Some(item) =
                     present_view_item_for_app(self.plugin_host.as_deref(), tool_call_id, None, view)
                 {
                     self.upsert_tool_presentation_item(tool_call_id, item);
@@ -2926,6 +2933,7 @@ impl BmuxApp {
     fn upsert_tool_presentation_item(&mut self, tool_call_id: &str, item: TranscriptItem) {
         self.transcript.retain(|existing| {
             !(existing.is_generic_tool_fallback_for(tool_call_id)
+                || existing.is_tool_native_presentation_for(tool_call_id)
                 || existing.is_tool_presentation_card_for(
                     tool_call_id,
                     bcode_session_models::ToolPresentationTarget::Preview,
@@ -4140,6 +4148,23 @@ const fn presentation_field_kind_to_session(
     }
 }
 
+fn native_view_item_for_app(
+    runtime: Option<&bcode_plugin::PluginHost>,
+    tool_call_id: &str,
+    tool_name: Option<&str>,
+    view: &bcode_session_models::ToolPluginViewPresentation,
+) -> Option<TranscriptItem> {
+    let registry = runtime?.tui_registry(&view.producer_plugin_id)?;
+    let rows = registry.visual_rows(&view.schema, &view.payload, 80)?;
+    Some(tool_native_presentation_rows_item(
+        tool_call_id,
+        tool_name.or(Some(&view.producer_plugin_id)),
+        view.title.as_deref().unwrap_or("Tool"),
+        view.target == bcode_session_models::ToolPresentationTarget::Preview,
+        rows,
+    ))
+}
+
 fn present_view_item_for_app(
     runtime: Option<&bcode_plugin::PluginHost>,
     tool_call_id: &str,
@@ -4255,6 +4280,9 @@ fn item_is_replaceable_tool_transcript_for_tool_call(
         } | TranscriptItemKind::ToolPresentationCard {
             tool_call_id: item_tool_call_id,
             ..
+        } | TranscriptItemKind::ToolNativePresentationRows {
+            tool_call_id: item_tool_call_id,
+            ..
         } | TranscriptItemKind::ToolProtocolPresentation {
             tool_call_id: item_tool_call_id,
             ..
@@ -4317,6 +4345,7 @@ fn referenced_tool_call_ids(items: &[TranscriptItem]) -> BTreeSet<String> {
             | TranscriptItemKind::ToolResult { tool_call_id, .. }
             | TranscriptItemKind::FileChangePresentation { tool_call_id, .. }
             | TranscriptItemKind::ToolPresentationCard { tool_call_id, .. }
+            | TranscriptItemKind::ToolNativePresentationRows { tool_call_id, .. }
             | TranscriptItemKind::TerminalOutput { tool_call_id, .. }
             | TranscriptItemKind::InteractiveToolRequest { tool_call_id, .. }
             | TranscriptItemKind::InteractiveToolResolution { tool_call_id, .. }

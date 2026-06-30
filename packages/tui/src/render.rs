@@ -687,6 +687,12 @@ fn push_transcript_item_rows(
                 inline_view_config,
             );
         }
+        TranscriptItemKind::ToolNativePresentationRows {
+            rows: native_rows, ..
+        } => {
+            rows.extend(native_rows.iter().cloned());
+            rows.push(Line::default());
+        }
         TranscriptItemKind::ToolProtocolPresentation { .. } => {
             push_protocol_presentation_placeholder_rows(rows, item, width);
         }
