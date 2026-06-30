@@ -770,7 +770,9 @@ pub fn reconcile_auth_vault_security_with_options(
         return Ok(actions);
     }
 
-    if profile_has_device_seal(&vault, profile) {
+    if profile_has_device_seal(&vault, profile)
+        && profile_device_seal_matches_options(&vault, profile, options.seal)
+    {
         return Ok(actions);
     }
 
@@ -796,12 +798,17 @@ pub fn reconcile_auth_vault_security_with_options(
         actions.push("enabled per-profile auth vault encryption".to_string());
     }
 
+    let rebinding_existing_seal = profile_has_device_seal(&vault, profile);
     vault
         .require_profile_device_seal_with_options(profile, options.seal)
         .map_err(|error| {
             format!("failed to bind auth profile {profile} to this device: {error}")
         })?;
-    actions.push(format!("bound auth profile {profile} to this device"));
+    actions.push(if rebinding_existing_seal {
+        format!("rebound auth profile {profile} to configured device seal")
+    } else {
+        format!("bound auth profile {profile} to this device")
+    });
     vault
         .save(vault_path, &data_key)
         .map_err(|error| format!("failed to save reconciled auth vault: {error}"))?;
@@ -836,6 +843,65 @@ fn profile_has_device_seal(vault: &sshenv_vault::Vault, profile: &str) -> bool {
                     .contains(&ProfileFactorRequirement::DeviceSeal)
             })
     })
+}
+
+fn profile_device_seal_matches_options(
+    vault: &sshenv_vault::Vault,
+    profile: &str,
+    options: sshenv_vault::device::DeviceSealOptions,
+) -> bool {
+    let Some(metadata) = profile_device_seal_metadata(vault, profile) else {
+        return false;
+    };
+    metadata
+        .params
+        .get("backend")
+        .is_some_and(|backend| expected_device_seal_backends(options).contains(&backend.as_str()))
+        && metadata
+            .params
+            .get("strict")
+            .is_none_or(|strict| parse_bool_setting(strict, options.strict) == options.strict)
+}
+
+const fn expected_device_seal_backends(
+    options: sshenv_vault::device::DeviceSealOptions,
+) -> &'static [&'static str] {
+    match options.selection {
+        sshenv_vault::device::DeviceSealSelection::Policy(policy) => match policy {
+            sshenv_vault::device::DeviceSealPolicy::Default => &[
+                "secure-enclave",
+                "macos-keychain",
+                "linux-secret-service",
+                "windows-dpapi",
+                "tpm",
+                "local-file",
+            ],
+            sshenv_vault::device::DeviceSealPolicy::TransparentDeviceOnly if options.strict => {
+                &["macos-keychain-device-only", "windows-dpapi", "tpm"]
+            }
+            sshenv_vault::device::DeviceSealPolicy::TransparentDeviceOnly => &[
+                "macos-keychain-device-only",
+                "windows-dpapi",
+                "tpm",
+                "linux-secret-service",
+            ],
+        },
+        sshenv_vault::device::DeviceSealSelection::Backend(backend) => match backend {
+            sshenv_vault::device::DeviceSealBackendSelection::MacosKeychain => &["macos-keychain"],
+            sshenv_vault::device::DeviceSealBackendSelection::MacosKeychainDeviceOnly => {
+                &["macos-keychain-device-only"]
+            }
+            sshenv_vault::device::DeviceSealBackendSelection::WindowsDpapiCurrentUser => {
+                &["windows-dpapi"]
+            }
+            sshenv_vault::device::DeviceSealBackendSelection::LinuxTpm => &["tpm"],
+            sshenv_vault::device::DeviceSealBackendSelection::LinuxSecretService => {
+                &["linux-secret-service"]
+            }
+            sshenv_vault::device::DeviceSealBackendSelection::SecureEnclave => &["secure-enclave"],
+            sshenv_vault::device::DeviceSealBackendSelection::LocalFile => &["local-file"],
+        },
+    }
 }
 
 fn profile_device_seal_metadata<'a>(
