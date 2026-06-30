@@ -885,8 +885,6 @@ pub enum ToolInvocationResult {
     Text { text: String },
     Json { value: String },
     Artifact { artifact: Box<ToolArtifact> },
-    ShellRun { result: ShellRunResult },
-    FileChange { result: FileChangeResult },
 }
 
 /// Semantic shell execution result.

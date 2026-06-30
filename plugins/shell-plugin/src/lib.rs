@@ -10,13 +10,14 @@ use bcode_config::{
 };
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
-    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, ShellRunResult, TOOL_SERVICE_INTERFACE_ID,
-    ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult,
-    ToolInvocationStreamEvent, ToolList, ToolLiveArgumentPreviewMetadata, ToolOutputStream,
-    ToolPresentationEvent, ToolPresentationField, ToolPresentationFieldKind,
-    ToolPresentationFieldValue, ToolPresentationLevel, ToolPresentationSection,
-    ToolPresentationTarget, ToolRequestPresentationMetadata, ToolSideEffect,
-    ToolStatusPresentation,
+    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, OP_PRESENT_ARTIFACT, ShellRunResult,
+    TOOL_SERVICE_INTERFACE_ID, ToolArtifact, ToolArtifactPresentationRequest,
+    ToolArtifactPresentationResponse, ToolDefinition, ToolInvocationRequest,
+    ToolInvocationResponse, ToolInvocationResult, ToolInvocationStreamEvent, ToolList,
+    ToolLiveArgumentPreviewMetadata, ToolOutputStream, ToolPresentationEvent,
+    ToolPresentationField, ToolPresentationFieldKind, ToolPresentationFieldValue,
+    ToolPresentationLevel, ToolPresentationSection, ToolPresentationTarget,
+    ToolRequestPresentationMetadata, ToolSideEffect, ToolStatusPresentation,
 };
 use bcode_tool_runtime::{ProcessExecutionRequest, ToolExecutionRuntime};
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,7 @@ fn invoke_shell_service(context: &NativeServiceContext) -> ServiceResponse {
     match context.request.operation.as_str() {
         OP_LIST_TOOLS => list_tools(&context.request),
         OP_INVOKE_TOOL => invoke_tool(context),
+        OP_PRESENT_ARTIFACT => present_artifact(&context.request),
         _ => ServiceResponse::error(
             "unsupported_operation",
             "unsupported tool service operation",
@@ -371,7 +373,7 @@ fn emit_shell_result_presentation(
     tool_call_id: &str,
     response: &ToolInvocationResponse,
 ) {
-    let Some(ToolInvocationResult::ShellRun { result }) = &response.result else {
+    let Some(result) = shell_result_from_response(response) else {
         return;
     };
     if matches!(result, ShellRunResult::Terminal { .. }) {
@@ -385,6 +387,16 @@ fn emit_shell_result_presentation(
             presentation: ToolPresentationEvent::Card(shell_result_card(response)),
         },
     );
+}
+
+fn shell_result_from_response(response: &ToolInvocationResponse) -> Option<ShellRunResult> {
+    let Some(ToolInvocationResult::Artifact { artifact }) = &response.result else {
+        return None;
+    };
+    if artifact.schema != "bcode.shell.run" {
+        return None;
+    }
+    serde_json::from_value(artifact.metadata.clone()).ok()
 }
 
 fn shell_presentation_fields(arguments: &ShellRunArguments) -> Vec<ToolPresentationFieldValue> {
@@ -422,8 +434,8 @@ fn shell_result_card(response: &ToolInvocationResponse) -> bcode_tool::ToolCardP
         kind: ToolPresentationFieldKind::Text,
     }];
     let mut sections = Vec::new();
-    if let Some(ToolInvocationResult::ShellRun { result }) = &response.result {
-        extend_captured_shell_result_presentation(result, &mut fields);
+    if let Some(result) = shell_result_from_response(response) {
+        extend_captured_shell_result_presentation(&result, &mut fields);
     }
     sections.insert(0, ToolPresentationSection::Fields { fields });
     bcode_tool::ToolCardPresentation {
@@ -805,8 +817,9 @@ fn run_terminal_shell_command_inner(
         content: Vec::new(),
         full_output: Some(full_encoded),
         host_action: None,
-        result: Some(ToolInvocationResult::ShellRun {
-            result: ShellRunResult::Terminal {
+        result: Some(shell_run_artifact(
+            "shell.run",
+            &ShellRunResult::Terminal {
                 exit_code: Some(status.exit_code),
                 timed_out: status.timed_out,
                 cancelled: status.cancelled,
@@ -820,7 +833,7 @@ fn run_terminal_shell_command_inner(
                 columns,
                 rows,
             },
-        }),
+        )),
     })
 }
 
@@ -887,8 +900,9 @@ fn build_process_tool_response(
         content: Vec::new(),
         full_output: Some(full_output),
         host_action: None,
-        result: Some(ToolInvocationResult::ShellRun {
-            result: ShellRunResult::Captured {
+        result: Some(shell_run_artifact(
+            "shell.run",
+            &ShellRunResult::Captured {
                 exit_code: result.exit_code,
                 timed_out: result.timed_out,
                 cancelled: result.cancelled,
@@ -900,7 +914,7 @@ fn build_process_tool_response(
                 stdout_bytes: Some(stdout.original_bytes as u64),
                 stderr_bytes: Some(stderr.original_bytes as u64),
             },
-        }),
+        )),
     }
 }
 
@@ -1231,6 +1245,93 @@ fn json_response<T: serde::Serialize>(value: &T) -> ServiceResponse {
     }
 }
 
+fn shell_run_artifact(tool_call_id: &str, result: &ShellRunResult) -> ToolInvocationResult {
+    ToolInvocationResult::Artifact {
+        artifact: Box::new(ToolArtifact {
+            artifact_id: format!("{tool_call_id}-shell-run"),
+            producer_plugin_id: "bcode.shell".to_string(),
+            schema: "bcode.shell.run".to_string(),
+            schema_version: 1,
+            tool_call_id: Some(tool_call_id.to_string()),
+            title: Some("Shell run".to_string()),
+            metadata: serde_json::to_value(result).unwrap_or_else(|_| json!({})),
+            refs: Vec::new(),
+        }),
+    }
+}
+
+fn present_artifact(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<ToolArtifactPresentationRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    if request.artifact.schema != "bcode.shell.run" || request.artifact.schema_version != 1 {
+        return json_response(&ToolArtifactPresentationResponse::default());
+    }
+    let mode = request
+        .artifact
+        .metadata
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let output = match mode {
+        "terminal" => request
+            .artifact
+            .metadata
+            .get("output_tail")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        "captured" => {
+            let stdout = request
+                .artifact
+                .metadata
+                .get("stdout")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let stderr = request
+                .artifact
+                .metadata
+                .get("stderr")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if stderr.is_empty() {
+                stdout.to_string()
+            } else {
+                format!("{stdout}\n{stderr}")
+            }
+        }
+        _ => serde_json::to_string_pretty(&request.artifact.metadata).unwrap_or_default(),
+    };
+    json_response(&ToolArtifactPresentationResponse {
+        presentation: Some(ToolPresentationEvent::Card(
+            bcode_tool::ToolCardPresentation {
+                target: ToolPresentationTarget::Result,
+                title: "Shell run".to_string(),
+                subtitle: Some(mode.to_string()),
+                sections: vec![ToolPresentationSection::Terminal {
+                    output,
+                    columns: request
+                        .artifact
+                        .metadata
+                        .get("columns")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|value| u16::try_from(value).ok())
+                        .unwrap_or(DEFAULT_TERMINAL_COLUMNS),
+                    rows: request
+                        .artifact
+                        .metadata
+                        .get("rows")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|value| u16::try_from(value).ok())
+                        .unwrap_or(DEFAULT_TERMINAL_ROWS),
+                }],
+            },
+        )),
+        state: request.state,
+    })
+}
+
 fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
     ServiceResponse::error("invalid_request", error.to_string())
 }
@@ -1407,18 +1508,15 @@ mod tests {
         );
 
         assert!(!response.is_error, "{}", response.output);
-        let Some(ToolInvocationResult::ShellRun {
-            result:
-                ShellRunResult::Terminal {
-                    exit_code,
-                    timed_out,
-                    cancelled,
-                    output_tail,
-                    columns,
-                    rows,
-                    ..
-                },
-        }) = response.result
+        let ShellRunResult::Terminal {
+            exit_code,
+            timed_out,
+            cancelled,
+            output_tail,
+            columns,
+            rows,
+            ..
+        } = shell_result_from_response(&response).expect("expected shell artifact")
         else {
             panic!("expected semantic terminal shell result");
         };
@@ -1453,19 +1551,16 @@ mod tests {
         .expect("shell command should complete");
 
         assert!(!response.is_error, "{}", response.output);
-        let Some(ToolInvocationResult::ShellRun {
-            result:
-                ShellRunResult::Captured {
-                    exit_code,
-                    timed_out,
-                    cancelled,
-                    stdout,
-                    stderr,
-                    stdout_truncated,
-                    stderr_truncated,
-                    ..
-                },
-        }) = response.result
+        let ShellRunResult::Captured {
+            exit_code,
+            timed_out,
+            cancelled,
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+            ..
+        } = shell_result_from_response(&response).expect("expected shell artifact")
         else {
             panic!("expected semantic captured shell result");
         };
@@ -1498,9 +1593,8 @@ mod tests {
         );
 
         assert!(!response.is_error, "{}", response.output);
-        let Some(ToolInvocationResult::ShellRun {
-            result: ShellRunResult::Terminal { output_tail, .. },
-        }) = response.result
+        let ShellRunResult::Terminal { output_tail, .. } =
+            shell_result_from_response(&response).expect("expected shell artifact")
         else {
             panic!("expected semantic terminal shell result");
         };
@@ -1607,8 +1701,9 @@ mod tests {
             content: Vec::new(),
             full_output: None,
             host_action: None,
-            result: Some(ToolInvocationResult::ShellRun {
-                result: ShellRunResult::Captured {
+            result: Some(shell_run_artifact(
+                "test-captured-card",
+                &ShellRunResult::Captured {
                     exit_code: Some(0),
                     timed_out: false,
                     cancelled: false,
@@ -1620,7 +1715,7 @@ mod tests {
                     stdout_bytes: Some(2),
                     stderr_bytes: Some(4),
                 },
-            }),
+            )),
         };
 
         let card = shell_result_card(&response);
@@ -1649,8 +1744,9 @@ mod tests {
             content: Vec::new(),
             full_output: None,
             host_action: None,
-            result: Some(ToolInvocationResult::ShellRun {
-                result: ShellRunResult::Terminal {
+            result: Some(shell_run_artifact(
+                "test-terminal-card",
+                &ShellRunResult::Terminal {
                     exit_code: Some(0),
                     timed_out: false,
                     cancelled: false,
@@ -1662,7 +1758,7 @@ mod tests {
                     columns: 80,
                     rows: 24,
                 },
-            }),
+            )),
         };
 
         let card = shell_result_card(&response);

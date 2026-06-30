@@ -2844,8 +2844,8 @@ mod tests {
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProviderStreamEvent, RuntimeWorkId,
         RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance,
         SessionForkKind, SessionId, SessionLiveEvent, SessionLiveEventKind, SessionTraceEvent,
-        SessionTracePayload, SessionTracePhase, ShellRunResult, ToolInvocationResult,
-        ToolInvocationStreamEvent, ToolOutputStream, TraceBlobRef,
+        SessionTracePayload, SessionTracePhase, ToolInvocationResult, ToolInvocationStreamEvent,
+        ToolOutputStream, TraceBlobRef,
     };
     use bcode_skill_models::{SkillActivationMode, SkillId};
     use serde::Serialize;
@@ -3034,19 +3034,29 @@ mod tests {
                     "legacy fallback".to_string(),
                     false,
                     None,
-                    Some(ToolInvocationResult::ShellRun {
-                        result: ShellRunResult::Terminal {
-                            exit_code: Some(0),
-                            timed_out: false,
-                            cancelled: false,
-                            duration_ms: None,
-                            output_tail: "hello\n".to_string(),
-                            output_truncated: false,
-                            output_bytes: Some(6),
-                            retained_output_bytes: Some(6),
-                            columns: 120,
-                            rows: 30,
-                        },
+                    Some(ToolInvocationResult::Artifact {
+                        artifact: Box::new(bcode_session_models::ToolArtifact {
+                            artifact_id: "call-1-shell-run".to_string(),
+                            producer_plugin_id: "bcode.shell".to_string(),
+                            schema: "bcode.shell.run".to_string(),
+                            schema_version: 1,
+                            tool_call_id: Some("call-1".to_string()),
+                            title: Some("Shell run".to_string()),
+                            metadata: serde_json::json!({
+                                "mode": "terminal",
+                                "exit_code": 0,
+                                "timed_out": false,
+                                "cancelled": false,
+                                "duration_ms": null,
+                                "output_tail": "hello\n",
+                                "output_truncated": false,
+                                "output_bytes": 6,
+                                "retained_output_bytes": 6,
+                                "columns": 120,
+                                "rows": 30,
+                            }),
+                            refs: Vec::new(),
+                        }),
                     }),
                 )
                 .await

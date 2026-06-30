@@ -684,10 +684,6 @@ pub enum ToolInvocationResult {
     Json { value: String },
     /// Opaque plugin artifact rendered by visual adapters.
     Artifact { artifact: Box<ToolArtifact> },
-    /// Shell command result.
-    ShellRun { result: ShellRunResult },
-    /// Filesystem or file-edit result.
-    FileChange { result: FileChangeResult },
 }
 
 /// Opaque artifact produced by a tool plugin and rendered by visual adapters.
@@ -1650,59 +1646,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_finished_semantic_result_json_decodes_current_shape() {
-        let payload = serde_json::json!({
-            "tool_call_finished": {
-                "tool_call_id": "call-1",
-                "result": "tool result",
-                "is_error": false,
-                "semantic_result": {
-                    "type": "shell_run",
-                    "result": {
-                        "mode": "terminal",
-                        "exit_code": 0,
-                        "timed_out": false,
-                        "cancelled": false,
-                        "output_tail": "hello\n",
-                        "output_truncated": false,
-                        "output_bytes": 6,
-                        "retained_output_bytes": 6,
-                        "columns": 120,
-                        "rows": 30
-                    }
-                }
-            }
-        })
-        .to_string();
-
-        let decoded: SessionEventKind =
-            serde_json::from_str(&payload).expect("tool call finished event kind should decode");
-
-        let SessionEventKind::ToolCallFinished {
-            semantic_result: Some(ToolInvocationResult::ShellRun { result }),
-            ..
-        } = decoded
-        else {
-            panic!("expected shell semantic result");
-        };
-        assert_eq!(
-            result,
-            ShellRunResult::Terminal {
-                exit_code: Some(0),
-                timed_out: false,
-                cancelled: false,
-                duration_ms: None,
-                output_tail: "hello\n".to_string(),
-                output_truncated: false,
-                output_bytes: Some(6),
-                retained_output_bytes: Some(6),
-                columns: 120,
-                rows: 30,
-            }
-        );
-    }
-
-    #[test]
     fn tool_call_finished_without_semantic_result_json_decodes() {
         let decoded: SessionEventKind = serde_json::from_str(
             r#"{"tool_call_finished":{"tool_call_id":"call-1","result":"legacy result"}}"#,
@@ -1717,51 +1660,6 @@ mod tests {
                 is_error: false,
                 output: None,
                 semantic_result: None,
-            }
-        );
-    }
-
-    #[test]
-    fn semantic_tool_result_json_decodes_missing_optional_fields() {
-        let decoded: ToolInvocationResult = serde_json::from_str(
-            r#"{"type":"shell_run","result":{"mode":"terminal","output_tail":"minimal"}}"#,
-        )
-        .expect("minimal terminal semantic result should decode");
-
-        assert_eq!(
-            decoded,
-            ToolInvocationResult::ShellRun {
-                result: ShellRunResult::Terminal {
-                    exit_code: None,
-                    timed_out: false,
-                    cancelled: false,
-                    duration_ms: None,
-                    output_tail: "minimal".to_string(),
-                    output_truncated: false,
-                    output_bytes: None,
-                    retained_output_bytes: None,
-                    columns: 80,
-                    rows: 24,
-                },
-            }
-        );
-    }
-
-    #[test]
-    fn semantic_tool_result_json_ignores_unknown_extra_fields() {
-        let decoded: ToolInvocationResult = serde_json::from_str(
-            r#"{"type":"file_change","result":{"tool_name":"filesystem.write","summary":"wrote bytes","path":"file.txt","future_field":"ignored"},"future_top_level":"ignored"}"#,
-        )
-        .expect("semantic result with future fields should decode");
-
-        assert_eq!(
-            decoded,
-            ToolInvocationResult::FileChange {
-                result: FileChangeResult {
-                    tool_name: "filesystem.write".to_string(),
-                    summary: "wrote bytes".to_string(),
-                    path: Some("file.txt".to_string()),
-                },
             }
         );
     }
@@ -1799,50 +1697,6 @@ mod tests {
                             metadata: None,
                         }],
                     }),
-                },
-            ),
-            (
-                r#"{"type":"file_change","result":{"tool_name":"filesystem.write","summary":"wrote 171 bytes","path":"/tmp/hello.txt"}}"#,
-                ToolInvocationResult::FileChange {
-                    result: FileChangeResult {
-                        tool_name: "filesystem.write".to_string(),
-                        summary: "wrote 171 bytes".to_string(),
-                        path: Some("/tmp/hello.txt".to_string()),
-                    },
-                },
-            ),
-            (
-                r#"{"type":"shell_run","result":{"mode":"terminal","exit_code":0,"timed_out":false,"cancelled":false,"output_tail":"hello\n","output_truncated":false,"output_bytes":6,"retained_output_bytes":6,"columns":120,"rows":30}}"#,
-                ToolInvocationResult::ShellRun {
-                    result: ShellRunResult::Terminal {
-                        exit_code: Some(0),
-                        timed_out: false,
-                        cancelled: false,
-                        duration_ms: None,
-                        output_tail: "hello\n".to_string(),
-                        output_truncated: false,
-                        output_bytes: Some(6),
-                        retained_output_bytes: Some(6),
-                        columns: 120,
-                        rows: 30,
-                    },
-                },
-            ),
-            (
-                r#"{"type":"shell_run","result":{"mode":"captured","exit_code":0,"timed_out":false,"cancelled":false,"stdout":"hello\n","stderr":"","stdout_truncated":false,"stderr_truncated":false,"stdout_bytes":6,"stderr_bytes":0}}"#,
-                ToolInvocationResult::ShellRun {
-                    result: ShellRunResult::Captured {
-                        exit_code: Some(0),
-                        timed_out: false,
-                        cancelled: false,
-                        duration_ms: None,
-                        stdout: "hello\n".to_string(),
-                        stderr: String::new(),
-                        stdout_truncated: false,
-                        stderr_truncated: false,
-                        stdout_bytes: Some(6),
-                        stderr_bytes: Some(0),
-                    },
                 },
             ),
         ]

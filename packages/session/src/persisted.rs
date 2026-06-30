@@ -1192,12 +1192,6 @@ impl From<&ToolInvocationResult> for PersistedToolInvocationResult {
             ToolInvocationResult::Artifact { artifact } => Self::Artifact {
                 artifact: artifact.clone(),
             },
-            ToolInvocationResult::ShellRun { result } => Self::ShellRun {
-                result: PersistedShellRunResult::from(result),
-            },
-            ToolInvocationResult::FileChange { result } => Self::FileChange {
-                result: result.clone(),
-            },
         }
     }
 }

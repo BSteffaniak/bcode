@@ -6,8 +6,9 @@
 
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
-    FileChangeResult, ImageMetadata, ImageRefContent, ListToolsRequest, OP_INVOKE_TOOL,
-    OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition, ToolInvocationRequest,
+    ImageMetadata, ImageRefContent, ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS,
+    OP_PRESENT_ARTIFACT, TOOL_SERVICE_INTERFACE_ID, ToolArtifact, ToolArtifactPresentationRequest,
+    ToolArtifactPresentationResponse, ToolDefinition, ToolInvocationRequest,
     ToolInvocationResponse, ToolInvocationResult, ToolInvocationStreamEvent, ToolList,
     ToolLiveArgumentPreviewMetadata, ToolPresentationEvent, ToolPresentationField,
     ToolPresentationFieldKind, ToolPresentationFieldValue, ToolPresentationSection,
@@ -314,6 +315,7 @@ fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
     match request.operation.as_str() {
         OP_LIST_TOOLS => list_tools(request),
         OP_INVOKE_TOOL => invoke_tool(context),
+        OP_PRESENT_ARTIFACT => present_artifact(request),
         _ => ServiceResponse::error(
             "unsupported_operation",
             "unsupported tool service operation",
@@ -1137,6 +1139,71 @@ fn file_change_fields(path: &Path, summary: &str) -> ToolPresentationSection {
     }
 }
 
+fn file_change_artifact(
+    tool_call_id: &str,
+    tool_name: &str,
+    summary: &str,
+    path: Option<&Path>,
+) -> ToolInvocationResult {
+    ToolInvocationResult::Artifact {
+        artifact: Box::new(ToolArtifact {
+            artifact_id: format!("{tool_call_id}-filesystem-change"),
+            producer_plugin_id: "bcode.filesystem".to_string(),
+            schema: "bcode.filesystem.change".to_string(),
+            schema_version: 1,
+            tool_call_id: Some(tool_call_id.to_string()),
+            title: Some("File change".to_string()),
+            metadata: json!({
+                "tool_name": tool_name,
+                "summary": summary,
+                "path": path.map(|path| path.display().to_string()),
+            }),
+            refs: Vec::new(),
+        }),
+    }
+}
+
+fn present_artifact(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<ToolArtifactPresentationRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    if request.artifact.schema != "bcode.filesystem.change" || request.artifact.schema_version != 1
+    {
+        return json_response(&ToolArtifactPresentationResponse::default());
+    }
+    let summary = request
+        .artifact
+        .metadata
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("file changed");
+    let path = request
+        .artifact
+        .metadata
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from);
+    let section = path.as_deref().map_or_else(
+        || ToolPresentationSection::Text {
+            label: Some("Summary".to_string()),
+            text: summary.to_string(),
+        },
+        |path| file_change_fields(path, summary),
+    );
+    json_response(&ToolArtifactPresentationResponse {
+        presentation: Some(ToolPresentationEvent::Card(
+            bcode_tool::ToolCardPresentation {
+                target: ToolPresentationTarget::Result,
+                title: "Applied file change".to_string(),
+                subtitle: None,
+                sections: vec![section],
+            },
+        )),
+        state: request.state,
+    })
+}
+
 fn tool_write(
     arguments: serde_json::Value,
     cwd: Option<&Path>,
@@ -1211,13 +1278,12 @@ fn tool_write(
                         content: Vec::new(),
                         full_output: None,
                         host_action: None,
-                        result: Some(ToolInvocationResult::FileChange {
-                            result: FileChangeResult {
-                                tool_name: "filesystem.write".to_owned(),
-                                summary,
-                                path: Some(request.path.display().to_string()),
-                            },
-                        }),
+                        result: Some(file_change_artifact(
+                            tool_call_id,
+                            "filesystem.write",
+                            &summary,
+                            Some(&request.path),
+                        )),
                     }
                 },
             )
@@ -1304,13 +1370,12 @@ fn tool_edit(
                         content: Vec::new(),
                         full_output: None,
                         host_action: None,
-                        result: Some(ToolInvocationResult::FileChange {
-                            result: FileChangeResult {
-                                tool_name: "filesystem.edit".to_owned(),
-                                summary,
-                                path: Some(request.path.display().to_string()),
-                            },
-                        }),
+                        result: Some(file_change_artifact(
+                            tool_call_id,
+                            "filesystem.edit",
+                            &summary,
+                            Some(&request.path),
+                        )),
                     }
                 },
             )
@@ -2371,16 +2436,7 @@ mod tests {
             None,
             "test",
         );
-        assert!(matches!(
-            write_response.result,
-            Some(ToolInvocationResult::FileChange {
-                result: FileChangeResult {
-                    tool_name,
-                    summary,
-                    path: Some(_),
-                },
-            }) if tool_name == "filesystem.write" && summary == "wrote 5 bytes"
-        ));
+        assert_file_change_artifact(write_response.result, "filesystem.write", "wrote 5 bytes");
 
         let edit_response = tool_edit(
             serde_json::json!({
@@ -2392,17 +2448,27 @@ mod tests {
             None,
             "test",
         );
-        assert!(matches!(
+        assert_file_change_artifact(
             edit_response.result,
-            Some(ToolInvocationResult::FileChange {
-                result: FileChangeResult {
-                    tool_name,
-                    summary,
-                    path: Some(_),
-                },
-            }) if tool_name == "filesystem.edit" && summary == "applied 1 replacement"
-        ));
+            "filesystem.edit",
+            "applied 1 replacement",
+        );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn assert_file_change_artifact(
+        result: Option<ToolInvocationResult>,
+        tool_name: &str,
+        summary: &str,
+    ) {
+        let Some(ToolInvocationResult::Artifact { artifact }) = result else {
+            panic!("expected artifact result");
+        };
+        assert_eq!(artifact.schema, "bcode.filesystem.change");
+        assert_eq!(artifact.producer_plugin_id, "bcode.filesystem");
+        assert_eq!(artifact.metadata["tool_name"], tool_name);
+        assert_eq!(artifact.metadata["summary"], summary);
+        assert!(artifact.metadata["path"].is_string());
     }
 
     #[test]

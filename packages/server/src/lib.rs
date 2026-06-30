@@ -43,11 +43,11 @@ use bcode_session_models::{
     LiveShellCommandPreview, LiveToolArgumentPreview, ModelTurnOutcome, ProviderStreamEvent,
     ProviderToolCallProgress, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind,
     SessionId, SessionLiveEventKind, SessionTokenUsage, SessionTraceEvent, SessionTracePayload,
-    SessionTracePhase, ShellRunResult, ToolCardPresentation, ToolInvocationResult,
-    ToolInvocationStreamEvent, ToolOutputStream as SessionToolOutputStream, ToolPresentationEvent,
-    ToolPresentationField, ToolPresentationFieldKind, ToolPresentationFieldValue,
-    ToolPresentationLevel, ToolPresentationSection, ToolPresentationTarget,
-    ToolProgressPresentation, ToolRequestPresentationMetadata, TraceBlobRef, TraceRedaction,
+    SessionTracePhase, ToolCardPresentation, ToolInvocationResult, ToolInvocationStreamEvent,
+    ToolOutputStream as SessionToolOutputStream, ToolPresentationEvent, ToolPresentationField,
+    ToolPresentationFieldKind, ToolPresentationFieldValue, ToolPresentationLevel,
+    ToolPresentationSection, ToolPresentationTarget, ToolProgressPresentation,
+    ToolRequestPresentationMetadata, TraceBlobRef, TraceRedaction,
 };
 use bcode_settings::SettingsStore;
 use bcode_skill::{
@@ -62,9 +62,9 @@ use bcode_skill_models::{
 };
 use bcode_tool::{
     InteractiveToolResolution, InteractiveToolResumeRequest, ListToolsRequest, OP_INVOKE_TOOL,
-    OP_LIST_TOOLS, OP_RESUME_INTERACTIVE_TOOL, ShellRunResult as ServiceShellRunResult,
-    TOOL_SERVICE_INTERFACE_ID, ToolDefinition as ServiceToolDefinition, ToolInvocationRequest,
-    ToolInvocationResponse, ToolInvocationResult as ServiceToolInvocationResult,
+    OP_LIST_TOOLS, OP_RESUME_INTERACTIVE_TOOL, TOOL_SERVICE_INTERFACE_ID,
+    ToolDefinition as ServiceToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
+    ToolInvocationResult as ServiceToolInvocationResult,
     ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent, ToolList, ToolOutputStream,
     ToolPresentationEvent as ServiceToolPresentationEvent,
     ToolPresentationFieldKind as ServiceToolPresentationFieldKind,
@@ -14936,67 +14936,6 @@ fn service_tool_result_to_session(result: ServiceToolInvocationResult) -> ToolIn
                     .collect(),
             }),
         },
-        ServiceToolInvocationResult::ShellRun { result } => ToolInvocationResult::ShellRun {
-            result: service_shell_result_to_session(result),
-        },
-        ServiceToolInvocationResult::FileChange { result } => ToolInvocationResult::FileChange {
-            result: bcode_session_models::FileChangeResult {
-                tool_name: result.tool_name,
-                summary: result.summary,
-                path: result.path,
-            },
-        },
-    }
-}
-
-fn service_shell_result_to_session(result: ServiceShellRunResult) -> ShellRunResult {
-    match result {
-        ServiceShellRunResult::Terminal {
-            exit_code,
-            timed_out,
-            cancelled,
-            duration_ms,
-            output_tail,
-            output_truncated,
-            output_bytes,
-            retained_output_bytes,
-            columns,
-            rows,
-        } => ShellRunResult::Terminal {
-            exit_code,
-            timed_out,
-            cancelled,
-            duration_ms,
-            output_tail,
-            output_truncated,
-            output_bytes,
-            retained_output_bytes,
-            columns: columns.max(1),
-            rows: rows.max(1),
-        },
-        ServiceShellRunResult::Captured {
-            exit_code,
-            timed_out,
-            cancelled,
-            duration_ms,
-            stdout,
-            stderr,
-            stdout_truncated,
-            stderr_truncated,
-            stdout_bytes,
-            stderr_bytes,
-        } => ShellRunResult::Captured {
-            exit_code,
-            timed_out,
-            cancelled,
-            duration_ms,
-            stdout,
-            stderr,
-            stdout_truncated,
-            stderr_truncated,
-            stdout_bytes,
-            stderr_bytes,
-        },
     }
 }
 
@@ -16212,25 +16151,23 @@ mod tests {
             content: Vec::new(),
             full_output: None,
             host_action: None,
-            result: Some(ServiceToolInvocationResult::ShellRun {
-                result: ServiceShellRunResult::Terminal {
-                    exit_code: Some(0),
-                    timed_out: false,
-                    cancelled: false,
-                    duration_ms: None,
-                    output_tail: "terminal".to_owned(),
-                    output_truncated: false,
-                    output_bytes: Some(8),
-                    retained_output_bytes: Some(8),
-                    columns: 80,
-                    rows: 24,
-                },
+            result: Some(ServiceToolInvocationResult::Artifact {
+                artifact: Box::new(bcode_tool::ToolArtifact {
+                    artifact_id: "call-test-shell-run".to_string(),
+                    producer_plugin_id: "bcode.shell".to_string(),
+                    schema: "bcode.shell.run".to_string(),
+                    schema_version: 1,
+                    tool_call_id: Some("call-test".to_string()),
+                    title: Some("Shell run".to_string()),
+                    metadata: serde_json::json!({"mode":"terminal","output_tail":"terminal"}),
+                    refs: Vec::new(),
+                }),
             }),
         };
 
         assert!(matches!(
             response.result,
-            Some(ServiceToolInvocationResult::ShellRun { .. })
+            Some(ServiceToolInvocationResult::Artifact { .. })
         ));
     }
 

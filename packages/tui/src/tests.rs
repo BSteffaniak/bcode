@@ -2002,20 +2002,18 @@ fn transcript_renders_shell_output_with_ansi_and_limits() {
                 result: String::new(),
                 is_error: false,
                 output: None,
-                semantic_result: Some(ToolInvocationResult::ShellRun {
-                    result: ShellRunResult::Terminal {
-                        exit_code: Some(0),
-                        timed_out: false,
-                        cancelled: false,
-                        duration_ms: None,
-                        output_tail: stdout,
-                        output_truncated: false,
-                        output_bytes: None,
-                        retained_output_bytes: None,
-                        columns: 80,
-                        rows: 10,
-                    },
-                }),
+                semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    cancelled: false,
+                    duration_ms: None,
+                    output_tail: stdout,
+                    output_truncated: false,
+                    output_bytes: None,
+                    retained_output_bytes: None,
+                    columns: 80,
+                    rows: 10,
+                })),
             },
         ),
     ];
@@ -2062,20 +2060,18 @@ fn transcript_renders_terminal_shell_output_without_unbounded_row_request() {
                 result: String::new(),
                 is_error: false,
                 output: None,
-                semantic_result: Some(ToolInvocationResult::ShellRun {
-                    result: ShellRunResult::Terminal {
-                        exit_code: Some(0),
-                        timed_out: false,
-                        cancelled: false,
-                        duration_ms: None,
-                        output_tail: output,
-                        output_truncated: false,
-                        output_bytes: None,
-                        retained_output_bytes: None,
-                        columns: 80,
-                        rows: 10,
-                    },
-                }),
+                semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    cancelled: false,
+                    duration_ms: None,
+                    output_tail: output,
+                    output_truncated: false,
+                    output_bytes: None,
+                    retained_output_bytes: None,
+                    columns: 80,
+                    rows: 10,
+                })),
             },
         ),
     ];
@@ -2105,20 +2101,18 @@ fn transcript_renders_terminal_shell_output_without_viewport_padding() {
             result: String::new(),
             is_error: false,
             output: None,
-            semantic_result: Some(ToolInvocationResult::ShellRun {
-                result: ShellRunResult::Terminal {
-                    exit_code: Some(0),
-                    timed_out: false,
-                    cancelled: false,
-                    duration_ms: None,
-                    output_tail: "one\r\ntwo".to_owned(),
-                    output_truncated: false,
-                    output_bytes: None,
-                    retained_output_bytes: None,
-                    columns: 80,
-                    rows: 10,
-                },
-            }),
+            semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
+                exit_code: Some(0),
+                timed_out: false,
+                cancelled: false,
+                duration_ms: None,
+                output_tail: "one\r\ntwo".to_owned(),
+                output_truncated: false,
+                output_bytes: None,
+                retained_output_bytes: None,
+                columns: 80,
+                rows: 10,
+            })),
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
@@ -2144,20 +2138,18 @@ fn transcript_renders_truncated_terminal_shell_output_as_terminal() {
             result: String::new(),
             is_error: false,
             output: None,
-            semantic_result: Some(ToolInvocationResult::ShellRun {
-                result: ShellRunResult::Terminal {
-                    exit_code: Some(0),
-                    timed_out: false,
-                    cancelled: false,
-                    duration_ms: None,
-                    output_tail: "one\r\ntwo".to_owned(),
-                    output_truncated: true,
-                    output_bytes: Some(70000),
-                    retained_output_bytes: Some(65536),
-                    columns: 80,
-                    rows: 10,
-                },
-            }),
+            semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
+                exit_code: Some(0),
+                timed_out: false,
+                cancelled: false,
+                duration_ms: None,
+                output_tail: "one\r\ntwo".to_owned(),
+                output_truncated: true,
+                output_bytes: Some(70000),
+                retained_output_bytes: Some(65536),
+                columns: 80,
+                rows: 10,
+            })),
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
@@ -2334,20 +2326,18 @@ fn streamed_terminal_output_updates_header_after_final_result() {
             result: "done\n".to_string(),
             is_error: true,
             output: None,
-            semantic_result: Some(ToolInvocationResult::ShellRun {
-                result: ShellRunResult::Terminal {
-                    exit_code: Some(2),
-                    timed_out: false,
-                    cancelled: false,
-                    duration_ms: None,
-                    output_tail: "done\n".to_owned(),
-                    output_truncated: false,
-                    output_bytes: Some(5),
-                    retained_output_bytes: Some(5),
-                    columns: 80,
-                    rows: 24,
-                },
-            }),
+            semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
+                exit_code: Some(2),
+                timed_out: false,
+                cancelled: false,
+                duration_ms: None,
+                output_tail: "done\n".to_owned(),
+                output_truncated: false,
+                output_bytes: Some(5),
+                retained_output_bytes: Some(5),
+                columns: 80,
+                rows: 24,
+            })),
         },
     ));
 
@@ -3383,13 +3373,13 @@ fn file_change_semantic_result_events(
             result: "wrote 2 bytes".to_owned(),
             is_error: false,
             output: None,
-            semantic_result: Some(ToolInvocationResult::FileChange {
-                result: bcode_session_models::FileChangeResult {
+            semantic_result: Some(file_change_artifact(
+                &bcode_session_models::FileChangeResult {
                     tool_name: "example.write".to_owned(),
                     summary: "wrote 2 bytes".to_owned(),
                     path: Some("file.txt".to_owned()),
                 },
-            }),
+            )),
         },
     ));
     events
@@ -3521,20 +3511,18 @@ fn streamed_terminal_tool_events(session_id: SessionId) -> Vec<SessionEvent> {
                 result: "final duplicate tail".to_owned(),
                 is_error: false,
                 output: None,
-                semantic_result: Some(ToolInvocationResult::ShellRun {
-                    result: ShellRunResult::Terminal {
-                        exit_code: Some(7),
-                        timed_out: true,
-                        cancelled: false,
-                        duration_ms: None,
-                        output_tail: "final duplicate tail".to_owned(),
-                        output_truncated: false,
-                        output_bytes: Some("final duplicate tail".len() as u64),
-                        retained_output_bytes: Some("final duplicate tail".len() as u64),
-                        columns: 120,
-                        rows: 40,
-                    },
-                }),
+                semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
+                    exit_code: Some(7),
+                    timed_out: true,
+                    cancelled: false,
+                    duration_ms: None,
+                    output_tail: "final duplicate tail".to_owned(),
+                    output_truncated: false,
+                    output_bytes: Some("final duplicate tail".len() as u64),
+                    retained_output_bytes: Some("final duplicate tail".len() as u64),
+                    columns: 120,
+                    rows: 40,
+                })),
             },
         ),
     ]
@@ -3577,20 +3565,18 @@ fn semantic_terminal_result_without_live_delta_renders_terminal_history() {
                 result: String::new(),
                 is_error: false,
                 output: None,
-                semantic_result: Some(ToolInvocationResult::ShellRun {
-                    result: ShellRunResult::Terminal {
-                        exit_code: Some(0),
-                        timed_out: false,
-                        cancelled: false,
-                        duration_ms: None,
-                        output_tail: String::new(),
-                        output_truncated: false,
-                        output_bytes: Some(0),
-                        retained_output_bytes: Some(0),
-                        columns: 80,
-                        rows: 24,
-                    },
-                }),
+                semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    cancelled: false,
+                    duration_ms: None,
+                    output_tail: String::new(),
+                    output_truncated: false,
+                    output_bytes: Some(0),
+                    retained_output_bytes: Some(0),
+                    columns: 80,
+                    rows: 24,
+                })),
             },
         ),
     ];
@@ -3622,20 +3608,18 @@ fn semantic_terminal_result_without_stream_renders_terminal_not_raw_json() {
             result: r#"{"mode":"terminal","output":"raw json"}"#.to_owned(),
             is_error: false,
             output: None,
-            semantic_result: Some(ToolInvocationResult::ShellRun {
-                result: ShellRunResult::Terminal {
-                    exit_code: Some(0),
-                    timed_out: false,
-                    cancelled: false,
-                    duration_ms: None,
-                    output_tail: "ansi tail\n".to_owned(),
-                    output_truncated: false,
-                    output_bytes: Some(10),
-                    retained_output_bytes: Some(10),
-                    columns: 100,
-                    rows: 40,
-                },
-            }),
+            semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
+                exit_code: Some(0),
+                timed_out: false,
+                cancelled: false,
+                duration_ms: None,
+                output_tail: "ansi tail\n".to_owned(),
+                output_truncated: false,
+                output_bytes: Some(10),
+                retained_output_bytes: Some(10),
+                columns: 100,
+                rows: 40,
+            })),
         },
     )];
 
@@ -3695,20 +3679,18 @@ fn semantic_terminal_result_finishes_existing_stream_item() {
                 result: r#"{"mode":"terminal"}"#.to_owned(),
                 is_error: true,
                 output: None,
-                semantic_result: Some(ToolInvocationResult::ShellRun {
-                    result: ShellRunResult::Terminal {
-                        exit_code: Some(2),
-                        timed_out: true,
-                        cancelled: false,
-                        duration_ms: None,
-                        output_tail: "final tail\n".to_owned(),
-                        output_truncated: false,
-                        output_bytes: Some(11),
-                        retained_output_bytes: Some(11),
-                        columns: 80,
-                        rows: 24,
-                    },
-                }),
+                semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
+                    exit_code: Some(2),
+                    timed_out: true,
+                    cancelled: false,
+                    duration_ms: None,
+                    output_tail: "final tail\n".to_owned(),
+                    output_truncated: false,
+                    output_bytes: Some(11),
+                    retained_output_bytes: Some(11),
+                    columns: 80,
+                    rows: 24,
+                })),
             },
         ),
     ];
@@ -3751,20 +3733,18 @@ fn semantic_captured_shell_result_renders_captured_text_not_terminal() {
             result: "legacy output should not be used".to_owned(),
             is_error: false,
             output: None,
-            semantic_result: Some(ToolInvocationResult::ShellRun {
-                result: ShellRunResult::Captured {
-                    exit_code: Some(0),
-                    timed_out: false,
-                    cancelled: false,
-                    duration_ms: None,
-                    stdout: "captured stdout\n".to_owned(),
-                    stderr: "captured stderr\n".to_owned(),
-                    stdout_truncated: false,
-                    stderr_truncated: true,
-                    stdout_bytes: Some(16),
-                    stderr_bytes: Some(16),
-                },
-            }),
+            semantic_result: Some(shell_result_artifact(&ShellRunResult::Captured {
+                exit_code: Some(0),
+                timed_out: false,
+                cancelled: false,
+                duration_ms: None,
+                stdout: "captured stdout\n".to_owned(),
+                stderr: "captured stderr\n".to_owned(),
+                stdout_truncated: false,
+                stderr_truncated: true,
+                stdout_bytes: Some(16),
+                stderr_bytes: Some(16),
+            })),
         },
     )];
 
@@ -4086,20 +4066,18 @@ fn live_semantic_terminal_result_finishes_stream_with_semantic_status_not_legacy
             result: r#"{"mode":"terminal","exit_code":0,"timed_out":false}"#.to_owned(),
             is_error: true,
             output: None,
-            semantic_result: Some(ToolInvocationResult::ShellRun {
-                result: ShellRunResult::Terminal {
-                    exit_code: Some(7),
-                    timed_out: true,
-                    cancelled: false,
-                    duration_ms: None,
-                    output_tail: "semantic final tail\n".to_owned(),
-                    output_truncated: false,
-                    output_bytes: Some(20),
-                    retained_output_bytes: Some(20),
-                    columns: 80,
-                    rows: 24,
-                },
-            }),
+            semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
+                exit_code: Some(7),
+                timed_out: true,
+                cancelled: false,
+                duration_ms: None,
+                output_tail: "semantic final tail\n".to_owned(),
+                output_truncated: false,
+                output_bytes: Some(20),
+                retained_output_bytes: Some(20),
+                columns: 80,
+                rows: 24,
+            })),
         },
     ));
 
@@ -4275,6 +4253,35 @@ fn transcript_resident_window_prunes_old_tool_state_after_trim() {
     assert_eq!(app.resident_streamed_tool_result_count(), 0);
 }
 
+fn shell_result_artifact(result: &ShellRunResult) -> ToolInvocationResult {
+    ToolInvocationResult::Artifact {
+        artifact: Box::new(bcode_session_models::ToolArtifact {
+            artifact_id: "test-shell-run".to_string(),
+            producer_plugin_id: "bcode.shell".to_string(),
+            schema: "bcode.shell.run".to_string(),
+            schema_version: 1,
+            tool_call_id: None,
+            title: Some("Shell run".to_string()),
+            metadata: serde_json::to_value(result).expect("shell result should serialize"),
+            refs: Vec::new(),
+        }),
+    }
+}
+
+fn file_change_artifact(result: &bcode_session_models::FileChangeResult) -> ToolInvocationResult {
+    ToolInvocationResult::Artifact {
+        artifact: Box::new(bcode_session_models::ToolArtifact {
+            artifact_id: "test-file-change".to_string(),
+            producer_plugin_id: "bcode.filesystem".to_string(),
+            schema: "bcode.filesystem.change".to_string(),
+            schema_version: 1,
+            tool_call_id: None,
+            title: Some("File change".to_string()),
+            metadata: serde_json::to_value(result).expect("file change should serialize"),
+            refs: Vec::new(),
+        }),
+    }
+}
 fn event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> SessionEvent {
     SessionEvent {
         schema_version: 1,

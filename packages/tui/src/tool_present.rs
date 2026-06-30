@@ -25,30 +25,6 @@ pub struct ToolRequestPresentationField {
     pub kind: ToolPresentationFieldKind,
 }
 
-/// Human-readable presentation for shell results that were already parsed into semantic data.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ShellResultPresentation {
-    /// Terminal-backed shell output.
-    Terminal {
-        /// Process exit code.
-        exit_code: Option<i32>,
-        /// Whether execution timed out.
-        timed_out: bool,
-        /// Terminal output tail.
-        output: String,
-        /// Whether terminal output was truncated.
-        output_truncated: bool,
-        /// Original terminal output byte count.
-        output_bytes: Option<u64>,
-        /// Retained terminal output byte count.
-        retained_output_bytes: Option<u64>,
-        /// Terminal columns used by the producer.
-        columns: u16,
-        /// Terminal rows used by the producer.
-        rows: u16,
-    },
-}
-
 /// Build a metadata-driven request presentation from raw tool arguments.
 #[must_use]
 pub fn tool_request_presentation(

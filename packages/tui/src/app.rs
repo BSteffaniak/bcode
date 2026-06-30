@@ -49,7 +49,6 @@ use super::runtime_work_view::RuntimeWorkViewState;
 use super::temporal::next_elapsed_invalidation_capped;
 use super::theme::{PresentedTheme, ResolvedTheme};
 use super::timeline_dialog::TimelineEntry;
-use super::tool_present::ShellResultPresentation;
 use super::transcript::{
     FileEditPhase, TranscriptItem, TranscriptItemKind, file_change_presentation_item,
     interactive_tool_request_item, interactive_tool_resolution_item, live_tool_preview_anchor_item,
@@ -2718,11 +2717,8 @@ impl BmuxApp {
         if let Some(index) = context.index
             && let Some(item) = self.transcript.get_mut(index)
         {
-            if let Some(ShellResultPresentation::Terminal {
-                exit_code,
-                timed_out,
-                ..
-            }) = semantic_result.and_then(semantic_terminal_presentation)
+            if let Some((exit_code, timed_out)) =
+                semantic_result.and_then(shell_terminal_finish_metadata)
             {
                 item.finish_terminal(exit_code, timed_out, is_error.unwrap_or(false), None);
             } else {
@@ -2797,16 +2793,15 @@ impl BmuxApp {
             self.finish_tool_request_preview(tool_call_id);
             return;
         }
-        if let Some(item) = semantic_tool_result_item_for_app(
+        let item = semantic_tool_result_item_for_app(
             tool_call_id,
             tool_name.as_deref(),
             arguments_json.as_deref(),
             semantic_result,
             result,
             is_error,
-        ) {
-            self.transcript.push(item);
-        }
+        );
+        self.transcript.push(item);
         if is_error {
             if application.live_activity() {
                 "failed".clone_into(&mut self.status);
@@ -3998,6 +3993,24 @@ fn context_window_percentage(input_tokens: u32, context_window: u32) -> u32 {
     u32::try_from(numerator / denominator).unwrap_or(u32::MAX)
 }
 
+fn shell_terminal_finish_metadata(result: &ToolInvocationResult) -> Option<(Option<i32>, bool)> {
+    let ToolInvocationResult::Artifact { artifact } = result else {
+        return None;
+    };
+    if artifact.schema != "bcode.shell.run" {
+        return None;
+    }
+    let bcode_session_models::ShellRunResult::Terminal {
+        exit_code,
+        timed_out,
+        ..
+    } = serde_json::from_value(artifact.metadata.clone()).ok()?
+    else {
+        return None;
+    };
+    Some((exit_code, timed_out))
+}
+
 fn semantic_tool_result_item_for_app(
     tool_call_id: &str,
     tool_name: Option<&str>,
@@ -4005,108 +4018,120 @@ fn semantic_tool_result_item_for_app(
     semantic_result: Option<&ToolInvocationResult>,
     fallback_result: &str,
     is_error: bool,
-) -> Option<TranscriptItem> {
+) -> TranscriptItem {
     match semantic_result {
-        Some(ToolInvocationResult::ShellRun {
-            result:
-                bcode_session_models::ShellRunResult::Terminal {
-                    exit_code,
-                    timed_out,
-                    output_tail,
-                    columns,
-                    rows,
-                    ..
-                },
-        }) => {
-            let mut item = streaming_terminal_output_item(
+        Some(ToolInvocationResult::Text { text }) => {
+            tool_result_item(tool_call_id, tool_name, arguments_json, text, is_error)
+        }
+        Some(ToolInvocationResult::Json { value }) => {
+            tool_result_item(tool_call_id, tool_name, arguments_json, value, is_error)
+        }
+        Some(ToolInvocationResult::Artifact { artifact }) => artifact_result_item_for_app(
+            tool_call_id,
+            tool_name,
+            arguments_json,
+            artifact,
+            fallback_result,
+            is_error,
+        )
+        .unwrap_or_else(|| {
+            tool_result_item(
                 tool_call_id,
                 tool_name,
-                output_tail,
-                (*columns).max(1),
-                (*rows).max(1),
-                None,
-            );
-            item.apply_terminal_presentation(
-                output_tail.clone(),
-                *exit_code,
-                *timed_out,
+                arguments_json,
+                &serde_json::to_string(artifact).unwrap_or_else(|_| fallback_result.to_owned()),
                 is_error,
-                None,
-            );
-            Some(item)
-        }
-        Some(ToolInvocationResult::FileChange { result }) if tool_name.is_none() => {
-            Some(file_change_presentation_item(
-                tool_call_id,
-                &result.tool_name,
-                &result.summary,
-                result.path.as_deref(),
-                is_error,
-            ))
-        }
-        Some(ToolInvocationResult::FileChange { .. }) => None,
-        Some(ToolInvocationResult::Text { text }) => Some(tool_result_item(
+            )
+        }),
+        None => tool_result_item(
             tool_call_id,
             tool_name,
             arguments_json,
-            text,
+            fallback_result,
             is_error,
-        )),
-        Some(ToolInvocationResult::Json { value }) => Some(tool_result_item(
-            tool_call_id,
-            tool_name,
-            arguments_json,
-            value,
-            is_error,
-        )),
-        Some(ToolInvocationResult::Artifact { artifact }) => Some(tool_result_item(
+        ),
+    }
+}
+
+fn artifact_result_item_for_app(
+    tool_call_id: &str,
+    tool_name: Option<&str>,
+    arguments_json: Option<&str>,
+    artifact: &bcode_session_models::ToolArtifact,
+    fallback_result: &str,
+    is_error: bool,
+) -> Option<TranscriptItem> {
+    match artifact.schema.as_str() {
+        "bcode.shell.run" => {
+            shell_artifact_item_for_app(tool_call_id, tool_name, arguments_json, artifact, is_error)
+        }
+        "bcode.filesystem.change" if tool_name.is_none() => {
+            file_change_artifact_item_for_app(tool_call_id, artifact, is_error)
+        }
+        _ => Some(tool_result_item(
             tool_call_id,
             tool_name,
             arguments_json,
             &serde_json::to_string(artifact).unwrap_or_else(|_| fallback_result.to_owned()),
             is_error,
         )),
-        Some(ToolInvocationResult::ShellRun { .. }) | None => Some(tool_result_item(
+    }
+}
+
+fn shell_artifact_item_for_app(
+    tool_call_id: &str,
+    tool_name: Option<&str>,
+    arguments_json: Option<&str>,
+    artifact: &bcode_session_models::ToolArtifact,
+    is_error: bool,
+) -> Option<TranscriptItem> {
+    match serde_json::from_value::<bcode_session_models::ShellRunResult>(artifact.metadata.clone())
+        .ok()?
+    {
+        bcode_session_models::ShellRunResult::Terminal {
+            exit_code,
+            timed_out,
+            output_tail,
+            columns,
+            rows,
+            ..
+        } => {
+            let mut item = streaming_terminal_output_item(
+                tool_call_id,
+                tool_name,
+                &output_tail,
+                columns.max(1),
+                rows.max(1),
+                None,
+            );
+            item.finish_terminal(exit_code, timed_out, is_error, None);
+            Some(item)
+        }
+        bcode_session_models::ShellRunResult::Captured { .. } => Some(tool_result_item(
             tool_call_id,
             tool_name,
             arguments_json,
-            fallback_result,
+            &serde_json::to_string(&artifact.metadata).unwrap_or_else(|_| "shell run".to_string()),
             is_error,
         )),
     }
 }
 
-fn semantic_terminal_presentation(
-    result: &ToolInvocationResult,
-) -> Option<ShellResultPresentation> {
-    let ToolInvocationResult::ShellRun {
-        result:
-            bcode_session_models::ShellRunResult::Terminal {
-                exit_code,
-                timed_out,
-                cancelled: _,
-                output_tail,
-                output_truncated,
-                output_bytes,
-                retained_output_bytes,
-                columns,
-                rows,
-                ..
-            },
-    } = result
-    else {
-        return None;
-    };
-    Some(ShellResultPresentation::Terminal {
-        exit_code: *exit_code,
-        timed_out: *timed_out,
-        output: output_tail.clone(),
-        output_truncated: *output_truncated,
-        output_bytes: *output_bytes,
-        retained_output_bytes: *retained_output_bytes,
-        columns: *columns,
-        rows: *rows,
-    })
+fn file_change_artifact_item_for_app(
+    tool_call_id: &str,
+    artifact: &bcode_session_models::ToolArtifact,
+    is_error: bool,
+) -> Option<TranscriptItem> {
+    let result =
+        serde_json::from_value::<bcode_session_models::FileChangeResult>(artifact.metadata.clone())
+            .ok()?;
+    Some(file_change_presentation_item(
+        tool_call_id,
+        &result.tool_name,
+        &result.summary,
+        result.path.as_deref(),
+        is_error,
+    ))
 }
 
 fn working_directory_changed_message(

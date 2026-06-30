@@ -1659,10 +1659,10 @@ fn default_socket_path() -> PathBuf {
 mod tests {
     use super::*;
     use bcode_session_models::{
-        CURRENT_SESSION_EVENT_SCHEMA_VERSION, FileChangeResult, ModelTurnOutcome, SessionEventKind,
-        SessionForkKind, SessionForkResult, SessionId, SessionSummary, SessionTraceEvent,
-        ShellRunResult, ToolInvocationResult, ToolInvocationStreamEvent, ToolPresentationEvent,
-        ToolPresentationLevel, ToolPresentationTarget, ToolStatusPresentation,
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ModelTurnOutcome, SessionEventKind, SessionForkKind,
+        SessionForkResult, SessionId, SessionSummary, SessionTraceEvent, ToolInvocationResult,
+        ToolInvocationStreamEvent, ToolPresentationEvent, ToolPresentationLevel,
+        ToolPresentationTarget, ToolStatusPresentation,
     };
     use bcode_skill_models::SkillActivationMode;
     use std::collections::BTreeSet;
@@ -2567,41 +2567,6 @@ mod tests {
                         metadata: None,
                     }],
                 }),
-            },
-            ToolInvocationResult::FileChange {
-                result: FileChangeResult {
-                    tool_name: "filesystem.write".to_string(),
-                    summary: "wrote 171 bytes".to_string(),
-                    path: Some("/tmp/hello_world.rs".to_string()),
-                },
-            },
-            ToolInvocationResult::ShellRun {
-                result: ShellRunResult::Terminal {
-                    exit_code: Some(0),
-                    timed_out: false,
-                    cancelled: false,
-                    duration_ms: None,
-                    output_tail: "hello\n".to_string(),
-                    output_truncated: false,
-                    output_bytes: Some(6),
-                    retained_output_bytes: Some(6),
-                    columns: 120,
-                    rows: 30,
-                },
-            },
-            ToolInvocationResult::ShellRun {
-                result: ShellRunResult::Captured {
-                    exit_code: Some(0),
-                    timed_out: false,
-                    cancelled: false,
-                    duration_ms: None,
-                    stdout: "hello\n".to_string(),
-                    stderr: String::new(),
-                    stdout_truncated: false,
-                    stderr_truncated: false,
-                    stdout_bytes: Some(6),
-                    stderr_bytes: Some(0),
-                },
             },
             ToolInvocationResult::Text {
                 text: "plain text".to_string(),
