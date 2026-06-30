@@ -609,9 +609,16 @@ impl BmuxApp {
     }
 
     /// Apply canonical session metadata from an attach/list response.
+    ///
+    /// Only overwrites `session_title` when `summary.name` is `Some`; this
+    /// prevents a snapshot that lacks the resolved name from clobbering a
+    /// title that was already populated via `SessionCreated` or a prior
+    /// `apply_session_summary` that carried a name.
     pub fn apply_session_summary(&mut self, summary: &bcode_session_models::SessionSummary) {
         self.session_id = Some(summary.id);
-        self.session_title.clone_from(&summary.name);
+        if summary.name.is_some() {
+            self.session_title.clone_from(&summary.name);
+        }
         self.working_directory = Some(summary.working_directory.clone());
     }
 

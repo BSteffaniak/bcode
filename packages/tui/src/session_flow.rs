@@ -394,6 +394,10 @@ pub async fn persist_draft_session<W: Write>(
     };
     chat.session_id = Some(session.id);
     chat.event_task = Some(event_task);
+    // Apply the authoritative summary from create_session first so the
+    // session title is populated even if the subsequent attach snapshot
+    // has not yet resolved the name via bounded first-event discovery.
+    chat.app.apply_session_summary(&session);
     chat.app.apply_session_summary(&attached.session);
     if let Err(error) = commit_draft_reasoning(client, &chat.app, session.id).await {
         chat.app
