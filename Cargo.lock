@@ -1561,6 +1561,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "base64 0.22.1",
  "bcode_plugin_sdk",
+ "bcode_syntax_render",
  "bcode_tool",
  "bmux_tui",
  "image",

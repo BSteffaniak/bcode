@@ -16,6 +16,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 base64               = { workspace = true }
 bcode_plugin_sdk     = { workspace = true }
+bcode_syntax_render  = { workspace = true, optional = true }
 bcode_tool           = { workspace = true }
 bmux_tui             = { workspace = true, optional = true }
 image                = { workspace = true }
@@ -27,4 +28,4 @@ unicode-segmentation = { workspace = true, optional = true }
 [features]
 default          = []
 fail-on-warnings = []
-static-bundled   = ["bmux_tui", "unicode-segmentation"]
+static-bundled   = ["bcode_syntax_render", "bmux_tui", "unicode-segmentation"]
