@@ -2477,7 +2477,8 @@ fn auth_status() -> Result<(), CliError> {
         }
     }
     println!("Auth vault security:");
-    let policy = bcode_provider_auth::security::device_seal_policy_for_auth_profile(auth_profile);
+    let options = bcode_provider_auth::security::device_seal_options_for_auth_profile(auth_profile);
+    let policy = options.policy;
     let vault_path = auth_profile
         .settings
         .get("vault")
@@ -2516,6 +2517,11 @@ fn auth_status() -> Result<(), CliError> {
     );
     println!("  Configured device_seal: {policy:?}");
     println!(
+        "  Configured device_seal mode: {}",
+        format_auth_device_seal_selection(options.seal.selection)
+    );
+    println!("  Configured device_seal strict: {}", options.seal.strict);
+    println!(
         "  Profile device seal: {}",
         if security_status.profile_device_sealed {
             "enabled"
@@ -2523,6 +2529,15 @@ fn auth_status() -> Result<(), CliError> {
             "missing"
         }
     );
+    if let Some(backend) = &security_status.device_seal_backend {
+        println!("  Profile device seal backend: {backend}");
+    }
+    if let Some(mode) = &security_status.device_seal_mode {
+        println!("  Profile device seal mode: {mode}");
+    }
+    if let Some(strict) = security_status.device_seal_strict {
+        println!("  Profile device seal strict: {strict}");
+    }
     println!(
         "  Policy status: {}",
         if security_status.policy_satisfied {
@@ -2569,6 +2584,34 @@ fn auth_status() -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+const fn format_auth_device_seal_selection(
+    selection: sshenv_vault::device::DeviceSealSelection,
+) -> &'static str {
+    match selection {
+        sshenv_vault::device::DeviceSealSelection::Policy(policy) => match policy {
+            sshenv_vault::device::DeviceSealPolicy::Default => "default",
+            sshenv_vault::device::DeviceSealPolicy::TransparentDeviceOnly => {
+                "transparent-device-only"
+            }
+        },
+        sshenv_vault::device::DeviceSealSelection::Backend(backend) => match backend {
+            sshenv_vault::device::DeviceSealBackendSelection::MacosKeychain => "macos-keychain",
+            sshenv_vault::device::DeviceSealBackendSelection::MacosKeychainDeviceOnly => {
+                "macos-keychain-device-only"
+            }
+            sshenv_vault::device::DeviceSealBackendSelection::WindowsDpapiCurrentUser => {
+                "windows-dpapi-current-user"
+            }
+            sshenv_vault::device::DeviceSealBackendSelection::LinuxTpm => "linux-tpm",
+            sshenv_vault::device::DeviceSealBackendSelection::LinuxSecretService => {
+                "linux-secret-service"
+            }
+            sshenv_vault::device::DeviceSealBackendSelection::SecureEnclave => "secure-enclave",
+            sshenv_vault::device::DeviceSealBackendSelection::LocalFile => "local-file",
+        },
+    }
 }
 
 fn format_provider_request_value(value: &bcode_model::ProviderRequestValue) -> String {

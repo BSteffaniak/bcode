@@ -63,6 +63,23 @@ Permission prompts are modal by default: permission actions only apply in the pe
 
 Bcode uses an agent-scoped permission model with `allow` / `ask` / `deny` rules under `[agent.<id>.permission]` in `bcode.toml`. See [`docs/permissions.md`](docs/permissions.md) for the full shape, category list, and built-in defaults for the `plan` and `build` agents.
 
+## Auth vault device seals
+
+Bcode stores provider secrets in sshenv-backed auth vault profiles. By default, Bcode prefers a strict transparent device-only seal for those profiles: macOS uses a non-syncing `ThisDeviceOnly` Keychain item, Windows uses current-user DPAPI, and Linux uses TPM when available. If the seal cannot be applied and `device_seal = "preferred"`, Bcode continues with a warning; `device_seal = "required"` turns that into an error.
+
+Advanced auth profile settings can override the default:
+
+```toml
+[auth.profiles.openai.settings]
+device_seal = "preferred"              # off, preferred, required
+device_seal_mode = "transparent-device-only" # transparent-device-only, default
+device_seal_strict = "true"
+# Optional explicit backend override:
+# device_seal_backend = "macos-keychain-device-only"
+```
+
+Run `bcode auth status` to inspect the configured mode and the backend recorded in vault metadata.
+
 ## Session import
 
 Bcode can discover sessions from other coding agents through bundled session-import plugins. The Pi importer is enabled by default and reads Pi JSONL history without mutating Pi's files.

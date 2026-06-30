@@ -7,7 +7,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use ssh_key::{Algorithm, LineEnding, PrivateKey, rand_core::OsRng};
-use sshenv_vault::models::{ProfileFactorRequirement, VERSION_V2};
+use sshenv_vault::models::{ProfileFactorRequirement, UnlockFactorKindV2, VERSION_V2};
 
 const BCODE_VAULT_KEY_DIR_SUFFIX: &str = "keys";
 const BCODE_VAULT_PRIVATE_KEY_FILE_NAME: &str = "bcode_sshenv_ed25519";
@@ -331,6 +331,15 @@ pub struct AuthSecurityStatus {
     pub profile_exists: bool,
     /// Whether the profile policy requires device seal.
     pub profile_device_sealed: bool,
+    /// Device-seal factor backend recorded in profile metadata.
+    #[serde(default)]
+    pub device_seal_backend: Option<String>,
+    /// Device-seal policy recorded in profile metadata.
+    #[serde(default)]
+    pub device_seal_mode: Option<String>,
+    /// Strictness recorded in profile metadata.
+    #[serde(default)]
+    pub device_seal_strict: Option<bool>,
     /// Whether the current config policy is satisfied by this vault state.
     pub policy_satisfied: bool,
     /// Structured diagnostics for this status.
@@ -353,6 +362,9 @@ pub fn inspect_auth_vault_security(
         profile_keys_enabled: false,
         profile_exists: false,
         profile_device_sealed: false,
+        device_seal_backend: None,
+        device_seal_mode: None,
+        device_seal_strict: None,
         policy_satisfied: policy != AuthDeviceSealPolicy::Required,
         diagnostics: Vec::new(),
     };
@@ -385,7 +397,7 @@ pub fn inspect_auth_vault_security(
     status.profile_keys_enabled = vault.profile_keys_enabled();
     status.profile_exists = vault.profiles.profiles.contains_key(profile)
         || vault.profiles.profile_entries.contains_key(profile);
-    status.profile_device_sealed = profile_has_device_seal(&vault, profile);
+    populate_device_seal_status(&vault, profile, &mut status);
     let profile_unlockable = if status.profile_exists
         && vault.profiles.get(profile).is_none()
         && vault.profiles.profile_entries.contains_key(profile)
@@ -797,15 +809,45 @@ pub fn reconcile_auth_vault_security_with_options(
     Ok(actions)
 }
 
+fn populate_device_seal_status(
+    vault: &sshenv_vault::Vault,
+    profile: &str,
+    status: &mut AuthSecurityStatus,
+) {
+    status.profile_device_sealed = profile_has_device_seal(vault, profile);
+    if let Some(metadata) = profile_device_seal_metadata(vault, profile) {
+        status.device_seal_backend = metadata.params.get("backend").cloned();
+        status.device_seal_mode = metadata.params.get("policy").cloned();
+        status.device_seal_strict = metadata
+            .params
+            .get("strict")
+            .map(|value| parse_bool_setting(value, true));
+    }
+}
+
 fn profile_has_device_seal(vault: &sshenv_vault::Vault, profile: &str) -> bool {
-    vault
-        .profiles
-        .profile_policy(profile)
-        .is_some_and(|policy| {
-            policy
-                .required_factors
-                .contains(&ProfileFactorRequirement::DeviceSeal)
-        })
+    profile_device_seal_metadata(vault, profile).is_some_and(|_| {
+        vault
+            .profiles
+            .profile_policy(profile)
+            .is_some_and(|policy| {
+                policy
+                    .required_factors
+                    .contains(&ProfileFactorRequirement::DeviceSeal)
+            })
+    })
+}
+
+fn profile_device_seal_metadata<'a>(
+    vault: &'a sshenv_vault::Vault,
+    profile: &str,
+) -> Option<&'a sshenv_vault::models::UnlockFactorV2> {
+    vault.profiles.profile_policy(profile).and_then(|policy| {
+        policy
+            .factor_metadata
+            .iter()
+            .find(|factor| factor.kind == UnlockFactorKindV2::DeviceSeal)
+    })
 }
 
 fn recipient_keys_for_vault(
