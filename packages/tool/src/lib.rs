@@ -323,33 +323,39 @@ pub struct ToolUiMetadata {
     pub live_argument_preview: Option<ToolLiveArgumentPreviewMetadata>,
 }
 
-/// A generic argument field selector for plugin-owned presentation templates.
+/// A generic argument field selector for plugin-owned opaque presentation payloads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolPresentationFieldSelector {
+pub struct ToolPresentationPayloadSelector {
     /// Candidate top-level JSON argument names, in priority order.
     #[serde(default)]
     pub fields: Vec<String>,
     /// Literal fallback value when no field is available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub literal: Option<String>,
-    /// Whether this selector must resolve before the section can be rendered.
+    pub literal: Option<serde_json::Value>,
+    /// Whether this selector must resolve before the payload can be emitted.
     #[serde(default)]
     pub required: bool,
 }
 
-/// Declarative presentation section template owned by a tool provider.
+/// Opaque plugin-owned presentation payload metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ToolPresentationTemplateSection {
-    /// Generic text diff section.
-    Diff {
-        /// Optional path/title selector.
-        path: ToolPresentationFieldSelector,
-        /// Old text selector.
-        old_text: ToolPresentationFieldSelector,
-        /// New text selector.
-        new_text: ToolPresentationFieldSelector,
-    },
+pub struct ToolPluginViewMetadata {
+    /// Producer-owned schema identifier.
+    pub schema: String,
+    /// Producer-owned schema version.
+    pub schema_version: u32,
+    /// Producer plugin id for adapter routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_plugin_id: Option<String>,
+    /// Optional human-readable fallback title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Optional human-readable fallback subtitle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
+    /// Payload keys mapped to tool argument fields/literals.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub payload: std::collections::BTreeMap<String, ToolPresentationPayloadSelector>,
 }
 
 /// Declarative live argument preview metadata owned by a tool provider.
@@ -357,15 +363,9 @@ pub enum ToolPresentationTemplateSection {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolLiveArgumentPreviewMetadata {
     /// Plugin-owned generic presentation preview.
-    Presentation {
-        /// Preview card title.
-        title: String,
-        /// Optional preview card subtitle.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        subtitle: Option<String>,
-        /// Declarative presentation sections.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        sections: Vec<ToolPresentationTemplateSection>,
+    PluginView {
+        /// Opaque plugin-owned view metadata.
+        view: ToolPluginViewMetadata,
         /// Plugin-owned streaming status template.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         streaming_status: Option<String>,
@@ -422,15 +422,9 @@ pub enum ToolLiveArgumentPreviewMetadata {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolRequestPreviewMetadata {
     /// Plugin-owned generic presentation template.
-    Presentation {
-        /// Preview card title.
-        title: String,
-        /// Optional preview card subtitle.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        subtitle: Option<String>,
-        /// Declarative presentation sections.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        sections: Vec<ToolPresentationTemplateSection>,
+    PluginView {
+        /// Opaque plugin-owned view metadata.
+        view: ToolPluginViewMetadata,
     },
     /// File edit/write style preview.
     FileEdit {
@@ -649,10 +643,26 @@ pub enum ToolPresentationEvent {
     Card(ToolCardPresentation),
     /// Progress update.
     Progress(ToolProgressPresentation),
+    /// Opaque plugin-owned presentation view.
+    PluginView(ToolPluginViewPresentation),
     /// Generic protocol component-tree presentation.
     Protocol(ToolProtocolPresentation),
     /// Clear a previous presentation target.
     Clear { target: ToolPresentationTarget },
+}
+
+/// Opaque plugin-owned presentation payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolPluginViewPresentation {
+    pub target: ToolPresentationTarget,
+    pub producer_plugin_id: String,
+    pub schema: String,
+    pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
+    pub payload: serde_json::Value,
 }
 
 /// Tool protocol component-tree presentation.
@@ -725,11 +735,6 @@ pub enum ToolPresentationSection {
     },
     Fields {
         fields: Vec<ToolPresentationFieldValue>,
-    },
-    Diff {
-        path: Option<String>,
-        old_text: String,
-        new_text: String,
     },
     Terminal {
         output: String,

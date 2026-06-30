@@ -33,6 +33,7 @@ use super::app::{BmuxApp, DaemonConnectionState, LiveToolPreviewState, composer_
 use super::diff_extract::FileEditTranscript;
 use super::pending_submission::{PendingSubmission, PendingSubmissionState};
 use super::tool_present::{ToolRequestPresentation, tool_request_presentation};
+use super::transcript::pretty_jsonish;
 use super::transcript::{FileEditPhase, TranscriptItem, TranscriptItemKind};
 use super::transcript_layout::TranscriptLayoutSignature;
 use crate::time_format::{format_elapsed_millis, format_millis};
@@ -882,7 +883,7 @@ fn push_tool_presentation_card_rows(
     tool_name: Option<&str>,
     card: &ToolCardPresentation,
     width: u16,
-    inline_diff_config: TuiInlineDiffConfig,
+    _inline_diff_config: TuiInlineDiffConfig,
 ) {
     let color = presentation_level_color(card_level(card));
     let heading = tool_name.map_or_else(
@@ -937,25 +938,6 @@ fn push_tool_presentation_card_rows(
                     width,
                     Style::new(),
                     Style::new(),
-                );
-            }
-            ToolPresentationSection::Diff {
-                path,
-                old_text,
-                new_text,
-            } => {
-                let edit = FileEditTranscript::new(
-                    path.clone().unwrap_or_else(|| "<diff>".to_owned()),
-                    old_text.clone(),
-                    new_text.clone(),
-                );
-                push_file_edit_preview_rows(
-                    rows,
-                    &FileEditPreview::Known(edit),
-                    width,
-                    inline_diff_config,
-                    None,
-                    false,
                 );
             }
             ToolPresentationSection::Terminal {
@@ -1225,14 +1207,35 @@ fn push_live_tool_preview_anchor_rows(
         return;
     };
     match &state.preview {
-        LiveToolArgumentPreview::Presentation(card) => {
-            push_tool_presentation_card_rows(
+        LiveToolArgumentPreview::PluginView(view) => {
+            let title = view.title.as_deref().unwrap_or(&view.schema);
+            push_wrapped_styled_text(
                 rows,
-                Some(&state.tool_name),
-                card,
+                Vec::new(),
+                &format!("{title} · {}", state.tool_name),
                 width,
-                inline_diff_config,
+                Style::new().fg(Color::Cyan),
+                Style::new().fg(Color::Cyan),
             );
+            if let Some(subtitle) = &view.subtitle {
+                push_wrapped_styled_text(
+                    rows,
+                    vec![Span::styled("  ", muted_style())],
+                    subtitle,
+                    width,
+                    muted_style(),
+                    muted_style(),
+                );
+            }
+            push_wrapped_styled_text(
+                rows,
+                vec![Span::styled("  ", muted_style())],
+                &pretty_jsonish(&view.payload.to_string()),
+                width,
+                Style::new(),
+                Style::new(),
+            );
+            rows.push(Line::default());
         }
         LiveToolArgumentPreview::FileEdit(file) => push_live_file_edit_preview_rows(
             rows,

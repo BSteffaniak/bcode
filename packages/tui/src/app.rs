@@ -2949,6 +2949,20 @@ impl BmuxApp {
             ToolPresentationEvent::Card(card) => {
                 self.upsert_tool_presentation_card(tool_call_id, card.clone());
             }
+            ToolPresentationEvent::PluginView(view) => {
+                let payload = serde_json::to_string_pretty(&view.payload)
+                    .unwrap_or_else(|_| view.payload.to_string());
+                let card = bcode_session_models::ToolCardPresentation {
+                    target: view.target,
+                    title: view.title.clone().unwrap_or_else(|| view.schema.clone()),
+                    subtitle: view.subtitle.clone(),
+                    sections: vec![bcode_session_models::ToolPresentationSection::Text {
+                        label: None,
+                        text: payload,
+                    }],
+                };
+                self.upsert_tool_presentation_card(tool_call_id, card);
+            }
             ToolPresentationEvent::Clear { target } => {
                 self.clear_tool_presentation_card(tool_call_id, *target);
             }
@@ -3272,8 +3286,8 @@ impl BmuxApp {
         self.ensure_live_tool_preview_anchor(tool_call_id, tool_name);
         let bytes = format_provider_bytes(argument_bytes);
         match preview {
-            LiveToolArgumentPreview::Presentation(card) => {
-                let status = card
+            LiveToolArgumentPreview::PluginView(view) => {
+                let status = view
                     .subtitle
                     .clone()
                     .unwrap_or_else(|| format!("streaming {tool_name} · {bytes} received"));
@@ -3985,7 +3999,7 @@ fn render_live_preview_template(
 
 fn live_preview_primary(preview: &LiveToolArgumentPreview) -> Option<&str> {
     match preview {
-        LiveToolArgumentPreview::Presentation(card) => card.subtitle.as_deref(),
+        LiveToolArgumentPreview::PluginView(view) => view.subtitle.as_deref(),
         LiveToolArgumentPreview::FileEdit(file) => file.path.as_deref(),
         LiveToolArgumentPreview::ShellCommand(shell) => Some(shell.command_prefix.as_str()),
         LiveToolArgumentPreview::Query(query) => query.fields.values().next().map(String::as_str),
@@ -4146,15 +4160,6 @@ fn presentation_section_to_session(
         bcode_tool::ToolPresentationSection::Text { label, text } => {
             bcode_session_models::ToolPresentationSection::Text { label, text }
         }
-        bcode_tool::ToolPresentationSection::Diff {
-            path,
-            old_text,
-            new_text,
-        } => bcode_session_models::ToolPresentationSection::Diff {
-            path,
-            old_text,
-            new_text,
-        },
         bcode_tool::ToolPresentationSection::Terminal {
             output,
             columns,
@@ -4320,7 +4325,7 @@ fn submitted_protocol_state_json(resolution_json: &str) -> Option<String> {
 
 const fn live_tool_preview_truncated(preview: &LiveToolArgumentPreview) -> bool {
     match preview {
-        LiveToolArgumentPreview::Presentation(_) => false,
+        LiveToolArgumentPreview::PluginView(_) => false,
         LiveToolArgumentPreview::FileEdit(file) => file.truncated,
         LiveToolArgumentPreview::ShellCommand(shell) => shell.truncated,
         LiveToolArgumentPreview::Query(query) => query.truncated,

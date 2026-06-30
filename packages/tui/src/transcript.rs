@@ -627,6 +627,7 @@ pub fn tool_presentation_card_from_event(
         }
         ToolPresentationEvent::Status(_)
         | ToolPresentationEvent::Progress(_)
+        | ToolPresentationEvent::PluginView(_)
         | ToolPresentationEvent::Clear { .. } => None,
     }
 }

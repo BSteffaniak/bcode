@@ -10,9 +10,9 @@ use bcode_tool::{
     OP_PRESENT_ARTIFACT, TOOL_SERVICE_INTERFACE_ID, ToolArtifact, ToolArtifactPresentationRequest,
     ToolArtifactPresentationResponse, ToolDefinition, ToolInvocationRequest,
     ToolInvocationResponse, ToolInvocationResult, ToolInvocationStreamEvent, ToolList,
-    ToolLiveArgumentPreviewMetadata, ToolPresentationEvent, ToolPresentationField,
-    ToolPresentationFieldKind, ToolPresentationFieldSelector, ToolPresentationFieldValue,
-    ToolPresentationSection, ToolPresentationTarget, ToolPresentationTemplateSection,
+    ToolLiveArgumentPreviewMetadata, ToolPluginViewMetadata, ToolPresentationEvent,
+    ToolPresentationField, ToolPresentationFieldKind, ToolPresentationFieldValue,
+    ToolPresentationPayloadSelector, ToolPresentationSection, ToolPresentationTarget,
     ToolRequestPresentationMetadata, ToolResultContent, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
@@ -399,30 +399,47 @@ fn path_tool_ui(activity_label: &str, title: &str) -> bcode_tool::ToolUiMetadata
     }
 }
 
-fn field_selector(
+fn payload_selector(
     fields: &[&str],
-    literal: Option<&str>,
+    literal: Option<serde_json::Value>,
     required: bool,
-) -> ToolPresentationFieldSelector {
-    ToolPresentationFieldSelector {
+) -> ToolPresentationPayloadSelector {
+    ToolPresentationPayloadSelector {
         fields: fields.iter().map(|field| (*field).to_string()).collect(),
-        literal: literal.map(str::to_string),
+        literal,
         required,
     }
 }
 
-fn diff_preview_sections(
-    path_fields: &[&str],
+fn file_change_view_metadata(
+    title: &str,
     old_text_fields: &[&str],
     old_text_literal: Option<&str>,
     old_text_required: bool,
     new_text_fields: &[&str],
-) -> Vec<ToolPresentationTemplateSection> {
-    vec![ToolPresentationTemplateSection::Diff {
-        path: field_selector(path_fields, None, false),
-        old_text: field_selector(old_text_fields, old_text_literal, old_text_required),
-        new_text: field_selector(new_text_fields, None, true),
-    }]
+) -> ToolPluginViewMetadata {
+    let mut payload = std::collections::BTreeMap::new();
+    payload.insert("path".to_string(), payload_selector(&["path"], None, false));
+    payload.insert(
+        "old_text".to_string(),
+        payload_selector(
+            old_text_fields,
+            old_text_literal.map(|value| serde_json::Value::String(value.to_string())),
+            old_text_required,
+        ),
+    );
+    payload.insert(
+        "new_text".to_string(),
+        payload_selector(new_text_fields, None, true),
+    );
+    ToolPluginViewMetadata {
+        schema: "bcode.filesystem.file_change".to_string(),
+        schema_version: 1,
+        producer_plugin_id: Some("filesystem".to_string()),
+        title: Some(title.to_string()),
+        subtitle: None,
+        payload,
+    }
 }
 
 fn write_tool_ui(
@@ -432,11 +449,9 @@ fn write_tool_ui(
 ) -> bcode_tool::ToolUiMetadata {
     bcode_tool::ToolUiMetadata {
         activity_label: Some(activity_label.to_string()),
-        live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::Presentation {
-            title: preview_title.to_string(),
-            subtitle: Some(format!("{activity_label} {{path}} · {{bytes}}")),
-            sections: diff_preview_sections(
-                &["path"],
+        live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::PluginView {
+            view: file_change_view_metadata(
+                preview_title,
                 &[],
                 Some(""),
                 false,
@@ -461,11 +476,9 @@ fn write_tool_ui(
                     optional: false,
                 },
             ],
-            preview: Some(bcode_tool::ToolRequestPreviewMetadata::Presentation {
-                title: preview_title.to_string(),
-                subtitle: None,
-                sections: diff_preview_sections(
-                    &["path"],
+            preview: Some(bcode_tool::ToolRequestPreviewMetadata::PluginView {
+                view: file_change_view_metadata(
+                    preview_title,
                     &[],
                     Some(""),
                     false,
@@ -483,10 +496,14 @@ fn edit_tool_ui(
 ) -> bcode_tool::ToolUiMetadata {
     bcode_tool::ToolUiMetadata {
         activity_label: Some(activity_label.to_string()),
-        live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::Presentation {
-            title: preview_title.to_string(),
-            subtitle: Some(format!("{activity_label} {{path}} · {{bytes}}")),
-            sections: diff_preview_sections(&["path"], &["old_text"], None, true, &["new_text"]),
+        live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::PluginView {
+            view: file_change_view_metadata(
+                preview_title,
+                &["old_text"],
+                None,
+                true,
+                &["new_text"],
+            ),
             streaming_status: Some(format!("{activity_label} {{path}} · {{bytes}}")),
         }),
 
@@ -512,11 +529,9 @@ fn edit_tool_ui(
                     optional: false,
                 },
             ],
-            preview: Some(bcode_tool::ToolRequestPreviewMetadata::Presentation {
-                title: preview_title.to_string(),
-                subtitle: None,
-                sections: diff_preview_sections(
-                    &["path"],
+            preview: Some(bcode_tool::ToolRequestPreviewMetadata::PluginView {
+                view: file_change_view_metadata(
+                    preview_title,
                     &["old_text"],
                     None,
                     true,
@@ -1180,6 +1195,29 @@ fn file_change_fields(path: &Path, summary: &str) -> ToolPresentationSection {
     }
 }
 
+fn file_change_plugin_view_event(
+    target: ToolPresentationTarget,
+    title: &str,
+    subtitle: Option<&str>,
+    path: &Path,
+    old_text: &str,
+    new_text: &str,
+) -> ToolPresentationEvent {
+    ToolPresentationEvent::PluginView(bcode_tool::ToolPluginViewPresentation {
+        target,
+        producer_plugin_id: "filesystem".to_string(),
+        schema: "bcode.filesystem.file_change".to_string(),
+        schema_version: 1,
+        title: Some(title.to_string()),
+        subtitle: subtitle.map(str::to_string),
+        payload: json!({
+            "path": path.display().to_string(),
+            "old_text": old_text,
+            "new_text": new_text,
+        }),
+    })
+}
+
 fn file_change_artifact(
     tool_call_id: &str,
     tool_name: &str,
@@ -1268,22 +1306,14 @@ fn tool_write(
                 events,
                 tool_call_id,
                 2,
-                ToolPresentationEvent::Card(bcode_tool::ToolCardPresentation {
-                    target: ToolPresentationTarget::Preview,
-                    title: "Write preview".to_string(),
-                    subtitle: Some("Applying".to_string()),
-                    sections: vec![
-                        file_change_fields(
-                            &request.path,
-                            &format!("{} bytes", request.contents.len()),
-                        ),
-                        ToolPresentationSection::Diff {
-                            path: Some(request.path.display().to_string()),
-                            old_text: String::new(),
-                            new_text: request.contents.clone(),
-                        },
-                    ],
-                }),
+                file_change_plugin_view_event(
+                    ToolPresentationTarget::Preview,
+                    "Write preview",
+                    Some("Applying"),
+                    &request.path,
+                    "",
+                    &request.contents,
+                ),
             );
             write_file_inner(&request.path, &request.contents).map_or_else(
                 |error| {
@@ -1356,19 +1386,14 @@ fn tool_edit(
                 events,
                 tool_call_id,
                 2,
-                ToolPresentationEvent::Card(bcode_tool::ToolCardPresentation {
-                    target: ToolPresentationTarget::Preview,
-                    title: "Edit preview".to_string(),
-                    subtitle: Some("Applying".to_string()),
-                    sections: vec![
-                        file_change_fields(&request.path, "replacement"),
-                        ToolPresentationSection::Diff {
-                            path: Some(request.path.display().to_string()),
-                            old_text: request.old_text.clone(),
-                            new_text: request.new_text.clone(),
-                        },
-                    ],
-                }),
+                file_change_plugin_view_event(
+                    ToolPresentationTarget::Preview,
+                    "Edit preview",
+                    Some("Applying"),
+                    &request.path,
+                    &request.old_text,
+                    &request.new_text,
+                ),
             );
             edit_file_inner(&request).map_or_else(
                 |error| {

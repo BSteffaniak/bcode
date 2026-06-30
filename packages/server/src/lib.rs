@@ -44,9 +44,9 @@ use bcode_session_models::{
     ProviderToolCallProgress, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind,
     SessionId, SessionLiveEventKind, SessionTokenUsage, SessionTraceEvent, SessionTracePayload,
     SessionTracePhase, ToolCardPresentation, ToolInvocationResult, ToolInvocationStreamEvent,
-    ToolOutputStream as SessionToolOutputStream, ToolPresentationEvent, ToolPresentationField,
-    ToolPresentationFieldKind, ToolPresentationFieldValue, ToolPresentationLevel,
-    ToolPresentationSection, ToolPresentationTarget, ToolPresentationTemplateSection,
+    ToolOutputStream as SessionToolOutputStream, ToolPluginViewPresentation, ToolPresentationEvent,
+    ToolPresentationField, ToolPresentationFieldKind, ToolPresentationFieldValue,
+    ToolPresentationLevel, ToolPresentationSection, ToolPresentationTarget,
     ToolProgressPresentation, ToolRequestPresentationMetadata, TraceBlobRef, TraceRedaction,
 };
 use bcode_settings::SettingsStore;
@@ -66,12 +66,12 @@ use bcode_tool::{
     ToolDefinition as ServiceToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
     ToolInvocationResult as ServiceToolInvocationResult,
     ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent, ToolList, ToolOutputStream,
+    ToolPluginViewPresentation as ServiceToolPluginViewPresentation,
     ToolPresentationEvent as ServiceToolPresentationEvent,
     ToolPresentationFieldKind as ServiceToolPresentationFieldKind,
     ToolPresentationLevel as ServiceToolPresentationLevel,
     ToolPresentationSection as ServiceToolPresentationSection,
     ToolPresentationTarget as ServiceToolPresentationTarget,
-    ToolPresentationTemplateSection as ServiceToolPresentationTemplateSection,
     ToolRequestPresentationMetadata as ServiceToolRequestPresentationMetadata, ToolResultContent,
 };
 use runtime_work::{CancellationHandle, RuntimeWorkManager, RuntimeWorkSpec};
@@ -5944,7 +5944,7 @@ async fn process_user_message_command(
                 queued_followups,
                 Arc::clone(&current_turn),
             );
-            run_model_turn(
+            Box::pin(run_model_turn(
                 state,
                 permit,
                 &user_event,
@@ -5952,7 +5952,7 @@ async fn process_user_message_command(
                 runtime_context,
                 &mut command_context,
                 &phase,
-            )
+            ))
             .await
         }
         Ok(None) => {
@@ -5996,7 +5996,7 @@ async fn process_existing_user_event_command(
         queued_followups,
         Arc::clone(&current_turn),
     );
-    let completion = run_model_turn(
+    let completion = Box::pin(run_model_turn(
         state,
         permit,
         &user_event,
@@ -6004,7 +6004,7 @@ async fn process_existing_user_event_command(
         runtime_context,
         &mut command_context,
         &phase,
-    )
+    ))
     .await;
     set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
     if let Some(sender) = completion_sender {
@@ -6082,7 +6082,7 @@ async fn process_skill_invocation_command(
                 queued_followups,
                 Arc::clone(&current_turn),
             );
-            run_model_turn(
+            Box::pin(run_model_turn(
                 state,
                 permit,
                 &user_event,
@@ -6090,7 +6090,7 @@ async fn process_skill_invocation_command(
                 runtime_context,
                 &mut command_context,
                 &phase,
-            )
+            ))
             .await;
         }
         Ok(None) => {
@@ -8220,19 +8220,11 @@ fn live_tool_argument_preview_from_fields(
     fields: &StreamingJsonStringFields,
 ) -> Option<LiveToolArgumentPreview> {
     match metadata {
-        bcode_tool::ToolLiveArgumentPreviewMetadata::Presentation {
-            title,
-            subtitle,
-            sections,
+        bcode_tool::ToolLiveArgumentPreviewMetadata::PluginView {
+            view,
             streaming_status,
-        } => live_presentation_preview_from_fields(
-            fields,
-            title,
-            subtitle.clone(),
-            sections,
-            streaming_status.clone(),
-        )
-        .map(LiveToolArgumentPreview::Presentation),
+        } => live_plugin_view_preview_from_fields(fields, view, streaming_status.clone())
+            .map(LiveToolArgumentPreview::PluginView),
         bcode_tool::ToolLiveArgumentPreviewMetadata::FileEdit {
             path_fields,
             old_text_fields,
@@ -8277,64 +8269,45 @@ fn live_tool_argument_preview_from_fields(
     }
 }
 
-fn live_presentation_preview_from_fields(
+fn live_plugin_view_preview_from_fields(
     fields: &StreamingJsonStringFields,
-    title: &str,
-    subtitle: Option<String>,
-    sections: &[ServiceToolPresentationTemplateSection],
+    view: &bcode_tool::ToolPluginViewMetadata,
     streaming_status: Option<String>,
-) -> Option<ToolCardPresentation> {
-    let rendered_sections = presentation_sections_from_fields(fields, sections)?;
+) -> Option<ToolPluginViewPresentation> {
+    let payload = plugin_view_payload_from_fields(fields, &view.payload)?;
     let subtitle = streaming_status
         .map(|status| render_live_status_template(&status, fields))
-        .or(subtitle);
-    Some(ToolCardPresentation {
+        .or_else(|| view.subtitle.clone());
+    Some(ToolPluginViewPresentation {
         target: ToolPresentationTarget::Preview,
-        title: title.to_owned(),
+        producer_plugin_id: view.producer_plugin_id.clone().unwrap_or_default(),
+        schema: view.schema.clone(),
+        schema_version: view.schema_version,
+        title: view.title.clone(),
         subtitle,
-        sections: rendered_sections,
+        payload,
     })
 }
 
-fn presentation_sections_from_fields(
+fn plugin_view_payload_from_fields(
     fields: &StreamingJsonStringFields,
-    sections: &[ServiceToolPresentationTemplateSection],
-) -> Option<Vec<ToolPresentationSection>> {
-    let mut rendered = Vec::new();
-    for section in sections {
-        match section {
-            ServiceToolPresentationTemplateSection::Diff {
-                path,
-                old_text,
-                new_text,
-            } => {
-                let Some(new_text) = resolve_template_selector(fields, new_text) else {
-                    if new_text.required {
-                        return None;
-                    }
-                    continue;
-                };
-                let old_text = resolve_template_selector(fields, old_text)?;
-                let path = resolve_template_selector(fields, path);
-                rendered.push(ToolPresentationSection::Diff {
-                    path,
-                    old_text,
-                    new_text,
-                });
-            }
+    selectors: &BTreeMap<String, bcode_tool::ToolPresentationPayloadSelector>,
+) -> Option<serde_json::Value> {
+    let mut payload = serde_json::Map::new();
+    for (key, selector) in selectors {
+        if let Some(value) = resolve_payload_selector(fields, selector) {
+            payload.insert(key.clone(), value);
+        } else if selector.required {
+            return None;
         }
     }
-    if rendered.is_empty() {
-        None
-    } else {
-        Some(rendered)
-    }
+    Some(serde_json::Value::Object(payload))
 }
 
-fn resolve_template_selector(
+fn resolve_payload_selector(
     fields: &StreamingJsonStringFields,
-    selector: &bcode_tool::ToolPresentationFieldSelector,
-) -> Option<String> {
+    selector: &bcode_tool::ToolPresentationPayloadSelector,
+) -> Option<serde_json::Value> {
     fields
         .field(
             &selector
@@ -8343,9 +8316,8 @@ fn resolve_template_selector(
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
         )
-        .map(|field| field.value)
+        .map(|field| serde_json::Value::String(field.value))
         .or_else(|| selector.literal.clone())
-        .or_else(|| (!selector.required).then(String::new))
 }
 
 fn render_live_status_template(template: &str, fields: &StreamingJsonStringFields) -> String {
@@ -11366,7 +11338,7 @@ const fn live_tool_argument_preview_with_bytes(
     argument_bytes: usize,
 ) -> LiveToolArgumentPreview {
     match &mut preview {
-        LiveToolArgumentPreview::Presentation(_) => {}
+        LiveToolArgumentPreview::PluginView(_) => {}
         LiveToolArgumentPreview::FileEdit(file) => {
             file.argument_bytes = argument_bytes;
         }
@@ -13764,6 +13736,9 @@ fn convert_tool_presentation_event(
                 level: convert_tool_presentation_level(progress.level),
             }))
         }
+        ServiceToolPresentationEvent::PluginView(view) => Some(ToolPresentationEvent::PluginView(
+            convert_tool_plugin_view_presentation(view),
+        )),
         ServiceToolPresentationEvent::Protocol(_) => None,
         ServiceToolPresentationEvent::Clear { target } => Some(ToolPresentationEvent::Clear {
             target: convert_tool_presentation_target(target),
@@ -13807,6 +13782,20 @@ const fn convert_tool_presentation_field_kind(
     }
 }
 
+fn convert_tool_plugin_view_presentation(
+    view: ServiceToolPluginViewPresentation,
+) -> ToolPluginViewPresentation {
+    ToolPluginViewPresentation {
+        target: convert_tool_presentation_target(view.target),
+        producer_plugin_id: view.producer_plugin_id,
+        schema: view.schema,
+        schema_version: view.schema_version,
+        title: view.title,
+        subtitle: view.subtitle,
+        payload: view.payload,
+    }
+}
+
 fn convert_tool_presentation_section(
     section: ServiceToolPresentationSection,
 ) -> ToolPresentationSection {
@@ -13823,15 +13812,6 @@ fn convert_tool_presentation_section(
                     kind: convert_tool_presentation_field_kind(field.kind),
                 })
                 .collect(),
-        },
-        ServiceToolPresentationSection::Diff {
-            path,
-            old_text,
-            new_text,
-        } => ToolPresentationSection::Diff {
-            path,
-            old_text,
-            new_text,
         },
         ServiceToolPresentationSection::Terminal {
             output,
@@ -14104,18 +14084,11 @@ fn service_request_preview_to_session(
     value: &bcode_tool::ToolRequestPreviewMetadata,
 ) -> bcode_session_models::ToolRequestPreviewMetadata {
     match value {
-        bcode_tool::ToolRequestPreviewMetadata::Presentation {
-            title,
-            subtitle,
-            sections,
-        } => bcode_session_models::ToolRequestPreviewMetadata::Presentation {
-            title: title.clone(),
-            subtitle: subtitle.clone(),
-            sections: sections
-                .iter()
-                .map(service_presentation_template_section_to_session)
-                .collect(),
-        },
+        bcode_tool::ToolRequestPreviewMetadata::PluginView { view } => {
+            bcode_session_models::ToolRequestPreviewMetadata::PluginView {
+                view: service_plugin_view_metadata_to_session(view),
+            }
+        }
         bcode_tool::ToolRequestPreviewMetadata::FileEdit {
             path_fields,
             old_text_fields,
@@ -14128,29 +14101,29 @@ fn service_request_preview_to_session(
     }
 }
 
-fn service_presentation_template_section_to_session(
-    value: &ServiceToolPresentationTemplateSection,
-) -> ToolPresentationTemplateSection {
-    match value {
-        ServiceToolPresentationTemplateSection::Diff {
-            path,
-            old_text,
-            new_text,
-        } => ToolPresentationTemplateSection::Diff {
-            path: service_field_selector_to_session(path),
-            old_text: service_field_selector_to_session(old_text),
-            new_text: service_field_selector_to_session(new_text),
-        },
-    }
-}
-
-fn service_field_selector_to_session(
-    value: &bcode_tool::ToolPresentationFieldSelector,
-) -> bcode_session_models::ToolPresentationFieldSelector {
-    bcode_session_models::ToolPresentationFieldSelector {
-        fields: value.fields.clone(),
-        literal: value.literal.clone(),
-        required: value.required,
+fn service_plugin_view_metadata_to_session(
+    value: &bcode_tool::ToolPluginViewMetadata,
+) -> bcode_session_models::ToolPluginViewMetadata {
+    bcode_session_models::ToolPluginViewMetadata {
+        schema: value.schema.clone(),
+        schema_version: value.schema_version,
+        producer_plugin_id: value.producer_plugin_id.clone(),
+        title: value.title.clone(),
+        subtitle: value.subtitle.clone(),
+        payload: value
+            .payload
+            .iter()
+            .map(|(key, selector)| {
+                (
+                    key.clone(),
+                    bcode_session_models::ToolPresentationPayloadSelector {
+                        fields: selector.fields.clone(),
+                        literal: selector.literal.clone(),
+                        required: selector.required,
+                    },
+                )
+            })
+            .collect(),
     }
 }
 

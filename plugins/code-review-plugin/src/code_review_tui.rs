@@ -3452,8 +3452,8 @@ impl ReviewAgentSessionStreamState {
 
 fn live_tool_preview_status(tool_name: &str, preview: &LiveToolArgumentPreview) -> String {
     let (streaming_status, preview_title) = match preview {
-        LiveToolArgumentPreview::Presentation(preview) => {
-            (preview.subtitle.as_deref(), Some(preview.title.as_str()))
+        LiveToolArgumentPreview::PluginView(preview) => {
+            (preview.subtitle.as_deref(), preview.title.as_deref())
         }
         LiveToolArgumentPreview::FileEdit(preview) => (
             preview.streaming_status.as_deref(),
