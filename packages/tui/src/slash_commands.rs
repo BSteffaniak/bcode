@@ -95,13 +95,13 @@ pub enum SlashCommandOutcome {
         skill_id: bcode_skill_models::SkillId,
         arguments: String,
     },
-    /// Open thinking settings dialog.
+    /// Open reasoning output settings dialog.
     OpenThinkingSettings(super::thinking_dialog::ThinkingDialogFocus),
     /// Toggle diff panel.
     ToggleDiff,
-    /// Toggle local thinking display.
+    /// Set local reasoning output display.
     SetThinkingDisplay(bool),
-    /// Toggle local thinking display.
+    /// Toggle local reasoning output display.
     ToggleThinkingDisplay,
     /// Show a system note.
     SystemNote(String),
@@ -197,11 +197,11 @@ fn draft_thinking_command(parts: &[&str]) -> SlashCommandOutcome {
         Some("show") => SlashCommandOutcome::SetThinkingDisplay(true),
         Some("hide") => SlashCommandOutcome::SetThinkingDisplay(false),
         Some("toggle") => SlashCommandOutcome::ToggleThinkingDisplay,
-        Some("status" | "capabilities") => {
-            SlashCommandOutcome::Handled("thinking status requires an active session".to_owned())
-        }
+        Some("status" | "capabilities") => SlashCommandOutcome::Handled(
+            "reasoning output status requires an active session".to_owned(),
+        ),
         Some(_) => SlashCommandOutcome::Handled(
-            "setting thinking effort requires an active session".to_owned(),
+            "setting reasoning effort requires an active session".to_owned(),
         ),
     }
 }
@@ -240,7 +240,7 @@ async fn thinking_command(
                 session_id,
                 effort: Some(effort.clone()),
                 summary: None,
-                status: format!("thinking effort set to {effort}"),
+                status: format!("reasoning effort set to {effort}"),
             })
         }
         Some("summary") if parts.len() > 2 => {
@@ -259,7 +259,7 @@ async fn thinking_command(
                 session_id,
                 effort: None,
                 summary: Some(summary.clone()),
-                status: format!("thinking summary set to {summary}"),
+                status: format!("visible reasoning summary set to {summary}"),
             })
         }
         Some("show") => Ok(SlashCommandOutcome::SetThinkingDisplay(true)),
@@ -280,7 +280,7 @@ async fn thinking_command(
                 session_id,
                 effort: Some(value.to_owned()),
                 summary: None,
-                status: format!("thinking effort set to {value}"),
+                status: format!("reasoning effort set to {value}"),
             })
         }
     }
@@ -296,7 +296,7 @@ fn unsupported_reasoning_value(
         return None;
     }
     Some(format!(
-        "unsupported thinking {kind} '{value}' (supported: {})",
+        "unsupported reasoning {kind} '{value}' (supported: {})",
         list_or_default(supported)
     ))
 }
@@ -321,14 +321,14 @@ fn thinking_status(status: &bcode_ipc::SessionModelStatus) -> String {
                 .as_ref()
                 .and_then(|reasoning| reasoning.default_summary.as_deref())
         })
-        .unwrap_or("provider default");
+        .unwrap_or("not requested");
     format!(
-        "thinking: effort={effort}, summary={summary}{}",
+        "reasoning output: effort={effort}, visible_summary={summary}{}",
         status
             .reasoning
             .as_ref()
             .map_or_else(String::new, |reasoning| format!(
-                "\nsource: {}\navailable effort: {}\navailable summary: {}",
+                "\nsource: {}\navailable effort: {}\navailable visible summaries: {}",
                 reasoning_source_label(reasoning.source),
                 list_or_default(&reasoning.effort_values),
                 list_or_default(&reasoning.summary_values)
@@ -338,10 +338,11 @@ fn thinking_status(status: &bcode_ipc::SessionModelStatus) -> String {
 
 fn thinking_capabilities(status: &bcode_ipc::SessionModelStatus) -> String {
     let Some(reasoning) = &status.reasoning else {
-        return "thinking: no provider-declared reasoning capabilities for this model".to_owned();
+        return "reasoning output: no provider-declared reasoning capabilities for this model"
+            .to_owned();
     };
     format!(
-        "thinking capabilities\nsource: {}\neffort: {}\ndefault effort: {}\nvisible summary: {}\nsummary values: {}\ndefault summary: {}\nraw reasoning: {}",
+        "reasoning capabilities\nsource: {}\neffort values: {}\ndefault effort: {}\nvisible summary supported: {}\nsummary values: {}\ndefault visible summary: {}\nraw reasoning exposed: {}",
         reasoning_source_label(reasoning.source),
         list_or_default(&reasoning.effort_values),
         reasoning.default_effort.as_deref().unwrap_or("unknown"),

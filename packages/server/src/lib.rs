@@ -11939,10 +11939,7 @@ async fn build_model_turn_request(
             ) {
                 p.reasoning_effort_value = Some(effort.to_owned());
             }
-            if let Some(summary) = supported_reasoning_value(
-                selection.reasoning_summary.as_deref(),
-                &reasoning.summary_values,
-            ) {
+            if let Some(summary) = requested_reasoning_summary(selection, reasoning) {
                 p.reasoning_summary = Some(summary.to_owned());
             }
         }
@@ -12020,6 +12017,17 @@ fn insert_reasoning_metadata(
     if let Some(summary) = &parameters.reasoning_summary {
         metadata.insert("reasoning_summary".to_string(), summary.clone());
     }
+}
+
+fn requested_reasoning_summary<'a>(
+    selection: &'a SessionModelSelection,
+    reasoning: &'a bcode_model::ModelReasoningInfo,
+) -> Option<&'a str> {
+    let requested = selection
+        .reasoning_summary
+        .as_deref()
+        .or(reasoning.default_summary.as_deref());
+    supported_reasoning_value(requested, &reasoning.summary_values)
 }
 
 fn supported_reasoning_value<'a>(
@@ -16666,6 +16674,39 @@ mod tests {
         assert_eq!(
             consecutive_no_progress_iterations(&iterations, &iterations[2]),
             2
+        );
+    }
+
+    #[test]
+    fn requested_reasoning_summary_uses_default_when_unset() {
+        let selection = SessionModelSelection::default();
+        let reasoning = bcode_model::ModelReasoningInfo {
+            summary_values: vec!["auto".to_owned(), "detailed".to_owned()],
+            default_summary: Some("auto".to_owned()),
+            ..bcode_model::ModelReasoningInfo::default()
+        };
+
+        assert_eq!(
+            requested_reasoning_summary(&selection, &reasoning),
+            Some("auto")
+        );
+    }
+
+    #[test]
+    fn requested_reasoning_summary_prefers_user_selection() {
+        let selection = SessionModelSelection {
+            reasoning_summary: Some("detailed".to_owned()),
+            ..SessionModelSelection::default()
+        };
+        let reasoning = bcode_model::ModelReasoningInfo {
+            summary_values: vec!["auto".to_owned(), "detailed".to_owned()],
+            default_summary: Some("auto".to_owned()),
+            ..bcode_model::ModelReasoningInfo::default()
+        };
+
+        assert_eq!(
+            requested_reasoning_summary(&selection, &reasoning),
+            Some("detailed")
         );
     }
 

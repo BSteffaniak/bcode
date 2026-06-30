@@ -24,7 +24,7 @@ pub enum KeyRequest {
     Interrupt,
     /// Cycle to the next available agent.
     CycleAgent,
-    /// Cycle to the next supported thinking effort.
+    /// Cycle to the next supported reasoning effort.
     CycleThinkingEffort,
 }
 

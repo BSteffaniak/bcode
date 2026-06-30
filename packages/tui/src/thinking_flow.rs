@@ -8,7 +8,7 @@ use super::TuiError;
 use super::session_flow::ActiveChat;
 use super::thinking_dialog::ThinkingDialogState;
 
-/// Cycle the selected thinking effort for the current model.
+/// Cycle the selected reasoning effort for the current model.
 pub async fn cycle_thinking_effort(
     client: &BcodeClient,
     chat: &mut ActiveChat,
@@ -21,7 +21,7 @@ pub async fn cycle_thinking_effort(
     };
     let Some(next_effort) = next_effort_for_status(&status, chat.app.reasoning_effort()) else {
         chat.app
-            .set_status("thinking effort unavailable for current model".to_owned());
+            .set_status("reasoning effort unavailable for current model".to_owned());
         return Ok(());
     };
     let summary = chat
@@ -40,7 +40,7 @@ pub async fn cycle_thinking_effort(
             .await?;
     }
     chat.app
-        .set_status(format!("thinking effort set to {next_effort}"));
+        .set_status(format!("reasoning effort set to {next_effort}"));
     Ok(())
 }
 
@@ -78,23 +78,25 @@ pub async fn handle_thinking_key(
     match stroke.key {
         KeyCode::Up => {
             dialog.focus_previous();
-            chat.app.set_status("thinking settings".to_owned());
+            chat.app.set_status("reasoning output settings".to_owned());
             Ok(true)
         }
         KeyCode::Down => {
             dialog.focus_next();
-            chat.app.set_status("thinking settings".to_owned());
+            chat.app.set_status("reasoning output settings".to_owned());
             Ok(true)
         }
         KeyCode::Char(' ') => {
             dialog.cycle_focused();
-            chat.app.set_status("thinking setting changed".to_owned());
+            chat.app
+                .set_status("reasoning output setting changed".to_owned());
             Ok(true)
         }
         KeyCode::Enter => apply_thinking_dialog(client, chat, thinking_dialog).await,
         KeyCode::Escape => {
             *thinking_dialog = None;
-            chat.app.set_status("thinking settings canceled".to_owned());
+            chat.app
+                .set_status("reasoning output settings canceled".to_owned());
             Ok(true)
         }
         _ => Ok(false),
@@ -115,7 +117,7 @@ async fn apply_thinking_dialog(
     let Some(session_id) = chat.app.session_id() else {
         chat.app.apply_reasoning_selection(effort, summary, visible);
         chat.app.set_status(format!(
-            "thinking settings applied: {}",
+            "reasoning output settings applied: {}",
             chat.app.thinking_label()
         ));
         return Ok(true);
@@ -128,7 +130,7 @@ async fn apply_thinking_dialog(
         chat.app.apply_model_status(status);
     }
     chat.app.set_status(format!(
-        "thinking settings applied: {}",
+        "reasoning output settings applied: {}",
         chat.app.thinking_label()
     ));
     Ok(true)

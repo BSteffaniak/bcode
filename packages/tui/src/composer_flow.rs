@@ -20,7 +20,7 @@ pub type SubmitComposerOutcome = Option<ComposerModalRequest>;
 
 /// Modal requested by a composer submission.
 pub enum ComposerModalRequest {
-    /// Open thinking settings.
+    /// Open reasoning output settings.
     Thinking(thinking_dialog::ThinkingDialogState),
     /// Open timeline browser.
     Timeline(super::timeline_dialog::TimelineDialogState),
@@ -63,13 +63,17 @@ async fn open_thinking_settings(
     } {
         Ok(status) => status,
         Err(error) => {
-            helpers::report_client_issue(&mut chat.app, "thinking settings unavailable", &error);
+            helpers::report_client_issue(
+                &mut chat.app,
+                "reasoning output settings unavailable",
+                &error,
+            );
             return Ok(None);
         }
     };
     chat.app.apply_model_status(status.clone());
     chat.app
-        .set_status("thinking settings: enter apply, esc cancel".to_owned());
+        .set_status("reasoning output settings: enter apply, esc cancel".to_owned());
     Ok(Some(ComposerModalRequest::Thinking(
         thinking_dialog::ThinkingDialogState::new_focused(
             chat.app.reasoning_visible(),
@@ -106,9 +110,9 @@ async fn handle_slash_command<W: Write>(
             chat.app.clear_pending_submission(message);
             chat.app.set_reasoning_visible(show);
             chat.app.set_status(if show {
-                "thinking display shown".to_owned()
+                "reasoning output shown".to_owned()
             } else {
-                "thinking display hidden".to_owned()
+                "reasoning output hidden".to_owned()
             });
         }
         slash_commands::SlashCommandOutcome::ToggleThinkingDisplay => {
@@ -116,9 +120,9 @@ async fn handle_slash_command<W: Write>(
             let show = !chat.app.reasoning_visible();
             chat.app.set_reasoning_visible(show);
             chat.app.set_status(if show {
-                "thinking display shown".to_owned()
+                "reasoning output shown".to_owned()
             } else {
-                "thinking display hidden".to_owned()
+                "reasoning output hidden".to_owned()
             });
         }
         slash_commands::SlashCommandOutcome::SystemNote(note) => {

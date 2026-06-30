@@ -215,7 +215,7 @@ const STATIC_COMPLETIONS: &[SlashCompletion] = &[
     },
     SlashCompletion {
         command: "/thinking",
-        description: "Open thinking settings",
+        description: "Open reasoning output settings",
     },
     SlashCompletion {
         command: "/timeline",
@@ -223,19 +223,19 @@ const STATIC_COMPLETIONS: &[SlashCompletion] = &[
     },
     SlashCompletion {
         command: "/thinking status",
-        description: "Show thinking settings status",
+        description: "Show reasoning output status",
     },
     SlashCompletion {
         command: "/thinking capabilities",
-        description: "Show model thinking capabilities",
+        description: "Show model reasoning capabilities",
     },
     SlashCompletion {
         command: "/thinking effort",
-        description: "Open thinking settings focused on effort",
+        description: "Open reasoning settings focused on effort",
     },
     SlashCompletion {
         command: "/thinking summary",
-        description: "Open thinking settings focused on summary",
+        description: "Open reasoning settings focused on summary",
     },
     SlashCompletion {
         command: "/diff",

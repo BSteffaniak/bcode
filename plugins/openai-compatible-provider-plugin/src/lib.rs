@@ -411,7 +411,7 @@ impl OpenAiCompatibleDialect {
             Self::ChatGptCodex => ReasoningRequestShape {
                 supports_reasoning_object: true,
                 include_state: &["reasoning.encrypted_content"],
-                include_summary: &["reasoning.summary"],
+                include_summary: &[],
                 fallback_effort_values: &["none", "minimal", "low", "medium", "high", "xhigh"],
                 fallback_summary_values: &["auto", "concise", "detailed"],
                 source: ModelReasoningCapabilitySource::KnownModelTable,
@@ -5208,6 +5208,51 @@ mod tests {
                 .model_ids
                 .contains(&"gpt-5.3-codex-spark".to_string())
         );
+    }
+
+    #[test]
+    fn responses_request_includes_reasoning_summary_when_requested() {
+        let mut request = test_request(vec![text_message(MessageRole::User, "hello")]);
+        request.parameters.reasoning_summary = Some("auto".to_owned());
+        let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ResponsesApi);
+
+        let body =
+            build_responses_request(&settings, &request, "gpt-5").expect("request should build");
+
+        assert_eq!(
+            body.get("reasoning")
+                .and_then(|reasoning| reasoning.get("summary"))
+                .and_then(serde_json::Value::as_str),
+            Some("auto")
+        );
+        assert_eq!(
+            body.get("include")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|include| include.first())
+                .and_then(serde_json::Value::as_str),
+            Some("reasoning.summary")
+        );
+    }
+
+    #[test]
+    fn chatgpt_codex_request_does_not_include_unsupported_reasoning_summary() {
+        let mut request = test_request(vec![text_message(MessageRole::User, "hello")]);
+        request.parameters.reasoning_summary = Some("auto".to_owned());
+        let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
+
+        let body =
+            build_responses_request(&settings, &request, "gpt-5.5").expect("request should build");
+
+        let include = body
+            .get("include")
+            .and_then(serde_json::Value::as_array)
+            .expect("include should be an array");
+        assert!(
+            include
+                .iter()
+                .any(|value| value == "reasoning.encrypted_content")
+        );
+        assert!(!include.iter().any(|value| value == "reasoning.summary"));
     }
 
     #[test]

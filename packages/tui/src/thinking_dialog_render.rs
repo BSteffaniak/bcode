@@ -1,4 +1,4 @@
-//! TUI thinking settings dialog rendering.
+//! TUI reasoning output settings dialog rendering.
 
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
@@ -16,7 +16,7 @@ const MAX_DIALOG_WIDTH: u16 = 96;
 const MIN_DIALOG_HEIGHT: u16 = 15;
 const MAX_DIALOG_HEIGHT: u16 = 22;
 
-/// Render a thinking settings dialog.
+/// Render a reasoning output settings dialog.
 pub fn render_thinking_dialog(state: &ThinkingDialogState, frame: &mut Frame<'_>, theme: TuiTheme) {
     let modal = modal_frame(theme);
     modal.render(frame.area(), frame);
@@ -49,7 +49,7 @@ fn modal_frame(theme: TuiTheme) -> ModalFrame {
         ),
         ModalTheme::dark(theme.accent),
     )
-    .title(" Thinking settings ")
+    .title(" Reasoning output settings ")
     .padding(Insets::new(1, 2, 1, 2))
     .placement(ModalPlacement::UpperThird)
 }
@@ -57,7 +57,7 @@ fn modal_frame(theme: TuiTheme) -> ModalFrame {
 fn rows(state: &ThinkingDialogState, theme: TuiTheme) -> Vec<Line> {
     let mut rows = Vec::new();
     rows.push(Line::from_spans(vec![Span::styled(
-        "Control what reasoning is requested and whether provider-visible reasoning is shown.",
+        "Control requested reasoning effort and provider-visible reasoning summaries.",
         Style::new().fg(Color::BrightWhite).bg(MODAL_BG),
     )]));
     if !state.supported() {
@@ -69,9 +69,9 @@ fn rows(state: &ThinkingDialogState, theme: TuiTheme) -> Vec<Line> {
     rows.push(modal_blank_line());
     rows.push(setting_row(
         state.focused_row() == 0,
-        "Display reasoning",
+        "Show reasoning output",
         if state.visible() { "shown" } else { "hidden" },
-        Some("local TUI display only"),
+        Some("local display filter; provider must emit reasoning events"),
         theme,
     ));
     rows.push(setting_row(
@@ -90,7 +90,7 @@ fn rows(state: &ThinkingDialogState, theme: TuiTheme) -> Vec<Line> {
     ));
     rows.push(setting_row(
         state.focused_row() == 2,
-        "Reasoning summary",
+        "Visible reasoning summary",
         if state.supported() {
             state.effective_summary_label()
         } else {

@@ -929,10 +929,10 @@ fn push_transcript_item_from_event(
             finish_streaming_transcript_item(items, "Assistant", text);
         }
         SessionEventKind::AssistantReasoningDelta { text } if include_reasoning => {
-            push_streaming_transcript_item(items, "Reasoning", text);
+            push_streaming_transcript_item(items, "Reasoning summary", text);
         }
         SessionEventKind::AssistantReasoningMessage { text } if include_reasoning => {
-            finish_streaming_transcript_item(items, "Reasoning", text);
+            finish_streaming_transcript_item(items, "Reasoning summary", text);
         }
         SessionEventKind::AssistantReasoningDelta { .. }
         | SessionEventKind::AssistantReasoningMessage { .. } => {}
@@ -1686,7 +1686,7 @@ fn kind_for_role(role: &str) -> TranscriptItemKind {
     match role {
         "You" => TranscriptItemKind::UserMessage,
         "Assistant" => TranscriptItemKind::AssistantMessage,
-        "Reasoning" => TranscriptItemKind::ReasoningMessage,
+        "Reasoning summary" => TranscriptItemKind::ReasoningMessage,
         "System" => TranscriptItemKind::System,
         "Skill" => TranscriptItemKind::Skill,
         "Skill error" => TranscriptItemKind::SkillError,

@@ -98,7 +98,7 @@ pub async fn handle_slash_palette_key<W: Write>(
                     {
                         helpers::report_client_error(
                             &mut chat.app,
-                            "thinking effort failed",
+                            "reasoning effort failed",
                             &error,
                         );
                     }

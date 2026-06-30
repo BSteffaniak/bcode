@@ -471,7 +471,7 @@ impl BmuxApp {
             presented_theme: initial_theme.into(),
             theme_transition: ThemeTransitionState::new(initial_theme.accent, now),
             reasoning_visible: true,
-            thinking_label: "shown · unsupported".to_owned(),
+            thinking_label: "reasoning output shown · unsupported".to_owned(),
             reasoning_effort: None,
             reasoning_summary: None,
             reasoning_support: ReasoningSupport::Unsupported,
@@ -782,7 +782,7 @@ impl BmuxApp {
         Some(agent_id)
     }
 
-    /// Return the current thinking display label.
+    /// Return the current reasoning output label.
     #[must_use]
     pub fn thinking_label(&self) -> &str {
         &self.thinking_label
@@ -1402,19 +1402,19 @@ impl BmuxApp {
         self.reasoning_summary.as_deref()
     }
 
-    /// Apply configured thinking display visibility.
+    /// Apply configured reasoning output visibility.
     pub fn apply_thinking_config(&mut self, config: TuiThinkingConfig) {
         self.set_reasoning_visible(config.show);
     }
 
     fn refresh_thinking_label(&mut self) {
         let display = if self.reasoning_visible {
-            "shown"
+            "reasoning output shown"
         } else {
-            "hidden"
+            "reasoning output hidden"
         };
         if !self.reasoning_support.is_supported() {
-            self.thinking_label = format!("{display} · unsupported");
+            self.thinking_label = format!("{display} · unsupported by current model");
             return;
         }
         let effort = self
@@ -1426,8 +1426,8 @@ impl BmuxApp {
             .reasoning_summary
             .as_deref()
             .or(self.reasoning_default_summary.as_deref())
-            .unwrap_or("provider default");
-        self.thinking_label = format!("{display} · effort: {effort} · summary: {summary}");
+            .unwrap_or("not requested");
+        self.thinking_label = format!("{display} · effort: {effort} · visible summary: {summary}");
     }
 
     /// Mark the app as waiting for turn cancellation.
@@ -2047,7 +2047,7 @@ impl BmuxApp {
                 self.viewport.preserve_for_append();
                 self.add_streaming_delta(text, SessionEventApplication::Live);
                 if self.reasoning_visible() {
-                    self.push_streaming_item("Reasoning", text);
+                    self.push_streaming_item("Reasoning summary", text);
                 }
             }
             SessionLiveEventKind::ToolOutputDelta { event } => {
@@ -2293,11 +2293,11 @@ impl BmuxApp {
             SessionEventKind::AssistantReasoningDelta { text } => {
                 self.add_streaming_delta(text, application);
                 if self.reasoning_visible() {
-                    self.push_streaming_item("Reasoning", text);
+                    self.push_streaming_item("Reasoning summary", text);
                 }
             }
             SessionEventKind::AssistantReasoningMessage { text } if self.reasoning_visible() => {
-                self.finish_streaming_item("Reasoning", text, application);
+                self.finish_streaming_item("Reasoning summary", text, application);
             }
             SessionEventKind::SessionCreated {
                 name: Some(name), ..

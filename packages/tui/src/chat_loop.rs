@@ -1105,7 +1105,7 @@ fn apply_set_session_reasoning_result(
     match result {
         Ok(()) => chat.app.set_status(status),
         Err(error) => {
-            daemon_issue::report_client_issue(&mut chat.app, "thinking setting failed", &error);
+            daemon_issue::report_client_issue(&mut chat.app, "reasoning setting failed", &error);
         }
     }
 }
@@ -1223,14 +1223,14 @@ fn apply_thinking_cycle_result(
                     result.visible,
                 );
                 chat.app
-                    .set_status(format!("thinking effort set to {next_effort}"));
+                    .set_status(format!("reasoning effort set to {next_effort}"));
             } else {
                 chat.app
-                    .set_status("thinking effort unavailable for current model".to_owned());
+                    .set_status("reasoning effort unavailable for current model".to_owned());
             }
         }
         Ok(_stale) => {}
-        Err(error) => report_nonfatal_client_error(chat, "thinking effort failed", &error),
+        Err(error) => report_nonfatal_client_error(chat, "reasoning effort failed", &error),
     }
 }
 
@@ -1242,10 +1242,10 @@ fn start_thinking_cycle(chat: &mut ActiveChat, loop_state: &mut ChatLoopState) {
         visible: chat.app.reasoning_visible(),
     });
     if started {
-        chat.app.set_status("updating thinking effort…".to_owned());
+        chat.app.set_status("updating reasoning effort…".to_owned());
     } else {
         chat.app
-            .set_status("thinking effort change already in progress".to_owned());
+            .set_status("reasoning effort change already in progress".to_owned());
     }
 }
 

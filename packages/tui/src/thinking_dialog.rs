@@ -1,8 +1,8 @@
-//! TUI thinking settings modal state.
+//! TUI reasoning output settings modal state.
 
 use bcode_ipc::SessionModelStatus;
 
-/// Initially focused thinking setting.
+/// Initially focused reasoning output setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThinkingDialogFocus {
     /// Focus the local display toggle.
@@ -23,7 +23,7 @@ impl ThinkingDialogFocus {
     }
 }
 
-/// Pending thinking settings dialog state.
+/// Pending reasoning output settings dialog state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThinkingDialogState {
     supported: bool,
@@ -134,13 +134,13 @@ impl ThinkingDialogState {
             .unwrap_or("provider default")
     }
 
-    /// Return effective summary label.
+    /// Return effective visible reasoning summary label.
     #[must_use]
     pub fn effective_summary_label(&self) -> &str {
         self.summary
             .as_deref()
             .or(self.default_summary.as_deref())
-            .unwrap_or("provider default")
+            .unwrap_or("not requested")
     }
 
     /// Return focused row index.

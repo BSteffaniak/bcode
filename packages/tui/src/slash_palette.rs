@@ -235,7 +235,7 @@ fn thinking_items(
         .map(|value| {
             item(
                 format!("/thinking {subcommand} {value}"),
-                "model-supported value",
+                "provider-supported reasoning value",
             )
         })
         .collect()
@@ -336,7 +336,7 @@ mod tests {
             vec![
                 super::item("/agent", "a thin agent"),
                 super::item("/plan", "Switch to plan agent"),
-                super::item("/thinking", "Open thinking settings"),
+                super::item("/thinking", "Open reasoning output settings"),
                 super::item("/thin", "Short thinking alias"),
             ],
             "thin",
@@ -352,7 +352,7 @@ mod tests {
         let items = filter_items(
             vec![
                 super::item("/agent", "Set session agent by id"),
-                super::item("/thinking", "Open thinking settings"),
+                super::item("/thinking", "Open reasoning output settings"),
             ],
             "t",
         );

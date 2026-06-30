@@ -397,7 +397,7 @@ pub async fn persist_draft_session<W: Write>(
     chat.app.apply_session_summary(&attached.session);
     if let Err(error) = commit_draft_reasoning(client, &chat.app, session.id).await {
         chat.app
-            .set_status(format!("thinking settings failed: {error}"));
+            .set_status(format!("reasoning output settings failed: {error}"));
     }
     hydrate_status(client, &mut chat.app).await;
     Ok(session.id)
