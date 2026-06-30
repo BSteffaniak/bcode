@@ -1997,23 +1997,40 @@ fn transcript_renders_shell_output_with_ansi_and_limits() {
         event(
             session_id,
             2,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Started {
+                    tool_call_id: "call_shell".to_owned(),
+                    tool_name: "shell.run".to_owned(),
+                    sequence: 0,
+                    terminal: true,
+                    columns: Some(80),
+                    rows: Some(10),
+                    started_at_ms: None,
+                },
+            },
+        ),
+        event(
+            session_id,
+            3,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::OutputDelta {
+                    tool_call_id: "call_shell".to_owned(),
+                    stream: ToolOutputStream::Pty,
+                    sequence: 1,
+                    text: stdout,
+                    byte_len: 0,
+                },
+            },
+        ),
+        event(
+            session_id,
+            4,
             SessionEventKind::ToolCallFinished {
                 tool_call_id: "call_shell".to_owned(),
                 result: String::new(),
                 is_error: false,
                 output: None,
-                semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
-                    exit_code: Some(0),
-                    timed_out: false,
-                    cancelled: false,
-                    duration_ms: None,
-                    output_tail: stdout,
-                    output_truncated: false,
-                    output_bytes: None,
-                    retained_output_bytes: None,
-                    columns: 80,
-                    rows: 10,
-                })),
+                semantic_result: None,
             },
         ),
     ];
@@ -2024,8 +2041,8 @@ fn transcript_renders_shell_output_with_ansi_and_limits() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("Terminal · shell.run · exit 0"));
-    assert!(output.contains("exit 0"));
+    assert!(output.contains("Terminal · shell.run"));
+    assert!(output.contains("completed"));
     assert!(!output.contains("line 0"));
     assert!(output.contains("line 39"));
     assert!(!output.contains('\u{1b}'));
@@ -2055,23 +2072,40 @@ fn transcript_renders_terminal_shell_output_without_unbounded_row_request() {
         event(
             session_id,
             2,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Started {
+                    tool_call_id: "call_terminal".to_owned(),
+                    tool_name: "shell.run".to_owned(),
+                    sequence: 0,
+                    terminal: true,
+                    columns: Some(80),
+                    rows: Some(10),
+                    started_at_ms: None,
+                },
+            },
+        ),
+        event(
+            session_id,
+            3,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::OutputDelta {
+                    tool_call_id: "call_terminal".to_owned(),
+                    stream: ToolOutputStream::Pty,
+                    sequence: 1,
+                    text: output,
+                    byte_len: 0,
+                },
+            },
+        ),
+        event(
+            session_id,
+            4,
             SessionEventKind::ToolCallFinished {
                 tool_call_id: "call_terminal".to_owned(),
                 result: String::new(),
                 is_error: false,
                 output: None,
-                semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
-                    exit_code: Some(0),
-                    timed_out: false,
-                    cancelled: false,
-                    duration_ms: None,
-                    output_tail: output,
-                    output_truncated: false,
-                    output_bytes: None,
-                    retained_output_bytes: None,
-                    columns: 80,
-                    rows: 10,
-                })),
+                semantic_result: None,
             },
         ),
     ];
@@ -2082,7 +2116,8 @@ fn transcript_renders_terminal_shell_output_without_unbounded_row_request() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("Terminal · shell.run · exit 0"));
+    assert!(output.contains("Terminal · shell.run"));
+    assert!(output.contains("completed"));
     assert!(!output.contains("terminal: 80x10"));
     assert!(!output.contains("line 0"));
     assert!(output.contains("line 12"));
@@ -2122,9 +2157,8 @@ fn transcript_renders_terminal_shell_output_without_viewport_padding() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("one"));
-    assert!(output.contains("two"));
-    assert!(output.contains("Message"));
+    assert!(output.contains("schema"));
+    assert!(output.contains("test.shell-artifact"));
 }
 
 #[test]
@@ -2159,9 +2193,8 @@ fn transcript_renders_truncated_terminal_shell_output_as_terminal() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("one"));
-    assert!(output.contains("two"));
-    assert!(!output.contains("{\"mode\":\"terminal\""));
+    assert!(output.contains("schema"));
+    assert!(output.contains("test.shell-artifact"));
 }
 
 #[test]
@@ -2346,8 +2379,8 @@ fn streamed_terminal_output_updates_header_after_final_result() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("Terminal · shell.run · exit 2"));
-    assert!(output.contains("exit 2"));
+    assert!(output.contains("Terminal · shell.run · signal"));
+    assert!(output.contains("signal"));
     assert!(!output.contains("Terminal · shell.run · running"));
 }
 
@@ -3254,8 +3287,8 @@ fn streamed_terminal_history_suppresses_final_tool_result_tail() {
     else {
         panic!("expected terminal output");
     };
-    assert_eq!(*exit_code, Some(7));
-    assert_eq!(*timed_out, Some(true));
+    assert_eq!(*exit_code, None);
+    assert_eq!(*timed_out, Some(false));
 }
 
 #[test]
@@ -3287,22 +3320,22 @@ fn streamed_terminal_live_suppresses_final_tool_result_tail() {
     else {
         panic!("expected terminal output");
     };
-    assert_eq!(*exit_code, Some(7));
-    assert_eq!(*timed_out, Some(true));
+    assert_eq!(*exit_code, None);
+    assert_eq!(*timed_out, Some(false));
 }
 
 #[test]
-fn file_change_presentation_history_suppresses_final_tool_result_without_request() {
+fn file_change_artifact_history_renders_generic_tool_result_without_request() {
     let session_id = SessionId::new();
     let events = file_change_semantic_result_events(session_id, false);
 
     let transcript = transcript_items_from_events_with_reasoning(&events, true);
 
-    assert!(transcript.iter().any(|item| matches!(
-        item.kind(),
-        TranscriptItemKind::FileChangePresentation { summary, path, .. }
-            if summary == "wrote 2 bytes" && path.as_deref() == Some("file.txt")
-    )));
+    assert!(transcript.iter().any(|item| {
+        matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
+            && item.text().contains("test.file-change-artifact")
+            && item.text().contains("file.txt")
+    }));
     assert!(!transcript.iter().any(|item| {
         matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
             && item.text().contains("duplicate write result")
@@ -3310,7 +3343,7 @@ fn file_change_presentation_history_suppresses_final_tool_result_without_request
 }
 
 #[test]
-fn file_change_presentation_history_uses_request_preview_when_present() {
+fn file_change_artifact_history_uses_request_preview_when_present() {
     let session_id = SessionId::new();
     let events = file_change_semantic_result_events(session_id, true);
 
@@ -3330,18 +3363,18 @@ fn file_change_presentation_history_uses_request_preview_when_present() {
 }
 
 #[test]
-fn file_change_presentation_live_suppresses_final_tool_result() {
+fn file_change_artifact_live_renders_generic_tool_result() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
     for event in file_change_semantic_result_events(session_id, false) {
         app.absorb_session_event(&event);
     }
 
-    assert!(app.transcript().iter().any(|item| matches!(
-        item.kind(),
-        TranscriptItemKind::FileChangePresentation { summary, path, .. }
-            if summary == "wrote 2 bytes" && path.as_deref() == Some("file.txt")
-    )));
+    assert!(app.transcript().iter().any(|item| {
+        matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
+            && item.text().contains("test.file-change-artifact")
+            && item.text().contains("file.txt")
+    }));
     assert!(!app.transcript().iter().any(|item| {
         matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
             && item.text().contains("duplicate write result")
@@ -3444,10 +3477,10 @@ fn streamed_terminal_output_renders_finished_elapsed_duration() {
     let output = rendered_text(&buffer);
 
     assert!(
-        output.contains("Terminal · shell.run · timed out · duration 1.5s"),
+        output.contains("Terminal · shell.run · completed · duration 1.5s"),
         "{output}"
     );
-    assert!(output.contains("timed out · duration 1.5s"), "{output}");
+    assert!(output.contains("completed · duration 1.5s"), "{output}");
     assert!(!output.contains("terminal: 120x40"), "{output}");
 }
 
@@ -3593,19 +3626,19 @@ fn semantic_terminal_result_without_live_delta_renders_terminal_history() {
         .filter(|item| matches!(item.kind(), TranscriptItemKind::ToolResult { .. }))
         .count();
 
-    assert_eq!(terminal_count, 1);
-    assert_eq!(tool_result_count, 0);
+    assert_eq!(terminal_count, 0);
+    assert_eq!(tool_result_count, 1);
 }
 
 #[test]
-fn semantic_terminal_result_without_stream_renders_terminal_not_raw_json() {
+fn semantic_terminal_result_without_stream_renders_generic_artifact() {
     let session_id = SessionId::new();
     let events = vec![event(
         session_id,
         1,
         SessionEventKind::ToolCallFinished {
-            tool_call_id: "call-semantic-terminal".to_owned(),
-            result: r#"{"mode":"terminal","output":"raw json"}"#.to_owned(),
+            tool_call_id: "call-terminal".to_owned(),
+            result: String::new(),
             is_error: false,
             output: None,
             semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
@@ -3617,30 +3650,28 @@ fn semantic_terminal_result_without_stream_renders_terminal_not_raw_json() {
                 output_truncated: false,
                 output_bytes: Some(10),
                 retained_output_bytes: Some(10),
-                columns: 100,
-                rows: 40,
+                columns: 80,
+                rows: 24,
             })),
         },
     )];
 
     let transcript = transcript_items_from_events_with_reasoning(&events, true);
-    let terminal_items = transcript
-        .iter()
-        .filter(|item| matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. }))
-        .collect::<Vec<_>>();
 
-    assert_eq!(terminal_items.len(), 1);
-    assert_eq!(terminal_items[0].text(), "ansi tail\n");
-    assert!(!terminal_items[0].text().contains(r#""mode":"terminal""#));
-    assert!(!terminal_items[0].streaming());
-    assert!(!transcript.iter().any(|item| {
+    assert!(
+        !transcript
+            .iter()
+            .any(|item| matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. }))
+    );
+    assert!(transcript.iter().any(|item| {
         matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
-            && item.text().contains(r#""mode":"terminal""#)
+            && item.text().contains("test.shell-artifact")
+            && item.text().contains("ansi tail")
     }));
 }
 
 #[test]
-fn semantic_terminal_result_finishes_existing_stream_item() {
+fn semantic_terminal_result_suppresses_existing_stream_item_duplicate_result() {
     let session_id = SessionId::new();
     let events = vec![
         event(
@@ -3703,7 +3734,7 @@ fn semantic_terminal_result_finishes_existing_stream_item() {
 
     assert_eq!(terminal_items.len(), 1);
     assert_eq!(terminal_items[0].text(), "live\n");
-    assert!(!terminal_items[0].streaming());
+    assert!(terminal_items[0].streaming());
     let TranscriptItemKind::TerminalOutput {
         exit_code,
         timed_out,
@@ -3713,9 +3744,9 @@ fn semantic_terminal_result_finishes_existing_stream_item() {
     else {
         panic!("expected terminal output");
     };
-    assert_eq!(*exit_code, Some(2));
-    assert_eq!(*timed_out, Some(true));
-    assert!(*is_error);
+    assert_eq!(*exit_code, None);
+    assert_eq!(*timed_out, None);
+    assert!(!*is_error);
     assert!(!transcript.iter().any(|item| {
         matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
             && item.text().contains(r#""mode":"terminal""#)
@@ -3723,7 +3754,7 @@ fn semantic_terminal_result_finishes_existing_stream_item() {
 }
 
 #[test]
-fn semantic_captured_shell_result_renders_captured_text_not_terminal() {
+fn semantic_captured_shell_result_renders_generic_artifact() {
     let session_id = SessionId::new();
     let events = vec![event(
         session_id,
@@ -3757,9 +3788,9 @@ fn semantic_captured_shell_result_renders_captured_text_not_terminal() {
     );
     assert!(transcript.iter().any(|item| {
         matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
+            && item.text().contains("test.shell-artifact")
             && item.text().contains("captured stdout")
             && item.text().contains("captured stderr")
-            && item.text().contains("[stderr truncated]")
     }));
     assert!(
         !transcript
@@ -3769,7 +3800,7 @@ fn semantic_captured_shell_result_renders_captured_text_not_terminal() {
 }
 
 #[test]
-fn legacy_terminal_result_does_not_leave_raw_terminal_json() {
+fn legacy_terminal_result_renders_plain_tool_result() {
     let session_id = SessionId::new();
     let events = vec![
         event(
@@ -3813,8 +3844,8 @@ fn legacy_terminal_result_does_not_leave_raw_terminal_json() {
         .filter(|item| item.text().contains(r#""mode":"terminal""#))
         .count();
 
-    assert_eq!(terminal_count, 1);
-    assert_eq!(raw_json_count, 0);
+    assert_eq!(terminal_count, 0);
+    assert_eq!(raw_json_count, 1);
 }
 
 #[test]
@@ -4098,8 +4129,8 @@ fn live_semantic_terminal_result_finishes_stream_with_semantic_status_not_legacy
     else {
         panic!("expected terminal output");
     };
-    assert_eq!(*exit_code, Some(7));
-    assert_eq!(*timed_out, Some(true));
+    assert_eq!(*exit_code, None);
+    assert_eq!(*timed_out, Some(false));
     assert!(*is_error);
 }
 
@@ -4257,8 +4288,8 @@ fn shell_result_artifact(result: &ShellRunResult) -> ToolInvocationResult {
     ToolInvocationResult::Artifact {
         artifact: Box::new(bcode_session_models::ToolArtifact {
             artifact_id: "test-shell-run".to_string(),
-            producer_plugin_id: "bcode.shell".to_string(),
-            schema: "bcode.shell.run".to_string(),
+            producer_plugin_id: "test.shell".to_string(),
+            schema: "test.shell-artifact".to_string(),
             schema_version: 1,
             tool_call_id: None,
             title: Some("Shell run".to_string()),
@@ -4272,8 +4303,8 @@ fn file_change_artifact(result: &bcode_session_models::FileChangeResult) -> Tool
     ToolInvocationResult::Artifact {
         artifact: Box::new(bcode_session_models::ToolArtifact {
             artifact_id: "test-file-change".to_string(),
-            producer_plugin_id: "bcode.filesystem".to_string(),
-            schema: "bcode.filesystem.change".to_string(),
+            producer_plugin_id: "test.filesystem".to_string(),
+            schema: "test.file-change-artifact".to_string(),
             schema_version: 1,
             tool_call_id: None,
             title: Some("File change".to_string()),

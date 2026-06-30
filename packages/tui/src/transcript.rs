@@ -332,6 +332,7 @@ impl TranscriptItem {
     }
 
     /// Mark a terminal output item as finished with final process metadata.
+    #[allow(dead_code)]
     pub const fn finish_terminal(
         &mut self,
         exit_code: Option<i32>,
@@ -371,6 +372,7 @@ impl TranscriptItem {
     }
 
     /// Set the terminal output finish timestamp.
+    #[allow(dead_code)]
     pub const fn set_terminal_finished_at(&mut self, finished_at_ms: Option<u64>) {
         if let TranscriptItemKind::TerminalOutput {
             finished_at_ms: terminal_finished_at_ms,
@@ -909,62 +911,40 @@ fn push_transcript_item_from_event(
         | SessionEventKind::AssistantReasoningMessage { .. } => {}
         SessionEventKind::ToolCallFinished {
             tool_call_id,
-            result,
+            result: _,
             is_error,
             semantic_result,
             ..
         } => {
             if let Some(semantic_result) = semantic_result {
-                apply_semantic_tool_result(
-                    items,
+                if presented_tool_results.contains(tool_call_id)
+                    || streamed_tool_results
+                        .get(tool_call_id)
+                        .is_some_and(|replay| replay.saw_output)
+                {
+                    return;
+                }
+                let item = semantic_tool_result_item(
                     tool_call_id,
                     tool_calls.get(tool_call_id),
-                    &mut streamed_tool_results.get_mut(tool_call_id),
                     semantic_result,
                     *is_error,
                 );
+                items.push(item);
                 presented_tool_results.insert(tool_call_id.clone());
                 return;
             }
-            if let Some(legacy_result) = legacy_semantic_tool_result(
-                tool_calls
-                    .get(tool_call_id)
-                    .map(|context| context.tool_name.as_str()),
-                result,
-            ) {
-                apply_semantic_tool_result(
-                    items,
-                    tool_call_id,
-                    tool_calls.get(tool_call_id),
-                    &mut streamed_tool_results.get_mut(tool_call_id),
-                    &legacy_result,
-                    *is_error,
-                );
-                presented_tool_results.insert(tool_call_id.clone());
-                return;
-            }
-            let should_render_final = if let Some(replay) =
-                streamed_tool_results.get_mut(tool_call_id)
-            {
-                if let Some(index) = replay.index
-                    && let Some(item) = items.get_mut(index)
-                {
-                    if let Some((exit_code, timed_out)) = terminal_shell_result_metadata(result) {
-                        item.finish_terminal(
-                            exit_code,
-                            timed_out,
-                            *is_error,
-                            replay.finished_at_ms,
-                        );
-                    } else {
-                        item.set_terminal_error(*is_error);
-                        item.finish_streaming();
+            let should_render_final =
+                if let Some(replay) = streamed_tool_results.get_mut(tool_call_id) {
+                    if let Some(index) = replay.index
+                        && let Some(item) = items.get_mut(index)
+                    {
+                        item.finish_terminal(None, false, *is_error, replay.finished_at_ms);
                     }
-                }
-                !replay.saw_output
-            } else {
-                true
-            };
+                    !replay.saw_output
+                } else {
+                    true
+                };
             if should_render_final
                 && !presented_tool_results.contains(tool_call_id)
                 && let Some(item) = non_streaming_transcript_item_from_event(
@@ -1095,19 +1075,6 @@ fn non_streaming_transcript_item_from_event(
                     *is_error,
                 ));
             }
-            if let Some(legacy_result) = legacy_semantic_tool_result(
-                tool_calls
-                    .get(tool_call_id)
-                    .map(|context| context.tool_name.as_str()),
-                result,
-            ) {
-                return Some(semantic_tool_result_item(
-                    tool_call_id,
-                    tool_calls.get(tool_call_id),
-                    &legacy_result,
-                    *is_error,
-                ));
-            }
             if streamed_tool_results
                 .get(tool_call_id)
                 .is_some_and(|replay| replay.saw_output)
@@ -1216,129 +1183,18 @@ fn working_directory_changed_message(
     )
 }
 
-fn legacy_semantic_tool_result(
-    tool_name: Option<&str>,
-    result: &str,
-) -> Option<ToolInvocationResult> {
-    let value = serde_json::from_str::<serde_json::Value>(result).ok()?;
-    if value.get("mode")?.as_str()? != "terminal" {
-        return None;
-    }
-    let output = value
-        .get("output")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    Some(ToolInvocationResult::Artifact {
-        artifact: Box::new(bcode_session_models::ToolArtifact {
-            artifact_id: "legacy-terminal".to_string(),
-            producer_plugin_id: "bcode.shell".to_string(),
-            schema: "bcode.shell.run".to_string(),
-            schema_version: 1,
-            tool_call_id: None,
-            title: Some("Shell run".to_string()),
-            metadata: serde_json::json!({
-                "mode": "terminal",
-                "exit_code": value.get("exit_code").cloned().unwrap_or(serde_json::Value::Null),
-                "timed_out": value.get("timed_out").cloned().unwrap_or(serde_json::Value::Bool(false)),
-                "cancelled": value.get("cancelled").cloned().unwrap_or(serde_json::Value::Bool(false)),
-                "duration_ms": null,
-                "output_tail": legacy_terminal_output_text(tool_name, &value, &output),
-                "output_truncated": value.get("output_truncated").cloned().unwrap_or(serde_json::Value::Bool(false)),
-                "output_bytes": value.get("output_bytes").cloned().unwrap_or(serde_json::Value::Null),
-                "retained_output_bytes": value.get("retained_output_bytes").cloned().unwrap_or(serde_json::Value::Null),
-                "columns": value.get("columns").cloned().unwrap_or_else(|| serde_json::json!(120)),
-                "rows": value.get("rows").cloned().unwrap_or_else(|| serde_json::json!(24)),
-            }),
-            refs: Vec::new(),
-        }),
-    })
-}
-
-fn legacy_terminal_output_text(
-    tool_name: Option<&str>,
-    value: &serde_json::Value,
-    output: &str,
-) -> String {
-    if !value
-        .get("output_truncated")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or_default()
-    {
-        return output.to_owned();
-    }
-    let Some(output_bytes) = value
-        .get("output_bytes")
-        .and_then(serde_json::Value::as_u64)
-    else {
-        return output.to_owned();
-    };
-    let Some(retained_output_bytes) = value
-        .get("retained_output_bytes")
-        .and_then(serde_json::Value::as_u64)
-    else {
-        return output.to_owned();
-    };
-    format!(
-        "{} output truncated; showing {retained_output_bytes} of {output_bytes} bytes\n{output}",
-        tool_name.unwrap_or("terminal")
-    )
-}
-
-fn terminal_shell_result_metadata(result: &str) -> Option<(Option<i32>, bool)> {
-    let value = serde_json::from_str::<serde_json::Value>(result).ok()?;
-    if value.get("mode")?.as_str()? != "terminal" {
-        return None;
-    }
-    let exit_code = value
-        .get("exit_code")
-        .and_then(serde_json::Value::as_i64)
-        .and_then(|code| i32::try_from(code).ok());
-    let timed_out = value.get("timed_out")?.as_bool()?;
-    Some((exit_code, timed_out))
-}
-
 #[allow(clippy::single_match_else, clippy::needless_pass_by_ref_mut)]
+#[allow(dead_code)]
 fn apply_semantic_tool_result(
     items: &mut Vec<TranscriptItem>,
     tool_call_id: &str,
     context: Option<&ToolCallContext>,
-    replay: &mut Option<&mut StreamedToolReplayContext>,
+    _replay: &mut Option<&mut StreamedToolReplayContext>,
     result: &ToolInvocationResult,
     is_error: bool,
 ) {
-    if let Some((exit_code, timed_out)) = shell_terminal_finish_metadata(result)
-        && let Some(replay) = replay.as_deref_mut()
-        && replay.saw_output
-    {
-        if let Some(index) = replay.index
-            && let Some(item) = items.get_mut(index)
-        {
-            item.finish_terminal(exit_code, timed_out, is_error, replay.finished_at_ms);
-        }
-        return;
-    }
-
     let item = semantic_tool_result_item(tool_call_id, context, result, is_error);
     items.push(item);
-}
-
-fn shell_terminal_finish_metadata(result: &ToolInvocationResult) -> Option<(Option<i32>, bool)> {
-    let ToolInvocationResult::Artifact { artifact } = result else {
-        return None;
-    };
-    if artifact.schema != "bcode.shell.run" {
-        return None;
-    }
-    let bcode_session_models::ShellRunResult::Terminal {
-        exit_code,
-        timed_out,
-        ..
-    } = serde_json::from_value(artifact.metadata.clone()).ok()?
-    else {
-        return None;
-    };
-    Some((exit_code, timed_out))
 }
 
 fn semantic_tool_result_item(
@@ -1374,15 +1230,7 @@ fn artifact_result_item(
     artifact: &bcode_session_models::ToolArtifact,
     is_error: bool,
 ) -> TranscriptItem {
-    match artifact.schema.as_str() {
-        "bcode.shell.run" => shell_artifact_item(tool_call_id, context, artifact, is_error)
-            .unwrap_or_else(|| generic_artifact_item(tool_call_id, context, artifact, is_error)),
-        "bcode.filesystem.change" if context.is_none() => {
-            file_change_artifact_item(tool_call_id, artifact, is_error)
-                .unwrap_or_else(|| generic_artifact_item(tool_call_id, context, artifact, is_error))
-        }
-        _ => generic_artifact_item(tool_call_id, context, artifact, is_error),
-    }
+    generic_artifact_item(tool_call_id, context, artifact, is_error)
 }
 
 fn generic_artifact_item(
@@ -1398,86 +1246,6 @@ fn generic_artifact_item(
         &serde_json::to_string(artifact).unwrap_or_else(|_| "artifact".to_string()),
         is_error,
     )
-}
-
-fn shell_artifact_item(
-    tool_call_id: &str,
-    context: Option<&ToolCallContext>,
-    artifact: &bcode_session_models::ToolArtifact,
-    is_error: bool,
-) -> Option<TranscriptItem> {
-    match serde_json::from_value::<bcode_session_models::ShellRunResult>(artifact.metadata.clone())
-        .ok()?
-    {
-        bcode_session_models::ShellRunResult::Terminal {
-            exit_code,
-            timed_out,
-            output_tail,
-            columns,
-            rows,
-            ..
-        } => {
-            let mut item = streaming_terminal_output_item(
-                tool_call_id,
-                context.map(|context| context.tool_name.as_str()),
-                &output_tail,
-                columns.max(1),
-                rows.max(1),
-                None,
-            );
-            item.finish_terminal(exit_code, timed_out, is_error, None);
-            Some(item)
-        }
-        bcode_session_models::ShellRunResult::Captured {
-            stdout,
-            stderr,
-            stdout_truncated,
-            stderr_truncated,
-            exit_code,
-            timed_out,
-            cancelled,
-            ..
-        } => {
-            let mut text = format!(
-                "exit_code: {}\ntimed_out: {timed_out}\ncancelled: {cancelled}",
-                exit_code.map_or_else(|| "null".to_owned(), |code| code.to_string())
-            );
-            text.push_str("\nstdout:\n");
-            text.push_str(&stdout);
-            if stdout_truncated {
-                text.push_str("\n[stdout truncated]");
-            }
-            text.push_str("\nstderr:\n");
-            text.push_str(&stderr);
-            if stderr_truncated {
-                text.push_str("\n[stderr truncated]");
-            }
-            Some(tool_result_item(
-                tool_call_id,
-                context.map(|context| context.tool_name.as_str()),
-                context.map(|context| context.arguments_json.as_str()),
-                &text,
-                is_error,
-            ))
-        }
-    }
-}
-
-fn file_change_artifact_item(
-    tool_call_id: &str,
-    artifact: &bcode_session_models::ToolArtifact,
-    is_error: bool,
-) -> Option<TranscriptItem> {
-    let result =
-        serde_json::from_value::<bcode_session_models::FileChangeResult>(artifact.metadata.clone())
-            .ok()?;
-    Some(file_change_presentation_item(
-        tool_call_id,
-        &result.tool_name,
-        &result.summary,
-        result.path.as_deref(),
-        is_error,
-    ))
 }
 
 fn apply_tool_invocation_stream_event(
@@ -1557,8 +1325,7 @@ fn apply_tool_invocation_stream_event(
                 && let Some(index) = replay.index
                 && let Some(item) = items.get_mut(index)
             {
-                item.set_terminal_error(*is_error);
-                item.set_terminal_finished_at(*finished_at_ms);
+                item.finish_terminal(None, false, *is_error, *finished_at_ms);
                 replay.finished_at_ms = *finished_at_ms;
             }
         }

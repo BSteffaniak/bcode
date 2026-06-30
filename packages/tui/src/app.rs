@@ -50,12 +50,11 @@ use super::temporal::next_elapsed_invalidation_capped;
 use super::theme::{PresentedTheme, ResolvedTheme};
 use super::timeline_dialog::TimelineEntry;
 use super::transcript::{
-    FileEditPhase, TranscriptItem, TranscriptItemKind, file_change_presentation_item,
-    interactive_tool_request_item, interactive_tool_resolution_item, live_tool_preview_anchor_item,
-    model_usage_item, permission_request_item, permission_result_item,
-    streaming_terminal_output_item, streaming_tool_output_item, tool_presentation_card_from_event,
-    tool_presentation_card_item, tool_request_item, tool_result_item,
-    transcript_items_from_events_with_reasoning,
+    FileEditPhase, TranscriptItem, TranscriptItemKind, interactive_tool_request_item,
+    interactive_tool_resolution_item, live_tool_preview_anchor_item, model_usage_item,
+    permission_request_item, permission_result_item, streaming_terminal_output_item,
+    streaming_tool_output_item, tool_presentation_card_from_event, tool_presentation_card_item,
+    tool_request_item, tool_result_item, transcript_items_from_events_with_reasoning,
 };
 use super::transcript_document::TranscriptDocument;
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
@@ -2708,7 +2707,7 @@ impl BmuxApp {
         tool_call_id: &str,
         is_error: Option<bool>,
         _result: Option<&str>,
-        semantic_result: Option<&ToolInvocationResult>,
+        _semantic_result: Option<&ToolInvocationResult>,
     ) -> bool {
         let Some(context) = self.streamed_tool_results.get(tool_call_id) else {
             return false;
@@ -2717,16 +2716,7 @@ impl BmuxApp {
         if let Some(index) = context.index
             && let Some(item) = self.transcript.get_mut(index)
         {
-            if let Some((exit_code, timed_out)) =
-                semantic_result.and_then(shell_terminal_finish_metadata)
-            {
-                item.finish_terminal(exit_code, timed_out, is_error.unwrap_or(false), None);
-            } else {
-                if let Some(is_error) = is_error {
-                    item.set_terminal_error(is_error);
-                }
-                item.finish_streaming();
-            }
+            item.finish_terminal(None, false, is_error.unwrap_or(false), None);
         }
         saw_output
     }
@@ -3993,24 +3983,6 @@ fn context_window_percentage(input_tokens: u32, context_window: u32) -> u32 {
     u32::try_from(numerator / denominator).unwrap_or(u32::MAX)
 }
 
-fn shell_terminal_finish_metadata(result: &ToolInvocationResult) -> Option<(Option<i32>, bool)> {
-    let ToolInvocationResult::Artifact { artifact } = result else {
-        return None;
-    };
-    if artifact.schema != "bcode.shell.run" {
-        return None;
-    }
-    let bcode_session_models::ShellRunResult::Terminal {
-        exit_code,
-        timed_out,
-        ..
-    } = serde_json::from_value(artifact.metadata.clone()).ok()?
-    else {
-        return None;
-    };
-    Some((exit_code, timed_out))
-}
-
 fn semantic_tool_result_item_for_app(
     tool_call_id: &str,
     tool_name: Option<&str>,
@@ -4033,16 +4005,7 @@ fn semantic_tool_result_item_for_app(
             artifact,
             fallback_result,
             is_error,
-        )
-        .unwrap_or_else(|| {
-            tool_result_item(
-                tool_call_id,
-                tool_name,
-                arguments_json,
-                &serde_json::to_string(artifact).unwrap_or_else(|_| fallback_result.to_owned()),
-                is_error,
-            )
-        }),
+        ),
         None => tool_result_item(
             tool_call_id,
             tool_name,
@@ -4060,78 +4023,14 @@ fn artifact_result_item_for_app(
     artifact: &bcode_session_models::ToolArtifact,
     fallback_result: &str,
     is_error: bool,
-) -> Option<TranscriptItem> {
-    match artifact.schema.as_str() {
-        "bcode.shell.run" => {
-            shell_artifact_item_for_app(tool_call_id, tool_name, arguments_json, artifact, is_error)
-        }
-        "bcode.filesystem.change" if tool_name.is_none() => {
-            file_change_artifact_item_for_app(tool_call_id, artifact, is_error)
-        }
-        _ => Some(tool_result_item(
-            tool_call_id,
-            tool_name,
-            arguments_json,
-            &serde_json::to_string(artifact).unwrap_or_else(|_| fallback_result.to_owned()),
-            is_error,
-        )),
-    }
-}
-
-fn shell_artifact_item_for_app(
-    tool_call_id: &str,
-    tool_name: Option<&str>,
-    arguments_json: Option<&str>,
-    artifact: &bcode_session_models::ToolArtifact,
-    is_error: bool,
-) -> Option<TranscriptItem> {
-    match serde_json::from_value::<bcode_session_models::ShellRunResult>(artifact.metadata.clone())
-        .ok()?
-    {
-        bcode_session_models::ShellRunResult::Terminal {
-            exit_code,
-            timed_out,
-            output_tail,
-            columns,
-            rows,
-            ..
-        } => {
-            let mut item = streaming_terminal_output_item(
-                tool_call_id,
-                tool_name,
-                &output_tail,
-                columns.max(1),
-                rows.max(1),
-                None,
-            );
-            item.finish_terminal(exit_code, timed_out, is_error, None);
-            Some(item)
-        }
-        bcode_session_models::ShellRunResult::Captured { .. } => Some(tool_result_item(
-            tool_call_id,
-            tool_name,
-            arguments_json,
-            &serde_json::to_string(&artifact.metadata).unwrap_or_else(|_| "shell run".to_string()),
-            is_error,
-        )),
-    }
-}
-
-fn file_change_artifact_item_for_app(
-    tool_call_id: &str,
-    artifact: &bcode_session_models::ToolArtifact,
-    is_error: bool,
-) -> Option<TranscriptItem> {
-    let result =
-        serde_json::from_value::<bcode_session_models::FileChangeResult>(artifact.metadata.clone())
-            .ok()?;
-    Some(file_change_presentation_item(
+) -> TranscriptItem {
+    tool_result_item(
         tool_call_id,
-        &result.tool_name,
-        &result.summary,
-        result.path.as_deref(),
+        tool_name,
+        arguments_json,
+        &serde_json::to_string(artifact).unwrap_or_else(|_| fallback_result.to_owned()),
         is_error,
-    ))
+    )
 }
 
 fn working_directory_changed_message(
@@ -4145,32 +4044,145 @@ fn working_directory_changed_message(
     )
 }
 
-fn protocol_presentation_item_from_plugin(
+fn tool_presentation_item_from_plugin(
     tool_call_id: &str,
     tool_name: &str,
     presentation: bcode_tool::ToolPresentationEvent,
 ) -> Option<TranscriptItem> {
-    let bcode_tool::ToolPresentationEvent::Protocol(protocol) = presentation else {
-        return None;
-    };
-    if protocol.target != bcode_tool::ToolPresentationTarget::Result {
-        return None;
+    match presentation {
+        bcode_tool::ToolPresentationEvent::Card(card)
+            if card.target == bcode_tool::ToolPresentationTarget::Result =>
+        {
+            let card = bcode_session_models::ToolCardPresentation {
+                target: presentation_target_to_session(card.target),
+                title: card.title,
+                subtitle: card.subtitle,
+                sections: card
+                    .sections
+                    .into_iter()
+                    .map(presentation_section_to_session)
+                    .collect(),
+            };
+            Some(tool_presentation_card_item(
+                tool_call_id,
+                Some(tool_name),
+                card,
+            ))
+        }
+        bcode_tool::ToolPresentationEvent::Protocol(protocol)
+            if protocol.target == bcode_tool::ToolPresentationTarget::Result =>
+        {
+            Some(TranscriptItem::with_kind(
+                "Tool",
+                "protocol presentation".to_owned(),
+                false,
+                TranscriptItemKind::ToolProtocolPresentation {
+                    tool_call_id: tool_call_id.to_owned(),
+                    tool_name: Some(tool_name.to_owned()),
+                    surface_kind: protocol.surface_kind,
+                    tree_json: serde_json::to_string(&protocol.tree).ok()?,
+                    state_json: protocol
+                        .state
+                        .as_ref()
+                        .and_then(|state| serde_json::to_string(state).ok()),
+                },
+            ))
+        }
+        _ => None,
     }
-    Some(TranscriptItem::with_kind(
-        "Tool",
-        "protocol presentation".to_owned(),
-        false,
-        TranscriptItemKind::ToolProtocolPresentation {
-            tool_call_id: tool_call_id.to_owned(),
-            tool_name: Some(tool_name.to_owned()),
-            surface_kind: protocol.surface_kind,
-            tree_json: serde_json::to_string(&protocol.tree).ok()?,
-            state_json: protocol
-                .state
-                .as_ref()
-                .and_then(|state| serde_json::to_string(state).ok()),
+}
+
+const fn presentation_target_to_session(
+    target: bcode_tool::ToolPresentationTarget,
+) -> bcode_session_models::ToolPresentationTarget {
+    match target {
+        bcode_tool::ToolPresentationTarget::Activity => {
+            bcode_session_models::ToolPresentationTarget::Activity
+        }
+        bcode_tool::ToolPresentationTarget::Preview => {
+            bcode_session_models::ToolPresentationTarget::Preview
+        }
+        bcode_tool::ToolPresentationTarget::Result => {
+            bcode_session_models::ToolPresentationTarget::Result
+        }
+    }
+}
+
+fn presentation_section_to_session(
+    section: bcode_tool::ToolPresentationSection,
+) -> bcode_session_models::ToolPresentationSection {
+    match section {
+        bcode_tool::ToolPresentationSection::Text { label, text } => {
+            bcode_session_models::ToolPresentationSection::Text { label, text }
+        }
+        bcode_tool::ToolPresentationSection::Diff {
+            path,
+            old_text,
+            new_text,
+        } => bcode_session_models::ToolPresentationSection::Diff {
+            path,
+            old_text,
+            new_text,
         },
-    ))
+        bcode_tool::ToolPresentationSection::Terminal {
+            output,
+            columns,
+            rows,
+        } => bcode_session_models::ToolPresentationSection::Terminal {
+            output,
+            columns,
+            rows,
+        },
+        bcode_tool::ToolPresentationSection::Fields { fields } => {
+            bcode_session_models::ToolPresentationSection::Fields {
+                fields: fields
+                    .into_iter()
+                    .map(presentation_field_to_session)
+                    .collect(),
+            }
+        }
+    }
+}
+
+fn presentation_field_to_session(
+    field: bcode_tool::ToolPresentationFieldValue,
+) -> bcode_session_models::ToolPresentationFieldValue {
+    bcode_session_models::ToolPresentationFieldValue {
+        label: field.label,
+        value: field.value,
+        kind: presentation_field_kind_to_session(field.kind),
+    }
+}
+
+const fn presentation_field_kind_to_session(
+    kind: bcode_tool::ToolPresentationFieldKind,
+) -> bcode_session_models::ToolPresentationFieldKind {
+    match kind {
+        bcode_tool::ToolPresentationFieldKind::Text => {
+            bcode_session_models::ToolPresentationFieldKind::Text
+        }
+        bcode_tool::ToolPresentationFieldKind::Path => {
+            bcode_session_models::ToolPresentationFieldKind::Path
+        }
+        bcode_tool::ToolPresentationFieldKind::Url => {
+            bcode_session_models::ToolPresentationFieldKind::Url
+        }
+        bcode_tool::ToolPresentationFieldKind::Command => {
+            bcode_session_models::ToolPresentationFieldKind::Command
+        }
+        bcode_tool::ToolPresentationFieldKind::DurationMs => {
+            bcode_session_models::ToolPresentationFieldKind::DurationMs
+        }
+        bcode_tool::ToolPresentationFieldKind::Json => {
+            bcode_session_models::ToolPresentationFieldKind::Json
+        }
+        bcode_tool::ToolPresentationFieldKind::Count => {
+            bcode_session_models::ToolPresentationFieldKind::Count
+        }
+        bcode_tool::ToolPresentationFieldKind::Boolean => {
+            bcode_session_models::ToolPresentationFieldKind::Boolean
+        }
+    }
 }
 
 fn present_artifact_item_for_app(
@@ -4189,7 +4201,7 @@ fn present_artifact_item_for_app(
     };
     let response = runtime.present_artifact(&request).ok()??;
     response.presentation.and_then(|presentation| {
-        protocol_presentation_item_from_plugin(
+        tool_presentation_item_from_plugin(
             tool_call_id,
             tool_name.unwrap_or(&artifact.producer_plugin_id),
             presentation,

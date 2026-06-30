@@ -1776,4 +1776,82 @@ mod tests {
                 && !fields.iter().any(|field| field.label == "Cancelled")
         )));
     }
+
+    fn shell_artifact_presentation_response(
+        result: &ShellRunResult,
+    ) -> ToolArtifactPresentationResponse {
+        let ToolInvocationResult::Artifact { artifact } = shell_run_artifact("call-shell", result)
+        else {
+            panic!("expected artifact");
+        };
+        let request = ToolArtifactPresentationRequest {
+            artifact: *artifact,
+            surface: "tui".to_string(),
+            viewport: None,
+            capabilities: None,
+            state: None,
+        };
+        let request = ServiceRequest {
+            interface_id: TOOL_SERVICE_INTERFACE_ID.to_string(),
+            operation: OP_PRESENT_ARTIFACT.to_string(),
+            payload: serde_json::to_vec(&request).expect("request should encode"),
+        };
+        let response = present_artifact(&request);
+        assert!(response.error.is_none());
+        response
+            .payload_json::<ToolArtifactPresentationResponse>()
+            .expect("response should decode")
+    }
+
+    #[test]
+    fn present_terminal_shell_artifact_as_plugin_owned_terminal_card() {
+        let response = shell_artifact_presentation_response(&ShellRunResult::Terminal {
+            exit_code: Some(7),
+            timed_out: true,
+            cancelled: false,
+            duration_ms: Some(1_500),
+            output_tail: "terminal tail\n".to_string(),
+            output_truncated: false,
+            output_bytes: Some(14),
+            retained_output_bytes: Some(14),
+            columns: 80,
+            rows: 24,
+        });
+        let Some(ToolPresentationEvent::Card(card)) = response.presentation else {
+            panic!("expected card presentation");
+        };
+        assert_eq!(card.target, ToolPresentationTarget::Result);
+        assert_eq!(card.title, "Shell run");
+        assert_eq!(card.subtitle.as_deref(), Some("terminal"));
+        assert!(matches!(
+            card.sections.as_slice(),
+            [ToolPresentationSection::Terminal { output, columns: 80, rows: 24 }]
+                if output == "terminal tail\n"
+        ));
+    }
+
+    #[test]
+    fn present_captured_shell_artifact_as_plugin_owned_terminal_card() {
+        let response = shell_artifact_presentation_response(&ShellRunResult::Captured {
+            exit_code: Some(0),
+            timed_out: false,
+            cancelled: false,
+            duration_ms: None,
+            stdout: "captured stdout\n".to_string(),
+            stderr: "captured stderr\n".to_string(),
+            stdout_truncated: false,
+            stderr_truncated: true,
+            stdout_bytes: Some(16),
+            stderr_bytes: Some(16),
+        });
+        let Some(ToolPresentationEvent::Card(card)) = response.presentation else {
+            panic!("expected card presentation");
+        };
+        assert_eq!(card.subtitle.as_deref(), Some("captured"));
+        assert!(matches!(
+            card.sections.as_slice(),
+            [ToolPresentationSection::Terminal { output, .. }]
+                if output.contains("captured stdout") && output.contains("captured stderr")
+        ));
+    }
 }

@@ -3037,8 +3037,8 @@ mod tests {
                     Some(ToolInvocationResult::Artifact {
                         artifact: Box::new(bcode_session_models::ToolArtifact {
                             artifact_id: "call-1-shell-run".to_string(),
-                            producer_plugin_id: "bcode.shell".to_string(),
-                            schema: "bcode.shell.run".to_string(),
+                            producer_plugin_id: "test.shell".to_string(),
+                            schema: "test.shell-artifact".to_string(),
                             schema_version: 1,
                             tool_call_id: Some("call-1".to_string()),
                             title: Some("Shell run".to_string()),
@@ -3075,7 +3075,7 @@ mod tests {
             SessionEventKind::ToolCallFinished {
                 semantic_result: Some(ToolInvocationResult::Artifact { artifact }),
                 ..
-            } if artifact.schema == "bcode.shell.run"
+            } if artifact.schema == "test.shell-artifact"
                 && artifact.metadata["mode"] == "terminal"
                 && artifact.metadata["output_tail"] == "hello\n"
         )));

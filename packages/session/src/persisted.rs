@@ -1107,61 +1107,8 @@ enum PersistedToolInvocationPresentation {
 fn semantic_from_legacy_presentation(
     presentation: &PersistedToolInvocationPresentation,
 ) -> ToolInvocationResult {
-    match presentation {
-        PersistedToolInvocationPresentation::Terminal {
-            exit_code,
-            timed_out,
-            cancelled,
-            output,
-            output_truncated,
-            output_bytes,
-            retained_output_bytes,
-            columns,
-            rows,
-        } => ToolInvocationResult::Artifact {
-            artifact: Box::new(ToolArtifact {
-                artifact_id: "legacy-shell-run".to_string(),
-                producer_plugin_id: "bcode.shell".to_string(),
-                schema: "bcode.shell.run".to_string(),
-                schema_version: 1,
-                tool_call_id: None,
-                title: Some("Shell run".to_string()),
-                metadata: serde_json::json!({
-                    "mode": "terminal",
-                    "exit_code": exit_code,
-                    "timed_out": timed_out,
-                    "cancelled": cancelled,
-                    "duration_ms": null,
-                    "output_tail": output,
-                    "output_truncated": output_truncated,
-                    "output_bytes": output_bytes,
-                    "retained_output_bytes": retained_output_bytes,
-                    "columns": (*columns).max(1),
-                    "rows": (*rows).max(1),
-                }),
-                refs: Vec::new(),
-            }),
-        },
-        PersistedToolInvocationPresentation::FileChange {
-            tool_name,
-            summary,
-            path,
-        } => ToolInvocationResult::Artifact {
-            artifact: Box::new(ToolArtifact {
-                artifact_id: format!("legacy-file-change-{tool_name}"),
-                producer_plugin_id: "bcode.filesystem".to_string(),
-                schema: "bcode.filesystem.change".to_string(),
-                schema_version: 1,
-                tool_call_id: None,
-                title: Some("File change".to_string()),
-                metadata: serde_json::json!({
-                    "tool_name": tool_name,
-                    "summary": summary,
-                    "path": path,
-                }),
-                refs: Vec::new(),
-            }),
-        },
+    ToolInvocationResult::Text {
+        text: legacy_presentation_result_text(presentation),
     }
 }
 
@@ -1202,8 +1149,12 @@ impl PersistedToolInvocationResult {
             Self::Text { text } => ToolInvocationResult::Text { text },
             Self::Json { value } => ToolInvocationResult::Json { value },
             Self::Artifact { artifact } => ToolInvocationResult::Artifact { artifact },
-            Self::ShellRun { result } => shell_run_artifact(&result.into_domain()),
-            Self::FileChange { result } => file_change_artifact(&result),
+            Self::ShellRun { result } => ToolInvocationResult::Json {
+                value: serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_string()),
+            },
+            Self::FileChange { result } => ToolInvocationResult::Json {
+                value: serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_string()),
+            },
         }
     }
 }
@@ -1308,90 +1259,6 @@ impl From<&ShellRunResult> for PersistedShellRunResult {
                 stderr_bytes: *stderr_bytes,
             },
         }
-    }
-}
-
-impl PersistedShellRunResult {
-    fn into_domain(self) -> ShellRunResult {
-        match self {
-            Self::Terminal {
-                exit_code,
-                timed_out,
-                cancelled,
-                duration_ms,
-                output_tail,
-                output_truncated,
-                output_bytes,
-                retained_output_bytes,
-                columns,
-                rows,
-            } => ShellRunResult::Terminal {
-                exit_code,
-                timed_out,
-                cancelled,
-                duration_ms,
-                output_tail,
-                output_truncated,
-                output_bytes,
-                retained_output_bytes,
-                columns,
-                rows,
-            },
-            Self::Captured {
-                exit_code,
-                timed_out,
-                cancelled,
-                duration_ms,
-                stdout,
-                stderr,
-                stdout_truncated,
-                stderr_truncated,
-                stdout_bytes,
-                stderr_bytes,
-            } => ShellRunResult::Captured {
-                exit_code,
-                timed_out,
-                cancelled,
-                duration_ms,
-                stdout,
-                stderr,
-                stdout_truncated,
-                stderr_truncated,
-                stdout_bytes,
-                stderr_bytes,
-            },
-        }
-    }
-}
-
-fn shell_run_artifact(result: &ShellRunResult) -> ToolInvocationResult {
-    let metadata = serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({}));
-    ToolInvocationResult::Artifact {
-        artifact: Box::new(ToolArtifact {
-            artifact_id: "legacy-shell-run".to_string(),
-            producer_plugin_id: "bcode.shell".to_string(),
-            schema: "bcode.shell.run".to_string(),
-            schema_version: 1,
-            tool_call_id: None,
-            title: Some("Shell run".to_string()),
-            metadata,
-            refs: Vec::new(),
-        }),
-    }
-}
-
-fn file_change_artifact(result: &FileChangeResult) -> ToolInvocationResult {
-    ToolInvocationResult::Artifact {
-        artifact: Box::new(ToolArtifact {
-            artifact_id: format!("legacy-file-change-{}", result.tool_name),
-            producer_plugin_id: "bcode.filesystem".to_string(),
-            schema: "bcode.filesystem.change".to_string(),
-            schema_version: 1,
-            tool_call_id: None,
-            title: Some("File change".to_string()),
-            metadata: serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({})),
-            refs: Vec::new(),
-        }),
     }
 }
 
@@ -1805,44 +1672,36 @@ mod tests {
     }
 
     fn assert_file_change_result(event: SessionEvent) {
-        let ToolInvocationResult::Artifact { artifact } = tool_result(event) else {
-            panic!("expected file-change artifact");
+        let ToolInvocationResult::Json { value } = tool_result(event) else {
+            panic!("expected generic file-change json");
         };
-        assert_eq!(artifact.producer_plugin_id, "bcode.filesystem");
-        assert_eq!(artifact.schema, "bcode.filesystem.change");
-        assert_eq!(artifact.schema_version, 1);
-        assert_eq!(
-            artifact.metadata,
-            serde_json::json!({
-                "tool_name": "filesystem.write",
-                "summary": "wrote bytes",
-                "path": "file.txt",
-            })
-        );
+        let value: serde_json::Value =
+            serde_json::from_str(&value).expect("file change should decode");
+        assert_eq!(value["tool_name"], "filesystem.write");
+        assert_eq!(value["summary"], "wrote bytes");
+        assert_eq!(value["path"], "file.txt");
     }
 
     fn assert_legacy_terminal_result(event: SessionEvent) {
-        let ToolInvocationResult::Artifact { artifact } = tool_result(event) else {
-            panic!("expected shell artifact");
+        let ToolInvocationResult::Json { value } = tool_result(event) else {
+            panic!("expected generic shell-run json");
         };
-        assert_eq!(artifact.producer_plugin_id, "bcode.shell");
-        assert_eq!(artifact.schema, "bcode.shell.run");
-        assert_eq!(artifact.schema_version, 1);
-        assert_eq!(artifact.metadata["mode"], "terminal");
-        assert_eq!(artifact.metadata["output_tail"], "legacy tail");
-        assert_eq!(artifact.metadata["columns"], 80);
-        assert_eq!(artifact.metadata["rows"], 24);
+        let value: serde_json::Value =
+            serde_json::from_str(&value).expect("shell result should decode");
+        assert_eq!(value["mode"], "terminal");
+        assert_eq!(value["output_tail"], "legacy tail");
+        assert_eq!(value["columns"], 80);
+        assert_eq!(value["rows"], 24);
     }
 
     fn assert_captured_result(event: SessionEvent) {
-        let ToolInvocationResult::Artifact { artifact } = tool_result(event) else {
-            panic!("expected shell artifact");
+        let ToolInvocationResult::Json { value } = tool_result(event) else {
+            panic!("expected generic shell-run json");
         };
-        assert_eq!(artifact.producer_plugin_id, "bcode.shell");
-        assert_eq!(artifact.schema, "bcode.shell.run");
-        assert_eq!(artifact.schema_version, 1);
-        assert_eq!(artifact.metadata["mode"], "captured");
-        assert_eq!(artifact.metadata["stdout"], "hello\n");
-        assert_eq!(artifact.metadata["stderr"], "");
+        let value: serde_json::Value =
+            serde_json::from_str(&value).expect("shell result should decode");
+        assert_eq!(value["mode"], "captured");
+        assert_eq!(value["stdout"], "hello\n");
+        assert_eq!(value["stderr"], "");
     }
 }

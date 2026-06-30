@@ -16154,8 +16154,8 @@ mod tests {
             result: Some(ServiceToolInvocationResult::Artifact {
                 artifact: Box::new(bcode_tool::ToolArtifact {
                     artifact_id: "call-test-shell-run".to_string(),
-                    producer_plugin_id: "bcode.shell".to_string(),
-                    schema: "bcode.shell.run".to_string(),
+                    producer_plugin_id: "test.shell".to_string(),
+                    schema: "test.shell-artifact".to_string(),
                     schema_version: 1,
                     tool_call_id: Some("call-test".to_string()),
                     title: Some("Shell run".to_string()),
