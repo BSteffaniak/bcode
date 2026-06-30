@@ -2097,6 +2097,9 @@ impl BmuxApp {
             self.viewport.preserve_for_append();
         }
         match &event.kind {
+            SessionEventKind::SessionCreated { name, .. } => {
+                self.session_title.clone_from(name);
+            }
             SessionEventKind::UserMessage { text, .. } => {
                 self.active_tool_calls.clear();
                 self.tool_activity_seen = false;
@@ -2296,11 +2299,6 @@ impl BmuxApp {
             }
             SessionEventKind::AssistantReasoningMessage { text } if self.reasoning_visible() => {
                 self.finish_streaming_item("Reasoning summary", text, application);
-            }
-            SessionEventKind::SessionCreated {
-                name: Some(name), ..
-            } => {
-                self.session_title = Some(name.clone());
             }
             SessionEventKind::AgentChanged { agent_id } => {
                 self.set_current_agent_id(agent_id.clone());
