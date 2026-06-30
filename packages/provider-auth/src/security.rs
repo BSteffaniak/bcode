@@ -10,6 +10,7 @@ use ssh_key::{Algorithm, LineEnding, PrivateKey, rand_core::OsRng};
 use sshenv_vault::models::{ProfileFactorRequirement, UnlockFactorKindV2, VERSION_V2};
 
 const BCODE_VAULT_KEY_DIR_SUFFIX: &str = "keys";
+const MACOS_DEVICE_ONLY_KEYCHAIN_SERVICE: &str = "sshenv device seal device-only noninteractive v1";
 const BCODE_VAULT_PRIVATE_KEY_FILE_NAME: &str = "bcode_sshenv_ed25519";
 const BCODE_VAULT_PUBLIC_KEY_FILE_NAME: &str = "bcode_sshenv_ed25519.pub";
 const BCODE_VAULT_KEY_COMMENT: &str = "bcode sshenv vault key";
@@ -340,6 +341,9 @@ pub struct AuthSecurityStatus {
     /// Strictness recorded in profile metadata.
     #[serde(default)]
     pub device_seal_strict: Option<bool>,
+    /// macOS Keychain service recorded in profile metadata when applicable.
+    #[serde(default)]
+    pub device_seal_keychain_service: Option<String>,
     /// Whether the current config policy is satisfied by this vault state.
     pub policy_satisfied: bool,
     /// Structured diagnostics for this status.
@@ -365,6 +369,7 @@ pub fn inspect_auth_vault_security(
         device_seal_backend: None,
         device_seal_mode: None,
         device_seal_strict: None,
+        device_seal_keychain_service: None,
         policy_satisfied: policy != AuthDeviceSealPolicy::Required,
         diagnostics: Vec::new(),
     };
@@ -829,6 +834,7 @@ fn populate_device_seal_status(
             .params
             .get("strict")
             .map(|value| parse_bool_setting(value, true));
+        status.device_seal_keychain_service = metadata.params.get("keychain-service").cloned();
     }
 }
 
@@ -861,6 +867,16 @@ fn profile_device_seal_matches_options(
             .params
             .get("strict")
             .is_none_or(|strict| parse_bool_setting(strict, options.strict) == options.strict)
+        && profile_device_seal_storage_matches(&metadata.params)
+}
+
+fn profile_device_seal_storage_matches(params: &BTreeMap<String, String>) -> bool {
+    params.get("backend").is_none_or(|backend| {
+        backend != "macos-keychain-device-only"
+            || params
+                .get("keychain-service")
+                .is_some_and(|service| service == MACOS_DEVICE_ONLY_KEYCHAIN_SERVICE)
+    })
 }
 
 const fn expected_device_seal_backends(

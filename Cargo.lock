@@ -763,9 +763,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.17.0"
+version = "1.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ec2f1fc3ec205783a5da9a7e6c1509cc69dedf09a1949e412c1e18469326d00"
+checksum = "4342d8937fc7e5dd9b1c60292261c0670c882a2cd1719cfc11b1af41731e32ad"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -773,14 +773,15 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.41.0"
+version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a2f9779ce85b93ab6170dd940ad0169b5766ff848247aff13bb788b832fe3f4"
+checksum = "6d9ceb1da931507a12f4fccea479dccd00da1943e1b4ae72d8e502d707361444"
 dependencies = [
  "cc",
  "cmake",
  "dunce",
  "fs_extra",
+ "pkg-config",
 ]
 
 [[package]]
@@ -2308,7 +2309,7 @@ dependencies = [
 [[package]]
 name = "bmux_attach_image_protocol"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a66a0694a6d90b7eba41109cdf87905d3d1b1f6e"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#35210d60f31ecfe17c03d5df96ffcc0a16b3d3a1"
 dependencies = [
  "bmux_codec",
  "serde",
@@ -2318,7 +2319,7 @@ dependencies = [
 [[package]]
 name = "bmux_codec"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a66a0694a6d90b7eba41109cdf87905d3d1b1f6e"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#35210d60f31ecfe17c03d5df96ffcc0a16b3d3a1"
 dependencies = [
  "serde",
 ]
@@ -2326,7 +2327,7 @@ dependencies = [
 [[package]]
 name = "bmux_ipc"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a66a0694a6d90b7eba41109cdf87905d3d1b1f6e"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#35210d60f31ecfe17c03d5df96ffcc0a16b3d3a1"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_codec",
@@ -2340,7 +2341,7 @@ dependencies = [
 [[package]]
 name = "bmux_keyboard"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a66a0694a6d90b7eba41109cdf87905d3d1b1f6e"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#35210d60f31ecfe17c03d5df96ffcc0a16b3d3a1"
 dependencies = [
  "crossterm",
 ]
@@ -2348,7 +2349,7 @@ dependencies = [
 [[package]]
 name = "bmux_perf_telemetry"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a66a0694a6d90b7eba41109cdf87905d3d1b1f6e"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#35210d60f31ecfe17c03d5df96ffcc0a16b3d3a1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2357,7 +2358,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a66a0694a6d90b7eba41109cdf87905d3d1b1f6e"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#35210d60f31ecfe17c03d5df96ffcc0a16b3d3a1"
 dependencies = [
  "bmux_ipc",
  "bmux_perf_telemetry",
@@ -2378,7 +2379,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin_runtime"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a66a0694a6d90b7eba41109cdf87905d3d1b1f6e"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#35210d60f31ecfe17c03d5df96ffcc0a16b3d3a1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2388,7 +2389,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin_schema"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a66a0694a6d90b7eba41109cdf87905d3d1b1f6e"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#35210d60f31ecfe17c03d5df96ffcc0a16b3d3a1"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -2397,7 +2398,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin_sdk"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a66a0694a6d90b7eba41109cdf87905d3d1b1f6e"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#35210d60f31ecfe17c03d5df96ffcc0a16b3d3a1"
 dependencies = [
  "bmux_codec",
  "bmux_ipc",
@@ -2416,7 +2417,7 @@ dependencies = [
 [[package]]
 name = "bmux_terminal_grid"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a66a0694a6d90b7eba41109cdf87905d3d1b1f6e"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#35210d60f31ecfe17c03d5df96ffcc0a16b3d3a1"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -2427,7 +2428,7 @@ dependencies = [
 [[package]]
 name = "bmux_text_edit"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a66a0694a6d90b7eba41109cdf87905d3d1b1f6e"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#35210d60f31ecfe17c03d5df96ffcc0a16b3d3a1"
 dependencies = [
  "bmux_keyboard",
  "unicode-segmentation",
@@ -2437,7 +2438,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a66a0694a6d90b7eba41109cdf87905d3d1b1f6e"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#35210d60f31ecfe17c03d5df96ffcc0a16b3d3a1"
 dependencies = [
  "bmux_keyboard",
  "bmux_text_edit",
@@ -2449,7 +2450,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui_component_protocol"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a66a0694a6d90b7eba41109cdf87905d3d1b1f6e"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#35210d60f31ecfe17c03d5df96ffcc0a16b3d3a1"
 dependencies = [
  "serde",
 ]
@@ -2457,7 +2458,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui_components"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a66a0694a6d90b7eba41109cdf87905d3d1b1f6e"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#35210d60f31ecfe17c03d5df96ffcc0a16b3d3a1"
 dependencies = [
  "bmux_keyboard",
  "bmux_text_edit",
@@ -7727,9 +7728,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-pki-types"
-version = "1.14.1"
+version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30a7197ae7eb376e574fe940d068c30fe0462554a3ddbe4eca7838e049c937a9"
+checksum = "764899a24af3980067ee14bc143654f297b22eaebfe3c7b6b211920a5a59b046"
 dependencies = [
  "web-time",
  "zeroize",
@@ -8385,18 +8386,20 @@ dependencies = [
 [[package]]
 name = "sshenv_vault"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/sshenv.git?branch=master#1222a03e8c954ac62e0fb90748145db7cb989eda"
+source = "git+https://github.com/BSteffaniak/sshenv.git?branch=master#8881ed655768ca0c55c36543e36735b0974d2a68"
 dependencies = [
  "aes-siv",
  "age",
  "anyhow",
  "base64 0.22.1",
+ "core-foundation 0.10.1",
  "dirs",
  "hex",
  "hkdf",
  "rand_core 0.6.4",
  "rpassword",
  "security-framework",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -8411,7 +8414,7 @@ dependencies = [
 [[package]]
 name = "sshenv_vault_models"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/sshenv.git?branch=master#1222a03e8c954ac62e0fb90748145db7cb989eda"
+source = "git+https://github.com/BSteffaniak/sshenv.git?branch=master#8881ed655768ca0c55c36543e36735b0974d2a68"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
