@@ -1683,6 +1683,8 @@ dependencies = [
  "aws-sdk-bedrock",
  "bcode_model_catalog_models",
  "clap",
+ "reqwest",
+ "serde",
  "serde_json",
  "tokio",
 ]

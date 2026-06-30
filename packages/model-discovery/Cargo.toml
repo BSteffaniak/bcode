@@ -16,12 +16,17 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
-aws-config                 = { workspace = true }
-aws-sdk-bedrock            = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-bedrock = { workspace = true }
 bcode_model_catalog_models = { workspace = true }
-clap                       = { workspace = true, features = ["derive", "std"] }
-serde_json                 = { workspace = true, features = ["std"] }
-tokio                      = { workspace = true, features = ["macros", "rt-multi-thread"] }
+clap = { workspace = true, features = ["derive", "std"] }
+reqwest = { workspace = true, default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [features]
 default          = []

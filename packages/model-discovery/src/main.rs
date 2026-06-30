@@ -24,6 +24,15 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Generate an xAI live model snapshot.
+    Xai {
+        /// xAI API key (falls back to `XAI_API_KEY` env var).
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Output JSON path.
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -43,6 +52,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bcode_model_discovery::write_snapshot(&output, &snapshot)?;
             println!(
                 "wrote {} Bedrock live models to {}",
+                snapshot.models.len(),
+                output.display()
+            );
+        }
+        Command::Xai { api_key, output } => {
+            let snapshot = bcode_model_discovery::xai::discover(api_key).await?;
+            bcode_model_discovery::write_snapshot(&output, &snapshot)?;
+            println!(
+                "wrote {} xAI live models to {}",
                 snapshot.models.len(),
                 output.display()
             );

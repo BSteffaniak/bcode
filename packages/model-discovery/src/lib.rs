@@ -5,6 +5,7 @@
 //! Generated live model catalog discovery.
 
 pub mod bedrock;
+pub mod xai;
 
 use bcode_model_catalog_models::LiveCatalogSnapshot;
 use std::path::Path;
