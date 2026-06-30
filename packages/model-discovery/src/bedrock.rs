@@ -67,6 +67,7 @@ fn live_model_from_summary(summary: &FoundationModelSummary) -> LiveModel {
         capabilities: capabilities_from_summary(summary),
         context_window: None,
         max_output_tokens: None,
+        reasoning: None,
         raw: Some(raw_summary(summary)),
     }
 }

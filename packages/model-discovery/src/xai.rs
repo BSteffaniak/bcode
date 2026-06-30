@@ -98,6 +98,7 @@ fn live_model_from_api(model: LanguageModel) -> LiveModel {
         ),
         context_window,
         max_output_tokens: None,
+        reasoning: None,
         raw: None,
     }
 }

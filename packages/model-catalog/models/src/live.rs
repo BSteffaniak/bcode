@@ -1,6 +1,6 @@
 //! Generated live model catalog snapshot types.
 
-use crate::CatalogCapabilities;
+use crate::{CatalogCapabilities, CatalogReasoning};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -61,6 +61,9 @@ pub struct LiveModel {
     /// Maximum output tokens, when returned by the provider API.
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    /// Reasoning-specific metadata, when returned by the provider API.
+    #[serde(default)]
+    pub reasoning: Option<CatalogReasoning>,
     /// Compact raw provider metadata for debugging/auditing.
     #[serde(default)]
     pub raw: Option<serde_json::Value>,

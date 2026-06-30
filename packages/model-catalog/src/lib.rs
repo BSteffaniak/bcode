@@ -11,8 +11,8 @@ use bcode_model::{
 };
 use bcode_model_catalog_models::{
     BcodeSupportStatus, CatalogCapabilities, CatalogDocument, CatalogModelStatus, CatalogPricing,
-    LiveCatalogSnapshot, LiveModelMetadata, ModelCatalogDefaults, ModelCatalogEntry,
-    ModelSupportTarget, ProviderCatalog,
+    CatalogProviderKind, LiveCatalogSnapshot, LiveModelMetadata, ModelCatalogDefaults,
+    ModelCatalogEntry, ModelSupportTarget, ProviderCatalog,
 };
 use serde_json::json;
 use std::fmt::{Display, Formatter};
@@ -630,9 +630,31 @@ pub(crate) fn merge_live_snapshots(
     snapshots: &[LiveCatalogSnapshot],
 ) {
     for snapshot in snapshots {
-        let Some(provider) = catalog.providers.get_mut(&snapshot.provider_id) else {
-            continue;
-        };
+        // Auto-create provider if it does not exist (live data is the source of truth for new providers)
+        if !catalog.providers.contains_key(&snapshot.provider_id) {
+            catalog.providers.insert(
+                snapshot.provider_id.clone(),
+                ProviderCatalog {
+                    provider_id: snapshot.provider_id.clone(),
+                    display_name: snapshot.provider_id.clone(),
+                    kind: CatalogProviderKind::Other,
+                    website_url: None,
+                    default_model_id: None,
+                    default_codex_model_id: None,
+                    fallback_model_ids: Vec::new(),
+                    defaults: None,
+                    error_handling:
+                        bcode_model_catalog_models::ProviderErrorHandlingMetadata::default(),
+                    models: std::collections::BTreeMap::new(),
+                },
+            );
+        }
+
+        let provider = catalog
+            .providers
+            .get_mut(&snapshot.provider_id)
+            .expect("provider was just inserted or already existed");
+
         for live_model in snapshot.models.values() {
             let entry = provider
                 .models
@@ -648,6 +670,9 @@ pub(crate) fn merge_live_snapshots(
             }
             if entry.max_output_tokens.is_none() {
                 entry.max_output_tokens = live_model.max_output_tokens;
+            }
+            if entry.reasoning.is_none() {
+                entry.reasoning.clone_from(&live_model.reasoning);
             }
             entry.capabilities = merge_capabilities(&entry.capabilities, &live_model.capabilities);
             entry.live = Some(LiveModelMetadata {
@@ -682,7 +707,7 @@ fn live_model_entry(
         documentation_url: None,
         pricing: None,
         capabilities: live_model.capabilities.clone(),
-        reasoning: None,
+        reasoning: live_model.reasoning.clone(),
         supported_by: std::collections::BTreeSet::new(),
         live: Some(LiveModelMetadata {
             status: live_model.status.clone(),
