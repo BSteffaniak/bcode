@@ -323,10 +323,53 @@ pub struct ToolUiMetadata {
     pub live_argument_preview: Option<ToolLiveArgumentPreviewMetadata>,
 }
 
+/// A generic argument field selector for plugin-owned presentation templates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolPresentationFieldSelector {
+    /// Candidate top-level JSON argument names, in priority order.
+    #[serde(default)]
+    pub fields: Vec<String>,
+    /// Literal fallback value when no field is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub literal: Option<String>,
+    /// Whether this selector must resolve before the section can be rendered.
+    #[serde(default)]
+    pub required: bool,
+}
+
+/// Declarative presentation section template owned by a tool provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolPresentationTemplateSection {
+    /// Generic text diff section.
+    Diff {
+        /// Optional path/title selector.
+        path: ToolPresentationFieldSelector,
+        /// Old text selector.
+        old_text: ToolPresentationFieldSelector,
+        /// New text selector.
+        new_text: ToolPresentationFieldSelector,
+    },
+}
+
 /// Declarative live argument preview metadata owned by a tool provider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolLiveArgumentPreviewMetadata {
+    /// Plugin-owned generic presentation preview.
+    Presentation {
+        /// Preview card title.
+        title: String,
+        /// Optional preview card subtitle.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subtitle: Option<String>,
+        /// Declarative presentation sections.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sections: Vec<ToolPresentationTemplateSection>,
+        /// Plugin-owned streaming status template.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        streaming_status: Option<String>,
+    },
     /// File edit/write style preview.
     FileEdit {
         /// Candidate path fields.
@@ -378,6 +421,17 @@ pub enum ToolLiveArgumentPreviewMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolRequestPreviewMetadata {
+    /// Plugin-owned generic presentation template.
+    Presentation {
+        /// Preview card title.
+        title: String,
+        /// Optional preview card subtitle.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subtitle: Option<String>,
+        /// Declarative presentation sections.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sections: Vec<ToolPresentationTemplateSection>,
+    },
     /// File edit/write style preview.
     FileEdit {
         /// Candidate path fields.

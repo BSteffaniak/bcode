@@ -1225,6 +1225,15 @@ fn push_live_tool_preview_anchor_rows(
         return;
     };
     match &state.preview {
+        LiveToolArgumentPreview::Presentation(card) => {
+            push_tool_presentation_card_rows(
+                rows,
+                Some(&state.tool_name),
+                card,
+                width,
+                inline_diff_config,
+            );
+        }
         LiveToolArgumentPreview::FileEdit(file) => push_live_file_edit_preview_rows(
             rows,
             &LiveFileEditPreviewRenderContext {

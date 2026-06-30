@@ -11,8 +11,9 @@ use bcode_tool::{
     ToolArtifactPresentationResponse, ToolDefinition, ToolInvocationRequest,
     ToolInvocationResponse, ToolInvocationResult, ToolInvocationStreamEvent, ToolList,
     ToolLiveArgumentPreviewMetadata, ToolPresentationEvent, ToolPresentationField,
-    ToolPresentationFieldKind, ToolPresentationFieldValue, ToolPresentationSection,
-    ToolPresentationTarget, ToolRequestPresentationMetadata, ToolResultContent, ToolSideEffect,
+    ToolPresentationFieldKind, ToolPresentationFieldSelector, ToolPresentationFieldValue,
+    ToolPresentationSection, ToolPresentationTarget, ToolPresentationTemplateSection,
+    ToolRequestPresentationMetadata, ToolResultContent, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -398,6 +399,32 @@ fn path_tool_ui(activity_label: &str, title: &str) -> bcode_tool::ToolUiMetadata
     }
 }
 
+fn field_selector(
+    fields: &[&str],
+    literal: Option<&str>,
+    required: bool,
+) -> ToolPresentationFieldSelector {
+    ToolPresentationFieldSelector {
+        fields: fields.iter().map(|field| (*field).to_string()).collect(),
+        literal: literal.map(str::to_string),
+        required,
+    }
+}
+
+fn diff_preview_sections(
+    path_fields: &[&str],
+    old_text_fields: &[&str],
+    old_text_literal: Option<&str>,
+    old_text_required: bool,
+    new_text_fields: &[&str],
+) -> Vec<ToolPresentationTemplateSection> {
+    vec![ToolPresentationTemplateSection::Diff {
+        path: field_selector(path_fields, None, false),
+        old_text: field_selector(old_text_fields, old_text_literal, old_text_required),
+        new_text: field_selector(new_text_fields, None, true),
+    }]
+}
+
 fn write_tool_ui(
     activity_label: &str,
     title: &str,
@@ -405,12 +432,16 @@ fn write_tool_ui(
 ) -> bcode_tool::ToolUiMetadata {
     bcode_tool::ToolUiMetadata {
         activity_label: Some(activity_label.to_string()),
-        live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::FileEdit {
-            path_fields: vec!["path".to_string()],
-            old_text_fields: Vec::new(),
-            new_text_fields: vec!["contents".to_string(), "new_text".to_string()],
-            old_text_required: false,
-            preview_title: Some(preview_title.to_string()),
+        live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::Presentation {
+            title: preview_title.to_string(),
+            subtitle: Some(format!("{activity_label} {{path}} · {{bytes}}")),
+            sections: diff_preview_sections(
+                &["path"],
+                &[],
+                Some(""),
+                false,
+                &["contents", "new_text"],
+            ),
             streaming_status: Some(format!("{activity_label} {{path}} · {{bytes}}")),
         }),
 
@@ -430,10 +461,16 @@ fn write_tool_ui(
                     optional: false,
                 },
             ],
-            preview: Some(bcode_tool::ToolRequestPreviewMetadata::FileEdit {
-                path_fields: vec!["path".to_string()],
-                old_text_fields: Vec::new(),
-                new_text_fields: vec!["contents".to_string(), "new_text".to_string()],
+            preview: Some(bcode_tool::ToolRequestPreviewMetadata::Presentation {
+                title: preview_title.to_string(),
+                subtitle: None,
+                sections: diff_preview_sections(
+                    &["path"],
+                    &[],
+                    Some(""),
+                    false,
+                    &["contents", "new_text"],
+                ),
             }),
         }),
     }
@@ -446,12 +483,10 @@ fn edit_tool_ui(
 ) -> bcode_tool::ToolUiMetadata {
     bcode_tool::ToolUiMetadata {
         activity_label: Some(activity_label.to_string()),
-        live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::FileEdit {
-            path_fields: vec!["path".to_string()],
-            old_text_fields: vec!["old_text".to_string()],
-            new_text_fields: vec!["new_text".to_string()],
-            old_text_required: true,
-            preview_title: Some(preview_title.to_string()),
+        live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::Presentation {
+            title: preview_title.to_string(),
+            subtitle: Some(format!("{activity_label} {{path}} · {{bytes}}")),
+            sections: diff_preview_sections(&["path"], &["old_text"], None, true, &["new_text"]),
             streaming_status: Some(format!("{activity_label} {{path}} · {{bytes}}")),
         }),
 
@@ -477,10 +512,16 @@ fn edit_tool_ui(
                     optional: false,
                 },
             ],
-            preview: Some(bcode_tool::ToolRequestPreviewMetadata::FileEdit {
-                path_fields: vec!["path".to_string()],
-                old_text_fields: vec!["old_text".to_string()],
-                new_text_fields: vec!["new_text".to_string()],
+            preview: Some(bcode_tool::ToolRequestPreviewMetadata::Presentation {
+                title: preview_title.to_string(),
+                subtitle: None,
+                sections: diff_preview_sections(
+                    &["path"],
+                    &["old_text"],
+                    None,
+                    true,
+                    &["new_text"],
+                ),
             }),
         }),
     }

@@ -64,7 +64,10 @@ pub fn file_edit_from_request_preview(
         path_fields,
         old_text_fields,
         new_text_fields,
-    } = preview;
+    } = preview
+    else {
+        return None;
+    };
     let value = serde_json::from_str::<serde_json::Value>(arguments_json).ok()?;
     let path = first_string_field(&value, path_fields)?;
     let old_text = first_string_field(&value, old_text_fields).unwrap_or_default();

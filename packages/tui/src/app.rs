@@ -3272,6 +3272,16 @@ impl BmuxApp {
         self.ensure_live_tool_preview_anchor(tool_call_id, tool_name);
         let bytes = format_provider_bytes(argument_bytes);
         match preview {
+            LiveToolArgumentPreview::Presentation(card) => {
+                let status = card
+                    .subtitle
+                    .clone()
+                    .unwrap_or_else(|| format!("streaming {tool_name} · {bytes} received"));
+                self.set_activity(ActivityState::ProviderStream {
+                    detail: status.clone(),
+                });
+                self.status = status;
+            }
             LiveToolArgumentPreview::FileEdit(file) => {
                 self.set_file_activity(tool_name);
                 self.status = file.streaming_status.clone().map_or_else(
@@ -3975,6 +3985,7 @@ fn render_live_preview_template(
 
 fn live_preview_primary(preview: &LiveToolArgumentPreview) -> Option<&str> {
     match preview {
+        LiveToolArgumentPreview::Presentation(card) => card.subtitle.as_deref(),
         LiveToolArgumentPreview::FileEdit(file) => file.path.as_deref(),
         LiveToolArgumentPreview::ShellCommand(shell) => Some(shell.command_prefix.as_str()),
         LiveToolArgumentPreview::Query(query) => query.fields.values().next().map(String::as_str),
@@ -4309,6 +4320,7 @@ fn submitted_protocol_state_json(resolution_json: &str) -> Option<String> {
 
 const fn live_tool_preview_truncated(preview: &LiveToolArgumentPreview) -> bool {
     match preview {
+        LiveToolArgumentPreview::Presentation(_) => false,
         LiveToolArgumentPreview::FileEdit(file) => file.truncated,
         LiveToolArgumentPreview::ShellCommand(shell) => shell.truncated,
         LiveToolArgumentPreview::Query(query) => query.truncated,
