@@ -1589,10 +1589,6 @@ pub struct TuiConfig {
     #[config_doc(nested)]
     #[serde(default)]
     pub theme: TuiThemeConfig,
-    /// Inline diff preview rendering configuration.
-    #[config_doc(nested)]
-    #[serde(default)]
-    pub inline_diff: TuiInlineDiffConfig,
 }
 
 /// Duration/easing curve for terminal UI accent color transitions.
@@ -1660,17 +1656,6 @@ pub enum TuiAccentTransitionMode {
     /// Animate accent color changes over the configured duration.
     #[default]
     Transition,
-}
-
-/// Terminal UI inline diff preview rendering configuration.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
-#[config_doc(section = "inline_diff")]
-pub struct TuiInlineDiffConfig {
-    /// Maximum inline diff card width in terminal columns.
-    ///
-    /// When unset, inline diff cards use the available transcript width.
-    #[serde(default)]
-    pub max_width: Option<usize>,
 }
 
 /// Terminal UI mouse interaction configuration.
@@ -4215,7 +4200,6 @@ fn write_tui_toml(output: &mut String, tui: &TuiConfig) {
         write_tui_keybinding_section(output, "session_picker", &tui.keybindings.session_picker);
     }
     write_tui_mouse_toml(output, &tui.mouse);
-    write_tui_inline_diff_toml(output, &tui.inline_diff);
     writeln!(output, "[tui.thinking]").expect("writing to string should not fail");
     writeln!(output, "show = {}", tui.thinking.show).expect("writing to string should not fail");
     writeln!(
@@ -4231,17 +4215,6 @@ const fn tui_thinking_mode_name(mode: TuiThinkingMode) -> &'static str {
         TuiThinkingMode::Summary => "summary",
         TuiThinkingMode::Raw => "raw",
     }
-}
-
-fn write_tui_inline_diff_toml(output: &mut String, inline_diff: &TuiInlineDiffConfig) {
-    if inline_diff == &TuiInlineDiffConfig::default() {
-        return;
-    }
-    writeln!(output, "[tui.inline_diff]").expect("writing to string should not fail");
-    if let Some(max_width) = inline_diff.max_width {
-        writeln!(output, "max_width = {max_width}").expect("writing to string should not fail");
-    }
-    output.push('\n');
 }
 
 fn write_tui_mouse_toml(output: &mut String, mouse: &TuiMouseConfig) {
@@ -5092,6 +5065,7 @@ mod tests {
     use bcode_plugin::PluginSelection;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const TEST_CODE_REVIEW_PLUGIN_ID: &str = "bcode.code_review";
@@ -6730,10 +6704,12 @@ extends = ["a"]
     }
 
     fn unique_temp_dir() -> std::path::PathBuf {
+        static NEXT_TEMP_DIR_ID: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("bcode-config-test-{nanos}"))
+        let id = NEXT_TEMP_DIR_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("bcode-config-test-{nanos}-{id}"))
     }
 }

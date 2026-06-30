@@ -3,38 +3,31 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use bcode_config::TuiInlineDiffConfig;
 use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
 use bcode_session_models::{
-    LiveFileEditPreview, LiveToolArgumentPreview, ToolCardPresentation, ToolPresentationFieldKind,
+    LiveToolArgumentPreview, ToolCardPresentation, ToolPresentationFieldKind,
     ToolPresentationLevel, ToolPresentationSection,
 };
-use bcode_syntax_render::{SyntaxHighlighter, SyntaxStyle};
 use bmux_terminal_grid::{
     Color as GridColor, GridLimits, PhysicalRow, Style as GridStyle, TerminalGrid,
     TerminalGridStream,
 };
 use bmux_tui::ansi::ansi_to_lines;
 use bmux_tui::chrome::{Border, Panel};
-use bmux_tui::diff::{
-    DiffChangedRange, DiffFileList, DiffFileListState, DiffInlineSpan, DiffLine, DiffLineKind,
-    DiffView, DiffViewMode, DiffViewState, DiffViewStyles,
-};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect};
 use bmux_tui::hit::{HitRegion, HitRole};
 use bmux_tui::input::TextInput;
-use bmux_tui::prelude::{Line, Span, StatefulWidget, Style, Widget};
+use bmux_tui::prelude::{Line, Span, Style, Widget};
 use bmux_tui::style::{Color, Modifier};
 use bmux_tui_components::text_input::TextInputControl;
 
 use super::activity::ActivityState;
 use super::app::{BmuxApp, DaemonConnectionState, LiveToolPreviewState, composer_policy};
-use super::diff_extract::FileEditTranscript;
 use super::pending_submission::{PendingSubmission, PendingSubmissionState};
 use super::tool_present::{ToolRequestPresentation, tool_request_presentation};
 use super::transcript::pretty_jsonish;
-use super::transcript::{FileEditPhase, TranscriptItem, TranscriptItemKind};
+use super::transcript::{TranscriptItem, TranscriptItemKind};
 use super::transcript_layout::TranscriptLayoutSignature;
 use crate::time_format::{format_elapsed_millis, format_millis};
 use bmux_tui::text_width::{display_width as text_display_width, truncate_to_display_width};
@@ -42,10 +35,6 @@ use unicode_segmentation::UnicodeSegmentation;
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MAX_COMPOSER_ROWS: u16 = 6;
-const MAX_INLINE_DIFF_ROWS: usize = 28;
-const INLINE_DIFF_CARD_MIN_WIDTH: usize = 48;
-const INLINE_DIFF_CARD_CHROME_WIDTH: usize = 14;
-const INLINE_DIFF_BODY_CHROME_WIDTH: usize = 14;
 const MAX_INLINE_TOOL_TEXT_ROWS: usize = 28;
 const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(420);
 #[derive(Debug, Clone, Copy)]
@@ -137,7 +126,7 @@ pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>, layout: FrameLa
 impl FrameLayout {
     /// Return the transcript area for this prepared frame.
     #[must_use]
-    pub fn transcript_area(self, app: &BmuxApp) -> Rect {
+    pub const fn transcript_area(self, app: &BmuxApp) -> Rect {
         transcript_area_for_body(app, self.body)
     }
 
@@ -483,32 +472,16 @@ fn render_body(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
     }
-    let transcript_area = transcript_area_for_body(app, area);
-    render_transcript(app, transcript_area, frame);
+    render_transcript(app, area, frame);
     frame.push_hit(
-        HitRegion::new("transcript", transcript_area)
+        HitRegion::new("transcript", area)
             .role(HitRole::Scroll)
             .layer(0),
     );
-    let diff_height = area.height.saturating_sub(transcript_area.height);
-    if diff_height > 0 {
-        let diff_area = Rect::new(area.x, transcript_area.bottom(), area.width, diff_height);
-        render_changed_files(app, diff_area, frame);
-    }
 }
 
-pub fn transcript_area_for_body(app: &BmuxApp, area: Rect) -> Rect {
-    let diff_height = if app.changed_files().is_empty() || !app.diff_visible() {
-        0
-    } else {
-        area.height.min(9)
-    };
-    Rect::new(
-        area.x,
-        area.y,
-        area.width,
-        area.height.saturating_sub(diff_height),
-    )
+pub const fn transcript_area_for_body(_app: &BmuxApp, area: Rect) -> Rect {
+    area
 }
 
 fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
@@ -534,72 +507,15 @@ fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     }
 }
 
-fn render_changed_files(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
-    let panel = Panel::new()
-        .border(Border::single().style(Style::new().fg(Color::BrightBlack)))
-        .title(" Changed files / diff preview ")
-        .padding(Insets::new(0, 1, 0, 1));
-    panel.render(area, frame);
-    let inner = panel.inner_area(area);
-    if inner.is_empty() {
-        return;
-    }
-    let split = if app.diff_lines().is_empty() {
-        inner.width
-    } else {
-        inner.width.min(32)
-    };
-    let list_area = Rect::new(inner.x, inner.y, split, inner.height);
-    frame.push_hit(
-        HitRegion::new("diff-files", list_area)
-            .role(HitRole::ListItem)
-            .layer(1),
-    );
-    let mut state = DiffFileListState::new();
-    if !app.changed_files().is_empty() {
-        state.select(Some(0));
-    }
-    DiffFileList::new(app.changed_files()).render(list_area, frame, &mut state);
-    if app.diff_lines().is_empty() || split >= inner.width.saturating_sub(1) {
-        return;
-    }
-    let detail_area = Rect::new(
-        inner.x.saturating_add(split).saturating_add(1),
-        inner.y,
-        inner.width.saturating_sub(split).saturating_sub(1),
-        inner.height,
-    );
-    frame.push_hit(
-        HitRegion::new("diff-detail", detail_area)
-            .role(HitRole::Scroll)
-            .layer(1),
-    );
-    let mut diff_state = DiffViewState {
-        offset: app.diff_scroll_offset(),
-    };
-    DiffView::new(app.diff_lines())
-        .mode(DiffViewMode::Responsive)
-        .styles(diff_view_styles())
-        .fold_context(20, 3)
-        .render(detail_area, frame, &mut diff_state);
-}
-
 pub fn transcript_item_rows(
     transcript: &[TranscriptItem],
     live_tool_previews: &BTreeMap<String, LiveToolPreviewState>,
     index: usize,
     width: u16,
-    inline_diff_config: TuiInlineDiffConfig,
+    _inline_view_config: (),
 ) -> Vec<Line> {
     let mut rows = Vec::new();
-    push_transcript_item_rows(
-        &mut rows,
-        transcript,
-        live_tool_previews,
-        index,
-        width,
-        inline_diff_config,
-    );
+    push_transcript_item_rows(&mut rows, transcript, live_tool_previews, index, width, ());
     rows
 }
 
@@ -637,10 +553,10 @@ pub const fn history_banner_text(
 pub fn transcript_item_signature(
     item: &TranscriptItem,
     width: u16,
-    inline_diff_config: TuiInlineDiffConfig,
+    _inline_view_config: (),
 ) -> TranscriptLayoutSignature {
     TranscriptLayoutSignature::new(format!(
-        "item:{}:{}:{width}:{inline_diff_config:?}:{}:{}:{:?}:{}:{}",
+        "item:{}:{}:{width}::{}:{}:{:?}:{}:{}",
         item.id().get(),
         item.revision(),
         item.role(),
@@ -675,24 +591,6 @@ pub fn pending_submission_signature(
     ))
 }
 
-fn has_file_preview_before(
-    transcript: &[TranscriptItem],
-    index: usize,
-    tool_call_id: &str,
-) -> bool {
-    transcript[..index].iter().rev().any(|item| {
-        let TranscriptItemKind::ToolRequest {
-            tool_call_id: item_tool_call_id,
-            file_edit,
-            ..
-        } = item.kind()
-        else {
-            return false;
-        };
-        item_tool_call_id == tool_call_id && file_edit.is_some()
-    })
-}
-
 #[allow(clippy::too_many_lines)]
 fn push_transcript_item_rows(
     rows: &mut Vec<Line>,
@@ -700,7 +598,7 @@ fn push_transcript_item_rows(
     live_tool_previews: &BTreeMap<String, LiveToolPreviewState>,
     index: usize,
     width: u16,
-    inline_diff_config: TuiInlineDiffConfig,
+    inline_view_config: (),
 ) {
     let item = &transcript[index];
     match item.kind() {
@@ -718,8 +616,6 @@ fn push_transcript_item_rows(
             tool_name,
             arguments_json,
             request_presentation,
-            file_edit,
-            file_edit_phase,
             live_preview,
         } => {
             let context = ToolRequestRenderContext {
@@ -727,10 +623,8 @@ fn push_transcript_item_rows(
                 tool_name,
                 arguments_json,
                 request_presentation: request_presentation.as_ref(),
-                file_edit: file_edit.as_ref(),
-                file_edit_phase: *file_edit_phase,
-                live_preview: *live_preview,
-                inline_diff_config,
+                _live_preview: *live_preview,
+                _inline_view_config: inline_view_config,
             };
             push_tool_request_rows(rows, item, &context, width);
         }
@@ -743,7 +637,7 @@ fn push_transcript_item_rows(
                 tool_name,
                 live_tool_previews.get(tool_call_id),
                 width,
-                inline_diff_config,
+                inline_view_config,
             );
         }
         TranscriptItemKind::ToolResult {
@@ -753,7 +647,6 @@ fn push_transcript_item_rows(
             result,
             is_error,
         } => {
-            let has_file_preview = has_file_preview_before(transcript, index, tool_call_id);
             push_tool_result_rows(
                 rows,
                 item,
@@ -762,7 +655,7 @@ fn push_transcript_item_rows(
                     tool_name: tool_name.as_deref(),
                     result,
                     is_error: *is_error,
-                    has_file_preview,
+                    has_file_preview: false,
                 },
                 width,
             );
@@ -791,7 +684,7 @@ fn push_transcript_item_rows(
                 tool_name.as_deref(),
                 card,
                 width,
-                inline_diff_config,
+                inline_view_config,
             );
         }
         TranscriptItemKind::ToolProtocolPresentation { .. } => {
@@ -883,7 +776,7 @@ fn push_tool_presentation_card_rows(
     tool_name: Option<&str>,
     card: &ToolCardPresentation,
     width: u16,
-    _inline_diff_config: TuiInlineDiffConfig,
+    _inline_view_config: (),
 ) {
     let color = presentation_level_color(card_level(card));
     let heading = tool_name.map_or_else(
@@ -1105,10 +998,8 @@ struct ToolRequestRenderContext<'a> {
     tool_name: &'a str,
     arguments_json: &'a str,
     request_presentation: Option<&'a bcode_session_models::ToolRequestPresentationMetadata>,
-    file_edit: Option<&'a FileEditTranscript>,
-    file_edit_phase: Option<FileEditPhase>,
-    live_preview: bool,
-    inline_diff_config: TuiInlineDiffConfig,
+    _live_preview: bool,
+    _inline_view_config: (),
 }
 
 fn push_tool_request_rows(
@@ -1117,21 +1008,8 @@ fn push_tool_request_rows(
     context: &ToolRequestRenderContext<'_>,
     width: u16,
 ) {
-    let mut title = if context.file_edit.is_some() {
-        format!(
-            "{} · {}",
-            file_tool_action(item.streaming()),
-            context.tool_name
-        )
-    } else {
-        format!("Tool · {}", context.tool_name)
-    };
-    if context.file_edit_phase == Some(FileEditPhase::Failed) {
-        title.push_str(" · failed");
-    }
-    let title_color = if context.file_edit_phase == Some(FileEditPhase::Failed) {
-        Color::Red
-    } else if item.streaming() {
+    let title = format!("Tool · {}", context.tool_name);
+    let title_color = if item.streaming() {
         Color::Cyan
     } else {
         Color::Yellow
@@ -1152,16 +1030,7 @@ fn push_tool_request_rows(
         muted_style(),
         muted_style(),
     );
-    if let Some(edit) = context.file_edit {
-        push_file_edit_preview_rows(
-            rows,
-            &FileEditPreview::Known(edit.clone()),
-            width,
-            context.inline_diff_config,
-            context.file_edit_phase,
-            context.live_preview,
-        );
-    } else if let Some(presentation) =
+    if let Some(presentation) =
         tool_request_presentation(context.arguments_json, context.request_presentation)
     {
         push_tool_request_presentation_rows(rows, &presentation, width);
@@ -1171,20 +1040,13 @@ fn push_tool_request_rows(
     rows.push(Line::default());
 }
 
-const fn file_tool_action(streaming: bool) -> &'static str {
-    if streaming {
-        "File change …"
-    } else {
-        "File change preview"
-    }
-}
-
+#[allow(clippy::too_many_lines)]
 fn push_live_tool_preview_anchor_rows(
     rows: &mut Vec<Line>,
     fallback_tool_name: &str,
     state: Option<&LiveToolPreviewState>,
     width: u16,
-    inline_diff_config: TuiInlineDiffConfig,
+    _inline_view_config: (),
 ) {
     let Some(state) = state else {
         push_wrapped_styled_text(
@@ -1237,20 +1099,48 @@ fn push_live_tool_preview_anchor_rows(
             );
             rows.push(Line::default());
         }
-        LiveToolArgumentPreview::FileEdit(file) => push_live_file_edit_preview_rows(
-            rows,
-            &LiveFileEditPreviewRenderContext {
-                tool_name: &state.tool_name,
-                title: file
-                    .preview_title
+        LiveToolArgumentPreview::FileEdit(file) => {
+            push_wrapped_styled_text(
+                rows,
+                Vec::new(),
+                file.preview_title
                     .as_deref()
                     .unwrap_or("File change preview"),
-                preview: file,
-                argument_bytes: state.argument_bytes,
-                inline_diff_config,
-            },
-            width,
-        ),
+                width,
+                Style::new().fg(Color::Cyan),
+                Style::new().fg(Color::Cyan),
+            );
+            push_kv_row(
+                rows,
+                "received",
+                &format_preview_bytes(state.argument_bytes),
+                width,
+            );
+            if let Some(path) = &file.path {
+                push_kv_row(rows, "path", path, width);
+            }
+            if file.old_text_required && file.old_text_prefix.is_none() {
+                push_wrapped_styled_text(
+                    rows,
+                    vec![Span::styled("  ", muted_style())],
+                    "original text pending; showing available new text",
+                    width,
+                    muted_style(),
+                    muted_style(),
+                );
+            }
+            if file.truncated {
+                push_wrapped_styled_text(
+                    rows,
+                    vec![Span::styled("  ", muted_style())],
+                    "preview truncated by live display limit",
+                    width,
+                    muted_style(),
+                    muted_style(),
+                );
+            }
+            rows.push(Line::default());
+        }
         LiveToolArgumentPreview::ShellCommand(shell) => push_shell_preview_rows(
             rows,
             shell.preview_title.as_deref().unwrap_or("Shell command"),
@@ -1269,171 +1159,6 @@ fn push_live_tool_preview_anchor_rows(
             width,
         ),
     }
-}
-
-struct LiveFileEditPreviewRenderContext<'a> {
-    tool_name: &'a str,
-    title: &'a str,
-    preview: &'a LiveFileEditPreview,
-    argument_bytes: usize,
-    inline_diff_config: TuiInlineDiffConfig,
-}
-
-fn push_live_file_edit_preview_rows(
-    rows: &mut Vec<Line>,
-    context: &LiveFileEditPreviewRenderContext<'_>,
-    width: u16,
-) {
-    push_wrapped_styled_text(
-        rows,
-        Vec::new(),
-        &format!("{} · {}", context.title, context.tool_name),
-        width,
-        Style::new().fg(Color::Cyan),
-        Style::new().fg(Color::Cyan),
-    );
-    push_kv_row(
-        rows,
-        "received",
-        &format_preview_bytes(context.argument_bytes),
-        width,
-    );
-
-    let edit = file_edit_from_live_preview(context.preview);
-    push_file_edit_preview_rows(
-        rows,
-        &edit,
-        width,
-        context.inline_diff_config,
-        Some(FileEditPhase::Pending),
-        true,
-    );
-
-    if context.preview.truncated {
-        push_wrapped_styled_text(
-            rows,
-            vec![Span::styled("  ", muted_style())],
-            "preview truncated by live display limit",
-            width,
-            muted_style(),
-            muted_style(),
-        );
-    }
-    rows.push(Line::default());
-}
-
-fn file_edit_from_live_preview(preview: &LiveFileEditPreview) -> FileEditPreview {
-    let path = preview
-        .path
-        .clone()
-        .unwrap_or_else(|| "<streaming file>".to_owned());
-    if let Some(old_text) = preview.old_text_prefix.clone() {
-        return FileEditPreview::Known(FileEditTranscript::new(
-            path,
-            old_text,
-            preview.new_text_prefix.clone(),
-        ));
-    }
-    if !preview.old_text_required {
-        return FileEditPreview::Known(FileEditTranscript::new(
-            path,
-            String::new(),
-            preview.new_text_prefix.clone(),
-        ));
-    }
-
-    FileEditPreview::Streaming {
-        path,
-        new_text: preview.new_text_prefix.clone(),
-        original_pending: true,
-    }
-}
-
-#[derive(Debug, Clone)]
-enum FileEditPreview {
-    Known(FileEditTranscript),
-    Streaming {
-        path: String,
-        new_text: String,
-        original_pending: bool,
-    },
-}
-
-impl FileEditPreview {
-    fn path(&self) -> &str {
-        match self {
-            Self::Known(edit) => edit.path(),
-            Self::Streaming { path, .. } => path,
-        }
-    }
-
-    fn is_write(&self) -> bool {
-        match self {
-            Self::Known(edit) => edit.old_text_is_empty(),
-            Self::Streaming {
-                original_pending, ..
-            } => !original_pending,
-        }
-    }
-
-    fn summary_counts(&self) -> (u32, u32) {
-        match self {
-            Self::Known(edit) => {
-                let summary = edit.summary();
-                (summary.added, summary.removed)
-            }
-            Self::Streaming { new_text, .. } => (line_count(new_text), 0),
-        }
-    }
-
-    fn diff_lines(&self) -> Vec<DiffLine> {
-        match self {
-            Self::Known(edit) => edit.diff_lines(),
-            Self::Streaming { path, new_text, .. } => provisional_added_diff_lines(path, new_text),
-        }
-    }
-
-    const fn original_pending(&self) -> bool {
-        matches!(
-            self,
-            Self::Streaming {
-                original_pending: true,
-                ..
-            }
-        )
-    }
-}
-
-fn provisional_added_diff_lines(path: &str, new_text: &str) -> Vec<DiffLine> {
-    let mut lines = new_text
-        .lines()
-        .map(|line| DiffLine::new(DiffLineKind::Added, None, None, line.to_owned()))
-        .collect::<Vec<_>>();
-    apply_inline_syntax_highlighting(path, &mut lines);
-    lines
-}
-
-fn apply_inline_syntax_highlighting(path: &str, lines: &mut [DiffLine]) {
-    let highlighter = SyntaxHighlighter::new();
-    if !highlighter.can_highlight(path) {
-        return;
-    }
-    for line in lines.iter_mut().filter(|line| {
-        matches!(
-            line.kind,
-            DiffLineKind::Context | DiffLineKind::Added | DiffLineKind::Removed
-        )
-    }) {
-        line.inline_spans = highlighter
-            .highlight_line(path, &line.content)
-            .into_iter()
-            .map(|span| DiffInlineSpan::new(span.content, span.style))
-            .collect();
-    }
-}
-
-fn line_count(text: &str) -> u32 {
-    u32::try_from(text.lines().count()).unwrap_or(u32::MAX)
 }
 
 fn format_preview_bytes(bytes: usize) -> String {
@@ -1798,715 +1523,6 @@ fn format_presentation_field_value(value: &str, kind: ToolPresentationFieldKind)
 
 fn parse_duration_millis(value: &str) -> Option<u64> {
     value.trim().parse::<u64>().ok()
-}
-
-fn push_file_edit_preview_rows(
-    rows: &mut Vec<Line>,
-    edit: &FileEditPreview,
-    width: u16,
-    inline_diff_config: TuiInlineDiffConfig,
-    phase: Option<FileEditPhase>,
-    live_preview: bool,
-) {
-    let (added, removed) = edit.summary_counts();
-    let phase = phase.unwrap_or(FileEditPhase::Applied);
-    let phase_label = if live_preview {
-        "Streaming preview"
-    } else {
-        phase.label()
-    };
-    let phase_style = file_edit_phase_style(phase);
-    push_wrapped_styled_text(
-        rows,
-        vec![Span::styled("  ", muted_style())],
-        &format!(
-            "{} · {}",
-            phase_label,
-            file_write_mode_label(edit.is_write())
-        ),
-        width,
-        phase_style,
-        muted_style(),
-    );
-    push_wrapped_styled_text(
-        rows,
-        vec![Span::styled("  ", muted_style())],
-        &format!("{}  +{} -{}", edit.path(), added, removed),
-        width,
-        Style::new()
-            .fg(Color::BrightWhite)
-            .add_modifier(Modifier::BOLD),
-        muted_style(),
-    );
-    push_wrapped_styled_text(
-        rows,
-        vec![Span::styled("  ", muted_style())],
-        &edit_change_summary(added, removed),
-        width,
-        muted_style(),
-        muted_style(),
-    );
-
-    if edit.original_pending() {
-        push_wrapped_styled_text(
-            rows,
-            vec![Span::styled("  ", muted_style())],
-            "original text pending; showing available new text",
-            width,
-            muted_style(),
-            muted_style(),
-        );
-    }
-
-    let diff_lines = edit
-        .diff_lines()
-        .into_iter()
-        .filter(|line| {
-            line.kind != DiffLineKind::FileHeader && line.kind != DiffLineKind::HunkHeader
-        })
-        .collect::<Vec<_>>();
-    let total_rows = diff_lines.len();
-    let shown_rows = total_rows.min(MAX_INLINE_DIFF_ROWS);
-    let progress = if total_rows > shown_rows {
-        format!(
-            "live preview · showing {shown_rows} of {total_rows} diff rows · /diff for full view"
-        )
-    } else {
-        "live preview · /diff for full view".to_owned()
-    };
-    push_wrapped_styled_text(
-        rows,
-        vec![Span::styled("  ", muted_style())],
-        &progress,
-        width,
-        muted_style(),
-        muted_style(),
-    );
-
-    let preview = inline_diff_preview(&diff_lines, MAX_INLINE_DIFF_ROWS);
-    let card_width = inline_diff_card_width(&preview, width.saturating_sub(2), inline_diff_config);
-    rows.push(inline_diff_card_border('┌', '─', '┐', card_width));
-    for row in preview {
-        match row {
-            InlineDiffPreviewRow::Line(line) => {
-                rows.extend(render_inline_diff_line(line, card_width, edit.path()));
-            }
-            InlineDiffPreviewRow::Hidden(count) => {
-                rows.push(render_inline_diff_hidden_row(count, card_width));
-            }
-        }
-    }
-    rows.push(inline_diff_card_border('└', '─', '┘', card_width));
-}
-
-const fn file_edit_phase_style(phase: FileEditPhase) -> Style {
-    match phase {
-        FileEditPhase::Pending | FileEditPhase::Applying => Style::new().fg(Color::Cyan),
-        FileEditPhase::WaitingPermission => Style::new().fg(Color::Yellow),
-        FileEditPhase::Applied => Style::new().fg(Color::Green),
-        FileEditPhase::Failed => Style::new().fg(Color::Red),
-    }
-}
-
-const fn file_write_mode_label(old_text_is_empty: bool) -> &'static str {
-    if old_text_is_empty {
-        "Writing file"
-    } else {
-        "Editing file"
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum InlineDiffPreviewRow<'line> {
-    Line(&'line DiffLine),
-    Hidden(usize),
-}
-
-fn inline_diff_preview(lines: &[DiffLine], max_rows: usize) -> Vec<InlineDiffPreviewRow<'_>> {
-    if lines.len() <= max_rows || max_rows < 4 {
-        return lines.iter().map(InlineDiffPreviewRow::Line).collect();
-    }
-    let head = max_rows / 2;
-    let tail = max_rows.saturating_sub(head).saturating_sub(1);
-    let hidden = lines.len().saturating_sub(head).saturating_sub(tail);
-    lines
-        .iter()
-        .take(head)
-        .map(InlineDiffPreviewRow::Line)
-        .chain(std::iter::once(InlineDiffPreviewRow::Hidden(hidden)))
-        .chain(
-            lines
-                .iter()
-                .skip(lines.len().saturating_sub(tail))
-                .map(InlineDiffPreviewRow::Line),
-        )
-        .collect()
-}
-
-fn inline_diff_card_width(
-    preview: &[InlineDiffPreviewRow<'_>],
-    available_width: u16,
-    config: TuiInlineDiffConfig,
-) -> u16 {
-    let available = usize::from(available_width.max(1));
-    let content_width = preview
-        .iter()
-        .map(|row| match row {
-            InlineDiffPreviewRow::Line(line) => inline_diff_line_display_width(line),
-            InlineDiffPreviewRow::Hidden(count) => inline_diff_hidden_text(*count).len(),
-        })
-        .max()
-        .unwrap_or(0);
-    let max_width = config
-        .max_width
-        .filter(|width| *width > 0)
-        .map_or(available, |max_width| max_width.min(available));
-    let width = content_width
-        .saturating_add(INLINE_DIFF_CARD_CHROME_WIDTH)
-        .clamp(INLINE_DIFF_CARD_MIN_WIDTH.min(max_width), max_width);
-    u16::try_from(width).unwrap_or(u16::MAX)
-}
-
-fn inline_diff_line_display_width(line: &DiffLine) -> usize {
-    text_display_width(&line.content)
-}
-
-fn inline_diff_card_border(left: char, fill: char, right: char, width: u16) -> Line {
-    let inner_width = usize::from(width.saturating_sub(2));
-    Line::from_spans(vec![
-        Span::styled("  ", muted_style()),
-        Span::styled(
-            format!("{left}{}{right}", fill.to_string().repeat(inner_width)),
-            muted_style(),
-        ),
-    ])
-}
-
-fn render_inline_diff_hidden_row(count: usize, width: u16) -> Line {
-    let text = inline_diff_hidden_text(count);
-    let inner_width = usize::from(width.saturating_sub(4));
-    let clipped = truncate_to_display_width(&text, inner_width);
-    let clipped_width = text_display_width(&clipped);
-    let mut spans = vec![
-        Span::styled("  ", muted_style()),
-        Span::styled("│ ", muted_style()),
-        Span::styled(clipped, muted_style()),
-    ];
-    let padding = inner_width.saturating_sub(clipped_width);
-    if padding > 0 {
-        spans.push(Span::styled(" ".repeat(padding), muted_style()));
-    }
-    spans.push(Span::styled(" │", muted_style()));
-    Line::from_spans(spans)
-}
-
-fn inline_diff_hidden_text(count: usize) -> String {
-    format!("… {count} diff rows hidden …")
-}
-
-fn render_inline_diff_line(line: &DiffLine, width: u16, syntax_hint: &str) -> Vec<Line> {
-    let (sign, sign_style, body_style) = inline_diff_line_styles(line.kind);
-    let row_style = inline_diff_row_style(line.kind);
-    let emphasis_style = inline_diff_emphasis_style(line.kind);
-    let line_number = inline_diff_line_number(line);
-    let gutter_style = row_style.patch(muted_style());
-    let body_width = inline_diff_body_width(width);
-    let content_rows = wrap_inline_diff_content_spans(
-        inline_diff_content_spans(
-            line,
-            syntax_hint,
-            row_style.patch(body_style),
-            emphasis_style,
-        ),
-        body_width,
-    );
-    let content_rows = if content_rows.is_empty() {
-        vec![Vec::new()]
-    } else {
-        content_rows
-    };
-
-    content_rows
-        .into_iter()
-        .enumerate()
-        .map(|(index, content_spans)| {
-            let mut spans = vec![Span::styled("  ", muted_style())];
-            let mut card_spans = if index == 0 {
-                vec![
-                    Span::styled("│ ", muted_style()),
-                    Span::styled("  ", gutter_style),
-                    Span::styled(
-                        sign,
-                        row_style.patch(sign_style.add_modifier(Modifier::BOLD)),
-                    ),
-                    Span::styled(format!("{line_number:>4}"), gutter_style),
-                    Span::styled(" │ ", gutter_style),
-                ]
-            } else {
-                inline_diff_continuation_prefix(gutter_style)
-            };
-            card_spans.extend(content_spans);
-            pad_inline_diff_spans(
-                &mut card_spans,
-                usize::from(width).saturating_sub(2),
-                row_style,
-            );
-            card_spans.push(Span::styled(" │", muted_style()));
-            spans.extend(card_spans);
-            Line::from_spans(spans)
-        })
-        .collect()
-}
-
-fn inline_diff_continuation_prefix(gutter_style: Style) -> Vec<Span> {
-    vec![
-        Span::styled("│ ", muted_style()),
-        Span::styled("  ", gutter_style),
-        Span::styled(" ", gutter_style),
-        Span::styled("    ", gutter_style),
-        Span::styled(" │ ", gutter_style),
-    ]
-}
-
-const fn inline_diff_body_width(width: u16) -> usize {
-    (width as usize).saturating_sub(INLINE_DIFF_BODY_CHROME_WIDTH)
-}
-
-fn inline_diff_content_spans(
-    line: &DiffLine,
-    syntax_hint: &str,
-    body_style: Style,
-    emphasis_style: Style,
-) -> Vec<Span> {
-    let source_spans = if line.inline_spans.is_empty() {
-        syntax_inline_spans(syntax_hint, &line.content)
-    } else {
-        line.inline_spans.clone()
-    };
-    let mut spans = Vec::new();
-    let mut offset = 0usize;
-    for span in source_spans {
-        let span_start = offset;
-        let span_end = span_start.saturating_add(span.content.len());
-        for segment in inline_diff_span_segments(&span, span_start, span_end, &line.changed_ranges)
-        {
-            spans.push(Span::styled(
-                segment.content.to_owned(),
-                inline_diff_content_style(
-                    body_style,
-                    segment.style,
-                    if segment.emphasized {
-                        emphasis_style
-                    } else {
-                        Style::new()
-                    },
-                ),
-            ));
-        }
-        offset = span_end;
-    }
-    spans
-}
-
-const fn syntax_style_to_tui_style(style: SyntaxStyle) -> Style {
-    let mut output = Style::new().fg(Color::Rgb(
-        style.foreground_r,
-        style.foreground_g,
-        style.foreground_b,
-    ));
-    if style.bold {
-        output = output.add_modifier(Modifier::BOLD);
-    }
-    if style.italic {
-        output = output.add_modifier(Modifier::ITALIC);
-    }
-    if style.underline {
-        output = output.add_modifier(Modifier::UNDERLINE);
-    }
-    output
-}
-
-fn wrap_inline_diff_content_spans(spans: Vec<Span>, width: usize) -> Vec<Vec<Span>> {
-    let width = width.max(1);
-    let mut rows: Vec<Vec<Span>> = Vec::new();
-    let mut current = Vec::new();
-    let mut current_width = 0usize;
-    for span in spans {
-        for grapheme in span.content.graphemes(true) {
-            let grapheme_width = text_display_width(grapheme);
-            if current_width > 0 && current_width.saturating_add(grapheme_width) > width {
-                rows.push(current);
-                current = Vec::new();
-                current_width = 0;
-            }
-            current.push(Span::styled(grapheme.to_owned(), span.style));
-            current_width = current_width.saturating_add(grapheme_width);
-        }
-    }
-    rows.push(current);
-    rows
-}
-
-#[derive(Debug, Clone, Copy)]
-struct InlineDiffSpanSegment<'content> {
-    content: &'content str,
-    style: Style,
-    emphasized: bool,
-}
-
-fn syntax_inline_spans(syntax_hint: &str, content: &str) -> Vec<DiffInlineSpan> {
-    if syntax_hint.is_empty() || !SyntaxHighlighter::new().can_highlight(syntax_hint) {
-        return vec![DiffInlineSpan::new(content.to_owned(), Style::new())];
-    }
-    SyntaxHighlighter::new()
-        .highlight_line_tokens(syntax_hint, content)
-        .into_iter()
-        .map(|span| DiffInlineSpan::new(span.content, syntax_style_to_tui_style(span.style)))
-        .collect()
-}
-
-fn inline_diff_span_segments<'span>(
-    span: &'span DiffInlineSpan,
-    span_start: usize,
-    span_end: usize,
-    changed_ranges: &[DiffChangedRange],
-) -> Vec<InlineDiffSpanSegment<'span>> {
-    let mut segments = Vec::new();
-    let mut local_start = 0usize;
-    for range in changed_ranges
-        .iter()
-        .copied()
-        .filter(|range| range.start < span_end && range.end > span_start)
-    {
-        let overlap_start = range.start.max(span_start).saturating_sub(span_start);
-        let overlap_end = range.end.min(span_end).saturating_sub(span_start);
-        if overlap_start > span.content.len()
-            || overlap_end > span.content.len()
-            || !span.content.is_char_boundary(overlap_start)
-            || !span.content.is_char_boundary(overlap_end)
-        {
-            continue;
-        }
-        if local_start < overlap_start {
-            segments.push(InlineDiffSpanSegment {
-                content: &span.content[local_start..overlap_start],
-                style: span.style,
-                emphasized: false,
-            });
-        }
-        segments.push(InlineDiffSpanSegment {
-            content: &span.content[overlap_start..overlap_end],
-            style: span.style,
-            emphasized: true,
-        });
-        local_start = overlap_end;
-    }
-    if local_start < span.content.len() {
-        segments.push(InlineDiffSpanSegment {
-            content: &span.content[local_start..],
-            style: span.style,
-            emphasized: false,
-        });
-    }
-    segments
-}
-
-const fn inline_diff_content_style(
-    body_style: Style,
-    span_style: Style,
-    emphasis_style: Style,
-) -> Style {
-    body_style.patch(span_style).patch(emphasis_style)
-}
-
-fn pad_inline_diff_spans(spans: &mut Vec<Span>, width: usize, style: Style) {
-    let current_width = spans
-        .iter()
-        .map(|span| text_display_width(&span.content))
-        .sum::<usize>();
-    if current_width < width {
-        spans.push(Span::styled(
-            " ".repeat(width.saturating_sub(current_width)),
-            style,
-        ));
-    }
-}
-
-const fn inline_diff_row_style(kind: DiffLineKind) -> Style {
-    match kind {
-        DiffLineKind::Added => Style::new().bg(Color::Rgb(0, 24, 16)),
-        DiffLineKind::Removed => Style::new().bg(Color::Rgb(32, 10, 10)),
-        DiffLineKind::Context | DiffLineKind::FileHeader | DiffLineKind::HunkHeader => Style::new(),
-    }
-}
-
-const fn inline_diff_emphasis_style(kind: DiffLineKind) -> Style {
-    match kind {
-        DiffLineKind::Added => Style::new().bg(Color::Rgb(0, 42, 26)),
-        DiffLineKind::Removed => Style::new().bg(Color::Rgb(50, 14, 14)),
-        DiffLineKind::Context | DiffLineKind::FileHeader | DiffLineKind::HunkHeader => Style::new(),
-    }
-}
-
-const fn inline_diff_line_styles(kind: DiffLineKind) -> (&'static str, Style, Style) {
-    match kind {
-        DiffLineKind::Added => (
-            "+",
-            Style::new().fg(Color::BrightGreen),
-            Style::new().fg(Color::BrightGreen),
-        ),
-        DiffLineKind::Removed => (
-            "-",
-            Style::new().fg(Color::BrightRed),
-            Style::new().fg(Color::BrightRed),
-        ),
-        DiffLineKind::HunkHeader => (
-            "·",
-            Style::new().fg(Color::BrightCyan),
-            Style::new().fg(Color::BrightCyan),
-        ),
-        DiffLineKind::Context | DiffLineKind::FileHeader => (" ", muted_style(), Style::new()),
-    }
-}
-
-fn inline_diff_line_number(line: &DiffLine) -> String {
-    line.new_line
-        .or(line.old_line)
-        .map_or_else(String::new, |line| line.to_string())
-}
-
-fn edit_change_summary(added: u32, removed: u32) -> String {
-    match (added, removed) {
-        (0, 0) => "no textual changes detected".to_owned(),
-        (added, 0) => format!("added {}", line_count_label(added)),
-        (0, removed) => format!("removed {}", line_count_label(removed)),
-        (added, removed) => {
-            format!(
-                "replaced {} with {}",
-                line_count_label(removed),
-                line_count_label(added)
-            )
-        }
-    }
-}
-
-fn line_count_label(count: u32) -> String {
-    if count == 1 {
-        "1 line".to_owned()
-    } else {
-        format!("{count} lines")
-    }
-}
-
-const fn diff_view_styles() -> DiffViewStyles {
-    DiffViewStyles {
-        file_header: Style::new().fg(Color::BrightBlack),
-        hunk_header: Style::new().fg(Color::BrightCyan),
-        context: Style::new(),
-        added: Style::new().fg(Color::BrightGreen),
-        removed: Style::new().fg(Color::BrightRed),
-        added_row: Style::new().bg(Color::Indexed(22)),
-        removed_row: Style::new().bg(Color::Indexed(52)),
-        added_emphasis: Style::new().bg(Color::Indexed(28)),
-        removed_emphasis: Style::new().bg(Color::Indexed(88)),
-        gutter: Style::new().fg(Color::BrightBlack),
-    }
-}
-
-struct TerminalOutputTranscript {
-    exit_code: Option<i32>,
-    timed_out: Option<bool>,
-    elapsed: Option<String>,
-    output: String,
-    output_truncated: bool,
-    output_bytes: Option<u64>,
-    retained_output_bytes: Option<u64>,
-    columns: u16,
-    rows: u16,
-}
-
-fn push_terminal_output_rows(rows: &mut Vec<Line>, output: &TerminalOutputTranscript, width: u16) {
-    let status = terminal_status(output);
-    push_wrapped_styled_text(
-        rows,
-        vec![Span::styled("  ", muted_style())],
-        &status,
-        width,
-        terminal_status_style(output),
-        muted_style(),
-    );
-    if output.output_truncated {
-        push_wrapped_styled_text(
-            rows,
-            vec![Span::styled("  ", muted_style())],
-            &terminal_truncation_status(output),
-            width,
-            muted_style(),
-            muted_style(),
-        );
-    }
-    for line in terminal_output_lines(output) {
-        rows.push(prefix_line(line, "    ", muted_style()));
-    }
-}
-
-fn terminal_truncation_status(output: &TerminalOutputTranscript) -> String {
-    match (output.retained_output_bytes, output.output_bytes) {
-        (Some(retained), Some(original)) => {
-            format!("output truncated · showing {retained} of {original} bytes")
-        }
-        _ => "output truncated".to_owned(),
-    }
-}
-
-fn terminal_output_lines(output: &TerminalOutputTranscript) -> Vec<Line> {
-    let Ok(mut stream) = TerminalGridStream::new(
-        output.columns.max(1),
-        output.rows.max(1),
-        GridLimits {
-            scrollback_rows: MAX_INLINE_TOOL_TEXT_ROWS.saturating_mul(8),
-        },
-    ) else {
-        return ansi_to_lines(&output.output);
-    };
-    stream.process(output.output.as_bytes());
-    let grid = stream.grid();
-    let rows = grid.main_content_tail_rows(MAX_INLINE_TOOL_TEXT_ROWS);
-    let lines = rows
-        .iter()
-        .map(|row| terminal_grid_row_to_line(grid, row))
-        .collect::<Vec<_>>();
-    preview_lines(&lines, MAX_INLINE_TOOL_TEXT_ROWS)
-        .into_iter()
-        .cloned()
-        .collect()
-}
-
-fn terminal_grid_row_to_line(grid: &TerminalGrid, row: &PhysicalRow) -> Line {
-    let mut spans = Vec::new();
-    let mut current_style = None;
-    let mut current_text = String::new();
-    for cell in row.cells() {
-        if cell.is_wide_continuation() {
-            continue;
-        }
-        let style = terminal_grid_style(grid.palette().get(cell.style()));
-        if current_style == Some(style) {
-            current_text.push_str(cell.text());
-            continue;
-        }
-        if !current_text.is_empty() {
-            spans.push(Span::styled(
-                current_text,
-                current_style.unwrap_or_default(),
-            ));
-            current_text = String::new();
-        }
-        current_style = Some(style);
-        current_text.push_str(cell.text());
-    }
-    if !current_text.is_empty() {
-        spans.push(Span::styled(
-            current_text,
-            current_style.unwrap_or_default(),
-        ));
-    }
-    Line::from_spans(spans)
-}
-
-fn terminal_grid_style(style: GridStyle) -> Style {
-    let mut output = Style::new();
-    if let Some(fg) = style.fg {
-        output = output.fg(terminal_grid_color(fg));
-    }
-    if let Some(bg) = style.bg {
-        output = output.bg(terminal_grid_color(bg));
-    }
-    let mut modifier = Modifier::EMPTY;
-    if style.bold {
-        modifier |= Modifier::BOLD;
-    }
-    if style.italic {
-        modifier |= Modifier::ITALIC;
-    }
-    if style.underline {
-        modifier |= Modifier::UNDERLINE;
-    }
-    if style.dim {
-        modifier |= Modifier::DIM;
-    }
-    if style.inverse {
-        modifier |= Modifier::REVERSED;
-    }
-    if style.strike {
-        modifier |= Modifier::CROSSED_OUT;
-    }
-    output.add_modifier(modifier)
-}
-
-const fn terminal_grid_color(color: GridColor) -> Color {
-    match color {
-        GridColor::Indexed(index) => ansi_indexed_color(index),
-        GridColor::Rgb { r, g, b } => Color::Rgb(r, g, b),
-    }
-}
-
-const fn ansi_indexed_color(index: u8) -> Color {
-    match index {
-        0 => Color::Black,
-        1 => Color::Red,
-        2 => Color::Green,
-        3 => Color::Yellow,
-        4 => Color::Blue,
-        5 => Color::Magenta,
-        6 => Color::Cyan,
-        7 => Color::White,
-        8 => Color::BrightBlack,
-        9 => Color::BrightRed,
-        10 => Color::BrightGreen,
-        11 => Color::BrightYellow,
-        12 => Color::BrightBlue,
-        13 => Color::BrightMagenta,
-        14 => Color::BrightCyan,
-        15 => Color::BrightWhite,
-        other => Color::Indexed(other),
-    }
-}
-
-fn terminal_status(output: &TerminalOutputTranscript) -> String {
-    let timing_label = if output.timed_out.is_some() {
-        "duration"
-    } else {
-        "elapsed"
-    };
-    let timing = output
-        .elapsed
-        .as_ref()
-        .map(|elapsed| format!(" · {timing_label} {elapsed}"))
-        .unwrap_or_default();
-    let Some(timed_out) = output.timed_out else {
-        return format!("running{timing}");
-    };
-    if timed_out {
-        return format!("timed out{timing}");
-    }
-    let exit_code = output
-        .exit_code
-        .map_or_else(|| "signal".to_owned(), |code| format!("exit {code}"));
-    format!("{exit_code}{timing}")
-}
-
-fn terminal_status_style(output: &TerminalOutputTranscript) -> Style {
-    if output
-        .timed_out
-        .is_some_and(|timed_out| timed_out || output.exit_code.is_some_and(|code| code != 0))
-    {
-        Style::new().fg(Color::Red)
-    } else if output.timed_out.is_none() {
-        Style::new().fg(Color::Cyan)
-    } else {
-        Style::new().fg(Color::Green)
-    }
 }
 
 fn push_labeled_text_preview(
@@ -3081,4 +2097,199 @@ fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: 
 
 const fn muted_style() -> Style {
     Style::new().fg(Color::BrightBlack)
+}
+struct TerminalOutputTranscript {
+    exit_code: Option<i32>,
+    timed_out: Option<bool>,
+    elapsed: Option<String>,
+    output: String,
+    output_truncated: bool,
+    output_bytes: Option<u64>,
+    retained_output_bytes: Option<u64>,
+    columns: u16,
+    rows: u16,
+}
+
+fn push_terminal_output_rows(rows: &mut Vec<Line>, output: &TerminalOutputTranscript, width: u16) {
+    let status = terminal_status(output);
+    push_wrapped_styled_text(
+        rows,
+        vec![Span::styled("  ", muted_style())],
+        &status,
+        width,
+        terminal_status_style(output),
+        muted_style(),
+    );
+    if output.output_truncated {
+        push_wrapped_styled_text(
+            rows,
+            vec![Span::styled("  ", muted_style())],
+            &terminal_truncation_status(output),
+            width,
+            muted_style(),
+            muted_style(),
+        );
+    }
+    for line in terminal_output_lines(output) {
+        rows.push(prefix_line(line, "    ", muted_style()));
+    }
+}
+
+fn terminal_truncation_status(output: &TerminalOutputTranscript) -> String {
+    match (output.retained_output_bytes, output.output_bytes) {
+        (Some(retained), Some(original)) => {
+            format!("output truncated · showing {retained} of {original} bytes")
+        }
+        _ => "output truncated".to_owned(),
+    }
+}
+
+fn terminal_output_lines(output: &TerminalOutputTranscript) -> Vec<Line> {
+    let Ok(mut stream) = TerminalGridStream::new(
+        output.columns.max(1),
+        output.rows.max(1),
+        GridLimits {
+            scrollback_rows: MAX_INLINE_TOOL_TEXT_ROWS.saturating_mul(8),
+        },
+    ) else {
+        return ansi_to_lines(&output.output);
+    };
+    stream.process(output.output.as_bytes());
+    let grid = stream.grid();
+    let rows = grid.main_content_tail_rows(MAX_INLINE_TOOL_TEXT_ROWS);
+    let lines = rows
+        .iter()
+        .map(|row| terminal_grid_row_to_line(grid, row))
+        .collect::<Vec<_>>();
+    preview_lines(&lines, MAX_INLINE_TOOL_TEXT_ROWS)
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
+fn terminal_grid_row_to_line(grid: &TerminalGrid, row: &PhysicalRow) -> Line {
+    let mut spans = Vec::new();
+    let mut current_style = None;
+    let mut current_text = String::new();
+    for cell in row.cells() {
+        if cell.is_wide_continuation() {
+            continue;
+        }
+        let style = terminal_grid_style(grid.palette().get(cell.style()));
+        if current_style == Some(style) {
+            current_text.push_str(cell.text());
+            continue;
+        }
+        if !current_text.is_empty() {
+            spans.push(Span::styled(
+                current_text,
+                current_style.unwrap_or_default(),
+            ));
+            current_text = String::new();
+        }
+        current_style = Some(style);
+        current_text.push_str(cell.text());
+    }
+    if !current_text.is_empty() {
+        spans.push(Span::styled(
+            current_text,
+            current_style.unwrap_or_default(),
+        ));
+    }
+    Line::from_spans(spans)
+}
+
+fn terminal_grid_style(style: GridStyle) -> Style {
+    let mut output = Style::new();
+    if let Some(fg) = style.fg {
+        output = output.fg(terminal_grid_color(fg));
+    }
+    if let Some(bg) = style.bg {
+        output = output.bg(terminal_grid_color(bg));
+    }
+    let mut modifier = Modifier::EMPTY;
+    if style.bold {
+        modifier |= Modifier::BOLD;
+    }
+    if style.italic {
+        modifier |= Modifier::ITALIC;
+    }
+    if style.underline {
+        modifier |= Modifier::UNDERLINE;
+    }
+    if style.dim {
+        modifier |= Modifier::DIM;
+    }
+    if style.inverse {
+        modifier |= Modifier::REVERSED;
+    }
+    if style.strike {
+        modifier |= Modifier::CROSSED_OUT;
+    }
+    output.add_modifier(modifier)
+}
+
+const fn terminal_grid_color(color: GridColor) -> Color {
+    match color {
+        GridColor::Indexed(index) => ansi_indexed_color(index),
+        GridColor::Rgb { r, g, b } => Color::Rgb(r, g, b),
+    }
+}
+
+const fn ansi_indexed_color(index: u8) -> Color {
+    match index {
+        0 => Color::Black,
+        1 => Color::Red,
+        2 => Color::Green,
+        3 => Color::Yellow,
+        4 => Color::Blue,
+        5 => Color::Magenta,
+        6 => Color::Cyan,
+        7 => Color::White,
+        8 => Color::BrightBlack,
+        9 => Color::BrightRed,
+        10 => Color::BrightGreen,
+        11 => Color::BrightYellow,
+        12 => Color::BrightBlue,
+        13 => Color::BrightMagenta,
+        14 => Color::BrightCyan,
+        15 => Color::BrightWhite,
+        other => Color::Indexed(other),
+    }
+}
+
+fn terminal_status(output: &TerminalOutputTranscript) -> String {
+    let timing_label = if output.timed_out.is_some() {
+        "duration"
+    } else {
+        "elapsed"
+    };
+    let timing = output
+        .elapsed
+        .as_ref()
+        .map(|elapsed| format!(" · {timing_label} {elapsed}"))
+        .unwrap_or_default();
+    let Some(timed_out) = output.timed_out else {
+        return format!("running{timing}");
+    };
+    if timed_out {
+        return format!("timed out{timing}");
+    }
+    let exit_code = output
+        .exit_code
+        .map_or_else(|| "signal".to_owned(), |code| format!("exit {code}"));
+    format!("{exit_code}{timing}")
+}
+
+fn terminal_status_style(output: &TerminalOutputTranscript) -> Style {
+    if output
+        .timed_out
+        .is_some_and(|timed_out| timed_out || output.exit_code.is_some_and(|code| code != 0))
+    {
+        Style::new().fg(Color::Red)
+    } else if output.timed_out.is_none() {
+        Style::new().fg(Color::Cyan)
+    } else {
+        Style::new().fg(Color::Green)
+    }
 }

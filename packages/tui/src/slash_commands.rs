@@ -97,8 +97,6 @@ pub enum SlashCommandOutcome {
     },
     /// Open reasoning output settings dialog.
     OpenThinkingSettings(super::thinking_dialog::ThinkingDialogFocus),
-    /// Toggle diff panel.
-    ToggleDiff,
     /// Set local reasoning output display.
     SetThinkingDisplay(bool),
     /// Toggle local reasoning output display.
@@ -696,7 +694,6 @@ async fn execute_builtin(
                 status.compaction_mode.as_deref().unwrap_or("unknown")
             )))
         }
-        "diff" => Ok(SlashCommandOutcome::ToggleDiff),
         "cwd" => {
             let Some(session_id) = session_id else {
                 return Ok(SlashCommandOutcome::Handled(

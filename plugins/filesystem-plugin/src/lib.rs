@@ -7,13 +7,14 @@
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ImageMetadata, ImageRefContent, ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS,
-    OP_PRESENT_ARTIFACT, TOOL_SERVICE_INTERFACE_ID, ToolArtifact, ToolArtifactPresentationRequest,
-    ToolArtifactPresentationResponse, ToolDefinition, ToolInvocationRequest,
-    ToolInvocationResponse, ToolInvocationResult, ToolInvocationStreamEvent, ToolList,
-    ToolLiveArgumentPreviewMetadata, ToolPluginViewMetadata, ToolPresentationEvent,
+    OP_PRESENT_ARTIFACT, OP_PRESENT_VIEW, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
+    ToolArtifactPresentationRequest, ToolArtifactPresentationResponse, ToolDefinition,
+    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolInvocationStreamEvent,
+    ToolList, ToolLiveArgumentPreviewMetadata, ToolPluginViewMetadata, ToolPresentationEvent,
     ToolPresentationField, ToolPresentationFieldKind, ToolPresentationFieldValue,
     ToolPresentationPayloadSelector, ToolPresentationSection, ToolPresentationTarget,
     ToolRequestPresentationMetadata, ToolResultContent, ToolSideEffect,
+    ToolViewPresentationRequest, ToolViewPresentationResponse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -317,6 +318,7 @@ fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
         OP_LIST_TOOLS => list_tools(request),
         OP_INVOKE_TOOL => invoke_tool(context),
         OP_PRESENT_ARTIFACT => present_artifact(request),
+        OP_PRESENT_VIEW => present_view(request),
         _ => ServiceResponse::error(
             "unsupported_operation",
             "unsupported tool service operation",
@@ -1281,6 +1283,67 @@ fn present_artifact(request: &ServiceRequest) -> ServiceResponse {
         )),
         state: request.state,
     })
+}
+
+fn present_view(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<ToolViewPresentationRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    if request.view.schema != "bcode.filesystem.file_change" || request.view.schema_version != 1 {
+        return json_response(&ToolViewPresentationResponse::default());
+    }
+    let path = request
+        .view
+        .payload
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<path>");
+    let old_text = request
+        .view
+        .payload
+        .get("old_text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let new_text = request
+        .view
+        .payload
+        .get("new_text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let output = file_change_text(path, old_text, new_text);
+    json_response(&ToolViewPresentationResponse {
+        presentation: Some(ToolPresentationEvent::Card(
+            bcode_tool::ToolCardPresentation {
+                target: request.view.target,
+                title: request
+                    .view
+                    .title
+                    .unwrap_or_else(|| "File change".to_string()),
+                subtitle: request.view.subtitle,
+                sections: vec![ToolPresentationSection::Text {
+                    label: Some(path.to_string()),
+                    text: output,
+                }],
+            },
+        )),
+        state: request.state,
+    })
+}
+
+fn file_change_text(path: &str, old_text: &str, new_text: &str) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "--- {path}");
+    let _ = writeln!(output, "+++ {path}");
+    if !old_text.is_empty() {
+        for line in old_text.lines() {
+            let _ = writeln!(output, "-{line}");
+        }
+    }
+    for line in new_text.lines() {
+        let _ = writeln!(output, "+{line}");
+    }
+    output
 }
 
 fn tool_write(

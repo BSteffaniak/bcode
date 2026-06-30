@@ -14,13 +14,24 @@ interface_id = "bcode.tool/v1"
 name         = "Filesystem Tools"
 
 [[visual_adapters]]
-artifact_schema      = "bcode.filesystem.change"
 id                   = "filesystem-change-card"
 max_schema_version   = 1
 min_schema_version   = 1
 operation            = "present_artifact"
 priority             = 100
 producer_default     = true
+schema               = "bcode.filesystem.change"
+service_interface_id = "bcode.tool/v1"
+surfaces             = ["tui", "web", "generic-component"]
+
+[[visual_adapters]]
+id                   = "filesystem-file-change-view"
+max_schema_version   = 1
+min_schema_version   = 1
+operation            = "present_view"
+priority             = 100
+producer_default     = true
+schema               = "bcode.filesystem.file_change"
 service_interface_id = "bcode.tool/v1"
 surfaces             = ["tui", "web", "generic-component"]
 

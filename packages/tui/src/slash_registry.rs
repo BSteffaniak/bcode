@@ -107,10 +107,6 @@ const BUILTIN_COMMANDS: &[BuiltinSlashCommand] = &[
         draft_safe: false,
     },
     BuiltinSlashCommand {
-        name: "diff",
-        draft_safe: true,
-    },
-    BuiltinSlashCommand {
         name: "cwd",
         draft_safe: false,
     },
@@ -236,10 +232,6 @@ const STATIC_COMPLETIONS: &[SlashCompletion] = &[
     SlashCompletion {
         command: "/thinking summary",
         description: "Open reasoning settings focused on summary",
-    },
-    SlashCompletion {
-        command: "/diff",
-        description: "Toggle diff panel",
     },
     SlashCompletion {
         command: "/fork",

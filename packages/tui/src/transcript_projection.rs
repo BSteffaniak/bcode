@@ -1,6 +1,5 @@
 //! Transcript layout projection preparation.
 
-use bcode_config::TuiInlineDiffConfig;
 use bmux_tui::geometry::Rect;
 
 use super::app::{BmuxApp, LiveToolPreviewState};
@@ -75,7 +74,7 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
                 input.live_tool_previews,
                 index,
                 input.width,
-                input.inline_diff_config,
+                (),
             )
         },
         pending_signature: |index| {
@@ -103,7 +102,6 @@ struct TranscriptLayoutInput<'a> {
     pending_submissions_projection_revision: u64,
     has_older_history: bool,
     loading_older_history: bool,
-    inline_diff_config: TuiInlineDiffConfig,
 }
 
 impl<'a> TranscriptLayoutInput<'a> {
@@ -117,7 +115,6 @@ impl<'a> TranscriptLayoutInput<'a> {
             pending_submissions_projection_revision: app.pending_submissions_projection_revision(),
             has_older_history: app.has_older_history(),
             loading_older_history: app.loading_older_history(),
-            inline_diff_config: app.inline_diff_config(),
         }
     }
 
@@ -152,9 +149,8 @@ impl<'a> TranscriptLayoutInput<'a> {
             .collect::<Vec<_>>()
             .join(",");
         TranscriptLayoutFingerprint::new(format!(
-            "width:{};diff:{:?};history:{}:{};transcript-rev:{};transcript:{};pending-rev:{};pending:{}",
+            "width:{};history:{}:{};transcript-rev:{};transcript:{};pending-rev:{};pending:{}",
             self.width,
-            self.inline_diff_config,
             self.has_older_history,
             self.loading_older_history,
             self.transcript_projection_revision,
@@ -169,7 +165,7 @@ fn transcript_item_signature(
     item: &TranscriptItem,
     input: &TranscriptLayoutInput<'_>,
 ) -> TranscriptLayoutSignature {
-    let base = render::transcript_item_signature(item, input.width, input.inline_diff_config);
+    let base = render::transcript_item_signature(item, input.width, ());
     let live_preview_revision = match item.kind() {
         super::transcript::TranscriptItemKind::LiveToolPreviewAnchor { tool_call_id, .. } => input
             .live_tool_previews

@@ -35,7 +35,7 @@ bcode_worktree_models = { workspace = true }
 bmux_keyboard = { workspace = true }
 bmux_terminal_grid = { workspace = true }
 bmux_text_edit = { workspace = true }
-bmux_tui = { workspace = true, features = ["crossterm", "diff"] }
+bmux_tui = { workspace = true, features = ["crossterm"] }
 bmux_tui_component_protocol = { workspace = true, features = ["serde"] }
 bmux_tui_components = { workspace = true, features = [
     "protocol",

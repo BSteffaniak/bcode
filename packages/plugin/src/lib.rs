@@ -105,7 +105,8 @@ fn default_tool_service_interface_id() -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginVisualAdapterDeclaration {
     pub id: String,
-    pub artifact_schema: String,
+    #[serde(default, alias = "artifact_schema")]
+    pub schema: String,
     #[serde(default)]
     pub min_schema_version: Option<u32>,
     #[serde(default)]
@@ -126,7 +127,7 @@ impl PluginVisualAdapterDeclaration {
     /// Return whether this adapter can present the artifact schema/version on the requested surface.
     #[must_use]
     pub fn supports(&self, schema: &str, schema_version: u32, surface: &str) -> bool {
-        self.artifact_schema == schema
+        self.schema == schema
             && self
                 .min_schema_version
                 .is_none_or(|minimum| schema_version >= minimum)
@@ -1894,7 +1895,7 @@ impl PluginRegistry {
 pub struct PluginVisualAdapterRoute {
     pub plugin_id: String,
     pub adapter_id: String,
-    pub artifact_schema: String,
+    pub schema: String,
     pub service_interface_id: String,
     pub operation: String,
     pub surfaces: Vec<String>,
@@ -1937,7 +1938,7 @@ where
         .map(|(plugin_id, adapter, _)| PluginVisualAdapterRoute {
             plugin_id: plugin_id.clone(),
             adapter_id: adapter.id.clone(),
-            artifact_schema: adapter.artifact_schema.clone(),
+            schema: adapter.schema.clone(),
             service_interface_id: adapter.service_interface_id.clone(),
             operation: adapter.operation.clone(),
             surfaces: adapter.surfaces.clone(),
@@ -2903,6 +2904,36 @@ impl PluginHost {
             return Ok(None);
         };
         self.invoke_service_json::<_, bcode_tool::ToolArtifactPresentationResponse>(
+            &route.plugin_id,
+            route.service_interface_id,
+            route.operation,
+            request,
+        )
+        .map(Some)
+    }
+
+    /// Present an opaque plugin-owned view through the highest-priority compatible visual adapter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected visual adapter cannot be invoked or its response cannot be
+    /// decoded.
+    pub fn present_view(
+        &self,
+        request: &bcode_tool::ToolViewPresentationRequest,
+    ) -> Result<Option<bcode_tool::ToolViewPresentationResponse>, PluginServiceCallError> {
+        let Some(route) = select_visual_adapter(
+            self.loaded
+                .iter()
+                .map(|plugin| (&plugin.manifest.id, &plugin.manifest)),
+            &request.view.schema,
+            request.view.schema_version,
+            &request.surface,
+            Some(&request.view.producer_plugin_id),
+        ) else {
+            return Ok(None);
+        };
+        self.invoke_service_json::<_, bcode_tool::ToolViewPresentationResponse>(
             &route.plugin_id,
             route.service_interface_id,
             route.operation,

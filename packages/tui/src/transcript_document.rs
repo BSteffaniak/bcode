@@ -45,12 +45,6 @@ impl TranscriptDocument {
         self.items.get_mut(index)
     }
 
-    /// Return a mutable iterator over items and bump the collection revision.
-    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, TranscriptItem> {
-        self.bump_revision();
-        self.items.iter_mut()
-    }
-
     /// Return the last item mutably and bump the collection revision if it exists.
     pub fn last_mut(&mut self) -> Option<&mut TranscriptItem> {
         self.bump_revision();

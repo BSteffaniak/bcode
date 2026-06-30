@@ -14,8 +14,6 @@ pub(crate) mod command_palette_render;
 pub(crate) mod composer_flow;
 pub(crate) mod cursor_blink;
 pub(crate) mod daemon_issue;
-pub(crate) mod diff_extract;
-pub(crate) mod diff_panel;
 pub(crate) mod effects;
 pub(crate) mod exit_state;
 pub(crate) mod filtered_list;

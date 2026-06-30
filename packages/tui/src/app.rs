@@ -4,9 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use bcode_config::{
-    TuiAccentTransitionCurve, TuiConfig, TuiInlineDiffConfig, TuiThemeConfig, TuiThinkingConfig,
-};
+use bcode_config::{TuiAccentTransitionCurve, TuiConfig, TuiThemeConfig, TuiThinkingConfig};
 use bcode_session_models::{
     LiveToolArgumentPreview, ModelTurnOutcome, ProviderStreamEvent, RuntimeWorkStatus,
     SessionEvent, SessionEventKind, SessionHistoryCursor, SessionId, SessionInputHistoryEntry,
@@ -27,7 +25,6 @@ pub struct LiveToolPreviewState {
 }
 use bcode_skill_models::SkillSource;
 use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
-use bmux_tui::diff::{DiffFileSummary, DiffLine};
 use bmux_tui::event::MouseEvent;
 use bmux_tui::geometry::Rect;
 use bmux_tui::style::Color;
@@ -37,7 +34,6 @@ use bmux_tui_components::text_input::{
 
 use super::activity::{ActivityState, model_turn_outcome_label};
 use super::cursor_blink::CursorBlink;
-use super::diff_panel::DiffPanel;
 use super::exit_state::ExitState;
 use super::input_history::{InputHistory, InputHistoryOutcome};
 use super::invalidation::{InvalidationKey, InvalidationRequest, UiInvalidation};
@@ -50,7 +46,7 @@ use super::temporal::next_elapsed_invalidation_capped;
 use super::theme::{PresentedTheme, ResolvedTheme};
 use super::timeline_dialog::TimelineEntry;
 use super::transcript::{
-    FileEditPhase, TranscriptItem, TranscriptItemKind, interactive_tool_request_item,
+    TranscriptItem, TranscriptItemKind, interactive_tool_request_item,
     interactive_tool_resolution_item, live_tool_preview_anchor_item, model_usage_item,
     permission_request_item, permission_result_item, streaming_terminal_output_item,
     streaming_tool_output_item, tool_presentation_card_from_event, tool_presentation_card_item,
@@ -288,7 +284,6 @@ pub struct BmuxApp {
     live_preview_duplicates_skipped: u64,
     live_preview_truncated_snapshots: u64,
     runtime_work: RuntimeWorkViewState,
-    diff_panel: DiffPanel,
     pending_submissions: PendingSubmissions,
     transcript_layout: TranscriptLayoutCache,
     viewport: TranscriptViewport,
@@ -490,7 +485,6 @@ impl BmuxApp {
             live_preview_duplicates_skipped: 0,
             live_preview_truncated_snapshots: 0,
             runtime_work: RuntimeWorkViewState::default(),
-            diff_panel: DiffPanel::new(),
             pending_submissions: PendingSubmissions::default(),
             transcript_layout: TranscriptLayoutCache::default(),
             viewport: TranscriptViewport::default(),
@@ -634,12 +628,6 @@ impl BmuxApp {
     #[must_use]
     pub const fn tui_config(&self) -> &TuiConfig {
         &self.tui_config
-    }
-
-    /// Return inline diff preview rendering configuration.
-    #[must_use]
-    pub const fn inline_diff_config(&self) -> TuiInlineDiffConfig {
-        self.tui_config.inline_diff
     }
 
     /// Return the currently selected provider plugin id, if explicit.
@@ -888,60 +876,6 @@ impl BmuxApp {
     #[must_use]
     pub const fn live_tool_previews(&self) -> &BTreeMap<String, LiveToolPreviewState> {
         &self.live_tool_previews
-    }
-
-    /// Return changed-file summaries inferred from edit tool calls.
-    #[must_use]
-    pub fn changed_files(&self) -> &[DiffFileSummary] {
-        self.diff_panel.changed_files()
-    }
-
-    /// Return whether the diff panel is visible.
-    #[must_use]
-    pub fn diff_visible(&self) -> bool {
-        self.diff_panel.visible()
-    }
-
-    /// Toggle diff panel visibility.
-    pub const fn toggle_diff_visible(&mut self) -> bool {
-        self.diff_panel.toggle_visible()
-    }
-
-    /// Return detailed diff lines inferred from edit tool calls.
-    #[must_use]
-    pub fn diff_lines(&self) -> &[DiffLine] {
-        self.diff_panel.lines()
-    }
-
-    /// Return diff scroll offset.
-    #[must_use]
-    pub const fn diff_scroll_offset(&self) -> usize {
-        self.diff_panel.scroll_offset()
-    }
-
-    /// Scroll diff preview up.
-    pub fn scroll_diff_up(&mut self, rows: usize) -> bool {
-        self.diff_panel.scroll_up(rows)
-    }
-
-    /// Scroll diff preview down.
-    pub const fn scroll_diff_down(&mut self, rows: usize) -> bool {
-        self.diff_panel.scroll_down(rows)
-    }
-
-    /// Select a changed-file diff detail.
-    pub const fn select_diff_file(&mut self, index: usize) -> bool {
-        self.diff_panel.select_file(index)
-    }
-
-    /// Select next changed file.
-    pub fn select_next_diff_file(&mut self) -> bool {
-        self.diff_panel.select_next_file()
-    }
-
-    /// Select previous changed file.
-    pub fn select_previous_diff_file(&mut self) -> bool {
-        self.diff_panel.select_previous_file()
     }
 
     /// Extend composer selection with an editor motion.
@@ -2787,11 +2721,6 @@ impl BmuxApp {
                     "finished".clone_into(&mut self.status);
                 }
             }
-            if is_error {
-                self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Failed);
-            } else {
-                self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Applied);
-            }
             self.finish_tool_request_preview(tool_call_id);
             return;
         }
@@ -2808,17 +2737,12 @@ impl BmuxApp {
             if application.live_activity() {
                 "failed".clone_into(&mut self.status);
             }
-            self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Failed);
         } else if let Some(status) = Self::tool_call_file_status(tool_call_id) {
-            self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Applied);
             if application.live_activity() {
                 self.status = format!("applied · {status}");
             }
-        } else {
-            self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Applied);
-            if application.live_activity() {
-                "finished".clone_into(&mut self.status);
-            }
+        } else if application.live_activity() {
+            "finished".clone_into(&mut self.status);
         }
         self.finish_tool_request_preview(tool_call_id);
     }
@@ -2866,7 +2790,6 @@ impl BmuxApp {
                 if application.live_activity() {
                     self.set_activity_for_tool_call(tool_call_id, tool_name);
                 }
-                self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Applying);
                 if application.live_activity() {
                     if let Some(status) = Self::tool_call_file_status(tool_call_id) {
                         self.status = status;
@@ -2901,17 +2824,12 @@ impl BmuxApp {
                     if application.live_activity() {
                         "failed".clone_into(&mut self.status);
                     }
-                    self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Failed);
                 } else if let Some(status) = Self::tool_call_file_status(tool_call_id) {
-                    self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Applied);
                     if application.live_activity() {
                         self.status = format!("applied · {status}");
                     }
-                } else {
-                    self.set_tool_request_file_phase(tool_call_id, FileEditPhase::Applied);
-                    if application.live_activity() {
-                        "finished".clone_into(&mut self.status);
-                    }
+                } else if application.live_activity() {
+                    "finished".clone_into(&mut self.status);
                 }
             }
         }
@@ -2950,6 +2868,12 @@ impl BmuxApp {
                 self.upsert_tool_presentation_card(tool_call_id, card.clone());
             }
             ToolPresentationEvent::PluginView(view) => {
+                if let Some(item) =
+                    present_view_item_for_app(self.plugin_host.as_deref(), tool_call_id, None, view)
+                {
+                    self.upsert_tool_presentation_item(tool_call_id, item);
+                    return;
+                }
                 let payload = serde_json::to_string_pretty(&view.payload)
                     .unwrap_or_else(|_| view.payload.to_string());
                 let card = bcode_session_models::ToolCardPresentation {
@@ -2997,6 +2921,17 @@ impl BmuxApp {
             self.transcript
                 .push(tool_presentation_card_item(tool_call_id, tool_name, card));
         }
+    }
+
+    fn upsert_tool_presentation_item(&mut self, tool_call_id: &str, item: TranscriptItem) {
+        self.transcript.retain(|existing| {
+            !(existing.is_generic_tool_fallback_for(tool_call_id)
+                || existing.is_tool_presentation_card_for(
+                    tool_call_id,
+                    bcode_session_models::ToolPresentationTarget::Preview,
+                ))
+        });
+        self.transcript.push(item);
     }
 
     fn clear_tool_presentation_card(
@@ -3172,7 +3107,6 @@ impl BmuxApp {
                 name: input.tool_name.to_owned(),
             });
         }
-        self.set_tool_request_file_phase(input.tool_call_id, FileEditPhase::WaitingPermission);
         if input.application.live_activity() {
             self.status = Self::tool_call_file_status(input.tool_call_id).map_or_else(
                 || {
@@ -3191,7 +3125,6 @@ impl BmuxApp {
             "permission denied"
         };
         if !approved && let Some(tool_call_id) = self.permission_tool_call_id(permission_id) {
-            self.set_tool_request_file_phase(&tool_call_id, FileEditPhase::Failed);
             self.finish_tool_request_preview(&tool_call_id);
         }
         status.clone_into(&mut self.status);
@@ -3216,14 +3149,6 @@ impl BmuxApp {
 
     const fn tool_call_file_status(_tool_call_id: &str) -> Option<String> {
         None
-    }
-
-    fn set_tool_request_file_phase(&mut self, tool_call_id: &str, phase: FileEditPhase) {
-        for item in self.transcript.iter_mut().rev() {
-            if item.set_file_edit_phase(tool_call_id, phase) {
-                break;
-            }
-        }
     }
 
     fn record_live_preview_state(
@@ -4095,9 +4020,7 @@ fn tool_presentation_item_from_plugin(
     presentation: bcode_tool::ToolPresentationEvent,
 ) -> Option<TranscriptItem> {
     match presentation {
-        bcode_tool::ToolPresentationEvent::Card(card)
-            if card.target == bcode_tool::ToolPresentationTarget::Result =>
-        {
+        bcode_tool::ToolPresentationEvent::Card(card) => {
             let card = bcode_session_models::ToolCardPresentation {
                 target: presentation_target_to_session(card.target),
                 title: card.title,
@@ -4114,25 +4037,21 @@ fn tool_presentation_item_from_plugin(
                 card,
             ))
         }
-        bcode_tool::ToolPresentationEvent::Protocol(protocol)
-            if protocol.target == bcode_tool::ToolPresentationTarget::Result =>
-        {
-            Some(TranscriptItem::with_kind(
-                "Tool",
-                "protocol presentation".to_owned(),
-                false,
-                TranscriptItemKind::ToolProtocolPresentation {
-                    tool_call_id: tool_call_id.to_owned(),
-                    tool_name: Some(tool_name.to_owned()),
-                    surface_kind: protocol.surface_kind,
-                    tree_json: serde_json::to_string(&protocol.tree).ok()?,
-                    state_json: protocol
-                        .state
-                        .as_ref()
-                        .and_then(|state| serde_json::to_string(state).ok()),
-                },
-            ))
-        }
+        bcode_tool::ToolPresentationEvent::Protocol(protocol) => Some(TranscriptItem::with_kind(
+            "Tool",
+            "protocol presentation".to_owned(),
+            false,
+            TranscriptItemKind::ToolProtocolPresentation {
+                tool_call_id: tool_call_id.to_owned(),
+                tool_name: Some(tool_name.to_owned()),
+                surface_kind: protocol.surface_kind,
+                tree_json: serde_json::to_string(&protocol.tree).ok()?,
+                state_json: protocol
+                    .state
+                    .as_ref()
+                    .and_then(|state| serde_json::to_string(state).ok()),
+            },
+        )),
         _ => None,
     }
 }
@@ -4221,6 +4140,38 @@ const fn presentation_field_kind_to_session(
     }
 }
 
+fn present_view_item_for_app(
+    runtime: Option<&bcode_plugin::PluginHost>,
+    tool_call_id: &str,
+    tool_name: Option<&str>,
+    view: &bcode_session_models::ToolPluginViewPresentation,
+) -> Option<TranscriptItem> {
+    let runtime = runtime?;
+    let request = bcode_tool::ToolViewPresentationRequest {
+        view: bcode_tool::ToolPluginViewPresentation {
+            target: presentation_target_to_service(view.target),
+            producer_plugin_id: view.producer_plugin_id.clone(),
+            schema: view.schema.clone(),
+            schema_version: view.schema_version,
+            title: view.title.clone(),
+            subtitle: view.subtitle.clone(),
+            payload: view.payload.clone(),
+        },
+        surface: "tui".to_string(),
+        viewport: None,
+        capabilities: None,
+        state: None,
+    };
+    let response = runtime.present_view(&request).ok()??;
+    response.presentation.and_then(|presentation| {
+        tool_presentation_item_from_plugin(
+            tool_call_id,
+            tool_name.unwrap_or(&view.producer_plugin_id),
+            presentation,
+        )
+    })
+}
+
 fn present_artifact_item_for_app(
     runtime: Option<&bcode_plugin::PluginHost>,
     tool_call_id: &str,
@@ -4243,6 +4194,22 @@ fn present_artifact_item_for_app(
             presentation,
         )
     })
+}
+
+const fn presentation_target_to_service(
+    target: bcode_session_models::ToolPresentationTarget,
+) -> bcode_tool::ToolPresentationTarget {
+    match target {
+        bcode_session_models::ToolPresentationTarget::Activity => {
+            bcode_tool::ToolPresentationTarget::Activity
+        }
+        bcode_session_models::ToolPresentationTarget::Preview => {
+            bcode_tool::ToolPresentationTarget::Preview
+        }
+        bcode_session_models::ToolPresentationTarget::Result => {
+            bcode_tool::ToolPresentationTarget::Result
+        }
+    }
 }
 
 fn tool_artifact_to_service(

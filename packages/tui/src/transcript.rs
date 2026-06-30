@@ -8,37 +8,6 @@ use bcode_session_models::{
     ToolRequestPresentationMetadata,
 };
 
-use super::diff_extract::FileEditTranscript;
-
-/// Lifecycle phase for a file edit/write preview.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileEditPhase {
-    /// Tool request has been observed but not started.
-    Pending,
-    /// Tool is waiting for user permission.
-    WaitingPermission,
-    /// Tool is actively applying the change.
-    Applying,
-    /// Tool finished successfully.
-    Applied,
-    /// Tool failed or permission was denied.
-    Failed,
-}
-
-impl FileEditPhase {
-    /// Return user-facing phase text.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Pending => "Ready to apply",
-            Self::WaitingPermission => "Waiting for permission",
-            Self::Applying => "Applying",
-            Self::Applied => "Applied",
-            Self::Failed => "Failed",
-        }
-    }
-}
-
 /// Semantic transcript item type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptItemKind {
@@ -58,10 +27,6 @@ pub enum TranscriptItemKind {
         arguments_json: String,
         /// Declarative plugin-owned request presentation metadata.
         request_presentation: Option<ToolRequestPresentationMetadata>,
-        /// Optional semantic file edit extracted from filesystem tools.
-        file_edit: Option<FileEditTranscript>,
-        /// Lifecycle phase for file edit/write previews.
-        file_edit_phase: Option<FileEditPhase>,
         /// Whether this item was derived from live-only partial tool arguments.
         live_preview: bool,
     },
@@ -390,26 +355,6 @@ impl TranscriptItem {
         self.bump_revision();
     }
 
-    /// Set file-edit phase for a tool request item.
-    pub fn set_file_edit_phase(&mut self, tool_call_id: &str, phase: FileEditPhase) -> bool {
-        let TranscriptItemKind::ToolRequest {
-            tool_call_id: item_tool_call_id,
-            file_edit_phase,
-            ..
-        } = &mut self.kind
-        else {
-            return false;
-        };
-        if item_tool_call_id != tool_call_id {
-            return false;
-        }
-        if file_edit_phase.is_some() {
-            *file_edit_phase = Some(phase);
-            self.bump_revision();
-        }
-        true
-    }
-
     /// Replace a generic tool presentation card.
     pub fn set_tool_presentation_card(&mut self, card: ToolCardPresentation) {
         if let TranscriptItemKind::ToolPresentationCard {
@@ -577,8 +522,6 @@ pub fn tool_request_item(
             tool_name: tool_name.to_owned(),
             arguments_json: arguments_json.to_owned(),
             request_presentation,
-            file_edit: None,
-            file_edit_phase: None,
             live_preview: false,
         },
     )

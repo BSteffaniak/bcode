@@ -288,9 +288,8 @@ fn transcript_document_mutations_bump_revision() {
     item.append_text("!");
     assert_eq!(document.revision(), 3);
 
-    for item in document.iter_mut() {
-        item.finish_streaming();
-    }
+    let item = document.get_mut(0).expect("item exists");
+    item.finish_streaming();
     assert_eq!(document.revision(), 4);
 }
 
@@ -1939,7 +1938,7 @@ fn denied_file_permission_marks_preview_failed() {
 }
 
 #[test]
-fn transcript_renders_filesystem_edit_request_without_core_inline_diff_preview() {
+fn transcript_renders_filesystem_edit_request_without_core_inline_preview() {
     let session_id = SessionId::new();
     let history = [event(
         session_id,
@@ -4787,14 +4786,8 @@ fn live_file_preview_updates_without_duplicates_and_final_replaces_it() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
     assert_eq!(output.matches("File change preview").count(), 1, "{output}");
-    assert!(
-        output.contains("Streaming preview · Writing file"),
-        "{output}"
-    );
-    assert!(output.contains("src/main.rs  +3 -0"), "{output}");
-    assert!(output.contains("┌"), "{output}");
-    assert!(output.contains("+   2"), "{output}");
-    assert!(output.contains("println!(\"hi\");"), "{output}");
+    assert!(output.contains("received:"), "{output}");
+    assert!(output.contains("path: src/main.rs"), "{output}");
     assert!(!output.contains("Ready to apply"), "{output}");
 
     app.absorb_session_event(&event(
@@ -4849,16 +4842,12 @@ fn live_file_preview_renders_available_new_text_before_original_text() {
     let output = rendered_text(&buffer);
 
     assert!(!output.contains("waiting for original text"), "{output}");
-    assert!(
-        output.contains("Streaming preview · Editing file"),
-        "{output}"
-    );
-    assert!(output.contains("src/lib.rs  +3 -0"), "{output}");
+    assert!(output.contains("File change preview"), "{output}");
+    assert!(output.contains("path: src/lib.rs"), "{output}");
     assert!(
         output.contains("original text pending; showing available new text"),
         "{output}"
     );
-    assert!(output.contains("println!(\"hi\");"), "{output}");
     assert!(!output.contains("+   2"), "{output}");
 }
 
@@ -4898,7 +4887,7 @@ fn live_file_preview_renders_truncation_note_and_received_bytes() {
 }
 
 #[test]
-fn live_file_preview_uses_syntax_highlighted_inline_diff_renderer() {
+fn live_file_preview_uses_plugin_owned_renderer() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
     app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
@@ -4925,18 +4914,7 @@ fn live_file_preview_uses_syntax_highlighted_inline_diff_renderer() {
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
-    let row = output_line_y(&buffer, "pub fn demo").unwrap();
-
-    assert!(
-        output.contains("Streaming preview · Writing file"),
-        "{output}"
-    );
-    assert!(output.contains("src/lib.rs  +3 -0"), "{output}");
-    assert!(
-        (0..buffer.area().width).any(|column| buffer
-            .get(Point::new(column, row))
-            .and_then(|cell| cell.style.fg)
-            .is_some_and(|color| !matches!(color, bmux_tui::style::Color::Green))),
-        "expected syntax-colored spans on live file preview row:\n{output}"
-    );
+    assert!(output.contains("File change preview"), "{output}");
+    assert!(output.contains("path: src/lib.rs"), "{output}");
+    assert!(!output.contains("pub fn demo"), "{output}");
 }

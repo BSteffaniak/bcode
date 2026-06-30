@@ -11,7 +11,6 @@ fn palette_flow_does_not_dispatch_migrated_plugin_commands_by_id() {
         "model.select",
         "skills.list",
         "skills.active",
-        "diff.toggle",
         "bcode.worktree",
         "bcode.model",
         "bcode.skills",

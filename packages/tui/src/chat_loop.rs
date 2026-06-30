@@ -7,7 +7,7 @@ use bcode_client::{BcodeClient, ClientError, DaemonAvailability};
 use bcode_config::TuiConfig;
 use bcode_ipc::{ComposerDraftScope, Event as BcodeEvent};
 use bcode_session_models::SessionEventKind;
-use bmux_keyboard::{KeyCode, KeyStroke};
+use bmux_keyboard::KeyStroke;
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
@@ -1770,14 +1770,6 @@ async fn handle_chat_key<W: Write>(
         } {
             apply_composer_modal_request(loop_state, dialog);
         }
-        return Ok(true);
-    }
-    let changed = match stroke.key {
-        KeyCode::Char(']') if stroke.modifiers.is_empty() => chat.app.select_next_diff_file(),
-        KeyCode::Char('[') if stroke.modifiers.is_empty() => chat.app.select_previous_diff_file(),
-        _ => false,
-    };
-    if changed {
         return Ok(true);
     }
     if loop_state.permission_dialog.is_some() {

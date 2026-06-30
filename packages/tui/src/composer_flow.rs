@@ -322,15 +322,6 @@ async fn handle_slash_command<W: Write>(
             chat.app.clear_pending_submission(message);
             ralph_flow::show_prompt(chat, kind)?;
         }
-        slash_commands::SlashCommandOutcome::ToggleDiff => {
-            chat.app.clear_pending_submission(message);
-            let _changed = chat.app.toggle_diff_visible();
-            chat.app.set_status(if chat.app.diff_visible() {
-                "diff panel shown".to_owned()
-            } else {
-                "diff panel hidden".to_owned()
-            });
-        }
     }
     Ok(None)
 }

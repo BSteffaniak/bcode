@@ -305,17 +305,8 @@ fn apply_plugin_surface_outcome(chat: &mut ActiveChat, outcome: Option<serde_jso
 }
 
 fn toggle_surface(chat: &mut ActiveChat, surface_id: &str) {
-    if surface_id == "diff" {
-        let _changed = chat.app.toggle_diff_visible();
-        chat.app.set_status(if chat.app.diff_visible() {
-            "surface shown".to_owned()
-        } else {
-            "surface hidden".to_owned()
-        });
-    } else {
-        chat.app
-            .set_status(format!("surface toggle requested: {surface_id}"));
-    }
+    chat.app
+        .set_status(format!("surface toggle requested: {surface_id}"));
 }
 
 async fn dispatch_host_palette_route<W: Write>(
