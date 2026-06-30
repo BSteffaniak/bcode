@@ -2967,6 +2967,14 @@ impl BmuxApp {
             .tool_call_contexts
             .get(tool_call_id)
             .map(|context| context.tool_name.as_str());
+        self.transcript.retain(|item| {
+            !(item.is_generic_tool_fallback_for(tool_call_id)
+                || card.target == bcode_session_models::ToolPresentationTarget::Result
+                    && item.is_tool_presentation_card_for(
+                        tool_call_id,
+                        bcode_session_models::ToolPresentationTarget::Preview,
+                    ))
+        });
         let updated = self.transcript.mutate_rev_find(
             |item| item.is_tool_presentation_card_for(tool_call_id, card.target),
             |item| item.set_tool_presentation_card(card.clone()),

@@ -3910,6 +3910,153 @@ fn presentation_events_replay_as_generic_transcript_cards() {
 }
 
 #[test]
+fn presentation_card_replaces_generic_tool_request_fallback() {
+    let session_id = SessionId::new();
+    let events = vec![
+        event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-present".to_owned(),
+                tool_name: "third.party".to_owned(),
+                arguments_json: serde_json::json!({"raw": "arguments"}).to_string(),
+                request_presentation: None,
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Presentation {
+                    tool_call_id: "call-present".to_owned(),
+                    sequence: 1,
+                    presentation: ToolPresentationEvent::Card(
+                        bcode_session_models::ToolCardPresentation {
+                            target: ToolPresentationTarget::Preview,
+                            title: "Plugin preview".to_owned(),
+                            subtitle: None,
+                            sections: vec![ToolPresentationSection::Text {
+                                label: None,
+                                text: "plugin-owned preview".to_owned(),
+                            }],
+                        },
+                    ),
+                },
+            },
+        ),
+    ];
+
+    let transcript = transcript_items_from_events_with_reasoning(&events, true);
+
+    assert!(transcript.iter().any(|item| matches!(
+        item.kind(),
+        TranscriptItemKind::ToolPresentationCard { card, .. }
+            if card.title == "Plugin preview"
+    )));
+    assert!(
+        !transcript
+            .iter()
+            .any(|item| matches!(item.kind(), TranscriptItemKind::ToolRequest { .. }))
+    );
+    assert!(
+        !transcript
+            .iter()
+            .any(|item| item.text().contains("arguments"))
+    );
+}
+
+#[test]
+fn result_presentation_replaces_preview_card_and_generic_tool_request() {
+    let session_id = SessionId::new();
+    let events = vec![
+        event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-present".to_owned(),
+                tool_name: "third.party".to_owned(),
+                arguments_json: serde_json::json!({"raw": "arguments"}).to_string(),
+                request_presentation: None,
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Presentation {
+                    tool_call_id: "call-present".to_owned(),
+                    sequence: 1,
+                    presentation: ToolPresentationEvent::Card(
+                        bcode_session_models::ToolCardPresentation {
+                            target: ToolPresentationTarget::Preview,
+                            title: "Plugin preview".to_owned(),
+                            subtitle: None,
+                            sections: Vec::new(),
+                        },
+                    ),
+                },
+            },
+        ),
+        event(
+            session_id,
+            3,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Presentation {
+                    tool_call_id: "call-present".to_owned(),
+                    sequence: 2,
+                    presentation: ToolPresentationEvent::Card(
+                        bcode_session_models::ToolCardPresentation {
+                            target: ToolPresentationTarget::Result,
+                            title: "Plugin result".to_owned(),
+                            subtitle: None,
+                            sections: vec![ToolPresentationSection::Text {
+                                label: None,
+                                text: "plugin-owned result".to_owned(),
+                            }],
+                        },
+                    ),
+                },
+            },
+        ),
+        event(
+            session_id,
+            4,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "call-present".to_owned(),
+                result: "legacy raw output".to_owned(),
+                is_error: false,
+                output: None,
+                semantic_result: None,
+            },
+        ),
+    ];
+
+    let transcript = transcript_items_from_events_with_reasoning(&events, true);
+
+    assert_eq!(
+        transcript
+            .iter()
+            .filter(|item| matches!(item.kind(), TranscriptItemKind::ToolPresentationCard { .. }))
+            .count(),
+        1
+    );
+    assert!(transcript.iter().any(|item| matches!(
+        item.kind(),
+        TranscriptItemKind::ToolPresentationCard { card, .. }
+            if card.title == "Plugin result"
+    )));
+    assert!(!transcript.iter().any(|item| matches!(
+        item.kind(),
+        TranscriptItemKind::ToolRequest { .. } | TranscriptItemKind::ToolResult { .. }
+    )));
+    assert!(
+        !transcript
+            .iter()
+            .any(|item| item.text().contains("legacy raw output"))
+    );
+}
+
+#[test]
 fn presentation_clear_removes_replayed_transcript_card() {
     let session_id = SessionId::new();
     let events = vec![

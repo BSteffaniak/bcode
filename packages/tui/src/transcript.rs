@@ -440,6 +440,24 @@ impl TranscriptItem {
         )
     }
 
+    /// Return whether this item is a generic request/result fallback for `tool_call_id`.
+    #[must_use]
+    pub fn is_generic_tool_fallback_for(&self, tool_call_id: &str) -> bool {
+        matches!(
+            &self.kind,
+            TranscriptItemKind::ToolRequest {
+                tool_call_id: item_tool_call_id,
+                ..
+            } | TranscriptItemKind::LiveToolPreviewAnchor {
+                tool_call_id: item_tool_call_id,
+                ..
+            } | TranscriptItemKind::ToolResult {
+                tool_call_id: item_tool_call_id,
+                ..
+            } if item_tool_call_id == tool_call_id
+        )
+    }
+
     /// Return whether this item is a live preview anchor for `tool_call_id`.
     #[must_use]
     pub fn is_live_preview_anchor_for(&self, tool_call_id: &str) -> bool {
@@ -1366,6 +1384,14 @@ fn apply_tool_presentation_replay_event(
                 let tool_name = tool_calls
                     .get(tool_call_id)
                     .map(|context| context.tool_name.as_str());
+                items.retain(|item| {
+                    !(item.is_generic_tool_fallback_for(tool_call_id)
+                        || card.target == ToolPresentationTarget::Result
+                            && item.is_tool_presentation_card_for(
+                                tool_call_id,
+                                ToolPresentationTarget::Preview,
+                            ))
+                });
                 if let Some(existing) = items
                     .iter_mut()
                     .rev()
