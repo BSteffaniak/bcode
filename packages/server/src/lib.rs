@@ -11237,10 +11237,17 @@ async fn handle_provider_metadata_event(
         session_id,
         turn_id,
         "provider_metadata",
-        Some(key.clone()),
+        Some(provider_metadata_trace_detail(&key, &value)),
     )
     .await;
     update_provider_metadata_state(state, session_id, &key, value).await;
+}
+
+fn provider_metadata_trace_detail(key: &str, value: &str) -> String {
+    if key.starts_with("diagnostic.") {
+        return format!("{key}={value}");
+    }
+    key.to_string()
 }
 
 async fn publish_provider_stream_progress_live(

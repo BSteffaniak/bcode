@@ -27,6 +27,7 @@ httpdate = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 sshenv_vault = { workspace = true }
 tokio = { workspace = true, features = [
     "io-util",

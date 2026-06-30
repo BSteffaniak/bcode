@@ -30,6 +30,7 @@ use bcode_plugin_sdk::prelude::*;
 use reqwest::Client;
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -450,6 +451,58 @@ impl AuthSettings {
     const fn is_configured(&self) -> bool {
         !matches!(self, Self::Missing)
     }
+}
+
+fn auth_trace_metadata(settings: &Settings, context: &ProviderRequestContext) -> String {
+    let auth = context.auth.as_ref();
+    serde_json::json!({
+        "auth_source": settings.auth_diagnostics.source,
+        "auth_mode": settings.auth_diagnostics.mode,
+        "auth_detail": settings.auth_diagnostics.detail,
+        "auth_configured": settings.auth.is_configured(),
+        "auth_credential_fingerprint": auth_credential_fingerprint(&settings.auth),
+        "context_auth_profile": auth.and_then(|auth| auth.profile.as_deref()),
+        "context_auth_backend": auth.and_then(|auth| auth.backend.as_deref()),
+        "context_auth_scheme": auth.and_then(|auth| auth.scheme.as_deref()),
+        "context_auth_provider": auth.and_then(|auth| auth.attributes.get("provider").map(String::as_str)),
+        "context_auth_credential_sources": context_auth_credential_sources(auth),
+        "base_url": settings.base_url,
+        "dialect": settings.dialect.metadata_value(),
+    })
+    .to_string()
+}
+
+fn context_auth_credential_sources(auth: Option<&bcode_model::ProviderAuthContext>) -> Vec<String> {
+    auth.map_or_else(Vec::new, |auth| {
+        auth.credentials
+            .iter()
+            .map(|(name, credential)| {
+                credential
+                    .source
+                    .as_ref()
+                    .map_or_else(|| name.clone(), |source| format!("{name}:{source}"))
+            })
+            .collect()
+    })
+}
+
+fn auth_credential_fingerprint(auth: &AuthSettings) -> Option<String> {
+    let secret = match auth {
+        AuthSettings::ApiKey(api_key) => api_key.as_str(),
+        AuthSettings::ChatGpt { access_token, .. } => access_token.as_str(),
+        AuthSettings::Missing => return None,
+    };
+    Some(sha256_prefix(secret.as_bytes(), 12))
+}
+
+fn sha256_prefix(bytes: &[u8], len: usize) -> String {
+    let hash = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(hash.len() * 2);
+    for byte in hash {
+        use std::fmt::Write as _;
+        write!(encoded, "{byte:02x}").expect("writing to string should not fail");
+    }
+    encoded.chars().take(len).collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -1394,6 +1447,10 @@ async fn stream_chat_completion_inner(
 ) -> Result<StreamOutcome, ProviderError> {
     let mut settings = settings_for_context(&request.provider_context);
     refresh_chatgpt_auth_if_needed(&mut settings).await?;
+    turn.push(ProviderTurnEvent::ProviderMetadata {
+        key: "diagnostic.auth".to_string(),
+        value: auth_trace_metadata(&settings, &request.provider_context),
+    });
     if matches!(settings.auth, AuthSettings::Missing) {
         return Err(provider_error(
             "missing_openai_auth",
