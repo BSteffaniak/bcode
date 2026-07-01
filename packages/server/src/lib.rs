@@ -6524,7 +6524,7 @@ async fn model_status_for_selection(
     state: &ServerState,
     selection: SessionModelSelection,
 ) -> bcode_ipc::SessionModelStatus {
-    let mut models = match invoke_model_provider_json_blocking::<_, ModelList>(
+    let mut models = invoke_model_provider_json_blocking::<_, ModelList>(
         state,
         selection.provider_plugin_id.clone(),
         OP_MODELS,
@@ -6534,19 +6534,7 @@ async fn model_status_for_selection(
         },
     )
     .await
-    {
-        Ok(models) => Some(models),
-        Err(error) => {
-            tracing::warn!(
-                target: "bcode_server::model_status",
-                provider_plugin_id = ?selection.provider_plugin_id,
-                selected_model_id = ?selection.model_id,
-                error = %error,
-                "failed to list provider models for model status"
-            );
-            None
-        }
-    };
+    .ok();
     if let Some(models) = &mut models {
         let provider_for_ignores = selection
             .provider_plugin_id
@@ -6588,7 +6576,7 @@ async fn model_status_for_selection(
     let base_reasoning = selection
         .reasoning_capabilities
         .or_else(|| model.as_ref().and_then(|model| model.reasoning.clone()));
-    let status = bcode_ipc::SessionModelStatus {
+    bcode_ipc::SessionModelStatus {
         provider_plugin_id: selection.provider_plugin_id,
         model_id,
         context_window,
@@ -6604,33 +6592,7 @@ async fn model_status_for_selection(
         cache: cache_info,
         metadata_source,
         pricing: model.as_ref().and_then(|model| model.pricing.clone()),
-    };
-    trace_model_status_resolution(&status, model.is_some(), models.as_ref());
-    status
-}
-
-fn trace_model_status_resolution(
-    status: &bcode_ipc::SessionModelStatus,
-    selected_model_found: bool,
-    models: Option<&ModelList>,
-) {
-    tracing::debug!(
-        target: "bcode_server::model_status",
-        provider_plugin_id = ?status.provider_plugin_id,
-        model_id = ?status.model_id,
-        context_window = ?status.context_window,
-        max_output_tokens = ?status.max_output_tokens,
-        metadata_source = ?status.metadata_source,
-        selected_model_found,
-        model_count = models.map_or(0, |models| models.models.len()),
-        provider_models = ?models.map(|models| models.models.iter().map(|model| (
-            model.model_id.as_str(),
-            model.context_window,
-            model.metadata_source,
-            model.is_default,
-        )).collect::<Vec<_>>()),
-        "resolved model status"
-    );
+    }
 }
 
 async fn handle_session_model_list(

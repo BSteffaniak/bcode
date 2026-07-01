@@ -3230,19 +3230,6 @@ fn unsupported_content_type_retry_rule() -> ProviderRetryRule {
 impl OpenAiCompatibleProviderPlugin {
     fn models(&self, request: &ModelListRequest) -> ModelList {
         let settings = settings_for_context(&request.provider_context);
-        tracing::debug!(
-            target: "bcode_model::provider::openai_compatible",
-            base_url = %settings.base_url,
-            dialect = %settings.dialect.metadata_value(),
-            catalog_provider = %catalog_provider_id(&settings),
-            selected_model_id = ?request.selected_model_id,
-            default_model = ?settings.default_model,
-            model_ids = ?settings.model_ids,
-            explicit_model_ids = settings.model_ids_are_explicit,
-            auth_configured = settings.auth.is_configured(),
-            auth_candidates = request.provider_context.auth_candidates.len(),
-            "provider model list start"
-        );
         let models = if let Some(models) = self.models_from_context(
             &settings,
             &request.provider_context,
@@ -3253,14 +3240,9 @@ impl OpenAiCompatibleProviderPlugin {
             model_infos_from_ids(&settings.model_ids, settings.default_model.as_deref())
         };
         let models = ensure_selected_model_info(models, request.selected_model_id.as_deref());
-        let models = apply_provider_static_metadata(&settings, models);
-        tracing::debug!(
-            target: "bcode_model::provider::openai_compatible",
-            model_count = models.len(),
-            models = ?models.iter().map(model_debug_summary).collect::<Vec<_>>(),
-            "provider model list complete"
-        );
-        ModelList { models }
+        ModelList {
+            models: apply_provider_static_metadata(&settings, models),
+        }
     }
 }
 
@@ -3268,17 +3250,6 @@ fn model_list_request(request: &ServiceRequest) -> ModelListRequest {
     request
         .payload_json::<ModelListRequest>()
         .unwrap_or_default()
-}
-
-const fn model_debug_summary(
-    model: &ModelInfo,
-) -> (&str, Option<u32>, Option<ModelMetadataSource>, bool) {
-    (
-        model.model_id.as_str(),
-        model.context_window,
-        model.metadata_source,
-        model.is_default,
-    )
 }
 
 fn apply_provider_static_metadata(settings: &Settings, models: Vec<ModelInfo>) -> Vec<ModelInfo> {
@@ -3693,28 +3664,12 @@ impl OpenAiCompatibleProviderPlugin {
         let settings = settings.clone();
         let api_key = model_metadata_api_key(&settings, context)?;
         let selected_model_id = selected_model_id.map(str::to_string);
-        let result = runtime.block_on(async move {
-            models_from_settings_async(&settings, &api_key, selected_model_id.as_deref()).await
-        });
-        match result {
-            Ok(Ok(models)) => Some(models),
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    target: "bcode_model::provider::openai_compatible",
-                    error = ?error,
-                    "provider model metadata discovery failed; falling back to configured model ids"
-                );
-                None
-            }
-            Err(error) => {
-                tracing::warn!(
-                    target: "bcode_model::provider::openai_compatible",
-                    error = ?error,
-                    "provider model metadata runtime failed; falling back to configured model ids"
-                );
-                None
-            }
-        }
+        runtime
+            .block_on(async move {
+                models_from_settings_async(&settings, &api_key, selected_model_id.as_deref()).await
+            })
+            .ok()
+            .and_then(Result::ok)
     }
 }
 
