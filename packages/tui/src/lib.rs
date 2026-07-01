@@ -370,11 +370,11 @@ pub async fn run_ralph_home() -> Result<(), TuiError> {
             })?,
             helpers::terminal_area()?,
         );
-        runtime::run_event_loop_with_startup(
+        Box::pin(runtime::run_event_loop_with_startup(
             &mut terminal,
             None,
             startup_action::StartupTuiAction::OpenRalphHome,
-        )
+        ))
         .await
     };
     let _writer = guard.leave()?;
@@ -389,7 +389,7 @@ pub async fn run_ralph_home() -> Result<(), TuiError> {
 /// client operations.
 #[allow(clippy::future_not_send)]
 pub async fn run(session_id: Option<SessionId>) -> Result<(), TuiError> {
-    run_with_static_bundled(session_id, &[]).await
+    Box::pin(run_with_static_bundled(session_id, &[])).await
 }
 
 /// Run the terminal user interface with caller-provided static bundled plugins.
@@ -412,7 +412,12 @@ pub async fn run_with_static_bundled(
             })?,
             helpers::terminal_area()?,
         );
-        runtime::run_event_loop_with_static_bundled(&mut terminal, session_id, static_plugins).await
+        Box::pin(runtime::run_event_loop_with_static_bundled(
+            &mut terminal,
+            session_id,
+            static_plugins,
+        ))
+        .await
     };
 
     match result {
@@ -485,7 +490,7 @@ pub async fn run_code_review_workspace(
         Ok(session_id) => {
             let _writer = guard.leave()?;
             if let Some(session_id) = session_id {
-                run(Some(session_id)).await
+                Box::pin(run(Some(session_id))).await
             } else {
                 Ok(())
             }
@@ -520,7 +525,7 @@ pub async fn run_code_review(
         Ok(session_id) => {
             let _writer = guard.leave()?;
             if let Some(session_id) = session_id {
-                run(Some(session_id)).await
+                Box::pin(run(Some(session_id))).await
             } else {
                 Ok(())
             }

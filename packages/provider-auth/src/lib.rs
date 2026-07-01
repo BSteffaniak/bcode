@@ -32,6 +32,10 @@ pub fn resolve_provider_request_context(
         model_profile: request.selection.model_profile,
         auth_profile: request.selection.auth_profile.clone(),
         auth_pool: request.selection.auth_pool.clone(),
+        auth_pool_routing: selected_auth_pool_routing(
+            request.config,
+            request.selection.auth_pool.as_deref(),
+        ),
         settings: request.selection.settings,
         auth: None,
         auth_candidates: Vec::new(),
@@ -357,6 +361,27 @@ fn auth_credential_source_keys(
         }
     }
     source_keys
+}
+
+fn selected_auth_pool_routing(
+    config: &bcode_config::BcodeConfig,
+    auth_pool: Option<&str>,
+) -> bcode_model::ProviderAuthPoolRouting {
+    let Some(auth_pool) = auth_pool else {
+        return bcode_model::ProviderAuthPoolRouting::default();
+    };
+    let Some(pool) = config.auth.pools.get(auth_pool) else {
+        return bcode_model::ProviderAuthPoolRouting::default();
+    };
+    bcode_model::ProviderAuthPoolRouting {
+        strategy: Some(match pool.strategy {
+            bcode_config::AuthPoolStrategy::Failover => "failover".to_string(),
+            bcode_config::AuthPoolStrategy::RoundRobin => "round_robin".to_string(),
+        }),
+        priming_enabled: pool.priming.enabled,
+        priming_include_primary: pool.priming.include_primary,
+        priming_reprime_after: pool.priming.reprime_after.clone(),
+    }
 }
 
 #[cfg(test)]

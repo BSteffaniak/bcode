@@ -241,6 +241,7 @@ fn current_runtime_context() -> Option<ClientRuntimeContext> {
     resolved.auth_profile = selected_auth_profile(&resolved);
     resolved.auth_pool = selected_auth_pool(&config, &resolved);
     let auth = merge_selected_auth_profile_env(&config, resolved.auth_profile.as_deref(), &mut env);
+    let auth_pool_routing = selected_auth_pool_routing(&config, resolved.auth_pool.as_deref());
     let auth_candidates = merge_selected_auth_pool_env(
         &config,
         resolved.auth_pool.as_deref(),
@@ -255,6 +256,7 @@ fn current_runtime_context() -> Option<ClientRuntimeContext> {
             model_profile: resolved.model_profile,
             auth_profile: resolved.auth_profile,
             auth_pool: resolved.auth_pool,
+            auth_pool_routing,
             settings: resolved.settings,
             auth,
             auth_candidates,
@@ -292,6 +294,27 @@ fn is_openai_chatgpt_auth_profile(config: &bcode_config::BcodeConfig, auth_profi
     profile.settings.get("provider").map(String::as_str) == Some("openai")
         && (profile.scheme.as_deref() == Some("chatgpt")
             || profile.settings.get("mode").map(String::as_str) == Some("chatgpt"))
+}
+
+fn selected_auth_pool_routing(
+    config: &bcode_config::BcodeConfig,
+    auth_pool: Option<&str>,
+) -> bcode_model::ProviderAuthPoolRouting {
+    let Some(auth_pool) = auth_pool else {
+        return bcode_model::ProviderAuthPoolRouting::default();
+    };
+    let Some(pool) = config.auth.pools.get(auth_pool) else {
+        return bcode_model::ProviderAuthPoolRouting::default();
+    };
+    bcode_model::ProviderAuthPoolRouting {
+        strategy: Some(match pool.strategy {
+            bcode_config::AuthPoolStrategy::Failover => "failover".to_string(),
+            bcode_config::AuthPoolStrategy::RoundRobin => "round_robin".to_string(),
+        }),
+        priming_enabled: pool.priming.enabled,
+        priming_include_primary: pool.priming.include_primary,
+        priming_reprime_after: pool.priming.reprime_after.clone(),
+    }
 }
 
 fn merge_selected_auth_profile_env(

@@ -487,6 +487,7 @@ struct ProviderStateKey {
     session_id: SessionId,
     provider_plugin_id: String,
     model_id: String,
+    auth_profile: Option<String>,
     stable_prompt_hash: String,
     tools_hash: String,
     parameters_hash: String,
@@ -12023,15 +12024,16 @@ async fn build_model_turn_request(
         parameters_timer.elapsed_ms(),
     );
     let projection_timer = state.metrics.timer();
-    let projection = ConversationProjection::new(
+    let projection = ConversationProjection::new(&ConversationProjectionInput {
         session_id,
-        provider_plugin_id.unwrap_or("<auto>"),
-        &model_id,
-        &system_prompt,
-        &tools,
-        &parameters,
-        &messages,
-    );
+        provider_plugin_id: provider_plugin_id.unwrap_or("<auto>"),
+        model_id: &model_id,
+        auth_profile: selection.provider_context.auth_profile.as_deref(),
+        system_prompt: &system_prompt,
+        tools: &tools,
+        parameters: &parameters,
+        messages: &messages,
+    });
     state.metrics.record_histogram(
         "model.request_build.conversation_projection_duration_ms",
         projection_timer.elapsed_ms(),
@@ -12418,25 +12420,29 @@ struct ConversationProjection {
     conversation_hash: String,
 }
 
+struct ConversationProjectionInput<'a> {
+    session_id: SessionId,
+    provider_plugin_id: &'a str,
+    model_id: &'a str,
+    auth_profile: Option<&'a str>,
+    system_prompt: &'a str,
+    tools: &'a [bcode_model::ToolDefinition],
+    parameters: &'a ModelParameters,
+    messages: &'a [ModelMessage],
+}
+
 impl ConversationProjection {
-    fn new(
-        session_id: SessionId,
-        provider_plugin_id: &str,
-        model_id: &str,
-        system_prompt: &str,
-        tools: &[bcode_model::ToolDefinition],
-        parameters: &ModelParameters,
-        messages: &[ModelMessage],
-    ) -> Self {
-        let stable_prompt_hash = stable_hash(system_prompt);
-        let tools_hash = stable_json_hash(tools);
-        let parameters_hash = stable_json_hash(parameters);
-        let conversation_hash = stable_json_hash(messages);
+    fn new(input: &ConversationProjectionInput<'_>) -> Self {
+        let stable_prompt_hash = stable_hash(input.system_prompt);
+        let tools_hash = stable_json_hash(input.tools);
+        let parameters_hash = stable_json_hash(input.parameters);
+        let conversation_hash = stable_json_hash(input.messages);
         Self {
             key: ProviderStateKey {
-                session_id,
-                provider_plugin_id: provider_plugin_id.to_string(),
-                model_id: model_id.to_string(),
+                session_id: input.session_id,
+                provider_plugin_id: input.provider_plugin_id.to_string(),
+                model_id: input.model_id.to_string(),
+                auth_profile: input.auth_profile.map(ToString::to_string),
                 stable_prompt_hash,
                 tools_hash,
                 parameters_hash,
@@ -12459,6 +12465,13 @@ impl ConversationProjection {
             (
                 "parameters_hash".to_string(),
                 self.key.parameters_hash.clone(),
+            ),
+            (
+                "auth_profile".to_string(),
+                self.key
+                    .auth_profile
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string()),
             ),
             (
                 "conversation_hash".to_string(),

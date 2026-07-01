@@ -2014,6 +2014,10 @@ pub struct AuthPoolConfig {
     #[config_doc(list_index = "<index>")]
     #[serde(default)]
     pub profiles: Vec<String>,
+    /// Pre-strategy priming behavior.
+    #[config_doc(nested)]
+    #[serde(default)]
+    pub priming: AuthPoolPrimingConfig,
     /// Provider-specific quota/cooldown policy hints.
     #[config_doc(nested)]
     #[serde(default)]
@@ -2027,6 +2031,23 @@ pub enum AuthPoolStrategy {
     /// Use the first healthy profile and fail over when provider-owned quota detection requires it.
     #[default]
     Failover,
+    /// Rotate requests across healthy profiles.
+    RoundRobin,
+}
+
+/// Pre-strategy auth pool priming behavior.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "priming")]
+pub struct AuthPoolPrimingConfig {
+    /// Route to unprimed profiles before applying the normal strategy.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Include the primary selected auth profile in priming.
+    #[serde(default)]
+    pub include_primary: bool,
+    /// Optional duration after which a profile should be primed again.
+    #[serde(default)]
+    pub reprime_after: Option<String>,
 }
 
 /// Provider-specific quota/cooldown policy hints for an auth pool.
@@ -3061,6 +3082,7 @@ pub fn add_openai_chatgpt_subscription_auth(
                 provider_plugin_id: Some("bcode.openai-compatible".to_string()),
                 strategy: AuthPoolStrategy::Failover,
                 profiles: Vec::new(),
+                priming: AuthPoolPrimingConfig::default(),
                 quota: AuthPoolQuotaConfig::default(),
             });
         auth_pool.provider_plugin_id = Some("bcode.openai-compatible".to_string());

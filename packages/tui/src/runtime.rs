@@ -20,7 +20,12 @@ pub async fn run_event_loop<W: Write>(
     terminal: &mut Terminal<&mut W>,
     session_id: Option<SessionId>,
 ) -> Result<(), TuiError> {
-    run_event_loop_with_startup(terminal, session_id, StartupTuiAction::None).await
+    Box::pin(run_event_loop_with_startup(
+        terminal,
+        session_id,
+        StartupTuiAction::None,
+    ))
+    .await
 }
 
 /// Attach to a session and run the active chat loop with caller-provided static bundled plugins.
@@ -30,12 +35,12 @@ pub async fn run_event_loop_with_static_bundled<W: Write>(
     session_id: Option<SessionId>,
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
 ) -> Result<(), TuiError> {
-    run_event_loop_with_startup_and_static_bundled(
+    Box::pin(run_event_loop_with_startup_and_static_bundled(
         terminal,
         session_id,
         StartupTuiAction::None,
         static_plugins,
-    )
+    ))
     .await
 }
 
@@ -46,7 +51,13 @@ pub async fn run_event_loop_with_startup<W: Write>(
     session_id: Option<SessionId>,
     startup_action: StartupTuiAction,
 ) -> Result<(), TuiError> {
-    run_event_loop_with_startup_and_static_bundled(terminal, session_id, startup_action, &[]).await
+    Box::pin(run_event_loop_with_startup_and_static_bundled(
+        terminal,
+        session_id,
+        startup_action,
+        &[],
+    ))
+    .await
 }
 
 /// Attach to a session, run an optional startup action, and run the active chat loop with caller-provided static bundled plugins.

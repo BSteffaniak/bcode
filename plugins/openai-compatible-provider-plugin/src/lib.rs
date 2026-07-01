@@ -1113,87 +1113,59 @@ enum CandidateAttemptOutcome {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthPoolStrategy {
+    Failover,
+    RoundRobin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateSelectionReason {
+    Priming,
+    Strategy,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CandidateSelection<'a> {
+    candidate: &'a ProviderAuthCandidate,
+    reason: CandidateSelectionReason,
+}
+
 async fn try_auth_candidates_once(
     request: &ModelTurnRequest,
     turn: &TurnState,
 ) -> Result<CandidateAttemptOutcome, ProviderError> {
     let (available_candidates, cooldown_candidates, skipped_profiles) =
         partition_auth_candidates(request);
+    let selections =
+        order_candidate_selections(request, &available_candidates, &cooldown_candidates);
 
-    let mut last_error = None;
-    let mut earliest_retry_at_unix = None;
-    let mut warned_cooldown_profiles = BTreeSet::new();
-    for candidate in available_candidates.into_iter().chain(cooldown_candidates) {
-        if skipped_profiles
-            .iter()
-            .any(|profile| Some(profile) == candidate.profile.as_ref())
-            && let Some(profile) = &candidate.profile
-            && !warned_cooldown_profiles.contains(profile)
-        {
-            warned_cooldown_profiles.insert(profile.clone());
-            turn.push(ProviderTurnEvent::Warning {
-                message: format!(
-                    "OpenAI subscription auth profile '{profile}' is on cooldown; probing it because no earlier subscription completed the request."
-                ),
-            });
-        }
-        let mut candidate_request = request.clone();
-        candidate_request.provider_context.auth_profile = candidate.profile.clone();
-        candidate_request.provider_context.auth = Some(candidate.auth.clone());
-        candidate_request.provider_context.env = candidate.env.clone();
-        match stream_chat_completion_inner(&candidate_request, turn).await {
-            Ok(outcome) => {
-                if let Some(profile) = candidate.profile.as_deref() {
-                    auth_pool_state::clear_profile_quota_limited(
-                        request.provider_context.auth_pool.as_deref(),
-                        Some(profile),
-                    );
-                }
+    let mut attempt_state = CandidateAttemptState::default();
+    for selection in selections {
+        warn_if_probing_cooldown_candidate(
+            turn,
+            selection.candidate,
+            &skipped_profiles,
+            &mut attempt_state.warned_cooldown_profiles,
+        );
+        match try_auth_candidate(request, turn, selection).await? {
+            CandidateTryOutcome::Finished(outcome) => {
                 return Ok(CandidateAttemptOutcome::Finished(outcome));
             }
-            Err(error) if is_subscription_quota_error(&error) => {
-                if let Some(profile) = &candidate.profile {
-                    let retry_at_unix = quota_error_retry_at_unix(&error);
-                    if let Some(retry_at_unix) = retry_at_unix {
-                        auth_pool_state::mark_profile_quota_limited_until(
-                            request.provider_context.auth_pool.as_deref(),
-                            Some(profile),
-                            quota_error_reason(&error),
-                            &error.message,
-                            retry_at_unix,
-                            error.retry.as_ref().and_then(|hint| hint.source.as_deref()),
-                        );
-                    } else {
-                        auth_pool_state::mark_profile_quota_limited(
-                            request.provider_context.auth_pool.as_deref(),
-                            Some(profile),
-                            quota_error_reason(&error),
-                            &error.message,
-                            quota_error_cooldown(&error),
-                        );
-                    }
-                    let profile_retry_at = retry_at_unix.or_else(|| {
-                        auth_pool_state::profile_cooldown_until(
-                            request.provider_context.auth_pool.as_deref(),
-                            Some(profile),
-                        )
-                    });
-                    earliest_retry_at_unix = earliest_retry_at_unix
-                        .into_iter()
-                        .chain(profile_retry_at)
-                        .min();
-                    turn.push(ProviderTurnEvent::Warning {
-                        message: format!(
-                            "OpenAI subscription auth profile '{profile}' appears quota-limited; trying the next configured subscription."
-                        ),
-                    });
-                }
-                last_error = Some(error);
+            CandidateTryOutcome::QuotaLimited {
+                error,
+                retry_at_unix,
+            } => {
+                attempt_state.last_error = Some(error);
+                attempt_state.earliest_retry_at_unix = attempt_state
+                    .earliest_retry_at_unix
+                    .into_iter()
+                    .chain(retry_at_unix)
+                    .min();
             }
-            Err(error) => return Err(error),
         }
     }
-    let error = last_error.unwrap_or_else(|| {
+    let error = attempt_state.last_error.unwrap_or_else(|| {
         provider_error(
             "openai_auth_pool_exhausted",
             ProviderErrorCategory::RateLimit,
@@ -1202,8 +1174,156 @@ async fn try_auth_candidates_once(
     });
     Ok(CandidateAttemptOutcome::Exhausted {
         error,
-        retry_at_unix: earliest_retry_at_unix,
+        retry_at_unix: attempt_state.earliest_retry_at_unix,
     })
+}
+
+#[derive(Debug, Default)]
+struct CandidateAttemptState {
+    last_error: Option<ProviderError>,
+    earliest_retry_at_unix: Option<u64>,
+    warned_cooldown_profiles: BTreeSet<String>,
+}
+
+#[derive(Debug)]
+enum CandidateTryOutcome {
+    Finished(StreamOutcome),
+    QuotaLimited {
+        error: ProviderError,
+        retry_at_unix: Option<u64>,
+    },
+}
+
+async fn try_auth_candidate(
+    request: &ModelTurnRequest,
+    turn: &TurnState,
+    selection: CandidateSelection<'_>,
+) -> Result<CandidateTryOutcome, ProviderError> {
+    let candidate = selection.candidate;
+    let candidate_request = auth_candidate_request(request, candidate);
+    match stream_chat_completion_inner(&candidate_request, turn).await {
+        Ok(outcome) => {
+            record_auth_candidate_success(request, candidate, selection.reason);
+            Ok(CandidateTryOutcome::Finished(outcome))
+        }
+        Err(error) if is_subscription_quota_error(&error) => {
+            let retry_at_unix = record_auth_candidate_quota_error(request, turn, candidate, &error);
+            Ok(CandidateTryOutcome::QuotaLimited {
+                error,
+                retry_at_unix,
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn auth_candidate_request(
+    request: &ModelTurnRequest,
+    candidate: &ProviderAuthCandidate,
+) -> ModelTurnRequest {
+    let mut candidate_request = request.clone();
+    candidate_request
+        .provider_context
+        .auth_profile
+        .clone_from(&candidate.profile);
+    candidate_request.provider_context.auth = Some(candidate.auth.clone());
+    candidate_request.provider_context.env = candidate.env.clone();
+    if candidate.profile != request.provider_context.auth_profile {
+        candidate_request
+            .conversation_reuse
+            .previous_provider_response_id = None;
+        candidate_request
+            .conversation_reuse
+            .new_messages_start_index = None;
+        candidate_request.conversation_reuse.provider_state = None;
+        candidate_request.metadata.insert(
+            "suppress_provider_reuse_state".to_string(),
+            "auth_profile_changed".to_string(),
+        );
+    }
+    candidate_request
+}
+
+fn record_auth_candidate_success(
+    request: &ModelTurnRequest,
+    candidate: &ProviderAuthCandidate,
+    reason: CandidateSelectionReason,
+) {
+    let Some(profile) = candidate.profile.as_deref() else {
+        return;
+    };
+    let pool = request.provider_context.auth_pool.as_deref();
+    auth_pool_state::clear_profile_quota_limited(pool, Some(profile));
+    auth_pool_state::mark_pool_selected(pool, Some(profile));
+    match reason {
+        CandidateSelectionReason::Priming => {
+            auth_pool_state::mark_profile_primed(pool, Some(profile));
+        }
+        CandidateSelectionReason::Strategy => {
+            auth_pool_state::mark_profile_success(pool, Some(profile));
+        }
+    }
+}
+
+fn record_auth_candidate_quota_error(
+    request: &ModelTurnRequest,
+    turn: &TurnState,
+    candidate: &ProviderAuthCandidate,
+    error: &ProviderError,
+) -> Option<u64> {
+    let profile = candidate.profile.as_deref()?;
+    let retry_at_unix = quota_error_retry_at_unix(error);
+    if let Some(retry_at_unix) = retry_at_unix {
+        auth_pool_state::mark_profile_quota_limited_until(
+            request.provider_context.auth_pool.as_deref(),
+            Some(profile),
+            quota_error_reason(error),
+            &error.message,
+            retry_at_unix,
+            error.retry.as_ref().and_then(|hint| hint.source.as_deref()),
+        );
+    } else {
+        auth_pool_state::mark_profile_quota_limited(
+            request.provider_context.auth_pool.as_deref(),
+            Some(profile),
+            quota_error_reason(error),
+            &error.message,
+            quota_error_cooldown(error),
+        );
+    }
+    let profile_retry_at = retry_at_unix.or_else(|| {
+        auth_pool_state::profile_cooldown_until(
+            request.provider_context.auth_pool.as_deref(),
+            Some(profile),
+        )
+    });
+    turn.push(ProviderTurnEvent::Warning {
+        message: format!(
+            "OpenAI subscription auth profile '{profile}' appears quota-limited; trying the next configured subscription."
+        ),
+    });
+    profile_retry_at
+}
+
+fn warn_if_probing_cooldown_candidate(
+    turn: &TurnState,
+    candidate: &ProviderAuthCandidate,
+    skipped_profiles: &[String],
+    warned_cooldown_profiles: &mut BTreeSet<String>,
+) {
+    if skipped_profiles
+        .iter()
+        .any(|profile| Some(profile) == candidate.profile.as_ref())
+        && let Some(profile) = &candidate.profile
+        && !warned_cooldown_profiles.contains(profile)
+    {
+        warned_cooldown_profiles.insert(profile.clone());
+        turn.push(ProviderTurnEvent::Warning {
+            message: format!(
+                "OpenAI subscription auth profile '{profile}' is on cooldown; probing it because no earlier subscription completed the request."
+            ),
+        });
+    }
 }
 
 fn partition_auth_candidates(
@@ -1230,6 +1350,140 @@ fn partition_auth_candidates(
         }
     }
     (available_candidates, cooldown_candidates, skipped_profiles)
+}
+
+fn order_candidate_selections<'a>(
+    request: &ModelTurnRequest,
+    available_candidates: &[&'a ProviderAuthCandidate],
+    cooldown_candidates: &[&'a ProviderAuthCandidate],
+) -> Vec<CandidateSelection<'a>> {
+    let mut ordered = Vec::new();
+    let mut selected_profiles = BTreeSet::new();
+    if let Some(candidate) = priming_candidate(request, available_candidates) {
+        if let Some(profile) = candidate.profile.as_ref() {
+            selected_profiles.insert(profile.clone());
+        }
+        ordered.push(CandidateSelection {
+            candidate,
+            reason: CandidateSelectionReason::Priming,
+        });
+    }
+    for candidate in strategy_ordered_candidates(request, available_candidates) {
+        if candidate
+            .profile
+            .as_ref()
+            .is_some_and(|profile| selected_profiles.contains(profile))
+        {
+            continue;
+        }
+        ordered.push(CandidateSelection {
+            candidate,
+            reason: CandidateSelectionReason::Strategy,
+        });
+    }
+    ordered.extend(
+        cooldown_candidates
+            .iter()
+            .map(|candidate| CandidateSelection {
+                candidate,
+                reason: CandidateSelectionReason::Strategy,
+            }),
+    );
+    ordered
+}
+
+fn priming_candidate<'a>(
+    request: &ModelTurnRequest,
+    available_candidates: &[&'a ProviderAuthCandidate],
+) -> Option<&'a ProviderAuthCandidate> {
+    let routing = &request.provider_context.auth_pool_routing;
+    if !routing.priming_enabled {
+        return None;
+    }
+    let primary = request.provider_context.auth_profile.as_deref();
+    let reprime_after = routing
+        .priming_reprime_after
+        .as_deref()
+        .and_then(parse_duration);
+    available_candidates.iter().copied().find(|candidate| {
+        if !routing.priming_include_primary && candidate.profile.as_deref() == primary {
+            return false;
+        }
+        auth_pool_state::profile_needs_priming(
+            request.provider_context.auth_pool.as_deref(),
+            candidate.profile.as_deref(),
+            reprime_after,
+        )
+    })
+}
+
+fn strategy_ordered_candidates<'a>(
+    request: &ModelTurnRequest,
+    available_candidates: &[&'a ProviderAuthCandidate],
+) -> Vec<&'a ProviderAuthCandidate> {
+    match auth_pool_strategy(request) {
+        AuthPoolStrategy::Failover => available_candidates.to_vec(),
+        AuthPoolStrategy::RoundRobin => {
+            round_robin_ordered_candidates(request, available_candidates)
+        }
+    }
+}
+
+fn auth_pool_strategy(request: &ModelTurnRequest) -> AuthPoolStrategy {
+    match request
+        .provider_context
+        .auth_pool_routing
+        .strategy
+        .as_deref()
+    {
+        Some("round_robin") => AuthPoolStrategy::RoundRobin,
+        _ => AuthPoolStrategy::Failover,
+    }
+}
+
+fn round_robin_ordered_candidates<'a>(
+    request: &ModelTurnRequest,
+    available_candidates: &[&'a ProviderAuthCandidate],
+) -> Vec<&'a ProviderAuthCandidate> {
+    if available_candidates.len() < 2 {
+        return available_candidates.to_vec();
+    }
+    let Some(last_selected) =
+        auth_pool_state::last_selected_profile(request.provider_context.auth_pool.as_deref())
+    else {
+        return available_candidates.to_vec();
+    };
+    let Some(position) = available_candidates
+        .iter()
+        .position(|candidate| candidate.profile.as_deref() == Some(last_selected.as_str()))
+    else {
+        return available_candidates.to_vec();
+    };
+    available_candidates[position.saturating_add(1)..]
+        .iter()
+        .chain(&available_candidates[..=position])
+        .copied()
+        .collect()
+}
+
+fn parse_duration(value: &str) -> Option<Duration> {
+    let trimmed = value.trim();
+    let (number, multiplier) = trimmed
+        .strip_suffix('d')
+        .map_or_else(|| (trimmed, 1), |number| (number, 86_400));
+    let (number, multiplier) = number
+        .strip_suffix('h')
+        .map_or((number, multiplier), |number| (number, 3_600));
+    let (number, multiplier) = number
+        .strip_suffix('m')
+        .map_or((number, multiplier), |number| (number, 60));
+    let (number, multiplier) = number
+        .strip_suffix('s')
+        .map_or((number, multiplier), |number| (number, 1));
+    number
+        .parse::<u64>()
+        .ok()
+        .map(|seconds| Duration::from_secs(seconds.saturating_mul(multiplier)))
 }
 
 async fn wait_for_retry_or_cancel(turn: &TurnState, wait_seconds: u64) -> bool {
@@ -1694,6 +1948,15 @@ async fn read_responses_stream_events(
     let mut tool_calls = BTreeMap::new();
     let mut reasoning_items = BTreeMap::new();
     let mut saw_tool_call = false;
+    let suppress_provider_reuse_state = request
+        .metadata
+        .contains_key("suppress_provider_reuse_state");
+    let processor = ResponsesStreamProcessor {
+        turn,
+        dialect,
+        name_map: &name_map,
+        suppress_provider_reuse_state,
+    };
     loop {
         if turn.is_cancelled() {
             return Ok(StreamOutcome::Cancelled);
@@ -1706,12 +1969,10 @@ async fn read_responses_stream_events(
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
                 let outcome = process_responses_stream_buffer(
                     &mut buffer,
-                    turn,
-                    dialect,
+                    &processor,
                     &mut tool_calls,
                     &mut reasoning_items,
                     &mut saw_tool_call,
-                    &name_map,
                 )?;
                 if matches!(outcome, StreamOutcome::Finished | StreamOutcome::ToolCall) {
                     return Ok(outcome);
@@ -1722,14 +1983,19 @@ async fn read_responses_stream_events(
     }
 }
 
+struct ResponsesStreamProcessor<'a> {
+    turn: &'a TurnState,
+    dialect: OpenAiCompatibleDialect,
+    name_map: &'a BTreeMap<String, String>,
+    suppress_provider_reuse_state: bool,
+}
+
 fn process_responses_stream_buffer(
     buffer: &mut String,
-    turn: &TurnState,
-    dialect: OpenAiCompatibleDialect,
+    processor: &ResponsesStreamProcessor<'_>,
     tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
     reasoning_items: &mut BTreeMap<u32, ReasoningItemAccumulator>,
     saw_tool_call: &mut bool,
-    name_map: &BTreeMap<String, String>,
 ) -> Result<StreamOutcome, ProviderError> {
     while let Some(position) = buffer.find('\n') {
         let mut line = buffer[..position].to_string();
@@ -1739,12 +2005,10 @@ fn process_responses_stream_buffer(
         buffer.drain(..=position);
         let outcome = process_responses_stream_line(
             line.trim(),
-            turn,
-            dialect,
+            processor,
             tool_calls,
             reasoning_items,
             saw_tool_call,
-            name_map,
         )?;
         if matches!(outcome, StreamOutcome::Finished | StreamOutcome::ToolCall) {
             return Ok(outcome);
@@ -1756,12 +2020,10 @@ fn process_responses_stream_buffer(
 #[allow(clippy::too_many_lines)]
 fn process_responses_stream_line(
     line: &str,
-    turn: &TurnState,
-    dialect: OpenAiCompatibleDialect,
+    processor: &ResponsesStreamProcessor<'_>,
     tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
     reasoning_items: &mut BTreeMap<u32, ReasoningItemAccumulator>,
     saw_tool_call: &mut bool,
-    name_map: &BTreeMap<String, String>,
 ) -> Result<StreamOutcome, ProviderError> {
     let Some(data) = line.strip_prefix("data: ") else {
         return Ok(StreamOutcome::Cancelled);
@@ -1789,7 +2051,7 @@ fn process_responses_stream_line(
             if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str)
                 && !delta.is_empty()
             {
-                turn.push(ProviderTurnEvent::TextDelta {
+                processor.turn.push(ProviderTurnEvent::TextDelta {
                     text: delta.to_string(),
                 });
             }
@@ -1798,43 +2060,57 @@ fn process_responses_stream_line(
             if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str)
                 && !delta.is_empty()
             {
-                turn.push(ProviderTurnEvent::ReasoningDelta {
+                processor.turn.push(ProviderTurnEvent::ReasoningDelta {
                     text: delta.to_string(),
                 });
             }
         }
         "response.output_item.added" | "response.output_item.done" => {
-            process_responses_output_item(&event, turn, tool_calls, saw_tool_call, name_map);
+            process_responses_output_item(
+                &event,
+                processor.turn,
+                tool_calls,
+                saw_tool_call,
+                processor.name_map,
+            );
             process_responses_reasoning_output_item(&event, reasoning_items);
         }
         "response.function_call_arguments.delta" => {
-            process_responses_function_arguments_delta(&event, turn, tool_calls);
+            process_responses_function_arguments_delta(&event, processor.turn, tool_calls);
         }
         "response.function_call_arguments.done" => {
             process_responses_function_arguments_done(&event, tool_calls);
         }
         "response.completed" | "response.done" | "response.incomplete" => {
             if let Some(usage) = token_usage_from_responses_event(&event) {
-                turn.push(ProviderTurnEvent::Usage { usage });
+                processor.turn.push(ProviderTurnEvent::Usage { usage });
             }
             let outcome = if *saw_tool_call {
-                finish_tool_calls(turn, tool_calls, name_map, dialect)?;
+                finish_tool_calls(
+                    processor.turn,
+                    tool_calls,
+                    processor.name_map,
+                    processor.dialect,
+                )?;
                 StreamOutcome::ToolCall
             } else {
                 StreamOutcome::Finished
             };
-            if dialect.supports_native_conversation_reuse()
+            if processor.dialect.supports_native_conversation_reuse()
+                && !processor.suppress_provider_reuse_state
                 && let Some(response_id) = event
                     .get("response")
                     .and_then(|response| response.get("id"))
                     .and_then(serde_json::Value::as_str)
             {
-                turn.push(ProviderTurnEvent::ProviderMetadata {
+                processor.turn.push(ProviderTurnEvent::ProviderMetadata {
                     key: "provider_response_id".to_string(),
                     value: response_id.to_string(),
                 });
             }
-            push_responses_provider_state(turn, reasoning_items);
+            if !processor.suppress_provider_reuse_state {
+                push_responses_provider_state(processor.turn, reasoning_items);
+            }
             return Ok(outcome);
         }
         "response.failed" | "error" => {
@@ -5982,6 +6258,18 @@ mod tests {
         )));
     }
 
+    fn test_responses_stream_processor<'a>(
+        turn: &'a TurnState,
+        name_map: &'a BTreeMap<String, String>,
+    ) -> ResponsesStreamProcessor<'a> {
+        ResponsesStreamProcessor {
+            turn,
+            dialect: OpenAiCompatibleDialect::ResponsesApi,
+            name_map,
+            suppress_provider_reuse_state: false,
+        }
+    }
+
     #[test]
     fn chat_completion_stream_reads_usage_after_finish_reason() {
         let turn = TurnState::default();
@@ -6051,25 +6339,22 @@ mod tests {
         let mut reasoning_items = BTreeMap::new();
         let mut saw_tool_call = false;
         let name_map = BTreeMap::new();
+        let processor = test_responses_stream_processor(&turn, &name_map);
 
         process_responses_stream_line(
             r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"filesystem_write"}}"#,
-            &turn,
-            OpenAiCompatibleDialect::ResponsesApi,
+            &processor,
             &mut tool_calls,
             &mut reasoning_items,
             &mut saw_tool_call,
-            &name_map,
         )
         .expect("tool event should process");
         let outcome = process_responses_stream_line(
             r#"data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"path\""}"#,
-            &turn,
-            OpenAiCompatibleDialect::ResponsesApi,
+            &processor,
             &mut tool_calls,
             &mut reasoning_items,
             &mut saw_tool_call,
-            &name_map,
         )
         .expect("argument delta should process");
 
@@ -6123,25 +6408,27 @@ mod tests {
         let mut tool_calls = BTreeMap::new();
         let mut reasoning_items = BTreeMap::new();
         let mut saw_tool_call = false;
+        let processor = ResponsesStreamProcessor {
+            turn: &turn,
+            dialect: OpenAiCompatibleDialect::ChatGptCodex,
+            name_map: &name_map,
+            suppress_provider_reuse_state: false,
+        };
 
         let added = process_responses_stream_line(
             r#"data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"shell_run","arguments":"{\"cmd\":\"ls\",\"workdir\":\"/tmp\",\"timeout\":2}"}}"#,
-            &turn,
-            OpenAiCompatibleDialect::ChatGptCodex,
+            &processor,
             &mut tool_calls,
             &mut reasoning_items,
             &mut saw_tool_call,
-            &name_map,
         )
         .expect("tool event should process");
         let completed = process_responses_stream_line(
             r#"data: {"type":"response.completed","response":{"id":"resp_123"}}"#,
-            &turn,
-            OpenAiCompatibleDialect::ChatGptCodex,
+            &processor,
             &mut tool_calls,
             &mut reasoning_items,
             &mut saw_tool_call,
-            &name_map,
         )
         .expect("completed event should process");
 
@@ -6164,15 +6451,14 @@ mod tests {
         let mut reasoning_items = BTreeMap::new();
         let mut saw_tool_call = false;
         let name_map = BTreeMap::new();
+        let processor = test_responses_stream_processor(&turn, &name_map);
 
         let outcome = process_responses_stream_line(
             r#"data: {"type":"response.completed","response":{"id":"resp_123"}}"#,
-            &turn,
-            OpenAiCompatibleDialect::ResponsesApi,
+            &processor,
             &mut tool_calls,
             &mut reasoning_items,
             &mut saw_tool_call,
-            &name_map,
         )
         .expect("stream event should process");
 
@@ -6191,15 +6477,19 @@ mod tests {
         let mut reasoning_items = BTreeMap::new();
         let mut saw_tool_call = false;
         let name_map = BTreeMap::new();
+        let processor = ResponsesStreamProcessor {
+            turn: &turn,
+            dialect: OpenAiCompatibleDialect::ChatGptCodex,
+            name_map: &name_map,
+            suppress_provider_reuse_state: false,
+        };
 
         let outcome = process_responses_stream_line(
             r#"data: {"type":"response.completed","response":{"id":"resp_123"}}"#,
-            &turn,
-            OpenAiCompatibleDialect::ChatGptCodex,
+            &processor,
             &mut tool_calls,
             &mut reasoning_items,
             &mut saw_tool_call,
-            &name_map,
         )
         .expect("stream event should process");
 
@@ -6218,25 +6508,22 @@ mod tests {
         let mut reasoning_items = BTreeMap::new();
         let mut saw_tool_call = false;
         let name_map = BTreeMap::new();
+        let processor = test_responses_stream_processor(&turn, &name_map);
 
         process_responses_stream_line(
             r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","encrypted_content":"encrypted","summary":[{"type":"summary_text","text":"kept summary"}]}}"#,
-            &turn,
-            OpenAiCompatibleDialect::ChatGptCodex,
+            &processor,
             &mut tool_calls,
             &mut reasoning_items,
             &mut saw_tool_call,
-            &name_map,
         )
         .expect("reasoning item should process");
         let outcome = process_responses_stream_line(
             r#"data: {"type":"response.completed","response":{"id":"resp_123"}}"#,
-            &turn,
-            OpenAiCompatibleDialect::ChatGptCodex,
+            &processor,
             &mut tool_calls,
             &mut reasoning_items,
             &mut saw_tool_call,
-            &name_map,
         )
         .expect("completed event should process");
 
@@ -6279,15 +6566,14 @@ mod tests {
         let mut reasoning_items = BTreeMap::new();
         let mut saw_tool_call = false;
         let name_map = BTreeMap::new();
+        let processor = test_responses_stream_processor(&turn, &name_map);
 
         let error = process_responses_stream_line(
             r#"data: {"type":"response.failed","error":{"code":"context_length_exceeded","message":"input is too long for the model context window"}}"#,
-            &turn,
-            OpenAiCompatibleDialect::ResponsesApi,
+            &processor,
             &mut tool_calls,
             &mut reasoning_items,
             &mut saw_tool_call,
-            &name_map,
         )
         .expect_err("context error should fail");
 

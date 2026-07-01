@@ -595,6 +595,23 @@ pub struct ProviderAuthCandidate {
     pub env: BTreeMap<String, String>,
 }
 
+/// Auth pool routing settings resolved from declarative configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderAuthPoolRouting {
+    /// Strategy used after pre-routing modifiers such as priming are satisfied.
+    #[serde(default)]
+    pub strategy: Option<String>,
+    /// Whether to route once to unprimed profiles before normal strategy selection.
+    #[serde(default)]
+    pub priming_enabled: bool,
+    /// Whether priming should include the primary selected auth profile.
+    #[serde(default)]
+    pub priming_include_primary: bool,
+    /// Optional duration after which a successfully primed profile should be primed again.
+    #[serde(default)]
+    pub priming_reprime_after: Option<String>,
+}
+
 /// Provider-neutral request context resolved by the host from model/provider profiles.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderRequestContext {
@@ -604,6 +621,9 @@ pub struct ProviderRequestContext {
     pub auth_profile: Option<String>,
     #[serde(default)]
     pub auth_pool: Option<String>,
+    /// Auth pool routing settings resolved from declarative configuration.
+    #[serde(default)]
+    pub auth_pool_routing: ProviderAuthPoolRouting,
     #[serde(default)]
     pub settings: BTreeMap<String, String>,
     /// Semantic auth material resolved from the selected auth profile.

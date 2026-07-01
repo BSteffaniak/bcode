@@ -2227,14 +2227,28 @@ fn auth_profile_show(profile: &str) -> Result<(), CliError> {
 struct OpenAiAuthPoolStateFile {
     #[serde(default)]
     entries: BTreeMap<String, OpenAiAuthPoolProfileState>,
+    #[serde(default)]
+    pools: BTreeMap<String, OpenAiAuthPoolRoutingState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 struct OpenAiAuthPoolProfileState {
+    #[serde(default)]
     cooldown_until_unix: u64,
+    #[serde(default)]
     reason: String,
     #[serde(default)]
     last_error: Option<String>,
+    #[serde(default)]
+    last_success_unix: Option<u64>,
+    #[serde(default)]
+    primed_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+struct OpenAiAuthPoolRoutingState {
+    #[serde(default)]
+    last_selected_profile: Option<String>,
 }
 
 fn auth_pool_state_path() -> PathBuf {
@@ -2313,6 +2327,25 @@ fn auth_pool_status(pool_name: &str) -> Result<(), CliError> {
     }
     if let Some(pool) = declared_pool {
         println!("Strategy: {:?}", pool.strategy);
+        println!(
+            "Priming: {}{}{}",
+            if pool.priming.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            if pool.priming.include_primary {
+                ", includes primary"
+            } else {
+                ""
+            },
+            pool.priming
+                .reprime_after
+                .as_ref()
+                .map_or_else(String::new, |duration| format!(
+                    ", reprime after {duration}"
+                ))
+        );
     }
     let profiles = declared_pool
         .map(|pool| pool.profiles.clone())
@@ -2330,6 +2363,13 @@ fn auth_pool_status(pool_name: &str) -> Result<(), CliError> {
         return Ok(());
     }
     let state = load_openai_auth_pool_state();
+    if let Some(last_selected_profile) = state
+        .pools
+        .get(pool_name)
+        .and_then(|pool| pool.last_selected_profile.as_ref())
+    {
+        println!("Runtime routing: last selected profile {last_selected_profile}");
+    }
     let now = unix_now_secs();
     println!("Profiles:");
     for profile in profiles {
@@ -2360,11 +2400,29 @@ fn print_auth_pool_profile_status(
         "missing"
     };
     let key = auth_pool_state_key(pool_name, profile);
+    let last_success = state
+        .entries
+        .get(&key)
+        .and_then(|entry| entry.last_success_unix)
+        .map_or_else(
+            || "never used".to_string(),
+            |timestamp| {
+                format!(
+                    "last success {} ago",
+                    format_duration(now.saturating_sub(timestamp))
+                )
+            },
+        );
+    let priming = state
+        .entries
+        .get(&key)
+        .and_then(|entry| entry.primed_unix)
+        .map_or("unprimed", |_| "primed");
     if let Some(entry) = state.entries.get(&key)
         && entry.cooldown_until_unix > now
     {
         println!(
-            "  {profile}: {source}, {config_status}, storage {storage}, vault {vault}, cooldown {} remaining, reason: {}",
+            "  {profile}: {source}, {config_status}, storage {storage}, vault {vault}, {last_success}, {priming}, cooldown {} remaining, reason: {}",
             format_duration(entry.cooldown_until_unix.saturating_sub(now)),
             entry.reason,
             storage = auth_pool_profile_storage(config, profile).unwrap_or_else(|| "-".to_string()),
@@ -2373,7 +2431,7 @@ fn print_auth_pool_profile_status(
         return;
     }
     println!(
-        "  {profile}: {source}, {config_status}, storage {storage}, vault {vault}, available",
+        "  {profile}: {source}, {config_status}, storage {storage}, vault {vault}, available, {last_success}, {priming}",
         storage = auth_pool_profile_storage(config, profile).unwrap_or_else(|| "-".to_string()),
         vault = auth_pool_profile_vault(config, profile).unwrap_or_else(|| "-".to_string()),
     );

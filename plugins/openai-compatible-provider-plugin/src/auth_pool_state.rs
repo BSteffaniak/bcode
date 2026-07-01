@@ -2,33 +2,51 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+static STATE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct AuthPoolState {
     #[serde(default)]
     entries: BTreeMap<String, AuthPoolProfileState>,
+    #[serde(default)]
+    pools: BTreeMap<String, AuthPoolRoutingState>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct AuthPoolRoutingState {
+    #[serde(default)]
+    last_selected_profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct AuthPoolProfileState {
+    #[serde(default)]
     cooldown_until_unix: u64,
+    #[serde(default)]
     reason: String,
     #[serde(default)]
     last_error: Option<String>,
     #[serde(default)]
     reset_source: Option<String>,
+    #[serde(default)]
+    last_success_unix: Option<u64>,
+    #[serde(default)]
+    primed_unix: Option<u64>,
 }
 
 pub fn is_profile_available(pool: Option<&str>, profile: Option<&str>) -> bool {
     let Some(key) = state_key(pool, profile) else {
         return true;
     };
-    let state = load_state();
-    state
-        .entries
-        .get(&key)
-        .is_none_or(|entry| entry.cooldown_until_unix <= now_unix())
+    with_state(|state| {
+        state
+            .entries
+            .get(&key)
+            .is_none_or(|entry| entry.cooldown_until_unix <= now_unix())
+    })
 }
 
 pub fn mark_profile_quota_limited(
@@ -59,37 +77,115 @@ pub fn mark_profile_quota_limited_until(
     let Some(key) = state_key(pool, profile) else {
         return;
     };
-    let mut state = load_state();
-    state.entries.insert(
-        key,
-        AuthPoolProfileState {
-            cooldown_until_unix,
-            reason: reason.to_string(),
-            last_error: Some(message.to_string()),
-            reset_source: reset_source.map(ToString::to_string),
-        },
-    );
-    save_state(&state);
+    mutate_state(|state| {
+        let entry = state.entries.entry(key).or_default();
+        entry.cooldown_until_unix = cooldown_until_unix;
+        entry.reason = reason.to_string();
+        entry.last_error = Some(message.to_string());
+        entry.reset_source = reset_source.map(ToString::to_string);
+    });
 }
 
 pub fn profile_cooldown_until(pool: Option<&str>, profile: Option<&str>) -> Option<u64> {
     let key = state_key(pool, profile)?;
-    let state = load_state();
-    state
-        .entries
-        .get(&key)
-        .map(|entry| entry.cooldown_until_unix)
-        .filter(|until| *until > now_unix())
+    with_state(|state| {
+        state
+            .entries
+            .get(&key)
+            .map(|entry| entry.cooldown_until_unix)
+            .filter(|until| *until > now_unix())
+    })
 }
 
 pub fn clear_profile_quota_limited(pool: Option<&str>, profile: Option<&str>) {
     let Some(key) = state_key(pool, profile) else {
         return;
     };
+    mutate_state(|state| {
+        if let Some(entry) = state.entries.get_mut(&key) {
+            entry.cooldown_until_unix = 0;
+            entry.reason.clear();
+            entry.last_error = None;
+            entry.reset_source = None;
+        }
+    });
+}
+
+pub fn mark_profile_success(pool: Option<&str>, profile: Option<&str>) {
+    let Some(key) = state_key(pool, profile) else {
+        return;
+    };
+    mutate_state(|state| {
+        state.entries.entry(key).or_default().last_success_unix = Some(now_unix());
+    });
+}
+
+pub fn mark_profile_primed(pool: Option<&str>, profile: Option<&str>) {
+    let Some(key) = state_key(pool, profile) else {
+        return;
+    };
+    mutate_state(|state| {
+        let now = now_unix();
+        let entry = state.entries.entry(key).or_default();
+        entry.last_success_unix = Some(now);
+        entry.primed_unix = Some(now);
+    });
+}
+
+pub fn profile_needs_priming(
+    pool: Option<&str>,
+    profile: Option<&str>,
+    reprime_after: Option<Duration>,
+) -> bool {
+    let Some(key) = state_key(pool, profile) else {
+        return false;
+    };
+    with_state(|state| {
+        let Some(primed_unix) = state.entries.get(&key).and_then(|entry| entry.primed_unix) else {
+            return true;
+        };
+        reprime_after
+            .is_some_and(|duration| now_unix().saturating_sub(primed_unix) >= duration.as_secs())
+    })
+}
+
+pub fn last_selected_profile(pool: Option<&str>) -> Option<String> {
+    let pool = pool.filter(|value| !value.trim().is_empty())?;
+    with_state(|state| {
+        state
+            .pools
+            .get(pool)
+            .and_then(|entry| entry.last_selected_profile.clone())
+    })
+}
+
+pub fn mark_pool_selected(pool: Option<&str>, profile: Option<&str>) {
+    let Some(pool) = pool.filter(|value| !value.trim().is_empty()) else {
+        return;
+    };
+    let Some(profile) = profile.filter(|value| !value.trim().is_empty()) else {
+        return;
+    };
+    mutate_state(|state| {
+        state
+            .pools
+            .entry(pool.to_string())
+            .or_default()
+            .last_selected_profile = Some(profile.to_string());
+    });
+}
+
+fn with_state<T>(f: impl FnOnce(&AuthPoolState) -> T) -> T {
+    let _guard = STATE_LOCK.lock().ok();
+    let state = load_state();
+    f(&state)
+}
+
+fn mutate_state(f: impl FnOnce(&mut AuthPoolState)) {
+    let _guard = STATE_LOCK.lock().ok();
     let mut state = load_state();
-    if state.entries.remove(&key).is_some() {
-        save_state(&state);
-    }
+    f(&mut state);
+    save_state(&state);
 }
 
 fn state_key(pool: Option<&str>, profile: Option<&str>) -> Option<String> {
