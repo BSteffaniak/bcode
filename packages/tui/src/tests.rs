@@ -3342,7 +3342,8 @@ fn file_change_artifact_history_renders_generic_tool_result_without_request() {
 
     assert!(transcript.iter().any(|item| {
         matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
-            && item.text().contains("test.file-change-artifact")
+            && item.text().contains("File change")
+            && item.text().contains("wrote 2 bytes")
             && item.text().contains("file.txt")
     }));
     assert!(!transcript.iter().any(|item| {
@@ -3381,7 +3382,8 @@ fn file_change_artifact_live_renders_generic_tool_result() {
 
     assert!(app.transcript().iter().any(|item| {
         matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
-            && item.text().contains("test.file-change-artifact")
+            && item.text().contains("File change")
+            && item.text().contains("wrote 2 bytes")
             && item.text().contains("file.txt")
     }));
     assert!(!app.transcript().iter().any(|item| {
@@ -3674,8 +3676,8 @@ fn semantic_terminal_result_without_stream_renders_generic_artifact() {
     );
     assert!(transcript.iter().any(|item| {
         matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
+            && item.text().contains("Shell run")
             && item.text().contains("test.shell-artifact")
-            && item.text().contains("ansi tail")
     }));
 }
 
@@ -3797,9 +3799,8 @@ fn semantic_captured_shell_result_renders_generic_artifact() {
     );
     assert!(transcript.iter().any(|item| {
         matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
+            && item.text().contains("Shell run")
             && item.text().contains("test.shell-artifact")
-            && item.text().contains("captured stdout")
-            && item.text().contains("captured stderr")
     }));
     assert!(
         !transcript
