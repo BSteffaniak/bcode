@@ -1776,6 +1776,7 @@ dependencies = [
  "sha2 0.10.9",
  "sshenv_vault",
  "tokio",
+ "tracing",
  "zeroize",
 ]
 

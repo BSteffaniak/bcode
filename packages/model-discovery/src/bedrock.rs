@@ -59,6 +59,7 @@ fn live_model_from_summary(summary: &FoundationModelSummary) -> LiveModel {
     LiveModel {
         model_id: summary.model_id.clone(),
         display_name: summary.model_name.clone(),
+        aliases: std::collections::BTreeSet::new(),
         status: summary
             .model_lifecycle
             .as_ref()

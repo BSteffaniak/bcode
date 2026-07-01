@@ -103,10 +103,11 @@ impl ModelCatalog {
         &self.document
     }
 
-    /// Access the underlying catalog document mutably (for live snapshot merging).
-    #[allow(clippy::missing_const_for_fn)]
-    pub fn document_mut(&mut self) -> &mut CatalogDocument {
-        &mut self.document
+    /// Return a catalog with live model snapshots applied.
+    #[must_use]
+    pub fn with_live_snapshots(mut self, snapshots: &[LiveCatalogSnapshot]) -> Self {
+        merge_live_snapshots(&mut self.document, snapshots);
+        self
     }
 
     /// Load the checked-in bundled catalog source.
@@ -690,6 +691,7 @@ pub fn merge_live_snapshots(catalog: &mut CatalogDocument, snapshots: &[LiveCata
             {
                 entry.display_name.clone_from(display_name);
             }
+            entry.aliases.extend(live_model.aliases.iter().cloned());
             if entry.context_window.is_none() {
                 entry.context_window = live_model.context_window;
             }
@@ -720,7 +722,7 @@ fn live_model_entry(
             .display_name
             .clone()
             .unwrap_or_else(|| live_model.model_id.clone()),
-        aliases: std::collections::BTreeSet::new(),
+        aliases: live_model.aliases.clone(),
         status: CatalogModelStatus::Unknown,
         bcode_support: BcodeSupportStatus::Unknown,
         context_window: live_model.context_window,

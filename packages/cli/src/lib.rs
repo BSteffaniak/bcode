@@ -1337,7 +1337,21 @@ enum SessionExportFormat {
 
 #[derive(Debug, Subcommand)]
 enum ModelCommand {
-    List,
+    List {
+        /// Print raw JSON including context metadata.
+        #[arg(long)]
+        json: bool,
+        /// Provider plugin id to query.
+        #[arg(long)]
+        provider: Option<String>,
+    },
+    Status {
+        /// Session id to inspect. Defaults to the draft/default model status.
+        session_id: Option<SessionId>,
+        /// Print raw JSON.
+        #[arg(long)]
+        json: bool,
+    },
     Capabilities,
     Validate,
     Ignore {
@@ -2031,7 +2045,10 @@ async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
         other => {
             ensure_server_running().await?;
             match other {
-                ModelCommand::List => list_models().await?,
+                ModelCommand::List { json, provider } => list_models(json, provider).await?,
+                ModelCommand::Status { session_id, json } => {
+                    model_status(session_id, json).await?;
+                }
                 ModelCommand::Capabilities => model_capabilities().await?,
                 ModelCommand::Validate => model_validate_config().await?,
                 ModelCommand::Set {
@@ -4204,15 +4221,60 @@ async fn publish_plugin_event(
     Ok(())
 }
 
-async fn list_models() -> Result<(), CliError> {
-    let response = call_model_provider_service(bcode_model::OP_MODELS).await?;
-    if let Some(error) = response.error {
-        println!("ERROR\t{}\t{}", error.code, error.message);
-        return Ok(());
+async fn list_models(json: bool, provider: Option<String>) -> Result<(), CliError> {
+    let models = BcodeClient::default_endpoint()
+        .session_model_list(provider)
+        .await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&models)?);
+    } else {
+        print_model_list(&models.models);
     }
-    let models: bcode_model::ModelList = serde_json::from_slice(&response.payload)?;
-    print_model_list(&models.models);
     Ok(())
+}
+
+async fn model_status(session_id: Option<SessionId>, json: bool) -> Result<(), CliError> {
+    let client = BcodeClient::default_endpoint();
+    let status = if let Some(session_id) = session_id {
+        client.session_model_status(session_id).await?
+    } else {
+        client.default_model_status().await?
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+    } else {
+        print_model_status(&status);
+    }
+    Ok(())
+}
+
+fn print_model_status(status: &bcode_ipc::SessionModelStatus) {
+    println!(
+        "provider\t{}",
+        status.provider_plugin_id.as_deref().unwrap_or("<auto>")
+    );
+    println!(
+        "model\t{}",
+        status.model_id.as_deref().unwrap_or("<default>")
+    );
+    println!(
+        "context_window\t{}",
+        status
+            .context_window
+            .map_or_else(|| "<none>".to_string(), |value| value.to_string())
+    );
+    println!(
+        "max_output_tokens\t{}",
+        status
+            .max_output_tokens
+            .map_or_else(|| "<none>".to_string(), |value| value.to_string())
+    );
+    println!(
+        "metadata_source\t{}",
+        status
+            .metadata_source
+            .map_or_else(|| "<none>".to_string(), |source| format!("{source:?}"))
+    );
 }
 
 fn print_model_list(models: &[bcode_model::ModelInfo]) {
@@ -4229,17 +4291,29 @@ fn print_model_list(models: &[bcode_model::ModelInfo]) {
         .unwrap_or("DISPLAY NAME".len())
         .max("DISPLAY NAME".len());
     println!(
-        "{:<model_width$}  {:<display_name_width$}  DEFAULT",
-        "MODEL", "DISPLAY NAME"
+        "{:<model_width$}  {:<display_name_width$}  {:>10}  {:>10}  {:<16}  DEFAULT",
+        "MODEL", "DISPLAY NAME", "CTX", "MAX OUT", "METADATA"
     );
     for model in models {
+        let context = model
+            .context_window
+            .map_or_else(|| "-".to_string(), |value| value.to_string());
+        let max_output = model
+            .max_output_tokens
+            .map_or_else(|| "-".to_string(), |value| value.to_string());
+        let metadata = model
+            .metadata_source
+            .map_or_else(|| "-".to_string(), |source| format!("{source:?}"));
         if model.is_default {
             println!(
-                "{:<model_width$}  {:<display_name_width$}  yes",
-                model.model_id, model.display_name
+                "{:<model_width$}  {:<display_name_width$}  {:>10}  {:>10}  {:<16}  yes",
+                model.model_id, model.display_name, context, max_output, metadata
             );
         } else {
-            println!("{:<model_width$}  {}", model.model_id, model.display_name);
+            println!(
+                "{:<model_width$}  {:<display_name_width$}  {:>10}  {:>10}  {:<16}",
+                model.model_id, model.display_name, context, max_output, metadata
+            );
         }
     }
 }

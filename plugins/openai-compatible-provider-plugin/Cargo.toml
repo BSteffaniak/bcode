@@ -37,6 +37,7 @@ tokio = { workspace = true, features = [
     "sync",
     "time",
 ] }
+tracing = { workspace = true }
 zeroize = { workspace = true }
 
 [features]

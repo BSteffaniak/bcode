@@ -46,6 +46,9 @@ pub struct LiveModel {
     /// Provider display name, if returned by the provider API.
     #[serde(default)]
     pub display_name: Option<String>,
+    /// Provider-native aliases, when returned by the provider API.
+    #[serde(default)]
+    pub aliases: BTreeSet<String>,
     /// Provider lifecycle/status text.
     #[serde(default)]
     pub status: Option<String>,

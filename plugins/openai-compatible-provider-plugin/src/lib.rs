@@ -1521,7 +1521,7 @@ async fn resolve_model_id_for_turn(
         return model_id.clone();
     }
     if let AuthSettings::ApiKey(api_key) = &settings.auth {
-        match discover_models_async(settings, api_key).await {
+        match models_from_settings_async(settings, api_key, None).await {
             Ok(models) => {
                 if let Some(model) = select_default_model_info(&models) {
                     return model.model_id.clone();
@@ -1656,6 +1656,7 @@ async fn read_stream_events(
     let mut buffer = String::new();
     let name_map = projected_tool_name_map(request, OpenAiCompatibleDialect::ChatCompletions)?;
     let mut tool_calls = BTreeMap::new();
+    let mut saw_tool_call = false;
     loop {
         if turn.is_cancelled() {
             return Ok(StreamOutcome::Cancelled);
@@ -1663,10 +1664,16 @@ async fn read_stream_events(
         tokio::select! {
             chunk = response.chunk() => {
                 let Some(chunk) = chunk.map_err(|error| stream_read_error(&error))? else {
-                    return Ok(StreamOutcome::Finished);
+                    return Ok(if saw_tool_call { StreamOutcome::ToolCall } else { StreamOutcome::Finished });
                 };
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
-                let outcome = process_stream_buffer(&mut buffer, turn, &mut tool_calls, &name_map)?;
+                let outcome = process_stream_buffer(
+                    &mut buffer,
+                    turn,
+                    &mut tool_calls,
+                    &mut saw_tool_call,
+                    &name_map,
+                )?;
                 if matches!(outcome, StreamOutcome::Finished | StreamOutcome::ToolCall) {
                     return Ok(outcome);
                 }
@@ -2029,6 +2036,7 @@ fn process_stream_buffer(
     buffer: &mut String,
     turn: &TurnState,
     tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
+    saw_tool_call: &mut bool,
     name_map: &BTreeMap<String, String>,
 ) -> Result<StreamOutcome, ProviderError> {
     while let Some(position) = buffer.find('\n') {
@@ -2037,7 +2045,7 @@ fn process_stream_buffer(
             line.pop();
         }
         buffer.drain(..=position);
-        let outcome = process_stream_line(&line, turn, tool_calls, name_map)?;
+        let outcome = process_stream_line(&line, turn, tool_calls, saw_tool_call, name_map)?;
         if matches!(outcome, StreamOutcome::Finished | StreamOutcome::ToolCall) {
             return Ok(outcome);
         }
@@ -2049,13 +2057,18 @@ fn process_stream_line(
     line: &str,
     turn: &TurnState,
     tool_calls: &mut BTreeMap<u32, ToolCallAccumulator>,
+    saw_tool_call: &mut bool,
     name_map: &BTreeMap<String, String>,
 ) -> Result<StreamOutcome, ProviderError> {
     let Some(data) = line.strip_prefix("data: ") else {
         return Ok(StreamOutcome::Cancelled);
     };
     if data == "[DONE]" {
-        return Ok(StreamOutcome::Finished);
+        return Ok(if *saw_tool_call {
+            StreamOutcome::ToolCall
+        } else {
+            StreamOutcome::Finished
+        });
     }
 
     // Some providers (including certain error cases on xAI/OpenAI-compatible)
@@ -2091,17 +2104,16 @@ fn process_stream_line(
             turn.push(ProviderTurnEvent::TextDelta { text: content });
         }
         process_tool_call_deltas(turn, &choice.delta.tool_calls, tool_calls, name_map);
-        if let Some(finish_reason) = choice.finish_reason {
-            if finish_reason == "tool_calls" {
-                finish_tool_calls(
-                    turn,
-                    tool_calls,
-                    name_map,
-                    OpenAiCompatibleDialect::ChatCompletions,
-                )?;
-                return Ok(StreamOutcome::ToolCall);
-            }
-            return Ok(StreamOutcome::Finished);
+        if let Some(finish_reason) = choice.finish_reason
+            && finish_reason == "tool_calls"
+        {
+            finish_tool_calls(
+                turn,
+                tool_calls,
+                name_map,
+                OpenAiCompatibleDialect::ChatCompletions,
+            )?;
+            *saw_tool_call = true;
         }
     }
     Ok(StreamOutcome::Cancelled)
@@ -3218,22 +3230,37 @@ fn unsupported_content_type_retry_rule() -> ProviderRetryRule {
 impl OpenAiCompatibleProviderPlugin {
     fn models(&self, request: &ModelListRequest) -> ModelList {
         let settings = settings_for_context(&request.provider_context);
-        if !settings.model_ids_are_explicit
-            && let Some(discovered_models) = self.discover_models(&settings)
-        {
-            return ModelList {
-                models: ensure_selected_model_info(
-                    discovered_models,
-                    request.selected_model_id.as_deref(),
-                ),
-            };
-        }
-        ModelList {
-            models: ensure_selected_model_info(
-                model_infos_from_ids(&settings.model_ids, settings.default_model.as_deref()),
-                request.selected_model_id.as_deref(),
-            ),
-        }
+        tracing::debug!(
+            target: "bcode_model::provider::openai_compatible",
+            base_url = %settings.base_url,
+            dialect = %settings.dialect.metadata_value(),
+            catalog_provider = %catalog_provider_id(&settings),
+            selected_model_id = ?request.selected_model_id,
+            default_model = ?settings.default_model,
+            model_ids = ?settings.model_ids,
+            explicit_model_ids = settings.model_ids_are_explicit,
+            auth_configured = settings.auth.is_configured(),
+            auth_candidates = request.provider_context.auth_candidates.len(),
+            "provider model list start"
+        );
+        let models = if let Some(models) = self.models_from_context(
+            &settings,
+            &request.provider_context,
+            request.selected_model_id.as_deref(),
+        ) {
+            models
+        } else {
+            model_infos_from_ids(&settings.model_ids, settings.default_model.as_deref())
+        };
+        let models = ensure_selected_model_info(models, request.selected_model_id.as_deref());
+        let models = apply_provider_static_metadata(&settings, models);
+        tracing::debug!(
+            target: "bcode_model::provider::openai_compatible",
+            model_count = models.len(),
+            models = ?models.iter().map(model_debug_summary).collect::<Vec<_>>(),
+            "provider model list complete"
+        );
+        ModelList { models }
     }
 }
 
@@ -3241,6 +3268,48 @@ fn model_list_request(request: &ServiceRequest) -> ModelListRequest {
     request
         .payload_json::<ModelListRequest>()
         .unwrap_or_default()
+}
+
+const fn model_debug_summary(
+    model: &ModelInfo,
+) -> (&str, Option<u32>, Option<ModelMetadataSource>, bool) {
+    (
+        model.model_id.as_str(),
+        model.context_window,
+        model.metadata_source,
+        model.is_default,
+    )
+}
+
+fn apply_provider_static_metadata(settings: &Settings, models: Vec<ModelInfo>) -> Vec<ModelInfo> {
+    if catalog_provider_id(settings) != "xai" {
+        return models;
+    }
+    models.into_iter().map(apply_xai_static_metadata).collect()
+}
+
+fn apply_xai_static_metadata(mut model: ModelInfo) -> ModelInfo {
+    if model.context_window.is_none()
+        && let Some(context_window) = xai_static_context_window(&model.model_id)
+    {
+        model.context_window = Some(context_window);
+        model.metadata_source = Some(ModelMetadataSource::ProviderDefault);
+    }
+    model
+}
+
+fn xai_static_context_window(model_id: &str) -> Option<u32> {
+    let model_id = model_id.trim();
+    if model_id == "grok-4.3"
+        || model_id.starts_with("grok-4.20")
+        || model_id.starts_with("grok-4.3-")
+    {
+        return Some(1_000_000);
+    }
+    if model_id == "grok-build-0.1" || model_id.starts_with("grok-build-0.1-") {
+        return Some(256_000);
+    }
+    None
 }
 
 fn ensure_selected_model_info(
@@ -3328,31 +3397,47 @@ fn model_infos_from_items(
     }
 }
 
-async fn model_infos_from_items_with_remote(
-    models: Vec<ModelResponseItem>,
-    default_model: Option<&str>,
-    xai_api_key: Option<&str>,
+async fn enrich_model_infos_with_catalog_and_live(
+    settings: &Settings,
+    api_key: Option<&str>,
+    models: Vec<ModelInfo>,
 ) -> Vec<ModelInfo> {
-    let discovered = model_infos_from_items(models, default_model);
-
-    // Load catalog with remote overlay
+    let provider_id = catalog_provider_id(settings);
     let Ok(mut catalog) =
         bcode_model_catalog::ModelCatalog::load_bundled_with_remote_overlay().await
     else {
-        return discovered;
+        return models;
     };
 
-    // On-demand xAI live discovery using user's API key (if provided)
-    if let Some(key) = xai_api_key
-        && let Ok(snapshot) = bcode_model_discovery::xai::discover(Some(key.to_string())).await
-    {
-        bcode_model_catalog::merge_live_snapshots(
-            catalog.document_mut(),
-            std::slice::from_ref(&snapshot),
-        );
+    if let Some(snapshot) = live_catalog_snapshot(settings, api_key).await {
+        catalog = catalog.with_live_snapshots(std::slice::from_ref(&snapshot));
     }
 
-    catalog.merge_provider_models("openai", discovered, true)
+    catalog.merge_provider_models(provider_id, models, true)
+}
+
+fn catalog_provider_id(settings: &Settings) -> &'static str {
+    if discovery::is_xai_provider(
+        Some(&settings.base_url),
+        Some(settings.dialect.metadata_value()),
+    ) {
+        "xai"
+    } else {
+        "openai"
+    }
+}
+
+async fn live_catalog_snapshot(
+    settings: &Settings,
+    api_key: Option<&str>,
+) -> Option<bcode_model_catalog_models::LiveCatalogSnapshot> {
+    match catalog_provider_id(settings) {
+        "xai" => {
+            let api_key = api_key.map(str::to_string);
+            bcode_model_discovery::xai::discover(api_key).await.ok()
+        }
+        _ => None,
+    }
 }
 
 fn pricing_from_provider_api(
@@ -3598,23 +3683,103 @@ fn numeric_version_key(model_id: &str) -> Vec<u32> {
 }
 
 impl OpenAiCompatibleProviderPlugin {
-    fn discover_models(&self, settings: &Settings) -> Option<Vec<ModelInfo>> {
-        let AuthSettings::ApiKey(api_key) = settings.auth.clone() else {
-            return None;
-        };
+    fn models_from_context(
+        &self,
+        settings: &Settings,
+        context: &ProviderRequestContext,
+        selected_model_id: Option<&str>,
+    ) -> Option<Vec<ModelInfo>> {
         let runtime = self.runtime.as_ref().ok()?;
         let settings = settings.clone();
-        runtime
-            .block_on(async move { discover_models_async(&settings, &api_key).await })
-            .ok()
-            .and_then(Result::ok)
+        let api_key = model_metadata_api_key(&settings, context)?;
+        let selected_model_id = selected_model_id.map(str::to_string);
+        let result = runtime.block_on(async move {
+            models_from_settings_async(&settings, &api_key, selected_model_id.as_deref()).await
+        });
+        match result {
+            Ok(Ok(models)) => Some(models),
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    target: "bcode_model::provider::openai_compatible",
+                    error = ?error,
+                    "provider model metadata discovery failed; falling back to configured model ids"
+                );
+                None
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "bcode_model::provider::openai_compatible",
+                    error = ?error,
+                    "provider model metadata runtime failed; falling back to configured model ids"
+                );
+                None
+            }
+        }
     }
 }
 
-async fn discover_models_async(
+fn model_metadata_api_key(settings: &Settings, context: &ProviderRequestContext) -> Option<String> {
+    if let AuthSettings::ApiKey(api_key) = &settings.auth {
+        return Some(api_key.clone());
+    }
+    context.auth_candidates.iter().find_map(|candidate| {
+        candidate
+            .auth
+            .credentials
+            .get("api_key")
+            .map(|credential| credential.value.clone())
+            .or_else(|| candidate.env.get("BCODE_XAI_API_KEY").cloned())
+            .or_else(|| candidate.env.get("XAI_API_KEY").cloned())
+            .or_else(|| candidate.env.get("BCODE_OPENAI_API_KEY").cloned())
+            .or_else(|| candidate.env.get("OPENAI_API_KEY").cloned())
+    })
+}
+
+async fn models_from_settings_async(
     settings: &Settings,
     api_key: &str,
+    selected_model_id: Option<&str>,
 ) -> Result<Vec<ModelInfo>, ProviderError> {
+    let candidates = resolve_model_candidates(settings, api_key, selected_model_id).await?;
+    Ok(enrich_model_infos_with_catalog_and_live(settings, Some(api_key), candidates).await)
+}
+
+async fn resolve_model_candidates(
+    settings: &Settings,
+    api_key: &str,
+    selected_model_id: Option<&str>,
+) -> Result<Vec<ModelInfo>, ProviderError> {
+    let configured_model_ids = model_ids_with_selected(&settings.model_ids, selected_model_id);
+    if settings.model_ids_are_explicit {
+        return Ok(model_infos_from_ids(
+            &configured_model_ids,
+            settings.default_model.as_deref(),
+        ));
+    }
+
+    let mut models = fetch_provider_model_items(settings, api_key).await?;
+    append_missing_model_items(&mut models, &configured_model_ids);
+    Ok(model_infos_from_items(
+        models,
+        settings.default_model.as_deref(),
+    ))
+}
+
+fn model_ids_with_selected(model_ids: &[String], selected_model_id: Option<&str>) -> Vec<String> {
+    let mut result = model_ids.to_vec();
+    if let Some(selected_model_id) =
+        selected_model_id.filter(|model_id| !model_id.trim().is_empty())
+        && !result.iter().any(|model_id| model_id == selected_model_id)
+    {
+        result.push(selected_model_id.to_string());
+    }
+    result
+}
+
+async fn fetch_provider_model_items(
+    settings: &Settings,
+    api_key: &str,
+) -> Result<Vec<ModelResponseItem>, ProviderError> {
     let client = Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
@@ -3653,26 +3818,14 @@ async fn discover_models_async(
     if !status.is_success() {
         return Err(error_from_status(status.as_u16(), &body));
     }
-    let mut body = serde_json::from_str::<ModelsResponseBody>(&body).map_err(|error| {
+    let body = serde_json::from_str::<ModelsResponseBody>(&body).map_err(|error| {
         provider_error(
             "models_response_decode_failed",
             ProviderErrorCategory::ProviderInternal,
             error.to_string(),
         )
     })?;
-    append_missing_model_items(&mut body.data, &settings.model_ids);
-    // Pass xAI key for on-demand live discovery if this is an xAI provider
-    let xai_key: Option<String> = if discovery::is_xai_provider(Some(&settings.base_url), None) {
-        Some(api_key.to_string())
-    } else {
-        None
-    };
-    Ok(model_infos_from_items_with_remote(
-        body.data,
-        settings.default_model.as_deref(),
-        xai_key.as_deref(),
-    )
-    .await)
+    Ok(body.data)
 }
 
 impl OpenAiCompatibleProviderPlugin {
@@ -3851,9 +4004,10 @@ fn settings_for_context(context: &ProviderRequestContext) -> Settings {
             "OPENAI_MODELS",
         ],
     );
-    let mut model_ids = model_ids_env
-        .as_deref()
-        .map_or_else(|| default_model_ids(chatgpt_mode), parse_model_list);
+    let mut model_ids = model_ids_env.as_deref().map_or_else(
+        || default_model_ids(chatgpt_mode, xai_mode),
+        parse_model_list,
+    );
     let extra_model_ids = first_context_env(
         context,
         [
@@ -4404,7 +4558,10 @@ fn saved_chatgpt_auth_settings(saved: &SavedOpenAiAuth) -> (AuthSettings, AuthDi
     )
 }
 
-fn default_model_ids(chatgpt_mode: bool) -> Vec<String> {
+fn default_model_ids(chatgpt_mode: bool, xai_mode: bool) -> Vec<String> {
+    if xai_mode {
+        return vec![DEFAULT_XAI_MODEL_ID.to_string()];
+    }
     chatgpt_mode
         .then(catalog_fallback_model_ids)
         .unwrap_or_default()
@@ -5850,12 +6007,14 @@ mod tests {
     fn chat_completion_tool_argument_delta_emits_progress_event() {
         let turn = TurnState::default();
         let mut tool_calls = BTreeMap::new();
+        let mut saw_tool_call = false;
         let name_map = BTreeMap::new();
 
         let outcome = process_stream_line(
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"filesystem_write","arguments":"{\"path\""}}]},"finish_reason":null}]}"#,
             &turn,
             &mut tool_calls,
+            &mut saw_tool_call,
             &name_map,
         )
         .expect("stream event should process");
@@ -5865,6 +6024,68 @@ mod tests {
             event,
             ProviderTurnEvent::ToolCallDelta { call_id, delta }
                 if call_id == "call_1" && delta == "{\"path\""
+        )));
+    }
+
+    #[test]
+    fn chat_completion_stream_reads_usage_after_finish_reason() {
+        let turn = TurnState::default();
+        let mut buffer = concat!(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":7,\"total_tokens\":49}}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .to_string();
+        let mut tool_calls = BTreeMap::new();
+        let mut saw_tool_call = false;
+        let name_map = BTreeMap::new();
+
+        let outcome = process_stream_buffer(
+            &mut buffer,
+            &turn,
+            &mut tool_calls,
+            &mut saw_tool_call,
+            &name_map,
+        )
+        .expect("stream should process");
+
+        assert!(matches!(outcome, StreamOutcome::Finished));
+        assert!(turn.drain().iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::Usage { usage }
+                if usage.input_tokens == Some(42)
+                    && usage.output_tokens == Some(7)
+                    && usage.total_tokens == Some(49)
+        )));
+    }
+
+    #[test]
+    fn chat_completion_stream_preserves_tool_call_outcome_until_done() {
+        let turn = TurnState::default();
+        let mut buffer = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"filesystem_write\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":null}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":1,\"total_tokens\":10}}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .to_string();
+        let mut tool_calls = BTreeMap::new();
+        let mut saw_tool_call = false;
+        let name_map = BTreeMap::new();
+
+        let outcome = process_stream_buffer(
+            &mut buffer,
+            &turn,
+            &mut tool_calls,
+            &mut saw_tool_call,
+            &name_map,
+        )
+        .expect("stream should process");
+
+        assert!(matches!(outcome, StreamOutcome::ToolCall));
+        assert!(saw_tool_call);
+        assert!(turn.drain().iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::Usage { usage } if usage.input_tokens == Some(9)
         )));
     }
 
