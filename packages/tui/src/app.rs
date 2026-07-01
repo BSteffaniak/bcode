@@ -46,12 +46,12 @@ use super::temporal::next_elapsed_invalidation_capped;
 use super::theme::{PresentedTheme, ResolvedTheme};
 use super::timeline_dialog::TimelineEntry;
 use super::transcript::{
-    TranscriptItem, TranscriptItemKind, interactive_tool_request_item,
-    interactive_tool_resolution_item, live_tool_preview_anchor_item, model_usage_item,
-    permission_request_item, permission_result_item, streaming_terminal_output_item,
-    streaming_tool_output_item, tool_native_presentation_item, tool_presentation_card_from_event,
-    tool_presentation_card_item, tool_request_item, tool_result_item,
-    transcript_items_from_events_with_reasoning,
+    TranscriptItem, TranscriptItemKind, artifact_summary_text, display_tool_result_text,
+    interactive_tool_request_item, interactive_tool_resolution_item, live_tool_preview_anchor_item,
+    model_usage_item, permission_request_item, permission_result_item,
+    plugin_view_payload_summary_text, streaming_terminal_output_item, streaming_tool_output_item,
+    tool_native_presentation_item, tool_presentation_card_from_event, tool_presentation_card_item,
+    tool_request_item, tool_result_item, transcript_items_from_events_with_reasoning,
 };
 use super::transcript_document::TranscriptDocument;
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
@@ -2732,6 +2732,7 @@ impl BmuxApp {
             return;
         }
         let item = semantic_tool_result_item_for_app(
+            self.plugin_host.as_deref(),
             tool_call_id,
             tool_name.as_deref(),
             arguments_json.as_deref(),
@@ -2887,8 +2888,7 @@ impl BmuxApp {
                     self.upsert_tool_presentation_item(tool_call_id, item);
                     return;
                 }
-                let payload = serde_json::to_string_pretty(&view.payload)
-                    .unwrap_or_else(|_| view.payload.to_string());
+                let payload = plugin_view_payload_summary_text(&view.payload);
                 let card = bcode_session_models::ToolCardPresentation {
                     target: view.target,
                     title: view.title.clone().unwrap_or_else(|| view.schema.clone()),
@@ -2937,6 +2937,9 @@ impl BmuxApp {
     }
 
     fn upsert_tool_presentation_item(&mut self, tool_call_id: &str, item: TranscriptItem) {
+        if !item.streaming() {
+            self.presented_tool_results.insert(tool_call_id.to_owned());
+        }
         self.transcript.retain(|existing| {
             !(existing.is_generic_tool_fallback_for(tool_call_id)
                 || existing.is_tool_native_presentation_for(tool_call_id)
@@ -3968,6 +3971,7 @@ fn context_window_percentage(input_tokens: u32, context_window: u32) -> u32 {
 }
 
 fn semantic_tool_result_item_for_app(
+    runtime: Option<&bcode_plugin::PluginHost>,
     tool_call_id: &str,
     tool_name: Option<&str>,
     arguments_json: Option<&str>,
@@ -3982,21 +3986,29 @@ fn semantic_tool_result_item_for_app(
         Some(ToolInvocationResult::Json { value }) => {
             tool_result_item(tool_call_id, tool_name, arguments_json, value, is_error)
         }
-        Some(ToolInvocationResult::Artifact { artifact }) => artifact_result_item_for_app(
-            tool_call_id,
-            tool_name,
-            arguments_json,
-            artifact,
-            fallback_result,
-            is_error,
-        ),
-        None => tool_result_item(
-            tool_call_id,
-            tool_name,
-            arguments_json,
-            fallback_result,
-            is_error,
-        ),
+        Some(ToolInvocationResult::Artifact { artifact }) => {
+            present_artifact_item_for_app(runtime, tool_call_id, tool_name, artifact)
+                .unwrap_or_else(|| {
+                    artifact_result_item_for_app(
+                        tool_call_id,
+                        tool_name,
+                        arguments_json,
+                        artifact,
+                        fallback_result,
+                        is_error,
+                    )
+                })
+        }
+        None => {
+            let fallback_result = display_tool_result_text(fallback_result);
+            tool_result_item(
+                tool_call_id,
+                tool_name,
+                arguments_json,
+                &fallback_result,
+                is_error,
+            )
+        }
     }
 }
 
@@ -4005,14 +4017,14 @@ fn artifact_result_item_for_app(
     tool_name: Option<&str>,
     arguments_json: Option<&str>,
     artifact: &bcode_session_models::ToolArtifact,
-    fallback_result: &str,
+    _fallback_result: &str,
     is_error: bool,
 ) -> TranscriptItem {
     tool_result_item(
         tool_call_id,
         tool_name,
         arguments_json,
-        &serde_json::to_string(artifact).unwrap_or_else(|_| fallback_result.to_owned()),
+        &artifact_summary_text(artifact),
         is_error,
     )
 }
@@ -4029,6 +4041,7 @@ fn working_directory_changed_message(
 }
 
 fn tool_presentation_item_from_plugin(
+    runtime: Option<&bcode_plugin::PluginHost>,
     tool_call_id: &str,
     tool_name: &str,
     presentation: bcode_tool::ToolPresentationEvent,
@@ -4050,6 +4063,32 @@ fn tool_presentation_item_from_plugin(
                 Some(tool_name),
                 card,
             ))
+        }
+        bcode_tool::ToolPresentationEvent::PluginView(view) => {
+            let view = bcode_session_models::ToolPluginViewPresentation {
+                target: presentation_target_to_session(view.target),
+                producer_plugin_id: view.producer_plugin_id,
+                schema: view.schema,
+                schema_version: view.schema_version,
+                title: view.title,
+                subtitle: view.subtitle,
+                payload: view.payload,
+            };
+            native_view_item_for_app(runtime, tool_call_id, Some(tool_name), &view).or_else(|| {
+                Some(tool_presentation_card_item(
+                    tool_call_id,
+                    Some(tool_name),
+                    bcode_session_models::ToolCardPresentation {
+                        target: view.target,
+                        title: view.title.unwrap_or_else(|| view.schema.clone()),
+                        subtitle: view.subtitle,
+                        sections: vec![bcode_session_models::ToolPresentationSection::Text {
+                            label: None,
+                            text: plugin_view_payload_summary_text(&view.payload),
+                        }],
+                    },
+                ))
+            })
         }
         bcode_tool::ToolPresentationEvent::Protocol(protocol) => Some(TranscriptItem::with_kind(
             "Tool",
@@ -4200,6 +4239,7 @@ fn present_view_item_for_app(
     let response = runtime.present_view(&request).ok()??;
     response.presentation.and_then(|presentation| {
         tool_presentation_item_from_plugin(
+            Some(runtime),
             tool_call_id,
             tool_name.unwrap_or(&view.producer_plugin_id),
             presentation,
@@ -4224,6 +4264,7 @@ fn present_artifact_item_for_app(
     let response = runtime.present_artifact(&request).ok()??;
     response.presentation.and_then(|presentation| {
         tool_presentation_item_from_plugin(
+            Some(runtime),
             tool_call_id,
             tool_name.unwrap_or(&artifact.producer_plugin_id),
             presentation,

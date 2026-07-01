@@ -25,9 +25,10 @@ use bmux_tui_components::text_input::TextInputControl;
 use super::activity::ActivityState;
 use super::app::{BmuxApp, DaemonConnectionState, LiveToolPreviewState, composer_policy};
 use super::pending_submission::{PendingSubmission, PendingSubmissionState};
-use super::tool_present::{ToolRequestPresentation, tool_request_presentation};
-use super::transcript::pretty_jsonish;
-use super::transcript::{TranscriptItem, TranscriptItemKind};
+use super::tool_present::{
+    ToolRequestPresentation, tool_request_plugin_view_preview, tool_request_presentation,
+};
+use super::transcript::{TranscriptItem, TranscriptItemKind, plugin_view_payload_summary_text};
 use super::transcript_layout::TranscriptLayoutSignature;
 use crate::time_format::{format_elapsed_millis, format_millis};
 use bmux_tui::text_width::{display_width as text_display_width, truncate_to_display_width};
@@ -631,7 +632,7 @@ fn push_transcript_item_rows(
                 arguments_json,
                 request_presentation: request_presentation.as_ref(),
                 _live_preview: *live_preview,
-                _inline_view_config: (),
+                plugin_host,
             };
             push_tool_request_rows(rows, item, &context, width);
         }
@@ -1016,7 +1017,7 @@ struct ToolRequestRenderContext<'a> {
     arguments_json: &'a str,
     request_presentation: Option<&'a bcode_session_models::ToolRequestPresentationMetadata>,
     _live_preview: bool,
-    _inline_view_config: (),
+    plugin_host: Option<&'a bcode_plugin::PluginHost>,
 }
 
 fn push_tool_request_rows(
@@ -1047,7 +1048,37 @@ fn push_tool_request_rows(
         muted_style(),
         muted_style(),
     );
-    if let Some(presentation) =
+    if let Some(view) =
+        tool_request_plugin_view_preview(context.arguments_json, context.request_presentation)
+    {
+        if let Some(native_rows) = context
+            .plugin_host
+            .and_then(|host| host.tui_registry(&view.producer_plugin_id))
+            .and_then(|registry| registry.visual_rows(&view.schema, &view.payload, width))
+        {
+            rows.extend(native_rows);
+        } else {
+            push_wrapped_styled_text(
+                rows,
+                Vec::new(),
+                view.title.as_deref().unwrap_or(&view.schema),
+                width,
+                Style::new().fg(Color::Cyan),
+                Style::new().fg(Color::Cyan),
+            );
+            let summary = plugin_view_payload_summary_text(&view.payload);
+            if !summary.is_empty() {
+                push_wrapped_styled_text(
+                    rows,
+                    vec![Span::styled("  ", muted_style())],
+                    &summary,
+                    width,
+                    Style::new(),
+                    Style::new(),
+                );
+            }
+        }
+    } else if let Some(presentation) =
         tool_request_presentation(context.arguments_json, context.request_presentation)
     {
         push_tool_request_presentation_rows(rows, &presentation, width);
@@ -1112,14 +1143,17 @@ fn push_live_tool_preview_anchor_rows(
                         muted_style(),
                     );
                 }
-                push_wrapped_styled_text(
-                    rows,
-                    vec![Span::styled("  ", muted_style())],
-                    &pretty_jsonish(&view.payload.to_string()),
-                    width,
-                    Style::new(),
-                    Style::new(),
-                );
+                let summary = plugin_view_payload_summary_text(&view.payload);
+                if !summary.is_empty() {
+                    push_wrapped_styled_text(
+                        rows,
+                        vec![Span::styled("  ", muted_style())],
+                        &summary,
+                        width,
+                        Style::new(),
+                        Style::new(),
+                    );
+                }
             }
             rows.push(Line::default());
         }

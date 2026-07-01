@@ -15,9 +15,10 @@ use bcode_session_models::{
     RuntimeWorkKind, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
     SessionProjectionKind, SessionSummary, SessionTitleSource, SessionTokenUsage,
     SessionTraceEvent, SessionTracePayload, SessionTracePhase, ShellRunResult,
-    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream, ToolPresentationEvent,
-    ToolPresentationField, ToolPresentationFieldKind, ToolPresentationFieldValue,
-    ToolPresentationLevel, ToolPresentationSection, ToolPresentationTarget,
+    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream, ToolPluginViewMetadata,
+    ToolPluginViewPresentation, ToolPresentationEvent, ToolPresentationField,
+    ToolPresentationFieldKind, ToolPresentationFieldValue, ToolPresentationLevel,
+    ToolPresentationPayloadSelector, ToolPresentationSection, ToolPresentationTarget,
     ToolProgressPresentation, ToolRequestPresentationMetadata, ToolRequestPreviewMetadata,
     ToolStatusPresentation,
 };
@@ -37,7 +38,10 @@ use super::{
     render, slash_palette, slash_palette_render,
     temporal::next_elapsed_invalidation_capped,
     time_format::{format_duration_nanos, format_millis},
-    transcript::{TranscriptItem, TranscriptItemKind, transcript_items_from_events_with_reasoning},
+    transcript::{
+        TranscriptItem, TranscriptItemKind, plugin_view_payload_summary_text,
+        transcript_items_from_events_with_reasoning,
+    },
     transcript_document::TranscriptDocument,
 };
 
@@ -2156,8 +2160,11 @@ fn transcript_renders_terminal_shell_output_without_viewport_padding() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("schema"));
+    assert!(output.contains("Shell run"));
     assert!(output.contains("test.shell-artifact"));
+    assert!(!output.contains("artifact_id"));
+    assert!(!output.contains("producer_plugin_id"));
+    assert!(!output.contains("metadata"));
 }
 
 #[test]
@@ -2192,8 +2199,11 @@ fn transcript_renders_truncated_terminal_shell_output_as_terminal() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("schema"));
+    assert!(output.contains("Shell run"));
     assert!(output.contains("test.shell-artifact"));
+    assert!(!output.contains("artifact_id"));
+    assert!(!output.contains("producer_plugin_id"));
+    assert!(!output.contains("metadata"));
 }
 
 #[test]
@@ -4430,6 +4440,96 @@ fn transcript_resident_window_prunes_old_tool_state_after_trim() {
     assert_eq!(app.resident_streamed_tool_result_count(), 0);
 }
 
+#[test]
+fn legacy_serialized_artifact_result_does_not_render_raw_json() {
+    let session_id = SessionId::new();
+    let artifact = bcode_session_models::ToolArtifact {
+        artifact_id: "call-file-filesystem-change".to_string(),
+        producer_plugin_id: "bcode.filesystem".to_string(),
+        schema: "bcode.filesystem.change".to_string(),
+        schema_version: 1,
+        tool_call_id: Some("call-file".to_string()),
+        title: Some("File change".to_string()),
+        metadata: serde_json::json!({
+            "summary": "wrote 12 bytes",
+            "path": "/tmp/hello.txt",
+            "old_text": "",
+            "new_text": "hello world\n"
+        }),
+        refs: Vec::new(),
+    };
+    let events = vec![event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call-file".to_owned(),
+            result: serde_json::to_string(&artifact).expect("artifact should serialize"),
+            is_error: false,
+            output: None,
+            semantic_result: None,
+        },
+    )];
+
+    let transcript = transcript_items_from_events_with_reasoning(&events, true);
+    let item = transcript
+        .iter()
+        .find(|item| matches!(item.kind(), TranscriptItemKind::ToolResult { .. }))
+        .expect("tool result should render");
+
+    assert!(item.text().contains("File change"));
+    assert!(item.text().contains("wrote 12 bytes"));
+    assert!(item.text().contains("/tmp/hello.txt"));
+    assert!(!item.text().contains("artifact_id"));
+    assert!(!item.text().contains("producer_plugin_id"));
+    assert!(!item.text().contains("metadata"));
+}
+
+#[test]
+fn legacy_serialized_semantic_artifact_result_does_not_render_raw_json() {
+    let session_id = SessionId::new();
+    let result = ToolInvocationResult::Artifact {
+        artifact: Box::new(bcode_session_models::ToolArtifact {
+            artifact_id: "call-file-filesystem-change".to_string(),
+            producer_plugin_id: "bcode.filesystem".to_string(),
+            schema: "bcode.filesystem.change".to_string(),
+            schema_version: 1,
+            tool_call_id: Some("call-file".to_string()),
+            title: Some("File change".to_string()),
+            metadata: serde_json::json!({
+                "summary": "edited file",
+                "path": "/tmp/hello.txt",
+                "old_text": "hello",
+                "new_text": "hello world"
+            }),
+            refs: Vec::new(),
+        }),
+    };
+    let events = vec![event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call-file".to_owned(),
+            result: serde_json::to_string(&result).expect("semantic result should serialize"),
+            is_error: false,
+            output: None,
+            semantic_result: None,
+        },
+    )];
+
+    let transcript = transcript_items_from_events_with_reasoning(&events, true);
+    let item = transcript
+        .iter()
+        .find(|item| matches!(item.kind(), TranscriptItemKind::ToolResult { .. }))
+        .expect("tool result should render");
+
+    assert!(item.text().contains("File change"));
+    assert!(item.text().contains("edited file"));
+    assert!(item.text().contains("/tmp/hello.txt"));
+    assert!(!item.text().contains("artifact_id"));
+    assert!(!item.text().contains("producer_plugin_id"));
+    assert!(!item.text().contains("metadata"));
+}
+
 fn shell_result_artifact(result: &ShellRunResult) -> ToolInvocationResult {
     ToolInvocationResult::Artifact {
         artifact: Box::new(bcode_session_models::ToolArtifact {
@@ -4694,6 +4794,227 @@ fn thinking_dialog_does_not_cycle_when_reasoning_is_unsupported() {
     dialog.cycle_focused();
     assert_eq!(dialog.summary(), None);
     assert!(dialog.summary_values().is_empty());
+}
+
+#[test]
+fn plugin_view_result_presentation_absorbs_as_summary_not_raw_json() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call-write".to_owned(),
+            tool_name: "filesystem.write".to_owned(),
+            arguments_json: r#"{"path":"file.txt","contents":"hi"}"#.to_owned(),
+            request_presentation: None,
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::ToolInvocationStream {
+            event: ToolInvocationStreamEvent::Presentation {
+                tool_call_id: "call-write".to_owned(),
+                sequence: 1,
+                presentation: ToolPresentationEvent::PluginView(ToolPluginViewPresentation {
+                    target: ToolPresentationTarget::Result,
+                    producer_plugin_id: "bcode.filesystem".to_owned(),
+                    schema: "bcode.filesystem.file_change".to_owned(),
+                    schema_version: 1,
+                    title: Some("Applied file change".to_owned()),
+                    subtitle: Some("wrote 45 bytes".to_owned()),
+                    payload: serde_json::json!({
+                        "path": "/tmp/main.rs",
+                        "old_text": "",
+                        "new_text": "fn main() {\n    println!(\"Hello, world!\");\n}\n"
+                    }),
+                }),
+            },
+        },
+    ));
+
+    let item = app
+        .transcript()
+        .iter()
+        .find(|item| matches!(item.kind(), TranscriptItemKind::ToolPresentationCard { .. }))
+        .expect("plugin view should become a card fallback");
+    assert!(item.text().contains("Applied file change"));
+    if let TranscriptItemKind::ToolPresentationCard { card, .. } = item.kind() {
+        let text = match &card.sections[0] {
+            ToolPresentationSection::Text { text, .. } => text,
+            other => panic!("unexpected section: {other:?}"),
+        };
+        assert!(text.contains("/tmp/main.rs"));
+        assert!(text.contains("+fn main()"));
+        assert!(!text.contains("old_text"));
+        assert!(!text.contains("new_text"));
+    }
+}
+
+#[test]
+fn replayed_plugin_view_result_suppresses_artifact_json_fallback() {
+    let session_id = SessionId::new();
+    let events = vec![
+        event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-write".to_owned(),
+                tool_name: "filesystem.write".to_owned(),
+                arguments_json: r#"{"path":"file.txt","contents":"hi"}"#.to_owned(),
+                request_presentation: None,
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Presentation {
+                    tool_call_id: "call-write".to_owned(),
+                    sequence: 1,
+                    presentation: ToolPresentationEvent::PluginView(ToolPluginViewPresentation {
+                        target: ToolPresentationTarget::Result,
+                        producer_plugin_id: "bcode.filesystem".to_owned(),
+                        schema: "bcode.filesystem.file_change".to_owned(),
+                        schema_version: 1,
+                        title: Some("Applied file change".to_owned()),
+                        subtitle: Some("wrote 45 bytes".to_owned()),
+                        payload: serde_json::json!({
+                            "path": "/tmp/main.rs",
+                            "old_text": "",
+                            "new_text": "fn main() {\n    println!(\"Hello, world!\");\n}\n"
+                        }),
+                    }),
+                },
+            },
+        ),
+        event(
+            session_id,
+            3,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "call-write".to_owned(),
+                result: "wrote 45 bytes".to_owned(),
+                is_error: false,
+                output: None,
+                semantic_result: Some(ToolInvocationResult::Artifact {
+                    artifact: Box::new(bcode_session_models::ToolArtifact {
+                        artifact_id: "call-write-filesystem-change".to_owned(),
+                        producer_plugin_id: "bcode.filesystem".to_owned(),
+                        schema: "bcode.filesystem.change".to_owned(),
+                        schema_version: 1,
+                        tool_call_id: Some("call-write".to_owned()),
+                        title: Some("File change".to_owned()),
+                        metadata: serde_json::json!({
+                            "summary": "wrote 45 bytes",
+                            "path": "/tmp/main.rs",
+                            "old_text": "",
+                            "new_text": "fn main() {\n    println!(\"Hello, world!\");\n}\n"
+                        }),
+                        refs: Vec::new(),
+                    }),
+                }),
+            },
+        ),
+    ];
+
+    let transcript = transcript_items_from_events_with_reasoning(&events, true);
+    let item = transcript
+        .iter()
+        .find(|item| matches!(item.kind(), TranscriptItemKind::ToolPresentationCard { .. }))
+        .expect("replayed plugin view should produce a card");
+    assert!(item.text().contains("Applied file change"));
+    if let TranscriptItemKind::ToolPresentationCard { card, .. } = item.kind() {
+        let text = match &card.sections[0] {
+            ToolPresentationSection::Text { text, .. } => text,
+            other => panic!("unexpected section: {other:?}"),
+        };
+        assert!(text.contains("/tmp/main.rs"));
+        assert!(text.contains("+fn main()"));
+        assert!(!text.contains("old_text"));
+        assert!(!text.contains("new_text"));
+    }
+    assert_eq!(
+        transcript
+            .iter()
+            .filter(|item| matches!(item.kind(), TranscriptItemKind::ToolResult { .. }))
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn request_plugin_view_preview_summary_does_not_render_selector_json() {
+    let arguments_json = serde_json::json!({
+        "path": "src/main.rs",
+        "contents": "fn main() {\n    println!(\"hi\");\n}\n"
+    })
+    .to_string();
+    let metadata = ToolRequestPresentationMetadata {
+        title: "Write file".to_owned(),
+        fields: Vec::new(),
+        preview: Some(ToolRequestPreviewMetadata::PluginView {
+            view: ToolPluginViewMetadata {
+                schema: "bcode.filesystem.file_change".to_owned(),
+                schema_version: 1,
+                producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                title: Some("Write preview".to_owned()),
+                subtitle: None,
+                payload: BTreeMap::from([
+                    (
+                        "path".to_owned(),
+                        ToolPresentationPayloadSelector {
+                            fields: vec!["path".to_owned()],
+                            literal: None,
+                            required: false,
+                        },
+                    ),
+                    (
+                        "old_text".to_owned(),
+                        ToolPresentationPayloadSelector {
+                            fields: Vec::new(),
+                            literal: Some(serde_json::json!("")),
+                            required: false,
+                        },
+                    ),
+                    (
+                        "new_text".to_owned(),
+                        ToolPresentationPayloadSelector {
+                            fields: vec!["contents".to_owned(), "new_text".to_owned()],
+                            literal: None,
+                            required: true,
+                        },
+                    ),
+                ]),
+            },
+        }),
+    };
+    let view =
+        super::tool_present::tool_request_plugin_view_preview(&arguments_json, Some(&metadata))
+            .expect("plugin view preview should resolve");
+    let summary = plugin_view_payload_summary_text(&view.payload);
+
+    assert!(summary.contains("src/main.rs"));
+    assert!(summary.contains("+fn main()"));
+    assert!(!summary.contains("old_text"));
+    assert!(!summary.contains("new_text"));
+    assert!(!summary.contains("fields"));
+}
+
+#[test]
+fn plugin_view_payload_summary_does_not_render_raw_json() {
+    let summary = plugin_view_payload_summary_text(&serde_json::json!({
+        "path": "src/main.rs",
+        "old_text": "fn main() {}",
+        "new_text": "fn main() { println!(\"hi\"); }"
+    }));
+
+    assert!(summary.contains("src/main.rs"));
+    assert!(summary.contains("-fn main() {}"));
+    assert!(summary.contains("+fn main() { println!(\"hi\"); }"));
+    assert!(!summary.contains("old_text"));
+    assert!(!summary.contains("new_text"));
+    assert!(!summary.contains(r#""path""#));
 }
 
 #[test]

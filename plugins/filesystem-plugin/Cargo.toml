@@ -24,8 +24,14 @@ png                  = { workspace = true }
 serde                = { workspace = true, features = ["derive", "std"] }
 serde_json           = { workspace = true }
 unicode-segmentation = { workspace = true, optional = true }
+unicode-width        = { workspace = true, optional = true }
 
 [features]
-default          = []
+default = []
 fail-on-warnings = []
-static-bundled   = ["bcode_syntax_render", "bmux_tui", "unicode-segmentation"]
+static-bundled = [
+    "bcode_syntax_render",
+    "bmux_tui",
+    "unicode-segmentation",
+    "unicode-width",
+]

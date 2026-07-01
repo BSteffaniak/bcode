@@ -2818,6 +2818,16 @@ impl PluginHost {
         Ok(host)
     }
 
+    /// Return the number of native TUI visual adapters available from statically loaded plugins.
+    #[must_use]
+    pub fn native_visual_adapter_count(&self) -> usize {
+        self.loaded
+            .iter()
+            .filter_map(LoadedPlugin::tui_registry)
+            .map(|registry| registry.visual_adapter_count())
+            .sum()
+    }
+
     /// Return the number of manifest-declared visual adapters in loaded plugins.
     #[must_use]
     pub fn visual_adapter_count(&self) -> usize {

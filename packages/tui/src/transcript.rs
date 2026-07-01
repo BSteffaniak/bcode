@@ -3,10 +3,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use bcode_session_models::{
-    SessionEvent, SessionEventKind, SessionTokenUsage, ToolCardPresentation, ToolInvocationResult,
-    ToolInvocationStreamEvent, ToolOutputStream, ToolPresentationEvent, ToolPresentationTarget,
-    ToolRequestPresentationMetadata,
+    SessionEvent, SessionEventKind, SessionTokenUsage, ToolArtifact, ToolCardPresentation,
+    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream, ToolPresentationEvent,
+    ToolPresentationSection, ToolPresentationTarget, ToolRequestPresentationMetadata,
 };
+use serde_json::Value;
 
 /// Semantic transcript item type.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -593,9 +594,17 @@ pub fn tool_presentation_card_from_event(
                 sections: Vec::new(),
             })
         }
+        ToolPresentationEvent::PluginView(view) => Some(ToolCardPresentation {
+            target: view.target,
+            title: view.title.clone().unwrap_or_else(|| view.schema.clone()),
+            subtitle: view.subtitle.clone(),
+            sections: vec![ToolPresentationSection::Text {
+                label: None,
+                text: plugin_view_payload_summary_text(&view.payload),
+            }],
+        }),
         ToolPresentationEvent::Status(_)
         | ToolPresentationEvent::Progress(_)
-        | ToolPresentationEvent::PluginView(_)
         | ToolPresentationEvent::Clear { .. } => None,
     }
 }
@@ -1094,11 +1103,12 @@ fn non_streaming_transcript_item_from_event(
                 return None;
             }
             let context = tool_calls.get(tool_call_id);
+            let result = display_tool_result_text(result);
             Some(tool_result_item(
                 tool_call_id,
                 context.map(|context| context.tool_name.as_str()),
                 context.map(|context| context.arguments_json.as_str()),
-                result,
+                &result,
                 *is_error,
             ))
         }
@@ -1255,9 +1265,98 @@ fn generic_artifact_item(
         tool_call_id,
         context.map(|context| context.tool_name.as_str()),
         context.map(|context| context.arguments_json.as_str()),
-        &serde_json::to_string(artifact).unwrap_or_else(|_| "artifact".to_string()),
+        &artifact_summary_text(artifact),
         is_error,
     )
+}
+
+pub fn display_tool_result_text(result: &str) -> String {
+    if let Ok(result) = serde_json::from_str::<ToolInvocationResult>(result) {
+        return match result {
+            ToolInvocationResult::Text { text } | ToolInvocationResult::Json { value: text } => {
+                text
+            }
+            ToolInvocationResult::Artifact { artifact } => artifact_summary_text(&artifact),
+        };
+    }
+    serde_json::from_str::<ToolArtifact>(result).map_or_else(
+        |_| result.to_owned(),
+        |artifact| artifact_summary_text(&artifact),
+    )
+}
+
+pub fn artifact_summary_text(artifact: &ToolArtifact) -> String {
+    let title = artifact.title.as_deref().unwrap_or("Tool artifact");
+    let summary = artifact
+        .metadata
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&artifact.schema);
+    let path = artifact
+        .metadata
+        .get("path")
+        .and_then(serde_json::Value::as_str);
+    let text = path.map_or_else(|| summary.to_owned(), |path| format!("{summary}\n{path}"));
+    format!("{title}\n{text}")
+}
+
+pub fn plugin_view_payload_summary_text(payload: &Value) -> String {
+    let Some(object) = payload.as_object() else {
+        return scalar_payload_text(payload);
+    };
+    let mut lines = Vec::new();
+    if let Some(summary) = object.get("summary").and_then(Value::as_str)
+        && !summary.is_empty()
+    {
+        lines.push(summary.to_string());
+    }
+    let path = object.get("path").and_then(Value::as_str);
+    if let Some(path) = path
+        && !path.is_empty()
+    {
+        lines.push(format!("path: {path}"));
+    }
+    let old_text = object.get("old_text").and_then(Value::as_str);
+    let new_text = object.get("new_text").and_then(Value::as_str);
+    if old_text.is_some() || new_text.is_some() {
+        lines.push(file_change_summary_text(
+            path.unwrap_or("file"),
+            old_text.unwrap_or_default(),
+            new_text.unwrap_or_default(),
+        ));
+    }
+    for (key, value) in object {
+        if matches!(key.as_str(), "summary" | "path" | "old_text" | "new_text") {
+            continue;
+        }
+        let value = scalar_payload_text(value);
+        if !value.is_empty() {
+            lines.push(format!("{key}: {value}"));
+        }
+    }
+    if lines.is_empty() {
+        "plugin view payload".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn file_change_summary_text(path: &str, old_text: &str, new_text: &str) -> String {
+    let mut lines = vec![format!("--- {path}"), format!("+++ {path}")];
+    lines.extend(old_text.lines().map(|line| format!("-{line}")));
+    lines.extend(new_text.lines().map(|line| format!("+{line}")));
+    lines.join("\n")
+}
+
+fn scalar_payload_text(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => value.clone(),
+        Value::Array(values) => format!("{} items", values.len()),
+        Value::Object(values) => format!("{} fields", values.len()),
+    }
 }
 
 fn apply_tool_invocation_stream_event(

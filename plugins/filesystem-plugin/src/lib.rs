@@ -442,7 +442,7 @@ fn file_change_view_metadata(
     ToolPluginViewMetadata {
         schema: "bcode.filesystem.file_change".to_string(),
         schema_version: 1,
-        producer_plugin_id: Some("filesystem".to_string()),
+        producer_plugin_id: Some("bcode.filesystem".to_string()),
         title: Some(title.to_string()),
         subtitle: None,
         payload,
@@ -1212,7 +1212,7 @@ fn file_change_plugin_view_event(
 ) -> ToolPresentationEvent {
     ToolPresentationEvent::PluginView(bcode_tool::ToolPluginViewPresentation {
         target,
-        producer_plugin_id: "filesystem".to_string(),
+        producer_plugin_id: "bcode.filesystem".to_string(),
         schema: "bcode.filesystem.file_change".to_string(),
         schema_version: 1,
         title: Some(title.to_string()),
@@ -1230,6 +1230,8 @@ fn file_change_artifact(
     tool_name: &str,
     summary: &str,
     path: Option<&Path>,
+    old_text: &str,
+    new_text: &str,
 ) -> ToolInvocationResult {
     ToolInvocationResult::Artifact {
         artifact: Box::new(ToolArtifact {
@@ -1243,6 +1245,8 @@ fn file_change_artifact(
                 "tool_name": tool_name,
                 "summary": summary,
                 "path": path.map(|path| path.display().to_string()),
+                "old_text": old_text,
+                "new_text": new_text,
             }),
             refs: Vec::new(),
         }),
@@ -1270,6 +1274,29 @@ fn present_artifact(request: &ServiceRequest) -> ServiceResponse {
         .get("path")
         .and_then(serde_json::Value::as_str)
         .map(PathBuf::from);
+    let old_text = request
+        .artifact
+        .metadata
+        .get("old_text")
+        .and_then(serde_json::Value::as_str);
+    let new_text = request
+        .artifact
+        .metadata
+        .get("new_text")
+        .and_then(serde_json::Value::as_str);
+    if let (Some(path), Some(old_text), Some(new_text)) = (path.as_deref(), old_text, new_text) {
+        return json_response(&ToolArtifactPresentationResponse {
+            presentation: Some(file_change_plugin_view_event(
+                ToolPresentationTarget::Result,
+                "Applied file change",
+                Some(summary),
+                path,
+                old_text,
+                new_text,
+            )),
+            state: request.state,
+        });
+    }
     let section = path.as_deref().map_or_else(
         || ToolPresentationSection::Text {
             label: Some("Summary".to_string()),
@@ -1404,12 +1431,14 @@ fn tool_write(
                         events,
                         tool_call_id,
                         3,
-                        ToolPresentationEvent::Card(bcode_tool::ToolCardPresentation {
-                            target: ToolPresentationTarget::Result,
-                            title: "Applied file change".to_string(),
-                            subtitle: None,
-                            sections: vec![file_change_fields(&request.path, &summary)],
-                        }),
+                        file_change_plugin_view_event(
+                            ToolPresentationTarget::Result,
+                            "Applied file change",
+                            Some(&summary),
+                            &request.path,
+                            "",
+                            &request.contents,
+                        ),
                     );
                     ToolInvocationResponse {
                         output: summary.clone(),
@@ -1422,6 +1451,8 @@ fn tool_write(
                             "filesystem.write",
                             &summary,
                             Some(&request.path),
+                            "",
+                            &request.contents,
                         )),
                     }
                 },
@@ -1491,12 +1522,14 @@ fn tool_edit(
                         events,
                         tool_call_id,
                         3,
-                        ToolPresentationEvent::Card(bcode_tool::ToolCardPresentation {
-                            target: ToolPresentationTarget::Result,
-                            title: "Applied file change".to_string(),
-                            subtitle: None,
-                            sections: vec![file_change_fields(&request.path, &summary)],
-                        }),
+                        file_change_plugin_view_event(
+                            ToolPresentationTarget::Result,
+                            "Applied file change",
+                            Some(&summary),
+                            &request.path,
+                            &request.old_text,
+                            &request.new_text,
+                        ),
                     );
                     ToolInvocationResponse {
                         output: summary.clone(),
@@ -1509,6 +1542,8 @@ fn tool_edit(
                             "filesystem.edit",
                             &summary,
                             Some(&request.path),
+                            &request.old_text,
+                            &request.new_text,
                         )),
                     }
                 },
@@ -2543,10 +2578,14 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
         FilesystemPlugin,
         include_str!("../bcode-plugin.toml")
     );
-    vtable.tui_registry = Some(filesystem_tui_registry);
+    #[cfg(feature = "static-bundled")]
+    {
+        vtable.tui_registry = Some(filesystem_tui_registry);
+    }
     vtable
 }
 
+#[cfg(feature = "static-bundled")]
 fn filesystem_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
     registry.register_visual_adapter(Box::new(file_change_tui::FileChangeTuiVisualAdapter));
@@ -2567,6 +2606,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("create temp dir");
         path
+    }
+
+    #[test]
+    fn write_and_edit_live_previews_use_file_change_plugin_view() {
+        assert_file_change_plugin_live_preview(
+            write_tool_definition().ui.live_argument_preview,
+            &["contents", "new_text"],
+            Some(""),
+            false,
+        );
+        assert_file_change_plugin_live_preview(
+            edit_tool_definition().ui.live_argument_preview,
+            &["new_text"],
+            None,
+            true,
+        );
+    }
+
+    fn assert_file_change_plugin_live_preview(
+        preview: Option<ToolLiveArgumentPreviewMetadata>,
+        expected_new_text_fields: &[&str],
+        expected_old_text_literal: Option<&str>,
+        expected_old_text_required: bool,
+    ) {
+        let Some(ToolLiveArgumentPreviewMetadata::PluginView {
+            view,
+            streaming_status,
+        }) = preview
+        else {
+            panic!("expected plugin-view live preview");
+        };
+        assert_eq!(view.producer_plugin_id.as_deref(), Some("bcode.filesystem"));
+        assert_eq!(view.schema, "bcode.filesystem.file_change");
+        assert_eq!(view.schema_version, 1);
+        assert!(streaming_status.is_some());
+        assert_eq!(
+            view.payload.get("path").expect("path selector").fields,
+            vec!["path".to_string()]
+        );
+        assert_eq!(
+            view.payload
+                .get("new_text")
+                .expect("new_text selector")
+                .fields,
+            expected_new_text_fields
+                .iter()
+                .map(|field| (*field).to_string())
+                .collect::<Vec<_>>()
+        );
+        let old_text = view.payload.get("old_text").expect("old_text selector");
+        assert_eq!(old_text.required, expected_old_text_required);
+        assert_eq!(
+            old_text
+                .literal
+                .as_ref()
+                .and_then(serde_json::Value::as_str),
+            expected_old_text_literal
+        );
     }
 
     #[test]

@@ -253,6 +253,12 @@ impl PluginTuiRegistry {
         self.visual_adapters.push(adapter);
     }
 
+    /// Return the number of native visual adapters in this registry.
+    #[must_use]
+    pub fn visual_adapter_count(&self) -> usize {
+        self.visual_adapters.len()
+    }
+
     /// Return whether a native visual adapter supports this payload kind.
     #[must_use]
     pub fn supports_visual(&self, kind: &str) -> bool {

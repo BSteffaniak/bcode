@@ -3,6 +3,7 @@
 use bcode_syntax_render::SyntaxStyle;
 use bmux_tui::prelude::{Color, Line, Modifier, Span, Style};
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::file_change_diff::{
     ChangedRange, FileChangeDiffLine, FileChangeDiffLineKind, diff_from_text,
@@ -10,8 +11,8 @@ use crate::file_change_diff::{
 
 const MAX_INLINE_DIFF_ROWS: usize = 24;
 const INLINE_DIFF_CARD_MIN_WIDTH: usize = 24;
-const INLINE_DIFF_CARD_CHROME_WIDTH: usize = 10;
-const INLINE_DIFF_BODY_CHROME_WIDTH: usize = 11;
+const INLINE_DIFF_CARD_CHROME_WIDTH: usize = 14;
+const INLINE_DIFF_BODY_CHROME_WIDTH: usize = 14;
 
 #[derive(Debug, Clone, Copy)]
 enum PreviewRow<'a> {
@@ -118,9 +119,11 @@ fn file_change_rows(
     let total_rows = diff.lines.len();
     let shown_rows = total_rows.min(MAX_INLINE_DIFF_ROWS);
     let progress = if total_rows > shown_rows {
-        format!("live preview · showing {shown_rows} of {total_rows} diff rows")
+        format!(
+            "live preview · showing {shown_rows} of {total_rows} diff rows · /diff for full view"
+        )
     } else {
-        "live preview".to_owned()
+        "live preview · /diff for full view".to_owned()
     };
     rows.push(Line::from_spans(vec![
         Span::styled("  ", muted_style()),
@@ -164,6 +167,7 @@ fn inline_preview(lines: &[FileChangeDiffLine], max_rows: usize) -> Vec<PreviewR
 fn render_diff_line(line: &FileChangeDiffLine, width: u16) -> Vec<Line> {
     let (sign, sign_style, body_style) = line_styles(line.kind);
     let row_style = row_style(line.kind);
+    let emphasis_style = emphasis_style(line.kind);
     let gutter_style = row_style.patch(muted_style());
     let body_width = usize::from(width)
         .saturating_sub(INLINE_DIFF_BODY_CHROME_WIDTH)
@@ -171,7 +175,7 @@ fn render_diff_line(line: &FileChangeDiffLine, width: u16) -> Vec<Line> {
     let chunks = wrap_spans(
         content_spans(line, row_style.patch(body_style)),
         &line.changed_ranges,
-        row_style,
+        emphasis_style,
         body_width,
     );
     let chunks = if chunks.is_empty() {
@@ -187,27 +191,58 @@ fn render_diff_line(line: &FileChangeDiffLine, width: u16) -> Vec<Line> {
         .enumerate()
         .map(|(index, chunk)| {
             let mut spans = vec![Span::styled("  ", muted_style())];
-            spans.extend([
-                Span::styled("│ ", muted_style()),
-                Span::styled("  ", gutter_style),
-                Span::styled(
-                    if index == 0 { sign } else { " " },
-                    row_style.patch(sign_style.add_modifier(Modifier::BOLD)),
-                ),
-                Span::styled(
-                    if index == 0 {
-                        format!("{:>4}", line_number(line))
-                    } else {
-                        "    ".to_owned()
-                    },
-                    gutter_style,
-                ),
-                Span::styled(" │ ", gutter_style),
-            ]);
-            spans.extend(chunk);
+            let mut card_spans = if index == 0 {
+                vec![
+                    Span::styled("│ ", muted_style()),
+                    Span::styled("  ", gutter_style),
+                    Span::styled(
+                        sign,
+                        row_style.patch(sign_style.add_modifier(Modifier::BOLD)),
+                    ),
+                    Span::styled(format!("{:>4}", line_number(line)), gutter_style),
+                    Span::styled(" │ ", gutter_style),
+                ]
+            } else {
+                continuation_prefix(gutter_style)
+            };
+            card_spans.extend(chunk);
+            pad_card_spans(
+                &mut card_spans,
+                usize::from(width).saturating_sub(2),
+                row_style,
+            );
+            card_spans.push(Span::styled(" │", muted_style()));
+            spans.extend(card_spans);
             Line::from_spans(spans)
         })
         .collect()
+}
+
+fn continuation_prefix(gutter_style: Style) -> Vec<Span> {
+    vec![
+        Span::styled("│ ", muted_style()),
+        Span::styled("  ", gutter_style),
+        Span::styled(" ", gutter_style),
+        Span::styled("    ", gutter_style),
+        Span::styled(" │ ", gutter_style),
+    ]
+}
+
+fn pad_card_spans(spans: &mut Vec<Span>, target_width: usize, style: Style) {
+    let current_width = spans_width(spans);
+    if current_width < target_width {
+        spans.push(Span::styled(
+            " ".repeat(target_width - current_width),
+            style,
+        ));
+    }
+}
+
+fn spans_width(spans: &[Span]) -> usize {
+    spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_str()))
+        .sum()
 }
 
 fn content_spans(line: &FileChangeDiffLine, fallback_style: Style) -> Vec<Span> {
@@ -228,9 +263,10 @@ fn content_spans(line: &FileChangeDiffLine, fallback_style: Style) -> Vec<Span> 
 fn wrap_spans(
     spans: Vec<Span>,
     changed_ranges: &[ChangedRange],
-    row_style: Style,
+    emphasis_style: Style,
     width: usize,
 ) -> Vec<Vec<Span>> {
+    let width = width.max(1);
     let mut rows = Vec::<Vec<Span>>::new();
     let mut current = Vec::<Span>::new();
     let mut current_width = 0usize;
@@ -238,7 +274,8 @@ fn wrap_spans(
     for span in spans {
         let text = span.content.clone();
         for grapheme in text.graphemes(true) {
-            if current_width >= width && !current.is_empty() {
+            let grapheme_width = UnicodeWidthStr::width(grapheme);
+            if current_width > 0 && current_width.saturating_add(grapheme_width) > width {
                 rows.push(std::mem::take(&mut current));
                 current_width = 0;
             }
@@ -250,14 +287,10 @@ fn wrap_spans(
                 .iter()
                 .any(|range| ranges_overlap(start, end, range.start, range.end))
             {
-                style = row_style.patch(
-                    style
-                        .add_modifier(Modifier::BOLD)
-                        .add_modifier(Modifier::UNDERLINE),
-                );
+                style = style.patch(emphasis_style);
             }
             current.push(Span::styled(grapheme.to_owned(), style));
-            current_width = current_width.saturating_add(1);
+            current_width = current_width.saturating_add(grapheme_width);
         }
     }
     if !current.is_empty() {
@@ -275,8 +308,8 @@ fn card_width(preview: &[PreviewRow<'_>], available_width: u16) -> u16 {
     let content_width = preview
         .iter()
         .map(|row| match row {
-            PreviewRow::Line(line) => line.content.graphemes(true).count(),
-            PreviewRow::Hidden(count) => hidden_text(*count).len(),
+            PreviewRow::Line(line) => UnicodeWidthStr::width(line.content.as_str()),
+            PreviewRow::Hidden(count) => UnicodeWidthStr::width(hidden_text(*count).as_str()),
         })
         .max()
         .unwrap_or(0);
@@ -302,13 +335,33 @@ fn card_border(left: char, fill: char, right: char, width: u16) -> Line {
 fn hidden_row(count: usize, width: u16) -> Line {
     let text = hidden_text(count);
     let inner_width = usize::from(width.saturating_sub(4));
-    let clipped = text.chars().take(inner_width).collect::<String>();
-    Line::from_spans(vec![
+    let clipped = truncate_to_display_width(&text, inner_width);
+    let clipped_width = UnicodeWidthStr::width(clipped.as_str());
+    let mut spans = vec![
         Span::styled("  ", muted_style()),
         Span::styled("│ ", muted_style()),
         Span::styled(clipped, muted_style()),
-        Span::styled(" │", muted_style()),
-    ])
+    ];
+    let padding = inner_width.saturating_sub(clipped_width);
+    if padding > 0 {
+        spans.push(Span::styled(" ".repeat(padding), muted_style()));
+    }
+    spans.push(Span::styled(" │", muted_style()));
+    Line::from_spans(spans)
+}
+
+fn truncate_to_display_width(text: &str, width: usize) -> String {
+    let mut output = String::new();
+    let mut output_width = 0usize;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if output_width.saturating_add(grapheme_width) > width {
+            break;
+        }
+        output.push_str(grapheme);
+        output_width = output_width.saturating_add(grapheme_width);
+    }
+    output
 }
 
 fn hidden_text(count: usize) -> String {
@@ -330,7 +383,7 @@ const fn muted_style() -> Style {
 fn line_number(line: &FileChangeDiffLine) -> String {
     line.new_line
         .or(line.old_line)
-        .map_or_else(String::new, |line| line.to_string())
+        .map_or_else(|| "·".to_owned(), |line| line.to_string())
 }
 
 fn change_summary(added: u32, removed: u32) -> String {
@@ -356,8 +409,18 @@ fn line_count_label(count: u32) -> String {
 
 const fn row_style(kind: FileChangeDiffLineKind) -> Style {
     match kind {
-        FileChangeDiffLineKind::Added => Style::new().bg(Color::Indexed(22)),
-        FileChangeDiffLineKind::Removed => Style::new().bg(Color::Indexed(52)),
+        FileChangeDiffLineKind::Added => Style::new().bg(Color::Rgb(0, 24, 16)),
+        FileChangeDiffLineKind::Removed => Style::new().bg(Color::Rgb(32, 10, 10)),
+        FileChangeDiffLineKind::Context
+        | FileChangeDiffLineKind::HunkHeader
+        | FileChangeDiffLineKind::FileHeader => Style::new(),
+    }
+}
+
+const fn emphasis_style(kind: FileChangeDiffLineKind) -> Style {
+    match kind {
+        FileChangeDiffLineKind::Added => Style::new().bg(Color::Rgb(0, 42, 26)),
+        FileChangeDiffLineKind::Removed => Style::new().bg(Color::Rgb(50, 14, 14)),
         FileChangeDiffLineKind::Context
         | FileChangeDiffLineKind::HunkHeader
         | FileChangeDiffLineKind::FileHeader => Style::new(),
@@ -429,6 +492,107 @@ mod tests {
     }
 
     #[test]
+    fn file_change_rows_use_pre_migration_inline_diff_palette() {
+        let rows = file_change_rows(
+            "src/lib.rs",
+            "let value = 1;\n",
+            "let value = 2;\n",
+            None,
+            false,
+            false,
+            80,
+        );
+        let rendered = format!("{rows:?}");
+        assert!(rendered.contains("Rgb(0, 24, 16)"), "{rendered}");
+        assert!(rendered.contains("Rgb(32, 10, 10)"), "{rendered}");
+        assert!(rendered.contains("Rgb(0, 42, 26)"), "{rendered}");
+        assert!(rendered.contains("Rgb(50, 14, 14)"), "{rendered}");
+        assert!(!rendered.contains("Indexed(22)"), "{rendered}");
+        assert!(!rendered.contains("Indexed(52)"), "{rendered}");
+        assert!(!rendered.contains("UNDERLINE"), "{rendered}");
+    }
+
+    #[test]
+    fn file_change_rows_use_pre_migration_progress_and_line_number_fallback() {
+        let rows = file_change_rows("src/lib.rs", "", "", None, false, false, 80);
+        let rendered = format!("{rows:?}");
+        assert!(
+            rendered.contains("live preview · /diff for full view"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("   ·"), "{rendered}");
+    }
+
+    #[test]
+    fn hidden_rows_pad_to_card_width() {
+        let width = 32;
+        let row = hidden_row(7, width);
+        let rendered_width: usize = row
+            .spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref() as &str))
+            .sum();
+        assert_eq!(rendered_width, usize::from(width) + 2);
+    }
+
+    #[test]
+    fn fitting_diff_lines_do_not_wrap() {
+        let content = "01234567890123456789012345678901234567890123456789";
+        let line = FileChangeDiffLine::new(FileChangeDiffLineKind::Added, None, Some(1), content);
+        let card_width = u16::try_from(content.len() + INLINE_DIFF_BODY_CHROME_WIDTH)
+            .expect("card width fits u16");
+
+        let rows = render_diff_line(&line, card_width);
+
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(line_width(&rows[0]), usize::from(card_width) + 2);
+    }
+
+    #[test]
+    fn wrapped_diff_lines_keep_a_straight_right_edge() {
+        let line = FileChangeDiffLine::new(
+            FileChangeDiffLineKind::Added,
+            None,
+            Some(1),
+            "0123456789012345678901234567890123456789",
+        );
+        let card_width = 28;
+
+        let rows = render_diff_line(&line, card_width);
+
+        assert!(rows.len() > 1, "{rows:?}");
+        for row in rows {
+            assert_eq!(line_width(&row), usize::from(card_width) + 2, "{row:?}");
+        }
+    }
+
+    #[test]
+    fn file_change_card_rows_share_one_width_and_never_exceed_available_width() {
+        let available_width = 80;
+        let rows = file_change_rows(
+            "src/lib.rs",
+            "let value = 1;\n",
+            "let value = 2;\n",
+            None,
+            false,
+            false,
+            available_width,
+        );
+        let card_widths = rows
+            .iter()
+            .filter(|row| is_card_row(row))
+            .map(line_width)
+            .collect::<Vec<_>>();
+
+        assert!(!card_widths.is_empty());
+        let first_width = card_widths[0];
+        for width in card_widths {
+            assert_eq!(width, first_width);
+            assert!(width <= usize::from(available_width));
+        }
+    }
+
+    #[test]
     fn file_change_rows_include_headers() {
         let rows = file_change_rows(
             "src/lib.rs",
@@ -441,5 +605,18 @@ mod tests {
         );
         let rendered = format!("{rows:?}");
         assert!(rendered.contains("src/lib.rs"));
+    }
+
+    fn line_width(line: &Line) -> usize {
+        line.spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref() as &str))
+            .sum()
+    }
+
+    fn is_card_row(line: &Line) -> bool {
+        line.spans
+            .get(1)
+            .is_some_and(|span| span.content.starts_with(['┌', '│', '└']))
     }
 }
