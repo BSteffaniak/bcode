@@ -116,7 +116,17 @@ fn file_change_rows(
         ]));
     }
 
-    let total_rows = diff.lines.len();
+    let visible_lines = diff
+        .lines
+        .iter()
+        .filter(|line| is_preview_content_line(line.kind))
+        .cloned()
+        .collect::<Vec<_>>();
+    if visible_lines.is_empty() {
+        return rows;
+    }
+
+    let total_rows = visible_lines.len();
     let shown_rows = total_rows.min(MAX_INLINE_DIFF_ROWS);
     let progress = if total_rows > shown_rows {
         format!(
@@ -130,7 +140,7 @@ fn file_change_rows(
         Span::styled(progress, muted_style()),
     ]));
 
-    let preview = inline_preview(&diff.lines, MAX_INLINE_DIFF_ROWS);
+    let preview = inline_preview(&visible_lines, MAX_INLINE_DIFF_ROWS);
     let card_width = card_width(&preview, width.saturating_sub(2));
     rows.push(card_border('┌', '─', '┐', card_width));
     for row in preview {
@@ -141,6 +151,15 @@ fn file_change_rows(
     }
     rows.push(card_border('└', '─', '┘', card_width));
     rows
+}
+
+const fn is_preview_content_line(kind: FileChangeDiffLineKind) -> bool {
+    matches!(
+        kind,
+        FileChangeDiffLineKind::Added
+            | FileChangeDiffLineKind::Removed
+            | FileChangeDiffLineKind::Context
+    )
 }
 
 fn inline_preview(lines: &[FileChangeDiffLine], max_rows: usize) -> Vec<PreviewRow<'_>> {
@@ -514,12 +533,23 @@ mod tests {
 
     #[test]
     fn file_change_rows_use_pre_migration_progress_and_line_number_fallback() {
-        let rows = file_change_rows("src/lib.rs", "", "", None, false, false, 80);
+        let rows = file_change_rows(
+            "src/lib.rs",
+            "let value = 1;\n",
+            "let value = 2;\n",
+            None,
+            false,
+            false,
+            80,
+        );
         let rendered = format!("{rows:?}");
         assert!(
             rendered.contains("live preview · /diff for full view"),
             "{rendered}"
         );
+
+        let line = FileChangeDiffLine::new(FileChangeDiffLineKind::Context, None, None, "context");
+        let rendered = format!("{:?}", render_diff_line(&line, 80));
         assert!(rendered.contains("   ·"), "{rendered}");
     }
 
@@ -564,6 +594,57 @@ mod tests {
         for row in rows {
             assert_eq!(line_width(&row), usize::from(card_width) + 2, "{row:?}");
         }
+    }
+
+    #[test]
+    fn file_change_card_excludes_file_and_hunk_headers() {
+        let rows = file_change_rows(
+            "src/lib.rs",
+            "fn main() {\n    let value = 1;\n}\n",
+            "fn main() {\n    let value = 2;\n}\n",
+            None,
+            false,
+            false,
+            80,
+        );
+        let rendered_card = rows
+            .iter()
+            .filter(|row| is_card_row(row))
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!rendered_card.contains("--- "), "{rendered_card}");
+        assert!(!rendered_card.contains("+++ "), "{rendered_card}");
+        assert!(!rendered_card.contains("@@"), "{rendered_card}");
+        assert!(rendered_card.contains("let value = 1"), "{rendered_card}");
+        assert!(rendered_card.contains("let value = 2"), "{rendered_card}");
+    }
+
+    #[test]
+    fn progress_count_excludes_file_and_hunk_headers() {
+        let rows = file_change_rows(
+            "src/lib.rs",
+            "fn main() {\n    let value = 1;\n}\n",
+            "fn main() {\n    let value = 2;\n}\n",
+            None,
+            false,
+            false,
+            80,
+        );
+        let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        assert!(
+            rendered.contains("live preview · /diff for full view"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("showing 5 of"), "{rendered}");
+    }
+
+    #[test]
+    fn no_content_diff_rows_skip_the_card() {
+        let rows = file_change_rows("src/lib.rs", "", "", None, false, false, 80);
+        assert!(!rows.iter().any(is_card_row));
     }
 
     #[test]
@@ -612,6 +693,13 @@ mod tests {
             .iter()
             .map(|span| UnicodeWidthStr::width(span.content.as_ref() as &str))
             .sum()
+    }
+
+    fn line_text(line: &Line) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref() as &str)
+            .collect::<String>()
     }
 
     fn is_card_row(line: &Line) -> bool {
