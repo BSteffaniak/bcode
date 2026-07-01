@@ -2042,6 +2042,7 @@ name = "bcode_tesseract_ocr"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_tesseract_sys",
+ "libloading 0.9.0",
  "thiserror 2.0.18",
  "toml 1.1.2+spec-1.1.0",
 ]

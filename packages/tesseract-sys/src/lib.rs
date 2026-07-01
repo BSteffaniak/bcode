@@ -61,9 +61,16 @@ unsafe extern "C" {
     pub fn TessDeleteText(text: *mut c_char);
 }
 
-/// Returns the tessdata prefix embedded by the linker/build script, when one
-/// was configured at compile time.
+/// Returns the bundled runtime root emitted by the build script, when bundled
+/// dynamic runtimes were built.
 #[must_use]
-pub const fn compiled_tessdata_prefix() -> Option<&'static str> {
-    option_env!("BCODE_TESSDATA_PREFIX")
+pub const fn compiled_bundled_runtime_root() -> Option<&'static str> {
+    option_env!("BCODE_TESSERACT_BUNDLED_RUNTIMES")
+}
+
+/// Returns the bundled versions emitted by the build script, when bundled
+/// dynamic runtimes were built.
+#[must_use]
+pub const fn compiled_bundled_versions() -> Option<&'static str> {
+    option_env!("BCODE_TESSERACT_BUNDLED_VERSIONS")
 }

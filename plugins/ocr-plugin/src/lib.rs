@@ -173,6 +173,8 @@ struct OcrOptions {
     oem: Option<u8>,
     #[serde(default)]
     config: Vec<String>,
+    #[serde(default)]
+    tesseract_version: Option<String>,
     #[serde(flatten)]
     extra: serde_json::Map<String, Value>,
 }
@@ -214,6 +216,12 @@ struct EngineStatus {
     available: bool,
     version: Option<String>,
     quality: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    available_bundled_versions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_bundled_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_bundled_version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -445,7 +453,12 @@ fn run_bundled_tesseract(
     let height =
         i32::try_from(height).map_err(|error| OcrError::BundledTesseract(error.to_string()))?;
     let bytes_per_line = width.saturating_mul(bytes_per_pixel);
-    let runtime = bcode_tesseract_ocr::TesseractRuntime::load_default()
+    let runtime = options
+        .and_then(|options| options.tesseract_version.as_deref())
+        .map_or_else(
+            bcode_tesseract_ocr::TesseractRuntime::load_default,
+            bcode_tesseract_ocr::TesseractRuntime::load_version,
+        )
         .map_err(|error| OcrError::BundledTesseract(error.to_string()))?;
     let engine = runtime
         .create_engine()
@@ -455,7 +468,7 @@ fn run_bundled_tesseract(
         .map(|oem| bcode_tesseract_ocr::EngineMode::from_raw(i32::from(oem)));
     engine
         .init(&bcode_tesseract_ocr::InitOptions {
-            datapath: Some(bcode_tesseract_ocr::resolve_tessdata_dir()),
+            datapath: None,
             language: language.to_string(),
             engine_mode,
         })
@@ -648,6 +661,12 @@ fn bundled_tesseract_status() -> EngineStatus {
                 .map_or("unavailable", |runtime| runtime.version())
         )),
         quality: "bundled".to_string(),
+        available_bundled_versions: bcode_tesseract_ocr::available_bundled_versions()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        default_bundled_version: Some(bcode_tesseract_ocr::bundled_default_version()),
+        latest_bundled_version: Some(bcode_tesseract_ocr::bundled_latest_version()),
     }
 }
 
@@ -667,12 +686,18 @@ fn tesseract_cli_status() -> EngineStatus {
                 .next()
                 .map(str::to_string),
             quality: "external_optional".to_string(),
+            available_bundled_versions: Vec::new(),
+            default_bundled_version: None,
+            latest_bundled_version: None,
         },
         _ => EngineStatus {
             name: "tesseract-cli".to_string(),
             available: false,
             version: None,
             quality: "external_optional".to_string(),
+            available_bundled_versions: Vec::new(),
+            default_bundled_version: None,
+            latest_bundled_version: None,
         },
     }
 }

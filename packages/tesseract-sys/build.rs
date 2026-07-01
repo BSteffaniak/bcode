@@ -1,5 +1,6 @@
 use std::env;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[cfg(any(
     feature = "bundled-tesseract",
@@ -29,7 +30,7 @@ const BUNDLED_TESSERACT_VERSION_5_5_1: bool = false;
 const BUNDLED_CATALOG_TOML: &str = include_str!("bundled/catalog.generated.toml");
 
 fn main() {
-    println!("cargo:rerun-if-changed=bundled/catalog.toml");
+    println!("cargo:rerun-if-changed=bundled/catalog.generated.toml");
     println!("cargo:rerun-if-env-changed=BCODE_TESSERACT_LINK_MODE");
     println!("cargo:rerun-if-env-changed=BCODE_TESSERACT_SOURCE_DIR");
     println!("cargo:rerun-if-env-changed=BCODE_LEPTONICA_SOURCE_DIR");
@@ -141,12 +142,6 @@ impl BundledCatalog {
         }
     }
 
-    fn selected_tesseract(&self) -> TesseractCatalogEntry {
-        let versions = selected_bundled_versions();
-        let version = default_selected_version(&versions, self);
-        self.tesseract(version)
-    }
-
     fn tesseract(&self, version: &str) -> TesseractCatalogEntry {
         let entry = self
             .value
@@ -200,31 +195,6 @@ impl BundledCatalog {
     }
 }
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
-fn default_selected_version<'a>(versions: &'a [&'a str], catalog: &BundledCatalog) -> &'a str {
-    let default = catalog.alias("default");
-    if versions.contains(&default) {
-        return versions
-            .iter()
-            .copied()
-            .find(|version| *version == default)
-            .expect("default version should be selected");
-    }
-    let latest = catalog.alias("latest");
-    if versions.contains(&latest) {
-        return versions
-            .iter()
-            .copied()
-            .find(|version| *version == latest)
-            .expect("latest version should be selected");
-    }
-    versions[0]
-}
-
 fn selected_bundled_versions() -> Vec<&'static str> {
     let mut versions = Vec::new();
     if BUNDLED_TESSERACT_VERSION_5_3_4 {
@@ -270,28 +240,51 @@ fn link_system() {
 ))]
 fn link_bundled() {
     let catalog = BundledCatalog::load();
-    let tesseract = catalog.selected_tesseract();
-    let leptonica = catalog.leptonica(&tesseract.leptonica);
+    let versions = selected_bundled_versions();
+    let runtimes_dir = out_dir().join("bundled-runtimes");
     let sources_dir = out_dir().join("sources");
+    fs::create_dir_all(&runtimes_dir).expect("failed to create bundled runtime directory");
     fs::create_dir_all(&sources_dir).expect("failed to create bundled source directory");
 
-    let leptonica_source = download_and_extract(
-        leptonica.url,
-        leptonica.sha256,
-        &sources_dir,
-        &format!("leptonica-{}", tesseract.leptonica),
-    );
-    let tesseract_source = download_and_extract(
-        &tesseract.url,
-        &tesseract.sha256,
-        &sources_dir,
-        &format!("tesseract-{}", tesseract.version),
-    );
-    if env::var_os("BCODE_TESSDATA_PREFIX").is_none() {
-        download_tessdata(&catalog);
+    for version in &versions {
+        let tesseract = catalog.tesseract(version);
+        let leptonica = catalog.leptonica(&tesseract.leptonica);
+        let leptonica_source = download_and_extract(
+            leptonica.url,
+            leptonica.sha256,
+            &sources_dir,
+            &format!("leptonica-{}", tesseract.leptonica),
+        );
+        let tesseract_source = download_and_extract(
+            &tesseract.url,
+            &tesseract.sha256,
+            &sources_dir,
+            &format!("tesseract-{}", tesseract.version),
+        );
+        build_runtime(
+            &tesseract,
+            &leptonica_source,
+            &tesseract_source,
+            &runtimes_dir,
+        );
     }
-
-    build_and_link(&leptonica_source, &tesseract_source);
+    download_runtime_tessdata(&catalog, &versions, &runtimes_dir);
+    println!(
+        "cargo:rustc-env=BCODE_TESSERACT_BUNDLED_RUNTIMES={}",
+        runtimes_dir.display()
+    );
+    println!(
+        "cargo:rustc-env=BCODE_TESSERACT_BUNDLED_VERSIONS={}",
+        versions.join(",")
+    );
+    println!(
+        "cargo:rustc-env=BCODE_TESSERACT_BUNDLED_DEFAULT={}",
+        catalog.alias("default")
+    );
+    println!(
+        "cargo:rustc-env=BCODE_TESSERACT_BUNDLED_LATEST={}",
+        catalog.alias("latest")
+    );
 }
 
 #[cfg(not(any(
@@ -369,6 +362,155 @@ fn build_and_link(leptonica_source: &Path, tesseract_source: &Path) {
     link_cpp_runtime();
 }
 
+fn build_runtime(
+    tesseract: &TesseractCatalogEntry,
+    leptonica_source: &Path,
+    tesseract_source: &Path,
+    runtimes_dir: &Path,
+) {
+    let runtime_dir = runtimes_dir.join(&tesseract.version);
+    let runtime_lib = runtime_dir.join("lib");
+    fs::create_dir_all(&runtime_lib).expect("failed to create bundled runtime lib directory");
+
+    let leptonica_install = cmake::Config::new(leptonica_source)
+        .define("CMAKE_POLICY_VERSION_MINIMUM", "3.5")
+        .define("CMAKE_BUILD_TYPE", "Release")
+        .define("BUILD_PROG", "OFF")
+        .define("BUILD_SHARED_LIBS", "ON")
+        .define("ENABLE_ZLIB", "OFF")
+        .define("ENABLE_PNG", "OFF")
+        .define("ENABLE_JPEG", "OFF")
+        .define("ENABLE_TIFF", "OFF")
+        .define("ENABLE_WEBP", "OFF")
+        .define("ENABLE_OPENJPEG", "OFF")
+        .define("ENABLE_GIF", "OFF")
+        .define("NO_CONSOLE_IO", "ON")
+        .define("SW_BUILD", "OFF")
+        .define("HAVE_LIBZ", "0")
+        .define("CMAKE_INSTALL_RPATH", runtime_rpath())
+        .build();
+
+    let leptonica_include = leptonica_install.join("include");
+    let leptonica_lib = leptonica_install.join("lib");
+    let leptonica_library = find_dynamic_library(&leptonica_lib, "leptonica");
+
+    let tesseract_install = cmake::Config::new(tesseract_source)
+        .define("CMAKE_POLICY_VERSION_MINIMUM", "3.5")
+        .define("CMAKE_BUILD_TYPE", "Release")
+        .define("BUILD_SHARED_LIBS", "ON")
+        .define("BUILD_TRAINING_TOOLS", "OFF")
+        .define("BUILD_TESTS", "OFF")
+        .define("BUILD_PROG", "OFF")
+        .define("DISABLED_LEGACY_ENGINE", "OFF")
+        .define("USE_OPENCL", "OFF")
+        .define("OPENMP_BUILD", "OFF")
+        .define("CMAKE_INSTALL_RPATH", runtime_rpath())
+        .define("Leptonica_INCLUDE_DIRS", &leptonica_include)
+        .define("Leptonica_LIBRARIES", &leptonica_library)
+        .build();
+
+    copy_runtime_libraries(&leptonica_lib, &runtime_lib, "leptonica");
+    copy_runtime_libraries(&tesseract_install.join("lib"), &runtime_lib, "tesseract");
+    patch_runtime_libraries(&runtime_lib);
+}
+
+fn runtime_rpath() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "@loader_path"
+    } else if cfg!(target_os = "windows") {
+        ""
+    } else {
+        "$ORIGIN"
+    }
+}
+
+fn find_dynamic_library(lib_dir: &Path, name: &str) -> PathBuf {
+    let expected = lib_dir.join(dynamic_library_name(name));
+    if expected.exists() {
+        return expected;
+    }
+    fs::read_dir(lib_dir)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", lib_dir.display()))
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|file_name| file_name.to_str())
+                .is_some_and(|file_name| {
+                    file_name.contains(name)
+                        && (file_name.ends_with(".dylib")
+                            || file_name.ends_with(".so")
+                            || file_name.ends_with(".dll"))
+                })
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "failed to find dynamic library {name} in {}",
+                lib_dir.display()
+            )
+        })
+}
+
+fn copy_runtime_libraries(source_lib_dir: &Path, runtime_lib: &Path, name: &str) {
+    for path in dynamic_libraries(source_lib_dir, name) {
+        fs::copy(
+            &path,
+            runtime_lib.join(path.file_name().expect("library file name is required")),
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to copy {} to {}: {error}",
+                path.display(),
+                runtime_lib.display()
+            )
+        });
+    }
+}
+
+fn dynamic_libraries(lib_dir: &Path, name: &str) -> Vec<PathBuf> {
+    let mut libraries: Vec<_> = fs::read_dir(lib_dir)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", lib_dir.display()))
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|file_name| file_name.to_str())
+                .is_some_and(|file_name| {
+                    file_name.contains(name)
+                        && (file_name.ends_with(".dylib")
+                            || file_name.contains(".so")
+                            || file_name.ends_with(".dll"))
+                })
+        })
+        .collect();
+    libraries.sort();
+    libraries.dedup();
+    libraries
+}
+
+fn patch_runtime_libraries(runtime_lib: &Path) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    for library in dynamic_libraries(runtime_lib, "") {
+        let _ = Command::new("install_name_tool")
+            .arg("-add_rpath")
+            .arg("@loader_path")
+            .arg(&library)
+            .status();
+    }
+}
+
+fn dynamic_library_name(name: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("lib{name}.dylib")
+    } else if cfg!(target_os = "windows") {
+        format!("{name}.dll")
+    } else {
+        format!("lib{name}.so")
+    }
+}
+
 fn link_cpp_runtime() {
     if cfg!(target_os = "macos") || cfg!(target_os = "ios") {
         println!("cargo:rustc-link-lib=c++");
@@ -424,20 +566,21 @@ fn download_and_extract(
     feature = "bundled-tesseract-v5-3-4",
     feature = "bundled-tesseract-v5-5-1"
 ))]
-fn download_tessdata(catalog: &BundledCatalog) {
-    let tessdata_dir = out_dir().join("tessdata");
-    fs::create_dir_all(&tessdata_dir).expect("failed to create tessdata directory");
-    for language in catalog.tessdata_languages() {
-        download_file_to(
-            language.url,
-            language.sha256,
-            &tessdata_dir.join(format!("{}.traineddata", language.code)),
-        );
+fn download_runtime_tessdata(catalog: &BundledCatalog, versions: &[&str], runtimes_dir: &Path) {
+    if env::var_os("BCODE_TESSDATA_PREFIX").is_some() {
+        return;
     }
-    println!(
-        "cargo:rustc-env=BCODE_TESSDATA_PREFIX={}",
-        tessdata_dir.display()
-    );
+    for version in versions {
+        let tessdata_dir = runtimes_dir.join(version).join("tessdata");
+        fs::create_dir_all(&tessdata_dir).expect("failed to create tessdata directory");
+        for language in catalog.tessdata_languages() {
+            download_file_to(
+                language.url,
+                language.sha256,
+                &tessdata_dir.join(format!("{}.traineddata", language.code)),
+            );
+        }
+    }
 }
 
 #[cfg(any(
