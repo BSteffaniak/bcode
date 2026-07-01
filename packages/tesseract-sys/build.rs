@@ -1,7 +1,11 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-#[cfg(any(feature = "bundled-tesseract", feature = "bundled-tesseract-v5-3-4"))]
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
 use std::{
     fs,
     io::{self, Cursor},
@@ -12,8 +16,17 @@ const BUNDLED_TESSERACT_VERSION_5_3_4: bool = true;
 #[cfg(not(feature = "bundled-tesseract-v5-3-4"))]
 const BUNDLED_TESSERACT_VERSION_5_3_4: bool = false;
 
-#[cfg(any(feature = "bundled-tesseract", feature = "bundled-tesseract-v5-3-4"))]
-const BUNDLED_CATALOG_TOML: &str = include_str!("bundled/catalog.toml");
+#[cfg(feature = "bundled-tesseract-v5-5-1")]
+const BUNDLED_TESSERACT_VERSION_5_5_1: bool = true;
+#[cfg(not(feature = "bundled-tesseract-v5-5-1"))]
+const BUNDLED_TESSERACT_VERSION_5_5_1: bool = false;
+
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
+const BUNDLED_CATALOG_TOML: &str = include_str!("bundled/catalog.generated.toml");
 
 fn main() {
     println!("cargo:rerun-if-changed=bundled/catalog.toml");
@@ -69,7 +82,11 @@ fn validate_bundled_selection() {
     }
 }
 
-#[cfg(any(feature = "bundled-tesseract", feature = "bundled-tesseract-v5-3-4"))]
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
 #[derive(Clone, Debug)]
 struct TesseractCatalogEntry {
     version: String,
@@ -78,14 +95,22 @@ struct TesseractCatalogEntry {
     leptonica: String,
 }
 
-#[cfg(any(feature = "bundled-tesseract", feature = "bundled-tesseract-v5-3-4"))]
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
 #[derive(Clone, Copy, Debug)]
 struct LeptonicaCatalogEntry<'a> {
     url: &'a str,
     sha256: &'a str,
 }
 
-#[cfg(any(feature = "bundled-tesseract", feature = "bundled-tesseract-v5-3-4"))]
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
 #[derive(Clone, Copy, Debug)]
 struct TessdataLanguageEntry<'a> {
     code: &'a str,
@@ -93,13 +118,21 @@ struct TessdataLanguageEntry<'a> {
     sha256: &'a str,
 }
 
-#[cfg(any(feature = "bundled-tesseract", feature = "bundled-tesseract-v5-3-4"))]
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
 #[derive(Debug)]
 struct BundledCatalog {
     value: toml::Value,
 }
 
-#[cfg(any(feature = "bundled-tesseract", feature = "bundled-tesseract-v5-3-4"))]
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
 impl BundledCatalog {
     fn load() -> Self {
         Self {
@@ -167,7 +200,11 @@ impl BundledCatalog {
     }
 }
 
-#[cfg(any(feature = "bundled-tesseract", feature = "bundled-tesseract-v5-3-4"))]
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
 fn default_selected_version<'a>(versions: &'a [&'a str], catalog: &BundledCatalog) -> &'a str {
     let default = catalog.alias("default");
     if versions.contains(&default) {
@@ -193,10 +230,17 @@ fn selected_bundled_versions() -> Vec<&'static str> {
     if BUNDLED_TESSERACT_VERSION_5_3_4 {
         versions.push("5.3.4");
     }
+    if BUNDLED_TESSERACT_VERSION_5_5_1 {
+        versions.push("5.5.1");
+    }
     versions
 }
 
-#[cfg(any(feature = "bundled-tesseract", feature = "bundled-tesseract-v5-3-4"))]
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
 fn required_str<'a>(value: &'a toml::Value, key: &str) -> &'a str {
     value
         .get(key)
@@ -219,7 +263,11 @@ fn link_system() {
     println!("cargo:rustc-link-lib=leptonica");
 }
 
-#[cfg(any(feature = "bundled-tesseract", feature = "bundled-tesseract-v5-3-4"))]
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
 fn link_bundled() {
     let catalog = BundledCatalog::load();
     let tesseract = catalog.selected_tesseract();
@@ -246,7 +294,11 @@ fn link_bundled() {
     build_and_link(&leptonica_source, &tesseract_source);
 }
 
-#[cfg(not(any(feature = "bundled-tesseract", feature = "bundled-tesseract-v5-3-4")))]
+#[cfg(not(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+)))]
 fn link_bundled() {
     panic!("BCODE_TESSERACT_LINK_MODE=bundled requires the bundled-tesseract feature")
 }
@@ -327,7 +379,11 @@ fn link_cpp_runtime() {
     }
 }
 
-#[cfg(any(feature = "bundled-tesseract", feature = "bundled-tesseract-v5-3-4"))]
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
 fn download_and_extract(
     url: &str,
     expected_sha256: &str,
@@ -363,7 +419,11 @@ fn download_and_extract(
     extracted
 }
 
-#[cfg(any(feature = "bundled-tesseract", feature = "bundled-tesseract-v5-3-4"))]
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
 fn download_tessdata(catalog: &BundledCatalog) {
     let tessdata_dir = out_dir().join("tessdata");
     fs::create_dir_all(&tessdata_dir).expect("failed to create tessdata directory");
@@ -380,7 +440,11 @@ fn download_tessdata(catalog: &BundledCatalog) {
     );
 }
 
-#[cfg(any(feature = "bundled-tesseract", feature = "bundled-tesseract-v5-3-4"))]
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
 fn download_file_to(url: &str, expected_sha256: &str, path: &Path) {
     if path.is_file() {
         let bytes = fs::read(path).expect("failed to read cached file");
@@ -392,7 +456,11 @@ fn download_file_to(url: &str, expected_sha256: &str, path: &Path) {
     fs::write(path, bytes).expect("failed to write downloaded file");
 }
 
-#[cfg(any(feature = "bundled-tesseract", feature = "bundled-tesseract-v5-3-4"))]
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
 fn download_verified(url: &str, expected_sha256: &str) -> Vec<u8> {
     let bytes = reqwest::blocking::get(url)
         .unwrap_or_else(|error| panic!("failed to download {url}: {error}"))
@@ -406,7 +474,11 @@ fn download_verified(url: &str, expected_sha256: &str) -> Vec<u8> {
     bytes
 }
 
-#[cfg(any(feature = "bundled-tesseract", feature = "bundled-tesseract-v5-3-4"))]
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
 
@@ -419,7 +491,11 @@ fn env_path(name: &str) -> PathBuf {
         .unwrap_or_else(|| panic!("{name} must be set when BCODE_TESSERACT_LINK_MODE=vendored"))
 }
 
-#[cfg(any(feature = "bundled-tesseract", feature = "bundled-tesseract-v5-3-4"))]
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
 fn out_dir() -> PathBuf {
     PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"))
 }
@@ -432,7 +508,11 @@ fn static_library_name(name: &str) -> String {
     }
 }
 
-#[cfg(any(feature = "bundled-tesseract", feature = "bundled-tesseract-v5-3-4"))]
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
 fn single_child_dir(path: &Path) -> Option<PathBuf> {
     let mut entries = fs::read_dir(path).ok()?.filter_map(Result::ok);
     let first = entries.next()?.path();
@@ -443,7 +523,11 @@ fn single_child_dir(path: &Path) -> Option<PathBuf> {
     }
 }
 
-#[cfg(any(feature = "bundled-tesseract", feature = "bundled-tesseract-v5-3-4"))]
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
 fn copy_dir_all(from: &Path, to: &Path) -> io::Result<()> {
     fs::create_dir_all(to)?;
     for entry in fs::read_dir(from)? {

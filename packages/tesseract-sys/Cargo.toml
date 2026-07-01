@@ -21,9 +21,10 @@ zip        = { workspace = true, optional = true }
 
 [features]
 bundled-tesseract         = ["bundled-tesseract-default"]
-bundled-tesseract-default = ["bundled-tesseract-v5-3-4"]
-bundled-tesseract-latest  = ["bundled-tesseract-v5-3-4"]
+bundled-tesseract-default = ["bundled-tesseract-v5-5-1"]
+bundled-tesseract-latest  = ["bundled-tesseract-v5-5-1"]
 bundled-tesseract-v5-3-4  = ["dep:reqwest", "dep:sha2", "dep:zip"]
+bundled-tesseract-v5-5-1  = ["dep:reqwest", "dep:sha2", "dep:zip"]
 default                   = []
 fail-on-warnings          = []
 system-tesseract          = []

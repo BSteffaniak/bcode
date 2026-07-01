@@ -4,13 +4,17 @@
 
 //! Bcode release automation tasks.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fmt;
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+use sha2::{Digest, Sha256};
 
 const PACKAGE_NAME: &str = "bcode";
 const BINARY_NAME: &str = "bcode";
@@ -50,6 +54,13 @@ enum CommandName {
     Help,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeneratedWriteMode {
+    Write,
+    Check,
+    DryRun,
+}
+
 #[derive(Debug)]
 struct Options {
     command: CommandName,
@@ -60,6 +71,7 @@ struct Options {
     dev_identity: String,
     allow_create_dev_identity: bool,
     skip_notarize: bool,
+    generated_write_mode: GeneratedWriteMode,
 }
 
 impl Options {
@@ -86,6 +98,7 @@ impl Options {
         let mut dev_identity =
             env_dev_identity.unwrap_or_else(|| DEFAULT_DEV_CODESIGN_IDENTITY.to_owned());
         let mut skip_notarize = env_flag("BCODE_SKIP_NOTARIZE");
+        let mut generated_write_mode = GeneratedWriteMode::Write;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -100,6 +113,8 @@ impl Options {
                     allow_create_dev_identity = false;
                 }
                 "--skip-notarize" => skip_notarize = true,
+                "--check" => generated_write_mode = GeneratedWriteMode::Check,
+                "--dry-run" => generated_write_mode = GeneratedWriteMode::DryRun,
                 "--help" | "-h" => return Ok(Self::help()),
                 unknown => return Err(format_error(format!("unknown option `{unknown}`"))),
             }
@@ -114,6 +129,7 @@ impl Options {
             dev_identity,
             allow_create_dev_identity,
             skip_notarize,
+            generated_write_mode,
         })
     }
 
@@ -127,6 +143,7 @@ impl Options {
             dev_identity: DEFAULT_DEV_CODESIGN_IDENTITY.to_owned(),
             allow_create_dev_identity: true,
             skip_notarize: false,
+            generated_write_mode: GeneratedWriteMode::Write,
         }
     }
 }
@@ -145,7 +162,7 @@ fn run() -> Result<()> {
         CommandName::VerifyRelease => verify_release(&options),
         CommandName::DevSign => dev_sign(&options),
         CommandName::DevRelease => dev_release(&options),
-        CommandName::UpdateTesseractCatalog => update_tesseract_catalog(),
+        CommandName::UpdateTesseractCatalog => update_tesseract_catalog(&options),
         CommandName::Help => {
             print_help();
             Ok(())
@@ -153,43 +170,425 @@ fn run() -> Result<()> {
     }
 }
 
-fn update_tesseract_catalog() -> Result<()> {
+#[derive(Debug)]
+struct TesseractSyncPolicy {
+    versions: Vec<String>,
+    default: String,
+    latest: String,
+    leptonica_default: String,
+    tessdata_flavor: String,
+    tessdata_repo: String,
+    tessdata_commit: String,
+    tessdata_languages: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ResolvedTesseractVersion {
+    version: String,
+    url: String,
+    sha256: String,
+    leptonica: String,
+}
+
+#[derive(Debug)]
+struct ResolvedArtifact {
+    url: String,
+    sha256: String,
+}
+
+fn update_tesseract_catalog(options: &Options) -> Result<()> {
     let root = workspace_root();
-    let catalog_path = root.join("packages/tesseract-sys/bundled/catalog.toml");
-    let catalog_text = fs::read_to_string(&catalog_path).map_err(|error| {
-        format_error(format!(
-            "failed to read {}: {error}",
-            catalog_path.display()
-        ))
-    })?;
-    let catalog = catalog_text
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|error| format_error(format!("failed to parse catalog TOML: {error}")))?;
-    let versions = catalog_tesseract_versions(&catalog)?;
+    let policy_path = root.join("packages/tesseract-sys/bundled/sync-policy.toml");
+    let catalog_path = root.join("packages/tesseract-sys/bundled/catalog.generated.toml");
+    let policy = read_tesseract_sync_policy(&policy_path)?;
+    validate_tesseract_sync_policy(&policy)?;
+
+    let resolved_tesseract = policy
+        .versions
+        .iter()
+        .map(|version| {
+            let url = tesseract_source_url(version);
+            let sha256 = sha256_url(&url)?;
+            Ok(ResolvedTesseractVersion {
+                version: version.clone(),
+                url,
+                sha256,
+                leptonica: policy.leptonica_default.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let leptonica_url = leptonica_source_url(&policy.leptonica_default);
+    let leptonica = ResolvedArtifact {
+        sha256: sha256_url(&leptonica_url)?,
+        url: leptonica_url,
+    };
+    let tessdata = policy
+        .tessdata_languages
+        .iter()
+        .map(|language| {
+            let url = tessdata_url(&policy.tessdata_repo, &policy.tessdata_commit, language);
+            Ok((
+                language.clone(),
+                ResolvedArtifact {
+                    sha256: sha256_url(&url)?,
+                    url,
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+
+    let catalog = render_tesseract_catalog(&policy, &resolved_tesseract, &leptonica, &tessdata);
+    write_generated_file(&catalog_path, &catalog, options)?;
+    sync_tesseract_feature_blocks(&root, &policy, options)?;
+
     println!(
-        "bundled Tesseract catalog has {} supported version(s): {}",
-        versions.len(),
-        versions.join(", ")
-    );
-    println!(
-        "feature names are generated from catalog versions; add versions in {}",
-        catalog_path.display()
+        "synced bundled Tesseract catalog: {} version(s), {} tessdata language(s)",
+        policy.versions.len(),
+        policy.tessdata_languages.len()
     );
     Ok(())
 }
 
-fn catalog_tesseract_versions(catalog: &toml_edit::DocumentMut) -> Result<Vec<String>> {
-    let table = catalog
-        .get("tesseract")
-        .and_then(toml_edit::Item::as_table)
-        .ok_or_else(|| format_error("catalog must contain a [tesseract] table"))?;
-    let mut versions = table
-        .iter()
-        .filter(|&(_version, item)| item.is_table())
-        .map(|(version, _item)| version.to_string())
-        .collect::<Vec<_>>();
-    versions.sort();
-    Ok(versions)
+fn read_tesseract_sync_policy(path: &Path) -> Result<TesseractSyncPolicy> {
+    let policy_text = fs::read_to_string(path)
+        .map_err(|error| format_error(format!("failed to read {}: {error}", path.display())))?;
+    let policy = policy_text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| format_error(format!("failed to parse policy TOML: {error}")))?;
+    Ok(TesseractSyncPolicy {
+        versions: string_array(&policy, &["tesseract", "versions"])
+            .ok_or_else(|| format_error("policy must contain tesseract.versions"))?,
+        default: string_value(&policy, &["tesseract", "default"])
+            .ok_or_else(|| format_error("policy must contain tesseract.default"))?,
+        latest: string_value(&policy, &["tesseract", "latest"])
+            .ok_or_else(|| format_error("policy must contain tesseract.latest"))?,
+        leptonica_default: string_value(&policy, &["leptonica", "default_version"])
+            .ok_or_else(|| format_error("policy must contain leptonica.default_version"))?,
+        tessdata_flavor: string_value(&policy, &["tessdata", "flavor"])
+            .ok_or_else(|| format_error("policy must contain tessdata.flavor"))?,
+        tessdata_repo: string_value(&policy, &["tessdata", "repo"])
+            .ok_or_else(|| format_error("policy must contain tessdata.repo"))?,
+        tessdata_commit: string_value(&policy, &["tessdata", "commit"])
+            .ok_or_else(|| format_error("policy must contain tessdata.commit"))?,
+        tessdata_languages: string_array(&policy, &["tessdata", "languages"])
+            .ok_or_else(|| format_error("policy must contain tessdata.languages"))?,
+    })
+}
+
+fn validate_tesseract_sync_policy(policy: &TesseractSyncPolicy) -> Result<()> {
+    if policy.versions.is_empty() {
+        return Err(format_error("policy tesseract.versions cannot be empty"));
+    }
+    for alias in [&policy.default, &policy.latest] {
+        if !policy.versions.contains(alias) {
+            return Err(format_error(format!(
+                "alias version {alias} is not listed in tesseract.versions"
+            )));
+        }
+    }
+    if policy.tessdata_languages.is_empty() {
+        return Err(format_error("policy tessdata.languages cannot be empty"));
+    }
+    Ok(())
+}
+
+fn string_value(document: &toml_edit::DocumentMut, path: &[&str]) -> Option<String> {
+    let mut item = document.as_item();
+    for segment in path {
+        item = item.get(segment)?;
+    }
+    item.as_str().map(ToOwned::to_owned)
+}
+
+fn string_array(document: &toml_edit::DocumentMut, path: &[&str]) -> Option<Vec<String>> {
+    let mut item = document.as_item();
+    for segment in path {
+        item = item.get(segment)?;
+    }
+    item.as_array().map(|array| {
+        array
+            .iter()
+            .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+            .collect()
+    })
+}
+
+fn tesseract_source_url(version: &str) -> String {
+    format!("https://github.com/tesseract-ocr/tesseract/archive/refs/tags/{version}.zip")
+}
+
+fn leptonica_source_url(version: &str) -> String {
+    format!("https://github.com/DanBloomberg/leptonica/archive/refs/tags/{version}.zip")
+}
+
+fn tessdata_url(repo: &str, commit: &str, language: &str) -> String {
+    format!("https://github.com/tesseract-ocr/{repo}/raw/{commit}/{language}.traineddata")
+}
+
+fn sha256_url(url: &str) -> Result<String> {
+    let response = reqwest::blocking::get(url)
+        .map_err(|error| format_error(format!("failed to download {url}: {error}")))?
+        .error_for_status()
+        .map_err(|error| format_error(format!("failed to download {url}: {error}")))?;
+    let bytes = response
+        .bytes()
+        .map_err(|error| format_error(format!("failed to read {url}: {error}")))?;
+    let digest = Sha256::digest(&bytes);
+    Ok(format!("{digest:x}"))
+}
+
+fn render_tesseract_catalog(
+    policy: &TesseractSyncPolicy,
+    tesseract: &[ResolvedTesseractVersion],
+    leptonica: &ResolvedArtifact,
+    tessdata: &BTreeMap<String, ResolvedArtifact>,
+) -> String {
+    let mut output = String::from(
+        "# @generated by cargo xtask update-tesseract-catalog\n# Do not edit manually.\n\n",
+    );
+    output.push_str("[aliases]\n");
+    writeln!(output, "default = \"{}\"", policy.default).expect("write to string cannot fail");
+    writeln!(output, "latest  = \"{}\"\n", policy.latest).expect("write to string cannot fail");
+    writeln!(output, "[leptonica.\"{}\"]", policy.leptonica_default)
+        .expect("write to string cannot fail");
+    writeln!(output, "sha256 = \"{}\"", leptonica.sha256).expect("write to string cannot fail");
+    writeln!(output, "url    = \"{}\"\n", leptonica.url).expect("write to string cannot fail");
+    for entry in tesseract {
+        writeln!(output, "[tesseract.\"{}\"]", entry.version).expect("write to string cannot fail");
+        writeln!(output, "leptonica = \"{}\"", entry.leptonica)
+            .expect("write to string cannot fail");
+        writeln!(output, "sha256    = \"{}\"", entry.sha256).expect("write to string cannot fail");
+        writeln!(output, "url       = \"{}\"\n", entry.url).expect("write to string cannot fail");
+    }
+    writeln!(output, "[tessdata.{}]", policy.tessdata_flavor).expect("write to string cannot fail");
+    writeln!(output, "commit = \"{}\"\n", policy.tessdata_commit)
+        .expect("write to string cannot fail");
+    for (language, artifact) in tessdata {
+        writeln!(
+            output,
+            "[tessdata.{}.languages.{language}]",
+            policy.tessdata_flavor
+        )
+        .expect("write to string cannot fail");
+        writeln!(output, "sha256 = \"{}\"", artifact.sha256).expect("write to string cannot fail");
+        writeln!(output, "url    = \"{}\"\n", artifact.url).expect("write to string cannot fail");
+    }
+    output
+}
+
+fn write_generated_file(path: &Path, contents: &str, options: &Options) -> Result<()> {
+    let current = fs::read_to_string(path).ok();
+    if current.as_deref() == Some(contents) {
+        return Ok(());
+    }
+    match options.generated_write_mode {
+        GeneratedWriteMode::Check => {
+            return Err(format_error(format!("{} is stale", path.display())));
+        }
+        GeneratedWriteMode::DryRun => {
+            println!("would update {}", path.display());
+            return Ok(());
+        }
+        GeneratedWriteMode::Write => {}
+    }
+    fs::write(path, contents)
+        .map_err(|error| format_error(format!("failed to write {}: {error}", path.display())))
+}
+
+fn sync_tesseract_feature_blocks(
+    root: &Path,
+    policy: &TesseractSyncPolicy,
+    options: &Options,
+) -> Result<()> {
+    sync_tesseract_sys_features(
+        &root.join("packages/tesseract-sys/Cargo.toml"),
+        policy,
+        options,
+    )?;
+    sync_tesseract_ocr_features(
+        &root.join("packages/tesseract-ocr/Cargo.toml"),
+        policy,
+        options,
+    )?;
+    sync_ocr_plugin_features(&root.join("plugins/ocr-plugin/Cargo.toml"), policy, options)?;
+    sync_bcode_features(&root.join("packages/bcode/Cargo.toml"), policy, options)
+}
+
+fn feature_name(prefix: &str, version: &str) -> String {
+    format!("{prefix}-v{}", version.replace('.', "-"))
+}
+
+fn array_item(value: &str) -> toml_edit::Value {
+    toml_edit::Value::from(value)
+}
+
+fn set_feature(features: &mut toml_edit::Table, name: &str, deps: &[String]) {
+    let mut array = toml_edit::Array::new();
+    for dep in deps {
+        array.push(array_item(dep));
+    }
+    features[name] = toml_edit::value(array);
+}
+
+fn load_cargo_toml(path: &Path) -> Result<toml_edit::DocumentMut> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| format_error(format!("failed to read {}: {error}", path.display())))?;
+    text.parse::<toml_edit::DocumentMut>()
+        .map_err(|error| format_error(format!("failed to parse {}: {error}", path.display())))
+}
+
+fn features_table(document: &mut toml_edit::DocumentMut) -> Result<&mut toml_edit::Table> {
+    document
+        .get_mut("features")
+        .and_then(toml_edit::Item::as_table_mut)
+        .ok_or_else(|| format_error("Cargo.toml must contain a [features] table"))
+}
+
+fn write_cargo_toml(
+    path: &Path,
+    document: &toml_edit::DocumentMut,
+    options: &Options,
+) -> Result<()> {
+    write_generated_file(path, &document.to_string(), options)
+}
+
+fn sync_tesseract_sys_features(
+    path: &Path,
+    policy: &TesseractSyncPolicy,
+    options: &Options,
+) -> Result<()> {
+    let mut document = load_cargo_toml(path)?;
+    let features = features_table(&mut document)?;
+    set_feature(
+        features,
+        "bundled-tesseract",
+        &["bundled-tesseract-default".to_owned()],
+    );
+    set_feature(
+        features,
+        "bundled-tesseract-default",
+        &[feature_name("bundled-tesseract", &policy.default)],
+    );
+    set_feature(
+        features,
+        "bundled-tesseract-latest",
+        &[feature_name("bundled-tesseract", &policy.latest)],
+    );
+    for version in &policy.versions {
+        set_feature(
+            features,
+            &feature_name("bundled-tesseract", version),
+            &[
+                "dep:reqwest".to_owned(),
+                "dep:sha2".to_owned(),
+                "dep:zip".to_owned(),
+            ],
+        );
+    }
+    write_cargo_toml(path, &document, options)
+}
+
+fn sync_tesseract_ocr_features(
+    path: &Path,
+    policy: &TesseractSyncPolicy,
+    options: &Options,
+) -> Result<()> {
+    let mut document = load_cargo_toml(path)?;
+    let features = features_table(&mut document)?;
+    set_feature(
+        features,
+        "bundled-tesseract",
+        &["bundled-tesseract-default".to_owned()],
+    );
+    set_feature(
+        features,
+        "bundled-tesseract-default",
+        &[feature_name("bundled-tesseract", &policy.default)],
+    );
+    set_feature(
+        features,
+        "bundled-tesseract-latest",
+        &[feature_name("bundled-tesseract", &policy.latest)],
+    );
+    for version in &policy.versions {
+        let feature = feature_name("bundled-tesseract", version);
+        set_feature(
+            features,
+            &feature,
+            &[format!("bcode_tesseract_sys/{feature}")],
+        );
+    }
+    write_cargo_toml(path, &document, options)
+}
+
+fn sync_ocr_plugin_features(
+    path: &Path,
+    policy: &TesseractSyncPolicy,
+    options: &Options,
+) -> Result<()> {
+    let mut document = load_cargo_toml(path)?;
+    let features = features_table(&mut document)?;
+    set_feature(
+        features,
+        "bundled-tesseract",
+        &["bundled-tesseract-default".to_owned()],
+    );
+    set_feature(
+        features,
+        "bundled-tesseract-default",
+        &[feature_name("bundled-tesseract", &policy.default)],
+    );
+    set_feature(
+        features,
+        "bundled-tesseract-latest",
+        &[feature_name("bundled-tesseract", &policy.latest)],
+    );
+    for version in &policy.versions {
+        let feature = feature_name("bundled-tesseract", version);
+        set_feature(
+            features,
+            &feature,
+            &[
+                "_bundled-tesseract-runtime".to_owned(),
+                format!("bcode_tesseract_ocr/{feature}"),
+            ],
+        );
+    }
+    write_cargo_toml(path, &document, options)
+}
+
+fn sync_bcode_features(path: &Path, policy: &TesseractSyncPolicy, options: &Options) -> Result<()> {
+    let mut document = load_cargo_toml(path)?;
+    let features = features_table(&mut document)?;
+    set_feature(
+        features,
+        "bundled-ocr-tesseract",
+        &["bundled-ocr-tesseract-default".to_owned()],
+    );
+    set_feature(
+        features,
+        "bundled-ocr-tesseract-default",
+        &[feature_name("bundled-ocr-tesseract", &policy.default)],
+    );
+    set_feature(
+        features,
+        "bundled-ocr-tesseract-latest",
+        &[feature_name("bundled-ocr-tesseract", &policy.latest)],
+    );
+    for version in &policy.versions {
+        let app_feature = feature_name("bundled-ocr-tesseract", version);
+        let plugin_feature = feature_name("bundled-tesseract", version);
+        set_feature(
+            features,
+            &app_feature,
+            &[
+                "static-bundled-ocr-plugin".to_owned(),
+                format!("bcode_ocr_plugin/{plugin_feature}"),
+            ],
+        );
+    }
+    write_cargo_toml(path, &document, options)
 }
 
 fn workspace_root() -> PathBuf {

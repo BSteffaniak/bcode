@@ -28,11 +28,15 @@ tokio                        = { workspace = true, features = ["fs", "io-util", 
 [features]
 _bundled-tesseract-runtime = ["dep:bcode_tesseract_ocr", "dep:image"]
 bundled-tesseract = ["bundled-tesseract-default"]
-bundled-tesseract-default = ["bundled-tesseract-v5-3-4"]
-bundled-tesseract-latest = ["bundled-tesseract-v5-3-4"]
+bundled-tesseract-default = ["bundled-tesseract-v5-5-1"]
+bundled-tesseract-latest = ["bundled-tesseract-v5-5-1"]
 bundled-tesseract-v5-3-4 = [
     "_bundled-tesseract-runtime",
     "bcode_tesseract_ocr/bundled-tesseract-v5-3-4",
+]
+bundled-tesseract-v5-5-1 = [
+    "_bundled-tesseract-runtime",
+    "bcode_tesseract_ocr/bundled-tesseract-v5-5-1",
 ]
 default = []
 external-tesseract-cli = []

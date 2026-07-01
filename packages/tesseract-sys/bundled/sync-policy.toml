@@ -1,0 +1,13 @@
+[tesseract]
+default  = "5.5.1"
+latest   = "5.5.1"
+versions = ["5.3.4", "5.5.1"]
+
+[leptonica]
+default_version = "1.84.1"
+
+[tessdata]
+commit    = "main"
+flavor    = "best"
+languages = ["eng", "tur"]
+repo      = "tessdata_best"

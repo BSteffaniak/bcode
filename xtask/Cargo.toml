@@ -9,7 +9,9 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-toml_edit = { workspace = true }
+reqwest   = { workspace = true, features = ["blocking"] }
+sha2      = { workspace = true, features = ["std"] }
+toml_edit = { workspace = true, features = ["display", "parse"] }
 
 [features]
 default = []

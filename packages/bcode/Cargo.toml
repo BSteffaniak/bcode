@@ -41,11 +41,15 @@ tokio                                   = { workspace = true, features = ["macro
 [features]
 _static-bundled = []
 bundled-ocr-tesseract = ["bundled-ocr-tesseract-default"]
-bundled-ocr-tesseract-default = ["bundled-ocr-tesseract-v5-3-4"]
-bundled-ocr-tesseract-latest = ["bundled-ocr-tesseract-v5-3-4"]
+bundled-ocr-tesseract-default = ["bundled-ocr-tesseract-v5-5-1"]
+bundled-ocr-tesseract-latest = ["bundled-ocr-tesseract-v5-5-1"]
 bundled-ocr-tesseract-v5-3-4 = [
     "static-bundled-ocr-plugin",
     "bcode_ocr_plugin/bundled-tesseract-v5-3-4",
+]
+bundled-ocr-tesseract-v5-5-1 = [
+    "static-bundled-ocr-plugin",
+    "bcode_ocr_plugin/bundled-tesseract-v5-5-1",
 ]
 default = ["static-bundled-plugins", "bundled-ocr-tesseract"]
 fail-on-warnings = []

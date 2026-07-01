@@ -122,7 +122,7 @@ impl TesseractRuntime {
 /// Returns the embedded bundled Tesseract catalog.
 #[must_use]
 pub const fn bundled_catalog_toml() -> &'static str {
-    include_str!("../../tesseract-sys/bundled/catalog.toml")
+    include_str!("../../tesseract-sys/bundled/catalog.generated.toml")
 }
 
 /// Returns bundled Tesseract versions selected by Cargo features.
@@ -131,6 +131,9 @@ pub fn available_bundled_versions() -> Vec<&'static str> {
     let mut versions = Vec::new();
     if cfg!(feature = "bundled-tesseract-v5-3-4") {
         versions.push("5.3.4");
+    }
+    if cfg!(feature = "bundled-tesseract-v5-5-1") {
+        versions.push("5.5.1");
     }
     versions
 }
