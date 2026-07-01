@@ -19,7 +19,6 @@ use bcode_tool::{
     ToolPresentationLevel, ToolPresentationSection, ToolPresentationTarget,
     ToolRequestPresentationMetadata, ToolSideEffect, ToolStatusPresentation,
 };
-use bcode_tool_runtime::{ProcessExecutionRequest, ToolExecutionRuntime};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::Read;
@@ -75,8 +74,6 @@ struct ShellRunArguments {
     cwd: Option<PathBuf>,
     #[serde(default)]
     timeout_ms: Option<u64>,
-    #[serde(default = "default_terminal_mode")]
-    terminal: bool,
     #[serde(default)]
     columns: Option<u16>,
     #[serde(default)]
@@ -99,10 +96,6 @@ impl ShellRunArguments {
     }
 }
 
-const fn default_terminal_mode() -> bool {
-    true
-}
-
 fn list_tools(request: &ServiceRequest) -> ServiceResponse {
     if let Err(error) = request.payload_json::<ListToolsRequest>() {
         return invalid_request(&error);
@@ -110,7 +103,7 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
     json_response(&ToolList {
         tools: vec![ToolDefinition {
             name: "shell.run".to_string(),
-            description: "Run a shell command. Defaults to pseudo-terminal mode for human-like CLI colors and formatting; set terminal=false for separate stdout/stderr capture.".to_string(),
+            description: "Run a shell command in pseudo-terminal mode so output streams live with human-like CLI colors and formatting.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "required": ["command"],
@@ -118,7 +111,6 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
                     "command": { "type": "string" },
                     "cwd": { "type": "string" },
                     "timeout_ms": { "type": "integer", "minimum": 1 },
-                    "terminal": { "type": "boolean", "default": true, "description": "Run under a pseudo-terminal for human-like CLI formatting. Set false only when separate stdout/stderr capture is required." },
                     "columns": { "type": "integer", "minimum": 1 },
                     "rows": { "type": "integer", "minimum": 1 }
                 }
@@ -239,9 +231,9 @@ fn run_shell_tool(
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.to_owned(),
             sequence: 0,
-            terminal: arguments.terminal,
-            columns: arguments.terminal.then_some(arguments.terminal_columns()),
-            rows: arguments.terminal.then_some(arguments.terminal_rows()),
+            terminal: true,
+            columns: Some(arguments.terminal_columns()),
+            rows: Some(arguments.terminal_rows()),
             started_at_ms: Some(now_ms),
         },
     );
@@ -252,35 +244,14 @@ fn run_shell_tool(
         0,
         format!("starting command: {}", arguments.command),
     );
-    let response = if arguments.terminal {
-        run_terminal_shell_command(
-            events,
-            &context.cancellation,
-            tool_call_id,
-            &arguments,
-            session_cwd,
-            cancellation_path,
-        )
-    } else {
-        match run_shell_command(
-            events,
-            &context.cancellation,
-            tool_call_id,
-            &arguments,
-            session_cwd,
-            cancellation_path,
-        ) {
-            Ok(output) => output,
-            Err(error) => ToolInvocationResponse {
-                output: error,
-                is_error: true,
-                content: Vec::new(),
-                full_output: None,
-                host_action: None,
-                result: None,
-            },
-        }
-    };
+    let response = run_terminal_shell_command(
+        events,
+        &context.cancellation,
+        tool_call_id,
+        &arguments,
+        session_cwd,
+        cancellation_path,
+    );
     emit_shell_result_presentation(events, tool_call_id, &response);
     emit_tool_stream_event(
         events,
@@ -435,7 +406,7 @@ fn shell_result_card(response: &ToolInvocationResponse) -> bcode_tool::ToolCardP
     }];
     let mut sections = Vec::new();
     if let Some(result) = shell_result_from_response(response) {
-        extend_captured_shell_result_presentation(&result, &mut fields);
+        extend_terminal_shell_result_presentation(&result, &mut fields);
     }
     sections.insert(0, ToolPresentationSection::Fields { fields });
     bcode_tool::ToolCardPresentation {
@@ -450,33 +421,25 @@ fn shell_result_card(response: &ToolInvocationResponse) -> bcode_tool::ToolCardP
     }
 }
 
-fn extend_captured_shell_result_presentation(
+fn extend_terminal_shell_result_presentation(
     result: &ShellRunResult,
     fields: &mut Vec<ToolPresentationFieldValue>,
 ) {
-    let ShellRunResult::Captured {
+    let ShellRunResult::Terminal {
         exit_code,
         timed_out,
         cancelled,
         duration_ms,
-        stdout_truncated,
-        stderr_truncated,
+        output_truncated,
         ..
     } = result
     else {
         return;
     };
     push_shell_common_result_fields(fields, *exit_code, *timed_out, *cancelled, *duration_ms);
-    if *stdout_truncated {
+    if *output_truncated {
         fields.push(ToolPresentationFieldValue {
-            label: "Stdout truncated".to_string(),
-            value: "true".to_string(),
-            kind: ToolPresentationFieldKind::Text,
-        });
-    }
-    if *stderr_truncated {
-        fields.push(ToolPresentationFieldValue {
-            label: "Stderr truncated".to_string(),
+            label: "Output truncated".to_string(),
             value: "true".to_string(),
             kind: ToolPresentationFieldKind::Text,
         });
@@ -858,162 +821,6 @@ const fn utf8_boundary_at_or_after(value: &str, mut index: usize) -> usize {
     index
 }
 
-fn build_process_tool_response(
-    command: &str,
-    result: &bcode_tool_runtime::ProcessExecutionResult,
-    max_output_bytes: usize,
-    inline_output_bytes: usize,
-) -> ToolInvocationResponse {
-    let stdout = limit_output_bytes_with_truncation(
-        &result.stdout.bytes,
-        max_output_bytes,
-        result.stdout.truncated,
-    );
-    let stderr = limit_output_bytes_with_truncation(
-        &result.stderr.bytes,
-        max_output_bytes,
-        result.stderr.truncated,
-    );
-    let inline_stdout = limit_inline_stream_output(&stdout, inline_output_bytes);
-    let inline_stderr = limit_inline_stream_output(&stderr, inline_output_bytes);
-    let output = format_command_output(
-        command,
-        result.exit_code,
-        result.timed_out,
-        result.cancelled,
-        &inline_stdout,
-        &inline_stderr,
-    );
-    let full_output = format_command_output(
-        command,
-        result.exit_code,
-        result.timed_out,
-        result.cancelled,
-        &stdout,
-        &stderr,
-    );
-    ToolInvocationResponse {
-        output,
-        is_error: result.timed_out
-            || result.cancelled
-            || result.exit_code.is_none_or(|code| code != 0),
-        content: Vec::new(),
-        full_output: Some(full_output),
-        host_action: None,
-        result: Some(shell_run_artifact(
-            "shell.run",
-            &ShellRunResult::Captured {
-                exit_code: result.exit_code,
-                timed_out: result.timed_out,
-                cancelled: result.cancelled,
-                duration_ms: Some(result.duration_ms),
-                stdout: inline_stdout.text,
-                stderr: inline_stderr.text,
-                stdout_truncated: inline_stdout.truncated,
-                stderr_truncated: inline_stderr.truncated,
-                stdout_bytes: Some(stdout.original_bytes as u64),
-                stderr_bytes: Some(stderr.original_bytes as u64),
-            },
-        )),
-    }
-}
-
-fn run_shell_command(
-    events: ServiceEventEmitter,
-    cancellation: &bcode_plugin_sdk::ServiceCancellation,
-    tool_call_id: &str,
-    arguments: &ShellRunArguments,
-    session_cwd: Option<&std::path::Path>,
-    cancellation_path: Option<&std::path::Path>,
-) -> Result<ToolInvocationResponse, String> {
-    run_shell_command_with_environment(
-        events,
-        cancellation,
-        tool_call_id,
-        arguments,
-        session_cwd,
-        cancellation_path,
-        &bcode_config::ProcessConfigEnvironment,
-    )
-}
-
-fn run_shell_command_with_environment(
-    _events: ServiceEventEmitter,
-    cancellation: &bcode_plugin_sdk::ServiceCancellation,
-    _tool_call_id: &str,
-    arguments: &ShellRunArguments,
-    session_cwd: Option<&std::path::Path>,
-    cancellation_path: Option<&std::path::Path>,
-    environment: &impl bcode_config::ConfigEnvironment,
-) -> Result<ToolInvocationResponse, String> {
-    let timeout = Duration::from_millis(arguments.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
-    let cwd = resolve_effective_cwd(arguments, session_cwd);
-    let config = shell_config_with_environment(cwd.as_deref(), environment)?;
-    let env_config = config.env;
-    let max_output_bytes = config.max_output_bytes;
-    let inline_output_bytes = config.inline_output_bytes;
-    let (program, args) = shell_program_and_args(&arguments.command, cwd.as_deref(), env_config)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| error.to_string())?;
-    let cancellation_path = cancellation_path.map(Path::to_path_buf);
-    let cancellation = cancellation.clone();
-    let result = runtime
-        .block_on(async {
-            let runtime = ToolExecutionRuntime::new(1);
-            let cancel_handle = runtime.cancellation_handle();
-            let cancel_task = cancellation_path.map(|path| {
-                let cancel_handle = cancel_handle.clone();
-                let cancellation = cancellation.clone();
-                tokio::spawn(async move {
-                    while !cancellation.is_cancelled() && !path.exists() {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                    cancel_handle.cancel();
-                })
-            });
-            let context_cancel_task = if cancel_task.is_none() {
-                let cancel_handle = cancel_handle.clone();
-                Some(tokio::spawn(async move {
-                    while !cancellation.is_cancelled() {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                    cancel_handle.cancel();
-                }))
-            } else {
-                None
-            };
-            let result = runtime
-                .run_process_streaming(
-                    ProcessExecutionRequest {
-                        program,
-                        args,
-                        cwd,
-                        timeout: Some(timeout),
-                        max_output_bytes,
-                    },
-                    move |_event| {},
-                )
-                .await;
-            if let Some(cancel_task) = cancel_task {
-                cancel_task.abort();
-            }
-            if let Some(context_cancel_task) = context_cancel_task {
-                context_cancel_task.abort();
-            }
-            result
-        })
-        .map_err(|error| error.to_string())?;
-
-    Ok(build_process_tool_response(
-        &arguments.command,
-        &result,
-        max_output_bytes,
-        inline_output_bytes,
-    ))
-}
-
 #[cfg(unix)]
 const fn shell_program() -> &'static str {
     "sh"
@@ -1139,39 +946,6 @@ fn limit_output_bytes_with_truncation(
     }
 }
 
-fn limit_inline_stream_output(output: &LimitedOutput, max_bytes: usize) -> LimitedOutput {
-    let bytes = output.text.as_bytes();
-    let limit = max_bytes.min(bytes.len());
-    if !output.truncated && limit == bytes.len() {
-        return output.clone();
-    }
-
-    let tail_budget = limit.saturating_mul(3) / 5;
-    let head_budget = limit.saturating_sub(tail_budget);
-    let head_end = utf8_boundary_at_or_before(&output.text, head_budget);
-    let tail_start =
-        utf8_boundary_at_or_after(&output.text, bytes.len().saturating_sub(tail_budget));
-    let text = if head_end >= tail_start {
-        output.text.clone()
-    } else {
-        format!("{}{}", &output.text[..head_end], &output.text[tail_start..])
-    };
-
-    LimitedOutput {
-        text,
-        original_bytes: output.original_bytes,
-        retained_bytes: head_end + bytes.len().saturating_sub(tail_start),
-        truncated: true,
-    }
-}
-
-const fn utf8_boundary_at_or_before(value: &str, mut index: usize) -> usize {
-    while index > 0 && !value.is_char_boundary(index) {
-        index = index.saturating_sub(1);
-    }
-    index
-}
-
 fn valid_utf8_prefix_len(bytes: &[u8], max_len: usize) -> usize {
     let mut len = max_len.min(bytes.len());
     while len > 0 && std::str::from_utf8(&bytes[..len]).is_err() {
@@ -1186,56 +960,6 @@ fn join_reader(
     handle
         .join()
         .map_err(|_| "output reader thread panicked".to_string())?
-}
-
-fn format_command_output(
-    command: &str,
-    exit_code: Option<i32>,
-    timed_out: bool,
-    cancelled: bool,
-    stdout: &LimitedOutput,
-    stderr: &LimitedOutput,
-) -> String {
-    let exit_code = exit_code.map_or_else(|| "signal".to_string(), |code| code.to_string());
-    let pipeline_note = output_slicing_pipeline_note(command);
-    format!(
-        "exit_code: {exit_code}\ntimed_out: {timed_out}\ncancelled: {cancelled}{pipeline_note}\nstdout:\n{}\nstderr:\n{}",
-        format_stream_output("stdout", stdout),
-        format_stream_output("stderr", stderr),
-    )
-}
-
-fn output_slicing_pipeline_note(command: &str) -> &'static str {
-    if command_contains_output_slicing_pipe(command) {
-        "\nnote: this command pipes output through sed/head/tail. Bcode already shows the beginning and end of long shell output; prefer unsliced validation commands plus artifact.read/artifact.grep for omitted retained output."
-    } else {
-        ""
-    }
-}
-
-fn command_contains_output_slicing_pipe(command: &str) -> bool {
-    let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
-    [
-        "| sed ", "| head", "| tail", "|& sed ", "|& head", "|& tail",
-    ]
-    .iter()
-    .any(|pattern| normalized.contains(pattern))
-}
-
-fn format_stream_output(stream: &str, output: &LimitedOutput) -> String {
-    if !output.truncated {
-        return output.text.clone();
-    }
-    let omitted = output.original_bytes.saturating_sub(output.retained_bytes);
-    let capture_note = if output.truncated && output.original_bytes >= DEFAULT_MAX_OUTPUT_BYTES {
-        " Process output may have exceeded Bcode's capture limit."
-    } else {
-        ""
-    };
-    format!(
-        "[{stream} truncated: omitted {omitted} bytes; showing first and last {} of {} retained bytes.{capture_note} Bcode already shows both the beginning and end of long shell output. Do not rerun the same command with sed/head/tail just to inspect omitted output; use artifact.read/from_end or artifact.grep.]\n{}",
-        output.retained_bytes, output.original_bytes, output.text
-    )
 }
 
 fn json_response<T: serde::Serialize>(value: &T) -> ServiceResponse {
@@ -1282,25 +1006,6 @@ fn present_artifact(request: &ServiceRequest) -> ServiceResponse {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        "captured" => {
-            let stdout = request
-                .artifact
-                .metadata
-                .get("stdout")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let stderr = request
-                .artifact
-                .metadata
-                .get("stderr")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            if stderr.is_empty() {
-                stdout.to_string()
-            } else {
-                format!("{stdout}\n{stderr}")
-            }
-        }
         _ => serde_json::to_string_pretty(&request.artifact.metadata).unwrap_or_default(),
     };
     json_response(&ToolArtifactPresentationResponse {
@@ -1362,12 +1067,40 @@ mod tests {
         bcode_config::ConfigEnvironmentSnapshot::isolated(root)
     }
 
+    #[test]
+    fn shell_run_schema_does_not_expose_terminal_toggle() {
+        let request = ServiceRequest {
+            interface_id: TOOL_SERVICE_INTERFACE_ID.to_string(),
+            operation: OP_LIST_TOOLS.to_string(),
+            payload: serde_json::to_vec(&ListToolsRequest::default())
+                .expect("request should encode"),
+        };
+        let response = list_tools(&request);
+        assert!(response.error.is_none());
+        let tools = response
+            .payload_json::<ToolList>()
+            .expect("tool list should decode");
+        let shell_run = tools
+            .tools
+            .iter()
+            .find(|tool| tool.name == "shell.run")
+            .expect("shell.run tool should be listed");
+        let properties = shell_run
+            .input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("schema should have object properties");
+
+        assert!(!properties.contains_key("terminal"));
+        assert!(shell_run.description.contains("streams live"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn timeout_terminates_shell_process_group() {
         let environment = isolated_config_environment("timeout");
         let started = Instant::now();
-        let response = run_shell_command_with_environment(
+        let response = run_terminal_shell_command_with_environment(
             ServiceEventEmitter::default(),
             &bcode_plugin_sdk::ServiceCancellation::default(),
             "test",
@@ -1375,19 +1108,17 @@ mod tests {
                 command: "sh -c 'trap \"\" HUP TERM; sleep 5' | cat".to_string(),
                 cwd: None,
                 timeout_ms: Some(100),
-                terminal: false,
                 columns: None,
                 rows: None,
             },
             None,
             None,
             &environment,
-        )
-        .expect("shell command should return timeout output");
+        );
 
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(response.is_error);
-        assert!(response.output.contains("timed_out: true"));
+        assert!(response.output.contains("\"timed_out\":true"));
     }
 
     #[test]
@@ -1400,66 +1131,11 @@ mod tests {
         assert!(output.truncated);
     }
 
-    #[test]
-    fn inline_stream_output_keeps_head_and_tail_when_truncated() {
-        let output = limit_output_bytes(b"head-middle-tail", 16);
-        let inline = limit_inline_stream_output(&output, 10);
-
-        assert_eq!(inline.text, "heade-tail");
-        assert_eq!(inline.original_bytes, 16);
-        assert_eq!(inline.retained_bytes, 10);
-        assert!(inline.truncated);
-    }
-
-    #[test]
-    fn command_output_marks_truncated_streams() {
-        let stdout = LimitedOutput {
-            text: "headtail".to_string(),
-            original_bytes: 16,
-            retained_bytes: 8,
-            truncated: true,
-        };
-        let stderr = LimitedOutput {
-            text: String::new(),
-            original_bytes: 0,
-            retained_bytes: 0,
-            truncated: false,
-        };
-
-        let output = format_command_output("echo test", Some(0), false, false, &stdout, &stderr);
-
-        assert!(output.contains("stdout truncated"));
-        assert!(output.contains("showing first and last 8 of 16 retained bytes"));
-        assert!(output.contains("headtail"));
-    }
-
-    #[test]
-    fn command_output_warns_about_output_slicing_pipelines() {
-        let stdout = LimitedOutput {
-            text: String::new(),
-            original_bytes: 0,
-            retained_bytes: 0,
-            truncated: false,
-        };
-        let stderr = stdout.clone();
-
-        let output = format_command_output(
-            "cargo clippy 2>&1 | sed -n '1,120p'",
-            Some(0),
-            false,
-            false,
-            &stdout,
-            &stderr,
-        );
-
-        assert!(output.contains("pipes output through sed/head/tail"));
-    }
-
     #[cfg(unix)]
     #[test]
     fn shell_pipeline_preserves_failing_left_side_status() {
         let environment = isolated_config_environment("pipeline");
-        let response = run_shell_command_with_environment(
+        let response = run_terminal_shell_command_with_environment(
             ServiceEventEmitter::default(),
             &bcode_plugin_sdk::ServiceCancellation::default(),
             "test",
@@ -1467,23 +1143,16 @@ mod tests {
                 command: "false | sed -n '1,1p'".to_string(),
                 cwd: None,
                 timeout_ms: Some(1_000),
-                terminal: false,
                 columns: None,
                 rows: None,
             },
             None,
             None,
             &environment,
-        )
-        .expect("shell command should run");
+        );
 
         assert!(response.is_error);
-        assert!(response.output.contains("exit_code: 1"));
-        assert!(
-            response
-                .output
-                .contains("pipes output through sed/head/tail")
-        );
+        assert!(response.output.contains("\"exit_code\":1"));
     }
 
     #[cfg(unix)]
@@ -1498,7 +1167,6 @@ mod tests {
                 command: "printf 'semantic terminal\\n'".to_string(),
                 cwd: None,
                 timeout_ms: Some(5_000),
-                terminal: true,
                 columns: Some(80),
                 rows: Some(24),
             },
@@ -1530,51 +1198,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn captured_mode_returns_semantic_captured_result() {
-        let environment = isolated_config_environment("captured");
-        let response = run_shell_command_with_environment(
-            ServiceEventEmitter::default(),
-            &bcode_plugin_sdk::ServiceCancellation::default(),
-            "test-captured-semantic",
-            &ShellRunArguments {
-                command: "printf 'semantic stdout'; printf 'semantic stderr' >&2".to_string(),
-                cwd: None,
-                timeout_ms: Some(5_000),
-                terminal: false,
-                columns: None,
-                rows: None,
-            },
-            None,
-            None,
-            &environment,
-        )
-        .expect("shell command should complete");
-
-        assert!(!response.is_error, "{}", response.output);
-        let ShellRunResult::Captured {
-            exit_code,
-            timed_out,
-            cancelled,
-            stdout,
-            stderr,
-            stdout_truncated,
-            stderr_truncated,
-            ..
-        } = shell_result_from_response(&response).expect("expected shell artifact")
-        else {
-            panic!("expected semantic captured shell result");
-        };
-        assert_eq!(exit_code, Some(0));
-        assert!(!timed_out);
-        assert!(!cancelled);
-        assert_eq!(stdout, "semantic stdout");
-        assert_eq!(stderr, "semantic stderr");
-        assert!(!stdout_truncated);
-        assert!(!stderr_truncated);
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn terminal_mode_preserves_ansi_output() {
         let response = run_terminal_shell_command(
             ServiceEventEmitter::default(),
@@ -1584,7 +1207,6 @@ mod tests {
                 command: "printf '\\033[31mred\\033[0m\\n'".to_string(),
                 cwd: None,
                 timeout_ms: Some(5_000),
-                terminal: true,
                 columns: Some(80),
                 rows: Some(24),
             },
@@ -1694,7 +1316,7 @@ mod tests {
         );
     }
     #[test]
-    fn captured_result_card_includes_relevant_process_metadata() {
+    fn terminal_result_card_includes_relevant_process_metadata() {
         let response = ToolInvocationResponse {
             output: String::new(),
             is_error: false,
@@ -1702,18 +1324,18 @@ mod tests {
             full_output: None,
             host_action: None,
             result: Some(shell_run_artifact(
-                "test-captured-card",
-                &ShellRunResult::Captured {
+                "test-terminal-card",
+                &ShellRunResult::Terminal {
                     exit_code: Some(0),
                     timed_out: false,
                     cancelled: false,
                     duration_ms: Some(5),
-                    stdout: "ok".to_string(),
-                    stderr: "warn".to_string(),
-                    stdout_truncated: false,
-                    stderr_truncated: true,
-                    stdout_bytes: Some(2),
-                    stderr_bytes: Some(4),
+                    output_tail: "ok".to_string(),
+                    output_truncated: true,
+                    output_bytes: Some(2),
+                    retained_output_bytes: Some(2),
+                    columns: 80,
+                    rows: 24,
                 },
             )),
         };
@@ -1725,10 +1347,10 @@ mod tests {
             ToolPresentationSection::Fields { fields }
             if fields.iter().any(|field| field.label == "Exit code" && field.value == "0")
                 && fields.iter().any(|field| field.label == "Duration" && field.value == "5")
-                && fields.iter().any(|field| field.label == "Stderr truncated" && field.value == "true")
+                && fields.iter().any(|field| field.label == "Output truncated" && field.value == "true")
                 && !fields.iter().any(|field| field.label == "Timed out")
                 && !fields.iter().any(|field| field.label == "Cancelled")
-                && !fields.iter().any(|field| field.label == "Stdout bytes")
+                && !fields.iter().any(|field| field.label == "Output bytes")
         )));
         assert!(card.sections.iter().all(|section| !matches!(
             section,
@@ -1827,31 +1449,6 @@ mod tests {
             card.sections.as_slice(),
             [ToolPresentationSection::Terminal { output, columns: 80, rows: 24 }]
                 if output == "terminal tail\n"
-        ));
-    }
-
-    #[test]
-    fn present_captured_shell_artifact_as_plugin_owned_terminal_card() {
-        let response = shell_artifact_presentation_response(&ShellRunResult::Captured {
-            exit_code: Some(0),
-            timed_out: false,
-            cancelled: false,
-            duration_ms: None,
-            stdout: "captured stdout\n".to_string(),
-            stderr: "captured stderr\n".to_string(),
-            stdout_truncated: false,
-            stderr_truncated: true,
-            stdout_bytes: Some(16),
-            stderr_bytes: Some(16),
-        });
-        let Some(ToolPresentationEvent::Card(card)) = response.presentation else {
-            panic!("expected card presentation");
-        };
-        assert_eq!(card.subtitle.as_deref(), Some("captured"));
-        assert!(matches!(
-            card.sections.as_slice(),
-            [ToolPresentationSection::Terminal { output, .. }]
-                if output.contains("captured stdout") && output.contains("captured stderr")
         ));
     }
 }
