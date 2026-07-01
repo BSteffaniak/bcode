@@ -12023,12 +12023,14 @@ async fn build_model_turn_request(
         "model.request_build.parameters_duration_ms",
         parameters_timer.elapsed_ms(),
     );
+    let mut provider_context = selection.provider_context.clone();
+    select_host_auth_pool_candidate(&mut provider_context);
     let projection_timer = state.metrics.timer();
     let projection = ConversationProjection::new(&ConversationProjectionInput {
         session_id,
         provider_plugin_id: provider_plugin_id.unwrap_or("<auto>"),
         model_id: &model_id,
-        auth_profile: selection.provider_context.auth_profile.as_deref(),
+        auth_profile: provider_context.auth_profile.as_deref(),
         system_prompt: &system_prompt,
         tools: &tools,
         parameters: &parameters,
@@ -12061,7 +12063,7 @@ async fn build_model_turn_request(
         session_id,
         turn_id: format!("{}-{}-{round}", session_id, trigger_event.sequence),
         model_id,
-        provider_context: selection.provider_context.clone(),
+        provider_context,
         system_prompt: Some(system_prompt),
         messages,
         tools,
@@ -12078,6 +12080,32 @@ async fn build_model_turn_request(
         .metrics
         .record_histogram("model.request_build_duration_ms", build_timer.elapsed_ms());
     Ok(request)
+}
+
+fn select_host_auth_pool_candidate(context: &mut bcode_model::ProviderRequestContext) {
+    if context.auth_candidates.is_empty() {
+        return;
+    }
+    let Some(selection) = bcode_provider_auth::auth_pool_routing::select_auth_pool_candidate(
+        &bcode_provider_auth::auth_pool_routing::AuthPoolSelectionInput {
+            pool: context.auth_pool.as_deref(),
+            primary_profile: context.auth_profile.as_deref(),
+            routing: &context.auth_pool_routing,
+            candidates: &context.auth_candidates,
+        },
+    ) else {
+        return;
+    };
+    let Some(candidate) = context
+        .auth_candidates
+        .iter()
+        .find(|candidate| candidate.profile == selection.profile)
+    else {
+        return;
+    };
+    context.auth_profile.clone_from(&candidate.profile);
+    context.auth = Some(candidate.auth.clone());
+    context.env = candidate.env.clone();
 }
 
 fn insert_reasoning_metadata(
@@ -16218,6 +16246,36 @@ mod tests {
 
         assert_eq!(hints.mode, bcode_model::PromptCacheMode::Auto);
         assert_eq!(prompt_cache_point_count_in_messages(&messages), 0);
+    }
+
+    #[test]
+    fn conversation_reuse_key_differs_by_auth_profile() {
+        let session_id = SessionId::new();
+        let messages = vec![test_model_message(MessageRole::User, "hello")];
+        let tools = Vec::new();
+        let parameters = ModelParameters::default();
+        let first = ConversationProjection::new(&ConversationProjectionInput {
+            session_id,
+            provider_plugin_id: "provider",
+            model_id: "model",
+            auth_profile: Some("openai"),
+            system_prompt: "system",
+            tools: &tools,
+            parameters: &parameters,
+            messages: &messages,
+        });
+        let second = ConversationProjection::new(&ConversationProjectionInput {
+            session_id,
+            provider_plugin_id: "provider",
+            model_id: "model",
+            auth_profile: Some("openai-2"),
+            system_prompt: "system",
+            tools: &tools,
+            parameters: &parameters,
+            messages: &messages,
+        });
+
+        assert_ne!(first.reuse_key(), second.reuse_key());
     }
 
     #[test]

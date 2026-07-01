@@ -8,6 +8,8 @@
 //! material for provider plugins, plus compatibility env values for providers
 //! that still consume environment-shaped credentials.
 
+pub mod auth_pool_routing;
+pub mod auth_pool_state;
 pub mod security;
 
 use std::collections::BTreeMap;

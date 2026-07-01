@@ -1,3 +1,5 @@
+//! Shared auth-pool runtime state.
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -7,36 +9,50 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static STATE_LOCK: Mutex<()> = Mutex::new(());
 
+/// Auth-pool runtime state file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct AuthPoolState {
+pub struct AuthPoolState {
+    /// Per-pool/profile observed state keyed as `<pool>/<profile>`.
     #[serde(default)]
-    entries: BTreeMap<String, AuthPoolProfileState>,
+    pub entries: BTreeMap<String, AuthPoolProfileState>,
+    /// Per-pool routing state.
     #[serde(default)]
-    pools: BTreeMap<String, AuthPoolRoutingState>,
+    pub pools: BTreeMap<String, AuthPoolRoutingState>,
 }
 
+/// Per-pool routing cursor state.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct AuthPoolRoutingState {
+pub struct AuthPoolRoutingState {
+    /// Last successfully selected profile.
     #[serde(default)]
-    last_selected_profile: Option<String>,
+    pub last_selected_profile: Option<String>,
 }
 
+/// Observed per-profile auth-pool state.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct AuthPoolProfileState {
+pub struct AuthPoolProfileState {
+    /// Unix timestamp until which this profile should be treated as quota-limited.
     #[serde(default)]
-    cooldown_until_unix: u64,
+    pub cooldown_until_unix: u64,
+    /// Human-readable cooldown reason.
     #[serde(default)]
-    reason: String,
+    pub reason: String,
+    /// Last provider error observed for this profile.
     #[serde(default)]
-    last_error: Option<String>,
+    pub last_error: Option<String>,
+    /// Source of reset/cooldown timing.
     #[serde(default)]
-    reset_source: Option<String>,
+    pub reset_source: Option<String>,
+    /// Last successful use timestamp.
     #[serde(default)]
-    last_success_unix: Option<u64>,
+    pub last_success_unix: Option<u64>,
+    /// Last priming success timestamp.
     #[serde(default)]
-    primed_unix: Option<u64>,
+    pub primed_unix: Option<u64>,
 }
 
+/// Whether an auth profile is outside local cooldown.
+#[must_use]
 pub fn is_profile_available(pool: Option<&str>, profile: Option<&str>) -> bool {
     let Some(key) = state_key(pool, profile) else {
         return true;
@@ -49,6 +65,7 @@ pub fn is_profile_available(pool: Option<&str>, profile: Option<&str>) -> bool {
     })
 }
 
+/// Mark a profile as quota-limited for a duration.
 pub fn mark_profile_quota_limited(
     pool: Option<&str>,
     profile: Option<&str>,
@@ -66,6 +83,7 @@ pub fn mark_profile_quota_limited(
     );
 }
 
+/// Mark a profile as quota-limited until an absolute Unix timestamp.
 pub fn mark_profile_quota_limited_until(
     pool: Option<&str>,
     profile: Option<&str>,
@@ -86,6 +104,8 @@ pub fn mark_profile_quota_limited_until(
     });
 }
 
+/// Return the current cooldown deadline for a profile, when active.
+#[must_use]
 pub fn profile_cooldown_until(pool: Option<&str>, profile: Option<&str>) -> Option<u64> {
     let key = state_key(pool, profile)?;
     with_state(|state| {
@@ -97,6 +117,7 @@ pub fn profile_cooldown_until(pool: Option<&str>, profile: Option<&str>) -> Opti
     })
 }
 
+/// Clear local quota-limited state for a profile.
 pub fn clear_profile_quota_limited(pool: Option<&str>, profile: Option<&str>) {
     let Some(key) = state_key(pool, profile) else {
         return;
@@ -111,6 +132,7 @@ pub fn clear_profile_quota_limited(pool: Option<&str>, profile: Option<&str>) {
     });
 }
 
+/// Record a successful profile use.
 pub fn mark_profile_success(pool: Option<&str>, profile: Option<&str>) {
     let Some(key) = state_key(pool, profile) else {
         return;
@@ -120,6 +142,7 @@ pub fn mark_profile_success(pool: Option<&str>, profile: Option<&str>) {
     });
 }
 
+/// Record a successful priming use.
 pub fn mark_profile_primed(pool: Option<&str>, profile: Option<&str>) {
     let Some(key) = state_key(pool, profile) else {
         return;
@@ -132,6 +155,8 @@ pub fn mark_profile_primed(pool: Option<&str>, profile: Option<&str>) {
     });
 }
 
+/// Whether a profile needs priming according to optional reprime interval.
+#[must_use]
 pub fn profile_needs_priming(
     pool: Option<&str>,
     profile: Option<&str>,
@@ -140,15 +165,11 @@ pub fn profile_needs_priming(
     let Some(key) = state_key(pool, profile) else {
         return false;
     };
-    with_state(|state| {
-        let Some(primed_unix) = state.entries.get(&key).and_then(|entry| entry.primed_unix) else {
-            return true;
-        };
-        reprime_after
-            .is_some_and(|duration| now_unix().saturating_sub(primed_unix) >= duration.as_secs())
-    })
+    with_state(|state| profile_needs_priming_in_state(state, &key, reprime_after, now_unix()))
 }
 
+/// Return last selected profile for a pool.
+#[must_use]
 pub fn last_selected_profile(pool: Option<&str>) -> Option<String> {
     let pool = pool.filter(|value| !value.trim().is_empty())?;
     with_state(|state| {
@@ -159,6 +180,7 @@ pub fn last_selected_profile(pool: Option<&str>) -> Option<String> {
     })
 }
 
+/// Mark the routing cursor for a pool.
 pub fn mark_pool_selected(pool: Option<&str>, profile: Option<&str>) {
     let Some(pool) = pool.filter(|value| !value.trim().is_empty()) else {
         return;
@@ -166,13 +188,17 @@ pub fn mark_pool_selected(pool: Option<&str>, profile: Option<&str>) {
     let Some(profile) = profile.filter(|value| !value.trim().is_empty()) else {
         return;
     };
-    mutate_state(|state| {
-        state
-            .pools
-            .entry(pool.to_string())
-            .or_default()
-            .last_selected_profile = Some(profile.to_string());
-    });
+    mutate_state(|state| mark_pool_selected_in_state(state, pool, profile));
+}
+
+/// Load the shared auth-pool state file.
+#[must_use]
+pub fn load_state() -> AuthPoolState {
+    let path = state_path();
+    let Ok(contents) = fs::read_to_string(path) else {
+        return AuthPoolState::default();
+    };
+    serde_json::from_str(&contents).unwrap_or_default()
 }
 
 fn with_state<T>(f: impl FnOnce(&AuthPoolState) -> T) -> T {
@@ -200,14 +226,6 @@ fn state_path() -> PathBuf {
         .join("openai-compatible-auth-pool-state.json")
 }
 
-fn load_state() -> AuthPoolState {
-    let path = state_path();
-    let Ok(contents) = fs::read_to_string(path) else {
-        return AuthPoolState::default();
-    };
-    serde_json::from_str(&contents).unwrap_or_default()
-}
-
 fn save_state(state: &AuthPoolState) {
     let path = state_path();
     let Some(parent) = path.parent() else {
@@ -225,4 +243,24 @@ fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
+}
+
+pub(crate) fn profile_needs_priming_in_state(
+    state: &AuthPoolState,
+    key: &str,
+    reprime_after: Option<Duration>,
+    now: u64,
+) -> bool {
+    let Some(primed_unix) = state.entries.get(key).and_then(|entry| entry.primed_unix) else {
+        return true;
+    };
+    reprime_after.is_some_and(|duration| now.saturating_sub(primed_unix) >= duration.as_secs())
+}
+
+pub(crate) fn mark_pool_selected_in_state(state: &mut AuthPoolState, pool: &str, profile: &str) {
+    state
+        .pools
+        .entry(pool.to_string())
+        .or_default()
+        .last_selected_profile = Some(profile.to_string());
 }

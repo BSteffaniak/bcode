@@ -4,7 +4,6 @@
 
 //! OpenAI-compatible model provider plugin for Bcode.
 
-mod auth_pool_state;
 mod discovery;
 
 use base64::Engine as _;
@@ -28,6 +27,7 @@ use bcode_model_provider_runtime::{
     ProviderRuntime, retry_hint_from_json_value, retry_hint_from_response_parts,
 };
 use bcode_plugin_sdk::prelude::*;
+use bcode_provider_auth::auth_pool_state;
 use reqwest::Client;
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
@@ -1071,6 +1071,16 @@ async fn stream_chat_completion_with_failover(
     if request.provider_context.auth_candidates.is_empty() {
         return stream_chat_completion_inner(request, turn).await;
     }
+    if request.provider_context.auth_profile.is_some() {
+        let outcome = stream_chat_completion_inner(request, turn).await;
+        return match outcome {
+            Err(error) if is_subscription_quota_error(&error) => {
+                record_selected_auth_profile_quota_error(request, turn, &error);
+                try_auth_candidates_after_selected_failure(request, turn).await
+            }
+            outcome => outcome,
+        };
+    }
     loop {
         match try_auth_candidates_once(request, turn).await? {
             CandidateAttemptOutcome::Finished(outcome) => return Ok(outcome),
@@ -1102,6 +1112,45 @@ async fn stream_chat_completion_with_failover(
             }
         }
     }
+}
+
+async fn try_auth_candidates_after_selected_failure(
+    request: &ModelTurnRequest,
+    turn: &TurnState,
+) -> Result<StreamOutcome, ProviderError> {
+    let selected_profile = request.provider_context.auth_profile.as_deref();
+    let mut fallback_request = request.clone();
+    fallback_request.provider_context.auth_candidates = request
+        .provider_context
+        .auth_candidates
+        .iter()
+        .filter(|candidate| candidate.profile.as_deref() != selected_profile)
+        .cloned()
+        .collect();
+    if fallback_request.provider_context.auth_candidates.is_empty() {
+        return Err(provider_error(
+            "openai_auth_pool_exhausted",
+            ProviderErrorCategory::RateLimit,
+            "all configured OpenAI subscriptions are quota-limited",
+        ));
+    }
+    match try_auth_candidates_once(&fallback_request, turn).await? {
+        CandidateAttemptOutcome::Finished(outcome) => Ok(outcome),
+        CandidateAttemptOutcome::Exhausted { error, .. } => Err(error),
+    }
+}
+
+fn record_selected_auth_profile_quota_error(
+    request: &ModelTurnRequest,
+    turn: &TurnState,
+    error: &ProviderError,
+) -> Option<u64> {
+    let candidate = request
+        .provider_context
+        .auth_candidates
+        .iter()
+        .find(|candidate| candidate.profile == request.provider_context.auth_profile)?;
+    record_auth_candidate_quota_error(request, turn, candidate, error)
 }
 
 #[derive(Debug)]
