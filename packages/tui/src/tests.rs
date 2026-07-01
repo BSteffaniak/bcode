@@ -3642,6 +3642,300 @@ fn semantic_terminal_result_without_live_delta_renders_terminal_history() {
 }
 
 #[test]
+fn live_shell_result_preserves_request_block() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    let events = vec![
+        event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-live-shell".to_owned(),
+                tool_name: "shell.run".to_owned(),
+                arguments_json: serde_json::json!({
+                    "command": "echo hello",
+                    "terminal": false,
+                })
+                .to_string(),
+                request_presentation: Some(shell_request_presentation()),
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "call-live-shell".to_owned(),
+                result: String::new(),
+                is_error: false,
+                output: None,
+                semantic_result: Some(shell_result_artifact(&ShellRunResult::Captured {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    cancelled: false,
+                    duration_ms: None,
+                    stdout: "hello\n".to_owned(),
+                    stderr: String::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                    stdout_bytes: Some(6),
+                    stderr_bytes: Some(0),
+                })),
+            },
+        ),
+    ];
+
+    for event in events {
+        app.absorb_session_event(&event);
+    }
+    let transcript = app.transcript();
+
+    assert!(transcript.iter().any(|item| {
+        matches!(item.kind(), TranscriptItemKind::ToolRequest { .. })
+            && item.text().contains("echo hello")
+    }));
+    assert!(transcript.iter().any(|item| {
+        matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
+            && item.text().contains("Shell run")
+    }));
+}
+
+#[test]
+fn live_streamed_shell_result_preserves_request_and_suppresses_artifact_duplicate() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    let events = vec![
+        event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-live-stream".to_owned(),
+                tool_name: "shell.run".to_owned(),
+                arguments_json: serde_json::json!({
+                    "command": "cargo test",
+                    "terminal": true,
+                })
+                .to_string(),
+                request_presentation: Some(shell_request_presentation()),
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Started {
+                    tool_call_id: "call-live-stream".to_owned(),
+                    tool_name: "shell.run".to_owned(),
+                    sequence: 0,
+                    terminal: true,
+                    columns: Some(80),
+                    rows: Some(24),
+                    started_at_ms: Some(10),
+                },
+            },
+        ),
+        event(
+            session_id,
+            3,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::OutputDelta {
+                    tool_call_id: "call-live-stream".to_owned(),
+                    stream: ToolOutputStream::Pty,
+                    sequence: 1,
+                    text: "running\n".to_owned(),
+                    byte_len: 8,
+                },
+            },
+        ),
+        event(
+            session_id,
+            4,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "call-live-stream".to_owned(),
+                result: String::new(),
+                is_error: false,
+                output: None,
+                semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    cancelled: false,
+                    duration_ms: None,
+                    output_tail: "final duplicate tail\n".to_owned(),
+                    output_truncated: false,
+                    output_bytes: Some(21),
+                    retained_output_bytes: Some(21),
+                    columns: 80,
+                    rows: 24,
+                })),
+            },
+        ),
+    ];
+
+    for event in events {
+        app.absorb_session_event(&event);
+    }
+    let transcript = app.transcript();
+
+    assert!(transcript.iter().any(|item| {
+        matches!(item.kind(), TranscriptItemKind::ToolRequest { .. })
+            && item.text().contains("cargo test")
+    }));
+    assert!(transcript.iter().any(|item| {
+        matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. })
+            && item.text().contains("running")
+    }));
+    assert!(!transcript.iter().any(|item| {
+        matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
+            && item.text().contains("Shell run")
+    }));
+}
+
+#[test]
+fn live_shell_preview_with_streamed_output_preserves_preview_and_suppresses_artifact_duplicate() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.absorb_session_live_event(&live_shell_preview_stream_preview(session_id));
+    for event in live_shell_preview_stream_events(session_id) {
+        app.absorb_session_event(&event);
+    }
+    let transcript = app.transcript();
+
+    assert!(
+        transcript
+            .iter()
+            .any(|item| item.is_live_preview_anchor_for("call-live-preview-stream"))
+    );
+    assert!(
+        !transcript
+            .iter()
+            .any(|item| matches!(item.kind(), TranscriptItemKind::ToolRequest { .. }))
+    );
+    assert!(transcript.iter().any(|item| {
+        matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. })
+            && item.text().contains("running")
+    }));
+    assert!(!transcript.iter().any(|item| {
+        matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
+            && item.text().contains("Shell run")
+    }));
+
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 30));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+    assert!(output.contains("Shell command"), "{output}");
+    assert!(output.contains("command: cargo test"), "{output}");
+    assert!(output.contains("running"), "{output}");
+    assert!(!output.contains("final duplicate tail"), "{output}");
+}
+
+fn live_shell_preview_stream_preview(
+    session_id: SessionId,
+) -> bcode_session_models::SessionLiveEvent {
+    bcode_session_models::SessionLiveEvent {
+        session_id,
+        kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
+            turn_id: "turn-1".to_owned(),
+            tool_call_id: "call-live-preview-stream".to_owned(),
+            tool_name: "shell.run".to_owned(),
+            argument_bytes: 28,
+            preview: LiveToolArgumentPreview::ShellCommand(LiveShellCommandPreview {
+                preview_title: None,
+                streaming_status: None,
+                command_prefix: "cargo test".to_owned(),
+                cwd: Some("/repo".to_owned()),
+                argument_bytes: 28,
+                truncated: false,
+            }),
+        },
+    }
+}
+
+fn live_shell_preview_stream_events(session_id: SessionId) -> Vec<SessionEvent> {
+    vec![
+        live_shell_preview_stream_request(session_id),
+        live_shell_preview_stream_started(session_id),
+        live_shell_preview_stream_output(session_id),
+        live_shell_preview_stream_finished(session_id),
+    ]
+}
+
+fn live_shell_preview_stream_request(session_id: SessionId) -> SessionEvent {
+    event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call-live-preview-stream".to_owned(),
+            tool_name: "shell.run".to_owned(),
+            arguments_json: serde_json::json!({
+                "command": "cargo test",
+                "terminal": true,
+            })
+            .to_string(),
+            request_presentation: Some(shell_request_presentation()),
+        },
+    )
+}
+
+fn live_shell_preview_stream_started(session_id: SessionId) -> SessionEvent {
+    event(
+        session_id,
+        2,
+        SessionEventKind::ToolInvocationStream {
+            event: ToolInvocationStreamEvent::Started {
+                tool_call_id: "call-live-preview-stream".to_owned(),
+                tool_name: "shell.run".to_owned(),
+                sequence: 0,
+                terminal: true,
+                columns: Some(80),
+                rows: Some(24),
+                started_at_ms: Some(10),
+            },
+        },
+    )
+}
+
+fn live_shell_preview_stream_output(session_id: SessionId) -> SessionEvent {
+    event(
+        session_id,
+        3,
+        SessionEventKind::ToolInvocationStream {
+            event: ToolInvocationStreamEvent::OutputDelta {
+                tool_call_id: "call-live-preview-stream".to_owned(),
+                stream: ToolOutputStream::Pty,
+                sequence: 1,
+                text: "running\n".to_owned(),
+                byte_len: 8,
+            },
+        },
+    )
+}
+
+fn live_shell_preview_stream_finished(session_id: SessionId) -> SessionEvent {
+    event(
+        session_id,
+        4,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call-live-preview-stream".to_owned(),
+            result: String::new(),
+            is_error: false,
+            output: None,
+            semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
+                exit_code: Some(0),
+                timed_out: false,
+                cancelled: false,
+                duration_ms: None,
+                output_tail: "final duplicate tail\n".to_owned(),
+                output_truncated: false,
+                output_bytes: Some(21),
+                retained_output_bytes: Some(21),
+                columns: 80,
+                rows: 24,
+            })),
+        },
+    )
+}
+
+#[test]
 fn semantic_terminal_result_without_stream_renders_generic_artifact() {
     let session_id = SessionId::new();
     let events = vec![event(
@@ -5019,7 +5313,7 @@ fn plugin_view_payload_summary_does_not_render_raw_json() {
 }
 
 #[test]
-fn live_shell_command_preview_streams_before_final_request_and_is_replaced() {
+fn live_shell_command_preview_streams_before_final_request_and_is_preserved() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
     app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
@@ -5069,12 +5363,36 @@ fn live_shell_command_preview_streams_before_final_request_and_is_replaced() {
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
-    assert!(output.contains("Tool · shell_run"), "{output}");
+    assert!(output.contains("Shell command"), "{output}");
+    assert!(!output.contains("Tool · shell_run"), "{output}");
     assert!(!output.contains("streaming preview"), "{output}");
     assert!(
         output.contains("command: cargo test -p bcode_tui"),
         "{output}"
     );
+
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call_shell".to_owned(),
+            result: "finished".to_owned(),
+            is_error: false,
+            output: None,
+            semantic_result: None,
+        },
+    ));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 30));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+    assert!(output.contains("Shell command"), "{output}");
+    assert!(!output.contains("Tool · shell_run"), "{output}");
+    assert!(
+        output.contains("command: cargo test -p bcode_tui"),
+        "{output}"
+    );
+    assert!(output.contains("finished"), "{output}");
 }
 
 #[test]

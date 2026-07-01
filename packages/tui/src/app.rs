@@ -2627,7 +2627,19 @@ impl BmuxApp {
                 request_presentation: request_presentation.clone(),
             },
         );
-        self.live_tool_previews.remove(tool_call_id);
+        let has_live_preview_anchor = self
+            .transcript
+            .iter()
+            .any(|item| item.is_live_preview_anchor_for(tool_call_id));
+        if has_live_preview_anchor {
+            self.finish_tool_request_preview(tool_call_id);
+            self.set_activity(ActivityState::RunningTool {
+                name: tool_name.to_owned(),
+            });
+            self.status =
+                tool_request_status(arguments_json).unwrap_or_else(|| "started".to_owned());
+            return;
+        }
         let item = tool_request_item(
             tool_call_id,
             tool_name,
@@ -2642,7 +2654,7 @@ impl BmuxApp {
                         tool_call_id: item_tool_call_id,
                         ..
                     } if item_tool_call_id == tool_call_id
-                ) || existing.is_live_preview_anchor_for(tool_call_id)
+                )
             },
             |existing| *existing = item.clone(),
         );
@@ -2694,29 +2706,6 @@ impl BmuxApp {
             .tool_call_contexts
             .get(tool_call_id)
             .map(|context| context.arguments_json.clone());
-        if let Some(ToolInvocationResult::Artifact { artifact }) = semantic_result
-            && let Some(item) = present_artifact_item_for_app(
-                self.plugin_host.as_deref(),
-                tool_call_id,
-                tool_name.as_deref(),
-                artifact,
-            )
-        {
-            self.transcript.retain(|item| {
-                !item_is_replaceable_tool_transcript_for_tool_call(item, tool_call_id)
-            });
-            self.transcript.push(item);
-            self.presented_tool_results.insert(tool_call_id.to_owned());
-            self.finish_tool_request_preview(tool_call_id);
-            if application.live_activity() {
-                if is_error {
-                    "failed".clone_into(&mut self.status);
-                } else {
-                    "finished".clone_into(&mut self.status);
-                }
-            }
-            return;
-        }
         if self.finish_live_tool_output(tool_call_id, Some(is_error), Some(result), semantic_result)
         {
             if application.live_activity() {
@@ -2729,6 +2718,29 @@ impl BmuxApp {
                 }
             }
             self.finish_tool_request_preview(tool_call_id);
+            return;
+        }
+        if let Some(ToolInvocationResult::Artifact { artifact }) = semantic_result
+            && let Some(item) = present_artifact_item_for_app(
+                self.plugin_host.as_deref(),
+                tool_call_id,
+                tool_name.as_deref(),
+                artifact,
+            )
+        {
+            self.transcript.retain(|item| {
+                !item_is_replaceable_tool_result_surface_for_tool_call(item, tool_call_id)
+            });
+            self.transcript.push(item);
+            self.presented_tool_results.insert(tool_call_id.to_owned());
+            self.finish_tool_request_preview(tool_call_id);
+            if application.live_activity() {
+                if is_error {
+                    "failed".clone_into(&mut self.status);
+                } else {
+                    "finished".clone_into(&mut self.status);
+                }
+            }
             return;
         }
         let item = semantic_tool_result_item_for_app(
@@ -4311,6 +4323,79 @@ fn tool_artifact_to_service(
             })
             .collect(),
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToolTranscriptSurface {
+    Request,
+    LiveArgumentPreview,
+    StreamOutput,
+    Result,
+    Presentation,
+    Interaction,
+}
+
+const fn tool_surface_for_item(item: &TranscriptItem) -> Option<(&str, ToolTranscriptSurface)> {
+    match item.kind() {
+        TranscriptItemKind::ToolRequest { tool_call_id, .. } => {
+            Some((tool_call_id.as_str(), ToolTranscriptSurface::Request))
+        }
+        TranscriptItemKind::LiveToolPreviewAnchor { tool_call_id, .. } => Some((
+            tool_call_id.as_str(),
+            ToolTranscriptSurface::LiveArgumentPreview,
+        )),
+        TranscriptItemKind::TerminalOutput { tool_call_id, .. } => {
+            Some((tool_call_id.as_str(), ToolTranscriptSurface::StreamOutput))
+        }
+        TranscriptItemKind::ToolResult { tool_call_id, .. }
+        | TranscriptItemKind::FileChangePresentation { tool_call_id, .. } => {
+            Some((tool_call_id.as_str(), ToolTranscriptSurface::Result))
+        }
+        TranscriptItemKind::ToolPresentationCard { tool_call_id, .. }
+        | TranscriptItemKind::ToolNativePresentation { tool_call_id, .. }
+        | TranscriptItemKind::ToolProtocolPresentation { tool_call_id, .. } => {
+            Some((tool_call_id.as_str(), ToolTranscriptSurface::Presentation))
+        }
+        TranscriptItemKind::InteractiveToolRequest { tool_call_id, .. }
+        | TranscriptItemKind::InteractiveToolResolution { tool_call_id, .. }
+        | TranscriptItemKind::PermissionRequest { tool_call_id, .. } => {
+            Some((tool_call_id.as_str(), ToolTranscriptSurface::Interaction))
+        }
+        TranscriptItemKind::UserMessage
+        | TranscriptItemKind::AssistantMessage
+        | TranscriptItemKind::ReasoningMessage
+        | TranscriptItemKind::Usage { .. }
+        | TranscriptItemKind::PermissionResult { .. }
+        | TranscriptItemKind::System
+        | TranscriptItemKind::Meta
+        | TranscriptItemKind::Skill
+        | TranscriptItemKind::SkillError
+        | TranscriptItemKind::Generic => None,
+    }
+}
+
+fn item_is_tool_surface_for_tool_call(
+    item: &TranscriptItem,
+    tool_call_id: &str,
+    surfaces: &[ToolTranscriptSurface],
+) -> bool {
+    tool_surface_for_item(item).is_some_and(|(item_tool_call_id, surface)| {
+        item_tool_call_id == tool_call_id && surfaces.contains(&surface)
+    })
+}
+
+fn item_is_replaceable_tool_result_surface_for_tool_call(
+    item: &TranscriptItem,
+    tool_call_id: &str,
+) -> bool {
+    item_is_tool_surface_for_tool_call(
+        item,
+        tool_call_id,
+        &[
+            ToolTranscriptSurface::Result,
+            ToolTranscriptSurface::Presentation,
+        ],
+    )
 }
 
 fn item_is_replaceable_tool_transcript_for_tool_call(
