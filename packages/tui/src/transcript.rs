@@ -7,7 +7,6 @@ use bcode_session_models::{
     ToolInvocationStreamEvent, ToolOutputStream, ToolPresentationEvent, ToolPresentationTarget,
     ToolRequestPresentationMetadata,
 };
-use bmux_tui::prelude::Line;
 
 /// Semantic transcript item type.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,14 +73,18 @@ pub enum TranscriptItemKind {
         /// Structured plugin-owned card.
         card: ToolCardPresentation,
     },
-    /// Plugin-owned native TUI presentation rows.
-    ToolNativePresentationRows {
+    /// Plugin-owned native TUI presentation.
+    ToolNativePresentation {
         /// Provider tool call identifier.
         tool_call_id: String,
         /// Tool name, when known.
         tool_name: Option<String>,
-        /// Renderer-built rows.
-        rows: Vec<Line>,
+        /// Producer plugin identifier.
+        producer_plugin_id: String,
+        /// View/schema kind.
+        kind: String,
+        /// Plugin-owned payload.
+        payload: serde_json::Value,
     },
     /// Plugin-owned generic protocol presentation.
     ToolProtocolPresentation {
@@ -400,7 +403,7 @@ impl TranscriptItem {
     pub fn is_tool_native_presentation_for(&self, tool_call_id: &str) -> bool {
         matches!(
             &self.kind,
-            TranscriptItemKind::ToolNativePresentationRows {
+            TranscriptItemKind::ToolNativePresentation {
                 tool_call_id: item_tool_call_id,
                 ..
             } if item_tool_call_id == tool_call_id
@@ -618,21 +621,25 @@ pub fn tool_presentation_card_item(
 
 /// Build a plugin-owned native TUI row presentation item.
 #[must_use]
-pub fn tool_native_presentation_rows_item(
+pub fn tool_native_presentation_item(
     tool_call_id: &str,
     tool_name: Option<&str>,
     title: &str,
     preview: bool,
-    rows: Vec<Line>,
+    producer_plugin_id: &str,
+    kind: &str,
+    payload: serde_json::Value,
 ) -> TranscriptItem {
     TranscriptItem::with_kind(
         "Tool",
         title.to_owned(),
         preview,
-        TranscriptItemKind::ToolNativePresentationRows {
+        TranscriptItemKind::ToolNativePresentation {
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.map(ToOwned::to_owned),
-            rows,
+            producer_plugin_id: producer_plugin_id.to_owned(),
+            kind: kind.to_owned(),
+            payload,
         },
     )
 }

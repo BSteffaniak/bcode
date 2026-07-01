@@ -512,10 +512,17 @@ pub fn transcript_item_rows(
     live_tool_previews: &BTreeMap<String, LiveToolPreviewState>,
     index: usize,
     width: u16,
-    _inline_view_config: (),
+    plugin_host: Option<&bcode_plugin::PluginHost>,
 ) -> Vec<Line> {
     let mut rows = Vec::new();
-    push_transcript_item_rows(&mut rows, transcript, live_tool_previews, index, width, ());
+    push_transcript_item_rows(
+        &mut rows,
+        transcript,
+        live_tool_previews,
+        index,
+        width,
+        plugin_host,
+    );
     rows
 }
 
@@ -598,7 +605,7 @@ fn push_transcript_item_rows(
     live_tool_previews: &BTreeMap<String, LiveToolPreviewState>,
     index: usize,
     width: u16,
-    inline_view_config: (),
+    plugin_host: Option<&bcode_plugin::PluginHost>,
 ) {
     let item = &transcript[index];
     match item.kind() {
@@ -624,7 +631,7 @@ fn push_transcript_item_rows(
                 arguments_json,
                 request_presentation: request_presentation.as_ref(),
                 _live_preview: *live_preview,
-                _inline_view_config: inline_view_config,
+                _inline_view_config: (),
             };
             push_tool_request_rows(rows, item, &context, width);
         }
@@ -637,7 +644,7 @@ fn push_transcript_item_rows(
                 tool_name,
                 live_tool_previews.get(tool_call_id),
                 width,
-                inline_view_config,
+                plugin_host,
             );
         }
         TranscriptItemKind::ToolResult {
@@ -679,18 +686,22 @@ fn push_transcript_item_rows(
         TranscriptItemKind::ToolPresentationCard {
             tool_name, card, ..
         } => {
-            push_tool_presentation_card_rows(
-                rows,
-                tool_name.as_deref(),
-                card,
-                width,
-                inline_view_config,
-            );
+            push_tool_presentation_card_rows(rows, tool_name.as_deref(), card, width, ());
         }
-        TranscriptItemKind::ToolNativePresentationRows {
-            rows: native_rows, ..
+        TranscriptItemKind::ToolNativePresentation {
+            producer_plugin_id,
+            kind,
+            payload,
+            ..
         } => {
-            rows.extend(native_rows.iter().cloned());
+            if let Some(native_rows) = plugin_host
+                .and_then(|host| host.tui_registry(producer_plugin_id))
+                .and_then(|registry| registry.visual_rows(kind, payload, width))
+            {
+                rows.extend(native_rows);
+            } else {
+                push_detail_block(rows, "Tool", item.text(), Color::BrightBlack, width);
+            }
             rows.push(Line::default());
         }
         TranscriptItemKind::ToolProtocolPresentation { .. } => {
@@ -1052,7 +1063,7 @@ fn push_live_tool_preview_anchor_rows(
     fallback_tool_name: &str,
     state: Option<&LiveToolPreviewState>,
     width: u16,
-    _inline_view_config: (),
+    plugin_host: Option<&bcode_plugin::PluginHost>,
 ) {
     let Some(state) = state else {
         push_wrapped_styled_text(
@@ -1076,33 +1087,40 @@ fn push_live_tool_preview_anchor_rows(
     };
     match &state.preview {
         LiveToolArgumentPreview::PluginView(view) => {
-            let title = view.title.as_deref().unwrap_or(&view.schema);
-            push_wrapped_styled_text(
-                rows,
-                Vec::new(),
-                &format!("{title} · {}", state.tool_name),
-                width,
-                Style::new().fg(Color::Cyan),
-                Style::new().fg(Color::Cyan),
-            );
-            if let Some(subtitle) = &view.subtitle {
+            if let Some(native_rows) = plugin_host
+                .and_then(|host| host.tui_registry(&view.producer_plugin_id))
+                .and_then(|registry| registry.visual_rows(&view.schema, &view.payload, width))
+            {
+                rows.extend(native_rows);
+            } else {
+                let title = view.title.as_deref().unwrap_or(&view.schema);
+                push_wrapped_styled_text(
+                    rows,
+                    Vec::new(),
+                    &format!("{title} · {}", state.tool_name),
+                    width,
+                    Style::new().fg(Color::Cyan),
+                    Style::new().fg(Color::Cyan),
+                );
+                if let Some(subtitle) = &view.subtitle {
+                    push_wrapped_styled_text(
+                        rows,
+                        vec![Span::styled("  ", muted_style())],
+                        subtitle,
+                        width,
+                        muted_style(),
+                        muted_style(),
+                    );
+                }
                 push_wrapped_styled_text(
                     rows,
                     vec![Span::styled("  ", muted_style())],
-                    subtitle,
+                    &pretty_jsonish(&view.payload.to_string()),
                     width,
-                    muted_style(),
-                    muted_style(),
+                    Style::new(),
+                    Style::new(),
                 );
             }
-            push_wrapped_styled_text(
-                rows,
-                vec![Span::styled("  ", muted_style())],
-                &pretty_jsonish(&view.payload.to_string()),
-                width,
-                Style::new(),
-                Style::new(),
-            );
             rows.push(Line::default());
         }
         LiveToolArgumentPreview::FileEdit(file) => {

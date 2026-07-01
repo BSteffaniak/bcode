@@ -253,6 +253,14 @@ impl PluginTuiRegistry {
         self.visual_adapters.push(adapter);
     }
 
+    /// Return whether a native visual adapter supports this payload kind.
+    #[must_use]
+    pub fn supports_visual(&self, kind: &str) -> bool {
+        self.visual_adapters
+            .iter()
+            .any(|adapter| adapter.supports(kind))
+    }
+
     /// Build transcript rows for a plugin-owned artifact/view payload.
     #[must_use]
     pub fn visual_rows(

@@ -9,6 +9,7 @@ use super::transcript::TranscriptItem;
 use super::transcript_layout::{
     TranscriptLayoutFingerprint, TranscriptLayoutSignature, TranscriptLayoutSpec,
 };
+use bcode_plugin::PluginHost;
 
 /// Prepare transcript layout and viewport projections for a frame body.
 pub fn prepare_for_body(app: &mut BmuxApp, body: Rect) {
@@ -74,7 +75,7 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
                 input.live_tool_previews,
                 index,
                 input.width,
-                (),
+                input.plugin_host,
             )
         },
         pending_signature: |index| {
@@ -97,6 +98,7 @@ struct TranscriptLayoutInput<'a> {
     width: u16,
     transcript: &'a [TranscriptItem],
     live_tool_previews: &'a std::collections::BTreeMap<String, LiveToolPreviewState>,
+    plugin_host: Option<&'a PluginHost>,
     pending: &'a [PendingSubmission],
     transcript_projection_revision: u64,
     pending_submissions_projection_revision: u64,
@@ -110,6 +112,7 @@ impl<'a> TranscriptLayoutInput<'a> {
             width,
             transcript: app.transcript(),
             live_tool_previews: app.live_tool_previews(),
+            plugin_host: app.plugin_host(),
             pending: app.pending_submissions(),
             transcript_projection_revision: app.transcript_projection_revision(),
             pending_submissions_projection_revision: app.pending_submissions_projection_revision(),
