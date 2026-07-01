@@ -508,7 +508,7 @@ fn edit_tool_ui(
                 preview_title,
                 &["old_text"],
                 None,
-                true,
+                false,
                 &["new_text"],
             ),
             streaming_status: Some(format!("{activity_label} {{path}} · {{bytes}}")),
@@ -2620,7 +2620,7 @@ mod tests {
             edit_tool_definition().ui.live_argument_preview,
             &["new_text"],
             None,
-            true,
+            false,
         );
     }
 

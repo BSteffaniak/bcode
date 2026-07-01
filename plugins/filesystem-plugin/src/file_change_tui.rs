@@ -45,19 +45,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapte
             .get("truncated")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        let original_pending = payload
-            .get("original_pending")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(old_text.is_empty());
-        file_change_rows(
-            path,
-            old_text,
-            new_text,
-            subtitle,
-            truncated,
-            original_pending,
-            width,
-        )
+        file_change_rows(path, old_text, new_text, subtitle, truncated, width)
     }
 }
 
@@ -67,7 +55,6 @@ fn file_change_rows(
     new_text: &str,
     subtitle: Option<&str>,
     truncated: bool,
-    original_pending: bool,
     width: u16,
 ) -> Vec<Line> {
     let diff = diff_from_text(path, old_text, new_text);
@@ -97,15 +84,6 @@ fn file_change_rows(
         Span::styled(change_summary(diff.added, diff.removed), muted_style()),
     ]));
 
-    if original_pending {
-        rows.push(Line::from_spans(vec![
-            Span::styled("  ", muted_style()),
-            Span::styled(
-                "original text pending; showing available new text",
-                muted_style(),
-            ),
-        ]));
-    }
     if truncated {
         rows.push(Line::from_spans(vec![
             Span::styled("  ", muted_style()),
@@ -496,15 +474,7 @@ mod tests {
             .map(|index| format!("line {index}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let rows = file_change_rows(
-            "src/lib.rs",
-            "",
-            &new_text,
-            Some("Applying"),
-            false,
-            true,
-            80,
-        );
+        let rows = file_change_rows("src/lib.rs", "", &new_text, Some("Applying"), false, 80);
         let rendered = format!("{rows:?}");
         assert!(rendered.contains("src/lib.rs  +40 -0"));
         assert!(rendered.contains("diff rows hidden"));
@@ -517,7 +487,6 @@ mod tests {
             "let value = 1;\n",
             "let value = 2;\n",
             None,
-            false,
             false,
             80,
         );
@@ -532,13 +501,57 @@ mod tests {
     }
 
     #[test]
+    fn file_change_rows_render_available_new_text_without_pending_warning() {
+        let rows = file_change_rows(
+            "src/lib.rs",
+            "",
+            "fn main() {\n    println!(\"hello\");\n}\n",
+            Some("Editing"),
+            false,
+            80,
+        );
+        let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        assert!(rendered.contains("println!"), "{rendered}");
+        assert!(!rendered.contains("original text pending"), "{rendered}");
+        assert!(!rendered.contains("waiting for original"), "{rendered}");
+        assert!(
+            !rendered.contains("showing available new text"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn adapter_ignores_legacy_original_pending_payload_warning() {
+        let payload = serde_json::json!({
+            "path": "src/lib.rs",
+            "old_text": "",
+            "new_text": "fn main() {}\n",
+            "original_pending": true
+        });
+        let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            &FileChangeTuiVisualAdapter,
+            "bcode.filesystem.file_change",
+            &payload,
+            80,
+        );
+        let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        assert!(rendered.contains("fn main"), "{rendered}");
+        assert!(!rendered.contains("original text pending"), "{rendered}");
+        assert!(
+            !rendered.contains("showing available new text"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn file_change_rows_use_pre_migration_progress_and_line_number_fallback() {
         let rows = file_change_rows(
             "src/lib.rs",
             "let value = 1;\n",
             "let value = 2;\n",
             None,
-            false,
             false,
             80,
         );
@@ -604,7 +617,6 @@ mod tests {
             "fn main() {\n    let value = 2;\n}\n",
             None,
             false,
-            false,
             80,
         );
         let rendered_card = rows
@@ -629,7 +641,6 @@ mod tests {
             "fn main() {\n    let value = 2;\n}\n",
             None,
             false,
-            false,
             80,
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
@@ -643,7 +654,7 @@ mod tests {
 
     #[test]
     fn no_content_diff_rows_skip_the_card() {
-        let rows = file_change_rows("src/lib.rs", "", "", None, false, false, 80);
+        let rows = file_change_rows("src/lib.rs", "", "", None, false, 80);
         assert!(!rows.iter().any(is_card_row));
     }
 
@@ -655,7 +666,6 @@ mod tests {
             "let value = 1;\n",
             "let value = 2;\n",
             None,
-            false,
             false,
             available_width,
         );
@@ -680,7 +690,6 @@ mod tests {
             "let x = 1;\n",
             "let x = 2;\n",
             None,
-            false,
             false,
             80,
         );
