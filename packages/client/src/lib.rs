@@ -257,6 +257,7 @@ fn current_runtime_context() -> Option<ClientRuntimeContext> {
             auth_profile: resolved.auth_profile,
             auth_pool: resolved.auth_pool,
             auth_pool_routing,
+            auth_pool_selection_reason: None,
             settings: resolved.settings,
             auth,
             auth_candidates,

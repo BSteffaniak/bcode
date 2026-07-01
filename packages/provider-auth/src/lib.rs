@@ -38,6 +38,7 @@ pub fn resolve_provider_request_context(
             request.config,
             request.selection.auth_pool.as_deref(),
         ),
+        auth_pool_selection_reason: None,
         settings: request.selection.settings,
         auth: None,
         auth_candidates: Vec::new(),

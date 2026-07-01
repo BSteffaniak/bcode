@@ -12106,6 +12106,13 @@ fn select_host_auth_pool_candidate(context: &mut bcode_model::ProviderRequestCon
     context.auth_profile.clone_from(&candidate.profile);
     context.auth = Some(candidate.auth.clone());
     context.env = candidate.env.clone();
+    context.auth_pool_selection_reason = Some(
+        match selection.reason {
+            bcode_provider_auth::auth_pool_routing::AuthPoolSelectionReason::Priming => "priming",
+            bcode_provider_auth::auth_pool_routing::AuthPoolSelectionReason::Strategy => "strategy",
+        }
+        .to_string(),
+    );
 }
 
 fn insert_reasoning_metadata(

@@ -86,6 +86,41 @@ auth_pool = "openai"
 
 Config declares the desired subscription candidates. Runtime quota/cooldown observations are stored under Bcode's state directory and do not mutate declarative config.
 
+## Routing strategies
+
+Auth pools default to failover routing, which tries profiles in configured order and only moves to the next profile when the active subscription reports quota or rate-limit exhaustion.
+
+Use `strategy = "round_robin"` to rotate the host-selected profile for each request:
+
+```toml
+[auth.pools.openai]
+provider_plugin_id = "bcode.openai-compatible"
+strategy = "round_robin"
+profiles = ["openai", "openai-2", "openai-3"]
+```
+
+Round-robin selection is recorded after successful requests, so the next request starts with the following profile. This intentionally starts provider reset timers across subscriptions earlier instead of draining one subscription before touching the next.
+
+You can also enable priming as a gateway before the configured strategy. Priming selects unprimed profiles before normal failover or round-robin routing, then returns to the configured strategy after those profiles have succeeded once:
+
+```toml
+[auth.pools.openai]
+provider_plugin_id = "bcode.openai-compatible"
+strategy = "round_robin"
+profiles = ["openai", "openai-2", "openai-3"]
+
+[auth.pools.openai.priming]
+enabled = true
+include_primary = false
+reprime_after = "7d"
+```
+
+`include_primary = false` primes only secondary subscriptions. `reprime_after` treats old priming successes as stale after the configured duration (`s`, `m`, `h`, or `d`).
+
+## Provider-native reuse safety
+
+Bcode scopes provider-native conversation reuse state by auth profile. The host selects the subscription before planning reuse, so native provider response IDs and encrypted reasoning state are reused only with the same auth profile. If OpenAI quota handling falls back to a different subscription after the request was built, the plugin suppresses provider-native reuse state for that fallback request.
+
 ## Failover behavior
 
 Bcode tries profiles in pool order. On quota-like OpenAI errors, it marks the profile on cooldown and retries the next available profile. If all profiles are unavailable, Bcode reports a friendly error suggesting another login or waiting for reset.

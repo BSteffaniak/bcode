@@ -1074,6 +1074,10 @@ async fn stream_chat_completion_with_failover(
     if request.provider_context.auth_profile.is_some() {
         let outcome = stream_chat_completion_inner(request, turn).await;
         return match outcome {
+            Ok(outcome) => {
+                record_selected_auth_profile_success(request);
+                Ok(outcome)
+            }
             Err(error) if is_subscription_quota_error(&error) => {
                 record_selected_auth_profile_quota_error(request, turn, &error);
                 try_auth_candidates_after_selected_failure(request, turn).await
@@ -1137,6 +1141,23 @@ async fn try_auth_candidates_after_selected_failure(
     match try_auth_candidates_once(&fallback_request, turn).await? {
         CandidateAttemptOutcome::Finished(outcome) => Ok(outcome),
         CandidateAttemptOutcome::Exhausted { error, .. } => Err(error),
+    }
+}
+
+fn record_selected_auth_profile_success(request: &ModelTurnRequest) {
+    let Some(profile) = request.provider_context.auth_profile.as_deref() else {
+        return;
+    };
+    let pool = request.provider_context.auth_pool.as_deref();
+    auth_pool_state::clear_profile_quota_limited(pool, Some(profile));
+    auth_pool_state::mark_pool_selected(pool, Some(profile));
+    match request
+        .provider_context
+        .auth_pool_selection_reason
+        .as_deref()
+    {
+        Some("priming") => auth_pool_state::mark_profile_primed(pool, Some(profile)),
+        _ => auth_pool_state::mark_profile_success(pool, Some(profile)),
     }
 }
 

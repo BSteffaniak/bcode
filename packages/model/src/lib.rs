@@ -624,6 +624,9 @@ pub struct ProviderRequestContext {
     /// Auth pool routing settings resolved from declarative configuration.
     #[serde(default)]
     pub auth_pool_routing: ProviderAuthPoolRouting,
+    /// Reason the host selected the active auth-pool candidate.
+    #[serde(default)]
+    pub auth_pool_selection_reason: Option<String>,
     #[serde(default)]
     pub settings: BTreeMap<String, String>,
     /// Semantic auth material resolved from the selected auth profile.

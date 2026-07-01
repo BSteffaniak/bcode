@@ -2112,7 +2112,8 @@ fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
                 auth_pool_status(&pool)
             }
             AuthPoolCommand::ResetCooldown { pool, profile } => {
-                auth_pool_reset_cooldown(&pool, profile.as_deref())
+                auth_pool_reset_cooldown(&pool, profile.as_deref());
+                Ok(())
             }
         },
         AuthCommand::Login {
@@ -2223,59 +2224,8 @@ fn auth_profile_show(profile: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-struct OpenAiAuthPoolStateFile {
-    #[serde(default)]
-    entries: BTreeMap<String, OpenAiAuthPoolProfileState>,
-    #[serde(default)]
-    pools: BTreeMap<String, OpenAiAuthPoolRoutingState>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-struct OpenAiAuthPoolProfileState {
-    #[serde(default)]
-    cooldown_until_unix: u64,
-    #[serde(default)]
-    reason: String,
-    #[serde(default)]
-    last_error: Option<String>,
-    #[serde(default)]
-    last_success_unix: Option<u64>,
-    #[serde(default)]
-    primed_unix: Option<u64>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-struct OpenAiAuthPoolRoutingState {
-    #[serde(default)]
-    last_selected_profile: Option<String>,
-}
-
-fn auth_pool_state_path() -> PathBuf {
-    bcode_config::default_state_dir()
-        .join("provider")
-        .join("openai-compatible-auth-pool-state.json")
-}
-
-fn load_openai_auth_pool_state() -> OpenAiAuthPoolStateFile {
-    let path = auth_pool_state_path();
-    let Ok(contents) = fs::read_to_string(path) else {
-        return OpenAiAuthPoolStateFile::default();
-    };
-    serde_json::from_str(&contents).unwrap_or_default()
-}
-
-fn save_openai_auth_pool_state(state: &OpenAiAuthPoolStateFile) -> Result<(), CliError> {
-    let path = auth_pool_state_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, serde_json::to_string_pretty(state)?)?;
-    Ok(())
-}
-
-fn auth_pool_state_key(pool: &str, profile: &str) -> String {
-    format!("{pool}/{profile}")
+fn load_openai_auth_pool_state() -> bcode_provider_auth::auth_pool_state::AuthPoolState {
+    bcode_provider_auth::auth_pool_state::load_state()
 }
 
 fn auth_pool_list() -> Result<(), CliError> {
@@ -2389,7 +2339,7 @@ fn print_auth_pool_profile_status(
     pool_name: &str,
     profile: &str,
     source: &str,
-    state: &OpenAiAuthPoolStateFile,
+    state: &bcode_provider_auth::auth_pool_state::AuthPoolState,
     now: u64,
 ) {
     let config_status = if config.auth.profiles.contains_key(profile) {
@@ -2399,7 +2349,7 @@ fn print_auth_pool_profile_status(
     } else {
         "missing"
     };
-    let key = auth_pool_state_key(pool_name, profile);
+    let key = format!("{pool_name}/{profile}");
     let last_success = state
         .entries
         .get(&key)
@@ -2452,27 +2402,12 @@ fn auth_pool_profile_vault(config: &bcode_config::BcodeConfig, profile: &str) ->
         .map(|vault| vault.display().to_string())
 }
 
-fn auth_pool_reset_cooldown(pool_name: &str, profile: Option<&str>) -> Result<(), CliError> {
-    let mut state = load_openai_auth_pool_state();
-    let removed = if let Some(profile) = profile {
-        usize::from(
-            state
-                .entries
-                .remove(&auth_pool_state_key(pool_name, profile))
-                .is_some(),
-        )
-    } else {
-        let prefix = format!("{pool_name}/");
-        let before = state.entries.len();
-        state.entries.retain(|key, _| !key.starts_with(&prefix));
-        before.saturating_sub(state.entries.len())
-    };
-    save_openai_auth_pool_state(&state)?;
+fn auth_pool_reset_cooldown(pool_name: &str, profile: Option<&str>) {
+    let removed = bcode_provider_auth::auth_pool_state::reset_cooldowns(pool_name, profile);
     println!(
         "Reset {removed} cooldown entr{} for auth pool '{pool_name}'.",
         if removed == 1 { "y" } else { "ies" }
     );
-    Ok(())
 }
 
 fn unix_now_secs() -> u64 {

@@ -191,6 +191,12 @@ pub fn mark_pool_selected(pool: Option<&str>, profile: Option<&str>) {
     mutate_state(|state| mark_pool_selected_in_state(state, pool, profile));
 }
 
+/// Remove cooldown entries for one profile or an entire pool.
+#[must_use]
+pub fn reset_cooldowns(pool: &str, profile: Option<&str>) -> usize {
+    mutate_state(|state| reset_cooldowns_in_state(state, pool, profile))
+}
+
 /// Load the shared auth-pool state file.
 #[must_use]
 pub fn load_state() -> AuthPoolState {
@@ -207,11 +213,12 @@ fn with_state<T>(f: impl FnOnce(&AuthPoolState) -> T) -> T {
     f(&state)
 }
 
-fn mutate_state(f: impl FnOnce(&mut AuthPoolState)) {
+fn mutate_state<T>(f: impl FnOnce(&mut AuthPoolState) -> T) -> T {
     let _guard = STATE_LOCK.lock().ok();
     let mut state = load_state();
-    f(&mut state);
+    let result = f(&mut state);
     save_state(&state);
+    result
 }
 
 fn state_key(pool: Option<&str>, profile: Option<&str>) -> Option<String> {
@@ -263,4 +270,19 @@ pub(crate) fn mark_pool_selected_in_state(state: &mut AuthPoolState, pool: &str,
         .entry(pool.to_string())
         .or_default()
         .last_selected_profile = Some(profile.to_string());
+}
+
+pub(crate) fn reset_cooldowns_in_state(
+    state: &mut AuthPoolState,
+    pool: &str,
+    profile: Option<&str>,
+) -> usize {
+    if let Some(profile) = profile {
+        let key = format!("{pool}/{profile}");
+        return usize::from(state.entries.remove(&key).is_some());
+    }
+    let prefix = format!("{pool}/");
+    let before = state.entries.len();
+    state.entries.retain(|key, _| !key.starts_with(&prefix));
+    before.saturating_sub(state.entries.len())
 }
