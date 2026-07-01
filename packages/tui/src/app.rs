@@ -46,12 +46,13 @@ use super::temporal::next_elapsed_invalidation_capped;
 use super::theme::{PresentedTheme, ResolvedTheme};
 use super::timeline_dialog::TimelineEntry;
 use super::transcript::{
-    TranscriptItem, TranscriptItemKind, artifact_summary_text, display_tool_result_text,
-    interactive_tool_request_item, interactive_tool_resolution_item, live_tool_preview_anchor_item,
-    model_usage_item, permission_request_item, permission_result_item,
-    plugin_view_payload_summary_text, streaming_terminal_output_item, streaming_tool_output_item,
-    tool_native_presentation_item, tool_presentation_card_from_event, tool_presentation_card_item,
-    tool_request_item, tool_result_item, transcript_items_from_events_with_reasoning,
+    ToolTranscriptSurface, TranscriptItem, TranscriptItemKind, artifact_summary_text,
+    display_tool_result_text, interactive_tool_request_item, interactive_tool_resolution_item,
+    item_is_tool_surface_for_tool_call, live_tool_preview_anchor_item, model_usage_item,
+    permission_request_item, permission_result_item, plugin_view_payload_summary_text,
+    streaming_terminal_output_item, streaming_tool_output_item, tool_native_presentation_item,
+    tool_presentation_card_from_event, tool_presentation_card_item, tool_request_item,
+    tool_result_item, transcript_items_from_events_with_reasoning,
 };
 use super::transcript_document::TranscriptDocument;
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
@@ -2729,7 +2730,14 @@ impl BmuxApp {
             )
         {
             self.transcript.retain(|item| {
-                !item_is_replaceable_tool_result_surface_for_tool_call(item, tool_call_id)
+                !item_is_tool_surface_for_tool_call(
+                    item,
+                    tool_call_id,
+                    &[
+                        ToolTranscriptSurface::Result,
+                        ToolTranscriptSurface::Presentation,
+                    ],
+                )
             });
             self.transcript.push(item);
             self.presented_tool_results.insert(tool_call_id.to_owned());
@@ -2891,13 +2899,13 @@ impl BmuxApp {
                 if let Some(item) =
                     native_view_item_for_app(self.plugin_host.as_deref(), tool_call_id, None, view)
                 {
-                    self.upsert_tool_presentation_item(tool_call_id, item);
+                    self.upsert_tool_presentation_item(tool_call_id, view.target, item);
                     return;
                 }
                 if let Some(item) =
                     present_view_item_for_app(self.plugin_host.as_deref(), tool_call_id, None, view)
                 {
-                    self.upsert_tool_presentation_item(tool_call_id, item);
+                    self.upsert_tool_presentation_item(tool_call_id, view.target, item);
                     return;
                 }
                 let payload = plugin_view_payload_summary_text(&view.payload);
@@ -2930,14 +2938,21 @@ impl BmuxApp {
             .tool_call_contexts
             .get(tool_call_id)
             .map(|context| context.tool_name.as_str());
-        self.transcript.retain(|item| {
-            !(item.is_generic_tool_fallback_for(tool_call_id)
-                || card.target == bcode_session_models::ToolPresentationTarget::Result
-                    && item.is_tool_presentation_card_for(
-                        tool_call_id,
-                        bcode_session_models::ToolPresentationTarget::Preview,
-                    ))
-        });
+        if card.target == bcode_session_models::ToolPresentationTarget::Result {
+            self.transcript.retain(|item| {
+                !item_is_tool_surface_for_tool_call(
+                    item,
+                    tool_call_id,
+                    &[
+                        ToolTranscriptSurface::Result,
+                        ToolTranscriptSurface::Presentation,
+                    ],
+                )
+            });
+        } else {
+            self.transcript
+                .retain(|item| !item.is_tool_presentation_card_for(tool_call_id, card.target));
+        }
         let updated = self.transcript.mutate_rev_find(
             |item| item.is_tool_presentation_card_for(tool_call_id, card.target),
             |item| item.set_tool_presentation_card(card.clone()),
@@ -2948,18 +2963,32 @@ impl BmuxApp {
         }
     }
 
-    fn upsert_tool_presentation_item(&mut self, tool_call_id: &str, item: TranscriptItem) {
-        if !item.streaming() {
+    fn upsert_tool_presentation_item(
+        &mut self,
+        tool_call_id: &str,
+        target: bcode_session_models::ToolPresentationTarget,
+        item: TranscriptItem,
+    ) {
+        if target == bcode_session_models::ToolPresentationTarget::Result && !item.streaming() {
             self.presented_tool_results.insert(tool_call_id.to_owned());
         }
-        self.transcript.retain(|existing| {
-            !(existing.is_generic_tool_fallback_for(tool_call_id)
-                || existing.is_tool_native_presentation_for(tool_call_id)
-                || existing.is_tool_presentation_card_for(
+        if target == bcode_session_models::ToolPresentationTarget::Result {
+            self.transcript.retain(|existing| {
+                !item_is_tool_surface_for_tool_call(
+                    existing,
                     tool_call_id,
-                    bcode_session_models::ToolPresentationTarget::Preview,
-                ))
-        });
+                    &[
+                        ToolTranscriptSurface::Result,
+                        ToolTranscriptSurface::Presentation,
+                    ],
+                )
+            });
+        } else {
+            self.transcript.retain(|existing| {
+                !(existing.is_tool_native_presentation_for(tool_call_id)
+                    || existing.is_tool_presentation_card_for(tool_call_id, target))
+            });
+        }
         self.transcript.push(item);
     }
 
@@ -3103,7 +3132,7 @@ impl BmuxApp {
             return false;
         };
         self.transcript
-            .retain(|item| !item_is_replaceable_tool_transcript_for_tool_call(item, tool_call_id));
+            .retain(|item| !item_is_protocol_submission_surface_for_tool_call(item, tool_call_id));
         self.transcript.push(TranscriptItem::with_kind(
             "Tool",
             "protocol presentation".to_owned(),
@@ -4325,66 +4354,7 @@ fn tool_artifact_to_service(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ToolTranscriptSurface {
-    Request,
-    LiveArgumentPreview,
-    StreamOutput,
-    Result,
-    Presentation,
-    Interaction,
-}
-
-const fn tool_surface_for_item(item: &TranscriptItem) -> Option<(&str, ToolTranscriptSurface)> {
-    match item.kind() {
-        TranscriptItemKind::ToolRequest { tool_call_id, .. } => {
-            Some((tool_call_id.as_str(), ToolTranscriptSurface::Request))
-        }
-        TranscriptItemKind::LiveToolPreviewAnchor { tool_call_id, .. } => Some((
-            tool_call_id.as_str(),
-            ToolTranscriptSurface::LiveArgumentPreview,
-        )),
-        TranscriptItemKind::TerminalOutput { tool_call_id, .. } => {
-            Some((tool_call_id.as_str(), ToolTranscriptSurface::StreamOutput))
-        }
-        TranscriptItemKind::ToolResult { tool_call_id, .. }
-        | TranscriptItemKind::FileChangePresentation { tool_call_id, .. } => {
-            Some((tool_call_id.as_str(), ToolTranscriptSurface::Result))
-        }
-        TranscriptItemKind::ToolPresentationCard { tool_call_id, .. }
-        | TranscriptItemKind::ToolNativePresentation { tool_call_id, .. }
-        | TranscriptItemKind::ToolProtocolPresentation { tool_call_id, .. } => {
-            Some((tool_call_id.as_str(), ToolTranscriptSurface::Presentation))
-        }
-        TranscriptItemKind::InteractiveToolRequest { tool_call_id, .. }
-        | TranscriptItemKind::InteractiveToolResolution { tool_call_id, .. }
-        | TranscriptItemKind::PermissionRequest { tool_call_id, .. } => {
-            Some((tool_call_id.as_str(), ToolTranscriptSurface::Interaction))
-        }
-        TranscriptItemKind::UserMessage
-        | TranscriptItemKind::AssistantMessage
-        | TranscriptItemKind::ReasoningMessage
-        | TranscriptItemKind::Usage { .. }
-        | TranscriptItemKind::PermissionResult { .. }
-        | TranscriptItemKind::System
-        | TranscriptItemKind::Meta
-        | TranscriptItemKind::Skill
-        | TranscriptItemKind::SkillError
-        | TranscriptItemKind::Generic => None,
-    }
-}
-
-fn item_is_tool_surface_for_tool_call(
-    item: &TranscriptItem,
-    tool_call_id: &str,
-    surfaces: &[ToolTranscriptSurface],
-) -> bool {
-    tool_surface_for_item(item).is_some_and(|(item_tool_call_id, surface)| {
-        item_tool_call_id == tool_call_id && surfaces.contains(&surface)
-    })
-}
-
-fn item_is_replaceable_tool_result_surface_for_tool_call(
+fn item_is_protocol_submission_surface_for_tool_call(
     item: &TranscriptItem,
     tool_call_id: &str,
 ) -> bool {
@@ -4394,44 +4364,8 @@ fn item_is_replaceable_tool_result_surface_for_tool_call(
         &[
             ToolTranscriptSurface::Result,
             ToolTranscriptSurface::Presentation,
+            ToolTranscriptSurface::Interaction,
         ],
-    )
-}
-
-fn item_is_replaceable_tool_transcript_for_tool_call(
-    item: &TranscriptItem,
-    tool_call_id: &str,
-) -> bool {
-    matches!(
-        item.kind(),
-        TranscriptItemKind::ToolRequest {
-            tool_call_id: item_tool_call_id,
-            ..
-        } | TranscriptItemKind::LiveToolPreviewAnchor {
-            tool_call_id: item_tool_call_id,
-            ..
-        } | TranscriptItemKind::ToolResult {
-            tool_call_id: item_tool_call_id,
-            ..
-        } | TranscriptItemKind::ToolPresentationCard {
-            tool_call_id: item_tool_call_id,
-            ..
-        } | TranscriptItemKind::ToolNativePresentation {
-            tool_call_id: item_tool_call_id,
-            ..
-        } | TranscriptItemKind::ToolProtocolPresentation {
-            tool_call_id: item_tool_call_id,
-            ..
-        } | TranscriptItemKind::TerminalOutput {
-            tool_call_id: item_tool_call_id,
-            ..
-        } | TranscriptItemKind::InteractiveToolRequest {
-            tool_call_id: item_tool_call_id,
-            ..
-        } | TranscriptItemKind::InteractiveToolResolution {
-            tool_call_id: item_tool_call_id,
-            ..
-        } if item_tool_call_id == tool_call_id
     )
 }
 

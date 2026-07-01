@@ -193,6 +193,85 @@ struct ToolCallContext {
     request_presentation: Option<ToolRequestPresentationMetadata>,
 }
 
+/// Lifecycle surface for a tool-related transcript item.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolTranscriptSurface {
+    /// Durable request context for what tool/arguments were requested.
+    Request,
+    /// Live-only argument preview used as richer request context.
+    LiveArgumentPreview,
+    /// Streamed terminal or textual output.
+    StreamOutput,
+    /// Generic or semantic tool result.
+    Result,
+    /// Plugin/domain-owned presentation surface.
+    Presentation,
+    /// Permission or interactive tool request/resolution flow.
+    Interaction,
+}
+
+/// Return the tool call id and lifecycle surface for a tool transcript item.
+#[must_use]
+pub const fn tool_surface_for_item(item: &TranscriptItem) -> Option<(&str, ToolTranscriptSurface)> {
+    match item.kind() {
+        TranscriptItemKind::ToolRequest { tool_call_id, .. } => {
+            Some((tool_call_id.as_str(), ToolTranscriptSurface::Request))
+        }
+        TranscriptItemKind::LiveToolPreviewAnchor { tool_call_id, .. } => Some((
+            tool_call_id.as_str(),
+            ToolTranscriptSurface::LiveArgumentPreview,
+        )),
+        TranscriptItemKind::TerminalOutput { tool_call_id, .. } => {
+            Some((tool_call_id.as_str(), ToolTranscriptSurface::StreamOutput))
+        }
+        TranscriptItemKind::ToolResult { tool_call_id, .. }
+        | TranscriptItemKind::FileChangePresentation { tool_call_id, .. } => {
+            Some((tool_call_id.as_str(), ToolTranscriptSurface::Result))
+        }
+        TranscriptItemKind::ToolPresentationCard { tool_call_id, .. }
+        | TranscriptItemKind::ToolNativePresentation { tool_call_id, .. }
+        | TranscriptItemKind::ToolProtocolPresentation { tool_call_id, .. } => {
+            Some((tool_call_id.as_str(), ToolTranscriptSurface::Presentation))
+        }
+        TranscriptItemKind::InteractiveToolRequest { tool_call_id, .. }
+        | TranscriptItemKind::InteractiveToolResolution { tool_call_id, .. }
+        | TranscriptItemKind::PermissionRequest { tool_call_id, .. } => {
+            Some((tool_call_id.as_str(), ToolTranscriptSurface::Interaction))
+        }
+        TranscriptItemKind::UserMessage
+        | TranscriptItemKind::AssistantMessage
+        | TranscriptItemKind::ReasoningMessage
+        | TranscriptItemKind::Usage { .. }
+        | TranscriptItemKind::PermissionResult { .. }
+        | TranscriptItemKind::System
+        | TranscriptItemKind::Meta
+        | TranscriptItemKind::Skill
+        | TranscriptItemKind::SkillError
+        | TranscriptItemKind::Generic => None,
+    }
+}
+
+/// Return whether `item` belongs to one of `surfaces` for `tool_call_id`.
+#[must_use]
+pub fn item_is_tool_surface_for_tool_call(
+    item: &TranscriptItem,
+    tool_call_id: &str,
+    surfaces: &[ToolTranscriptSurface],
+) -> bool {
+    tool_surface_for_item(item).is_some_and(|(item_tool_call_id, surface)| {
+        item_tool_call_id == tool_call_id && surfaces.contains(&surface)
+    })
+}
+
+/// Remove selected tool lifecycle surfaces from a projected transcript item list.
+pub fn remove_tool_surfaces_for_tool_call(
+    items: &mut Vec<TranscriptItem>,
+    tool_call_id: &str,
+    surfaces: &[ToolTranscriptSurface],
+) {
+    items.retain(|item| !item_is_tool_surface_for_tool_call(item, tool_call_id, surfaces));
+}
+
 /// Stable identity for a rendered transcript item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TranscriptItemId(u64);
@@ -405,24 +484,6 @@ impl TranscriptItem {
         matches!(
             &self.kind,
             TranscriptItemKind::ToolNativePresentation {
-                tool_call_id: item_tool_call_id,
-                ..
-            } if item_tool_call_id == tool_call_id
-        )
-    }
-
-    /// Return whether this item is a generic request/result fallback for `tool_call_id`.
-    #[must_use]
-    pub fn is_generic_tool_fallback_for(&self, tool_call_id: &str) -> bool {
-        matches!(
-            &self.kind,
-            TranscriptItemKind::ToolRequest {
-                tool_call_id: item_tool_call_id,
-                ..
-            } | TranscriptItemKind::LiveToolPreviewAnchor {
-                tool_call_id: item_tool_call_id,
-                ..
-            } | TranscriptItemKind::ToolResult {
                 tool_call_id: item_tool_call_id,
                 ..
             } if item_tool_call_id == tool_call_id
@@ -1477,14 +1538,20 @@ fn apply_tool_presentation_replay_event(
                 let tool_name = tool_calls
                     .get(tool_call_id)
                     .map(|context| context.tool_name.as_str());
-                items.retain(|item| {
-                    !(item.is_generic_tool_fallback_for(tool_call_id)
-                        || card.target == ToolPresentationTarget::Result
-                            && item.is_tool_presentation_card_for(
-                                tool_call_id,
-                                ToolPresentationTarget::Preview,
-                            ))
-                });
+                if card.target == ToolPresentationTarget::Result {
+                    remove_tool_surfaces_for_tool_call(
+                        items,
+                        tool_call_id,
+                        &[
+                            ToolTranscriptSurface::Result,
+                            ToolTranscriptSurface::Presentation,
+                        ],
+                    );
+                } else {
+                    items.retain(|item| {
+                        !item.is_tool_presentation_card_for(tool_call_id, card.target)
+                    });
+                }
                 if let Some(existing) = items
                     .iter_mut()
                     .rev()

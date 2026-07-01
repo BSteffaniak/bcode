@@ -4214,7 +4214,7 @@ fn presentation_events_replay_as_generic_transcript_cards() {
 }
 
 #[test]
-fn presentation_card_replaces_generic_tool_request_fallback() {
+fn presentation_card_preserves_tool_request_surface() {
     let session_id = SessionId::new();
     let events = vec![
         event(
@@ -4258,19 +4258,19 @@ fn presentation_card_replaces_generic_tool_request_fallback() {
             if card.title == "Plugin preview"
     )));
     assert!(
-        !transcript
+        transcript
             .iter()
             .any(|item| matches!(item.kind(), TranscriptItemKind::ToolRequest { .. }))
     );
     assert!(
-        !transcript
+        transcript
             .iter()
             .any(|item| item.text().contains("arguments"))
     );
 }
 
 #[test]
-fn result_presentation_replaces_preview_card_and_generic_tool_request() {
+fn result_presentation_replaces_preview_card_and_suppresses_generic_tool_result() {
     let session_id = SessionId::new();
     let events = vec![
         event(
@@ -4349,10 +4349,16 @@ fn result_presentation_replaces_preview_card_and_generic_tool_request() {
         TranscriptItemKind::ToolPresentationCard { card, .. }
             if card.title == "Plugin result"
     )));
-    assert!(!transcript.iter().any(|item| matches!(
-        item.kind(),
-        TranscriptItemKind::ToolRequest { .. } | TranscriptItemKind::ToolResult { .. }
-    )));
+    assert!(
+        transcript
+            .iter()
+            .any(|item| matches!(item.kind(), TranscriptItemKind::ToolRequest { .. }))
+    );
+    assert!(
+        !transcript
+            .iter()
+            .any(|item| matches!(item.kind(), TranscriptItemKind::ToolResult { .. }))
+    );
     assert!(
         !transcript
             .iter()
