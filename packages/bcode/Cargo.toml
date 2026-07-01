@@ -169,3 +169,7 @@ static-bundled-worktree-plugin = [
     "dep:bcode_worktree_plugin",
     "bcode_worktree_plugin/static-bundled",
 ]
+system-ocr-tesseract = [
+    "static-bundled-ocr-plugin",
+    "bcode_ocr_plugin/system-tesseract",
+]

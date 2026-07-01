@@ -440,66 +440,53 @@ fn run_bundled_tesseract(
     let image = image::open(path)?.to_rgba8();
     let (width, height) = image.dimensions();
     let bytes_per_pixel = 4_i32;
-    let bytes_per_line = i32::try_from(width)
-        .map_err(|error| OcrError::BundledTesseract(error.to_string()))?
-        .saturating_mul(bytes_per_pixel);
-    let api = tesseract_rs::TesseractAPI::new();
-    let oem = options.and_then(|options| options.oem).map_or(3, i32::from);
-    let tessdata_dir = tessdata_dir();
-    api.init_2(tessdata_dir.to_str().unwrap_or_default(), language, oem)
+    let width =
+        i32::try_from(width).map_err(|error| OcrError::BundledTesseract(error.to_string()))?;
+    let height =
+        i32::try_from(height).map_err(|error| OcrError::BundledTesseract(error.to_string()))?;
+    let bytes_per_line = width.saturating_mul(bytes_per_pixel);
+    let engine = bcode_tesseract_ocr::TesseractEngine::new()
         .map_err(|error| OcrError::BundledTesseract(error.to_string()))?;
+    let engine_mode = options
+        .and_then(|options| options.oem)
+        .map(|oem| bcode_tesseract_ocr::EngineMode::from_raw(i32::from(oem)));
+    engine
+        .init(&bcode_tesseract_ocr::InitOptions {
+            datapath: Some(bcode_tesseract_ocr::resolve_tessdata_dir()),
+            language: language.to_string(),
+            engine_mode,
+        })
+        .map_err(|error| OcrError::BundledTesseract(error.to_string()))?;
+
+    let mut recognition_options = bcode_tesseract_ocr::RecognitionOptions::default();
     if let Some(options) = options {
-        if let Some(psm) = options.psm {
-            api.set_page_seg_mode(tesseract_rs::TessPageSegMode::from_int(i32::from(psm)))
-                .map_err(|error| OcrError::BundledTesseract(error.to_string()))?;
-        }
+        recognition_options.page_seg_mode = options
+            .psm
+            .map(|psm| bcode_tesseract_ocr::PageSegMode::from_raw(i32::from(psm)));
         for config in &options.config {
             let Some((name, value)) = config.split_once('=') else {
                 return Err(OcrError::BundledTesseract(format!(
                     "bundled tesseract config must use name=value syntax: {config}"
                 )));
             };
-            api.set_variable(name, value)
-                .map_err(|error| OcrError::BundledTesseract(error.to_string()))?;
+            recognition_options
+                .variables
+                .push((name.to_string(), value.to_string()));
         }
     }
-    api.set_image(
-        image.as_raw(),
-        i32::try_from(width).map_err(|error| OcrError::BundledTesseract(error.to_string()))?,
-        i32::try_from(height).map_err(|error| OcrError::BundledTesseract(error.to_string()))?,
-        bytes_per_pixel,
-        bytes_per_line,
-    )
-    .map_err(|error| OcrError::BundledTesseract(error.to_string()))?;
-    api.recognize()
-        .map_err(|error| OcrError::BundledTesseract(error.to_string()))?;
-    api.get_utf8_text()
-        .map_err(|error| OcrError::BundledTesseract(error.to_string()))
-}
 
-#[cfg(feature = "bundled-tesseract")]
-fn tessdata_dir() -> PathBuf {
-    if let Ok(prefix) = env::var("TESSDATA_PREFIX") {
-        return PathBuf::from(prefix);
-    }
-    if cfg!(target_os = "macos")
-        && let Ok(home) = env::var("HOME")
-    {
-        return PathBuf::from(home)
-            .join("Library")
-            .join("Application Support")
-            .join("tesseract-rs")
-            .join("tessdata");
-    }
-    if cfg!(target_os = "windows")
-        && let Ok(appdata) = env::var("APPDATA")
-    {
-        return PathBuf::from(appdata).join("tesseract-rs").join("tessdata");
-    }
-    env::var("HOME").map_or_else(
-        |_| PathBuf::from("tessdata"),
-        |home| PathBuf::from(home).join(".tesseract-rs").join("tessdata"),
-    )
+    engine
+        .recognize(
+            bcode_tesseract_ocr::ImageView {
+                bytes: image.as_raw(),
+                width,
+                height,
+                bytes_per_pixel,
+                bytes_per_line,
+            },
+            &recognition_options,
+        )
+        .map_err(|error| OcrError::BundledTesseract(error.to_string()))
 }
 
 async fn download_source(
@@ -645,11 +632,11 @@ fn ocr_engine_statuses() -> Vec<EngineStatus> {
 
 #[cfg(feature = "bundled-tesseract")]
 fn bundled_tesseract_status() -> EngineStatus {
-    let tessdata = tessdata_dir();
+    let tessdata = bcode_tesseract_ocr::resolve_tessdata_dir();
     EngineStatus {
         name: "tesseract".to_string(),
         available: tessdata.is_dir(),
-        version: Some(tesseract_rs::TesseractAPI::version()),
+        version: Some(bcode_tesseract_ocr::TesseractEngine::version()),
         quality: "bundled".to_string(),
     }
 }

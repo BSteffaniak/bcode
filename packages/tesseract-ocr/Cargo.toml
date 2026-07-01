@@ -1,0 +1,21 @@
+[package]
+authors     = { workspace = true }
+categories  = ["computer-vision", "text-processing"]
+description = "Safe, minimal Tesseract OCR wrapper for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "ocr", "tesseract"]
+license     = { workspace = true }
+name        = "bcode_tesseract_ocr"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_tesseract_sys = { workspace = true, default-features = false }
+thiserror           = { workspace = true }
+
+[features]
+bundled-tesseract = ["bcode_tesseract_sys/bundled-tesseract"]
+default           = []
+fail-on-warnings  = ["bcode_tesseract_sys/fail-on-warnings"]
+system-tesseract  = ["bcode_tesseract_sys/system-tesseract"]

@@ -1,0 +1,25 @@
+[package]
+authors     = { workspace = true }
+categories  = ["external-ffi-bindings"]
+description = "Raw Tesseract C API bindings and linker integration for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "ocr", "tesseract", "ffi"]
+license     = { workspace = true }
+links       = "tesseract"
+name        = "bcode_tesseract_sys"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[build-dependencies]
+cmake      = { workspace = true }
+pkg-config = { workspace = true }
+reqwest    = { workspace = true, features = ["blocking"], optional = true }
+sha2       = { workspace = true, features = ["std"], optional = true }
+zip        = { workspace = true, optional = true }
+
+[features]
+bundled-tesseract = ["dep:reqwest", "dep:sha2", "dep:zip"]
+default           = []
+fail-on-warnings  = []
+system-tesseract  = []
