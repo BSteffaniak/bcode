@@ -178,14 +178,23 @@ pub struct SessionSummary {
 }
 
 impl SessionSummary {
-    /// Return the best user-visible title for this session.
+    /// Return the resolved display title for this session, if any.
+    ///
+    /// This is the canonical source of truth for a session's user-visible name.
+    /// Callers should prefer this over inspecting `name`/`explicit_name`/`derived_title`
+    /// directly. The precedence is: `name` → `explicit_name` → `derived_title`.
     #[must_use]
-    pub fn display_title(&self) -> &str {
+    pub fn title(&self) -> Option<&str> {
         self.name
             .as_deref()
             .or(self.explicit_name.as_deref())
             .or(self.derived_title.as_deref())
-            .unwrap_or("empty draft")
+    }
+
+    /// Return the best user-visible title for this session.
+    #[must_use]
+    pub fn display_title(&self) -> &str {
+        self.title().unwrap_or("empty draft")
     }
 }
 
