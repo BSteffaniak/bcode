@@ -2105,14 +2105,20 @@ impl BmuxApp {
             self.viewport.preserve_for_append();
         }
         match &event.kind {
-            SessionEventKind::SessionCreated { name, .. } => {
-                self.session_title.clone_from(name);
+            SessionEventKind::SessionCreated { name: Some(n), .. } => {
+                self.session_title = Some(n.clone());
             }
             SessionEventKind::UserMessage { text, .. } => {
                 self.active_tool_calls.clear();
                 self.tool_activity_seen = false;
                 self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
                 self.pending_assistant_stream_anchor = false;
+                if self.session_title.is_none() {
+                    // Local display heuristic: derive a title from the first user message
+                    // so the header is never stuck on "Untitled session". Mirrors the
+                    // server-side title inference logic.
+                    self.session_title = Some(derive_session_title_from_prompt(text));
+                }
                 self.push_committed_user_message(
                     event.sequence,
                     text,
@@ -4383,5 +4389,30 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::SkillDeactivated { .. }
         | SessionEventKind::SkillContextLoaded { .. }
         | SessionEventKind::TraceEvent { .. } => false,
+    }
+}
+
+fn derive_session_title_from_prompt(prompt: &str) -> String {
+    let first = prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("```") && !line.starts_with("---"))
+        .unwrap_or(prompt);
+    let cleaned = first
+        .trim_start_matches(|c: char| {
+            matches!(c, '#' | '-' | '*' | '>' | '`' | ':' | ';') || c.is_whitespace()
+        })
+        .trim();
+    let squished: String = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if squished.is_empty() {
+        return "New session".to_string();
+    }
+    if squished.len() > 64 {
+        let mut out = String::with_capacity(67);
+        out.push_str(&squished[..61]);
+        out.push_str("...");
+        out
+    } else {
+        squished
     }
 }
