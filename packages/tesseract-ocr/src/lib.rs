@@ -39,12 +39,120 @@ pub enum Error {
     /// Tesseract returned a null text pointer.
     #[error("tesseract returned no recognized text")]
     Text,
+
+    /// The requested bundled runtime was not enabled by Cargo features.
+    #[error("bundled tesseract runtime '{version}' is not available in this build")]
+    BundledRuntimeUnavailable { version: String },
+
+    /// No bundled runtime was enabled by Cargo features.
+    #[error("no bundled tesseract runtime is available in this build")]
+    NoBundledRuntime,
 }
 
 /// Convenient result alias for Tesseract OCR operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Tesseract engine mode.
+/// A bundled Tesseract runtime selected at compile time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TesseractRuntime {
+    version: &'static str,
+}
+
+impl TesseractRuntime {
+    /// Loads the default bundled Tesseract runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no bundled runtime is available.
+    pub fn load_default() -> Result<Self> {
+        let default = catalog_alias("default");
+        if available_bundled_versions().contains(&default.as_str()) {
+            return Ok(Self {
+                version: version_static(&default),
+            });
+        }
+        let latest = catalog_alias("latest");
+        if available_bundled_versions().contains(&latest.as_str()) {
+            return Ok(Self {
+                version: version_static(&latest),
+            });
+        }
+        available_bundled_versions()
+            .first()
+            .copied()
+            .map(|version| Self { version })
+            .ok_or(Error::NoBundledRuntime)
+    }
+
+    /// Loads a specific bundled Tesseract runtime by catalog version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the version was not selected by Cargo features.
+    pub fn load_version(version: &str) -> Result<Self> {
+        if let Some(version) = available_bundled_versions()
+            .iter()
+            .copied()
+            .find(|available| *available == version)
+        {
+            return Ok(Self { version });
+        }
+        Err(Error::BundledRuntimeUnavailable {
+            version: version.to_string(),
+        })
+    }
+
+    /// Returns the selected bundled version.
+    #[must_use]
+    pub const fn version(self) -> &'static str {
+        self.version
+    }
+
+    /// Creates a Tesseract API handle for this runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Tesseract returns a null API handle.
+    pub fn create_engine(self) -> Result<TesseractEngine> {
+        let _ = self;
+        TesseractEngine::new()
+    }
+}
+
+/// Returns the embedded bundled Tesseract catalog.
+#[must_use]
+pub const fn bundled_catalog_toml() -> &'static str {
+    include_str!("../../tesseract-sys/bundled/catalog.toml")
+}
+
+/// Returns bundled Tesseract versions selected by Cargo features.
+#[must_use]
+pub fn available_bundled_versions() -> Vec<&'static str> {
+    let mut versions = Vec::new();
+    if cfg!(feature = "bundled-tesseract-v5-3-4") {
+        versions.push("5.3.4");
+    }
+    versions
+}
+
+fn catalog_alias(name: &str) -> String {
+    let value: toml::Value =
+        toml::from_str(bundled_catalog_toml()).expect("failed to parse bundled Tesseract catalog");
+    value
+        .get("aliases")
+        .and_then(|aliases| aliases.get(name))
+        .and_then(toml::Value::as_str)
+        .unwrap_or_else(|| panic!("bundled Tesseract catalog alias {name} is required"))
+        .to_string()
+}
+
+fn version_static(version: &str) -> &'static str {
+    available_bundled_versions()
+        .into_iter()
+        .find(|available| *available == version)
+        .unwrap_or_else(|| panic!("bundled Tesseract version {version} is unavailable"))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(i32)]
 pub enum EngineMode {

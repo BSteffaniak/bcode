@@ -1,0 +1,23 @@
+[aliases]
+default = "5.3.4"
+latest  = "5.3.4"
+
+[leptonica."1.84.1"]
+sha256 = "d13af21fddf8839a81ff06385e36ed51ee7442e053ab65903f2351b25904284f"
+url    = "https://github.com/DanBloomberg/leptonica/archive/refs/tags/1.84.1.zip"
+
+[tesseract."5.3.4"]
+leptonica = "1.84.1"
+sha256    = "01e93044f5ee7c42ded713d55ec54a44e08200237b48f9256029ba1e144b1dbc"
+url       = "https://github.com/tesseract-ocr/tesseract/archive/refs/tags/5.3.4.zip"
+
+[tessdata.best]
+commit = "main"
+
+[tessdata.best.languages.eng]
+sha256 = "8280aed0782fe27257a68ea10fe7ef324ca0f8d85bd2fd145d1c2b560bcb66ba"
+url    = "https://github.com/tesseract-ocr/tessdata_best/raw/main/eng.traineddata"
+
+[tessdata.best.languages.tur]
+sha256 = "e0c3338dc17503dc7d335a507c9ae01b2b46cfd07561171e1e1ac55d85e8e438"
+url    = "https://github.com/tesseract-ocr/tessdata_best/raw/main/tur.traineddata"

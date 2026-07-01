@@ -251,10 +251,10 @@ enum OcrError {
     Download(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    #[cfg(feature = "bundled-tesseract")]
+    #[cfg(feature = "_bundled-tesseract-runtime")]
     #[error("image decoding failed: {0}")]
     Image(#[from] image::ImageError),
-    #[cfg(feature = "bundled-tesseract")]
+    #[cfg(feature = "_bundled-tesseract-runtime")]
     #[error("bundled tesseract failed: {0}")]
     BundledTesseract(String),
 }
@@ -356,11 +356,11 @@ fn validate_options(options: Option<&OcrOptions>) -> Result<(), OcrError> {
 }
 
 fn default_engine_name() -> String {
-    #[cfg(feature = "bundled-tesseract")]
+    #[cfg(feature = "_bundled-tesseract-runtime")]
     {
         "tesseract".to_string()
     }
-    #[cfg(not(feature = "bundled-tesseract"))]
+    #[cfg(not(feature = "_bundled-tesseract-runtime"))]
     {
         "tesseract-cli".to_string()
     }
@@ -368,7 +368,7 @@ fn default_engine_name() -> String {
 
 fn is_supported_engine(engine: &str) -> bool {
     matches!(engine, "tesseract-cli")
-        || cfg!(feature = "bundled-tesseract") && engine == "tesseract"
+        || cfg!(feature = "_bundled-tesseract-runtime") && engine == "tesseract"
 }
 
 async fn run_ocr_engine(
@@ -380,7 +380,7 @@ async fn run_ocr_engine(
 ) -> Result<String, OcrError> {
     match engine {
         "tesseract-cli" => run_tesseract_cli(path, language, options, timeout_ms).await,
-        #[cfg(feature = "bundled-tesseract")]
+        #[cfg(feature = "_bundled-tesseract-runtime")]
         "tesseract" => run_bundled_tesseract(path, language, options),
         _ => Err(OcrError::UnsupportedEngine(engine.to_string())),
     }
@@ -431,7 +431,7 @@ async fn run_tesseract_cli(
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-#[cfg(feature = "bundled-tesseract")]
+#[cfg(feature = "_bundled-tesseract-runtime")]
 fn run_bundled_tesseract(
     path: &Path,
     language: &str,
@@ -445,7 +445,10 @@ fn run_bundled_tesseract(
     let height =
         i32::try_from(height).map_err(|error| OcrError::BundledTesseract(error.to_string()))?;
     let bytes_per_line = width.saturating_mul(bytes_per_pixel);
-    let engine = bcode_tesseract_ocr::TesseractEngine::new()
+    let runtime = bcode_tesseract_ocr::TesseractRuntime::load_default()
+        .map_err(|error| OcrError::BundledTesseract(error.to_string()))?;
+    let engine = runtime
+        .create_engine()
         .map_err(|error| OcrError::BundledTesseract(error.to_string()))?;
     let engine_mode = options
         .and_then(|options| options.oem)
@@ -620,23 +623,30 @@ fn status_response() -> StatusResponse {
     }
 }
 
-#[cfg(feature = "bundled-tesseract")]
+#[cfg(feature = "_bundled-tesseract-runtime")]
 fn ocr_engine_statuses() -> Vec<EngineStatus> {
     vec![bundled_tesseract_status(), tesseract_cli_status()]
 }
 
-#[cfg(not(feature = "bundled-tesseract"))]
+#[cfg(not(feature = "_bundled-tesseract-runtime"))]
 fn ocr_engine_statuses() -> Vec<EngineStatus> {
     vec![tesseract_cli_status()]
 }
 
-#[cfg(feature = "bundled-tesseract")]
+#[cfg(feature = "_bundled-tesseract-runtime")]
 fn bundled_tesseract_status() -> EngineStatus {
     let tessdata = bcode_tesseract_ocr::resolve_tessdata_dir();
+    let runtime = bcode_tesseract_ocr::TesseractRuntime::load_default();
     EngineStatus {
         name: "tesseract".to_string(),
-        available: tessdata.is_dir(),
-        version: Some(bcode_tesseract_ocr::TesseractEngine::version()),
+        available: tessdata.is_dir() && runtime.is_ok(),
+        version: Some(format!(
+            "{} (bundled runtime {})",
+            bcode_tesseract_ocr::TesseractEngine::version(),
+            runtime
+                .as_ref()
+                .map_or("unavailable", |runtime| runtime.version())
+        )),
         quality: "bundled".to_string(),
     }
 }

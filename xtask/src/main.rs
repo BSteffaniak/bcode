@@ -46,6 +46,7 @@ enum CommandName {
     VerifyRelease,
     DevSign,
     DevRelease,
+    UpdateTesseractCatalog,
     Help,
 }
 
@@ -69,6 +70,7 @@ impl Options {
             Some("verify-release") => CommandName::VerifyRelease,
             Some("dev-sign") => CommandName::DevSign,
             Some("dev-release") => CommandName::DevRelease,
+            Some("update-tesseract-catalog") => CommandName::UpdateTesseractCatalog,
             Some("help" | "--help" | "-h") | None => CommandName::Help,
             Some(command) => {
                 return Err(format_error(format!("unknown xtask command `{command}`")));
@@ -143,11 +145,58 @@ fn run() -> Result<()> {
         CommandName::VerifyRelease => verify_release(&options),
         CommandName::DevSign => dev_sign(&options),
         CommandName::DevRelease => dev_release(&options),
+        CommandName::UpdateTesseractCatalog => update_tesseract_catalog(),
         CommandName::Help => {
             print_help();
             Ok(())
         }
     }
+}
+
+fn update_tesseract_catalog() -> Result<()> {
+    let root = workspace_root();
+    let catalog_path = root.join("packages/tesseract-sys/bundled/catalog.toml");
+    let catalog_text = fs::read_to_string(&catalog_path).map_err(|error| {
+        format_error(format!(
+            "failed to read {}: {error}",
+            catalog_path.display()
+        ))
+    })?;
+    let catalog = catalog_text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| format_error(format!("failed to parse catalog TOML: {error}")))?;
+    let versions = catalog_tesseract_versions(&catalog)?;
+    println!(
+        "bundled Tesseract catalog has {} supported version(s): {}",
+        versions.len(),
+        versions.join(", ")
+    );
+    println!(
+        "feature names are generated from catalog versions; add versions in {}",
+        catalog_path.display()
+    );
+    Ok(())
+}
+
+fn catalog_tesseract_versions(catalog: &toml_edit::DocumentMut) -> Result<Vec<String>> {
+    let table = catalog
+        .get("tesseract")
+        .and_then(toml_edit::Item::as_table)
+        .ok_or_else(|| format_error("catalog must contain a [tesseract] table"))?;
+    let mut versions = table
+        .iter()
+        .filter(|&(_version, item)| item.is_table())
+        .map(|(version, _item)| version.to_string())
+        .collect::<Vec<_>>();
+    versions.sort();
+    Ok(versions)
+}
+
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask lives under workspace root")
+        .to_path_buf()
 }
 
 fn build_bcode_release(target: &str) -> Result<()> {
@@ -965,7 +1014,8 @@ fn print_help() {
            cargo xtask release --target <triple> --version <version>\n\
            cargo xtask verify-release --target <triple> --version <version>\n\
            cargo xtask dev-release [--target <triple>] [--identity <name>]\n\
-           cargo xtask dev-sign --target <triple> [--binary <path>] [--identity <name>]\n\n\
+           cargo xtask dev-sign --target <triple> [--binary <path>] [--identity <name>]\n\
+           cargo xtask update-tesseract-catalog\n\n\
          Supported release targets:\n\
            * aarch64-apple-darwin\n\
            * x86_64-apple-darwin\n\

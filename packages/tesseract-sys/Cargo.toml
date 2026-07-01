@@ -16,10 +16,14 @@ cmake      = { workspace = true }
 pkg-config = { workspace = true }
 reqwest    = { workspace = true, features = ["blocking"], optional = true }
 sha2       = { workspace = true, features = ["std"], optional = true }
+toml       = { workspace = true }
 zip        = { workspace = true, optional = true }
 
 [features]
-bundled-tesseract = ["dep:reqwest", "dep:sha2", "dep:zip"]
-default           = []
-fail-on-warnings  = []
-system-tesseract  = []
+bundled-tesseract         = ["bundled-tesseract-default"]
+bundled-tesseract-default = ["bundled-tesseract-v5-3-4"]
+bundled-tesseract-latest  = ["bundled-tesseract-v5-3-4"]
+bundled-tesseract-v5-3-4  = ["dep:reqwest", "dep:sha2", "dep:zip"]
+default                   = []
+fail-on-warnings          = []
+system-tesseract          = []
