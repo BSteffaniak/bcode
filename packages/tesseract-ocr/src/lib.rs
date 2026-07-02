@@ -31,6 +31,10 @@ pub enum Error {
     #[error("failed to initialize tesseract for language '{language}' using tessdata '{datapath}'")]
     Init { datapath: String, language: String },
 
+    /// The OCR result did not match the expected smoke-test text.
+    #[error("OCR text did not contain expected text '{expected}': {actual:?}")]
+    UnexpectedText { expected: String, actual: String },
+
     /// Tesseract rejected a configuration variable.
     #[error("failed to set tesseract variable '{name}'")]
     SetVariable { name: String },
@@ -99,7 +103,143 @@ struct TesseractSymbols {
 unsafe impl Send for TesseractRuntimeInner {}
 unsafe impl Sync for TesseractRuntimeInner {}
 
+/// Runtime backend selection for the high-level OCR builder.
+#[derive(Clone, Debug, Default)]
+pub enum RuntimeSelection {
+    /// Use the linked/system Tesseract backend.
+    Linked,
+    /// Use the bundled default runtime.
+    #[default]
+    BundledDefault,
+    /// Use the bundled latest runtime.
+    BundledLatest,
+    /// Use an exact bundled runtime version.
+    BundledVersion(String),
+}
+
+/// Builder for a configured OCR engine.
+#[derive(Clone, Debug)]
+pub struct TesseractEngineBuilder {
+    runtime: RuntimeSelection,
+    language: String,
+    datapath: Option<PathBuf>,
+    engine_mode: Option<EngineMode>,
+    page_seg_mode: Option<PageSegMode>,
+    variables: Vec<(String, String)>,
+}
+
+impl Default for TesseractEngineBuilder {
+    fn default() -> Self {
+        Self {
+            runtime: RuntimeSelection::default(),
+            language: "eng".to_string(),
+            datapath: None,
+            engine_mode: None,
+            page_seg_mode: None,
+            variables: Vec::new(),
+        }
+    }
+}
+
+impl TesseractEngineBuilder {
+    /// Selects the runtime backend.
+    #[must_use]
+    pub fn runtime(mut self, runtime: RuntimeSelection) -> Self {
+        self.runtime = runtime;
+        self
+    }
+
+    /// Sets the OCR language code.
+    #[must_use]
+    pub fn language(mut self, language: impl Into<String>) -> Self {
+        self.language = language.into();
+        self
+    }
+
+    /// Overrides the tessdata directory.
+    #[must_use]
+    pub fn datapath(mut self, datapath: impl Into<PathBuf>) -> Self {
+        self.datapath = Some(datapath.into());
+        self
+    }
+
+    /// Sets the Tesseract engine mode.
+    #[must_use]
+    pub const fn engine_mode(mut self, mode: EngineMode) -> Self {
+        self.engine_mode = Some(mode);
+        self
+    }
+
+    /// Sets the page segmentation mode used by `recognize`.
+    #[must_use]
+    pub const fn page_seg_mode(mut self, mode: PageSegMode) -> Self {
+        self.page_seg_mode = Some(mode);
+        self
+    }
+
+    /// Sets a Tesseract configuration variable.
+    #[must_use]
+    pub fn variable(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.variables.push((name.into(), value.into()));
+        self
+    }
+
+    /// Builds and initializes an OCR engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selected runtime cannot be loaded or initialized.
+    pub fn build(self) -> Result<ConfiguredTesseractEngine> {
+        let engine = match self.runtime {
+            RuntimeSelection::Linked => TesseractEngine::new()?,
+            RuntimeSelection::BundledDefault => {
+                TesseractRuntime::load_default()?.create_engine()?
+            }
+            RuntimeSelection::BundledLatest => TesseractRuntime::load_latest()?.create_engine()?,
+            RuntimeSelection::BundledVersion(version) => {
+                TesseractRuntime::load_version(&version)?.create_engine()?
+            }
+        };
+        engine.init(&InitOptions {
+            datapath: self.datapath,
+            language: self.language,
+            engine_mode: self.engine_mode,
+        })?;
+        Ok(ConfiguredTesseractEngine {
+            engine,
+            recognition_options: RecognitionOptions {
+                page_seg_mode: self.page_seg_mode,
+                variables: self.variables,
+            },
+        })
+    }
+}
+
+/// Initialized OCR engine with default recognition options.
+pub struct ConfiguredTesseractEngine {
+    engine: TesseractEngine,
+    recognition_options: RecognitionOptions,
+}
+
+impl ConfiguredTesseractEngine {
+    /// Recognizes text from a raw image buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Tesseract recognition fails.
+    pub fn recognize(&self, image: ImageView<'_>) -> Result<String> {
+        self.engine.recognize(image, &self.recognition_options)
+    }
+
+    /// Returns the Tesseract backend version.
+    #[must_use]
+    pub fn backend_version(&self) -> String {
+        self.engine.backend_version()
+    }
+}
+
 impl TesseractRuntime {
+    /// Loads the default bundled Tesseract runtime.
     /// Loads the default bundled Tesseract runtime.
     ///
     /// # Errors
@@ -183,6 +323,12 @@ impl TesseractRuntime {
     /// Returns an error if Tesseract returns a null API handle.
     pub fn create_engine(&self) -> Result<TesseractEngine> {
         TesseractEngine::new_dynamic(Arc::clone(&self.inner))
+    }
+
+    /// Returns the tessdata directory used by this bundled runtime.
+    #[must_use]
+    pub fn tessdata_dir(&self) -> &Path {
+        &self.inner.tessdata_dir
     }
 }
 
@@ -448,6 +594,12 @@ enum Backend {
 unsafe impl Send for TesseractEngine {}
 
 impl TesseractEngine {
+    /// Creates a builder for an initialized OCR engine.
+    #[must_use]
+    pub fn builder() -> TesseractEngineBuilder {
+        TesseractEngineBuilder::default()
+    }
+
     /// Creates a new Tesseract API handle.
     ///
     /// # Errors

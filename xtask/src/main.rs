@@ -86,7 +86,7 @@ impl Options {
             Some("dev-release") => CommandName::DevRelease,
             Some("update-tesseract-catalog") => CommandName::UpdateTesseractCatalog,
             Some("package-tesseract-runtimes") => CommandName::PackageTesseractRuntimes,
-            Some("smoke-test-tesseract") => CommandName::SmokeTestTesseract,
+            Some("smoke-test-tesseract" | "tesseract-smoke") => CommandName::SmokeTestTesseract,
             Some("help" | "--help" | "-h") | None => CommandName::Help,
             Some(command) => {
                 return Err(format_error(format!("unknown xtask command `{command}`")));
@@ -652,6 +652,7 @@ fn package_tesseract_runtimes(options: &Options) -> Result<()> {
     };
     recreate_dir(&destination)?;
     copy_dir_recursive(&source, &destination)?;
+    write_runtime_manifest(&destination)?;
     println!(
         "packaged bundled Tesseract runtimes: {} -> {}",
         source.display(),
@@ -679,6 +680,18 @@ fn smoke_test_tesseract(options: &Options) -> Result<()> {
     run_command(
         Command::new(&binary)
             .arg("--version")
+            .env("BCODE_TESSERACT_RUNTIME_ROOT", &runtime_root),
+    )?;
+    run_command(
+        Command::new("cargo")
+            .arg("run")
+            .arg("--package")
+            .arg("bcode_tesseract_ocr")
+            .arg("--bin")
+            .arg("tesseract-smoke")
+            .arg("--no-default-features")
+            .arg("--features")
+            .arg("bundled-tesseract-default")
             .env("BCODE_TESSERACT_RUNTIME_ROOT", &runtime_root),
     )?;
     println!(
@@ -745,6 +758,55 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn write_runtime_manifest(runtime_root: &Path) -> Result<()> {
+    let catalog = load_cargo_toml(
+        &workspace_root().join("packages/tesseract-sys/bundled/catalog.generated.toml"),
+    )?;
+    let default = string_value(&catalog, &["aliases", "default"])
+        .ok_or_else(|| format_error("catalog is missing aliases.default"))?;
+    let latest = string_value(&catalog, &["aliases", "latest"])
+        .ok_or_else(|| format_error("catalog is missing aliases.latest"))?;
+    let mut versions = fs::read_dir(runtime_root)?
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect::<Vec<_>>();
+    versions.sort();
+    let mut languages = Vec::new();
+    if let Some(first_version) = versions.first() {
+        let tessdata = runtime_root.join(first_version).join("tessdata");
+        if tessdata.is_dir() {
+            languages = fs::read_dir(tessdata)?
+                .filter_map(std::result::Result::ok)
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter_map(|name| name.strip_suffix(".traineddata").map(str::to_string))
+                .collect();
+            languages.sort();
+        }
+    }
+    let manifest = format!(
+        "{{\n  \"default\": \"{}\",\n  \"latest\": \"{}\",\n  \"versions\": [{}],\n  \"languages\": [{}]\n}}\n",
+        json_escape(&default),
+        json_escape(&latest),
+        json_array(&versions),
+        json_array(&languages)
+    );
+    fs::write(runtime_root.join("manifest.json"), manifest)?;
+    Ok(())
+}
+
+fn json_array(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| format!("\"{}\"", json_escape(value)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn json_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -786,6 +848,12 @@ fn release(options: &Options) -> Result<()> {
             staged_binary.display()
         ))
     })?;
+    if let Ok(runtime_source) = latest_bundled_runtime_root(&options.target) {
+        let runtime_destination = staging_dir.join("bcode-runtimes").join("tesseract");
+        recreate_dir(&runtime_destination)?;
+        copy_dir_recursive(&runtime_source, &runtime_destination)?;
+        write_runtime_manifest(&runtime_destination)?;
+    }
 
     let archive = archive_path(options, target_kind);
     if archive.exists() {
