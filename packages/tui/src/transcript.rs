@@ -943,7 +943,7 @@ fn non_streaming_transcript_item_from_event(
             tool_call_id,
             tool_name,
             arguments_json,
-            legacy_request_presentation: _legacy_legacy_request_presentation,
+            legacy_request_presentation: _legacy_request_presentation,
             ..
         } => {
             tool_calls.insert(
@@ -1023,7 +1023,7 @@ fn non_streaming_transcript_item_from_event(
             tool_call_id,
             tool_name,
             arguments_json,
-            legacy_request_presentation: _legacy_legacy_request_presentation,
+            legacy_request_presentation: _legacy_request_presentation,
             policy_source,
             policy_reason,
             ..
