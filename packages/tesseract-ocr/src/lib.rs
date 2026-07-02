@@ -428,6 +428,9 @@ pub fn available_bundled_versions() -> Vec<&'static str> {
     if cfg!(feature = "bundled-tesseract-v5-5-1") {
         versions.push("5.5.1");
     }
+    if cfg!(feature = "bundled-tesseract-v5-5-2") {
+        versions.push("5.5.2");
+    }
     versions
 }
 
@@ -582,7 +585,8 @@ pub struct TesseractEngine {
     any(
         feature = "bundled-tesseract",
         feature = "bundled-tesseract-v5-3-4",
-        feature = "bundled-tesseract-v5-5-1"
+        feature = "bundled-tesseract-v5-5-1",
+        feature = "bundled-tesseract-v5-5-2"
     ),
     allow(dead_code)
 )]
@@ -610,7 +614,8 @@ impl TesseractEngine {
         #[cfg(any(
             feature = "bundled-tesseract",
             feature = "bundled-tesseract-v5-3-4",
-            feature = "bundled-tesseract-v5-5-1"
+            feature = "bundled-tesseract-v5-5-1",
+            feature = "bundled-tesseract-v5-5-2"
         ))]
         {
             Err(Error::LinkedRuntimeUnavailable)
@@ -618,7 +623,8 @@ impl TesseractEngine {
         #[cfg(not(any(
             feature = "bundled-tesseract",
             feature = "bundled-tesseract-v5-3-4",
-            feature = "bundled-tesseract-v5-5-1"
+            feature = "bundled-tesseract-v5-5-1",
+            feature = "bundled-tesseract-v5-5-2"
         )))]
         {
             let handle = unsafe { bcode_tesseract_sys::TessBaseAPICreate() };
@@ -826,7 +832,8 @@ fn c_string_lossy(value: *const c_char) -> String {
 #[cfg(not(any(
     feature = "bundled-tesseract",
     feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
+    feature = "bundled-tesseract-v5-5-1",
+    feature = "bundled-tesseract-v5-5-2"
 )))]
 unsafe fn linked_init2(
     handle: *mut c_void,
@@ -840,7 +847,8 @@ unsafe fn linked_init2(
 #[cfg(any(
     feature = "bundled-tesseract",
     feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
+    feature = "bundled-tesseract-v5-5-1",
+    feature = "bundled-tesseract-v5-5-2"
 ))]
 unsafe fn linked_init2(
     _handle: *mut c_void,
@@ -854,7 +862,8 @@ unsafe fn linked_init2(
 #[cfg(not(any(
     feature = "bundled-tesseract",
     feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
+    feature = "bundled-tesseract-v5-5-1",
+    feature = "bundled-tesseract-v5-5-2"
 )))]
 unsafe fn linked_set_image(
     handle: *mut c_void,
@@ -879,7 +888,8 @@ unsafe fn linked_set_image(
 #[cfg(any(
     feature = "bundled-tesseract",
     feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
+    feature = "bundled-tesseract-v5-5-1",
+    feature = "bundled-tesseract-v5-5-2"
 ))]
 unsafe fn linked_set_image(
     _handle: *mut c_void,
@@ -895,7 +905,8 @@ unsafe fn linked_set_image(
 #[cfg(not(any(
     feature = "bundled-tesseract",
     feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
+    feature = "bundled-tesseract-v5-5-1",
+    feature = "bundled-tesseract-v5-5-2"
 )))]
 unsafe fn linked_set_page_seg_mode(handle: *mut c_void, mode: c_int) {
     unsafe { bcode_tesseract_sys::TessBaseAPISetPageSegMode(handle, mode) };
@@ -904,7 +915,8 @@ unsafe fn linked_set_page_seg_mode(handle: *mut c_void, mode: c_int) {
 #[cfg(any(
     feature = "bundled-tesseract",
     feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
+    feature = "bundled-tesseract-v5-5-1",
+    feature = "bundled-tesseract-v5-5-2"
 ))]
 unsafe fn linked_set_page_seg_mode(_handle: *mut c_void, _mode: c_int) {
     unreachable!("linked Tesseract backend is unavailable in bundled dynamic builds")
@@ -913,7 +925,8 @@ unsafe fn linked_set_page_seg_mode(_handle: *mut c_void, _mode: c_int) {
 #[cfg(not(any(
     feature = "bundled-tesseract",
     feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
+    feature = "bundled-tesseract-v5-5-1",
+    feature = "bundled-tesseract-v5-5-2"
 )))]
 unsafe fn linked_set_variable(
     handle: *mut c_void,
@@ -926,7 +939,8 @@ unsafe fn linked_set_variable(
 #[cfg(any(
     feature = "bundled-tesseract",
     feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
+    feature = "bundled-tesseract-v5-5-1",
+    feature = "bundled-tesseract-v5-5-2"
 ))]
 unsafe fn linked_set_variable(
     _handle: *mut c_void,
@@ -939,7 +953,8 @@ unsafe fn linked_set_variable(
 #[cfg(not(any(
     feature = "bundled-tesseract",
     feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
+    feature = "bundled-tesseract-v5-5-1",
+    feature = "bundled-tesseract-v5-5-2"
 )))]
 unsafe fn linked_recognize(handle: *mut c_void, monitor: *mut c_void) -> c_int {
     unsafe { bcode_tesseract_sys::TessBaseAPIRecognize(handle, monitor) }
@@ -948,7 +963,8 @@ unsafe fn linked_recognize(handle: *mut c_void, monitor: *mut c_void) -> c_int {
 #[cfg(any(
     feature = "bundled-tesseract",
     feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
+    feature = "bundled-tesseract-v5-5-1",
+    feature = "bundled-tesseract-v5-5-2"
 ))]
 unsafe fn linked_recognize(_handle: *mut c_void, _monitor: *mut c_void) -> c_int {
     unreachable!("linked Tesseract backend is unavailable in bundled dynamic builds")
@@ -957,7 +973,8 @@ unsafe fn linked_recognize(_handle: *mut c_void, _monitor: *mut c_void) -> c_int
 #[cfg(not(any(
     feature = "bundled-tesseract",
     feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
+    feature = "bundled-tesseract-v5-5-1",
+    feature = "bundled-tesseract-v5-5-2"
 )))]
 unsafe fn linked_get_utf8_text(handle: *mut c_void) -> *mut c_char {
     unsafe { bcode_tesseract_sys::TessBaseAPIGetUTF8Text(handle) }
@@ -966,7 +983,8 @@ unsafe fn linked_get_utf8_text(handle: *mut c_void) -> *mut c_char {
 #[cfg(any(
     feature = "bundled-tesseract",
     feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
+    feature = "bundled-tesseract-v5-5-1",
+    feature = "bundled-tesseract-v5-5-2"
 ))]
 unsafe fn linked_get_utf8_text(_handle: *mut c_void) -> *mut c_char {
     unreachable!("linked Tesseract backend is unavailable in bundled dynamic builds")
@@ -975,7 +993,8 @@ unsafe fn linked_get_utf8_text(_handle: *mut c_void) -> *mut c_char {
 #[cfg(not(any(
     feature = "bundled-tesseract",
     feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
+    feature = "bundled-tesseract-v5-5-1",
+    feature = "bundled-tesseract-v5-5-2"
 )))]
 unsafe fn linked_delete_text(text: *mut c_char) {
     unsafe { bcode_tesseract_sys::TessDeleteText(text) };
@@ -984,7 +1003,8 @@ unsafe fn linked_delete_text(text: *mut c_char) {
 #[cfg(any(
     feature = "bundled-tesseract",
     feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
+    feature = "bundled-tesseract-v5-5-1",
+    feature = "bundled-tesseract-v5-5-2"
 ))]
 unsafe fn linked_delete_text(_text: *mut c_char) {
     unreachable!("linked Tesseract backend is unavailable in bundled dynamic builds")
@@ -993,7 +1013,8 @@ unsafe fn linked_delete_text(_text: *mut c_char) {
 #[cfg(not(any(
     feature = "bundled-tesseract",
     feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
+    feature = "bundled-tesseract-v5-5-1",
+    feature = "bundled-tesseract-v5-5-2"
 )))]
 unsafe fn linked_end(handle: *mut c_void) {
     unsafe { bcode_tesseract_sys::TessBaseAPIEnd(handle) };
@@ -1002,7 +1023,8 @@ unsafe fn linked_end(handle: *mut c_void) {
 #[cfg(any(
     feature = "bundled-tesseract",
     feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
+    feature = "bundled-tesseract-v5-5-1",
+    feature = "bundled-tesseract-v5-5-2"
 ))]
 unsafe fn linked_end(_handle: *mut c_void) {
     unreachable!("linked Tesseract backend is unavailable in bundled dynamic builds")
@@ -1011,7 +1033,8 @@ unsafe fn linked_end(_handle: *mut c_void) {
 #[cfg(not(any(
     feature = "bundled-tesseract",
     feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
+    feature = "bundled-tesseract-v5-5-1",
+    feature = "bundled-tesseract-v5-5-2"
 )))]
 unsafe fn linked_delete(handle: *mut c_void) {
     unsafe { bcode_tesseract_sys::TessBaseAPIDelete(handle) };
@@ -1020,7 +1043,8 @@ unsafe fn linked_delete(handle: *mut c_void) {
 #[cfg(any(
     feature = "bundled-tesseract",
     feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
+    feature = "bundled-tesseract-v5-5-1",
+    feature = "bundled-tesseract-v5-5-2"
 ))]
 unsafe fn linked_delete(_handle: *mut c_void) {
     unreachable!("linked Tesseract backend is unavailable in bundled dynamic builds")
@@ -1031,7 +1055,8 @@ fn linked_version() -> String {
     #[cfg(not(any(
         feature = "bundled-tesseract",
         feature = "bundled-tesseract-v5-3-4",
-        feature = "bundled-tesseract-v5-5-1"
+        feature = "bundled-tesseract-v5-5-1",
+        feature = "bundled-tesseract-v5-5-2"
     )))]
     {
         let version = unsafe { bcode_tesseract_sys::TessVersion() };
@@ -1040,7 +1065,8 @@ fn linked_version() -> String {
     #[cfg(any(
         feature = "bundled-tesseract",
         feature = "bundled-tesseract-v5-3-4",
-        feature = "bundled-tesseract-v5-5-1"
+        feature = "bundled-tesseract-v5-5-1",
+        feature = "bundled-tesseract-v5-5-2"
     ))]
     String::new()
 }

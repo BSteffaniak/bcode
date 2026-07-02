@@ -2,11 +2,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
+#[cfg(feature = "bundled-tesseract-build")]
 use std::{
     fs,
     io::{self, Cursor},
@@ -14,21 +10,7 @@ use std::{
     time::Duration,
 };
 
-#[cfg(feature = "bundled-tesseract-v5-3-4")]
-const BUNDLED_TESSERACT_VERSION_5_3_4: bool = true;
-#[cfg(not(feature = "bundled-tesseract-v5-3-4"))]
-const BUNDLED_TESSERACT_VERSION_5_3_4: bool = false;
-
-#[cfg(feature = "bundled-tesseract-v5-5-1")]
-const BUNDLED_TESSERACT_VERSION_5_5_1: bool = true;
-#[cfg(not(feature = "bundled-tesseract-v5-5-1"))]
-const BUNDLED_TESSERACT_VERSION_5_5_1: bool = false;
-
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
+#[cfg(feature = "bundled-tesseract-build")]
 const BUNDLED_CATALOG_TOML: &str = include_str!("bundled/catalog.generated.toml");
 
 fn main() {
@@ -88,11 +70,7 @@ fn validate_bundled_selection() {
     }
 }
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
+#[cfg(feature = "bundled-tesseract-build")]
 #[derive(Clone, Debug)]
 struct TesseractCatalogEntry {
     version: String,
@@ -101,22 +79,14 @@ struct TesseractCatalogEntry {
     leptonica: String,
 }
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
+#[cfg(feature = "bundled-tesseract-build")]
 #[derive(Clone, Copy, Debug)]
 struct LeptonicaCatalogEntry<'a> {
     url: &'a str,
     sha256: &'a str,
 }
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
+#[cfg(feature = "bundled-tesseract-build")]
 #[derive(Clone, Copy, Debug)]
 struct TessdataLanguageEntry<'a> {
     code: &'a str,
@@ -124,21 +94,13 @@ struct TessdataLanguageEntry<'a> {
     sha256: &'a str,
 }
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
+#[cfg(feature = "bundled-tesseract-build")]
 #[derive(Debug)]
 struct BundledCatalog {
     value: toml::Value,
 }
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
+#[cfg(feature = "bundled-tesseract-build")]
 impl BundledCatalog {
     fn load() -> Self {
         Self {
@@ -200,22 +162,27 @@ impl BundledCatalog {
     }
 }
 
-fn selected_bundled_versions() -> Vec<&'static str> {
-    let mut versions = Vec::new();
-    if BUNDLED_TESSERACT_VERSION_5_3_4 {
-        versions.push("5.3.4");
-    }
-    if BUNDLED_TESSERACT_VERSION_5_5_1 {
-        versions.push("5.5.1");
-    }
+fn selected_bundled_versions() -> Vec<String> {
+    let mut versions = env::vars()
+        .filter_map(|(name, value)| {
+            if value != "1" {
+                return None;
+            }
+            name.strip_prefix("CARGO_FEATURE_BUNDLED_TESSERACT_V")
+                .map(|version| version.replace('_', "."))
+        })
+        .collect::<Vec<_>>();
+    versions.sort_by_key(|version| {
+        version
+            .split('.')
+            .map(|part| part.parse::<u64>().unwrap_or(0))
+            .collect::<Vec<_>>()
+    });
+    versions.dedup();
     versions
 }
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
+#[cfg(feature = "bundled-tesseract-build")]
 fn required_str<'a>(value: &'a toml::Value, key: &str) -> &'a str {
     value
         .get(key)
@@ -238,11 +205,7 @@ fn link_system() {
     println!("cargo:rustc-link-lib=leptonica");
 }
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
+#[cfg(feature = "bundled-tesseract-build")]
 fn link_bundled() {
     let catalog = BundledCatalog::load();
     let versions = selected_bundled_versions();
@@ -295,7 +258,8 @@ fn link_bundled() {
 #[cfg(not(any(
     feature = "bundled-tesseract",
     feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
+    feature = "bundled-tesseract-v5-5-1",
+    feature = "bundled-tesseract-v5-5-2"
 )))]
 fn link_bundled() {
     panic!("BCODE_TESSERACT_LINK_MODE=bundled requires the bundled-tesseract feature")
@@ -625,11 +589,7 @@ fn link_cpp_runtime() {
     }
 }
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
+#[cfg(feature = "bundled-tesseract-build")]
 fn download_and_extract(
     url: &str,
     expected_sha256: &str,
@@ -677,12 +637,8 @@ fn download_and_extract(
     extracted
 }
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
-fn download_runtime_tessdata(catalog: &BundledCatalog, versions: &[&str], runtimes_dir: &Path) {
+#[cfg(feature = "bundled-tesseract-build")]
+fn download_runtime_tessdata(catalog: &BundledCatalog, versions: &[String], runtimes_dir: &Path) {
     if env::var_os("BCODE_TESSDATA_PREFIX").is_some() {
         return;
     }
@@ -699,11 +655,7 @@ fn download_runtime_tessdata(catalog: &BundledCatalog, versions: &[&str], runtim
     }
 }
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
+#[cfg(feature = "bundled-tesseract-build")]
 fn download_file_to(url: &str, expected_sha256: &str, path: &Path) {
     if path.is_file() {
         let bytes = fs::read(path).expect("failed to read cached file");
@@ -727,11 +679,7 @@ fn download_file_to(url: &str, expected_sha256: &str, path: &Path) {
     });
 }
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
+#[cfg(feature = "bundled-tesseract-build")]
 fn download_verified(url: &str, expected_sha256: &str) -> Vec<u8> {
     let cache_path = artifact_cache_path(url, expected_sha256);
     if env::var_os("BCODE_TESSERACT_OFFLINE").is_some() {
@@ -771,11 +719,7 @@ fn download_verified(url: &str, expected_sha256: &str) -> Vec<u8> {
     );
 }
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
+#[cfg(feature = "bundled-tesseract-build")]
 fn download_attempt(
     client: &reqwest::blocking::Client,
     url: &str,
@@ -801,11 +745,7 @@ fn download_attempt(
     }
 }
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
+#[cfg(feature = "bundled-tesseract-build")]
 fn read_valid_cached_artifact(path: &Path, expected_sha256: &str) -> Option<Vec<u8>> {
     if !path.is_file() {
         return None;
@@ -824,11 +764,7 @@ fn read_valid_cached_artifact(path: &Path, expected_sha256: &str) -> Option<Vec<
     }
 }
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
+#[cfg(feature = "bundled-tesseract-build")]
 fn write_cached_artifact(path: &Path, bytes: &[u8]) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).unwrap_or_else(|error| {
@@ -857,20 +793,12 @@ fn write_cached_artifact(path: &Path, bytes: &[u8]) {
     }
 }
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
+#[cfg(feature = "bundled-tesseract-build")]
 fn artifact_cache_path(url: &str, expected_sha256: &str) -> PathBuf {
     artifact_cache_dir().join(format!("{}{}", expected_sha256, artifact_extension(url)))
 }
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
+#[cfg(feature = "bundled-tesseract-build")]
 fn artifact_extension(url: &str) -> &'static str {
     if url.ends_with(".zip") {
         ".zip"
@@ -881,11 +809,7 @@ fn artifact_extension(url: &str) -> &'static str {
     }
 }
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
+#[cfg(feature = "bundled-tesseract-build")]
 fn artifact_cache_dir() -> PathBuf {
     if let Some(path) = env::var_os("BCODE_TESSERACT_ARTIFACT_CACHE") {
         return PathBuf::from(path);
@@ -893,11 +817,7 @@ fn artifact_cache_dir() -> PathBuf {
     cache_root().join("tesseract-artifacts")
 }
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
+#[cfg(feature = "bundled-tesseract-build")]
 fn source_cache_dir() -> PathBuf {
     if let Some(path) = env::var_os("BCODE_TESSERACT_SOURCE_CACHE") {
         return PathBuf::from(path);
@@ -905,11 +825,7 @@ fn source_cache_dir() -> PathBuf {
     cache_root().join("tesseract-sources")
 }
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
+#[cfg(feature = "bundled-tesseract-build")]
 fn cache_root() -> PathBuf {
     if let Some(path) = env::var_os("XDG_CACHE_HOME") {
         return PathBuf::from(path).join("bcode");
@@ -920,11 +836,7 @@ fn cache_root() -> PathBuf {
     out_dir().join("cache")
 }
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
+#[cfg(feature = "bundled-tesseract-build")]
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
 
@@ -937,11 +849,7 @@ fn env_path(name: &str) -> PathBuf {
         .unwrap_or_else(|| panic!("{name} must be set when BCODE_TESSERACT_LINK_MODE=vendored"))
 }
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
+#[cfg(feature = "bundled-tesseract-build")]
 fn out_dir() -> PathBuf {
     PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"))
 }
@@ -954,11 +862,7 @@ fn static_library_name(name: &str) -> String {
     }
 }
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
+#[cfg(feature = "bundled-tesseract-build")]
 fn single_child_dir(path: &Path) -> Option<PathBuf> {
     let mut entries = fs::read_dir(path).ok()?.filter_map(Result::ok);
     let first = entries.next()?.path();
@@ -969,11 +873,7 @@ fn single_child_dir(path: &Path) -> Option<PathBuf> {
     }
 }
 
-#[cfg(any(
-    feature = "bundled-tesseract",
-    feature = "bundled-tesseract-v5-3-4",
-    feature = "bundled-tesseract-v5-5-1"
-))]
+#[cfg(feature = "bundled-tesseract-build")]
 fn copy_dir_all(from: &Path, to: &Path) -> io::Result<()> {
     fs::create_dir_all(to)?;
     for entry in fs::read_dir(from)? {

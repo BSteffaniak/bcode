@@ -2,30 +2,35 @@
 # Do not edit manually.
 
 [aliases]
-default = "5.5.1"
-latest  = "5.5.1"
+default = "5.5.2"
+latest  = "5.5.2"
 
-[leptonica."1.84.1"]
-sha256 = "d13af21fddf8839a81ff06385e36ed51ee7442e053ab65903f2351b25904284f"
-url    = "https://github.com/DanBloomberg/leptonica/archive/refs/tags/1.84.1.zip"
+[leptonica."1.87.0"]
+sha256 = "2cfb7ebe6036f3d017280fa9a000c9699ab28be8dff8be8e2e948e2c79917eda"
+url    = "https://github.com/DanBloomberg/leptonica/archive/refs/tags/1.87.0.zip"
 
 [tesseract."5.3.4"]
-leptonica = "1.84.1"
+leptonica = "1.87.0"
 sha256    = "01e93044f5ee7c42ded713d55ec54a44e08200237b48f9256029ba1e144b1dbc"
 url       = "https://github.com/tesseract-ocr/tesseract/archive/refs/tags/5.3.4.zip"
 
 [tesseract."5.5.1"]
-leptonica = "1.84.1"
+leptonica = "1.87.0"
 sha256    = "291f4808d347410641d2b0d895ae424a45011e37c295067ee749648a2f58fef6"
 url       = "https://github.com/tesseract-ocr/tesseract/archive/refs/tags/5.5.1.zip"
 
+[tesseract."5.5.2"]
+leptonica = "1.87.0"
+sha256    = "449621680d529fde7a2d079805dce4687fef0a692c272be3ce431c30c69162d2"
+url       = "https://github.com/tesseract-ocr/tesseract/archive/refs/tags/5.5.2.zip"
+
 [tessdata.best]
-commit = "main"
+commit = "e12c65a915945e4c28e237a9b52bc4a8f39a0cec"
 
 [tessdata.best.languages.eng]
 sha256 = "8280aed0782fe27257a68ea10fe7ef324ca0f8d85bd2fd145d1c2b560bcb66ba"
-url    = "https://github.com/tesseract-ocr/tessdata_best/raw/main/eng.traineddata"
+url    = "https://github.com/tesseract-ocr/tessdata_best/raw/e12c65a915945e4c28e237a9b52bc4a8f39a0cec/eng.traineddata"
 
 [tessdata.best.languages.tur]
 sha256 = "e0c3338dc17503dc7d335a507c9ae01b2b46cfd07561171e1e1ac55d85e8e438"
-url    = "https://github.com/tesseract-ocr/tessdata_best/raw/main/tur.traineddata"
+url    = "https://github.com/tesseract-ocr/tessdata_best/raw/e12c65a915945e4c28e237a9b52bc4a8f39a0cec/tur.traineddata"

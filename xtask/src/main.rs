@@ -13,6 +13,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
@@ -51,6 +52,8 @@ enum CommandName {
     DevSign,
     DevRelease,
     UpdateTesseractCatalog,
+    DiscoverTesseractUpstream,
+    UpdateTesseractPolicy,
     PackageTesseractRuntimes,
     SmokeTestTesseract,
     Help,
@@ -74,6 +77,7 @@ struct Options {
     allow_create_dev_identity: bool,
     skip_notarize: bool,
     generated_write_mode: GeneratedWriteMode,
+    prune_tesseract_policy: bool,
 }
 
 impl Options {
@@ -85,6 +89,8 @@ impl Options {
             Some("dev-sign") => CommandName::DevSign,
             Some("dev-release") => CommandName::DevRelease,
             Some("update-tesseract-catalog") => CommandName::UpdateTesseractCatalog,
+            Some("discover-tesseract-upstream") => CommandName::DiscoverTesseractUpstream,
+            Some("update-tesseract-policy") => CommandName::UpdateTesseractPolicy,
             Some("package-tesseract-runtimes") => CommandName::PackageTesseractRuntimes,
             Some("smoke-test-tesseract" | "tesseract-smoke") => CommandName::SmokeTestTesseract,
             Some("help" | "--help" | "-h") | None => CommandName::Help,
@@ -103,6 +109,7 @@ impl Options {
             env_dev_identity.unwrap_or_else(|| DEFAULT_DEV_CODESIGN_IDENTITY.to_owned());
         let mut skip_notarize = env_flag("BCODE_SKIP_NOTARIZE");
         let mut generated_write_mode = GeneratedWriteMode::Write;
+        let mut prune_tesseract_policy = false;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -119,6 +126,7 @@ impl Options {
                 "--skip-notarize" => skip_notarize = true,
                 "--check" => generated_write_mode = GeneratedWriteMode::Check,
                 "--dry-run" => generated_write_mode = GeneratedWriteMode::DryRun,
+                "--prune" => prune_tesseract_policy = true,
                 "--help" | "-h" => return Ok(Self::help()),
                 unknown => return Err(format_error(format!("unknown option `{unknown}`"))),
             }
@@ -134,6 +142,7 @@ impl Options {
             allow_create_dev_identity,
             skip_notarize,
             generated_write_mode,
+            prune_tesseract_policy,
         })
     }
 
@@ -148,6 +157,7 @@ impl Options {
             allow_create_dev_identity: true,
             skip_notarize: false,
             generated_write_mode: GeneratedWriteMode::Write,
+            prune_tesseract_policy: false,
         }
     }
 }
@@ -167,6 +177,8 @@ fn run() -> Result<()> {
         CommandName::DevSign => dev_sign(&options),
         CommandName::DevRelease => dev_release(&options),
         CommandName::UpdateTesseractCatalog => update_tesseract_catalog(&options),
+        CommandName::DiscoverTesseractUpstream => discover_tesseract_upstream(),
+        CommandName::UpdateTesseractPolicy => update_tesseract_policy(&options),
         CommandName::PackageTesseractRuntimes => package_tesseract_runtimes(&options),
         CommandName::SmokeTestTesseract => smoke_test_tesseract(&options),
         CommandName::Help => {
@@ -176,7 +188,7 @@ fn run() -> Result<()> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TesseractSyncPolicy {
     versions: Vec<String>,
     default: String,
@@ -186,6 +198,50 @@ struct TesseractSyncPolicy {
     tessdata_repo: String,
     tessdata_commit: String,
     tessdata_languages: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct VersionTag {
+    major: u64,
+    minor: u64,
+    patch: u64,
+}
+
+impl VersionTag {
+    fn parse(tag: &str) -> Option<Self> {
+        let tag = tag.strip_prefix('v').unwrap_or(tag);
+        let mut parts = tag.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts.next()?.parse().ok()?;
+        parts.next().is_none().then_some(Self {
+            major,
+            minor,
+            patch,
+        })
+    }
+}
+
+impl fmt::Display for VersionTag {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+#[derive(Debug)]
+struct UpstreamTesseractState {
+    policy: TesseractSyncPolicy,
+    tesseract_versions: Vec<VersionTag>,
+    leptonica_versions: Vec<VersionTag>,
+    tessdata_commit: String,
+}
+
+#[derive(Debug)]
+struct TesseractPolicyUpdate {
+    policy: TesseractSyncPolicy,
+    tesseract_added: Vec<String>,
+    leptonica_changed: bool,
+    tessdata_changed: bool,
 }
 
 #[derive(Debug)]
@@ -200,6 +256,203 @@ struct ResolvedTesseractVersion {
 struct ResolvedArtifact {
     url: String,
     sha256: String,
+}
+
+fn discover_tesseract_upstream() -> Result<()> {
+    let state = discover_upstream_tesseract_state()?;
+    let update = recommended_tesseract_policy_update(&state);
+    let latest_tesseract = state
+        .tesseract_versions
+        .last()
+        .ok_or_else(|| format_error("no upstream Tesseract versions discovered"))?
+        .to_string();
+    let latest_leptonica = state
+        .leptonica_versions
+        .last()
+        .ok_or_else(|| format_error("no upstream Leptonica versions discovered"))?
+        .to_string();
+
+    println!(
+        "current policy Tesseract versions: {}",
+        state.policy.versions.join(", ")
+    );
+    println!("latest upstream Tesseract: {latest_tesseract}");
+    println!(
+        "current policy Leptonica: {}",
+        state.policy.leptonica_default
+    );
+    println!("latest upstream Leptonica: {latest_leptonica}");
+    println!("current tessdata commit: {}", state.policy.tessdata_commit);
+    println!("latest tessdata commit: {}", state.tessdata_commit);
+    if update.tesseract_added.is_empty() && !update.leptonica_changed && !update.tessdata_changed {
+        println!("policy is already up to date with discovered upstream state");
+    } else {
+        println!("recommended policy update:");
+        if !update.tesseract_added.is_empty() {
+            println!("  add Tesseract: {}", update.tesseract_added.join(", "));
+        }
+        if update.leptonica_changed {
+            println!("  set Leptonica: {}", update.policy.leptonica_default);
+        }
+        if update.tessdata_changed {
+            println!("  pin tessdata commit: {}", update.policy.tessdata_commit);
+        }
+        println!("run: cargo xtask update-tesseract-policy");
+    }
+    Ok(())
+}
+
+fn update_tesseract_policy(options: &Options) -> Result<()> {
+    let root = workspace_root();
+    let policy_path = root.join("packages/tesseract-sys/bundled/sync-policy.toml");
+    let mut update = recommended_tesseract_policy_update(&discover_upstream_tesseract_state()?);
+    if options.prune_tesseract_policy {
+        let latest = update.policy.latest.clone();
+        update.policy.versions.retain(|version| version == &latest);
+        update.tesseract_added.clear();
+    }
+    let rendered = render_tesseract_sync_policy(&update.policy);
+    write_generated_file(&policy_path, &rendered, options)?;
+    println!(
+        "updated Tesseract policy: default={}, latest={}, versions={}, leptonica={}, tessdata={}",
+        update.policy.default,
+        update.policy.latest,
+        update.policy.versions.join(","),
+        update.policy.leptonica_default,
+        update.policy.tessdata_commit
+    );
+    update_tesseract_catalog(options)
+}
+
+fn discover_upstream_tesseract_state() -> Result<UpstreamTesseractState> {
+    let policy_path = workspace_root().join("packages/tesseract-sys/bundled/sync-policy.toml");
+    let policy = read_tesseract_sync_policy(&policy_path)?;
+    Ok(UpstreamTesseractState {
+        tesseract_versions: github_semver_tags("tesseract-ocr", "tesseract")?
+            .into_iter()
+            .filter(|version| version.major == 5)
+            .collect(),
+        leptonica_versions: github_semver_tags("DanBloomberg", "leptonica")?,
+        tessdata_commit: github_branch_commit(
+            "tesseract-ocr",
+            &policy.tessdata_repo,
+            &policy.tessdata_commit,
+        )?,
+        policy,
+    })
+}
+
+fn recommended_tesseract_policy_update(state: &UpstreamTesseractState) -> TesseractPolicyUpdate {
+    let mut policy = state.policy.clone();
+    let old_versions = policy.versions.clone();
+    let current_latest = old_versions
+        .iter()
+        .filter_map(|version| VersionTag::parse(version))
+        .max();
+    for version in &state.tesseract_versions {
+        if current_latest.is_some_and(|current| version <= &current) {
+            continue;
+        }
+        let version = version.to_string();
+        if !policy.versions.contains(&version) {
+            policy.versions.push(version);
+        }
+    }
+    policy
+        .versions
+        .sort_by_key(|version| VersionTag::parse(version));
+    policy.versions.dedup();
+    if let Some(latest) = state.tesseract_versions.last() {
+        policy.latest = latest.to_string();
+        policy.default.clone_from(&policy.latest);
+    }
+    if let Some(latest) = state.leptonica_versions.last() {
+        policy.leptonica_default = latest.to_string();
+    }
+    policy.tessdata_commit.clone_from(&state.tessdata_commit);
+    let tesseract_added = policy
+        .versions
+        .iter()
+        .filter(|version| !old_versions.contains(version))
+        .cloned()
+        .collect();
+    TesseractPolicyUpdate {
+        leptonica_changed: policy.leptonica_default != state.policy.leptonica_default,
+        tessdata_changed: policy.tessdata_commit != state.policy.tessdata_commit,
+        policy,
+        tesseract_added,
+    }
+}
+
+fn github_semver_tags(owner: &str, repo: &str) -> Result<Vec<VersionTag>> {
+    let text = fetch_url(&format!(
+        "https://api.github.com/repos/{owner}/{repo}/git/matching-refs/tags/"
+    ))?;
+    let mut versions = text
+        .split("\"ref\":")
+        .skip(1)
+        .filter_map(|chunk| chunk.split('"').nth(1))
+        .filter_map(|reference| reference.strip_prefix("refs/tags/"))
+        .filter_map(VersionTag::parse)
+        .collect::<Vec<_>>();
+    versions.sort();
+    versions.dedup();
+    Ok(versions)
+}
+
+fn github_branch_commit(owner: &str, repo: &str, branch_or_commit: &str) -> Result<String> {
+    if is_git_sha(branch_or_commit) {
+        return Ok(branch_or_commit.to_owned());
+    }
+    let text = fetch_url(&format!(
+        "https://api.github.com/repos/{owner}/{repo}/commits/{branch_or_commit}"
+    ))?;
+    text.split("\"sha\":")
+        .nth(1)
+        .and_then(|chunk| chunk.split('"').nth(1))
+        .map(str::to_owned)
+        .ok_or_else(|| format_error("failed to parse GitHub commit sha"))
+}
+
+fn fetch_url(url: &str) -> Result<String> {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("bcode-xtask/0.0.1")
+        .build()
+        .map_err(|error| format_error(format!("failed to build HTTP client: {error}")))?;
+    client
+        .get(url)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .and_then(reqwest::blocking::Response::text)
+        .map_err(|error| format_error(format!("failed to fetch {url}: {error}")))
+}
+
+fn is_git_sha(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn render_tesseract_sync_policy(policy: &TesseractSyncPolicy) -> String {
+    format!(
+        "[tesseract]\ndefault  = \"{}\"\nlatest   = \"{}\"\nversions = [{}]\n\n[leptonica]\ndefault_version = \"{}\"\n\n[tessdata]\ncommit    = \"{}\"\nflavor    = \"{}\"\nlanguages = [{}]\nrepo      = \"{}\"\n",
+        policy.default,
+        policy.latest,
+        policy
+            .versions
+            .iter()
+            .map(|version| format!("\"{version}\""))
+            .collect::<Vec<_>>()
+            .join(", "),
+        policy.leptonica_default,
+        policy.tessdata_commit,
+        policy.tessdata_flavor,
+        policy
+            .tessdata_languages
+            .iter()
+            .map(|language| format!("\"{language}\""))
+            .collect::<Vec<_>>()
+            .join(", "),
+        policy.tessdata_repo
+    )
 }
 
 fn update_tesseract_catalog(options: &Options) -> Result<()> {
@@ -333,15 +586,36 @@ fn tessdata_url(repo: &str, commit: &str, language: &str) -> String {
 }
 
 fn sha256_url(url: &str) -> Result<String> {
-    let response = reqwest::blocking::get(url)
-        .map_err(|error| format_error(format!("failed to download {url}: {error}")))?
-        .error_for_status()
-        .map_err(|error| format_error(format!("failed to download {url}: {error}")))?;
-    let bytes = response
-        .bytes()
-        .map_err(|error| format_error(format!("failed to read {url}: {error}")))?;
-    let digest = Sha256::digest(&bytes);
-    Ok(format!("{digest:x}"))
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("bcode-xtask/0.0.1")
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_mins(5))
+        .build()
+        .map_err(|error| format_error(format!("failed to build HTTP client: {error}")))?;
+    let mut last_error = None;
+    for attempt in 1..=5 {
+        match client
+            .get(url)
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .and_then(reqwest::blocking::Response::bytes)
+        {
+            Ok(bytes) => {
+                let digest = Sha256::digest(&bytes);
+                return Ok(format!("{digest:x}"));
+            }
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < 5 {
+                    std::thread::sleep(Duration::from_secs(attempt * 2));
+                }
+            }
+        }
+    }
+    Err(format_error(format!(
+        "failed to hash {url}: {}",
+        last_error.map_or_else(|| "unknown error".to_string(), |error| error.to_string())
+    )))
 }
 
 fn render_tesseract_catalog(
@@ -490,15 +764,20 @@ fn sync_tesseract_sys_features(
             .map(|version| feature_name("bundled-tesseract", version))
             .collect::<Vec<_>>(),
     );
+    set_feature(
+        features,
+        "bundled-tesseract-build",
+        &[
+            "dep:reqwest".to_owned(),
+            "dep:sha2".to_owned(),
+            "dep:zip".to_owned(),
+        ],
+    );
     for version in &policy.versions {
         set_feature(
             features,
             &feature_name("bundled-tesseract", version),
-            &[
-                "dep:reqwest".to_owned(),
-                "dep:sha2".to_owned(),
-                "dep:zip".to_owned(),
-            ],
+            &["bundled-tesseract-build".to_owned()],
         );
     }
     write_cargo_toml(path, &document, options)
@@ -1647,7 +1926,9 @@ fn print_help() {
            cargo xtask verify-release --target <triple> --version <version>\n\
            cargo xtask dev-release [--target <triple>] [--identity <name>]\n\
            cargo xtask dev-sign --target <triple> [--binary <path>] [--identity <name>]\n\
-           cargo xtask update-tesseract-catalog\n\n\
+           cargo xtask update-tesseract-catalog\n\
+           cargo xtask discover-tesseract-upstream\n\
+           cargo xtask update-tesseract-policy [--prune]\n\n\
          Supported release targets:\n\
            * aarch64-apple-darwin\n\
            * x86_64-apple-darwin\n\
