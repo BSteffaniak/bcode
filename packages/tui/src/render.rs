@@ -4,10 +4,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
-use bcode_session_models::{
-    LiveToolArgumentPreview, ToolCardPresentation, ToolPresentationFieldKind,
-    ToolPresentationLevel, ToolPresentationSection,
-};
+use bcode_session_models::LiveToolArgumentPreview;
 use bmux_terminal_grid::{
     Color as GridColor, GridLimits, PhysicalRow, Style as GridStyle, TerminalGrid,
     TerminalGridStream,
@@ -30,7 +27,7 @@ use super::tool_present::{
 };
 use super::transcript::{TranscriptItem, TranscriptItemKind, plugin_view_payload_summary_text};
 use super::transcript_layout::TranscriptLayoutSignature;
-use crate::time_format::{format_elapsed_millis, format_millis};
+use crate::time_format::format_elapsed_millis;
 use bmux_tui::text_width::{display_width as text_display_width, truncate_to_display_width};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -668,46 +665,6 @@ fn push_transcript_item_rows(
                 width,
             );
         }
-        TranscriptItemKind::FileChangePresentation {
-            tool_name,
-            summary,
-            path,
-            is_error,
-            ..
-        } => {
-            push_file_change_presentation_rows(
-                rows,
-                tool_name,
-                summary,
-                path.as_deref(),
-                *is_error,
-                width,
-            );
-        }
-        TranscriptItemKind::ToolPresentationCard {
-            tool_name, card, ..
-        } => {
-            push_tool_presentation_card_rows(rows, tool_name.as_deref(), card, width, ());
-        }
-        TranscriptItemKind::ToolNativePresentation {
-            producer_plugin_id,
-            kind,
-            payload,
-            ..
-        } => {
-            if let Some(native_rows) = plugin_host
-                .and_then(|host| host.tui_registry(producer_plugin_id))
-                .and_then(|registry| registry.visual_rows(kind, payload, width))
-            {
-                rows.extend(native_rows);
-            } else {
-                push_detail_block(rows, "Tool", item.text(), Color::BrightBlack, width);
-            }
-            rows.push(Line::default());
-        }
-        TranscriptItemKind::ToolProtocolPresentation { .. } => {
-            push_protocol_presentation_placeholder_rows(rows, item, width);
-        }
         TranscriptItemKind::TerminalOutput { .. } => {
             push_terminal_transcript_item_rows(rows, item, width);
         }
@@ -787,146 +744,6 @@ fn push_interactive_protocol_placeholder_rows(
         ]));
     }
     rows.push(Line::default());
-}
-
-fn push_tool_presentation_card_rows(
-    rows: &mut Vec<Line>,
-    tool_name: Option<&str>,
-    card: &ToolCardPresentation,
-    width: u16,
-    _inline_view_config: (),
-) {
-    let color = presentation_level_color(card_level(card));
-    let heading = tool_name.map_or_else(
-        || card.title.clone(),
-        |tool_name| format!("{} · {}", card.title, tool_name),
-    );
-    push_wrapped_styled_text(
-        rows,
-        Vec::new(),
-        &heading,
-        width,
-        Style::new().fg(color),
-        Style::new().fg(color),
-    );
-    if let Some(subtitle) = &card.subtitle {
-        push_wrapped_styled_text(
-            rows,
-            vec![Span::styled("  ", muted_style())],
-            subtitle,
-            width,
-            muted_style(),
-            muted_style(),
-        );
-    }
-    for section in &card.sections {
-        match section {
-            ToolPresentationSection::Fields { fields } => {
-                for field in fields {
-                    push_kv_row(
-                        rows,
-                        &field.label,
-                        &format_presentation_field_value(&field.value, field.kind),
-                        width,
-                    );
-                }
-            }
-            ToolPresentationSection::Text { label, text } => {
-                if let Some(label) = label {
-                    push_wrapped_styled_text(
-                        rows,
-                        vec![Span::styled("  ", muted_style())],
-                        label,
-                        width,
-                        Style::new().fg(color),
-                        Style::new().fg(color),
-                    );
-                }
-                push_wrapped_styled_text(
-                    rows,
-                    vec![Span::styled("  ", muted_style())],
-                    text,
-                    width,
-                    Style::new(),
-                    Style::new(),
-                );
-            }
-            ToolPresentationSection::Terminal {
-                output,
-                columns,
-                rows: terminal_rows,
-            } => {
-                push_terminal_tool_result_rows(
-                    rows,
-                    TerminalToolRenderContext {
-                        tool_call_id: "presentation",
-                        tool_name,
-                        output,
-                        columns: *columns,
-                        rows: *terminal_rows,
-                        started_at_ms: None,
-                        finished_at_ms: None,
-                        exit_code: None,
-                        timed_out: None,
-                        is_error: card_level(card) == ToolPresentationLevel::Error,
-                        streaming: false,
-                    },
-                    width,
-                );
-            }
-        }
-    }
-    rows.push(Line::default());
-}
-
-fn card_level(card: &ToolCardPresentation) -> ToolPresentationLevel {
-    if card.title.to_ascii_lowercase().contains("failed") {
-        ToolPresentationLevel::Error
-    } else if card.target == bcode_session_models::ToolPresentationTarget::Result {
-        ToolPresentationLevel::Success
-    } else {
-        ToolPresentationLevel::Info
-    }
-}
-
-const fn presentation_level_color(level: ToolPresentationLevel) -> Color {
-    match level {
-        ToolPresentationLevel::Info => Color::Cyan,
-        ToolPresentationLevel::Success => Color::Green,
-        ToolPresentationLevel::Warning => Color::Yellow,
-        ToolPresentationLevel::Error => Color::Red,
-    }
-}
-
-fn push_file_change_presentation_rows(
-    rows: &mut Vec<Line>,
-    tool_name: &str,
-    summary: &str,
-    path: Option<&str>,
-    is_error: bool,
-    width: u16,
-) {
-    let title = if is_error {
-        "File change failed"
-    } else {
-        "File changed"
-    };
-    let color = if is_error { Color::Red } else { Color::Green };
-    push_wrapped_styled_text(
-        rows,
-        vec![Span::styled(
-            format!("{title} · "),
-            Style::new().fg(color).add_modifier(Modifier::BOLD),
-        )],
-        tool_name,
-        width,
-        muted_style(),
-        muted_style(),
-    );
-    if let Some(path) = path {
-        push_kv_row(rows, "path", path, width);
-    }
-    push_kv_row(rows, "result", summary, width);
 }
 
 fn push_assistant_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) {
@@ -1313,37 +1130,6 @@ fn push_query_preview_rows(
     rows.push(Line::default());
 }
 
-fn push_protocol_presentation_placeholder_rows(
-    rows: &mut Vec<Line>,
-    item: &TranscriptItem,
-    width: u16,
-) {
-    push_wrapped_styled_text(
-        rows,
-        Vec::new(),
-        "Tool result",
-        width,
-        Style::new().fg(Color::Green),
-        Style::new().fg(Color::Green),
-    );
-    let surface_width = width.saturating_sub(2);
-    let height = match item.kind() {
-        TranscriptItemKind::ToolProtocolPresentation { tree_json, .. } => {
-            super::protocol_surface::measure_tree_json_height(tree_json, surface_width)
-        }
-        _ => 1,
-    };
-    for index in 0..height {
-        let marker = if index == 0 { "┌" } else { "│" };
-        rows.push(Line::from_spans(vec![
-            Span::styled(marker, muted_style()),
-            Span::styled(" ", muted_style()),
-            Span::styled(" ".repeat(usize::from(surface_width)), Style::new()),
-        ]));
-    }
-    rows.push(Line::default());
-}
-
 fn push_terminal_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) {
     let TranscriptItemKind::TerminalOutput {
         tool_call_id,
@@ -1568,19 +1354,6 @@ fn push_tool_request_presentation_rows(
     for field in &presentation.fields {
         push_kv_row(rows, &field.label, &field.value, width);
     }
-}
-
-fn format_presentation_field_value(value: &str, kind: ToolPresentationFieldKind) -> String {
-    if kind == ToolPresentationFieldKind::DurationMs
-        && let Some(ms) = parse_duration_millis(value)
-    {
-        return format_millis(ms);
-    }
-    value.to_owned()
-}
-
-fn parse_duration_millis(value: &str) -> Option<u64> {
-    value.trim().parse::<u64>().ok()
 }
 
 fn push_labeled_text_preview(

@@ -13046,20 +13046,12 @@ async fn execute_model_tool(
     cancel_state: Arc<TurnCancelState>,
     command_context: &mut RuntimeCommandContext<'_>,
 ) {
-    let request_presentation = find_tool_provider(state, &call.name)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|(_, definition)| definition.ui.request_presentation)
-        .as_ref()
-        .map(service_request_presentation_to_session);
     append_tool_request_event(
         state,
         session_id,
         call.id.clone(),
         call.name.clone(),
         serde_json::to_string(&call.arguments).unwrap_or_default(),
-        request_presentation,
     )
     .await;
     if cancel_state.is_cancelled() {
@@ -13636,6 +13628,9 @@ async fn append_tool_stream_event(
             .sessions
             .publish_live_event(session_id, SessionLiveEventKind::ToolOutputDelta { event })
             .await;
+        return;
+    }
+    if matches!(event, ToolInvocationStreamEvent::Presentation { .. }) {
         return;
     }
 
@@ -14323,11 +14318,7 @@ async fn request_tool_permission(
             tool_call_id: call.id.clone(),
             tool_name: definition.name.clone(),
             arguments_json: arguments_json.clone(),
-            request_presentation: definition
-                .ui
-                .request_presentation
-                .as_ref()
-                .map(service_request_presentation_to_session),
+            request_presentation: None,
             policy_source: policy_context.source.clone(),
             policy_reason: policy_context.reason.clone(),
         },
@@ -14859,20 +14850,13 @@ async fn append_tool_request_event(
     tool_call_id: String,
     tool_name: String,
     arguments_json: String,
-    request_presentation: Option<ToolRequestPresentationMetadata>,
 ) {
     let runtime_work_id = RuntimeWorkId::new(format!("tool_{tool_call_id}"));
     let runtime_label = tool_name.clone();
     let runtime_tool_call_id = tool_call_id.clone();
     match state
         .sessions
-        .append_tool_call_requested(
-            session_id,
-            tool_call_id,
-            tool_name,
-            arguments_json,
-            request_presentation,
-        )
+        .append_tool_call_requested(session_id, tool_call_id, tool_name, arguments_json, None)
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,
@@ -18275,6 +18259,146 @@ mod tests {
                 event: ToolInvocationStreamEvent::OutputDelta { .. }
             }
         )));
+    }
+
+    #[tokio::test]
+    async fn tool_stream_presentation_events_are_not_persisted() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("test".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        let state = test_server_state(sessions);
+
+        append_tool_stream_event(
+            &state,
+            session_id,
+            ToolInvocationStreamEvent::Presentation {
+                tool_call_id: "call-1".to_owned(),
+                sequence: 1,
+                presentation: ToolPresentationEvent::Card(ToolCardPresentation {
+                    target: ToolPresentationTarget::Result,
+                    title: "legacy card".to_owned(),
+                    subtitle: None,
+                    sections: Vec::new(),
+                }),
+            },
+        )
+        .await;
+
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        assert!(!history.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Presentation { .. }
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn tool_call_request_events_do_not_persist_request_presentation() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("test".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        let state = test_server_state(sessions);
+
+        append_tool_request_event(
+            &state,
+            session_id,
+            "call-1".to_owned(),
+            "example.tool".to_owned(),
+            "{}".to_owned(),
+        )
+        .await;
+
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        let request_presentation = history.iter().find_map(|event| {
+            if let SessionEventKind::ToolCallRequested {
+                request_presentation,
+                ..
+            } = &event.kind
+            {
+                Some(request_presentation)
+            } else {
+                None
+            }
+        });
+        assert_eq!(request_presentation, Some(&None));
+    }
+
+    #[tokio::test]
+    async fn permission_request_events_do_not_persist_request_presentation() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("test".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        let state = test_server_state(sessions);
+        let cancel_state = TurnCancelState::default();
+        cancel_state.cancel();
+        let definition = ServiceToolDefinition {
+            name: "example.tool".to_owned(),
+            description: "example".to_owned(),
+            input_schema: serde_json::json!({"type": "object"}),
+            side_effect: bcode_tool::ToolSideEffect::ReadOnly,
+            requires_permission: true,
+            policy: bcode_tool::ToolPolicyMetadata::default(),
+            ui: bcode_tool::ToolUiMetadata {
+                request_presentation: Some(bcode_tool::ToolRequestPresentationMetadata {
+                    title: "legacy request".to_owned(),
+                    fields: Vec::new(),
+                    preview: None,
+                }),
+                ..bcode_tool::ToolUiMetadata::default()
+            },
+        };
+        let call = bcode_model::ToolCall {
+            id: "call-1".to_owned(),
+            name: definition.name.clone(),
+            arguments: serde_json::json!({}),
+        };
+
+        let approved = request_tool_permission(
+            &state,
+            session_id,
+            &call,
+            &definition,
+            &cancel_state,
+            PermissionPolicyContext::default(),
+        )
+        .await;
+
+        assert!(!approved);
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        let request_presentation = history.iter().find_map(|event| {
+            if let SessionEventKind::PermissionRequested {
+                request_presentation,
+                ..
+            } = &event.kind
+            {
+                Some(request_presentation)
+            } else {
+                None
+            }
+        });
+        assert_eq!(request_presentation, Some(&None));
     }
 
     #[tokio::test]

@@ -14,13 +14,12 @@ use bcode_session_models::{
     ClientId, LiveFileEditPreview, LiveShellCommandPreview, LiveToolArgumentPreview, RuntimeWorkId,
     RuntimeWorkKind, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
     SessionProjectionKind, SessionSummary, SessionTitleSource, SessionTokenUsage,
-    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ShellRunResult,
+    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ShellRunResult, ToolArtifact,
     ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream, ToolPluginViewMetadata,
     ToolPluginViewPresentation, ToolPresentationEvent, ToolPresentationField,
-    ToolPresentationFieldKind, ToolPresentationFieldValue, ToolPresentationLevel,
-    ToolPresentationPayloadSelector, ToolPresentationSection, ToolPresentationTarget,
-    ToolProgressPresentation, ToolRequestPresentationMetadata, ToolRequestPreviewMetadata,
-    ToolStatusPresentation,
+    ToolPresentationFieldKind, ToolPresentationLevel, ToolPresentationPayloadSelector,
+    ToolPresentationSection, ToolPresentationTarget, ToolRequestPresentationMetadata,
+    ToolRequestPreviewMetadata, ToolStatusPresentation,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::TextMotion;
@@ -3364,11 +3363,8 @@ fn file_change_artifact_history_uses_request_preview_when_present() {
         TranscriptItemKind::ToolRequest { tool_call_id, .. } if tool_call_id == "call-file"
     )));
     assert!(!transcript.iter().any(|item| {
-        matches!(
-            item.kind(),
-            TranscriptItemKind::FileChangePresentation { .. }
-        ) || (matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
-            && item.text().contains("duplicate write result"))
+        matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
+            && item.text().contains("duplicate write result")
     }));
 }
 
@@ -4153,7 +4149,7 @@ fn legacy_terminal_result_renders_plain_tool_result() {
 }
 
 #[test]
-fn presentation_events_replay_as_generic_transcript_cards() {
+fn presentation_events_replay_ignores_legacy_presentation_events() {
     let session_id = SessionId::new();
     let events = vec![
         event(
@@ -4181,96 +4177,23 @@ fn presentation_events_replay_as_generic_transcript_cards() {
                 },
             },
         ),
-        event(
-            session_id,
-            3,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Presentation {
-                    tool_call_id: "call-present".to_owned(),
-                    sequence: 2,
-                    presentation: ToolPresentationEvent::Progress(ToolProgressPresentation {
-                        target: ToolPresentationTarget::Result,
-                        text: "custom progress".to_owned(),
-                        percent: Some(80),
-                        level: ToolPresentationLevel::Info,
-                    }),
-                },
-            },
-        ),
-    ];
-
-    let transcript = transcript_items_from_events_with_reasoning(&events, true);
-    let cards = transcript
-        .iter()
-        .filter_map(|item| match item.kind() {
-            TranscriptItemKind::ToolPresentationCard { card, .. } => Some(card),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-
-    assert_eq!(cards.len(), 1);
-    assert_eq!(cards[0].title, "custom progress");
-    assert_eq!(cards[0].subtitle.as_deref(), Some("80%"));
-}
-
-#[test]
-fn presentation_card_preserves_tool_request_surface() {
-    let session_id = SessionId::new();
-    let events = vec![
-        event(
-            session_id,
-            1,
-            SessionEventKind::ToolCallRequested {
-                tool_call_id: "call-present".to_owned(),
-                tool_name: "third.party".to_owned(),
-                arguments_json: serde_json::json!({"raw": "arguments"}).to_string(),
-                request_presentation: None,
-            },
-        ),
-        event(
-            session_id,
-            2,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Presentation {
-                    tool_call_id: "call-present".to_owned(),
-                    sequence: 1,
-                    presentation: ToolPresentationEvent::Card(
-                        bcode_session_models::ToolCardPresentation {
-                            target: ToolPresentationTarget::Preview,
-                            title: "Plugin preview".to_owned(),
-                            subtitle: None,
-                            sections: vec![ToolPresentationSection::Text {
-                                label: None,
-                                text: "plugin-owned preview".to_owned(),
-                            }],
-                        },
-                    ),
-                },
-            },
-        ),
     ];
 
     let transcript = transcript_items_from_events_with_reasoning(&events, true);
 
     assert!(transcript.iter().any(|item| matches!(
         item.kind(),
-        TranscriptItemKind::ToolPresentationCard { card, .. }
-            if card.title == "Plugin preview"
+        TranscriptItemKind::ToolRequest { tool_call_id, .. } if tool_call_id == "call-present"
     )));
     assert!(
-        transcript
+        !transcript
             .iter()
-            .any(|item| matches!(item.kind(), TranscriptItemKind::ToolRequest { .. }))
-    );
-    assert!(
-        transcript
-            .iter()
-            .any(|item| item.text().contains("arguments"))
+            .any(|item| item.text().contains("custom status"))
     );
 }
 
 #[test]
-fn result_presentation_replaces_preview_card_and_suppresses_generic_tool_result() {
+fn legacy_presentation_card_does_not_replace_tool_request_surface() {
     let session_id = SessionId::new();
     let events = vec![
         event(
@@ -4301,22 +4224,53 @@ fn result_presentation_replaces_preview_card_and_suppresses_generic_tool_result(
                 },
             },
         ),
+    ];
+
+    let transcript = transcript_items_from_events_with_reasoning(&events, true);
+
+    assert!(transcript.iter().any(|item| matches!(
+        item.kind(),
+        TranscriptItemKind::ToolRequest { tool_call_id, .. } if tool_call_id == "call-present"
+    )));
+    assert!(
+        transcript
+            .iter()
+            .any(|item| item.text().contains("arguments"))
+    );
+    assert!(
+        !transcript
+            .iter()
+            .any(|item| item.text().contains("Plugin preview"))
+    );
+}
+
+#[test]
+fn legacy_result_presentation_does_not_suppress_generic_tool_result() {
+    let session_id = SessionId::new();
+    let events = vec![
         event(
             session_id,
-            3,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-present".to_owned(),
+                tool_name: "third.party".to_owned(),
+                arguments_json: serde_json::json!({"raw": "arguments"}).to_string(),
+                request_presentation: None,
+            },
+        ),
+        event(
+            session_id,
+            2,
             SessionEventKind::ToolInvocationStream {
                 event: ToolInvocationStreamEvent::Presentation {
                     tool_call_id: "call-present".to_owned(),
-                    sequence: 2,
+                    sequence: 1,
                     presentation: ToolPresentationEvent::Card(
                         bcode_session_models::ToolCardPresentation {
                             target: ToolPresentationTarget::Result,
                             title: "Plugin result".to_owned(),
                             subtitle: None,
-                            sections: vec![ToolPresentationSection::Text {
-                                label: None,
-                                text: "plugin-owned result".to_owned(),
-                            }],
+                            sections: Vec::new(),
                         },
                     ),
                 },
@@ -4324,10 +4278,10 @@ fn result_presentation_replaces_preview_card_and_suppresses_generic_tool_result(
         ),
         event(
             session_id,
-            4,
+            3,
             SessionEventKind::ToolCallFinished {
                 tool_call_id: "call-present".to_owned(),
-                result: "legacy raw output".to_owned(),
+                result: "raw result".to_owned(),
                 is_error: false,
                 output: None,
                 semantic_result: None,
@@ -4337,33 +4291,15 @@ fn result_presentation_replaces_preview_card_and_suppresses_generic_tool_result(
 
     let transcript = transcript_items_from_events_with_reasoning(&events, true);
 
-    assert_eq!(
-        transcript
+    assert!(
+        !transcript
             .iter()
-            .filter(|item| matches!(item.kind(), TranscriptItemKind::ToolPresentationCard { .. }))
-            .count(),
-        1
+            .any(|item| item.text().contains("Plugin result"))
     );
     assert!(transcript.iter().any(|item| matches!(
         item.kind(),
-        TranscriptItemKind::ToolPresentationCard { card, .. }
-            if card.title == "Plugin result"
+        TranscriptItemKind::ToolResult { result, .. } if result == "raw result"
     )));
-    assert!(
-        transcript
-            .iter()
-            .any(|item| matches!(item.kind(), TranscriptItemKind::ToolRequest { .. }))
-    );
-    assert!(
-        !transcript
-            .iter()
-            .any(|item| matches!(item.kind(), TranscriptItemKind::ToolResult { .. }))
-    );
-    assert!(
-        !transcript
-            .iter()
-            .any(|item| item.text().contains("legacy raw output"))
-    );
 }
 
 #[test]
@@ -4405,82 +4341,58 @@ fn presentation_clear_removes_replayed_transcript_card() {
     assert!(
         !transcript
             .iter()
-            .any(|item| matches!(item.kind(), TranscriptItemKind::ToolPresentationCard { .. }))
+            .any(|item| item.text().contains("custom status"))
     );
 }
 
 #[test]
-fn presentation_card_sections_render_for_custom_tool_without_name_special_case() {
+fn legacy_live_presentation_card_is_ignored_by_normal_transcript() {
     let session_id = SessionId::new();
-    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
-    app.absorb_session_event(&event(
-        session_id,
-        1,
-        SessionEventKind::ToolCallRequested {
-            tool_call_id: "call-present".to_owned(),
-            tool_name: "third.party".to_owned(),
-            arguments_json: "{}".to_owned(),
-            request_presentation: None,
-        },
-    ));
-    app.absorb_session_event(&event(
-        session_id,
-        2,
-        SessionEventKind::ToolInvocationStream {
-            event: ToolInvocationStreamEvent::Presentation {
+    let events = vec![
+        event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
                 tool_call_id: "call-present".to_owned(),
-                sequence: 1,
-                presentation: ToolPresentationEvent::Card(
-                    bcode_session_models::ToolCardPresentation {
-                        target: ToolPresentationTarget::Result,
-                        title: "Custom result".to_owned(),
-                        subtitle: Some("plugin-owned".to_owned()),
-                        sections: vec![
-                            ToolPresentationSection::Text {
+                tool_name: "third.party".to_owned(),
+                arguments_json: serde_json::json!({"raw": "arguments"}).to_string(),
+                request_presentation: None,
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Presentation {
+                    tool_call_id: "call-present".to_owned(),
+                    sequence: 1,
+                    presentation: ToolPresentationEvent::Card(
+                        bcode_session_models::ToolCardPresentation {
+                            target: ToolPresentationTarget::Result,
+                            title: "Custom result".to_owned(),
+                            subtitle: Some("plugin-owned".to_owned()),
+                            sections: vec![ToolPresentationSection::Text {
                                 label: Some("Summary".to_owned()),
                                 text: "Rendered from plugin presentation".to_owned(),
-                            },
-                            ToolPresentationSection::Fields {
-                                fields: vec![
-                                    ToolPresentationFieldValue {
-                                        label: "Answer".to_owned(),
-                                        value: "42".to_owned(),
-                                        kind: ToolPresentationFieldKind::Text,
-                                    },
-                                    ToolPresentationFieldValue {
-                                        label: "Timeout".to_owned(),
-                                        value: "300000".to_owned(),
-                                        kind: ToolPresentationFieldKind::DurationMs,
-                                    },
-                                    ToolPresentationFieldValue {
-                                        label: "Malformed timeout".to_owned(),
-                                        value: "300000 ms".to_owned(),
-                                        kind: ToolPresentationFieldKind::DurationMs,
-                                    },
-                                ],
-                            },
-                        ],
-                    },
-                ),
+                            }],
+                        },
+                    ),
+                },
             },
-        },
-    ));
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 24));
-    let mut frame = Frame::new(&mut buffer);
+        ),
+    ];
 
-    render::render(&mut app, &mut frame);
-    let output = rendered_text(&buffer);
+    let transcript = transcript_items_from_events_with_reasoning(&events, true);
 
-    assert!(output.contains("Custom result · third.party"), "{output}");
-    assert!(output.contains("plugin-owned"), "{output}");
-    assert!(output.contains("Summary"), "{output}");
+    assert!(transcript.iter().any(|item| matches!(
+        item.kind(),
+        TranscriptItemKind::ToolRequest { tool_call_id, .. } if tool_call_id == "call-present"
+    )));
     assert!(
-        output.contains("Rendered from plugin presentation"),
-        "{output}"
+        !transcript
+            .iter()
+            .any(|item| item.text().contains("Custom result"))
     );
-    assert!(output.contains("Answer: 42"), "{output}");
-    assert!(output.contains("Timeout: 5m"), "{output}");
-    assert!(output.contains("Malformed timeout: 300000 ms"), "{output}");
 }
 
 #[test]
@@ -4831,6 +4743,47 @@ fn legacy_serialized_semantic_artifact_result_does_not_render_raw_json() {
     assert!(!item.text().contains("metadata"));
 }
 
+#[test]
+fn generic_artifact_fallback_projection_is_repeatable_and_non_mutating() {
+    let session_id = SessionId::new();
+    let events = vec![event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call-artifact".to_owned(),
+            result: "fallback".to_owned(),
+            is_error: false,
+            output: None,
+            semantic_result: Some(ToolInvocationResult::Artifact {
+                artifact: Box::new(bcode_session_models::ToolArtifact {
+                    artifact_id: "artifact-1".to_owned(),
+                    producer_plugin_id: "test.plugin".to_owned(),
+                    schema: "test.schema".to_owned(),
+                    schema_version: 1,
+                    tool_call_id: Some("call-artifact".to_owned()),
+                    title: Some("Test artifact".to_owned()),
+                    metadata: serde_json::json!({"path": "/tmp/example.txt"}),
+                    refs: Vec::new(),
+                }),
+            }),
+        },
+    )];
+    let original_events = events.clone();
+
+    let first = transcript_items_from_events_with_reasoning(&events, true);
+    let second = transcript_items_from_events_with_reasoning(&events, true);
+
+    assert_eq!(events, original_events);
+    assert_eq!(first.len(), second.len());
+    assert_eq!(first[0].text(), second[0].text());
+    assert_eq!(first[0].kind(), second[0].kind());
+    assert!(first.iter().any(|item| matches!(
+        item.kind(),
+        TranscriptItemKind::ToolResult { result, .. }
+            if result.contains("Test artifact") && result.contains("test.schema")
+    )));
+}
+
 fn shell_result_artifact(result: &ShellRunResult) -> ToolInvocationResult {
     ToolInvocationResult::Artifact {
         artifact: Box::new(bcode_session_models::ToolArtifact {
@@ -5098,120 +5051,76 @@ fn thinking_dialog_does_not_cycle_when_reasoning_is_unsupported() {
 }
 
 #[test]
-fn plugin_view_result_presentation_absorbs_as_summary_not_raw_json() {
+fn plugin_view_result_presentation_is_ignored_in_normal_live_path() {
     let session_id = SessionId::new();
-    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-    app.absorb_session_event(&event(
+    let events = vec![event(
         session_id,
         1,
-        SessionEventKind::ToolCallRequested {
-            tool_call_id: "call-write".to_owned(),
-            tool_name: "filesystem.write".to_owned(),
-            arguments_json: r#"{"path":"file.txt","contents":"hi"}"#.to_owned(),
-            request_presentation: None,
-        },
-    ));
-    app.absorb_session_event(&event(
-        session_id,
-        2,
         SessionEventKind::ToolInvocationStream {
             event: ToolInvocationStreamEvent::Presentation {
-                tool_call_id: "call-write".to_owned(),
+                tool_call_id: "call-view".to_owned(),
                 sequence: 1,
                 presentation: ToolPresentationEvent::PluginView(ToolPluginViewPresentation {
                     target: ToolPresentationTarget::Result,
-                    producer_plugin_id: "bcode.filesystem".to_owned(),
-                    schema: "bcode.filesystem.file_change".to_owned(),
+                    producer_plugin_id: "plugin".to_owned(),
+                    schema: "legacy.view".to_owned(),
                     schema_version: 1,
-                    title: Some("Applied file change".to_owned()),
-                    subtitle: Some("wrote 45 bytes".to_owned()),
-                    payload: serde_json::json!({
-                        "path": "/tmp/main.rs",
-                        "old_text": "",
-                        "new_text": "fn main() {\n    println!(\"Hello, world!\");\n}\n"
-                    }),
+                    title: Some("Legacy view".to_owned()),
+                    subtitle: None,
+                    payload: serde_json::json!({"raw": true}),
                 }),
             },
         },
-    ));
+    )];
+    let transcript = transcript_items_from_events_with_reasoning(&events, true);
 
-    let item = app
-        .transcript()
-        .iter()
-        .find(|item| matches!(item.kind(), TranscriptItemKind::ToolPresentationCard { .. }))
-        .expect("plugin view should become a card fallback");
-    assert!(item.text().contains("Applied file change"));
-    if let TranscriptItemKind::ToolPresentationCard { card, .. } = item.kind() {
-        let text = match &card.sections[0] {
-            ToolPresentationSection::Text { text, .. } => text,
-            other => panic!("unexpected section: {other:?}"),
-        };
-        assert!(text.contains("/tmp/main.rs"));
-        assert!(text.contains("+fn main()"));
-        assert!(!text.contains("old_text"));
-        assert!(!text.contains("new_text"));
-    }
+    assert!(
+        !transcript
+            .iter()
+            .any(|item| item.text().contains("Legacy view"))
+    );
 }
 
 #[test]
-fn replayed_plugin_view_result_suppresses_artifact_json_fallback() {
+fn replayed_plugin_view_result_does_not_suppress_artifact_json_fallback() {
     let session_id = SessionId::new();
     let events = vec![
         event(
             session_id,
             1,
-            SessionEventKind::ToolCallRequested {
-                tool_call_id: "call-write".to_owned(),
-                tool_name: "filesystem.write".to_owned(),
-                arguments_json: r#"{"path":"file.txt","contents":"hi"}"#.to_owned(),
-                request_presentation: None,
-            },
-        ),
-        event(
-            session_id,
-            2,
             SessionEventKind::ToolInvocationStream {
                 event: ToolInvocationStreamEvent::Presentation {
-                    tool_call_id: "call-write".to_owned(),
+                    tool_call_id: "call-view".to_owned(),
                     sequence: 1,
                     presentation: ToolPresentationEvent::PluginView(ToolPluginViewPresentation {
                         target: ToolPresentationTarget::Result,
-                        producer_plugin_id: "bcode.filesystem".to_owned(),
-                        schema: "bcode.filesystem.file_change".to_owned(),
+                        producer_plugin_id: "plugin".to_owned(),
+                        schema: "legacy.view".to_owned(),
                         schema_version: 1,
-                        title: Some("Applied file change".to_owned()),
-                        subtitle: Some("wrote 45 bytes".to_owned()),
-                        payload: serde_json::json!({
-                            "path": "/tmp/main.rs",
-                            "old_text": "",
-                            "new_text": "fn main() {\n    println!(\"Hello, world!\");\n}\n"
-                        }),
+                        title: Some("Legacy view".to_owned()),
+                        subtitle: None,
+                        payload: serde_json::json!({"raw": true}),
                     }),
                 },
             },
         ),
         event(
             session_id,
-            3,
+            2,
             SessionEventKind::ToolCallFinished {
-                tool_call_id: "call-write".to_owned(),
-                result: "wrote 45 bytes".to_owned(),
+                tool_call_id: "call-view".to_owned(),
+                result: "fallback".to_owned(),
                 is_error: false,
                 output: None,
                 semantic_result: Some(ToolInvocationResult::Artifact {
-                    artifact: Box::new(bcode_session_models::ToolArtifact {
-                        artifact_id: "call-write-filesystem-change".to_owned(),
-                        producer_plugin_id: "bcode.filesystem".to_owned(),
+                    artifact: Box::new(ToolArtifact {
+                        artifact_id: "artifact-1".to_owned(),
+                        producer_plugin_id: "filesystem".to_owned(),
                         schema: "bcode.filesystem.change".to_owned(),
                         schema_version: 1,
-                        tool_call_id: Some("call-write".to_owned()),
-                        title: Some("File change".to_owned()),
-                        metadata: serde_json::json!({
-                            "summary": "wrote 45 bytes",
-                            "path": "/tmp/main.rs",
-                            "old_text": "",
-                            "new_text": "fn main() {\n    println!(\"Hello, world!\");\n}\n"
-                        }),
+                        tool_call_id: Some("call-view".to_owned()),
+                        title: Some("Applied file change".to_owned()),
+                        metadata: serde_json::json!({"path": "/tmp/main.rs"}),
                         refs: Vec::new(),
                     }),
                 }),
@@ -5220,28 +5129,16 @@ fn replayed_plugin_view_result_suppresses_artifact_json_fallback() {
     ];
 
     let transcript = transcript_items_from_events_with_reasoning(&events, true);
-    let item = transcript
-        .iter()
-        .find(|item| matches!(item.kind(), TranscriptItemKind::ToolPresentationCard { .. }))
-        .expect("replayed plugin view should produce a card");
-    assert!(item.text().contains("Applied file change"));
-    if let TranscriptItemKind::ToolPresentationCard { card, .. } = item.kind() {
-        let text = match &card.sections[0] {
-            ToolPresentationSection::Text { text, .. } => text,
-            other => panic!("unexpected section: {other:?}"),
-        };
-        assert!(text.contains("/tmp/main.rs"));
-        assert!(text.contains("+fn main()"));
-        assert!(!text.contains("old_text"));
-        assert!(!text.contains("new_text"));
-    }
-    assert_eq!(
-        transcript
+
+    assert!(
+        !transcript
             .iter()
-            .filter(|item| matches!(item.kind(), TranscriptItemKind::ToolResult { .. }))
-            .count(),
-        0
+            .any(|item| item.text().contains("Legacy view"))
     );
+    assert!(transcript.iter().any(|item| matches!(
+        item.kind(),
+        TranscriptItemKind::ToolResult { result, .. } if result.contains("bcode.filesystem.change")
+    )));
 }
 
 #[test]

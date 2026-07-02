@@ -1,11 +1,10 @@
 //! Transcript item projection for the TUI.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use bcode_session_models::{
-    SessionEvent, SessionEventKind, SessionTokenUsage, ToolArtifact, ToolCardPresentation,
-    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream, ToolPresentationEvent,
-    ToolPresentationSection, ToolPresentationTarget, ToolRequestPresentationMetadata,
+    SessionEvent, SessionEventKind, SessionTokenUsage, ToolArtifact, ToolInvocationResult,
+    ToolInvocationStreamEvent, ToolOutputStream, ToolRequestPresentationMetadata,
 };
 use serde_json::Value;
 
@@ -50,55 +49,6 @@ pub enum TranscriptItemKind {
         result: String,
         /// Whether the tool failed.
         is_error: bool,
-    },
-    /// Durable filesystem write/edit presentation.
-    #[allow(dead_code)]
-    FileChangePresentation {
-        /// Provider tool call identifier.
-        tool_call_id: String,
-        /// Tool name that produced the change.
-        tool_name: String,
-        /// Human-readable result summary.
-        summary: String,
-        /// Best-effort target path.
-        path: Option<String>,
-        /// Whether the tool failed.
-        is_error: bool,
-    },
-    /// Plugin-owned generic tool presentation card.
-    ToolPresentationCard {
-        /// Provider tool call identifier.
-        tool_call_id: String,
-        /// Tool name, when known.
-        tool_name: Option<String>,
-        /// Structured plugin-owned card.
-        card: ToolCardPresentation,
-    },
-    /// Plugin-owned native TUI presentation.
-    ToolNativePresentation {
-        /// Provider tool call identifier.
-        tool_call_id: String,
-        /// Tool name, when known.
-        tool_name: Option<String>,
-        /// Producer plugin identifier.
-        producer_plugin_id: String,
-        /// View/schema kind.
-        kind: String,
-        /// Plugin-owned payload.
-        payload: serde_json::Value,
-    },
-    /// Plugin-owned generic protocol presentation.
-    ToolProtocolPresentation {
-        /// Provider tool call identifier.
-        tool_call_id: String,
-        /// Tool name, when known.
-        tool_name: Option<String>,
-        /// Protocol surface kind.
-        surface_kind: String,
-        /// Serialized component tree.
-        tree_json: String,
-        /// Serialized component runtime state.
-        state_json: Option<String>,
     },
     /// Live or replayed terminal output from a tool.
     TerminalOutput {
@@ -204,8 +154,6 @@ pub enum ToolTranscriptSurface {
     StreamOutput,
     /// Generic or semantic tool result.
     Result,
-    /// Plugin/domain-owned presentation surface.
-    Presentation,
     /// Permission or interactive tool request/resolution flow.
     Interaction,
 }
@@ -224,14 +172,8 @@ pub const fn tool_surface_for_item(item: &TranscriptItem) -> Option<(&str, ToolT
         TranscriptItemKind::TerminalOutput { tool_call_id, .. } => {
             Some((tool_call_id.as_str(), ToolTranscriptSurface::StreamOutput))
         }
-        TranscriptItemKind::ToolResult { tool_call_id, .. }
-        | TranscriptItemKind::FileChangePresentation { tool_call_id, .. } => {
+        TranscriptItemKind::ToolResult { tool_call_id, .. } => {
             Some((tool_call_id.as_str(), ToolTranscriptSurface::Result))
-        }
-        TranscriptItemKind::ToolPresentationCard { tool_call_id, .. }
-        | TranscriptItemKind::ToolNativePresentation { tool_call_id, .. }
-        | TranscriptItemKind::ToolProtocolPresentation { tool_call_id, .. } => {
-            Some((tool_call_id.as_str(), ToolTranscriptSurface::Presentation))
         }
         TranscriptItemKind::InteractiveToolRequest { tool_call_id, .. }
         | TranscriptItemKind::InteractiveToolResolution { tool_call_id, .. }
@@ -261,15 +203,6 @@ pub fn item_is_tool_surface_for_tool_call(
     tool_surface_for_item(item).is_some_and(|(item_tool_call_id, surface)| {
         item_tool_call_id == tool_call_id && surfaces.contains(&surface)
     })
-}
-
-/// Remove selected tool lifecycle surfaces from a projected transcript item list.
-pub fn remove_tool_surfaces_for_tool_call(
-    items: &mut Vec<TranscriptItem>,
-    tool_call_id: &str,
-    surfaces: &[ToolTranscriptSurface],
-) {
-    items.retain(|item| !item_is_tool_surface_for_tool_call(item, tool_call_id, surfaces));
 }
 
 /// Stable identity for a rendered transcript item.
@@ -448,48 +381,6 @@ impl TranscriptItem {
         self.bump_revision();
     }
 
-    /// Replace a generic tool presentation card.
-    pub fn set_tool_presentation_card(&mut self, card: ToolCardPresentation) {
-        if let TranscriptItemKind::ToolPresentationCard {
-            card: existing_card,
-            ..
-        } = &mut self.kind
-        {
-            self.text.clone_from(&card.title);
-            *existing_card = card;
-            self.bump_revision();
-        }
-    }
-
-    /// Return whether this item is a generic presentation card for `tool_call_id` and `target`.
-    #[must_use]
-    pub fn is_tool_presentation_card_for(
-        &self,
-        tool_call_id: &str,
-        target: ToolPresentationTarget,
-    ) -> bool {
-        matches!(
-            &self.kind,
-            TranscriptItemKind::ToolPresentationCard {
-                tool_call_id: item_tool_call_id,
-                card,
-                ..
-            } if item_tool_call_id == tool_call_id && card.target == target
-        )
-    }
-
-    /// Return whether this item is a native plugin presentation for `tool_call_id`.
-    #[must_use]
-    pub fn is_tool_native_presentation_for(&self, tool_call_id: &str) -> bool {
-        matches!(
-            &self.kind,
-            TranscriptItemKind::ToolNativePresentation {
-                tool_call_id: item_tool_call_id,
-                ..
-            } if item_tool_call_id == tool_call_id
-        )
-    }
-
     /// Return whether this item is a live preview anchor for `tool_call_id`.
     #[must_use]
     pub fn is_live_preview_anchor_for(&self, tool_call_id: &str) -> bool {
@@ -542,7 +433,6 @@ struct TranscriptProjector {
     items: Vec<TranscriptItem>,
     tool_calls: BTreeMap<String, ToolCallContext>,
     streamed_tool_results: BTreeMap<String, StreamedToolReplayContext>,
-    presented_tool_results: BTreeSet<String>,
     include_reasoning: bool,
 }
 
@@ -552,7 +442,6 @@ impl TranscriptProjector {
             items: Vec::new(),
             tool_calls: BTreeMap::new(),
             streamed_tool_results: BTreeMap::new(),
-            presented_tool_results: BTreeSet::new(),
             include_reasoning,
         }
     }
@@ -562,7 +451,6 @@ impl TranscriptProjector {
             &mut self.items,
             &mut self.tool_calls,
             &mut self.streamed_tool_results,
-            &mut self.presented_tool_results,
             self.include_reasoning,
             event,
         );
@@ -624,117 +512,6 @@ pub fn live_tool_preview_anchor_item(tool_call_id: &str, tool_name: &str) -> Tra
         TranscriptItemKind::LiveToolPreviewAnchor {
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.to_owned(),
-        },
-    )
-}
-
-/// Convert a plugin-owned presentation event into a replayable transcript card.
-#[must_use]
-pub fn tool_presentation_card_from_event(
-    presentation: &ToolPresentationEvent,
-) -> Option<ToolCardPresentation> {
-    match presentation {
-        ToolPresentationEvent::Card(card) => Some(card.clone()),
-        ToolPresentationEvent::Status(status)
-            if status.target != ToolPresentationTarget::Activity =>
-        {
-            Some(ToolCardPresentation {
-                target: status.target,
-                title: status.text.clone(),
-                subtitle: None,
-                sections: Vec::new(),
-            })
-        }
-        ToolPresentationEvent::Progress(progress)
-            if progress.target != ToolPresentationTarget::Activity =>
-        {
-            Some(ToolCardPresentation {
-                target: progress.target,
-                title: progress.text.clone(),
-                subtitle: progress.percent.map(|percent| format!("{percent}%")),
-                sections: Vec::new(),
-            })
-        }
-        ToolPresentationEvent::PluginView(view) => Some(ToolCardPresentation {
-            target: view.target,
-            title: view.title.clone().unwrap_or_else(|| view.schema.clone()),
-            subtitle: view.subtitle.clone(),
-            sections: vec![ToolPresentationSection::Text {
-                label: None,
-                text: plugin_view_payload_summary_text(&view.payload),
-            }],
-        }),
-        ToolPresentationEvent::Status(_)
-        | ToolPresentationEvent::Progress(_)
-        | ToolPresentationEvent::Clear { .. } => None,
-    }
-}
-
-/// Build a generic plugin-owned tool presentation card item.
-#[must_use]
-pub fn tool_presentation_card_item(
-    tool_call_id: &str,
-    tool_name: Option<&str>,
-    card: ToolCardPresentation,
-) -> TranscriptItem {
-    TranscriptItem::with_kind(
-        "Tool",
-        card.title.clone(),
-        card.target == ToolPresentationTarget::Preview,
-        TranscriptItemKind::ToolPresentationCard {
-            tool_call_id: tool_call_id.to_owned(),
-            tool_name: tool_name.map(ToOwned::to_owned),
-            card,
-        },
-    )
-}
-
-/// Build a plugin-owned native TUI row presentation item.
-#[must_use]
-pub fn tool_native_presentation_item(
-    tool_call_id: &str,
-    tool_name: Option<&str>,
-    title: &str,
-    preview: bool,
-    producer_plugin_id: &str,
-    kind: &str,
-    payload: serde_json::Value,
-) -> TranscriptItem {
-    TranscriptItem::with_kind(
-        "Tool",
-        title.to_owned(),
-        preview,
-        TranscriptItemKind::ToolNativePresentation {
-            tool_call_id: tool_call_id.to_owned(),
-            tool_name: tool_name.map(ToOwned::to_owned),
-            producer_plugin_id: producer_plugin_id.to_owned(),
-            kind: kind.to_owned(),
-            payload,
-        },
-    )
-}
-
-/// Build a durable file-change presentation item.
-#[must_use]
-#[allow(dead_code)]
-pub fn file_change_presentation_item(
-    tool_call_id: &str,
-    tool_name: &str,
-    summary: &str,
-    path: Option<&str>,
-    is_error: bool,
-) -> TranscriptItem {
-    let text = path.map_or_else(|| summary.to_owned(), |path| format!("{summary}: {path}"));
-    TranscriptItem::with_kind(
-        if is_error { "Tool error" } else { "Tool" },
-        text,
-        false,
-        TranscriptItemKind::FileChangePresentation {
-            tool_call_id: tool_call_id.to_owned(),
-            tool_name: tool_name.to_owned(),
-            summary: summary.to_owned(),
-            path: path.map(ToOwned::to_owned),
-            is_error,
         },
     )
 }
@@ -972,7 +749,6 @@ fn push_transcript_item_from_event(
     items: &mut Vec<TranscriptItem>,
     tool_calls: &mut BTreeMap<String, ToolCallContext>,
     streamed_tool_results: &mut BTreeMap<String, StreamedToolReplayContext>,
-    presented_tool_results: &mut BTreeSet<String>,
     include_reasoning: bool,
     event: &SessionEvent,
 ) {
@@ -999,10 +775,9 @@ fn push_transcript_item_from_event(
             ..
         } => {
             if let Some(semantic_result) = semantic_result {
-                if presented_tool_results.contains(tool_call_id)
-                    || streamed_tool_results
-                        .get(tool_call_id)
-                        .is_some_and(|replay| replay.saw_output)
+                if streamed_tool_results
+                    .get(tool_call_id)
+                    .is_some_and(|replay| replay.saw_output)
                 {
                     return;
                 }
@@ -1013,7 +788,6 @@ fn push_transcript_item_from_event(
                     *is_error,
                 );
                 items.push(item);
-                presented_tool_results.insert(tool_call_id.clone());
                 return;
             }
             let should_render_final =
@@ -1028,7 +802,6 @@ fn push_transcript_item_from_event(
                     true
                 };
             if should_render_final
-                && !presented_tool_results.contains(tool_call_id)
                 && let Some(item) = non_streaming_transcript_item_from_event(
                     event,
                     tool_calls,
@@ -1039,13 +812,7 @@ fn push_transcript_item_from_event(
             }
         }
         SessionEventKind::ToolInvocationStream { event } => {
-            apply_tool_invocation_stream_event(
-                items,
-                tool_calls,
-                streamed_tool_results,
-                presented_tool_results,
-                event,
-            );
+            apply_tool_invocation_stream_event(items, tool_calls, streamed_tool_results, event);
         }
         _ => {
             if let Some(item) =
@@ -1424,7 +1191,6 @@ fn apply_tool_invocation_stream_event(
     items: &mut Vec<TranscriptItem>,
     tool_calls: &BTreeMap<String, ToolCallContext>,
     streamed_tool_results: &mut BTreeMap<String, StreamedToolReplayContext>,
-    presented_tool_results: &mut BTreeSet<String>,
     event: &ToolInvocationStreamEvent,
 ) {
     match event {
@@ -1501,68 +1267,7 @@ fn apply_tool_invocation_stream_event(
                 replay.finished_at_ms = *finished_at_ms;
             }
         }
-        ToolInvocationStreamEvent::Presentation {
-            tool_call_id,
-            presentation,
-            ..
-        } => apply_tool_presentation_replay_event(
-            items,
-            tool_calls,
-            presented_tool_results,
-            tool_call_id,
-            presentation,
-        ),
         _ => {}
-    }
-}
-
-fn apply_tool_presentation_replay_event(
-    items: &mut Vec<TranscriptItem>,
-    tool_calls: &BTreeMap<String, ToolCallContext>,
-    presented_tool_results: &mut BTreeSet<String>,
-    tool_call_id: &str,
-    presentation: &ToolPresentationEvent,
-) {
-    match presentation {
-        ToolPresentationEvent::Clear { target } => {
-            if *target == ToolPresentationTarget::Result {
-                presented_tool_results.remove(tool_call_id);
-            }
-            items.retain(|item| !item.is_tool_presentation_card_for(tool_call_id, *target));
-        }
-        _ => {
-            if let Some(card) = tool_presentation_card_from_event(presentation) {
-                if card.target == ToolPresentationTarget::Result {
-                    presented_tool_results.insert(tool_call_id.to_owned());
-                }
-                let tool_name = tool_calls
-                    .get(tool_call_id)
-                    .map(|context| context.tool_name.as_str());
-                if card.target == ToolPresentationTarget::Result {
-                    remove_tool_surfaces_for_tool_call(
-                        items,
-                        tool_call_id,
-                        &[
-                            ToolTranscriptSurface::Result,
-                            ToolTranscriptSurface::Presentation,
-                        ],
-                    );
-                } else {
-                    items.retain(|item| {
-                        !item.is_tool_presentation_card_for(tool_call_id, card.target)
-                    });
-                }
-                if let Some(existing) = items
-                    .iter_mut()
-                    .rev()
-                    .find(|item| item.is_tool_presentation_card_for(tool_call_id, card.target))
-                {
-                    existing.set_tool_presentation_card(card);
-                } else {
-                    items.push(tool_presentation_card_item(tool_call_id, tool_name, card));
-                }
-            }
-        }
     }
 }
 

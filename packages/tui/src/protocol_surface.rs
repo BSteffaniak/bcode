@@ -6,7 +6,6 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui_component_protocol::event::{ComponentEvent, ComponentEventKind};
 use bmux_tui_component_protocol::model::ComponentTree;
-use bmux_tui_component_protocol::state::ComponentRuntimeState;
 use bmux_tui_components::protocol::{
     ProtocolBindings, ProtocolRuntime, ProtocolTree, bmux_component_bindings,
 };
@@ -67,38 +66,6 @@ impl ProtocolSurfaceState {
             event,
         );
         resolution_from_events(&events, &self.runtime).or_else(|| escape_resolution(event))
-    }
-}
-
-/// Read-only rendering state for a plugin-owned protocol presentation.
-pub struct ResolvedProtocolSurface {
-    tree: ComponentTree,
-    runtime: ProtocolRuntime,
-    bindings: ProtocolBindings,
-}
-
-impl ResolvedProtocolSurface {
-    /// Create a read-only presentation from serialized plugin-owned tree/state.
-    #[must_use]
-    pub fn from_tree_json(tree_json: &str, state_json: Option<&str>) -> Option<Self> {
-        let tree = serde_json::from_str::<ComponentTree>(tree_json).ok()?;
-        let state = state_json
-            .and_then(|state| serde_json::from_str::<ComponentRuntimeState>(state).ok())
-            .unwrap_or_default();
-        Some(Self {
-            tree,
-            runtime: ProtocolRuntime::from_state(state),
-            bindings: bmux_component_bindings(),
-        })
-    }
-
-    /// Render the resolved protocol tree.
-    pub fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
-        ProtocolTree::new(&self.tree, &self.bindings).render_runtime(
-            area,
-            &mut self.runtime,
-            frame,
-        );
     }
 }
 
