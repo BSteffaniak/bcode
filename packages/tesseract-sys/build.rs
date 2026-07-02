@@ -42,6 +42,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BCODE_LEPTONICA_INCLUDE_DIR");
     println!("cargo:rerun-if-env-changed=BCODE_TESSDATA_PREFIX");
     println!("cargo:rerun-if-env-changed=BCODE_TESSERACT_ARTIFACT_CACHE");
+    println!("cargo:rerun-if-env-changed=BCODE_TESSERACT_SOURCE_CACHE");
     println!("cargo:rerun-if-env-changed=BCODE_TESSERACT_OFFLINE");
     emit_tessdata_prefix_override();
 
@@ -493,10 +494,14 @@ fn dynamic_libraries(lib_dir: &Path, name: &str) -> Vec<PathBuf> {
 }
 
 fn patch_runtime_libraries(runtime_lib: &Path) {
-    if !cfg!(target_os = "macos") {
-        return;
+    if cfg!(target_os = "macos") {
+        patch_macos_runtime_libraries(runtime_lib);
+    } else if cfg!(target_os = "linux") {
+        validate_linux_runtime_libraries(runtime_lib);
     }
+}
 
+fn patch_macos_runtime_libraries(runtime_lib: &Path) {
     let tesseract = runtime_lib.join(dynamic_library_name("tesseract"));
     let leptonica = runtime_lib.join(dynamic_library_name("leptonica"));
     patch_id(&tesseract, "@loader_path/libtesseract.dylib");
@@ -511,31 +516,93 @@ fn patch_runtime_libraries(runtime_lib: &Path) {
     }
     patch_add_rpath(&tesseract, "@loader_path");
     patch_add_rpath(&leptonica, "@loader_path");
+    verify_otool_contains(&tesseract, "@loader_path/libleptonica.dylib");
 }
 
 fn patch_id(library: &Path, id: &str) {
-    let _ = Command::new("install_name_tool")
-        .arg("-id")
-        .arg(id)
-        .arg(library)
-        .status();
+    run_install_name_tool(library, &["-id", id]);
 }
 
 fn patch_change(library: &Path, old: &str, new: &str) {
-    let _ = Command::new("install_name_tool")
-        .arg("-change")
-        .arg(old)
-        .arg(new)
-        .arg(library)
-        .status();
+    run_install_name_tool(library, &["-change", old, new]);
 }
 
 fn patch_add_rpath(library: &Path, rpath: &str) {
-    let _ = Command::new("install_name_tool")
-        .arg("-add_rpath")
-        .arg(rpath)
+    if otool_contains(library, rpath) {
+        return;
+    }
+    run_install_name_tool(library, &["-add_rpath", rpath]);
+}
+
+fn run_install_name_tool(library: &Path, args: &[&str]) {
+    let status = Command::new("install_name_tool")
+        .args(args)
         .arg(library)
-        .status();
+        .status()
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to run install_name_tool on {}: {error}",
+                library.display()
+            )
+        });
+    if !status.success() {
+        panic!(
+            "install_name_tool failed with {status} for {} args {:?}",
+            library.display(),
+            args
+        );
+    }
+}
+
+fn verify_otool_contains(library: &Path, needle: &str) {
+    if !otool_contains(library, needle) {
+        let output = Command::new("otool")
+            .arg("-L")
+            .arg(library)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("failed to run otool on {}: {error}", library.display())
+            });
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        panic!(
+            "{} does not reference {needle}; otool output:\n{stdout}",
+            library.display()
+        );
+    }
+}
+
+fn otool_contains(library: &Path, needle: &str) -> bool {
+    let output = Command::new("otool")
+        .arg("-l")
+        .arg(library)
+        .output()
+        .or_else(|_| Command::new("otool").arg("-L").arg(library).output())
+        .unwrap_or_else(|error| panic!("failed to run otool on {}: {error}", library.display()));
+    if !output.status.success() {
+        panic!("otool failed for {}", library.display());
+    }
+    String::from_utf8_lossy(&output.stdout).contains(needle)
+}
+
+fn validate_linux_runtime_libraries(runtime_lib: &Path) {
+    for library in dynamic_libraries(runtime_lib, "") {
+        if let Some(output) = command_stdout("readelf", &["-d", &library.display().to_string()])
+            && !output.contains("$ORIGIN")
+        {
+            eprintln!(
+                "warning: {} does not report a $ORIGIN RUNPATH/RPATH; dependent loading may require LD_LIBRARY_PATH",
+                library.display()
+            );
+        }
+    }
+}
+
+fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn dynamic_library_name(name: &str) -> String {
@@ -574,6 +641,12 @@ fn download_and_extract(
         return extracted;
     }
 
+    let source_cache = source_cache_dir().join(expected_sha256);
+    if source_cache.join("CMakeLists.txt").is_file() {
+        copy_dir_all(&source_cache, &extracted).expect("failed to copy cached source directory");
+        return extracted;
+    }
+
     let bytes = download_verified(url, expected_sha256);
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("failed to open source zip");
     let tmp_dir = target_dir.join(format!("{name}.tmp"));
@@ -592,6 +665,12 @@ fn download_and_extract(
     fs::rename(&root, &extracted)
         .or_else(|_| copy_dir_all(&root, &extracted))
         .expect("failed to install extracted source directory");
+    if let Err(error) = copy_dir_all(&extracted, &source_cache) {
+        eprintln!(
+            "warning: failed to populate source cache {}: {error}",
+            source_cache.display()
+        );
+    }
     if tmp_dir.exists() {
         fs::remove_dir_all(&tmp_dir).expect("failed to clean source tmp directory");
     }
@@ -811,18 +890,34 @@ fn artifact_cache_dir() -> PathBuf {
     if let Some(path) = env::var_os("BCODE_TESSERACT_ARTIFACT_CACHE") {
         return PathBuf::from(path);
     }
+    cache_root().join("tesseract-artifacts")
+}
+
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
+fn source_cache_dir() -> PathBuf {
+    if let Some(path) = env::var_os("BCODE_TESSERACT_SOURCE_CACHE") {
+        return PathBuf::from(path);
+    }
+    cache_root().join("tesseract-sources")
+}
+
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
+fn cache_root() -> PathBuf {
     if let Some(path) = env::var_os("XDG_CACHE_HOME") {
-        return PathBuf::from(path)
-            .join("bcode")
-            .join("tesseract-artifacts");
+        return PathBuf::from(path).join("bcode");
     }
     if let Some(home) = env::var_os("HOME") {
-        return PathBuf::from(home)
-            .join(".cache")
-            .join("bcode")
-            .join("tesseract-artifacts");
+        return PathBuf::from(home).join(".cache").join("bcode");
     }
-    out_dir().join("artifact-cache")
+    out_dir().join("cache")
 }
 
 #[cfg(any(
