@@ -14,7 +14,7 @@ use bcode_model::{
     MessageRole, ModelCapability, ModelInfo, ModelList, ModelListRequest, ModelMessage,
     ModelMetadataSource, ModelPricingInfo, ModelPricingSource, ModelPricingUnit,
     ModelReasoningCapabilitySource, ModelTokenPrice, ModelTurnRequest, NativeWebSearchRequest,
-    NativeWebSearchResponse, NativeWebSearchResult, OP_CANCEL_TURN, OP_CAPABILITIES,
+    NativeWebSearchResponse, NativeWebSearchResult, OP_AUTH_USAGE, OP_CANCEL_TURN, OP_CAPABILITIES,
     OP_FINISH_TURN, OP_MODELS, OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS, OP_START_TURN,
     OP_VALIDATE_CONFIG, OP_VERIFY_MODEL, PollTurnEventsRequest, PollTurnEventsResponse,
     ProviderAuthCandidate, ProviderCapabilities, ProviderCapability, ProviderError,
@@ -213,6 +213,7 @@ impl OpenAiCompatibleProviderPlugin {
             OP_MODELS => self.models_response(&context.request),
             OP_VALIDATE_CONFIG => json_response(&self.validate_config()),
             OP_VERIFY_MODEL => self.verify_model(&context.request),
+            OP_AUTH_USAGE => self.auth_usage(&context.request),
             OP_NATIVE_WEB_SEARCH => self.native_web_search(&context.request),
             OP_START_TURN => self.start_turn(&context.request),
             OP_POLL_TURN_EVENTS => self.poll_turn_events(&context.request),
@@ -238,6 +239,21 @@ impl OpenAiCompatibleProviderPlugin {
             Ok(runtime) => match runtime.block_on(verify_model_inner(request)) {
                 Ok(Ok(response)) => json_response(&response),
                 Ok(Err(error)) => json_response(&verify_response_from_provider_error(&error)),
+                Err(error) => ServiceResponse::error("runtime_error", error.to_string()),
+            },
+            Err(error) => ServiceResponse::error("runtime_error", error),
+        }
+    }
+
+    fn auth_usage(&self, request: &ServiceRequest) -> ServiceResponse {
+        let request = match request.payload_json::<bcode_model::AuthUsageRequest>() {
+            Ok(request) => request,
+            Err(error) => return invalid_request(&error),
+        };
+        match &self.runtime {
+            Ok(runtime) => match runtime.block_on(auth_usage_inner(request)) {
+                Ok(Ok(response)) => json_response(&response),
+                Ok(Err(error)) => ServiceResponse::error(error.code, error.message),
                 Err(error) => ServiceResponse::error("runtime_error", error.to_string()),
             },
             Err(error) => ServiceResponse::error("runtime_error", error),
@@ -1041,6 +1057,193 @@ fn append_text_with_space(buffer: &mut String, text: &str) {
     buffer.push_str(text.trim());
 }
 
+#[derive(Debug, Deserialize)]
+struct CodexUsagePayload {
+    #[serde(default)]
+    rate_limit: Option<CodexRateLimitStatusDetails>,
+    #[serde(default)]
+    additional_rate_limits: Option<Vec<CodexAdditionalRateLimitDetails>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexAdditionalRateLimitDetails {
+    #[serde(default)]
+    limit_id: Option<String>,
+    #[serde(default)]
+    limit_name: Option<String>,
+    #[serde(default)]
+    rate_limit: Option<CodexRateLimitStatusDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexRateLimitStatusDetails {
+    #[serde(default)]
+    primary_window: Option<CodexRateLimitWindowSnapshot>,
+    #[serde(default)]
+    secondary_window: Option<CodexRateLimitWindowSnapshot>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexRateLimitWindowSnapshot {
+    used_percent: i32,
+    #[serde(default)]
+    limit_window_seconds: Option<i64>,
+    #[serde(default)]
+    reset_at: Option<i64>,
+}
+
+async fn auth_usage_inner(
+    request: bcode_model::AuthUsageRequest,
+) -> Result<bcode_model::AuthUsageResponse, ProviderError> {
+    let mut settings = settings_for_context(&request.provider_context);
+    refresh_chatgpt_auth_if_needed(&mut settings).await?;
+    if !settings.dialect.uses_codex_request_shape() {
+        return Ok(bcode_model::AuthUsageResponse {
+            supported: false,
+            degraded_reason: Some(
+                "provider usage windows are currently implemented for ChatGPT Codex auth only"
+                    .to_string(),
+            ),
+            meters: Vec::new(),
+        });
+    }
+    let AuthSettings::ChatGpt { access_token, .. } = &settings.auth else {
+        return Ok(bcode_model::AuthUsageResponse {
+            supported: false,
+            degraded_reason: Some("ChatGPT auth is required for Codex usage windows".to_string()),
+            meters: Vec::new(),
+        });
+    };
+    let client = Client::new();
+    let url = codex_usage_endpoint(&settings);
+    let response = client
+        .get(&url)
+        .bearer_auth(access_token)
+        .header("originator", "bcode")
+        .header("User-Agent", "bcode/0.0.1")
+        .send()
+        .await
+        .map_err(|error| {
+            provider_error(
+                "auth_usage_request_failed",
+                if error.is_timeout() {
+                    ProviderErrorCategory::Timeout
+                } else {
+                    ProviderErrorCategory::Network
+                },
+                error.to_string(),
+            )
+        })?;
+    let status = response.status();
+    let body = response.text().await.map_err(|error| {
+        provider_error(
+            "auth_usage_response_read_failed",
+            ProviderErrorCategory::Network,
+            error.to_string(),
+        )
+    })?;
+    if !status.is_success() {
+        return Err(error_from_status(status.as_u16(), &body));
+    }
+    let payload = serde_json::from_str::<CodexUsagePayload>(&body).map_err(|error| {
+        provider_error(
+            "auth_usage_response_decode_failed",
+            ProviderErrorCategory::ProviderInternal,
+            error.to_string(),
+        )
+    })?;
+    let meters = codex_usage_meters(&payload, unix_timestamp());
+    Ok(bcode_model::AuthUsageResponse {
+        supported: true,
+        degraded_reason: meters
+            .is_empty()
+            .then(|| "Codex usage endpoint returned no usage windows".to_string()),
+        meters,
+    })
+}
+
+fn codex_usage_endpoint(settings: &Settings) -> String {
+    let trimmed = settings.base_url.trim_end_matches('/');
+    if trimmed.ends_with("/backend-api") || trimmed.ends_with("/backend-api/") {
+        format!("{trimmed}/wham/usage")
+    } else if trimmed.ends_with("/backend-api/codex") {
+        format!("{trimmed}/usage")
+    } else {
+        "https://chatgpt.com/backend-api/codex/usage".to_string()
+    }
+}
+
+fn codex_usage_meters(
+    payload: &CodexUsagePayload,
+    observed_at_unix: u64,
+) -> Vec<bcode_model::AuthUsageMeterSnapshot> {
+    let mut meters = Vec::new();
+    if let Some(rate_limit) = &payload.rate_limit {
+        meters.push(codex_usage_meter(
+            "codex".to_string(),
+            None,
+            rate_limit,
+            observed_at_unix,
+        ));
+    }
+    for additional in payload
+        .additional_rate_limits
+        .as_deref()
+        .unwrap_or_default()
+    {
+        if let Some(rate_limit) = &additional.rate_limit {
+            meters.push(codex_usage_meter(
+                additional
+                    .limit_id
+                    .clone()
+                    .unwrap_or_else(|| "codex".to_string()),
+                additional.limit_name.clone(),
+                rate_limit,
+                observed_at_unix,
+            ));
+        }
+    }
+    meters
+        .into_iter()
+        .filter(|meter| !meter.windows.is_empty())
+        .collect()
+}
+
+fn codex_usage_meter(
+    meter_id: String,
+    meter_name: Option<String>,
+    rate_limit: &CodexRateLimitStatusDetails,
+    observed_at_unix: u64,
+) -> bcode_model::AuthUsageMeterSnapshot {
+    let windows = [
+        ("primary", rate_limit.primary_window.as_ref()),
+        ("secondary", rate_limit.secondary_window.as_ref()),
+    ]
+    .into_iter()
+    .filter_map(|(window_id, window)| {
+        window.map(|window| bcode_model::AuthUsageWindowSnapshot {
+            window_id: window_id.to_string(),
+            window_duration_secs: window
+                .limit_window_seconds
+                .and_then(|seconds| u64::try_from(seconds).ok()),
+            resets_at_unix: window
+                .reset_at
+                .and_then(|reset_at| u64::try_from(reset_at).ok()),
+            used_percent: u32::try_from(window.used_percent).ok(),
+            used_amount: None,
+            limit_amount: None,
+            observed_at_unix,
+            source: Some("openai_codex_usage_api".to_string()),
+        })
+    })
+    .collect();
+    bcode_model::AuthUsageMeterSnapshot {
+        meter_id,
+        meter_name,
+        windows,
+    }
+}
+
 async fn stream_chat_completion(request: &ModelTurnRequest, turn: &TurnState) {
     match stream_chat_completion_with_failover(request, turn).await {
         Ok(StreamOutcome::Finished) => turn.push(ProviderTurnEvent::TurnFinished {
@@ -1156,7 +1359,17 @@ fn record_selected_auth_profile_success(request: &ModelTurnRequest) {
         .auth_pool_selection_reason
         .as_deref()
     {
-        Some("priming") => auth_pool_state::mark_profile_primed(pool, Some(profile)),
+        Some("priming") => {
+            auth_pool_state::mark_profile_primed(pool, Some(profile));
+            auth_pool_state::mark_profile_usage_windows_primed(
+                pool,
+                Some(profile),
+                &request
+                    .provider_context
+                    .auth_pool_routing
+                    .priming_required_windows,
+            );
+        }
         _ => auth_pool_state::mark_profile_success(pool, Some(profile)),
     }
 }
@@ -1328,6 +1541,14 @@ fn record_auth_candidate_success(
     match reason {
         CandidateSelectionReason::Priming => {
             auth_pool_state::mark_profile_primed(pool, Some(profile));
+            auth_pool_state::mark_profile_usage_windows_primed(
+                pool,
+                Some(profile),
+                &request
+                    .provider_context
+                    .auth_pool_routing
+                    .priming_required_windows,
+            );
         }
         CandidateSelectionReason::Strategy => {
             auth_pool_state::mark_profile_success(pool, Some(profile));
@@ -1474,10 +1695,19 @@ fn priming_candidate<'a>(
     let reprime_after = routing
         .priming_reprime_after
         .as_deref()
+        .or(routing.priming_fallback_reprime_after.as_deref())
         .and_then(parse_duration);
     available_candidates.iter().copied().find(|candidate| {
         if !routing.priming_include_primary && candidate.profile.as_deref() == primary {
             return false;
+        }
+        if routing.priming_provider_windows {
+            return auth_pool_state::profile_needs_priming_with_windows(
+                request.provider_context.auth_pool.as_deref(),
+                candidate.profile.as_deref(),
+                &routing.priming_required_windows,
+                reprime_after,
+            );
         }
         auth_pool_state::profile_needs_priming(
             request.provider_context.auth_pool.as_deref(),

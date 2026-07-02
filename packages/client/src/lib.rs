@@ -315,6 +315,9 @@ fn selected_auth_pool_routing(
         priming_enabled: pool.priming.enabled,
         priming_include_primary: pool.priming.include_primary,
         priming_reprime_after: pool.priming.reprime_after.clone(),
+        priming_provider_windows: pool.priming.provider_windows,
+        priming_fallback_reprime_after: pool.priming.fallback_reprime_after.clone(),
+        priming_required_windows: pool.priming.required_windows.clone(),
     }
 }
 

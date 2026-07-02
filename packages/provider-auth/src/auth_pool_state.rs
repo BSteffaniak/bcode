@@ -1,7 +1,7 @@
 //! Shared auth-pool runtime state.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -49,6 +49,35 @@ pub struct AuthPoolProfileState {
     /// Last priming success timestamp.
     #[serde(default)]
     pub primed_unix: Option<u64>,
+    /// Provider-confirmed usage windows keyed by meter id, then window id.
+    #[serde(default)]
+    pub usage_windows: BTreeMap<String, BTreeMap<String, AuthPoolUsageWindowState>>,
+}
+
+/// Provider-confirmed usage window state for one profile.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthPoolUsageWindowState {
+    /// Provider meter id.
+    #[serde(default)]
+    pub meter_id: String,
+    /// Provider window id within the meter.
+    #[serde(default)]
+    pub window_id: String,
+    /// Provider reset timestamp in Unix seconds when known.
+    #[serde(default)]
+    pub resets_at_unix: Option<u64>,
+    /// Provider-rounded usage percentage when known.
+    #[serde(default)]
+    pub used_percent: Option<u32>,
+    /// Local observation timestamp in Unix seconds.
+    #[serde(default)]
+    pub observed_at_unix: u64,
+    /// Last successful Bcode priming/use timestamp for this provider window.
+    #[serde(default)]
+    pub primed_at_unix: Option<u64>,
+    /// Provider/source identifier for this observation.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// Whether an auth profile is outside local cooldown.
@@ -155,6 +184,28 @@ pub fn mark_profile_primed(pool: Option<&str>, profile: Option<&str>) {
     });
 }
 
+/// Whether a profile needs priming according to provider usage windows or fallback interval.
+#[must_use]
+pub fn profile_needs_priming_with_windows(
+    pool: Option<&str>,
+    profile: Option<&str>,
+    required_windows: &BTreeMap<String, Vec<String>>,
+    fallback_reprime_after: Option<Duration>,
+) -> bool {
+    let Some(key) = state_key(pool, profile) else {
+        return false;
+    };
+    with_state(|state| {
+        profile_needs_priming_with_windows_in_state(
+            state,
+            &key,
+            required_windows,
+            fallback_reprime_after,
+            now_unix(),
+        )
+    })
+}
+
 /// Whether a profile needs priming according to optional reprime interval.
 #[must_use]
 pub fn profile_needs_priming(
@@ -166,6 +217,73 @@ pub fn profile_needs_priming(
         return false;
     };
     with_state(|state| profile_needs_priming_in_state(state, &key, reprime_after, now_unix()))
+}
+
+/// Record provider-confirmed usage windows for a profile.
+pub fn record_profile_usage_windows(
+    pool: Option<&str>,
+    profile: Option<&str>,
+    meters: &[bcode_model::AuthUsageMeterSnapshot],
+) {
+    let Some(key) = state_key(pool, profile) else {
+        return;
+    };
+    mutate_state(|state| {
+        let entry = state.entries.entry(key).or_default();
+        for meter in meters {
+            let windows = entry
+                .usage_windows
+                .entry(meter.meter_id.clone())
+                .or_default();
+            for window in &meter.windows {
+                windows.insert(
+                    window.window_id.clone(),
+                    AuthPoolUsageWindowState {
+                        meter_id: meter.meter_id.clone(),
+                        window_id: window.window_id.clone(),
+                        resets_at_unix: window.resets_at_unix,
+                        used_percent: window.used_percent,
+                        observed_at_unix: window.observed_at_unix,
+                        primed_at_unix: None,
+                        source: window.source.clone(),
+                    },
+                );
+            }
+        }
+    });
+}
+
+/// Record that a successful request should count as touching current provider usage windows.
+pub fn mark_profile_usage_windows_primed(
+    pool: Option<&str>,
+    profile: Option<&str>,
+    required_windows: &BTreeMap<String, Vec<String>>,
+) {
+    let Some(key) = state_key(pool, profile) else {
+        return;
+    };
+    mutate_state(|state| {
+        let now = now_unix();
+        let entry = state.entries.entry(key).or_default();
+        entry.last_success_unix = Some(now);
+        entry.primed_unix = Some(now);
+        let targets = usage_window_targets(entry, required_windows);
+        for (meter_id, window_id) in targets {
+            let window = entry
+                .usage_windows
+                .entry(meter_id.clone())
+                .or_default()
+                .entry(window_id.clone())
+                .or_insert_with(|| AuthPoolUsageWindowState {
+                    meter_id: meter_id.clone(),
+                    window_id: window_id.clone(),
+                    observed_at_unix: now,
+                    ..AuthPoolUsageWindowState::default()
+                });
+            window.primed_at_unix = Some(now);
+            window.observed_at_unix = window.observed_at_unix.max(now);
+        }
+    });
 }
 
 /// Return last selected profile for a pool.
@@ -262,6 +380,71 @@ pub(crate) fn profile_needs_priming_in_state(
         return true;
     };
     reprime_after.is_some_and(|duration| now.saturating_sub(primed_unix) >= duration.as_secs())
+}
+
+pub(crate) fn profile_needs_priming_with_windows_in_state(
+    state: &AuthPoolState,
+    key: &str,
+    required_windows: &BTreeMap<String, Vec<String>>,
+    fallback_reprime_after: Option<Duration>,
+    now: u64,
+) -> bool {
+    let Some(entry) = state.entries.get(key) else {
+        return true;
+    };
+    let targets = usage_window_targets(entry, required_windows);
+    if targets.is_empty() {
+        return profile_needs_priming_in_state(state, key, fallback_reprime_after, now);
+    }
+    targets
+        .iter()
+        .any(|(meter_id, window_id)| usage_window_needs_priming(entry, meter_id, window_id, now))
+}
+
+fn usage_window_needs_priming(
+    entry: &AuthPoolProfileState,
+    meter_id: &str,
+    window_id: &str,
+    now: u64,
+) -> bool {
+    let Some(window) = entry
+        .usage_windows
+        .get(meter_id)
+        .and_then(|windows| windows.get(window_id))
+    else {
+        return true;
+    };
+    if window
+        .resets_at_unix
+        .is_some_and(|resets_at| resets_at <= now)
+    {
+        return true;
+    }
+    if window.used_percent.is_some_and(|percent| percent > 0) {
+        return false;
+    }
+    window.primed_at_unix.is_none()
+}
+
+fn usage_window_targets(
+    entry: &AuthPoolProfileState,
+    required_windows: &BTreeMap<String, Vec<String>>,
+) -> BTreeSet<(String, String)> {
+    let mut targets = BTreeSet::new();
+    for (meter_id, windows) in required_windows {
+        for window_id in windows {
+            targets.insert((meter_id.clone(), window_id.clone()));
+        }
+    }
+    if !targets.is_empty() {
+        return targets;
+    }
+    for (meter_id, windows) in &entry.usage_windows {
+        for window_id in windows.keys() {
+            targets.insert((meter_id.clone(), window_id.clone()));
+        }
+    }
+    targets
 }
 
 pub(crate) fn mark_pool_selected_in_state(state: &mut AuthPoolState, pool: &str, profile: &str) {

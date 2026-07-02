@@ -32,9 +32,9 @@ use bcode_model::{
     CancelTurnRequest, ContentBlock, FinishTurnRequest, ImageMetadata as ModelImageMetadata,
     ImageRefContent, MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelList, ModelMessage,
     ModelParameters, ModelTurnRequest, NativeWebSearchRequest, NativeWebSearchResponse,
-    OP_CANCEL_TURN, OP_FINISH_TURN, OP_MODELS, OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS,
-    OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse, ProviderTurnEvent,
-    ReasoningEffort, StartTurnResponse, TokenUsage,
+    OP_AUTH_USAGE, OP_CANCEL_TURN, OP_FINISH_TURN, OP_MODELS, OP_NATIVE_WEB_SEARCH,
+    OP_POLL_TURN_EVENTS, OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse,
+    ProviderTurnEvent, ReasoningEffort, StartTurnResponse, TokenUsage,
 };
 use bcode_plugin::{PluginInvocationScope, StreamingServiceInvocationEvent};
 use bcode_session::{CatalogLoadStatus, SessionManager, lease::SessionLeaseOwnerContext};
@@ -12024,7 +12024,7 @@ async fn build_model_turn_request(
         parameters_timer.elapsed_ms(),
     );
     let mut provider_context = selection.provider_context.clone();
-    select_host_auth_pool_candidate(&mut provider_context);
+    select_host_auth_pool_candidate(state, provider_plugin_id, &mut provider_context).await;
     let projection_timer = state.metrics.timer();
     let projection = ConversationProjection::new(&ConversationProjectionInput {
         session_id,
@@ -12082,10 +12082,15 @@ async fn build_model_turn_request(
     Ok(request)
 }
 
-fn select_host_auth_pool_candidate(context: &mut bcode_model::ProviderRequestContext) {
+async fn select_host_auth_pool_candidate(
+    state: &ServerState,
+    provider_plugin_id: Option<&str>,
+    context: &mut bcode_model::ProviderRequestContext,
+) {
     if context.auth_candidates.is_empty() {
         return;
     }
+    refresh_auth_usage_windows_for_priming(state, provider_plugin_id, context).await;
     let Some(selection) = bcode_provider_auth::auth_pool_routing::select_auth_pool_candidate(
         &bcode_provider_auth::auth_pool_routing::AuthPoolSelectionInput {
             pool: context.auth_pool.as_deref(),
@@ -12113,6 +12118,91 @@ fn select_host_auth_pool_candidate(context: &mut bcode_model::ProviderRequestCon
         }
         .to_string(),
     );
+}
+
+async fn refresh_auth_usage_windows_for_priming(
+    state: &ServerState,
+    provider_plugin_id: Option<&str>,
+    context: &bcode_model::ProviderRequestContext,
+) {
+    if !context.auth_pool_routing.priming_enabled
+        || !context.auth_pool_routing.priming_provider_windows
+    {
+        return;
+    }
+    let provider_plugin_id = provider_plugin_id.map(str::to_string);
+    for candidate in &context.auth_candidates {
+        let fallback_reprime_after = context
+            .auth_pool_routing
+            .priming_reprime_after
+            .as_deref()
+            .or(context
+                .auth_pool_routing
+                .priming_fallback_reprime_after
+                .as_deref())
+            .and_then(parse_duration);
+        if !bcode_provider_auth::auth_pool_state::profile_needs_priming_with_windows(
+            context.auth_pool.as_deref(),
+            candidate.profile.as_deref(),
+            &context.auth_pool_routing.priming_required_windows,
+            fallback_reprime_after,
+        ) {
+            continue;
+        }
+        let mut candidate_context = context.clone();
+        candidate_context
+            .auth_profile
+            .clone_from(&candidate.profile);
+        candidate_context.auth = Some(candidate.auth.clone());
+        candidate_context.env = candidate.env.clone();
+        let request = bcode_model::AuthUsageRequest {
+            provider_context: candidate_context,
+            meter_ids: context
+                .auth_pool_routing
+                .priming_required_windows
+                .keys()
+                .cloned()
+                .collect(),
+        };
+        let Ok(response) =
+            invoke_model_provider_json_blocking::<_, bcode_model::AuthUsageResponse>(
+                state,
+                provider_plugin_id.clone(),
+                OP_AUTH_USAGE,
+                request,
+            )
+            .await
+        else {
+            continue;
+        };
+        if response.supported {
+            bcode_provider_auth::auth_pool_state::record_profile_usage_windows(
+                context.auth_pool.as_deref(),
+                candidate.profile.as_deref(),
+                &response.meters,
+            );
+        }
+    }
+}
+
+fn parse_duration(value: &str) -> Option<std::time::Duration> {
+    let trimmed = value.trim();
+    let (number, multiplier) = trimmed
+        .strip_suffix('d')
+        .map_or_else(|| (trimmed, 1), |number| (number, 86_400));
+    let (number, multiplier) = number
+        .strip_suffix('h')
+        .map_or((number, multiplier), |number| (number, 3_600));
+    let (number, multiplier) = number
+        .strip_suffix('m')
+        .map_or((number, multiplier), |number| (number, 60));
+    let (number, multiplier) = number
+        .strip_suffix('s')
+        .map_or((number, multiplier), |number| (number, 1));
+    number
+        .parse::<u64>()
+        .ok()
+        .map(|seconds| std::time::Duration::from_secs(seconds.saturating_mul(multiplier)))
 }
 
 fn insert_reasoning_metadata(

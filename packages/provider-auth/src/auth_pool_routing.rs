@@ -107,6 +107,7 @@ fn priming_candidate<'a>(
         .routing
         .priming_reprime_after
         .as_deref()
+        .or(input.routing.priming_fallback_reprime_after.as_deref())
         .and_then(parse_duration);
     available.iter().copied().find(|candidate| {
         if !input.routing.priming_include_primary
@@ -120,6 +121,15 @@ fn priming_candidate<'a>(
         let Some(profile) = candidate.profile.as_deref() else {
             return false;
         };
+        if input.routing.priming_provider_windows {
+            return auth_pool_state::profile_needs_priming_with_windows_in_state(
+                state,
+                &format!("{pool}/{profile}"),
+                &input.routing.priming_required_windows,
+                reprime_after,
+                now,
+            );
+        }
         auth_pool_state::profile_needs_priming_in_state(
             state,
             &format!("{pool}/{profile}"),

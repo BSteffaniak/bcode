@@ -2045,9 +2045,28 @@ pub struct AuthPoolPrimingConfig {
     /// Include the primary selected auth profile in priming.
     #[serde(default)]
     pub include_primary: bool,
-    /// Optional duration after which a profile should be primed again.
+    /// Optional duration after which local fallback priming should be attempted again.
     #[serde(default)]
     pub reprime_after: Option<String>,
+    /// Use provider-confirmed usage windows when the provider supports them.
+    #[serde(default = "default_priming_provider_windows")]
+    pub provider_windows: bool,
+    /// Fallback duration when provider usage windows are unavailable.
+    #[serde(default = "default_priming_fallback_reprime_after")]
+    pub fallback_reprime_after: Option<String>,
+    /// Required usage windows grouped by provider meter id.
+    #[config_doc(skip)]
+    #[serde(default)]
+    pub required_windows: BTreeMap<String, Vec<String>>,
+}
+
+const fn default_priming_provider_windows() -> bool {
+    true
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn default_priming_fallback_reprime_after() -> Option<String> {
+    Some("7d".to_string())
 }
 
 /// Provider-specific quota/cooldown policy hints for an auth pool.

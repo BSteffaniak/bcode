@@ -39,6 +39,9 @@ pub const OP_NATIVE_WEB_SEARCH: &str = "native_web_search";
 /// Operation for provider turn cleanup.
 pub const OP_FINISH_TURN: &str = "finish_turn";
 
+/// Operation for provider-confirmed auth usage window discovery.
+pub const OP_AUTH_USAGE: &str = "auth_usage";
+
 /// Provider-level capability report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderCapabilities {
@@ -607,9 +610,84 @@ pub struct ProviderAuthPoolRouting {
     /// Whether priming should include the primary selected auth profile.
     #[serde(default)]
     pub priming_include_primary: bool,
-    /// Optional duration after which a successfully primed profile should be primed again.
+    /// Optional duration after which local fallback priming should be attempted again.
     #[serde(default)]
     pub priming_reprime_after: Option<String>,
+    /// Whether provider-confirmed usage windows should drive priming when available.
+    #[serde(default)]
+    pub priming_provider_windows: bool,
+    /// Local fallback duration used when provider usage windows are unavailable.
+    #[serde(default)]
+    pub priming_fallback_reprime_after: Option<String>,
+    /// Required provider usage windows grouped by meter id.
+    #[serde(default)]
+    pub priming_required_windows: BTreeMap<String, Vec<String>>,
+}
+
+/// Request for provider-confirmed auth usage window discovery.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthUsageRequest {
+    /// Provider context identifying the auth profile to inspect.
+    #[serde(default)]
+    pub provider_context: ProviderRequestContext,
+    /// Optional usage meter ids the caller is interested in.
+    #[serde(default)]
+    pub meter_ids: Vec<String>,
+}
+
+/// Provider-confirmed auth usage window discovery response.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthUsageResponse {
+    /// Whether this provider/auth mode supports usage window discovery.
+    #[serde(default)]
+    pub supported: bool,
+    /// Optional degraded-state explanation when discovery could not produce complete data.
+    #[serde(default)]
+    pub degraded_reason: Option<String>,
+    /// Usage meters returned by the provider.
+    #[serde(default)]
+    pub meters: Vec<AuthUsageMeterSnapshot>,
+}
+
+/// Provider usage meter containing one or more windows.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthUsageMeterSnapshot {
+    /// Stable provider meter id, for example `codex` or `tokens`.
+    pub meter_id: String,
+    /// Human-readable meter name.
+    #[serde(default)]
+    pub meter_name: Option<String>,
+    /// Provider windows for this meter.
+    #[serde(default)]
+    pub windows: Vec<AuthUsageWindowSnapshot>,
+}
+
+/// Provider-confirmed usage state for one metering window.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthUsageWindowSnapshot {
+    /// Stable window id within the meter, for example `primary`, `secondary`, `5h`, or `7d`.
+    pub window_id: String,
+    /// Window length in seconds when known.
+    #[serde(default)]
+    pub window_duration_secs: Option<u64>,
+    /// Provider reset timestamp in Unix seconds when known.
+    #[serde(default)]
+    pub resets_at_unix: Option<u64>,
+    /// Usage percentage when known. Integer to preserve provider-rounded values exactly.
+    #[serde(default)]
+    pub used_percent: Option<u32>,
+    /// Absolute usage amount when known.
+    #[serde(default)]
+    pub used_amount: Option<u64>,
+    /// Absolute limit amount when known.
+    #[serde(default)]
+    pub limit_amount: Option<u64>,
+    /// Local observation timestamp in Unix seconds.
+    #[serde(default)]
+    pub observed_at_unix: u64,
+    /// Provider/source identifier for this observation.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// Provider-neutral request context resolved by the host from model/provider profiles.
