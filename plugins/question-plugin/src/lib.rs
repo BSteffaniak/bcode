@@ -4,14 +4,15 @@
 
 //! Interactive question tool plugin for Bcode.
 
+#[cfg(feature = "static-bundled")]
+mod question_outcome_tui;
+
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     InteractiveToolResolution, InteractiveToolResumeRequest, ListToolsRequest, OP_INVOKE_TOOL,
-    OP_LIST_TOOLS, OP_PRESENT_ARTIFACT, OP_RESUME_INTERACTIVE_TOOL, TOOL_SERVICE_INTERFACE_ID,
-    ToolArtifact, ToolArtifactPresentationRequest, ToolArtifactPresentationResponse,
+    OP_LIST_TOOLS, OP_RESUME_INTERACTIVE_TOOL, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
     ToolCompatibilityAlias, ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationResult, ToolList, ToolPolicyMetadata, ToolPresentationEvent,
-    ToolPresentationTarget, ToolProtocolPresentation, ToolSideEffect,
+    ToolInvocationResult, ToolList, ToolPolicyMetadata, ToolSideEffect,
 };
 use bmux_tui_component_protocol::model::{ComponentKind, ComponentNode};
 use bmux_tui_component_protocol::value::ComponentValue;
@@ -156,7 +157,6 @@ fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
         OP_LIST_TOOLS => list_tools(&context.request),
         OP_INVOKE_TOOL => invoke_tool(context),
         OP_RESUME_INTERACTIVE_TOOL => resume_interactive_tool(&context.request),
-        OP_PRESENT_ARTIFACT => present_artifact_service(&context.request),
         _ => ServiceResponse::error(
             "unsupported_operation",
             "unsupported question tool service operation",
@@ -353,46 +353,6 @@ fn question_response(
             }),
         }),
     }
-}
-
-fn present_artifact_service(
-    request: &bcode_plugin_sdk::prelude::ServiceRequest,
-) -> ServiceResponse {
-    let request = match serde_json::from_slice::<ToolArtifactPresentationRequest>(&request.payload)
-    {
-        Ok(request) => request,
-        Err(error) => {
-            return ServiceResponse::error(
-                "invalid_request",
-                format!("invalid artifact presentation request: {error}"),
-            );
-        }
-    };
-    let Some(outcome) = question_outcome_from_artifact(&request) else {
-        return json_response(&ToolArtifactPresentationResponse::default());
-    };
-    json_response(&ToolArtifactPresentationResponse {
-        presentation: Some(question_result_presentation(&outcome)),
-        state: request.state,
-    })
-}
-
-fn question_outcome_from_artifact(
-    request: &ToolArtifactPresentationRequest,
-) -> Option<QuestionToolOutcome> {
-    if request.artifact.schema != "bcode.question.outcome" || request.artifact.schema_version != 1 {
-        return None;
-    }
-    serde_json::from_value(request.artifact.metadata.clone()).ok()
-}
-
-fn question_result_presentation(outcome: &QuestionToolOutcome) -> ToolPresentationEvent {
-    ToolPresentationEvent::Protocol(ToolProtocolPresentation {
-        target: ToolPresentationTarget::Result,
-        surface_kind: "bmux.protocol.inline.result".to_owned(),
-        tree: question_result_component_tree(outcome),
-        state: None,
-    })
 }
 
 fn question_result_component_tree(outcome: &QuestionToolOutcome) -> Value {
@@ -988,7 +948,21 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
 #[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(QuestionPlugin, include_str!("../bcode-plugin.toml"))
+    let mut vtable = bcode_plugin_sdk::static_plugin_vtable!(
+        QuestionPlugin,
+        include_str!("../bcode-plugin.toml")
+    );
+    vtable.tui_registry = Some(question_tui_registry);
+    vtable
+}
+
+#[cfg(feature = "static-bundled")]
+fn question_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
+    let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
+    registry.register_visual_adapter(Box::new(
+        question_outcome_tui::QuestionOutcomeTuiVisualAdapter,
+    ));
+    registry
 }
 
 bcode_plugin_sdk::export_plugin!(QuestionPlugin, include_str!("../bcode-plugin.toml"));

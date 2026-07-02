@@ -18,6 +18,7 @@ bcode_config       = { workspace = true }
 bcode_plugin_sdk   = { workspace = true }
 bcode_tool         = { workspace = true }
 bcode_tool_runtime = { workspace = true }
+bmux_tui           = { workspace = true, optional = true }
 portable-pty       = { workspace = true }
 serde              = { workspace = true, features = ["derive", "std"] }
 serde_json         = { workspace = true }
@@ -26,4 +27,4 @@ tokio              = { workspace = true, features = ["rt"] }
 [features]
 default          = []
 fail-on-warnings = []
-static-bundled   = []
+static-bundled   = ["bmux_tui"]

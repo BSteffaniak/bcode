@@ -4,20 +4,20 @@
 
 //! shell execution tool plugin for Bcode.
 
+#[cfg(feature = "static-bundled")]
+mod shell_run_tui;
+
 use bcode_config::{
     ShellToolConfig, ShellToolEnvAutoFallback, ShellToolEnvConfig, ShellToolEnvMode,
     default_config_paths_from_with_environment, load_config_from_paths_with_environment,
 };
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
-    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, OP_PRESENT_ARTIFACT, ShellRunResult,
-    TOOL_SERVICE_INTERFACE_ID, ToolArtifact, ToolArtifactPresentationRequest,
-    ToolArtifactPresentationResponse, ToolDefinition, ToolInvocationRequest,
-    ToolInvocationResponse, ToolInvocationResult, ToolInvocationStreamEvent, ToolList,
-    ToolLiveArgumentPreviewMetadata, ToolOutputStream, ToolPresentationEvent,
-    ToolPresentationField, ToolPresentationFieldKind, ToolPresentationFieldValue,
-    ToolPresentationLevel, ToolPresentationSection, ToolPresentationTarget,
-    ToolRequestPresentationMetadata, ToolSideEffect, ToolStatusPresentation,
+    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, ShellRunResult, TOOL_SERVICE_INTERFACE_ID,
+    ToolArtifact, ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
+    ToolInvocationResult, ToolInvocationStreamEvent, ToolList, ToolLiveArgumentPreviewMetadata,
+    ToolOutputStream, ToolPresentationField, ToolPresentationFieldKind,
+    ToolRequestPresentationMetadata, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -59,7 +59,6 @@ fn invoke_shell_service(context: &NativeServiceContext) -> ServiceResponse {
     match context.request.operation.as_str() {
         OP_LIST_TOOLS => list_tools(&context.request),
         OP_INVOKE_TOOL => invoke_tool(context),
-        OP_PRESENT_ARTIFACT => present_artifact(&context.request),
         _ => ServiceResponse::error(
             "unsupported_operation",
             "unsupported tool service operation",
@@ -237,7 +236,6 @@ fn run_shell_tool(
             started_at_ms: Some(now_ms),
         },
     );
-    emit_shell_start_presentation(events, tool_call_id, &arguments);
     emit_tool_status(
         events,
         tool_call_id,
@@ -252,7 +250,6 @@ fn run_shell_tool(
         session_cwd,
         cancellation_path,
     );
-    emit_shell_result_presentation(events, tool_call_id, &response);
     emit_tool_stream_event(
         events,
         &ToolInvocationStreamEvent::Finished {
@@ -303,182 +300,6 @@ fn resolve_effective_cwd(
             }
         },
     )
-}
-
-fn emit_shell_start_presentation(
-    events: ServiceEventEmitter,
-    tool_call_id: &str,
-    arguments: &ShellRunArguments,
-) {
-    emit_tool_stream_event(
-        events,
-        &ToolInvocationStreamEvent::Presentation {
-            tool_call_id: tool_call_id.to_owned(),
-            sequence: 0,
-            presentation: ToolPresentationEvent::Card(bcode_tool::ToolCardPresentation {
-                target: ToolPresentationTarget::Preview,
-                title: "Shell command".to_string(),
-                subtitle: None,
-                sections: vec![ToolPresentationSection::Fields {
-                    fields: shell_presentation_fields(arguments),
-                }],
-            }),
-        },
-    );
-    emit_tool_stream_event(
-        events,
-        &ToolInvocationStreamEvent::Presentation {
-            tool_call_id: tool_call_id.to_owned(),
-            sequence: 0,
-            presentation: ToolPresentationEvent::Status(ToolStatusPresentation {
-                target: ToolPresentationTarget::Activity,
-                text: format!("running {}", arguments.command),
-                level: ToolPresentationLevel::Info,
-            }),
-        },
-    );
-}
-
-fn emit_shell_result_presentation(
-    events: ServiceEventEmitter,
-    tool_call_id: &str,
-    response: &ToolInvocationResponse,
-) {
-    let Some(result) = shell_result_from_response(response) else {
-        return;
-    };
-    if matches!(result, ShellRunResult::Terminal { .. }) {
-        return;
-    }
-    emit_tool_stream_event(
-        events,
-        &ToolInvocationStreamEvent::Presentation {
-            tool_call_id: tool_call_id.to_owned(),
-            sequence: 1,
-            presentation: ToolPresentationEvent::Card(shell_result_card(response)),
-        },
-    );
-}
-
-fn shell_result_from_response(response: &ToolInvocationResponse) -> Option<ShellRunResult> {
-    let Some(ToolInvocationResult::Artifact { artifact }) = &response.result else {
-        return None;
-    };
-    if artifact.schema != "bcode.shell.run" {
-        return None;
-    }
-    serde_json::from_value(artifact.metadata.clone()).ok()
-}
-
-fn shell_presentation_fields(arguments: &ShellRunArguments) -> Vec<ToolPresentationFieldValue> {
-    let mut fields = vec![ToolPresentationFieldValue {
-        label: "Command".to_string(),
-        value: arguments.command.clone(),
-        kind: ToolPresentationFieldKind::Text,
-    }];
-    if let Some(cwd) = &arguments.cwd {
-        fields.push(ToolPresentationFieldValue {
-            label: "CWD".to_string(),
-            value: cwd.display().to_string(),
-            kind: ToolPresentationFieldKind::Text,
-        });
-    }
-    if let Some(timeout_ms) = arguments.timeout_ms {
-        fields.push(ToolPresentationFieldValue {
-            label: "Timeout".to_string(),
-            value: timeout_ms.to_string(),
-            kind: ToolPresentationFieldKind::DurationMs,
-        });
-    }
-    fields
-}
-
-fn shell_result_card(response: &ToolInvocationResponse) -> bcode_tool::ToolCardPresentation {
-    let mut fields = vec![ToolPresentationFieldValue {
-        label: "Status".to_string(),
-        value: if response.is_error {
-            "failed"
-        } else {
-            "completed"
-        }
-        .to_string(),
-        kind: ToolPresentationFieldKind::Text,
-    }];
-    let mut sections = Vec::new();
-    if let Some(result) = shell_result_from_response(response) {
-        extend_terminal_shell_result_presentation(&result, &mut fields);
-    }
-    sections.insert(0, ToolPresentationSection::Fields { fields });
-    bcode_tool::ToolCardPresentation {
-        target: ToolPresentationTarget::Result,
-        title: if response.is_error {
-            "Shell command failed".to_string()
-        } else {
-            "Shell command completed".to_string()
-        },
-        subtitle: None,
-        sections,
-    }
-}
-
-fn extend_terminal_shell_result_presentation(
-    result: &ShellRunResult,
-    fields: &mut Vec<ToolPresentationFieldValue>,
-) {
-    let ShellRunResult::Terminal {
-        exit_code,
-        timed_out,
-        cancelled,
-        duration_ms,
-        output_truncated,
-        ..
-    } = result
-    else {
-        return;
-    };
-    push_shell_common_result_fields(fields, *exit_code, *timed_out, *cancelled, *duration_ms);
-    if *output_truncated {
-        fields.push(ToolPresentationFieldValue {
-            label: "Output truncated".to_string(),
-            value: "true".to_string(),
-            kind: ToolPresentationFieldKind::Text,
-        });
-    }
-}
-
-fn push_shell_common_result_fields(
-    fields: &mut Vec<ToolPresentationFieldValue>,
-    exit_code: Option<i32>,
-    timed_out: bool,
-    cancelled: bool,
-    duration_ms: Option<u64>,
-) {
-    fields.push(ToolPresentationFieldValue {
-        label: "Exit code".to_string(),
-        value: exit_code.map_or_else(|| "unknown".to_string(), |code| code.to_string()),
-        kind: ToolPresentationFieldKind::Text,
-    });
-    if let Some(duration_ms) = duration_ms {
-        fields.push(ToolPresentationFieldValue {
-            label: "Duration".to_string(),
-            value: duration_ms.to_string(),
-            kind: ToolPresentationFieldKind::DurationMs,
-        });
-    }
-    if timed_out {
-        fields.push(ToolPresentationFieldValue {
-            label: "Timed out".to_string(),
-            value: "true".to_string(),
-            kind: ToolPresentationFieldKind::Text,
-        });
-    }
-    if cancelled {
-        fields.push(ToolPresentationFieldValue {
-            label: "Cancelled".to_string(),
-            value: "true".to_string(),
-            kind: ToolPresentationFieldKind::Text,
-        });
-    }
 }
 
 fn shell_config_with_environment(
@@ -984,59 +805,6 @@ fn shell_run_artifact(tool_call_id: &str, result: &ShellRunResult) -> ToolInvoca
     }
 }
 
-fn present_artifact(request: &ServiceRequest) -> ServiceResponse {
-    let request = match request.payload_json::<ToolArtifactPresentationRequest>() {
-        Ok(request) => request,
-        Err(error) => return invalid_request(&error),
-    };
-    if request.artifact.schema != "bcode.shell.run" || request.artifact.schema_version != 1 {
-        return json_response(&ToolArtifactPresentationResponse::default());
-    }
-    let mode = request
-        .artifact
-        .metadata
-        .get("mode")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
-    let output = match mode {
-        "terminal" => request
-            .artifact
-            .metadata
-            .get("output_tail")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        _ => serde_json::to_string_pretty(&request.artifact.metadata).unwrap_or_default(),
-    };
-    json_response(&ToolArtifactPresentationResponse {
-        presentation: Some(ToolPresentationEvent::Card(
-            bcode_tool::ToolCardPresentation {
-                target: ToolPresentationTarget::Result,
-                title: "Shell run".to_string(),
-                subtitle: Some(mode.to_string()),
-                sections: vec![ToolPresentationSection::Terminal {
-                    output,
-                    columns: request
-                        .artifact
-                        .metadata
-                        .get("columns")
-                        .and_then(serde_json::Value::as_u64)
-                        .and_then(|value| u16::try_from(value).ok())
-                        .unwrap_or(DEFAULT_TERMINAL_COLUMNS),
-                    rows: request
-                        .artifact
-                        .metadata
-                        .get("rows")
-                        .and_then(serde_json::Value::as_u64)
-                        .and_then(|value| u16::try_from(value).ok())
-                        .unwrap_or(DEFAULT_TERMINAL_ROWS),
-                }],
-            },
-        )),
-        state: request.state,
-    })
-}
-
 fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
     ServiceResponse::error("invalid_request", error.to_string())
 }
@@ -1044,10 +812,19 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
 #[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_concurrent_plugin_vtable!(
+    let mut vtable = bcode_plugin_sdk::static_concurrent_plugin_vtable!(
         ShellPlugin,
         include_str!("../bcode-plugin.toml")
-    )
+    );
+    vtable.tui_registry = Some(shell_tui_registry);
+    vtable
+}
+
+#[cfg(feature = "static-bundled")]
+fn shell_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
+    let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
+    registry.register_visual_adapter(Box::new(shell_run_tui::ShellRunTuiVisualAdapter));
+    registry
 }
 
 bcode_plugin_sdk::export_concurrent_plugin!(ShellPlugin, include_str!("../bcode-plugin.toml"));
@@ -1065,6 +842,16 @@ mod tests {
                 .as_nanos()
         ));
         bcode_config::ConfigEnvironmentSnapshot::isolated(root)
+    }
+
+    fn shell_result_from_artifact(response: &ToolInvocationResponse) -> Option<ShellRunResult> {
+        let Some(ToolInvocationResult::Artifact { artifact }) = &response.result else {
+            return None;
+        };
+        if artifact.schema != "bcode.shell.run" {
+            return None;
+        }
+        serde_json::from_value(artifact.metadata.clone()).ok()
     }
 
     #[test]
@@ -1184,7 +971,7 @@ mod tests {
             columns,
             rows,
             ..
-        } = shell_result_from_response(&response).expect("expected shell artifact")
+        } = shell_result_from_artifact(&response).expect("expected shell artifact")
         else {
             panic!("expected semantic terminal shell result");
         };
@@ -1216,7 +1003,7 @@ mod tests {
 
         assert!(!response.is_error, "{}", response.output);
         let ShellRunResult::Terminal { output_tail, .. } =
-            shell_result_from_response(&response).expect("expected shell artifact")
+            shell_result_from_artifact(&response).expect("expected shell artifact")
         else {
             panic!("expected semantic terminal shell result");
         };
@@ -1314,141 +1101,5 @@ mod tests {
                 .and_then(serde_json::Value::as_bool),
             Some(true)
         );
-    }
-    #[test]
-    fn terminal_result_card_includes_relevant_process_metadata() {
-        let response = ToolInvocationResponse {
-            output: String::new(),
-            is_error: false,
-            content: Vec::new(),
-            full_output: None,
-            host_action: None,
-            result: Some(shell_run_artifact(
-                "test-terminal-card",
-                &ShellRunResult::Terminal {
-                    exit_code: Some(0),
-                    timed_out: false,
-                    cancelled: false,
-                    duration_ms: Some(5),
-                    output_tail: "ok".to_string(),
-                    output_truncated: true,
-                    output_bytes: Some(2),
-                    retained_output_bytes: Some(2),
-                    columns: 80,
-                    rows: 24,
-                },
-            )),
-        };
-
-        let card = shell_result_card(&response);
-
-        assert_eq!(card.title, "Shell command completed");
-        assert!(card.sections.iter().any(|section| matches!(section,
-            ToolPresentationSection::Fields { fields }
-            if fields.iter().any(|field| field.label == "Exit code" && field.value == "0")
-                && fields.iter().any(|field| field.label == "Duration" && field.value == "5")
-                && fields.iter().any(|field| field.label == "Output truncated" && field.value == "true")
-                && !fields.iter().any(|field| field.label == "Timed out")
-                && !fields.iter().any(|field| field.label == "Cancelled")
-                && !fields.iter().any(|field| field.label == "Output bytes")
-        )));
-        assert!(card.sections.iter().all(|section| !matches!(
-            section,
-            ToolPresentationSection::Text { .. } | ToolPresentationSection::Terminal { .. }
-        )));
-    }
-
-    #[test]
-    fn terminal_result_card_omits_duplicate_terminal_output() {
-        let response = ToolInvocationResponse {
-            output: String::new(),
-            is_error: false,
-            content: Vec::new(),
-            full_output: None,
-            host_action: None,
-            result: Some(shell_run_artifact(
-                "test-terminal-card",
-                &ShellRunResult::Terminal {
-                    exit_code: Some(0),
-                    timed_out: false,
-                    cancelled: false,
-                    duration_ms: Some(5),
-                    output_tail: "pty output".to_string(),
-                    output_truncated: false,
-                    output_bytes: Some(10),
-                    retained_output_bytes: Some(10),
-                    columns: 80,
-                    rows: 24,
-                },
-            )),
-        };
-
-        let card = shell_result_card(&response);
-
-        assert!(
-            card.sections
-                .iter()
-                .all(|section| !matches!(section, ToolPresentationSection::Terminal { .. }))
-        );
-        assert!(card.sections.iter().any(|section| matches!(section,
-            ToolPresentationSection::Fields { fields }
-            if !fields.iter().any(|field| field.label == "Output bytes")
-                && !fields.iter().any(|field| field.label == "Columns")
-                && !fields.iter().any(|field| field.label == "Timed out")
-                && !fields.iter().any(|field| field.label == "Cancelled")
-        )));
-    }
-
-    fn shell_artifact_presentation_response(
-        result: &ShellRunResult,
-    ) -> ToolArtifactPresentationResponse {
-        let ToolInvocationResult::Artifact { artifact } = shell_run_artifact("call-shell", result)
-        else {
-            panic!("expected artifact");
-        };
-        let request = ToolArtifactPresentationRequest {
-            artifact: *artifact,
-            surface: "tui".to_string(),
-            viewport: None,
-            capabilities: None,
-            state: None,
-        };
-        let request = ServiceRequest {
-            interface_id: TOOL_SERVICE_INTERFACE_ID.to_string(),
-            operation: OP_PRESENT_ARTIFACT.to_string(),
-            payload: serde_json::to_vec(&request).expect("request should encode"),
-        };
-        let response = present_artifact(&request);
-        assert!(response.error.is_none());
-        response
-            .payload_json::<ToolArtifactPresentationResponse>()
-            .expect("response should decode")
-    }
-
-    #[test]
-    fn present_terminal_shell_artifact_as_plugin_owned_terminal_card() {
-        let response = shell_artifact_presentation_response(&ShellRunResult::Terminal {
-            exit_code: Some(7),
-            timed_out: true,
-            cancelled: false,
-            duration_ms: Some(1_500),
-            output_tail: "terminal tail\n".to_string(),
-            output_truncated: false,
-            output_bytes: Some(14),
-            retained_output_bytes: Some(14),
-            columns: 80,
-            rows: 24,
-        });
-        let Some(ToolPresentationEvent::Card(card)) = response.presentation else {
-            panic!("expected card presentation");
-        };
-        assert_eq!(card.target, ToolPresentationTarget::Result);
-        assert_eq!(card.title, "Shell run");
-        assert_eq!(card.subtitle.as_deref(), Some("terminal"));
-        assert!(matches!(
-            card.sections.as_slice(),
-            [ToolPresentationSection::Terminal { output, columns: 80, rows: 24 }]
-                if output == "terminal tail\n"
-        ));
     }
 }

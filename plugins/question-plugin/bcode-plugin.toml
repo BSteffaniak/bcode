@@ -8,15 +8,13 @@ interface_id = "bcode.tool/v1"
 name         = "Question Tool"
 
 [[visual_adapters]]
-artifact_schema      = "bcode.question.outcome"
-id                   = "question-outcome-component"
-max_schema_version   = 1
-min_schema_version   = 1
-operation            = "present_artifact"
-priority             = 100
-producer_default     = true
-service_interface_id = "bcode.tool/v1"
-surfaces             = ["tui", "web", "generic-component"]
+artifact_schema    = "bcode.question.outcome"
+id                 = "question-outcome-component"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+surfaces           = ["tui"]
 
 [runtime]
 abi_version    = 1

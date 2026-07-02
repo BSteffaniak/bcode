@@ -4716,11 +4716,196 @@ fn filesystem_plugin_host() -> bcode_plugin::PluginHost {
         .expect("static filesystem plugin should load")
 }
 
+fn shell_run_artifact() -> bcode_session_models::ToolArtifact {
+    bcode_session_models::ToolArtifact {
+        artifact_id: "call-shell-shell-run".to_owned(),
+        producer_plugin_id: "bcode.shell".to_owned(),
+        schema: "bcode.shell.run".to_owned(),
+        schema_version: 1,
+        tool_call_id: Some("call-shell".to_owned()),
+        title: Some("Shell run".to_owned()),
+        metadata: serde_json::json!({
+            "mode": "terminal",
+            "exit_code": 0,
+            "timed_out": false,
+            "cancelled": false,
+            "duration_ms": 12,
+            "output_tail": "shell raw output\n",
+            "output_truncated": false,
+            "output_bytes": 17,
+            "retained_output_bytes": 17,
+            "columns": 80,
+            "rows": 24
+        }),
+        refs: Vec::new(),
+    }
+}
+
+fn shell_plugin_host() -> bcode_plugin::PluginHost {
+    let bundled = [bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
+        bcode_shell_plugin::static_plugin(),
+    )];
+    let selected = bcode_plugin::filter_selected_static_plugins(
+        &bundled,
+        &bcode_plugin::PluginSelection::all_enabled(),
+    )
+    .expect("static shell plugin manifest should parse");
+    bcode_plugin::PluginHost::load_static_plugins(&selected)
+        .expect("static shell plugin should load")
+}
+
+fn question_outcome_artifact() -> bcode_session_models::ToolArtifact {
+    bcode_session_models::ToolArtifact {
+        artifact_id: "question-outcome-call-question".to_owned(),
+        producer_plugin_id: "bcode.question".to_owned(),
+        schema: "bcode.question.outcome".to_owned(),
+        schema_version: 1,
+        tool_call_id: Some("call-question".to_owned()),
+        title: Some("Question outcome".to_owned()),
+        metadata: serde_json::json!({
+            "status": "answered",
+            "questions": [{
+                "question_index": 0,
+                "header": "Decision",
+                "question": "Proceed?",
+                "status": "answered",
+                "selected": [{"label": "Yes", "value": "yes"}],
+                "custom": null,
+                "required": true
+            }]
+        }),
+        refs: Vec::new(),
+    }
+}
+
+fn question_plugin_host() -> bcode_plugin::PluginHost {
+    let bundled = [bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
+        bcode_question_plugin::static_plugin(),
+    )];
+    let selected = bcode_plugin::filter_selected_static_plugins(
+        &bundled,
+        &bcode_plugin::PluginSelection::all_enabled(),
+    )
+    .expect("static question plugin manifest should parse");
+    bcode_plugin::PluginHost::load_static_plugins(&selected)
+        .expect("static question plugin should load")
+}
+
 fn render_app_text(app: &mut BmuxApp) -> String {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 40));
     let mut frame = Frame::new(&mut buffer);
     render::render(app, &mut frame);
     rendered_text(&buffer)
+}
+
+#[test]
+fn live_question_artifact_renders_outcome_from_raw_metadata() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_plugin_host(Arc::new(question_plugin_host()));
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call-question".to_owned(),
+            result: "question answered".to_owned(),
+            is_error: false,
+            output: None,
+            semantic_result: Some(ToolInvocationResult::Artifact {
+                artifact: Box::new(question_outcome_artifact()),
+            }),
+        },
+    ));
+
+    let rendered = render_app_text(&mut app);
+
+    assert!(rendered.contains("Question outcome"), "{rendered}");
+    assert!(rendered.contains("Proceed?"), "{rendered}");
+    assert!(rendered.contains("✓ Yes"), "{rendered}");
+    assert!(!rendered.contains("bcode.question.outcome"), "{rendered}");
+}
+
+#[test]
+fn replayed_question_artifact_renders_outcome_from_raw_metadata() {
+    let session_id = SessionId::new();
+    let events = vec![event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call-question".to_owned(),
+            result: "question answered".to_owned(),
+            is_error: false,
+            output: None,
+            semantic_result: Some(ToolInvocationResult::Artifact {
+                artifact: Box::new(question_outcome_artifact()),
+            }),
+        },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
+    app.set_plugin_host(Arc::new(question_plugin_host()));
+
+    let rendered = render_app_text(&mut app);
+
+    assert!(rendered.contains("Question outcome"), "{rendered}");
+    assert!(rendered.contains("Proceed?"), "{rendered}");
+    assert!(rendered.contains("✓ Yes"), "{rendered}");
+    assert!(!rendered.contains("bcode.question.outcome"), "{rendered}");
+}
+
+#[test]
+fn live_shell_artifact_renders_terminal_output_from_raw_run_metadata() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call-shell".to_owned(),
+            result: "shell completed".to_owned(),
+            is_error: false,
+            output: None,
+            semantic_result: Some(ToolInvocationResult::Artifact {
+                artifact: Box::new(shell_run_artifact()),
+            }),
+        },
+    ));
+
+    let rendered = render_app_text(&mut app);
+
+    assert!(rendered.contains("Shell run"), "{rendered}");
+    assert!(rendered.contains("terminal"), "{rendered}");
+    assert!(rendered.contains("shell raw output"), "{rendered}");
+    assert!(!rendered.contains("bcode.shell.run"), "{rendered}");
+}
+
+#[test]
+fn replayed_shell_artifact_renders_terminal_output_from_raw_run_metadata() {
+    let session_id = SessionId::new();
+    let events = vec![event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call-shell".to_owned(),
+            result: "shell completed".to_owned(),
+            is_error: false,
+            output: None,
+            semantic_result: Some(ToolInvocationResult::Artifact {
+                artifact: Box::new(shell_run_artifact()),
+            }),
+        },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
+
+    let rendered = render_app_text(&mut app);
+
+    assert!(rendered.contains("Shell run"), "{rendered}");
+    assert!(rendered.contains("terminal"), "{rendered}");
+    assert!(rendered.contains("shell raw output"), "{rendered}");
+    assert!(!rendered.contains("bcode.shell.run"), "{rendered}");
 }
 
 #[test]

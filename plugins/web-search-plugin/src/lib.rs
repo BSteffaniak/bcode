@@ -9,10 +9,7 @@ use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
     ToolInvocationHostAction, ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationStreamEvent, ToolList, ToolLiveArgumentPreviewMetadata, ToolPresentationEvent,
-    ToolPresentationField, ToolPresentationFieldKind, ToolPresentationFieldValue,
-    ToolPresentationSection, ToolPresentationTarget, ToolRequestPresentationMetadata,
-    ToolSideEffect,
+    ToolInvocationStreamEvent, ToolList, ToolLiveArgumentPreviewMetadata, ToolSideEffect,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -69,101 +66,6 @@ impl Default for WebSearchPlugin {
         Self {
             runtime: ProviderRuntime::new().map_err(|error| error.to_string()),
         }
-    }
-}
-
-fn emit_presentation(
-    events: ServiceEventEmitter,
-    tool_call_id: &str,
-    sequence: u64,
-    presentation: ToolPresentationEvent,
-) {
-    let event = ToolInvocationStreamEvent::Presentation {
-        tool_call_id: tool_call_id.to_owned(),
-        sequence,
-        presentation,
-    };
-    if let Ok(payload) = serde_json::to_vec(&event) {
-        events.emit(&payload);
-    }
-}
-
-fn field(label: &str, value: &impl ToString) -> ToolPresentationFieldValue {
-    ToolPresentationFieldValue {
-        label: label.to_string(),
-        value: value.to_string(),
-        kind: ToolPresentationFieldKind::Text,
-    }
-}
-
-fn search_preview_card(request: &SearchRequest) -> bcode_tool::ToolCardPresentation {
-    let mut fields = vec![field("Query", &request.query)];
-    if let Some(provider) = &request.provider {
-        fields.push(field("Provider", &provider));
-    }
-    if let Some(site) = &request.site {
-        fields.push(field("Site", &site));
-    }
-    if let Some(max_results) = request.max_results {
-        fields.push(field("Max results", &max_results));
-    }
-    bcode_tool::ToolCardPresentation {
-        target: ToolPresentationTarget::Preview,
-        title: "Search web".to_string(),
-        subtitle: None,
-        sections: vec![ToolPresentationSection::Fields { fields }],
-    }
-}
-
-fn search_result_card(response: &SearchResponse) -> bcode_tool::ToolCardPresentation {
-    bcode_tool::ToolCardPresentation {
-        target: ToolPresentationTarget::Result,
-        title: "Search results".to_string(),
-        subtitle: response.message.clone(),
-        sections: vec![ToolPresentationSection::Fields {
-            fields: vec![
-                field("Query", &response.query),
-                field("Provider", &response.provider),
-                field("Results", &response.results.len()),
-                field("Partial", &response.partial),
-            ],
-        }],
-    }
-}
-
-fn fetch_preview_card(request: &FetchRequest) -> bcode_tool::ToolCardPresentation {
-    bcode_tool::ToolCardPresentation {
-        target: ToolPresentationTarget::Preview,
-        title: "Fetch URL".to_string(),
-        subtitle: None,
-        sections: vec![ToolPresentationSection::Fields {
-            fields: vec![
-                field("URL", &request.url),
-                field(
-                    "Max bytes",
-                    &request.max_bytes.unwrap_or(DEFAULT_FETCH_MAX_BYTES),
-                ),
-                field("Rendered", &request.render),
-            ],
-        }],
-    }
-}
-
-fn fetch_result_card(response: &FetchResponse) -> bcode_tool::ToolCardPresentation {
-    bcode_tool::ToolCardPresentation {
-        target: ToolPresentationTarget::Result,
-        title: "Fetched URL".to_string(),
-        subtitle: response.title.clone(),
-        sections: vec![ToolPresentationSection::Fields {
-            fields: vec![
-                field("URL", &response.url),
-                field("Final URL", &response.final_url),
-                field("Status", &response.status),
-                field("Bytes", &response.text.len()),
-                field("Truncated", &response.truncated),
-                field("Rendered", &response.rendered),
-            ],
-        }],
     }
 }
 
@@ -245,27 +147,13 @@ impl WebSearchPlugin {
             Ok(runtime) => runtime,
             Err(error) => return tool_error(format!("web runtime unavailable: {error}")),
         };
-        emit_presentation(
-            events,
-            &invocation.tool_call_id,
-            0,
-            ToolPresentationEvent::Card(search_preview_card(&request)),
-        );
         let progress = ProgressReporter::new(events, invocation.tool_call_id.clone());
         progress.emit(format!("search: query {}", request.query));
         match runtime.block_on(run_cancellable(
             search_async(request, plugin_config, Some(progress)),
             cancellation.clone(),
         )) {
-            Ok(Ok(response)) => {
-                emit_presentation(
-                    events,
-                    &invocation.tool_call_id,
-                    1,
-                    ToolPresentationEvent::Card(search_result_card(&response)),
-                );
-                search_tool_response(&response)
-            }
+            Ok(Ok(response)) => search_tool_response(&response),
             Ok(Err(error)) => tool_error(error.to_string()),
             Err(error) => tool_error(error.to_string()),
         }
@@ -290,27 +178,13 @@ impl WebSearchPlugin {
             Ok(runtime) => runtime,
             Err(error) => return tool_error(format!("web runtime unavailable: {error}")),
         };
-        emit_presentation(
-            events,
-            &invocation.tool_call_id,
-            0,
-            ToolPresentationEvent::Card(fetch_preview_card(&request)),
-        );
         let progress = ProgressReporter::new(events, invocation.tool_call_id.clone());
         progress.emit(format!("fetch: requesting {}", request.url));
         match runtime.block_on(run_cancellable(
             fetch_async(request, plugin_config, Some(progress)),
             cancellation.clone(),
         )) {
-            Ok(Ok(response)) => {
-                emit_presentation(
-                    events,
-                    &invocation.tool_call_id,
-                    1,
-                    ToolPresentationEvent::Card(fetch_result_card(&response)),
-                );
-                json_tool_response(&response)
-            }
+            Ok(Ok(response)) => json_tool_response(&response),
             Ok(Err(error)) => tool_error(error.to_string()),
             Err(error) => tool_error(error.to_string()),
         }
@@ -1637,31 +1511,7 @@ fn search_tool_definition() -> ToolDefinition {
                 preview_title: Some("Search web".to_string()),
                 streaming_status: Some("searching {primary} · {bytes}".to_string()),
             }),
-
-            request_presentation: Some(ToolRequestPresentationMetadata {
-                title: "Search web".to_string(),
-                fields: vec![
-                    ToolPresentationField {
-                        label: "Query".to_string(),
-                        argument: "query".to_string(),
-                        kind: ToolPresentationFieldKind::Text,
-                        optional: false,
-                    },
-                    ToolPresentationField {
-                        label: "Provider".to_string(),
-                        argument: "provider".to_string(),
-                        kind: ToolPresentationFieldKind::Text,
-                        optional: true,
-                    },
-                    ToolPresentationField {
-                        label: "Max results".to_string(),
-                        argument: "max_results".to_string(),
-                        kind: ToolPresentationFieldKind::Count,
-                        optional: true,
-                    },
-                ],
-                preview: None,
-            }),
+            request_presentation: None,
         },
     }
 }
@@ -1703,31 +1553,7 @@ fn fetch_tool_definition() -> ToolDefinition {
                 preview_title: Some("Fetch URL".to_string()),
                 streaming_status: Some("fetching {primary} · {bytes}".to_string()),
             }),
-
-            request_presentation: Some(ToolRequestPresentationMetadata {
-                title: "Fetch URL".to_string(),
-                fields: vec![
-                    ToolPresentationField {
-                        label: "URL".to_string(),
-                        argument: "url".to_string(),
-                        kind: ToolPresentationFieldKind::Url,
-                        optional: false,
-                    },
-                    ToolPresentationField {
-                        label: "Max bytes".to_string(),
-                        argument: "max_bytes".to_string(),
-                        kind: ToolPresentationFieldKind::Count,
-                        optional: true,
-                    },
-                    ToolPresentationField {
-                        label: "Rendered".to_string(),
-                        argument: "render".to_string(),
-                        kind: ToolPresentationFieldKind::Boolean,
-                        optional: true,
-                    },
-                ],
-                preview: None,
-            }),
+            request_presentation: None,
         },
     }
 }
@@ -2502,6 +2328,61 @@ bcode_plugin_sdk::export_plugin!(WebSearchPlugin, include_str!("../bcode-plugin.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_tool_definitions_do_not_request_durable_presentations() {
+        assert!(search_tool_definition().ui.request_presentation.is_none());
+        assert!(fetch_tool_definition().ui.request_presentation.is_none());
+    }
+
+    #[test]
+    fn web_search_output_is_usable_without_presentation_events() {
+        let response = search_tool_response(&SearchResponse {
+            query: "rust".to_string(),
+            provider: "test".to_string(),
+            results: vec![SearchResult {
+                title: "Rust".to_string(),
+                url: "https://www.rust-lang.org/".to_string(),
+                snippet: "A language empowering everyone".to_string(),
+                published: None,
+                source: Some("example".to_string()),
+            }],
+            partial: false,
+            message: Some("ok".to_string()),
+            host_action: None,
+        });
+
+        assert!(!response.is_error);
+        assert!(response.output.contains("\"query\": \"rust\""));
+        assert!(response.output.contains("Rust"));
+        assert!(response.output.contains("https://www.rust-lang.org/"));
+        assert!(response.result.is_none());
+    }
+
+    #[test]
+    fn web_fetch_output_is_usable_without_presentation_events() {
+        let response = json_tool_response(&FetchResponse {
+            url: "https://example.com".to_string(),
+            final_url: "https://example.com/".to_string(),
+            status: 200,
+            title: Some("Example".to_string()),
+            content_type: Some("text/html".to_string()),
+            text: "Example Domain".to_string(),
+            markdown: None,
+            truncated: false,
+            rendered: false,
+            fallback_used: "none".to_string(),
+            content_format: "text".to_string(),
+            extraction: "plain".to_string(),
+            prompt: None,
+            prompt_response: None,
+        });
+
+        assert!(!response.is_error);
+        assert!(response.output.contains("https://example.com"));
+        assert!(response.output.contains("Example Domain"));
+        assert!(response.result.is_none());
+    }
 
     #[test]
     fn html_text_removes_tags_and_decodes_common_entities() {

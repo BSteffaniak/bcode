@@ -9,15 +9,13 @@ interface_id = "bcode.tool/v1"
 name         = "Shell Tools"
 
 [[visual_adapters]]
-artifact_schema      = "bcode.shell.run"
-id                   = "shell-run-terminal-card"
-max_schema_version   = 1
-min_schema_version   = 1
-operation            = "present_artifact"
-priority             = 100
-producer_default     = true
-service_interface_id = "bcode.tool/v1"
-surfaces             = ["tui", "web", "generic-component"]
+artifact_schema    = "bcode.shell.run"
+id                 = "shell-run-terminal-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+surfaces           = ["tui"]
 
 [concurrency]
 type = "concurrent"
