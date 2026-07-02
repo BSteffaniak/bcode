@@ -43,11 +43,9 @@ use bcode_session_models::{
     LiveShellCommandPreview, LiveToolArgumentPreview, ModelTurnOutcome, ProviderStreamEvent,
     ProviderToolCallProgress, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind,
     SessionId, SessionLiveEventKind, SessionTokenUsage, SessionTraceEvent, SessionTracePayload,
-    SessionTracePhase, ToolCardPresentation, ToolInvocationResult, ToolInvocationStreamEvent,
-    ToolOutputStream as SessionToolOutputStream, ToolPluginViewPresentation, ToolPresentationEvent,
-    ToolPresentationField, ToolPresentationFieldKind, ToolPresentationFieldValue,
-    ToolPresentationLevel, ToolPresentationSection, ToolPresentationTarget,
-    ToolProgressPresentation, ToolRequestPresentationMetadata, TraceBlobRef, TraceRedaction,
+    SessionTracePhase, ToolInvocationResult, ToolInvocationStreamEvent,
+    ToolOutputStream as SessionToolOutputStream, ToolPluginViewPresentation,
+    ToolPresentationTarget, TraceBlobRef, TraceRedaction,
 };
 use bcode_settings::SettingsStore;
 use bcode_skill::{
@@ -66,13 +64,7 @@ use bcode_tool::{
     ToolDefinition as ServiceToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
     ToolInvocationResult as ServiceToolInvocationResult,
     ToolInvocationStreamEvent as ServiceToolInvocationStreamEvent, ToolList, ToolOutputStream,
-    ToolPluginViewPresentation as ServiceToolPluginViewPresentation,
-    ToolPresentationEvent as ServiceToolPresentationEvent,
-    ToolPresentationFieldKind as ServiceToolPresentationFieldKind,
-    ToolPresentationLevel as ServiceToolPresentationLevel,
-    ToolPresentationSection as ServiceToolPresentationSection,
-    ToolPresentationTarget as ServiceToolPresentationTarget,
-    ToolRequestPresentationMetadata as ServiceToolRequestPresentationMetadata, ToolResultContent,
+    ToolResultContent,
 };
 use runtime_work::{CancellationHandle, RuntimeWorkManager, RuntimeWorkSpec};
 use serde::{Deserialize, Serialize};
@@ -13638,7 +13630,7 @@ async fn append_tool_stream_event(
             .await;
         return;
     }
-    if matches!(event, ToolInvocationStreamEvent::Presentation { .. }) {
+    if is_legacy_tool_presentation_stream_event(&event) {
         return;
     }
 
@@ -13653,6 +13645,10 @@ async fn append_tool_stream_event(
     if let Some((work_id, message)) = progress {
         append_runtime_work_progress_event(state, session_id, work_id, message, None, None).await;
     }
+}
+
+const fn is_legacy_tool_presentation_stream_event(event: &ToolInvocationStreamEvent) -> bool {
+    matches!(event, ToolInvocationStreamEvent::Presentation { .. })
 }
 
 fn runtime_work_progress_from_tool_stream_event(
@@ -13823,15 +13819,7 @@ fn convert_tool_stream_event(
             sequence,
             message,
         }),
-        ServiceToolInvocationStreamEvent::Presentation {
-            tool_call_id,
-            sequence,
-            presentation,
-        } => Some(ToolInvocationStreamEvent::Presentation {
-            tool_call_id,
-            sequence,
-            presentation: convert_tool_presentation_event(presentation)?,
-        }),
+        ServiceToolInvocationStreamEvent::Presentation { .. } => None,
         ServiceToolInvocationStreamEvent::Finished {
             tool_call_id,
             sequence,
@@ -13843,126 +13831,6 @@ fn convert_tool_stream_event(
             is_error,
             finished_at_ms: finished_at_ms.or_else(|| Some(current_unix_millis())),
         }),
-    }
-}
-
-fn convert_tool_presentation_event(
-    event: ServiceToolPresentationEvent,
-) -> Option<ToolPresentationEvent> {
-    match event {
-        ServiceToolPresentationEvent::Status(status) => Some(ToolPresentationEvent::Status(
-            bcode_session_models::ToolStatusPresentation {
-                target: convert_tool_presentation_target(status.target),
-                text: status.text,
-                level: convert_tool_presentation_level(status.level),
-            },
-        )),
-        ServiceToolPresentationEvent::Card(card) => {
-            Some(ToolPresentationEvent::Card(ToolCardPresentation {
-                target: convert_tool_presentation_target(card.target),
-                title: card.title,
-                subtitle: card.subtitle,
-                sections: card
-                    .sections
-                    .into_iter()
-                    .map(convert_tool_presentation_section)
-                    .collect(),
-            }))
-        }
-        ServiceToolPresentationEvent::Progress(progress) => {
-            Some(ToolPresentationEvent::Progress(ToolProgressPresentation {
-                target: convert_tool_presentation_target(progress.target),
-                text: progress.text,
-                percent: progress.percent,
-                level: convert_tool_presentation_level(progress.level),
-            }))
-        }
-        ServiceToolPresentationEvent::PluginView(view) => Some(ToolPresentationEvent::PluginView(
-            convert_tool_plugin_view_presentation(view),
-        )),
-        ServiceToolPresentationEvent::Protocol(_) => None,
-        ServiceToolPresentationEvent::Clear { target } => Some(ToolPresentationEvent::Clear {
-            target: convert_tool_presentation_target(target),
-        }),
-    }
-}
-
-const fn convert_tool_presentation_target(
-    target: ServiceToolPresentationTarget,
-) -> ToolPresentationTarget {
-    match target {
-        ServiceToolPresentationTarget::Activity => ToolPresentationTarget::Activity,
-        ServiceToolPresentationTarget::Preview => ToolPresentationTarget::Preview,
-        ServiceToolPresentationTarget::Result => ToolPresentationTarget::Result,
-    }
-}
-
-const fn convert_tool_presentation_level(
-    level: ServiceToolPresentationLevel,
-) -> ToolPresentationLevel {
-    match level {
-        ServiceToolPresentationLevel::Info => ToolPresentationLevel::Info,
-        ServiceToolPresentationLevel::Success => ToolPresentationLevel::Success,
-        ServiceToolPresentationLevel::Warning => ToolPresentationLevel::Warning,
-        ServiceToolPresentationLevel::Error => ToolPresentationLevel::Error,
-    }
-}
-
-const fn convert_tool_presentation_field_kind(
-    kind: ServiceToolPresentationFieldKind,
-) -> ToolPresentationFieldKind {
-    match kind {
-        ServiceToolPresentationFieldKind::Text => ToolPresentationFieldKind::Text,
-        ServiceToolPresentationFieldKind::Path => ToolPresentationFieldKind::Path,
-        ServiceToolPresentationFieldKind::Url => ToolPresentationFieldKind::Url,
-        ServiceToolPresentationFieldKind::Command => ToolPresentationFieldKind::Command,
-        ServiceToolPresentationFieldKind::Boolean => ToolPresentationFieldKind::Boolean,
-        ServiceToolPresentationFieldKind::Count => ToolPresentationFieldKind::Count,
-        ServiceToolPresentationFieldKind::DurationMs => ToolPresentationFieldKind::DurationMs,
-        ServiceToolPresentationFieldKind::Json => ToolPresentationFieldKind::Json,
-    }
-}
-
-fn convert_tool_plugin_view_presentation(
-    view: ServiceToolPluginViewPresentation,
-) -> ToolPluginViewPresentation {
-    ToolPluginViewPresentation {
-        target: convert_tool_presentation_target(view.target),
-        producer_plugin_id: view.producer_plugin_id,
-        schema: view.schema,
-        schema_version: view.schema_version,
-        title: view.title,
-        subtitle: view.subtitle,
-        payload: view.payload,
-    }
-}
-
-fn convert_tool_presentation_section(
-    section: ServiceToolPresentationSection,
-) -> ToolPresentationSection {
-    match section {
-        ServiceToolPresentationSection::Text { label, text } => {
-            ToolPresentationSection::Text { label, text }
-        }
-        ServiceToolPresentationSection::Fields { fields } => ToolPresentationSection::Fields {
-            fields: fields
-                .into_iter()
-                .map(|field| ToolPresentationFieldValue {
-                    label: field.label,
-                    value: field.value,
-                    kind: convert_tool_presentation_field_kind(field.kind),
-                })
-                .collect(),
-        },
-        ServiceToolPresentationSection::Terminal {
-            output,
-            columns,
-            rows,
-        } => ToolPresentationSection::Terminal {
-            output,
-            columns,
-            rows,
-        },
     }
 }
 
@@ -14199,90 +14067,6 @@ async fn find_tool_provider(
     Ok(None)
 }
 
-fn service_request_presentation_to_session(
-    value: &ServiceToolRequestPresentationMetadata,
-) -> ToolRequestPresentationMetadata {
-    ToolRequestPresentationMetadata {
-        title: value.title.clone(),
-        fields: value
-            .fields
-            .iter()
-            .map(|field| ToolPresentationField {
-                label: field.label.clone(),
-                argument: field.argument.clone(),
-                kind: service_presentation_field_kind_to_session(field.kind),
-                optional: field.optional,
-            })
-            .collect(),
-        preview: value
-            .preview
-            .as_ref()
-            .map(service_request_preview_to_session),
-    }
-}
-
-fn service_request_preview_to_session(
-    value: &bcode_tool::ToolRequestPreviewMetadata,
-) -> bcode_session_models::ToolRequestPreviewMetadata {
-    match value {
-        bcode_tool::ToolRequestPreviewMetadata::PluginView { view } => {
-            bcode_session_models::ToolRequestPreviewMetadata::PluginView {
-                view: service_plugin_view_metadata_to_session(view),
-            }
-        }
-        bcode_tool::ToolRequestPreviewMetadata::FileEdit {
-            path_fields,
-            old_text_fields,
-            new_text_fields,
-        } => bcode_session_models::ToolRequestPreviewMetadata::FileEdit {
-            path_fields: path_fields.clone(),
-            old_text_fields: old_text_fields.clone(),
-            new_text_fields: new_text_fields.clone(),
-        },
-    }
-}
-
-fn service_plugin_view_metadata_to_session(
-    value: &bcode_tool::ToolPluginViewMetadata,
-) -> bcode_session_models::ToolPluginViewMetadata {
-    bcode_session_models::ToolPluginViewMetadata {
-        schema: value.schema.clone(),
-        schema_version: value.schema_version,
-        producer_plugin_id: value.producer_plugin_id.clone(),
-        title: value.title.clone(),
-        subtitle: value.subtitle.clone(),
-        payload: value
-            .payload
-            .iter()
-            .map(|(key, selector)| {
-                (
-                    key.clone(),
-                    bcode_session_models::ToolPresentationPayloadSelector {
-                        fields: selector.fields.clone(),
-                        literal: selector.literal.clone(),
-                        required: selector.required,
-                    },
-                )
-            })
-            .collect(),
-    }
-}
-
-const fn service_presentation_field_kind_to_session(
-    value: ServiceToolPresentationFieldKind,
-) -> ToolPresentationFieldKind {
-    match value {
-        ServiceToolPresentationFieldKind::Text => ToolPresentationFieldKind::Text,
-        ServiceToolPresentationFieldKind::Path => ToolPresentationFieldKind::Path,
-        ServiceToolPresentationFieldKind::Url => ToolPresentationFieldKind::Url,
-        ServiceToolPresentationFieldKind::Command => ToolPresentationFieldKind::Command,
-        ServiceToolPresentationFieldKind::Boolean => ToolPresentationFieldKind::Boolean,
-        ServiceToolPresentationFieldKind::Count => ToolPresentationFieldKind::Count,
-        ServiceToolPresentationFieldKind::DurationMs => ToolPresentationFieldKind::DurationMs,
-        ServiceToolPresentationFieldKind::Json => ToolPresentationFieldKind::Json,
-    }
-}
-
 fn tool_provider_plugin_ids(state: &ServerState) -> Vec<String> {
     state
         .plugins
@@ -14356,11 +14140,7 @@ async fn request_tool_permission(
             tool_name: definition.name.clone(),
             arguments_json,
             agent_id,
-            request_presentation: definition
-                .ui
-                .request_presentation
-                .as_ref()
-                .map(service_request_presentation_to_session),
+            request_presentation: None,
             policy_source: policy_context.source,
             policy_reason: policy_context.reason,
             can_remember_policy: policy_context.skill_decision_key.is_some(),
@@ -16256,7 +16036,10 @@ fn default_session_artifact_dir(session_id: SessionId) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bcode_session_models::{CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEvent};
+    use bcode_session_models::{
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEvent, ToolCardPresentation,
+        ToolPresentationEvent, ToolPresentationTarget,
+    };
 
     fn session_event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> SessionEvent {
         SessionEvent {

@@ -16,8 +16,7 @@ use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, ShellRunResult, TOOL_SERVICE_INTERFACE_ID,
     ToolArtifact, ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
     ToolInvocationResult, ToolInvocationStreamEvent, ToolList, ToolLiveArgumentPreviewMetadata,
-    ToolOutputStream, ToolPresentationField, ToolPresentationFieldKind,
-    ToolRequestPresentationMetadata, ToolSideEffect,
+    ToolOutputStream, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -135,30 +134,7 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
                     streaming_status: Some("shell command · {bytes}".to_string()),
                 }),
 
-                request_presentation: Some(ToolRequestPresentationMetadata {
-                    title: "Shell command".to_string(),
-                    fields: vec![
-                        ToolPresentationField {
-                            label: "Command".to_string(),
-                            argument: "command".to_string(),
-                            kind: ToolPresentationFieldKind::Command,
-                            optional: false,
-                        },
-                        ToolPresentationField {
-                            label: "Working directory".to_string(),
-                            argument: "cwd".to_string(),
-                            kind: ToolPresentationFieldKind::Path,
-                            optional: true,
-                        },
-                        ToolPresentationField {
-                            label: "Timeout".to_string(),
-                            argument: "timeout_ms".to_string(),
-                            kind: ToolPresentationFieldKind::DurationMs,
-                            optional: true,
-                        },
-                    ],
-                    preview: None,
-                }),
+                request_presentation: None,
             },
         }],
     })

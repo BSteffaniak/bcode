@@ -14,10 +14,8 @@ use bcode_tool::{
     ImageMetadata, ImageRefContent, ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS,
     TOOL_SERVICE_INTERFACE_ID, ToolArtifact, ToolDefinition, ToolInvocationRequest,
     ToolInvocationResponse, ToolInvocationResult, ToolInvocationStreamEvent, ToolList,
-    ToolLiveArgumentPreviewMetadata, ToolPluginViewMetadata, ToolPresentationEvent,
-    ToolPresentationField, ToolPresentationFieldKind, ToolPresentationFieldValue,
-    ToolPresentationPayloadSelector, ToolPresentationSection, ToolPresentationTarget,
-    ToolRequestPresentationMetadata, ToolResultContent, ToolSideEffect,
+    ToolLiveArgumentPreviewMetadata, ToolPluginViewMetadata, ToolPresentationPayloadSelector,
+    ToolResultContent, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -384,21 +382,12 @@ fn compatibility_aliases_for(aliases: &[&str]) -> Vec<bcode_tool::ToolCompatibil
         .collect()
 }
 
-fn path_tool_ui(activity_label: &str, title: &str) -> bcode_tool::ToolUiMetadata {
+fn path_tool_ui(activity_label: &str) -> bcode_tool::ToolUiMetadata {
     bcode_tool::ToolUiMetadata {
         activity_label: Some(activity_label.to_string()),
         live_argument_preview: None,
 
-        request_presentation: Some(ToolRequestPresentationMetadata {
-            title: title.to_string(),
-            fields: vec![ToolPresentationField {
-                label: "Path".to_string(),
-                argument: "path".to_string(),
-                kind: ToolPresentationFieldKind::Path,
-                optional: false,
-            }],
-            preview: None,
-        }),
+        request_presentation: None,
     }
 }
 
@@ -445,11 +434,7 @@ fn file_change_metadata(
     }
 }
 
-fn write_tool_ui(
-    activity_label: &str,
-    title: &str,
-    preview_title: &str,
-) -> bcode_tool::ToolUiMetadata {
+fn write_tool_ui(activity_label: &str, preview_title: &str) -> bcode_tool::ToolUiMetadata {
     bcode_tool::ToolUiMetadata {
         activity_label: Some(activity_label.to_string()),
         live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::PluginView {
@@ -463,40 +448,11 @@ fn write_tool_ui(
             streaming_status: Some(format!("{activity_label} {{path}} · {{bytes}}")),
         }),
 
-        request_presentation: Some(ToolRequestPresentationMetadata {
-            title: title.to_string(),
-            fields: vec![
-                ToolPresentationField {
-                    label: "Path".to_string(),
-                    argument: "path".to_string(),
-                    kind: ToolPresentationFieldKind::Path,
-                    optional: false,
-                },
-                ToolPresentationField {
-                    label: "Contents".to_string(),
-                    argument: "contents".to_string(),
-                    kind: ToolPresentationFieldKind::Text,
-                    optional: false,
-                },
-            ],
-            preview: Some(bcode_tool::ToolRequestPreviewMetadata::PluginView {
-                view: file_change_metadata(
-                    preview_title,
-                    &[],
-                    Some(""),
-                    false,
-                    &["contents", "new_text"],
-                ),
-            }),
-        }),
+        request_presentation: None,
     }
 }
 
-fn edit_tool_ui(
-    activity_label: &str,
-    title: &str,
-    preview_title: &str,
-) -> bcode_tool::ToolUiMetadata {
+fn edit_tool_ui(activity_label: &str, preview_title: &str) -> bcode_tool::ToolUiMetadata {
     bcode_tool::ToolUiMetadata {
         activity_label: Some(activity_label.to_string()),
         live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::PluginView {
@@ -504,32 +460,7 @@ fn edit_tool_ui(
             streaming_status: Some(format!("{activity_label} {{path}} · {{bytes}}")),
         }),
 
-        request_presentation: Some(ToolRequestPresentationMetadata {
-            title: title.to_string(),
-            fields: vec![
-                ToolPresentationField {
-                    label: "Path".to_string(),
-                    argument: "path".to_string(),
-                    kind: ToolPresentationFieldKind::Path,
-                    optional: false,
-                },
-                ToolPresentationField {
-                    label: "Old text".to_string(),
-                    argument: "old_text".to_string(),
-                    kind: ToolPresentationFieldKind::Text,
-                    optional: false,
-                },
-                ToolPresentationField {
-                    label: "New text".to_string(),
-                    argument: "new_text".to_string(),
-                    kind: ToolPresentationFieldKind::Text,
-                    optional: false,
-                },
-            ],
-            preview: Some(bcode_tool::ToolRequestPreviewMetadata::PluginView {
-                view: file_change_metadata(preview_title, &["old_text"], None, true, &["new_text"]),
-            }),
-        }),
+        request_presentation: None,
     }
 }
 
@@ -549,7 +480,7 @@ fn read_tool_definition() -> ToolDefinition {
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: path_policy(&["read"], "read", bcode_tool::ToolArgumentKind::ReadPath),
-        ui: path_tool_ui("reading", "Read file"),
+        ui: path_tool_ui("reading"),
     }
 }
 
@@ -568,7 +499,7 @@ fn write_tool_definition() -> ToolDefinition {
         side_effect: ToolSideEffect::WriteFiles,
         requires_permission: true,
         policy: path_policy(&["write"], "write", bcode_tool::ToolArgumentKind::WritePath),
-        ui: write_tool_ui("writing", "Write file", "Write preview"),
+        ui: write_tool_ui("writing", "Write preview"),
     }
 }
 
@@ -588,7 +519,7 @@ fn edit_tool_definition() -> ToolDefinition {
         side_effect: ToolSideEffect::WriteFiles,
         requires_permission: true,
         policy: path_policy(&["edit"], "edit", bcode_tool::ToolArgumentKind::WritePath),
-        ui: edit_tool_ui("editing", "Edit file", "Edit preview"),
+        ui: edit_tool_ui("editing", "Edit preview"),
     }
 }
 
@@ -604,7 +535,7 @@ fn exists_tool_definition() -> ToolDefinition {
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: path_policy(&["read"], "read", bcode_tool::ToolArgumentKind::ReadPath),
-        ui: path_tool_ui("checking", "Check path"),
+        ui: path_tool_ui("checking"),
     }
 }
 
@@ -629,7 +560,7 @@ fn list_tool_definition() -> ToolDefinition {
             "read",
             bcode_tool::ToolArgumentKind::ReadPath,
         ),
-        ui: path_tool_ui("listing", "List directory"),
+        ui: path_tool_ui("listing"),
     }
 }
 
@@ -654,7 +585,7 @@ fn find_tool_definition() -> ToolDefinition {
             "read",
             bcode_tool::ToolArgumentKind::ReadPath,
         ),
-        ui: path_tool_ui("finding", "Find paths"),
+        ui: path_tool_ui("finding"),
     }
 }
 
@@ -681,7 +612,7 @@ fn grep_tool_definition() -> ToolDefinition {
             "read",
             bcode_tool::ToolArgumentKind::ReadPath,
         ),
-        ui: path_tool_ui("searching", "Search files"),
+        ui: path_tool_ui("searching"),
     }
 }
 
@@ -701,7 +632,7 @@ fn stat_tool_definition() -> ToolDefinition {
             "read",
             bcode_tool::ToolArgumentKind::ReadPath,
         ),
-        ui: path_tool_ui("stat", "Inspect path"),
+        ui: path_tool_ui("stat"),
     }
 }
 
@@ -783,18 +714,8 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
     let cwd = request.cwd.clone();
     let response = match request.name.as_str() {
         "filesystem.read" => tool_read(request.arguments, cwd.as_deref()),
-        "filesystem.write" => tool_write(
-            request.arguments,
-            cwd.as_deref(),
-            Some(context.events),
-            &request.tool_call_id,
-        ),
-        "filesystem.edit" => tool_edit(
-            request.arguments,
-            cwd.as_deref(),
-            Some(context.events),
-            &request.tool_call_id,
-        ),
+        "filesystem.write" => tool_write(request.arguments, cwd.as_deref(), &request.tool_call_id),
+        "filesystem.edit" => tool_edit(request.arguments, cwd.as_deref(), &request.tool_call_id),
         "filesystem.exists" => tool_exists(request.arguments, cwd.as_deref()),
         "filesystem.list" => tool_list(
             request.arguments,
@@ -1151,41 +1072,6 @@ fn sniff_supported_image_mime(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-fn emit_presentation(
-    events: Option<ServiceEventEmitter>,
-    tool_call_id: &str,
-    sequence: u64,
-    presentation: ToolPresentationEvent,
-) {
-    let event = ToolInvocationStreamEvent::Presentation {
-        tool_call_id: tool_call_id.to_string(),
-        sequence,
-        presentation,
-    };
-    if let Ok(payload) = serde_json::to_vec(&event)
-        && let Some(events) = events
-    {
-        events.emit(&payload);
-    }
-}
-
-fn file_change_fields(path: &Path, summary: &str) -> ToolPresentationSection {
-    ToolPresentationSection::Fields {
-        fields: vec![
-            ToolPresentationFieldValue {
-                label: "Path".to_string(),
-                value: path.display().to_string(),
-                kind: ToolPresentationFieldKind::Path,
-            },
-            ToolPresentationFieldValue {
-                label: "Summary".to_string(),
-                value: summary.to_string(),
-                kind: ToolPresentationFieldKind::Text,
-            },
-        ],
-    }
-}
-
 fn file_change_artifact(
     tool_call_id: &str,
     tool_name: &str,
@@ -1217,37 +1103,13 @@ fn file_change_artifact(
 fn tool_write(
     arguments: serde_json::Value,
     cwd: Option<&Path>,
-    events: Option<ServiceEventEmitter>,
     tool_call_id: &str,
 ) -> ToolInvocationResponse {
     match serde_json::from_value::<WriteRequest>(arguments) {
         Ok(mut request) => {
             request.path = resolve_session_path(cwd, &request.path);
-            emit_presentation(
-                events,
-                tool_call_id,
-                1,
-                ToolPresentationEvent::Status(bcode_tool::ToolStatusPresentation {
-                    target: ToolPresentationTarget::Activity,
-                    text: format!("applying file change {}", request.path.display()),
-                    level: bcode_tool::ToolPresentationLevel::Info,
-                }),
-            );
             write_file_inner(&request.path, &request.contents).map_or_else(
-                |error| {
-                    emit_presentation(
-                        events,
-                        tool_call_id,
-                        3,
-                        ToolPresentationEvent::Card(bcode_tool::ToolCardPresentation {
-                            target: ToolPresentationTarget::Result,
-                            title: "File change failed".to_string(),
-                            subtitle: None,
-                            sections: vec![file_change_fields(&request.path, &error.to_string())],
-                        }),
-                    );
-                    tool_io_error(&error)
-                },
+                |error| tool_io_error(&error),
                 |bytes_written| {
                     let summary = format!("wrote {bytes_written} bytes");
                     ToolInvocationResponse {
@@ -1275,43 +1137,19 @@ fn tool_write(
 fn tool_edit(
     arguments: serde_json::Value,
     cwd: Option<&Path>,
-    events: Option<ServiceEventEmitter>,
     tool_call_id: &str,
 ) -> ToolInvocationResponse {
     match serde_json::from_value::<EditRequest>(arguments) {
         Ok(mut request) => {
             request.path = resolve_session_path(cwd, &request.path);
-            emit_presentation(
-                events,
-                tool_call_id,
-                1,
-                ToolPresentationEvent::Status(bcode_tool::ToolStatusPresentation {
-                    target: ToolPresentationTarget::Activity,
-                    text: format!("applying file change {}", request.path.display()),
-                    level: bcode_tool::ToolPresentationLevel::Info,
-                }),
-            );
             edit_file_inner(&request).map_or_else(
-                |error| {
-                    emit_presentation(
-                        events,
-                        tool_call_id,
-                        3,
-                        ToolPresentationEvent::Card(bcode_tool::ToolCardPresentation {
-                            target: ToolPresentationTarget::Result,
-                            title: "File change failed".to_string(),
-                            subtitle: None,
-                            sections: vec![file_change_fields(&request.path, &error)],
-                        }),
-                    );
-                    ToolInvocationResponse {
-                        output: error,
-                        is_error: true,
-                        content: Vec::new(),
-                        full_output: None,
-                        host_action: None,
-                        result: None,
-                    }
+                |error| ToolInvocationResponse {
+                    output: error,
+                    is_error: true,
+                    content: Vec::new(),
+                    full_output: None,
+                    host_action: None,
+                    result: None,
                 },
                 |replacements| {
                     let summary = format!("applied {replacements} replacement");
@@ -2459,7 +2297,6 @@ mod tests {
                 "contents": "hello",
             }),
             None,
-            None,
             "test",
         );
         assert_file_change_artifact(write_response.result, "filesystem.write", "wrote 5 bytes");
@@ -2470,7 +2307,6 @@ mod tests {
                 "old_text": "hello",
                 "new_text": "hello world",
             }),
-            None,
             None,
             "test",
         );

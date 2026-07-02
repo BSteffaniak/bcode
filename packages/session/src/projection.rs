@@ -570,10 +570,16 @@ fn tool_stream_content_bytes(event: &ToolInvocationStreamEvent) -> usize {
         ToolInvocationStreamEvent::OutputDelta { text, .. }
         | ToolInvocationStreamEvent::Status { message: text, .. } => text.len(),
         ToolInvocationStreamEvent::Presentation { presentation, .. } => {
-            serde_json::to_vec(presentation).map_or(0, |encoded| encoded.len())
+            legacy_tool_presentation_content_bytes(presentation)
         }
         ToolInvocationStreamEvent::Finished { .. } => 0,
     }
+}
+
+fn legacy_tool_presentation_content_bytes(
+    presentation: &bcode_session_models::ToolPresentationEvent,
+) -> usize {
+    serde_json::to_vec(presentation).map_or(0, |encoded| encoded.len())
 }
 
 fn estimate_rows(content_bytes: usize, width_columns: Option<u16>) -> Option<usize> {

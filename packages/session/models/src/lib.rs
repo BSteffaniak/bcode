@@ -140,9 +140,16 @@ fn apply_tool_invocation_stream_projection_event(
             projection.is_error = Some(*is_error);
         }
         ToolInvocationStreamEvent::Presentation { presentation, .. } => {
-            projection.legacy_presentations.push(presentation.clone());
+            legacy_record_tool_presentation(projection, presentation);
         }
     }
+}
+
+fn legacy_record_tool_presentation(
+    projection: &mut ToolInvocationProjection,
+    presentation: &ToolPresentationEvent,
+) {
+    projection.legacy_presentations.push(presentation.clone());
 }
 
 fn tool_invocation_projection_mut<'a>(

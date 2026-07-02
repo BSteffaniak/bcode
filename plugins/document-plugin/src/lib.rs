@@ -9,7 +9,6 @@ use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
     ToolInvocationRequest, ToolInvocationResponse, ToolInvocationStreamEvent, ToolList,
-    ToolPresentationField, ToolPresentationFieldKind, ToolRequestPresentationMetadata,
     ToolSideEffect,
 };
 use reqwest::Client;
@@ -533,30 +532,7 @@ fn extract_tool_definition() -> ToolDefinition {
             activity_label: Some("extracting".to_string()),
             live_argument_preview: None,
 
-            request_presentation: Some(ToolRequestPresentationMetadata {
-                title: "Extract document".to_string(),
-                fields: vec![
-                    ToolPresentationField {
-                        label: "URL".to_string(),
-                        argument: "url".to_string(),
-                        kind: ToolPresentationFieldKind::Url,
-                        optional: true,
-                    },
-                    ToolPresentationField {
-                        label: "Path".to_string(),
-                        argument: "path".to_string(),
-                        kind: ToolPresentationFieldKind::Path,
-                        optional: true,
-                    },
-                    ToolPresentationField {
-                        label: "Max bytes".to_string(),
-                        argument: "max_bytes".to_string(),
-                        kind: ToolPresentationFieldKind::Count,
-                        optional: true,
-                    },
-                ],
-                preview: None,
-            }),
+            request_presentation: None,
         },
     }
 }

@@ -2833,7 +2833,9 @@ impl BmuxApp {
                     }
                 }
             }
-            ToolInvocationStreamEvent::Presentation { .. } => {}
+            ToolInvocationStreamEvent::Presentation { .. } => {
+                Self::legacy_discard_tool_presentation_stream_event();
+            }
             ToolInvocationStreamEvent::Finished {
                 tool_call_id,
                 is_error,
@@ -2863,6 +2865,8 @@ impl BmuxApp {
             }
         }
     }
+
+    const fn legacy_discard_tool_presentation_stream_event() {}
 
     fn push_tool_output_delta(&mut self, tool_call_id: &str, stream: ToolOutputStream, text: &str) {
         if text.is_empty() {

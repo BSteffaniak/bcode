@@ -7,10 +7,8 @@
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
-    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationStreamEvent, ToolList,
-    ToolLiveArgumentPreviewMetadata, ToolPresentationEvent, ToolPresentationField,
-    ToolPresentationFieldKind, ToolPresentationFieldValue, ToolPresentationSection,
-    ToolPresentationTarget, ToolRequestPresentationMetadata, ToolSideEffect,
+    ToolInvocationRequest, ToolInvocationResponse, ToolList, ToolLiveArgumentPreviewMetadata,
+    ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -32,62 +30,6 @@ impl RustPlugin for GitPlugin {
                 "unsupported Git plugin service interface",
             ),
         }
-    }
-}
-
-fn emit_presentation(
-    events: ServiceEventEmitter,
-    tool_call_id: &str,
-    sequence: u64,
-    presentation: ToolPresentationEvent,
-) {
-    let event = ToolInvocationStreamEvent::Presentation {
-        tool_call_id: tool_call_id.to_owned(),
-        sequence,
-        presentation,
-    };
-    if let Ok(payload) = serde_json::to_vec(&event) {
-        events.emit(&payload);
-    }
-}
-
-fn git_field(label: &str, value: &impl ToString) -> ToolPresentationFieldValue {
-    ToolPresentationFieldValue {
-        label: label.to_string(),
-        value: value.to_string(),
-        kind: ToolPresentationFieldKind::Text,
-    }
-}
-
-fn clone_preview_card(request: &CloneRequest) -> bcode_tool::ToolCardPresentation {
-    let mut fields = vec![git_field("URL", &request.url)];
-    if let Some(destination) = &request.destination {
-        fields.push(git_field("Destination", &destination.display()));
-    }
-    if let Some(git_ref) = &request.git_ref {
-        fields.push(git_field("Ref", git_ref));
-    }
-    bcode_tool::ToolCardPresentation {
-        target: ToolPresentationTarget::Preview,
-        title: "Clone repository".to_string(),
-        subtitle: None,
-        sections: vec![ToolPresentationSection::Fields { fields }],
-    }
-}
-
-fn clone_result_card(response: &CloneResponse) -> bcode_tool::ToolCardPresentation {
-    bcode_tool::ToolCardPresentation {
-        target: ToolPresentationTarget::Result,
-        title: "Repository cloned".to_string(),
-        subtitle: None,
-        sections: vec![ToolPresentationSection::Fields {
-            fields: vec![
-                git_field("URL", &response.url),
-                git_field("Destination", &response.path.display()),
-                git_field("Ref", &response.git_ref.as_deref().unwrap_or("default")),
-                git_field("Already exists", &response.already_exists),
-            ],
-        }],
     }
 }
 
@@ -137,28 +79,14 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
 
 fn invoke_clone(
     invocation: &ToolInvocationRequest,
-    events: ServiceEventEmitter,
+    _events: ServiceEventEmitter,
 ) -> ToolInvocationResponse {
     let request = match serde_json::from_value::<CloneRequest>(invocation.arguments.clone()) {
         Ok(request) => request,
         Err(error) => return tool_error(error.to_string()),
     };
-    emit_presentation(
-        events,
-        &invocation.tool_call_id,
-        0,
-        ToolPresentationEvent::Card(clone_preview_card(&request)),
-    );
     match clone_repository(&request, invocation.artifact_dir.as_deref()) {
-        Ok(response) => {
-            emit_presentation(
-                events,
-                &invocation.tool_call_id,
-                1,
-                ToolPresentationEvent::Card(clone_result_card(&response)),
-            );
-            json_tool_response(&response)
-        }
+        Ok(response) => json_tool_response(&response),
         Err(error) => tool_error(error.to_string()),
     }
 }
@@ -431,8 +359,8 @@ fn clone_tool_definition() -> ToolDefinition {
         policy: bcode_tool::ToolPolicyMetadata {
             aliases: Vec::new(),
             compatibility_aliases: Vec::new(),
-                capabilities: Vec::new(),
-                permission_category: Some("write".to_string()),
+            capabilities: Vec::new(),
+            permission_category: Some("write".to_string()),
             argument_extractors: vec![bcode_tool::ToolArgumentExtractor {
                 kind: bcode_tool::ToolArgumentKind::WritePath,
                 argument: "destination".to_string(),
@@ -451,30 +379,7 @@ fn clone_tool_definition() -> ToolDefinition {
                 streaming_status: Some("cloning {primary} · {bytes}".to_string()),
             }),
 
-            request_presentation: Some(ToolRequestPresentationMetadata {
-                title: "Clone repository".to_string(),
-                fields: vec![
-                    ToolPresentationField {
-                        label: "URL".to_string(),
-                        argument: "url".to_string(),
-                        kind: ToolPresentationFieldKind::Url,
-                        optional: false,
-                    },
-                    ToolPresentationField {
-                        label: "Destination".to_string(),
-                        argument: "destination".to_string(),
-                        kind: ToolPresentationFieldKind::Path,
-                        optional: true,
-                    },
-                    ToolPresentationField {
-                        label: "Ref".to_string(),
-                        argument: "ref".to_string(),
-                        kind: ToolPresentationFieldKind::Text,
-                        optional: true,
-                    },
-                ],
-                preview: None,
-            }),
+            request_presentation: None,
         },
     }
 }

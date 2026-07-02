@@ -20,11 +20,6 @@ pub const OP_INVOKE_TOOL: &str = "invoke_tool";
 /// Operation for resuming a suspended interactive tool invocation.
 pub const OP_RESUME_INTERACTIVE_TOOL: &str = "resume_interactive_tool";
 
-/// Operation for presenting an opaque artifact in a client-local renderer.
-pub const OP_PRESENT_ARTIFACT: &str = "present_artifact";
-/// Operation name for rendering opaque plugin-owned view payloads through visual adapters.
-pub const OP_PRESENT_VIEW: &str = "present_view";
-
 /// List tools request.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListToolsRequest {}

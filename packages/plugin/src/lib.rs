@@ -113,8 +113,6 @@ pub struct PluginVisualAdapterDeclaration {
     pub max_schema_version: Option<u32>,
     #[serde(default = "default_tool_service_interface_id")]
     pub service_interface_id: String,
-    #[serde(default = "default_present_artifact_operation")]
-    pub operation: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub surfaces: Vec<String>,
     #[serde(default)]
@@ -136,10 +134,6 @@ impl PluginVisualAdapterDeclaration {
                 .is_none_or(|maximum| schema_version <= maximum)
             && (self.surfaces.is_empty() || self.surfaces.iter().any(|value| value == surface))
     }
-}
-
-fn default_present_artifact_operation() -> String {
-    bcode_tool::OP_PRESENT_ARTIFACT.to_owned()
 }
 
 /// Native TUI surface declared by a plugin manifest.
@@ -1908,7 +1902,6 @@ pub struct PluginVisualAdapterRoute {
     pub adapter_id: String,
     pub schema: String,
     pub service_interface_id: String,
-    pub operation: String,
     pub surfaces: Vec<String>,
     pub priority: i32,
     pub producer_default: bool,
@@ -1951,7 +1944,6 @@ where
             adapter_id: adapter.id.clone(),
             schema: adapter.schema.clone(),
             service_interface_id: adapter.service_interface_id.clone(),
-            operation: adapter.operation.clone(),
             surfaces: adapter.surfaces.clone(),
             priority: adapter.priority,
             producer_default: adapter.producer_default,
@@ -2930,66 +2922,6 @@ impl PluginHost {
     #[must_use]
     pub fn service_registry(&self) -> PluginServiceRegistry {
         PluginServiceRegistry::from_loaded_plugins(&self.loaded)
-    }
-
-    /// Present an opaque artifact through the highest-priority compatible visual adapter.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the selected visual adapter cannot be invoked or its response cannot be
-    /// decoded.
-    pub fn present_artifact(
-        &self,
-        request: &bcode_tool::ToolArtifactPresentationRequest,
-    ) -> Result<Option<bcode_tool::ToolArtifactPresentationResponse>, PluginServiceCallError> {
-        let Some(route) = select_visual_adapter(
-            self.loaded
-                .iter()
-                .map(|plugin| (&plugin.manifest.id, &plugin.manifest)),
-            &request.artifact.schema,
-            request.artifact.schema_version,
-            &request.surface,
-            Some(&request.artifact.producer_plugin_id),
-        ) else {
-            return Ok(None);
-        };
-        self.invoke_service_json::<_, bcode_tool::ToolArtifactPresentationResponse>(
-            &route.plugin_id,
-            route.service_interface_id,
-            route.operation,
-            request,
-        )
-        .map(Some)
-    }
-
-    /// Present an opaque plugin-owned view through the highest-priority compatible visual adapter.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the selected visual adapter cannot be invoked or its response cannot be
-    /// decoded.
-    pub fn present_view(
-        &self,
-        request: &bcode_tool::ToolViewPresentationRequest,
-    ) -> Result<Option<bcode_tool::ToolViewPresentationResponse>, PluginServiceCallError> {
-        let Some(route) = select_visual_adapter(
-            self.loaded
-                .iter()
-                .map(|plugin| (&plugin.manifest.id, &plugin.manifest)),
-            &request.view.schema,
-            request.view.schema_version,
-            &request.surface,
-            Some(&request.view.producer_plugin_id),
-        ) else {
-            return Ok(None);
-        };
-        self.invoke_service_json::<_, bcode_tool::ToolViewPresentationResponse>(
-            &route.plugin_id,
-            route.service_interface_id,
-            route.operation,
-            request,
-        )
-        .map(Some)
     }
 
     /// Invoke a service operation on a loaded plugin by ID.
