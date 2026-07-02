@@ -10,6 +10,8 @@ use std::process::Command;
 use std::{
     fs,
     io::{self, Cursor},
+    thread,
+    time::Duration,
 };
 
 #[cfg(feature = "bundled-tesseract-v5-3-4")]
@@ -39,6 +41,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BCODE_LEPTONICA_LIB_DIR");
     println!("cargo:rerun-if-env-changed=BCODE_LEPTONICA_INCLUDE_DIR");
     println!("cargo:rerun-if-env-changed=BCODE_TESSDATA_PREFIX");
+    println!("cargo:rerun-if-env-changed=BCODE_TESSERACT_ARTIFACT_CACHE");
+    println!("cargo:rerun-if-env-changed=BCODE_TESSERACT_OFFLINE");
     emit_tessdata_prefix_override();
 
     let mode = env::var("BCODE_TESSERACT_LINK_MODE").unwrap_or_else(|_| default_link_mode());
@@ -627,9 +631,21 @@ fn download_file_to(url: &str, expected_sha256: &str, path: &Path) {
         if sha256_hex(&bytes) == expected_sha256 {
             return;
         }
+        eprintln!(
+            "cached artifact {} had unexpected sha256; redownloading {url}",
+            path.display()
+        );
     }
     let bytes = download_verified(url, expected_sha256);
-    fs::write(path, bytes).expect("failed to write downloaded file");
+    let tmp_path = path.with_extension("tmp");
+    fs::write(&tmp_path, bytes).expect("failed to write downloaded file");
+    fs::rename(&tmp_path, path).unwrap_or_else(|error| {
+        panic!(
+            "failed to install downloaded file {} -> {}: {error}",
+            tmp_path.display(),
+            path.display()
+        )
+    });
 }
 
 #[cfg(any(
@@ -638,16 +654,175 @@ fn download_file_to(url: &str, expected_sha256: &str, path: &Path) {
     feature = "bundled-tesseract-v5-5-1"
 ))]
 fn download_verified(url: &str, expected_sha256: &str) -> Vec<u8> {
-    let bytes = reqwest::blocking::get(url)
-        .unwrap_or_else(|error| panic!("failed to download {url}: {error}"))
+    let cache_path = artifact_cache_path(url, expected_sha256);
+    if env::var_os("BCODE_TESSERACT_OFFLINE").is_some() {
+        panic!(
+            "artifact {url} is not in cache {} and BCODE_TESSERACT_OFFLINE is set",
+            cache_path.display()
+        );
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("bcode-tesseract-sys-build/0.0.1")
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(300))
+        .build()
+        .expect("failed to build HTTP client");
+
+    let mut errors = Vec::new();
+    for attempt in 1..=5 {
+        match download_attempt(&client, url, expected_sha256) {
+            Ok(bytes) => {
+                write_cached_artifact(&cache_path, &bytes);
+                return bytes;
+            }
+            Err(error) => {
+                errors.push(format!("attempt {attempt}: {error}"));
+                if attempt < 5 {
+                    thread::sleep(Duration::from_secs(attempt * 2));
+                }
+            }
+        }
+    }
+
+    panic!(
+        "failed to download verified artifact {url}\ncache: {}\nexpected sha256: {expected_sha256}\n{}",
+        cache_path.display(),
+        errors.join("\n")
+    );
+}
+
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
+fn download_attempt(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    expected_sha256: &str,
+) -> Result<Vec<u8>, String> {
+    let response = client
+        .get(url)
+        .send()
+        .map_err(|error| format!("request failed: {error}"))?
         .error_for_status()
-        .unwrap_or_else(|error| panic!("failed to download {url}: {error}"))
+        .map_err(|error| format!("HTTP error: {error}"))?;
+    let bytes = response
         .bytes()
-        .unwrap_or_else(|error| panic!("failed to read {url}: {error}"))
+        .map_err(|error| format!("failed to read response body: {error}"))?
         .to_vec();
     let actual_sha256 = sha256_hex(&bytes);
-    assert_eq!(actual_sha256, expected_sha256, "sha256 mismatch for {url}");
-    bytes
+    if actual_sha256 == expected_sha256 {
+        Ok(bytes)
+    } else {
+        Err(format!(
+            "sha256 mismatch: expected {expected_sha256}, got {actual_sha256}"
+        ))
+    }
+}
+
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
+fn read_valid_cached_artifact(path: &Path, expected_sha256: &str) -> Option<Vec<u8>> {
+    if !path.is_file() {
+        return None;
+    }
+    let bytes = fs::read(path).unwrap_or_else(|error| {
+        panic!("failed to read cached artifact {}: {error}", path.display())
+    });
+    if sha256_hex(&bytes) == expected_sha256 {
+        Some(bytes)
+    } else {
+        eprintln!(
+            "cached artifact {} had unexpected sha256; redownloading",
+            path.display()
+        );
+        None
+    }
+}
+
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
+fn write_cached_artifact(path: &Path, bytes: &[u8]) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap_or_else(|error| {
+            panic!(
+                "failed to create artifact cache directory {}: {error}",
+                parent.display()
+            )
+        });
+    }
+    let tmp_path = path.with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(&tmp_path, bytes).unwrap_or_else(|error| {
+        panic!(
+            "failed to write artifact cache file {}: {error}",
+            tmp_path.display()
+        )
+    });
+    if let Err(error) = fs::rename(&tmp_path, path) {
+        if read_valid_cached_artifact(path, &sha256_hex(bytes)).is_none() {
+            panic!(
+                "failed to install artifact cache file {} -> {}: {error}",
+                tmp_path.display(),
+                path.display()
+            );
+        }
+        let _ = fs::remove_file(&tmp_path);
+    }
+}
+
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
+fn artifact_cache_path(url: &str, expected_sha256: &str) -> PathBuf {
+    artifact_cache_dir().join(format!("{}{}", expected_sha256, artifact_extension(url)))
+}
+
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
+fn artifact_extension(url: &str) -> &'static str {
+    if url.ends_with(".zip") {
+        ".zip"
+    } else if url.ends_with(".traineddata") {
+        ".traineddata"
+    } else {
+        ".bin"
+    }
+}
+
+#[cfg(any(
+    feature = "bundled-tesseract",
+    feature = "bundled-tesseract-v5-3-4",
+    feature = "bundled-tesseract-v5-5-1"
+))]
+fn artifact_cache_dir() -> PathBuf {
+    if let Some(path) = env::var_os("BCODE_TESSERACT_ARTIFACT_CACHE") {
+        return PathBuf::from(path);
+    }
+    if let Some(path) = env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(path)
+            .join("bcode")
+            .join("tesseract-artifacts");
+    }
+    if let Some(home) = env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".cache")
+            .join("bcode")
+            .join("tesseract-artifacts");
+    }
+    out_dir().join("artifact-cache")
 }
 
 #[cfg(any(
