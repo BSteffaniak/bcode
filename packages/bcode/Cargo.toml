@@ -41,6 +41,10 @@ tokio                                   = { workspace = true, features = ["macro
 [features]
 _static-bundled = []
 bundled-ocr-tesseract = ["bundled-ocr-tesseract-default"]
+bundled-ocr-tesseract-all = [
+    "bundled-ocr-tesseract-v5-3-4",
+    "bundled-ocr-tesseract-v5-5-1",
+]
 bundled-ocr-tesseract-default = ["bundled-ocr-tesseract-v5-5-1"]
 bundled-ocr-tesseract-latest = ["bundled-ocr-tesseract-v5-5-1"]
 bundled-ocr-tesseract-v5-3-4 = [

@@ -18,6 +18,7 @@ toml                = { workspace = true }
 
 [features]
 bundled-tesseract         = ["bundled-tesseract-default"]
+bundled-tesseract-all     = ["bundled-tesseract-v5-3-4", "bundled-tesseract-v5-5-1"]
 bundled-tesseract-default = ["bundled-tesseract-v5-5-1"]
 bundled-tesseract-latest  = ["bundled-tesseract-v5-5-1"]
 bundled-tesseract-v5-3-4  = ["bcode_tesseract_sys/bundled-tesseract-v5-3-4"]

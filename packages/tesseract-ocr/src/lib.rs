@@ -9,8 +9,9 @@
 
 use std::env;
 use std::ffi::{CStr, CString, NulError};
+use std::fs;
 use std::os::raw::{c_char, c_int, c_void};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
 use thiserror::Error;
@@ -150,7 +151,7 @@ impl TesseractRuntime {
         let library = unsafe { libloading::Library::new(&library_path) }.map_err(|error| {
             Error::LoadBundledRuntime {
                 version: version.to_string(),
-                message: format!("{}: {error}", library_path.display()),
+                message: runtime_load_diagnostics(&library_path, &error.to_string()),
             }
         })?;
         let symbols = unsafe { load_tesseract_symbols(&library) }.map_err(|error| {
@@ -186,9 +187,55 @@ impl TesseractRuntime {
 }
 
 fn bundled_runtime_root() -> Result<PathBuf> {
+    if let Some(root) = env::var_os("BCODE_TESSERACT_RUNTIME_ROOT") {
+        return Ok(PathBuf::from(root));
+    }
+    if let Some(root) = executable_relative_runtime_root() {
+        return Ok(root);
+    }
     bcode_tesseract_sys::compiled_bundled_runtime_root()
         .map(PathBuf::from)
         .ok_or(Error::BundledRuntimePathUnavailable)
+}
+
+fn executable_relative_runtime_root() -> Option<PathBuf> {
+    let exe = env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+    let root = exe_dir.join("bcode-runtimes").join("tesseract");
+    root.is_dir().then_some(root)
+}
+
+fn runtime_load_diagnostics(library_path: &Path, loader_error: &str) -> String {
+    let lib_dir = library_path.parent();
+    let entries = lib_dir.and_then(|dir| fs::read_dir(dir).ok()).map_or_else(
+        || "<unreadable>".to_string(),
+        |entries| {
+            let mut names = entries
+                .filter_map(std::result::Result::ok)
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .collect::<Vec<_>>();
+            names.sort();
+            names.join(", ")
+        },
+    );
+    format!(
+        "library: {}; exists: {}; lib dir entries: {}; loader error: {}; hint: {}",
+        library_path.display(),
+        library_path.exists(),
+        entries,
+        loader_error,
+        platform_loader_hint(library_path)
+    )
+}
+
+fn platform_loader_hint(library_path: &Path) -> String {
+    if cfg!(target_os = "macos") {
+        format!("run `otool -L {}`", library_path.display())
+    } else if cfg!(target_os = "linux") {
+        format!("run `ldd {}`", library_path.display())
+    } else {
+        "verify the dependent DLLs are next to the runtime library".to_string()
+    }
 }
 
 fn dynamic_library_name(name: &str) -> String {

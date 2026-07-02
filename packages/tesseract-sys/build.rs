@@ -492,13 +492,46 @@ fn patch_runtime_libraries(runtime_lib: &Path) {
     if !cfg!(target_os = "macos") {
         return;
     }
-    for library in dynamic_libraries(runtime_lib, "") {
-        let _ = Command::new("install_name_tool")
-            .arg("-add_rpath")
-            .arg("@loader_path")
-            .arg(&library)
-            .status();
+
+    let tesseract = runtime_lib.join(dynamic_library_name("tesseract"));
+    let leptonica = runtime_lib.join(dynamic_library_name("leptonica"));
+    patch_id(&tesseract, "@loader_path/libtesseract.dylib");
+    patch_id(&leptonica, "@loader_path/libleptonica.dylib");
+    for old_name in [
+        "@rpath/libleptonica.6.dylib",
+        "@rpath/libleptonica.dylib",
+        "libleptonica.6.dylib",
+        "libleptonica.dylib",
+    ] {
+        patch_change(&tesseract, old_name, "@loader_path/libleptonica.dylib");
     }
+    patch_add_rpath(&tesseract, "@loader_path");
+    patch_add_rpath(&leptonica, "@loader_path");
+}
+
+fn patch_id(library: &Path, id: &str) {
+    let _ = Command::new("install_name_tool")
+        .arg("-id")
+        .arg(id)
+        .arg(library)
+        .status();
+}
+
+fn patch_change(library: &Path, old: &str, new: &str) {
+    let _ = Command::new("install_name_tool")
+        .arg("-change")
+        .arg(old)
+        .arg(new)
+        .arg(library)
+        .status();
+}
+
+fn patch_add_rpath(library: &Path, rpath: &str) {
+    let _ = Command::new("install_name_tool")
+        .arg("-add_rpath")
+        .arg(rpath)
+        .arg(library)
+        .status();
 }
 
 fn dynamic_library_name(name: &str) -> String {

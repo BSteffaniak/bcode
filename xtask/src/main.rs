@@ -51,6 +51,8 @@ enum CommandName {
     DevSign,
     DevRelease,
     UpdateTesseractCatalog,
+    PackageTesseractRuntimes,
+    SmokeTestTesseract,
     Help,
 }
 
@@ -83,6 +85,8 @@ impl Options {
             Some("dev-sign") => CommandName::DevSign,
             Some("dev-release") => CommandName::DevRelease,
             Some("update-tesseract-catalog") => CommandName::UpdateTesseractCatalog,
+            Some("package-tesseract-runtimes") => CommandName::PackageTesseractRuntimes,
+            Some("smoke-test-tesseract") => CommandName::SmokeTestTesseract,
             Some("help" | "--help" | "-h") | None => CommandName::Help,
             Some(command) => {
                 return Err(format_error(format!("unknown xtask command `{command}`")));
@@ -163,6 +167,8 @@ fn run() -> Result<()> {
         CommandName::DevSign => dev_sign(&options),
         CommandName::DevRelease => dev_release(&options),
         CommandName::UpdateTesseractCatalog => update_tesseract_catalog(&options),
+        CommandName::PackageTesseractRuntimes => package_tesseract_runtimes(&options),
+        CommandName::SmokeTestTesseract => smoke_test_tesseract(&options),
         CommandName::Help => {
             print_help();
             Ok(())
@@ -475,6 +481,15 @@ fn sync_tesseract_sys_features(
         "bundled-tesseract-latest",
         &[feature_name("bundled-tesseract", &policy.latest)],
     );
+    set_feature(
+        features,
+        "bundled-tesseract-all",
+        &policy
+            .versions
+            .iter()
+            .map(|version| feature_name("bundled-tesseract", version))
+            .collect::<Vec<_>>(),
+    );
     for version in &policy.versions {
         set_feature(
             features,
@@ -511,6 +526,15 @@ fn sync_tesseract_ocr_features(
         "bundled-tesseract-latest",
         &[feature_name("bundled-tesseract", &policy.latest)],
     );
+    set_feature(
+        features,
+        "bundled-tesseract-all",
+        &policy
+            .versions
+            .iter()
+            .map(|version| feature_name("bundled-tesseract", version))
+            .collect::<Vec<_>>(),
+    );
     for version in &policy.versions {
         let feature = feature_name("bundled-tesseract", version);
         set_feature(
@@ -544,6 +568,15 @@ fn sync_ocr_plugin_features(
         "bundled-tesseract-latest",
         &[feature_name("bundled-tesseract", &policy.latest)],
     );
+    set_feature(
+        features,
+        "bundled-tesseract-all",
+        &policy
+            .versions
+            .iter()
+            .map(|version| feature_name("bundled-tesseract", version))
+            .collect::<Vec<_>>(),
+    );
     for version in &policy.versions {
         let feature = feature_name("bundled-tesseract", version);
         set_feature(
@@ -576,6 +609,15 @@ fn sync_bcode_features(path: &Path, policy: &TesseractSyncPolicy, options: &Opti
         "bundled-ocr-tesseract-latest",
         &[feature_name("bundled-ocr-tesseract", &policy.latest)],
     );
+    set_feature(
+        features,
+        "bundled-ocr-tesseract-all",
+        &policy
+            .versions
+            .iter()
+            .map(|version| feature_name("bundled-ocr-tesseract", version))
+            .collect::<Vec<_>>(),
+    );
     for version in &policy.versions {
         let app_feature = feature_name("bundled-ocr-tesseract", version);
         let plugin_feature = feature_name("bundled-tesseract", version);
@@ -589,6 +631,118 @@ fn sync_bcode_features(path: &Path, policy: &TesseractSyncPolicy, options: &Opti
         );
     }
     write_cargo_toml(path, &document, options)
+}
+
+fn package_tesseract_runtimes(options: &Options) -> Result<()> {
+    let source = latest_bundled_runtime_root(&options.target)?;
+    let binary = options
+        .dev_binary
+        .clone()
+        .unwrap_or_else(|| built_binary(&options.target));
+    let binary_dir = binary.parent().ok_or_else(|| {
+        format_error(format!(
+            "failed to determine binary directory for {}",
+            binary.display()
+        ))
+    })?;
+    let destination = if options.out_dir == Path::new(DIST_DIR) {
+        binary_dir.join("bcode-runtimes").join("tesseract")
+    } else {
+        options.out_dir.clone()
+    };
+    recreate_dir(&destination)?;
+    copy_dir_recursive(&source, &destination)?;
+    println!(
+        "packaged bundled Tesseract runtimes: {} -> {}",
+        source.display(),
+        destination.display()
+    );
+    Ok(())
+}
+
+fn smoke_test_tesseract(options: &Options) -> Result<()> {
+    let binary = options
+        .dev_binary
+        .clone()
+        .unwrap_or_else(|| built_binary(&options.target));
+    let runtime_root = if options.out_dir == Path::new(DIST_DIR) {
+        binary
+            .parent()
+            .ok_or_else(|| format_error("failed to determine binary directory"))?
+            .join("bcode-runtimes")
+            .join("tesseract")
+    } else {
+        options.out_dir.clone()
+    };
+    ensure_file(&binary)?;
+    ensure_dir(&runtime_root)?;
+    run_command(
+        Command::new(&binary)
+            .arg("--version")
+            .env("BCODE_TESSERACT_RUNTIME_ROOT", &runtime_root),
+    )?;
+    println!(
+        "smoke-tested bcode binary with bundled Tesseract runtime root {}",
+        runtime_root.display()
+    );
+    Ok(())
+}
+
+fn latest_bundled_runtime_root(target: &str) -> Result<PathBuf> {
+    let build_dir = workspace_root()
+        .join("target")
+        .join(target)
+        .join("debug")
+        .join("build");
+    let release_build_dir = workspace_root()
+        .join("target")
+        .join(target)
+        .join("release")
+        .join("build");
+    let fallback_build_dir = workspace_root().join("target").join("debug").join("build");
+    [release_build_dir, build_dir, fallback_build_dir]
+        .into_iter()
+        .filter(|dir| dir.is_dir())
+        .flat_map(|dir| bundled_runtime_roots(&dir).unwrap_or_default())
+        .max_by_key(|path| {
+            path.metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+        })
+        .ok_or_else(|| format_error("failed to find built bundled Tesseract runtimes"))
+}
+
+fn bundled_runtime_roots(build_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    for entry in fs::read_dir(build_dir)? {
+        let path = entry?.path().join("out").join("bundled-runtimes");
+        if path.is_dir() {
+            roots.push(path);
+        }
+    }
+    Ok(roots)
+}
+
+fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
+    ensure_dir(source)?;
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_dir_recursive(&source_path, &destination_path)?;
+        } else {
+            fs::copy(&source_path, &destination_path).map_err(|error| {
+                format_error(format!(
+                    "failed to copy {} to {}: {error}",
+                    source_path.display(),
+                    destination_path.display()
+                ))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn workspace_root() -> PathBuf {
@@ -1308,6 +1462,17 @@ fn ensure_file(path: &Path) -> Result<()> {
         Ok(())
     } else {
         Err(format_error(format!("expected file {}", path.display())))
+    }
+}
+
+fn ensure_dir(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        Ok(())
+    } else {
+        Err(format_error(format!(
+            "expected directory {}",
+            path.display()
+        )))
     }
 }
 
