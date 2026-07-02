@@ -1657,10 +1657,10 @@ fn default_socket_path() -> PathBuf {
 mod tests {
     use super::*;
     use bcode_session_models::{
-        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ModelTurnOutcome, SessionEventKind, SessionForkKind,
-        SessionForkResult, SessionId, SessionSummary, SessionTraceEvent, ToolInvocationResult,
-        ToolInvocationStreamEvent, ToolPresentationEvent, ToolPresentationLevel,
-        ToolPresentationTarget, ToolStatusPresentation,
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, LegacyToolPresentationEvent,
+        LegacyToolPresentationLevel, LegacyToolPresentationTarget, LegacyToolStatusPresentation,
+        ModelTurnOutcome, SessionEventKind, SessionForkKind, SessionForkResult, SessionId,
+        SessionSummary, SessionTraceEvent, ToolInvocationResult, ToolInvocationStreamEvent,
     };
     use bcode_skill_models::SkillActivationMode;
     use std::collections::BTreeSet;
@@ -2165,7 +2165,7 @@ mod tests {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_string(),
                 arguments_json: "{}".to_string(),
-                request_presentation: None,
+                legacy_request_presentation: None,
             },
             SessionEventKind::ToolCallFinished {
                 tool_call_id: "call-1".to_string(),
@@ -2182,7 +2182,7 @@ mod tests {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_string(),
                 arguments_json: "{}".to_string(),
-                request_presentation: None,
+                legacy_request_presentation: None,
                 policy_source: None,
                 policy_reason: None,
             },
@@ -2333,14 +2333,16 @@ mod tests {
                 },
             },
             SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Presentation {
+                event: ToolInvocationStreamEvent::LegacyPresentation {
                     tool_call_id: "call-1".to_string(),
                     sequence: 1,
-                    presentation: ToolPresentationEvent::Status(ToolStatusPresentation {
-                        target: ToolPresentationTarget::Activity,
-                        text: "running".to_string(),
-                        level: ToolPresentationLevel::Info,
-                    }),
+                    presentation: LegacyToolPresentationEvent::Status(
+                        LegacyToolStatusPresentation {
+                            target: LegacyToolPresentationTarget::Activity,
+                            text: "running".to_string(),
+                            level: LegacyToolPresentationLevel::Info,
+                        },
+                    ),
                 },
             },
             SessionEventKind::WorkingDirectoryChanged {
@@ -2481,14 +2483,16 @@ mod tests {
             session_id,
             provenance: None,
             kind: SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Presentation {
+                event: ToolInvocationStreamEvent::LegacyPresentation {
                     tool_call_id: "call-1".to_string(),
                     sequence: 1,
-                    presentation: ToolPresentationEvent::Status(ToolStatusPresentation {
-                        target: ToolPresentationTarget::Result,
-                        text: "completed".to_string(),
-                        level: ToolPresentationLevel::Success,
-                    }),
+                    presentation: LegacyToolPresentationEvent::Status(
+                        LegacyToolStatusPresentation {
+                            target: LegacyToolPresentationTarget::Result,
+                            text: "completed".to_string(),
+                            level: LegacyToolPresentationLevel::Success,
+                        },
+                    ),
                 },
             },
         };

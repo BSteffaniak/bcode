@@ -559,7 +559,7 @@ fn tool_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &str {
         ToolInvocationStreamEvent::Started { tool_call_id, .. }
         | ToolInvocationStreamEvent::OutputDelta { tool_call_id, .. }
         | ToolInvocationStreamEvent::Status { tool_call_id, .. }
-        | ToolInvocationStreamEvent::Presentation { tool_call_id, .. }
+        | ToolInvocationStreamEvent::LegacyPresentation { tool_call_id, .. }
         | ToolInvocationStreamEvent::Finished { tool_call_id, .. } => tool_call_id,
     }
 }
@@ -569,7 +569,7 @@ fn tool_stream_content_bytes(event: &ToolInvocationStreamEvent) -> usize {
         ToolInvocationStreamEvent::Started { tool_name, .. } => tool_name.len(),
         ToolInvocationStreamEvent::OutputDelta { text, .. }
         | ToolInvocationStreamEvent::Status { message: text, .. } => text.len(),
-        ToolInvocationStreamEvent::Presentation { presentation, .. } => {
+        ToolInvocationStreamEvent::LegacyPresentation { presentation, .. } => {
             legacy_tool_presentation_content_bytes(presentation)
         }
         ToolInvocationStreamEvent::Finished { .. } => 0,
@@ -577,7 +577,7 @@ fn tool_stream_content_bytes(event: &ToolInvocationStreamEvent) -> usize {
 }
 
 fn legacy_tool_presentation_content_bytes(
-    presentation: &bcode_session_models::ToolPresentationEvent,
+    presentation: &bcode_session_models::LegacyToolPresentationEvent,
 ) -> usize {
     serde_json::to_vec(presentation).map_or(0, |encoded| encoded.len())
 }
@@ -594,10 +594,11 @@ fn estimate_rows(content_bytes: usize, width_columns: Option<u16>) -> Option<usi
 mod tests {
     use super::*;
     use bcode_session_models::{
-        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProjectionWindowLimits,
-        ProjectionWindowRequest, ProjectionWindowTarget, SessionId, ToolInvocationProjectionStatus,
-        ToolInvocationProjectionTerminalOutput, ToolInvocationResult, ToolInvocationStreamEvent,
-        ToolOutputStream, ToolPresentationEvent, build_tool_invocation_projections,
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, LegacyToolPresentationEvent,
+        ProjectionWindowLimits, ProjectionWindowRequest, ProjectionWindowTarget, SessionId,
+        ToolInvocationProjectionStatus, ToolInvocationProjectionTerminalOutput,
+        ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
+        build_tool_invocation_projections,
     };
 
     fn tool_invocation_projection_replay_events(session_id: SessionId) -> Vec<SessionEvent> {
@@ -610,7 +611,7 @@ mod tests {
                     producer_plugin_id: Some("plugin.shell".to_owned()),
                     tool_name: "shell.run".to_owned(),
                     arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
-                    request_presentation: None,
+                    legacy_request_presentation: None,
                 },
             ),
             event(
@@ -645,14 +646,14 @@ mod tests {
                 session_id,
                 4,
                 SessionEventKind::ToolInvocationStream {
-                    event: ToolInvocationStreamEvent::Presentation {
+                    event: ToolInvocationStreamEvent::LegacyPresentation {
                         tool_call_id: "call-1".to_owned(),
                         sequence: 2,
-                        presentation: ToolPresentationEvent::Status(
-                            bcode_session_models::ToolStatusPresentation {
-                                target: bcode_session_models::ToolPresentationTarget::Result,
+                        presentation: LegacyToolPresentationEvent::Status(
+                            bcode_session_models::LegacyToolStatusPresentation {
+                                target: bcode_session_models::LegacyToolPresentationTarget::Result,
                                 text: "legacy status".to_owned(),
-                                level: bcode_session_models::ToolPresentationLevel::Success,
+                                level: bcode_session_models::LegacyToolPresentationLevel::Success,
                             },
                         ),
                     },
@@ -725,7 +726,7 @@ mod tests {
                     producer_plugin_id: None,
                     tool_name: "unknown.tool".to_owned(),
                     arguments_json: "{}".to_owned(),
-                    request_presentation: None,
+                    legacy_request_presentation: None,
                 },
             ),
             event(
@@ -998,7 +999,7 @@ mod tests {
                     producer_plugin_id: None,
                     tool_name: "shell".to_owned(),
                     arguments_json: "{}".to_owned(),
-                    request_presentation: None,
+                    legacy_request_presentation: None,
                 },
             ),
             event(
@@ -1063,7 +1064,7 @@ mod tests {
                     producer_plugin_id: None,
                     tool_name: "read".to_owned(),
                     arguments_json: "{}".to_owned(),
-                    request_presentation: None,
+                    legacy_request_presentation: None,
                 },
             ),
             event(
@@ -1375,7 +1376,7 @@ mod tests {
                     producer_plugin_id: None,
                     tool_name: "late".to_owned(),
                     arguments_json: "{}".to_owned(),
-                    request_presentation: None,
+                    legacy_request_presentation: None,
                 },
             ),
             event(
@@ -1386,7 +1387,7 @@ mod tests {
                     producer_plugin_id: None,
                     tool_name: "early".to_owned(),
                     arguments_json: "{}".to_owned(),
-                    request_presentation: None,
+                    legacy_request_presentation: None,
                 },
             ),
             event(

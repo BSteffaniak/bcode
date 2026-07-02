@@ -144,7 +144,7 @@ pub async fn import_external_session(
                         producer_plugin_id: None,
                         tool_name,
                         arguments_json,
-                        request_presentation: None,
+                        legacy_request_presentation: None,
                     },
                     ImportableSessionEventKind::ToolCallFinished {
                         tool_call_id,

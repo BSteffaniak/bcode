@@ -12,14 +12,15 @@ use bcode_config::{
     TuiAccentTransitionCurve, TuiAccentTransitionMode, TuiConfig, TuiThemeConfig, TuiThinkingConfig,
 };
 use bcode_session_models::{
-    ClientId, LegacyToolRequestPresentationMetadata, LegacyToolRequestPreviewMetadata,
-    LiveFileEditPreview, LiveShellCommandPreview, LiveToolArgumentPreview, RuntimeWorkId,
-    RuntimeWorkKind, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
-    SessionProjectionKind, SessionSummary, SessionTitleSource, SessionTokenUsage,
-    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ShellRunResult, ToolArtifact,
-    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream, ToolPluginViewPresentation,
-    ToolPresentationEvent, ToolPresentationField, ToolPresentationFieldKind, ToolPresentationLevel,
-    ToolPresentationSection, ToolPresentationTarget, ToolStatusPresentation,
+    ClientId, LegacyLegacyToolPresentationFieldKind, LegacyToolPluginViewPresentation,
+    LegacyToolPresentationEvent, LegacyToolPresentationField, LegacyToolPresentationLevel,
+    LegacyToolPresentationSection, LegacyToolPresentationTarget,
+    LegacyToolRequestPresentationMetadata, LegacyToolRequestPreviewMetadata,
+    LegacyToolStatusPresentation, LiveFileEditPreview, LiveShellCommandPreview,
+    LiveToolArgumentPreview, RuntimeWorkId, RuntimeWorkKind, SessionEvent, SessionEventKind,
+    SessionId, SessionInputHistoryEntry, SessionProjectionKind, SessionSummary, SessionTitleSource,
+    SessionTokenUsage, SessionTraceEvent, SessionTracePayload, SessionTracePhase, ShellRunResult,
+    ToolArtifact, ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
     build_tool_invocation_projections,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
@@ -45,26 +46,26 @@ use super::{
     transcript_document::TranscriptDocument,
 };
 
-fn shell_request_presentation() -> LegacyToolRequestPresentationMetadata {
+fn shell_legacy_request_presentation() -> LegacyToolRequestPresentationMetadata {
     LegacyToolRequestPresentationMetadata {
         title: "Shell command".to_owned(),
         fields: vec![
-            ToolPresentationField {
+            LegacyToolPresentationField {
                 label: "command".to_owned(),
                 argument: "command".to_owned(),
-                kind: ToolPresentationFieldKind::Command,
+                kind: LegacyLegacyToolPresentationFieldKind::Command,
                 optional: false,
             },
-            ToolPresentationField {
+            LegacyToolPresentationField {
                 label: "cwd".to_owned(),
                 argument: "cwd".to_owned(),
-                kind: ToolPresentationFieldKind::Path,
+                kind: LegacyLegacyToolPresentationFieldKind::Path,
                 optional: true,
             },
-            ToolPresentationField {
+            LegacyToolPresentationField {
                 label: "terminal".to_owned(),
                 argument: "terminal".to_owned(),
-                kind: ToolPresentationFieldKind::Boolean,
+                kind: LegacyLegacyToolPresentationFieldKind::Boolean,
                 optional: true,
             },
         ],
@@ -72,26 +73,26 @@ fn shell_request_presentation() -> LegacyToolRequestPresentationMetadata {
     }
 }
 
-fn file_edit_request_presentation() -> LegacyToolRequestPresentationMetadata {
+fn file_edit_legacy_request_presentation() -> LegacyToolRequestPresentationMetadata {
     LegacyToolRequestPresentationMetadata {
         title: "Edit file".to_owned(),
         fields: vec![
-            ToolPresentationField {
+            LegacyToolPresentationField {
                 label: "Path".to_owned(),
                 argument: "path".to_owned(),
-                kind: ToolPresentationFieldKind::Path,
+                kind: LegacyLegacyToolPresentationFieldKind::Path,
                 optional: false,
             },
-            ToolPresentationField {
+            LegacyToolPresentationField {
                 label: "Old text".to_owned(),
                 argument: "old_text".to_owned(),
-                kind: ToolPresentationFieldKind::Text,
+                kind: LegacyLegacyToolPresentationFieldKind::Text,
                 optional: false,
             },
-            ToolPresentationField {
+            LegacyToolPresentationField {
                 label: "New text".to_owned(),
                 argument: "new_text".to_owned(),
-                kind: ToolPresentationFieldKind::Text,
+                kind: LegacyLegacyToolPresentationFieldKind::Text,
                 optional: false,
             },
         ],
@@ -1754,7 +1755,7 @@ fn transcript_renders_tool_blocks_with_structure_and_pretty_arguments() {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: r#"{"command":"cargo check","cwd":"/tmp/project"}"#.to_owned(),
-                request_presentation: Some(shell_request_presentation()),
+                legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
         event(
@@ -1801,7 +1802,7 @@ fn live_file_write_statusline_is_not_duplicated_and_truncates_path() {
                 "contents": "fn main() {}\n",
             })
             .to_string(),
-            request_presentation: Some(file_edit_request_presentation()),
+            legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
         },
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 72, 16));
@@ -1838,7 +1839,7 @@ fn live_file_edit_card_shows_permission_and_applied_phases() {
             producer_plugin_id: None,
             tool_name: "filesystem_edit".to_owned(),
             arguments_json: args.clone(),
-            request_presentation: Some(file_edit_request_presentation()),
+            legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
         },
     ));
     app.absorb_session_event(&event(
@@ -1850,7 +1851,7 @@ fn live_file_edit_card_shows_permission_and_applied_phases() {
             producer_plugin_id: None,
             tool_name: "filesystem_edit".to_owned(),
             arguments_json: args,
-            request_presentation: Some(file_edit_request_presentation()),
+            legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
             policy_source: None,
             policy_reason: None,
         },
@@ -1914,7 +1915,7 @@ fn denied_file_permission_marks_preview_failed() {
             producer_plugin_id: None,
             tool_name: "filesystem_edit".to_owned(),
             arguments_json: args.clone(),
-            request_presentation: Some(file_edit_request_presentation()),
+            legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
         },
     ));
     app.absorb_session_event(&event(
@@ -1926,7 +1927,7 @@ fn denied_file_permission_marks_preview_failed() {
             producer_plugin_id: None,
             tool_name: "filesystem_edit".to_owned(),
             arguments_json: args,
-            request_presentation: Some(file_edit_request_presentation()),
+            legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
             policy_source: None,
             policy_reason: None,
         },
@@ -1964,7 +1965,7 @@ fn transcript_renders_filesystem_edit_request_without_core_inline_preview() {
                 "new_text": "fn answer() -> i32 {\n    42\n}\n",
             })
             .to_string(),
-            request_presentation: Some(file_edit_request_presentation()),
+            legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
@@ -2003,7 +2004,7 @@ fn transcript_renders_shell_output_with_ansi_and_limits() {
                     "terminal": true,
                 })
                 .to_string(),
-                request_presentation: Some(file_edit_request_presentation()),
+                legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
             },
         ),
         event(
@@ -2079,7 +2080,7 @@ fn transcript_renders_terminal_shell_output_without_unbounded_row_request() {
                     "command": "git status --short && ls",
                 })
                 .to_string(),
-                request_presentation: Some(shell_request_presentation()),
+                legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
         event(
@@ -2229,7 +2230,7 @@ fn streamed_terminal_output_renders_running_until_final_result() {
             producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
-            request_presentation: Some(shell_request_presentation()),
+            legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
     ));
     app.absorb_session_event(&event(
@@ -2285,7 +2286,7 @@ fn streamed_terminal_output_preserves_ansi_color() {
             producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
-            request_presentation: Some(shell_request_presentation()),
+            legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
     ));
     app.absorb_session_event(&event(
@@ -2342,7 +2343,7 @@ fn streamed_terminal_output_updates_header_after_final_result() {
             producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
-            request_presentation: Some(shell_request_presentation()),
+            legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
     ));
     app.absorb_session_event(&event(
@@ -2813,7 +2814,7 @@ fn tool_activity_after_submitted_user_message_resumes_following_latest_rows() {
             producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
-            request_presentation: Some(shell_request_presentation()),
+            legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
@@ -2989,7 +2990,7 @@ fn tool_activity_after_assistant_preamble_resumes_following_latest_rows() {
             producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
-            request_presentation: None,
+            legacy_request_presentation: None,
         },
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
@@ -3071,7 +3072,7 @@ fn assistant_response_after_tool_loop_transitions_to_message_top() {
             producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
-            request_presentation: Some(shell_request_presentation()),
+            legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
     ));
     app.absorb_session_event(&event(
@@ -3234,7 +3235,7 @@ fn streamed_tool_output_is_not_duplicated_by_final_result() {
             producer_plugin_id: None,
             tool_name: "filesystem.shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
-            request_presentation: Some(file_edit_request_presentation()),
+            legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
         },
     ));
     app.absorb_session_event(&event(
@@ -3420,7 +3421,7 @@ fn file_change_semantic_result_events(
                 producer_plugin_id: None,
                 tool_name: "example.write".to_owned(),
                 arguments_json: r#"{"path":"file.txt","contents":"hi"}"#.to_owned(),
-                request_presentation: Some(file_edit_request_presentation()),
+                legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
             },
         ));
     }
@@ -3456,7 +3457,7 @@ fn streamed_tool_without_output_renders_final_result() {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
-                request_presentation: Some(shell_request_presentation()),
+                legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
         event(
@@ -3521,7 +3522,7 @@ fn streamed_terminal_tool_events(session_id: SessionId) -> Vec<SessionEvent> {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
-                request_presentation: Some(shell_request_presentation()),
+                legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
         event(
@@ -3601,7 +3602,7 @@ fn semantic_terminal_result_without_live_delta_renders_terminal_history() {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
-                request_presentation: Some(shell_request_presentation()),
+                legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
         event(
@@ -3676,7 +3677,7 @@ fn live_shell_result_preserves_request_block() {
                     "terminal": false,
                 })
                 .to_string(),
-                request_presentation: Some(shell_request_presentation()),
+                legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
         event(
@@ -3735,7 +3736,7 @@ fn live_streamed_shell_result_preserves_request_and_suppresses_artifact_duplicat
                     "terminal": true,
                 })
                 .to_string(),
-                request_presentation: Some(shell_request_presentation()),
+                legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
         event(
@@ -3892,7 +3893,7 @@ fn live_shell_preview_stream_request(session_id: SessionId) -> SessionEvent {
                 "terminal": true,
             })
             .to_string(),
-            request_presentation: Some(shell_request_presentation()),
+            legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
     )
 }
@@ -4136,7 +4137,7 @@ fn legacy_terminal_result_renders_plain_tool_result() {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
-                request_presentation: Some(shell_request_presentation()),
+                legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
         event(
@@ -4186,21 +4187,23 @@ fn presentation_events_replay_ignores_legacy_presentation_events() {
                 producer_plugin_id: None,
                 tool_name: "third.party".to_owned(),
                 arguments_json: "{}".to_owned(),
-                request_presentation: None,
+                legacy_request_presentation: None,
             },
         ),
         event(
             session_id,
             2,
             SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Presentation {
+                event: ToolInvocationStreamEvent::LegacyPresentation {
                     tool_call_id: "call-present".to_owned(),
                     sequence: 1,
-                    presentation: ToolPresentationEvent::Status(ToolStatusPresentation {
-                        target: ToolPresentationTarget::Result,
-                        text: "custom status".to_owned(),
-                        level: ToolPresentationLevel::Success,
-                    }),
+                    presentation: LegacyToolPresentationEvent::Status(
+                        LegacyToolStatusPresentation {
+                            target: LegacyToolPresentationTarget::Result,
+                            text: "custom status".to_owned(),
+                            level: LegacyToolPresentationLevel::Success,
+                        },
+                    ),
                 },
             },
         ),
@@ -4231,19 +4234,19 @@ fn legacy_presentation_card_does_not_replace_tool_request_surface() {
                 producer_plugin_id: None,
                 tool_name: "third.party".to_owned(),
                 arguments_json: serde_json::json!({"raw": "arguments"}).to_string(),
-                request_presentation: None,
+                legacy_request_presentation: None,
             },
         ),
         event(
             session_id,
             2,
             SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Presentation {
+                event: ToolInvocationStreamEvent::LegacyPresentation {
                     tool_call_id: "call-present".to_owned(),
                     sequence: 1,
-                    presentation: ToolPresentationEvent::Card(
-                        bcode_session_models::ToolCardPresentation {
-                            target: ToolPresentationTarget::Preview,
+                    presentation: LegacyToolPresentationEvent::Card(
+                        bcode_session_models::LegacyToolCardPresentation {
+                            target: LegacyToolPresentationTarget::Preview,
                             title: "Plugin preview".to_owned(),
                             subtitle: None,
                             sections: Vec::new(),
@@ -4284,19 +4287,19 @@ fn legacy_result_presentation_does_not_suppress_generic_tool_result() {
                 producer_plugin_id: None,
                 tool_name: "third.party".to_owned(),
                 arguments_json: serde_json::json!({"raw": "arguments"}).to_string(),
-                request_presentation: None,
+                legacy_request_presentation: None,
             },
         ),
         event(
             session_id,
             2,
             SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Presentation {
+                event: ToolInvocationStreamEvent::LegacyPresentation {
                     tool_call_id: "call-present".to_owned(),
                     sequence: 1,
-                    presentation: ToolPresentationEvent::Card(
-                        bcode_session_models::ToolCardPresentation {
-                            target: ToolPresentationTarget::Result,
+                    presentation: LegacyToolPresentationEvent::Card(
+                        bcode_session_models::LegacyToolCardPresentation {
+                            target: LegacyToolPresentationTarget::Result,
                             title: "Plugin result".to_owned(),
                             subtitle: None,
                             sections: Vec::new(),
@@ -4339,14 +4342,16 @@ fn presentation_clear_removes_replayed_transcript_card() {
             session_id,
             1,
             SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Presentation {
+                event: ToolInvocationStreamEvent::LegacyPresentation {
                     tool_call_id: "call-present".to_owned(),
                     sequence: 1,
-                    presentation: ToolPresentationEvent::Status(ToolStatusPresentation {
-                        target: ToolPresentationTarget::Result,
-                        text: "custom status".to_owned(),
-                        level: ToolPresentationLevel::Success,
-                    }),
+                    presentation: LegacyToolPresentationEvent::Status(
+                        LegacyToolStatusPresentation {
+                            target: LegacyToolPresentationTarget::Result,
+                            text: "custom status".to_owned(),
+                            level: LegacyToolPresentationLevel::Success,
+                        },
+                    ),
                 },
             },
         ),
@@ -4354,11 +4359,11 @@ fn presentation_clear_removes_replayed_transcript_card() {
             session_id,
             2,
             SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Presentation {
+                event: ToolInvocationStreamEvent::LegacyPresentation {
                     tool_call_id: "call-present".to_owned(),
                     sequence: 2,
-                    presentation: ToolPresentationEvent::Clear {
-                        target: ToolPresentationTarget::Result,
+                    presentation: LegacyToolPresentationEvent::Clear {
+                        target: LegacyToolPresentationTarget::Result,
                     },
                 },
             },
@@ -4386,22 +4391,22 @@ fn legacy_live_presentation_card_is_ignored_by_normal_transcript() {
                 producer_plugin_id: None,
                 tool_name: "third.party".to_owned(),
                 arguments_json: serde_json::json!({"raw": "arguments"}).to_string(),
-                request_presentation: None,
+                legacy_request_presentation: None,
             },
         ),
         event(
             session_id,
             2,
             SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Presentation {
+                event: ToolInvocationStreamEvent::LegacyPresentation {
                     tool_call_id: "call-present".to_owned(),
                     sequence: 1,
-                    presentation: ToolPresentationEvent::Card(
-                        bcode_session_models::ToolCardPresentation {
-                            target: ToolPresentationTarget::Result,
+                    presentation: LegacyToolPresentationEvent::Card(
+                        bcode_session_models::LegacyToolCardPresentation {
+                            target: LegacyToolPresentationTarget::Result,
                             title: "Custom result".to_owned(),
                             subtitle: Some("plugin-owned".to_owned()),
-                            sections: vec![ToolPresentationSection::Text {
+                            sections: vec![LegacyToolPresentationSection::Text {
                                 label: Some("Summary".to_owned()),
                                 text: "Rendered from plugin presentation".to_owned(),
                             }],
@@ -4624,7 +4629,7 @@ fn transcript_resident_window_does_not_trim_with_active_tool() {
             producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
-            request_presentation: Some(shell_request_presentation()),
+            legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
     ));
     for index in 0..50_u64 {
@@ -4664,7 +4669,7 @@ fn transcript_resident_window_prunes_old_tool_state_after_trim() {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
-                request_presentation: Some(shell_request_presentation()),
+                legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ));
         app.absorb_session_event(&event(
@@ -4801,6 +4806,23 @@ fn render_app_text(app: &mut BmuxApp) -> String {
     rendered_text(&buffer)
 }
 
+fn rendered_tool_body(rendered: &str) -> Vec<String> {
+    rendered
+        .lines()
+        .skip(1)
+        .take_while(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with('⠴')
+                && !trimmed.starts_with('⠸')
+                && !trimmed.starts_with('⠼')
+                && !trimmed.starts_with('┌')
+        })
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 #[test]
 fn live_question_artifact_renders_outcome_from_raw_metadata() {
     let session_id = SessionId::new();
@@ -4926,7 +4948,7 @@ fn filesystem_write_request_preview_renders_from_raw_arguments_without_metadata(
                 "contents": "created from raw args\n"
             })
             .to_string(),
-            request_presentation: None,
+            legacy_request_presentation: None,
         },
     ));
 
@@ -4955,7 +4977,7 @@ fn filesystem_edit_request_preview_renders_from_raw_arguments_without_metadata()
                 "new_text": "new raw args\n"
             })
             .to_string(),
-            request_presentation: None,
+            legacy_request_presentation: None,
         },
     ));
 
@@ -4965,6 +4987,60 @@ fn filesystem_edit_request_preview_renders_from_raw_arguments_without_metadata()
     assert!(rendered.contains("old raw args"), "{rendered}");
     assert!(rendered.contains("new raw args"), "{rendered}");
     assert!(!rendered.contains("arguments"), "{rendered}");
+}
+
+#[test]
+fn same_raw_filesystem_events_render_same_live_and_replayed_tool_ui() {
+    let session_id = SessionId::new();
+    let events = vec![
+        event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-file".to_owned(),
+                producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                tool_name: "filesystem.edit".to_owned(),
+                arguments_json: serde_json::json!({
+                    "path": "/tmp/hello.txt",
+                    "old_text": "before\n",
+                    "new_text": "after\n"
+                })
+                .to_string(),
+                legacy_request_presentation: None,
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "call-file".to_owned(),
+                result: "edited file".to_owned(),
+                is_error: false,
+                output: None,
+                semantic_result: Some(ToolInvocationResult::Artifact {
+                    artifact: Box::new(filesystem_change_artifact()),
+                }),
+            },
+        ),
+    ];
+
+    let plugin_host = Arc::new(filesystem_plugin_host());
+    let mut live_app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    live_app.set_plugin_host(Arc::clone(&plugin_host));
+    for event in &events {
+        live_app.absorb_session_event(event);
+    }
+    let mut replayed_app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
+    replayed_app.set_plugin_host(plugin_host);
+
+    let live_rendered = render_app_text(&mut live_app);
+    let replayed_rendered = render_app_text(&mut replayed_app);
+
+    assert_eq!(
+        rendered_tool_body(&live_rendered),
+        rendered_tool_body(&replayed_rendered),
+        "live:\n{live_rendered}\n\nreplayed:\n{replayed_rendered}"
+    );
 }
 
 #[test]
@@ -4985,7 +5061,7 @@ fn live_filesystem_artifact_renders_rich_diff_from_raw_change_metadata() {
                 "new_text": "after\n"
             })
             .to_string(),
-            request_presentation: None,
+            legacy_request_presentation: None,
         },
     ));
     app.absorb_session_event(&event(
@@ -5038,7 +5114,8 @@ fn replayed_filesystem_artifact_renders_rich_diff_from_raw_change_metadata() {
 }
 
 #[test]
-fn missing_filesystem_renderer_uses_generic_raw_artifact_fallback_without_projection_mutation() {
+fn disabled_filesystem_renderer_falls_back_generically_and_reenabled_renderer_restores_rich_display()
+ {
     let session_id = SessionId::new();
     let events = vec![event(
         session_id,
@@ -5056,13 +5133,34 @@ fn missing_filesystem_renderer_uses_generic_raw_artifact_fallback_without_projec
     let mut app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
     let before = app.tool_invocation_projections().clone();
 
-    let rendered = render_app_text(&mut app);
+    let fallback_rendered = render_app_text(&mut app);
 
-    assert!(rendered.contains("File change"), "{rendered}");
-    assert!(rendered.contains("edited file"), "{rendered}");
-    assert!(rendered.contains("/tmp/hello.txt"), "{rendered}");
-    assert!(!rendered.contains("before"), "{rendered}");
-    assert!(!rendered.contains("after"), "{rendered}");
+    assert!(
+        fallback_rendered.contains("File change"),
+        "{fallback_rendered}"
+    );
+    assert!(
+        fallback_rendered.contains("edited file"),
+        "{fallback_rendered}"
+    );
+    assert!(
+        fallback_rendered.contains("/tmp/hello.txt"),
+        "{fallback_rendered}"
+    );
+    assert!(!fallback_rendered.contains("before"), "{fallback_rendered}");
+    assert!(!fallback_rendered.contains("after"), "{fallback_rendered}");
+    assert_eq!(&before, app.tool_invocation_projections());
+
+    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+    let rich_rendered = render_app_text(&mut app);
+
+    assert!(rich_rendered.contains("/tmp/hello.txt"), "{rich_rendered}");
+    assert!(rich_rendered.contains("before"), "{rich_rendered}");
+    assert!(rich_rendered.contains("after"), "{rich_rendered}");
+    assert!(
+        !rich_rendered.contains("bcode.filesystem.change"),
+        "{rich_rendered}"
+    );
     assert_eq!(&before, app.tool_invocation_projections());
 }
 
@@ -5209,7 +5307,7 @@ fn live_tool_invocation_projection_matches_replayed_projection() {
                 producer_plugin_id: Some("plugin.shell".to_owned()),
                 tool_name: "shell.run".to_owned(),
                 arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
-                request_presentation: None,
+                legacy_request_presentation: None,
             },
         ),
         event(
@@ -5542,18 +5640,20 @@ fn plugin_view_result_presentation_is_ignored_in_normal_live_path() {
         session_id,
         1,
         SessionEventKind::ToolInvocationStream {
-            event: ToolInvocationStreamEvent::Presentation {
+            event: ToolInvocationStreamEvent::LegacyPresentation {
                 tool_call_id: "call-view".to_owned(),
                 sequence: 1,
-                presentation: ToolPresentationEvent::PluginView(ToolPluginViewPresentation {
-                    target: ToolPresentationTarget::Result,
-                    producer_plugin_id: "plugin".to_owned(),
-                    schema: "legacy.view".to_owned(),
-                    schema_version: 1,
-                    title: Some("Legacy view".to_owned()),
-                    subtitle: None,
-                    payload: serde_json::json!({"raw": true}),
-                }),
+                presentation: LegacyToolPresentationEvent::PluginView(
+                    LegacyToolPluginViewPresentation {
+                        target: LegacyToolPresentationTarget::Result,
+                        producer_plugin_id: "plugin".to_owned(),
+                        schema: "legacy.view".to_owned(),
+                        schema_version: 1,
+                        title: Some("Legacy view".to_owned()),
+                        subtitle: None,
+                        payload: serde_json::json!({"raw": true}),
+                    },
+                ),
             },
         },
     )];
@@ -5574,18 +5674,20 @@ fn replayed_plugin_view_result_does_not_suppress_artifact_json_fallback() {
             session_id,
             1,
             SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Presentation {
+                event: ToolInvocationStreamEvent::LegacyPresentation {
                     tool_call_id: "call-view".to_owned(),
                     sequence: 1,
-                    presentation: ToolPresentationEvent::PluginView(ToolPluginViewPresentation {
-                        target: ToolPresentationTarget::Result,
-                        producer_plugin_id: "plugin".to_owned(),
-                        schema: "legacy.view".to_owned(),
-                        schema_version: 1,
-                        title: Some("Legacy view".to_owned()),
-                        subtitle: None,
-                        payload: serde_json::json!({"raw": true}),
-                    }),
+                    presentation: LegacyToolPresentationEvent::PluginView(
+                        LegacyToolPluginViewPresentation {
+                            target: LegacyToolPresentationTarget::Result,
+                            producer_plugin_id: "plugin".to_owned(),
+                            schema: "legacy.view".to_owned(),
+                            schema_version: 1,
+                            title: Some("Legacy view".to_owned()),
+                            subtitle: None,
+                            payload: serde_json::json!({"raw": true}),
+                        },
+                    ),
                 },
             },
         ),
@@ -5687,7 +5789,7 @@ fn live_shell_command_preview_streams_before_final_request_and_is_preserved() {
                 "cwd": "/repo",
             })
             .to_string(),
-            request_presentation: Some(shell_request_presentation()),
+            legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 20));
@@ -5773,7 +5875,7 @@ fn live_file_preview_updates_without_duplicates_and_final_replaces_it() {
                 "contents": "fn main() {\n    println!(\"hi\");\n}",
             })
             .to_string(),
-            request_presentation: Some(file_edit_request_presentation()),
+            legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
         },
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 30));

@@ -1970,7 +1970,9 @@ impl SessionManager {
         tool_name: String,
         arguments_json: String,
         producer_plugin_id: Option<String>,
-        request_presentation: Option<bcode_session_models::LegacyToolRequestPresentationMetadata>,
+        legacy_request_presentation: Option<
+            bcode_session_models::LegacyToolRequestPresentationMetadata,
+        >,
     ) -> Result<SessionEvent, SessionError> {
         self.append_event(
             session_id,
@@ -1979,7 +1981,7 @@ impl SessionManager {
                 tool_name,
                 arguments_json,
                 producer_plugin_id,
-                request_presentation,
+                legacy_request_presentation,
             },
         )
         .await
@@ -4489,7 +4491,7 @@ mod tests {
                     producer_plugin_id: None,
                     tool_name: "tool".to_string(),
                     arguments_json: "{}".to_string(),
-                    request_presentation: None,
+                    legacy_request_presentation: None,
                 },
             ),
             (
@@ -4512,7 +4514,7 @@ mod tests {
                     producer_plugin_id: None,
                     tool_name: "tool".to_string(),
                     arguments_json: "{}".to_string(),
-                    request_presentation: None,
+                    legacy_request_presentation: None,
                     policy_source: None,
                     policy_reason: None,
                 },

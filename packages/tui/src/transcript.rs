@@ -943,7 +943,7 @@ fn non_streaming_transcript_item_from_event(
             tool_call_id,
             tool_name,
             arguments_json,
-            request_presentation: _legacy_request_presentation,
+            legacy_request_presentation: _legacy_legacy_request_presentation,
             ..
         } => {
             tool_calls.insert(
@@ -1023,7 +1023,7 @@ fn non_streaming_transcript_item_from_event(
             tool_call_id,
             tool_name,
             arguments_json,
-            request_presentation: _legacy_request_presentation,
+            legacy_request_presentation: _legacy_legacy_request_presentation,
             policy_source,
             policy_reason,
             ..
@@ -1106,40 +1106,35 @@ fn semantic_tool_result_item(
     result: &ToolInvocationResult,
     is_error: bool,
 ) -> TranscriptItem {
-    match result {
-        ToolInvocationResult::Text { text } => tool_result_item(
-            tool_call_id,
-            context.map(|context| context.tool_name.as_str()),
-            context.map(|context| context.arguments_json.as_str()),
-            text,
-            is_error,
-        ),
-        ToolInvocationResult::Json { value } => tool_result_item(
-            tool_call_id,
-            context.map(|context| context.tool_name.as_str()),
-            context.map(|context| context.arguments_json.as_str()),
-            value,
-            is_error,
-        ),
-        ToolInvocationResult::Artifact { artifact } => {
-            artifact_result_item(tool_call_id, context, artifact, is_error)
-        }
-    }
-}
-
-fn artifact_result_item(
-    tool_call_id: &str,
-    context: Option<&ToolCallContext>,
-    artifact: &bcode_session_models::ToolArtifact,
-    is_error: bool,
-) -> TranscriptItem {
-    artifact_tool_result_item(
+    semantic_tool_result_item_from_raw(
         tool_call_id,
         context.map(|context| context.tool_name.as_str()),
         context.map(|context| context.arguments_json.as_str()),
-        artifact,
+        result,
         is_error,
     )
+}
+
+/// Build a transcript item from a raw semantic tool result.
+#[must_use]
+pub fn semantic_tool_result_item_from_raw(
+    tool_call_id: &str,
+    tool_name: Option<&str>,
+    arguments_json: Option<&str>,
+    result: &ToolInvocationResult,
+    is_error: bool,
+) -> TranscriptItem {
+    match result {
+        ToolInvocationResult::Text { text } => {
+            tool_result_item(tool_call_id, tool_name, arguments_json, text, is_error)
+        }
+        ToolInvocationResult::Json { value } => {
+            tool_result_item(tool_call_id, tool_name, arguments_json, value, is_error)
+        }
+        ToolInvocationResult::Artifact { artifact } => {
+            artifact_tool_result_item(tool_call_id, tool_name, arguments_json, artifact, is_error)
+        }
+    }
 }
 
 pub fn display_tool_result_text(result: &str) -> String {

@@ -184,8 +184,12 @@ enum PersistedSessionEventKind {
         producer_plugin_id: Option<String>,
         tool_name: String,
         arguments_json: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        request_presentation: Option<LegacyToolRequestPresentationMetadata>,
+        #[serde(
+            default,
+            rename = "request_presentation",
+            skip_serializing_if = "Option::is_none"
+        )]
+        legacy_request_presentation: Option<LegacyToolRequestPresentationMetadata>,
     },
     ToolCallFinished {
         tool_call_id: String,
@@ -222,8 +226,12 @@ enum PersistedSessionEventKind {
         producer_plugin_id: Option<String>,
         tool_name: String,
         arguments_json: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        request_presentation: Option<LegacyToolRequestPresentationMetadata>,
+        #[serde(
+            default,
+            rename = "request_presentation",
+            skip_serializing_if = "Option::is_none"
+        )]
+        legacy_request_presentation: Option<LegacyToolRequestPresentationMetadata>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy_source: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -385,15 +393,16 @@ enum PersistedSessionEventKind {
         external_session_id: String,
         imported_at_ms: u64,
     },
-    /// Durable bounded presentation state for a completed tool invocation.
-    ToolInvocationPresentation {
+    /// Legacy durable bounded presentation state for a completed tool invocation.
+    #[serde(rename = "tool_invocation_presentation")]
+    LegacyToolInvocationPresentation {
         tool_call_id: String,
         #[serde(default)]
         started_at_ms: Option<u64>,
         #[serde(default)]
         finished_at_ms: Option<u64>,
         is_error: bool,
-        presentation: PersistedToolInvocationPresentation,
+        presentation: LegacyPersistedToolInvocationPresentation,
     },
     /// Durable provenance marker for sessions forked or cloned from another session.
     SessionForked {
@@ -456,13 +465,13 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 producer_plugin_id,
                 tool_name,
                 arguments_json,
-                request_presentation,
+                legacy_request_presentation,
             } => Self::ToolCallRequested {
                 tool_call_id: tool_call_id.clone(),
                 producer_plugin_id: producer_plugin_id.clone(),
                 tool_name: tool_name.clone(),
                 arguments_json: arguments_json.clone(),
-                request_presentation: request_presentation.clone(),
+                legacy_request_presentation: legacy_request_presentation.clone(),
             },
             SessionEventKind::ToolCallFinished {
                 tool_call_id,
@@ -513,7 +522,7 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 producer_plugin_id,
                 tool_name,
                 arguments_json,
-                request_presentation,
+                legacy_request_presentation,
                 policy_source,
                 policy_reason,
             } => Self::PermissionRequested {
@@ -522,7 +531,7 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 producer_plugin_id: producer_plugin_id.clone(),
                 tool_name: tool_name.clone(),
                 arguments_json: arguments_json.clone(),
-                request_presentation: request_presentation.clone(),
+                legacy_request_presentation: legacy_request_presentation.clone(),
                 policy_source: policy_source.clone(),
                 policy_reason: policy_reason.clone(),
             },
@@ -783,13 +792,13 @@ impl PersistedSessionEventKind {
                 producer_plugin_id,
                 tool_name,
                 arguments_json,
-                request_presentation,
+                legacy_request_presentation,
             } => SessionEventKind::ToolCallRequested {
                 tool_call_id,
                 producer_plugin_id,
                 tool_name,
                 arguments_json,
-                request_presentation,
+                legacy_request_presentation,
             },
             Self::ToolCallFinished {
                 tool_call_id,
@@ -838,7 +847,7 @@ impl PersistedSessionEventKind {
                 producer_plugin_id,
                 tool_name,
                 arguments_json,
-                request_presentation,
+                legacy_request_presentation,
                 policy_source,
                 policy_reason,
             } => SessionEventKind::PermissionRequested {
@@ -847,7 +856,7 @@ impl PersistedSessionEventKind {
                 producer_plugin_id,
                 tool_name,
                 arguments_json,
-                request_presentation,
+                legacy_request_presentation,
                 policy_source,
                 policy_reason,
             },
@@ -1037,7 +1046,7 @@ impl PersistedSessionEventKind {
                 external_session_id,
                 imported_at_ms,
             },
-            Self::ToolInvocationPresentation {
+            Self::LegacyToolInvocationPresentation {
                 tool_call_id,
                 is_error,
                 presentation,
@@ -1087,7 +1096,7 @@ impl PersistedSessionEventKind {
 /// Persisted legacy presentation DTO retained only to decode old session logs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum PersistedToolInvocationPresentation {
+enum LegacyPersistedToolInvocationPresentation {
     Terminal {
         #[serde(default)]
         exit_code: Option<i32>,
@@ -1117,17 +1126,19 @@ enum PersistedToolInvocationPresentation {
 }
 
 fn semantic_from_legacy_presentation(
-    presentation: &PersistedToolInvocationPresentation,
+    presentation: &LegacyPersistedToolInvocationPresentation,
 ) -> ToolInvocationResult {
     ToolInvocationResult::Text {
         text: legacy_presentation_result_text(presentation),
     }
 }
 
-fn legacy_presentation_result_text(presentation: &PersistedToolInvocationPresentation) -> String {
+fn legacy_presentation_result_text(
+    presentation: &LegacyPersistedToolInvocationPresentation,
+) -> String {
     match presentation {
-        PersistedToolInvocationPresentation::Terminal { output, .. } => output.clone(),
-        PersistedToolInvocationPresentation::FileChange { summary, .. } => summary.clone(),
+        LegacyPersistedToolInvocationPresentation::Terminal { output, .. } => output.clone(),
+        LegacyPersistedToolInvocationPresentation::FileChange { summary, .. } => summary.clone(),
     }
 }
 
@@ -1359,7 +1370,7 @@ mod tests {
                 producer_plugin_id: None,
                 tool_name: "tool".to_string(),
                 arguments_json: "{}".to_string(),
-                request_presentation: None,
+                legacy_request_presentation: None,
             },
             SessionEventKind::ToolCallFinished {
                 tool_call_id: "call".to_string(),
@@ -1376,7 +1387,7 @@ mod tests {
                 producer_plugin_id: None,
                 tool_name: "tool".to_string(),
                 arguments_json: "{}".to_string(),
-                request_presentation: None,
+                legacy_request_presentation: None,
                 policy_source: None,
                 policy_reason: None,
             },

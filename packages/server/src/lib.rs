@@ -39,13 +39,13 @@ use bcode_model::{
 use bcode_plugin::{PluginInvocationScope, StreamingServiceInvocationEvent};
 use bcode_session::{CatalogLoadStatus, SessionManager, lease::SessionLeaseOwnerContext};
 use bcode_session_models::{
-    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, LiveFileEditPreview, LiveQueryPreview,
-    LiveShellCommandPreview, LiveToolArgumentPreview, ModelTurnOutcome, ProviderStreamEvent,
-    ProviderToolCallProgress, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind,
-    SessionId, SessionLiveEventKind, SessionTokenUsage, SessionTraceEvent, SessionTracePayload,
-    SessionTracePhase, ToolInvocationResult, ToolInvocationStreamEvent,
-    ToolOutputStream as SessionToolOutputStream, ToolPluginViewPresentation,
-    ToolPresentationTarget, TraceBlobRef, TraceRedaction,
+    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, LiveFileEditPreview, LivePluginViewPreview,
+    LiveQueryPreview, LiveShellCommandPreview, LiveToolArgumentPreview, ModelTurnOutcome,
+    ProviderStreamEvent, ProviderToolCallProgress, RuntimeWorkId, RuntimeWorkKind,
+    RuntimeWorkStatus, SessionEventKind, SessionId, SessionLiveEventKind, SessionTokenUsage,
+    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ToolInvocationResult,
+    ToolInvocationStreamEvent, ToolOutputStream as SessionToolOutputStream, TraceBlobRef,
+    TraceRedaction,
 };
 use bcode_settings::SettingsStore;
 use bcode_skill::{
@@ -8264,15 +8264,14 @@ fn live_tool_argument_preview_from_fields(
 
 fn live_plugin_view_preview_from_fields(
     fields: &StreamingJsonStringFields,
-    view: &bcode_tool::ToolPluginViewMetadata,
+    view: &bcode_tool::ToolLivePluginViewMetadata,
     streaming_status: Option<String>,
-) -> Option<ToolPluginViewPresentation> {
+) -> Option<LivePluginViewPreview> {
     let payload = plugin_view_payload_from_fields(fields, &view.payload)?;
     let subtitle = streaming_status
         .map(|status| render_live_status_template(&status, fields))
         .or_else(|| view.subtitle.clone());
-    Some(ToolPluginViewPresentation {
-        target: ToolPresentationTarget::Preview,
+    Some(LivePluginViewPreview {
         producer_plugin_id: view.producer_plugin_id.clone().unwrap_or_default(),
         schema: view.schema.clone(),
         schema_version: view.schema_version,
@@ -8284,7 +8283,7 @@ fn live_plugin_view_preview_from_fields(
 
 fn plugin_view_payload_from_fields(
     fields: &StreamingJsonStringFields,
-    selectors: &BTreeMap<String, bcode_tool::ToolPresentationPayloadSelector>,
+    selectors: &BTreeMap<String, bcode_tool::ToolLivePreviewPayloadSelector>,
 ) -> Option<serde_json::Value> {
     let mut payload = serde_json::Map::new();
     for (key, selector) in selectors {
@@ -8299,7 +8298,7 @@ fn plugin_view_payload_from_fields(
 
 fn resolve_payload_selector(
     fields: &StreamingJsonStringFields,
-    selector: &bcode_tool::ToolPresentationPayloadSelector,
+    selector: &bcode_tool::ToolLivePreviewPayloadSelector,
 ) -> Option<serde_json::Value> {
     fields
         .field(
@@ -13476,10 +13475,11 @@ async fn invoke_model_tool(
             event = invocation.next_event() => {
                 match event.map_err(|error| error.to_string())? {
                     StreamingServiceInvocationEvent::Event(payload) => {
-                        if let Ok(event) = serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload)
-                            && let Some(event) =
-                                normalize_tool_stream_event_sequence(event, &mut stream_sequences)
+                        if let Ok(event) =
+                            serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload)
                         {
+                            let event =
+                                normalize_tool_stream_event_sequence(event, &mut stream_sequences);
                             tool_output_publisher
                                 .push_stream_event(state, session_id, event)
                                 .await;
@@ -13493,9 +13493,8 @@ async fn invoke_model_tool(
         }
     };
     while let Some(payload) = invocation.try_recv_event() {
-        if let Ok(event) = serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload)
-            && let Some(event) = normalize_tool_stream_event_sequence(event, &mut stream_sequences)
-        {
+        if let Ok(event) = serde_json::from_slice::<ServiceToolInvocationStreamEvent>(&payload) {
+            let event = normalize_tool_stream_event_sequence(event, &mut stream_sequences);
             tool_output_publisher
                 .push_stream_event(state, session_id, event)
                 .await;
@@ -13648,7 +13647,7 @@ async fn append_tool_stream_event(
 }
 
 const fn is_legacy_tool_presentation_stream_event(event: &ToolInvocationStreamEvent) -> bool {
-    matches!(event, ToolInvocationStreamEvent::Presentation { .. })
+    matches!(event, ToolInvocationStreamEvent::LegacyPresentation { .. })
 }
 
 fn runtime_work_progress_from_tool_stream_event(
@@ -13685,20 +13684,20 @@ fn runtime_work_progress_from_tool_stream_event(
             .to_string(),
         )),
         ToolInvocationStreamEvent::OutputDelta { .. }
-        | ToolInvocationStreamEvent::Presentation { .. } => None,
+        | ToolInvocationStreamEvent::LegacyPresentation { .. } => None,
     }
 }
 
 fn normalize_tool_stream_event_sequence(
     event: ServiceToolInvocationStreamEvent,
     stream_sequences: &mut BTreeMap<String, u64>,
-) -> Option<ToolInvocationStreamEvent> {
-    let event = convert_tool_stream_event(event)?;
+) -> ToolInvocationStreamEvent {
+    let event = convert_tool_stream_event(event);
     let tool_call_id = match &event {
         ToolInvocationStreamEvent::Started { tool_call_id, .. }
         | ToolInvocationStreamEvent::OutputDelta { tool_call_id, .. }
         | ToolInvocationStreamEvent::Status { tool_call_id, .. }
-        | ToolInvocationStreamEvent::Presentation { tool_call_id, .. }
+        | ToolInvocationStreamEvent::LegacyPresentation { tool_call_id, .. }
         | ToolInvocationStreamEvent::Finished { tool_call_id, .. } => tool_call_id.clone(),
     };
     let next = stream_sequences
@@ -13706,7 +13705,7 @@ fn normalize_tool_stream_event_sequence(
         .and_modify(|sequence| *sequence = sequence.saturating_add(1))
         .or_insert(1);
     let sequence = *next;
-    Some(set_tool_stream_event_sequence(event, sequence))
+    set_tool_stream_event_sequence(event, sequence)
 }
 
 fn set_tool_stream_event_sequence(
@@ -13753,11 +13752,11 @@ fn set_tool_stream_event_sequence(
             sequence,
             message,
         },
-        ToolInvocationStreamEvent::Presentation {
+        ToolInvocationStreamEvent::LegacyPresentation {
             tool_call_id,
             presentation,
             ..
-        } => ToolInvocationStreamEvent::Presentation {
+        } => ToolInvocationStreamEvent::LegacyPresentation {
             tool_call_id,
             sequence,
             presentation,
@@ -13776,9 +13775,7 @@ fn set_tool_stream_event_sequence(
     }
 }
 
-fn convert_tool_stream_event(
-    event: ServiceToolInvocationStreamEvent,
-) -> Option<ToolInvocationStreamEvent> {
+fn convert_tool_stream_event(event: ServiceToolInvocationStreamEvent) -> ToolInvocationStreamEvent {
     match event {
         ServiceToolInvocationStreamEvent::Started {
             tool_call_id,
@@ -13788,7 +13785,7 @@ fn convert_tool_stream_event(
             columns,
             rows,
             started_at_ms,
-        } => Some(ToolInvocationStreamEvent::Started {
+        } => ToolInvocationStreamEvent::Started {
             tool_call_id,
             tool_name,
             sequence,
@@ -13796,41 +13793,40 @@ fn convert_tool_stream_event(
             columns,
             rows,
             started_at_ms: started_at_ms.or_else(|| Some(current_unix_millis())),
-        }),
+        },
         ServiceToolInvocationStreamEvent::OutputDelta {
             tool_call_id,
             stream,
             sequence,
             text,
             byte_len,
-        } => Some(ToolInvocationStreamEvent::OutputDelta {
+        } => ToolInvocationStreamEvent::OutputDelta {
             tool_call_id,
             stream: convert_tool_output_stream(stream),
             sequence,
             text,
             byte_len,
-        }),
+        },
         ServiceToolInvocationStreamEvent::Status {
             tool_call_id,
             sequence,
             message,
-        } => Some(ToolInvocationStreamEvent::Status {
+        } => ToolInvocationStreamEvent::Status {
             tool_call_id,
             sequence,
             message,
-        }),
-        ServiceToolInvocationStreamEvent::Presentation { .. } => None,
+        },
         ServiceToolInvocationStreamEvent::Finished {
             tool_call_id,
             sequence,
             is_error,
             finished_at_ms,
-        } => Some(ToolInvocationStreamEvent::Finished {
+        } => ToolInvocationStreamEvent::Finished {
             tool_call_id,
             sequence,
             is_error,
             finished_at_ms: finished_at_ms.or_else(|| Some(current_unix_millis())),
-        }),
+        },
     }
 }
 
@@ -14112,7 +14108,7 @@ async fn request_tool_permission(
             producer_plugin_id: Some(producer_plugin_id.to_owned()),
             tool_name: definition.name.clone(),
             arguments_json: arguments_json.clone(),
-            request_presentation: None,
+            legacy_request_presentation: None,
             policy_source: policy_context.source.clone(),
             policy_reason: policy_context.reason.clone(),
         },
@@ -16036,8 +16032,8 @@ fn default_session_artifact_dir(session_id: SessionId) -> PathBuf {
 mod tests {
     use super::*;
     use bcode_session_models::{
-        CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEvent, ToolCardPresentation,
-        ToolPresentationEvent, ToolPresentationTarget,
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, LegacyToolCardPresentation,
+        LegacyToolPresentationEvent, LegacyToolPresentationTarget, SessionEvent,
     };
 
     fn session_event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> SessionEvent {
@@ -16857,15 +16853,15 @@ mod tests {
 
         assert!(matches!(
             first,
-            Some(ToolInvocationStreamEvent::Started { sequence: 1, .. })
+            ToolInvocationStreamEvent::Started { sequence: 1, .. }
         ));
         assert!(matches!(
             second,
-            Some(ToolInvocationStreamEvent::Status { sequence: 2, .. })
+            ToolInvocationStreamEvent::Status { sequence: 2, .. }
         ));
         assert!(matches!(
             other_call,
-            Some(ToolInvocationStreamEvent::Finished { sequence: 1, .. })
+            ToolInvocationStreamEvent::Finished { sequence: 1, .. }
         ));
     }
 
@@ -17101,7 +17097,7 @@ mod tests {
                     producer_plugin_id: None,
                     tool_name: "shell.run".to_string(),
                     arguments_json: r#"{"command":"true"}"#.to_string(),
-                    request_presentation: None,
+                    legacy_request_presentation: None,
                 },
             ),
             session_event(
@@ -17139,7 +17135,7 @@ mod tests {
                     producer_plugin_id: None,
                     tool_name: "shell.run".to_string(),
                     arguments_json: r#"{"command":"true"}"#.to_string(),
-                    request_presentation: None,
+                    legacy_request_presentation: None,
                 },
             ),
             session_event(
@@ -17205,7 +17201,7 @@ mod tests {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_string(),
                 arguments_json: "{not-json".to_string(),
-                request_presentation: None,
+                legacy_request_presentation: None,
             },
         )];
 
@@ -18077,11 +18073,11 @@ mod tests {
         append_tool_stream_event(
             &state,
             session_id,
-            ToolInvocationStreamEvent::Presentation {
+            ToolInvocationStreamEvent::LegacyPresentation {
                 tool_call_id: "call-1".to_owned(),
                 sequence: 1,
-                presentation: ToolPresentationEvent::Card(ToolCardPresentation {
-                    target: ToolPresentationTarget::Result,
+                presentation: LegacyToolPresentationEvent::Card(LegacyToolCardPresentation {
+                    target: LegacyToolPresentationTarget::Result,
                     title: "legacy card".to_owned(),
                     subtitle: None,
                     sections: Vec::new(),
@@ -18098,13 +18094,13 @@ mod tests {
         assert!(!history.iter().any(|event| matches!(
             event.kind,
             SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Presentation { .. }
+                event: ToolInvocationStreamEvent::LegacyPresentation { .. }
             }
         )));
     }
 
     #[tokio::test]
-    async fn tool_call_request_events_do_not_persist_request_presentation() {
+    async fn tool_call_request_events_do_not_persist_legacy_request_presentation() {
         let sessions = SessionManager::default();
         let summary = sessions
             .create_session(Some("test".to_owned()), test_working_directory())
@@ -18131,11 +18127,11 @@ mod tests {
         let request_fields = history.iter().find_map(|event| {
             if let SessionEventKind::ToolCallRequested {
                 producer_plugin_id,
-                request_presentation,
+                legacy_request_presentation,
                 ..
             } = &event.kind
             {
-                Some((producer_plugin_id, request_presentation))
+                Some((producer_plugin_id, legacy_request_presentation))
             } else {
                 None
             }
@@ -18147,7 +18143,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permission_request_events_do_not_persist_request_presentation() {
+    async fn permission_request_events_do_not_persist_legacy_request_presentation() {
         let sessions = SessionManager::default();
         let summary = sessions
             .create_session(Some("test".to_owned()), test_working_directory())
@@ -18192,11 +18188,11 @@ mod tests {
         let request_fields = history.iter().find_map(|event| {
             if let SessionEventKind::PermissionRequested {
                 producer_plugin_id,
-                request_presentation,
+                legacy_request_presentation,
                 ..
             } = &event.kind
             {
-                Some((producer_plugin_id, request_presentation))
+                Some((producer_plugin_id, legacy_request_presentation))
             } else {
                 None
             }
@@ -18514,7 +18510,7 @@ mod tests {
                     producer_plugin_id: None,
                     tool_name: "filesystem.read".to_string(),
                     arguments_json: r#"{"path":"Cargo.toml"}"#.to_string(),
-                    request_presentation: None,
+                    legacy_request_presentation: None,
                 },
             },
             SessionEvent {

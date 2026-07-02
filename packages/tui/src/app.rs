@@ -46,11 +46,11 @@ use super::temporal::next_elapsed_invalidation_capped;
 use super::theme::{PresentedTheme, ResolvedTheme};
 use super::timeline_dialog::TimelineEntry;
 use super::transcript::{
-    ToolTranscriptSurface, TranscriptItem, TranscriptItemKind, artifact_tool_result_item,
-    display_tool_result_text, generic_tool_result_item_from_projection,
-    interactive_tool_request_item, interactive_tool_resolution_item,
-    item_is_tool_surface_for_tool_call, live_tool_preview_anchor_item, model_usage_item,
-    permission_request_item, permission_result_item, streaming_terminal_output_item,
+    ToolTranscriptSurface, TranscriptItem, TranscriptItemKind, display_tool_result_text,
+    generic_tool_result_item_from_projection, interactive_tool_request_item,
+    interactive_tool_resolution_item, item_is_tool_surface_for_tool_call,
+    live_tool_preview_anchor_item, model_usage_item, permission_request_item,
+    permission_result_item, semantic_tool_result_item_from_raw, streaming_terminal_output_item,
     streaming_tool_output_item, tool_request_item_from_projection, tool_result_item,
     transcript_items_from_events_with_reasoning,
 };
@@ -2090,7 +2090,7 @@ impl BmuxApp {
                 tool_call_id,
                 tool_name,
                 arguments_json,
-                request_presentation: _legacy_request_presentation,
+                legacy_request_presentation: _legacy_legacy_request_presentation,
                 ..
             } => {
                 self.active_tool_calls.insert(tool_call_id.clone());
@@ -2165,7 +2165,7 @@ impl BmuxApp {
                 tool_call_id,
                 tool_name,
                 arguments_json,
-                request_presentation: _legacy_request_presentation,
+                legacy_request_presentation: _legacy_legacy_request_presentation,
                 policy_source,
                 policy_reason,
                 ..
@@ -2723,14 +2723,12 @@ impl BmuxApp {
             self.finish_tool_request_preview(tool_call_id);
             return;
         }
-        let item = if semantic_result.is_some() {
-            semantic_tool_result_item_for_app(
-                self.plugin_host.as_deref(),
+        let item = if let Some(semantic_result) = semantic_result {
+            semantic_tool_result_item_from_raw(
                 tool_call_id,
                 tool_name.as_deref(),
                 arguments_json.as_deref(),
                 semantic_result,
-                result,
                 is_error,
             )
         } else {
@@ -2813,7 +2811,7 @@ impl BmuxApp {
                     }
                 }
             }
-            ToolInvocationStreamEvent::Presentation { .. } => {
+            ToolInvocationStreamEvent::LegacyPresentation { .. } => {
                 Self::legacy_discard_tool_presentation_stream_event();
             }
             ToolInvocationStreamEvent::Finished {
@@ -3840,54 +3838,6 @@ fn context_window_percentage(input_tokens: u32, context_window: u32) -> u32 {
     let numerator = u64::from(input_tokens).saturating_mul(100);
     let denominator = u64::from(context_window).max(1);
     u32::try_from(numerator / denominator).unwrap_or(u32::MAX)
-}
-
-fn semantic_tool_result_item_for_app(
-    _runtime: Option<&bcode_plugin::PluginHost>,
-    tool_call_id: &str,
-    tool_name: Option<&str>,
-    arguments_json: Option<&str>,
-    semantic_result: Option<&ToolInvocationResult>,
-    fallback_result: &str,
-    is_error: bool,
-) -> TranscriptItem {
-    match semantic_result {
-        Some(ToolInvocationResult::Text { text }) => {
-            tool_result_item(tool_call_id, tool_name, arguments_json, text, is_error)
-        }
-        Some(ToolInvocationResult::Json { value }) => {
-            tool_result_item(tool_call_id, tool_name, arguments_json, value, is_error)
-        }
-        Some(ToolInvocationResult::Artifact { artifact }) => artifact_result_item_for_app(
-            tool_call_id,
-            tool_name,
-            arguments_json,
-            artifact,
-            fallback_result,
-            is_error,
-        ),
-        None => {
-            let fallback_result = display_tool_result_text(fallback_result);
-            tool_result_item(
-                tool_call_id,
-                tool_name,
-                arguments_json,
-                &fallback_result,
-                is_error,
-            )
-        }
-    }
-}
-
-fn artifact_result_item_for_app(
-    tool_call_id: &str,
-    tool_name: Option<&str>,
-    arguments_json: Option<&str>,
-    artifact: &bcode_session_models::ToolArtifact,
-    _fallback_result: &str,
-    is_error: bool,
-) -> TranscriptItem {
-    artifact_tool_result_item(tool_call_id, tool_name, arguments_json, artifact, is_error)
 }
 
 fn working_directory_changed_message(

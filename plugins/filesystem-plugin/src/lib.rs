@@ -14,7 +14,7 @@ use bcode_tool::{
     ImageMetadata, ImageRefContent, ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS,
     TOOL_SERVICE_INTERFACE_ID, ToolArtifact, ToolDefinition, ToolInvocationRequest,
     ToolInvocationResponse, ToolInvocationResult, ToolInvocationStreamEvent, ToolList,
-    ToolLiveArgumentPreviewMetadata, ToolPluginViewMetadata, ToolPresentationPayloadSelector,
+    ToolLiveArgumentPreviewMetadata, ToolLivePluginViewMetadata, ToolLivePreviewPayloadSelector,
     ToolResultContent, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
@@ -393,8 +393,8 @@ fn payload_selector(
     fields: &[&str],
     literal: Option<serde_json::Value>,
     required: bool,
-) -> ToolPresentationPayloadSelector {
-    ToolPresentationPayloadSelector {
+) -> ToolLivePreviewPayloadSelector {
+    ToolLivePreviewPayloadSelector {
         fields: fields.iter().map(|field| (*field).to_string()).collect(),
         literal,
         required,
@@ -407,7 +407,7 @@ fn file_change_metadata(
     old_text_literal: Option<&str>,
     old_text_required: bool,
     new_text_fields: &[&str],
-) -> ToolPluginViewMetadata {
+) -> ToolLivePluginViewMetadata {
     let mut payload = std::collections::BTreeMap::new();
     payload.insert("path".to_string(), payload_selector(&["path"], None, false));
     payload.insert(
@@ -422,7 +422,7 @@ fn file_change_metadata(
         "new_text".to_string(),
         payload_selector(new_text_fields, None, true),
     );
-    ToolPluginViewMetadata {
+    ToolLivePluginViewMetadata {
         schema: "bcode.filesystem.change".to_string(),
         schema_version: 1,
         producer_plugin_id: Some("bcode.filesystem".to_string()),

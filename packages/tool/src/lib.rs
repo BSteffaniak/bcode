@@ -319,7 +319,7 @@ pub struct ToolUiMetadata {
 
 /// A generic argument field selector for plugin-owned opaque presentation payloads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolPresentationPayloadSelector {
+pub struct ToolLivePreviewPayloadSelector {
     /// Candidate top-level JSON argument names, in priority order.
     #[serde(default)]
     pub fields: Vec<String>,
@@ -333,7 +333,7 @@ pub struct ToolPresentationPayloadSelector {
 
 /// Opaque plugin-owned presentation payload metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolPluginViewMetadata {
+pub struct ToolLivePluginViewMetadata {
     /// Producer-owned schema identifier.
     pub schema: String,
     /// Producer-owned schema version.
@@ -349,7 +349,7 @@ pub struct ToolPluginViewMetadata {
     pub subtitle: Option<String>,
     /// Payload keys mapped to tool argument fields/literals.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub payload: std::collections::BTreeMap<String, ToolPresentationPayloadSelector>,
+    pub payload: std::collections::BTreeMap<String, ToolLivePreviewPayloadSelector>,
 }
 
 /// Declarative live argument preview metadata owned by a tool provider.
@@ -359,7 +359,7 @@ pub enum ToolLiveArgumentPreviewMetadata {
     /// Plugin-owned generic presentation preview.
     PluginView {
         /// Opaque plugin-owned view metadata.
-        view: ToolPluginViewMetadata,
+        view: ToolLivePluginViewMetadata,
         /// Plugin-owned streaming status template.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         streaming_status: Option<String>,
@@ -409,106 +409,6 @@ pub enum ToolLiveArgumentPreviewMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         streaming_status: Option<String>,
     },
-}
-
-/// Declarative presentation metadata for one request argument field.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolPresentationField {
-    /// Human-readable field label.
-    pub label: String,
-    /// Top-level JSON argument name to display.
-    pub argument: String,
-    /// Field rendering hint for generic UI presentation.
-    pub kind: ToolPresentationFieldKind,
-    /// Whether the field may be omitted from the request arguments.
-    #[serde(default)]
-    pub optional: bool,
-}
-
-/// Generic UI presentation hint for request argument fields.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ToolPresentationFieldKind {
-    /// Plain text value.
-    #[default]
-    Text,
-    /// File or directory path value.
-    Path,
-    /// URL value.
-    Url,
-    /// Shell or process command value.
-    Command,
-    /// Boolean value.
-    Boolean,
-    /// Integer count or limit value.
-    Count,
-    /// Millisecond duration value.
-    DurationMs,
-    /// JSON value with no more specific semantic hint.
-    Json,
-}
-
-impl ToolPresentationFieldKind {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Text => "text",
-            Self::Path => "path",
-            Self::Url => "url",
-            Self::Command => "command",
-            Self::Boolean => "boolean",
-            Self::Count => "count",
-            Self::DurationMs => "duration_ms",
-            Self::Json => "json",
-        }
-    }
-
-    #[must_use]
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "text" => Some(Self::Text),
-            "path" => Some(Self::Path),
-            "url" => Some(Self::Url),
-            "command" => Some(Self::Command),
-            "boolean" => Some(Self::Boolean),
-            "count" => Some(Self::Count),
-            "duration_ms" => Some(Self::DurationMs),
-            "json" => Some(Self::Json),
-            _ => None,
-        }
-    }
-}
-
-impl Serialize for ToolPresentationFieldKind {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for ToolPresentationFieldKind {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::parse(&value).ok_or_else(|| {
-            serde::de::Error::unknown_variant(
-                &value,
-                &[
-                    "text",
-                    "path",
-                    "url",
-                    "command",
-                    "boolean",
-                    "count",
-                    "duration_ms",
-                    "json",
-                ],
-            )
-        })
-    }
 }
 
 /// Side-effect category for a model-callable tool.
@@ -573,13 +473,6 @@ pub enum ToolInvocationStreamEvent {
         sequence: u64,
         message: String,
     },
-    /// Plugin-owned presentation update.
-    Presentation {
-        tool_call_id: String,
-        #[serde(default)]
-        sequence: u64,
-        presentation: ToolPresentationEvent,
-    },
     /// Tool has finished; full result follows through normal invoke response.
     Finished {
         tool_call_id: String,
@@ -590,129 +483,6 @@ pub enum ToolInvocationStreamEvent {
         #[serde(default)]
         finished_at_ms: Option<u64>,
     },
-}
-
-/// Plugin-owned presentation update for a running tool invocation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ToolPresentationEvent {
-    /// Status text for an activity, preview, or result target.
-    Status(ToolStatusPresentation),
-    /// Card-style structured presentation.
-    Card(ToolCardPresentation),
-    /// Progress update.
-    Progress(ToolProgressPresentation),
-    /// Opaque plugin-owned presentation view.
-    PluginView(ToolPluginViewPresentation),
-    /// Generic protocol component-tree presentation.
-    Protocol(ToolProtocolPresentation),
-    /// Clear a previous presentation target.
-    Clear { target: ToolPresentationTarget },
-}
-
-/// Opaque plugin-owned presentation payload.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolPluginViewPresentation {
-    pub target: ToolPresentationTarget,
-    pub producer_plugin_id: String,
-    pub schema: String,
-    pub schema_version: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subtitle: Option<String>,
-    pub payload: serde_json::Value,
-}
-
-/// Tool protocol component-tree presentation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolProtocolPresentation {
-    pub target: ToolPresentationTarget,
-    pub surface_kind: String,
-    pub tree: serde_json::Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state: Option<serde_json::Value>,
-}
-
-/// Tool presentation target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolPresentationTarget {
-    Activity,
-    Preview,
-    Result,
-}
-
-/// Presentation severity/level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolPresentationLevel {
-    Info,
-    Success,
-    Warning,
-    Error,
-}
-
-/// Tool status presentation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolStatusPresentation {
-    pub target: ToolPresentationTarget,
-    pub text: String,
-    #[serde(default = "default_presentation_level")]
-    pub level: ToolPresentationLevel,
-}
-
-/// Tool progress presentation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolProgressPresentation {
-    pub target: ToolPresentationTarget,
-    pub text: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub percent: Option<u8>,
-    #[serde(default = "default_presentation_level")]
-    pub level: ToolPresentationLevel,
-}
-
-/// Tool card presentation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolCardPresentation {
-    pub target: ToolPresentationTarget,
-    pub title: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subtitle: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sections: Vec<ToolPresentationSection>,
-}
-
-/// Generic section in a tool presentation card.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ToolPresentationSection {
-    Text {
-        label: Option<String>,
-        text: String,
-    },
-    Fields {
-        fields: Vec<ToolPresentationFieldValue>,
-    },
-    Terminal {
-        output: String,
-        columns: u16,
-        rows: u16,
-    },
-}
-
-/// Label/value field for a presentation section.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolPresentationFieldValue {
-    pub label: String,
-    pub value: String,
-    #[serde(default)]
-    pub kind: ToolPresentationFieldKind,
-}
-
-const fn default_presentation_level() -> ToolPresentationLevel {
-    ToolPresentationLevel::Info
 }
 
 /// Logical output stream for an incremental tool output chunk.
@@ -774,58 +544,7 @@ pub struct ToolArtifactRef {
     pub metadata: Option<serde_json::Value>,
 }
 
-/// Client-local presentation request for an opaque tool artifact.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolArtifactPresentationRequest {
-    pub artifact: ToolArtifact,
-    pub surface: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub viewport: Option<ToolArtifactPresentationViewport>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capabilities: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state: Option<serde_json::Value>,
-}
-
-/// Viewport information supplied by a client when asking a visual adapter to render.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolArtifactPresentationViewport {
-    pub width: u16,
-    pub height: u16,
-}
-
-/// Client-local presentation response for an opaque tool artifact.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolArtifactPresentationResponse {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub presentation: Option<ToolPresentationEvent>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state: Option<serde_json::Value>,
-}
-
-/// Client-local presentation request for an opaque plugin-owned view.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolViewPresentationRequest {
-    pub view: ToolPluginViewPresentation,
-    pub surface: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub viewport: Option<ToolArtifactPresentationViewport>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capabilities: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state: Option<serde_json::Value>,
-}
-
-/// Client-local presentation response for an opaque plugin-owned view.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolViewPresentationResponse {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub presentation: Option<ToolPresentationEvent>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state: Option<serde_json::Value>,
-}
-
-/// Typed host action requested by a tool plugin.
+/// Host action requested by a tool invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolInvocationHostAction {

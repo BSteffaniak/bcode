@@ -151,8 +151,11 @@ impl<'a> TranscriptLayoutInput<'a> {
             .map(|pending| format!("{}:{:?}", pending.text(), pending.state()))
             .collect::<Vec<_>>()
             .join(",");
+        let plugin_host_revision = self
+            .plugin_host
+            .map_or(0, |host| std::ptr::from_ref(host).addr());
         TranscriptLayoutFingerprint::new(format!(
-            "width:{};history:{}:{};transcript-rev:{};transcript:{};pending-rev:{};pending:{}",
+            "width:{};history:{}:{};plugin-host:{plugin_host_revision};transcript-rev:{};transcript:{};pending-rev:{};pending:{}",
             self.width,
             self.has_older_history,
             self.loading_older_history,
@@ -176,8 +179,11 @@ fn transcript_item_signature(
             .map_or(0, |preview| preview.revision),
         _ => 0,
     };
+    let plugin_host_revision = input
+        .plugin_host
+        .map_or(0, |host| std::ptr::from_ref(host).addr());
     TranscriptLayoutSignature::new(format!(
-        "{};live-preview-rev:{live_preview_revision}",
+        "{};plugin-host:{plugin_host_revision};live-preview-rev:{live_preview_revision}",
         base.as_str()
     ))
 }

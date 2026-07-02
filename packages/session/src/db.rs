@@ -2202,7 +2202,7 @@ mod tests {
                 producer_plugin_id: None,
                 tool_name: "shell".to_string(),
                 arguments_json: "{}".to_string(),
-                request_presentation: None,
+                legacy_request_presentation: None,
             },
         ))
         .await

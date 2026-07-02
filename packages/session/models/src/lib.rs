@@ -35,7 +35,7 @@ pub struct ToolInvocationProjection {
     /// Raw terminal/text stream output observed for the tool.
     pub terminal_output: Option<ToolInvocationProjectionTerminalOutput>,
     /// Legacy persisted presentation events, retained only as compatibility facts.
-    pub legacy_presentations: Vec<ToolPresentationEvent>,
+    pub legacy_presentations: Vec<LegacyToolPresentationEvent>,
 }
 
 /// Renderer-neutral tool invocation lifecycle status.
@@ -139,7 +139,7 @@ fn apply_tool_invocation_stream_projection_event(
             projection.status = ToolInvocationProjectionStatus::Finished;
             projection.is_error = Some(*is_error);
         }
-        ToolInvocationStreamEvent::Presentation { presentation, .. } => {
+        ToolInvocationStreamEvent::LegacyPresentation { presentation, .. } => {
             legacy_record_tool_presentation(projection, presentation);
         }
     }
@@ -147,7 +147,7 @@ fn apply_tool_invocation_stream_projection_event(
 
 fn legacy_record_tool_presentation(
     projection: &mut ToolInvocationProjection,
-    presentation: &ToolPresentationEvent,
+    presentation: &LegacyToolPresentationEvent,
 ) {
     projection.legacy_presentations.push(presentation.clone());
 }
@@ -169,7 +169,7 @@ fn tool_projection_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &st
         ToolInvocationStreamEvent::Started { tool_call_id, .. }
         | ToolInvocationStreamEvent::OutputDelta { tool_call_id, .. }
         | ToolInvocationStreamEvent::Status { tool_call_id, .. }
-        | ToolInvocationStreamEvent::Presentation { tool_call_id, .. }
+        | ToolInvocationStreamEvent::LegacyPresentation { tool_call_id, .. }
         | ToolInvocationStreamEvent::Finished { tool_call_id, .. } => tool_call_id,
     }
 }
@@ -575,14 +575,33 @@ pub enum SessionLiveEventKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LiveToolArgumentPreview {
-    /// Plugin-owned opaque presentation view preview.
-    PluginView(ToolPluginViewPresentation),
+    /// Plugin-owned opaque live preview.
+    PluginView(LivePluginViewPreview),
     /// File edit/write preview.
     FileEdit(LiveFileEditPreview),
     /// Shell command preview.
     ShellCommand(LiveShellCommandPreview),
     /// Query/search preview.
     Query(LiveQueryPreview),
+}
+
+/// Live-only opaque plugin-owned preview derived from partial tool-call arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LivePluginViewPreview {
+    /// Producer plugin id.
+    pub producer_plugin_id: String,
+    /// Producer-owned schema identifier.
+    pub schema: String,
+    /// Producer-owned schema version.
+    pub schema_version: u32,
+    /// Optional human-readable fallback title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Optional human-readable fallback subtitle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
+    /// Opaque producer-owned payload.
+    pub payload: serde_json::Value,
 }
 
 /// Live-only query-like tool preview derived from partial tool-call arguments.
@@ -1032,11 +1051,12 @@ pub enum ToolInvocationStreamEvent {
         sequence: u64,
         message: String,
     },
-    /// Plugin-owned presentation update.
-    Presentation {
+    /// Legacy plugin-owned presentation update retained only for old persisted logs.
+    #[serde(rename = "presentation")]
+    LegacyPresentation {
         tool_call_id: String,
         sequence: u64,
-        presentation: ToolPresentationEvent,
+        presentation: LegacyToolPresentationEvent,
     },
     /// Tool execution has finished inside the provider plugin.
     Finished {
@@ -1050,7 +1070,7 @@ pub enum ToolInvocationStreamEvent {
 
 /// A generic argument field selector for plugin-owned opaque presentation payloads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolPresentationPayloadSelector {
+pub struct LegacyToolPresentationPayloadSelector {
     /// Candidate top-level JSON argument names, in priority order.
     #[serde(default)]
     pub fields: Vec<String>,
@@ -1064,7 +1084,7 @@ pub struct ToolPresentationPayloadSelector {
 
 /// Opaque plugin-owned presentation payload metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolPluginViewMetadata {
+pub struct LegacyToolPluginViewMetadata {
     /// Producer-owned schema identifier.
     pub schema: String,
     /// Producer-owned schema version.
@@ -1080,14 +1100,14 @@ pub struct ToolPluginViewMetadata {
     pub subtitle: Option<String>,
     /// Payload keys mapped to tool argument fields/literals.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub payload: BTreeMap<String, ToolPresentationPayloadSelector>,
+    pub payload: BTreeMap<String, LegacyToolPresentationPayloadSelector>,
 }
 
 /// Opaque plugin-owned presentation payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolPluginViewPresentation {
+pub struct LegacyToolPluginViewPresentation {
     /// Presentation target.
-    pub target: ToolPresentationTarget,
+    pub target: LegacyToolPresentationTarget,
     /// Producer plugin id.
     pub producer_plugin_id: String,
     /// Producer-owned schema identifier.
@@ -1113,7 +1133,7 @@ pub enum LegacyToolRequestPreviewMetadata {
     /// Plugin-owned generic presentation template.
     PluginView {
         /// Opaque plugin-owned view metadata.
-        view: ToolPluginViewMetadata,
+        view: LegacyToolPluginViewMetadata,
     },
     /// File edit/write style preview.
     FileEdit {
@@ -1135,24 +1155,24 @@ pub enum LegacyToolRequestPreviewMetadata {
 pub struct LegacyToolRequestPresentationMetadata {
     pub title: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fields: Vec<ToolPresentationField>,
+    pub fields: Vec<LegacyToolPresentationField>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<LegacyToolRequestPreviewMetadata>,
 }
 
 /// Declarative presentation metadata for one request argument field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolPresentationField {
+pub struct LegacyToolPresentationField {
     pub label: String,
     pub argument: String,
-    pub kind: ToolPresentationFieldKind,
+    pub kind: LegacyLegacyToolPresentationFieldKind,
     #[serde(default)]
     pub optional: bool,
 }
 
 /// Generic UI presentation hint for request argument fields.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ToolPresentationFieldKind {
+pub enum LegacyLegacyToolPresentationFieldKind {
     #[default]
     Text,
     Path,
@@ -1164,7 +1184,7 @@ pub enum ToolPresentationFieldKind {
     Json,
 }
 
-impl ToolPresentationFieldKind {
+impl LegacyLegacyToolPresentationFieldKind {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -1195,7 +1215,7 @@ impl ToolPresentationFieldKind {
     }
 }
 
-impl Serialize for ToolPresentationFieldKind {
+impl Serialize for LegacyLegacyToolPresentationFieldKind {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -1204,7 +1224,7 @@ impl Serialize for ToolPresentationFieldKind {
     }
 }
 
-impl<'de> Deserialize<'de> for ToolPresentationFieldKind {
+impl<'de> Deserialize<'de> for LegacyLegacyToolPresentationFieldKind {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -1234,23 +1254,25 @@ impl<'de> Deserialize<'de> for ToolPresentationFieldKind {
 /// can carry nested presentation payloads without codec-specific DTO shims.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ToolPresentationEvent {
+pub enum LegacyToolPresentationEvent {
     /// Status text for an activity, preview, or result target.
-    Status(ToolStatusPresentation),
+    Status(LegacyToolStatusPresentation),
     /// Card-style structured presentation.
-    Card(ToolCardPresentation),
+    Card(LegacyToolCardPresentation),
     /// Progress update.
-    Progress(ToolProgressPresentation),
+    Progress(LegacyToolProgressPresentation),
     /// Opaque plugin-owned presentation view.
-    PluginView(ToolPluginViewPresentation),
+    PluginView(LegacyToolPluginViewPresentation),
     /// Clear a previous presentation target.
-    Clear { target: ToolPresentationTarget },
+    Clear {
+        target: LegacyToolPresentationTarget,
+    },
 }
 
 /// Tool presentation target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ToolPresentationTarget {
+pub enum LegacyToolPresentationTarget {
     Activity,
     Preview,
     Result,
@@ -1259,7 +1281,7 @@ pub enum ToolPresentationTarget {
 /// Presentation severity/level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ToolPresentationLevel {
+pub enum LegacyToolPresentationLevel {
     Info,
     Success,
     Warning,
@@ -1268,45 +1290,45 @@ pub enum ToolPresentationLevel {
 
 /// Tool status presentation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolStatusPresentation {
-    pub target: ToolPresentationTarget,
+pub struct LegacyToolStatusPresentation {
+    pub target: LegacyToolPresentationTarget,
     pub text: String,
     #[serde(default = "default_presentation_level")]
-    pub level: ToolPresentationLevel,
+    pub level: LegacyToolPresentationLevel,
 }
 
 /// Tool progress presentation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolProgressPresentation {
-    pub target: ToolPresentationTarget,
+pub struct LegacyToolProgressPresentation {
+    pub target: LegacyToolPresentationTarget,
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub percent: Option<u8>,
     #[serde(default = "default_presentation_level")]
-    pub level: ToolPresentationLevel,
+    pub level: LegacyToolPresentationLevel,
 }
 
 /// Tool card presentation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolCardPresentation {
-    pub target: ToolPresentationTarget,
+pub struct LegacyToolCardPresentation {
+    pub target: LegacyToolPresentationTarget,
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitle: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sections: Vec<ToolPresentationSection>,
+    pub sections: Vec<LegacyToolPresentationSection>,
 }
 
 /// Generic section in a tool presentation card.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ToolPresentationSection {
+pub enum LegacyToolPresentationSection {
     Text {
         label: Option<String>,
         text: String,
     },
     Fields {
-        fields: Vec<ToolPresentationFieldValue>,
+        fields: Vec<LegacyLegacyToolPresentationFieldValue>,
     },
     Terminal {
         output: String,
@@ -1317,15 +1339,15 @@ pub enum ToolPresentationSection {
 
 /// Label/value field for a presentation section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolPresentationFieldValue {
+pub struct LegacyLegacyToolPresentationFieldValue {
     pub label: String,
     pub value: String,
     #[serde(default)]
-    pub kind: ToolPresentationFieldKind,
+    pub kind: LegacyLegacyToolPresentationFieldKind,
 }
 
-const fn default_presentation_level() -> ToolPresentationLevel {
-    ToolPresentationLevel::Info
+const fn default_presentation_level() -> LegacyToolPresentationLevel {
+    LegacyToolPresentationLevel::Info
 }
 
 /// Logical output stream for an incremental tool output chunk.
@@ -1639,8 +1661,12 @@ pub enum SessionEventKind {
         producer_plugin_id: Option<String>,
         tool_name: String,
         arguments_json: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        request_presentation: Option<LegacyToolRequestPresentationMetadata>,
+        #[serde(
+            default,
+            rename = "request_presentation",
+            skip_serializing_if = "Option::is_none"
+        )]
+        legacy_request_presentation: Option<LegacyToolRequestPresentationMetadata>,
     },
     ToolCallFinished {
         tool_call_id: String,
@@ -1659,8 +1685,12 @@ pub enum SessionEventKind {
         producer_plugin_id: Option<String>,
         tool_name: String,
         arguments_json: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        request_presentation: Option<LegacyToolRequestPresentationMetadata>,
+        #[serde(
+            default,
+            rename = "request_presentation",
+            skip_serializing_if = "Option::is_none"
+        )]
+        legacy_request_presentation: Option<LegacyToolRequestPresentationMetadata>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy_source: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1898,6 +1928,27 @@ mod tests {
                 is_error: false,
                 output: None,
                 semantic_result: None,
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_serialized_tool_stream_presentation_decodes_to_legacy_variant() {
+        let decoded: ToolInvocationStreamEvent = serde_json::from_str(
+            r#"{"presentation":{"tool_call_id":"call-1","sequence":2,"presentation":{"status":{"target":"result","text":"done","level":"success"}}}}"#,
+        )
+        .expect("legacy presentation stream event should decode");
+
+        assert_eq!(
+            decoded,
+            ToolInvocationStreamEvent::LegacyPresentation {
+                tool_call_id: "call-1".to_string(),
+                sequence: 2,
+                presentation: LegacyToolPresentationEvent::Status(LegacyToolStatusPresentation {
+                    target: LegacyToolPresentationTarget::Result,
+                    text: "done".to_string(),
+                    level: LegacyToolPresentationLevel::Success,
+                }),
             }
         );
     }
