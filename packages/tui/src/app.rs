@@ -9,8 +9,8 @@ use bcode_session_models::{
     LiveToolArgumentPreview, ModelTurnOutcome, ProviderStreamEvent, RuntimeWorkStatus,
     SessionEvent, SessionEventKind, SessionHistoryCursor, SessionId, SessionInputHistoryEntry,
     SessionLiveEvent, SessionLiveEventKind, SessionTraceEvent, SessionTracePayload,
-    SessionTracePhase, ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
-    ToolRequestPresentationMetadata,
+    SessionTracePhase, ToolInvocationProjection, ToolInvocationResult, ToolInvocationStreamEvent,
+    ToolOutputStream, ToolRequestPresentationMetadata, apply_tool_invocation_projection_event,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,10 +47,11 @@ use super::theme::{PresentedTheme, ResolvedTheme};
 use super::timeline_dialog::TimelineEntry;
 use super::transcript::{
     ToolTranscriptSurface, TranscriptItem, TranscriptItemKind, artifact_summary_text,
-    display_tool_result_text, interactive_tool_request_item, interactive_tool_resolution_item,
+    display_tool_result_text, generic_tool_result_item_from_projection,
+    interactive_tool_request_item, interactive_tool_resolution_item,
     item_is_tool_surface_for_tool_call, live_tool_preview_anchor_item, model_usage_item,
     permission_request_item, permission_result_item, streaming_terminal_output_item,
-    streaming_tool_output_item, tool_request_item, tool_result_item,
+    streaming_tool_output_item, tool_request_item_from_projection, tool_result_item,
     transcript_items_from_events_with_reasoning,
 };
 use super::transcript_document::TranscriptDocument;
@@ -277,6 +278,7 @@ pub struct BmuxApp {
     transcript_window: TranscriptResidentWindow,
     latest_history_sequence: Option<u64>,
     tool_call_contexts: BTreeMap<String, ToolCallContext>,
+    tool_invocation_projections: BTreeMap<String, ToolInvocationProjection>,
     streamed_tool_results: BTreeMap<String, StreamedToolResultContext>,
     live_tool_previews: BTreeMap<String, LiveToolPreviewState>,
     live_preview_revision: u64,
@@ -477,6 +479,7 @@ impl BmuxApp {
             transcript_window: TranscriptResidentWindow::default(),
             latest_history_sequence: None,
             tool_call_contexts: BTreeMap::new(),
+            tool_invocation_projections: BTreeMap::new(),
             streamed_tool_results: BTreeMap::new(),
             live_tool_previews: BTreeMap::new(),
             live_preview_revision: 0,
@@ -526,6 +529,14 @@ impl BmuxApp {
     #[must_use]
     pub fn plugin_host(&self) -> Option<&bcode_plugin::PluginHost> {
         self.plugin_host.as_deref()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn tool_invocation_projections(
+        &self,
+    ) -> &BTreeMap<String, ToolInvocationProjection> {
+        &self.tool_invocation_projections
     }
 
     /// Return timeline entries for committed user messages.
@@ -1830,6 +1841,7 @@ impl BmuxApp {
         let events = self.transcript_window.events().to_vec();
         self.transcript.replace(Vec::new());
         self.tool_call_contexts.clear();
+        self.tool_invocation_projections.clear();
         self.live_tool_previews.clear();
         self.streamed_tool_results.clear();
         self.active_tool_calls.clear();
@@ -1877,6 +1889,8 @@ impl BmuxApp {
     fn reconcile_tool_state_with_resident_transcript(&mut self) {
         let referenced = referenced_tool_call_ids(self.transcript.items());
         self.tool_call_contexts
+            .retain(|tool_call_id, _| referenced.contains(tool_call_id));
+        self.tool_invocation_projections
             .retain(|tool_call_id, _| referenced.contains(tool_call_id));
         self.live_tool_previews
             .retain(|tool_call_id, _| referenced.contains(tool_call_id));
@@ -2029,6 +2043,7 @@ impl BmuxApp {
 
     #[allow(clippy::too_many_lines)]
     fn apply_session_event(&mut self, event: &SessionEvent, application: SessionEventApplication) {
+        apply_tool_invocation_projection_event(&mut self.tool_invocation_projections, event);
         if event_breaks_sticky_entry_anchor(event) {
             self.downgrade_sticky_entry_anchor();
         }
@@ -2078,6 +2093,7 @@ impl BmuxApp {
                 tool_name,
                 arguments_json,
                 request_presentation,
+                ..
             } => {
                 self.active_tool_calls.insert(tool_call_id.clone());
                 self.tool_activity_seen = true;
@@ -2085,7 +2101,7 @@ impl BmuxApp {
                     tool_call_id,
                     tool_name,
                     arguments_json,
-                    request_presentation.clone(),
+                    request_presentation.as_ref(),
                 );
             }
             SessionEventKind::ToolCallFinished {
@@ -2159,6 +2175,7 @@ impl BmuxApp {
                 request_presentation,
                 policy_source,
                 policy_reason,
+                ..
             } => {
                 self.push_permission_request(PermissionRequestInput {
                     permission_id,
@@ -2614,14 +2631,14 @@ impl BmuxApp {
         tool_call_id: &str,
         tool_name: &str,
         arguments_json: &str,
-        request_presentation: Option<ToolRequestPresentationMetadata>,
+        request_presentation: Option<&ToolRequestPresentationMetadata>,
     ) {
         self.tool_call_contexts.insert(
             tool_call_id.to_owned(),
             ToolCallContext {
                 tool_name: tool_name.to_owned(),
                 arguments_json: arguments_json.to_owned(),
-                request_presentation: request_presentation.clone(),
+                request_presentation: request_presentation.cloned(),
             },
         );
         let has_live_preview_anchor = self
@@ -2637,12 +2654,25 @@ impl BmuxApp {
                 tool_request_status(arguments_json).unwrap_or_else(|| "started".to_owned());
             return;
         }
-        let item = tool_request_item(
-            tool_call_id,
-            tool_name,
-            arguments_json,
-            request_presentation,
-        );
+        let item = self
+            .tool_invocation_projections
+            .get(tool_call_id)
+            .map_or_else(
+                || {
+                    tool_request_item_from_projection(
+                        &ToolInvocationProjection {
+                            tool_call_id: tool_call_id.to_owned(),
+                            tool_name: Some(tool_name.to_owned()),
+                            arguments_json: Some(arguments_json.to_owned()),
+                            ..ToolInvocationProjection::default()
+                        },
+                        request_presentation.cloned(),
+                    )
+                },
+                |projection| {
+                    tool_request_item_from_projection(projection, request_presentation.cloned())
+                },
+            );
         let replaced = self.transcript.mutate_rev_find(
             |existing| {
                 matches!(
@@ -2713,15 +2743,30 @@ impl BmuxApp {
             self.finish_tool_request_preview(tool_call_id);
             return;
         }
-        let item = semantic_tool_result_item_for_app(
-            self.plugin_host.as_deref(),
-            tool_call_id,
-            tool_name.as_deref(),
-            arguments_json.as_deref(),
-            semantic_result,
-            result,
-            is_error,
-        );
+        let item = if semantic_result.is_some() {
+            semantic_tool_result_item_for_app(
+                self.plugin_host.as_deref(),
+                tool_call_id,
+                tool_name.as_deref(),
+                arguments_json.as_deref(),
+                semantic_result,
+                result,
+                is_error,
+            )
+        } else {
+            self.tool_invocation_projections
+                .get(tool_call_id)
+                .and_then(generic_tool_result_item_from_projection)
+                .unwrap_or_else(|| {
+                    tool_result_item(
+                        tool_call_id,
+                        tool_name.as_deref(),
+                        arguments_json.as_deref(),
+                        &display_tool_result_text(result),
+                        is_error,
+                    )
+                })
+        };
         self.transcript.push(item);
         if is_error {
             if application.live_activity() {

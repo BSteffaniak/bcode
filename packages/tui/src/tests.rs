@@ -19,7 +19,7 @@ use bcode_session_models::{
     ToolPluginViewPresentation, ToolPresentationEvent, ToolPresentationField,
     ToolPresentationFieldKind, ToolPresentationLevel, ToolPresentationPayloadSelector,
     ToolPresentationSection, ToolPresentationTarget, ToolRequestPresentationMetadata,
-    ToolRequestPreviewMetadata, ToolStatusPresentation,
+    ToolRequestPreviewMetadata, ToolStatusPresentation, build_tool_invocation_projections,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::TextMotion;
@@ -1750,6 +1750,7 @@ fn transcript_renders_tool_blocks_with_structure_and_pretty_arguments() {
             1,
             SessionEventKind::ToolCallRequested {
                 tool_call_id: full_call_id.to_owned(),
+                producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: r#"{"command":"cargo check","cwd":"/tmp/project"}"#.to_owned(),
                 request_presentation: Some(shell_request_presentation()),
@@ -1792,6 +1793,7 @@ fn live_file_write_statusline_is_not_duplicated_and_truncates_path() {
         1,
         SessionEventKind::ToolCallRequested {
             tool_call_id: "call_write".to_owned(),
+            producer_plugin_id: None,
             tool_name: "filesystem_write".to_owned(),
             arguments_json: serde_json::json!({
                 "path": "/Users/braden/projects/bcode/packages/tui/src/render.rs",
@@ -1831,6 +1833,7 @@ fn live_file_edit_card_shows_permission_and_applied_phases() {
         1,
         SessionEventKind::ToolCallRequested {
             tool_call_id: "call_edit".to_owned(),
+            producer_plugin_id: None,
             tool_name: "filesystem_edit".to_owned(),
             arguments_json: args.clone(),
             request_presentation: Some(file_edit_request_presentation()),
@@ -1842,6 +1845,7 @@ fn live_file_edit_card_shows_permission_and_applied_phases() {
         SessionEventKind::PermissionRequested {
             permission_id: "perm_edit".to_owned(),
             tool_call_id: "call_edit".to_owned(),
+            producer_plugin_id: None,
             tool_name: "filesystem_edit".to_owned(),
             arguments_json: args,
             request_presentation: Some(file_edit_request_presentation()),
@@ -1905,6 +1909,7 @@ fn denied_file_permission_marks_preview_failed() {
         1,
         SessionEventKind::ToolCallRequested {
             tool_call_id: "call_edit".to_owned(),
+            producer_plugin_id: None,
             tool_name: "filesystem_edit".to_owned(),
             arguments_json: args.clone(),
             request_presentation: Some(file_edit_request_presentation()),
@@ -1916,6 +1921,7 @@ fn denied_file_permission_marks_preview_failed() {
         SessionEventKind::PermissionRequested {
             permission_id: "perm_edit".to_owned(),
             tool_call_id: "call_edit".to_owned(),
+            producer_plugin_id: None,
             tool_name: "filesystem_edit".to_owned(),
             arguments_json: args,
             request_presentation: Some(file_edit_request_presentation()),
@@ -1948,6 +1954,7 @@ fn transcript_renders_filesystem_edit_request_without_core_inline_preview() {
         1,
         SessionEventKind::ToolCallRequested {
             tool_call_id: "call_edit".to_owned(),
+            producer_plugin_id: None,
             tool_name: "example.edit".to_owned(),
             arguments_json: serde_json::json!({
                 "path": "src/lib.rs",
@@ -1986,6 +1993,7 @@ fn transcript_renders_shell_output_with_ansi_and_limits() {
             1,
             SessionEventKind::ToolCallRequested {
                 tool_call_id: "call_shell".to_owned(),
+                producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: serde_json::json!({
                     "command": "cargo test",
@@ -2063,6 +2071,7 @@ fn transcript_renders_terminal_shell_output_without_unbounded_row_request() {
             1,
             SessionEventKind::ToolCallRequested {
                 tool_call_id: "call_terminal".to_owned(),
+                producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: serde_json::json!({
                     "command": "git status --short && ls",
@@ -2215,6 +2224,7 @@ fn streamed_terminal_output_renders_running_until_final_result() {
         1,
         SessionEventKind::ToolCallRequested {
             tool_call_id: "call-running".to_owned(),
+            producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
             request_presentation: Some(shell_request_presentation()),
@@ -2270,6 +2280,7 @@ fn streamed_terminal_output_preserves_ansi_color() {
         1,
         SessionEventKind::ToolCallRequested {
             tool_call_id: "call-color".to_owned(),
+            producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
             request_presentation: Some(shell_request_presentation()),
@@ -2326,6 +2337,7 @@ fn streamed_terminal_output_updates_header_after_final_result() {
         1,
         SessionEventKind::ToolCallRequested {
             tool_call_id: "call-final".to_owned(),
+            producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
             request_presentation: Some(shell_request_presentation()),
@@ -2796,6 +2808,7 @@ fn tool_activity_after_submitted_user_message_resumes_following_latest_rows() {
         13,
         SessionEventKind::ToolCallRequested {
             tool_call_id: "tool-1".to_owned(),
+            producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
             request_presentation: Some(shell_request_presentation()),
@@ -2971,6 +2984,7 @@ fn tool_activity_after_assistant_preamble_resumes_following_latest_rows() {
         2,
         SessionEventKind::ToolCallRequested {
             tool_call_id: "tool-1".to_owned(),
+            producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
             request_presentation: None,
@@ -3052,6 +3066,7 @@ fn assistant_response_after_tool_loop_transitions_to_message_top() {
         1,
         SessionEventKind::ToolCallRequested {
             tool_call_id: "tool-1".to_owned(),
+            producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
             request_presentation: Some(shell_request_presentation()),
@@ -3214,6 +3229,7 @@ fn streamed_tool_output_is_not_duplicated_by_final_result() {
         1,
         SessionEventKind::ToolCallRequested {
             tool_call_id: "call-1".to_owned(),
+            producer_plugin_id: None,
             tool_name: "filesystem.shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
             request_presentation: Some(file_edit_request_presentation()),
@@ -3399,6 +3415,7 @@ fn file_change_semantic_result_events(
             1,
             SessionEventKind::ToolCallRequested {
                 tool_call_id: "call-file".to_owned(),
+                producer_plugin_id: None,
                 tool_name: "example.write".to_owned(),
                 arguments_json: r#"{"path":"file.txt","contents":"hi"}"#.to_owned(),
                 request_presentation: Some(file_edit_request_presentation()),
@@ -3434,6 +3451,7 @@ fn streamed_tool_without_output_renders_final_result() {
             1,
             SessionEventKind::ToolCallRequested {
                 tool_call_id: "call-empty".to_owned(),
+                producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
                 request_presentation: Some(shell_request_presentation()),
@@ -3498,6 +3516,7 @@ fn streamed_terminal_tool_events(session_id: SessionId) -> Vec<SessionEvent> {
             1,
             SessionEventKind::ToolCallRequested {
                 tool_call_id: "call-stream".to_owned(),
+                producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
                 request_presentation: Some(shell_request_presentation()),
@@ -3577,6 +3596,7 @@ fn semantic_terminal_result_without_live_delta_renders_terminal_history() {
             1,
             SessionEventKind::ToolCallRequested {
                 tool_call_id: "call-no-live".to_owned(),
+                producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
                 request_presentation: Some(shell_request_presentation()),
@@ -3647,6 +3667,7 @@ fn live_shell_result_preserves_request_block() {
             1,
             SessionEventKind::ToolCallRequested {
                 tool_call_id: "call-live-shell".to_owned(),
+                producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: serde_json::json!({
                     "command": "echo hello",
@@ -3705,6 +3726,7 @@ fn live_streamed_shell_result_preserves_request_and_suppresses_artifact_duplicat
             1,
             SessionEventKind::ToolCallRequested {
                 tool_call_id: "call-live-stream".to_owned(),
+                producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: serde_json::json!({
                     "command": "cargo test",
@@ -3861,6 +3883,7 @@ fn live_shell_preview_stream_request(session_id: SessionId) -> SessionEvent {
         1,
         SessionEventKind::ToolCallRequested {
             tool_call_id: "call-live-preview-stream".to_owned(),
+            producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: serde_json::json!({
                 "command": "cargo test",
@@ -4108,6 +4131,7 @@ fn legacy_terminal_result_renders_plain_tool_result() {
             1,
             SessionEventKind::ToolCallRequested {
                 tool_call_id: "call-old-order".to_owned(),
+                producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
                 request_presentation: Some(shell_request_presentation()),
@@ -4157,6 +4181,7 @@ fn presentation_events_replay_ignores_legacy_presentation_events() {
             1,
             SessionEventKind::ToolCallRequested {
                 tool_call_id: "call-present".to_owned(),
+                producer_plugin_id: None,
                 tool_name: "third.party".to_owned(),
                 arguments_json: "{}".to_owned(),
                 request_presentation: None,
@@ -4201,6 +4226,7 @@ fn legacy_presentation_card_does_not_replace_tool_request_surface() {
             1,
             SessionEventKind::ToolCallRequested {
                 tool_call_id: "call-present".to_owned(),
+                producer_plugin_id: None,
                 tool_name: "third.party".to_owned(),
                 arguments_json: serde_json::json!({"raw": "arguments"}).to_string(),
                 request_presentation: None,
@@ -4253,6 +4279,7 @@ fn legacy_result_presentation_does_not_suppress_generic_tool_result() {
             1,
             SessionEventKind::ToolCallRequested {
                 tool_call_id: "call-present".to_owned(),
+                producer_plugin_id: None,
                 tool_name: "third.party".to_owned(),
                 arguments_json: serde_json::json!({"raw": "arguments"}).to_string(),
                 request_presentation: None,
@@ -4354,6 +4381,7 @@ fn legacy_live_presentation_card_is_ignored_by_normal_transcript() {
             1,
             SessionEventKind::ToolCallRequested {
                 tool_call_id: "call-present".to_owned(),
+                producer_plugin_id: None,
                 tool_name: "third.party".to_owned(),
                 arguments_json: serde_json::json!({"raw": "arguments"}).to_string(),
                 request_presentation: None,
@@ -4591,6 +4619,7 @@ fn transcript_resident_window_does_not_trim_with_active_tool() {
         1_001,
         SessionEventKind::ToolCallRequested {
             tool_call_id: "active-tool".to_owned(),
+            producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
             request_presentation: Some(shell_request_presentation()),
@@ -4630,6 +4659,7 @@ fn transcript_resident_window_prunes_old_tool_state_after_trim() {
             base.saturating_add(1),
             SessionEventKind::ToolCallRequested {
                 tool_call_id: tool_call_id.clone(),
+                producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
                 request_presentation: Some(shell_request_presentation()),
@@ -4782,6 +4812,78 @@ fn generic_artifact_fallback_projection_is_repeatable_and_non_mutating() {
         TranscriptItemKind::ToolResult { result, .. }
             if result.contains("Test artifact") && result.contains("test.schema")
     )));
+}
+
+#[test]
+fn live_tool_invocation_projection_matches_replayed_projection() {
+    let session_id = SessionId::new();
+    let events = vec![
+        event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: Some("plugin.shell".to_owned()),
+                tool_name: "shell.run".to_owned(),
+                arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
+                request_presentation: None,
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Started {
+                    tool_call_id: "call-1".to_owned(),
+                    tool_name: "shell.run".to_owned(),
+                    sequence: 0,
+                    terminal: true,
+                    columns: Some(120),
+                    rows: Some(30),
+                    started_at_ms: Some(10),
+                },
+            },
+        ),
+        event(
+            session_id,
+            3,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::OutputDelta {
+                    tool_call_id: "call-1".to_owned(),
+                    stream: ToolOutputStream::Stdout,
+                    sequence: 1,
+                    text: "hi\n".to_owned(),
+                    byte_len: 3,
+                },
+            },
+        ),
+        event(
+            session_id,
+            4,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "call-1".to_owned(),
+                result: "final text".to_owned(),
+                is_error: false,
+                output: None,
+                semantic_result: Some(ToolInvocationResult::Text {
+                    text: "semantic text".to_owned(),
+                }),
+            },
+        ),
+    ];
+    let replay_projection = build_tool_invocation_projections(&events);
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+
+    for event in &events {
+        app.absorb_session_event(event);
+    }
+    let live_projection = app
+        .tool_invocation_projections()
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+
+    assert_eq!(live_projection, replay_projection);
 }
 
 fn shell_result_artifact(result: &ShellRunResult) -> ToolInvocationResult {
@@ -5253,6 +5355,7 @@ fn live_shell_command_preview_streams_before_final_request_and_is_preserved() {
         1,
         SessionEventKind::ToolCallRequested {
             tool_call_id: "call_shell".to_owned(),
+            producer_plugin_id: None,
             tool_name: "shell_run".to_owned(),
             arguments_json: serde_json::json!({
                 "command": "cargo test -p bcode_tui",
@@ -5338,6 +5441,7 @@ fn live_file_preview_updates_without_duplicates_and_final_replaces_it() {
         1,
         SessionEventKind::ToolCallRequested {
             tool_call_id: "call_write".to_owned(),
+            producer_plugin_id: None,
             tool_name: "filesystem_write".to_owned(),
             arguments_json: serde_json::json!({
                 "path": "src/main.rs",

@@ -1969,6 +1969,7 @@ impl SessionManager {
         tool_call_id: String,
         tool_name: String,
         arguments_json: String,
+        producer_plugin_id: Option<String>,
         request_presentation: Option<bcode_session_models::ToolRequestPresentationMetadata>,
     ) -> Result<SessionEvent, SessionError> {
         self.append_event(
@@ -1977,6 +1978,7 @@ impl SessionManager {
                 tool_call_id,
                 tool_name,
                 arguments_json,
+                producer_plugin_id,
                 request_presentation,
             },
         )
@@ -3024,6 +3026,7 @@ mod tests {
                     "shell.run".to_string(),
                     "{}".to_string(),
                     None,
+                    None,
                 )
                 .await
                 .expect("request should append");
@@ -3450,6 +3453,7 @@ mod tests {
                 "tool-1".to_string(),
                 "read".to_string(),
                 r#"{"path":"README.md"}"#.to_string(),
+                None,
                 None,
             )
             .await
@@ -4482,6 +4486,7 @@ mod tests {
                 "ToolCallRequested",
                 SessionEventKind::ToolCallRequested {
                     tool_call_id: "call".to_string(),
+                    producer_plugin_id: None,
                     tool_name: "tool".to_string(),
                     arguments_json: "{}".to_string(),
                     request_presentation: None,
@@ -4504,6 +4509,7 @@ mod tests {
                 SessionEventKind::PermissionRequested {
                     permission_id: "permission".to_string(),
                     tool_call_id: "call".to_string(),
+                    producer_plugin_id: None,
                     tool_name: "tool".to_string(),
                     arguments_json: "{}".to_string(),
                     request_presentation: None,

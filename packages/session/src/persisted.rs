@@ -180,6 +180,8 @@ enum PersistedSessionEventKind {
     },
     ToolCallRequested {
         tool_call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        producer_plugin_id: Option<String>,
         tool_name: String,
         arguments_json: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -216,6 +218,8 @@ enum PersistedSessionEventKind {
     PermissionRequested {
         permission_id: String,
         tool_call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        producer_plugin_id: Option<String>,
         tool_name: String,
         arguments_json: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -449,11 +453,13 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
             }
             SessionEventKind::ToolCallRequested {
                 tool_call_id,
+                producer_plugin_id,
                 tool_name,
                 arguments_json,
                 request_presentation,
             } => Self::ToolCallRequested {
                 tool_call_id: tool_call_id.clone(),
+                producer_plugin_id: producer_plugin_id.clone(),
                 tool_name: tool_name.clone(),
                 arguments_json: arguments_json.clone(),
                 request_presentation: request_presentation.clone(),
@@ -504,6 +510,7 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
             SessionEventKind::PermissionRequested {
                 permission_id,
                 tool_call_id,
+                producer_plugin_id,
                 tool_name,
                 arguments_json,
                 request_presentation,
@@ -512,6 +519,7 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
             } => Self::PermissionRequested {
                 permission_id: permission_id.clone(),
                 tool_call_id: tool_call_id.clone(),
+                producer_plugin_id: producer_plugin_id.clone(),
                 tool_name: tool_name.clone(),
                 arguments_json: arguments_json.clone(),
                 request_presentation: request_presentation.clone(),
@@ -772,11 +780,13 @@ impl PersistedSessionEventKind {
             Self::AssistantMessage { text } => SessionEventKind::AssistantMessage { text },
             Self::ToolCallRequested {
                 tool_call_id,
+                producer_plugin_id,
                 tool_name,
                 arguments_json,
                 request_presentation,
             } => SessionEventKind::ToolCallRequested {
                 tool_call_id,
+                producer_plugin_id,
                 tool_name,
                 arguments_json,
                 request_presentation,
@@ -825,6 +835,7 @@ impl PersistedSessionEventKind {
             Self::PermissionRequested {
                 permission_id,
                 tool_call_id,
+                producer_plugin_id,
                 tool_name,
                 arguments_json,
                 request_presentation,
@@ -833,6 +844,7 @@ impl PersistedSessionEventKind {
             } => SessionEventKind::PermissionRequested {
                 permission_id,
                 tool_call_id,
+                producer_plugin_id,
                 tool_name,
                 arguments_json,
                 request_presentation,
@@ -1344,6 +1356,7 @@ mod tests {
             },
             SessionEventKind::ToolCallRequested {
                 tool_call_id: "call".to_string(),
+                producer_plugin_id: None,
                 tool_name: "tool".to_string(),
                 arguments_json: "{}".to_string(),
                 request_presentation: None,
@@ -1360,6 +1373,7 @@ mod tests {
             SessionEventKind::PermissionRequested {
                 permission_id: "perm".to_string(),
                 tool_call_id: "call".to_string(),
+                producer_plugin_id: None,
                 tool_name: "tool".to_string(),
                 arguments_json: "{}".to_string(),
                 request_presentation: None,

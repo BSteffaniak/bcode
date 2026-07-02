@@ -13,6 +13,160 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+/// Renderer-neutral state for one tool invocation reconstructed from raw session events.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolInvocationProjection {
+    /// Provider tool call identifier.
+    pub tool_call_id: String,
+    /// Plugin that produced/owns the tool, when known.
+    pub producer_plugin_id: Option<String>,
+    /// Tool name requested by the model.
+    pub tool_name: Option<String>,
+    /// Raw JSON arguments requested by the model.
+    pub arguments_json: Option<String>,
+    /// Current lifecycle status.
+    pub status: ToolInvocationProjectionStatus,
+    /// Raw final text result returned by the tool, when finished.
+    pub result_text: Option<String>,
+    /// Whether the final tool result was an error.
+    pub is_error: Option<bool>,
+    /// Raw semantic result returned by the tool.
+    pub raw_result: Option<ToolInvocationResult>,
+    /// Raw terminal/text stream output observed for the tool.
+    pub terminal_output: Option<ToolInvocationProjectionTerminalOutput>,
+    /// Legacy persisted presentation events, retained only as compatibility facts.
+    pub legacy_presentations: Vec<ToolPresentationEvent>,
+}
+
+/// Renderer-neutral tool invocation lifecycle status.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolInvocationProjectionStatus {
+    /// Request was observed but no stream/final result has been seen.
+    #[default]
+    Requested,
+    /// Stream lifecycle/output was observed.
+    Running,
+    /// Final result was observed.
+    Finished,
+}
+
+/// Renderer-neutral raw stream output captured for a tool invocation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolInvocationProjectionTerminalOutput {
+    /// Raw stream output text.
+    pub output: String,
+    /// Terminal columns reported by the producer.
+    pub columns: Option<u16>,
+    /// Terminal rows reported by the producer.
+    pub rows: Option<u16>,
+}
+
+/// Build renderer-neutral tool invocation projections from chronological session events.
+#[must_use]
+pub fn build_tool_invocation_projections(events: &[SessionEvent]) -> Vec<ToolInvocationProjection> {
+    let mut projections = BTreeMap::new();
+    for event in events {
+        apply_tool_invocation_projection_event(&mut projections, event);
+    }
+    projections.into_values().collect()
+}
+
+/// Apply one session event to a renderer-neutral tool invocation projection map.
+pub fn apply_tool_invocation_projection_event(
+    projections: &mut BTreeMap<String, ToolInvocationProjection>,
+    event: &SessionEvent,
+) {
+    match &event.kind {
+        SessionEventKind::ToolCallRequested {
+            tool_call_id,
+            producer_plugin_id,
+            tool_name,
+            arguments_json,
+            ..
+        } => {
+            let projection = tool_invocation_projection_mut(projections, tool_call_id);
+            projection.producer_plugin_id.clone_from(producer_plugin_id);
+            projection.tool_name = Some(tool_name.clone());
+            projection.arguments_json = Some(arguments_json.clone());
+        }
+        SessionEventKind::ToolInvocationStream { event } => {
+            apply_tool_invocation_stream_projection_event(projections, event);
+        }
+        SessionEventKind::ToolCallFinished {
+            tool_call_id,
+            result,
+            is_error,
+            semantic_result,
+            ..
+        } => {
+            let projection = tool_invocation_projection_mut(projections, tool_call_id);
+            projection.status = ToolInvocationProjectionStatus::Finished;
+            projection.result_text = Some(result.clone());
+            projection.is_error = Some(*is_error);
+            projection.raw_result.clone_from(semantic_result);
+        }
+        _ => {}
+    }
+}
+
+fn apply_tool_invocation_stream_projection_event(
+    projections: &mut BTreeMap<String, ToolInvocationProjection>,
+    event: &ToolInvocationStreamEvent,
+) {
+    let tool_call_id = tool_projection_stream_tool_call_id(event);
+    let projection = tool_invocation_projection_mut(projections, tool_call_id);
+    match event {
+        ToolInvocationStreamEvent::Started { columns, rows, .. } => {
+            projection.status = ToolInvocationProjectionStatus::Running;
+            let terminal_output = projection
+                .terminal_output
+                .get_or_insert_with(Default::default);
+            terminal_output.columns = *columns;
+            terminal_output.rows = *rows;
+        }
+        ToolInvocationStreamEvent::OutputDelta { text, .. } => {
+            projection.status = ToolInvocationProjectionStatus::Running;
+            projection
+                .terminal_output
+                .get_or_insert_with(Default::default)
+                .output
+                .push_str(text);
+        }
+        ToolInvocationStreamEvent::Status { .. } => {
+            projection.status = ToolInvocationProjectionStatus::Running;
+        }
+        ToolInvocationStreamEvent::Finished { is_error, .. } => {
+            projection.status = ToolInvocationProjectionStatus::Finished;
+            projection.is_error = Some(*is_error);
+        }
+        ToolInvocationStreamEvent::Presentation { presentation, .. } => {
+            projection.legacy_presentations.push(presentation.clone());
+        }
+    }
+}
+
+fn tool_invocation_projection_mut<'a>(
+    projections: &'a mut BTreeMap<String, ToolInvocationProjection>,
+    tool_call_id: &str,
+) -> &'a mut ToolInvocationProjection {
+    projections
+        .entry(tool_call_id.to_owned())
+        .or_insert_with(|| ToolInvocationProjection {
+            tool_call_id: tool_call_id.to_owned(),
+            ..ToolInvocationProjection::default()
+        })
+}
+
+fn tool_projection_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &str {
+    match event {
+        ToolInvocationStreamEvent::Started { tool_call_id, .. }
+        | ToolInvocationStreamEvent::OutputDelta { tool_call_id, .. }
+        | ToolInvocationStreamEvent::Status { tool_call_id, .. }
+        | ToolInvocationStreamEvent::Presentation { tool_call_id, .. }
+        | ToolInvocationStreamEvent::Finished { tool_call_id, .. } => tool_call_id,
+    }
+}
+
 /// Current persisted session event schema version.
 pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 25;
 
@@ -1470,6 +1624,8 @@ pub enum SessionEventKind {
     },
     ToolCallRequested {
         tool_call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        producer_plugin_id: Option<String>,
         tool_name: String,
         arguments_json: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1488,6 +1644,8 @@ pub enum SessionEventKind {
     PermissionRequested {
         permission_id: String,
         tool_call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        producer_plugin_id: Option<String>,
         tool_name: String,
         arguments_json: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]

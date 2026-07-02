@@ -3,8 +3,9 @@
 use std::collections::BTreeMap;
 
 use bcode_session_models::{
-    SessionEvent, SessionEventKind, SessionTokenUsage, ToolArtifact, ToolInvocationResult,
-    ToolInvocationStreamEvent, ToolOutputStream, ToolRequestPresentationMetadata,
+    SessionEvent, SessionEventKind, SessionTokenUsage, ToolArtifact, ToolInvocationProjection,
+    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
+    ToolRequestPresentationMetadata,
 };
 use serde_json::Value;
 
@@ -482,6 +483,36 @@ pub fn merge_transcript_boundary(
 
 /// Build a transcript item for a tool request.
 #[must_use]
+pub fn tool_request_item_from_projection(
+    projection: &ToolInvocationProjection,
+    request_presentation: Option<ToolRequestPresentationMetadata>,
+) -> TranscriptItem {
+    let tool_name = projection.tool_name.as_deref().unwrap_or("unknown tool");
+    let arguments_json = projection.arguments_json.as_deref().unwrap_or("{}");
+    tool_request_item(
+        &projection.tool_call_id,
+        tool_name,
+        arguments_json,
+        request_presentation,
+    )
+}
+
+/// Build a transcript item for a generic tool result from renderer-neutral projection state.
+#[must_use]
+pub fn generic_tool_result_item_from_projection(
+    projection: &ToolInvocationProjection,
+) -> Option<TranscriptItem> {
+    Some(tool_result_item(
+        &projection.tool_call_id,
+        projection.tool_name.as_deref(),
+        projection.arguments_json.as_deref(),
+        &display_tool_result_text(projection.result_text.as_deref()?),
+        projection.is_error.unwrap_or(false),
+    ))
+}
+
+/// Build a transcript item for a tool request.
+#[must_use]
 pub fn tool_request_item(
     tool_call_id: &str,
     tool_name: &str,
@@ -893,6 +924,7 @@ fn non_streaming_transcript_item_from_event(
             tool_name,
             arguments_json,
             request_presentation,
+            ..
         } => {
             tool_calls.insert(
                 tool_call_id.clone(),
@@ -902,10 +934,14 @@ fn non_streaming_transcript_item_from_event(
                     request_presentation: request_presentation.clone(),
                 },
             );
-            Some(tool_request_item(
-                tool_call_id,
-                tool_name,
-                arguments_json,
+            let projection = ToolInvocationProjection {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: Some(tool_name.clone()),
+                arguments_json: Some(arguments_json.clone()),
+                ..ToolInvocationProjection::default()
+            };
+            Some(tool_request_item_from_projection(
+                &projection,
                 request_presentation.clone(),
             ))
         }
@@ -931,14 +967,15 @@ fn non_streaming_transcript_item_from_event(
                 return None;
             }
             let context = tool_calls.get(tool_call_id);
-            let result = display_tool_result_text(result);
-            Some(tool_result_item(
-                tool_call_id,
-                context.map(|context| context.tool_name.as_str()),
-                context.map(|context| context.arguments_json.as_str()),
-                &result,
-                *is_error,
-            ))
+            let projection = ToolInvocationProjection {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: context.map(|context| context.tool_name.clone()),
+                arguments_json: context.map(|context| context.arguments_json.clone()),
+                result_text: Some(result.clone()),
+                is_error: Some(*is_error),
+                ..ToolInvocationProjection::default()
+            };
+            generic_tool_result_item_from_projection(&projection)
         }
         SessionEventKind::InteractiveToolRequestCreated {
             interaction_id,
@@ -973,6 +1010,7 @@ fn non_streaming_transcript_item_from_event(
             request_presentation,
             policy_source,
             policy_reason,
+            ..
         } => Some(permission_request_item(
             permission_id,
             tool_call_id,

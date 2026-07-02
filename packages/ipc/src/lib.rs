@@ -2164,6 +2164,7 @@ mod tests {
             },
             SessionEventKind::ToolCallRequested {
                 tool_call_id: "call-1".to_string(),
+                producer_plugin_id: None,
                 tool_name: "shell.run".to_string(),
                 arguments_json: "{}".to_string(),
                 request_presentation: None,
@@ -2180,6 +2181,7 @@ mod tests {
             SessionEventKind::PermissionRequested {
                 permission_id: "perm-1".to_string(),
                 tool_call_id: "call-1".to_string(),
+                producer_plugin_id: None,
                 tool_name: "shell.run".to_string(),
                 arguments_json: "{}".to_string(),
                 request_presentation: None,

@@ -2199,6 +2199,7 @@ mod tests {
             0,
             SessionEventKind::ToolCallRequested {
                 tool_call_id: "tool-1".to_string(),
+                producer_plugin_id: None,
                 tool_name: "shell".to_string(),
                 arguments_json: "{}".to_string(),
                 request_presentation: None,

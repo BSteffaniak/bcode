@@ -13046,12 +13046,18 @@ async fn execute_model_tool(
     cancel_state: Arc<TurnCancelState>,
     command_context: &mut RuntimeCommandContext<'_>,
 ) {
+    let producer_plugin_id = find_tool_provider(state, &call.name)
+        .await
+        .ok()
+        .flatten()
+        .map(|(plugin_id, _definition)| plugin_id);
     append_tool_request_event(
         state,
         session_id,
         call.id.clone(),
         call.name.clone(),
         serde_json::to_string(&call.arguments).unwrap_or_default(),
+        producer_plugin_id,
     )
     .await;
     if cancel_state.is_cancelled() {
@@ -13240,6 +13246,7 @@ async fn invoke_model_tool(
                 session_id,
                 call,
                 &definition,
+                &plugin_id,
                 cancel_state,
                 PermissionPolicyContext {
                     source: None,
@@ -13316,6 +13323,7 @@ async fn invoke_model_tool(
                             session_id,
                             call,
                             &definition,
+                            &plugin_id,
                             cancel_state,
                             PermissionPolicyContext {
                                 source: Some("skill".to_string()),
@@ -14304,6 +14312,7 @@ async fn request_tool_permission(
     session_id: SessionId,
     call: &bcode_model::ToolCall,
     definition: &ServiceToolDefinition,
+    producer_plugin_id: &str,
     cancel_state: &TurnCancelState,
     policy_context: PermissionPolicyContext,
 ) -> bool {
@@ -14316,6 +14325,7 @@ async fn request_tool_permission(
         SessionEventKind::PermissionRequested {
             permission_id: permission_id.clone(),
             tool_call_id: call.id.clone(),
+            producer_plugin_id: Some(producer_plugin_id.to_owned()),
             tool_name: definition.name.clone(),
             arguments_json: arguments_json.clone(),
             request_presentation: None,
@@ -14850,13 +14860,21 @@ async fn append_tool_request_event(
     tool_call_id: String,
     tool_name: String,
     arguments_json: String,
+    producer_plugin_id: Option<String>,
 ) {
     let runtime_work_id = RuntimeWorkId::new(format!("tool_{tool_call_id}"));
     let runtime_label = tool_name.clone();
     let runtime_tool_call_id = tool_call_id.clone();
     match state
         .sessions
-        .append_tool_call_requested(session_id, tool_call_id, tool_name, arguments_json, None)
+        .append_tool_call_requested(
+            session_id,
+            tool_call_id,
+            tool_name,
+            arguments_json,
+            producer_plugin_id,
+            None,
+        )
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,
@@ -17298,6 +17316,7 @@ mod tests {
                 0,
                 SessionEventKind::ToolCallRequested {
                     tool_call_id: "call-1".to_string(),
+                    producer_plugin_id: None,
                     tool_name: "shell.run".to_string(),
                     arguments_json: r#"{"command":"true"}"#.to_string(),
                     request_presentation: None,
@@ -17335,6 +17354,7 @@ mod tests {
                 0,
                 SessionEventKind::ToolCallRequested {
                     tool_call_id: "call-1".to_string(),
+                    producer_plugin_id: None,
                     tool_name: "shell.run".to_string(),
                     arguments_json: r#"{"command":"true"}"#.to_string(),
                     request_presentation: None,
@@ -17400,6 +17420,7 @@ mod tests {
             1,
             SessionEventKind::ToolCallRequested {
                 tool_call_id: "call-1".to_string(),
+                producer_plugin_id: None,
                 tool_name: "shell.run".to_string(),
                 arguments_json: "{not-json".to_string(),
                 request_presentation: None,
@@ -18316,6 +18337,7 @@ mod tests {
             "call-1".to_owned(),
             "example.tool".to_owned(),
             "{}".to_owned(),
+            Some("test.plugin".to_owned()),
         )
         .await;
 
@@ -18324,18 +18346,22 @@ mod tests {
             .session_history(session_id)
             .await
             .expect("history should read");
-        let request_presentation = history.iter().find_map(|event| {
+        let request_fields = history.iter().find_map(|event| {
             if let SessionEventKind::ToolCallRequested {
+                producer_plugin_id,
                 request_presentation,
                 ..
             } = &event.kind
             {
-                Some(request_presentation)
+                Some((producer_plugin_id, request_presentation))
             } else {
                 None
             }
         });
-        assert_eq!(request_presentation, Some(&None));
+        assert_eq!(
+            request_fields,
+            Some((&Some("test.plugin".to_owned()), &None))
+        );
     }
 
     #[tokio::test]
@@ -18376,6 +18402,7 @@ mod tests {
             session_id,
             &call,
             &definition,
+            "test.plugin",
             &cancel_state,
             PermissionPolicyContext::default(),
         )
@@ -18387,18 +18414,22 @@ mod tests {
             .session_history(session_id)
             .await
             .expect("history should read");
-        let request_presentation = history.iter().find_map(|event| {
+        let request_fields = history.iter().find_map(|event| {
             if let SessionEventKind::PermissionRequested {
+                producer_plugin_id,
                 request_presentation,
                 ..
             } = &event.kind
             {
-                Some(request_presentation)
+                Some((producer_plugin_id, request_presentation))
             } else {
                 None
             }
         });
-        assert_eq!(request_presentation, Some(&None));
+        assert_eq!(
+            request_fields,
+            Some((&Some("test.plugin".to_owned()), &None))
+        );
     }
 
     #[tokio::test]
@@ -18705,6 +18736,7 @@ mod tests {
                 provenance: None,
                 kind: SessionEventKind::ToolCallRequested {
                     tool_call_id: "call-1".to_string(),
+                    producer_plugin_id: None,
                     tool_name: "filesystem.read".to_string(),
                     arguments_json: r#"{"path":"Cargo.toml"}"#.to_string(),
                     request_presentation: None,

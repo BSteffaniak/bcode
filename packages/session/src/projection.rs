@@ -589,10 +589,162 @@ mod tests {
     use super::*;
     use bcode_session_models::{
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProjectionWindowLimits,
-        ProjectionWindowRequest, ProjectionWindowTarget, SessionId, ToolInvocationStreamEvent,
-        ToolOutputStream,
+        ProjectionWindowRequest, ProjectionWindowTarget, SessionId, ToolInvocationProjectionStatus,
+        ToolInvocationProjectionTerminalOutput, ToolInvocationResult, ToolInvocationStreamEvent,
+        ToolOutputStream, ToolPresentationEvent, build_tool_invocation_projections,
     };
 
+    fn tool_invocation_projection_replay_events(session_id: SessionId) -> Vec<SessionEvent> {
+        vec![
+            event(
+                session_id,
+                1,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-1".to_owned(),
+                    producer_plugin_id: Some("plugin.shell".to_owned()),
+                    tool_name: "shell.run".to_owned(),
+                    arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
+                    request_presentation: None,
+                },
+            ),
+            event(
+                session_id,
+                2,
+                SessionEventKind::ToolInvocationStream {
+                    event: ToolInvocationStreamEvent::Started {
+                        tool_call_id: "call-1".to_owned(),
+                        tool_name: "shell.run".to_owned(),
+                        sequence: 0,
+                        terminal: true,
+                        columns: Some(120),
+                        rows: Some(30),
+                        started_at_ms: Some(10),
+                    },
+                },
+            ),
+            event(
+                session_id,
+                3,
+                SessionEventKind::ToolInvocationStream {
+                    event: ToolInvocationStreamEvent::OutputDelta {
+                        tool_call_id: "call-1".to_owned(),
+                        sequence: 1,
+                        stream: ToolOutputStream::Stdout,
+                        text: "hi\n".to_owned(),
+                        byte_len: 3,
+                    },
+                },
+            ),
+            event(
+                session_id,
+                4,
+                SessionEventKind::ToolInvocationStream {
+                    event: ToolInvocationStreamEvent::Presentation {
+                        tool_call_id: "call-1".to_owned(),
+                        sequence: 2,
+                        presentation: ToolPresentationEvent::Status(
+                            bcode_session_models::ToolStatusPresentation {
+                                target: bcode_session_models::ToolPresentationTarget::Result,
+                                text: "legacy status".to_owned(),
+                                level: bcode_session_models::ToolPresentationLevel::Success,
+                            },
+                        ),
+                    },
+                },
+            ),
+            event(
+                session_id,
+                5,
+                SessionEventKind::ToolCallFinished {
+                    tool_call_id: "call-1".to_owned(),
+                    result: "final text".to_owned(),
+                    is_error: false,
+                    output: None,
+                    semantic_result: Some(ToolInvocationResult::Text {
+                        text: "semantic text".to_owned(),
+                    }),
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn tool_invocation_projection_preserves_raw_replayed_facts() {
+        let session_id = SessionId::new();
+        let events = tool_invocation_projection_replay_events(session_id);
+
+        let projections = build_tool_invocation_projections(&events);
+
+        assert_eq!(projections.len(), 1);
+        let projection = &projections[0];
+        assert_eq!(projection.tool_call_id, "call-1");
+        assert_eq!(
+            projection.producer_plugin_id.as_deref(),
+            Some("plugin.shell")
+        );
+        assert_eq!(projection.tool_name.as_deref(), Some("shell.run"));
+        assert_eq!(
+            projection.arguments_json.as_deref(),
+            Some(r#"{"command":"echo hi"}"#)
+        );
+        assert_eq!(projection.status, ToolInvocationProjectionStatus::Finished);
+        assert_eq!(projection.result_text.as_deref(), Some("final text"));
+        assert_eq!(projection.is_error, Some(false));
+        assert_eq!(
+            projection.raw_result,
+            Some(ToolInvocationResult::Text {
+                text: "semantic text".to_owned()
+            })
+        );
+        assert_eq!(
+            projection.terminal_output,
+            Some(ToolInvocationProjectionTerminalOutput {
+                output: "hi\n".to_owned(),
+                columns: Some(120),
+                rows: Some(30),
+            })
+        );
+        assert_eq!(projection.legacy_presentations.len(), 1);
+    }
+
+    #[test]
+    fn tool_invocation_projection_does_not_store_generic_fallback_output() {
+        let session_id = SessionId::new();
+        let events = vec![
+            event(
+                session_id,
+                1,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-1".to_owned(),
+                    producer_plugin_id: None,
+                    tool_name: "unknown.tool".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    request_presentation: None,
+                },
+            ),
+            event(
+                session_id,
+                2,
+                SessionEventKind::ToolCallFinished {
+                    tool_call_id: "call-1".to_owned(),
+                    result: "raw result only".to_owned(),
+                    is_error: false,
+                    output: None,
+                    semantic_result: None,
+                },
+            ),
+        ];
+
+        let projection = build_tool_invocation_projections(&events)
+            .into_iter()
+            .next()
+            .expect("tool projection");
+
+        assert_eq!(projection.result_text.as_deref(), Some("raw result only"));
+        assert!(projection.raw_result.is_none());
+        assert!(projection.terminal_output.is_none());
+        assert!(projection.legacy_presentations.is_empty());
+    }
     #[test]
     fn latest_projection_window_from_db_transcript_items_satisfies_targets() {
         let entries = vec![
@@ -837,6 +989,7 @@ mod tests {
                 1,
                 SessionEventKind::ToolCallRequested {
                     tool_call_id: "tool".to_owned(),
+                    producer_plugin_id: None,
                     tool_name: "shell".to_owned(),
                     arguments_json: "{}".to_owned(),
                     request_presentation: None,
@@ -901,6 +1054,7 @@ mod tests {
                 1,
                 SessionEventKind::ToolCallRequested {
                     tool_call_id: "tool".to_owned(),
+                    producer_plugin_id: None,
                     tool_name: "read".to_owned(),
                     arguments_json: "{}".to_owned(),
                     request_presentation: None,
@@ -1212,6 +1366,7 @@ mod tests {
                 1,
                 SessionEventKind::ToolCallRequested {
                     tool_call_id: "z".to_owned(),
+                    producer_plugin_id: None,
                     tool_name: "late".to_owned(),
                     arguments_json: "{}".to_owned(),
                     request_presentation: None,
@@ -1222,6 +1377,7 @@ mod tests {
                 2,
                 SessionEventKind::ToolCallRequested {
                     tool_call_id: "a".to_owned(),
+                    producer_plugin_id: None,
                     tool_name: "early".to_owned(),
                     arguments_json: "{}".to_owned(),
                     request_presentation: None,
