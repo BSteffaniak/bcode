@@ -14140,7 +14140,6 @@ async fn request_tool_permission(
             tool_name: definition.name.clone(),
             arguments_json,
             agent_id,
-            request_presentation: None,
             policy_source: policy_context.source,
             policy_reason: policy_context.reason,
             can_remember_policy: policy_context.skill_decision_key.is_some(),
@@ -18165,14 +18164,7 @@ mod tests {
             side_effect: bcode_tool::ToolSideEffect::ReadOnly,
             requires_permission: true,
             policy: bcode_tool::ToolPolicyMetadata::default(),
-            ui: bcode_tool::ToolUiMetadata {
-                request_presentation: Some(bcode_tool::ToolRequestPresentationMetadata {
-                    title: "legacy request".to_owned(),
-                    fields: Vec::new(),
-                    preview: None,
-                }),
-                ..bcode_tool::ToolUiMetadata::default()
-            },
+            ui: bcode_tool::ToolUiMetadata::default(),
         };
         let call = bcode_model::ToolCall {
             id: "call-1".to_owned(),

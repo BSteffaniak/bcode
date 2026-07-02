@@ -93,7 +93,6 @@ mod tests {
             tool_name: "tool".to_string(),
             arguments_json: "{}".to_string(),
             agent_id: "build".to_string(),
-            request_presentation: None,
             policy_source: can_remember_policy.then(|| "skill".to_string()),
             policy_reason: can_remember_policy.then(|| "skill asks".to_string()),
             can_remember_policy,

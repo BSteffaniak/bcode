@@ -22,11 +22,7 @@ pub fn render_permission_dialog(state: &PermissionDialogState, frame: &mut Frame
     let modal = modal_frame();
     let area = modal.panel_area(frame.area());
     let permission = state.permission();
-    let presentation = permission_presentation(
-        &permission.tool_name,
-        &permission.arguments_json,
-        permission.request_presentation.as_ref(),
-    );
+    let presentation = permission_presentation(&permission.tool_name, &permission.arguments_json);
     let rows = permission_rows(&PermissionRowsInput {
         state,
         tool_name: &permission.tool_name,
@@ -321,7 +317,6 @@ mod tests {
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"cargo check --workspace","cwd":"/repo"}"#.to_owned(),
             agent_id: "build".to_owned(),
-            request_presentation: None,
             policy_source: None,
             policy_reason: None,
             can_remember_policy: false,

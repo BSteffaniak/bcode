@@ -386,8 +386,6 @@ fn path_tool_ui(activity_label: &str) -> bcode_tool::ToolUiMetadata {
     bcode_tool::ToolUiMetadata {
         activity_label: Some(activity_label.to_string()),
         live_argument_preview: None,
-
-        request_presentation: None,
     }
 }
 
@@ -447,8 +445,6 @@ fn write_tool_ui(activity_label: &str, preview_title: &str) -> bcode_tool::ToolU
             ),
             streaming_status: Some(format!("{activity_label} {{path}} · {{bytes}}")),
         }),
-
-        request_presentation: None,
     }
 }
 
@@ -459,8 +455,6 @@ fn edit_tool_ui(activity_label: &str, preview_title: &str) -> bcode_tool::ToolUi
             view: file_change_metadata(preview_title, &["old_text"], None, false, &["new_text"]),
             streaming_status: Some(format!("{activity_label} {{path}} · {{bytes}}")),
         }),
-
-        request_presentation: None,
     }
 }
 

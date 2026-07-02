@@ -532,7 +532,6 @@ fn extract_tool_definition() -> ToolDefinition {
             activity_label: Some("extracting".to_string()),
             live_argument_preview: None,
 
-            request_presentation: None,
         },
     }
 }

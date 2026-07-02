@@ -1511,7 +1511,6 @@ fn search_tool_definition() -> ToolDefinition {
                 preview_title: Some("Search web".to_string()),
                 streaming_status: Some("searching {primary} · {bytes}".to_string()),
             }),
-            request_presentation: None,
         },
     }
 }
@@ -1553,7 +1552,6 @@ fn fetch_tool_definition() -> ToolDefinition {
                 preview_title: Some("Fetch URL".to_string()),
                 streaming_status: Some("fetching {primary} · {bytes}".to_string()),
             }),
-            request_presentation: None,
         },
     }
 }
@@ -2328,12 +2326,6 @@ bcode_plugin_sdk::export_plugin!(WebSearchPlugin, include_str!("../bcode-plugin.
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn web_tool_definitions_do_not_request_durable_presentations() {
-        assert!(search_tool_definition().ui.request_presentation.is_none());
-        assert!(fetch_tool_definition().ui.request_presentation.is_none());
-    }
 
     #[test]
     fn web_search_output_is_usable_without_presentation_events() {

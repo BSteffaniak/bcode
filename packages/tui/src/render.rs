@@ -22,9 +22,6 @@ use bmux_tui_components::text_input::TextInputControl;
 use super::activity::ActivityState;
 use super::app::{BmuxApp, DaemonConnectionState, LiveToolPreviewState, composer_policy};
 use super::pending_submission::{PendingSubmission, PendingSubmissionState};
-use super::tool_present::{
-    ToolRequestPresentation, tool_request_plugin_view_preview, tool_request_presentation,
-};
 use super::transcript::{TranscriptItem, TranscriptItemKind, plugin_view_payload_summary_text};
 use super::transcript_layout::TranscriptLayoutSignature;
 use crate::time_format::format_elapsed_millis;
@@ -621,7 +618,6 @@ fn push_transcript_item_rows(
             producer_plugin_id,
             tool_name,
             arguments_json,
-            request_presentation,
             live_preview,
         } => {
             let context = ToolRequestRenderContext {
@@ -629,7 +625,6 @@ fn push_transcript_item_rows(
                 producer_plugin_id: producer_plugin_id.as_deref(),
                 tool_name,
                 arguments_json,
-                request_presentation: request_presentation.as_ref(),
                 _live_preview: *live_preview,
                 plugin_host,
             };
@@ -838,7 +833,6 @@ struct ToolRequestRenderContext<'a> {
     producer_plugin_id: Option<&'a str>,
     tool_name: &'a str,
     arguments_json: &'a str,
-    request_presentation: Option<&'a bcode_session_models::ToolRequestPresentationMetadata>,
     _live_preview: bool,
     plugin_host: Option<&'a bcode_plugin::PluginHost>,
 }
@@ -873,40 +867,6 @@ fn push_tool_request_rows(
     );
     if let Some(native_rows) = raw_tool_request_visual_rows(context, width) {
         rows.extend(native_rows);
-    } else if let Some(view) =
-        tool_request_plugin_view_preview(context.arguments_json, context.request_presentation)
-    {
-        if let Some(native_rows) = context
-            .plugin_host
-            .and_then(|host| host.tui_registry(&view.producer_plugin_id))
-            .and_then(|registry| registry.visual_rows(&view.schema, &view.payload, width))
-        {
-            rows.extend(native_rows);
-        } else {
-            push_wrapped_styled_text(
-                rows,
-                Vec::new(),
-                view.title.as_deref().unwrap_or(&view.schema),
-                width,
-                Style::new().fg(Color::Cyan),
-                Style::new().fg(Color::Cyan),
-            );
-            let summary = plugin_view_payload_summary_text(&view.payload);
-            if !summary.is_empty() {
-                push_wrapped_styled_text(
-                    rows,
-                    vec![Span::styled("  ", muted_style())],
-                    &summary,
-                    width,
-                    Style::new(),
-                    Style::new(),
-                );
-            }
-        }
-    } else if let Some(presentation) =
-        tool_request_presentation(context.arguments_json, context.request_presentation)
-    {
-        push_tool_request_presentation_rows(rows, &presentation, width);
     } else if !item.text().is_empty() {
         push_labeled_text_preview(rows, "arguments", item.text(), width, 16);
     }
@@ -1421,16 +1381,6 @@ fn push_kv_row(rows: &mut Vec<Line>, key: &str, value: &str, width: u16) {
         Style::new(),
         muted_style(),
     );
-}
-
-fn push_tool_request_presentation_rows(
-    rows: &mut Vec<Line>,
-    presentation: &ToolRequestPresentation,
-    width: u16,
-) {
-    for field in &presentation.fields {
-        push_kv_row(rows, &field.label, &field.value, width);
-    }
 }
 
 fn push_labeled_text_preview(

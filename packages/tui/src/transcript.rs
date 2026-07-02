@@ -5,7 +5,6 @@ use std::collections::BTreeMap;
 use bcode_session_models::{
     SessionEvent, SessionEventKind, SessionTokenUsage, ToolArtifact, ToolInvocationProjection,
     ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
-    ToolRequestPresentationMetadata,
 };
 use serde_json::Value;
 
@@ -28,8 +27,6 @@ pub enum TranscriptItemKind {
         tool_name: String,
         /// Raw tool arguments JSON.
         arguments_json: String,
-        /// Declarative plugin-owned request presentation metadata.
-        request_presentation: Option<ToolRequestPresentationMetadata>,
         /// Whether this item was derived from live-only partial tool arguments.
         live_preview: bool,
     },
@@ -117,8 +114,6 @@ pub enum TranscriptItemKind {
         tool_name: String,
         /// Raw tool arguments JSON.
         arguments_json: String,
-        /// Declarative plugin-owned request presentation metadata.
-        request_presentation: Option<ToolRequestPresentationMetadata>,
         /// Policy source that requested approval.
         policy_source: Option<String>,
         /// Human-readable policy reason.
@@ -145,7 +140,6 @@ pub enum TranscriptItemKind {
 struct ToolCallContext {
     tool_name: String,
     arguments_json: String,
-    request_presentation: Option<ToolRequestPresentationMetadata>,
 }
 
 /// Lifecycle surface for a tool-related transcript item.
@@ -487,10 +481,7 @@ pub fn merge_transcript_boundary(
 
 /// Build a transcript item for a tool request.
 #[must_use]
-pub fn tool_request_item_from_projection(
-    projection: &ToolInvocationProjection,
-    request_presentation: Option<ToolRequestPresentationMetadata>,
-) -> TranscriptItem {
+pub fn tool_request_item_from_projection(projection: &ToolInvocationProjection) -> TranscriptItem {
     let tool_name = projection.tool_name.as_deref().unwrap_or("unknown tool");
     let arguments_json = projection.arguments_json.as_deref().unwrap_or("{}");
     tool_request_item(
@@ -498,7 +489,6 @@ pub fn tool_request_item_from_projection(
         projection.producer_plugin_id.as_deref(),
         tool_name,
         arguments_json,
-        request_presentation,
     )
 }
 
@@ -523,7 +513,6 @@ pub fn tool_request_item(
     producer_plugin_id: Option<&str>,
     tool_name: &str,
     arguments_json: &str,
-    request_presentation: Option<ToolRequestPresentationMetadata>,
 ) -> TranscriptItem {
     TranscriptItem::with_kind(
         "Tool",
@@ -534,7 +523,6 @@ pub fn tool_request_item(
             producer_plugin_id: producer_plugin_id.map(ToOwned::to_owned),
             tool_name: tool_name.to_owned(),
             arguments_json: arguments_json.to_owned(),
-            request_presentation,
             live_preview: false,
         },
     )
@@ -711,7 +699,6 @@ pub fn permission_request_item(
     tool_call_id: &str,
     tool_name: &str,
     arguments_json: &str,
-    request_presentation: Option<ToolRequestPresentationMetadata>,
     policy_source: Option<&str>,
     policy_reason: Option<&str>,
 ) -> TranscriptItem {
@@ -731,7 +718,6 @@ pub fn permission_request_item(
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.to_owned(),
             arguments_json: arguments_json.to_owned(),
-            request_presentation,
             policy_source: policy_source.map(str::to_owned),
             policy_reason: policy_reason.map(str::to_owned),
         },
@@ -957,7 +943,7 @@ fn non_streaming_transcript_item_from_event(
             tool_call_id,
             tool_name,
             arguments_json,
-            request_presentation,
+            request_presentation: _legacy_request_presentation,
             ..
         } => {
             tool_calls.insert(
@@ -965,7 +951,6 @@ fn non_streaming_transcript_item_from_event(
                 ToolCallContext {
                     tool_name: tool_name.clone(),
                     arguments_json: arguments_json.clone(),
-                    request_presentation: request_presentation.clone(),
                 },
             );
             let projection = ToolInvocationProjection {
@@ -974,10 +959,7 @@ fn non_streaming_transcript_item_from_event(
                 arguments_json: Some(arguments_json.clone()),
                 ..ToolInvocationProjection::default()
             };
-            Some(tool_request_item_from_projection(
-                &projection,
-                request_presentation.clone(),
-            ))
+            Some(tool_request_item_from_projection(&projection))
         }
         SessionEventKind::ToolCallFinished {
             tool_call_id,
@@ -1041,7 +1023,7 @@ fn non_streaming_transcript_item_from_event(
             tool_call_id,
             tool_name,
             arguments_json,
-            request_presentation,
+            request_presentation: _legacy_request_presentation,
             policy_source,
             policy_reason,
             ..
@@ -1050,7 +1032,6 @@ fn non_streaming_transcript_item_from_event(
             tool_call_id,
             tool_name,
             arguments_json,
-            request_presentation.clone(),
             policy_source.as_deref(),
             policy_reason.as_deref(),
         )),

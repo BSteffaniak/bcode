@@ -1104,10 +1104,12 @@ pub struct ToolPluginViewPresentation {
     pub payload: serde_json::Value,
 }
 
-/// Declarative request preview metadata persisted with tool request events.
+/// Legacy request-preview metadata retained only for old persisted session events.
+///
+/// New tool definitions and new session writes must not use this as active UI input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ToolRequestPreviewMetadata {
+pub enum LegacyToolRequestPreviewMetadata {
     /// Plugin-owned generic presentation template.
     PluginView {
         /// Opaque plugin-owned view metadata.
@@ -1126,14 +1128,16 @@ pub enum ToolRequestPreviewMetadata {
     },
 }
 
-/// Declarative request presentation metadata persisted with tool request events.
+/// Legacy request-presentation metadata retained only for old persisted session events.
+///
+/// New tool definitions and new session writes must not use this as active UI input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolRequestPresentationMetadata {
+pub struct LegacyToolRequestPresentationMetadata {
     pub title: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<ToolPresentationField>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preview: Option<ToolRequestPreviewMetadata>,
+    pub preview: Option<LegacyToolRequestPreviewMetadata>,
 }
 
 /// Declarative presentation metadata for one request argument field.
@@ -1636,7 +1640,7 @@ pub enum SessionEventKind {
         tool_name: String,
         arguments_json: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        request_presentation: Option<ToolRequestPresentationMetadata>,
+        request_presentation: Option<LegacyToolRequestPresentationMetadata>,
     },
     ToolCallFinished {
         tool_call_id: String,
@@ -1656,7 +1660,7 @@ pub enum SessionEventKind {
         tool_name: String,
         arguments_json: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        request_presentation: Option<ToolRequestPresentationMetadata>,
+        request_presentation: Option<LegacyToolRequestPresentationMetadata>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy_source: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

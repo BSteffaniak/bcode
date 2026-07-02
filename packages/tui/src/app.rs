@@ -10,7 +10,7 @@ use bcode_session_models::{
     SessionEvent, SessionEventKind, SessionHistoryCursor, SessionId, SessionInputHistoryEntry,
     SessionLiveEvent, SessionLiveEventKind, SessionTraceEvent, SessionTracePayload,
     SessionTracePhase, ToolInvocationProjection, ToolInvocationResult, ToolInvocationStreamEvent,
-    ToolOutputStream, ToolRequestPresentationMetadata, apply_tool_invocation_projection_event,
+    ToolOutputStream, apply_tool_invocation_projection_event,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -402,7 +402,6 @@ impl AssistantScrollAnchorState {
 struct ToolCallContext {
     tool_name: String,
     arguments_json: String,
-    request_presentation: Option<ToolRequestPresentationMetadata>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,7 +410,6 @@ struct PermissionRequestInput<'a> {
     tool_call_id: &'a str,
     tool_name: &'a str,
     arguments_json: &'a str,
-    request_presentation: Option<&'a ToolRequestPresentationMetadata>,
     policy_source: Option<&'a str>,
     policy_reason: Option<&'a str>,
     application: SessionEventApplication,
@@ -2092,17 +2090,12 @@ impl BmuxApp {
                 tool_call_id,
                 tool_name,
                 arguments_json,
-                request_presentation,
+                request_presentation: _legacy_request_presentation,
                 ..
             } => {
                 self.active_tool_calls.insert(tool_call_id.clone());
                 self.tool_activity_seen = true;
-                self.push_tool_request(
-                    tool_call_id,
-                    tool_name,
-                    arguments_json,
-                    request_presentation.as_ref(),
-                );
+                self.push_tool_request(tool_call_id, tool_name, arguments_json);
             }
             SessionEventKind::ToolCallFinished {
                 tool_call_id,
@@ -2172,7 +2165,7 @@ impl BmuxApp {
                 tool_call_id,
                 tool_name,
                 arguments_json,
-                request_presentation,
+                request_presentation: _legacy_request_presentation,
                 policy_source,
                 policy_reason,
                 ..
@@ -2182,7 +2175,6 @@ impl BmuxApp {
                     tool_call_id,
                     tool_name,
                     arguments_json,
-                    request_presentation: request_presentation.as_ref(),
                     policy_source: policy_source.as_deref(),
                     policy_reason: policy_reason.as_deref(),
                     application,
@@ -2626,19 +2618,12 @@ impl BmuxApp {
         }
     }
 
-    fn push_tool_request(
-        &mut self,
-        tool_call_id: &str,
-        tool_name: &str,
-        arguments_json: &str,
-        request_presentation: Option<&ToolRequestPresentationMetadata>,
-    ) {
+    fn push_tool_request(&mut self, tool_call_id: &str, tool_name: &str, arguments_json: &str) {
         self.tool_call_contexts.insert(
             tool_call_id.to_owned(),
             ToolCallContext {
                 tool_name: tool_name.to_owned(),
                 arguments_json: arguments_json.to_owned(),
-                request_presentation: request_presentation.cloned(),
             },
         );
         let has_live_preview_anchor = self
@@ -2659,19 +2644,14 @@ impl BmuxApp {
             .get(tool_call_id)
             .map_or_else(
                 || {
-                    tool_request_item_from_projection(
-                        &ToolInvocationProjection {
-                            tool_call_id: tool_call_id.to_owned(),
-                            tool_name: Some(tool_name.to_owned()),
-                            arguments_json: Some(arguments_json.to_owned()),
-                            ..ToolInvocationProjection::default()
-                        },
-                        request_presentation.cloned(),
-                    )
+                    tool_request_item_from_projection(&ToolInvocationProjection {
+                        tool_call_id: tool_call_id.to_owned(),
+                        tool_name: Some(tool_name.to_owned()),
+                        arguments_json: Some(arguments_json.to_owned()),
+                        ..ToolInvocationProjection::default()
+                    })
                 },
-                |projection| {
-                    tool_request_item_from_projection(projection, request_presentation.cloned())
-                },
+                tool_request_item_from_projection,
             );
         let replaced = self.transcript.mutate_rev_find(
             |existing| {
@@ -3008,7 +2988,6 @@ impl BmuxApp {
             input.tool_call_id,
             input.tool_name,
             input.arguments_json,
-            input.request_presentation.cloned(),
             input.policy_source,
             input.policy_reason,
         ));

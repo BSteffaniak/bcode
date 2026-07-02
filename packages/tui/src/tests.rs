@@ -12,15 +12,15 @@ use bcode_config::{
     TuiAccentTransitionCurve, TuiAccentTransitionMode, TuiConfig, TuiThemeConfig, TuiThinkingConfig,
 };
 use bcode_session_models::{
-    ClientId, LiveFileEditPreview, LiveShellCommandPreview, LiveToolArgumentPreview, RuntimeWorkId,
+    ClientId, LegacyToolRequestPresentationMetadata, LegacyToolRequestPreviewMetadata,
+    LiveFileEditPreview, LiveShellCommandPreview, LiveToolArgumentPreview, RuntimeWorkId,
     RuntimeWorkKind, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
     SessionProjectionKind, SessionSummary, SessionTitleSource, SessionTokenUsage,
     SessionTraceEvent, SessionTracePayload, SessionTracePhase, ShellRunResult, ToolArtifact,
-    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream, ToolPluginViewMetadata,
-    ToolPluginViewPresentation, ToolPresentationEvent, ToolPresentationField,
-    ToolPresentationFieldKind, ToolPresentationLevel, ToolPresentationPayloadSelector,
-    ToolPresentationSection, ToolPresentationTarget, ToolRequestPresentationMetadata,
-    ToolRequestPreviewMetadata, ToolStatusPresentation, build_tool_invocation_projections,
+    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream, ToolPluginViewPresentation,
+    ToolPresentationEvent, ToolPresentationField, ToolPresentationFieldKind, ToolPresentationLevel,
+    ToolPresentationSection, ToolPresentationTarget, ToolStatusPresentation,
+    build_tool_invocation_projections,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::TextMotion;
@@ -45,8 +45,8 @@ use super::{
     transcript_document::TranscriptDocument,
 };
 
-fn shell_request_presentation() -> ToolRequestPresentationMetadata {
-    ToolRequestPresentationMetadata {
+fn shell_request_presentation() -> LegacyToolRequestPresentationMetadata {
+    LegacyToolRequestPresentationMetadata {
         title: "Shell command".to_owned(),
         fields: vec![
             ToolPresentationField {
@@ -72,8 +72,8 @@ fn shell_request_presentation() -> ToolRequestPresentationMetadata {
     }
 }
 
-fn file_edit_request_presentation() -> ToolRequestPresentationMetadata {
-    ToolRequestPresentationMetadata {
+fn file_edit_request_presentation() -> LegacyToolRequestPresentationMetadata {
+    LegacyToolRequestPresentationMetadata {
         title: "Edit file".to_owned(),
         fields: vec![
             ToolPresentationField {
@@ -95,7 +95,7 @@ fn file_edit_request_presentation() -> ToolRequestPresentationMetadata {
                 optional: false,
             },
         ],
-        preview: Some(ToolRequestPreviewMetadata::FileEdit {
+        preview: Some(LegacyToolRequestPreviewMetadata::FileEdit {
             path_fields: vec!["path".to_owned()],
             old_text_fields: vec!["old_text".to_owned()],
             new_text_fields: vec!["new_text".to_owned(), "contents".to_owned()],
@@ -1779,8 +1779,8 @@ fn transcript_renders_tool_blocks_with_structure_and_pretty_arguments() {
     assert!(output.contains("Tool · shell.run"));
     assert!(output.contains("call call_ABCD"));
     assert!(output.contains(full_call_id));
-    assert!(output.contains("command: cargo check"));
-    assert!(output.contains("cwd: /tmp/project"));
+    assert!(output.contains("\"command\": \"cargo check\""), "{output}");
+    assert!(output.contains("\"cwd\": \"/tmp/project\""), "{output}");
     assert!(output.contains("Tool result · shell.run · ok"));
     assert!(output.contains("    ok"));
 }
@@ -1811,8 +1811,9 @@ fn live_file_write_statusline_is_not_duplicated_and_truncates_path() {
     let output = rendered_text(&buffer);
 
     assert!(output.contains("tool filesystem_write"));
+    assert!(output.contains("\"path\":"), "{output}");
     assert!(
-        output.contains("Path: /Users/braden/projects/bcode/packages/tui/src/render.rs"),
+        output.contains("/Users/braden/projects/bcode/packages/tui/src/render.rs"),
         "{output}"
     );
     assert!(!output.contains("File change preview"));
@@ -1974,9 +1975,9 @@ fn transcript_renders_filesystem_edit_request_without_core_inline_preview() {
     let output = rendered_text(&buffer);
 
     assert!(output.contains("example.edit"), "{output}");
-    assert!(output.contains("Path: src/lib.rs"), "{output}");
-    assert!(output.contains("Old text:"), "{output}");
-    assert!(output.contains("New text:"), "{output}");
+    assert!(output.contains("\"path\": \"src/lib.rs\""), "{output}");
+    assert!(output.contains("\"old_text\":"), "{output}");
+    assert!(output.contains("\"new_text\":"), "{output}");
     assert!(!output.contains("File change preview"), "{output}");
     assert!(!output.contains("replaced 1 line with 1 line"), "{output}");
 }
@@ -5623,64 +5624,6 @@ fn replayed_plugin_view_result_does_not_suppress_artifact_json_fallback() {
         item.kind(),
         TranscriptItemKind::ToolResult { result, .. } if result.contains("bcode.filesystem.change")
     )));
-}
-
-#[test]
-fn request_plugin_view_preview_summary_does_not_render_selector_json() {
-    let arguments_json = serde_json::json!({
-        "path": "src/main.rs",
-        "contents": "fn main() {\n    println!(\"hi\");\n}\n"
-    })
-    .to_string();
-    let metadata = ToolRequestPresentationMetadata {
-        title: "Write file".to_owned(),
-        fields: Vec::new(),
-        preview: Some(ToolRequestPreviewMetadata::PluginView {
-            view: ToolPluginViewMetadata {
-                schema: "bcode.filesystem.file_change".to_owned(),
-                schema_version: 1,
-                producer_plugin_id: Some("bcode.filesystem".to_owned()),
-                title: Some("Write preview".to_owned()),
-                subtitle: None,
-                payload: BTreeMap::from([
-                    (
-                        "path".to_owned(),
-                        ToolPresentationPayloadSelector {
-                            fields: vec!["path".to_owned()],
-                            literal: None,
-                            required: false,
-                        },
-                    ),
-                    (
-                        "old_text".to_owned(),
-                        ToolPresentationPayloadSelector {
-                            fields: Vec::new(),
-                            literal: Some(serde_json::json!("")),
-                            required: false,
-                        },
-                    ),
-                    (
-                        "new_text".to_owned(),
-                        ToolPresentationPayloadSelector {
-                            fields: vec!["contents".to_owned(), "new_text".to_owned()],
-                            literal: None,
-                            required: true,
-                        },
-                    ),
-                ]),
-            },
-        }),
-    };
-    let view =
-        super::tool_present::tool_request_plugin_view_preview(&arguments_json, Some(&metadata))
-            .expect("plugin view preview should resolve");
-    let summary = plugin_view_payload_summary_text(&view.payload);
-
-    assert!(summary.contains("src/main.rs"));
-    assert!(summary.contains("+fn main()"));
-    assert!(!summary.contains("old_text"));
-    assert!(!summary.contains("new_text"));
-    assert!(!summary.contains("fields"));
 }
 
 #[test]

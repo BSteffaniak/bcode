@@ -6,11 +6,11 @@
 //! non-self-describing `bmux_codec` wire format.
 
 use bcode_session_models::{
-    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, FileChangeResult, ModelTurnOutcome,
-    RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
-    SessionEventProvenance, SessionForkKind, SessionId, SessionTokenUsage, SessionTraceEvent,
-    ShellRunResult, ToolArtifact, ToolInvocationResult, ToolInvocationStreamEvent,
-    ToolRequestPresentationMetadata, TraceBlobRef, current_unix_timestamp_ms,
+    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, FileChangeResult,
+    LegacyToolRequestPresentationMetadata, ModelTurnOutcome, RuntimeWorkId, RuntimeWorkKind,
+    RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance, SessionForkKind,
+    SessionId, SessionTokenUsage, SessionTraceEvent, ShellRunResult, ToolArtifact,
+    ToolInvocationResult, ToolInvocationStreamEvent, TraceBlobRef, current_unix_timestamp_ms,
 };
 use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
 use serde::{Deserialize, Serialize};
@@ -185,7 +185,7 @@ enum PersistedSessionEventKind {
         tool_name: String,
         arguments_json: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        request_presentation: Option<ToolRequestPresentationMetadata>,
+        request_presentation: Option<LegacyToolRequestPresentationMetadata>,
     },
     ToolCallFinished {
         tool_call_id: String,
@@ -223,7 +223,7 @@ enum PersistedSessionEventKind {
         tool_name: String,
         arguments_json: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        request_presentation: Option<ToolRequestPresentationMetadata>,
+        request_presentation: Option<LegacyToolRequestPresentationMetadata>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy_source: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

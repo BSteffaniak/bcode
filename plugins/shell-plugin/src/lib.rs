@@ -134,7 +134,6 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
                     streaming_status: Some("shell command · {bytes}".to_string()),
                 }),
 
-                request_presentation: None,
             },
         }],
     })

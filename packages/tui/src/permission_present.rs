@@ -1,9 +1,7 @@
 //! Permission dialog presentation models.
 
-use bcode_session_models::ToolRequestPresentationMetadata;
 use serde_json::Value;
 
-use super::tool_present::tool_request_presentation;
 use super::transcript::pretty_jsonish;
 
 /// One labeled permission-detail row.
@@ -41,24 +39,7 @@ pub struct PermissionPresentation {
 
 /// Build a structured permission presentation from a tool name and arguments.
 #[must_use]
-pub fn permission_presentation(
-    tool_name: &str,
-    arguments_json: &str,
-    request_presentation: Option<&ToolRequestPresentationMetadata>,
-) -> PermissionPresentation {
-    if let Some(presentation) = tool_request_presentation(arguments_json, request_presentation) {
-        return PermissionPresentation {
-            title: presentation.title,
-            risk: "tool request".to_owned(),
-            details: presentation
-                .fields
-                .into_iter()
-                .map(|field| PermissionDetail::new(field.label, field.value))
-                .collect(),
-            raw_details: None,
-        };
-    }
-
+pub fn permission_presentation(tool_name: &str, arguments_json: &str) -> PermissionPresentation {
     PermissionPresentation {
         title: tool_name.to_owned(),
         risk: "tool request".to_owned(),
@@ -111,50 +92,11 @@ fn is_duration_or_timeout_label(label: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use bcode_session_models::{
-        ToolPresentationField, ToolPresentationFieldKind, ToolRequestPresentationMetadata,
-    };
-
     use super::permission_presentation;
 
     #[test]
-    fn metadata_permission_uses_declared_fields() {
-        let metadata = ToolRequestPresentationMetadata {
-            title: "Run command".to_string(),
-            fields: vec![
-                ToolPresentationField {
-                    label: "command".to_string(),
-                    argument: "command".to_string(),
-                    kind: ToolPresentationFieldKind::Command,
-                    optional: false,
-                },
-                ToolPresentationField {
-                    label: "timeout".to_string(),
-                    argument: "timeout_ms".to_string(),
-                    kind: ToolPresentationFieldKind::DurationMs,
-                    optional: false,
-                },
-            ],
-            preview: None,
-        };
-        let presentation = permission_presentation(
-            "shell.run",
-            r#"{"command":"cargo check --workspace","cwd":"/repo","timeout_ms":300000}"#,
-            Some(&metadata),
-        );
-
-        assert_eq!(presentation.title, "Run command");
-        assert_eq!(presentation.risk, "tool request");
-        assert_eq!(presentation.details[0].label, "command");
-        assert_eq!(presentation.details[0].value, "cargo check --workspace");
-        assert_eq!(presentation.details[1].label, "timeout");
-        assert_eq!(presentation.details[1].value, "5m");
-    }
-
-    #[test]
     fn generic_json_string_values_are_unescaped() {
-        let presentation =
-            permission_presentation("custom.tool", r#"{"text":"hello\nworld"}"#, None);
+        let presentation = permission_presentation("custom.tool", r#"{"text":"hello\nworld"}"#);
 
         assert_eq!(presentation.details[0].value, "hello\nworld");
     }

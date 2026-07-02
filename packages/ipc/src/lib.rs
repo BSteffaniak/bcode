@@ -9,7 +9,7 @@ use bcode_metrics::MetricsSnapshot;
 use bcode_session_models::{
     ClientId, ProjectionWindowRequest, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus,
     SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId, SessionInputHistoryEntry,
-    SessionLiveEvent, SessionSummary, ToolRequestPresentationMetadata,
+    SessionLiveEvent, SessionSummary,
 };
 use bcode_skill_models::{SkillContextResponse, SkillId, SkillList, SkillManifest};
 pub use bcode_worktree_models::{
@@ -581,8 +581,6 @@ pub struct PermissionSummary {
     pub tool_name: String,
     pub arguments_json: String,
     pub agent_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_presentation: Option<ToolRequestPresentationMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

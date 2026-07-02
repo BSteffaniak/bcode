@@ -312,9 +312,6 @@ pub struct ToolUiMetadata {
     /// Short activity label suitable for progress/status displays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity_label: Option<String>,
-    /// Declarative request presentation metadata for permission prompts and transcripts.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_presentation: Option<ToolRequestPresentationMetadata>,
     /// Declarative live argument preview metadata for streamed tool arguments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_argument_preview: Option<ToolLiveArgumentPreviewMetadata>,
@@ -412,41 +409,6 @@ pub enum ToolLiveArgumentPreviewMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         streaming_status: Option<String>,
     },
-}
-
-/// Declarative request preview metadata owned by a tool provider.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ToolRequestPreviewMetadata {
-    /// Plugin-owned generic presentation template.
-    PluginView {
-        /// Opaque plugin-owned view metadata.
-        view: ToolPluginViewMetadata,
-    },
-    /// File edit/write style preview.
-    FileEdit {
-        /// Candidate path fields.
-        #[serde(default)]
-        path_fields: Vec<String>,
-        /// Candidate old-text fields.
-        #[serde(default)]
-        old_text_fields: Vec<String>,
-        /// Candidate new-text/content fields.
-        new_text_fields: Vec<String>,
-    },
-}
-
-/// Declarative request presentation metadata owned by a tool provider.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolRequestPresentationMetadata {
-    /// Human-readable request title.
-    pub title: String,
-    /// Ordered argument fields that should be shown in request summaries.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fields: Vec<ToolPresentationField>,
-    /// Optional structured preview metadata for rich generic request UI.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preview: Option<ToolRequestPreviewMetadata>,
 }
 
 /// Declarative presentation metadata for one request argument field.
@@ -1045,35 +1007,4 @@ pub struct ImageMetadata {
     pub byte_len: Option<u64>,
     #[serde(default)]
     pub source_path: Option<String>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        ToolPresentationField, ToolPresentationFieldKind, ToolRequestPresentationMetadata,
-        ToolUiMetadata,
-    };
-
-    #[test]
-    fn request_presentation_metadata_round_trips() {
-        let metadata = ToolUiMetadata {
-            activity_label: Some("running".to_string()),
-            live_argument_preview: None,
-            request_presentation: Some(ToolRequestPresentationMetadata {
-                title: "Run command".to_string(),
-                fields: vec![ToolPresentationField {
-                    label: "Command".to_string(),
-                    argument: "command".to_string(),
-                    kind: ToolPresentationFieldKind::Command,
-                    optional: false,
-                }],
-                preview: None,
-            }),
-        };
-
-        let encoded = serde_json::to_string(&metadata).expect("metadata encodes");
-        let decoded = serde_json::from_str::<ToolUiMetadata>(&encoded).expect("metadata decodes");
-
-        assert_eq!(decoded, metadata);
-    }
 }

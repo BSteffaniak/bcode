@@ -379,7 +379,6 @@ fn clone_tool_definition() -> ToolDefinition {
                 streaming_status: Some("cloning {primary} · {bytes}".to_string()),
             }),
 
-            request_presentation: None,
         },
     }
 }

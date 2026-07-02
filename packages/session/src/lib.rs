@@ -1970,7 +1970,7 @@ impl SessionManager {
         tool_name: String,
         arguments_json: String,
         producer_plugin_id: Option<String>,
-        request_presentation: Option<bcode_session_models::ToolRequestPresentationMetadata>,
+        request_presentation: Option<bcode_session_models::LegacyToolRequestPresentationMetadata>,
     ) -> Result<SessionEvent, SessionError> {
         self.append_event(
             session_id,
