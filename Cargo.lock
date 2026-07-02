@@ -2088,6 +2088,7 @@ dependencies = [
  "bcode_code_review_plugin",
  "bcode_command",
  "bcode_config",
+ "bcode_filesystem_plugin",
  "bcode_ipc",
  "bcode_markdown_render",
  "bcode_model",

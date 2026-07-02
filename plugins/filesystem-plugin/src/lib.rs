@@ -12,14 +12,12 @@ mod file_change_tui;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ImageMetadata, ImageRefContent, ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS,
-    OP_PRESENT_ARTIFACT, OP_PRESENT_VIEW, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
-    ToolArtifactPresentationRequest, ToolArtifactPresentationResponse, ToolDefinition,
-    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolInvocationStreamEvent,
-    ToolList, ToolLiveArgumentPreviewMetadata, ToolPluginViewMetadata, ToolPresentationEvent,
+    TOOL_SERVICE_INTERFACE_ID, ToolArtifact, ToolDefinition, ToolInvocationRequest,
+    ToolInvocationResponse, ToolInvocationResult, ToolInvocationStreamEvent, ToolList,
+    ToolLiveArgumentPreviewMetadata, ToolPluginViewMetadata, ToolPresentationEvent,
     ToolPresentationField, ToolPresentationFieldKind, ToolPresentationFieldValue,
     ToolPresentationPayloadSelector, ToolPresentationSection, ToolPresentationTarget,
     ToolRequestPresentationMetadata, ToolResultContent, ToolSideEffect,
-    ToolViewPresentationRequest, ToolViewPresentationResponse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -322,8 +320,6 @@ fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
     match request.operation.as_str() {
         OP_LIST_TOOLS => list_tools(request),
         OP_INVOKE_TOOL => invoke_tool(context),
-        OP_PRESENT_ARTIFACT => present_artifact(request),
-        OP_PRESENT_VIEW => present_view(request),
         _ => ServiceResponse::error(
             "unsupported_operation",
             "unsupported tool service operation",
@@ -418,7 +414,7 @@ fn payload_selector(
     }
 }
 
-fn file_change_view_metadata(
+fn file_change_metadata(
     title: &str,
     old_text_fields: &[&str],
     old_text_literal: Option<&str>,
@@ -440,7 +436,7 @@ fn file_change_view_metadata(
         payload_selector(new_text_fields, None, true),
     );
     ToolPluginViewMetadata {
-        schema: "bcode.filesystem.file_change".to_string(),
+        schema: "bcode.filesystem.change".to_string(),
         schema_version: 1,
         producer_plugin_id: Some("bcode.filesystem".to_string()),
         title: Some(title.to_string()),
@@ -457,7 +453,7 @@ fn write_tool_ui(
     bcode_tool::ToolUiMetadata {
         activity_label: Some(activity_label.to_string()),
         live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::PluginView {
-            view: file_change_view_metadata(
+            view: file_change_metadata(
                 preview_title,
                 &[],
                 Some(""),
@@ -484,7 +480,7 @@ fn write_tool_ui(
                 },
             ],
             preview: Some(bcode_tool::ToolRequestPreviewMetadata::PluginView {
-                view: file_change_view_metadata(
+                view: file_change_metadata(
                     preview_title,
                     &[],
                     Some(""),
@@ -504,13 +500,7 @@ fn edit_tool_ui(
     bcode_tool::ToolUiMetadata {
         activity_label: Some(activity_label.to_string()),
         live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::PluginView {
-            view: file_change_view_metadata(
-                preview_title,
-                &["old_text"],
-                None,
-                false,
-                &["new_text"],
-            ),
+            view: file_change_metadata(preview_title, &["old_text"], None, false, &["new_text"]),
             streaming_status: Some(format!("{activity_label} {{path}} · {{bytes}}")),
         }),
 
@@ -537,13 +527,7 @@ fn edit_tool_ui(
                 },
             ],
             preview: Some(bcode_tool::ToolRequestPreviewMetadata::PluginView {
-                view: file_change_view_metadata(
-                    preview_title,
-                    &["old_text"],
-                    None,
-                    true,
-                    &["new_text"],
-                ),
+                view: file_change_metadata(preview_title, &["old_text"], None, true, &["new_text"]),
             }),
         }),
     }
@@ -1202,29 +1186,6 @@ fn file_change_fields(path: &Path, summary: &str) -> ToolPresentationSection {
     }
 }
 
-fn file_change_plugin_view_event(
-    target: ToolPresentationTarget,
-    title: &str,
-    subtitle: Option<&str>,
-    path: &Path,
-    old_text: &str,
-    new_text: &str,
-) -> ToolPresentationEvent {
-    ToolPresentationEvent::PluginView(bcode_tool::ToolPluginViewPresentation {
-        target,
-        producer_plugin_id: "bcode.filesystem".to_string(),
-        schema: "bcode.filesystem.file_change".to_string(),
-        schema_version: 1,
-        title: Some(title.to_string()),
-        subtitle: subtitle.map(str::to_string),
-        payload: json!({
-            "path": path.display().to_string(),
-            "old_text": old_text,
-            "new_text": new_text,
-        }),
-    })
-}
-
 fn file_change_artifact(
     tool_call_id: &str,
     tool_name: &str,
@@ -1253,131 +1214,6 @@ fn file_change_artifact(
     }
 }
 
-fn present_artifact(request: &ServiceRequest) -> ServiceResponse {
-    let request = match request.payload_json::<ToolArtifactPresentationRequest>() {
-        Ok(request) => request,
-        Err(error) => return invalid_request(&error),
-    };
-    if request.artifact.schema != "bcode.filesystem.change" || request.artifact.schema_version != 1
-    {
-        return json_response(&ToolArtifactPresentationResponse::default());
-    }
-    let summary = request
-        .artifact
-        .metadata
-        .get("summary")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("file changed");
-    let path = request
-        .artifact
-        .metadata
-        .get("path")
-        .and_then(serde_json::Value::as_str)
-        .map(PathBuf::from);
-    let old_text = request
-        .artifact
-        .metadata
-        .get("old_text")
-        .and_then(serde_json::Value::as_str);
-    let new_text = request
-        .artifact
-        .metadata
-        .get("new_text")
-        .and_then(serde_json::Value::as_str);
-    if let (Some(path), Some(old_text), Some(new_text)) = (path.as_deref(), old_text, new_text) {
-        return json_response(&ToolArtifactPresentationResponse {
-            presentation: Some(file_change_plugin_view_event(
-                ToolPresentationTarget::Result,
-                "Applied file change",
-                Some(summary),
-                path,
-                old_text,
-                new_text,
-            )),
-            state: request.state,
-        });
-    }
-    let section = path.as_deref().map_or_else(
-        || ToolPresentationSection::Text {
-            label: Some("Summary".to_string()),
-            text: summary.to_string(),
-        },
-        |path| file_change_fields(path, summary),
-    );
-    json_response(&ToolArtifactPresentationResponse {
-        presentation: Some(ToolPresentationEvent::Card(
-            bcode_tool::ToolCardPresentation {
-                target: ToolPresentationTarget::Result,
-                title: "Applied file change".to_string(),
-                subtitle: None,
-                sections: vec![section],
-            },
-        )),
-        state: request.state,
-    })
-}
-
-fn present_view(request: &ServiceRequest) -> ServiceResponse {
-    let request = match request.payload_json::<ToolViewPresentationRequest>() {
-        Ok(request) => request,
-        Err(error) => return invalid_request(&error),
-    };
-    if request.view.schema != "bcode.filesystem.file_change" || request.view.schema_version != 1 {
-        return json_response(&ToolViewPresentationResponse::default());
-    }
-    let path = request
-        .view
-        .payload
-        .get("path")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("<path>");
-    let old_text = request
-        .view
-        .payload
-        .get("old_text")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let new_text = request
-        .view
-        .payload
-        .get("new_text")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let output = file_change_text(path, old_text, new_text);
-    json_response(&ToolViewPresentationResponse {
-        presentation: Some(ToolPresentationEvent::Card(
-            bcode_tool::ToolCardPresentation {
-                target: request.view.target,
-                title: request
-                    .view
-                    .title
-                    .unwrap_or_else(|| "File change".to_string()),
-                subtitle: request.view.subtitle,
-                sections: vec![ToolPresentationSection::Text {
-                    label: Some(path.to_string()),
-                    text: output,
-                }],
-            },
-        )),
-        state: request.state,
-    })
-}
-
-fn file_change_text(path: &str, old_text: &str, new_text: &str) -> String {
-    let mut output = String::new();
-    let _ = writeln!(output, "--- {path}");
-    let _ = writeln!(output, "+++ {path}");
-    if !old_text.is_empty() {
-        for line in old_text.lines() {
-            let _ = writeln!(output, "-{line}");
-        }
-    }
-    for line in new_text.lines() {
-        let _ = writeln!(output, "+{line}");
-    }
-    output
-}
-
 fn tool_write(
     arguments: serde_json::Value,
     cwd: Option<&Path>,
@@ -1397,19 +1233,6 @@ fn tool_write(
                     level: bcode_tool::ToolPresentationLevel::Info,
                 }),
             );
-            emit_presentation(
-                events,
-                tool_call_id,
-                2,
-                file_change_plugin_view_event(
-                    ToolPresentationTarget::Preview,
-                    "Write preview",
-                    Some("Applying"),
-                    &request.path,
-                    "",
-                    &request.contents,
-                ),
-            );
             write_file_inner(&request.path, &request.contents).map_or_else(
                 |error| {
                     emit_presentation(
@@ -1427,19 +1250,6 @@ fn tool_write(
                 },
                 |bytes_written| {
                     let summary = format!("wrote {bytes_written} bytes");
-                    emit_presentation(
-                        events,
-                        tool_call_id,
-                        3,
-                        file_change_plugin_view_event(
-                            ToolPresentationTarget::Result,
-                            "Applied file change",
-                            Some(&summary),
-                            &request.path,
-                            "",
-                            &request.contents,
-                        ),
-                    );
                     ToolInvocationResponse {
                         output: summary.clone(),
                         is_error: false,
@@ -1481,19 +1291,6 @@ fn tool_edit(
                     level: bcode_tool::ToolPresentationLevel::Info,
                 }),
             );
-            emit_presentation(
-                events,
-                tool_call_id,
-                2,
-                file_change_plugin_view_event(
-                    ToolPresentationTarget::Preview,
-                    "Edit preview",
-                    Some("Applying"),
-                    &request.path,
-                    &request.old_text,
-                    &request.new_text,
-                ),
-            );
             edit_file_inner(&request).map_or_else(
                 |error| {
                     emit_presentation(
@@ -1518,19 +1315,6 @@ fn tool_edit(
                 },
                 |replacements| {
                     let summary = format!("applied {replacements} replacement");
-                    emit_presentation(
-                        events,
-                        tool_call_id,
-                        3,
-                        file_change_plugin_view_event(
-                            ToolPresentationTarget::Result,
-                            "Applied file change",
-                            Some(&summary),
-                            &request.path,
-                            &request.old_text,
-                            &request.new_text,
-                        ),
-                    );
                     ToolInvocationResponse {
                         output: summary.clone(),
                         is_error: false,
@@ -2638,7 +2422,7 @@ mod tests {
             panic!("expected plugin-view live preview");
         };
         assert_eq!(view.producer_plugin_id.as_deref(), Some("bcode.filesystem"));
-        assert_eq!(view.schema, "bcode.filesystem.file_change");
+        assert_eq!(view.schema, "bcode.filesystem.change");
         assert_eq!(view.schema_version, 1);
         assert!(streaming_status.is_some());
         assert_eq!(

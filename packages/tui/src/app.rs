@@ -46,7 +46,7 @@ use super::temporal::next_elapsed_invalidation_capped;
 use super::theme::{PresentedTheme, ResolvedTheme};
 use super::timeline_dialog::TimelineEntry;
 use super::transcript::{
-    ToolTranscriptSurface, TranscriptItem, TranscriptItemKind, artifact_summary_text,
+    ToolTranscriptSurface, TranscriptItem, TranscriptItemKind, artifact_tool_result_item,
     display_tool_result_text, generic_tool_result_item_from_projection,
     interactive_tool_request_item, interactive_tool_resolution_item,
     item_is_tool_surface_for_tool_call, live_tool_preview_anchor_item, model_usage_item,
@@ -3904,13 +3904,7 @@ fn artifact_result_item_for_app(
     _fallback_result: &str,
     is_error: bool,
 ) -> TranscriptItem {
-    tool_result_item(
-        tool_call_id,
-        tool_name,
-        arguments_json,
-        &artifact_summary_text(artifact),
-        is_error,
-    )
+    artifact_tool_result_item(tool_call_id, tool_name, arguments_json, artifact, is_error)
 }
 
 fn working_directory_changed_message(

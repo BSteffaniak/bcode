@@ -618,6 +618,7 @@ fn push_transcript_item_rows(
         }
         TranscriptItemKind::ToolRequest {
             tool_call_id,
+            producer_plugin_id,
             tool_name,
             arguments_json,
             request_presentation,
@@ -625,6 +626,7 @@ fn push_transcript_item_rows(
         } => {
             let context = ToolRequestRenderContext {
                 tool_call_id,
+                producer_plugin_id: producer_plugin_id.as_deref(),
                 tool_name,
                 arguments_json,
                 request_presentation: request_presentation.as_ref(),
@@ -650,6 +652,7 @@ fn push_transcript_item_rows(
             tool_name,
             arguments_json: _,
             result,
+            artifact,
             is_error,
         } => {
             push_tool_result_rows(
@@ -659,10 +662,12 @@ fn push_transcript_item_rows(
                     tool_call_id,
                     tool_name: tool_name.as_deref(),
                     result,
+                    artifact: artifact.as_deref(),
                     is_error: *is_error,
                     has_file_preview: false,
                 },
                 width,
+                plugin_host,
             );
         }
         TranscriptItemKind::TerminalOutput { .. } => {
@@ -830,6 +835,7 @@ fn push_reasoning_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) 
 #[derive(Clone, Copy)]
 struct ToolRequestRenderContext<'a> {
     tool_call_id: &'a str,
+    producer_plugin_id: Option<&'a str>,
     tool_name: &'a str,
     arguments_json: &'a str,
     request_presentation: Option<&'a bcode_session_models::ToolRequestPresentationMetadata>,
@@ -865,7 +871,9 @@ fn push_tool_request_rows(
         muted_style(),
         muted_style(),
     );
-    if let Some(view) =
+    if let Some(native_rows) = raw_tool_request_visual_rows(context, width) {
+        rows.extend(native_rows);
+    } else if let Some(view) =
         tool_request_plugin_view_preview(context.arguments_json, context.request_presentation)
     {
         if let Some(native_rows) = context
@@ -903,6 +911,49 @@ fn push_tool_request_rows(
         push_labeled_text_preview(rows, "arguments", item.text(), width, 16);
     }
     rows.push(Line::default());
+}
+
+fn raw_tool_request_visual_rows(
+    context: &ToolRequestRenderContext<'_>,
+    width: u16,
+) -> Option<Vec<Line>> {
+    if context.producer_plugin_id != Some("bcode.filesystem") {
+        return None;
+    }
+    let payload = filesystem_change_preview_payload(context.tool_name, context.arguments_json)?;
+    let host = context.plugin_host?;
+    let route = host.visual_adapter(
+        "bcode.filesystem.change",
+        1,
+        "tui",
+        context.producer_plugin_id,
+    )?;
+    host.tui_registry(&route.plugin_id)?
+        .visual_rows(&route.schema, &payload, width)
+}
+
+fn filesystem_change_preview_payload(
+    tool_name: &str,
+    arguments_json: &str,
+) -> Option<serde_json::Value> {
+    let arguments = serde_json::from_str::<serde_json::Value>(arguments_json).ok()?;
+    let path = arguments.get("path")?.as_str()?;
+    let payload = match tool_name {
+        "filesystem.write" => serde_json::json!({
+            "summary": "Write preview",
+            "path": path,
+            "old_text": "",
+            "new_text": arguments.get("contents")?.as_str()?,
+        }),
+        "filesystem.edit" => serde_json::json!({
+            "summary": "Edit preview",
+            "path": path,
+            "old_text": arguments.get("old_text")?.as_str()?,
+            "new_text": arguments.get("new_text")?.as_str()?,
+        }),
+        _ => return None,
+    };
+    Some(payload)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1270,10 +1321,27 @@ fn terminal_title(
     )
 }
 
+fn artifact_visual_rows(
+    plugin_host: Option<&bcode_plugin::PluginHost>,
+    artifact: &bcode_session_models::ToolArtifact,
+    width: u16,
+) -> Option<Vec<Line>> {
+    let host = plugin_host?;
+    let route = host.visual_adapter(
+        &artifact.schema,
+        artifact.schema_version,
+        "tui",
+        Some(&artifact.producer_plugin_id),
+    )?;
+    host.tui_registry(&route.plugin_id)?
+        .visual_rows(&route.schema, &artifact.metadata, width)
+}
+
 struct ToolResultRenderContext<'a> {
     tool_call_id: &'a str,
     tool_name: Option<&'a str>,
     result: &'a str,
+    artifact: Option<&'a bcode_session_models::ToolArtifact>,
     is_error: bool,
     has_file_preview: bool,
 }
@@ -1283,6 +1351,7 @@ fn push_tool_result_rows(
     item: &TranscriptItem,
     context: &ToolResultRenderContext<'_>,
     width: u16,
+    plugin_host: Option<&bcode_plugin::PluginHost>,
 ) {
     let status = if context.is_error { "failed" } else { "ok" };
     let title = context.tool_name.map_or_else(
@@ -1301,6 +1370,14 @@ fn push_tool_result_rows(
         },
         muted_style(),
     );
+    if let Some(native_rows) = context
+        .artifact
+        .and_then(|artifact| artifact_visual_rows(plugin_host, artifact, width))
+    {
+        rows.extend(native_rows);
+        rows.push(Line::default());
+        return;
+    }
     if context.has_file_preview && !context.result.trim().is_empty() {
         push_wrapped_styled_text(
             rows,

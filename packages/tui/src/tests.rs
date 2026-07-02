@@ -2,6 +2,7 @@
 
 use std::{
     collections::BTreeMap,
+    sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -4681,6 +4682,202 @@ fn transcript_resident_window_prunes_old_tool_state_after_trim() {
     assert!(app.resident_transcript_event_count() <= 600);
     assert!(app.resident_tool_call_context_count() < 360);
     assert_eq!(app.resident_streamed_tool_result_count(), 0);
+}
+
+fn filesystem_change_artifact() -> bcode_session_models::ToolArtifact {
+    bcode_session_models::ToolArtifact {
+        artifact_id: "call-file-filesystem-change".to_owned(),
+        producer_plugin_id: "bcode.filesystem".to_owned(),
+        schema: "bcode.filesystem.change".to_owned(),
+        schema_version: 1,
+        tool_call_id: Some("call-file".to_owned()),
+        title: Some("File change".to_owned()),
+        metadata: serde_json::json!({
+            "summary": "edited file",
+            "path": "/tmp/hello.txt",
+            "old_text": "before\n",
+            "new_text": "after\n"
+        }),
+        refs: Vec::new(),
+    }
+}
+
+fn filesystem_plugin_host() -> bcode_plugin::PluginHost {
+    let bundled = [bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
+        bcode_filesystem_plugin::static_plugin(),
+    )];
+    let selected = bcode_plugin::filter_selected_static_plugins(
+        &bundled,
+        &bcode_plugin::PluginSelection::all_enabled(),
+    )
+    .expect("static filesystem plugin manifest should parse");
+    bcode_plugin::PluginHost::load_static_plugins(&selected)
+        .expect("static filesystem plugin should load")
+}
+
+fn render_app_text(app: &mut BmuxApp) -> String {
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 40));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(app, &mut frame);
+    rendered_text(&buffer)
+}
+
+#[test]
+fn filesystem_write_request_preview_renders_from_raw_arguments_without_metadata() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call-write".to_owned(),
+            producer_plugin_id: Some("bcode.filesystem".to_owned()),
+            tool_name: "filesystem.write".to_owned(),
+            arguments_json: serde_json::json!({
+                "path": "/tmp/raw-preview.txt",
+                "contents": "created from raw args\n"
+            })
+            .to_string(),
+            request_presentation: None,
+        },
+    ));
+
+    let rendered = render_app_text(&mut app);
+
+    assert!(rendered.contains("/tmp/raw-preview.txt"), "{rendered}");
+    assert!(rendered.contains("created from raw args"), "{rendered}");
+    assert!(!rendered.contains("arguments"), "{rendered}");
+}
+
+#[test]
+fn filesystem_edit_request_preview_renders_from_raw_arguments_without_metadata() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call-edit".to_owned(),
+            producer_plugin_id: Some("bcode.filesystem".to_owned()),
+            tool_name: "filesystem.edit".to_owned(),
+            arguments_json: serde_json::json!({
+                "path": "/tmp/raw-edit.txt",
+                "old_text": "old raw args\n",
+                "new_text": "new raw args\n"
+            })
+            .to_string(),
+            request_presentation: None,
+        },
+    ));
+
+    let rendered = render_app_text(&mut app);
+
+    assert!(rendered.contains("/tmp/raw-edit.txt"), "{rendered}");
+    assert!(rendered.contains("old raw args"), "{rendered}");
+    assert!(rendered.contains("new raw args"), "{rendered}");
+    assert!(!rendered.contains("arguments"), "{rendered}");
+}
+
+#[test]
+fn live_filesystem_artifact_renders_rich_diff_from_raw_change_metadata() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call-file".to_owned(),
+            producer_plugin_id: Some("bcode.filesystem".to_owned()),
+            tool_name: "filesystem.edit".to_owned(),
+            arguments_json: serde_json::json!({
+                "path": "/tmp/hello.txt",
+                "old_text": "before\n",
+                "new_text": "after\n"
+            })
+            .to_string(),
+            request_presentation: None,
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call-file".to_owned(),
+            result: "edited file".to_owned(),
+            is_error: false,
+            output: None,
+            semantic_result: Some(ToolInvocationResult::Artifact {
+                artifact: Box::new(filesystem_change_artifact()),
+            }),
+        },
+    ));
+
+    let rendered = render_app_text(&mut app);
+
+    assert!(rendered.contains("/tmp/hello.txt"), "{rendered}");
+    assert!(rendered.contains("before"), "{rendered}");
+    assert!(rendered.contains("after"), "{rendered}");
+    assert!(!rendered.contains("bcode.filesystem.change"), "{rendered}");
+}
+
+#[test]
+fn replayed_filesystem_artifact_renders_rich_diff_from_raw_change_metadata() {
+    let session_id = SessionId::new();
+    let events = vec![event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call-file".to_owned(),
+            result: "edited file".to_owned(),
+            is_error: false,
+            output: None,
+            semantic_result: Some(ToolInvocationResult::Artifact {
+                artifact: Box::new(filesystem_change_artifact()),
+            }),
+        },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
+    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+
+    let rendered = render_app_text(&mut app);
+
+    assert!(rendered.contains("/tmp/hello.txt"), "{rendered}");
+    assert!(rendered.contains("before"), "{rendered}");
+    assert!(rendered.contains("after"), "{rendered}");
+    assert!(!rendered.contains("bcode.filesystem.change"), "{rendered}");
+}
+
+#[test]
+fn missing_filesystem_renderer_uses_generic_raw_artifact_fallback_without_projection_mutation() {
+    let session_id = SessionId::new();
+    let events = vec![event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call-file".to_owned(),
+            result: "edited file".to_owned(),
+            is_error: false,
+            output: None,
+            semantic_result: Some(ToolInvocationResult::Artifact {
+                artifact: Box::new(filesystem_change_artifact()),
+            }),
+        },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
+    let before = app.tool_invocation_projections().clone();
+
+    let rendered = render_app_text(&mut app);
+
+    assert!(rendered.contains("File change"), "{rendered}");
+    assert!(rendered.contains("edited file"), "{rendered}");
+    assert!(rendered.contains("/tmp/hello.txt"), "{rendered}");
+    assert!(!rendered.contains("before"), "{rendered}");
+    assert!(!rendered.contains("after"), "{rendered}");
+    assert_eq!(&before, app.tool_invocation_projections());
 }
 
 #[test]

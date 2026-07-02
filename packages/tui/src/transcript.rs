@@ -22,6 +22,8 @@ pub enum TranscriptItemKind {
     ToolRequest {
         /// Provider tool call identifier.
         tool_call_id: String,
+        /// Producer plugin id, when known.
+        producer_plugin_id: Option<String>,
         /// Tool name.
         tool_name: String,
         /// Raw tool arguments JSON.
@@ -48,6 +50,8 @@ pub enum TranscriptItemKind {
         arguments_json: Option<String>,
         /// Raw tool result.
         result: String,
+        /// Raw artifact result, when the result is artifact-backed.
+        artifact: Option<Box<ToolArtifact>>,
         /// Whether the tool failed.
         is_error: bool,
     },
@@ -491,6 +495,7 @@ pub fn tool_request_item_from_projection(
     let arguments_json = projection.arguments_json.as_deref().unwrap_or("{}");
     tool_request_item(
         &projection.tool_call_id,
+        projection.producer_plugin_id.as_deref(),
         tool_name,
         arguments_json,
         request_presentation,
@@ -515,6 +520,7 @@ pub fn generic_tool_result_item_from_projection(
 #[must_use]
 pub fn tool_request_item(
     tool_call_id: &str,
+    producer_plugin_id: Option<&str>,
     tool_name: &str,
     arguments_json: &str,
     request_presentation: Option<ToolRequestPresentationMetadata>,
@@ -525,6 +531,7 @@ pub fn tool_request_item(
         false,
         TranscriptItemKind::ToolRequest {
             tool_call_id: tool_call_id.to_owned(),
+            producer_plugin_id: producer_plugin_id.map(ToOwned::to_owned),
             tool_name: tool_name.to_owned(),
             arguments_json: arguments_json.to_owned(),
             request_presentation,
@@ -593,6 +600,7 @@ pub fn streaming_tool_output_item(
             tool_name: tool_name.map(ToOwned::to_owned),
             arguments_json: arguments_json.map(ToOwned::to_owned),
             result: text.to_owned(),
+            artifact: None,
             is_error: false,
         },
     )
@@ -616,6 +624,32 @@ pub fn tool_result_item(
             tool_name: tool_name.map(ToOwned::to_owned),
             arguments_json: arguments_json.map(ToOwned::to_owned),
             result: result.to_owned(),
+            artifact: None,
+            is_error,
+        },
+    )
+}
+
+/// Build a transcript item for an artifact-backed tool result.
+#[must_use]
+pub fn artifact_tool_result_item(
+    tool_call_id: &str,
+    tool_name: Option<&str>,
+    arguments_json: Option<&str>,
+    artifact: &ToolArtifact,
+    is_error: bool,
+) -> TranscriptItem {
+    let result = artifact_summary_text(artifact);
+    TranscriptItem::with_kind(
+        if is_error { "Tool error" } else { "Tool" },
+        result.clone(),
+        false,
+        TranscriptItemKind::ToolResult {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: tool_name.map(ToOwned::to_owned),
+            arguments_json: arguments_json.map(ToOwned::to_owned),
+            result,
+            artifact: Some(Box::new(artifact.clone())),
             is_error,
         },
     )
@@ -1118,20 +1152,11 @@ fn artifact_result_item(
     artifact: &bcode_session_models::ToolArtifact,
     is_error: bool,
 ) -> TranscriptItem {
-    generic_artifact_item(tool_call_id, context, artifact, is_error)
-}
-
-fn generic_artifact_item(
-    tool_call_id: &str,
-    context: Option<&ToolCallContext>,
-    artifact: &bcode_session_models::ToolArtifact,
-    is_error: bool,
-) -> TranscriptItem {
-    tool_result_item(
+    artifact_tool_result_item(
         tool_call_id,
         context.map(|context| context.tool_name.as_str()),
         context.map(|context| context.arguments_json.as_str()),
-        &artifact_summary_text(artifact),
+        artifact,
         is_error,
     )
 }

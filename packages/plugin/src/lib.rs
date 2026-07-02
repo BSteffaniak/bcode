@@ -2723,6 +2723,26 @@ impl PluginHost {
             .and_then(LoadedPlugin::tui_registry)
     }
 
+    /// Return the highest-priority compatible visual adapter route for a loaded plugin.
+    #[must_use]
+    pub fn visual_adapter(
+        &self,
+        schema: &str,
+        schema_version: u32,
+        surface: &str,
+        producer_plugin_id: Option<&str>,
+    ) -> Option<PluginVisualAdapterRoute> {
+        select_visual_adapter(
+            self.loaded
+                .iter()
+                .map(|plugin| (&plugin.manifest.id, &plugin.manifest)),
+            schema,
+            schema_version,
+            surface,
+            producer_plugin_id,
+        )
+    }
+
     /// Discover, load, and activate plugins from default roots.
     ///
     /// # Errors

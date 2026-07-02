@@ -24,7 +24,11 @@ pub struct FileChangeTuiVisualAdapter;
 
 impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapter {
     fn supports(&self, kind: &str) -> bool {
-        kind == "bcode.filesystem.file_change"
+        // Keep the old plugin-view schema as a local TUI-only replay shim for pre-artifact logs.
+        matches!(
+            kind,
+            "bcode.filesystem.change" | "bcode.filesystem.file_change"
+        )
     }
 
     fn rows(&self, _kind: &str, payload: &serde_json::Value, width: u16) -> Vec<Line> {
@@ -467,6 +471,32 @@ const fn syntax_style(style: SyntaxStyle) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapter_supports_raw_filesystem_change_artifact_schema() {
+        let payload = serde_json::json!({
+            "path": "src/lib.rs",
+            "summary": "edited file",
+            "old_text": "before\n",
+            "new_text": "after\n"
+        });
+        assert!(bcode_plugin_sdk::tui::PluginTuiVisualAdapter::supports(
+            &FileChangeTuiVisualAdapter,
+            "bcode.filesystem.change"
+        ));
+
+        let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            &FileChangeTuiVisualAdapter,
+            "bcode.filesystem.change",
+            &payload,
+            80,
+        );
+        let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        assert!(rendered.contains("src/lib.rs"), "{rendered}");
+        assert!(rendered.contains("before"), "{rendered}");
+        assert!(rendered.contains("after"), "{rendered}");
+    }
 
     #[test]
     fn file_change_rows_show_counts_and_hidden_rows() {

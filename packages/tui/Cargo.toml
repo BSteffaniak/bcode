@@ -52,7 +52,8 @@ unicode-segmentation = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+bcode_filesystem_plugin = { workspace = true, features = ["static-bundled"] }
+tempfile                = { workspace = true }
 
 [features]
 default                           = []
