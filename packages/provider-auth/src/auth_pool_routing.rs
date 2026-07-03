@@ -224,7 +224,9 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth_pool_state::{AuthPoolProfileState, AuthPoolRoutingState};
+    use crate::auth_pool_state::{
+        AuthPoolProfileState, AuthPoolRoutingState, AuthPoolUsageWindowState,
+    };
 
     use std::collections::BTreeMap;
 
@@ -324,6 +326,61 @@ mod tests {
         .expect("candidate should select");
 
         assert_eq!(selection.profile.as_deref(), Some("openai"));
+        assert_eq!(selection.reason, AuthPoolSelectionReason::Priming);
+    }
+
+    #[test]
+    fn priming_keeps_selecting_profile_until_all_required_windows_are_active() {
+        let candidates = vec![candidate("openai"), candidate("openai-2")];
+        let routing = ProviderAuthPoolRouting {
+            priming_enabled: true,
+            priming_provider_windows: true,
+            priming_required_windows: BTreeMap::from([(
+                "codex".to_string(),
+                vec!["primary".to_string(), "secondary".to_string()],
+            )]),
+            ..ProviderAuthPoolRouting::default()
+        };
+        let state = AuthPoolState {
+            entries: BTreeMap::from([(
+                "openai/openai-2".to_string(),
+                AuthPoolProfileState {
+                    usage_windows: BTreeMap::from([(
+                        "codex".to_string(),
+                        BTreeMap::from([
+                            (
+                                "primary".to_string(),
+                                AuthPoolUsageWindowState {
+                                    meter_id: "codex".to_string(),
+                                    window_id: "primary".to_string(),
+                                    resets_at_unix: Some(200),
+                                    used_percent: Some(1),
+                                    ..AuthPoolUsageWindowState::default()
+                                },
+                            ),
+                            (
+                                "secondary".to_string(),
+                                AuthPoolUsageWindowState {
+                                    meter_id: "codex".to_string(),
+                                    window_id: "secondary".to_string(),
+                                    resets_at_unix: Some(200),
+                                    used_percent: Some(0),
+                                    ..AuthPoolUsageWindowState::default()
+                                },
+                            ),
+                        ]),
+                    )]),
+                    ..AuthPoolProfileState::default()
+                },
+            )]),
+            ..AuthPoolState::default()
+        };
+
+        let selection =
+            select_auth_pool_candidate_with_state(&input(&routing, &candidates), &state, 100)
+                .expect("candidate should select");
+
+        assert_eq!(selection.profile.as_deref(), Some("openai-2"));
         assert_eq!(selection.reason, AuthPoolSelectionReason::Priming);
     }
 

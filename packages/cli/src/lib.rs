@@ -2376,43 +2376,64 @@ fn auth_prime_run(
             if !force && !report.profiles[index].needs_priming {
                 continue;
             }
-            let mut provider_context = provider_context_for_prime_target(&plan, target);
-            provider_context.auth_pool_selection_reason = Some("manual_prime".to_string());
-            let request = bcode_model::AuthPrimeRequest {
-                provider_context,
-                required_windows: plan.required_windows.clone(),
-                model_id: selected_model_id.clone(),
-                timeout_seconds: Some(timeout_seconds),
-                force,
-            };
-            let response: bcode_model::AuthPrimeResponse = host
-                .invoke_service_json(
-                    &plan.provider_plugin_id,
-                    bcode_model::MODEL_PROVIDER_INTERFACE_ID,
-                    bcode_model::OP_AUTH_PRIME,
-                    &request,
-                )
-                .map_err(plugin_service_call_error)?;
-            let profile_report = &mut report.profiles[index];
-            profile_report.status = match response.status {
-                bcode_model::AuthPrimeStatus::Primed => "primed".to_string(),
-                bcode_model::AuthPrimeStatus::AlreadyPrimed => "already_primed".to_string(),
-                bcode_model::AuthPrimeStatus::Unsupported => "unsupported".to_string(),
-                bcode_model::AuthPrimeStatus::Failed => "failed".to_string(),
-            };
-            profile_report.reason = response.message;
-            if let Some(usage) = response.after.as_ref().or(response.before.as_ref()) {
-                bcode_provider_auth::auth_pool_state::record_profile_usage_windows(
-                    Some(&plan.pool),
-                    Some(&target.profile),
-                    &usage.meters,
-                );
-            }
-            if response.status == bcode_model::AuthPrimeStatus::Primed {
-                bcode_provider_auth::auth_pool_state::mark_profile_primed(
-                    Some(&plan.pool),
-                    Some(&target.profile),
-                );
+            loop {
+                let mut provider_context = provider_context_for_prime_target(&plan, target);
+                provider_context.auth_pool_selection_reason = Some("manual_prime".to_string());
+                let request = bcode_model::AuthPrimeRequest {
+                    provider_context,
+                    required_windows: plan.required_windows.clone(),
+                    model_id: selected_model_id.clone(),
+                    timeout_seconds: Some(timeout_seconds),
+                    force,
+                };
+                let response: bcode_model::AuthPrimeResponse = host
+                    .invoke_service_json(
+                        &plan.provider_plugin_id,
+                        bcode_model::MODEL_PROVIDER_INTERFACE_ID,
+                        bcode_model::OP_AUTH_PRIME,
+                        &request,
+                    )
+                    .map_err(plugin_service_call_error)?;
+                let status = response.status;
+                let message = response.message.clone();
+                let has_after_usage = response.after.is_some();
+                if let Some(usage) = response.after.as_ref().or(response.before.as_ref()) {
+                    bcode_provider_auth::auth_pool_state::record_profile_usage_windows(
+                        Some(&plan.pool),
+                        Some(&target.profile),
+                        &usage.meters,
+                    );
+                }
+                report = auth_prime_report(&plan, true, dry_run, &BTreeMap::new());
+                let Some(profile_report) = report.profiles.get_mut(index) else {
+                    break;
+                };
+                if status == bcode_model::AuthPrimeStatus::Primed {
+                    bcode_provider_auth::auth_pool_state::mark_profile_primed(
+                        Some(&plan.pool),
+                        Some(&target.profile),
+                    );
+                    profile_report.status = "primed".to_string();
+                    profile_report.reason = message;
+                    break;
+                }
+                profile_report.status = match status {
+                    bcode_model::AuthPrimeStatus::Primed => "primed".to_string(),
+                    bcode_model::AuthPrimeStatus::AlreadyPrimed => "already_primed".to_string(),
+                    bcode_model::AuthPrimeStatus::Unsupported => "unsupported".to_string(),
+                    bcode_model::AuthPrimeStatus::Failed => "failed".to_string(),
+                };
+                profile_report.reason = message;
+                if !profile_report.needs_priming {
+                    bcode_provider_auth::auth_pool_state::mark_profile_primed(
+                        Some(&plan.pool),
+                        Some(&target.profile),
+                    );
+                    break;
+                }
+                if status != bcode_model::AuthPrimeStatus::Failed || !has_after_usage {
+                    break;
+                }
             }
         }
         host.deactivate_all()?;

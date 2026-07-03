@@ -1488,6 +1488,7 @@ async fn stream_chat_completion_with_failover(
         return match outcome {
             Ok(outcome) => {
                 record_selected_auth_profile_success(request);
+                refresh_priming_auth_profile_usage(request).await;
                 Ok(outcome)
             }
             Err(error) if is_subscription_quota_error(&error) => {
@@ -1571,6 +1572,38 @@ fn record_selected_auth_profile_success(request: &ModelTurnRequest) {
         Some("priming") => {}
         _ => auth_pool_state::mark_profile_success(pool, Some(profile)),
     }
+}
+
+async fn refresh_priming_auth_profile_usage(request: &ModelTurnRequest) {
+    if request
+        .provider_context
+        .auth_pool_selection_reason
+        .as_deref()
+        != Some("priming")
+    {
+        return;
+    }
+    let Some(profile) = request.provider_context.auth_profile.as_deref() else {
+        return;
+    };
+    let usage_request = bcode_model::AuthUsageRequest {
+        provider_context: request.provider_context.clone(),
+        meter_ids: request
+            .provider_context
+            .auth_pool_routing
+            .priming_required_windows
+            .keys()
+            .cloned()
+            .collect(),
+    };
+    let Ok(usage) = auth_usage_inner(usage_request).await else {
+        return;
+    };
+    auth_pool_state::record_profile_usage_windows(
+        request.provider_context.auth_pool.as_deref(),
+        Some(profile),
+        &usage.meters,
+    );
 }
 
 fn record_selected_auth_profile_quota_error(
@@ -1682,10 +1715,18 @@ async fn try_auth_candidate(
     selection: CandidateSelection<'_>,
 ) -> Result<CandidateTryOutcome, ProviderError> {
     let candidate = selection.candidate;
-    let candidate_request = auth_candidate_request(request, candidate);
+    let mut candidate_request = auth_candidate_request(request, candidate);
+    if selection.reason == CandidateSelectionReason::Priming {
+        candidate_request
+            .provider_context
+            .auth_pool_selection_reason = Some("priming".to_string());
+    }
     match stream_chat_completion_inner(&candidate_request, turn).await {
         Ok(outcome) => {
             record_auth_candidate_success(request, candidate, selection.reason);
+            if selection.reason == CandidateSelectionReason::Priming {
+                refresh_priming_auth_profile_usage(&candidate_request).await;
+            }
             Ok(CandidateTryOutcome::Finished(outcome))
         }
         Err(error) if is_subscription_quota_error(&error) => {
