@@ -337,21 +337,10 @@ fn current_time_ms() -> u64 {
     .unwrap_or(u64::MAX)
 }
 
-/// Return statically bundled plugin registrations compiled into `bcode_tui`.
+/// Return statically bundled plugin registrations enabled through `bcode_bundled_plugins`.
 #[must_use]
 pub fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
-    vec![
-        #[cfg(feature = "static-bundled-code-review-plugin")]
-        bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/code-review-plugin/bcode-plugin.toml"),
-            bcode_code_review_plugin::static_plugin(),
-        ),
-        #[cfg(feature = "static-bundled-ralph-plugin")]
-        bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/ralph-plugin/bcode-plugin.toml"),
-            bcode_ralph_plugin::static_plugin(),
-        ),
-    ]
+    bcode_bundled_plugins::static_bundled_plugins()
 }
 
 /// Run the main terminal user interface and open Ralph on startup.
@@ -370,10 +359,11 @@ pub async fn run_ralph_home() -> Result<(), TuiError> {
             })?,
             helpers::terminal_area()?,
         );
-        Box::pin(runtime::run_event_loop_with_startup(
+        Box::pin(runtime::run_event_loop_with_startup_and_static_bundled(
             &mut terminal,
             None,
             startup_action::StartupTuiAction::OpenRalphHome,
+            &static_bundled_plugins(),
         ))
         .await
     };
@@ -389,7 +379,11 @@ pub async fn run_ralph_home() -> Result<(), TuiError> {
 /// client operations.
 #[allow(clippy::future_not_send)]
 pub async fn run(session_id: Option<SessionId>) -> Result<(), TuiError> {
-    Box::pin(run_with_static_bundled(session_id, &[])).await
+    Box::pin(run_with_static_bundled(
+        session_id,
+        &static_bundled_plugins(),
+    ))
+    .await
 }
 
 /// Run the terminal user interface with caller-provided static bundled plugins.

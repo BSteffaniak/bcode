@@ -1261,27 +1261,8 @@ dependencies = [
 name = "bcode"
 version = "0.0.1-alpha.0"
 dependencies = [
- "bcode_bedrock_provider_plugin",
- "bcode_blims_plugin",
+ "bcode_bundled_plugins",
  "bcode_cli",
- "bcode_code_review_plugin",
- "bcode_default_agents_plugin",
- "bcode_document_plugin",
- "bcode_fake_provider_plugin",
- "bcode_filesystem_plugin",
- "bcode_git_plugin",
- "bcode_github_review_publisher_plugin",
- "bcode_model_plugin",
- "bcode_ocr_plugin",
- "bcode_openai_compatible_provider_plugin",
- "bcode_opencode_session_import_plugin",
- "bcode_pi_session_import_plugin",
- "bcode_plugin",
- "bcode_question_plugin",
- "bcode_shell_plugin",
- "bcode_skills_plugin",
- "bcode_web_search_plugin",
- "bcode_worktree_plugin",
  "tokio",
 ]
 
@@ -1352,6 +1333,34 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "bcode_bundled_plugins"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_bedrock_provider_plugin",
+ "bcode_blims_plugin",
+ "bcode_code_review_plugin",
+ "bcode_default_agents_plugin",
+ "bcode_document_plugin",
+ "bcode_fake_provider_plugin",
+ "bcode_filesystem_plugin",
+ "bcode_git_plugin",
+ "bcode_github_review_publisher_plugin",
+ "bcode_model_plugin",
+ "bcode_ocr_plugin",
+ "bcode_openai_compatible_provider_plugin",
+ "bcode_opencode_session_import_plugin",
+ "bcode_pi_session_import_plugin",
+ "bcode_plugin",
+ "bcode_question_plugin",
+ "bcode_ralph_plugin",
+ "bcode_shell_plugin",
+ "bcode_skills_plugin",
+ "bcode_web_search_plugin",
+ "bcode_worktree_plugin",
+ "serde_json",
 ]
 
 [[package]]
@@ -2085,9 +2094,9 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "arboard",
  "bcode_agent_profile",
+ "bcode_bundled_plugins",
  "bcode_client",
  "bcode_code_review_models",
- "bcode_code_review_plugin",
  "bcode_command",
  "bcode_config",
  "bcode_filesystem_plugin",
@@ -2099,7 +2108,6 @@ dependencies = [
  "bcode_provider_auth",
  "bcode_question_plugin",
  "bcode_ralph",
- "bcode_ralph_plugin",
  "bcode_session_models",
  "bcode_settings",
  "bcode_shell_plugin",

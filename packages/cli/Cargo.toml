@@ -60,7 +60,10 @@ static-bundled-code-review-plugin = [
 static-bundled-default-agents-plugin = ["_static-bundled"]
 static-bundled-document-plugin = ["_static-bundled"]
 static-bundled-fake-provider-plugin = ["_static-bundled"]
-static-bundled-filesystem-plugin = ["_static-bundled"]
+static-bundled-filesystem-plugin = [
+    "_static-bundled",
+    "bcode_tui/static-bundled-filesystem-plugin",
+]
 static-bundled-git-plugin = ["_static-bundled"]
 static-bundled-github-review-publisher-plugin = ["_static-bundled"]
 static-bundled-openai-compatible-provider-plugin = ["_static-bundled"]
@@ -80,11 +83,14 @@ static-bundled-plugins = [
     "static-bundled-openai-compatible-provider-plugin",
     "static-bundled-opencode-session-import-plugin",
     "static-bundled-pi-session-import-plugin",
+    "static-bundled-question-plugin",
     "static-bundled-ralph-plugin",
     "static-bundled-shell-plugin",
     "static-bundled-web-search-plugin",
     "static-bundled-worktree-plugin",
+    "bcode_tui/static-bundled-plugins",
 ]
+static-bundled-question-plugin = ["_static-bundled"]
 static-bundled-ralph-plugin = [
     "_static-bundled",
     "bcode_tui/static-bundled-ralph-plugin",

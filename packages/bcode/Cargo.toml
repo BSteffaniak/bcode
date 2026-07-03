@@ -15,31 +15,11 @@ name = "bcode"
 path = "src/main.rs"
 
 [dependencies]
-bcode_bedrock_provider_plugin           = { workspace = true, optional = true }
-bcode_blims_plugin                      = { workspace = true, optional = true }
-bcode_cli                               = { workspace = true }
-bcode_code_review_plugin                = { workspace = true, optional = true }
-bcode_default_agents_plugin             = { workspace = true, optional = true }
-bcode_document_plugin                   = { workspace = true, optional = true }
-bcode_fake_provider_plugin              = { workspace = true, optional = true }
-bcode_filesystem_plugin                 = { workspace = true, optional = true }
-bcode_git_plugin                        = { workspace = true, optional = true }
-bcode_github_review_publisher_plugin    = { workspace = true, optional = true }
-bcode_model_plugin                      = { workspace = true, optional = true }
-bcode_ocr_plugin                        = { workspace = true, optional = true }
-bcode_openai_compatible_provider_plugin = { workspace = true, optional = true }
-bcode_opencode_session_import_plugin    = { workspace = true, optional = true }
-bcode_pi_session_import_plugin          = { workspace = true, optional = true }
-bcode_plugin                            = { workspace = true }
-bcode_question_plugin                   = { workspace = true, optional = true }
-bcode_shell_plugin                      = { workspace = true, optional = true }
-bcode_skills_plugin                     = { workspace = true, optional = true }
-bcode_web_search_plugin                 = { workspace = true, optional = true }
-bcode_worktree_plugin                   = { workspace = true, optional = true }
-tokio                                   = { workspace = true, features = ["macros", "rt-multi-thread"] }
+bcode_bundled_plugins = { workspace = true }
+bcode_cli             = { workspace = true }
+tokio                 = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [features]
-_static-bundled = []
 bundled-ocr-tesseract = ["bundled-ocr-tesseract-default"]
 bundled-ocr-tesseract-all = [
     "bundled-ocr-tesseract-v5-3-4",
@@ -50,142 +30,84 @@ bundled-ocr-tesseract-default = ["bundled-ocr-tesseract-v5-5-2"]
 bundled-ocr-tesseract-latest = ["bundled-ocr-tesseract-v5-5-2"]
 bundled-ocr-tesseract-v5-3-4 = [
     "static-bundled-ocr-plugin",
-    "bcode_ocr_plugin/bundled-tesseract-v5-3-4",
+    "bcode_bundled_plugins/bundled-ocr-tesseract-v5-3-4",
 ]
 bundled-ocr-tesseract-v5-5-1 = [
     "static-bundled-ocr-plugin",
-    "bcode_ocr_plugin/bundled-tesseract-v5-5-1",
+    "bcode_bundled_plugins/bundled-ocr-tesseract-v5-5-1",
 ]
 bundled-ocr-tesseract-v5-5-2 = [
     "static-bundled-ocr-plugin",
-    "bcode_ocr_plugin/bundled-tesseract-v5-5-2",
+    "bcode_bundled_plugins/bundled-ocr-tesseract-v5-5-2",
 ]
 default = ["static-bundled-plugins", "bundled-ocr-tesseract"]
 fail-on-warnings = []
 static-bundled-bedrock-provider-plugin = [
-    "_static-bundled",
-    "dep:bcode_bedrock_provider_plugin",
-    "bcode_bedrock_provider_plugin/static-bundled",
+    "bcode_bundled_plugins/static-bundled-bedrock-provider-plugin",
 ]
 static-bundled-blims-plugin = [
-    "_static-bundled",
-    "dep:bcode_blims_plugin",
-    "bcode_blims_plugin/static-bundled",
+    "bcode_bundled_plugins/static-bundled-blims-plugin",
 ]
 static-bundled-code-review-plugin = [
-    "_static-bundled",
-    "dep:bcode_code_review_plugin",
-    "bcode_code_review_plugin/static-bundled",
+    "bcode_bundled_plugins/static-bundled-code-review-plugin",
     "bcode_cli/static-bundled-code-review-plugin",
 ]
 static-bundled-default-agents-plugin = [
-    "_static-bundled",
-    "dep:bcode_default_agents_plugin",
-    "bcode_default_agents_plugin/static-bundled",
+    "bcode_bundled_plugins/static-bundled-default-agents-plugin",
 ]
 static-bundled-document-plugin = [
-    "_static-bundled",
-    "dep:bcode_document_plugin",
-    "bcode_document_plugin/static-bundled",
+    "bcode_bundled_plugins/static-bundled-document-plugin",
 ]
 static-bundled-fake-provider-plugin = [
-    "_static-bundled",
-    "dep:bcode_fake_provider_plugin",
-    "bcode_fake_provider_plugin/static-bundled",
+    "bcode_bundled_plugins/static-bundled-fake-provider-plugin",
 ]
 static-bundled-filesystem-plugin = [
-    "_static-bundled",
-    "dep:bcode_filesystem_plugin",
-    "bcode_filesystem_plugin/static-bundled",
+    "bcode_bundled_plugins/static-bundled-filesystem-plugin",
+    "bcode_cli/static-bundled-filesystem-plugin",
 ]
-static-bundled-git-plugin = [
-    "_static-bundled",
-    "dep:bcode_git_plugin",
-    "bcode_git_plugin/static-bundled",
-]
+static-bundled-git-plugin = ["bcode_bundled_plugins/static-bundled-git-plugin"]
 static-bundled-github-review-publisher-plugin = [
-    "_static-bundled",
-    "dep:bcode_github_review_publisher_plugin",
-    "bcode_github_review_publisher_plugin/static-bundled",
+    "bcode_bundled_plugins/static-bundled-github-review-publisher-plugin",
 ]
 static-bundled-model-plugin = [
-    "_static-bundled",
-    "dep:bcode_model_plugin",
-    "bcode_model_plugin/static-bundled",
+    "bcode_bundled_plugins/static-bundled-model-plugin",
 ]
-static-bundled-ocr-plugin = [
-    "_static-bundled",
-    "dep:bcode_ocr_plugin",
-    "bcode_ocr_plugin/static-bundled",
-]
+static-bundled-ocr-plugin = ["bcode_bundled_plugins/static-bundled-ocr-plugin"]
 static-bundled-openai-compatible-provider-plugin = [
-    "_static-bundled",
-    "dep:bcode_openai_compatible_provider_plugin",
-    "bcode_openai_compatible_provider_plugin/static-bundled",
+    "bcode_bundled_plugins/static-bundled-openai-compatible-provider-plugin",
 ]
 static-bundled-opencode-session-import-plugin = [
-    "_static-bundled",
-    "dep:bcode_opencode_session_import_plugin",
-    "bcode_opencode_session_import_plugin/static-bundled",
+    "bcode_bundled_plugins/static-bundled-opencode-session-import-plugin",
 ]
 static-bundled-pi-session-import-plugin = [
-    "_static-bundled",
-    "dep:bcode_pi_session_import_plugin",
-    "bcode_pi_session_import_plugin/static-bundled",
+    "bcode_bundled_plugins/static-bundled-pi-session-import-plugin",
 ]
 static-bundled-plugins = [
-    "_static-bundled",
-    "static-bundled-bedrock-provider-plugin",
-    "static-bundled-blims-plugin",
-    "static-bundled-code-review-plugin",
-    "static-bundled-default-agents-plugin",
-    "static-bundled-document-plugin",
-    "static-bundled-ocr-plugin",
-    "static-bundled-fake-provider-plugin",
-    "static-bundled-filesystem-plugin",
-    "static-bundled-git-plugin",
-    "static-bundled-github-review-publisher-plugin",
-    "static-bundled-model-plugin",
-    "static-bundled-openai-compatible-provider-plugin",
-    "static-bundled-opencode-session-import-plugin",
-    "static-bundled-pi-session-import-plugin",
-    "static-bundled-question-plugin",
-    "static-bundled-ralph-plugin",
-    "static-bundled-shell-plugin",
-    "static-bundled-skills-plugin",
-    "static-bundled-web-search-plugin",
-    "static-bundled-worktree-plugin",
+    "bcode_bundled_plugins/static-bundled-plugins",
+    "bcode_cli/static-bundled-plugins",
 ]
 static-bundled-question-plugin = [
-    "_static-bundled",
-    "dep:bcode_question_plugin",
-    "bcode_question_plugin/static-bundled",
+    "bcode_bundled_plugins/static-bundled-question-plugin",
+    "bcode_cli/static-bundled-question-plugin",
 ]
 static-bundled-ralph-plugin = [
-    "_static-bundled",
+    "bcode_bundled_plugins/static-bundled-ralph-plugin",
     "bcode_cli/static-bundled-ralph-plugin",
 ]
 static-bundled-shell-plugin = [
-    "_static-bundled",
-    "dep:bcode_shell_plugin",
-    "bcode_shell_plugin/static-bundled",
+    "bcode_bundled_plugins/static-bundled-shell-plugin",
+    "bcode_cli/static-bundled-shell-plugin",
 ]
 static-bundled-skills-plugin = [
-    "_static-bundled",
-    "dep:bcode_skills_plugin",
-    "bcode_skills_plugin/static-bundled",
+    "bcode_bundled_plugins/static-bundled-skills-plugin",
 ]
 static-bundled-web-search-plugin = [
-    "_static-bundled",
-    "dep:bcode_web_search_plugin",
-    "bcode_web_search_plugin/static-bundled",
+    "bcode_bundled_plugins/static-bundled-web-search-plugin",
 ]
 static-bundled-worktree-plugin = [
-    "_static-bundled",
-    "dep:bcode_worktree_plugin",
-    "bcode_worktree_plugin/static-bundled",
+    "bcode_bundled_plugins/static-bundled-worktree-plugin",
 ]
 system-ocr-tesseract = [
     "static-bundled-ocr-plugin",
-    "bcode_ocr_plugin/system-tesseract",
+    "bcode_bundled_plugins/system-ocr-tesseract",
 ]

@@ -13,9 +13,9 @@ version     = { workspace = true }
 [dependencies]
 arboard = { workspace = true }
 bcode_agent_profile = { workspace = true }
+bcode_bundled_plugins = { workspace = true }
 bcode_client = { workspace = true }
 bcode_code_review_models = { workspace = true }
-bcode_code_review_plugin = { workspace = true }
 bcode_command = { workspace = true }
 bcode_config = { workspace = true }
 bcode_ipc = { workspace = true }
@@ -25,7 +25,6 @@ bcode_plugin = { workspace = true }
 bcode_plugin_sdk = { workspace = true }
 bcode_provider_auth = { workspace = true }
 bcode_ralph = { workspace = true }
-bcode_ralph_plugin = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_settings = { workspace = true }
 bcode_skill_models = { workspace = true }
@@ -58,7 +57,15 @@ bcode_shell_plugin      = { workspace = true, features = ["static-bundled"] }
 tempfile                = { workspace = true }
 
 [features]
-default                           = []
-fail-on-warnings                  = []
-static-bundled-code-review-plugin = ["bcode_code_review_plugin/static-bundled"]
-static-bundled-ralph-plugin       = ["bcode_ralph_plugin/static-bundled"]
+default = []
+fail-on-warnings = []
+static-bundled-code-review-plugin = [
+    "bcode_bundled_plugins/static-bundled-code-review-plugin",
+]
+static-bundled-filesystem-plugin = [
+    "bcode_bundled_plugins/static-bundled-filesystem-plugin",
+]
+static-bundled-plugins = ["bcode_bundled_plugins/static-bundled-plugins"]
+static-bundled-ralph-plugin = [
+    "bcode_bundled_plugins/static-bundled-ralph-plugin",
+]
