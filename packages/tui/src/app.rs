@@ -45,6 +45,7 @@ use super::runtime_work_view::RuntimeWorkViewState;
 use super::temporal::next_elapsed_invalidation_capped;
 use super::theme::{PresentedTheme, ResolvedTheme};
 use super::timeline_dialog::TimelineEntry;
+use super::tool_render_projection::semantic_result_supersedes_live_preview;
 use super::transcript::{
     ToolTranscriptSurface, TranscriptItem, TranscriptItemKind, display_tool_result_text,
     generic_tool_result_item_from_projection, interactive_tool_request_item,
@@ -413,6 +414,12 @@ struct PermissionRequestInput<'a> {
     policy_source: Option<&'a str>,
     policy_reason: Option<&'a str>,
     application: SessionEventApplication,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinishedStreamedToolOutput {
+    PlainToolResult,
+    TerminalOutput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2678,19 +2685,26 @@ impl BmuxApp {
         &mut self,
         tool_call_id: &str,
         is_error: Option<bool>,
-        _result: Option<&str>,
-        _semantic_result: Option<&ToolInvocationResult>,
-    ) -> bool {
-        let Some(context) = self.streamed_tool_results.get(tool_call_id) else {
-            return false;
-        };
-        let saw_output = context.saw_output;
-        if let Some(index) = context.index
-            && let Some(item) = self.transcript.get_mut(index)
-        {
+    ) -> Option<FinishedStreamedToolOutput> {
+        let context = self.streamed_tool_results.get(tool_call_id)?;
+        if !context.saw_output {
+            return None;
+        }
+        let index = context.index?;
+        let output_kind = self.transcript.get(index).map_or(
+            FinishedStreamedToolOutput::PlainToolResult,
+            |item| {
+                if matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. }) {
+                    FinishedStreamedToolOutput::TerminalOutput
+                } else {
+                    FinishedStreamedToolOutput::PlainToolResult
+                }
+            },
+        );
+        if let Some(item) = self.transcript.get_mut(index) {
             item.finish_terminal(None, false, is_error.unwrap_or(false), None);
         }
-        saw_output
+        Some(output_kind)
     }
 
     fn push_tool_result(
@@ -2709,20 +2723,25 @@ impl BmuxApp {
             .tool_call_contexts
             .get(tool_call_id)
             .map(|context| context.arguments_json.clone());
-        if self.finish_live_tool_output(tool_call_id, Some(is_error), Some(result), semantic_result)
-        {
-            if application.live_activity() {
-                if is_error {
-                    "failed".clone_into(&mut self.status);
-                } else if let Some(status) = Self::tool_call_file_status(tool_call_id) {
-                    self.status = format!("applied · {status}");
-                } else {
-                    "finished".clone_into(&mut self.status);
+        if let Some(streamed_output) = self.finish_live_tool_output(tool_call_id, Some(is_error)) {
+            if semantic_result.is_none()
+                || matches!(streamed_output, FinishedStreamedToolOutput::TerminalOutput)
+            {
+                if application.live_activity() {
+                    if is_error {
+                        "failed".clone_into(&mut self.status);
+                    } else if let Some(status) = Self::tool_call_file_status(tool_call_id) {
+                        self.status = format!("applied · {status}");
+                    } else {
+                        "finished".clone_into(&mut self.status);
+                    }
                 }
+                self.finish_tool_request_preview(tool_call_id);
+                return;
             }
-            self.finish_tool_request_preview(tool_call_id);
-            return;
+            self.remove_plain_streamed_tool_result(tool_call_id);
         }
+        self.supersede_matching_live_preview(tool_call_id, semantic_result);
         let item = if let Some(semantic_result) = semantic_result {
             semantic_tool_result_item_from_raw(
                 tool_call_id,
@@ -3083,6 +3102,43 @@ impl BmuxApp {
         }
         self.live_preview_revision = self.live_preview_revision.saturating_add(1);
         true
+    }
+
+    fn remove_plain_streamed_tool_result(&mut self, tool_call_id: &str) {
+        self.transcript.retain(|item| {
+            !matches!(
+                item.kind(),
+                TranscriptItemKind::ToolResult {
+                    tool_call_id: item_tool_call_id,
+                    artifact: None,
+                    ..
+                } if item_tool_call_id == tool_call_id
+            )
+        });
+    }
+
+    fn supersede_matching_live_preview(
+        &mut self,
+        tool_call_id: &str,
+        semantic_result: Option<&ToolInvocationResult>,
+    ) {
+        let superseded = self
+            .live_tool_previews
+            .get(tool_call_id)
+            .is_some_and(|state| {
+                semantic_result_supersedes_live_preview(
+                    tool_call_id,
+                    &state.preview,
+                    semantic_result,
+                )
+            });
+        if !superseded {
+            return;
+        }
+        self.live_tool_previews.remove(tool_call_id);
+        self.transcript
+            .retain(|item| !item.is_live_preview_anchor_for(tool_call_id));
+        self.mark_live_preview_dirty();
     }
 
     fn apply_live_tool_argument_preview(

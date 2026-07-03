@@ -16,12 +16,12 @@ use bcode_session_models::{
     LegacyToolPresentationEvent, LegacyToolPresentationField, LegacyToolPresentationLevel,
     LegacyToolPresentationSection, LegacyToolPresentationTarget,
     LegacyToolRequestPresentationMetadata, LegacyToolRequestPreviewMetadata,
-    LegacyToolStatusPresentation, LiveFileEditPreview, LiveShellCommandPreview,
-    LiveToolArgumentPreview, RuntimeWorkId, RuntimeWorkKind, SessionEvent, SessionEventKind,
-    SessionId, SessionInputHistoryEntry, SessionProjectionKind, SessionSummary, SessionTitleSource,
-    SessionTokenUsage, SessionTraceEvent, SessionTracePayload, SessionTracePhase, ShellRunResult,
-    ToolArtifact, ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
-    build_tool_invocation_projections,
+    LegacyToolStatusPresentation, LiveFileEditPreview, LivePluginViewPreview, LiveQueryPreview,
+    LiveShellCommandPreview, LiveToolArgumentPreview, RuntimeWorkId, RuntimeWorkKind, SessionEvent,
+    SessionEventKind, SessionId, SessionInputHistoryEntry, SessionProjectionKind, SessionSummary,
+    SessionTitleSource, SessionTokenUsage, SessionTraceEvent, SessionTracePayload,
+    SessionTracePhase, ShellRunResult, ToolArtifact, ToolInvocationResult,
+    ToolInvocationStreamEvent, ToolOutputStream, build_tool_invocation_projections,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::TextMotion;
@@ -39,10 +39,7 @@ use super::{
     render, slash_palette, slash_palette_render,
     temporal::next_elapsed_invalidation_capped,
     time_format::{format_duration_nanos, format_millis},
-    transcript::{
-        TranscriptItem, TranscriptItemKind, plugin_view_payload_summary_text,
-        transcript_items_from_events_with_reasoning,
-    },
+    transcript::{TranscriptItem, TranscriptItemKind, transcript_items_from_events_with_reasoning},
     transcript_document::TranscriptDocument,
 };
 
@@ -2172,7 +2169,8 @@ fn transcript_renders_terminal_shell_output_without_viewport_padding() {
     let output = rendered_text(&buffer);
 
     assert!(output.contains("Shell run"));
-    assert!(output.contains("test.shell-artifact"));
+    assert!(output.contains("plugin host unavailable"));
+    assert!(!output.contains("test.shell-artifact"));
     assert!(!output.contains("artifact_id"));
     assert!(!output.contains("producer_plugin_id"));
     assert!(!output.contains("metadata"));
@@ -2211,7 +2209,8 @@ fn transcript_renders_truncated_terminal_shell_output_as_terminal() {
     let output = rendered_text(&buffer);
 
     assert!(output.contains("Shell run"));
-    assert!(output.contains("test.shell-artifact"));
+    assert!(output.contains("plugin host unavailable"));
+    assert!(!output.contains("test.shell-artifact"));
     assert!(!output.contains("artifact_id"));
     assert!(!output.contains("producer_plugin_id"));
     assert!(!output.contains("metadata"));
@@ -5087,6 +5086,210 @@ fn live_filesystem_artifact_renders_rich_diff_from_raw_change_metadata() {
 }
 
 #[test]
+fn final_filesystem_artifact_supersedes_matching_live_plugin_preview() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
+        session_id,
+        kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
+            turn_id: "turn-1".to_owned(),
+            tool_call_id: "call-file".to_owned(),
+            tool_name: "filesystem.write".to_owned(),
+            argument_bytes: 42,
+            preview: LiveToolArgumentPreview::PluginView(LivePluginViewPreview {
+                producer_plugin_id: "bcode.filesystem".to_owned(),
+                schema: "bcode.filesystem.change".to_owned(),
+                schema_version: 1,
+                title: Some("Writing file".to_owned()),
+                subtitle: Some("Writing file".to_owned()),
+                payload: serde_json::json!({
+                    "subtitle": "Writing file",
+                    "path": "/tmp/hello.txt",
+                    "old_text": "before\n",
+                    "new_text": "after\n",
+                    "truncated": false
+                }),
+            }),
+        },
+    });
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call-file".to_owned(),
+            result: "edited file".to_owned(),
+            is_error: false,
+            output: None,
+            semantic_result: Some(ToolInvocationResult::Artifact {
+                artifact: Box::new(filesystem_change_artifact()),
+            }),
+        },
+    ));
+
+    let rendered = render_app_text(&mut app);
+
+    assert!(rendered.contains("/tmp/hello.txt"), "{rendered}");
+    assert!(rendered.contains("after"), "{rendered}");
+    assert!(!rendered.contains("Streaming preview"), "{rendered}");
+    assert!(rendered.contains("File change"), "{rendered}");
+}
+
+#[test]
+fn streamed_filesystem_json_is_replaced_by_final_rich_artifact() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
+        session_id,
+        kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
+            turn_id: "turn-1".to_owned(),
+            tool_call_id: "call-file".to_owned(),
+            tool_name: "filesystem.write".to_owned(),
+            argument_bytes: 42,
+            preview: LiveToolArgumentPreview::PluginView(LivePluginViewPreview {
+                producer_plugin_id: "bcode.filesystem".to_owned(),
+                schema: "bcode.filesystem.change".to_owned(),
+                schema_version: 1,
+                title: Some("Writing file".to_owned()),
+                subtitle: Some("Writing file".to_owned()),
+                payload: serde_json::json!({
+                    "subtitle": "Writing file",
+                    "path": "/tmp/hello.txt",
+                    "old_text": "before\n",
+                    "new_text": "after\n",
+                    "truncated": false
+                }),
+            }),
+        },
+    });
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolInvocationStream {
+            event: ToolInvocationStreamEvent::OutputDelta {
+                tool_call_id: "call-file".to_owned(),
+                stream: ToolOutputStream::Stdout,
+                sequence: 1,
+                text: r#"{"path":"/tmp/hello.txt","new_text":"after"}"#.to_owned(),
+                byte_len: 44,
+            },
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call-file".to_owned(),
+            result: "edited file".to_owned(),
+            is_error: false,
+            output: None,
+            semantic_result: Some(ToolInvocationResult::Artifact {
+                artifact: Box::new(filesystem_change_artifact()),
+            }),
+        },
+    ));
+
+    let rendered = render_app_text(&mut app);
+
+    assert!(rendered.contains("/tmp/hello.txt"), "{rendered}");
+    assert!(rendered.contains("after"), "{rendered}");
+    assert!(rendered.contains("File change"), "{rendered}");
+    assert!(!rendered.contains(r#"{"path":"#), "{rendered}");
+    assert!(!rendered.contains("Streaming preview"), "{rendered}");
+}
+
+#[test]
+fn shell_live_preview_is_not_superseded_by_terminal_result() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
+    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
+        session_id,
+        kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
+            turn_id: "turn-1".to_owned(),
+            tool_call_id: "call-shell".to_owned(),
+            tool_name: "shell.run".to_owned(),
+            argument_bytes: 24,
+            preview: LiveToolArgumentPreview::ShellCommand(LiveShellCommandPreview {
+                preview_title: None,
+                streaming_status: None,
+                command_prefix: "cargo test".to_owned(),
+                cwd: Some("/tmp/project".to_owned()),
+                argument_bytes: 24,
+                truncated: false,
+            }),
+        },
+    });
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call-shell".to_owned(),
+            result: "finished".to_owned(),
+            is_error: false,
+            output: None,
+            semantic_result: Some(ToolInvocationResult::Artifact {
+                artifact: Box::new(shell_run_artifact()),
+            }),
+        },
+    ));
+
+    let rendered = render_app_text(&mut app);
+
+    assert!(rendered.contains("Shell command"), "{rendered}");
+    assert!(rendered.contains("command: cargo test"), "{rendered}");
+    assert!(rendered.contains("Shell run"), "{rendered}");
+    assert!(rendered.contains("terminal"), "{rendered}");
+    assert!(rendered.contains("shell raw output"), "{rendered}");
+}
+
+#[test]
+fn query_live_preview_is_not_superseded_by_unmatched_result() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    let mut fields = BTreeMap::new();
+    fields.insert("query".to_owned(), "rust borrow checker".to_owned());
+    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
+        session_id,
+        kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
+            turn_id: "turn-1".to_owned(),
+            tool_call_id: "call-query".to_owned(),
+            tool_name: "web.search".to_owned(),
+            argument_bytes: 32,
+            preview: LiveToolArgumentPreview::Query(LiveQueryPreview {
+                preview_title: Some("Search query".to_owned()),
+                streaming_status: None,
+                fields,
+                argument_bytes: 32,
+                truncated: false,
+            }),
+        },
+    });
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call-query".to_owned(),
+            result: "search completed".to_owned(),
+            is_error: false,
+            output: None,
+            semantic_result: None,
+        },
+    ));
+
+    let rendered = render_app_text(&mut app);
+
+    assert!(rendered.contains("Search query"), "{rendered}");
+    assert!(
+        rendered.contains("query: rust borrow checker"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("Tool result"), "{rendered}");
+    assert!(rendered.contains("search completed"), "{rendered}");
+}
+
+#[test]
 fn replayed_filesystem_artifact_renders_rich_diff_from_raw_change_metadata() {
     let session_id = SessionId::new();
     let events = vec![event(
@@ -5140,11 +5343,11 @@ fn disabled_filesystem_renderer_falls_back_generically_and_reenabled_renderer_re
         "{fallback_rendered}"
     );
     assert!(
-        fallback_rendered.contains("edited file"),
+        fallback_rendered.contains("plugin host unavailable"),
         "{fallback_rendered}"
     );
     assert!(
-        fallback_rendered.contains("/tmp/hello.txt"),
+        fallback_rendered.contains("edited file"),
         "{fallback_rendered}"
     );
     assert!(!fallback_rendered.contains("before"), "{fallback_rendered}");
@@ -5729,19 +5932,39 @@ fn replayed_plugin_view_result_does_not_suppress_artifact_json_fallback() {
 }
 
 #[test]
-fn plugin_view_payload_summary_does_not_render_raw_json() {
-    let summary = plugin_view_payload_summary_text(&serde_json::json!({
-        "path": "src/main.rs",
-        "old_text": "fn main() {}",
-        "new_text": "fn main() { println!(\"hi\"); }"
-    }));
+fn plugin_visual_degrades_without_rendering_raw_payload() {
+    let artifact = ToolArtifact {
+        artifact_id: "artifact-1".to_owned(),
+        producer_plugin_id: "bcode.filesystem".to_owned(),
+        schema: "bcode.filesystem.change".to_owned(),
+        schema_version: 1,
+        tool_call_id: Some("call-1".to_owned()),
+        title: Some("File change".to_owned()),
+        metadata: serde_json::json!({
+            "path": "src/main.rs",
+            "old_text": "fn main() {}",
+            "new_text": "fn main() { println!(\"hi\"); }"
+        }),
+        refs: Vec::new(),
+    };
+    let item = super::transcript::semantic_tool_result_item_from_raw(
+        "call-1",
+        None,
+        None,
+        &ToolInvocationResult::Artifact {
+            artifact: Box::new(artifact),
+        },
+        false,
+    );
 
-    assert!(summary.contains("src/main.rs"));
-    assert!(summary.contains("-fn main() {}"));
-    assert!(summary.contains("+fn main() { println!(\"hi\"); }"));
-    assert!(!summary.contains("old_text"));
-    assert!(!summary.contains("new_text"));
-    assert!(!summary.contains(r#""path""#));
+    let rows = render::transcript_item_rows(&[item], &BTreeMap::new(), 0, 90, None);
+    let output = format!("{rows:?}");
+
+    assert!(output.contains("File change"), "{output}");
+    assert!(output.contains("plugin host unavailable"), "{output}");
+    assert!(!output.contains("old_text"), "{output}");
+    assert!(!output.contains("new_text"), "{output}");
+    assert!(!output.contains("fn main() {}"), "{output}");
 }
 
 #[test]
@@ -5832,6 +6055,7 @@ fn live_shell_command_preview_streams_before_final_request_and_is_preserved() {
 fn live_file_preview_updates_without_duplicates_and_final_replaces_it() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
     for contents in ["fn main", "fn main() {\n    println!(\"hi\");\n}"] {
         app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
             session_id,
@@ -5860,7 +6084,7 @@ fn live_file_preview_updates_without_duplicates_and_final_replaces_it() {
     let output = rendered_text(&buffer);
     assert_eq!(output.matches("File change preview").count(), 1, "{output}");
     assert!(output.contains("received:"), "{output}");
-    assert!(output.contains("path: src/main.rs"), "{output}");
+    assert!(output.contains("src/main.rs"), "{output}");
     assert!(!output.contains("Ready to apply"), "{output}");
 
     app.absorb_session_event(&event(
@@ -5890,6 +6114,7 @@ fn live_file_preview_updates_without_duplicates_and_final_replaces_it() {
 fn live_file_preview_renders_available_new_text_before_original_text() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
     app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
         session_id,
         kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
@@ -5917,18 +6142,20 @@ fn live_file_preview_renders_available_new_text_before_original_text() {
 
     assert!(!output.contains("waiting for original text"), "{output}");
     assert!(output.contains("File change preview"), "{output}");
-    assert!(output.contains("path: src/lib.rs"), "{output}");
+    assert!(output.contains("src/lib.rs"), "{output}");
     assert!(
         output.contains("original text pending; showing available new text"),
         "{output}"
     );
-    assert!(!output.contains("+   2"), "{output}");
+    assert!(!output.contains("old_text"), "{output}");
+    assert!(!output.contains("new_text"), "{output}");
 }
 
 #[test]
 fn live_file_preview_renders_truncation_note_and_received_bytes() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
     app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
         session_id,
         kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
@@ -5955,7 +6182,7 @@ fn live_file_preview_renders_truncation_note_and_received_bytes() {
     let output = rendered_text(&buffer);
     assert!(output.contains("received: 2.0 KiB"), "{output}");
     assert!(
-        output.contains("preview truncated by live display limit"),
+        output.contains("preview truncated; showing available diff rows"),
         "{output}"
     );
 }
@@ -5964,6 +6191,7 @@ fn live_file_preview_renders_truncation_note_and_received_bytes() {
 fn live_file_preview_uses_plugin_owned_renderer() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
     app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
         session_id,
         kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
@@ -5989,6 +6217,7 @@ fn live_file_preview_uses_plugin_owned_renderer() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
     assert!(output.contains("File change preview"), "{output}");
-    assert!(output.contains("path: src/lib.rs"), "{output}");
-    assert!(!output.contains("pub fn demo"), "{output}");
+    assert!(output.contains("src/lib.rs"), "{output}");
+    assert!(!output.contains("old_text"), "{output}");
+    assert!(!output.contains("new_text"), "{output}");
 }

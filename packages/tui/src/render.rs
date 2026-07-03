@@ -4,7 +4,6 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
-use bcode_session_models::LiveToolArgumentPreview;
 use bmux_terminal_grid::{
     Color as GridColor, GridLimits, PhysicalRow, Style as GridStyle, TerminalGrid,
     TerminalGridStream,
@@ -22,7 +21,8 @@ use bmux_tui_components::text_input::TextInputControl;
 use super::activity::ActivityState;
 use super::app::{BmuxApp, DaemonConnectionState, LiveToolPreviewState, composer_policy};
 use super::pending_submission::{PendingSubmission, PendingSubmissionState};
-use super::transcript::{TranscriptItem, TranscriptItemKind, plugin_view_payload_summary_text};
+use super::tool_render_projection::{CanonicalPluginVisual, CanonicalToolVisual};
+use super::transcript::{TranscriptItem, TranscriptItemKind};
 use super::transcript_layout::TranscriptLayoutSignature;
 use crate::time_format::format_elapsed_millis;
 use bmux_tui::text_width::{display_width as text_display_width, truncate_to_display_width};
@@ -865,55 +865,16 @@ fn push_tool_request_rows(
         muted_style(),
         muted_style(),
     );
-    if let Some(native_rows) = raw_tool_request_visual_rows(context, width) {
-        rows.extend(native_rows);
+    if let Some(visual) = CanonicalToolVisual::from_filesystem_request(
+        context.producer_plugin_id,
+        context.tool_name,
+        context.arguments_json,
+    ) {
+        push_canonical_tool_visual_rows(rows, &visual, width, context.plugin_host);
     } else if !item.text().is_empty() {
         push_labeled_text_preview(rows, "arguments", item.text(), width, 16);
     }
     rows.push(Line::default());
-}
-
-fn raw_tool_request_visual_rows(
-    context: &ToolRequestRenderContext<'_>,
-    width: u16,
-) -> Option<Vec<Line>> {
-    if context.producer_plugin_id != Some("bcode.filesystem") {
-        return None;
-    }
-    let payload = filesystem_change_preview_payload(context.tool_name, context.arguments_json)?;
-    let host = context.plugin_host?;
-    let route = host.visual_adapter(
-        "bcode.filesystem.change",
-        1,
-        "tui",
-        context.producer_plugin_id,
-    )?;
-    host.tui_registry(&route.plugin_id)?
-        .visual_rows(&route.schema, &payload, width)
-}
-
-fn filesystem_change_preview_payload(
-    tool_name: &str,
-    arguments_json: &str,
-) -> Option<serde_json::Value> {
-    let arguments = serde_json::from_str::<serde_json::Value>(arguments_json).ok()?;
-    let path = arguments.get("path")?.as_str()?;
-    let payload = match tool_name {
-        "filesystem.write" => serde_json::json!({
-            "summary": "Write preview",
-            "path": path,
-            "old_text": "",
-            "new_text": arguments.get("contents")?.as_str()?,
-        }),
-        "filesystem.edit" => serde_json::json!({
-            "summary": "Edit preview",
-            "path": path,
-            "old_text": arguments.get("old_text")?.as_str()?,
-            "new_text": arguments.get("new_text")?.as_str()?,
-        }),
-        _ => return None,
-    };
-    Some(payload)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -944,201 +905,118 @@ fn push_live_tool_preview_anchor_rows(
         rows.push(Line::default());
         return;
     };
-    match &state.preview {
-        LiveToolArgumentPreview::PluginView(view) => {
-            if let Some(native_rows) = plugin_host
-                .and_then(|host| host.tui_registry(&view.producer_plugin_id))
-                .and_then(|registry| registry.visual_rows(&view.schema, &view.payload, width))
-            {
-                rows.extend(native_rows);
-            } else {
-                let title = view.title.as_deref().unwrap_or(&view.schema);
-                push_wrapped_styled_text(
-                    rows,
-                    Vec::new(),
-                    &format!("{title} · {}", state.tool_name),
-                    width,
-                    Style::new().fg(Color::Cyan),
-                    Style::new().fg(Color::Cyan),
-                );
-                if let Some(subtitle) = &view.subtitle {
-                    push_wrapped_styled_text(
-                        rows,
-                        vec![Span::styled("  ", muted_style())],
-                        subtitle,
-                        width,
-                        muted_style(),
-                        muted_style(),
-                    );
-                }
-                let summary = plugin_view_payload_summary_text(&view.payload);
-                if !summary.is_empty() {
-                    push_wrapped_styled_text(
-                        rows,
-                        vec![Span::styled("  ", muted_style())],
-                        &summary,
-                        width,
-                        Style::new(),
-                        Style::new(),
-                    );
-                }
-            }
-            rows.push(Line::default());
+    let visual = CanonicalToolVisual::from_live_preview(&state.tool_name, &state.preview);
+    push_canonical_tool_visual_rows(rows, &visual, width, plugin_host);
+    rows.push(Line::default());
+}
+
+fn push_canonical_tool_visual_rows(
+    rows: &mut Vec<Line>,
+    visual: &CanonicalToolVisual,
+    width: u16,
+    plugin_host: Option<&bcode_plugin::PluginHost>,
+) {
+    match visual {
+        CanonicalToolVisual::Plugin(plugin_visual) => {
+            push_canonical_plugin_visual_rows(rows, plugin_visual, width, plugin_host);
         }
-        LiveToolArgumentPreview::FileEdit(file) => {
+        CanonicalToolVisual::PlainText { title, text } => {
             push_wrapped_styled_text(
                 rows,
                 Vec::new(),
-                file.preview_title
-                    .as_deref()
-                    .unwrap_or("File change preview"),
+                title,
                 width,
                 Style::new().fg(Color::Cyan),
                 Style::new().fg(Color::Cyan),
             );
-            push_kv_row(
-                rows,
-                "received",
-                &format_preview_bytes(state.argument_bytes),
-                width,
-            );
-            if let Some(path) = &file.path {
-                push_kv_row(rows, "path", path, width);
-            }
-            if file.old_text_required && file.old_text_prefix.is_none() {
+            if !text.is_empty() {
                 push_wrapped_styled_text(
                     rows,
                     vec![Span::styled("  ", muted_style())],
-                    "original text pending; showing available new text",
+                    text,
                     width,
-                    muted_style(),
-                    muted_style(),
+                    Style::new(),
+                    Style::new(),
                 );
             }
-            if file.truncated {
-                push_wrapped_styled_text(
-                    rows,
-                    vec![Span::styled("  ", muted_style())],
-                    "preview truncated by live display limit",
-                    width,
-                    muted_style(),
-                    muted_style(),
-                );
-            }
-            rows.push(Line::default());
         }
-        LiveToolArgumentPreview::ShellCommand(shell) => push_shell_preview_rows(
-            rows,
-            shell.preview_title.as_deref().unwrap_or("Shell command"),
-            &shell.command_prefix,
-            shell.cwd.as_deref(),
-            state.argument_bytes,
-            shell.truncated,
-            width,
-        ),
-        LiveToolArgumentPreview::Query(query) => push_query_preview_rows(
-            rows,
-            query.preview_title.as_deref().unwrap_or(&state.tool_name),
-            &query.fields,
-            state.argument_bytes,
-            query.truncated,
-            width,
-        ),
     }
 }
 
-fn format_preview_bytes(bytes: usize) -> String {
-    const KIB: usize = 1024;
-    const MIB: usize = KIB * 1024;
-    if bytes >= MIB {
-        let whole = bytes / MIB;
-        let decimal = (bytes % MIB) * 10 / MIB;
-        format!("{whole}.{decimal} MiB")
-    } else if bytes >= KIB {
-        let whole = bytes / KIB;
-        let decimal = (bytes % KIB) * 10 / KIB;
-        format!("{whole}.{decimal} KiB")
-    } else {
-        format!("{bytes} B")
-    }
-}
-
-fn push_shell_preview_rows(
+fn push_canonical_plugin_visual_rows(
     rows: &mut Vec<Line>,
-    title: &str,
-    command_prefix: &str,
-    cwd: Option<&str>,
-    argument_bytes: usize,
-    truncated: bool,
+    visual: &CanonicalPluginVisual,
+    width: u16,
+    plugin_host: Option<&bcode_plugin::PluginHost>,
+) {
+    let Some(host) = plugin_host else {
+        push_plugin_visual_degraded_rows(rows, visual, "plugin host unavailable", width);
+        return;
+    };
+    let producer = visual.producer_plugin_id.as_deref();
+    let Some(route) = host.visual_adapter(&visual.schema, visual.schema_version, "tui", producer)
+    else {
+        push_plugin_visual_degraded_rows(rows, visual, "no TUI visual adapter registered", width);
+        return;
+    };
+    let Some(registry) = host.tui_registry(&route.plugin_id) else {
+        push_plugin_visual_degraded_rows(
+            rows,
+            visual,
+            "TUI visual adapter plugin unavailable",
+            width,
+        );
+        return;
+    };
+    if let Some(native_rows) = registry.visual_rows(&route.schema, &visual.payload, width) {
+        rows.extend(native_rows);
+        return;
+    }
+    push_plugin_visual_degraded_rows(
+        rows,
+        visual,
+        "TUI visual adapter could not render payload",
+        width,
+    );
+}
+
+fn push_plugin_visual_degraded_rows(
+    rows: &mut Vec<Line>,
+    visual: &CanonicalPluginVisual,
+    message: &str,
     width: u16,
 ) {
-    push_wrapped_styled_text(
-        rows,
-        Vec::new(),
-        title,
-        width,
-        Style::new().fg(Color::Cyan),
-        Style::new().fg(Color::Cyan),
-    );
-    push_kv_row(rows, "command", command_prefix, width);
-    if let Some(cwd) = cwd {
-        push_kv_row(rows, "cwd", cwd, width);
-    }
-    push_kv_row(
-        rows,
-        "received",
-        &format_preview_bytes(argument_bytes),
-        width,
-    );
-    if truncated {
+    let title = visual.title.as_deref().unwrap_or(&visual.schema);
+    push_degraded_tool_visual_rows(rows, title, message, width);
+    if let Some(subtitle) = &visual.subtitle {
         push_wrapped_styled_text(
             rows,
             vec![Span::styled("  ", muted_style())],
-            "preview truncated by live display limit",
+            subtitle,
             width,
             muted_style(),
             muted_style(),
         );
     }
-    rows.push(Line::default());
 }
 
-fn push_query_preview_rows(
-    rows: &mut Vec<Line>,
-    title: &str,
-    fields: &std::collections::BTreeMap<String, String>,
-    argument_bytes: usize,
-    truncated: bool,
-    width: u16,
-) {
+fn push_degraded_tool_visual_rows(rows: &mut Vec<Line>, title: &str, message: &str, width: u16) {
     push_wrapped_styled_text(
         rows,
         Vec::new(),
         title,
         width,
-        Style::new().fg(Color::Cyan),
-        Style::new().fg(Color::Cyan),
+        Style::new().fg(Color::Yellow),
+        Style::new().fg(Color::Yellow),
     );
-    for (key, value) in fields {
-        push_kv_row(rows, key, value, width);
-    }
-    push_kv_row(
+    push_wrapped_styled_text(
         rows,
-        "received",
-        &format_preview_bytes(argument_bytes),
+        vec![Span::styled("  ", muted_style())],
+        message,
         width,
+        muted_style(),
+        muted_style(),
     );
-    if truncated {
-        push_wrapped_styled_text(
-            rows,
-            vec![Span::styled("  ", muted_style())],
-            "preview truncated by live display limit",
-            width,
-            muted_style(),
-            muted_style(),
-        );
-    }
-    rows.push(Line::default());
 }
 
 fn push_terminal_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) {
@@ -1281,22 +1159,6 @@ fn terminal_title(
     )
 }
 
-fn artifact_visual_rows(
-    plugin_host: Option<&bcode_plugin::PluginHost>,
-    artifact: &bcode_session_models::ToolArtifact,
-    width: u16,
-) -> Option<Vec<Line>> {
-    let host = plugin_host?;
-    let route = host.visual_adapter(
-        &artifact.schema,
-        artifact.schema_version,
-        "tui",
-        Some(&artifact.producer_plugin_id),
-    )?;
-    host.tui_registry(&route.plugin_id)?
-        .visual_rows(&route.schema, &artifact.metadata, width)
-}
-
 struct ToolResultRenderContext<'a> {
     tool_call_id: &'a str,
     tool_name: Option<&'a str>,
@@ -1330,11 +1192,9 @@ fn push_tool_result_rows(
         },
         muted_style(),
     );
-    if let Some(native_rows) = context
-        .artifact
-        .and_then(|artifact| artifact_visual_rows(plugin_host, artifact, width))
-    {
-        rows.extend(native_rows);
+    if let Some(artifact) = context.artifact {
+        let visual = CanonicalToolVisual::from_artifact(artifact);
+        push_canonical_tool_visual_rows(rows, &visual, width, plugin_host);
         rows.push(Line::default());
         return;
     }
@@ -1367,20 +1227,6 @@ fn push_tool_result_rows(
         );
     }
     rows.push(Line::default());
-}
-
-fn push_kv_row(rows: &mut Vec<Line>, key: &str, value: &str, width: u16) {
-    push_wrapped_styled_text(
-        rows,
-        vec![
-            Span::styled("  ", muted_style()),
-            Span::styled(format!("{key}: "), muted_style()),
-        ],
-        value,
-        width,
-        Style::new(),
-        muted_style(),
-    );
 }
 
 fn push_labeled_text_preview(

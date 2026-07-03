@@ -44,32 +44,78 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapte
             .get("new_text")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
+        let title = payload
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| payload.get("summary").and_then(serde_json::Value::as_str))
+            .unwrap_or_else(|| {
+                if payload.get("tool_name").is_some() {
+                    "File change"
+                } else {
+                    "Streaming preview"
+                }
+            });
         let subtitle = payload.get("subtitle").and_then(serde_json::Value::as_str);
+        let argument_bytes = payload
+            .get("argument_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|bytes| usize::try_from(bytes).ok());
         let truncated = payload
             .get("truncated")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        file_change_rows(path, old_text, new_text, subtitle, truncated, width)
+        file_change_rows(
+            FileChangeRowsInput {
+                path,
+                old_text,
+                new_text,
+                title,
+                subtitle,
+                argument_bytes,
+                truncated,
+            },
+            width,
+        )
     }
 }
 
-fn file_change_rows(
-    path: &str,
-    old_text: &str,
-    new_text: &str,
-    subtitle: Option<&str>,
+fn format_preview_bytes(bytes: usize) -> String {
+    const KIB: usize = 1024;
+    const MIB: usize = KIB * 1024;
+    if bytes >= MIB {
+        let whole = bytes / MIB;
+        let decimal = (bytes % MIB) * 10 / MIB;
+        format!("{whole}.{decimal} MiB")
+    } else if bytes >= KIB {
+        let whole = bytes / KIB;
+        let decimal = (bytes % KIB) * 10 / KIB;
+        format!("{whole}.{decimal} KiB")
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FileChangeRowsInput<'a> {
+    path: &'a str,
+    old_text: &'a str,
+    new_text: &'a str,
+    title: &'a str,
+    subtitle: Option<&'a str>,
+    argument_bytes: Option<usize>,
     truncated: bool,
-    width: u16,
-) -> Vec<Line> {
-    let diff = diff_from_text(path, old_text, new_text);
+}
+
+fn file_change_rows(input: FileChangeRowsInput<'_>, width: u16) -> Vec<Line> {
+    let diff = diff_from_text(input.path, input.old_text, input.new_text);
     let mut rows = Vec::new();
     rows.push(Line::from_spans(vec![
         Span::styled("  ", muted_style()),
         Span::styled(
             format!(
                 "{} · {}",
-                subtitle.unwrap_or("Streaming preview"),
-                mode_label(old_text.is_empty())
+                input.title,
+                mode_label(input.old_text.is_empty())
             ),
             Style::new().fg(Color::Cyan),
         ),
@@ -88,7 +134,23 @@ fn file_change_rows(
         Span::styled(change_summary(diff.added, diff.removed), muted_style()),
     ]));
 
-    if truncated {
+    if let Some(argument_bytes) = input.argument_bytes {
+        rows.push(Line::from_spans(vec![
+            Span::styled("  ", muted_style()),
+            Span::styled(
+                format!("received: {}", format_preview_bytes(argument_bytes)),
+                muted_style(),
+            ),
+        ]));
+    }
+    if let Some(subtitle) = input.subtitle {
+        rows.push(Line::from_spans(vec![
+            Span::styled("  ", muted_style()),
+            Span::styled(subtitle.to_owned(), muted_style()),
+        ]));
+    }
+
+    if input.truncated {
         rows.push(Line::from_spans(vec![
             Span::styled("  ", muted_style()),
             Span::styled(
@@ -472,6 +534,28 @@ const fn syntax_style(style: SyntaxStyle) -> Style {
 mod tests {
     use super::*;
 
+    fn test_file_change_rows(
+        path: &str,
+        old_text: &str,
+        new_text: &str,
+        title: &str,
+        truncated: bool,
+        width: u16,
+    ) -> Vec<Line> {
+        file_change_rows(
+            FileChangeRowsInput {
+                path,
+                old_text,
+                new_text,
+                title,
+                subtitle: None,
+                argument_bytes: None,
+                truncated,
+            },
+            width,
+        )
+    }
+
     #[test]
     fn adapter_supports_raw_filesystem_change_artifact_schema() {
         let payload = serde_json::json!({
@@ -504,7 +588,7 @@ mod tests {
             .map(|index| format!("line {index}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let rows = file_change_rows("src/lib.rs", "", &new_text, Some("Applying"), false, 80);
+        let rows = test_file_change_rows("src/lib.rs", "", &new_text, "Applying", false, 80);
         let rendered = format!("{rows:?}");
         assert!(rendered.contains("src/lib.rs  +40 -0"));
         assert!(rendered.contains("diff rows hidden"));
@@ -512,11 +596,11 @@ mod tests {
 
     #[test]
     fn file_change_rows_use_pre_migration_inline_diff_palette() {
-        let rows = file_change_rows(
+        let rows = test_file_change_rows(
             "src/lib.rs",
             "let value = 1;\n",
             "let value = 2;\n",
-            None,
+            "File change",
             false,
             80,
         );
@@ -532,11 +616,11 @@ mod tests {
 
     #[test]
     fn file_change_rows_render_available_new_text_without_pending_warning() {
-        let rows = file_change_rows(
+        let rows = test_file_change_rows(
             "src/lib.rs",
             "",
             "fn main() {\n    println!(\"hello\");\n}\n",
-            Some("Editing"),
+            "Editing",
             false,
             80,
         );
@@ -577,11 +661,11 @@ mod tests {
 
     #[test]
     fn file_change_rows_use_pre_migration_progress_and_line_number_fallback() {
-        let rows = file_change_rows(
+        let rows = test_file_change_rows(
             "src/lib.rs",
             "let value = 1;\n",
             "let value = 2;\n",
-            None,
+            "File change",
             false,
             80,
         );
@@ -641,11 +725,11 @@ mod tests {
 
     #[test]
     fn file_change_card_excludes_file_and_hunk_headers() {
-        let rows = file_change_rows(
+        let rows = test_file_change_rows(
             "src/lib.rs",
             "fn main() {\n    let value = 1;\n}\n",
             "fn main() {\n    let value = 2;\n}\n",
-            None,
+            "File change",
             false,
             80,
         );
@@ -665,11 +749,11 @@ mod tests {
 
     #[test]
     fn progress_count_excludes_file_and_hunk_headers() {
-        let rows = file_change_rows(
+        let rows = test_file_change_rows(
             "src/lib.rs",
             "fn main() {\n    let value = 1;\n}\n",
             "fn main() {\n    let value = 2;\n}\n",
-            None,
+            "File change",
             false,
             80,
         );
@@ -684,18 +768,18 @@ mod tests {
 
     #[test]
     fn no_content_diff_rows_skip_the_card() {
-        let rows = file_change_rows("src/lib.rs", "", "", None, false, 80);
+        let rows = test_file_change_rows("src/lib.rs", "", "", "File change", false, 80);
         assert!(!rows.iter().any(is_card_row));
     }
 
     #[test]
     fn file_change_card_rows_share_one_width_and_never_exceed_available_width() {
         let available_width = 80;
-        let rows = file_change_rows(
+        let rows = test_file_change_rows(
             "src/lib.rs",
             "let value = 1;\n",
             "let value = 2;\n",
-            None,
+            "File change",
             false,
             available_width,
         );
@@ -715,11 +799,11 @@ mod tests {
 
     #[test]
     fn file_change_rows_include_headers() {
-        let rows = file_change_rows(
+        let rows = test_file_change_rows(
             "src/lib.rs",
             "let x = 1;\n",
             "let x = 2;\n",
-            None,
+            "File change",
             false,
             80,
         );

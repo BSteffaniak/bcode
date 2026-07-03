@@ -6,7 +6,6 @@ use bcode_session_models::{
     SessionEvent, SessionEventKind, SessionTokenUsage, ToolArtifact, ToolInvocationProjection,
     ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
 };
-use serde_json::Value;
 
 /// Semantic transcript item type.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1165,65 +1164,6 @@ pub fn artifact_summary_text(artifact: &ToolArtifact) -> String {
         .and_then(serde_json::Value::as_str);
     let text = path.map_or_else(|| summary.to_owned(), |path| format!("{summary}\n{path}"));
     format!("{title}\n{text}")
-}
-
-pub fn plugin_view_payload_summary_text(payload: &Value) -> String {
-    let Some(object) = payload.as_object() else {
-        return scalar_payload_text(payload);
-    };
-    let mut lines = Vec::new();
-    if let Some(summary) = object.get("summary").and_then(Value::as_str)
-        && !summary.is_empty()
-    {
-        lines.push(summary.to_string());
-    }
-    let path = object.get("path").and_then(Value::as_str);
-    if let Some(path) = path
-        && !path.is_empty()
-    {
-        lines.push(format!("path: {path}"));
-    }
-    let old_text = object.get("old_text").and_then(Value::as_str);
-    let new_text = object.get("new_text").and_then(Value::as_str);
-    if old_text.is_some() || new_text.is_some() {
-        lines.push(file_change_summary_text(
-            path.unwrap_or("file"),
-            old_text.unwrap_or_default(),
-            new_text.unwrap_or_default(),
-        ));
-    }
-    for (key, value) in object {
-        if matches!(key.as_str(), "summary" | "path" | "old_text" | "new_text") {
-            continue;
-        }
-        let value = scalar_payload_text(value);
-        if !value.is_empty() {
-            lines.push(format!("{key}: {value}"));
-        }
-    }
-    if lines.is_empty() {
-        "plugin view payload".to_string()
-    } else {
-        lines.join("\n")
-    }
-}
-
-fn file_change_summary_text(path: &str, old_text: &str, new_text: &str) -> String {
-    let mut lines = vec![format!("--- {path}"), format!("+++ {path}")];
-    lines.extend(old_text.lines().map(|line| format!("-{line}")));
-    lines.extend(new_text.lines().map(|line| format!("+{line}")));
-    lines.join("\n")
-}
-
-fn scalar_payload_text(value: &Value) -> String {
-    match value {
-        Value::Null => String::new(),
-        Value::Bool(value) => value.to_string(),
-        Value::Number(value) => value.to_string(),
-        Value::String(value) => value.clone(),
-        Value::Array(values) => format!("{} items", values.len()),
-        Value::Object(values) => format!("{} fields", values.len()),
-    }
 }
 
 fn apply_tool_invocation_stream_event(
