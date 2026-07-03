@@ -53,12 +53,35 @@ pub fn semantic_result_supersedes_live_preview(
     if artifact.tool_call_id.as_deref() != Some(tool_call_id) {
         return false;
     }
-    let LiveToolArgumentPreview::PluginView(view) = preview else {
-        return false;
-    };
-    view.producer_plugin_id == artifact.producer_plugin_id
-        && view.schema == artifact.schema
-        && view.schema_version == artifact.schema_version
+    live_preview_artifact_identity(preview).is_some_and(|identity| {
+        identity.producer_plugin_id == artifact.producer_plugin_id
+            && identity.schema == artifact.schema
+            && identity.schema_version == artifact.schema_version
+    })
+}
+
+struct LivePreviewArtifactIdentity<'a> {
+    producer_plugin_id: &'a str,
+    schema: &'a str,
+    schema_version: u32,
+}
+
+fn live_preview_artifact_identity(
+    preview: &LiveToolArgumentPreview,
+) -> Option<LivePreviewArtifactIdentity<'_>> {
+    match preview {
+        LiveToolArgumentPreview::PluginView(view) => Some(LivePreviewArtifactIdentity {
+            producer_plugin_id: &view.producer_plugin_id,
+            schema: &view.schema,
+            schema_version: view.schema_version,
+        }),
+        LiveToolArgumentPreview::FileEdit(_) => Some(LivePreviewArtifactIdentity {
+            producer_plugin_id: "bcode.filesystem",
+            schema: "bcode.filesystem.change",
+            schema_version: 1,
+        }),
+        LiveToolArgumentPreview::ShellCommand(_) | LiveToolArgumentPreview::Query(_) => None,
+    }
 }
 
 impl CanonicalToolVisual {

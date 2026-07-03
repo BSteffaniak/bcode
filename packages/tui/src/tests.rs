@@ -6247,6 +6247,95 @@ fn live_file_preview_updates_without_duplicates_and_final_replaces_it() {
 }
 
 #[test]
+fn live_file_preview_is_removed_when_final_filesystem_artifact_arrives() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
+        session_id,
+        kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
+            turn_id: "turn-1".to_owned(),
+            tool_call_id: "call_write".to_owned(),
+            tool_name: "filesystem.write".to_owned(),
+            argument_bytes: 18,
+            preview: LiveToolArgumentPreview::FileEdit(LiveFileEditPreview {
+                preview_title: Some("Write preview".to_owned()),
+                streaming_status: Some("writing src/main.rs".to_owned()),
+                path: Some("src/main.rs".to_owned()),
+                old_text_prefix: None,
+                new_text_prefix: "fn main() {}".to_owned(),
+                old_text_required: false,
+                argument_bytes: 18,
+                truncated: false,
+            }),
+        },
+    });
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call_write".to_owned(),
+            producer_plugin_id: None,
+            tool_name: "filesystem.write".to_owned(),
+            arguments_json: serde_json::json!({
+                "path": "src/main.rs",
+                "contents": "fn main() {}",
+            })
+            .to_string(),
+            legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call_write".to_owned(),
+            result: "wrote 12 bytes".to_owned(),
+            is_error: false,
+            output: None,
+            semantic_result: Some(ToolInvocationResult::Artifact {
+                artifact: Box::new(ToolArtifact {
+                    artifact_id: "call_write-filesystem-change".to_owned(),
+                    producer_plugin_id: "bcode.filesystem".to_owned(),
+                    schema: "bcode.filesystem.change".to_owned(),
+                    schema_version: 1,
+                    tool_call_id: Some("call_write".to_owned()),
+                    title: Some("File change".to_owned()),
+                    metadata: serde_json::json!({
+                        "tool_name": "filesystem.write",
+                        "summary": "wrote 12 bytes",
+                        "path": "src/main.rs",
+                        "old_text": "",
+                        "new_text": "fn main() {}",
+                    }),
+                    refs: Vec::new(),
+                }),
+            }),
+        },
+    ));
+
+    assert!(
+        !app.transcript()
+            .iter()
+            .any(|item| item.is_live_preview_anchor_for("call_write"))
+    );
+    assert_eq!(
+        app.transcript()
+            .iter()
+            .filter(|item| matches!(item.kind(), TranscriptItemKind::ToolResult { .. }))
+            .count(),
+        1
+    );
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 30));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut app, &mut frame);
+    let output = rendered_text(&buffer);
+    assert!(output.contains("File change"), "{output}");
+    assert!(!output.contains("Write preview"), "{output}");
+    assert!(!output.contains("received:"), "{output}");
+}
+
+#[test]
 fn live_file_preview_renders_available_new_text_before_original_text() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
