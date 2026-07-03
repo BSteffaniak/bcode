@@ -10,7 +10,6 @@ use ssh_key::{Algorithm, LineEnding, PrivateKey, rand_core::OsRng};
 use sshenv_vault::models::{ProfileFactorRequirement, UnlockFactorKindV2, VERSION_V2};
 
 const BCODE_VAULT_KEY_DIR_SUFFIX: &str = "keys";
-const MACOS_DEVICE_ONLY_KEYCHAIN_SERVICE: &str = "sshenv device seal device-only noninteractive v1";
 const BCODE_VAULT_PRIVATE_KEY_FILE_NAME: &str = "bcode_sshenv_ed25519";
 const BCODE_VAULT_PUBLIC_KEY_FILE_NAME: &str = "bcode_sshenv_ed25519.pub";
 const BCODE_VAULT_KEY_COMMENT: &str = "bcode sshenv vault key";
@@ -856,68 +855,8 @@ fn profile_device_seal_matches_options(
     profile: &str,
     options: sshenv_vault::device::DeviceSealOptions,
 ) -> bool {
-    let Some(metadata) = profile_device_seal_metadata(vault, profile) else {
-        return false;
-    };
-    metadata
-        .params
-        .get("backend")
-        .is_some_and(|backend| expected_device_seal_backends(options).contains(&backend.as_str()))
-        && metadata
-            .params
-            .get("strict")
-            .is_none_or(|strict| parse_bool_setting(strict, options.strict) == options.strict)
-        && profile_device_seal_storage_matches(&metadata.params)
-}
-
-fn profile_device_seal_storage_matches(params: &BTreeMap<String, String>) -> bool {
-    params.get("backend").is_none_or(|backend| {
-        backend != "macos-keychain-device-only"
-            || params
-                .get("keychain-service")
-                .is_some_and(|service| service == MACOS_DEVICE_ONLY_KEYCHAIN_SERVICE)
-    })
-}
-
-const fn expected_device_seal_backends(
-    options: sshenv_vault::device::DeviceSealOptions,
-) -> &'static [&'static str] {
-    match options.selection {
-        sshenv_vault::device::DeviceSealSelection::Policy(policy) => match policy {
-            sshenv_vault::device::DeviceSealPolicy::Default => &[
-                "secure-enclave",
-                "macos-keychain",
-                "linux-secret-service",
-                "windows-dpapi",
-                "tpm",
-                "local-file",
-            ],
-            sshenv_vault::device::DeviceSealPolicy::TransparentDeviceOnly if options.strict => {
-                &["macos-keychain-device-only", "windows-dpapi", "tpm"]
-            }
-            sshenv_vault::device::DeviceSealPolicy::TransparentDeviceOnly => &[
-                "macos-keychain-device-only",
-                "windows-dpapi",
-                "tpm",
-                "linux-secret-service",
-            ],
-        },
-        sshenv_vault::device::DeviceSealSelection::Backend(backend) => match backend {
-            sshenv_vault::device::DeviceSealBackendSelection::MacosKeychain => &["macos-keychain"],
-            sshenv_vault::device::DeviceSealBackendSelection::MacosKeychainDeviceOnly => {
-                &["macos-keychain-device-only"]
-            }
-            sshenv_vault::device::DeviceSealBackendSelection::WindowsDpapiCurrentUser => {
-                &["windows-dpapi"]
-            }
-            sshenv_vault::device::DeviceSealBackendSelection::LinuxTpm => &["tpm"],
-            sshenv_vault::device::DeviceSealBackendSelection::LinuxSecretService => {
-                &["linux-secret-service"]
-            }
-            sshenv_vault::device::DeviceSealBackendSelection::SecureEnclave => &["secure-enclave"],
-            sshenv_vault::device::DeviceSealBackendSelection::LocalFile => &["local-file"],
-        },
-    }
+    profile_device_seal_metadata(vault, profile)
+        .is_some_and(|metadata| sshenv_vault::device::factor_matches_options(metadata, options))
 }
 
 fn profile_device_seal_metadata<'a>(

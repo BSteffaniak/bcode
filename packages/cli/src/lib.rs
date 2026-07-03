@@ -3654,6 +3654,9 @@ const fn format_auth_device_seal_selection(
             sshenv_vault::device::DeviceSealBackendSelection::MacosKeychainDeviceOnly => {
                 "macos-keychain-device-only"
             }
+            sshenv_vault::device::DeviceSealBackendSelection::MacosKeychainDeviceOnlyAnyApplication => {
+                "macos-keychain-device-only-any-application"
+            }
             sshenv_vault::device::DeviceSealBackendSelection::WindowsDpapiCurrentUser => {
                 "windows-dpapi-current-user"
             }
