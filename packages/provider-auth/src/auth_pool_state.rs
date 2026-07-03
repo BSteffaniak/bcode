@@ -63,6 +63,9 @@ pub struct AuthPoolUsageWindowState {
     /// Provider window id within the meter.
     #[serde(default)]
     pub window_id: String,
+    /// Window length in seconds when known.
+    #[serde(default)]
+    pub window_duration_secs: Option<u64>,
     /// Provider reset timestamp in Unix seconds when known.
     #[serde(default)]
     pub resets_at_unix: Option<u64>,
@@ -242,6 +245,7 @@ pub fn record_profile_usage_windows(
                         meter_id: meter.meter_id.clone(),
                         window_id: window.window_id.clone(),
                         resets_at_unix: window.resets_at_unix,
+                        window_duration_secs: window.window_duration_secs,
                         used_percent: window.used_percent,
                         observed_at_unix: window.observed_at_unix,
                         primed_at_unix: None,

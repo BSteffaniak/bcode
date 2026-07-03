@@ -42,6 +42,9 @@ pub const OP_FINISH_TURN: &str = "finish_turn";
 /// Operation for provider-confirmed auth usage window discovery.
 pub const OP_AUTH_USAGE: &str = "auth_usage";
 
+/// Operation for explicitly priming provider auth usage windows.
+pub const OP_AUTH_PRIME: &str = "auth_prime";
+
 /// Provider-level capability report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderCapabilities {
@@ -644,6 +647,9 @@ pub struct AuthUsageResponse {
     /// Optional degraded-state explanation when discovery could not produce complete data.
     #[serde(default)]
     pub degraded_reason: Option<String>,
+    /// Optional debug metadata useful for provider integration diagnostics.
+    #[serde(default)]
+    pub debug: BTreeMap<String, String>,
     /// Usage meters returned by the provider.
     #[serde(default)]
     pub meters: Vec<AuthUsageMeterSnapshot>,
@@ -688,6 +694,65 @@ pub struct AuthUsageWindowSnapshot {
     /// Provider/source identifier for this observation.
     #[serde(default)]
     pub source: Option<String>,
+}
+
+/// Request for explicitly priming provider auth usage windows.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthPrimeRequest {
+    /// Provider context identifying the auth profile to prime.
+    #[serde(default)]
+    pub provider_context: ProviderRequestContext,
+    /// Required usage windows grouped by provider meter id.
+    #[serde(default)]
+    pub required_windows: BTreeMap<String, Vec<String>>,
+    /// Optional model id to use for providers that prime by sending a small model request.
+    #[serde(default)]
+    pub model_id: Option<String>,
+    /// Request timeout in seconds.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+    /// Prime even when provider usage appears already active.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// Result of explicitly priming provider auth usage windows.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthPrimeResponse {
+    /// Prime operation status.
+    pub status: AuthPrimeStatus,
+    /// Usage snapshot before priming, when available.
+    #[serde(default)]
+    pub before: Option<AuthUsageResponse>,
+    /// Usage snapshot after priming, when available.
+    #[serde(default)]
+    pub after: Option<AuthUsageResponse>,
+    /// Windows touched by the priming request.
+    #[serde(default)]
+    pub touched: Vec<AuthUsageWindowRef>,
+    /// Optional human-readable detail.
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// Prime operation status.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthPrimeStatus {
+    #[default]
+    Unsupported,
+    AlreadyPrimed,
+    Primed,
+    Failed,
+}
+
+/// Reference to one provider usage window.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthUsageWindowRef {
+    /// Provider meter id.
+    pub meter_id: String,
+    /// Provider window id.
+    pub window_id: String,
 }
 
 /// Provider-neutral request context resolved by the host from model/provider profiles.

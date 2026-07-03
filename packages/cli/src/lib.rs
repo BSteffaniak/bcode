@@ -1407,6 +1407,10 @@ enum AuthCommand {
         #[command(subcommand)]
         command: AuthPoolCommand,
     },
+    Prime {
+        #[command(subcommand)]
+        command: AuthPrimeCommand,
+    },
     Login {
         #[arg(long)]
         profile: Option<String>,
@@ -1438,6 +1442,56 @@ enum AuthPoolCommand {
         #[arg(default_value = "openai")]
         pool: String,
         profile: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthPrimeCommand {
+    /// Prime all subscription auth profiles in a provider/auth pool.
+    Run {
+        #[arg(default_value = "openai")]
+        pool: String,
+        /// Only prime one auth profile.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Exclude the primary auth profile.
+        #[arg(long)]
+        no_primary: bool,
+        /// Deprecated alias retained for compatibility; primary is included by default.
+        #[arg(long, hide = true)]
+        include_primary: bool,
+        /// Prime even when windows appear already active.
+        #[arg(long)]
+        force: bool,
+        /// Show what would be primed without sending requests.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print JSON output.
+        #[arg(long)]
+        json: bool,
+        /// Request timeout in seconds.
+        #[arg(long, default_value_t = 20)]
+        timeout_seconds: u64,
+    },
+    /// Report priming window status for a provider/auth pool.
+    Status {
+        #[arg(default_value = "openai")]
+        pool: String,
+        /// Only report one auth profile.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Exclude the primary auth profile.
+        #[arg(long)]
+        no_primary: bool,
+        /// Deprecated alias retained for compatibility; primary is included by default.
+        #[arg(long, hide = true)]
+        include_primary: bool,
+        /// Refresh provider usage windows before reporting.
+        #[arg(long)]
+        refresh: bool,
+        /// Print JSON output.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -2116,12 +2170,598 @@ fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
                 Ok(())
             }
         },
+        AuthCommand::Prime { command } => handle_auth_prime_command(command),
         AuthCommand::Login {
             profile,
             vault,
             recipient_key,
         } => auth_login(profile, vault, recipient_key),
     }
+}
+
+fn handle_auth_prime_command(command: AuthPrimeCommand) -> Result<(), CliError> {
+    match command {
+        AuthPrimeCommand::Run {
+            pool,
+            profile,
+            no_primary,
+            include_primary: _include_primary,
+            force,
+            dry_run,
+            json,
+            timeout_seconds,
+        } => auth_prime_run(
+            &pool,
+            profile.as_deref(),
+            !no_primary,
+            force,
+            dry_run,
+            json,
+            timeout_seconds,
+        ),
+        AuthPrimeCommand::Status {
+            pool,
+            profile,
+            no_primary,
+            include_primary: _include_primary,
+            refresh,
+            json,
+        } => auth_prime_status(&pool, profile.as_deref(), !no_primary, refresh, json),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AuthPrimeProfileTarget {
+    profile: String,
+    source: String,
+    candidate: bcode_model::ProviderAuthCandidate,
+    primary: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AuthPrimePlan {
+    pool: String,
+    provider_plugin_id: String,
+    required_windows: BTreeMap<String, Vec<String>>,
+    targets: Vec<AuthPrimeProfileTarget>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AuthPrimeReport {
+    pool: String,
+    provider_plugin_id: String,
+    refreshed: bool,
+    dry_run: bool,
+    profiles: Vec<AuthPrimeProfileReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AuthPrimeProfileReport {
+    profile: String,
+    source: String,
+    primary: bool,
+    status: String,
+    needs_priming: bool,
+    reason: Option<String>,
+    windows: Vec<AuthPrimeWindowReport>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    debug: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AuthPrimeWindowReport {
+    meter_id: String,
+    window_id: String,
+    status: String,
+    used_percent: Option<u32>,
+    window_duration_secs: Option<u64>,
+    resets_at_unix: Option<u64>,
+    observed_at_unix: Option<u64>,
+    primed_at_unix: Option<u64>,
+    source: Option<String>,
+    detail: String,
+}
+
+#[allow(clippy::fn_params_excessive_bools)]
+fn auth_prime_status(
+    pool: &str,
+    profile: Option<&str>,
+    include_primary: bool,
+    refresh: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    let plan = auth_prime_plan(pool, profile, include_primary)?;
+    let refresh_debug = if refresh {
+        refresh_prime_usage_windows(&plan)?
+    } else {
+        BTreeMap::new()
+    };
+    let report = auth_prime_report(&plan, refresh, false, &refresh_debug);
+    print_auth_prime_report(&report, json)
+}
+
+#[allow(clippy::fn_params_excessive_bools)]
+fn auth_prime_run(
+    pool: &str,
+    profile: Option<&str>,
+    include_primary: bool,
+    force: bool,
+    dry_run: bool,
+    json: bool,
+    timeout_seconds: u64,
+) -> Result<(), CliError> {
+    let plan = auth_prime_plan(pool, profile, include_primary)?;
+    let _refresh_debug = refresh_prime_usage_windows(&plan)?;
+    let mut report = auth_prime_report(&plan, true, dry_run, &BTreeMap::new());
+    if !dry_run {
+        let config = bcode_config::load_config()?;
+        let selected_model_id = config.resolved_model_selection().selected_model_id;
+        let mut host = load_cli_plugin_host()?;
+        for (index, target) in plan.targets.iter().enumerate() {
+            if !force && !report.profiles[index].needs_priming {
+                continue;
+            }
+            let mut provider_context = provider_context_for_prime_target(&plan, target);
+            provider_context.auth_pool_selection_reason = Some("manual_prime".to_string());
+            let request = bcode_model::AuthPrimeRequest {
+                provider_context,
+                required_windows: plan.required_windows.clone(),
+                model_id: selected_model_id.clone(),
+                timeout_seconds: Some(timeout_seconds),
+                force,
+            };
+            let response: bcode_model::AuthPrimeResponse = host
+                .invoke_service_json(
+                    &plan.provider_plugin_id,
+                    bcode_model::MODEL_PROVIDER_INTERFACE_ID,
+                    bcode_model::OP_AUTH_PRIME,
+                    &request,
+                )
+                .map_err(plugin_service_call_error)?;
+            let profile_report = &mut report.profiles[index];
+            profile_report.status = match response.status {
+                bcode_model::AuthPrimeStatus::Primed => "primed".to_string(),
+                bcode_model::AuthPrimeStatus::AlreadyPrimed => "already_primed".to_string(),
+                bcode_model::AuthPrimeStatus::Unsupported => "unsupported".to_string(),
+                bcode_model::AuthPrimeStatus::Failed => "failed".to_string(),
+            };
+            profile_report.reason = response.message;
+            if let Some(usage) = response.after.as_ref().or(response.before.as_ref()) {
+                bcode_provider_auth::auth_pool_state::record_profile_usage_windows(
+                    Some(&plan.pool),
+                    Some(&target.profile),
+                    &usage.meters,
+                );
+            }
+            if response.status == bcode_model::AuthPrimeStatus::Primed {
+                bcode_provider_auth::auth_pool_state::mark_profile_primed(
+                    Some(&plan.pool),
+                    Some(&target.profile),
+                );
+                bcode_provider_auth::auth_pool_state::mark_profile_usage_windows_primed(
+                    Some(&plan.pool),
+                    Some(&target.profile),
+                    &plan.required_windows,
+                );
+            }
+        }
+        host.deactivate_all()?;
+        report = auth_prime_report(&plan, true, dry_run, &BTreeMap::new());
+    }
+    print_auth_prime_report(&report, json)
+}
+
+fn auth_prime_plan(
+    pool: &str,
+    profile: Option<&str>,
+    include_primary: bool,
+) -> Result<AuthPrimePlan, CliError> {
+    let config = bcode_config::load_config()?;
+    let registry = bcode_config::load_runtime_auth_subscriptions();
+    let declared_pool = config.auth.pools.get(pool);
+    let runtime_pool = registry.pools.get(pool);
+    let resolved_selection = config.resolved_model_selection();
+    let selected_primary_profile = resolved_selection.auth_profile.clone();
+    if declared_pool.is_none()
+        && runtime_pool.is_none()
+        && !(pool == "openai" && selected_primary_profile.is_some())
+    {
+        return Err(CliError::LoginProfile(format!(
+            "Auth pool '{pool}' is not declared or registered."
+        )));
+    }
+    let provider_plugin_id = declared_pool
+        .and_then(|pool| pool.provider_plugin_id.clone())
+        .or_else(|| runtime_pool.and_then(|pool| pool.provider_plugin_id.clone()))
+        .unwrap_or_else(|| "bcode.openai-compatible".to_string());
+    let required_windows = required_prime_windows(pool, declared_pool);
+    let include_primary = include_primary || profile.is_some();
+    let mut targets = Vec::new();
+    let mut seen = BTreeSet::new();
+    let primary_profile = selected_primary_profile.or_else(|| {
+        (resolved_selection.auth_pool.as_deref() == Some(pool))
+            .then(|| declared_pool.and_then(|pool| pool.profiles.first().cloned()))
+            .flatten()
+    });
+    let mut all_profiles = Vec::<(String, String)>::new();
+    if let Some(primary_profile) = &primary_profile {
+        all_profiles.push((primary_profile.clone(), "primary".to_string()));
+    }
+    if let Some(pool_config) = declared_pool {
+        all_profiles.extend(
+            pool_config
+                .profiles
+                .iter()
+                .map(|profile| (profile.clone(), "declared".to_string())),
+        );
+    }
+    if let Some(pool_config) = runtime_pool {
+        all_profiles.extend(
+            pool_config
+                .profiles
+                .iter()
+                .map(|profile| (profile.auth_profile.clone(), "runtime".to_string())),
+        );
+    }
+    for (profile_name, source) in all_profiles {
+        if !seen.insert(profile_name.clone()) {
+            continue;
+        }
+        let primary = primary_profile.as_deref() == Some(profile_name.as_str());
+        if primary && !include_primary {
+            continue;
+        }
+        if profile.is_some_and(|requested| requested != profile_name) {
+            continue;
+        }
+        if let Some(candidate) = auth_prime_candidate(&config, &registry, pool, &profile_name) {
+            targets.push(AuthPrimeProfileTarget {
+                profile: profile_name,
+                source,
+                candidate,
+                primary,
+            });
+        }
+    }
+    Ok(AuthPrimePlan {
+        pool: pool.to_string(),
+        provider_plugin_id,
+        required_windows,
+        targets,
+    })
+}
+
+fn auth_prime_candidate(
+    config: &bcode_config::BcodeConfig,
+    registry: &bcode_config::RuntimeAuthSubscriptions,
+    pool: &str,
+    profile_name: &str,
+) -> Option<bcode_model::ProviderAuthCandidate> {
+    if let Some(auth_profile) = config.auth.profiles.get(profile_name) {
+        let resolved = bcode_provider_auth::resolve_auth_profile(profile_name, auth_profile);
+        return Some(bcode_model::ProviderAuthCandidate {
+            profile: Some(profile_name.to_string()),
+            auth: resolved.auth,
+            env: resolved.env,
+        });
+    }
+    let runtime_profile = registry
+        .pools
+        .get(pool)?
+        .profiles
+        .iter()
+        .find(|candidate| candidate.auth_profile == profile_name)?;
+    let auth_profile = runtime_subscription_auth_profile_config(runtime_profile);
+    let resolved = bcode_provider_auth::resolve_auth_profile(profile_name, &auth_profile);
+    Some(bcode_model::ProviderAuthCandidate {
+        profile: Some(profile_name.to_string()),
+        auth: resolved.auth,
+        env: resolved.env,
+    })
+}
+
+fn runtime_subscription_auth_profile_config(
+    profile: &bcode_config::RuntimeAuthSubscriptionProfile,
+) -> bcode_config::AuthProfileConfig {
+    bcode_config::AuthProfileConfig {
+        backend: "sshenv".to_string(),
+        scheme: Some(profile.scheme.clone()),
+        map: BTreeMap::new(),
+        settings: BTreeMap::from([
+            ("provider".to_string(), profile.provider.clone()),
+            ("profile".to_string(), profile.storage_profile.clone()),
+            ("vault".to_string(), profile.vault.display().to_string()),
+            ("mode".to_string(), "chatgpt".to_string()),
+        ]),
+    }
+}
+
+fn required_prime_windows(
+    pool: &str,
+    declared_pool: Option<&bcode_config::AuthPoolConfig>,
+) -> BTreeMap<String, Vec<String>> {
+    let configured = declared_pool
+        .map(|pool| pool.priming.required_windows.clone())
+        .unwrap_or_default();
+    if !configured.is_empty() {
+        return configured;
+    }
+    if pool == "openai" {
+        return BTreeMap::from([(
+            "codex".to_string(),
+            vec!["primary".to_string(), "secondary".to_string()],
+        )]);
+    }
+    BTreeMap::new()
+}
+
+fn provider_context_for_prime_target(
+    plan: &AuthPrimePlan,
+    target: &AuthPrimeProfileTarget,
+) -> bcode_model::ProviderRequestContext {
+    bcode_model::ProviderRequestContext {
+        auth_profile: Some(target.profile.clone()),
+        auth_pool: Some(plan.pool.clone()),
+        auth_pool_routing: bcode_model::ProviderAuthPoolRouting {
+            priming_enabled: true,
+            priming_include_primary: true,
+            priming_provider_windows: true,
+            priming_required_windows: plan.required_windows.clone(),
+            ..bcode_model::ProviderAuthPoolRouting::default()
+        },
+        auth: Some(target.candidate.auth.clone()),
+        env: target.candidate.env.clone(),
+        ..bcode_model::ProviderRequestContext::default()
+    }
+}
+
+fn refresh_prime_usage_windows(
+    plan: &AuthPrimePlan,
+) -> Result<BTreeMap<String, BTreeMap<String, String>>, CliError> {
+    let mut refresh_debug = BTreeMap::new();
+    let mut host = load_cli_plugin_host()?;
+    for target in &plan.targets {
+        let request = bcode_model::AuthUsageRequest {
+            provider_context: provider_context_for_prime_target(plan, target),
+            meter_ids: plan.required_windows.keys().cloned().collect(),
+        };
+        let response = host.invoke_service_json::<_, bcode_model::AuthUsageResponse>(
+            &plan.provider_plugin_id,
+            bcode_model::MODEL_PROVIDER_INTERFACE_ID,
+            bcode_model::OP_AUTH_USAGE,
+            &request,
+        );
+        match response {
+            Ok(response) => {
+                refresh_debug.insert(target.profile.clone(), response.debug.clone());
+                if response.supported {
+                    bcode_provider_auth::auth_pool_state::record_profile_usage_windows(
+                        Some(&plan.pool),
+                        Some(&target.profile),
+                        &response.meters,
+                    );
+                }
+            }
+            Err(error) => {
+                refresh_debug.insert(
+                    target.profile.clone(),
+                    BTreeMap::from([("error".to_string(), error.to_string())]),
+                );
+            }
+        }
+    }
+    host.deactivate_all()?;
+    Ok(refresh_debug)
+}
+
+fn auth_prime_report(
+    plan: &AuthPrimePlan,
+    refreshed: bool,
+    dry_run: bool,
+    refresh_debug: &BTreeMap<String, BTreeMap<String, String>>,
+) -> AuthPrimeReport {
+    let state = load_openai_auth_pool_state();
+    let now = unix_now_secs();
+    let profiles = plan
+        .targets
+        .iter()
+        .map(|target| auth_prime_profile_report(plan, target, &state, now, refresh_debug))
+        .collect();
+    AuthPrimeReport {
+        pool: plan.pool.clone(),
+        provider_plugin_id: plan.provider_plugin_id.clone(),
+        refreshed,
+        dry_run,
+        profiles,
+    }
+}
+
+fn auth_prime_profile_report(
+    plan: &AuthPrimePlan,
+    target: &AuthPrimeProfileTarget,
+    state: &bcode_provider_auth::auth_pool_state::AuthPoolState,
+    now: u64,
+    refresh_debug: &BTreeMap<String, BTreeMap<String, String>>,
+) -> AuthPrimeProfileReport {
+    let key = format!("{}/{}", plan.pool, target.profile);
+    let entry = state.entries.get(&key);
+    let windows = auth_prime_window_reports(&plan.required_windows, entry, now);
+    let needs_priming = bcode_provider_auth::auth_pool_state::profile_needs_priming_with_windows(
+        Some(&plan.pool),
+        Some(&target.profile),
+        &plan.required_windows,
+        None,
+    );
+    let status = if windows.is_empty() {
+        "unknown"
+    } else if needs_priming {
+        "needs_priming"
+    } else {
+        "primed"
+    };
+    let mut debug = refresh_debug
+        .get(&target.profile)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(entry) = entry {
+        if let Some(last_success_unix) = entry.last_success_unix {
+            debug.insert(
+                "last_success_unix".to_string(),
+                last_success_unix.to_string(),
+            );
+        }
+        if let Some(primed_unix) = entry.primed_unix {
+            debug.insert("primed_unix".to_string(), primed_unix.to_string());
+        }
+    }
+    AuthPrimeProfileReport {
+        profile: target.profile.clone(),
+        source: target.source.clone(),
+        primary: target.primary,
+        status: status.to_string(),
+        needs_priming,
+        reason: windows
+            .iter()
+            .find(|window| window.status != "active")
+            .map(|window| window.detail.clone()),
+        windows,
+        debug,
+    }
+}
+
+fn auth_prime_window_reports(
+    required_windows: &BTreeMap<String, Vec<String>>,
+    entry: Option<&bcode_provider_auth::auth_pool_state::AuthPoolProfileState>,
+    now: u64,
+) -> Vec<AuthPrimeWindowReport> {
+    let mut targets = BTreeSet::<(String, String)>::new();
+    for (meter_id, windows) in required_windows {
+        for window_id in windows {
+            targets.insert((meter_id.clone(), window_id.clone()));
+        }
+    }
+    if targets.is_empty()
+        && let Some(entry) = entry
+    {
+        for (meter_id, windows) in &entry.usage_windows {
+            for window_id in windows.keys() {
+                targets.insert((meter_id.clone(), window_id.clone()));
+            }
+        }
+    }
+    targets
+        .into_iter()
+        .map(|(meter_id, window_id)| {
+            let window = entry
+                .and_then(|entry| entry.usage_windows.get(&meter_id))
+                .and_then(|windows| windows.get(&window_id));
+            auth_prime_window_report(&meter_id, &window_id, window, now)
+        })
+        .collect()
+}
+
+fn auth_prime_window_report(
+    meter_id: &str,
+    window_id: &str,
+    window: Option<&bcode_provider_auth::auth_pool_state::AuthPoolUsageWindowState>,
+    now: u64,
+) -> AuthPrimeWindowReport {
+    let (status, detail) = match window {
+        None => ("missing", "no provider usage snapshot".to_string()),
+        Some(window)
+            if window
+                .resets_at_unix
+                .is_some_and(|resets_at| resets_at <= now) =>
+        {
+            ("expired", "provider usage window has reset".to_string())
+        }
+        Some(window) if window.used_percent.is_some_and(|percent| percent > 0) => {
+            ("active", usage_detail(window, now))
+        }
+        Some(window) if window.primed_at_unix.is_some() => (
+            "active",
+            format!(
+                "{}; locally touched for current provider window",
+                usage_detail(window, now)
+            ),
+        ),
+        Some(window) => (
+            "needs_priming",
+            format!(
+                "{}; provider reports 0% used and no local prime touch",
+                usage_detail(window, now)
+            ),
+        ),
+    };
+    AuthPrimeWindowReport {
+        meter_id: meter_id.to_string(),
+        window_id: window_id.to_string(),
+        status: status.to_string(),
+        used_percent: window.and_then(|window| window.used_percent),
+        window_duration_secs: window.and_then(|window| window.window_duration_secs),
+        resets_at_unix: window.and_then(|window| window.resets_at_unix),
+        observed_at_unix: window.map(|window| window.observed_at_unix),
+        primed_at_unix: window.and_then(|window| window.primed_at_unix),
+        source: window.and_then(|window| window.source.clone()),
+        detail,
+    }
+}
+
+fn usage_detail(
+    window: &bcode_provider_auth::auth_pool_state::AuthPoolUsageWindowState,
+    now: u64,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(used_percent) = window.used_percent {
+        parts.push(format!(
+            "{used_percent}% used / {}% remaining",
+            100_u32.saturating_sub(used_percent)
+        ));
+    }
+    if let Some(duration) = window.window_duration_secs {
+        parts.push(format!("{} window", format_duration(duration)));
+    }
+    if let Some(resets_at) = window.resets_at_unix {
+        parts.push(format!(
+            "resets at {} (in {})",
+            format_unix_timestamp(resets_at),
+            format_duration(resets_at.saturating_sub(now))
+        ));
+    }
+    if parts.is_empty() {
+        "provider usage window is active".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn print_auth_prime_report(report: &AuthPrimeReport, json: bool) -> Result<(), CliError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    println!("Prime status: {}", report.pool);
+    println!("Provider plugin: {}", report.provider_plugin_id);
+    if report.dry_run {
+        println!("Mode: dry run");
+    }
+    if report.refreshed {
+        println!("Usage windows: refreshed");
+        println!("Debug metadata is included in `--json` output.");
+    }
+    println!();
+    println!("PROFILE\tSTATUS\tDETAIL");
+    for profile in &report.profiles {
+        let detail = profile.reason.as_deref().unwrap_or("-");
+        println!("{}\t{}\t{}", profile.profile, profile.status, detail);
+        for window in &profile.windows {
+            println!(
+                "  {}.{}\t{}\t{}",
+                window.meter_id, window.window_id, window.status, window.detail
+            );
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2427,6 +3067,10 @@ fn format_duration(seconds: u64) -> String {
     } else {
         format!("{minutes}m")
     }
+}
+
+fn format_unix_timestamp(timestamp: u64) -> String {
+    timestamp.to_string()
 }
 
 #[allow(clippy::too_many_lines)]
