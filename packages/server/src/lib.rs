@@ -7483,13 +7483,15 @@ async fn handle_subscribe_runtime_work(
     writer: &SharedWriter,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
-    let attachment = state
-        .sessions
-        .attach_session_recent(session_id, ClientId::new(), 1)
-        .await?;
+    let subscription = state.sessions.subscribe_session_events(session_id).await?;
+    let runtime_work = state.sessions.active_runtime_work(session_id).await?;
     let handle = forward_runtime_work_events(
         ClientEventSink::new(client_id, writer.clone()),
-        attachment.events,
+        runtime_work
+            .into_iter()
+            .flat_map(|work| runtime_work_projection_to_events(session_id, work))
+            .collect(),
+        subscription.events,
     );
     state.register_client_forwarder(client_id, handle).await;
     send_response(
@@ -10928,7 +10930,9 @@ async fn handle_provider_turn_event(
     }
     match event {
         ProviderTurnEvent::TextDelta { text } => {
-            append_provider_event_trace(state, session_id, turn_id, "text_delta", None).await;
+            if state.observability.debug_enabled() {
+                append_provider_event_trace(state, session_id, turn_id, "text_delta", None).await;
+            }
             state.metrics.record_histogram(
                 "model.provider.text_delta_chars",
                 text.chars().count() as u64,
@@ -11035,7 +11039,10 @@ async fn handle_provider_turn_event(
         ProviderTurnEvent::ReasoningDelta { text } => {
             stream.push_reasoning(&text);
             stream.flush_if_ready(state).await;
-            append_provider_event_trace(state, session_id, turn_id, "reasoning_delta", None).await;
+            if state.observability.debug_enabled() {
+                append_provider_event_trace(state, session_id, turn_id, "reasoning_delta", None)
+                    .await;
+            }
         }
         ProviderTurnEvent::ToolCallDelta { call_id, delta } => {
             stream_progress.record_tool_call_delta(&call_id, &delta);
@@ -15631,9 +15638,21 @@ fn forward_session_events(
 
 fn forward_runtime_work_events(
     sink: ClientEventSink,
+    initial_events: Vec<bcode_session_models::SessionEvent>,
     mut events: tokio::sync::broadcast::Receiver<bcode_session_models::SessionEvent>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        for event in initial_events {
+            if let Err(error) = sink.send(Event::RuntimeWork(event)).await {
+                if !is_expected_disconnect(&error) {
+                    eprintln!(
+                        "failed to send runtime work event to {}: {error}",
+                        sink.client_id()
+                    );
+                }
+                return;
+            }
+        }
         while let Ok(event) = events.recv().await {
             if !matches!(
                 event.kind,

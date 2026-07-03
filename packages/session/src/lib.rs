@@ -512,6 +512,14 @@ pub struct SessionAttachment {
     pub live_events: broadcast::Receiver<SessionLiveEvent>,
 }
 
+/// Non-mutating event subscription for a session.
+#[derive(Debug)]
+pub struct SessionEventSubscription {
+    pub session: SessionSummary,
+    pub events: broadcast::Receiver<SessionEvent>,
+    pub live_events: broadcast::Receiver<SessionLiveEvent>,
+}
+
 /// Notification emitted after a durable session mutation is committed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionMutationCommitted {
@@ -1704,6 +1712,25 @@ impl SessionManager {
     ) -> Result<Option<String>, SessionError> {
         let handle = self.session_handle(session_id).await?;
         handle.current_agent_selection().await
+    }
+
+    /// Subscribe to a session's committed/live events without registering as an attached client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist.
+    pub async fn subscribe_session_events(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionEventSubscription, SessionError> {
+        self.ensure_session_loaded(session_id).await?;
+        let handle = self.session_handle(session_id).await?;
+        let (session, events, live_events) = handle.subscribe_events().await?;
+        Ok(SessionEventSubscription {
+            session,
+            events,
+            live_events,
+        })
     }
 
     /// Attach a client to an existing session.

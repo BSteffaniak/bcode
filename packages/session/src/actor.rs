@@ -11,7 +11,7 @@ use super::{
 use crate::db::{MaterializedProjection, SessionDb};
 use bcode_session_models::ProjectionWindowAnchor;
 use std::sync::RwLock;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 #[derive(Debug, Clone)]
 pub struct SessionHandle {
@@ -119,6 +119,10 @@ impl SessionHandle {
         receiver
             .await
             .map_err(|_| SessionError::NotFound(self.snapshot().summary.id))?
+    }
+
+    pub async fn subscribe_events(&self) -> Result<SessionEventReceivers, SessionError> {
+        self.send(SessionCommand::SubscribeEvents).await?
     }
 
     pub async fn detach(&self, client_id: ClientId) -> Result<bool, SessionError> {
@@ -255,6 +259,12 @@ pub enum AttachMode {
     ProjectionWindow { history: Vec<SessionEvent> },
 }
 
+type SessionEventReceivers = (
+    SessionSummary,
+    broadcast::Receiver<SessionEvent>,
+    broadcast::Receiver<SessionLiveEvent>,
+);
+
 enum SessionCommand {
     AppendEvent {
         kind: SessionEventKind,
@@ -274,6 +284,7 @@ enum SessionCommand {
         queued_at: Instant,
         reply: oneshot::Sender<Result<SessionAttachment, SessionError>>,
     },
+    SubscribeEvents(oneshot::Sender<Result<SessionEventReceivers, SessionError>>),
     Detach {
         client_id: ClientId,
         reply: oneshot::Sender<Result<bool, SessionError>>,
@@ -379,6 +390,9 @@ impl SessionActor {
             | SessionCommand::AppendUserMessage { .. }
             | SessionCommand::Attach { .. } => {
                 unreachable!("write commands are handled before read commands")
+            }
+            SessionCommand::SubscribeEvents(reply) => {
+                let _ = reply.send(Ok(self.subscribe_events()));
             }
             SessionCommand::Detach { client_id, reply } => {
                 let _ = reply.send(Ok(self.detach(client_id)));
@@ -763,6 +777,14 @@ impl SessionActor {
             events,
             live_events: self.state.live_events.subscribe(),
         })
+    }
+
+    fn subscribe_events(&self) -> SessionEventReceivers {
+        (
+            self.state.summary(),
+            self.state.sender.subscribe(),
+            self.state.live_events.subscribe(),
+        )
     }
 
     fn detach(&mut self, client_id: ClientId) -> bool {

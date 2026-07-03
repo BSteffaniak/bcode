@@ -29,7 +29,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
@@ -245,10 +245,25 @@ pub enum PluginConfigMetadataError {
     EmptyCategory,
 }
 
+/// Event delivery mode declared by a plugin manifest.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginEventDelivery {
+    /// Queue the event for plugin delivery without blocking the publisher.
+    #[default]
+    Async,
+    /// Block the publisher until the plugin handles the event or times out.
+    Barrier,
+}
+
 /// Event subscription declared by a plugin manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginEventSubscription {
     pub topic: String,
+    #[serde(default)]
+    pub delivery: PluginEventDelivery,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 /// Runtime configuration for a plugin.
@@ -900,6 +915,8 @@ pub enum PluginLoadError {
     EventEncode(#[source] serde_json::Error),
     #[error("plugin '{plugin_id}' event handler failed with code {code}")]
     EventHandlerFailed { plugin_id: String, code: i32 },
+    #[error("plugin '{plugin_id}' event handler timed out after {timeout_ms} ms")]
+    EventDeliveryTimeout { plugin_id: String, timeout_ms: u64 },
     #[error("plugin invocation {invocation_id:?} was cancelled before it started")]
     InvocationCancelled { invocation_id: PluginInvocationId },
     #[error("plugin '{plugin_id}' {hook} hook failed with code {code}")]
@@ -1957,11 +1974,67 @@ pub struct ServiceRuntimePolicy {
     pub class: Option<PluginInvocationClass>,
 }
 
+#[derive(Debug)]
+struct QueuedPluginEvent {
+    topic: String,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct PluginEventDispatcher {
+    plugin_id: String,
+    executor: Arc<PluginExecutorHandle>,
+    sender: mpsc::Sender<QueuedPluginEvent>,
+    receiver: Mutex<Option<mpsc::Receiver<QueuedPluginEvent>>>,
+    started: AtomicBool,
+}
+
+impl PluginEventDispatcher {
+    fn new(plugin_id: String, executor: Arc<PluginExecutorHandle>) -> Self {
+        let (sender, receiver) = mpsc::channel(256);
+        Self {
+            plugin_id,
+            executor,
+            sender,
+            receiver: Mutex::new(Some(receiver)),
+            started: AtomicBool::new(false),
+        }
+    }
+
+    fn start(&self) {
+        if self
+            .started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let Some(receiver) = self
+            .receiver
+            .lock()
+            .expect("plugin event dispatcher receiver lock")
+            .take()
+        else {
+            return;
+        };
+        spawn_plugin_event_dispatcher(self.plugin_id.clone(), Arc::clone(&self.executor), receiver);
+    }
+
+    fn try_send(
+        &self,
+        event: QueuedPluginEvent,
+    ) -> Result<(), mpsc::error::TrySendError<QueuedPluginEvent>> {
+        self.start();
+        self.sender.try_send(event)
+    }
+}
+
 /// Concurrent plugin runtime with plugin-local execution isolation.
 #[derive(Debug, Clone)]
 pub struct PluginRuntimeHost {
     registry: Arc<PluginRegistry>,
     executors: Arc<BTreeMap<String, Arc<PluginExecutorHandle>>>,
+    event_dispatchers: Arc<BTreeMap<String, Arc<PluginEventDispatcher>>>,
     configs: Arc<BTreeMap<String, ResolvedPluginConfig>>,
     command_registry: Arc<bcode_command::CommandRegistry>,
     tui_registries: Arc<BTreeMap<String, PluginTuiRegistry>>,
@@ -2376,24 +2449,55 @@ impl PluginRuntimeHost {
             .registry
             .manifests
             .values()
-            .filter(|manifest| manifest_subscribes_to(manifest, &topic))
-            .map(|manifest| manifest.id.clone())
+            .filter_map(|manifest| {
+                manifest_event_delivery_policy(manifest, &topic)
+                    .map(|policy| (manifest.id.clone(), policy))
+            })
             .collect::<Vec<_>>();
-        let mut deliveries = Vec::new();
-        for plugin_id in subscribers {
-            let executor = self
-                .executors
-                .get(&plugin_id)
-                .cloned()
-                .ok_or_else(|| PluginLoadError::PluginNotLoaded(plugin_id.clone()))?;
+        let mut barrier_deliveries = Vec::new();
+        let mut delivered = 0;
+        for (plugin_id, policy) in subscribers {
             let topic = topic.clone();
             let payload = payload.to_vec();
-            deliveries.push(tokio::spawn(async move {
-                executor.handle_event(topic, payload).await
-            }));
+            match policy.delivery {
+                PluginEventDelivery::Async => {
+                    let event = QueuedPluginEvent { topic, payload };
+                    let Some(dispatcher) = self.event_dispatchers.get(&plugin_id) else {
+                        return Err(PluginLoadError::PluginNotLoaded(plugin_id));
+                    };
+                    match dispatcher.try_send(event) {
+                        Ok(()) => {
+                            delivered += 1;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "bcode_plugin::events",
+                                plugin_id = %plugin_id,
+                                %error,
+                                "asynchronous plugin event queue rejected event"
+                            );
+                        }
+                    }
+                }
+                PluginEventDelivery::Barrier => {
+                    let executor = self
+                        .executors
+                        .get(&plugin_id)
+                        .cloned()
+                        .ok_or_else(|| PluginLoadError::PluginNotLoaded(plugin_id.clone()))?;
+                    barrier_deliveries.push(tokio::spawn(async move {
+                        tokio::time::timeout(policy.timeout, executor.handle_event(topic, payload))
+                            .await
+                            .map_err(|_| PluginLoadError::EventDeliveryTimeout {
+                                plugin_id: plugin_id.clone(),
+                                timeout_ms: u64::try_from(policy.timeout.as_millis())
+                                    .unwrap_or(u64::MAX),
+                            })?
+                    }));
+                }
+            }
         }
-        let mut delivered = 0;
-        for delivery in deliveries {
+        for delivery in barrier_deliveries {
             delivery
                 .await
                 .map_err(|_| PluginLoadError::PluginNotLoaded("event subscriber".to_string()))??;
@@ -2423,6 +2527,7 @@ impl From<PluginHost> for PluginRuntimeHost {
         let configs = std::mem::take(&mut host.configs);
         let mut manifests = BTreeMap::new();
         let mut executors = BTreeMap::new();
+        let mut event_dispatchers = BTreeMap::new();
         let mut tui_registries = BTreeMap::new();
         for plugin in loaded {
             let manifest = plugin.manifest().clone();
@@ -2449,25 +2554,48 @@ impl From<PluginHost> for PluginRuntimeHost {
                     PluginExecutorKind::Concurrent(Arc::new(plugin), None)
                 }
             };
-            executors.insert(
-                plugin_id,
-                Arc::new(PluginExecutorHandle::new(
-                    manifest.clone(),
-                    concurrency,
-                    executor,
-                    metrics,
-                )),
-            );
+            let handle = Arc::new(PluginExecutorHandle::new(
+                manifest.clone(),
+                concurrency,
+                executor,
+                metrics,
+            ));
+            let dispatcher = Arc::new(PluginEventDispatcher::new(
+                plugin_id.clone(),
+                Arc::clone(&handle),
+            ));
+            event_dispatchers.insert(plugin_id.clone(), dispatcher);
+            executors.insert(plugin_id, handle);
         }
         Self {
             registry: Arc::new(PluginRegistry::from_manifests(manifests)),
             executors: Arc::new(executors),
+            event_dispatchers: Arc::new(event_dispatchers),
             configs: Arc::new(configs),
             tui_registries: Arc::new(tui_registries),
             command_registry: Arc::new(std::mem::take(&mut host.command_registry)),
             resources: Arc::default(),
         }
     }
+}
+
+fn spawn_plugin_event_dispatcher(
+    plugin_id: String,
+    executor: Arc<PluginExecutorHandle>,
+    mut receiver: mpsc::Receiver<QueuedPluginEvent>,
+) {
+    tokio::spawn(async move {
+        while let Some(event) = receiver.recv().await {
+            if let Err(error) = executor.handle_event(event.topic, event.payload).await {
+                tracing::warn!(
+                    target: "bcode_plugin::events",
+                    plugin_id = %plugin_id,
+                    %error,
+                    "asynchronous plugin event delivery failed"
+                );
+            }
+        }
+    });
 }
 
 fn execute_plugin_service_invocation(
@@ -2678,11 +2806,41 @@ fn classify_invocation(interface_id: &str, operation: &str) -> PluginInvocationC
     }
 }
 
-fn manifest_subscribes_to(manifest: &PluginManifest, topic: &str) -> bool {
+#[derive(Debug, Clone, Copy)]
+struct EventDeliveryPolicy {
+    delivery: PluginEventDelivery,
+    timeout: Duration,
+}
+
+const DEFAULT_EVENT_BARRIER_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn manifest_event_delivery_policy(
+    manifest: &PluginManifest,
+    topic: &str,
+) -> Option<EventDeliveryPolicy> {
+    let mut subscriptions = manifest_event_subscriptions(manifest, topic).peekable();
+    subscriptions.peek()?;
+    let mut delivery = PluginEventDelivery::Async;
+    let mut timeout = DEFAULT_EVENT_BARRIER_TIMEOUT;
+    for subscription in subscriptions {
+        if subscription.delivery == PluginEventDelivery::Barrier {
+            delivery = PluginEventDelivery::Barrier;
+        }
+        if let Some(timeout_ms) = subscription.timeout_ms {
+            timeout = timeout.min(Duration::from_millis(timeout_ms));
+        }
+    }
+    Some(EventDeliveryPolicy { delivery, timeout })
+}
+
+fn manifest_event_subscriptions<'a>(
+    manifest: &'a PluginManifest,
+    topic: &str,
+) -> impl Iterator<Item = &'a PluginEventSubscription> {
     manifest
         .event_subscriptions
         .iter()
-        .any(|subscription| subscription.topic == topic)
+        .filter(move |subscription| subscription.topic == topic)
 }
 
 /// Loaded plugin host retaining activated plugins.
