@@ -12,7 +12,7 @@ pub mod auth_pool_routing;
 pub mod auth_pool_state;
 pub mod security;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 /// Request for resolving a provider request context from model and auth config.
@@ -54,31 +54,81 @@ pub fn resolve_provider_request_context(
         context.auth = Some(resolved.auth);
     }
 
-    if let Some(auth_pool_name) = request.selection.auth_pool.as_deref()
-        && let Some(auth_pool) = request.config.auth.pools.get(auth_pool_name)
-    {
-        context.auth_candidates = auth_pool
-            .profiles
-            .iter()
-            .filter_map(|profile_name| {
-                request
-                    .config
-                    .auth
-                    .profiles
-                    .get(profile_name)
-                    .map(|profile| {
-                        let resolved = resolve_auth_profile(profile_name, profile);
-                        bcode_model::ProviderAuthCandidate {
-                            profile: Some(profile_name.clone()),
-                            auth: resolved.auth,
-                            env: resolved.env,
-                        }
-                    })
-            })
-            .collect();
+    if let Some(auth_pool_name) = request.selection.auth_pool.as_deref() {
+        let mut candidates = Vec::new();
+        let mut seen = BTreeSet::new();
+        if let Some(auth_profile_name) = request.selection.auth_profile.as_deref() {
+            push_config_auth_candidate(
+                request.config,
+                auth_profile_name,
+                &mut candidates,
+                &mut seen,
+            );
+        }
+        if let Some(auth_pool) = request.config.auth.pools.get(auth_pool_name) {
+            for profile_name in &auth_pool.profiles {
+                push_config_auth_candidate(
+                    request.config,
+                    profile_name,
+                    &mut candidates,
+                    &mut seen,
+                );
+            }
+        }
+        let registry = bcode_config::load_runtime_auth_subscriptions();
+        if let Some(pool) = registry.pools.get(auth_pool_name) {
+            for profile in &pool.profiles {
+                if !seen.insert(profile.auth_profile.clone()) {
+                    continue;
+                }
+                let auth_profile = runtime_subscription_auth_profile_config(profile);
+                let resolved = resolve_auth_profile(&profile.auth_profile, &auth_profile);
+                candidates.push(bcode_model::ProviderAuthCandidate {
+                    profile: Some(profile.auth_profile.clone()),
+                    auth: resolved.auth,
+                    env: resolved.env,
+                });
+            }
+        }
+        context.auth_candidates = candidates;
     }
 
     context
+}
+
+fn push_config_auth_candidate(
+    config: &bcode_config::BcodeConfig,
+    auth_profile_name: &str,
+    candidates: &mut Vec<bcode_model::ProviderAuthCandidate>,
+    seen: &mut BTreeSet<String>,
+) {
+    if !seen.insert(auth_profile_name.to_string()) {
+        return;
+    }
+    if let Some(auth_profile) = config.auth.profiles.get(auth_profile_name) {
+        let resolved = resolve_auth_profile(auth_profile_name, auth_profile);
+        candidates.push(bcode_model::ProviderAuthCandidate {
+            profile: Some(auth_profile_name.to_string()),
+            auth: resolved.auth,
+            env: resolved.env,
+        });
+    }
+}
+
+fn runtime_subscription_auth_profile_config(
+    profile: &bcode_config::RuntimeAuthSubscriptionProfile,
+) -> bcode_config::AuthProfileConfig {
+    bcode_config::AuthProfileConfig {
+        backend: "sshenv".to_string(),
+        scheme: Some(profile.scheme.clone()),
+        map: BTreeMap::new(),
+        settings: BTreeMap::from([
+            ("provider".to_string(), profile.provider.clone()),
+            ("profile".to_string(), profile.storage_profile.clone()),
+            ("vault".to_string(), profile.vault.display().to_string()),
+            ("mode".to_string(), "chatgpt".to_string()),
+        ]),
+    }
 }
 
 /// Auth material and compatibility environment resolved for a selected profile.
@@ -376,6 +426,9 @@ fn selected_auth_pool_routing(
     let Some(pool) = config.auth.pools.get(auth_pool) else {
         return bcode_model::ProviderAuthPoolRouting::default();
     };
+    let provider_plugin_id = pool.provider_plugin_id.as_deref();
+    let mut required_windows = pool.priming.required_windows.clone();
+    apply_default_priming_required_windows(auth_pool, provider_plugin_id, &mut required_windows);
     bcode_model::ProviderAuthPoolRouting {
         strategy: Some(match pool.strategy {
             bcode_config::AuthPoolStrategy::Failover => "failover".to_string(),
@@ -386,7 +439,23 @@ fn selected_auth_pool_routing(
         priming_reprime_after: pool.priming.reprime_after.clone(),
         priming_provider_windows: pool.priming.provider_windows,
         priming_fallback_reprime_after: pool.priming.fallback_reprime_after.clone(),
-        priming_required_windows: pool.priming.required_windows.clone(),
+        priming_required_windows: required_windows,
+    }
+}
+
+fn apply_default_priming_required_windows(
+    pool: &str,
+    provider_plugin_id: Option<&str>,
+    required_windows: &mut BTreeMap<String, Vec<String>>,
+) {
+    if !required_windows.is_empty() {
+        return;
+    }
+    if pool == "openai" || provider_plugin_id == Some("bcode.openai-compatible") {
+        required_windows.insert(
+            "codex".to_string(),
+            vec!["primary".to_string(), "secondary".to_string()],
+        );
     }
 }
 
@@ -430,6 +499,66 @@ mod tests {
                 .get("api_key")
                 .map(|storage| storage.key.as_str()),
             Some("TEST_PROVIDER_KEY")
+        );
+    }
+
+    #[test]
+    fn openai_pool_priming_uses_codex_window_defaults() {
+        let config = bcode_config::BcodeConfig {
+            auth: bcode_config::AuthConfig {
+                pools: BTreeMap::from([(
+                    "openai".to_string(),
+                    bcode_config::AuthPoolConfig {
+                        provider_plugin_id: Some("bcode.openai-compatible".to_string()),
+                        priming: bcode_config::AuthPoolPrimingConfig {
+                            enabled: true,
+                            ..bcode_config::AuthPoolPrimingConfig::default()
+                        },
+                        ..bcode_config::AuthPoolConfig::default()
+                    },
+                )]),
+                ..bcode_config::AuthConfig::default()
+            },
+            ..bcode_config::BcodeConfig::default()
+        };
+
+        let routing = selected_auth_pool_routing(&config, Some("openai"));
+
+        assert!(routing.priming_enabled);
+        assert_eq!(
+            routing.priming_required_windows.get("codex"),
+            Some(&vec!["primary".to_string(), "secondary".to_string()])
+        );
+    }
+
+    #[test]
+    fn explicit_priming_windows_override_openai_defaults() {
+        let config = bcode_config::BcodeConfig {
+            auth: bcode_config::AuthConfig {
+                pools: BTreeMap::from([(
+                    "openai".to_string(),
+                    bcode_config::AuthPoolConfig {
+                        provider_plugin_id: Some("bcode.openai-compatible".to_string()),
+                        priming: bcode_config::AuthPoolPrimingConfig {
+                            required_windows: BTreeMap::from([(
+                                "custom".to_string(),
+                                vec!["daily".to_string()],
+                            )]),
+                            ..bcode_config::AuthPoolPrimingConfig::default()
+                        },
+                        ..bcode_config::AuthPoolConfig::default()
+                    },
+                )]),
+                ..bcode_config::AuthConfig::default()
+            },
+            ..bcode_config::BcodeConfig::default()
+        };
+
+        let routing = selected_auth_pool_routing(&config, Some("openai"));
+
+        assert_eq!(
+            routing.priming_required_windows,
+            BTreeMap::from([("custom".to_string(), vec!["daily".to_string()])])
         );
     }
 }
