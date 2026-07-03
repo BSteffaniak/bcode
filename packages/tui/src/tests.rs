@@ -1472,6 +1472,142 @@ async fn async_session_open_initial_state_preserves_existing_draft() {
     assert_eq!(chat.app.composer().text(), "draft before opening");
 }
 
+#[tokio::test]
+async fn async_session_open_initial_state_preserves_plugin_host() {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let session_id = SessionId::new();
+    let mut chat = super::session_flow::ActiveChat {
+        app: BmuxApp::new_with_history(None, &[], &[], false),
+        agents: super::session_flow::AgentCatalog::default(),
+        session_id: None,
+        event_sender: sender,
+        event_receiver: receiver,
+        event_task: None,
+        opening_session_id: None,
+        pending_effects: super::effects::TuiEffectQueue::default(),
+    };
+    chat.app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+
+    super::session_flow::start_switch_session(
+        &mut chat,
+        session_id,
+        super::session_flow::initial_transcript_window_request(Rect::new(0, 0, 80, 24)),
+    );
+
+    assert!(chat.app.plugin_host().is_some());
+}
+
+#[tokio::test]
+async fn async_session_open_completion_preserves_plugin_host() {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let session_id = SessionId::new();
+    let mut chat = super::session_flow::ActiveChat {
+        app: BmuxApp::new_with_history(Some(session_id), &[], &[], false),
+        agents: super::session_flow::AgentCatalog::default(),
+        session_id: None,
+        event_sender: sender,
+        event_receiver: receiver,
+        event_task: None,
+        opening_session_id: Some(session_id),
+        pending_effects: super::effects::TuiEffectQueue::default(),
+    };
+    chat.app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+    let (_event_sender, event_receiver) = tokio::sync::broadcast::channel::<SessionEvent>(1);
+    let attached = AttachedSessionHistory {
+        session: session_summary(session_id),
+        history: Vec::new(),
+        input_history: Vec::new(),
+        import_warnings: Vec::new(),
+        draft: None,
+        runtime_selection: bcode_ipc::SessionRuntimeSelection::default(),
+    };
+
+    super::session_flow::complete_switch_session(
+        &mut chat,
+        session_id,
+        false,
+        Ok((
+            attached,
+            tokio::spawn(async move {
+                drop(event_receiver);
+            }),
+        )),
+    );
+
+    assert!(chat.app.plugin_host().is_some());
+}
+
+#[test]
+fn switch_to_draft_session_preserves_plugin_host() {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let session_id = SessionId::new();
+    let mut chat = super::session_flow::ActiveChat {
+        app: BmuxApp::new_with_history(Some(session_id), &[], &[], false),
+        agents: super::session_flow::AgentCatalog::default(),
+        session_id: Some(session_id),
+        event_sender: sender,
+        event_receiver: receiver,
+        event_task: None,
+        opening_session_id: None,
+        pending_effects: super::effects::TuiEffectQueue::default(),
+    };
+    chat.app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+
+    super::session_flow::switch_to_draft_session(&mut chat);
+
+    assert!(chat.app.plugin_host().is_some());
+}
+
+#[tokio::test]
+async fn session_open_preserved_plugin_host_renders_live_file_preview() {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let session_id = SessionId::new();
+    let mut chat = super::session_flow::ActiveChat {
+        app: BmuxApp::new_with_history(None, &[], &[], false),
+        agents: super::session_flow::AgentCatalog::default(),
+        session_id: None,
+        event_sender: sender,
+        event_receiver: receiver,
+        event_task: None,
+        opening_session_id: None,
+        pending_effects: super::effects::TuiEffectQueue::default(),
+    };
+    chat.app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+
+    super::session_flow::start_switch_session(
+        &mut chat,
+        session_id,
+        super::session_flow::initial_transcript_window_request(Rect::new(0, 0, 80, 24)),
+    );
+    chat.app
+        .absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
+                turn_id: "turn-1".to_owned(),
+                tool_call_id: "call_write".to_owned(),
+                tool_name: "filesystem_write".to_owned(),
+                argument_bytes: 36,
+                preview: LiveToolArgumentPreview::FileEdit(LiveFileEditPreview {
+                    preview_title: Some("Write preview".to_owned()),
+                    streaming_status: Some("writing src/lib.rs".to_owned()),
+                    path: Some("src/lib.rs".to_owned()),
+                    old_text_prefix: None,
+                    new_text_prefix: "pub fn demo() {}".to_owned(),
+                    old_text_required: false,
+                    argument_bytes: 36,
+                    truncated: false,
+                }),
+            },
+        });
+
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 30));
+    let mut frame = Frame::new(&mut buffer);
+    render::render(&mut chat.app, &mut frame);
+    let output = rendered_text(&buffer);
+    assert!(output.contains("Write preview"), "{output}");
+    assert!(!output.contains("plugin host unavailable"), "{output}");
+}
+
 #[test]
 fn slash_pending_submission_clears_after_take() {
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);

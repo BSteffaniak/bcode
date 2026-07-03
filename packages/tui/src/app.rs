@@ -525,6 +525,15 @@ impl BmuxApp {
         app
     }
 
+    /// Move app-level presentation/runtime state from another app after recreating session state.
+    pub(crate) fn take_cross_session_state_from(&mut self, source: &Self) {
+        self.apply_tui_config(source.tui_config().clone());
+        self.set_daemon_connection(source.daemon_connection());
+        self.set_agent_metadata_hydrated(source.is_agent_metadata_hydrated());
+        self.plugin_host.clone_from(&source.plugin_host);
+        self.take_theme_transition_state_from(source);
+    }
+
     /// Set the local plugin runtime used for client-side presentation projection.
     pub fn set_plugin_host(&mut self, host: Arc<bcode_plugin::PluginHost>) {
         self.plugin_host = Some(host);

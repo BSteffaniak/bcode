@@ -142,9 +142,6 @@ pub fn start_switch_session(
         event_task.abort();
     }
     while chat.event_receiver.try_recv().is_ok() {}
-    let tui_config = chat.app.tui_config().clone();
-    let daemon_connection = chat.app.daemon_connection();
-    let agent_metadata_hydrated = chat.app.is_agent_metadata_hydrated();
     let draft_text = chat.app.composer().text().to_owned();
     chat.opening_session_id = Some(next_session_id);
     chat.session_id = None;
@@ -152,11 +149,7 @@ pub fn start_switch_session(
         &mut chat.app,
         BmuxApp::new_with_history(Some(next_session_id), &[], &[], false),
     );
-    chat.app.apply_tui_config(tui_config);
-    chat.app.set_daemon_connection(daemon_connection);
-    chat.app
-        .set_agent_metadata_hydrated(agent_metadata_hydrated);
-    chat.app.take_theme_transition_state_from(&previous_app);
+    chat.app.take_cross_session_state_from(&previous_app);
     chat.agents.refresh_app_agent_metadata(&mut chat.app);
     if !draft_text.is_empty() {
         chat.app.replace_composer_with(&draft_text);
@@ -189,9 +182,6 @@ pub fn complete_switch_session(
             let draft_text = chat.app.composer().text().to_owned();
             chat.event_task = Some(next_task);
             chat.session_id = Some(session_id);
-            let tui_config = chat.app.tui_config().clone();
-            let daemon_connection = chat.app.daemon_connection();
-            let agent_metadata_hydrated = chat.app.is_agent_metadata_hydrated();
             let previous_app = std::mem::replace(
                 &mut chat.app,
                 BmuxApp::new_with_history(
@@ -201,11 +191,7 @@ pub fn complete_switch_session(
                     has_older_history,
                 ),
             );
-            chat.app.apply_tui_config(tui_config);
-            chat.app.set_daemon_connection(daemon_connection);
-            chat.app
-                .set_agent_metadata_hydrated(agent_metadata_hydrated);
-            chat.app.take_theme_transition_state_from(&previous_app);
+            chat.app.take_cross_session_state_from(&previous_app);
             chat.agents.refresh_app_agent_metadata(&mut chat.app);
             if !draft_text.is_empty() {
                 chat.app.replace_composer_with(&draft_text);
@@ -322,19 +308,12 @@ pub fn switch_to_draft_session(chat: &mut ActiveChat) {
     while chat.event_receiver.try_recv().is_ok() {}
     chat.opening_session_id = None;
     chat.session_id = None;
-    let tui_config = chat.app.tui_config().clone();
-    let daemon_connection = chat.app.daemon_connection();
-    let agent_metadata_hydrated = chat.app.is_agent_metadata_hydrated();
     let current_agent_id = chat.app.current_agent_id().to_owned();
     let previous_app = std::mem::replace(
         &mut chat.app,
         BmuxApp::new_with_history(None, &[], &[], false),
     );
-    chat.app.apply_tui_config(tui_config);
-    chat.app.set_daemon_connection(daemon_connection);
-    chat.app
-        .set_agent_metadata_hydrated(agent_metadata_hydrated);
-    chat.app.take_theme_transition_state_from(&previous_app);
+    chat.app.take_cross_session_state_from(&previous_app);
     chat.agents
         .apply_agent_to_app(&mut chat.app, current_agent_id);
     chat.app.set_status("New draft".to_owned());

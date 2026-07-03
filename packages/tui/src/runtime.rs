@@ -72,8 +72,9 @@ pub async fn run_event_loop_with_startup_and_static_bundled<W: Write>(
     let mut terminal_events = TuiInput::start();
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
     let mut app = BmuxApp::new_with_history(session_id, &[], &[], false);
-    if let Ok(host) = super::plugin_tui::load_default_host_with_static_bundled(static_plugins) {
-        app.set_plugin_host(Arc::new(host));
+    match super::plugin_tui::load_default_host_with_static_bundled(static_plugins) {
+        Ok(host) => app.set_plugin_host(Arc::new(host)),
+        Err(error) => app.set_status(format!("plugin presentation unavailable: {error}")),
     }
     let agents = session_flow::AgentCatalog::default();
     agents.refresh_app_agent_metadata(&mut app);
