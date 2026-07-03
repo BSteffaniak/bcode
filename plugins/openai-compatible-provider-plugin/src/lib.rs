@@ -1126,6 +1126,7 @@ async fn auth_usage_inner(
                 "dialect".to_string(),
                 settings.dialect.metadata_value().to_string(),
             )]),
+            capabilities: bcode_model::AuthUsageCapabilities::default(),
             meters: Vec::new(),
         });
     }
@@ -1137,6 +1138,7 @@ async fn auth_usage_inner(
                 "auth_mode".to_string(),
                 settings.auth_diagnostics.mode.clone(),
             )]),
+            capabilities: bcode_model::AuthUsageCapabilities::default(),
             meters: Vec::new(),
         });
     };
@@ -1180,6 +1182,14 @@ async fn auth_usage_inner(
             ("response_body_bytes".to_string(), body.len().to_string()),
             ("response_body_json".to_string(), body),
         ]),
+        capabilities: bcode_model::AuthUsageCapabilities {
+            features: BTreeSet::from([
+                bcode_model::AuthUsageCapability::Refresh,
+                bcode_model::AuthUsageCapability::WindowReset,
+                bcode_model::AuthUsageCapability::UsedPercent,
+                bcode_model::AuthUsageCapability::Priming,
+            ]),
+        },
         meters,
     })
 }

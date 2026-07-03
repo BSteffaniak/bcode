@@ -1411,6 +1411,10 @@ enum AuthCommand {
         #[command(subcommand)]
         command: AuthPrimeCommand,
     },
+    Usage {
+        #[command(subcommand)]
+        command: AuthUsageCommand,
+    },
     Login {
         #[arg(long)]
         profile: Option<String>,
@@ -1442,6 +1446,27 @@ enum AuthPoolCommand {
         #[arg(default_value = "openai")]
         pool: String,
         profile: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthUsageCommand {
+    /// Report provider auth usage windows for a provider/auth pool.
+    Status {
+        #[arg(default_value = "openai")]
+        pool: String,
+        /// Only report one auth profile.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Exclude the primary auth profile.
+        #[arg(long)]
+        no_primary: bool,
+        /// Refresh provider usage windows before reporting.
+        #[arg(long)]
+        refresh: bool,
+        /// Print JSON output.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -2171,11 +2196,24 @@ fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
             }
         },
         AuthCommand::Prime { command } => handle_auth_prime_command(command),
+        AuthCommand::Usage { command } => handle_auth_usage_command(command),
         AuthCommand::Login {
             profile,
             vault,
             recipient_key,
         } => auth_login(profile, vault, recipient_key),
+    }
+}
+
+fn handle_auth_usage_command(command: AuthUsageCommand) -> Result<(), CliError> {
+    match command {
+        AuthUsageCommand::Status {
+            pool,
+            profile,
+            no_primary,
+            refresh,
+            json,
+        } => auth_usage_status(&pool, profile.as_deref(), !no_primary, refresh, json),
     }
 }
 
@@ -2236,6 +2274,26 @@ struct AuthPrimeReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct AuthUsageReport {
+    pool: String,
+    provider_plugin_id: String,
+    refreshed: bool,
+    profiles: Vec<AuthUsageProfileReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AuthUsageProfileReport {
+    profile: String,
+    source: String,
+    primary: bool,
+    status: String,
+    reason: Option<String>,
+    windows: Vec<AuthPrimeWindowReport>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    debug: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct AuthPrimeProfileReport {
     profile: String,
     source: String,
@@ -2260,6 +2318,23 @@ struct AuthPrimeWindowReport {
     primed_at_unix: Option<u64>,
     source: Option<String>,
     detail: String,
+}
+
+fn auth_usage_status(
+    pool: &str,
+    profile: Option<&str>,
+    include_primary: bool,
+    refresh: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    let plan = auth_prime_plan(pool, profile, include_primary)?;
+    let refresh_debug = if refresh {
+        refresh_prime_usage_windows(&plan)?
+    } else {
+        BTreeMap::new()
+    };
+    let report = auth_usage_report(&plan, refresh, &refresh_debug);
+    print_auth_usage_report(&report, json)
 }
 
 #[allow(clippy::fn_params_excessive_bools)]
@@ -2554,6 +2629,69 @@ fn refresh_prime_usage_windows(
     Ok(refresh_debug)
 }
 
+fn auth_usage_report(
+    plan: &AuthPrimePlan,
+    refreshed: bool,
+    refresh_debug: &BTreeMap<String, BTreeMap<String, String>>,
+) -> AuthUsageReport {
+    let state = load_openai_auth_pool_state();
+    let now = unix_now_secs();
+    let profiles = plan
+        .targets
+        .iter()
+        .map(|target| auth_usage_profile_report(plan, target, &state, now, refresh_debug))
+        .collect();
+    AuthUsageReport {
+        pool: plan.pool.clone(),
+        provider_plugin_id: plan.provider_plugin_id.clone(),
+        refreshed,
+        profiles,
+    }
+}
+
+fn auth_usage_profile_report(
+    plan: &AuthPrimePlan,
+    target: &AuthPrimeProfileTarget,
+    state: &bcode_provider_auth::auth_pool_state::AuthPoolState,
+    now: u64,
+    refresh_debug: &BTreeMap<String, BTreeMap<String, String>>,
+) -> AuthUsageProfileReport {
+    let key = format!("{}/{}", plan.pool, target.profile);
+    let entry = state.entries.get(&key);
+    let windows = auth_usage_window_reports(entry, now);
+    let status = if windows.is_empty() {
+        "unknown"
+    } else if windows.iter().any(|window| window.status == "expired") {
+        "expired"
+    } else {
+        "available"
+    };
+    let mut debug = refresh_debug
+        .get(&target.profile)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(entry) = entry
+        && let Some(last_success_unix) = entry.last_success_unix
+    {
+        debug.insert(
+            "last_success_unix".to_string(),
+            last_success_unix.to_string(),
+        );
+    }
+    AuthUsageProfileReport {
+        profile: target.profile.clone(),
+        source: target.source.clone(),
+        primary: target.primary,
+        status: status.to_string(),
+        reason: windows
+            .iter()
+            .find(|window| window.status == "missing" || window.status == "expired")
+            .map(|window| window.detail.clone()),
+        windows,
+        debug,
+    }
+}
+
 fn auth_prime_report(
     plan: &AuthPrimePlan,
     refreshed: bool,
@@ -2626,6 +2764,57 @@ fn auth_prime_profile_report(
             .map(|window| window.detail.clone()),
         windows,
         debug,
+    }
+}
+
+fn auth_usage_window_reports(
+    entry: Option<&bcode_provider_auth::auth_pool_state::AuthPoolProfileState>,
+    now: u64,
+) -> Vec<AuthPrimeWindowReport> {
+    let Some(entry) = entry else {
+        return Vec::new();
+    };
+    entry
+        .usage_windows
+        .iter()
+        .flat_map(|(meter_id, windows)| {
+            windows.iter().map(|(window_id, window)| {
+                auth_usage_window_report(meter_id, window_id, window, now)
+            })
+        })
+        .collect()
+}
+
+fn auth_usage_window_report(
+    meter_id: &str,
+    window_id: &str,
+    window: &bcode_provider_auth::auth_pool_state::AuthPoolUsageWindowState,
+    now: u64,
+) -> AuthPrimeWindowReport {
+    let status = if window
+        .resets_at_unix
+        .is_some_and(|resets_at| resets_at <= now)
+    {
+        "expired"
+    } else {
+        "available"
+    };
+    let detail = if status == "expired" {
+        "provider usage window has reset".to_string()
+    } else {
+        usage_detail(window, now)
+    };
+    AuthPrimeWindowReport {
+        meter_id: meter_id.to_string(),
+        window_id: window_id.to_string(),
+        status: status.to_string(),
+        used_percent: window.used_percent,
+        window_duration_secs: window.window_duration_secs,
+        resets_at_unix: window.resets_at_unix,
+        observed_at_unix: Some(window.observed_at_unix),
+        primed_at_unix: window.primed_at_unix,
+        source: window.source.clone(),
+        detail,
     }
 }
 
@@ -2733,6 +2922,32 @@ fn usage_detail(
     } else {
         parts.join(", ")
     }
+}
+
+fn print_auth_usage_report(report: &AuthUsageReport, json: bool) -> Result<(), CliError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    println!("Auth usage: {}", report.pool);
+    println!("Provider plugin: {}", report.provider_plugin_id);
+    if report.refreshed {
+        println!("Usage windows: refreshed");
+        println!("Debug metadata is included in `--json` output.");
+    }
+    println!();
+    println!("PROFILE\tSTATUS\tDETAIL");
+    for profile in &report.profiles {
+        let detail = profile.reason.as_deref().unwrap_or("-");
+        println!("{}\t{}\t{}", profile.profile, profile.status, detail);
+        for window in &profile.windows {
+            println!(
+                "  {}.{}\t{}\t{}",
+                window.meter_id, window.window_id, window.status, window.detail
+            );
+        }
+    }
+    Ok(())
 }
 
 fn print_auth_prime_report(report: &AuthPrimeReport, json: bool) -> Result<(), CliError> {

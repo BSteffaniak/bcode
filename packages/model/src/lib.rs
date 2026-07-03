@@ -650,9 +650,36 @@ pub struct AuthUsageResponse {
     /// Optional debug metadata useful for provider integration diagnostics.
     #[serde(default)]
     pub debug: BTreeMap<String, String>,
+    /// Optional provider capability metadata for this usage response.
+    #[serde(default)]
+    pub capabilities: AuthUsageCapabilities,
     /// Usage meters returned by the provider.
     #[serde(default)]
     pub meters: Vec<AuthUsageMeterSnapshot>,
+}
+
+/// Provider capability metadata for auth usage discovery.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthUsageCapabilities {
+    /// Provider-supported usage capability flags.
+    #[serde(default)]
+    pub features: BTreeSet<AuthUsageCapability>,
+}
+
+/// Individual provider capability for auth usage discovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthUsageCapability {
+    /// The provider can fetch fresh usage from an upstream service.
+    Refresh,
+    /// Returned windows may include reset timestamps.
+    WindowReset,
+    /// Returned windows may include percent usage.
+    UsedPercent,
+    /// Returned windows may include absolute usage/limit amounts.
+    AbsoluteAmounts,
+    /// The provider also supports explicit auth priming.
+    Priming,
 }
 
 /// Provider usage meter containing one or more windows.
