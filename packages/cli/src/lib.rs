@@ -100,6 +100,8 @@ pub enum CliError {
     PluginService { code: String, message: String },
     #[error("session repair usage error: {0}")]
     SessionRepairUsage(String),
+    #[error("{0}")]
+    AuthPrimeFailed(String),
     #[error("skill check failed: {warning_count} warnings, {error_count} errors")]
     SkillCheckFailed {
         warning_count: usize,
@@ -1497,6 +1499,15 @@ enum AuthPrimeCommand {
         /// Request timeout in seconds.
         #[arg(long, default_value_t = 20)]
         timeout_seconds: u64,
+        /// Maximum priming attempts per profile before reporting a failure.
+        #[arg(long, default_value_t = 100)]
+        max_attempts: u64,
+        /// Disable the maximum priming attempt cap.
+        #[arg(long)]
+        no_max_attempts: bool,
+        /// Delay between repeated priming attempts in seconds.
+        #[arg(long, default_value_t = 1)]
+        delay_seconds: u64,
     },
     /// Report priming window status for a provider/auth pool.
     Status {
@@ -2228,15 +2239,23 @@ fn handle_auth_prime_command(command: AuthPrimeCommand) -> Result<(), CliError> 
             dry_run,
             json,
             timeout_seconds,
-        } => auth_prime_run(
-            &pool,
-            profile.as_deref(),
-            !no_primary,
-            force,
-            dry_run,
-            json,
-            timeout_seconds,
-        ),
+            max_attempts,
+            no_max_attempts,
+            delay_seconds,
+        } => {
+            let options = AuthPrimeRunOptions {
+                pool: &pool,
+                profile: profile.as_deref(),
+                include_primary: !no_primary,
+                force,
+                dry_run,
+                json,
+                timeout_seconds,
+                max_attempts: (!no_max_attempts).then_some(max_attempts),
+                delay_seconds,
+            };
+            auth_prime_run(&options)
+        }
         AuthPrimeCommand::Status {
             pool,
             profile,
@@ -2301,6 +2320,11 @@ struct AuthPrimeProfileReport {
     status: String,
     needs_priming: bool,
     reason: Option<String>,
+    attempts: u64,
+    limit_hit: bool,
+    failure_code: Option<String>,
+    diagnostic: Option<String>,
+    remaining_windows: Vec<String>,
     windows: Vec<AuthPrimeWindowReport>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     debug: BTreeMap<String, String>,
@@ -2356,90 +2380,222 @@ fn auth_prime_status(
 }
 
 #[allow(clippy::fn_params_excessive_bools)]
-fn auth_prime_run(
-    pool: &str,
-    profile: Option<&str>,
+#[allow(clippy::struct_excessive_bools)]
+struct AuthPrimeRunOptions<'a> {
+    pool: &'a str,
+    profile: Option<&'a str>,
     include_primary: bool,
     force: bool,
     dry_run: bool,
     json: bool,
     timeout_seconds: u64,
-) -> Result<(), CliError> {
-    let plan = auth_prime_plan(pool, profile, include_primary)?;
+    max_attempts: Option<u64>,
+    delay_seconds: u64,
+}
+
+fn auth_prime_run(options: &AuthPrimeRunOptions<'_>) -> Result<(), CliError> {
+    let plan = auth_prime_plan(options.pool, options.profile, options.include_primary)?;
     let _refresh_debug = refresh_prime_usage_windows(&plan)?;
-    let mut report = auth_prime_report(&plan, true, dry_run, &BTreeMap::new());
-    if !dry_run {
+    let mut report = auth_prime_report(&plan, true, options.dry_run, &BTreeMap::new());
+    let failures = if options.dry_run {
+        Vec::new()
+    } else {
         let config = bcode_config::load_config()?;
         let selected_model_id = config.resolved_model_selection().selected_model_id;
         let mut host = load_cli_plugin_host()?;
-        for (index, target) in plan.targets.iter().enumerate() {
-            if !force && !report.profiles[index].needs_priming {
-                continue;
-            }
-            loop {
-                let mut provider_context = provider_context_for_prime_target(&plan, target);
-                provider_context.auth_pool_selection_reason = Some("manual_prime".to_string());
-                let request = bcode_model::AuthPrimeRequest {
-                    provider_context,
-                    required_windows: plan.required_windows.clone(),
-                    model_id: selected_model_id.clone(),
-                    timeout_seconds: Some(timeout_seconds),
-                    force,
-                };
-                let response: bcode_model::AuthPrimeResponse = host
-                    .invoke_service_json(
-                        &plan.provider_plugin_id,
-                        bcode_model::MODEL_PROVIDER_INTERFACE_ID,
-                        bcode_model::OP_AUTH_PRIME,
-                        &request,
-                    )
-                    .map_err(plugin_service_call_error)?;
-                let status = response.status;
-                let message = response.message.clone();
-                let has_after_usage = response.after.is_some();
-                if let Some(usage) = response.after.as_ref().or(response.before.as_ref()) {
-                    bcode_provider_auth::auth_pool_state::record_profile_usage_windows(
-                        Some(&plan.pool),
-                        Some(&target.profile),
-                        &usage.meters,
-                    );
-                }
-                report = auth_prime_report(&plan, true, dry_run, &BTreeMap::new());
-                let Some(profile_report) = report.profiles.get_mut(index) else {
-                    break;
-                };
-                if status == bcode_model::AuthPrimeStatus::Primed {
-                    bcode_provider_auth::auth_pool_state::mark_profile_primed(
-                        Some(&plan.pool),
-                        Some(&target.profile),
-                    );
-                    profile_report.status = "primed".to_string();
-                    profile_report.reason = message;
-                    break;
-                }
-                profile_report.status = match status {
-                    bcode_model::AuthPrimeStatus::Primed => "primed".to_string(),
-                    bcode_model::AuthPrimeStatus::AlreadyPrimed => "already_primed".to_string(),
-                    bcode_model::AuthPrimeStatus::Unsupported => "unsupported".to_string(),
-                    bcode_model::AuthPrimeStatus::Failed => "failed".to_string(),
-                };
-                profile_report.reason = message;
-                if !profile_report.needs_priming {
-                    bcode_provider_auth::auth_pool_state::mark_profile_primed(
-                        Some(&plan.pool),
-                        Some(&target.profile),
-                    );
-                    break;
-                }
-                if status != bcode_model::AuthPrimeStatus::Failed || !has_after_usage {
-                    break;
-                }
-            }
-        }
+        let failures = run_auth_prime_targets(
+            &plan,
+            &mut report,
+            &host,
+            selected_model_id.as_deref(),
+            options,
+        )?;
         host.deactivate_all()?;
-        report = auth_prime_report(&plan, true, dry_run, &BTreeMap::new());
+        failures
+    };
+    if failures.is_empty() {
+        return print_auth_prime_report(&report, options.json);
     }
-    print_auth_prime_report(&report, json)
+    print_auth_prime_report(&report, options.json)?;
+    Err(CliError::AuthPrimeFailed(failures.join("; ")))
+}
+
+fn run_auth_prime_targets(
+    plan: &AuthPrimePlan,
+    report: &mut AuthPrimeReport,
+    host: &bcode_plugin::PluginHost,
+    selected_model_id: Option<&str>,
+    options: &AuthPrimeRunOptions<'_>,
+) -> Result<Vec<String>, CliError> {
+    let mut failures = Vec::new();
+    for (index, target) in plan.targets.iter().enumerate() {
+        if !options.force && !report.profiles[index].needs_priming {
+            continue;
+        }
+        if let Some(failure) = run_auth_prime_target(
+            plan,
+            target,
+            index,
+            report,
+            host,
+            selected_model_id,
+            options,
+        )? {
+            failures.push(failure);
+            break;
+        }
+    }
+    Ok(failures)
+}
+
+fn run_auth_prime_target(
+    plan: &AuthPrimePlan,
+    target: &AuthPrimeProfileTarget,
+    index: usize,
+    report: &mut AuthPrimeReport,
+    host: &bcode_plugin::PluginHost,
+    selected_model_id: Option<&str>,
+    options: &AuthPrimeRunOptions<'_>,
+) -> Result<Option<String>, CliError> {
+    let mut attempts = 0_u64;
+    loop {
+        if let Some(limit) = options.max_attempts
+            && attempts >= limit
+        {
+            let Some(profile_report) = report.profiles.get_mut(index) else {
+                return Ok(Some(format!(
+                    "priming did not complete for {} after {attempts} attempts",
+                    target.profile
+                )));
+            };
+            return Ok(Some(record_auth_prime_limit_hit(
+                profile_report,
+                &target.profile,
+                attempts,
+                limit,
+            )));
+        }
+
+        attempts = attempts.saturating_add(1);
+        let response = send_auth_prime_request(plan, target, host, selected_model_id, options)?;
+        let status = response.status;
+        let message = response.message.clone();
+        let has_after_usage = response.after.is_some();
+        if let Some(usage) = response.after.as_ref().or(response.before.as_ref()) {
+            bcode_provider_auth::auth_pool_state::record_profile_usage_windows(
+                Some(&plan.pool),
+                Some(&target.profile),
+                &usage.meters,
+            );
+        }
+        *report = auth_prime_report(plan, true, options.dry_run, &BTreeMap::new());
+        let Some(profile_report) = report.profiles.get_mut(index) else {
+            return Ok(None);
+        };
+        profile_report.attempts = attempts;
+        profile_report.status = auth_prime_status_label(status).to_string();
+        profile_report.reason = message;
+
+        if status == bcode_model::AuthPrimeStatus::Primed || !profile_report.needs_priming {
+            bcode_provider_auth::auth_pool_state::mark_profile_primed(
+                Some(&plan.pool),
+                Some(&target.profile),
+            );
+            profile_report.status = "primed".to_string();
+            return Ok(None);
+        }
+
+        if status == bcode_model::AuthPrimeStatus::Unsupported {
+            return Ok(Some(record_auth_prime_unsupported(
+                profile_report,
+                &target.profile,
+            )));
+        }
+
+        if status != bcode_model::AuthPrimeStatus::Failed || !has_after_usage {
+            return Ok(Some(record_auth_prime_request_failure(
+                profile_report,
+                &target.profile,
+            )));
+        }
+
+        if options.delay_seconds > 0 {
+            std::thread::sleep(Duration::from_secs(options.delay_seconds));
+        }
+    }
+}
+
+fn send_auth_prime_request(
+    plan: &AuthPrimePlan,
+    target: &AuthPrimeProfileTarget,
+    host: &bcode_plugin::PluginHost,
+    selected_model_id: Option<&str>,
+    options: &AuthPrimeRunOptions<'_>,
+) -> Result<bcode_model::AuthPrimeResponse, CliError> {
+    let mut provider_context = provider_context_for_prime_target(plan, target);
+    provider_context.auth_pool_selection_reason = Some("manual_prime".to_string());
+    let request = bcode_model::AuthPrimeRequest {
+        provider_context,
+        required_windows: plan.required_windows.clone(),
+        model_id: selected_model_id.map(str::to_string),
+        timeout_seconds: Some(options.timeout_seconds),
+        force: options.force,
+    };
+    host.invoke_service_json(
+        &plan.provider_plugin_id,
+        bcode_model::MODEL_PROVIDER_INTERFACE_ID,
+        bcode_model::OP_AUTH_PRIME,
+        &request,
+    )
+    .map_err(plugin_service_call_error)
+}
+
+const fn auth_prime_status_label(status: bcode_model::AuthPrimeStatus) -> &'static str {
+    match status {
+        bcode_model::AuthPrimeStatus::Primed => "primed",
+        bcode_model::AuthPrimeStatus::AlreadyPrimed => "already_primed",
+        bcode_model::AuthPrimeStatus::Unsupported => "unsupported",
+        bcode_model::AuthPrimeStatus::Failed => "failed",
+    }
+}
+
+fn record_auth_prime_limit_hit(
+    report: &mut AuthPrimeProfileReport,
+    profile: &str,
+    attempts: u64,
+    limit: u64,
+) -> String {
+    report.status = "failed".to_string();
+    report.reason = Some(format!("max attempts reached after {attempts} attempts"));
+    report.attempts = attempts;
+    report.limit_hit = true;
+    report.failure_code = Some("max_attempts_reached".to_string());
+    report.diagnostic = Some(format!(
+        "Priming did not complete after {limit} attempts. This likely indicates provider usage did not advance for one or more required windows, or Bcode is targeting the wrong usage meter/profile."
+    ));
+    report.remaining_windows = remaining_prime_window_ids(report);
+    format!("priming did not complete for {profile} after {attempts} attempts")
+}
+
+fn record_auth_prime_unsupported(report: &mut AuthPrimeProfileReport, profile: &str) -> String {
+    report.status = "failed".to_string();
+    report.failure_code = Some("unsupported".to_string());
+    report.diagnostic = Some(
+        "Provider does not support priming/usage verification for this auth profile.".to_string(),
+    );
+    report.remaining_windows = remaining_prime_window_ids(report);
+    format!("provider does not support priming/usage verification for {profile}")
+}
+
+fn record_auth_prime_request_failure(report: &mut AuthPrimeProfileReport, profile: &str) -> String {
+    report.status = "failed".to_string();
+    report.failure_code = Some("priming_request_failed".to_string());
+    report.diagnostic = Some(
+        "Priming request failed before provider usage could be verified for all required windows."
+            .to_string(),
+    );
+    report.remaining_windows = remaining_prime_window_ids(report);
+    format!("priming request failed before verification completed for {profile}")
 }
 
 fn auth_prime_plan(
@@ -2768,6 +2924,7 @@ fn auth_prime_profile_report(
             debug.insert("primed_unix".to_string(), primed_unix.to_string());
         }
     }
+    let remaining_windows = remaining_prime_window_ids_from_windows(&windows);
     AuthPrimeProfileReport {
         profile: target.profile.clone(),
         source: target.source.clone(),
@@ -2778,9 +2935,26 @@ fn auth_prime_profile_report(
             .iter()
             .find(|window| window.status != "active")
             .map(|window| window.detail.clone()),
+        attempts: 0,
+        limit_hit: false,
+        failure_code: None,
+        diagnostic: None,
+        remaining_windows,
         windows,
         debug,
     }
+}
+
+fn remaining_prime_window_ids(report: &AuthPrimeProfileReport) -> Vec<String> {
+    remaining_prime_window_ids_from_windows(&report.windows)
+}
+
+fn remaining_prime_window_ids_from_windows(windows: &[AuthPrimeWindowReport]) -> Vec<String> {
+    windows
+        .iter()
+        .filter(|window| window.status != "active")
+        .map(|window| format!("{}.{}", window.meter_id, window.window_id))
+        .collect()
 }
 
 fn auth_usage_window_reports(
@@ -2978,6 +3152,24 @@ fn print_auth_prime_report(report: &AuthPrimeReport, json: bool) -> Result<(), C
     for profile in &report.profiles {
         let detail = profile.reason.as_deref().unwrap_or("-");
         println!("{}\t{}\t{}", profile.profile, profile.status, detail);
+        if profile.limit_hit || profile.failure_code.is_some() {
+            println!("  ERROR: priming did not complete for {}.", profile.profile);
+            if let Some(failure_code) = &profile.failure_code {
+                println!("  Failure code: {failure_code}");
+            }
+            println!("  Attempts: {}", profile.attempts);
+            if !profile.remaining_windows.is_empty() {
+                println!(
+                    "  Remaining windows: {}",
+                    profile.remaining_windows.join(", ")
+                );
+            }
+            if let Some(diagnostic) = &profile.diagnostic {
+                println!("  Diagnostic: {diagnostic}");
+            }
+        } else if profile.attempts > 0 {
+            println!("  Attempts: {}", profile.attempts);
+        }
         for window in &profile.windows {
             println!(
                 "  {}.{}\t{}\t{}",
