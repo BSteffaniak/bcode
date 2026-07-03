@@ -452,10 +452,7 @@ fn apply_default_priming_required_windows(
         return;
     }
     if pool == "openai" || provider_plugin_id == Some("bcode.openai-compatible") {
-        required_windows.insert(
-            "codex".to_string(),
-            vec!["primary".to_string(), "secondary".to_string()],
-        );
+        required_windows.insert("codex".to_string(), vec!["primary".to_string()]);
     }
 }
 
@@ -527,7 +524,7 @@ mod tests {
         assert!(routing.priming_enabled);
         assert_eq!(
             routing.priming_required_windows.get("codex"),
-            Some(&vec!["primary".to_string(), "secondary".to_string()])
+            Some(&vec!["primary".to_string()])
         );
     }
 

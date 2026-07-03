@@ -1379,6 +1379,18 @@ async fn auth_prime_inner(
     })
     .await?;
     let touched = usage_window_refs(&request.required_windows, &after);
+    if !usage_response_satisfies_required_windows(&after, &request.required_windows) {
+        return Ok(bcode_model::AuthPrimeResponse {
+            status: bcode_model::AuthPrimeStatus::Failed,
+            before: Some(before),
+            after: Some(after),
+            touched,
+            message: Some(
+                "priming request completed, but provider usage windows are still inactive"
+                    .to_string(),
+            ),
+        });
+    }
     Ok(bcode_model::AuthPrimeResponse {
         status: bcode_model::AuthPrimeStatus::Primed,
         before: Some(before),
@@ -1556,17 +1568,7 @@ fn record_selected_auth_profile_success(request: &ModelTurnRequest) {
         .auth_pool_selection_reason
         .as_deref()
     {
-        Some("priming") => {
-            auth_pool_state::mark_profile_primed(pool, Some(profile));
-            auth_pool_state::mark_profile_usage_windows_primed(
-                pool,
-                Some(profile),
-                &request
-                    .provider_context
-                    .auth_pool_routing
-                    .priming_required_windows,
-            );
-        }
+        Some("priming") => {}
         _ => auth_pool_state::mark_profile_success(pool, Some(profile)),
     }
 }
@@ -1736,17 +1738,7 @@ fn record_auth_candidate_success(
     auth_pool_state::clear_profile_quota_limited(pool, Some(profile));
     auth_pool_state::mark_pool_selected(pool, Some(profile));
     match reason {
-        CandidateSelectionReason::Priming => {
-            auth_pool_state::mark_profile_primed(pool, Some(profile));
-            auth_pool_state::mark_profile_usage_windows_primed(
-                pool,
-                Some(profile),
-                &request
-                    .provider_context
-                    .auth_pool_routing
-                    .priming_required_windows,
-            );
-        }
+        CandidateSelectionReason::Priming => {}
         CandidateSelectionReason::Strategy => {
             auth_pool_state::mark_profile_success(pool, Some(profile));
         }

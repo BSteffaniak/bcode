@@ -424,10 +424,7 @@ fn usage_window_needs_priming(
     {
         return true;
     }
-    if window.used_percent.is_some_and(|percent| percent > 0) {
-        return false;
-    }
-    window.primed_at_unix.is_none()
+    window.used_percent.is_none_or(|percent| percent == 0)
 }
 
 fn usage_window_targets(
@@ -472,4 +469,81 @@ pub(crate) fn reset_cooldowns_in_state(
     let before = state.entries.len();
     state.entries.retain(|key, _| !key.starts_with(&prefix));
     before.saturating_sub(state.entries.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_window_with_zero_usage_still_needs_priming_even_when_locally_marked() {
+        let state = AuthPoolState {
+            entries: BTreeMap::from([(
+                "openai/openai-2".to_string(),
+                AuthPoolProfileState {
+                    primed_unix: Some(1_000),
+                    usage_windows: BTreeMap::from([(
+                        "codex".to_string(),
+                        BTreeMap::from([(
+                            "primary".to_string(),
+                            AuthPoolUsageWindowState {
+                                meter_id: "codex".to_string(),
+                                window_id: "primary".to_string(),
+                                resets_at_unix: Some(2_000),
+                                used_percent: Some(0),
+                                primed_at_unix: Some(1_000),
+                                ..AuthPoolUsageWindowState::default()
+                            },
+                        )]),
+                    )]),
+                    ..AuthPoolProfileState::default()
+                },
+            )]),
+            pools: BTreeMap::new(),
+        };
+        let required_windows = BTreeMap::from([("codex".to_string(), vec!["primary".to_string()])]);
+
+        assert!(profile_needs_priming_with_windows_in_state(
+            &state,
+            "openai/openai-2",
+            &required_windows,
+            None,
+            1_500,
+        ));
+    }
+
+    #[test]
+    fn provider_window_with_verified_usage_does_not_need_priming() {
+        let state = AuthPoolState {
+            entries: BTreeMap::from([(
+                "openai/openai-2".to_string(),
+                AuthPoolProfileState {
+                    usage_windows: BTreeMap::from([(
+                        "codex".to_string(),
+                        BTreeMap::from([(
+                            "primary".to_string(),
+                            AuthPoolUsageWindowState {
+                                meter_id: "codex".to_string(),
+                                window_id: "primary".to_string(),
+                                resets_at_unix: Some(2_000),
+                                used_percent: Some(1),
+                                ..AuthPoolUsageWindowState::default()
+                            },
+                        )]),
+                    )]),
+                    ..AuthPoolProfileState::default()
+                },
+            )]),
+            pools: BTreeMap::new(),
+        };
+        let required_windows = BTreeMap::from([("codex".to_string(), vec!["primary".to_string()])]);
+
+        assert!(!profile_needs_priming_with_windows_in_state(
+            &state,
+            "openai/openai-2",
+            &required_windows,
+            None,
+            1_500,
+        ));
+    }
 }

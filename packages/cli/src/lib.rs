@@ -2413,11 +2413,6 @@ fn auth_prime_run(
                     Some(&plan.pool),
                     Some(&target.profile),
                 );
-                bcode_provider_auth::auth_pool_state::mark_profile_usage_windows_primed(
-                    Some(&plan.pool),
-                    Some(&target.profile),
-                    &plan.required_windows,
-                );
             }
         }
         host.deactivate_all()?;
@@ -2867,13 +2862,6 @@ fn auth_prime_window_report(
         Some(window) if window.used_percent.is_some_and(|percent| percent > 0) => {
             ("active", usage_detail(window, now))
         }
-        Some(window) if window.primed_at_unix.is_some() => (
-            "active",
-            format!(
-                "{}; locally touched for current provider window",
-                usage_detail(window, now)
-            ),
-        ),
         Some(window) => (
             "needs_priming",
             format!(
