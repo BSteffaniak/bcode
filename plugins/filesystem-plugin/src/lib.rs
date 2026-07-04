@@ -5,8 +5,6 @@
 //! filesystem service plugin for Bcode.
 
 #[cfg(feature = "static-bundled")]
-mod file_change_diff;
-#[cfg(feature = "static-bundled")]
 mod file_change_tui;
 
 use bcode_plugin_sdk::prelude::*;

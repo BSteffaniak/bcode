@@ -1570,15 +1570,13 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "base64 0.22.1",
  "bcode_plugin_sdk",
- "bcode_syntax_render",
  "bcode_tool",
+ "bcode_tui_components",
  "bmux_tui",
  "image",
  "png",
  "serde",
  "serde_json",
- "unicode-segmentation",
- "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -2132,6 +2130,17 @@ dependencies = [
  "tokio",
  "unicode-segmentation",
  "uuid",
+]
+
+[[package]]
+name = "bcode_tui_components"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_syntax_render",
+ "bmux_tui",
+ "bmux_tui_components",
+ "unicode-segmentation",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]

@@ -61,6 +61,7 @@ members = [
     "packages/tool",
     "packages/tool-runtime",
     "packages/tui",
+    "packages/tui-components",
     "packages/worktree",
     "packages/worktree/models",
     "plugins/worktree-plugin",
@@ -134,6 +135,7 @@ bcode_tesseract_sys                     = { version = "0.0.1-alpha.0", default-f
 bcode_tool                              = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tool" }
 bcode_tool_runtime                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tool-runtime" }
 bcode_tui                               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui" }
+bcode_tui_components                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui-components" }
 bcode_web_search_plugin                 = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/web-search-plugin" }
 bcode_worktree                          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/worktree" }
 bcode_worktree_models                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/worktree/models" }

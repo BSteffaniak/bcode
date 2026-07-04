@@ -14,24 +14,19 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-base64               = { workspace = true }
-bcode_plugin_sdk     = { workspace = true }
-bcode_syntax_render  = { workspace = true, optional = true }
-bcode_tool           = { workspace = true }
-bmux_tui             = { workspace = true, optional = true }
-image                = { workspace = true }
-png                  = { workspace = true }
-serde                = { workspace = true, features = ["derive", "std"] }
-serde_json           = { workspace = true }
-unicode-segmentation = { workspace = true, optional = true }
-unicode-width        = { workspace = true, optional = true }
+base64 = { workspace = true }
+bcode_plugin_sdk = { workspace = true }
+bcode_tool = { workspace = true }
+bcode_tui_components = { workspace = true, features = [
+    "syntax",
+], optional = true }
+bmux_tui = { workspace = true, optional = true }
+image = { workspace = true }
+png = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true }
 
 [features]
-default = []
+default          = []
 fail-on-warnings = []
-static-bundled = [
-    "bcode_syntax_render",
-    "bmux_tui",
-    "unicode-segmentation",
-    "unicode-width",
-]
+static-bundled   = ["bcode_tui_components", "bmux_tui"]
