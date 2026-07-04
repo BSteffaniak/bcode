@@ -1,6 +1,7 @@
 //! TUI rendering.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::time::{Duration, Instant};
 
 use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
@@ -32,6 +33,8 @@ const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 const MAX_COMPOSER_ROWS: u16 = 6;
 const MAX_INLINE_TOOL_TEXT_ROWS: usize = 28;
 const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(420);
+const TERMINAL_PTY_STREAM_REF_KEY: &str = "terminal_pty_stream";
+const TERMINAL_PTY_STREAM_CONTENT_TYPE: &str = "application/x-bcode-terminal-pty-stream";
 #[derive(Debug, Clone, Copy)]
 pub struct TuiTheme {
     pub accent: Color,
@@ -1193,6 +1196,10 @@ fn push_tool_result_rows(
         muted_style(),
     );
     if let Some(artifact) = context.artifact {
+        if push_terminal_artifact_rows(rows, context, artifact, width) {
+            rows.push(Line::default());
+            return;
+        }
         let visual = CanonicalToolVisual::from_artifact(artifact);
         push_canonical_tool_visual_rows(rows, &visual, width, plugin_host);
         rows.push(Line::default());
@@ -1227,6 +1234,116 @@ fn push_tool_result_rows(
         );
     }
     rows.push(Line::default());
+}
+
+fn push_terminal_artifact_rows(
+    rows: &mut Vec<Line>,
+    context: &ToolResultRenderContext<'_>,
+    artifact: &bcode_session_models::ToolArtifact,
+    width: u16,
+) -> bool {
+    let Some(reference) = terminal_pty_stream_ref(artifact) else {
+        return false;
+    };
+    let Some(output) = terminal_pty_stream_ref_text(reference) else {
+        return false;
+    };
+    let columns = terminal_ref_u16(reference.metadata.as_ref(), "columns").unwrap_or_else(|| {
+        artifact
+            .metadata
+            .get("columns")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .unwrap_or(120)
+    });
+    let terminal_rows =
+        terminal_ref_u16(reference.metadata.as_ref(), "rows").unwrap_or_else(|| {
+            artifact
+                .metadata
+                .get("rows")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .unwrap_or(24)
+        });
+    let terminal_output = TerminalOutputTranscript {
+        exit_code: artifact
+            .metadata
+            .get("exit_code")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok()),
+        timed_out: artifact
+            .metadata
+            .get("timed_out")
+            .and_then(serde_json::Value::as_bool),
+        elapsed: None,
+        output,
+        output_truncated: reference
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("tail_truncated"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        output_bytes: reference.byte_len,
+        retained_output_bytes: reference
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("retained_tail_bytes"))
+            .and_then(serde_json::Value::as_u64)
+            .or(reference.byte_len),
+        columns,
+        rows: terminal_rows,
+    };
+    push_terminal_output_rows(rows, &terminal_output, width);
+    if context.is_error {
+        push_wrapped_styled_text(
+            rows,
+            vec![Span::styled("  ", muted_style())],
+            &format!("tool call {}", context.tool_call_id),
+            width,
+            muted_style(),
+            muted_style(),
+        );
+    }
+    true
+}
+
+fn terminal_pty_stream_ref(
+    artifact: &bcode_session_models::ToolArtifact,
+) -> Option<&bcode_session_models::ToolArtifactRef> {
+    artifact.refs.iter().find(|reference| {
+        reference.key == TERMINAL_PTY_STREAM_REF_KEY
+            || reference
+                .content_type
+                .as_deref()
+                .is_some_and(|content_type| {
+                    content_type.starts_with(TERMINAL_PTY_STREAM_CONTENT_TYPE)
+                })
+            || reference
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("stream"))
+                .and_then(serde_json::Value::as_str)
+                == Some("pty")
+    })
+}
+
+fn terminal_pty_stream_ref_text(
+    reference: &bcode_session_models::ToolArtifactRef,
+) -> Option<String> {
+    let uri = reference.storage_uri.as_deref()?;
+    let url = url::Url::parse(uri).ok()?;
+    if url.scheme() != "file" {
+        return None;
+    }
+    let path = url.to_file_path().ok()?;
+    fs::read_to_string(path).ok()
+}
+
+fn terminal_ref_u16(metadata: Option<&serde_json::Value>, key: &str) -> Option<u16> {
+    metadata
+        .and_then(|metadata| metadata.get(key))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
 }
 
 fn push_labeled_text_preview(

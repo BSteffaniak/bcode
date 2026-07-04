@@ -32,6 +32,9 @@ const DEFAULT_TERMINAL_COLUMNS: u16 = 120;
 const DEFAULT_TERMINAL_ROWS: u16 = 30;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_INLINE_TERMINAL_OUTPUT_BYTES: usize = 16 * 1024;
+const TERMINAL_PTY_STREAM_REF_KEY: &str = "terminal_pty_stream";
+const TERMINAL_PTY_STREAM_CONTENT_TYPE: &str =
+    "application/x-bcode-terminal-pty-stream; charset=utf-8";
 
 /// shell plugin.
 #[derive(Default)]
@@ -271,6 +274,7 @@ struct LimitedOutput {
 struct TerminalStreamOutput {
     raw: LimitedOutput,
     clean: LimitedOutput,
+    raw_artifact_path: Option<PathBuf>,
     clean_artifact_path: Option<PathBuf>,
 }
 
@@ -570,6 +574,7 @@ fn run_terminal_shell_command_inner(
         .try_clone_reader()
         .map_err(|error| error.to_string())?;
     let clean_artifact_path = clean_artifact_path(paths.artifact_dir, tool_call_id)?;
+    let raw_artifact_path = raw_artifact_path(paths.artifact_dir, tool_call_id)?;
     let reader_thread = std::thread::spawn({
         let tool_call_id = tool_call_id.to_owned();
         move || {
@@ -578,7 +583,10 @@ fn run_terminal_shell_command_inner(
                 events,
                 &tool_call_id,
                 ToolOutputStream::Pty,
-                clean_artifact_path,
+                TerminalStreamPaths {
+                    clean_artifact_path,
+                    raw_artifact_path,
+                },
                 columns,
                 rows,
             )
@@ -627,6 +635,10 @@ fn run_terminal_shell_command_inner(
                 .clean_artifact_path
                 .as_deref()
                 .map(|path| clean_artifact_ref(path, &stream_output.clean)),
+            stream_output
+                .raw_artifact_path
+                .as_deref()
+                .map(|path| raw_artifact_ref(path, &stream_output.raw, columns, rows)),
         )),
     })
 }
@@ -677,12 +689,17 @@ fn shell_args(command: &str) -> Vec<String> {
     vec!["/C".to_string(), command.to_string()]
 }
 
+struct TerminalStreamPaths {
+    clean_artifact_path: Option<PathBuf>,
+    raw_artifact_path: Option<PathBuf>,
+}
+
 fn read_limited_streaming<R>(
     mut reader: R,
     events: ServiceEventEmitter,
     tool_call_id: &str,
     stream: ToolOutputStream,
-    clean_artifact_path: Option<PathBuf>,
+    paths: TerminalStreamPaths,
     columns: u16,
     rows: u16,
 ) -> Result<TerminalStreamOutput, String>
@@ -690,7 +707,8 @@ where
     R: Read,
 {
     let mut raw_bytes = Vec::new();
-    let mut clean_writer = clean_artifact_writer(clean_artifact_path.as_deref())?;
+    let mut raw_writer = raw_artifact_writer(paths.raw_artifact_path.as_deref())?;
+    let mut clean_writer = clean_artifact_writer(paths.clean_artifact_path.as_deref())?;
     let mut cleaner = terminal_clean::TerminalCleanWriter::new(
         &mut clean_writer,
         columns,
@@ -721,9 +739,13 @@ where
             continue;
         }
         let retained = read.min(remaining);
+        raw_writer
+            .write_all(&buffer[..retained])
+            .map_err(|error| error.to_string())?;
         raw_bytes.extend_from_slice(&buffer[..retained]);
         raw_truncated = raw_truncated || retained < read;
     }
+    raw_writer.flush().map_err(|error| error.to_string())?;
     let clean_summary = cleaner.finish().map_err(|error| error.to_string())?;
     let clean_bytes = clean_summary.tail.into_bytes();
     Ok(TerminalStreamOutput {
@@ -739,13 +761,33 @@ where
             MAX_INLINE_TERMINAL_OUTPUT_BYTES,
             clean_summary.tail_truncated,
         ),
-        clean_artifact_path,
+        raw_artifact_path: paths.raw_artifact_path,
+        clean_artifact_path: paths.clean_artifact_path,
+    })
+}
+
+fn raw_artifact_path(
+    artifact_dir: Option<&Path>,
+    tool_call_id: &str,
+) -> Result<Option<PathBuf>, String> {
+    artifact_path(artifact_dir, tool_call_id, |safe_tool_call_id| {
+        format!("tool-output-{safe_tool_call_id}-pty.txt")
     })
 }
 
 fn clean_artifact_path(
     artifact_dir: Option<&Path>,
     tool_call_id: &str,
+) -> Result<Option<PathBuf>, String> {
+    artifact_path(artifact_dir, tool_call_id, |safe_tool_call_id| {
+        format!("tool-output-{safe_tool_call_id}-clean.txt")
+    })
+}
+
+fn artifact_path(
+    artifact_dir: Option<&Path>,
+    tool_call_id: &str,
+    name: impl FnOnce(&str) -> String,
 ) -> Result<Option<PathBuf>, String> {
     let Some(artifact_dir) = artifact_dir else {
         return Ok(None);
@@ -755,12 +797,18 @@ fn clean_artifact_path(
         .chars()
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
         .collect::<String>();
-    Ok(Some(artifact_dir.join(format!(
-        "tool-output-{safe_tool_call_id}-clean.txt"
-    ))))
+    Ok(Some(artifact_dir.join(name(&safe_tool_call_id))))
+}
+
+fn raw_artifact_writer(path: Option<&Path>) -> Result<Box<dyn Write + Send>, String> {
+    artifact_writer(path)
 }
 
 fn clean_artifact_writer(path: Option<&Path>) -> Result<Box<dyn Write + Send>, String> {
+    artifact_writer(path)
+}
+
+fn artifact_writer(path: Option<&Path>) -> Result<Box<dyn Write + Send>, String> {
     path.map_or_else(
         || Ok(Box::new(Vec::<u8>::new()) as Box<dyn Write + Send>),
         |path| {
@@ -868,6 +916,7 @@ fn shell_run_artifact(
     tool_call_id: &str,
     result: &ShellRunResult,
     clean_ref: Option<ToolArtifactRef>,
+    raw_ref: Option<ToolArtifactRef>,
 ) -> ToolInvocationResult {
     ToolInvocationResult::Artifact {
         artifact: Box::new(ToolArtifact {
@@ -878,7 +927,7 @@ fn shell_run_artifact(
             tool_call_id: Some(tool_call_id.to_string()),
             title: Some("Shell run".to_string()),
             metadata: serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-            refs: clean_ref.into_iter().collect(),
+            refs: clean_ref.into_iter().chain(raw_ref).collect(),
         }),
     }
 }
@@ -893,6 +942,29 @@ fn clean_artifact_ref(path: &Path, output: &LimitedOutput) -> ToolArtifactRef {
             "description": "Model-oriented terminal transcript normalized by the shell plugin",
             "retained_tail_bytes": output.retained_bytes,
             "tail_truncated": output.truncated,
+        })),
+    }
+}
+
+fn raw_artifact_ref(
+    path: &Path,
+    output: &LimitedOutput,
+    columns: u16,
+    rows: u16,
+) -> ToolArtifactRef {
+    ToolArtifactRef {
+        key: TERMINAL_PTY_STREAM_REF_KEY.to_string(),
+        content_type: Some(TERMINAL_PTY_STREAM_CONTENT_TYPE.to_string()),
+        storage_uri: file_storage_uri(path),
+        byte_len: Some(u64::try_from(output.retained_bytes).unwrap_or(u64::MAX)),
+        metadata: Some(json!({
+            "description": "Raw terminal PTY stream for display replay",
+            "stream": "pty",
+            "columns": columns,
+            "rows": rows,
+            "retained_tail_bytes": output.retained_bytes,
+            "tail_truncated": output.truncated,
+            "encoding": "utf-8-lossy",
         })),
     }
 }
@@ -998,6 +1070,27 @@ mod tests {
         assert_eq!(reference.storage_uri, None);
         assert_eq!(reference.key, "clean_output");
         assert_eq!(reference.byte_len, Some(12));
+    }
+
+    #[test]
+    fn raw_artifact_ref_records_terminal_replay_metadata() {
+        let reference = raw_artifact_ref(
+            Path::new("/tmp/raw-pty.txt"),
+            &test_limited_output(),
+            80,
+            24,
+        );
+
+        assert_eq!(reference.key, TERMINAL_PTY_STREAM_REF_KEY);
+        assert_eq!(
+            reference.content_type.as_deref(),
+            Some(TERMINAL_PTY_STREAM_CONTENT_TYPE)
+        );
+        assert_eq!(reference.byte_len, Some(12));
+        let metadata = reference.metadata.expect("metadata should exist");
+        assert_eq!(metadata["stream"], "pty");
+        assert_eq!(metadata["columns"], 80);
+        assert_eq!(metadata["rows"], 24);
     }
 
     #[test]

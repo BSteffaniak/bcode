@@ -20,7 +20,7 @@ use bcode_session_models::{
     LiveShellCommandPreview, LiveToolArgumentPreview, RuntimeWorkId, RuntimeWorkKind, SessionEvent,
     SessionEventKind, SessionId, SessionInputHistoryEntry, SessionProjectionKind, SessionSummary,
     SessionTitleSource, SessionTokenUsage, SessionTraceEvent, SessionTracePayload,
-    SessionTracePhase, ShellRunResult, ToolArtifact, ToolInvocationResult,
+    SessionTracePhase, ShellRunResult, ToolArtifact, ToolArtifactRef, ToolInvocationResult,
     ToolInvocationStreamEvent, ToolOutputStream, build_tool_invocation_projections,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
@@ -5099,6 +5099,53 @@ fn replayed_shell_artifact_renders_terminal_output_from_raw_run_metadata() {
     assert!(rendered.contains("terminal"), "{rendered}");
     assert!(rendered.contains("shell raw output"), "{rendered}");
     assert!(!rendered.contains("bcode.shell.run"), "{rendered}");
+}
+
+#[test]
+fn replayed_shell_artifact_renders_terminal_replay_ref_through_terminal_grid() {
+    let session_id = SessionId::new();
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let pty_path = temp_dir.path().join("raw-pty.txt");
+    std::fs::write(&pty_path, "first\rsecond\n").expect("write pty artifact");
+    let mut artifact = shell_run_artifact();
+    artifact.metadata["output_tail"] =
+        serde_json::Value::String("artifact raw fallback\n".to_owned());
+    artifact.refs.push(ToolArtifactRef {
+        key: "terminal_pty_stream".to_owned(),
+        content_type: Some("application/x-bcode-terminal-pty-stream; charset=utf-8".to_owned()),
+        storage_uri: url::Url::from_file_path(&pty_path)
+            .ok()
+            .map(|url| url.to_string()),
+        byte_len: Some(13),
+        metadata: Some(serde_json::json!({
+            "stream": "pty",
+            "columns": 80,
+            "rows": 24,
+            "retained_tail_bytes": 13,
+            "tail_truncated": false,
+        })),
+    });
+    let events = vec![event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallFinished {
+            tool_call_id: "call-shell".to_owned(),
+            result: "shell completed".to_owned(),
+            is_error: false,
+            output: None,
+            semantic_result: Some(ToolInvocationResult::Artifact {
+                artifact: Box::new(artifact),
+            }),
+        },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
+
+    let rendered = render_app_text(&mut app);
+
+    assert!(rendered.contains("second"), "{rendered}");
+    assert!(!rendered.contains("first"), "{rendered}");
+    assert!(!rendered.contains("artifact raw fallback"), "{rendered}");
 }
 
 #[test]
