@@ -50,17 +50,17 @@ pub fn select_auth_pool_candidate_with_state(
     now: u64,
 ) -> Option<AuthPoolSelection> {
     let available = available_candidates(input, state, now);
-    let candidate = priming_candidate(input, state, &available, now)
-        .map(|candidate| (candidate, AuthPoolSelectionReason::Priming))
-        .or_else(|| {
-            strategy_ordered_candidates(input, state, &available)
-                .into_iter()
-                .next()
-                .map(|candidate| (candidate, AuthPoolSelectionReason::Strategy))
-        })?;
+    let candidate = strategy_ordered_candidates(input, state, &available)
+        .into_iter()
+        .next()?;
+    let reason = if candidate_needs_priming(input, state, candidate, now) {
+        AuthPoolSelectionReason::Priming
+    } else {
+        AuthPoolSelectionReason::Strategy
+    };
     Some(AuthPoolSelection {
-        profile: candidate.0.profile.clone(),
-        reason: candidate.1,
+        profile: candidate.profile.clone(),
+        reason,
     })
 }
 
@@ -94,14 +94,19 @@ fn is_available(
         .is_none_or(|entry| entry.cooldown_until_unix <= now)
 }
 
-fn priming_candidate<'a>(
-    input: &AuthPoolSelectionInput<'a>,
+fn candidate_needs_priming(
+    input: &AuthPoolSelectionInput<'_>,
     state: &AuthPoolState,
-    available: &[&'a ProviderAuthCandidate],
+    candidate: &ProviderAuthCandidate,
     now: u64,
-) -> Option<&'a ProviderAuthCandidate> {
+) -> bool {
     if !input.routing.priming_enabled {
-        return None;
+        return false;
+    }
+    if !input.routing.priming_include_primary
+        && candidate.profile.as_deref() == input.primary_profile
+    {
+        return false;
     }
     let reprime_after = input
         .routing
@@ -109,34 +114,27 @@ fn priming_candidate<'a>(
         .as_deref()
         .or(input.routing.priming_fallback_reprime_after.as_deref())
         .and_then(parse_duration);
-    available.iter().copied().find(|candidate| {
-        if !input.routing.priming_include_primary
-            && candidate.profile.as_deref() == input.primary_profile
-        {
-            return false;
-        }
-        let Some(pool) = input.pool else {
-            return false;
-        };
-        let Some(profile) = candidate.profile.as_deref() else {
-            return false;
-        };
-        if input.routing.priming_provider_windows {
-            return auth_pool_state::profile_needs_priming_with_windows_in_state(
-                state,
-                &format!("{pool}/{profile}"),
-                &input.routing.priming_required_windows,
-                reprime_after,
-                now,
-            );
-        }
-        auth_pool_state::profile_needs_priming_in_state(
+    let Some(pool) = input.pool else {
+        return false;
+    };
+    let Some(profile) = candidate.profile.as_deref() else {
+        return false;
+    };
+    if input.routing.priming_provider_windows {
+        return auth_pool_state::profile_needs_priming_with_windows_in_state(
             state,
             &format!("{pool}/{profile}"),
+            &input.routing.priming_required_windows,
             reprime_after,
             now,
-        )
-    })
+        );
+    }
+    auth_pool_state::profile_needs_priming_in_state(
+        state,
+        &format!("{pool}/{profile}"),
+        reprime_after,
+        now,
+    )
 }
 
 fn strategy_ordered_candidates<'a>(
@@ -279,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn priming_selects_unprimed_secondary_before_strategy() {
+    fn priming_does_not_preempt_failover_strategy() {
         let candidates = vec![
             candidate("openai"),
             candidate("openai-2"),
@@ -305,8 +303,8 @@ mod tests {
             select_auth_pool_candidate_with_state(&input(&routing, &candidates), &state, 100)
                 .expect("candidate should select");
 
-        assert_eq!(selection.profile.as_deref(), Some("openai-3"));
-        assert_eq!(selection.reason, AuthPoolSelectionReason::Priming);
+        assert_eq!(selection.profile.as_deref(), Some("openai"));
+        assert_eq!(selection.reason, AuthPoolSelectionReason::Strategy);
     }
 
     #[test]
@@ -330,9 +328,10 @@ mod tests {
     }
 
     #[test]
-    fn priming_keeps_selecting_profile_until_all_required_windows_are_active() {
+    fn priming_marks_strategy_selected_candidate_when_required_windows_are_inactive() {
         let candidates = vec![candidate("openai"), candidate("openai-2")];
         let routing = ProviderAuthPoolRouting {
+            strategy: Some("round_robin".to_string()),
             priming_enabled: true,
             priming_provider_windows: true,
             priming_required_windows: BTreeMap::from([(
@@ -373,7 +372,12 @@ mod tests {
                     ..AuthPoolProfileState::default()
                 },
             )]),
-            ..AuthPoolState::default()
+            pools: BTreeMap::from([(
+                "openai".to_string(),
+                AuthPoolRoutingState {
+                    last_selected_profile: Some("openai".to_string()),
+                },
+            )]),
         };
 
         let selection =
@@ -388,6 +392,7 @@ mod tests {
     fn reprime_after_marks_old_priming_stale() {
         let candidates = vec![candidate("openai"), candidate("openai-2")];
         let routing = ProviderAuthPoolRouting {
+            strategy: Some("round_robin".to_string()),
             priming_enabled: true,
             priming_reprime_after: Some("10s".to_string()),
             ..ProviderAuthPoolRouting::default()
@@ -400,7 +405,12 @@ mod tests {
                     ..AuthPoolProfileState::default()
                 },
             )]),
-            ..AuthPoolState::default()
+            pools: BTreeMap::from([(
+                "openai".to_string(),
+                AuthPoolRoutingState {
+                    last_selected_profile: Some("openai".to_string()),
+                },
+            )]),
         };
 
         let selection =

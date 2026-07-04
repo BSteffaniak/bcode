@@ -1878,73 +1878,54 @@ fn order_candidate_selections<'a>(
     available_candidates: &[&'a ProviderAuthCandidate],
     cooldown_candidates: &[&'a ProviderAuthCandidate],
 ) -> Vec<CandidateSelection<'a>> {
-    let mut ordered = Vec::new();
-    let mut selected_profiles = BTreeSet::new();
-    if let Some(candidate) = priming_candidate(request, available_candidates) {
-        if let Some(profile) = candidate.profile.as_ref() {
-            selected_profiles.insert(profile.clone());
-        }
-        ordered.push(CandidateSelection {
+    strategy_ordered_candidates(request, available_candidates)
+        .into_iter()
+        .map(|candidate| CandidateSelection {
             candidate,
-            reason: CandidateSelectionReason::Priming,
-        });
-    }
-    for candidate in strategy_ordered_candidates(request, available_candidates) {
-        if candidate
-            .profile
-            .as_ref()
-            .is_some_and(|profile| selected_profiles.contains(profile))
-        {
-            continue;
-        }
-        ordered.push(CandidateSelection {
-            candidate,
-            reason: CandidateSelectionReason::Strategy,
-        });
-    }
-    ordered.extend(
-        cooldown_candidates
-            .iter()
-            .map(|candidate| CandidateSelection {
-                candidate,
-                reason: CandidateSelectionReason::Strategy,
-            }),
-    );
-    ordered
+            reason: if candidate_needs_priming(request, candidate) {
+                CandidateSelectionReason::Priming
+            } else {
+                CandidateSelectionReason::Strategy
+            },
+        })
+        .chain(
+            cooldown_candidates
+                .iter()
+                .map(|candidate| CandidateSelection {
+                    candidate,
+                    reason: CandidateSelectionReason::Strategy,
+                }),
+        )
+        .collect()
 }
 
-fn priming_candidate<'a>(
-    request: &ModelTurnRequest,
-    available_candidates: &[&'a ProviderAuthCandidate],
-) -> Option<&'a ProviderAuthCandidate> {
+fn candidate_needs_priming(request: &ModelTurnRequest, candidate: &ProviderAuthCandidate) -> bool {
     let routing = &request.provider_context.auth_pool_routing;
     if !routing.priming_enabled {
-        return None;
+        return false;
     }
     let primary = request.provider_context.auth_profile.as_deref();
+    if !routing.priming_include_primary && candidate.profile.as_deref() == primary {
+        return false;
+    }
     let reprime_after = routing
         .priming_reprime_after
         .as_deref()
         .or(routing.priming_fallback_reprime_after.as_deref())
         .and_then(parse_duration);
-    available_candidates.iter().copied().find(|candidate| {
-        if !routing.priming_include_primary && candidate.profile.as_deref() == primary {
-            return false;
-        }
-        if routing.priming_provider_windows {
-            return auth_pool_state::profile_needs_priming_with_windows(
-                request.provider_context.auth_pool.as_deref(),
-                candidate.profile.as_deref(),
-                &routing.priming_required_windows,
-                reprime_after,
-            );
-        }
-        auth_pool_state::profile_needs_priming(
+    if routing.priming_provider_windows {
+        return auth_pool_state::profile_needs_priming_with_windows(
             request.provider_context.auth_pool.as_deref(),
             candidate.profile.as_deref(),
+            &routing.priming_required_windows,
             reprime_after,
-        )
-    })
+        );
+    }
+    auth_pool_state::profile_needs_priming(
+        request.provider_context.auth_pool.as_deref(),
+        candidate.profile.as_deref(),
+        reprime_after,
+    )
 }
 
 fn strategy_ordered_candidates<'a>(
