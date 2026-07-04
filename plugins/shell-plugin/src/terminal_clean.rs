@@ -53,6 +53,7 @@ struct TerminalCleanPerformer<W> {
     lines: VecDeque<TerminalLine>,
     cursor_row: usize,
     cursor_col: usize,
+    saved_cursor: Option<(usize, usize)>,
     tail: ByteTail,
     bytes_written: u64,
     error: Option<io::Error>,
@@ -69,6 +70,7 @@ impl<W: Write> TerminalCleanPerformer<W> {
             lines,
             cursor_row: 0,
             cursor_col: 0,
+            saved_cursor: None,
             tail: ByteTail::new(max_tail_bytes),
             bytes_written: 0,
             error: None,
@@ -182,6 +184,18 @@ impl<W: Write> TerminalCleanPerformer<W> {
         self.cursor_row = row.saturating_sub(1).min(self.rows.saturating_sub(1));
         self.cursor_col = column.saturating_sub(1).min(self.columns.saturating_sub(1));
         self.ensure_cursor_line();
+    }
+
+    const fn save_cursor(&mut self) {
+        self.saved_cursor = Some((self.cursor_row, self.cursor_col));
+    }
+
+    fn restore_cursor(&mut self) {
+        if let Some((row, column)) = self.saved_cursor {
+            self.cursor_row = row.min(self.rows.saturating_sub(1));
+            self.cursor_col = column.min(self.columns.saturating_sub(1));
+            self.ensure_cursor_line();
+        }
     }
 
     fn erase_line(&mut self, mode: usize) {
@@ -324,8 +338,10 @@ impl<W: Write> vte::Perform for TerminalCleanPerformer<W> {
             }
             'G' | '`' => self.cursor_column(first),
             'H' | 'f' => self.cursor_position(first, second),
-            'J' => self.erase_display(first.saturating_sub(1)),
-            'K' => self.erase_line(first.saturating_sub(1)),
+            'J' => self.erase_display(first_param_or_zero(params)),
+            'K' => self.erase_line(first_param_or_zero(params)),
+            's' => self.save_cursor(),
+            'u' => self.restore_cursor(),
             _ => {}
         }
     }
@@ -337,6 +353,8 @@ impl<W: Write> vte::Perform for TerminalCleanPerformer<W> {
                 self.newline();
                 self.carriage_return();
             }
+            b'7' => self.save_cursor(),
+            b'8' => self.restore_cursor(),
             b'M' => self.cursor_up(1),
             b'c' => self.erase_display(2),
             _ => {}
@@ -346,6 +364,10 @@ impl<W: Write> vte::Perform for TerminalCleanPerformer<W> {
 
 fn first_param(params: &vte::Params) -> usize {
     nth_param(params, 0).unwrap_or(1).max(1)
+}
+
+fn first_param_or_zero(params: &vte::Params) -> usize {
+    nth_param(params, 0).unwrap_or(0)
 }
 
 fn second_param(params: &vte::Params) -> usize {
@@ -534,5 +556,75 @@ mod tests {
         let summary = clean_with_size(&[b"a\nb\nc\nd\ne\n"], 80, 2);
 
         assert_eq!(summary.tail, "a\nb\nc\nd\ne\n");
+    }
+
+    #[test]
+    fn carriage_return_without_erase_preserves_remaining_cells() {
+        let summary = clean(&[b"abcdef\rxy\n"]);
+
+        assert_eq!(summary.tail, "xycdef\n");
+    }
+
+    #[test]
+    fn erase_entire_line_removes_all_cells() {
+        let summary = clean(&[b"abcdef\r\x1b[2Kxy\n"]);
+
+        assert_eq!(summary.tail, "xy\n");
+    }
+
+    #[test]
+    fn erase_to_left_preserves_right_cells() {
+        let summary = clean(&[b"abcdef\x1b[3D\x1b[1KX\n"]);
+
+        assert_eq!(summary.tail, "   Xef\n");
+    }
+
+    #[test]
+    fn erase_display_below_clears_lower_viewport_lines() {
+        let summary = clean_with_size(&[b"one\ntwo\x1b[1;1H\x1b[Jtop\n"], 80, 3);
+
+        assert_eq!(summary.tail, "top\n");
+    }
+
+    #[test]
+    fn utf8_codepoint_can_be_split_across_chunks() {
+        let summary = clean(&[b"caf", &[0xC3], &[0xA9], b"\n"]);
+
+        assert_eq!(summary.tail, "café\n");
+    }
+
+    #[test]
+    fn osc_st_sequences_are_ignored() {
+        let summary = clean(&[b"a\x1b]8;;https://example.test\x1b\\b\x1b]8;;\x1b\\\n"]);
+
+        assert_eq!(summary.tail, "ab\n");
+    }
+
+    #[test]
+    fn dcs_payload_is_ignored() {
+        let summary = clean(&[b"a\x1bPignored\x1b\\b\n"]);
+
+        assert_eq!(summary.tail, "ab\n");
+    }
+
+    #[test]
+    fn csi_save_and_restore_cursor_rewrites_saved_position() {
+        let summary = clean(&[b"abc\x1b[sdef\x1b[uX\n"]);
+
+        assert_eq!(summary.tail, "abcXef\n");
+    }
+
+    #[test]
+    fn esc_save_and_restore_cursor_rewrites_saved_position() {
+        let summary = clean(&[b"abc\x1b7def\x1b8X\n"]);
+
+        assert_eq!(summary.tail, "abcXef\n");
+    }
+
+    #[test]
+    fn wrapping_at_last_column_scrolls_viewport() {
+        let summary = clean_with_size(&[b"abcdef"], 3, 2);
+
+        assert_eq!(summary.tail, "abc\ndef\n");
     }
 }
