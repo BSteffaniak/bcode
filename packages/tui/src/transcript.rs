@@ -884,7 +884,7 @@ pub fn push_streaming_transcript_item(
     role: &'static str,
     text: &str,
 ) {
-    if let Some(item) = latest_streaming_item_mut(items, role) {
+    if let Some(item) = active_streaming_item_mut(items, role) {
         item.text.push_str(text);
         return;
     }
@@ -897,6 +897,10 @@ pub fn finish_streaming_transcript_item(
     role: &'static str,
     text: &str,
 ) {
+    if role_requires_last_item_stream_boundary(role) {
+        finish_boundary_streaming_transcript_item(items, role, text);
+        return;
+    }
     if let Some(item) = latest_streaming_item_mut(items, role) {
         item.text.clear();
         item.text.push_str(text);
@@ -904,6 +908,55 @@ pub fn finish_streaming_transcript_item(
         return;
     }
     items.push(TranscriptItem::new(role, text.to_owned()));
+}
+
+fn active_streaming_item_mut<'items>(
+    items: &'items mut [TranscriptItem],
+    role: &'static str,
+) -> Option<&'items mut TranscriptItem> {
+    if role_requires_last_item_stream_boundary(role) {
+        return latest_item_mut_if_streaming_role(items, role);
+    }
+    latest_streaming_item_mut(items, role)
+}
+
+fn finish_boundary_streaming_transcript_item(
+    items: &mut Vec<TranscriptItem>,
+    role: &'static str,
+    text: &str,
+) {
+    let matching_stream_count = items
+        .iter()
+        .filter(|item| item.role == role && item.streaming)
+        .count();
+    if matching_stream_count > 1 {
+        for item in items
+            .iter_mut()
+            .filter(|item| item.role == role && item.streaming)
+        {
+            item.streaming = false;
+        }
+        return;
+    }
+    if let Some(item) = latest_item_mut_if_streaming_role(items, role) {
+        item.text.clear();
+        item.text.push_str(text);
+        item.streaming = false;
+        return;
+    }
+    items.push(TranscriptItem::new(role, text.to_owned()));
+}
+
+fn latest_item_mut_if_streaming_role<'items>(
+    items: &'items mut [TranscriptItem],
+    role: &'static str,
+) -> Option<&'items mut TranscriptItem> {
+    let item = items.last_mut()?;
+    if item.role == role && item.streaming {
+        Some(item)
+    } else {
+        None
+    }
 }
 
 fn latest_streaming_item_mut<'items>(
@@ -914,6 +967,10 @@ fn latest_streaming_item_mut<'items>(
         .iter_mut()
         .rev()
         .find(|item| item.role == role && item.streaming)
+}
+
+fn role_requires_last_item_stream_boundary(role: &'static str) -> bool {
+    role == "Reasoning summary"
 }
 
 #[allow(clippy::too_many_lines)]

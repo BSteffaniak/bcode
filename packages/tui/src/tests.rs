@@ -313,6 +313,41 @@ fn transcript_document_streaming_helpers_bump_revision() {
 }
 
 #[test]
+fn reasoning_streaming_starts_new_item_after_interleaved_transcript_item() {
+    let mut document = TranscriptDocument::default();
+
+    document.push_streaming_item("Reasoning summary", "first thought");
+    document.push(TranscriptItem::new("System", "tool output".to_owned()));
+    document.push_streaming_item("Reasoning summary", "second thought");
+
+    assert_eq!(document.len(), 3);
+    assert_eq!(document.items()[0].text(), "first thought");
+    assert_eq!(document.items()[1].text(), "tool output");
+    assert_eq!(document.items()[2].text(), "second thought");
+    assert!(document.items()[0].streaming());
+    assert!(document.items()[2].streaming());
+}
+
+#[test]
+fn reasoning_finish_preserves_split_streaming_items() {
+    let mut document = TranscriptDocument::default();
+
+    document.push_streaming_item("Reasoning summary", "first thought");
+    document.push(TranscriptItem::new("System", "tool output".to_owned()));
+    document.push_streaming_item("Reasoning summary", "second thought");
+    document.finish_streaming_item(
+        "Reasoning summary",
+        "first thought second thought final aggregate",
+    );
+
+    assert_eq!(document.len(), 3);
+    assert_eq!(document.items()[0].text(), "first thought");
+    assert_eq!(document.items()[2].text(), "second thought");
+    assert!(!document.items()[0].streaming());
+    assert!(!document.items()[2].streaming());
+}
+
+#[test]
 fn pending_submissions_mutations_bump_revision() {
     let mut pending = PendingSubmissions::default();
     assert_eq!(pending.revision(), 0);
