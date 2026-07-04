@@ -525,9 +525,23 @@ pub struct AuthDeviceSealOptions {
 impl AuthDeviceSealOptions {
     /// Default Bcode auth-vault device-seal behavior.
     #[must_use]
-    pub const fn preferred_transparent_device_only() -> Self {
+    pub const fn preferred_prompt_free() -> Self {
         Self {
             policy: AuthDeviceSealPolicy::Preferred,
+            seal: sshenv_vault::device::DeviceSealOptions {
+                selection: sshenv_vault::device::DeviceSealSelection::Backend(
+                    sshenv_vault::device::DeviceSealBackendSelection::LocalFile,
+                ),
+                strict: false,
+            },
+        }
+    }
+
+    /// Required Bcode auth-vault device-seal behavior.
+    #[must_use]
+    pub const fn required_transparent_device_only() -> Self {
+        Self {
+            policy: AuthDeviceSealPolicy::Required,
             seal: sshenv_vault::device::DeviceSealOptions {
                 selection: sshenv_vault::device::DeviceSealSelection::Policy(
                     sshenv_vault::device::DeviceSealPolicy::TransparentDeviceOnly,
@@ -540,9 +554,12 @@ impl AuthDeviceSealOptions {
     /// Build options from the legacy policy-only API.
     #[must_use]
     pub const fn from_policy(policy: AuthDeviceSealPolicy) -> Self {
-        Self {
-            policy,
-            ..Self::preferred_transparent_device_only()
+        match policy {
+            AuthDeviceSealPolicy::Required => Self::required_transparent_device_only(),
+            AuthDeviceSealPolicy::Off | AuthDeviceSealPolicy::Preferred => Self {
+                policy,
+                ..Self::preferred_prompt_free()
+            },
         }
     }
 }
@@ -570,26 +587,29 @@ pub fn device_seal_options_for_auth_profile(
     auth_profile: &bcode_config::AuthProfileConfig,
 ) -> AuthDeviceSealOptions {
     let policy = device_seal_policy_for_auth_profile(auth_profile);
+    let default_options = AuthDeviceSealOptions::from_policy(policy);
     let selection = auth_profile
         .settings
         .get("device_seal_backend")
         .and_then(|value| parse_device_seal_backend(value))
         .map_or_else(
             || {
-                sshenv_vault::device::DeviceSealSelection::Policy(
-                    auth_profile
-                        .settings
-                        .get("device_seal_mode")
-                        .and_then(|value| parse_device_seal_policy(value))
-                        .unwrap_or(sshenv_vault::device::DeviceSealPolicy::TransparentDeviceOnly),
-                )
+                auth_profile
+                    .settings
+                    .get("device_seal_mode")
+                    .and_then(|value| parse_device_seal_policy(value))
+                    .map_or(default_options.seal.selection, |mode| {
+                        sshenv_vault::device::DeviceSealSelection::Policy(mode)
+                    })
             },
             sshenv_vault::device::DeviceSealSelection::Backend,
         );
     let strict = auth_profile
         .settings
         .get("device_seal_strict")
-        .is_none_or(|value| parse_bool_setting(value, true));
+        .map_or(default_options.seal.strict, |value| {
+            parse_bool_setting(value, default_options.seal.strict)
+        });
     AuthDeviceSealOptions {
         policy,
         seal: sshenv_vault::device::DeviceSealOptions { selection, strict },
