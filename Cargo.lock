@@ -1994,10 +1994,12 @@ dependencies = [
  "bcode_plugin_sdk",
  "bcode_tool",
  "bcode_tool_runtime",
+ "bcode_tui_components",
  "bmux_tui",
  "portable-pty",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "url 2.5.8",
  "vte",
@@ -2114,6 +2116,7 @@ dependencies = [
  "bcode_skill_models",
  "bcode_syntax_render",
  "bcode_tool",
+ "bcode_tui_components",
  "bcode_worktree_models",
  "bmux_keyboard",
  "bmux_terminal_grid",
@@ -2130,7 +2133,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "unicode-segmentation",
- "url 2.5.8",
  "uuid",
 ]
 
@@ -2139,6 +2141,7 @@ name = "bcode_tui_components"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_syntax_render",
+ "bmux_terminal_grid",
  "bmux_tui",
  "bmux_tui_components",
  "unicode-segmentation",

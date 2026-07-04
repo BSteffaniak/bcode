@@ -5113,9 +5113,7 @@ fn replayed_shell_artifact_renders_terminal_replay_ref_through_terminal_grid() {
     artifact.refs.push(ToolArtifactRef {
         key: "terminal_pty_stream".to_owned(),
         content_type: Some("application/x-bcode-terminal-pty-stream; charset=utf-8".to_owned()),
-        storage_uri: url::Url::from_file_path(&pty_path)
-            .ok()
-            .map(|url| url.to_string()),
+        storage_uri: Some(format!("file://{}", pty_path.to_string_lossy())),
         byte_len: Some(13),
         metadata: Some(serde_json::json!({
             "stream": "pty",

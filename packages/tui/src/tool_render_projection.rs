@@ -103,6 +103,12 @@ impl CanonicalToolVisual {
                 .entry("subtitle".to_owned())
                 .or_insert_with(|| Value::String(summary.to_owned()));
         }
+        if !artifact.refs.is_empty()
+            && let Some(object) = payload.as_object_mut()
+            && let Ok(refs) = serde_json::to_value(&artifact.refs)
+        {
+            object.insert("_artifact_refs".to_owned(), refs);
+        }
         Self::Plugin(CanonicalPluginVisual {
             producer_plugin_id: Some(artifact.producer_plugin_id.clone()),
             schema: artifact.schema.clone(),

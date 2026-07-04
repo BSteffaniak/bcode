@@ -5,3 +5,4 @@
 //! Reusable Bcode TUI components.
 
 pub mod diff_viewer;
+pub mod terminal_viewer;

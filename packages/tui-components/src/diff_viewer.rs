@@ -491,6 +491,7 @@ mod diff_tests {
         }));
     }
 
+    #[cfg(feature = "syntax")]
     #[test]
     fn syntax_highlighting_is_plugin_owned() {
         let diff = diff_from_text("src/main.rs", "", "fn main() {}\n");
@@ -749,22 +750,23 @@ fn spans_width(spans: &[Span]) -> usize {
 fn content_spans(line: &DiffLine, fallback_style: Style) -> Vec<Span> {
     #[cfg(not(feature = "syntax"))]
     {
-        let _ = line;
-        return vec![Span::styled(line.content.clone(), fallback_style)];
+        vec![Span::styled(line.content.clone(), fallback_style)]
     }
     #[cfg(feature = "syntax")]
-    if line.syntax_spans.is_empty() {
-        return vec![Span::styled(line.content.clone(), fallback_style)];
+    {
+        if line.syntax_spans.is_empty() {
+            return vec![Span::styled(line.content.clone(), fallback_style)];
+        }
+        line.syntax_spans
+            .iter()
+            .map(|span| {
+                Span::styled(
+                    span.content.clone(),
+                    fallback_style.patch(syntax_style(span.style)),
+                )
+            })
+            .collect()
     }
-    line.syntax_spans
-        .iter()
-        .map(|span| {
-            Span::styled(
-                span.content.clone(),
-                fallback_style.patch(syntax_style(span.style)),
-            )
-        })
-        .collect()
 }
 
 fn wrap_spans(

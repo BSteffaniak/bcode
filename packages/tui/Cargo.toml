@@ -30,6 +30,7 @@ bcode_settings = { workspace = true }
 bcode_skill_models = { workspace = true }
 bcode_syntax_render = { workspace = true }
 bcode_tool = { workspace = true }
+bcode_tui_components = { workspace = true }
 bcode_worktree_models = { workspace = true }
 bmux_keyboard = { workspace = true }
 bmux_terminal_grid = { workspace = true }
@@ -48,7 +49,6 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 unicode-segmentation = { workspace = true }
-url = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]

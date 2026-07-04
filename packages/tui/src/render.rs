@@ -1,15 +1,10 @@
 //! TUI rendering.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::time::{Duration, Instant};
 
 use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
-use bmux_terminal_grid::{
-    Color as GridColor, GridLimits, PhysicalRow, Style as GridStyle, TerminalGrid,
-    TerminalGridStream,
-};
-use bmux_tui::ansi::ansi_to_lines;
+use bcode_tui_components::terminal_viewer::{TerminalViewerInput, terminal_viewer_rows};
 use bmux_tui::chrome::{Border, Panel};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect};
@@ -33,8 +28,6 @@ const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 const MAX_COMPOSER_ROWS: u16 = 6;
 const MAX_INLINE_TOOL_TEXT_ROWS: usize = 28;
 const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(420);
-const TERMINAL_PTY_STREAM_REF_KEY: &str = "terminal_pty_stream";
-const TERMINAL_PTY_STREAM_CONTENT_TYPE: &str = "application/x-bcode-terminal-pty-stream";
 #[derive(Debug, Clone, Copy)]
 pub struct TuiTheme {
     pub accent: Color,
@@ -1196,10 +1189,6 @@ fn push_tool_result_rows(
         muted_style(),
     );
     if let Some(artifact) = context.artifact {
-        if push_terminal_artifact_rows(rows, context, artifact, width) {
-            rows.push(Line::default());
-            return;
-        }
         let visual = CanonicalToolVisual::from_artifact(artifact);
         push_canonical_tool_visual_rows(rows, &visual, width, plugin_host);
         rows.push(Line::default());
@@ -1234,116 +1223,6 @@ fn push_tool_result_rows(
         );
     }
     rows.push(Line::default());
-}
-
-fn push_terminal_artifact_rows(
-    rows: &mut Vec<Line>,
-    context: &ToolResultRenderContext<'_>,
-    artifact: &bcode_session_models::ToolArtifact,
-    width: u16,
-) -> bool {
-    let Some(reference) = terminal_pty_stream_ref(artifact) else {
-        return false;
-    };
-    let Some(output) = terminal_pty_stream_ref_text(reference) else {
-        return false;
-    };
-    let columns = terminal_ref_u16(reference.metadata.as_ref(), "columns").unwrap_or_else(|| {
-        artifact
-            .metadata
-            .get("columns")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| u16::try_from(value).ok())
-            .unwrap_or(120)
-    });
-    let terminal_rows =
-        terminal_ref_u16(reference.metadata.as_ref(), "rows").unwrap_or_else(|| {
-            artifact
-                .metadata
-                .get("rows")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|value| u16::try_from(value).ok())
-                .unwrap_or(24)
-        });
-    let terminal_output = TerminalOutputTranscript {
-        exit_code: artifact
-            .metadata
-            .get("exit_code")
-            .and_then(serde_json::Value::as_i64)
-            .and_then(|value| i32::try_from(value).ok()),
-        timed_out: artifact
-            .metadata
-            .get("timed_out")
-            .and_then(serde_json::Value::as_bool),
-        elapsed: None,
-        output,
-        output_truncated: reference
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.get("tail_truncated"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        output_bytes: reference.byte_len,
-        retained_output_bytes: reference
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.get("retained_tail_bytes"))
-            .and_then(serde_json::Value::as_u64)
-            .or(reference.byte_len),
-        columns,
-        rows: terminal_rows,
-    };
-    push_terminal_output_rows(rows, &terminal_output, width);
-    if context.is_error {
-        push_wrapped_styled_text(
-            rows,
-            vec![Span::styled("  ", muted_style())],
-            &format!("tool call {}", context.tool_call_id),
-            width,
-            muted_style(),
-            muted_style(),
-        );
-    }
-    true
-}
-
-fn terminal_pty_stream_ref(
-    artifact: &bcode_session_models::ToolArtifact,
-) -> Option<&bcode_session_models::ToolArtifactRef> {
-    artifact.refs.iter().find(|reference| {
-        reference.key == TERMINAL_PTY_STREAM_REF_KEY
-            || reference
-                .content_type
-                .as_deref()
-                .is_some_and(|content_type| {
-                    content_type.starts_with(TERMINAL_PTY_STREAM_CONTENT_TYPE)
-                })
-            || reference
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("stream"))
-                .and_then(serde_json::Value::as_str)
-                == Some("pty")
-    })
-}
-
-fn terminal_pty_stream_ref_text(
-    reference: &bcode_session_models::ToolArtifactRef,
-) -> Option<String> {
-    let uri = reference.storage_uri.as_deref()?;
-    let url = url::Url::parse(uri).ok()?;
-    if url.scheme() != "file" {
-        return None;
-    }
-    let path = url.to_file_path().ok()?;
-    fs::read_to_string(path).ok()
-}
-
-fn terminal_ref_u16(metadata: Option<&serde_json::Value>, key: &str) -> Option<u16> {
-    metadata
-        .and_then(|metadata| metadata.get(key))
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| u16::try_from(value).ok())
 }
 
 fn push_labeled_text_preview(
@@ -1932,185 +1811,18 @@ struct TerminalOutputTranscript {
 }
 
 fn push_terminal_output_rows(rows: &mut Vec<Line>, output: &TerminalOutputTranscript, width: u16) {
-    let status = terminal_status(output);
-    push_wrapped_styled_text(
-        rows,
-        vec![Span::styled("  ", muted_style())],
-        &status,
-        width,
-        terminal_status_style(output),
-        muted_style(),
-    );
-    if output.output_truncated {
-        push_wrapped_styled_text(
-            rows,
-            vec![Span::styled("  ", muted_style())],
-            &terminal_truncation_status(output),
-            width,
-            muted_style(),
-            muted_style(),
-        );
-    }
-    for line in terminal_output_lines(output) {
-        rows.push(prefix_line(line, "    ", muted_style()));
-    }
-}
-
-fn terminal_truncation_status(output: &TerminalOutputTranscript) -> String {
-    match (output.retained_output_bytes, output.output_bytes) {
-        (Some(retained), Some(original)) => {
-            format!("output truncated · showing {retained} of {original} bytes")
-        }
-        _ => "output truncated".to_owned(),
-    }
-}
-
-fn terminal_output_lines(output: &TerminalOutputTranscript) -> Vec<Line> {
-    let Ok(mut stream) = TerminalGridStream::new(
-        output.columns.max(1),
-        output.rows.max(1),
-        GridLimits {
-            scrollback_rows: MAX_INLINE_TOOL_TEXT_ROWS.saturating_mul(8),
+    rows.extend(terminal_viewer_rows(
+        TerminalViewerInput {
+            output: &output.output,
+            columns: output.columns,
+            rows: output.rows,
+            exit_code: output.exit_code,
+            timed_out: output.timed_out,
+            elapsed: output.elapsed.as_deref(),
+            output_truncated: output.output_truncated,
+            output_bytes: output.output_bytes,
+            retained_output_bytes: output.retained_output_bytes,
         },
-    ) else {
-        return ansi_to_lines(&output.output);
-    };
-    stream.process(output.output.as_bytes());
-    let grid = stream.grid();
-    let rows = grid.main_content_tail_rows(MAX_INLINE_TOOL_TEXT_ROWS);
-    let lines = rows
-        .iter()
-        .map(|row| terminal_grid_row_to_line(grid, row))
-        .collect::<Vec<_>>();
-    preview_lines(&lines, MAX_INLINE_TOOL_TEXT_ROWS)
-        .into_iter()
-        .cloned()
-        .collect()
-}
-
-fn terminal_grid_row_to_line(grid: &TerminalGrid, row: &PhysicalRow) -> Line {
-    let mut spans = Vec::new();
-    let mut current_style = None;
-    let mut current_text = String::new();
-    for cell in row.cells() {
-        if cell.is_wide_continuation() {
-            continue;
-        }
-        let style = terminal_grid_style(grid.palette().get(cell.style()));
-        if current_style == Some(style) {
-            current_text.push_str(cell.text());
-            continue;
-        }
-        if !current_text.is_empty() {
-            spans.push(Span::styled(
-                current_text,
-                current_style.unwrap_or_default(),
-            ));
-            current_text = String::new();
-        }
-        current_style = Some(style);
-        current_text.push_str(cell.text());
-    }
-    if !current_text.is_empty() {
-        spans.push(Span::styled(
-            current_text,
-            current_style.unwrap_or_default(),
-        ));
-    }
-    Line::from_spans(spans)
-}
-
-fn terminal_grid_style(style: GridStyle) -> Style {
-    let mut output = Style::new();
-    if let Some(fg) = style.fg {
-        output = output.fg(terminal_grid_color(fg));
-    }
-    if let Some(bg) = style.bg {
-        output = output.bg(terminal_grid_color(bg));
-    }
-    let mut modifier = Modifier::EMPTY;
-    if style.bold {
-        modifier |= Modifier::BOLD;
-    }
-    if style.italic {
-        modifier |= Modifier::ITALIC;
-    }
-    if style.underline {
-        modifier |= Modifier::UNDERLINE;
-    }
-    if style.dim {
-        modifier |= Modifier::DIM;
-    }
-    if style.inverse {
-        modifier |= Modifier::REVERSED;
-    }
-    if style.strike {
-        modifier |= Modifier::CROSSED_OUT;
-    }
-    output.add_modifier(modifier)
-}
-
-const fn terminal_grid_color(color: GridColor) -> Color {
-    match color {
-        GridColor::Indexed(index) => ansi_indexed_color(index),
-        GridColor::Rgb { r, g, b } => Color::Rgb(r, g, b),
-    }
-}
-
-const fn ansi_indexed_color(index: u8) -> Color {
-    match index {
-        0 => Color::Black,
-        1 => Color::Red,
-        2 => Color::Green,
-        3 => Color::Yellow,
-        4 => Color::Blue,
-        5 => Color::Magenta,
-        6 => Color::Cyan,
-        7 => Color::White,
-        8 => Color::BrightBlack,
-        9 => Color::BrightRed,
-        10 => Color::BrightGreen,
-        11 => Color::BrightYellow,
-        12 => Color::BrightBlue,
-        13 => Color::BrightMagenta,
-        14 => Color::BrightCyan,
-        15 => Color::BrightWhite,
-        other => Color::Indexed(other),
-    }
-}
-
-fn terminal_status(output: &TerminalOutputTranscript) -> String {
-    let timing_label = if output.timed_out.is_some() {
-        "duration"
-    } else {
-        "elapsed"
-    };
-    let timing = output
-        .elapsed
-        .as_ref()
-        .map(|elapsed| format!(" · {timing_label} {elapsed}"))
-        .unwrap_or_default();
-    let Some(timed_out) = output.timed_out else {
-        return format!("running{timing}");
-    };
-    if timed_out {
-        return format!("timed out{timing}");
-    }
-    let exit_code = output
-        .exit_code
-        .map_or_else(|| "signal".to_owned(), |code| format!("exit {code}"));
-    format!("{exit_code}{timing}")
-}
-
-fn terminal_status_style(output: &TerminalOutputTranscript) -> Style {
-    if output
-        .timed_out
-        .is_some_and(|timed_out| timed_out || output.exit_code.is_some_and(|code| code != 0))
-    {
-        Style::new().fg(Color::Red)
-    } else if output.timed_out.is_none() {
-        Style::new().fg(Color::Cyan)
-    } else {
-        Style::new().fg(Color::Green)
-    }
+        width,
+    ));
 }

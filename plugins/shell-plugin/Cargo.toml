@@ -14,19 +14,23 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bcode_config       = { workspace = true }
-bcode_plugin_sdk   = { workspace = true }
-bcode_tool         = { workspace = true }
-bcode_tool_runtime = { workspace = true }
-bmux_tui           = { workspace = true, optional = true }
-portable-pty       = { workspace = true }
-serde              = { workspace = true, features = ["derive", "std"] }
-serde_json         = { workspace = true }
-tokio              = { workspace = true, features = ["rt"] }
-url                = { workspace = true }
-vte                = { workspace = true }
+bcode_config         = { workspace = true }
+bcode_plugin_sdk     = { workspace = true }
+bcode_tool           = { workspace = true }
+bcode_tool_runtime   = { workspace = true }
+bcode_tui_components = { workspace = true, optional = true }
+bmux_tui             = { workspace = true, optional = true }
+portable-pty         = { workspace = true }
+serde                = { workspace = true, features = ["derive", "std"] }
+serde_json           = { workspace = true }
+tokio                = { workspace = true, features = ["rt"] }
+url                  = { workspace = true }
+vte                  = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [features]
 default          = []
 fail-on-warnings = []
-static-bundled   = ["bmux_tui"]
+static-bundled   = ["bcode_tui_components", "bmux_tui"]
