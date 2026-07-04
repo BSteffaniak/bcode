@@ -17,6 +17,7 @@ use bcode_session_models::{
     RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
     SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery,
     SessionId, SessionInputHistoryEntry, SessionSummary, SessionTitleSource,
+    ToolInvocationStreamEvent,
 };
 use switchy::{
     database::{
@@ -1569,15 +1570,11 @@ async fn project_event(db: &dyn Database, event: &SessionEvent) -> SessionDbResu
                 .where_eq("tool_call_id", tool_call_id.clone())
                 .execute(db)
                 .await?;
-            insert_transcript_item(
-                db,
-                event,
-                "tool",
-                "result",
-                if *is_error { "error" } else { "complete" },
-                None,
-            )
-            .await?;
+            insert_tool_result_transcript_item(db, event, tool_call_id, *is_error).await?;
+        }
+        SessionEventKind::ToolInvocationStream { event: stream } => {
+            update_tool_transcript_item_end(db, tool_stream_tool_call_id(stream), event.sequence)
+                .await?;
         }
         SessionEventKind::RuntimeWorkStarted {
             work_id,
@@ -1677,15 +1674,41 @@ async fn insert_transcript_item(
     status: &str,
     content: Option<String>,
 ) -> SessionDbResult<()> {
+    insert_transcript_item_with_range(
+        db,
+        event.sequence,
+        event.sequence,
+        event.sequence,
+        event_created_at_ms(event),
+        role,
+        kind,
+        status,
+        content,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_transcript_item_with_range(
+    db: &dyn Database,
+    transcript_seq: u64,
+    event_seq_start: u64,
+    event_seq_end: u64,
+    created_at_ms: u64,
+    role: &str,
+    kind: &str,
+    status: &str,
+    content: Option<String>,
+) -> SessionDbResult<()> {
     let mut statement = db
         .insert("transcript_items")
-        .value("transcript_seq", seq_to_value(event.sequence))
-        .value("event_seq_start", seq_to_value(event.sequence))
-        .value("event_seq_end", seq_to_value(event.sequence))
+        .value("transcript_seq", seq_to_value(transcript_seq))
+        .value("event_seq_start", seq_to_value(event_seq_start))
+        .value("event_seq_end", seq_to_value(event_seq_end))
         .value("role", role)
         .value("kind", kind)
         .value("status", status)
-        .value("created_at_ms", seq_to_value(event_created_at_ms(event)));
+        .value("created_at_ms", seq_to_value(created_at_ms));
 
     if let Some(content) = content {
         statement = statement.value("content", content);
@@ -1693,6 +1716,73 @@ async fn insert_transcript_item(
 
     statement.execute(db).await?;
     Ok(())
+}
+
+async fn insert_tool_result_transcript_item(
+    db: &dyn Database,
+    event: &SessionEvent,
+    tool_call_id: &str,
+    is_error: bool,
+) -> SessionDbResult<()> {
+    let row = db
+        .select("tool_runs")
+        .columns(&["event_seq_start"])
+        .where_eq("tool_call_id", tool_call_id.to_owned())
+        .execute_first(db)
+        .await?;
+    let event_seq_start = row
+        .as_ref()
+        .map(|row| required_i64(row, "event_seq_start").map(i64_to_u64))
+        .transpose()?
+        .unwrap_or(event.sequence);
+    insert_transcript_item_with_range(
+        db,
+        event.sequence,
+        event_seq_start,
+        event.sequence,
+        event_created_at_ms(event),
+        "tool",
+        "result",
+        if is_error { "error" } else { "complete" },
+        None,
+    )
+    .await
+}
+
+async fn update_tool_transcript_item_end(
+    db: &dyn Database,
+    tool_call_id: &str,
+    event_sequence: u64,
+) -> SessionDbResult<()> {
+    let row = db
+        .select("tool_runs")
+        .columns(&["event_seq_start"])
+        .where_eq("tool_call_id", tool_call_id.to_owned())
+        .execute_first(db)
+        .await?;
+    let Some(event_seq_start) = row
+        .as_ref()
+        .map(|row| required_i64(row, "event_seq_start").map(i64_to_u64))
+        .transpose()?
+    else {
+        return Ok(());
+    };
+    db.update("transcript_items")
+        .value("event_seq_end", seq_to_value(event_sequence))
+        .where_eq("transcript_seq", seq_to_value(event_seq_start))
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+fn tool_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &str {
+    match event {
+        ToolInvocationStreamEvent::Started { tool_call_id, .. }
+        | ToolInvocationStreamEvent::OutputDelta { tool_call_id, .. }
+        | ToolInvocationStreamEvent::Status { tool_call_id, .. }
+        | ToolInvocationStreamEvent::LegacyPresentation { tool_call_id, .. }
+        | ToolInvocationStreamEvent::Finished { tool_call_id, .. } => tool_call_id,
+    }
 }
 
 const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
@@ -2380,6 +2470,108 @@ mod tests {
             db.last_event_sequence().await.expect("last sequence"),
             Some(4)
         );
+    }
+
+    #[tokio::test]
+    async fn transcript_window_tool_result_spans_raw_pty_stream_events() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "shell-1".to_owned(),
+                producer_plugin_id: Some("bcode.shell".to_owned()),
+                tool_name: "shell.run".to_owned(),
+                arguments_json: r#"{"command":"printf hi"}"#.to_owned(),
+                legacy_request_presentation: None,
+            },
+        ))
+        .await
+        .expect("append request");
+        db.append_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Started {
+                    tool_call_id: "shell-1".to_owned(),
+                    tool_name: "shell.run".to_owned(),
+                    sequence: 0,
+                    terminal: true,
+                    columns: Some(80),
+                    rows: Some(24),
+                    started_at_ms: Some(1),
+                },
+            },
+        ))
+        .await
+        .expect("append stream start");
+        db.append_event(&event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::OutputDelta {
+                    tool_call_id: "shell-1".to_owned(),
+                    stream: bcode_session_models::ToolOutputStream::Pty,
+                    sequence: 1,
+                    text: "\u{1b}[31mhi\u{1b}[0m\n".to_owned(),
+                    byte_len: 12,
+                },
+            },
+        ))
+        .await
+        .expect("append pty output");
+        db.append_event(&event(
+            session_id,
+            3,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Finished {
+                    tool_call_id: "shell-1".to_owned(),
+                    sequence: 2,
+                    is_error: false,
+                    finished_at_ms: Some(3),
+                },
+            },
+        ))
+        .await
+        .expect("append stream finish");
+        db.append_event(&event(
+            session_id,
+            4,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "shell-1".to_owned(),
+                result: "done".to_owned(),
+                is_error: false,
+                output: None,
+                semantic_result: None,
+            },
+        ))
+        .await
+        .expect("append tool finish");
+
+        let items = db
+            .transcript_items_for_latest_window(1, 1, usize::MAX)
+            .await
+            .expect("transcript window items");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, "result");
+        assert_eq!(items[0].event_seq_start, 0);
+        assert_eq!(items[0].event_seq_end, 4);
+        let events = db
+            .events_range(items[0].event_seq_start, items[0].event_seq_end, 10)
+            .await
+            .expect("events range");
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::OutputDelta { stream, .. }
+            } if *stream == bcode_session_models::ToolOutputStream::Pty
+        )));
     }
 
     #[tokio::test]

@@ -5102,6 +5102,88 @@ fn replayed_shell_artifact_renders_terminal_output_from_raw_run_metadata() {
 }
 
 #[test]
+fn replayed_shell_run_prefers_raw_pty_stream_over_shell_artifact_metadata() {
+    let session_id = SessionId::new();
+    let mut artifact = shell_run_artifact();
+    artifact.metadata["output_tail"] =
+        serde_json::Value::String("artifact raw fallback\n".to_owned());
+    let events = vec![
+        event(
+            session_id,
+            0,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-shell".to_owned(),
+                producer_plugin_id: Some("bcode.shell".to_owned()),
+                tool_name: "shell.run".to_owned(),
+                arguments_json: r#"{"command":"printf"}"#.to_owned(),
+                legacy_request_presentation: None,
+            },
+        ),
+        event(
+            session_id,
+            1,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Started {
+                    tool_call_id: "call-shell".to_owned(),
+                    tool_name: "shell.run".to_owned(),
+                    sequence: 0,
+                    terminal: true,
+                    columns: Some(80),
+                    rows: Some(24),
+                    started_at_ms: Some(1),
+                },
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::OutputDelta {
+                    tool_call_id: "call-shell".to_owned(),
+                    stream: ToolOutputStream::Pty,
+                    sequence: 1,
+                    text: "first\rsecond\n".to_owned(),
+                    byte_len: 13,
+                },
+            },
+        ),
+        event(
+            session_id,
+            3,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Finished {
+                    tool_call_id: "call-shell".to_owned(),
+                    sequence: 2,
+                    is_error: false,
+                    finished_at_ms: Some(3),
+                },
+            },
+        ),
+        event(
+            session_id,
+            4,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "call-shell".to_owned(),
+                result: "shell completed".to_owned(),
+                is_error: false,
+                output: None,
+                semantic_result: Some(ToolInvocationResult::Artifact {
+                    artifact: Box::new(artifact),
+                }),
+            },
+        ),
+    ];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
+
+    let rendered = render_app_text(&mut app);
+
+    assert!(rendered.contains("second"), "{rendered}");
+    assert!(!rendered.contains("first"), "{rendered}");
+    assert!(!rendered.contains("artifact raw fallback"), "{rendered}");
+}
+
+#[test]
 fn filesystem_write_request_preview_renders_from_raw_arguments_without_metadata() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
