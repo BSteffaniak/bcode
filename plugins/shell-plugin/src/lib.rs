@@ -952,21 +952,52 @@ mod tests {
         serde_json::from_value(artifact.metadata.clone()).ok()
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn clean_artifact_ref_uses_encoded_file_uri() {
-        let output = LimitedOutput {
+    fn test_limited_output() -> LimitedOutput {
+        LimitedOutput {
             text: String::new(),
             original_bytes: 12,
             retained_bytes: 12,
             truncated: false,
-        };
-        let reference = clean_artifact_ref(Path::new("/tmp/bcode shell #output%.txt"), &output);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_artifact_ref_uses_encoded_file_uri() {
+        let output = test_limited_output();
+        let reference = clean_artifact_ref(Path::new("/tmp/bcode shell #output%?.txt"), &output);
 
         assert_eq!(
             reference.storage_uri.as_deref(),
-            Some("file:///tmp/bcode%20shell%20%23output%25.txt")
+            Some("file:///tmp/bcode%20shell%20%23output%25%3F.txt")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_artifact_ref_file_uri_round_trips_unicode_path() {
+        let path = Path::new("/tmp/bcode café output.txt");
+        let reference = clean_artifact_ref(path, &test_limited_output());
+        let uri = reference
+            .storage_uri
+            .as_deref()
+            .and_then(|value| url::Url::parse(value).ok())
+            .expect("file uri should parse");
+
+        assert_eq!(uri.scheme(), "file");
+        assert_eq!(uri.to_file_path().expect("uri should become path"), path);
+    }
+
+    #[test]
+    fn clean_artifact_ref_omits_storage_uri_for_relative_path() {
+        let reference = clean_artifact_ref(
+            Path::new("relative/path with spaces.txt"),
+            &test_limited_output(),
+        );
+
+        assert_eq!(reference.storage_uri, None);
+        assert_eq!(reference.key, "clean_output");
+        assert_eq!(reference.byte_len, Some(12));
     }
 
     #[test]
