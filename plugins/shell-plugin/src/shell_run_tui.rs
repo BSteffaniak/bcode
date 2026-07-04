@@ -14,10 +14,13 @@ pub struct ShellRunTuiVisualAdapter;
 
 impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter {
     fn supports(&self, kind: &str) -> bool {
-        kind == "bcode.shell.run"
+        matches!(kind, "bcode.shell.run" | "bcode.tool.request.shell.run")
     }
 
-    fn rows(&self, _kind: &str, payload: &serde_json::Value, width: u16) -> Vec<Line> {
+    fn rows(&self, kind: &str, payload: &serde_json::Value, width: u16) -> Vec<Line> {
+        if kind == "bcode.tool.request.shell.run" {
+            return shell_request_rows(payload, width);
+        }
         let mode = payload
             .get("mode")
             .and_then(serde_json::Value::as_str)
@@ -65,6 +68,23 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         ));
         lines
     }
+}
+
+fn shell_request_rows(payload: &serde_json::Value, _width: u16) -> Vec<Line> {
+    let arguments = payload.get("arguments").unwrap_or(payload);
+    let command = arguments
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let cwd = arguments.get("cwd").and_then(serde_json::Value::as_str);
+    let mut lines = vec![Line::from("Shell command")];
+    if !command.is_empty() {
+        lines.push(Line::from(format!("command: {command}")));
+    }
+    if let Some(cwd) = cwd {
+        lines.push(Line::from(format!("cwd: {cwd}")));
+    }
+    lines
 }
 
 fn terminal_replay_output(payload: &serde_json::Value) -> Option<String> {

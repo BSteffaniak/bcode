@@ -839,6 +839,16 @@ fn push_tool_request_rows(
     context: &ToolRequestRenderContext<'_>,
     width: u16,
 ) {
+    if let Some(visual) = CanonicalToolVisual::from_tool_request(
+        context.producer_plugin_id,
+        context.tool_name,
+        context.arguments_json,
+    ) && canonical_plugin_visual_available(&visual, context.plugin_host)
+    {
+        push_canonical_tool_visual_rows(rows, &visual, width, context.plugin_host);
+        rows.push(Line::default());
+        return;
+    }
     let title = format!("Tool · {}", context.tool_name);
     let title_color = if item.streaming() {
         Color::Cyan
@@ -904,6 +914,25 @@ fn push_live_tool_preview_anchor_rows(
     let visual = CanonicalToolVisual::from_live_preview(&state.tool_name, &state.preview);
     push_canonical_tool_visual_rows(rows, &visual, width, plugin_host);
     rows.push(Line::default());
+}
+
+fn canonical_plugin_visual_available(
+    visual: &CanonicalToolVisual,
+    plugin_host: Option<&bcode_plugin::PluginHost>,
+) -> bool {
+    let CanonicalToolVisual::Plugin(plugin_visual) = visual else {
+        return false;
+    };
+    let Some(host) = plugin_host else {
+        return false;
+    };
+    host.visual_adapter(
+        &plugin_visual.schema,
+        plugin_visual.schema_version,
+        "tui",
+        plugin_visual.producer_plugin_id.as_deref(),
+    )
+    .is_some()
 }
 
 fn push_canonical_tool_visual_rows(

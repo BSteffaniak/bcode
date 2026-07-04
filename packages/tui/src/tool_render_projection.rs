@@ -196,6 +196,29 @@ impl CanonicalToolVisual {
         }
     }
 
+    /// Build a canonical plugin visual from raw tool request arguments.
+    #[must_use]
+    pub fn from_tool_request(
+        producer_plugin_id: Option<&str>,
+        tool_name: &str,
+        arguments_json: &str,
+    ) -> Option<Self> {
+        let arguments = serde_json::from_str::<Value>(arguments_json).ok()?;
+        Some(Self::Plugin(CanonicalPluginVisual {
+            producer_plugin_id: producer_plugin_id.map(ToOwned::to_owned),
+            schema: format!("bcode.tool.request.{tool_name}"),
+            schema_version: 1,
+            title: Some(tool_name.to_owned()),
+            subtitle: None,
+            payload: serde_json::json!({
+                "tool_name": tool_name,
+                "arguments": arguments,
+                "arguments_json": arguments_json,
+            }),
+            streaming: false,
+        }))
+    }
+
     /// Build a canonical plugin visual from filesystem request arguments.
     #[must_use]
     pub fn from_filesystem_request(

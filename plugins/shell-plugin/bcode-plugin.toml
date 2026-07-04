@@ -9,6 +9,15 @@ interface_id = "bcode.tool/v1"
 name         = "Shell Tools"
 
 [[visual_adapters]]
+artifact_schema    = "bcode.tool.request.shell.run"
+id                 = "shell-run-request-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+surfaces           = ["tui"]
+
+[[visual_adapters]]
 artifact_schema    = "bcode.shell.run"
 id                 = "shell-run-terminal-card"
 max_schema_version = 1

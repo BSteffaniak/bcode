@@ -6350,6 +6350,45 @@ fn live_shell_command_preview_streams_before_final_request_and_is_preserved() {
 }
 
 #[test]
+fn replayed_shell_request_uses_shell_plugin_request_renderer_without_legacy_metadata() {
+    let session_id = SessionId::new();
+    let history = vec![event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call_shell".to_owned(),
+            producer_plugin_id: Some("bcode.shell".to_owned()),
+            tool_name: "shell.run".to_owned(),
+            arguments_json: serde_json::json!({
+                "command": "cargo check --workspace",
+                "cwd": "/Users/braden/GitHub/bcode",
+                "columns": 120,
+                "rows": 30,
+                "timeout_ms": 120_000,
+            })
+            .to_string(),
+            legacy_request_presentation: None,
+        },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
+
+    let rendered = render_app_text(&mut app);
+
+    assert!(rendered.contains("Shell command"), "{rendered}");
+    assert!(
+        rendered.contains("command: cargo check --workspace"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("cwd: /Users/braden/GitHub/bcode"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("Tool · shell.run"), "{rendered}");
+    assert!(!rendered.contains("arguments"), "{rendered}");
+}
+
+#[test]
 fn live_file_preview_updates_without_duplicates_and_final_replaces_it() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
