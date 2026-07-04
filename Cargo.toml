@@ -275,6 +275,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 unicode-segmentation = { version = "1.13.0", default-features = false }
 unicode-width = { version = "0.2.2", default-features = false }
 uuid = { version = "1.21.0", default-features = false }
+vte = { version = "0.15.0", default-features = false, features = ["std"] }
 worktree_setup_config = { version = "0.4.0", default-features = false }
 worktree_setup_git = { version = "0.4.0", default-features = false }
 worktree_setup_operations = { version = "0.4.0", default-features = false }

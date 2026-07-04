@@ -6,6 +6,7 @@
 
 #[cfg(feature = "static-bundled")]
 mod shell_run_tui;
+mod terminal_clean;
 
 use bcode_config::{
     ShellToolConfig, ShellToolEnvAutoFallback, ShellToolEnvConfig, ShellToolEnvMode,
@@ -14,13 +15,14 @@ use bcode_config::{
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, ShellRunResult, TOOL_SERVICE_INTERFACE_ID,
-    ToolArtifact, ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
+    ToolArtifact, ToolArtifactRef, ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
     ToolInvocationResult, ToolInvocationStreamEvent, ToolList, ToolLiveArgumentPreviewMetadata,
     ToolOutputStream, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::io::Read;
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -152,7 +154,11 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             request.name.as_str(),
             request.arguments,
             request.cwd.as_deref(),
-            request.cancellation_path.as_deref(),
+            TerminalRunPaths {
+                session_cwd: request.cwd.as_deref(),
+                artifact_dir: request.artifact_dir.as_deref(),
+                cancellation_path: request.cancellation_path.as_deref(),
+            },
         ),
         _ => ToolInvocationResponse {
             output: format!("unknown shell tool: {}", request.name),
@@ -173,7 +179,7 @@ fn run_shell_tool(
     tool_name: &str,
     arguments: serde_json::Value,
     session_cwd: Option<&std::path::Path>,
-    cancellation_path: Option<&std::path::Path>,
+    paths: TerminalRunPaths<'_>,
 ) -> ToolInvocationResponse {
     let arguments = match serde_json::from_value::<ShellRunArguments>(arguments) {
         Ok(arguments) => arguments,
@@ -222,8 +228,10 @@ fn run_shell_tool(
         &context.cancellation,
         tool_call_id,
         &arguments,
-        session_cwd,
-        cancellation_path,
+        TerminalRunPaths {
+            session_cwd,
+            ..paths
+        },
     );
     emit_tool_stream_event(
         events,
@@ -257,6 +265,13 @@ struct LimitedOutput {
     original_bytes: usize,
     retained_bytes: usize,
     truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TerminalStreamOutput {
+    raw: LimitedOutput,
+    clean: LimitedOutput,
+    clean_artifact_path: Option<PathBuf>,
 }
 
 fn resolve_effective_cwd(
@@ -367,21 +382,26 @@ fn shell_program_and_args(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TerminalRunPaths<'a> {
+    session_cwd: Option<&'a Path>,
+    artifact_dir: Option<&'a Path>,
+    cancellation_path: Option<&'a Path>,
+}
+
 fn run_terminal_shell_command(
     events: ServiceEventEmitter,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
     tool_call_id: &str,
     arguments: &ShellRunArguments,
-    session_cwd: Option<&Path>,
-    cancellation_path: Option<&Path>,
+    paths: TerminalRunPaths<'_>,
 ) -> ToolInvocationResponse {
     run_terminal_shell_command_with_environment(
         events,
         cancellation,
         tool_call_id,
         arguments,
-        session_cwd,
-        cancellation_path,
+        paths,
         &bcode_config::ProcessConfigEnvironment,
     )
 }
@@ -391,8 +411,7 @@ fn run_terminal_shell_command_with_environment(
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
     tool_call_id: &str,
     arguments: &ShellRunArguments,
-    session_cwd: Option<&Path>,
-    cancellation_path: Option<&Path>,
+    paths: TerminalRunPaths<'_>,
     environment: &impl bcode_config::ConfigEnvironment,
 ) -> ToolInvocationResponse {
     match run_terminal_shell_command_inner(
@@ -400,8 +419,7 @@ fn run_terminal_shell_command_with_environment(
         cancellation,
         tool_call_id,
         arguments,
-        session_cwd,
-        cancellation_path,
+        paths,
         environment,
     ) {
         Ok(response) => response,
@@ -513,12 +531,11 @@ fn run_terminal_shell_command_inner(
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
     tool_call_id: &str,
     arguments: &ShellRunArguments,
-    session_cwd: Option<&Path>,
-    cancellation_path: Option<&Path>,
+    paths: TerminalRunPaths<'_>,
     environment: &impl bcode_config::ConfigEnvironment,
 ) -> Result<ToolInvocationResponse, String> {
     let timeout = Duration::from_millis(arguments.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
-    let cwd = resolve_effective_cwd(arguments, session_cwd);
+    let cwd = resolve_effective_cwd(arguments, paths.session_cwd);
     let env_config = shell_config_with_environment(cwd.as_deref(), environment)?.env;
     let columns = arguments.terminal_columns();
     let rows = arguments.terminal_rows();
@@ -552,24 +569,36 @@ fn run_terminal_shell_command_inner(
         .master
         .try_clone_reader()
         .map_err(|error| error.to_string())?;
+    let clean_artifact_path = clean_artifact_path(paths.artifact_dir, tool_call_id)?;
     let reader_thread = std::thread::spawn({
         let tool_call_id = tool_call_id.to_owned();
-        move || read_limited_streaming(&mut reader, events, &tool_call_id, ToolOutputStream::Pty)
+        move || {
+            read_limited_streaming(
+                &mut reader,
+                events,
+                &tool_call_id,
+                ToolOutputStream::Pty,
+                clean_artifact_path,
+                columns,
+                rows,
+            )
+        }
     });
 
     let started = Instant::now();
     let status = wait_for_terminal_shell_status(
         &mut child,
         cancellation,
-        cancellation_path,
+        paths.cancellation_path,
         timeout,
         tool_call_id,
         events,
     )?;
     drop(pair.master);
-    let output = join_reader(reader_thread)?;
-    let (encoded, full_encoded, inline_output) =
-        encode_terminal_output(status, &output, columns, rows)?;
+    let stream_output = join_reader(reader_thread)?;
+    let (encoded, full_encoded, _clean_inline_output) =
+        encode_terminal_output(status, &stream_output.clean, columns, rows)?;
+    let raw_inline_output = limit_terminal_inline_output(&stream_output.raw);
     Ok(ToolInvocationResponse {
         output: encoded,
         is_error: status.timed_out || status.cancelled || !status.success,
@@ -577,21 +606,27 @@ fn run_terminal_shell_command_inner(
         full_output: Some(full_encoded),
         host_action: None,
         result: Some(shell_run_artifact(
-            "shell.run",
+            tool_call_id,
             &ShellRunResult::Terminal {
                 exit_code: Some(status.exit_code),
                 timed_out: status.timed_out,
                 cancelled: status.cancelled,
                 duration_ms: Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
-                output_tail: inline_output.text,
-                output_truncated: inline_output.truncated,
-                output_bytes: Some(u64::try_from(inline_output.original_bytes).unwrap_or(u64::MAX)),
+                output_tail: raw_inline_output.text,
+                output_truncated: raw_inline_output.truncated,
+                output_bytes: Some(
+                    u64::try_from(raw_inline_output.original_bytes).unwrap_or(u64::MAX),
+                ),
                 retained_output_bytes: Some(
-                    u64::try_from(inline_output.retained_bytes).unwrap_or(u64::MAX),
+                    u64::try_from(raw_inline_output.retained_bytes).unwrap_or(u64::MAX),
                 ),
                 columns,
                 rows,
             },
+            stream_output
+                .clean_artifact_path
+                .as_deref()
+                .map(|path| clean_artifact_ref(path, &stream_output.clean)),
         )),
     })
 }
@@ -647,13 +682,25 @@ fn read_limited_streaming<R>(
     events: ServiceEventEmitter,
     tool_call_id: &str,
     stream: ToolOutputStream,
-) -> Result<LimitedOutput, String>
+    clean_artifact_path: Option<PathBuf>,
+    columns: u16,
+    rows: u16,
+) -> Result<TerminalStreamOutput, String>
 where
     R: Read,
 {
-    let mut bytes = Vec::new();
+    let mut raw_bytes = Vec::new();
+    let mut clean_writer = clean_artifact_writer(clean_artifact_path.as_deref())?;
+    let mut cleaner = terminal_clean::TerminalCleanWriter::new(
+        &mut clean_writer,
+        columns,
+        rows,
+        MAX_INLINE_TERMINAL_OUTPUT_BYTES,
+    );
     let mut buffer = [0_u8; 4096];
     let mut sequence = 0_u64;
+    let mut raw_original_bytes = 0_usize;
+    let mut raw_truncated = false;
     loop {
         let read = reader
             .read(&mut buffer)
@@ -662,15 +709,66 @@ where
             break;
         }
         sequence = sequence.saturating_add(1);
-        let remaining = DEFAULT_MAX_OUTPUT_BYTES.saturating_sub(bytes.len());
+        raw_original_bytes = raw_original_bytes.saturating_add(read);
+        emit_tool_output_delta(events, tool_call_id, stream, sequence, &buffer[..read]);
+        cleaner
+            .write_chunk(&buffer[..read])
+            .map_err(|error| error.to_string())?;
+
+        let remaining = DEFAULT_MAX_OUTPUT_BYTES.saturating_sub(raw_bytes.len());
         if remaining == 0 {
+            raw_truncated = true;
             continue;
         }
         let retained = read.min(remaining);
-        emit_tool_output_delta(events, tool_call_id, stream, sequence, &buffer[..retained]);
-        bytes.extend_from_slice(&buffer[..retained]);
+        raw_bytes.extend_from_slice(&buffer[..retained]);
+        raw_truncated = raw_truncated || retained < read;
     }
-    Ok(limit_output_bytes(&bytes, DEFAULT_MAX_OUTPUT_BYTES))
+    let clean_summary = cleaner.finish().map_err(|error| error.to_string())?;
+    let clean_bytes = clean_summary.tail.into_bytes();
+    Ok(TerminalStreamOutput {
+        raw: limit_output_bytes_with_original(
+            &raw_bytes,
+            raw_original_bytes,
+            DEFAULT_MAX_OUTPUT_BYTES,
+            raw_truncated,
+        ),
+        clean: limit_output_bytes_with_original(
+            &clean_bytes,
+            usize::try_from(clean_summary.bytes_written).unwrap_or(usize::MAX),
+            MAX_INLINE_TERMINAL_OUTPUT_BYTES,
+            clean_summary.tail_truncated,
+        ),
+        clean_artifact_path,
+    })
+}
+
+fn clean_artifact_path(
+    artifact_dir: Option<&Path>,
+    tool_call_id: &str,
+) -> Result<Option<PathBuf>, String> {
+    let Some(artifact_dir) = artifact_dir else {
+        return Ok(None);
+    };
+    std::fs::create_dir_all(artifact_dir).map_err(|error| error.to_string())?;
+    let safe_tool_call_id = tool_call_id
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>();
+    Ok(Some(artifact_dir.join(format!(
+        "tool-output-{safe_tool_call_id}-clean.txt"
+    ))))
+}
+
+fn clean_artifact_writer(path: Option<&Path>) -> Result<Box<dyn Write + Send>, String> {
+    path.map_or_else(
+        || Ok(Box::new(Vec::<u8>::new()) as Box<dyn Write + Send>),
+        |path| {
+            File::create(path)
+                .map(|file| Box::new(file) as Box<dyn Write + Send>)
+                .map_err(|error| error.to_string())
+        },
+    )
 }
 
 fn current_unix_millis() -> u64 {
@@ -722,23 +820,24 @@ fn emit_tool_stream_event(events: ServiceEventEmitter, event: &ToolInvocationStr
     }
 }
 
+#[cfg(test)]
 fn limit_output_bytes(bytes: &[u8], max_bytes: usize) -> LimitedOutput {
-    limit_output_bytes_with_truncation(bytes, max_bytes, false)
+    limit_output_bytes_with_original(bytes, bytes.len(), max_bytes, false)
 }
 
-fn limit_output_bytes_with_truncation(
+fn limit_output_bytes_with_original(
     bytes: &[u8],
+    original_bytes: usize,
     max_bytes: usize,
     already_truncated: bool,
 ) -> LimitedOutput {
-    let original_bytes = bytes.len();
-    let retained_len = valid_utf8_prefix_len(bytes, max_bytes.min(original_bytes));
+    let retained_len = valid_utf8_prefix_len(bytes, max_bytes.min(bytes.len()));
     let text = String::from_utf8_lossy(&bytes[..retained_len]).into_owned();
     LimitedOutput {
         text,
         original_bytes,
         retained_bytes: retained_len,
-        truncated: already_truncated || retained_len < original_bytes,
+        truncated: already_truncated || retained_len < bytes.len() || bytes.len() < original_bytes,
     }
 }
 
@@ -751,8 +850,8 @@ fn valid_utf8_prefix_len(bytes: &[u8], max_len: usize) -> usize {
 }
 
 fn join_reader(
-    handle: std::thread::JoinHandle<Result<LimitedOutput, String>>,
-) -> Result<LimitedOutput, String> {
+    handle: std::thread::JoinHandle<Result<TerminalStreamOutput, String>>,
+) -> Result<TerminalStreamOutput, String> {
     handle
         .join()
         .map_err(|_| "output reader thread panicked".to_string())?
@@ -765,7 +864,11 @@ fn json_response<T: serde::Serialize>(value: &T) -> ServiceResponse {
     }
 }
 
-fn shell_run_artifact(tool_call_id: &str, result: &ShellRunResult) -> ToolInvocationResult {
+fn shell_run_artifact(
+    tool_call_id: &str,
+    result: &ShellRunResult,
+    clean_ref: Option<ToolArtifactRef>,
+) -> ToolInvocationResult {
     ToolInvocationResult::Artifact {
         artifact: Box::new(ToolArtifact {
             artifact_id: format!("{tool_call_id}-shell-run"),
@@ -775,8 +878,22 @@ fn shell_run_artifact(tool_call_id: &str, result: &ShellRunResult) -> ToolInvoca
             tool_call_id: Some(tool_call_id.to_string()),
             title: Some("Shell run".to_string()),
             metadata: serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-            refs: Vec::new(),
+            refs: clean_ref.into_iter().collect(),
         }),
+    }
+}
+
+fn clean_artifact_ref(path: &Path, output: &LimitedOutput) -> ToolArtifactRef {
+    ToolArtifactRef {
+        key: "clean_output".to_string(),
+        content_type: Some("text/plain; charset=utf-8".to_string()),
+        storage_uri: Some(format!("file://{}", path.display())),
+        byte_len: Some(u64::try_from(output.original_bytes).unwrap_or(u64::MAX)),
+        metadata: Some(json!({
+            "description": "Model-oriented terminal transcript normalized by the shell plugin",
+            "retained_tail_bytes": output.retained_bytes,
+            "tail_truncated": output.truncated,
+        })),
     }
 }
 
@@ -873,8 +990,11 @@ mod tests {
                 columns: None,
                 rows: None,
             },
-            None,
-            None,
+            TerminalRunPaths {
+                session_cwd: None,
+                artifact_dir: None,
+                cancellation_path: None,
+            },
             &environment,
         );
 
@@ -908,8 +1028,11 @@ mod tests {
                 columns: None,
                 rows: None,
             },
-            None,
-            None,
+            TerminalRunPaths {
+                session_cwd: None,
+                artifact_dir: None,
+                cancellation_path: None,
+            },
             &environment,
         );
 
@@ -932,8 +1055,11 @@ mod tests {
                 columns: Some(80),
                 rows: Some(24),
             },
-            None,
-            None,
+            TerminalRunPaths {
+                session_cwd: None,
+                artifact_dir: None,
+                cancellation_path: None,
+            },
             &environment,
         );
 
@@ -972,8 +1098,11 @@ mod tests {
                 columns: Some(80),
                 rows: Some(24),
             },
-            None,
-            None,
+            TerminalRunPaths {
+                session_cwd: None,
+                artifact_dir: None,
+                cancellation_path: None,
+            },
         );
 
         assert!(!response.is_error, "{}", response.output);
