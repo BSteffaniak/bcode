@@ -101,6 +101,15 @@ fn default_tool_service_interface_id() -> String {
     bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned()
 }
 
+/// How a visual adapter's rows should be composed into host transcript chrome.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginVisualAdapterRenderMode {
+    #[default]
+    Inline,
+    FullBlock,
+}
+
 /// Visual adapter capability declared by a plugin manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginVisualAdapterDeclaration {
@@ -119,6 +128,8 @@ pub struct PluginVisualAdapterDeclaration {
     pub priority: i32,
     #[serde(default)]
     pub producer_default: bool,
+    #[serde(default)]
+    pub render_mode: PluginVisualAdapterRenderMode,
 }
 
 impl PluginVisualAdapterDeclaration {
@@ -1922,6 +1933,7 @@ pub struct PluginVisualAdapterRoute {
     pub surfaces: Vec<String>,
     pub priority: i32,
     pub producer_default: bool,
+    pub render_mode: PluginVisualAdapterRenderMode,
 }
 
 fn select_visual_adapter<'a, I>(
@@ -1964,6 +1976,7 @@ where
             surfaces: adapter.surfaces.clone(),
             priority: adapter.priority,
             producer_default: adapter.producer_default,
+            render_mode: adapter.render_mode,
         })
 }
 

@@ -17,6 +17,18 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         matches!(kind, "bcode.shell.run" | "bcode.tool.request.shell.run")
     }
 
+    fn render_mode(
+        &self,
+        kind: &str,
+        _payload: &serde_json::Value,
+    ) -> bcode_plugin_sdk::tui::PluginTuiVisualRenderMode {
+        if matches!(kind, "bcode.shell.run" | "bcode.tool.request.shell.run") {
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::FullBlock
+        } else {
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::Inline
+        }
+    }
+
     fn rows(&self, kind: &str, payload: &serde_json::Value, width: u16) -> Vec<Line> {
         if kind == "bcode.tool.request.shell.run" {
             return shell_request_rows(payload, width);
@@ -37,7 +49,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         });
 
         let mut lines = Vec::new();
-        lines.push(Line::from(format!("Shell run · {mode}")));
+        lines.push(Line::from(shell_run_terminal_title(payload, mode)));
         lines.extend(terminal_viewer_rows(
             TerminalViewerInput {
                 output: &output,
@@ -67,6 +79,54 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
             width,
         ));
         lines
+    }
+}
+
+fn shell_run_terminal_title(payload: &serde_json::Value, mode: &str) -> String {
+    if mode != "terminal" {
+        return format!("Shell run · {mode}");
+    }
+    let status = if payload
+        .get("timed_out")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        "timed out".to_owned()
+    } else if payload
+        .get("cancelled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        "cancelled".to_owned()
+    } else if let Some(exit_code) = payload.get("exit_code").and_then(serde_json::Value::as_i64) {
+        if exit_code == 0 {
+            "completed".to_owned()
+        } else {
+            format!("exit {exit_code}")
+        }
+    } else {
+        "completed".to_owned()
+    };
+    let duration = payload
+        .get("duration_ms")
+        .and_then(serde_json::Value::as_u64)
+        .map(format_duration_millis)
+        .map(|duration| format!(" · duration {duration}"))
+        .unwrap_or_default();
+    format!("Terminal · shell.run · {status}{duration}")
+}
+
+fn format_duration_millis(milliseconds: u64) -> String {
+    if milliseconds >= 1_000 {
+        let seconds = milliseconds / 1_000;
+        let tenths = (milliseconds % 1_000) / 100;
+        if tenths == 0 {
+            format!("{seconds}s")
+        } else {
+            format!("{seconds}.{tenths}s")
+        }
+    } else {
+        format!("{milliseconds}ms")
     }
 }
 
@@ -163,8 +223,8 @@ mod tests {
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
-        assert!(rendered.contains("Shell run"), "{rendered}");
-        assert!(rendered.contains("terminal"), "{rendered}");
+        assert!(rendered.contains("Terminal · shell.run"), "{rendered}");
+        assert!(rendered.contains("completed"), "{rendered}");
         assert!(rendered.contains("hello"), "{rendered}");
         assert!(rendered.contains("world"), "{rendered}");
     }

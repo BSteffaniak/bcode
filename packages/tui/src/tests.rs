@@ -5068,8 +5068,8 @@ fn live_shell_artifact_renders_terminal_output_from_raw_run_metadata() {
 
     let rendered = render_app_text(&mut app);
 
-    assert!(rendered.contains("Shell run"), "{rendered}");
-    assert!(rendered.contains("terminal"), "{rendered}");
+    assert!(rendered.contains("Terminal · shell.run"), "{rendered}");
+    assert!(rendered.contains("completed"), "{rendered}");
     assert!(rendered.contains("shell raw output"), "{rendered}");
     assert!(!rendered.contains("bcode.shell.run"), "{rendered}");
 }
@@ -5095,8 +5095,8 @@ fn replayed_shell_artifact_renders_terminal_output_from_raw_run_metadata() {
 
     let rendered = render_app_text(&mut app);
 
-    assert!(rendered.contains("Shell run"), "{rendered}");
-    assert!(rendered.contains("terminal"), "{rendered}");
+    assert!(rendered.contains("Terminal · shell.run"), "{rendered}");
+    assert!(rendered.contains("completed"), "{rendered}");
     assert!(rendered.contains("shell raw output"), "{rendered}");
     assert!(!rendered.contains("bcode.shell.run"), "{rendered}");
 }
@@ -5537,8 +5537,8 @@ fn shell_live_preview_is_not_superseded_by_terminal_result() {
 
     assert!(rendered.contains("Shell command"), "{rendered}");
     assert!(rendered.contains("command: cargo test"), "{rendered}");
-    assert!(rendered.contains("Shell run"), "{rendered}");
-    assert!(rendered.contains("terminal"), "{rendered}");
+    assert!(rendered.contains("Terminal · shell.run"), "{rendered}");
+    assert!(rendered.contains("completed"), "{rendered}");
     assert!(rendered.contains("shell raw output"), "{rendered}");
 }
 

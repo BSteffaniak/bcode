@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
+use bcode_plugin_sdk::tui::PluginTuiVisualRenderMode;
 use bcode_tui_components::terminal_viewer::{TerminalViewerInput, terminal_viewer_rows};
 use bmux_tui::chrome::{Border, Panel};
 use bmux_tui::frame::Frame;
@@ -916,6 +917,25 @@ fn push_live_tool_preview_anchor_rows(
     rows.push(Line::default());
 }
 
+fn canonical_plugin_visual_render_mode(
+    visual: &CanonicalPluginVisual,
+    plugin_host: Option<&bcode_plugin::PluginHost>,
+) -> Option<PluginTuiVisualRenderMode> {
+    let host = plugin_host?;
+    let route = host.visual_adapter(
+        &visual.schema,
+        visual.schema_version,
+        "tui",
+        visual.producer_plugin_id.as_deref(),
+    )?;
+    Some(match route.render_mode {
+        bcode_plugin::PluginVisualAdapterRenderMode::Inline => PluginTuiVisualRenderMode::Inline,
+        bcode_plugin::PluginVisualAdapterRenderMode::FullBlock => {
+            PluginTuiVisualRenderMode::FullBlock
+        }
+    })
+}
+
 fn canonical_plugin_visual_available(
     visual: &CanonicalToolVisual,
     plugin_host: Option<&bcode_plugin::PluginHost>,
@@ -1200,6 +1220,17 @@ fn push_tool_result_rows(
     width: u16,
     plugin_host: Option<&bcode_plugin::PluginHost>,
 ) {
+    if let Some(artifact) = context.artifact {
+        let visual = CanonicalToolVisual::from_artifact(artifact);
+        if let CanonicalToolVisual::Plugin(plugin_visual) = &visual
+            && canonical_plugin_visual_render_mode(plugin_visual, plugin_host)
+                == Some(PluginTuiVisualRenderMode::FullBlock)
+        {
+            push_canonical_tool_visual_rows(rows, &visual, width, plugin_host);
+            rows.push(Line::default());
+            return;
+        }
+    }
     let status = if context.is_error { "failed" } else { "ok" };
     let title = context.tool_name.map_or_else(
         || format!("Tool result · {status}"),

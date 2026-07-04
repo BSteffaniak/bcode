@@ -161,10 +161,24 @@ impl PluginTuiAction {
     }
 }
 
+/// How a visual adapter's rows should be composed into the host transcript block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginTuiVisualRenderMode {
+    /// Rows are rendered inside the host-provided transcript block chrome/header.
+    Inline,
+    /// Rows replace the host-provided transcript block chrome/header.
+    FullBlock,
+}
+
 /// Native Rust plugin artifact/view renderer for inline transcript content.
 pub trait PluginTuiVisualAdapter: Send + Sync {
     /// Return whether this adapter can render the artifact/view kind.
     fn supports(&self, kind: &str) -> bool;
+
+    /// Return how this visual should be composed by the host.
+    fn render_mode(&self, _kind: &str, _payload: &serde_json::Value) -> PluginTuiVisualRenderMode {
+        PluginTuiVisualRenderMode::Inline
+    }
 
     /// Build transcript rows for the artifact/view payload at the given width.
     fn rows(&self, kind: &str, payload: &serde_json::Value, width: u16) -> Vec<Line>;
@@ -265,6 +279,19 @@ impl PluginTuiRegistry {
         self.visual_adapters
             .iter()
             .any(|adapter| adapter.supports(kind))
+    }
+
+    /// Return how a native visual adapter wants this payload composed.
+    #[must_use]
+    pub fn visual_render_mode(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> Option<PluginTuiVisualRenderMode> {
+        self.visual_adapters
+            .iter()
+            .find(|adapter| adapter.supports(kind))
+            .map(|adapter| adapter.render_mode(kind, payload))
     }
 
     /// Build transcript rows for a plugin-owned artifact/view payload.
