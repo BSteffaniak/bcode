@@ -887,7 +887,7 @@ fn clean_artifact_ref(path: &Path, output: &LimitedOutput) -> ToolArtifactRef {
     ToolArtifactRef {
         key: "clean_output".to_string(),
         content_type: Some("text/plain; charset=utf-8".to_string()),
-        storage_uri: Some(format!("file://{}", path.display())),
+        storage_uri: file_storage_uri(path),
         byte_len: Some(u64::try_from(output.original_bytes).unwrap_or(u64::MAX)),
         metadata: Some(json!({
             "description": "Model-oriented terminal transcript normalized by the shell plugin",
@@ -895,6 +895,12 @@ fn clean_artifact_ref(path: &Path, output: &LimitedOutput) -> ToolArtifactRef {
             "tail_truncated": output.truncated,
         })),
     }
+}
+
+fn file_storage_uri(path: &Path) -> Option<String> {
+    url::Url::from_file_path(path)
+        .ok()
+        .map(|uri| uri.to_string())
 }
 
 fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
@@ -944,6 +950,23 @@ mod tests {
             return None;
         }
         serde_json::from_value(artifact.metadata.clone()).ok()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_artifact_ref_uses_encoded_file_uri() {
+        let output = LimitedOutput {
+            text: String::new(),
+            original_bytes: 12,
+            retained_bytes: 12,
+            truncated: false,
+        };
+        let reference = clean_artifact_ref(Path::new("/tmp/bcode shell #output%.txt"), &output);
+
+        assert_eq!(
+            reference.storage_uri.as_deref(),
+            Some("file:///tmp/bcode%20shell%20%23output%25.txt")
+        );
     }
 
     #[test]

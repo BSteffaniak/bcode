@@ -1999,6 +1999,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "url 2.5.8",
  "vte",
 ]
 
