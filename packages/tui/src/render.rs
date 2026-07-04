@@ -612,16 +612,15 @@ fn push_transcript_item_rows(
         }
         TranscriptItemKind::ToolRequest {
             tool_call_id,
-            producer_plugin_id,
+            producer_plugin_id: _,
             tool_name,
-            arguments_json,
+            request_visual,
             live_preview,
         } => {
             let context = ToolRequestRenderContext {
                 tool_call_id,
-                producer_plugin_id: producer_plugin_id.as_deref(),
                 tool_name,
-                arguments_json,
+                request_visual: request_visual.as_ref(),
                 _live_preview: *live_preview,
                 plugin_host,
             };
@@ -827,9 +826,8 @@ fn push_reasoning_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) 
 #[derive(Clone, Copy)]
 struct ToolRequestRenderContext<'a> {
     tool_call_id: &'a str,
-    producer_plugin_id: Option<&'a str>,
     tool_name: &'a str,
-    arguments_json: &'a str,
+    request_visual: Option<&'a bcode_session_models::PluginVisualDescriptor>,
     _live_preview: bool,
     plugin_host: Option<&'a bcode_plugin::PluginHost>,
 }
@@ -840,15 +838,13 @@ fn push_tool_request_rows(
     context: &ToolRequestRenderContext<'_>,
     width: u16,
 ) {
-    if let Some(visual) = CanonicalToolVisual::from_tool_request(
-        context.producer_plugin_id,
-        context.tool_name,
-        context.arguments_json,
-    ) && canonical_plugin_visual_available(&visual, context.plugin_host)
-    {
-        push_canonical_tool_visual_rows(rows, &visual, width, context.plugin_host);
-        rows.push(Line::default());
-        return;
+    if let Some(request_visual) = context.request_visual {
+        let visual = CanonicalToolVisual::from_plugin_descriptor(request_visual, false);
+        if canonical_plugin_visual_available(&visual, context.plugin_host) {
+            push_canonical_tool_visual_rows(rows, &visual, width, context.plugin_host);
+            rows.push(Line::default());
+            return;
+        }
     }
     let title = format!("Tool · {}", context.tool_name);
     let title_color = if item.streaming() {
@@ -872,13 +868,7 @@ fn push_tool_request_rows(
         muted_style(),
         muted_style(),
     );
-    if let Some(visual) = CanonicalToolVisual::from_filesystem_request(
-        context.producer_plugin_id,
-        context.tool_name,
-        context.arguments_json,
-    ) {
-        push_canonical_tool_visual_rows(rows, &visual, width, context.plugin_host);
-    } else if !item.text().is_empty() {
+    if !item.text().is_empty() {
         push_labeled_text_preview(rows, "arguments", item.text(), width, 16);
     }
     rows.push(Line::default());
@@ -940,9 +930,7 @@ fn canonical_plugin_visual_available(
     visual: &CanonicalToolVisual,
     plugin_host: Option<&bcode_plugin::PluginHost>,
 ) -> bool {
-    let CanonicalToolVisual::Plugin(plugin_visual) = visual else {
-        return false;
-    };
+    let CanonicalToolVisual::Plugin(plugin_visual) = visual;
     let Some(host) = plugin_host else {
         return false;
     };
@@ -961,31 +949,8 @@ fn push_canonical_tool_visual_rows(
     width: u16,
     plugin_host: Option<&bcode_plugin::PluginHost>,
 ) {
-    match visual {
-        CanonicalToolVisual::Plugin(plugin_visual) => {
-            push_canonical_plugin_visual_rows(rows, plugin_visual, width, plugin_host);
-        }
-        CanonicalToolVisual::PlainText { title, text } => {
-            push_wrapped_styled_text(
-                rows,
-                Vec::new(),
-                title,
-                width,
-                Style::new().fg(Color::Cyan),
-                Style::new().fg(Color::Cyan),
-            );
-            if !text.is_empty() {
-                push_wrapped_styled_text(
-                    rows,
-                    vec![Span::styled("  ", muted_style())],
-                    text,
-                    width,
-                    Style::new(),
-                    Style::new(),
-                );
-            }
-        }
-    }
+    let CanonicalToolVisual::Plugin(plugin_visual) = visual;
+    push_canonical_plugin_visual_rows(rows, plugin_visual, width, plugin_host);
 }
 
 fn push_canonical_plugin_visual_rows(
@@ -1043,6 +1008,25 @@ fn push_plugin_visual_degraded_rows(
             muted_style(),
         );
     }
+    if visual.streaming
+        && let Some(payload) = visual.payload.as_object() {
+            for (key, value) in payload {
+                if matches!(key.as_str(), "argument_bytes" | "truncated") {
+                    continue;
+                }
+                let rendered = value
+                    .as_str()
+                    .map_or_else(|| value.to_string(), ToOwned::to_owned);
+                push_wrapped_styled_text(
+                    rows,
+                    vec![Span::styled("  ", muted_style())],
+                    &format!("{key}: {rendered}"),
+                    width,
+                    muted_style(),
+                    muted_style(),
+                );
+            }
+        }
 }
 
 fn push_degraded_tool_visual_rows(rows: &mut Vec<Line>, title: &str, message: &str, width: u16) {

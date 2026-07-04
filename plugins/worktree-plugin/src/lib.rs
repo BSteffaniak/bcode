@@ -262,7 +262,7 @@ fn invoke_remove(invocation: &ToolInvocationRequest) -> ToolInvocationResponse {
 fn tool_ui(activity_label: &str) -> bcode_tool::ToolUiMetadata {
     bcode_tool::ToolUiMetadata {
         activity_label: Some(activity_label.to_string()),
-        live_argument_preview: None,
+        request_visual: None,
     }
 }
 

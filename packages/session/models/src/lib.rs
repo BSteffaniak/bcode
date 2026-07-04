@@ -24,6 +24,8 @@ pub struct ToolInvocationProjection {
     pub tool_name: Option<String>,
     /// Raw JSON arguments requested by the model.
     pub arguments_json: Option<String>,
+    /// Plugin-owned request visual reconstructed at request time.
+    pub request_visual: Option<PluginVisualDescriptor>,
     /// Current lifecycle status.
     pub status: ToolInvocationProjectionStatus,
     /// Raw final text result returned by the tool, when finished.
@@ -82,12 +84,14 @@ pub fn apply_tool_invocation_projection_event(
             producer_plugin_id,
             tool_name,
             arguments_json,
+            request_visual,
             ..
         } => {
             let projection = tool_invocation_projection_mut(projections, tool_call_id);
             projection.producer_plugin_id.clone_from(producer_plugin_id);
             projection.tool_name = Some(tool_name.clone());
             projection.arguments_json = Some(arguments_json.clone());
+            projection.request_visual.clone_from(request_visual);
         }
         SessionEventKind::ToolInvocationStream { event } => {
             apply_tool_invocation_stream_projection_event(projections, event);
@@ -549,7 +553,7 @@ pub enum SessionLiveEventKind {
     AssistantReasoningDelta { turn_id: String, text: String },
     /// Raw live tool output emitted while a tool is running.
     ToolOutputDelta { event: ToolInvocationStreamEvent },
-    /// Live-only tool argument preview derived from partial tool-call arguments.
+    /// Live-only tool argument visual derived from partial tool-call arguments.
     ToolArgumentPreview {
         /// Model turn associated with this preview update.
         turn_id: String,
@@ -559,7 +563,7 @@ pub enum SessionLiveEventKind {
         tool_name: String,
         /// Total assembled argument bytes received so far.
         argument_bytes: usize,
-        /// Partial tool argument preview.
+        /// Partial tool argument visual.
         preview: LiveToolArgumentPreview,
     },
     /// Live-only provider stream progress for active model turns.
@@ -571,25 +575,12 @@ pub enum SessionLiveEventKind {
     },
 }
 
-/// Live-only tool argument preview derived from partial tool-call arguments.
+/// Plugin-owned visual descriptor for transcript rendering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LiveToolArgumentPreview {
-    /// Plugin-owned opaque live preview.
-    PluginView(LivePluginViewPreview),
-    /// File edit/write preview.
-    FileEdit(LiveFileEditPreview),
-    /// Shell command preview.
-    ShellCommand(LiveShellCommandPreview),
-    /// Query/search preview.
-    Query(LiveQueryPreview),
-}
-
-/// Live-only opaque plugin-owned preview derived from partial tool-call arguments.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LivePluginViewPreview {
+pub struct PluginVisualDescriptor {
     /// Producer plugin id.
-    pub producer_plugin_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_plugin_id: Option<String>,
     /// Producer-owned schema identifier.
     pub schema: String,
     /// Producer-owned schema version.
@@ -604,74 +595,24 @@ pub struct LivePluginViewPreview {
     pub payload: serde_json::Value,
 }
 
-/// Live-only query-like tool preview derived from partial tool-call arguments.
+/// Live-only tool argument visual derived from partial tool-call arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LiveQueryPreview {
-    /// Plugin-owned live preview title.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preview_title: Option<String>,
+pub struct LiveToolArgumentPreview {
+    /// Plugin-owned visual descriptor.
+    pub visual: PluginVisualDescriptor,
     /// Plugin-owned streaming status text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub streaming_status: Option<String>,
-    /// Extracted string fields for display.
-    pub fields: BTreeMap<String, String>,
     /// Total assembled argument bytes received so far.
     pub argument_bytes: usize,
-    /// Whether the preview content was truncated by live-preview limits.
-    pub truncated: bool,
 }
 
-/// Live-only file edit/write preview derived from partial tool-call arguments.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LiveFileEditPreview {
-    /// Plugin-owned live preview title.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preview_title: Option<String>,
-    /// Plugin-owned streaming status text.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub streaming_status: Option<String>,
-    /// Best-effort file path extracted from partial arguments.
-    pub path: Option<String>,
-    /// Best-effort old text prefix extracted from partial arguments.
-    pub old_text_prefix: Option<String>,
-    /// Best-effort new text prefix extracted from partial arguments.
-    pub new_text_prefix: String,
-    /// Whether missing old text means unknown original text rather than empty original text.
-    #[serde(default)]
-    pub old_text_required: bool,
-    /// Total assembled argument bytes received so far.
-    pub argument_bytes: usize,
-    /// Whether the preview content was truncated by live-preview limits.
-    pub truncated: bool,
-}
-
-/// Live-only shell command preview derived from partial tool-call arguments.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LiveShellCommandPreview {
-    /// Plugin-owned live preview title.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preview_title: Option<String>,
-    /// Plugin-owned streaming status text.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub streaming_status: Option<String>,
-    /// Best-effort command prefix extracted from partial arguments.
-    pub command_prefix: String,
-    /// Best-effort working directory extracted from partial arguments.
-    pub cwd: Option<String>,
-    /// Total assembled argument bytes received so far.
-    pub argument_bytes: usize,
-    /// Whether the preview content was truncated by live-preview limits.
-    pub truncated: bool,
-}
-
-/// Product-facing derived view over durable session history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// Session projection kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionProjectionKind {
-    /// Conversation transcript intended for chat-oriented presentation.
+    /// Transcript conversation view.
     Transcript,
-    /// Model-context view used for prompt/context inspection.
-    ModelContext,
     /// User input history view.
     InputHistory,
     /// Runtime-work lifecycle view.
@@ -1661,6 +1602,8 @@ pub enum SessionEventKind {
         producer_plugin_id: Option<String>,
         tool_name: String,
         arguments_json: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_visual: Option<PluginVisualDescriptor>,
         #[serde(
             default,
             rename = "request_presentation",

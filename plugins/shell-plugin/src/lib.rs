@@ -16,11 +16,12 @@ use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, ShellRunResult, TOOL_SERVICE_INTERFACE_ID,
     ToolArtifact, ToolArtifactRef, ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationResult, ToolInvocationStreamEvent, ToolList, ToolLiveArgumentPreviewMetadata,
-    ToolOutputStream, ToolSideEffect,
+    ToolInvocationResult, ToolInvocationStreamEvent, ToolList, ToolOutputStream,
+    ToolPluginVisualMetadata, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -132,11 +133,30 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
             },
             ui: bcode_tool::ToolUiMetadata {
                 activity_label: Some("running".to_string()),
-                live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::ShellCommand {
-                    command_field: "command".to_string(),
-                    cwd_field: Some("cwd".to_string()),
-                    preview_title: Some("Shell command".to_string()),
-                    streaming_status: Some("shell command · {bytes}".to_string()),
+                request_visual: Some(ToolPluginVisualMetadata {
+                    producer_plugin_id: Some("bcode.shell".to_string()),
+                    schema: "bcode.tool.request.shell.run".to_string(),
+                    schema_version: 1,
+                    title: Some("Shell command".to_string()),
+                    subtitle: Some("shell command · {bytes}".to_string()),
+                    payload: BTreeMap::from([
+                        (
+                            "command".to_string(),
+                            bcode_tool::ToolVisualPayloadSelector {
+                                fields: vec!["command".to_string()],
+                                literal: None,
+                                required: true,
+                            },
+                        ),
+                        (
+                            "cwd".to_string(),
+                            bcode_tool::ToolVisualPayloadSelector {
+                                fields: vec!["cwd".to_string()],
+                                literal: None,
+                                required: false,
+                            },
+                        ),
+                    ]),
                 }),
 
             },

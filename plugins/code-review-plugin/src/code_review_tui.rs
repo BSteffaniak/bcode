@@ -3451,25 +3451,11 @@ impl ReviewAgentSessionStreamState {
 }
 
 fn live_tool_preview_status(tool_name: &str, preview: &LiveToolArgumentPreview) -> String {
-    let (streaming_status, preview_title) = match preview {
-        LiveToolArgumentPreview::PluginView(preview) => {
-            (preview.subtitle.as_deref(), preview.title.as_deref())
-        }
-        LiveToolArgumentPreview::FileEdit(preview) => (
-            preview.streaming_status.as_deref(),
-            preview.preview_title.as_deref(),
-        ),
-        LiveToolArgumentPreview::ShellCommand(preview) => (
-            preview.streaming_status.as_deref(),
-            preview.preview_title.as_deref(),
-        ),
-        LiveToolArgumentPreview::Query(preview) => (
-            preview.streaming_status.as_deref(),
-            preview.preview_title.as_deref(),
-        ),
-    };
-    streaming_status
-        .or(preview_title)
+    preview
+        .streaming_status
+        .as_deref()
+        .or(preview.visual.subtitle.as_deref())
+        .or(preview.visual.title.as_deref())
         .map_or_else(|| format!("preparing {tool_name}"), ToString::to_string)
 }
 

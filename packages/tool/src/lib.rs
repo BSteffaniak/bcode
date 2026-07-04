@@ -312,14 +312,14 @@ pub struct ToolUiMetadata {
     /// Short activity label suitable for progress/status displays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity_label: Option<String>,
-    /// Declarative live argument preview metadata for streamed tool arguments.
+    /// Declarative request visual metadata for streamed and persisted tool arguments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub live_argument_preview: Option<ToolLiveArgumentPreviewMetadata>,
+    pub request_visual: Option<ToolPluginVisualMetadata>,
 }
 
-/// A generic argument field selector for plugin-owned opaque presentation payloads.
+/// A generic argument field selector for plugin-owned presentation payloads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolLivePreviewPayloadSelector {
+pub struct ToolVisualPayloadSelector {
     /// Candidate top-level JSON argument names, in priority order.
     #[serde(default)]
     pub fields: Vec<String>,
@@ -331,9 +331,9 @@ pub struct ToolLivePreviewPayloadSelector {
     pub required: bool,
 }
 
-/// Opaque plugin-owned presentation payload metadata.
+/// Plugin-owned presentation descriptor metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolLivePluginViewMetadata {
+pub struct ToolPluginVisualMetadata {
     /// Producer-owned schema identifier.
     pub schema: String,
     /// Producer-owned schema version.
@@ -349,66 +349,7 @@ pub struct ToolLivePluginViewMetadata {
     pub subtitle: Option<String>,
     /// Payload keys mapped to tool argument fields/literals.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub payload: std::collections::BTreeMap<String, ToolLivePreviewPayloadSelector>,
-}
-
-/// Declarative live argument preview metadata owned by a tool provider.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ToolLiveArgumentPreviewMetadata {
-    /// Plugin-owned generic presentation preview.
-    PluginView {
-        /// Opaque plugin-owned view metadata.
-        view: ToolLivePluginViewMetadata,
-        /// Plugin-owned streaming status template.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        streaming_status: Option<String>,
-    },
-    /// File edit/write style preview.
-    FileEdit {
-        /// Candidate path fields.
-        #[serde(default)]
-        path_fields: Vec<String>,
-        /// Candidate old-text fields.
-        #[serde(default)]
-        old_text_fields: Vec<String>,
-        /// Candidate new-text/content fields.
-        new_text_fields: Vec<String>,
-        /// Whether missing old text should be treated as unknown instead of empty.
-        #[serde(default)]
-        old_text_required: bool,
-        /// Plugin-owned live preview title.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        preview_title: Option<String>,
-        /// Plugin-owned streaming status template.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        streaming_status: Option<String>,
-    },
-    /// Shell command style preview.
-    ShellCommand {
-        /// Command field.
-        command_field: String,
-        /// Optional cwd field.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cwd_field: Option<String>,
-        /// Plugin-owned live preview title.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        preview_title: Option<String>,
-        /// Plugin-owned streaming status template.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        streaming_status: Option<String>,
-    },
-    /// Query/key-value style preview.
-    Query {
-        /// Candidate display fields.
-        fields: Vec<String>,
-        /// Plugin-owned live preview title.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        preview_title: Option<String>,
-        /// Plugin-owned streaming status template.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        streaming_status: Option<String>,
-    },
+    pub payload: std::collections::BTreeMap<String, ToolVisualPayloadSelector>,
 }
 
 /// Side-effect category for a model-callable tool.

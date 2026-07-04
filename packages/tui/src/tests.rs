@@ -16,12 +16,12 @@ use bcode_session_models::{
     LegacyToolPresentationEvent, LegacyToolPresentationField, LegacyToolPresentationLevel,
     LegacyToolPresentationSection, LegacyToolPresentationTarget,
     LegacyToolRequestPresentationMetadata, LegacyToolRequestPreviewMetadata,
-    LegacyToolStatusPresentation, LiveFileEditPreview, LivePluginViewPreview, LiveQueryPreview,
-    LiveShellCommandPreview, LiveToolArgumentPreview, RuntimeWorkId, RuntimeWorkKind, SessionEvent,
-    SessionEventKind, SessionId, SessionInputHistoryEntry, SessionProjectionKind, SessionSummary,
-    SessionTitleSource, SessionTokenUsage, SessionTraceEvent, SessionTracePayload,
-    SessionTracePhase, ShellRunResult, ToolArtifact, ToolArtifactRef, ToolInvocationResult,
-    ToolInvocationStreamEvent, ToolOutputStream, build_tool_invocation_projections,
+    LegacyToolStatusPresentation, LiveToolArgumentPreview, PluginVisualDescriptor, RuntimeWorkId,
+    RuntimeWorkKind, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
+    SessionProjectionKind, SessionSummary, SessionTitleSource, SessionTokenUsage,
+    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ShellRunResult, ToolArtifact,
+    ToolArtifactRef, ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
+    build_tool_invocation_projections,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::TextMotion;
@@ -1622,16 +1622,14 @@ async fn session_open_preserved_plugin_host_renders_live_file_preview() {
                 tool_call_id: "call_write".to_owned(),
                 tool_name: "filesystem_write".to_owned(),
                 argument_bytes: 36,
-                preview: LiveToolArgumentPreview::FileEdit(LiveFileEditPreview {
-                    preview_title: Some("Write preview".to_owned()),
-                    streaming_status: Some("writing src/lib.rs".to_owned()),
-                    path: Some("src/lib.rs".to_owned()),
-                    old_text_prefix: None,
-                    new_text_prefix: "pub fn demo() {}".to_owned(),
-                    old_text_required: false,
-                    argument_bytes: 36,
-                    truncated: false,
-                }),
+                preview: file_change_preview(
+                    "Write preview",
+                    Some("writing src/lib.rs"),
+                    Some("src/lib.rs"),
+                    "",
+                    "pub fn demo() {}",
+                    false,
+                ),
             },
         });
 
@@ -1923,6 +1921,7 @@ fn transcript_renders_tool_blocks_with_structure_and_pretty_arguments() {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: r#"{"command":"cargo check","cwd":"/tmp/project"}"#.to_owned(),
+                request_visual: None,
                 legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
@@ -1970,6 +1969,7 @@ fn live_file_write_statusline_is_not_duplicated_and_truncates_path() {
                 "contents": "fn main() {}\n",
             })
             .to_string(),
+            request_visual: None,
             legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
         },
     ));
@@ -2007,6 +2007,7 @@ fn live_file_edit_card_shows_permission_and_applied_phases() {
             producer_plugin_id: None,
             tool_name: "filesystem_edit".to_owned(),
             arguments_json: args.clone(),
+            request_visual: None,
             legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
         },
     ));
@@ -2083,6 +2084,7 @@ fn denied_file_permission_marks_preview_failed() {
             producer_plugin_id: None,
             tool_name: "filesystem_edit".to_owned(),
             arguments_json: args.clone(),
+            request_visual: None,
             legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
         },
     ));
@@ -2133,6 +2135,7 @@ fn transcript_renders_filesystem_edit_request_without_core_inline_preview() {
                 "new_text": "fn answer() -> i32 {\n    42\n}\n",
             })
             .to_string(),
+            request_visual: None,
             legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
         },
     )];
@@ -2172,6 +2175,7 @@ fn transcript_renders_shell_output_with_ansi_and_limits() {
                     "terminal": true,
                 })
                 .to_string(),
+                request_visual: None,
                 legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
             },
         ),
@@ -2248,6 +2252,7 @@ fn transcript_renders_terminal_shell_output_without_unbounded_row_request() {
                     "command": "git status --short && ls",
                 })
                 .to_string(),
+                request_visual: None,
                 legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
@@ -2400,6 +2405,7 @@ fn streamed_terminal_output_renders_running_until_final_result() {
             producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
+            request_visual: None,
             legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
     ));
@@ -2456,6 +2462,7 @@ fn streamed_terminal_output_preserves_ansi_color() {
             producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
+            request_visual: None,
             legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
     ));
@@ -2513,6 +2520,7 @@ fn streamed_terminal_output_updates_header_after_final_result() {
             producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
+            request_visual: None,
             legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
     ));
@@ -2984,6 +2992,7 @@ fn tool_activity_after_submitted_user_message_resumes_following_latest_rows() {
             producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
+            request_visual: None,
             legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
     ));
@@ -3160,6 +3169,7 @@ fn tool_activity_after_assistant_preamble_resumes_following_latest_rows() {
             producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
+            request_visual: None,
             legacy_request_presentation: None,
         },
     ));
@@ -3242,6 +3252,7 @@ fn assistant_response_after_tool_loop_transitions_to_message_top() {
             producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
+            request_visual: None,
             legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
     ));
@@ -3405,6 +3416,7 @@ fn streamed_tool_output_is_not_duplicated_by_final_result() {
             producer_plugin_id: None,
             tool_name: "filesystem.shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
+            request_visual: None,
             legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
         },
     ));
@@ -3591,6 +3603,7 @@ fn file_change_semantic_result_events(
                 producer_plugin_id: None,
                 tool_name: "example.write".to_owned(),
                 arguments_json: r#"{"path":"file.txt","contents":"hi"}"#.to_owned(),
+                request_visual: None,
                 legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
             },
         ));
@@ -3627,6 +3640,7 @@ fn streamed_tool_without_output_renders_final_result() {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
+                request_visual: None,
                 legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
@@ -3692,6 +3706,7 @@ fn streamed_terminal_tool_events(session_id: SessionId) -> Vec<SessionEvent> {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
+                request_visual: None,
                 legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
@@ -3772,6 +3787,7 @@ fn semantic_terminal_result_without_live_delta_renders_terminal_history() {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
+                request_visual: None,
                 legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
@@ -3847,6 +3863,7 @@ fn live_shell_result_preserves_request_block() {
                     "terminal": false,
                 })
                 .to_string(),
+                request_visual: None,
                 legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
@@ -3906,6 +3923,7 @@ fn live_streamed_shell_result_preserves_request_and_suppresses_artifact_duplicat
                     "terminal": true,
                 })
                 .to_string(),
+                request_visual: None,
                 legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
@@ -4029,14 +4047,7 @@ fn live_shell_preview_stream_preview(
             tool_call_id: "call-live-preview-stream".to_owned(),
             tool_name: "shell.run".to_owned(),
             argument_bytes: 28,
-            preview: LiveToolArgumentPreview::ShellCommand(LiveShellCommandPreview {
-                preview_title: None,
-                streaming_status: None,
-                command_prefix: "cargo test".to_owned(),
-                cwd: Some("/repo".to_owned()),
-                argument_bytes: 28,
-                truncated: false,
-            }),
+            preview: shell_request_preview("cargo test", Some("/repo")),
         },
     }
 }
@@ -4063,6 +4074,7 @@ fn live_shell_preview_stream_request(session_id: SessionId) -> SessionEvent {
                 "terminal": true,
             })
             .to_string(),
+            request_visual: None,
             legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
     )
@@ -4307,6 +4319,7 @@ fn legacy_terminal_result_renders_plain_tool_result() {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
+                request_visual: None,
                 legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
@@ -4357,6 +4370,7 @@ fn presentation_events_replay_ignores_legacy_presentation_events() {
                 producer_plugin_id: None,
                 tool_name: "third.party".to_owned(),
                 arguments_json: "{}".to_owned(),
+                request_visual: None,
                 legacy_request_presentation: None,
             },
         ),
@@ -4404,6 +4418,7 @@ fn legacy_presentation_card_does_not_replace_tool_request_surface() {
                 producer_plugin_id: None,
                 tool_name: "third.party".to_owned(),
                 arguments_json: serde_json::json!({"raw": "arguments"}).to_string(),
+                request_visual: None,
                 legacy_request_presentation: None,
             },
         ),
@@ -4457,6 +4472,7 @@ fn legacy_result_presentation_does_not_suppress_generic_tool_result() {
                 producer_plugin_id: None,
                 tool_name: "third.party".to_owned(),
                 arguments_json: serde_json::json!({"raw": "arguments"}).to_string(),
+                request_visual: None,
                 legacy_request_presentation: None,
             },
         ),
@@ -4561,6 +4577,7 @@ fn legacy_live_presentation_card_is_ignored_by_normal_transcript() {
                 producer_plugin_id: None,
                 tool_name: "third.party".to_owned(),
                 arguments_json: serde_json::json!({"raw": "arguments"}).to_string(),
+                request_visual: None,
                 legacy_request_presentation: None,
             },
         ),
@@ -4799,6 +4816,7 @@ fn transcript_resident_window_does_not_trim_with_active_tool() {
             producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
+            request_visual: None,
             legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
     ));
@@ -4839,6 +4857,7 @@ fn transcript_resident_window_prunes_old_tool_state_after_trim() {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
+                request_visual: None,
                 legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ));
@@ -4890,6 +4909,109 @@ fn filesystem_plugin_host() -> bcode_plugin::PluginHost {
     .expect("static filesystem plugin manifest should parse");
     bcode_plugin::PluginHost::load_static_plugins(&selected)
         .expect("static filesystem plugin should load")
+}
+
+fn file_change_preview(
+    title: &str,
+    streaming_status: Option<&str>,
+    path: Option<&str>,
+    old_text: &str,
+    new_text: &str,
+    truncated: bool,
+) -> LiveToolArgumentPreview {
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "title".to_owned(),
+        serde_json::Value::String(title.to_owned()),
+    );
+    payload.insert(
+        "summary".to_owned(),
+        serde_json::Value::String(title.to_owned()),
+    );
+    if let Some(path) = path {
+        payload.insert(
+            "path".to_owned(),
+            serde_json::Value::String(path.to_owned()),
+        );
+    }
+    payload.insert(
+        "old_text".to_owned(),
+        serde_json::Value::String(old_text.to_owned()),
+    );
+    payload.insert(
+        "new_text".to_owned(),
+        serde_json::Value::String(new_text.to_owned()),
+    );
+    payload.insert("truncated".to_owned(), serde_json::Value::Bool(truncated));
+    LiveToolArgumentPreview {
+        visual: PluginVisualDescriptor {
+            producer_plugin_id: Some("bcode.filesystem".to_owned()),
+            schema: "bcode.filesystem.change".to_owned(),
+            schema_version: 1,
+            title: Some(title.to_owned()),
+            subtitle: streaming_status.map(ToOwned::to_owned),
+            payload: serde_json::Value::Object(payload),
+        },
+        streaming_status: streaming_status.map(ToOwned::to_owned),
+        argument_bytes: 36,
+    }
+}
+
+fn shell_request_preview(command: &str, cwd: Option<&str>) -> LiveToolArgumentPreview {
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "command".to_owned(),
+        serde_json::Value::String(command.to_owned()),
+    );
+    if let Some(cwd) = cwd {
+        payload.insert("cwd".to_owned(), serde_json::Value::String(cwd.to_owned()));
+    }
+    LiveToolArgumentPreview {
+        visual: PluginVisualDescriptor {
+            producer_plugin_id: Some("bcode.shell".to_owned()),
+            schema: "bcode.tool.request.shell.run".to_owned(),
+            schema_version: 1,
+            title: Some("Shell command".to_owned()),
+            subtitle: None,
+            payload: serde_json::Value::Object(payload),
+        },
+        streaming_status: None,
+        argument_bytes: 36,
+    }
+}
+
+fn shell_request_visual(command: &str, cwd: Option<&str>) -> PluginVisualDescriptor {
+    shell_request_preview(command, cwd).visual
+}
+
+fn file_change_visual(
+    title: &str,
+    path: Option<&str>,
+    old_text: &str,
+    new_text: &str,
+    truncated: bool,
+) -> PluginVisualDescriptor {
+    file_change_preview(title, None, path, old_text, new_text, truncated).visual
+}
+
+fn web_search_request_preview(query: &str) -> LiveToolArgumentPreview {
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "query".to_owned(),
+        serde_json::Value::String(query.to_owned()),
+    );
+    LiveToolArgumentPreview {
+        visual: PluginVisualDescriptor {
+            producer_plugin_id: Some("bcode.web_search".to_owned()),
+            schema: "bcode.web_search.search_request".to_owned(),
+            schema_version: 1,
+            title: Some("Search query".to_owned()),
+            subtitle: None,
+            payload: serde_json::Value::Object(payload),
+        },
+        streaming_status: None,
+        argument_bytes: 32,
+    }
 }
 
 fn shell_run_artifact() -> bcode_session_models::ToolArtifact {
@@ -5161,6 +5283,7 @@ fn replayed_shell_run_prefers_raw_pty_stream_over_shell_artifact_metadata() {
                 producer_plugin_id: Some("bcode.shell".to_owned()),
                 tool_name: "shell.run".to_owned(),
                 arguments_json: r#"{"command":"printf"}"#.to_owned(),
+                request_visual: None,
                 legacy_request_presentation: None,
             },
         ),
@@ -5229,7 +5352,7 @@ fn replayed_shell_run_prefers_raw_pty_stream_over_shell_artifact_metadata() {
 }
 
 #[test]
-fn filesystem_write_request_preview_renders_from_raw_arguments_without_metadata() {
+fn filesystem_write_request_preview_renders_from_plugin_visual_metadata() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
     app.set_plugin_host(Arc::new(filesystem_plugin_host()));
@@ -5245,6 +5368,13 @@ fn filesystem_write_request_preview_renders_from_raw_arguments_without_metadata(
                 "contents": "created from raw args\n"
             })
             .to_string(),
+            request_visual: Some(file_change_visual(
+                "Write preview",
+                Some("/tmp/raw-preview.txt"),
+                "",
+                "created from raw args\n",
+                false,
+            )),
             legacy_request_presentation: None,
         },
     ));
@@ -5257,7 +5387,7 @@ fn filesystem_write_request_preview_renders_from_raw_arguments_without_metadata(
 }
 
 #[test]
-fn filesystem_edit_request_preview_renders_from_raw_arguments_without_metadata() {
+fn filesystem_edit_request_preview_renders_from_plugin_visual_metadata() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
     app.set_plugin_host(Arc::new(filesystem_plugin_host()));
@@ -5274,6 +5404,15 @@ fn filesystem_edit_request_preview_renders_from_raw_arguments_without_metadata()
                 "new_text": "new raw args\n"
             })
             .to_string(),
+            request_visual: Some(file_change_visual(
+                "Edit preview",
+                Some("/tmp/raw-edit.txt"),
+                "old raw args
+",
+                "new raw args
+",
+                false,
+            )),
             legacy_request_presentation: None,
         },
     ));
@@ -5303,6 +5442,7 @@ fn same_raw_filesystem_events_render_same_live_and_replayed_tool_ui() {
                     "new_text": "after\n"
                 })
                 .to_string(),
+                request_visual: None,
                 legacy_request_presentation: None,
             },
         ),
@@ -5358,6 +5498,7 @@ fn live_filesystem_artifact_renders_rich_diff_from_raw_change_metadata() {
                 "new_text": "after\n"
             })
             .to_string(),
+            request_visual: None,
             legacy_request_presentation: None,
         },
     ));
@@ -5395,20 +5536,14 @@ fn final_filesystem_artifact_supersedes_matching_live_plugin_preview() {
             tool_call_id: "call-file".to_owned(),
             tool_name: "filesystem.write".to_owned(),
             argument_bytes: 42,
-            preview: LiveToolArgumentPreview::PluginView(LivePluginViewPreview {
-                producer_plugin_id: "bcode.filesystem".to_owned(),
-                schema: "bcode.filesystem.change".to_owned(),
-                schema_version: 1,
-                title: Some("Writing file".to_owned()),
-                subtitle: Some("Writing file".to_owned()),
-                payload: serde_json::json!({
-                    "subtitle": "Writing file",
-                    "path": "/tmp/hello.txt",
-                    "old_text": "before\n",
-                    "new_text": "after\n",
-                    "truncated": false
-                }),
-            }),
+            preview: file_change_preview(
+                "Writing file",
+                Some("Writing file"),
+                Some("/tmp/hello.txt"),
+                "before\n",
+                "after\n",
+                false,
+            ),
         },
     });
     app.absorb_session_event(&event(
@@ -5445,20 +5580,14 @@ fn streamed_filesystem_json_is_replaced_by_final_rich_artifact() {
             tool_call_id: "call-file".to_owned(),
             tool_name: "filesystem.write".to_owned(),
             argument_bytes: 42,
-            preview: LiveToolArgumentPreview::PluginView(LivePluginViewPreview {
-                producer_plugin_id: "bcode.filesystem".to_owned(),
-                schema: "bcode.filesystem.change".to_owned(),
-                schema_version: 1,
-                title: Some("Writing file".to_owned()),
-                subtitle: Some("Writing file".to_owned()),
-                payload: serde_json::json!({
-                    "subtitle": "Writing file",
-                    "path": "/tmp/hello.txt",
-                    "old_text": "before\n",
-                    "new_text": "after\n",
-                    "truncated": false
-                }),
-            }),
+            preview: file_change_preview(
+                "Writing file",
+                Some("Writing file"),
+                Some("/tmp/hello.txt"),
+                "before\n",
+                "after\n",
+                false,
+            ),
         },
     });
     app.absorb_session_event(&event(
@@ -5509,14 +5638,7 @@ fn shell_live_preview_is_not_superseded_by_terminal_result() {
             tool_call_id: "call-shell".to_owned(),
             tool_name: "shell.run".to_owned(),
             argument_bytes: 24,
-            preview: LiveToolArgumentPreview::ShellCommand(LiveShellCommandPreview {
-                preview_title: None,
-                streaming_status: None,
-                command_prefix: "cargo test".to_owned(),
-                cwd: Some("/tmp/project".to_owned()),
-                argument_bytes: 24,
-                truncated: false,
-            }),
+            preview: shell_request_preview("cargo test", Some("/tmp/project")),
         },
     });
     app.absorb_session_event(&event(
@@ -5546,8 +5668,6 @@ fn shell_live_preview_is_not_superseded_by_terminal_result() {
 fn query_live_preview_is_not_superseded_by_unmatched_result() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-    let mut fields = BTreeMap::new();
-    fields.insert("query".to_owned(), "rust borrow checker".to_owned());
     app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
         session_id,
         kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
@@ -5555,13 +5675,7 @@ fn query_live_preview_is_not_superseded_by_unmatched_result() {
             tool_call_id: "call-query".to_owned(),
             tool_name: "web.search".to_owned(),
             argument_bytes: 32,
-            preview: LiveToolArgumentPreview::Query(LiveQueryPreview {
-                preview_title: Some("Search query".to_owned()),
-                streaming_status: None,
-                fields,
-                argument_bytes: 32,
-                truncated: false,
-            }),
+            preview: web_search_request_preview("rust borrow checker"),
         },
     });
     app.absorb_session_event(&event(
@@ -5808,6 +5922,7 @@ fn live_tool_invocation_projection_matches_replayed_projection() {
                 producer_plugin_id: Some("plugin.shell".to_owned()),
                 tool_name: "shell.run".to_owned(),
                 arguments_json: r#"{"command":"echo hi"}"#.to_owned(),
+                request_visual: None,
                 legacy_request_presentation: None,
             },
         ),
@@ -6276,14 +6391,7 @@ fn live_shell_command_preview_streams_before_final_request_and_is_preserved() {
             tool_call_id: "call_shell".to_owned(),
             tool_name: "shell_run".to_owned(),
             argument_bytes: 36,
-            preview: LiveToolArgumentPreview::ShellCommand(LiveShellCommandPreview {
-                preview_title: None,
-                streaming_status: None,
-                command_prefix: "cargo test -p bcode_tui".to_owned(),
-                cwd: Some("/repo".to_owned()),
-                argument_bytes: 36,
-                truncated: false,
-            }),
+            preview: shell_request_preview("cargo test -p bcode_tui", Some("/repo")),
         },
     });
 
@@ -6310,6 +6418,7 @@ fn live_shell_command_preview_streams_before_final_request_and_is_preserved() {
                 "cwd": "/repo",
             })
             .to_string(),
+            request_visual: None,
             legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
     ));
@@ -6367,6 +6476,10 @@ fn replayed_shell_request_uses_shell_plugin_request_renderer_without_legacy_meta
                 "timeout_ms": 120_000,
             })
             .to_string(),
+            request_visual: Some(shell_request_visual(
+                "cargo check --workspace",
+                Some("/Users/braden/GitHub/bcode"),
+            )),
             legacy_request_presentation: None,
         },
     )];
@@ -6401,16 +6514,14 @@ fn live_file_preview_updates_without_duplicates_and_final_replaces_it() {
                 tool_call_id: "call_write".to_owned(),
                 tool_name: "filesystem_write".to_owned(),
                 argument_bytes: contents.len(),
-                preview: LiveToolArgumentPreview::FileEdit(LiveFileEditPreview {
-                    preview_title: None,
-                    streaming_status: None,
-                    path: Some("src/main.rs".to_owned()),
-                    old_text_prefix: None,
-                    new_text_prefix: contents.to_owned(),
-                    old_text_required: false,
-                    argument_bytes: contents.len(),
-                    truncated: false,
-                }),
+                preview: file_change_preview(
+                    "File change preview",
+                    None,
+                    Some("src/main.rs"),
+                    "",
+                    contents,
+                    false,
+                ),
             },
         });
     }
@@ -6436,6 +6547,7 @@ fn live_file_preview_updates_without_duplicates_and_final_replaces_it() {
                 "contents": "fn main() {\n    println!(\"hi\");\n}",
             })
             .to_string(),
+            request_visual: None,
             legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
         },
     ));
@@ -6459,16 +6571,14 @@ fn live_file_preview_is_removed_when_final_filesystem_artifact_arrives() {
             tool_call_id: "call_write".to_owned(),
             tool_name: "filesystem.write".to_owned(),
             argument_bytes: 18,
-            preview: LiveToolArgumentPreview::FileEdit(LiveFileEditPreview {
-                preview_title: Some("Write preview".to_owned()),
-                streaming_status: Some("writing src/main.rs".to_owned()),
-                path: Some("src/main.rs".to_owned()),
-                old_text_prefix: None,
-                new_text_prefix: "fn main() {}".to_owned(),
-                old_text_required: false,
-                argument_bytes: 18,
-                truncated: false,
-            }),
+            preview: file_change_preview(
+                "Write preview",
+                Some("writing src/main.rs"),
+                Some("src/main.rs"),
+                "",
+                "fn main() {}",
+                false,
+            ),
         },
     });
     app.absorb_session_event(&event(
@@ -6483,6 +6593,7 @@ fn live_file_preview_is_removed_when_final_filesystem_artifact_arrives() {
                 "contents": "fn main() {}",
             })
             .to_string(),
+            request_visual: None,
             legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
         },
     ));
@@ -6548,16 +6659,14 @@ fn live_file_preview_renders_available_new_text_before_original_text() {
             tool_call_id: "call_edit".to_owned(),
             tool_name: "filesystem_edit".to_owned(),
             argument_bytes: 40,
-            preview: LiveToolArgumentPreview::FileEdit(LiveFileEditPreview {
-                preview_title: None,
-                streaming_status: None,
-                path: Some("src/lib.rs".to_owned()),
-                old_text_prefix: None,
-                new_text_prefix: "pub fn demo() {\n    println!(\"hi\");\n}".to_owned(),
-                old_text_required: true,
-                argument_bytes: 40,
-                truncated: false,
-            }),
+            preview: file_change_preview(
+                "File change preview",
+                None,
+                Some("src/lib.rs"),
+                "",
+                "pub fn demo() {\n    println!(\"hi\");\n}",
+                false,
+            ),
         },
     });
 
@@ -6569,10 +6678,6 @@ fn live_file_preview_renders_available_new_text_before_original_text() {
     assert!(!output.contains("waiting for original text"), "{output}");
     assert!(output.contains("File change preview"), "{output}");
     assert!(output.contains("src/lib.rs"), "{output}");
-    assert!(
-        output.contains("original text pending; showing available new text"),
-        "{output}"
-    );
     assert!(!output.contains("old_text"), "{output}");
     assert!(!output.contains("new_text"), "{output}");
 }
@@ -6589,16 +6694,14 @@ fn live_file_preview_renders_truncation_note_and_received_bytes() {
             tool_call_id: "call_write".to_owned(),
             tool_name: "filesystem_write".to_owned(),
             argument_bytes: 2048,
-            preview: LiveToolArgumentPreview::FileEdit(LiveFileEditPreview {
-                preview_title: None,
-                streaming_status: None,
-                path: Some("src/lib.rs".to_owned()),
-                old_text_prefix: None,
-                new_text_prefix: "pub fn demo() {}".to_owned(),
-                old_text_required: false,
-                argument_bytes: 2048,
-                truncated: true,
-            }),
+            preview: file_change_preview(
+                "File change preview",
+                Some("received: 2.0 KiB"),
+                Some("src/lib.rs"),
+                "",
+                "pub fn demo() {}",
+                true,
+            ),
         },
     });
 
@@ -6625,16 +6728,14 @@ fn live_file_preview_uses_plugin_owned_renderer() {
             tool_call_id: "call_write".to_owned(),
             tool_name: "filesystem_write".to_owned(),
             argument_bytes: 36,
-            preview: LiveToolArgumentPreview::FileEdit(LiveFileEditPreview {
-                preview_title: None,
-                streaming_status: None,
-                path: Some("src/lib.rs".to_owned()),
-                old_text_prefix: None,
-                new_text_prefix: "pub fn demo() {\n    println!(\"hi\");\n}".to_owned(),
-                old_text_required: false,
-                argument_bytes: 36,
-                truncated: false,
-            }),
+            preview: file_change_preview(
+                "File change preview",
+                None,
+                Some("src/lib.rs"),
+                "",
+                "pub fn demo() {\n    println!(\"hi\");\n}",
+                false,
+            ),
         },
     });
 

@@ -2292,6 +2292,7 @@ mod tests {
                 producer_plugin_id: None,
                 tool_name: "shell".to_string(),
                 arguments_json: "{}".to_string(),
+                request_visual: None,
                 legacy_request_presentation: None,
             },
         ))
@@ -2488,6 +2489,7 @@ mod tests {
                 producer_plugin_id: Some("bcode.shell".to_owned()),
                 tool_name: "shell.run".to_owned(),
                 arguments_json: r#"{"command":"printf hi"}"#.to_owned(),
+                request_visual: None,
                 legacy_request_presentation: None,
             },
         ))

@@ -184,6 +184,8 @@ enum PersistedSessionEventKind {
         producer_plugin_id: Option<String>,
         tool_name: String,
         arguments_json: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_visual: Option<bcode_session_models::PluginVisualDescriptor>,
         #[serde(
             default,
             rename = "request_presentation",
@@ -465,12 +467,14 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 producer_plugin_id,
                 tool_name,
                 arguments_json,
+                request_visual,
                 legacy_request_presentation,
             } => Self::ToolCallRequested {
                 tool_call_id: tool_call_id.clone(),
                 producer_plugin_id: producer_plugin_id.clone(),
                 tool_name: tool_name.clone(),
                 arguments_json: arguments_json.clone(),
+                request_visual: request_visual.clone(),
                 legacy_request_presentation: legacy_request_presentation.clone(),
             },
             SessionEventKind::ToolCallFinished {
@@ -792,12 +796,14 @@ impl PersistedSessionEventKind {
                 producer_plugin_id,
                 tool_name,
                 arguments_json,
+                request_visual,
                 legacy_request_presentation,
             } => SessionEventKind::ToolCallRequested {
                 tool_call_id,
                 producer_plugin_id,
                 tool_name,
                 arguments_json,
+                request_visual,
                 legacy_request_presentation,
             },
             Self::ToolCallFinished {
@@ -1370,6 +1376,7 @@ mod tests {
                 producer_plugin_id: None,
                 tool_name: "tool".to_string(),
                 arguments_json: "{}".to_string(),
+                request_visual: None,
                 legacy_request_presentation: None,
             },
             SessionEventKind::ToolCallFinished {

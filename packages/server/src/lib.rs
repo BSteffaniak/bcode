@@ -37,15 +37,17 @@ use bcode_model::{
     ProviderTurnEvent, ReasoningEffort, StartTurnResponse, TokenUsage,
 };
 use bcode_plugin::{PluginInvocationScope, StreamingServiceInvocationEvent};
-use bcode_session::{CatalogLoadStatus, SessionManager, lease::SessionLeaseOwnerContext};
+use bcode_session::{
+    AppendToolCallRequestedInput, CatalogLoadStatus, SessionManager,
+    lease::SessionLeaseOwnerContext,
+};
 use bcode_session_models::{
-    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, LiveFileEditPreview, LivePluginViewPreview,
-    LiveQueryPreview, LiveShellCommandPreview, LiveToolArgumentPreview, ModelTurnOutcome,
-    ProviderStreamEvent, ProviderToolCallProgress, RuntimeWorkId, RuntimeWorkKind,
-    RuntimeWorkStatus, SessionEventKind, SessionId, SessionLiveEventKind, SessionTokenUsage,
-    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ToolInvocationResult,
-    ToolInvocationStreamEvent, ToolOutputStream as SessionToolOutputStream, TraceBlobRef,
-    TraceRedaction,
+    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, LiveToolArgumentPreview, ModelTurnOutcome,
+    PluginVisualDescriptor, ProviderStreamEvent, ProviderToolCallProgress, RuntimeWorkId,
+    RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind, SessionId, SessionLiveEventKind,
+    SessionTokenUsage, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
+    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream as SessionToolOutputStream,
+    TraceBlobRef, TraceRedaction,
 };
 use bcode_settings::SettingsStore;
 use bcode_skill::{
@@ -7764,7 +7766,7 @@ struct ToolArgumentStreamProgress {
     emitted_progress_events: usize,
     force_emit_final: bool,
     preview_fields: StreamingJsonStringFields,
-    preview_metadata: Option<bcode_tool::ToolLiveArgumentPreviewMetadata>,
+    preview_metadata: Option<bcode_tool::ToolPluginVisualMetadata>,
     last_emitted_preview: Option<LiveToolArgumentPreview>,
 }
 
@@ -8092,7 +8094,7 @@ impl ModelStreamProgress {
         &mut self,
         call_id: String,
         name: String,
-        preview_metadata: Option<bcode_tool::ToolLiveArgumentPreviewMetadata>,
+        preview_metadata: Option<bcode_tool::ToolPluginVisualMetadata>,
     ) {
         self.active_tool_call = Some(ToolArgumentStreamProgress {
             call_id,
@@ -8211,81 +8213,30 @@ fn serialized_tool_argument_len(arguments: &serde_json::Value) -> usize {
 }
 
 fn live_tool_argument_preview_from_fields(
-    metadata: &bcode_tool::ToolLiveArgumentPreviewMetadata,
+    metadata: &bcode_tool::ToolPluginVisualMetadata,
     fields: &StreamingJsonStringFields,
 ) -> Option<LiveToolArgumentPreview> {
-    match metadata {
-        bcode_tool::ToolLiveArgumentPreviewMetadata::PluginView {
-            view,
-            streaming_status,
-        } => live_plugin_view_preview_from_fields(fields, view, streaming_status.clone())
-            .map(LiveToolArgumentPreview::PluginView),
-        bcode_tool::ToolLiveArgumentPreviewMetadata::FileEdit {
-            path_fields,
-            old_text_fields,
-            new_text_fields,
-            old_text_required,
-            preview_title,
-            streaming_status,
-        } => live_file_edit_preview_from_fields(
-            fields,
-            path_fields,
-            old_text_fields,
-            new_text_fields,
-            *old_text_required,
-            preview_title.clone(),
-            streaming_status.clone(),
-        )
-        .map(LiveToolArgumentPreview::FileEdit),
-        bcode_tool::ToolLiveArgumentPreviewMetadata::ShellCommand {
-            command_field,
-            cwd_field,
-            preview_title,
-            streaming_status,
-        } => live_shell_command_preview_from_fields(
-            fields,
-            command_field,
-            cwd_field.as_deref(),
-            preview_title.clone(),
-            streaming_status.clone(),
-        )
-        .map(LiveToolArgumentPreview::ShellCommand),
-        bcode_tool::ToolLiveArgumentPreviewMetadata::Query {
-            fields: field_names,
-            preview_title,
-            streaming_status,
-        } => live_query_preview_from_fields(
-            fields,
-            field_names,
-            preview_title.clone(),
-            streaming_status.clone(),
-        )
-        .map(LiveToolArgumentPreview::Query),
-    }
-}
-
-fn live_plugin_view_preview_from_fields(
-    fields: &StreamingJsonStringFields,
-    view: &bcode_tool::ToolLivePluginViewMetadata,
-    streaming_status: Option<String>,
-) -> Option<LivePluginViewPreview> {
-    let payload = plugin_view_payload_from_fields(fields, &view.payload)?;
-    let subtitle = streaming_status
-        .map(|status| render_live_status_template(&status, fields))
-        .or_else(|| view.subtitle.clone());
-    Some(LivePluginViewPreview {
-        producer_plugin_id: view.producer_plugin_id.clone().unwrap_or_default(),
-        schema: view.schema.clone(),
-        schema_version: view.schema_version,
-        title: view.title.clone(),
-        subtitle,
-        payload,
+    let payload = resolve_visual_payload(fields, &metadata.payload)?;
+    Some(LiveToolArgumentPreview {
+        visual: PluginVisualDescriptor {
+            producer_plugin_id: metadata.producer_plugin_id.clone(),
+            schema: metadata.schema.clone(),
+            schema_version: metadata.schema_version,
+            title: metadata.title.clone(),
+            subtitle: metadata.subtitle.clone(),
+            payload,
+        },
+        streaming_status: metadata
+            .subtitle
+            .as_ref()
+            .map(|template| render_live_status_template(template, fields)),
+        argument_bytes: fields.input_bytes,
     })
 }
 
-fn plugin_view_payload_from_fields(
+fn resolve_visual_payload(
     fields: &StreamingJsonStringFields,
-    selectors: &BTreeMap<String, bcode_tool::ToolLivePreviewPayloadSelector>,
+    selectors: &BTreeMap<String, bcode_tool::ToolVisualPayloadSelector>,
 ) -> Option<serde_json::Value> {
     let mut payload = serde_json::Map::new();
     for (key, selector) in selectors {
@@ -8300,7 +8251,7 @@ fn plugin_view_payload_from_fields(
 
 fn resolve_payload_selector(
     fields: &StreamingJsonStringFields,
-    selector: &bcode_tool::ToolLivePreviewPayloadSelector,
+    selector: &bcode_tool::ToolVisualPayloadSelector,
 ) -> Option<serde_json::Value> {
     fields
         .field(
@@ -8320,75 +8271,6 @@ fn render_live_status_template(template: &str, fields: &StreamingJsonStringField
         rendered = rendered.replace(&format!("{{{name}}}"), &field.value);
     }
     rendered
-}
-
-fn live_file_edit_preview_from_fields(
-    fields: &StreamingJsonStringFields,
-    path_fields: &[String],
-    old_text_fields: &[String],
-    new_text_fields: &[String],
-    old_text_required: bool,
-    preview_title: Option<String>,
-    streaming_status: Option<String>,
-) -> Option<LiveFileEditPreview> {
-    let path = fields.field_owned(path_fields).map(|field| field.value);
-    let old_text_prefix = fields.field_owned(old_text_fields).map(|field| field.value);
-    let new_text = fields.field_owned(new_text_fields)?;
-    Some(LiveFileEditPreview {
-        preview_title,
-        streaming_status,
-        path,
-        old_text_prefix,
-        new_text_prefix: new_text.value,
-        old_text_required,
-        argument_bytes: fields.input_bytes,
-        truncated: new_text.truncated,
-    })
-}
-
-fn live_shell_command_preview_from_fields(
-    fields: &StreamingJsonStringFields,
-    command_field: &str,
-    cwd_field: Option<&str>,
-    preview_title: Option<String>,
-    streaming_status: Option<String>,
-) -> Option<LiveShellCommandPreview> {
-    let command = fields.field(&[command_field])?;
-    let cwd = cwd_field.and_then(|field| fields.field(&[field]).map(|value| value.value));
-    Some(LiveShellCommandPreview {
-        preview_title,
-        streaming_status,
-        command_prefix: command.value,
-        cwd,
-        argument_bytes: fields.input_bytes,
-        truncated: command.truncated,
-    })
-}
-
-fn live_query_preview_from_fields(
-    fields: &StreamingJsonStringFields,
-    field_names: &[String],
-    preview_title: Option<String>,
-    streaming_status: Option<String>,
-) -> Option<LiveQueryPreview> {
-    let mut preview_fields = BTreeMap::new();
-    let mut truncated = false;
-    for name in field_names {
-        if let Some(field) = fields.field(&[name.as_str()]) {
-            truncated |= field.truncated;
-            preview_fields.insert(name.clone(), field.value);
-        }
-    }
-    if preview_fields.is_empty() {
-        return None;
-    }
-    Some(LiveQueryPreview {
-        preview_title,
-        streaming_status,
-        fields: preview_fields,
-        argument_bytes: fields.input_bytes,
-        truncated,
-    })
 }
 
 #[derive(Debug, Clone)]
@@ -8434,10 +8316,6 @@ impl StreamingJsonStringFields {
         names
             .iter()
             .find_map(|name| self.fields.get(*name).cloned())
-    }
-
-    fn field_owned(&self, names: &[String]) -> Option<PartialJsonStringField> {
-        names.iter().find_map(|name| self.fields.get(name).cloned())
     }
 
     fn insert_field(&mut self, name: &str, value: &str, truncated: bool) {
@@ -11023,7 +10901,7 @@ async fn handle_provider_turn_event(
                 .await
                 .ok()
                 .flatten()
-                .and_then(|(_, definition)| definition.ui.live_argument_preview);
+                .and_then(|(_, definition)| definition.ui.request_visual);
             stream_progress.start_tool_call(call_id.clone(), name.clone(), preview_metadata);
             publish_provider_stream_progress_live(
                 state,
@@ -11229,7 +11107,7 @@ async fn handle_provider_tool_call_finished_event(
         .await
         .ok()
         .flatten()
-        .and_then(|(_, definition)| definition.ui.live_argument_preview);
+        .and_then(|(_, definition)| definition.ui.request_visual);
     if let Some(preview) = preview_metadata
         .as_ref()
         .and_then(|metadata| live_tool_argument_preview_from_fields(metadata, &preview_fields))
@@ -11336,18 +11214,7 @@ const fn live_tool_argument_preview_with_bytes(
     mut preview: LiveToolArgumentPreview,
     argument_bytes: usize,
 ) -> LiveToolArgumentPreview {
-    match &mut preview {
-        LiveToolArgumentPreview::PluginView(_) => {}
-        LiveToolArgumentPreview::FileEdit(file) => {
-            file.argument_bytes = argument_bytes;
-        }
-        LiveToolArgumentPreview::ShellCommand(shell) => {
-            shell.argument_bytes = argument_bytes;
-        }
-        LiveToolArgumentPreview::Query(query) => {
-            query.argument_bytes = argument_bytes;
-        }
-    }
+    preview.argument_bytes = argument_bytes;
     preview
 }
 
@@ -14636,6 +14503,23 @@ async fn append_interactive_tool_request_resolved_event(
     }
 }
 
+async fn tool_request_visual_descriptor(
+    state: &ServerState,
+    tool_name: &str,
+    arguments_json: &str,
+) -> Option<PluginVisualDescriptor> {
+    let metadata = find_tool_provider(state, tool_name)
+        .await
+        .ok()
+        .flatten()?
+        .1
+        .ui
+        .request_visual?;
+    let arguments = serde_json::from_str::<serde_json::Value>(arguments_json).ok()?;
+    let fields = StreamingJsonStringFields::from_json_value(&arguments);
+    live_tool_argument_preview_from_fields(&metadata, &fields).map(|preview| preview.visual)
+}
+
 async fn append_tool_request_event(
     state: &ServerState,
     session_id: SessionId,
@@ -14644,6 +14528,7 @@ async fn append_tool_request_event(
     arguments_json: String,
     producer_plugin_id: Option<String>,
 ) {
+    let request_visual = tool_request_visual_descriptor(state, &tool_name, &arguments_json).await;
     let runtime_work_id = RuntimeWorkId::new(format!("tool_{tool_call_id}"));
     let runtime_label = tool_name.clone();
     let runtime_tool_call_id = tool_call_id.clone();
@@ -14651,11 +14536,14 @@ async fn append_tool_request_event(
         .sessions
         .append_tool_call_requested(
             session_id,
-            tool_call_id,
-            tool_name,
-            arguments_json,
-            producer_plugin_id,
-            None,
+            AppendToolCallRequestedInput {
+                tool_call_id,
+                tool_name,
+                arguments_json,
+                producer_plugin_id,
+                request_visual,
+                legacy_request_presentation: None,
+            },
         )
         .await
     {
@@ -17116,6 +17004,7 @@ mod tests {
                     producer_plugin_id: None,
                     tool_name: "shell.run".to_string(),
                     arguments_json: r#"{"command":"true"}"#.to_string(),
+                    request_visual: None,
                     legacy_request_presentation: None,
                 },
             ),
@@ -17154,6 +17043,7 @@ mod tests {
                     producer_plugin_id: None,
                     tool_name: "shell.run".to_string(),
                     arguments_json: r#"{"command":"true"}"#.to_string(),
+                    request_visual: None,
                     legacy_request_presentation: None,
                 },
             ),
@@ -17220,6 +17110,7 @@ mod tests {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_string(),
                 arguments_json: "{not-json".to_string(),
+                request_visual: None,
                 legacy_request_presentation: None,
             },
         )];
@@ -18529,6 +18420,7 @@ mod tests {
                     producer_plugin_id: None,
                     tool_name: "filesystem.read".to_string(),
                     arguments_json: r#"{"path":"Cargo.toml"}"#.to_string(),
+                    request_visual: None,
                     legacy_request_presentation: None,
                 },
             },
@@ -18626,83 +18518,93 @@ mod tests {
     }
 
     #[test]
-    fn live_preview_extraction_supports_shell_file_and_query_tools() {
-        let shell_metadata = bcode_tool::ToolLiveArgumentPreviewMetadata::ShellCommand {
-            command_field: "command".to_owned(),
-            cwd_field: Some("cwd".to_owned()),
-            preview_title: None,
-            streaming_status: None,
+    fn live_preview_extraction_uses_plugin_visual_metadata() {
+        let metadata = bcode_tool::ToolPluginVisualMetadata {
+            producer_plugin_id: Some("bcode.shell".to_owned()),
+            schema: "bcode.tool.request.shell.run".to_owned(),
+            schema_version: 1,
+            title: Some("Shell command".to_owned()),
+            subtitle: Some("running {command} · {bytes}".to_owned()),
+            payload: BTreeMap::from([
+                (
+                    "command".to_owned(),
+                    bcode_tool::ToolVisualPayloadSelector {
+                        fields: vec!["command".to_owned()],
+                        literal: None,
+                        required: true,
+                    },
+                ),
+                (
+                    "cwd".to_owned(),
+                    bcode_tool::ToolVisualPayloadSelector {
+                        fields: vec!["cwd".to_owned()],
+                        literal: None,
+                        required: false,
+                    },
+                ),
+            ]),
         };
-        let mut shell_fields = StreamingJsonStringFields::default();
-        shell_fields.push(r#"{"command":"cargo test","cwd":"/repo"}"#);
-        let shell = live_tool_argument_preview_from_fields(&shell_metadata, &shell_fields)
-            .expect("shell preview");
-        assert!(matches!(shell, LiveToolArgumentPreview::ShellCommand(_)));
-
-        let file_metadata = bcode_tool::ToolLiveArgumentPreviewMetadata::FileEdit {
-            path_fields: vec!["path".to_owned()],
-            old_text_fields: Vec::new(),
-            new_text_fields: vec!["contents".to_owned()],
-            old_text_required: false,
-            preview_title: None,
-            streaming_status: None,
-        };
-        let mut file_fields = StreamingJsonStringFields::default();
-        file_fields.push(r#"{"path":"src/lib.rs","contents":"pub fn demo() {}"}"#);
-        let file = live_tool_argument_preview_from_fields(&file_metadata, &file_fields)
-            .expect("file preview");
-        assert!(matches!(file, LiveToolArgumentPreview::FileEdit(_)));
-
-        let query_metadata = bcode_tool::ToolLiveArgumentPreviewMetadata::Query {
-            fields: vec!["query".to_owned(), "provider".to_owned()],
-            preview_title: None,
-            streaming_status: None,
-        };
-        let mut query_fields = StreamingJsonStringFields::default();
-        query_fields.push(r#"{"query":"rust tui","provider":"brave"}"#);
-        let query = live_tool_argument_preview_from_fields(&query_metadata, &query_fields)
-            .expect("query preview");
-        let LiveToolArgumentPreview::Query(query) = query else {
-            panic!("expected query preview");
-        };
-        assert_eq!(query.fields.get("query"), Some(&"rust tui".to_owned()));
-        assert_eq!(query.fields.get("provider"), Some(&"brave".to_owned()));
-    }
-
-    #[test]
-    fn live_preview_suppresses_duplicate_preview_snapshots() {
-        let mut progress = ModelStreamProgress::default();
-        let metadata = bcode_tool::ToolLiveArgumentPreviewMetadata::ShellCommand {
-            command_field: "command".to_owned(),
-            cwd_field: None,
-            preview_title: None,
-            streaming_status: None,
-        };
-        progress.start_tool_call("call-1".to_owned(), "shell_run".to_owned(), Some(metadata));
-        progress.record_tool_call_delta("call-1", r#"{"command":"cargo"}"#);
-        assert!(progress.take_tool_argument_preview().is_some());
-        assert!(progress.take_tool_argument_preview().is_none());
-    }
-
-    #[test]
-    fn live_preview_is_independent_from_coarse_progress_threshold() {
-        let mut progress = ModelStreamProgress::default();
-        let metadata = bcode_tool::ToolLiveArgumentPreviewMetadata::ShellCommand {
-            command_field: "command".to_owned(),
-            cwd_field: None,
-            preview_title: None,
-            streaming_status: None,
-        };
-        progress.start_tool_call("call-1".to_owned(), "shell_run".to_owned(), Some(metadata));
-        progress.record_tool_call_delta("call-1", r#"{"command":"x"}"#);
-        assert!(progress.take_tool_progress_event().is_none());
-        assert!(progress.take_tool_argument_preview().is_some());
-    }
-
-    #[test]
-    fn streaming_json_fields_capture_path_after_large_contents() {
         let mut fields = StreamingJsonStringFields::default();
-        fields.push("{\"contents\":\"");
+        fields.push(r#"{"command":"cargo test","cwd":"/repo"}"#);
+
+        let preview = live_tool_argument_preview_from_fields(&metadata, &fields)
+            .expect("plugin visual preview");
+
+        assert_eq!(
+            preview.visual.producer_plugin_id.as_deref(),
+            Some("bcode.shell")
+        );
+        assert_eq!(preview.visual.schema, "bcode.tool.request.shell.run");
+        assert_eq!(preview.visual.schema_version, 1);
+        assert_eq!(
+            preview.streaming_status.as_deref(),
+            Some("running cargo test · 38")
+        );
+        assert_eq!(
+            preview
+                .visual
+                .payload
+                .get("command")
+                .and_then(serde_json::Value::as_str),
+            Some("cargo test")
+        );
+        assert_eq!(
+            preview
+                .visual
+                .payload
+                .get("cwd")
+                .and_then(serde_json::Value::as_str),
+            Some("/repo")
+        );
+    }
+
+    #[test]
+    fn live_preview_extraction_requires_required_visual_fields() {
+        let metadata = bcode_tool::ToolPluginVisualMetadata {
+            producer_plugin_id: Some("bcode.example".to_owned()),
+            schema: "bcode.example.request".to_owned(),
+            schema_version: 1,
+            title: None,
+            subtitle: None,
+            payload: BTreeMap::from([(
+                "query".to_owned(),
+                bcode_tool::ToolVisualPayloadSelector {
+                    fields: vec!["query".to_owned()],
+                    literal: None,
+                    required: true,
+                },
+            )]),
+        };
+        let mut fields = StreamingJsonStringFields::default();
+        fields.push(r#"{"other":"value"}"#);
+
+        assert!(live_tool_argument_preview_from_fields(&metadata, &fields).is_none());
+    }
+
+    #[test]
+    fn streaming_json_fields_truncate_large_values() {
+        let mut fields = StreamingJsonStringFields::default();
+        fields.push(r#"{"contents":""#);
         fields.push(&"pub fn hello() {}\n".repeat(40_000));
         fields.push("\",\"path\":\"src/hello.rs\"}");
 
@@ -18711,23 +18613,6 @@ mod tests {
         assert!(contents.truncated);
         let path = fields.field(&["path"]).expect("path field");
         assert_eq!(path.value, "src/hello.rs");
-
-        let metadata = bcode_tool::ToolLiveArgumentPreviewMetadata::FileEdit {
-            path_fields: vec!["path".to_owned()],
-            old_text_fields: Vec::new(),
-            new_text_fields: vec!["contents".to_owned()],
-            old_text_required: false,
-            preview_title: None,
-            streaming_status: None,
-        };
-        let preview =
-            live_tool_argument_preview_from_fields(&metadata, &fields).expect("file preview");
-        let LiveToolArgumentPreview::FileEdit(file) = preview else {
-            panic!("expected file edit preview");
-        };
-        assert_eq!(file.path.as_deref(), Some("src/hello.rs"));
-        assert!(file.new_text_prefix.starts_with("pub fn hello"));
-        assert!(file.truncated);
     }
 
     #[test]

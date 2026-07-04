@@ -2191,6 +2191,7 @@ mod tests {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_string(),
                 arguments_json: "{}".to_string(),
+                request_visual: None,
                 legacy_request_presentation: None,
             },
             SessionEventKind::ToolCallFinished {

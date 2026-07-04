@@ -24,8 +24,8 @@ pub enum TranscriptItemKind {
         producer_plugin_id: Option<String>,
         /// Tool name.
         tool_name: String,
-        /// Raw tool arguments JSON.
-        arguments_json: String,
+        /// Plugin-owned request visual.
+        request_visual: Option<bcode_session_models::PluginVisualDescriptor>,
         /// Whether this item was derived from live-only partial tool arguments.
         live_preview: bool,
     },
@@ -488,6 +488,7 @@ pub fn tool_request_item_from_projection(projection: &ToolInvocationProjection) 
         projection.producer_plugin_id.as_deref(),
         tool_name,
         arguments_json,
+        projection.request_visual.clone(),
     )
 }
 
@@ -512,6 +513,7 @@ pub fn tool_request_item(
     producer_plugin_id: Option<&str>,
     tool_name: &str,
     arguments_json: &str,
+    request_visual: Option<bcode_session_models::PluginVisualDescriptor>,
 ) -> TranscriptItem {
     TranscriptItem::with_kind(
         "Tool",
@@ -521,7 +523,7 @@ pub fn tool_request_item(
             tool_call_id: tool_call_id.to_owned(),
             producer_plugin_id: producer_plugin_id.map(ToOwned::to_owned),
             tool_name: tool_name.to_owned(),
-            arguments_json: arguments_json.to_owned(),
+            request_visual,
             live_preview: false,
         },
     )

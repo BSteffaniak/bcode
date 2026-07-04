@@ -7,8 +7,8 @@
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
-    ToolInvocationRequest, ToolInvocationResponse, ToolList, ToolLiveArgumentPreviewMetadata,
-    ToolSideEffect,
+    ToolInvocationRequest, ToolInvocationResponse, ToolList, ToolPluginVisualMetadata,
+    ToolSideEffect, ToolVisualPayloadSelector,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -368,15 +368,30 @@ fn clone_tool_definition() -> ToolDefinition {
         },
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("cloning".to_string()),
-            live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::Query {
-                fields: vec![
-                    "url".to_string(),
-                    "destination".to_string(),
-                    "ref".to_string(),
-                    "branch".to_string(),
-                ],
-                preview_title: Some("Clone repository".to_string()),
-                streaming_status: Some("cloning {primary} · {bytes}".to_string()),
+            request_visual: Some(ToolPluginVisualMetadata {
+                producer_plugin_id: Some("bcode.git".to_string()),
+                schema: "bcode.git.clone_request".to_string(),
+                schema_version: 1,
+                title: Some("Clone repository".to_string()),
+                subtitle: Some("cloning {url} · {bytes}".to_string()),
+                payload: [
+                    ("url", true),
+                    ("destination", false),
+                    ("ref", false),
+                    ("branch", false),
+                ]
+                .into_iter()
+                .map(|(field, required)| {
+                    (
+                        field.to_string(),
+                        ToolVisualPayloadSelector {
+                            fields: vec![field.to_string()],
+                            literal: None,
+                            required,
+                        },
+                    )
+                })
+                .collect(),
             }),
 
         },

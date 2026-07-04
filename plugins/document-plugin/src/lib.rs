@@ -530,7 +530,7 @@ fn extract_tool_definition() -> ToolDefinition {
         },
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("extracting".to_string()),
-            live_argument_preview: None,
+            request_visual: None,
 
         },
     }

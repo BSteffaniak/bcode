@@ -373,6 +373,24 @@ impl SessionStore {
     }
 }
 
+/// Input for appending a tool-call request event.
+#[derive(Debug, Clone, Default)]
+pub struct AppendToolCallRequestedInput {
+    /// Provider tool call identifier.
+    pub tool_call_id: String,
+    /// Tool name requested by the model.
+    pub tool_name: String,
+    /// Raw JSON arguments requested by the model.
+    pub arguments_json: String,
+    /// Producer plugin id, when known.
+    pub producer_plugin_id: Option<String>,
+    /// Plugin-owned request visual captured at request time.
+    pub request_visual: Option<bcode_session_models::PluginVisualDescriptor>,
+    /// Legacy request presentation metadata retained for old sessions/imports.
+    pub legacy_request_presentation:
+        Option<bcode_session_models::LegacyToolRequestPresentationMetadata>,
+}
+
 /// In-memory session manager with optional DB-backed persistence.
 #[derive(Debug)]
 pub struct SessionManager {
@@ -1993,22 +2011,17 @@ impl SessionManager {
     pub async fn append_tool_call_requested(
         &self,
         session_id: SessionId,
-        tool_call_id: String,
-        tool_name: String,
-        arguments_json: String,
-        producer_plugin_id: Option<String>,
-        legacy_request_presentation: Option<
-            bcode_session_models::LegacyToolRequestPresentationMetadata,
-        >,
+        input: AppendToolCallRequestedInput,
     ) -> Result<SessionEvent, SessionError> {
         self.append_event(
             session_id,
             SessionEventKind::ToolCallRequested {
-                tool_call_id,
-                tool_name,
-                arguments_json,
-                producer_plugin_id,
-                legacy_request_presentation,
+                tool_call_id: input.tool_call_id,
+                tool_name: input.tool_name,
+                arguments_json: input.arguments_json,
+                producer_plugin_id: input.producer_plugin_id,
+                request_visual: input.request_visual,
+                legacy_request_presentation: input.legacy_request_presentation,
             },
         )
         .await
@@ -3051,11 +3064,12 @@ mod tests {
             manager
                 .append_tool_call_requested(
                     session.id,
-                    "call-1".to_string(),
-                    "shell.run".to_string(),
-                    "{}".to_string(),
-                    None,
-                    None,
+                    crate::AppendToolCallRequestedInput {
+                        tool_call_id: "call-1".to_string(),
+                        tool_name: "shell.run".to_string(),
+                        arguments_json: "{}".to_string(),
+                        ..crate::AppendToolCallRequestedInput::default()
+                    },
                 )
                 .await
                 .expect("request should append");
@@ -3479,11 +3493,12 @@ mod tests {
         manager
             .append_tool_call_requested(
                 session.id,
-                "tool-1".to_string(),
-                "read".to_string(),
-                r#"{"path":"README.md"}"#.to_string(),
-                None,
-                None,
+                crate::AppendToolCallRequestedInput {
+                    tool_call_id: "tool-1".to_string(),
+                    tool_name: "read".to_string(),
+                    arguments_json: r#"{"path":"README.md"}"#.to_string(),
+                    ..crate::AppendToolCallRequestedInput::default()
+                },
             )
             .await
             .expect("tool request should append");
@@ -4518,6 +4533,7 @@ mod tests {
                     producer_plugin_id: None,
                     tool_name: "tool".to_string(),
                     arguments_json: "{}".to_string(),
+                    request_visual: None,
                     legacy_request_presentation: None,
                 },
             ),

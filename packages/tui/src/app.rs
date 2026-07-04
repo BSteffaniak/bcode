@@ -3162,45 +3162,14 @@ impl BmuxApp {
         }
         self.ensure_live_tool_preview_anchor(tool_call_id, tool_name);
         let bytes = format_provider_bytes(argument_bytes);
-        match preview {
-            LiveToolArgumentPreview::PluginView(view) => {
-                let status = view
-                    .subtitle
-                    .clone()
-                    .unwrap_or_else(|| format!("streaming {tool_name} · {bytes} received"));
-                self.set_activity(ActivityState::ProviderStream {
-                    detail: status.clone(),
-                });
-                self.status = status;
-            }
-            LiveToolArgumentPreview::FileEdit(file) => {
-                self.set_file_activity(tool_name);
-                self.status = file.streaming_status.clone().map_or_else(
-                    || format!("streaming file change · {bytes} received"),
-                    |status| render_live_preview_template(&status, preview, &bytes),
-                );
-            }
-            LiveToolArgumentPreview::ShellCommand(shell) => {
-                let status = shell.streaming_status.clone().map_or_else(
-                    || format!("streaming command · {bytes} received"),
-                    |status| render_live_preview_template(&status, preview, &bytes),
-                );
-                self.set_activity(ActivityState::ProviderStream {
-                    detail: status.clone(),
-                });
-                self.status = status;
-            }
-            LiveToolArgumentPreview::Query(query) => {
-                let status = query.streaming_status.clone().map_or_else(
-                    || format!("streaming {tool_name} · {bytes} received"),
-                    |status| render_live_preview_template(&status, preview, &bytes),
-                );
-                self.set_activity(ActivityState::ProviderStream {
-                    detail: status.clone(),
-                });
-                self.status = status;
-            }
-        }
+        let status = preview.streaming_status.clone().map_or_else(
+            || format!("streaming {tool_name} · {bytes} received"),
+            |status| render_visual_status_template(&status, preview, &bytes),
+        );
+        self.set_activity(ActivityState::ProviderStream {
+            detail: status.clone(),
+        });
+        self.status = status;
         self.mark_live_preview_dirty();
     }
 
@@ -3861,26 +3830,20 @@ fn format_usd_micros(micros: u64) -> String {
     }
 }
 
-fn render_live_preview_template(
+fn render_visual_status_template(
     template: &str,
     preview: &LiveToolArgumentPreview,
     bytes: &str,
 ) -> String {
-    let primary = live_preview_primary(preview).unwrap_or_default();
-    template
-        .replace(concat!("{", "bytes", "}"), bytes)
-        .replace(concat!("{", "primary", "}"), primary)
-        .replace(concat!("{", "path", "}"), primary)
-        .replace(concat!("{", "command", "}"), primary)
-}
-
-fn live_preview_primary(preview: &LiveToolArgumentPreview) -> Option<&str> {
-    match preview {
-        LiveToolArgumentPreview::PluginView(view) => view.subtitle.as_deref(),
-        LiveToolArgumentPreview::FileEdit(file) => file.path.as_deref(),
-        LiveToolArgumentPreview::ShellCommand(shell) => Some(shell.command_prefix.as_str()),
-        LiveToolArgumentPreview::Query(query) => query.fields.values().next().map(String::as_str),
+    let mut rendered = template.replace(concat!("{", "bytes", "}"), bytes);
+    if let Some(object) = preview.visual.payload.as_object() {
+        for (key, value) in object {
+            if let Some(value) = value.as_str() {
+                rendered = rendered.replace(&format!("{{{key}}}"), value);
+            }
+        }
     }
+    rendered
 }
 
 fn format_provider_bytes(bytes: usize) -> String {
@@ -3949,13 +3912,8 @@ fn submitted_protocol_state_json(resolution_json: &str) -> Option<String> {
     .ok()
 }
 
-const fn live_tool_preview_truncated(preview: &LiveToolArgumentPreview) -> bool {
-    match preview {
-        LiveToolArgumentPreview::PluginView(_) => false,
-        LiveToolArgumentPreview::FileEdit(file) => file.truncated,
-        LiveToolArgumentPreview::ShellCommand(shell) => shell.truncated,
-        LiveToolArgumentPreview::Query(query) => query.truncated,
-    }
+const fn live_tool_preview_truncated(_preview: &LiveToolArgumentPreview) -> bool {
+    false
 }
 
 const fn event_breaks_sticky_entry_anchor(event: &SessionEvent) -> bool {

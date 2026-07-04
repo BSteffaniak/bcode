@@ -12,8 +12,7 @@ use bcode_tool::{
     ImageMetadata, ImageRefContent, ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS,
     TOOL_SERVICE_INTERFACE_ID, ToolArtifact, ToolDefinition, ToolInvocationRequest,
     ToolInvocationResponse, ToolInvocationResult, ToolInvocationStreamEvent, ToolList,
-    ToolLiveArgumentPreviewMetadata, ToolLivePluginViewMetadata, ToolLivePreviewPayloadSelector,
-    ToolResultContent, ToolSideEffect,
+    ToolPluginVisualMetadata, ToolResultContent, ToolSideEffect, ToolVisualPayloadSelector,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -383,7 +382,7 @@ fn compatibility_aliases_for(aliases: &[&str]) -> Vec<bcode_tool::ToolCompatibil
 fn path_tool_ui(activity_label: &str) -> bcode_tool::ToolUiMetadata {
     bcode_tool::ToolUiMetadata {
         activity_label: Some(activity_label.to_string()),
-        live_argument_preview: None,
+        request_visual: None,
     }
 }
 
@@ -391,8 +390,8 @@ fn payload_selector(
     fields: &[&str],
     literal: Option<serde_json::Value>,
     required: bool,
-) -> ToolLivePreviewPayloadSelector {
-    ToolLivePreviewPayloadSelector {
+) -> ToolVisualPayloadSelector {
+    ToolVisualPayloadSelector {
         fields: fields.iter().map(|field| (*field).to_string()).collect(),
         literal,
         required,
@@ -405,7 +404,7 @@ fn file_change_metadata(
     old_text_literal: Option<&str>,
     old_text_required: bool,
     new_text_fields: &[&str],
-) -> ToolLivePluginViewMetadata {
+) -> ToolPluginVisualMetadata {
     let mut payload = std::collections::BTreeMap::new();
     payload.insert("path".to_string(), payload_selector(&["path"], None, false));
     payload.insert(
@@ -420,7 +419,7 @@ fn file_change_metadata(
         "new_text".to_string(),
         payload_selector(new_text_fields, None, true),
     );
-    ToolLivePluginViewMetadata {
+    ToolPluginVisualMetadata {
         schema: "bcode.filesystem.change".to_string(),
         schema_version: 1,
         producer_plugin_id: Some("bcode.filesystem".to_string()),
@@ -433,15 +432,16 @@ fn file_change_metadata(
 fn write_tool_ui(activity_label: &str, preview_title: &str) -> bcode_tool::ToolUiMetadata {
     bcode_tool::ToolUiMetadata {
         activity_label: Some(activity_label.to_string()),
-        live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::PluginView {
-            view: file_change_metadata(
+        request_visual: Some({
+            let mut metadata = file_change_metadata(
                 preview_title,
                 &[],
                 Some(""),
                 false,
                 &["contents", "new_text"],
-            ),
-            streaming_status: Some(format!("{activity_label} {{path}} · {{bytes}}")),
+            );
+            metadata.subtitle = Some(format!("{activity_label} {{path}} · {{bytes}}"));
+            metadata
         }),
     }
 }
@@ -449,9 +449,11 @@ fn write_tool_ui(activity_label: &str, preview_title: &str) -> bcode_tool::ToolU
 fn edit_tool_ui(activity_label: &str, preview_title: &str) -> bcode_tool::ToolUiMetadata {
     bcode_tool::ToolUiMetadata {
         activity_label: Some(activity_label.to_string()),
-        live_argument_preview: Some(ToolLiveArgumentPreviewMetadata::PluginView {
-            view: file_change_metadata(preview_title, &["old_text"], None, false, &["new_text"]),
-            streaming_status: Some(format!("{activity_label} {{path}} · {{bytes}}")),
+        request_visual: Some({
+            let mut metadata =
+                file_change_metadata(preview_title, &["old_text"], None, false, &["new_text"]);
+            metadata.subtitle = Some(format!("{activity_label} {{path}} · {{bytes}}"));
+            metadata
         }),
     }
 }
@@ -2225,13 +2227,13 @@ mod tests {
     #[test]
     fn write_and_edit_live_previews_use_file_change_plugin_view() {
         assert_file_change_plugin_live_preview(
-            write_tool_definition().ui.live_argument_preview,
+            write_tool_definition().ui.request_visual,
             &["contents", "new_text"],
             Some(""),
             false,
         );
         assert_file_change_plugin_live_preview(
-            edit_tool_definition().ui.live_argument_preview,
+            edit_tool_definition().ui.request_visual,
             &["new_text"],
             None,
             false,
@@ -2239,22 +2241,18 @@ mod tests {
     }
 
     fn assert_file_change_plugin_live_preview(
-        preview: Option<ToolLiveArgumentPreviewMetadata>,
+        preview: Option<ToolPluginVisualMetadata>,
         expected_new_text_fields: &[&str],
         expected_old_text_literal: Option<&str>,
         expected_old_text_required: bool,
     ) {
-        let Some(ToolLiveArgumentPreviewMetadata::PluginView {
-            view,
-            streaming_status,
-        }) = preview
-        else {
-            panic!("expected plugin-view live preview");
+        let Some(view) = preview else {
+            panic!("expected request visual");
         };
         assert_eq!(view.producer_plugin_id.as_deref(), Some("bcode.filesystem"));
         assert_eq!(view.schema, "bcode.filesystem.change");
         assert_eq!(view.schema_version, 1);
-        assert!(streaming_status.is_some());
+        assert!(view.subtitle.is_some());
         assert_eq!(
             view.payload.get("path").expect("path selector").fields,
             vec!["path".to_string()]
