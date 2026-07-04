@@ -3,7 +3,6 @@
 use std::collections::VecDeque;
 use std::io::{self, Write};
 
-const DEFAULT_RETAINED_LINES: usize = 64;
 const TAB_WIDTH: usize = 8;
 
 /// Summary of a completed normalized terminal transcript.
@@ -50,7 +49,7 @@ impl<W: Write> TerminalCleanWriter<W> {
 struct TerminalCleanPerformer<W> {
     writer: W,
     columns: usize,
-    retained_rows: usize,
+    rows: usize,
     lines: VecDeque<TerminalLine>,
     cursor_row: usize,
     cursor_col: usize,
@@ -61,15 +60,12 @@ struct TerminalCleanPerformer<W> {
 
 impl<W: Write> TerminalCleanPerformer<W> {
     fn new(writer: W, columns: u16, rows: u16, max_tail_bytes: usize) -> Self {
-        let retained_rows = usize::from(rows)
-            .saturating_add(DEFAULT_RETAINED_LINES)
-            .max(1);
         let mut lines = VecDeque::new();
         lines.push_back(TerminalLine::default());
         Self {
             writer,
             columns: usize::from(columns).max(1),
-            retained_rows,
+            rows: usize::from(rows).max(1),
             lines,
             cursor_row: 0,
             cursor_col: 0,
@@ -114,8 +110,7 @@ impl<W: Write> TerminalCleanPerformer<W> {
         self.cursor_col = self.cursor_col.saturating_add(1);
         if self.cursor_col >= self.columns {
             self.cursor_col = 0;
-            self.cursor_row = self.cursor_row.saturating_add(1);
-            self.ensure_cursor_line();
+            self.advance_row_with_scroll();
         }
     }
 
@@ -130,10 +125,17 @@ impl<W: Write> TerminalCleanPerformer<W> {
     }
 
     fn newline(&mut self) {
-        self.cursor_row = self.cursor_row.saturating_add(1);
         self.cursor_col = 0;
-        self.ensure_cursor_line();
-        self.flush_stable_lines();
+        self.advance_row_with_scroll();
+    }
+
+    fn advance_row_with_scroll(&mut self) {
+        if self.cursor_row.saturating_add(1) >= self.rows {
+            self.scroll_up_one();
+        } else {
+            self.cursor_row = self.cursor_row.saturating_add(1);
+            self.ensure_cursor_line();
+        }
     }
 
     const fn carriage_return(&mut self) {
@@ -154,9 +156,11 @@ impl<W: Write> TerminalCleanPerformer<W> {
     }
 
     fn cursor_down(&mut self, count: usize) {
-        self.cursor_row = self.cursor_row.saturating_add(count.max(1));
+        self.cursor_row = self
+            .cursor_row
+            .saturating_add(count.max(1))
+            .min(self.rows.saturating_sub(1));
         self.ensure_cursor_line();
-        self.flush_stable_lines();
     }
 
     fn cursor_forward(&mut self, count: usize) {
@@ -175,7 +179,7 @@ impl<W: Write> TerminalCleanPerformer<W> {
     }
 
     fn cursor_position(&mut self, row: usize, column: usize) {
-        self.cursor_row = row.saturating_sub(1);
+        self.cursor_row = row.saturating_sub(1).min(self.rows.saturating_sub(1));
         self.cursor_col = column.saturating_sub(1).min(self.columns.saturating_sub(1));
         self.ensure_cursor_line();
     }
@@ -220,30 +224,31 @@ impl<W: Write> TerminalCleanPerformer<W> {
     }
 
     fn ensure_cursor_line(&mut self) {
+        while self.lines.len() < self.rows {
+            self.lines.push_back(TerminalLine::default());
+        }
         while self.cursor_row >= self.lines.len() {
             self.lines.push_back(TerminalLine::default());
         }
     }
 
-    fn flush_stable_lines(&mut self) {
-        while self.lines.len() > self.retained_rows {
-            if let Some(line) = self.lines.pop_front() {
-                let result = self.write_line(&line);
-                self.record_result(result);
-                self.cursor_row = self.cursor_row.saturating_sub(1);
-            }
+    fn scroll_up_one(&mut self) {
+        if let Some(line) = self.lines.pop_front() {
+            let result = self.write_line(&line);
+            self.record_result(result);
         }
+        self.lines.push_back(TerminalLine::default());
+        self.cursor_row = self.rows.saturating_sub(1);
     }
 
     fn flush_all(&mut self) -> io::Result<()> {
-        while self.lines.len() > 1 {
-            if let Some(line) = self.lines.pop_front() {
-                self.write_line(&line)?;
-            }
-        }
-        if let Some(line) = self.lines.pop_front()
-            && !line.is_empty()
-        {
+        let last_content_row = self.lines.iter().rposition(|line| !line.is_empty());
+        let lines = self
+            .lines
+            .drain(..)
+            .take(last_content_row.map_or(0, |row| row.saturating_add(1)))
+            .collect::<Vec<_>>();
+        for line in lines {
             self.write_line(&line)?;
         }
         self.cursor_row = 0;
@@ -494,14 +499,40 @@ mod tests {
         assert_eq!(summary.tail, "ONE\ntwo\n");
     }
 
-    #[test]
-    fn tail_is_bounded() {
+    fn clean_with_size(chunks: &[&[u8]], columns: u16, rows: u16) -> TerminalCleanSummary {
         let mut output = Vec::new();
-        let mut cleaner = TerminalCleanWriter::new(&mut output, 80, 24, 6);
-        cleaner.write_chunk(b"alpha\nbeta\n").expect("chunk cleans");
-        let summary = cleaner.finish().expect("cleaner finishes");
+        let mut cleaner = TerminalCleanWriter::new(&mut output, columns, rows, 4096);
+        for chunk in chunks {
+            cleaner.write_chunk(chunk).expect("chunk cleans");
+        }
+        cleaner.finish().expect("cleaner finishes")
+    }
 
-        assert!(summary.tail_truncated);
-        assert_eq!(summary.tail, "\nbeta\n");
+    #[test]
+    fn cursor_up_cannot_rewrite_flushed_scrollback() {
+        let summary = clean_with_size(&[b"one\ntwo\nthree\x1b[A\rTWO\n"], 80, 2);
+
+        assert_eq!(summary.tail, "one\nTWO\nthree\n");
+    }
+
+    #[test]
+    fn absolute_cursor_position_is_viewport_relative() {
+        let summary = clean_with_size(&[b"one\ntwo\nthree\x1b[1;1HTOP\n"], 80, 2);
+
+        assert_eq!(summary.tail, "one\nTOP\nthree\n");
+    }
+
+    #[test]
+    fn cursor_down_clamps_without_scrolling() {
+        let summary = clean_with_size(&[b"top\x1b[99B\rbottom\n"], 80, 2);
+
+        assert_eq!(summary.tail, "top\nbottom\n");
+    }
+
+    #[test]
+    fn large_output_flushes_progressively() {
+        let summary = clean_with_size(&[b"a\nb\nc\nd\ne\n"], 80, 2);
+
+        assert_eq!(summary.tail, "a\nb\nc\nd\ne\n");
     }
 }
