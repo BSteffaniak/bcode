@@ -268,36 +268,19 @@ pub fn unix_time_millis() -> Result<u64, DaemonLifecycleError> {
 }
 
 fn endpoint_record(endpoint: &IpcEndpoint) -> DaemonEndpointRecord {
-    let debug = format!("{endpoint:?}");
-    #[cfg(unix)]
-    if let Some(path) = parse_unix_socket_debug(&debug) {
-        return DaemonEndpointRecord::UnixSocket { path };
+    if let Some(path) = endpoint.as_unix_socket() {
+        return DaemonEndpointRecord::UnixSocket {
+            path: path.to_path_buf(),
+        };
     }
-    #[cfg(windows)]
-    if let Some(name) = parse_windows_pipe_debug(&debug) {
-        return DaemonEndpointRecord::WindowsNamedPipe { name };
+    if let Some(name) = endpoint.as_windows_named_pipe() {
+        return DaemonEndpointRecord::WindowsNamedPipe {
+            name: name.to_owned(),
+        };
     }
-    DaemonEndpointRecord::Unknown { debug }
-}
-
-#[cfg(unix)]
-fn parse_unix_socket_debug(debug: &str) -> Option<PathBuf> {
-    let marker = "UnixSocket(";
-    let start = debug.find(marker)? + marker.len();
-    let rest = &debug[start..];
-    let end = rest.rfind(')')?;
-    let path = rest[..end].trim().trim_matches('"');
-    (!path.is_empty()).then(|| PathBuf::from(path))
-}
-
-#[cfg(windows)]
-fn parse_windows_pipe_debug(debug: &str) -> Option<String> {
-    let marker = "WindowsNamedPipe(";
-    let start = debug.find(marker)? + marker.len();
-    let rest = &debug[start..];
-    let end = rest.rfind(')')?;
-    let name = rest[..end].trim().trim_matches('"');
-    (!name.is_empty()).then(|| name.to_string())
+    DaemonEndpointRecord::Unknown {
+        debug: format!("{endpoint:?}"),
+    }
 }
 
 #[cfg(test)]
@@ -440,8 +423,13 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
         let stderr_log = log_file.try_clone()?;
 
         let exe = std::env::current_exe()?;
+        let (endpoint_env_name, endpoint_env_value) =
+            bcode_ipc::endpoint_env_pair(&options.endpoint)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
         let mut child = tokio::process::Command::new(exe)
             .args(["server", "run"])
+            .env(endpoint_env_name, endpoint_env_value)
+            .env("BCODE_DAEMON_LOG", &options.log_path)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::from(log_file))
             .stderr(std::process::Stdio::from(stderr_log))
@@ -657,8 +645,8 @@ fn remove_stale_socket(record: &DaemonRecord) {
 
 fn cleanup_stale_endpoint(endpoint: &IpcEndpoint) -> Result<(), DaemonLifecycleError> {
     #[cfg(unix)]
-    if let Some(path) = endpoint_unix_socket_path(endpoint) {
-        remove_stale_unix_socket_path(&path)?;
+    if let Some(path) = endpoint.as_unix_socket() {
+        remove_stale_unix_socket_path(path)?;
     }
     Ok(())
 }
@@ -680,17 +668,6 @@ fn remove_stale_unix_socket_path(path: &Path) -> Result<(), DaemonLifecycleError
             source,
         }),
     }
-}
-
-#[cfg(unix)]
-fn endpoint_unix_socket_path(endpoint: &IpcEndpoint) -> Option<PathBuf> {
-    let debug = format!("{endpoint:?}");
-    let marker = "UnixSocket(";
-    let start = debug.find(marker)? + marker.len();
-    let rest = &debug[start..];
-    let end = rest.rfind(')')?;
-    let path = rest[..end].trim().trim_matches('"');
-    (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
 #[cfg(unix)]

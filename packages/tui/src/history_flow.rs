@@ -1,6 +1,6 @@
 //! History and session event-stream plumbing for the TUI.
 
-use bcode_client::{BcodeClient, DaemonAvailability};
+use bcode_client::BcodeClient;
 use bcode_ipc::Event as BcodeEvent;
 use bcode_session_models::{
     ProjectionWindowAnchor, ProjectionWindowDirection, ProjectionWindowLimits,
@@ -125,9 +125,7 @@ pub async fn attach_session_event_stream_with_limit(
         }
         Err(error) => return Err(error.into()),
     };
-    let reconnect_client = client
-        .clone()
-        .with_daemon_availability(DaemonAvailability::RequireRunning);
+    let reconnect_client = client.clone();
     let event_task = spawn_reconnecting_recent_event_stream(
         reconnect_client,
         session_id,
@@ -161,9 +159,7 @@ pub async fn attach_session_event_stream_with_window_request(
         }
         Err(error) => return Err(error.into()),
     };
-    let reconnect_client = client
-        .clone()
-        .with_daemon_availability(DaemonAvailability::RequireRunning);
+    let reconnect_client = client.clone();
     let event_task = spawn_reconnecting_window_event_stream(
         reconnect_client,
         session_id,
@@ -228,11 +224,11 @@ fn spawn_reconnecting_window_event_stream(
 }
 
 async fn reconnecting_event_stream<F>(
-    _client: BcodeClient,
-    _session_id: SessionId,
+    client: BcodeClient,
+    session_id: SessionId,
     event_sender: mpsc::UnboundedSender<BcodeEvent>,
     mut connection: bcode_client::ClientConnection,
-    _attach: F,
+    attach: F,
 ) where
     F: for<'a> Fn(
             &'a mut bcode_client::ClientConnection,
@@ -244,9 +240,31 @@ async fn reconnecting_event_stream<F>(
         > + Send
         + 'static,
 {
-    while let Ok(event) = connection.recv_event().await {
-        if event_sender.send(event).is_err() {
-            return;
+    let mut reconnect_delay = std::time::Duration::from_millis(100);
+    loop {
+        match connection.recv_event().await {
+            Ok(event) => {
+                reconnect_delay = std::time::Duration::from_millis(100);
+                if event_sender.send(event).is_err() {
+                    return;
+                }
+            }
+            Err(_error) => loop {
+                if event_sender.is_closed() {
+                    return;
+                }
+                match client.connect("bcode-tui-bmux").await {
+                    Ok(mut next_connection) => {
+                        if attach(&mut next_connection, session_id).await.is_ok() {
+                            connection = next_connection;
+                            break;
+                        }
+                    }
+                    Err(_error) => {}
+                }
+                tokio::time::sleep(reconnect_delay).await;
+                reconnect_delay = (reconnect_delay * 2).min(std::time::Duration::from_secs(2));
+            },
         }
     }
 }

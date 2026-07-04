@@ -1577,8 +1577,8 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 fn prepare_endpoint_for_bind(endpoint: &IpcEndpoint) -> Result<(), IpcTransportError> {
     #[cfg(unix)]
-    if let Some(path) = unix_socket_path(endpoint) {
-        prepare_unix_socket_path_for_bind(&path)?;
+    if let Some(path) = endpoint.as_unix_socket() {
+        prepare_unix_socket_path_for_bind(path)?;
     }
     Ok(())
 }
@@ -1613,15 +1613,36 @@ fn prepare_unix_socket_path_for_bind(path: &Path) -> Result<(), IpcTransportErro
     }
 }
 
-#[cfg(unix)]
-fn unix_socket_path(endpoint: &IpcEndpoint) -> Option<PathBuf> {
-    let debug = format!("{endpoint:?}");
-    let marker = "UnixSocket(";
-    let start = debug.find(marker)? + marker.len();
-    let rest = &debug[start..];
-    let end = rest.rfind(')')?;
-    let path = rest[..end].trim().trim_matches('"');
-    (!path.is_empty()).then(|| PathBuf::from(path))
+/// Environment variable carrying an encoded local IPC endpoint for child processes.
+pub const BCODE_IPC_ENDPOINT_ENV: &str = "BCODE_IPC_ENDPOINT";
+
+/// Serialize an IPC endpoint for process environment propagation.
+///
+/// # Errors
+///
+/// Returns an error when endpoint serialization fails.
+pub fn endpoint_env_value(endpoint: &IpcEndpoint) -> Result<String, serde_json::Error> {
+    serde_json::to_string(endpoint)
+}
+
+/// Return the environment pair used to propagate an exact IPC endpoint.
+///
+/// # Errors
+///
+/// Returns an error when endpoint serialization fails.
+pub fn endpoint_env_pair(
+    endpoint: &IpcEndpoint,
+) -> Result<(&'static str, String), serde_json::Error> {
+    Ok((BCODE_IPC_ENDPOINT_ENV, endpoint_env_value(endpoint)?))
+}
+
+/// Parse an IPC endpoint previously produced by [`endpoint_env_value`].
+///
+/// # Errors
+///
+/// Returns an error when the encoded endpoint is invalid.
+pub fn endpoint_from_env_value(value: &str) -> Result<IpcEndpoint, serde_json::Error> {
+    serde_json::from_str(value)
 }
 
 /// Return the daemon namespace for this build and IPC protocol version.
@@ -1633,6 +1654,11 @@ pub fn daemon_namespace() -> String {
 /// Return the default local IPC endpoint.
 #[must_use]
 pub fn default_endpoint() -> IpcEndpoint {
+    if let Ok(value) = env::var(BCODE_IPC_ENDPOINT_ENV)
+        && let Ok(endpoint) = endpoint_from_env_value(&value)
+    {
+        return endpoint;
+    }
     #[cfg(unix)]
     {
         IpcEndpoint::unix_socket(default_socket_path())

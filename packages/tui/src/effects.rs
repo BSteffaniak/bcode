@@ -13,15 +13,12 @@ use bcode_worktree_models::{WorktreeCreateRequest, WorktreeCreateResponse};
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, timeout};
 
 use super::{
     TuiError, clipboard_image, daemon_issue, history_flow,
     session_flow::{self, AgentCatalog},
     slash_palette, thinking_flow,
 };
-
-const TUI_FOREGROUND_ACTION_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// Submit-message effect request payload.
 pub struct SubmitMessageRequest {
@@ -622,12 +619,12 @@ enum EffectSchedule {
     QueueLatest,
 }
 
-/// Daemon availability intent for an effect.
+/// Daemon-backed effect scheduling class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EffectDaemonIntent {
-    /// Use the passive client and never start the daemon.
-    Passive,
-    /// Use the foreground client and allow daemon autostart.
+    /// Use the background client clone for non-foreground work.
+    Background,
+    /// Use the foreground client clone for explicit user actions.
     Foreground,
 }
 
@@ -665,7 +662,7 @@ impl TuiEffect {
             | Self::LoadNewerHistory { .. }
             | Self::ListPermissions
             | Self::SaveDraft { .. }
-            | Self::LoadSlashPalette { .. } => EffectDaemonIntent::Passive,
+            | Self::LoadSlashPalette { .. } => EffectDaemonIntent::Background,
         }
     }
 }
@@ -767,7 +764,7 @@ impl TuiEffectRunner {
 
     fn spawn(&mut self, key: EffectKey, effect: TuiEffect) {
         let client = match effect.daemon_intent() {
-            EffectDaemonIntent::Passive => self.passive_client.clone(),
+            EffectDaemonIntent::Background => self.passive_client.clone(),
             EffectDaemonIntent::Foreground => self.foreground_client.clone(),
         };
         let task = tokio::spawn(async move { Box::pin(effect.run(client)).await });
@@ -1141,17 +1138,7 @@ async fn run_submit_message(
     let message = request.message.clone();
     TuiEffectResult::SubmitMessage {
         message,
-        result: Box::new(
-            timeout(
-                TUI_FOREGROUND_ACTION_TIMEOUT,
-                submit_message(client, request),
-            )
-            .await
-            .map_err(|_| ClientError::RequestTimeout {
-                timeout: TUI_FOREGROUND_ACTION_TIMEOUT,
-            })
-            .and_then(std::convert::identity),
-        ),
+        result: Box::new(submit_message(client, request).await),
     }
 }
 
