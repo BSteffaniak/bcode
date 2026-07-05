@@ -30,6 +30,7 @@ bcode_question_plugin                   = { workspace = true, optional = true }
 bcode_ralph_plugin                      = { workspace = true, optional = true }
 bcode_shell_plugin                      = { workspace = true, optional = true }
 bcode_skills_plugin                     = { workspace = true, optional = true }
+bcode_vim_edit_plugin                   = { workspace = true, optional = true }
 bcode_web_search_plugin                 = { workspace = true, optional = true }
 bcode_worktree_plugin                   = { workspace = true, optional = true }
 
@@ -134,6 +135,7 @@ static-bundled-plugins = [
     "static-bundled-ralph-plugin",
     "static-bundled-shell-plugin",
     "static-bundled-skills-plugin",
+    "static-bundled-vim-edit-plugin",
     "static-bundled-web-search-plugin",
     "static-bundled-worktree-plugin",
 ]
@@ -152,6 +154,10 @@ static-bundled-shell-plugin = [
 static-bundled-skills-plugin = [
     "dep:bcode_skills_plugin",
     "bcode_skills_plugin/static-bundled",
+]
+static-bundled-vim-edit-plugin = [
+    "dep:bcode_vim_edit_plugin",
+    "bcode_vim_edit_plugin/static-bundled",
 ]
 static-bundled-web-search-plugin = [
     "dep:bcode_web_search_plugin",

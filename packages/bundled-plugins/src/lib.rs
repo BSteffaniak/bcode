@@ -50,6 +50,8 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     plugins.push(shell_plugin());
     #[cfg(feature = "static-bundled-skills-plugin")]
     plugins.push(skills_plugin());
+    #[cfg(feature = "static-bundled-vim-edit-plugin")]
+    plugins.push(vim_edit_plugin());
     #[cfg(feature = "static-bundled-web-search-plugin")]
     plugins.push(web_search_plugin());
     #[cfg(feature = "static-bundled-worktree-plugin")]
@@ -200,6 +202,14 @@ fn skills_plugin() -> bcode_plugin::StaticBundledPlugin {
     )
 }
 
+#[cfg(feature = "static-bundled-vim-edit-plugin")]
+fn vim_edit_plugin() -> bcode_plugin::StaticBundledPlugin {
+    bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/vim-edit-plugin/bcode-plugin.toml"),
+        bcode_vim_edit_plugin::static_plugin(),
+    )
+}
+
 #[cfg(feature = "static-bundled-web-search-plugin")]
 fn web_search_plugin() -> bcode_plugin::StaticBundledPlugin {
     bcode_plugin::StaticBundledPlugin::new(
@@ -218,7 +228,6 @@ fn worktree_plugin() -> bcode_plugin::StaticBundledPlugin {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[cfg(not(any(
         feature = "static-bundled-bedrock-provider-plugin",
@@ -239,18 +248,19 @@ mod tests {
         feature = "static-bundled-ralph-plugin",
         feature = "static-bundled-shell-plugin",
         feature = "static-bundled-skills-plugin",
+        feature = "static-bundled-vim-edit-plugin",
         feature = "static-bundled-web-search-plugin",
         feature = "static-bundled-worktree-plugin"
     )))]
     #[test]
     fn bundled_plugins_are_opt_in() {
-        assert!(static_bundled_plugins().is_empty());
+        assert!(super::static_bundled_plugins().is_empty());
     }
 
     #[cfg(feature = "static-bundled-filesystem-plugin")]
     #[test]
     fn filesystem_bundle_provides_tui_file_change_visual_adapter() {
-        let static_plugins = static_bundled_plugins();
+        let static_plugins = super::static_bundled_plugins();
         let selected = bcode_plugin::filter_selected_static_plugins(
             &static_plugins,
             &bcode_plugin::PluginSelection::all_enabled(),

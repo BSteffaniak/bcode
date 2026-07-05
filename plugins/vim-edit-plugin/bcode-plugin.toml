@@ -1,0 +1,20 @@
+id      = "bcode.vim-edit"
+name    = "Bcode Vim Edit Plugin"
+version = "0.0.1"
+
+[[services]]
+class        = "tool_execution"
+description  = "Model-callable Vim/Neovim editing tools"
+interface_id = "bcode.tool/v1"
+name         = "Vim Edit Tools"
+
+[concurrency]
+max  = 2
+type = "limited"
+
+[runtime]
+abi_version    = 1
+event_symbol   = "bcode_plugin_handle_event_v1"
+library        = "libbcode_vim_edit_plugin.dylib"
+service_symbol = "bcode_plugin_invoke_service_v1"
+type           = "native"

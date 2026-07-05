@@ -19,6 +19,7 @@ members = [
     "plugins/pi-session-import-plugin",
     "plugins/shell-plugin",
     "plugins/web-search-plugin",
+    "plugins/vim-edit-plugin",
     "plugins/model-plugin",
     "plugins/skills-plugin",
     "plugins/worktree-plugin",
@@ -138,6 +139,7 @@ bcode_tool_runtime                      = { version = "0.0.1-alpha.0", default-f
 bcode_tui                               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui" }
 bcode_tui_components                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui-components" }
 bcode_vim_edit                          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/vim-edit" }
+bcode_vim_edit_plugin                   = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/vim-edit-plugin" }
 bcode_web_search_plugin                 = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/web-search-plugin" }
 bcode_worktree                          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/worktree" }
 bcode_worktree_models                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/worktree/models" }

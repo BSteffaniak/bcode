@@ -1358,6 +1358,7 @@ dependencies = [
  "bcode_ralph_plugin",
  "bcode_shell_plugin",
  "bcode_skills_plugin",
+ "bcode_vim_edit_plugin",
  "bcode_web_search_plugin",
  "bcode_worktree_plugin",
  "serde_json",
@@ -2162,6 +2163,18 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "bcode_vim_edit_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_plugin_sdk",
+ "bcode_tool",
+ "bcode_vim_edit",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

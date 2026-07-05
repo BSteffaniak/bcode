@@ -7,6 +7,9 @@
 //! This crate owns reusable Vim edit behavior. It starts isolated headless
 //! Neovim processes, drives them through RPC, records state after each edit
 //! step, and optionally writes the final buffer back to the requested file.
+//! Diff rendering intentionally reuses `bcode_tui_components::diff_viewer`, so
+//! this crate does not need a dedicated diff dependency. Neovim is controlled
+//! through the embedded msgpack-RPC transport provided by `nvim --embed`.
 
 use bcode_tui_components::diff_viewer::{DiffLineKind, diff_from_text};
 use nvim_rs::compat::tokio::Compat;
@@ -200,7 +203,6 @@ pub enum VimEditError {
 /// * default sandbox mode rejects a step
 /// * the operation times out
 pub fn run_vim_edit(request: VimEditRequest) -> Result<VimEditResult, VimEditError> {
-    let timeout = request.timeout;
     Builder::new_current_thread()
         .enable_all()
         .build()
@@ -208,13 +210,7 @@ pub fn run_vim_edit(request: VimEditRequest) -> Result<VimEditResult, VimEditErr
             executable: "tokio runtime".to_string(),
             source,
         })?
-        .block_on(async move {
-            time::timeout(timeout, run_vim_edit_inner(request))
-                .await
-                .unwrap_or(Err(VimEditError::Timeout {
-                    timeout_ms: timeout.as_millis(),
-                }))
-        })
+        .block_on(run_vim_edit_inner(request))
 }
 
 async fn run_vim_edit_inner(request: VimEditRequest) -> Result<VimEditResult, VimEditError> {
@@ -228,6 +224,47 @@ async fn run_vim_edit_inner(request: VimEditRequest) -> Result<VimEditResult, Vi
             .unwrap_or_else(|| Path::new(NVIM_EXECUTABLE)),
     )
     .await?;
+    let operation = run_vim_edit_session(&session, &request);
+    let session_result = time::timeout(request.timeout, operation)
+        .await
+        .unwrap_or(Err(VimEditError::Timeout {
+            timeout_ms: request.timeout.as_millis(),
+        }));
+    session.shutdown().await;
+    let (final_text, cursor, nvim_mode, final_context, events) = session_result?;
+
+    let changed = original != final_text;
+    if request.mode == VimEditMode::Apply && changed {
+        fs::write(&request.path, final_text.as_bytes()).map_err(|source| {
+            VimEditError::WriteFile {
+                path: request.path.clone(),
+                source,
+            }
+        })?;
+    }
+
+    Ok(VimEditResult {
+        changed,
+        diff: render_diff(&request.path, &original, &final_text),
+        cursor,
+        nvim_mode,
+        final_context,
+        events,
+    })
+}
+
+type SessionEditOutput = (
+    String,
+    CursorPosition,
+    String,
+    TextContext,
+    Vec<VimEditEvent>,
+);
+
+async fn run_vim_edit_session(
+    session: &NeovimSession,
+    request: &VimEditRequest,
+) -> Result<SessionEditOutput, VimEditError> {
     session.configure_isolation().await?;
 
     let mut previous_buffer = session.buffer_text().await?;
@@ -258,26 +295,7 @@ async fn run_vim_edit_inner(request: VimEditRequest) -> Result<VimEditResult, Vi
     let cursor = session.cursor().await?;
     let nvim_mode = session.mode().await?;
     let final_context = session.context(DEFAULT_CONTEXT_RADIUS).await?;
-    session.shutdown().await;
-
-    let changed = original != final_text;
-    if request.mode == VimEditMode::Apply && changed {
-        fs::write(&request.path, final_text.as_bytes()).map_err(|source| {
-            VimEditError::WriteFile {
-                path: request.path.clone(),
-                source,
-            }
-        })?;
-    }
-
-    Ok(VimEditResult {
-        changed,
-        diff: render_diff(&request.path, &original, &final_text),
-        cursor,
-        nvim_mode,
-        final_context,
-        events,
-    })
+    Ok((final_text, cursor, nvim_mode, final_context, events))
 }
 
 fn read_text_file(path: &Path) -> Result<String, VimEditError> {
@@ -343,6 +361,8 @@ impl NeovimSession {
 
     async fn configure_isolation(&self) -> Result<(), VimEditError> {
         for command in [
+            // These options are supported by Neovim and intentionally set after
+            // startup to make the embedded RPC edit process deterministic.
             "set nomodeline",
             "set noexrc",
             "set noswapfile",
@@ -450,7 +470,7 @@ impl NeovimSession {
     }
 
     async fn shutdown(mut self) {
-        let _ = self.nvim.command("qa!").await;
+        let _ = time::timeout(Duration::from_millis(100), self.nvim.command("qa!")).await;
         let _ = time::timeout(Duration::from_millis(500), &mut self.io_handle).await;
         match self.child.try_wait() {
             Ok(Some(_)) => {}
@@ -478,40 +498,113 @@ fn reject_unsafe_step(
 }
 
 fn reject_unsafe_ex(command: &str, step_index: usize) -> Result<(), VimEditError> {
-    let trimmed = command.trim_start();
-    let trimmed = trimmed.strip_prefix(':').unwrap_or(trimmed).trim_start();
-    let command_name = trimmed
-        .split(|character: char| character.is_ascii_whitespace() || character == '!')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if trimmed.starts_with('!') || UNSAFE_EX_COMMANDS.contains(&command_name.as_str()) {
-        return Err(VimEditError::UnsafeCommand {
-            step_index,
-            reason: format!("Ex command `{command_name}` is blocked in default sandbox mode"),
-        });
+    let command_name = sandbox_command_name(command);
+    if command_name
+        .as_deref()
+        .is_some_and(|name| SAFE_EX_COMMANDS.contains(&name))
+    {
+        return Ok(());
     }
-    Ok(())
+
+    let display_name = command_name.unwrap_or_else(|| "<empty>".to_string());
+    Err(VimEditError::UnsafeCommand {
+        step_index,
+        reason: format!("Ex command `{display_name}` is not allowlisted in default sandbox mode"),
+    })
 }
 
 fn reject_unsafe_keys(input: &str, step_index: usize) -> Result<(), VimEditError> {
-    let lower = input.to_ascii_lowercase();
-    for marker in [
-        ":!", ":write", ":w", ":edit", ":e", ":read", ":r", ":source", ":so",
-    ] {
-        if lower.contains(marker) {
-            return Err(VimEditError::UnsafeCommand {
-                step_index,
-                reason: format!("key input contains blocked command-line marker `{marker}`"),
-            });
-        }
+    for command in command_line_key_segments(input) {
+        reject_unsafe_ex(&command, step_index)?;
     }
     Ok(())
 }
 
-const UNSAFE_EX_COMMANDS: &[&str] = &[
-    "!", "read", "r", "write", "w", "edit", "e", "source", "so", "lua", "python", "python3",
-    "perl", "ruby", "terminal", "term", "make", "grep", "vimgrep", "cexpr", "cgetexpr",
+fn command_line_key_segments(input: &str) -> Vec<String> {
+    let lower = input.to_ascii_lowercase();
+    let mut segments = Vec::new();
+    let mut offset = 0;
+    while let Some(relative_start) = lower[offset..].find(':') {
+        let start = offset.saturating_add(relative_start).saturating_add(1);
+        let rest = &lower[start..];
+        let end = [rest.find("<cr>"), rest.find('\n'), rest.find('\r')]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(rest.len());
+        segments.push(rest[..end].to_string());
+        offset = start.saturating_add(end);
+    }
+    segments
+}
+
+fn sandbox_command_name(command: &str) -> Option<String> {
+    let mut rest = command.trim_start();
+    rest = rest.strip_prefix(':').unwrap_or(rest).trim_start();
+    loop {
+        rest = strip_ex_range_prefix(rest).trim_start();
+        if rest.is_empty() {
+            return None;
+        }
+        if rest.starts_with('!') {
+            return Some("!".to_string());
+        }
+        let name_end = rest
+            .find(|character: char| !character.is_ascii_alphabetic())
+            .unwrap_or(rest.len());
+        if name_end == 0 {
+            return None;
+        }
+        let name = rest[..name_end].to_ascii_lowercase();
+        if EX_COMMAND_MODIFIERS.contains(&name.as_str()) {
+            rest = &rest[name_end..];
+            continue;
+        }
+        return Some(name);
+    }
+}
+
+fn strip_ex_range_prefix(command: &str) -> &str {
+    command.trim_start_matches(|character: char| {
+        character.is_ascii_digit()
+            || matches!(
+                character,
+                '%' | '.' | '$' | '\'' | '<' | '>' | ',' | ';' | '+' | '-' | '/' | '?' | '*'
+            )
+    })
+}
+
+const SAFE_EX_COMMANDS: &[&str] = &["s", "substitute", "nohlsearch"];
+
+const EX_COMMAND_MODIFIERS: &[&str] = &[
+    "aboveleft",
+    "abo",
+    "belowright",
+    "bel",
+    "botright",
+    "bo",
+    "browse",
+    "confirm",
+    "conf",
+    "hide",
+    "hid",
+    "keepalt",
+    "keepjumps",
+    "keeppatterns",
+    "leftabove",
+    "lefta",
+    "lockmarks",
+    "noautocmd",
+    "noa",
+    "rightbelow",
+    "rightb",
+    "silent",
+    "sil",
+    "tab",
+    "topleft",
+    "to",
+    "vertical",
+    "vert",
 ];
 
 fn render_diff(path: &Path, old_text: &str, new_text: &str) -> String {
@@ -560,6 +653,95 @@ mod tests {
     }
 
     #[test]
+    fn default_sandbox_rejects_all_blocked_ex_families() {
+        for command in [
+            "!echo unsafe",
+            "read /tmp/file",
+            "r /tmp/file",
+            "write /tmp/file",
+            "w /tmp/file",
+            "edit /tmp/file",
+            "e /tmp/file",
+            "source /tmp/file",
+            "so /tmp/file",
+            "lua print('unsafe')",
+            "python print('unsafe')",
+            "python3 print('unsafe')",
+            "perl print 'unsafe'",
+            "ruby puts 'unsafe'",
+            "terminal",
+            "term",
+            "make",
+            "grep unsafe *",
+            "vimgrep unsafe *",
+            "cexpr system('unsafe')",
+            "cgetexpr system('unsafe')",
+        ] {
+            let result = reject_unsafe_step(
+                &VimEditStep::Ex {
+                    command: command.to_string(),
+                },
+                0,
+                VimEditSandbox::Default,
+            );
+            assert!(
+                matches!(result, Err(VimEditError::UnsafeCommand { .. })),
+                "expected `{command}` to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn default_sandbox_allows_substitution_ex_commands() {
+        for command in ["s/foo/bar/", "%s/foo/bar/g", "1,3s/foo/bar/g"] {
+            let result = reject_unsafe_step(
+                &VimEditStep::Ex {
+                    command: command.to_string(),
+                },
+                0,
+                VimEditSandbox::Default,
+            );
+            assert!(result.is_ok(), "expected `{command}` to be allowed");
+        }
+    }
+
+    #[test]
+    fn default_sandbox_rejects_unsafe_command_line_key_segments() {
+        let result = reject_unsafe_step(
+            &VimEditStep::Keys {
+                input: ":write /tmp/other<CR>".to_string(),
+            },
+            0,
+            VimEditSandbox::Default,
+        );
+        assert!(matches!(result, Err(VimEditError::UnsafeCommand { .. })));
+    }
+
+    #[test]
+    fn default_sandbox_allows_search_key_segments() {
+        let result = reject_unsafe_step(
+            &VimEditStep::Keys {
+                input: "/needle<CR>ciw".to_string(),
+            },
+            0,
+            VimEditSandbox::Default,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn dangerous_sandbox_allows_unsafe_key_segments() {
+        let result = reject_unsafe_step(
+            &VimEditStep::Keys {
+                input: ":write /tmp/other<CR>".to_string(),
+            },
+            0,
+            VimEditSandbox::DangerouslyDisabled,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn dangerous_sandbox_allows_unsafe_ex_commands() {
         let result = reject_unsafe_step(
             &VimEditStep::Ex {
@@ -594,6 +776,168 @@ mod tests {
         .expect_err("missing nvim should error");
         assert!(matches!(error, VimEditError::StartNeovim { .. }));
         assert!(error.to_string().contains("definitely-missing-bcode-nvim"));
+    }
+
+    #[test]
+    fn search_edit_works_when_nvim_is_available() {
+        if !nvim_available() {
+            eprintln!("skipping Neovim integration test because `nvim` is not available");
+            return;
+        }
+        let file = NamedTempFile::new().expect("temp file");
+        fs::write(file.path(), "alpha beta gamma").expect("write original");
+        let result = run_vim_edit(VimEditRequest {
+            path: file.path().to_path_buf(),
+            nvim_executable: None,
+            steps: vec![
+                VimEditStep::Keys {
+                    input: "/beta<CR>".to_string(),
+                },
+                VimEditStep::Keys {
+                    input: "ciw".to_string(),
+                },
+                VimEditStep::Insert {
+                    text: "delta".to_string(),
+                },
+                VimEditStep::Keys {
+                    input: "<Esc>".to_string(),
+                },
+            ],
+            mode: VimEditMode::Apply,
+            sandbox: VimEditSandbox::Default,
+            timeout: Duration::from_secs(5),
+        })
+        .expect("run vim edit");
+
+        assert!(result.changed);
+        assert_eq!(
+            fs::read_to_string(file.path()).expect("read edited"),
+            "alpha delta gamma"
+        );
+    }
+
+    #[test]
+    fn substitution_ex_command_works_when_nvim_is_available() {
+        if !nvim_available() {
+            eprintln!("skipping Neovim integration test because `nvim` is not available");
+            return;
+        }
+        let file = NamedTempFile::new().expect("temp file");
+        fs::write(file.path(), "foo foo\nfoo").expect("write original");
+        let result = run_vim_edit(VimEditRequest {
+            path: file.path().to_path_buf(),
+            nvim_executable: None,
+            steps: vec![VimEditStep::Ex {
+                command: "%s/foo/bar/g".to_string(),
+            }],
+            mode: VimEditMode::Apply,
+            sandbox: VimEditSandbox::Default,
+            timeout: Duration::from_secs(5),
+        })
+        .expect("run vim edit");
+
+        assert!(result.changed);
+        assert_eq!(
+            fs::read_to_string(file.path()).expect("read edited"),
+            "bar bar\nbar"
+        );
+    }
+
+    #[test]
+    fn failed_apply_does_not_modify_original_file() {
+        let file = NamedTempFile::new().expect("temp file");
+        fs::write(file.path(), "foo").expect("write original");
+        let error = run_vim_edit(VimEditRequest {
+            path: file.path().to_path_buf(),
+            nvim_executable: None,
+            steps: vec![VimEditStep::Ex {
+                command: "write /tmp/bcode-vim-edit-should-not-exist".to_string(),
+            }],
+            mode: VimEditMode::Apply,
+            sandbox: VimEditSandbox::Default,
+            timeout: Duration::from_secs(5),
+        })
+        .expect_err("unsafe apply should fail");
+        assert!(matches!(error, VimEditError::UnsafeCommand { .. }));
+        assert_eq!(
+            fs::read_to_string(file.path()).expect("read original"),
+            "foo"
+        );
+    }
+
+    #[test]
+    fn timeout_returns_error_when_nvim_is_available() {
+        if !nvim_available() {
+            eprintln!("skipping Neovim integration test because `nvim` is not available");
+            return;
+        }
+        let file = NamedTempFile::new().expect("temp file");
+        fs::write(file.path(), "foo").expect("write original");
+        let error = run_vim_edit(VimEditRequest {
+            path: file.path().to_path_buf(),
+            nvim_executable: None,
+            steps: Vec::new(),
+            mode: VimEditMode::Preview,
+            sandbox: VimEditSandbox::Default,
+            timeout: Duration::from_nanos(1),
+        })
+        .expect_err("timeout should error");
+        assert!(matches!(error, VimEditError::Timeout { .. }));
+        assert_eq!(
+            fs::read_to_string(file.path()).expect("read original"),
+            "foo"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn timeout_kills_spawned_process() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let executable = temp_dir.path().join("fake-nvim");
+        let pid_file = temp_dir.path().join("pid");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\necho $$ > {}\nexec sleep 30\n",
+                pid_file.display()
+            ),
+        )
+        .expect("write fake nvim");
+        let mut permissions = fs::metadata(&executable)
+            .expect("fake nvim metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).expect("make fake nvim executable");
+
+        let file = NamedTempFile::new().expect("temp file");
+        fs::write(file.path(), "foo").expect("write original");
+        let error = run_vim_edit(VimEditRequest {
+            path: file.path().to_path_buf(),
+            nvim_executable: Some(executable),
+            steps: Vec::new(),
+            mode: VimEditMode::Preview,
+            sandbox: VimEditSandbox::Default,
+            timeout: Duration::from_millis(250),
+        })
+        .expect_err("fake nvim should time out");
+        assert!(matches!(error, VimEditError::Timeout { .. }));
+
+        std::thread::sleep(Duration::from_millis(100));
+        let pid = fs::read_to_string(&pid_file)
+            .expect("read fake nvim pid")
+            .trim()
+            .to_string();
+        let alive = std::process::Command::new("kill")
+            .arg("-0")
+            .arg(&pid)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run kill -0")
+            .success();
+        assert!(!alive, "fake nvim process {pid} should have been killed");
     }
 
     #[test]
