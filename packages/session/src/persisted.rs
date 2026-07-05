@@ -6,11 +6,11 @@
 //! non-self-describing `bmux_codec` wire format.
 
 use bcode_session_models::{
-    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, FileChangeResult,
-    LegacyToolRequestPresentationMetadata, ModelTurnOutcome, RuntimeWorkId, RuntimeWorkKind,
-    RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionEventProvenance, SessionForkKind,
-    SessionId, SessionTokenUsage, SessionTraceEvent, ShellRunResult, ToolArtifact,
-    ToolInvocationResult, ToolInvocationStreamEvent, TraceBlobRef, current_unix_timestamp_ms,
+    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, LegacyToolRequestPresentationMetadata,
+    ModelTurnOutcome, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent,
+    SessionEventKind, SessionEventProvenance, SessionForkKind, SessionId, SessionTokenUsage,
+    SessionTraceEvent, ToolArtifact, ToolInvocationResult, ToolInvocationStreamEvent, TraceBlobRef,
+    current_unix_timestamp_ms,
 };
 use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
 use serde::{Deserialize, Serialize};
@@ -404,7 +404,7 @@ enum PersistedSessionEventKind {
         #[serde(default)]
         finished_at_ms: Option<u64>,
         is_error: bool,
-        presentation: LegacyPersistedToolInvocationPresentation,
+        presentation: crate::persisted_legacy::ToolInvocationPresentation,
     },
     /// Durable provenance marker for sessions forked or cloned from another session.
     SessionForked {
@@ -1059,10 +1059,12 @@ impl PersistedSessionEventKind {
                 ..
             } => SessionEventKind::ToolCallFinished {
                 tool_call_id,
-                result: legacy_presentation_result_text(&presentation),
+                result: crate::persisted_legacy::presentation_result_text(&presentation),
                 is_error,
                 output: None,
-                semantic_result: Some(semantic_from_legacy_presentation(&presentation)),
+                semantic_result: Some(crate::persisted_legacy::semantic_from_presentation(
+                    &presentation,
+                )),
             },
             Self::SessionForked {
                 source_session_id,
@@ -1099,66 +1101,37 @@ impl PersistedSessionEventKind {
     }
 }
 
-/// Persisted legacy presentation DTO retained only to decode old session logs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum LegacyPersistedToolInvocationPresentation {
-    Terminal {
-        #[serde(default)]
-        exit_code: Option<i32>,
-        #[serde(default)]
-        timed_out: bool,
-        #[serde(default)]
-        cancelled: bool,
-        #[serde(default)]
-        output: String,
-        #[serde(default)]
-        output_truncated: bool,
-        #[serde(default)]
-        output_bytes: Option<u64>,
-        #[serde(default)]
-        retained_output_bytes: Option<u64>,
-        #[serde(default = "default_terminal_columns")]
-        columns: u16,
-        #[serde(default = "default_terminal_rows")]
-        rows: u16,
-    },
-    FileChange {
-        tool_name: String,
-        summary: String,
-        #[serde(default)]
-        path: Option<String>,
-    },
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum PersistedToolInvocationResult {
+    Current(CurrentPersistedToolInvocationResult),
+    Legacy(crate::persisted_legacy::ToolInvocationResultCompat),
 }
 
-fn semantic_from_legacy_presentation(
-    presentation: &LegacyPersistedToolInvocationPresentation,
-) -> ToolInvocationResult {
-    ToolInvocationResult::Text {
-        text: legacy_presentation_result_text(presentation),
+impl From<&ToolInvocationResult> for PersistedToolInvocationResult {
+    fn from(value: &ToolInvocationResult) -> Self {
+        Self::Current(CurrentPersistedToolInvocationResult::from(value))
     }
 }
 
-fn legacy_presentation_result_text(
-    presentation: &LegacyPersistedToolInvocationPresentation,
-) -> String {
-    match presentation {
-        LegacyPersistedToolInvocationPresentation::Terminal { output, .. } => output.clone(),
-        LegacyPersistedToolInvocationPresentation::FileChange { summary, .. } => summary.clone(),
+impl PersistedToolInvocationResult {
+    fn into_domain(self) -> ToolInvocationResult {
+        match self {
+            Self::Current(value) => value.into_domain(),
+            Self::Legacy(value) => value.into_domain(),
+        }
     }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum PersistedToolInvocationResult {
+enum CurrentPersistedToolInvocationResult {
     Text { text: String },
     Json { value: String },
     Artifact { artifact: Box<ToolArtifact> },
-    ShellRun { result: PersistedShellRunResult },
-    FileChange { result: FileChangeResult },
 }
 
-impl From<&ToolInvocationResult> for PersistedToolInvocationResult {
+impl From<&ToolInvocationResult> for CurrentPersistedToolInvocationResult {
     fn from(value: &ToolInvocationResult) -> Self {
         match value {
             ToolInvocationResult::Text { text } => Self::Text { text: text.clone() },
@@ -1172,131 +1145,14 @@ impl From<&ToolInvocationResult> for PersistedToolInvocationResult {
     }
 }
 
-impl PersistedToolInvocationResult {
+impl CurrentPersistedToolInvocationResult {
     fn into_domain(self) -> ToolInvocationResult {
         match self {
             Self::Text { text } => ToolInvocationResult::Text { text },
             Self::Json { value } => ToolInvocationResult::Json { value },
             Self::Artifact { artifact } => ToolInvocationResult::Artifact { artifact },
-            Self::ShellRun { result } => ToolInvocationResult::Json {
-                value: serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_string()),
-            },
-            Self::FileChange { result } => ToolInvocationResult::Json {
-                value: serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_string()),
-            },
         }
     }
-}
-
-/// Persisted shell-run result DTO.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-enum PersistedShellRunResult {
-    Terminal {
-        #[serde(default)]
-        exit_code: Option<i32>,
-        #[serde(default)]
-        timed_out: bool,
-        #[serde(default)]
-        cancelled: bool,
-        #[serde(default)]
-        duration_ms: Option<u64>,
-        #[serde(default, alias = "output")]
-        output_tail: String,
-        #[serde(default)]
-        output_truncated: bool,
-        #[serde(default)]
-        output_bytes: Option<u64>,
-        #[serde(default)]
-        retained_output_bytes: Option<u64>,
-        #[serde(default = "default_terminal_columns")]
-        columns: u16,
-        #[serde(default = "default_terminal_rows")]
-        rows: u16,
-    },
-    Captured {
-        #[serde(default)]
-        exit_code: Option<i32>,
-        #[serde(default)]
-        timed_out: bool,
-        #[serde(default)]
-        cancelled: bool,
-        #[serde(default)]
-        duration_ms: Option<u64>,
-        #[serde(default)]
-        stdout: String,
-        #[serde(default)]
-        stderr: String,
-        #[serde(default)]
-        stdout_truncated: bool,
-        #[serde(default)]
-        stderr_truncated: bool,
-        #[serde(default)]
-        stdout_bytes: Option<u64>,
-        #[serde(default)]
-        stderr_bytes: Option<u64>,
-    },
-}
-
-impl From<&ShellRunResult> for PersistedShellRunResult {
-    fn from(value: &ShellRunResult) -> Self {
-        match value {
-            ShellRunResult::Terminal {
-                exit_code,
-                timed_out,
-                cancelled,
-                duration_ms,
-                output_tail,
-                output_truncated,
-                output_bytes,
-                retained_output_bytes,
-                columns,
-                rows,
-            } => Self::Terminal {
-                exit_code: *exit_code,
-                timed_out: *timed_out,
-                cancelled: *cancelled,
-                duration_ms: *duration_ms,
-                output_tail: output_tail.clone(),
-                output_truncated: *output_truncated,
-                output_bytes: *output_bytes,
-                retained_output_bytes: *retained_output_bytes,
-                columns: *columns,
-                rows: *rows,
-            },
-            ShellRunResult::Captured {
-                exit_code,
-                timed_out,
-                cancelled,
-                duration_ms,
-                stdout,
-                stderr,
-                stdout_truncated,
-                stderr_truncated,
-                stdout_bytes,
-                stderr_bytes,
-            } => Self::Captured {
-                exit_code: *exit_code,
-                timed_out: *timed_out,
-                cancelled: *cancelled,
-                duration_ms: *duration_ms,
-                stdout: stdout.clone(),
-                stderr: stderr.clone(),
-                stdout_truncated: *stdout_truncated,
-                stderr_truncated: *stderr_truncated,
-                stdout_bytes: *stdout_bytes,
-                stderr_bytes: *stderr_bytes,
-            },
-        }
-    }
-}
-
-const fn default_terminal_columns() -> u16 {
-    80
-}
-
-const fn default_terminal_rows() -> u16 {
-    24
 }
 
 #[cfg(test)]

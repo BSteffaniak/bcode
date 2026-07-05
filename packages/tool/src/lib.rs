@@ -608,48 +608,6 @@ pub enum ToolInvocationResult {
     Artifact { artifact: Box<ToolArtifact> },
 }
 
-/// Semantic shell execution result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-pub enum ShellRunResult {
-    /// Terminal-backed execution with a single bounded output stream.
-    Terminal {
-        exit_code: Option<i32>,
-        timed_out: bool,
-        cancelled: bool,
-        #[serde(default)]
-        duration_ms: Option<u64>,
-        output_tail: String,
-        output_truncated: bool,
-        output_bytes: Option<u64>,
-        retained_output_bytes: Option<u64>,
-        columns: u16,
-        rows: u16,
-    },
-    /// Non-terminal execution with separately captured streams.
-    Captured {
-        exit_code: Option<i32>,
-        timed_out: bool,
-        cancelled: bool,
-        #[serde(default)]
-        duration_ms: Option<u64>,
-        stdout: String,
-        stderr: String,
-        stdout_truncated: bool,
-        stderr_truncated: bool,
-        stdout_bytes: Option<u64>,
-        stderr_bytes: Option<u64>,
-    },
-}
-
-/// Semantic filesystem change result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FileChangeResult {
-    pub tool_name: String,
-    pub summary: String,
-    pub path: Option<String>,
-}
-
 /// Structured model-visible tool result content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

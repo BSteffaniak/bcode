@@ -14,8 +14,8 @@ use bcode_config::{
 };
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
-    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, ShellRunResult, TOOL_SERVICE_INTERFACE_ID,
-    ToolArtifact, ToolArtifactRef, ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
+    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
+    ToolArtifactRef, ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
     ToolInvocationResult, ToolInvocationStreamEvent, ToolList, ToolOutputStream,
     ToolPluginVisualMetadata, ToolSideEffect, ToolStreamVisualUpdate,
 };
@@ -27,6 +27,37 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum ShellRunResult {
+    Terminal {
+        exit_code: Option<i32>,
+        timed_out: bool,
+        cancelled: bool,
+        #[serde(default)]
+        duration_ms: Option<u64>,
+        output_tail: String,
+        output_truncated: bool,
+        output_bytes: Option<u64>,
+        retained_output_bytes: Option<u64>,
+        columns: u16,
+        rows: u16,
+    },
+    Captured {
+        exit_code: Option<i32>,
+        timed_out: bool,
+        cancelled: bool,
+        #[serde(default)]
+        duration_ms: Option<u64>,
+        stdout: String,
+        stderr: String,
+        stdout_truncated: bool,
+        stderr_truncated: bool,
+        stdout_bytes: Option<u64>,
+        stderr_bytes: Option<u64>,
+    },
+}
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_TERMINAL_COLUMNS: u16 = 120;

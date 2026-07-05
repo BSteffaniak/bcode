@@ -19,8 +19,8 @@ use bcode_session_models::{
     LegacyToolStatusPresentation, LiveToolArgumentPreview, PluginVisualDescriptor, RuntimeWorkId,
     RuntimeWorkKind, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
     SessionProjectionKind, SessionSummary, SessionTitleSource, SessionTokenUsage,
-    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ShellRunResult, ToolArtifact,
-    ToolArtifactRef, ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
+    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ToolArtifact, ToolArtifactRef,
+    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
     build_tool_invocation_projections,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
@@ -29,6 +29,42 @@ use bmux_tui::buffer::Buffer;
 use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
+
+#[derive(serde::Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum ShellRunResult {
+    Terminal {
+        exit_code: Option<i32>,
+        timed_out: bool,
+        cancelled: bool,
+        duration_ms: Option<u64>,
+        output_tail: String,
+        output_truncated: bool,
+        output_bytes: Option<u64>,
+        retained_output_bytes: Option<u64>,
+        columns: u16,
+        rows: u16,
+    },
+    Captured {
+        exit_code: Option<i32>,
+        timed_out: bool,
+        cancelled: bool,
+        duration_ms: Option<u64>,
+        stdout: String,
+        stderr: String,
+        stdout_truncated: bool,
+        stderr_truncated: bool,
+        stdout_bytes: Option<u64>,
+        stderr_bytes: Option<u64>,
+    },
+}
+
+#[derive(serde::Serialize)]
+struct FileChangeResult {
+    tool_name: String,
+    summary: String,
+    path: Option<String>,
+}
 
 use super::{
     app::{BmuxApp, KeyActivationOutcome},
@@ -3341,13 +3377,11 @@ fn file_change_semantic_result_events(
             result: "wrote 2 bytes".to_owned(),
             is_error: false,
             output: None,
-            semantic_result: Some(file_change_artifact(
-                &bcode_session_models::FileChangeResult {
-                    tool_name: "example.write".to_owned(),
-                    summary: "wrote 2 bytes".to_owned(),
-                    path: Some("file.txt".to_owned()),
-                },
-            )),
+            semantic_result: Some(file_change_artifact(&FileChangeResult {
+                tool_name: "example.write".to_owned(),
+                summary: "wrote 2 bytes".to_owned(),
+                path: Some("file.txt".to_owned()),
+            })),
         },
     ));
     events
@@ -5140,7 +5174,7 @@ fn shell_result_artifact(result: &ShellRunResult) -> ToolInvocationResult {
     }
 }
 
-fn file_change_artifact(result: &bcode_session_models::FileChangeResult) -> ToolInvocationResult {
+fn file_change_artifact(result: &FileChangeResult) -> ToolInvocationResult {
     ToolInvocationResult::Artifact {
         artifact: Box::new(bcode_session_models::ToolArtifact {
             artifact_id: "test-file-change".to_string(),

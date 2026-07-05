@@ -12,6 +12,7 @@ mod actor;
 pub mod db;
 pub mod lease;
 pub mod persisted;
+mod persisted_legacy;
 pub mod projection;
 pub mod repair;
 pub mod semantic_migration;
