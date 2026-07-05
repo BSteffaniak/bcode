@@ -2711,6 +2711,9 @@ impl BmuxApp {
         is_error: Option<bool>,
     ) -> Option<FinishedStreamedToolOutput> {
         let context = self.streamed_tool_results.get(tool_call_id)?;
+        if !context.saw_output && is_error.is_some() {
+            return None;
+        }
         let index = context.index?;
         let output_kind = self.transcript.get(index).map_or(
             FinishedStreamedToolOutput::PlainToolResult,
@@ -2744,6 +2747,15 @@ impl BmuxApp {
             .tool_call_contexts
             .get(tool_call_id)
             .map(|context| context.arguments_json.clone());
+        if semantic_result.is_some()
+            && self
+                .streamed_tool_results
+                .get(tool_call_id)
+                .is_some_and(|context| context.index.is_some() && !context.saw_output)
+        {
+            self.remove_terminal_streamed_tool_result(tool_call_id);
+            self.streamed_tool_results.remove(tool_call_id);
+        }
         if let Some(streamed_output) = self.finish_live_tool_output(tool_call_id, Some(is_error)) {
             if semantic_result.is_none()
                 || matches!(streamed_output, FinishedStreamedToolOutput::TerminalOutput)
@@ -3151,6 +3163,18 @@ impl BmuxApp {
                 TranscriptItemKind::ToolResult {
                     tool_call_id: item_tool_call_id,
                     artifact: None,
+                    ..
+                } if item_tool_call_id == tool_call_id
+            )
+        });
+    }
+
+    fn remove_terminal_streamed_tool_result(&mut self, tool_call_id: &str) {
+        self.transcript.retain(|item| {
+            !matches!(
+                item.kind(),
+                TranscriptItemKind::TerminalOutput {
+                    tool_call_id: item_tool_call_id,
                     ..
                 } if item_tool_call_id == tool_call_id
             )

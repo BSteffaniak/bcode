@@ -3842,8 +3842,8 @@ fn semantic_terminal_result_without_live_delta_renders_terminal_history() {
         .filter(|item| matches!(item.kind(), TranscriptItemKind::ToolResult { .. }))
         .count();
 
-    assert_eq!(terminal_count, 1);
-    assert_eq!(tool_result_count, 0);
+    assert_eq!(terminal_count, 0);
+    assert_eq!(tool_result_count, 1);
 }
 
 #[test]

@@ -882,8 +882,20 @@ fn push_transcript_item_from_event(
                 if let Some(replay) = streamed_tool_results.get_mut(tool_call_id)
                     && let Some(index) = replay.index
                 {
-                    if let Some(item) = items.get_mut(index) {
-                        item.finish_terminal(None, false, *is_error, replay.finished_at_ms);
+                    let item = semantic_tool_result_item(
+                        tool_call_id,
+                        tool_calls.get(tool_call_id),
+                        semantic_result,
+                        *is_error,
+                    );
+                    if replay.saw_output {
+                        if let Some(existing) = items.get_mut(index) {
+                            existing.finish_terminal(None, false, *is_error, replay.finished_at_ms);
+                        }
+                    } else if let Some(existing) = items.get_mut(index) {
+                        *existing = item;
+                    } else {
+                        items.push(item);
                     }
                     return;
                 }
@@ -1328,15 +1340,16 @@ fn apply_tool_invocation_stream_event(
             text,
             ..
         } if *stream == ToolOutputStream::Pty => {
-            let replay = streamed_tool_results.get(tool_call_id).cloned();
-            if let Some(replay) = replay.as_ref()
+            if let Some(replay) = streamed_tool_results.get_mut(tool_call_id)
                 && let Some(index) = replay.index
             {
+                replay.saw_output = true;
                 if let Some(item) = items.get_mut(index) {
                     item.append_text(text);
                 }
                 return;
             }
+            let replay = streamed_tool_results.get(tool_call_id).cloned();
             let context = tool_calls.get(tool_call_id);
             let (columns, rows) = replay
                 .as_ref()
