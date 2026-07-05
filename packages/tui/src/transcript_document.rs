@@ -79,12 +79,8 @@ impl TranscriptDocument {
     }
 
     /// Upsert a terminal output item and bump the collection revision.
-    pub fn upsert_streaming_terminal_output(
-        &mut self,
-        input: super::transcript::StreamingTerminalOutputInput<'_>,
-    ) -> usize {
-        let index =
-            super::transcript::upsert_streaming_terminal_output_item(&mut self.items, input);
+    pub fn upsert_terminal_output_item(&mut self, item: TranscriptItem) -> usize {
+        let index = super::transcript::upsert_terminal_output_item(&mut self.items, item);
         self.bump_revision();
         index
     }

@@ -577,66 +577,43 @@ pub fn streaming_terminal_output_item(
     )
 }
 
-/// Input for upserting a streaming terminal output item.
-#[derive(Clone, Copy)]
-pub struct StreamingTerminalOutputInput<'a> {
-    /// Provider tool call identifier.
-    pub tool_call_id: &'a str,
-    /// Tool name, when known.
-    pub tool_name: Option<&'a str>,
-    /// Plugin-owned request visual associated with terminal output.
-    pub request_visual: Option<&'a bcode_session_models::PluginVisualDescriptor>,
-    /// Output delta or initial output.
-    pub text: &'a str,
-    /// Terminal columns.
-    pub columns: u16,
-    /// Terminal rows.
-    pub rows: u16,
-    /// Unix timestamp in milliseconds when execution started.
-    pub started_at_ms: Option<u64>,
-}
-
 /// Upsert a streaming terminal output item for a tool call.
 ///
 /// Reuses the canonical terminal transcript item across live and replay paths by
 /// replacing an existing request/preview placeholder instead of creating a
 /// second block for terminal output.
-pub fn upsert_streaming_terminal_output_item(
-    items: &mut Vec<TranscriptItem>,
-    input: StreamingTerminalOutputInput<'_>,
-) -> usize {
-    if let Some(index) = items.iter().position(|item| {
+pub fn upsert_terminal_output_item(items: &mut Vec<TranscriptItem>, item: TranscriptItem) -> usize {
+    let tool_call_id = if let TranscriptItemKind::TerminalOutput { tool_call_id, .. } = item.kind()
+    {
+        tool_call_id.clone()
+    } else {
+        items.push(item);
+        return items.len().saturating_sub(1);
+    };
+
+    if let Some(index) = items.iter().position(|existing| {
         matches!(
-            item.kind(),
+            existing.kind(),
             TranscriptItemKind::TerminalOutput {
                 tool_call_id: item_tool_call_id,
                 ..
-            } if item_tool_call_id == input.tool_call_id
+            } if item_tool_call_id == &tool_call_id
         )
     }) {
-        if !input.text.is_empty() {
-            items[index].append_text(input.text);
+        if !item.text().is_empty() {
+            items[index].append_text(item.text());
         }
         return index;
     }
 
-    let item = streaming_terminal_output_item(
-        input.tool_call_id,
-        input.tool_name,
-        input.request_visual,
-        input.text,
-        input.columns,
-        input.rows,
-        input.started_at_ms,
-    );
     if let Some(index) = items.iter().position(|existing| {
-        existing.is_live_preview_anchor_for(input.tool_call_id)
+        existing.is_live_preview_anchor_for(&tool_call_id)
             || matches!(
                 existing.kind(),
                 TranscriptItemKind::ToolRequest {
                     tool_call_id: item_tool_call_id,
                     ..
-                } if item_tool_call_id == input.tool_call_id
+                } if item_tool_call_id == &tool_call_id
             )
     }) {
         items[index] = item;
@@ -1323,18 +1300,16 @@ fn apply_tool_invocation_stream_event(
             let context = tool_calls.get(tool_call_id);
             let columns = columns.unwrap_or(120).max(1);
             let rows = rows.unwrap_or(24).max(1);
-            let index = upsert_streaming_terminal_output_item(
-                items,
-                StreamingTerminalOutputInput {
-                    tool_call_id,
-                    tool_name: context.map(|context| context.tool_name.as_str()),
-                    request_visual: context.and_then(|context| context.request_visual.as_ref()),
-                    text: "",
-                    columns,
-                    rows,
-                    started_at_ms: *started_at_ms,
-                },
+            let item = streaming_terminal_output_item(
+                tool_call_id,
+                context.map(|context| context.tool_name.as_str()),
+                context.and_then(|context| context.request_visual.as_ref()),
+                "",
+                columns,
+                rows,
+                *started_at_ms,
             );
+            let index = upsert_terminal_output_item(items, item);
             streamed_tool_results.insert(
                 tool_call_id.clone(),
                 StreamedToolReplayContext {
@@ -1368,18 +1343,16 @@ fn apply_tool_invocation_stream_event(
                 .map_or((120, 24), |replay| (replay.columns, replay.rows));
             let started_at_ms = replay.as_ref().and_then(|replay| replay.started_at_ms);
             let finished_at_ms = replay.as_ref().and_then(|replay| replay.finished_at_ms);
-            let index = upsert_streaming_terminal_output_item(
-                items,
-                StreamingTerminalOutputInput {
-                    tool_call_id,
-                    tool_name: context.map(|context| context.tool_name.as_str()),
-                    request_visual: context.and_then(|context| context.request_visual.as_ref()),
-                    text,
-                    columns,
-                    rows,
-                    started_at_ms,
-                },
+            let item = streaming_terminal_output_item(
+                tool_call_id,
+                context.map(|context| context.tool_name.as_str()),
+                context.and_then(|context| context.request_visual.as_ref()),
+                text,
+                columns,
+                rows,
+                started_at_ms,
             );
+            let index = upsert_terminal_output_item(items, item);
             streamed_tool_results.insert(
                 tool_call_id.clone(),
                 StreamedToolReplayContext {

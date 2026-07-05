@@ -47,11 +47,11 @@ use super::theme::{PresentedTheme, ResolvedTheme};
 use super::timeline_dialog::TimelineEntry;
 use super::tool_render_projection::semantic_result_supersedes_live_preview;
 use super::transcript::{
-    StreamingTerminalOutputInput, ToolTranscriptSurface, TranscriptItem, TranscriptItemKind,
-    display_tool_result_text, generic_tool_result_item_from_projection,
-    interactive_tool_request_item, interactive_tool_resolution_item,
-    item_is_tool_surface_for_tool_call, live_tool_preview_anchor_item, model_usage_item,
-    permission_request_item, permission_result_item, semantic_tool_result_item_from_raw,
+    ToolTranscriptSurface, TranscriptItem, TranscriptItemKind, display_tool_result_text,
+    generic_tool_result_item_from_projection, interactive_tool_request_item,
+    interactive_tool_resolution_item, item_is_tool_surface_for_tool_call,
+    live_tool_preview_anchor_item, model_usage_item, permission_request_item,
+    permission_result_item, semantic_tool_result_item_from_raw, streaming_terminal_output_item,
     streaming_tool_output_item, tool_request_item_from_projection, tool_result_item,
     transcript_items_from_events_with_reasoning,
 };
@@ -2833,21 +2833,20 @@ impl BmuxApp {
                     let rows = rows.unwrap_or(24).max(1);
                     let tool_context = self.tool_call_contexts.get(tool_call_id);
                     let live_preview = self.live_tool_previews.get(tool_call_id);
-                    let index = self.transcript.upsert_streaming_terminal_output(
-                        StreamingTerminalOutputInput {
-                            tool_call_id,
-                            tool_name: tool_context
-                                .map(|context| context.tool_name.as_str())
-                                .or_else(|| live_preview.map(|state| state.tool_name.as_str())),
-                            request_visual: tool_context
-                                .and_then(|context| context.request_visual.as_ref())
-                                .or_else(|| live_preview.map(|state| &state.preview.visual)),
-                            text: "",
-                            columns,
-                            rows,
-                            started_at_ms: *started_at_ms,
-                        },
+                    let item = streaming_terminal_output_item(
+                        tool_call_id,
+                        tool_context
+                            .map(|context| context.tool_name.as_str())
+                            .or_else(|| live_preview.map(|state| state.tool_name.as_str())),
+                        tool_context
+                            .and_then(|context| context.request_visual.as_ref())
+                            .or_else(|| live_preview.map(|state| &state.preview.visual)),
+                        "",
+                        columns,
+                        rows,
+                        *started_at_ms,
                     );
+                    let index = self.transcript.upsert_terminal_output_item(item);
                     self.live_tool_previews.remove(tool_call_id);
                     self.mark_live_preview_dirty();
                     self.streamed_tool_results.insert(
@@ -2962,21 +2961,20 @@ impl BmuxApp {
             });
         let tool_context = self.tool_call_contexts.get(tool_call_id);
         let live_preview = self.live_tool_previews.get(tool_call_id);
-        let index =
-            self.transcript
-                .upsert_streaming_terminal_output(StreamingTerminalOutputInput {
-                    tool_call_id,
-                    tool_name: tool_context
-                        .map(|context| context.tool_name.as_str())
-                        .or_else(|| live_preview.map(|state| state.tool_name.as_str())),
-                    request_visual: tool_context
-                        .and_then(|context| context.request_visual.as_ref())
-                        .or_else(|| live_preview.map(|state| &state.preview.visual)),
-                    text,
-                    columns,
-                    rows,
-                    started_at_ms,
-                });
+        let item = streaming_terminal_output_item(
+            tool_call_id,
+            tool_context
+                .map(|context| context.tool_name.as_str())
+                .or_else(|| live_preview.map(|state| state.tool_name.as_str())),
+            tool_context
+                .and_then(|context| context.request_visual.as_ref())
+                .or_else(|| live_preview.map(|state| &state.preview.visual)),
+            text,
+            columns,
+            rows,
+            started_at_ms,
+        );
+        let index = self.transcript.upsert_terminal_output_item(item);
         self.live_tool_previews.remove(tool_call_id);
         self.mark_live_preview_dirty();
         self.streamed_tool_results
