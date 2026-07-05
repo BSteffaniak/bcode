@@ -132,6 +132,9 @@ pub async fn run_with_static_bundled(
     static_plugins: Vec<bcode_plugin::StaticBundledPlugin>,
 ) -> Result<(), CliError> {
     let static_plugin_ids = bcode_plugin::static_bundled_plugin_ids(&static_plugins)?;
+    if let Err(error) = bcode_daemon_lifecycle::ensure_current_executable_cached() {
+        tracing::warn!(%error, "failed to cache current executable for detached daemon startup");
+    }
     let _ = STATIC_BUNDLED_PLUGINS.set(static_plugins);
     let _ = STATIC_BUNDLED_PLUGIN_IDS.set(static_plugin_ids);
     init_tracing();

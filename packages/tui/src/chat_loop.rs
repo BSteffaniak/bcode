@@ -3,7 +3,7 @@
 use std::io::Write;
 use std::time::{Duration, Instant, SystemTime};
 
-use bcode_client::{BcodeClient, ClientError};
+use bcode_client::{BcodeClient, ClientError, DaemonAvailability};
 use bcode_config::TuiConfig;
 use bcode_ipc::{ComposerDraftScope, Event as BcodeEvent};
 use bcode_session_models::SessionEventKind;
@@ -285,7 +285,9 @@ pub async fn run_with_client<W: Write>(
     startup_action: super::startup_action::StartupTuiAction,
     daemon_host: TuiDaemonHost,
 ) -> Result<(), TuiError> {
-    let passive_client = client.clone();
+    let passive_client = client
+        .clone()
+        .with_daemon_availability(DaemonAvailability::RequireRunning);
     let mut loop_state = ChatLoopState::new(client, &passive_client, daemon_host);
     loop_state.drain_pending_effects(chat);
     sync_chat_key_labels(chat, &settings.keymap);

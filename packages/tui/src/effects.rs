@@ -632,11 +632,7 @@ enum EffectDaemonIntent {
 
 impl TuiEffect {
     #[allow(clippy::too_many_lines)]
-    fn daemon_start_failed(
-        self,
-        error: bcode_daemon_lifecycle::DaemonStartError,
-    ) -> TuiEffectResult {
-        let client_error = ClientError::DaemonStart(error);
+    fn daemon_start_failed(self, client_error: ClientError) -> TuiEffectResult {
         match self {
             Self::OpenSession { session_id, .. } => TuiEffectResult::SessionOpened {
                 session_id,
@@ -897,7 +893,7 @@ impl TuiEffectRunner {
         let daemon_host = self.daemon_host.clone();
         let task = tokio::spawn(async move {
             if daemon_intent == EffectDaemonIntent::Foreground
-                && let Err(error) = daemon_host.ensure_available().await
+                && let Err(error) = ensure_foreground_daemon(&client, &daemon_host).await
             {
                 return effect.daemon_start_failed(error);
             }
@@ -957,6 +953,21 @@ impl TuiEffectRunner {
         for (_key, task) in std::mem::take(&mut self.tasks) {
             task.abort();
         }
+    }
+}
+
+async fn ensure_foreground_daemon(
+    client: &BcodeClient,
+    daemon_host: &TuiDaemonHost,
+) -> Result<(), ClientError> {
+    match client.ensure_daemon_available().await {
+        Ok(()) => Ok(()),
+        Err(error) if error.is_daemon_unavailable() => {
+            tracing::warn!(%error, "detached daemon startup failed; falling back to in-process daemon");
+            daemon_host.ensure_available().await?;
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }
 

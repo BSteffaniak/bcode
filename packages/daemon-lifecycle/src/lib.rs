@@ -8,6 +8,8 @@ use bcode_ipc::{BUILD_FINGERPRINT, CURRENT_PROTOCOL_VERSION, IpcEndpoint, daemon
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write as _;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -255,6 +257,126 @@ pub fn remove_record_if_instance(
     Ok(())
 }
 
+/// Return the directory that stores cached exact-build daemon executables.
+#[must_use]
+pub fn daemon_image_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("daemon-images").join(daemon_namespace())
+}
+
+/// Return the cached executable path for the current daemon namespace.
+#[must_use]
+pub fn cached_daemon_executable_path(state_dir: &Path) -> PathBuf {
+    daemon_image_dir(state_dir).join(if cfg!(windows) { "bcode.exe" } else { "bcode" })
+}
+
+/// Ensure the currently running executable is cached for detached daemon starts.
+///
+/// # Errors
+///
+/// Returns an error when the current executable cannot be located, copied, or made executable.
+pub fn ensure_current_executable_cached() -> Result<PathBuf, DaemonLifecycleError> {
+    ensure_current_executable_cached_in_state(&bcode_config::default_state_dir())
+}
+
+fn ensure_current_executable_cached_in_state(
+    state_dir: &Path,
+) -> Result<PathBuf, DaemonLifecycleError> {
+    let source = std::env::current_exe().map_err(|source| DaemonLifecycleError::Io {
+        path: PathBuf::from("<current_exe>"),
+        source,
+    })?;
+    let target = cached_daemon_executable_path(state_dir);
+    if target == source && target.exists() {
+        return Ok(target);
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|source| DaemonLifecycleError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let temp = target.with_extension(format!("tmp-{}", std::process::id()));
+    fs::copy(&source, &temp).map_err(|source_error| DaemonLifecycleError::Io {
+        path: temp.clone(),
+        source: source_error,
+    })?;
+    preserve_executable_permissions(&source, &temp)?;
+    fs::rename(&temp, &target).map_err(|source_error| {
+        let _ = fs::remove_file(&temp);
+        DaemonLifecycleError::Io {
+            path: target.clone(),
+            source: source_error,
+        }
+    })?;
+    Ok(target)
+}
+
+#[cfg(unix)]
+fn preserve_executable_permissions(
+    source: &Path,
+    target: &Path,
+) -> Result<(), DaemonLifecycleError> {
+    let mode = fs::metadata(source)
+        .map_err(|source_error| DaemonLifecycleError::Io {
+            path: source.to_path_buf(),
+            source: source_error,
+        })?
+        .permissions()
+        .mode();
+    let mut permissions = fs::metadata(target)
+        .map_err(|source_error| DaemonLifecycleError::Io {
+            path: target.to_path_buf(),
+            source: source_error,
+        })?
+        .permissions();
+    permissions.set_mode(mode | 0o700);
+    fs::set_permissions(target, permissions).map_err(|source_error| DaemonLifecycleError::Io {
+        path: target.to_path_buf(),
+        source: source_error,
+    })
+}
+
+#[cfg(not(unix))]
+fn preserve_executable_permissions(
+    _source: &Path,
+    _target: &Path,
+) -> Result<(), DaemonLifecycleError> {
+    Ok(())
+}
+
+/// Remove cached daemon images that do not correspond to live daemon records.
+///
+/// # Errors
+///
+/// Returns an error when reading or removing image directories fails.
+pub fn cleanup_stale_daemon_images(state_dir: &Path) -> Result<usize, DaemonLifecycleError> {
+    let root = state_dir.join("daemon-images");
+    let Ok(entries) = fs::read_dir(&root) else {
+        return Ok(0);
+    };
+    let live_namespaces = read_records(state_dir)
+        .into_iter()
+        .map(|(_path, record)| record.namespace)
+        .chain(std::iter::once(daemon_namespace()))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+            continue;
+        }
+        let namespace = entry.file_name().to_string_lossy().into_owned();
+        if live_namespaces.contains(&namespace) {
+            continue;
+        }
+        fs::remove_dir_all(entry.path()).map_err(|source| DaemonLifecycleError::Io {
+            path: entry.path(),
+            source,
+        })?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 /// Return Unix time in milliseconds.
 ///
 /// # Errors
@@ -288,11 +410,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_path_uses_namespace_json() {
+    fn cached_daemon_executable_path_is_namespace_scoped() {
         assert_eq!(
-            record_path(Path::new("/state"), "ipc-v1-test"),
-            PathBuf::from("/state/daemons/ipc-v1-test.json")
+            cached_daemon_executable_path(Path::new("/state")),
+            Path::new("/state")
+                .join("daemon-images")
+                .join(daemon_namespace())
+                .join(if cfg!(windows) { "bcode.exe" } else { "bcode" })
         );
+    }
+
+    #[test]
+    fn caches_current_executable_into_namespace_image_dir() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "bcode-daemon-image-test-{}-{}",
+            std::process::id(),
+            unix_time_millis().unwrap()
+        ));
+
+        let cached = ensure_current_executable_cached_in_state(&state_dir).unwrap();
+
+        assert!(cached.exists());
+        assert_eq!(cached, cached_daemon_executable_path(&state_dir));
+        let _ = fs::remove_dir_all(state_dir);
     }
 }
 
@@ -402,7 +542,7 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
             writeln!(log_file, "--- bcode daemon start ---")?;
             let stderr_log = log_file.try_clone()?;
 
-            let exe = std::env::current_exe()?;
+            let exe = ensure_current_executable_cached()?;
             let (endpoint_env_name, endpoint_env_value) =
                 bcode_ipc::endpoint_env_pair(&endpoint)
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -472,6 +612,7 @@ where
             Ok(()) => {
                 let _cleanup_task = tokio::spawn(async {
                     let _ = cleanup_stale_daemon_records().await;
+                    let _ = cleanup_stale_daemon_images(&bcode_config::default_state_dir());
                 });
                 drop(lock);
                 print_daemon_status(options, "server started");
