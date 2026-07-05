@@ -18,9 +18,9 @@ use bcode_tool::{
     ToolUiMetadata,
 };
 use bcode_vim_edit::{
-    VimEditMode, VimEditRequest, VimEditResult, VimEditSandbox, VimEditSession,
-    VimEditSessionFinishResult, VimEditSessionSnapshot, VimEditStep, run_vim_edit,
-    start_vim_edit_session,
+    VimEditMode, VimEditMultiFileEntry, VimEditMultiFileRequest, VimEditRequest, VimEditResult,
+    VimEditSandbox, VimEditSession, VimEditSessionFinishResult, VimEditSessionSnapshot,
+    VimEditStep, run_vim_edit, run_vim_multi_file_edit, start_vim_edit_session,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -103,6 +103,22 @@ impl From<VimEditToolSandbox> for VimEditSandbox {
             VimEditToolSandbox::DangerouslyDisabled => Self::DangerouslyDisabled,
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct VimEditMultiFileToolRequest {
+    files: Vec<VimEditMultiFileToolEntry>,
+    #[serde(default)]
+    sandbox: VimEditToolSandbox,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VimEditMultiFileToolEntry {
+    path: PathBuf,
+    #[serde(default)]
+    steps: Vec<VimEditToolStep>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -220,6 +236,8 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
             session_snapshot_tool_definition(),
             session_finish_tool_definition(),
             session_cancel_tool_definition(),
+            multi_file_preview_tool_definition(),
+            multi_file_apply_tool_definition(),
         ],
     })
 }
@@ -256,6 +274,20 @@ fn invoke_tool_request(request: ToolInvocationRequest) -> ToolInvocationResponse
         "vim_edit.session_snapshot" => tool_session_snapshot(request.arguments),
         "vim_edit.session_finish" => tool_session_finish(request.arguments),
         "vim_edit.session_cancel" => tool_session_cancel(request.arguments),
+        "vim_edit.multi_file_preview" => tool_vim_multi_file(
+            request.arguments,
+            request.cwd.as_deref(),
+            VimEditMode::Preview,
+            &request.tool_call_id,
+            "vim_edit.multi_file_preview",
+        ),
+        "vim_edit.multi_file_apply" => tool_vim_multi_file(
+            request.arguments,
+            request.cwd.as_deref(),
+            VimEditMode::Apply,
+            &request.tool_call_id,
+            "vim_edit.multi_file_apply",
+        ),
         _ => ToolInvocationResponse {
             output: "unknown vim edit tool".to_string(),
             is_error: true,
@@ -293,6 +325,59 @@ fn tool_vim_edit_with_nvim_executable(
     match run_vim_edit(edit_request) {
         Ok(result) => vim_edit_success_response(&display_path, &result, tool_call_id, tool_name),
         Err(error) => vim_edit_error_response(Some(&display_path), error.to_string()),
+    }
+}
+
+fn tool_vim_multi_file(
+    arguments: serde_json::Value,
+    cwd: Option<&Path>,
+    mode: VimEditMode,
+    tool_call_id: &str,
+    tool_name: &str,
+) -> ToolInvocationResponse {
+    let request = match serde_json::from_value::<VimEditMultiFileToolRequest>(arguments) {
+        Ok(request) => request,
+        Err(error) => return tool_json_error(&error),
+    };
+    let entries = request
+        .files
+        .into_iter()
+        .map(|file| VimEditMultiFileEntry {
+            path: resolve_session_path(cwd, &file.path),
+            steps: file.steps.into_iter().map(Into::into).collect(),
+        })
+        .collect::<Vec<_>>();
+    match run_vim_multi_file_edit(&VimEditMultiFileRequest {
+        files: entries,
+        nvim_executable: None,
+        mode,
+        sandbox: request.sandbox.into(),
+        timeout: Duration::from_millis(request.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)),
+    }) {
+        Ok(result) => {
+            let output = json!({
+                "success": true,
+                "tool_name": tool_name,
+                "changed": result.changed,
+                "diff": result.diff,
+                "files": result.files,
+            });
+            let mut response = json_tool_response(&output, false);
+            response.result = Some(ToolInvocationResult::Artifact {
+                artifact: Box::new(ToolArtifact {
+                    artifact_id: format!("{tool_call_id}-vim-edit-multi-file"),
+                    producer_plugin_id: "bcode.vim-edit".to_string(),
+                    schema: "bcode.vim-edit.playback".to_string(),
+                    schema_version: 1,
+                    tool_call_id: Some(tool_call_id.to_string()),
+                    title: Some("Vim multi-file edit".to_string()),
+                    metadata: output,
+                    refs: Vec::new(),
+                }),
+            });
+            response
+        }
+        Err(error) => vim_edit_error_response(None, error.to_string()),
     }
 }
 
@@ -607,6 +692,30 @@ fn apply_tool_definition() -> ToolDefinition {
     }
 }
 
+fn multi_file_preview_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "vim_edit.multi_file_preview".to_string(),
+        description: "Preview explicit multi-file Vim/Neovim edits. Each file is listed separately with its own path and steps; default sandbox blocks unsafe external commands. Does not modify requested files.".to_string(),
+        input_schema: vim_multi_file_input_schema(),
+        side_effect: ToolSideEffect::ReadOnly,
+        requires_permission: false,
+        policy: multi_file_path_policy("read", ToolArgumentKind::ReadPath),
+        ui: ToolUiMetadata::default(),
+    }
+}
+
+fn multi_file_apply_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "vim_edit.multi_file_apply".to_string(),
+        description: "Apply explicit multi-file Vim/Neovim edits. Each writable file is listed in files[].path for permission review; writes requested files only after all file edits succeed. Optional sandbox=\"dangerously_disabled\" is unsafe and explicitly bypasses default command filtering.".to_string(),
+        input_schema: vim_multi_file_input_schema(),
+        side_effect: ToolSideEffect::WriteFiles,
+        requires_permission: true,
+        policy: multi_file_path_policy("edit", ToolArgumentKind::WritePath),
+        ui: ToolUiMetadata::default(),
+    }
+}
+
 fn session_start_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "vim_edit.session_start".to_string(),
@@ -722,6 +831,35 @@ fn vim_edit_step_schema() -> serde_json::Value {
     })
 }
 
+fn vim_multi_file_input_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "required": ["files"],
+        "properties": {
+            "files": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "required": ["path", "steps"],
+                    "properties": {
+                        "path": { "type": "string" },
+                        "steps": {
+                            "type": "array",
+                            "items": vim_edit_step_schema()
+                        }
+                    }
+                }
+            },
+            "sandbox": {
+                "type": "string",
+                "enum": ["default", "dangerously_disabled"]
+            },
+            "timeout_ms": { "type": "integer", "minimum": 1 }
+        }
+    })
+}
+
 fn vim_edit_input_schema() -> serde_json::Value {
     json!({
         "type": "object",
@@ -750,6 +888,19 @@ fn path_policy(category: &str, kind: ToolArgumentKind) -> ToolPolicyMetadata {
         argument_extractors: vec![ToolArgumentExtractor {
             kind,
             argument: "path".to_string(),
+        }],
+    }
+}
+
+fn multi_file_path_policy(category: &str, kind: ToolArgumentKind) -> ToolPolicyMetadata {
+    ToolPolicyMetadata {
+        aliases: vec![category.to_string()],
+        compatibility_aliases: Vec::new(),
+        capabilities: vec![format!("vim_edit.multi_file.{category}")],
+        permission_category: Some(category.to_string()),
+        argument_extractors: vec![ToolArgumentExtractor {
+            kind,
+            argument: "files".to_string(),
         }],
     }
 }
@@ -830,6 +981,8 @@ mod tests {
                 session_snapshot_tool_definition(),
                 session_finish_tool_definition(),
                 session_cancel_tool_definition(),
+                multi_file_preview_tool_definition(),
+                multi_file_apply_tool_definition(),
             ],
         };
         let names = tools
@@ -847,6 +1000,8 @@ mod tests {
                 "vim_edit.session_snapshot",
                 "vim_edit.session_finish",
                 "vim_edit.session_cancel",
+                "vim_edit.multi_file_preview",
+                "vim_edit.multi_file_apply",
             ]
         );
     }
@@ -856,6 +1011,18 @@ mod tests {
         let tool = preview_tool_definition();
         assert_eq!(tool.side_effect, ToolSideEffect::ReadOnly);
         assert!(!tool.requires_permission);
+    }
+
+    #[test]
+    fn multi_file_apply_tool_writes_and_requires_permission() {
+        let tool = multi_file_apply_tool_definition();
+        assert_eq!(tool.side_effect, ToolSideEffect::WriteFiles);
+        assert!(tool.requires_permission);
+        assert_eq!(tool.policy.argument_extractors[0].argument, "files");
+        assert_eq!(
+            tool.policy.argument_extractors[0].kind,
+            ToolArgumentKind::WritePath
+        );
     }
 
     #[test]
@@ -1151,6 +1318,110 @@ mod tests {
         });
         assert!(response.is_error);
         assert!(response.output.contains("unknown Vim edit session"));
+    }
+
+    #[test]
+    fn multi_file_preview_includes_every_changed_file_when_nvim_is_available() {
+        if !nvim_available() {
+            eprintln!("skipping Neovim plugin test because `nvim` is not available");
+            return;
+        }
+        let first = tempfile::NamedTempFile::new().expect("first temp file");
+        let second = tempfile::NamedTempFile::new().expect("second temp file");
+        std::fs::write(first.path(), "foo").expect("write first");
+        std::fs::write(second.path(), "bar").expect("write second");
+        let response = invoke_tool_request(ToolInvocationRequest {
+            tool_call_id: "test".to_string(),
+            name: "vim_edit.multi_file_preview".to_string(),
+            arguments: json!({
+                "files": [
+                    { "path": first.path(), "steps": [{ "ex": "%s/foo/one/" }] },
+                    { "path": second.path(), "steps": [{ "ex": "%s/bar/two/" }] }
+                ]
+            }),
+            cwd: None,
+            artifact_dir: None,
+            cancellation_path: None,
+        });
+        assert!(!response.is_error, "{}", response.output);
+        assert_eq!(
+            std::fs::read_to_string(first.path()).expect("read first"),
+            "foo"
+        );
+        assert_eq!(
+            std::fs::read_to_string(second.path()).expect("read second"),
+            "bar"
+        );
+        assert!(response.output.contains("one"), "{}", response.output);
+        assert!(response.output.contains("two"), "{}", response.output);
+    }
+
+    #[test]
+    fn multi_file_apply_writes_all_requested_files_when_nvim_is_available() {
+        if !nvim_available() {
+            eprintln!("skipping Neovim plugin test because `nvim` is not available");
+            return;
+        }
+        let first = tempfile::NamedTempFile::new().expect("first temp file");
+        let second = tempfile::NamedTempFile::new().expect("second temp file");
+        std::fs::write(first.path(), "foo").expect("write first");
+        std::fs::write(second.path(), "bar").expect("write second");
+        let response = invoke_tool_request(ToolInvocationRequest {
+            tool_call_id: "test".to_string(),
+            name: "vim_edit.multi_file_apply".to_string(),
+            arguments: json!({
+                "files": [
+                    { "path": first.path(), "steps": [{ "ex": "%s/foo/one/" }] },
+                    { "path": second.path(), "steps": [{ "ex": "%s/bar/two/" }] }
+                ]
+            }),
+            cwd: None,
+            artifact_dir: None,
+            cancellation_path: None,
+        });
+        assert!(!response.is_error, "{}", response.output);
+        assert_eq!(
+            std::fs::read_to_string(first.path()).expect("read first"),
+            "one"
+        );
+        assert_eq!(
+            std::fs::read_to_string(second.path()).expect("read second"),
+            "two"
+        );
+    }
+
+    #[test]
+    fn multi_file_apply_does_not_partially_write_when_later_file_fails_when_nvim_is_available() {
+        if !nvim_available() {
+            eprintln!("skipping Neovim plugin test because `nvim` is not available");
+            return;
+        }
+        let first = tempfile::NamedTempFile::new().expect("first temp file");
+        let second = tempfile::NamedTempFile::new().expect("second temp file");
+        std::fs::write(first.path(), "foo").expect("write first");
+        std::fs::write(second.path(), "bar").expect("write second");
+        let response = invoke_tool_request(ToolInvocationRequest {
+            tool_call_id: "test".to_string(),
+            name: "vim_edit.multi_file_apply".to_string(),
+            arguments: json!({
+                "files": [
+                    { "path": first.path(), "steps": [{ "ex": "%s/foo/one/" }] },
+                    { "path": second.path(), "steps": [{ "keys": "/missing<CR>" }] }
+                ]
+            }),
+            cwd: None,
+            artifact_dir: None,
+            cancellation_path: None,
+        });
+        assert!(response.is_error);
+        assert_eq!(
+            std::fs::read_to_string(first.path()).expect("read first"),
+            "foo"
+        );
+        assert_eq!(
+            std::fs::read_to_string(second.path()).expect("read second"),
+            "bar"
+        );
     }
 
     fn nvim_available() -> bool {

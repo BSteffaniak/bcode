@@ -118,6 +118,66 @@ pub struct TextContext {
     pub lines: Vec<String>,
 }
 
+/// Result for one edited file in a multi-file Vim edit request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VimEditMultiFileResult {
+    /// Edited file path.
+    pub path: PathBuf,
+    /// Whether this file changed.
+    pub changed: bool,
+    /// File-specific diff.
+    pub diff: String,
+    /// Final cursor position for this file's edit session.
+    pub cursor: CursorPosition,
+    /// Final Neovim mode for this file's edit session.
+    pub nvim_mode: String,
+    /// Final bounded context for this file.
+    pub final_context: TextContext,
+    /// Events recorded for this file.
+    pub events: Vec<VimEditEvent>,
+}
+
+/// Request for one file inside a multi-file Vim edit operation.
+#[derive(Debug, Clone)]
+pub struct VimEditMultiFileEntry {
+    /// File to edit.
+    pub path: PathBuf,
+    /// Steps to run against this file.
+    pub steps: Vec<VimEditStep>,
+}
+
+/// Explicit multi-file Vim edit request.
+#[derive(Debug, Clone)]
+pub struct VimEditMultiFileRequest {
+    /// Files to edit. Each file has independent Vim steps and an independent
+    /// isolated temp-buffer Neovim run.
+    pub files: Vec<VimEditMultiFileEntry>,
+    /// Optional Neovim executable override.
+    pub nvim_executable: Option<PathBuf>,
+    /// Whether to preview or apply after every file succeeds.
+    pub mode: VimEditMode,
+    /// Sandbox policy for every file.
+    pub sandbox: VimEditSandbox,
+    /// Timeout per file.
+    pub timeout: Duration,
+}
+
+/// Result of a multi-file Vim edit request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VimEditMultiFileEditResult {
+    /// Per-file results.
+    pub files: Vec<VimEditMultiFileResult>,
+    /// Combined diff containing every changed file.
+    pub diff: String,
+    /// Whether any file changed.
+    pub changed: bool,
+}
+
+struct VimEditExecution {
+    result: VimEditResult,
+    final_text: String,
+}
+
 /// Snapshot for an interactive Vim edit session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VimEditSessionSnapshot {
@@ -272,6 +332,79 @@ pub enum VimEditError {
     /// Failed to write the final buffer back to the requested path.
     #[error("failed to write {path:?}: {source}")]
     WriteFile { path: PathBuf, source: io::Error },
+}
+
+/// Run explicit multi-file Vim edit steps.
+///
+/// Apply mode is all-or-nothing with respect to Bcode writes: every file is
+/// edited against a temporary copy first, and requested files are written only
+/// after all Neovim runs succeed.
+///
+/// # Errors
+///
+/// Returns an error if any file validation, sandbox check, Neovim step, timeout,
+/// or final write fails.
+pub fn run_vim_multi_file_edit(
+    request: &VimEditMultiFileRequest,
+) -> Result<VimEditMultiFileEditResult, VimEditError> {
+    let mut executions = Vec::with_capacity(request.files.len());
+    for file in &request.files {
+        let single = VimEditRequest {
+            path: file.path.clone(),
+            nvim_executable: request.nvim_executable.clone(),
+            steps: file.steps.clone(),
+            mode: VimEditMode::Preview,
+            sandbox: request.sandbox,
+            timeout: request.timeout,
+        };
+        let execution = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|source| VimEditError::StartNeovim {
+                executable: "tokio runtime".to_string(),
+                source,
+            })?
+            .block_on(run_vim_edit_prepare(&single))?;
+        executions.push((file.path.clone(), execution));
+    }
+
+    if request.mode == VimEditMode::Apply {
+        for (path, execution) in &executions {
+            if execution.result.changed {
+                fs::write(path, execution.final_text.as_bytes()).map_err(|source| {
+                    VimEditError::WriteFile {
+                        path: path.clone(),
+                        source,
+                    }
+                })?;
+            }
+        }
+    }
+
+    let files = executions
+        .into_iter()
+        .map(|(path, execution)| VimEditMultiFileResult {
+            path,
+            changed: execution.result.changed,
+            diff: execution.result.diff,
+            cursor: execution.result.cursor,
+            nvim_mode: execution.result.nvim_mode,
+            final_context: execution.result.final_context,
+            events: execution.result.events,
+        })
+        .collect::<Vec<_>>();
+    let mut diff = String::new();
+    for file in &files {
+        if file.changed {
+            diff.push_str(&file.diff);
+        }
+    }
+    let changed = files.iter().any(|file| file.changed);
+    Ok(VimEditMultiFileEditResult {
+        files,
+        diff,
+        changed,
+    })
 }
 
 /// Start a long-lived interactive Vim edit session.
@@ -590,6 +723,19 @@ pub fn run_vim_edit(request: VimEditRequest) -> Result<VimEditResult, VimEditErr
 }
 
 async fn run_vim_edit_inner(request: VimEditRequest) -> Result<VimEditResult, VimEditError> {
+    let execution = run_vim_edit_prepare(&request).await?;
+    if request.mode == VimEditMode::Apply && execution.result.changed {
+        fs::write(&request.path, execution.final_text.as_bytes()).map_err(|source| {
+            VimEditError::WriteFile {
+                path: request.path.clone(),
+                source,
+            }
+        })?;
+    }
+    Ok(execution.result)
+}
+
+async fn run_vim_edit_prepare(request: &VimEditRequest) -> Result<VimEditExecution, VimEditError> {
     let original = read_text_file(&request.path)?;
     let temp_file = temp_file_with_contents(&original)?;
     let session = NeovimSession::start(
@@ -599,7 +745,7 @@ async fn run_vim_edit_inner(request: VimEditRequest) -> Result<VimEditResult, Vi
             .unwrap_or_else(|| Path::new(NVIM_EXECUTABLE)),
     )
     .await?;
-    let operation = run_vim_edit_session(&session, &request, temp_file.path());
+    let operation = run_vim_edit_session(&session, request, temp_file.path());
     let session_result = time::timeout(request.timeout, operation)
         .await
         .unwrap_or(Err(VimEditError::Timeout {
@@ -609,22 +755,16 @@ async fn run_vim_edit_inner(request: VimEditRequest) -> Result<VimEditResult, Vi
     let (final_text, cursor, nvim_mode, final_context, events) = session_result?;
 
     let changed = original != final_text;
-    if request.mode == VimEditMode::Apply && changed {
-        fs::write(&request.path, final_text.as_bytes()).map_err(|source| {
-            VimEditError::WriteFile {
-                path: request.path.clone(),
-                source,
-            }
-        })?;
-    }
-
-    Ok(VimEditResult {
-        changed,
-        diff: render_diff(&request.path, &original, &final_text),
-        cursor,
-        nvim_mode,
-        final_context,
-        events,
+    Ok(VimEditExecution {
+        result: VimEditResult {
+            changed,
+            diff: render_diff(&request.path, &original, &final_text),
+            cursor,
+            nvim_mode,
+            final_context,
+            events,
+        },
+        final_text,
     })
 }
 
