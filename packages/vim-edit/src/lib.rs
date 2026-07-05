@@ -21,7 +21,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use tokio::process::{Child, ChildStdin, Command};
@@ -116,6 +116,65 @@ pub struct TextContext {
     pub start_line: usize,
     /// Context lines.
     pub lines: Vec<String>,
+}
+
+/// Snapshot for an interactive Vim edit session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VimEditSessionSnapshot {
+    /// Cursor at snapshot time.
+    pub cursor: CursorPosition,
+    /// Neovim mode at snapshot time.
+    pub nvim_mode: String,
+    /// Bounded context around the cursor.
+    pub context: TextContext,
+    /// Diff between original file text and current session buffer.
+    pub diff: String,
+    /// Whether the session buffer differs from the original text.
+    pub changed: bool,
+}
+
+/// Result of applying one step to an interactive Vim edit session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VimEditSessionInputResult {
+    /// Event captured for the applied step.
+    pub event: VimEditEvent,
+    /// Snapshot after the step.
+    pub snapshot: VimEditSessionSnapshot,
+}
+
+/// Result of finishing an interactive Vim edit session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VimEditSessionFinishResult {
+    /// Whether the final buffer differs from the original file text.
+    pub changed: bool,
+    /// Final diff.
+    pub diff: String,
+    /// Final cursor position.
+    pub cursor: CursorPosition,
+    /// Final Neovim mode.
+    pub nvim_mode: String,
+    /// Final bounded context around the cursor.
+    pub final_context: TextContext,
+    /// Stepwise observations captured by the session.
+    pub events: Vec<VimEditEvent>,
+    /// Whether the final text was written to the requested file.
+    pub applied: bool,
+}
+
+/// Long-lived RPC-backed Vim edit session.
+pub struct VimEditSession {
+    runtime: tokio::runtime::Runtime,
+    session: Option<NeovimSession>,
+    _temp_file: NamedTempFile,
+    path: PathBuf,
+    original: String,
+    previous_buffer: String,
+    sandbox: VimEditSandbox,
+    timeout: Duration,
+    events: Vec<VimEditEvent>,
+    next_step_index: usize,
+    started_at: Instant,
+    last_accessed_at: Instant,
 }
 
 /// State captured for one Vim edit step.
@@ -213,6 +272,299 @@ pub enum VimEditError {
     /// Failed to write the final buffer back to the requested path.
     #[error("failed to write {path:?}: {source}")]
     WriteFile { path: PathBuf, source: io::Error },
+}
+
+/// Start a long-lived interactive Vim edit session.
+///
+/// # Errors
+///
+/// Returns an error for the same file validation, Neovim startup, timeout, and
+/// RPC failures as [`run_vim_edit`].
+pub fn start_vim_edit_session(request: VimEditRequest) -> Result<VimEditSession, VimEditError> {
+    VimEditSession::start(request)
+}
+
+impl VimEditSession {
+    /// Start a long-lived interactive Vim edit session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read, the file is unsupported,
+    /// Neovim cannot be started, or the initial session snapshot fails.
+    pub fn start(request: VimEditRequest) -> Result<Self, VimEditError> {
+        let original = read_text_file(&request.path)?;
+        let temp_file = temp_file_with_contents(&original)?;
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|source| VimEditError::StartNeovim {
+                executable: "tokio runtime".to_string(),
+                source,
+            })?;
+        let executable = request
+            .nvim_executable
+            .as_deref()
+            .unwrap_or_else(|| Path::new(NVIM_EXECUTABLE));
+        let session = runtime.block_on(timeout_result(request.timeout, async {
+            NeovimSession::start(executable).await
+        }))?;
+        runtime.block_on(timeout_result(request.timeout, async {
+            session.configure_isolation().await?;
+            session.edit_path(temp_file.path()).await?;
+            session.buffer_text().await
+        }))?;
+        let previous_buffer = original.clone();
+        let now = Instant::now();
+        Ok(Self {
+            runtime,
+            session: Some(session),
+            _temp_file: temp_file,
+            path: request.path,
+            original,
+            previous_buffer,
+            sandbox: request.sandbox,
+            timeout: request.timeout,
+            events: Vec::with_capacity(request.steps.len()),
+            next_step_index: 0,
+            started_at: now,
+            last_accessed_at: now,
+        })
+    }
+
+    /// Apply one step to the session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when sandbox policy rejects the step, Neovim reports a
+    /// step failure, the session times out, or the session has already ended.
+    pub fn input(&mut self, step: VimEditStep) -> Result<VimEditSessionInputResult, VimEditError> {
+        self.touch();
+        let step_index = self.next_step_index;
+        let timeout = self.timeout;
+        let sandbox = self.sandbox;
+        let previous_buffer = self.previous_buffer.clone();
+        let result = {
+            let session = self.session_ref()?;
+            self.runtime.block_on(timeout_result(timeout, async {
+                apply_session_step(
+                    session,
+                    step,
+                    step_index,
+                    sandbox,
+                    previous_buffer,
+                    &self.original,
+                    &self.path,
+                )
+                .await
+            }))
+        };
+        let (event, next_buffer, snapshot) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if matches!(
+                    error,
+                    VimEditError::Timeout { .. } | VimEditError::UnexpectedExit(_)
+                ) {
+                    self.shutdown_session();
+                }
+                return Err(error);
+            }
+        };
+        self.previous_buffer = next_buffer;
+        self.next_step_index = self.next_step_index.saturating_add(1);
+        self.events.push(event.clone());
+        Ok(VimEditSessionInputResult { event, snapshot })
+    }
+
+    /// Return current session state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session has ended, timed out, or cannot query Neovim.
+    pub fn snapshot(&mut self) -> Result<VimEditSessionSnapshot, VimEditError> {
+        self.touch();
+        let timeout = self.timeout;
+        let original = self.original.clone();
+        let path = self.path.clone();
+        let result = {
+            let session = self.session_ref()?;
+            self.runtime.block_on(timeout_result(timeout, async {
+                session_snapshot(session, &original, &path).await
+            }))
+        };
+        match result {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                if matches!(
+                    error,
+                    VimEditError::Timeout { .. } | VimEditError::UnexpectedExit(_)
+                ) {
+                    self.shutdown_session();
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Finish the session and optionally apply the final buffer to the requested file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the final state cannot be read or the requested file
+    /// cannot be written in apply mode.
+    pub fn finish(mut self, apply: bool) -> Result<VimEditSessionFinishResult, VimEditError> {
+        self.touch();
+        let timeout = self.timeout;
+        let original = self.original.clone();
+        let path = self.path.clone();
+        let result = {
+            let session = self.session_ref()?;
+            self.runtime.block_on(timeout_result(timeout, async {
+                let final_text = session.buffer_text().await?;
+                let cursor = session.cursor().await?;
+                let nvim_mode = session.mode().await?;
+                let final_context = session.context(DEFAULT_CONTEXT_RADIUS).await?;
+                let diff = render_diff(&path, &original, &final_text);
+                Ok::<_, VimEditError>((final_text, cursor, nvim_mode, final_context, diff))
+            }))
+        };
+        let (final_text, cursor, nvim_mode, final_context, diff) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.shutdown_session();
+                return Err(error);
+            }
+        };
+        self.shutdown_session();
+        let changed = original != final_text;
+        if apply && changed {
+            fs::write(&path, final_text.as_bytes()).map_err(|source| VimEditError::WriteFile {
+                path: path.clone(),
+                source,
+            })?;
+        }
+        Ok(VimEditSessionFinishResult {
+            changed,
+            diff,
+            cursor,
+            nvim_mode,
+            final_context,
+            events: std::mem::take(&mut self.events),
+            applied: apply && changed,
+        })
+    }
+
+    /// Cancel the session without writing to the requested file.
+    pub fn cancel(mut self) {
+        self.shutdown_session();
+    }
+
+    /// Return when the session started.
+    #[must_use]
+    pub const fn started_at(&self) -> Instant {
+        self.started_at
+    }
+
+    /// Return when the session was last accessed.
+    #[must_use]
+    pub const fn last_accessed_at(&self) -> Instant {
+        self.last_accessed_at
+    }
+
+    fn touch(&mut self) {
+        self.last_accessed_at = Instant::now();
+    }
+
+    fn session_ref(&self) -> Result<&NeovimSession, VimEditError> {
+        self.session
+            .as_ref()
+            .ok_or_else(|| VimEditError::UnexpectedExit("session is already closed".to_string()))
+    }
+
+    fn shutdown_session(&mut self) {
+        if let Some(session) = self.session.take() {
+            self.runtime.block_on(session.shutdown());
+        }
+    }
+}
+
+impl Drop for VimEditSession {
+    fn drop(&mut self) {
+        self.shutdown_session();
+    }
+}
+
+async fn timeout_result<T>(
+    timeout: Duration,
+    future: impl std::future::Future<Output = Result<T, VimEditError>>,
+) -> Result<T, VimEditError> {
+    time::timeout(timeout, future)
+        .await
+        .unwrap_or(Err(VimEditError::Timeout {
+            timeout_ms: timeout.as_millis(),
+        }))
+}
+
+async fn apply_session_step(
+    session: &NeovimSession,
+    step: VimEditStep,
+    step_index: usize,
+    sandbox: VimEditSandbox,
+    previous_buffer: String,
+    original: &str,
+    path: &Path,
+) -> Result<(VimEditEvent, String, VimEditSessionSnapshot), VimEditError> {
+    let before_cursor = session.cursor().await?;
+    if let Err(error) = reject_unsafe_step(&step, step_index, sandbox) {
+        let state = session.failure_state(step_index).await;
+        return Err(VimEditError::StepFailed {
+            state,
+            message: error.to_string(),
+        });
+    }
+    if let Err(error) = session.apply_step(&step).await {
+        let state = session.failure_state(step_index).await;
+        let message = classify_step_error(&step, &error.to_string());
+        return Err(VimEditError::StepFailed { state, message });
+    }
+    let after_cursor = session.cursor().await?;
+    let nvim_mode = session.mode().await?;
+    let context = session.context(DEFAULT_CONTEXT_RADIUS).await?;
+    let next_buffer = session.buffer_text().await?;
+    let changed = next_buffer != previous_buffer;
+    let event = VimEditEvent {
+        step_index,
+        step,
+        before_cursor,
+        after_cursor,
+        nvim_mode: nvim_mode.clone(),
+        context: context.clone(),
+        changed,
+        message: Some("step completed successfully".to_string()),
+    };
+    let snapshot = VimEditSessionSnapshot {
+        cursor: after_cursor,
+        nvim_mode,
+        context,
+        diff: render_diff(path, original, &next_buffer),
+        changed: original != next_buffer,
+    };
+    Ok((event, next_buffer, snapshot))
+}
+
+async fn session_snapshot(
+    session: &NeovimSession,
+    original: &str,
+    path: &Path,
+) -> Result<VimEditSessionSnapshot, VimEditError> {
+    let current_text = session.buffer_text().await?;
+    Ok(VimEditSessionSnapshot {
+        cursor: session.cursor().await?,
+        nvim_mode: session.mode().await?,
+        context: session.context(DEFAULT_CONTEXT_RADIUS).await?,
+        diff: render_diff(path, original, &current_text),
+        changed: original != current_text,
+    })
 }
 
 /// Run Vim edit steps against a single file.
@@ -738,6 +1090,195 @@ fn usize_to_i64(value: usize) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interactive_session_snapshot_input_finish_apply_when_nvim_is_available() {
+        if !nvim_available() {
+            eprintln!("skipping Neovim integration test because `nvim` is not available");
+            return;
+        }
+        let file = NamedTempFile::new().expect("temp file");
+        fs::write(file.path(), "foo bar baz").expect("write original");
+        let mut session = start_vim_edit_session(VimEditRequest {
+            path: file.path().to_path_buf(),
+            nvim_executable: None,
+            steps: Vec::new(),
+            mode: VimEditMode::Preview,
+            sandbox: VimEditSandbox::Default,
+            timeout: Duration::from_secs(5),
+        })
+        .expect("start session");
+        let initial = session.snapshot().expect("initial snapshot");
+        assert_eq!(initial.cursor.line, 1);
+        assert_eq!(initial.nvim_mode, "n");
+        assert_eq!(initial.context.start_line, 1);
+        assert!(!initial.changed);
+
+        session
+            .input(VimEditStep::Keys {
+                input: "w".to_string(),
+            })
+            .expect("move word");
+        session
+            .input(VimEditStep::Keys {
+                input: "ciw".to_string(),
+            })
+            .expect("change word");
+        let input = session
+            .input(VimEditStep::Insert {
+                text: "qux".to_string(),
+            })
+            .expect("insert word");
+        assert_eq!(input.event.step_index, 2);
+        assert!(input.snapshot.changed);
+        session
+            .input(VimEditStep::Keys {
+                input: "<Esc>".to_string(),
+            })
+            .expect("escape");
+
+        let finish = session.finish(true).expect("finish apply");
+        assert!(finish.changed);
+        assert!(finish.applied);
+        assert_eq!(finish.events.len(), 4);
+        assert_eq!(
+            fs::read_to_string(file.path()).expect("read edited"),
+            "foo qux baz"
+        );
+    }
+
+    #[test]
+    fn interactive_session_finish_without_apply_leaves_file_unchanged_when_nvim_is_available() {
+        if !nvim_available() {
+            eprintln!("skipping Neovim integration test because `nvim` is not available");
+            return;
+        }
+        let file = NamedTempFile::new().expect("temp file");
+        fs::write(file.path(), "foo").expect("write original");
+        let mut session = start_vim_edit_session(VimEditRequest {
+            path: file.path().to_path_buf(),
+            nvim_executable: None,
+            steps: Vec::new(),
+            mode: VimEditMode::Preview,
+            sandbox: VimEditSandbox::Default,
+            timeout: Duration::from_secs(5),
+        })
+        .expect("start session");
+        session
+            .input(VimEditStep::Ex {
+                command: "%s/foo/bar/".to_string(),
+            })
+            .expect("substitute");
+        let finish = session.finish(false).expect("finish without apply");
+        assert!(finish.changed);
+        assert!(!finish.applied);
+        assert_eq!(
+            fs::read_to_string(file.path()).expect("read original"),
+            "foo"
+        );
+    }
+
+    #[test]
+    fn interactive_session_input_returns_clear_step_error_when_nvim_is_available() {
+        if !nvim_available() {
+            eprintln!("skipping Neovim integration test because `nvim` is not available");
+            return;
+        }
+        let file = NamedTempFile::new().expect("temp file");
+        fs::write(file.path(), "foo").expect("write original");
+        let mut session = start_vim_edit_session(VimEditRequest {
+            path: file.path().to_path_buf(),
+            nvim_executable: None,
+            steps: Vec::new(),
+            mode: VimEditMode::Preview,
+            sandbox: VimEditSandbox::Default,
+            timeout: Duration::from_secs(5),
+        })
+        .expect("start session");
+        let error = session
+            .input(VimEditStep::Keys {
+                input: "/missing<CR>".to_string(),
+            })
+            .expect_err("missing search should fail");
+        let VimEditError::StepFailed { state, message } = error else {
+            panic!("expected step failure");
+        };
+        assert_eq!(state.step_index, 0);
+        assert!(state.cursor.is_some());
+        assert!(message.contains("search pattern"));
+    }
+
+    #[test]
+    fn interactive_session_cancel_leaves_file_unchanged_when_nvim_is_available() {
+        if !nvim_available() {
+            eprintln!("skipping Neovim integration test because `nvim` is not available");
+            return;
+        }
+        let file = NamedTempFile::new().expect("temp file");
+        fs::write(file.path(), "foo").expect("write original");
+        let mut session = start_vim_edit_session(VimEditRequest {
+            path: file.path().to_path_buf(),
+            nvim_executable: None,
+            steps: Vec::new(),
+            mode: VimEditMode::Preview,
+            sandbox: VimEditSandbox::Default,
+            timeout: Duration::from_secs(5),
+        })
+        .expect("start session");
+        session
+            .input(VimEditStep::Ex {
+                command: "%s/foo/bar/".to_string(),
+            })
+            .expect("substitute");
+        session.cancel();
+        assert_eq!(
+            fs::read_to_string(file.path()).expect("read original"),
+            "foo"
+        );
+    }
+
+    #[test]
+    fn interactive_session_sandbox_is_fixed_for_life_when_nvim_is_available() {
+        if !nvim_available() {
+            eprintln!("skipping Neovim integration test because `nvim` is not available");
+            return;
+        }
+        let file = NamedTempFile::new().expect("temp file");
+        fs::write(file.path(), "foo").expect("write original");
+        let mut session = start_vim_edit_session(VimEditRequest {
+            path: file.path().to_path_buf(),
+            nvim_executable: None,
+            steps: Vec::new(),
+            mode: VimEditMode::Preview,
+            sandbox: VimEditSandbox::Default,
+            timeout: Duration::from_secs(5),
+        })
+        .expect("start session");
+        let error = session
+            .input(VimEditStep::Ex {
+                command: "write /tmp/bcode-vim-edit-session-escape".to_string(),
+            })
+            .expect_err("write should remain blocked");
+        assert!(matches!(error, VimEditError::StepFailed { .. }));
+        session.cancel();
+    }
+
+    #[test]
+    fn interactive_session_start_missing_nvim_returns_clear_error() {
+        let file = NamedTempFile::new().expect("temp file");
+        fs::write(file.path(), "foo").expect("write original");
+        let Err(error) = start_vim_edit_session(VimEditRequest {
+            path: file.path().to_path_buf(),
+            nvim_executable: Some(PathBuf::from("definitely-missing-session-nvim")),
+            steps: Vec::new(),
+            mode: VimEditMode::Preview,
+            sandbox: VimEditSandbox::Default,
+            timeout: Duration::from_secs(1),
+        }) else {
+            panic!("missing nvim should fail");
+        };
+        assert!(matches!(error, VimEditError::StartNeovim { .. }));
+    }
 
     #[test]
     fn default_sandbox_rejects_unsafe_ex_commands() {
