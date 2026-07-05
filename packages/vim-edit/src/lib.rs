@@ -217,14 +217,13 @@ async fn run_vim_edit_inner(request: VimEditRequest) -> Result<VimEditResult, Vi
     let original = read_text_file(&request.path)?;
     let temp_file = temp_file_with_contents(&original)?;
     let session = NeovimSession::start(
-        temp_file.path(),
         request
             .nvim_executable
             .as_deref()
             .unwrap_or_else(|| Path::new(NVIM_EXECUTABLE)),
     )
     .await?;
-    let operation = run_vim_edit_session(&session, &request);
+    let operation = run_vim_edit_session(&session, &request, temp_file.path());
     let session_result = time::timeout(request.timeout, operation)
         .await
         .unwrap_or(Err(VimEditError::Timeout {
@@ -264,8 +263,10 @@ type SessionEditOutput = (
 async fn run_vim_edit_session(
     session: &NeovimSession,
     request: &VimEditRequest,
+    temp_path: &Path,
 ) -> Result<SessionEditOutput, VimEditError> {
     session.configure_isolation().await?;
+    session.edit_path(temp_path).await?;
 
     let mut previous_buffer = session.buffer_text().await?;
     let mut events = Vec::with_capacity(request.steps.len());
@@ -332,7 +333,7 @@ struct NeovimSession {
 }
 
 impl NeovimSession {
-    async fn start(path: &Path, executable: &Path) -> Result<Self, VimEditError> {
+    async fn start(executable: &Path) -> Result<Self, VimEditError> {
         let mut command = Command::new(executable);
         command
             .arg("--headless")
@@ -340,7 +341,6 @@ impl NeovimSession {
             .arg("-n")
             .arg("--noplugin")
             .arg("--embed")
-            .arg(path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -372,6 +372,19 @@ impl NeovimSession {
             self.nvim_command(command).await?;
         }
         Ok(())
+    }
+
+    async fn edit_path(&self, path: &Path) -> Result<(), VimEditError> {
+        let path_string = path.display().to_string();
+        let escaped = self
+            .nvim
+            .call_function("fnameescape", vec![Value::from(path_string)])
+            .await
+            .map_err(|error| VimEditError::Rpc(error.to_string()))?
+            .as_str()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| VimEditError::Rpc("fnameescape did not return a string".to_string()))?;
+        self.nvim_command(&format!("edit {escaped}")).await
     }
 
     async fn apply_step(&self, step: &VimEditStep) -> Result<(), VimEditError> {
@@ -751,6 +764,142 @@ mod tests {
             VimEditSandbox::DangerouslyDisabled,
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn default_sandbox_rejects_write_to_other_path_without_creating_file() {
+        let other_path =
+            std::env::temp_dir().join(format!("bcode-vim-edit-other-{}", std::process::id()));
+        let _ = fs::remove_file(&other_path);
+        let command = format!("write {}", other_path.display());
+        let result = reject_unsafe_step(&VimEditStep::Ex { command }, 0, VimEditSandbox::Default);
+        assert!(matches!(result, Err(VimEditError::UnsafeCommand { .. })));
+        assert!(!other_path.exists());
+    }
+
+    #[test]
+    fn default_sandbox_rejects_edit_escape_command() {
+        let result = reject_unsafe_step(
+            &VimEditStep::Ex {
+                command: "edit /tmp/other".to_string(),
+            },
+            0,
+            VimEditSandbox::Default,
+        );
+        assert!(matches!(result, Err(VimEditError::UnsafeCommand { .. })));
+    }
+
+    #[test]
+    fn default_sandbox_rejects_shell_escape_command() {
+        let result = reject_unsafe_step(
+            &VimEditStep::Ex {
+                command: "!echo unsafe".to_string(),
+            },
+            0,
+            VimEditSandbox::Default,
+        );
+        assert!(matches!(result, Err(VimEditError::UnsafeCommand { .. })));
+    }
+
+    #[test]
+    fn dangerous_bypass_is_not_default_for_requests() {
+        let request = VimEditRequest {
+            path: PathBuf::from("example.txt"),
+            nvim_executable: None,
+            steps: Vec::new(),
+            mode: VimEditMode::Preview,
+            sandbox: VimEditSandbox::Default,
+            timeout: Duration::from_secs(1),
+        };
+        assert_eq!(request.sandbox, VimEditSandbox::Default);
+    }
+
+    #[test]
+    fn large_file_is_rejected_before_spawning_nvim() {
+        let file = NamedTempFile::new().expect("temp file");
+        file.as_file()
+            .set_len(MAX_FILE_BYTES.saturating_add(1))
+            .expect("extend file");
+        let error = run_vim_edit(VimEditRequest {
+            path: file.path().to_path_buf(),
+            nvim_executable: Some(PathBuf::from("definitely-missing-bcode-nvim")),
+            steps: Vec::new(),
+            mode: VimEditMode::Preview,
+            sandbox: VimEditSandbox::Default,
+            timeout: Duration::from_secs(1),
+        })
+        .expect_err("large file should fail before nvim spawn");
+        assert!(matches!(error, VimEditError::FileTooLarge { .. }));
+    }
+
+    #[test]
+    fn non_utf8_file_is_rejected_before_spawning_nvim() {
+        let file = NamedTempFile::new().expect("temp file");
+        fs::write(file.path(), [0xff, 0xfe, 0xfd]).expect("write non-utf8");
+        let error = run_vim_edit(VimEditRequest {
+            path: file.path().to_path_buf(),
+            nvim_executable: Some(PathBuf::from("definitely-missing-bcode-nvim")),
+            steps: Vec::new(),
+            mode: VimEditMode::Preview,
+            sandbox: VimEditSandbox::Default,
+            timeout: Duration::from_secs(1),
+        })
+        .expect_err("non-utf8 file should fail before nvim spawn");
+        assert!(matches!(error, VimEditError::NonUtf8 { .. }));
+    }
+
+    #[test]
+    fn dangerous_bypass_preview_still_does_not_write_real_file_when_nvim_is_available() {
+        if !nvim_available() {
+            eprintln!("skipping Neovim integration test because `nvim` is not available");
+            return;
+        }
+        let file = NamedTempFile::new().expect("temp file");
+        fs::write(file.path(), "foo").expect("write original");
+        let result = run_vim_edit(VimEditRequest {
+            path: file.path().to_path_buf(),
+            nvim_executable: None,
+            steps: vec![VimEditStep::Ex {
+                command: "s/foo/bar/".to_string(),
+            }],
+            mode: VimEditMode::Preview,
+            sandbox: VimEditSandbox::DangerouslyDisabled,
+            timeout: Duration::from_secs(5),
+        })
+        .expect("run vim edit");
+        assert!(result.changed);
+        assert!(!result.diff.is_empty());
+        assert!(!result.events.is_empty());
+        assert_eq!(
+            fs::read_to_string(file.path()).expect("read original"),
+            "foo"
+        );
+    }
+
+    #[test]
+    fn modeline_does_not_execute_when_nvim_is_available() {
+        if !nvim_available() {
+            eprintln!("skipping Neovim integration test because `nvim` is not available");
+            return;
+        }
+        let file = NamedTempFile::new().expect("temp file");
+        fs::write(file.path(), "# vim: set nomodifiable:\nfoo bar").expect("write original");
+        let result = run_vim_edit(VimEditRequest {
+            path: file.path().to_path_buf(),
+            nvim_executable: None,
+            steps: vec![VimEditStep::Ex {
+                command: "%s/foo/baz/".to_string(),
+            }],
+            mode: VimEditMode::Apply,
+            sandbox: VimEditSandbox::Default,
+            timeout: Duration::from_secs(5),
+        })
+        .expect("modeline should not make buffer unmodifiable");
+        assert!(result.changed);
+        assert_eq!(
+            fs::read_to_string(file.path()).expect("read edited"),
+            "# vim: set nomodifiable:\nbaz bar"
+        );
     }
 
     #[test]
