@@ -18,6 +18,8 @@ build_tools = [
     "filesystem.stat",
     "filesystem.write",
     "filesystem.edit",
+    "vim_edit.preview",
+    "vim_edit.apply",
     "web.search",
     "web.fetch",
     "web.status",
