@@ -526,9 +526,9 @@ fn terminal_output_artifact(
     tool_call_id: &str,
     tool_name: Option<&str>,
     request_visual: Option<&bcode_session_models::PluginVisualDescriptor>,
+    arguments_json: Option<&str>,
     text: &str,
-    columns: u16,
-    rows: u16,
+    dimensions: (u16, u16),
     started_at_ms: Option<u64>,
 ) -> ToolArtifact {
     let visual = request_visual;
@@ -544,13 +544,19 @@ fn terminal_output_artifact(
     let mut metadata =
         visual.map_or_else(|| serde_json::json!({}), |visual| visual.payload.clone());
     if let Some(object) = metadata.as_object_mut() {
+        if !object.contains_key("arguments")
+            && let Some(arguments_json) = arguments_json
+            && let Ok(arguments) = serde_json::from_str::<serde_json::Value>(arguments_json)
+        {
+            object.insert("arguments".to_owned(), arguments);
+        }
         object.insert(
             "_bcode_runtime".to_owned(),
             serde_json::json!({
                 "surface": "terminal_output",
                 "output": text,
-                "columns": columns,
-                "rows": rows,
+                "columns": dimensions.0,
+                "rows": dimensions.1,
                 "started_at_ms": started_at_ms,
                 "finished_at_ms": null,
                 "exit_code": null,
@@ -628,18 +634,18 @@ pub fn streaming_terminal_output_item(
     tool_call_id: &str,
     tool_name: Option<&str>,
     request_visual: Option<&bcode_session_models::PluginVisualDescriptor>,
+    arguments_json: Option<&str>,
     text: &str,
-    columns: u16,
-    rows: u16,
+    dimensions: (u16, u16),
     started_at_ms: Option<u64>,
 ) -> TranscriptItem {
     let artifact = terminal_output_artifact(
         tool_call_id,
         tool_name,
         request_visual,
+        arguments_json,
         text,
-        columns,
-        rows,
+        dimensions,
         started_at_ms,
     );
     TranscriptItem::with_kind(
@@ -771,6 +777,14 @@ pub fn artifact_tool_result_item(
     is_error: bool,
 ) -> TranscriptItem {
     let result = artifact_summary_text(artifact);
+    let mut artifact = artifact.clone();
+    if let Some(arguments_json) = arguments_json
+        && let Some(object) = artifact.metadata.as_object_mut()
+        && !object.contains_key("arguments")
+        && let Ok(arguments) = serde_json::from_str::<serde_json::Value>(arguments_json)
+    {
+        object.insert("arguments".to_owned(), arguments);
+    }
     TranscriptItem::with_kind(
         if is_error { "Tool error" } else { "Tool" },
         result.clone(),
@@ -780,7 +794,7 @@ pub fn artifact_tool_result_item(
             tool_name: tool_name.map(ToOwned::to_owned),
             arguments_json: arguments_json.map(ToOwned::to_owned),
             result,
-            artifact: Some(Box::new(artifact.clone())),
+            artifact: Some(Box::new(artifact)),
             is_error,
         },
     )
@@ -1406,9 +1420,9 @@ fn apply_tool_invocation_stream_event(
                 tool_call_id,
                 context.map(|context| context.tool_name.as_str()),
                 context.and_then(|context| context.request_visual.as_ref()),
+                context.map(|context| context.arguments_json.as_str()),
                 "",
-                columns,
-                rows,
+                (columns, rows),
                 *started_at_ms,
             );
             let index = upsert_terminal_output_item(items, item);
@@ -1450,9 +1464,9 @@ fn apply_tool_invocation_stream_event(
                 tool_call_id,
                 context.map(|context| context.tool_name.as_str()),
                 context.and_then(|context| context.request_visual.as_ref()),
+                context.map(|context| context.arguments_json.as_str()),
                 text,
-                columns,
-                rows,
+                (columns, rows),
                 started_at_ms,
             );
             let index = upsert_terminal_output_item(items, item);

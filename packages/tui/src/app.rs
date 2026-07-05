@@ -2861,9 +2861,9 @@ impl BmuxApp {
                         tool_context
                             .and_then(|context| context.request_visual.as_ref())
                             .or_else(|| live_preview.map(|state| &state.preview.visual)),
+                        tool_context.map(|context| context.arguments_json.as_str()),
                         "",
-                        columns,
-                        rows,
+                        (columns, rows),
                         *started_at_ms,
                     );
                     let index = self.transcript.upsert_terminal_output_item(item);
@@ -2989,9 +2989,9 @@ impl BmuxApp {
             tool_context
                 .and_then(|context| context.request_visual.as_ref())
                 .or_else(|| live_preview.map(|state| &state.preview.visual)),
+            tool_context.map(|context| context.arguments_json.as_str()),
             text,
-            columns,
-            rows,
+            (columns, rows),
             started_at_ms,
         );
         let index = self.transcript.upsert_terminal_output_item(item);
