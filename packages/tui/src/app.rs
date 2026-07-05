@@ -3798,7 +3798,41 @@ fn render_visual_status_template(
             }
         }
     }
-    rendered
+    clean_unresolved_status_placeholders(&rendered)
+}
+
+fn clean_unresolved_status_placeholders(value: &str) -> String {
+    let mut cleaned = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '{' {
+            let mut placeholder = String::new();
+            let mut closed = false;
+            for next in chars.by_ref() {
+                if next == '}' {
+                    closed = true;
+                    break;
+                }
+                placeholder.push(next);
+            }
+            if closed && !placeholder.is_empty() {
+                continue;
+            }
+            cleaned.push('{');
+            cleaned.push_str(&placeholder);
+            if closed {
+                cleaned.push('}');
+            }
+        } else {
+            cleaned.push(ch);
+        }
+    }
+    cleaned
+        .split('·')
+        .map(|segment| segment.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 fn format_provider_bytes(bytes: usize) -> String {
@@ -3974,5 +4008,32 @@ fn derive_session_title_from_prompt(prompt: &str) -> String {
         out
     } else {
         squished
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visual_status_template_omits_unresolved_placeholders() {
+        let preview = LiveToolArgumentPreview {
+            visual: bcode_session_models::PluginVisualDescriptor {
+                producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                schema: "bcode.filesystem.change".to_owned(),
+                schema_version: 1,
+                title: Some("Edit preview".to_owned()),
+                subtitle: Some("editing {path} · {bytes}".to_owned()),
+                payload: serde_json::json!({
+                    "new_text": "hello"
+                }),
+            },
+            streaming_status: Some("editing {path} · {bytes}".to_owned()),
+            argument_bytes: 20,
+        };
+
+        let rendered = render_visual_status_template("editing {path} · {bytes}", &preview, "20 B");
+
+        assert_eq!(rendered, "editing · 20 B");
     }
 }

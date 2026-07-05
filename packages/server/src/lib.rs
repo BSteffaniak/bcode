@@ -8270,7 +8270,41 @@ fn render_live_status_template(template: &str, fields: &StreamingJsonStringField
     for (name, field) in &fields.fields {
         rendered = rendered.replace(&format!("{{{name}}}"), &field.value);
     }
-    rendered
+    clean_unresolved_status_placeholders(&rendered)
+}
+
+fn clean_unresolved_status_placeholders(value: &str) -> String {
+    let mut cleaned = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '{' {
+            let mut placeholder = String::new();
+            let mut closed = false;
+            for next in chars.by_ref() {
+                if next == '}' {
+                    closed = true;
+                    break;
+                }
+                placeholder.push(next);
+            }
+            if closed && !placeholder.is_empty() {
+                continue;
+            }
+            cleaned.push('{');
+            cleaned.push_str(&placeholder);
+            if closed {
+                cleaned.push('}');
+            }
+        } else {
+            cleaned.push(ch);
+        }
+    }
+    cleaned
+        .split('·')
+        .map(|segment| segment.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 #[derive(Debug, Clone)]
@@ -18546,6 +18580,16 @@ mod tests {
         };
         assert_eq!(result, "legacy text");
         assert_eq!(persisted_semantic_result, Some(semantic_result));
+    }
+
+    #[test]
+    fn live_status_template_omits_unresolved_placeholders() {
+        let mut fields = StreamingJsonStringFields::default();
+        fields.push(r#"{"contents":"hello"}"#);
+
+        let rendered = render_live_status_template("editing {path} · {bytes}", &fields);
+
+        assert_eq!(rendered, "editing · 20");
     }
 
     #[test]
