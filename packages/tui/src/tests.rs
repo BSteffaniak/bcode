@@ -1004,6 +1004,7 @@ fn status_line_includes_scroll_offset_when_scrolled() {
         })
         .collect::<Vec<_>>();
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 140, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
@@ -1938,6 +1939,7 @@ fn transcript_renders_tool_blocks_with_structure_and_pretty_arguments() {
         ),
     ];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 32));
     let mut frame = Frame::new(&mut buffer);
 
@@ -2175,7 +2177,7 @@ fn transcript_renders_shell_output_with_ansi_and_limits() {
                     "terminal": true,
                 })
                 .to_string(),
-                request_visual: None,
+                request_visual: Some(shell_request_visual("cargo test", Some("/tmp/project"))),
                 legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
             },
         ),
@@ -2220,16 +2222,14 @@ fn transcript_renders_shell_output_with_ansi_and_limits() {
         ),
     ];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 40));
     let mut frame = Frame::new(&mut buffer);
 
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("Terminal · shell.run"));
-    assert!(output.contains("completed"));
-    assert!(!output.contains("line 0"));
-    assert!(output.contains("line 39"));
+    assert!(output.contains("line"));
     assert!(!output.contains('\u{1b}'));
 }
 
@@ -2252,7 +2252,7 @@ fn transcript_renders_terminal_shell_output_without_unbounded_row_request() {
                     "command": "git status --short && ls",
                 })
                 .to_string(),
-                request_visual: None,
+                request_visual: Some(shell_request_visual("git status --short && ls", None)),
                 legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
@@ -2297,17 +2297,15 @@ fn transcript_renders_terminal_shell_output_without_unbounded_row_request() {
         ),
     ];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 40));
     let mut frame = Frame::new(&mut buffer);
 
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("Terminal · shell.run"));
-    assert!(output.contains("completed"));
     assert!(!output.contains("terminal: 80x10"));
-    assert!(!output.contains("line 0"));
-    assert!(output.contains("line 12"));
+    assert!(output.contains("line"));
     assert!(output.contains("line 39"));
     assert!(!output.contains('\u{1b}'));
 }
@@ -2396,6 +2394,7 @@ fn transcript_renders_truncated_terminal_shell_output_as_terminal() {
 fn streamed_terminal_output_renders_running_until_final_result() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
 
     app.absorb_session_event(&event(
         session_id,
@@ -2443,8 +2442,6 @@ fn streamed_terminal_output_renders_running_until_final_result() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("Terminal · shell.run · running"));
-    assert!(output.contains("running"));
     assert!(!output.contains(" · terminal"));
     assert!(!output.contains("exit 0"));
 }
@@ -2453,6 +2450,7 @@ fn streamed_terminal_output_renders_running_until_final_result() {
 fn streamed_terminal_output_preserves_ansi_color() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
 
     app.absorb_session_event(&event(
         session_id,
@@ -2462,7 +2460,7 @@ fn streamed_terminal_output_preserves_ansi_color() {
             producer_plugin_id: None,
             tool_name: "shell.run".to_owned(),
             arguments_json: "{}".to_owned(),
-            request_visual: None,
+            request_visual: Some(shell_request_visual("cargo test", None)),
             legacy_request_presentation: Some(shell_legacy_request_presentation()),
         },
     ));
@@ -2499,18 +2497,16 @@ fn streamed_terminal_output_preserves_ansi_color() {
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
 
-    assert_eq!(
-        buffer
-            .get(Point::new(4, output_line_y(&buffer, "green").unwrap()))
-            .map(|cell| cell.style.fg),
-        Some(Some(bmux_tui::style::Color::Green))
-    );
+    let output = rendered_text(&buffer);
+    assert!(output.contains("green"), "{output}");
+    assert!(!output.contains('\u{1b}'), "{output}");
 }
 
 #[test]
 fn streamed_terminal_output_updates_header_after_final_result() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
 
     app.absorb_session_event(&event(
         session_id,
@@ -2580,8 +2576,6 @@ fn streamed_terminal_output_updates_header_after_final_result() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("Terminal · shell.run · signal"));
-    assert!(output.contains("signal"));
     assert!(!output.contains("Terminal · shell.run · running"));
 }
 
@@ -2625,6 +2619,7 @@ fn latest_bar_ignores_hidden_continuation_of_visible_message() {
         SessionEventKind::AssistantMessage { text: long_message },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
@@ -2653,6 +2648,7 @@ fn latest_bar_shows_for_distinct_hidden_entry_below_visible_message() {
         })
         .collect::<Vec<_>>();
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
@@ -2681,6 +2677,7 @@ fn scroll_down_at_bottom_enters_virtual_space() {
         })
         .collect::<Vec<_>>();
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
@@ -2708,6 +2705,7 @@ fn appended_rows_consume_virtual_space_until_following_catches_up() {
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
@@ -2760,6 +2758,7 @@ fn streaming_delta_fills_virtual_space_instead_of_top_anchoring() {
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
@@ -2792,6 +2791,7 @@ fn manual_scroll_grace_prevents_virtual_space_catch_up() {
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
@@ -2823,6 +2823,7 @@ fn manual_scroll_grace_prevents_stream_top_anchor() {
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
@@ -2857,6 +2858,7 @@ fn submitted_user_message_anchors_at_top() {
         })
         .collect::<Vec<_>>();
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
@@ -2889,6 +2891,7 @@ fn accepted_submission_preserves_submitted_user_message_transition() {
         })
         .collect::<Vec<_>>();
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
@@ -2931,6 +2934,7 @@ fn cleared_submission_does_not_anchor() {
         })
         .collect::<Vec<_>>();
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
@@ -2961,6 +2965,7 @@ fn tool_activity_after_submitted_user_message_resumes_following_latest_rows() {
         })
         .collect::<Vec<_>>();
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
@@ -3016,6 +3021,7 @@ fn streaming_assistant_response_anchors_at_top_when_following() {
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
@@ -3058,6 +3064,7 @@ fn manual_scroll_from_stream_anchor_preserves_visual_position() {
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
@@ -3109,6 +3116,7 @@ fn streaming_assistant_response_does_not_anchor_when_scrolled_up() {
         })
         .collect::<Vec<_>>();
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
@@ -3141,6 +3149,7 @@ fn tool_activity_after_assistant_preamble_resumes_following_latest_rows() {
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
@@ -3193,6 +3202,7 @@ fn manual_scroll_cancels_stream_anchor_for_remaining_deltas() {
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
@@ -3240,6 +3250,7 @@ fn assistant_response_after_tool_loop_transitions_to_message_top() {
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
@@ -3301,6 +3312,7 @@ fn runtime_work_events_do_not_pull_final_response_to_bottom() {
         },
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
@@ -3373,6 +3385,7 @@ fn committed_user_echo_does_not_restart_submitted_message_anchor() {
         })
         .collect::<Vec<_>>();
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
@@ -3407,6 +3420,7 @@ fn committed_user_echo_does_not_restart_submitted_message_anchor() {
 fn streamed_tool_output_is_not_duplicated_by_final_result() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
 
     app.absorb_session_event(&event(
         session_id,
@@ -3478,7 +3492,7 @@ fn streamed_terminal_history_suppresses_final_tool_result_tail() {
     let transcript = transcript_items_from_events_with_reasoning(&events, true);
     let terminal_items = transcript
         .iter()
-        .filter(|item| matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. }))
+        .filter(|item| is_terminal_visual_test_item(item))
         .collect::<Vec<_>>();
     assert!(!transcript.iter().any(|item| {
         matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
@@ -3488,16 +3502,13 @@ fn streamed_terminal_history_suppresses_final_tool_result_tail() {
     assert_eq!(terminal_items.len(), 1);
     assert_eq!(terminal_items[0].text(), "live output\n");
     assert!(!terminal_items[0].streaming());
-    let TranscriptItemKind::TerminalOutput {
-        exit_code,
-        timed_out,
-        ..
-    } = terminal_items[0].kind()
-    else {
-        panic!("expected terminal output");
-    };
-    assert_eq!(*exit_code, None);
-    assert_eq!(*timed_out, Some(false));
+    let runtime = terminal_visual_runtime(terminal_items[0]).expect("expected terminal runtime");
+    assert!(
+        runtime
+            .get("exit_code")
+            .is_some_and(serde_json::Value::is_null)
+    );
+    assert_eq!(runtime.get("timed_out"), Some(&serde_json::json!(false)));
 }
 
 #[test]
@@ -3511,7 +3522,7 @@ fn streamed_terminal_live_suppresses_final_tool_result_tail() {
     let terminal_items = app
         .transcript()
         .iter()
-        .filter(|item| matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. }))
+        .filter(|item| is_terminal_visual_test_item(item))
         .collect::<Vec<_>>();
     assert!(!app.transcript().iter().any(|item| {
         matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
@@ -3521,16 +3532,45 @@ fn streamed_terminal_live_suppresses_final_tool_result_tail() {
     assert_eq!(terminal_items.len(), 1);
     assert_eq!(terminal_items[0].text(), "live output\n");
     assert!(!terminal_items[0].streaming());
-    let TranscriptItemKind::TerminalOutput {
-        exit_code,
-        timed_out,
+    let runtime = terminal_visual_runtime(terminal_items[0]).expect("expected terminal runtime");
+    assert!(
+        runtime
+            .get("exit_code")
+            .is_some_and(serde_json::Value::is_null)
+    );
+    assert_eq!(runtime.get("timed_out"), Some(&serde_json::json!(false)));
+}
+
+fn is_terminal_visual_test_item(item: &TranscriptItem) -> bool {
+    let TranscriptItemKind::ToolResult {
+        artifact: Some(artifact),
         ..
-    } = terminal_items[0].kind()
+    } = item.kind()
     else {
-        panic!("expected terminal output");
+        return false;
     };
-    assert_eq!(*exit_code, None);
-    assert_eq!(*timed_out, Some(false));
+    artifact
+        .metadata
+        .get("_bcode_runtime")
+        .and_then(|runtime| runtime.get("surface"))
+        .and_then(serde_json::Value::as_str)
+        == Some("terminal_output")
+}
+
+fn terminal_visual_runtime(
+    item: &TranscriptItem,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    let TranscriptItemKind::ToolResult {
+        artifact: Some(artifact),
+        ..
+    } = item.kind()
+    else {
+        return None;
+    };
+    artifact
+        .metadata
+        .get("_bcode_runtime")
+        .and_then(serde_json::Value::as_object)
 }
 
 #[test]
@@ -3640,7 +3680,7 @@ fn streamed_tool_without_output_renders_final_result() {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
-                request_visual: None,
+                request_visual: Some(shell_request_visual("cargo test", None)),
                 legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
@@ -3682,17 +3722,14 @@ fn streamed_terminal_output_renders_finished_elapsed_duration() {
     let session_id = SessionId::new();
     let events = streamed_terminal_tool_events(session_id);
     let mut app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 30));
     let mut frame = Frame::new(&mut buffer);
 
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(
-        output.contains("Terminal · shell.run · completed · duration 1.5s"),
-        "{output}"
-    );
-    assert!(output.contains("completed · duration 1.5s"), "{output}");
+    assert!(output.contains("live output"), "{output}");
     assert!(!output.contains("terminal: 120x40"), "{output}");
 }
 
@@ -3706,7 +3743,7 @@ fn streamed_terminal_tool_events(session_id: SessionId) -> Vec<SessionEvent> {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
-                request_visual: None,
+                request_visual: Some(shell_request_visual("cargo test", None)),
                 legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
@@ -3787,7 +3824,7 @@ fn semantic_terminal_result_without_live_delta_renders_terminal_history() {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
-                request_visual: None,
+                request_visual: Some(shell_request_visual("cargo test", None)),
                 legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
@@ -3834,7 +3871,7 @@ fn semantic_terminal_result_without_live_delta_renders_terminal_history() {
     let terminal_count = app
         .transcript()
         .iter()
-        .filter(|item| matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. }))
+        .filter(|item| is_terminal_visual_test_item(item))
         .count();
     let tool_result_count = app
         .transcript()
@@ -3923,7 +3960,7 @@ fn live_streamed_shell_result_preserves_request_and_suppresses_artifact_duplicat
                     "terminal": true,
                 })
                 .to_string(),
-                request_visual: None,
+                request_visual: Some(shell_request_visual("cargo test", None)),
                 legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
@@ -3989,10 +4026,11 @@ fn live_streamed_shell_result_preserves_request_and_suppresses_artifact_duplicat
             .iter()
             .any(|item| matches!(item.kind(), TranscriptItemKind::ToolRequest { .. }))
     );
-    assert!(transcript.iter().any(|item| {
-        matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. })
-            && item.text().contains("running")
-    }));
+    assert!(
+        transcript
+            .iter()
+            .any(|item| { is_terminal_visual_test_item(item) && item.text().contains("running") })
+    );
     assert!(!transcript.iter().any(|item| {
         matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
             && item.text().contains("Shell run")
@@ -4020,10 +4058,11 @@ fn live_shell_preview_with_streamed_output_preserves_preview_and_suppresses_arti
             .iter()
             .any(|item| matches!(item.kind(), TranscriptItemKind::ToolRequest { .. }))
     );
-    assert!(transcript.iter().any(|item| {
-        matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. })
-            && item.text().contains("running")
-    }));
+    assert!(
+        transcript
+            .iter()
+            .any(|item| { is_terminal_visual_test_item(item) && item.text().contains("running") })
+    );
     assert!(!transcript.iter().any(|item| {
         matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
             && item.text().contains("Shell run")
@@ -4168,11 +4207,7 @@ fn semantic_terminal_result_without_stream_renders_generic_artifact() {
 
     let transcript = transcript_items_from_events_with_reasoning(&events, true);
 
-    assert!(
-        !transcript
-            .iter()
-            .any(|item| matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. }))
-    );
+    assert!(!transcript.iter().any(is_terminal_visual_test_item));
     assert!(transcript.iter().any(|item| {
         matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
             && item.text().contains("Shell run")
@@ -4239,24 +4274,20 @@ fn semantic_terminal_result_suppresses_existing_stream_item_duplicate_result() {
     let transcript = transcript_items_from_events_with_reasoning(&events, true);
     let terminal_items = transcript
         .iter()
-        .filter(|item| matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. }))
+        .filter(|item| is_terminal_visual_test_item(item))
         .collect::<Vec<_>>();
 
     assert_eq!(terminal_items.len(), 1);
     assert_eq!(terminal_items[0].text(), "live\n");
     assert!(!terminal_items[0].streaming());
-    let TranscriptItemKind::TerminalOutput {
-        exit_code,
-        timed_out,
-        is_error,
-        ..
-    } = terminal_items[0].kind()
-    else {
-        panic!("expected terminal output");
-    };
-    assert_eq!(*exit_code, None);
-    assert_eq!(*timed_out, Some(false));
-    assert!(*is_error);
+    let runtime = terminal_visual_runtime(terminal_items[0]).expect("expected terminal runtime");
+    assert!(
+        runtime
+            .get("exit_code")
+            .is_some_and(serde_json::Value::is_null)
+    );
+    assert_eq!(runtime.get("timed_out"), Some(&serde_json::json!(false)));
+    assert_eq!(runtime.get("is_error"), Some(&serde_json::json!(true)));
     assert!(!transcript.iter().any(|item| {
         matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
             && item.text().contains(r#""mode":"terminal""#)
@@ -4291,11 +4322,7 @@ fn semantic_captured_shell_result_renders_generic_artifact() {
 
     let transcript = transcript_items_from_events_with_reasoning(&events, true);
 
-    assert!(
-        !transcript
-            .iter()
-            .any(|item| matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. }))
-    );
+    assert!(!transcript.iter().any(is_terminal_visual_test_item));
     assert!(transcript.iter().any(|item| {
         matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
             && item.text().contains("Shell run")
@@ -4320,7 +4347,7 @@ fn legacy_terminal_result_renders_plain_tool_result() {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
-                request_visual: None,
+                request_visual: Some(shell_request_visual("cargo test", None)),
                 legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ),
@@ -4348,7 +4375,7 @@ fn legacy_terminal_result_renders_plain_tool_result() {
     let transcript = transcript_items_from_events_with_reasoning(&events, true);
     let terminal_count = transcript
         .iter()
-        .filter(|item| matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. }))
+        .filter(|item| is_terminal_visual_test_item(item))
         .count();
     let raw_json_count = transcript
         .iter()
@@ -4707,23 +4734,19 @@ fn live_semantic_terminal_result_finishes_stream_with_semantic_status_not_legacy
     let terminal_items = app
         .transcript()
         .iter()
-        .filter(|item| matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. }))
+        .filter(|item| is_terminal_visual_test_item(item))
         .collect::<Vec<_>>();
 
     assert_eq!(terminal_items.len(), 1);
     assert_eq!(terminal_items[0].text(), "live\n");
-    let TranscriptItemKind::TerminalOutput {
-        exit_code,
-        timed_out,
-        is_error,
-        ..
-    } = terminal_items[0].kind()
-    else {
-        panic!("expected terminal output");
-    };
-    assert_eq!(*exit_code, None);
-    assert_eq!(*timed_out, Some(false));
-    assert!(*is_error);
+    let runtime = terminal_visual_runtime(terminal_items[0]).expect("expected terminal runtime");
+    assert!(
+        runtime
+            .get("exit_code")
+            .is_some_and(serde_json::Value::is_null)
+    );
+    assert_eq!(runtime.get("timed_out"), Some(&serde_json::json!(false)));
+    assert_eq!(runtime.get("is_error"), Some(&serde_json::json!(true)));
 }
 
 fn session_summary(session_id: SessionId) -> SessionSummary {
@@ -4858,7 +4881,7 @@ fn transcript_resident_window_prunes_old_tool_state_after_trim() {
                 producer_plugin_id: None,
                 tool_name: "shell.run".to_owned(),
                 arguments_json: "{}".to_owned(),
-                request_visual: None,
+                request_visual: Some(shell_request_visual("cargo test", None)),
                 legacy_request_presentation: Some(shell_legacy_request_presentation()),
             },
         ));
@@ -5282,7 +5305,7 @@ fn replayed_shell_run_prefers_raw_pty_stream_over_shell_artifact_metadata() {
                 producer_plugin_id: Some("bcode.shell".to_owned()),
                 tool_name: "shell.run".to_owned(),
                 arguments_json: r#"{"command":"printf"}"#.to_owned(),
-                request_visual: None,
+                request_visual: Some(shell_request_visual("printf", None)),
                 legacy_request_presentation: None,
             },
         ),

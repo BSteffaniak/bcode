@@ -51,31 +51,6 @@ pub enum TranscriptItemKind {
         /// Whether the tool failed.
         is_error: bool,
     },
-    /// Live or replayed terminal output from a tool.
-    TerminalOutput {
-        /// Provider tool call identifier.
-        tool_call_id: String,
-        /// Tool name, when the matching request is known.
-        tool_name: Option<String>,
-        /// Plugin-owned request visual associated with this terminal output.
-        request_visual: Option<bcode_session_models::PluginVisualDescriptor>,
-        /// Raw terminal stream decoded as UTF-8.
-        output: String,
-        /// Terminal columns used by the producer.
-        columns: u16,
-        /// Terminal rows used by the producer.
-        rows: u16,
-        /// Unix timestamp in milliseconds when execution started.
-        started_at_ms: Option<u64>,
-        /// Unix timestamp in milliseconds when execution finished.
-        finished_at_ms: Option<u64>,
-        /// Process exit code once known.
-        exit_code: Option<i32>,
-        /// Whether execution timed out once known.
-        timed_out: Option<bool>,
-        /// Whether the terminal command failed once finished.
-        is_error: bool,
-    },
     /// Token usage telemetry for a model turn.
     Usage {
         /// Model turn identifier.
@@ -151,8 +126,6 @@ pub enum ToolTranscriptSurface {
     Request,
     /// Live-only argument preview used as richer request context.
     LiveArgumentPreview,
-    /// Streamed terminal or textual output.
-    StreamOutput,
     /// Generic or semantic tool result.
     Result,
     /// Permission or interactive tool request/resolution flow.
@@ -170,9 +143,6 @@ pub const fn tool_surface_for_item(item: &TranscriptItem) -> Option<(&str, ToolT
             tool_call_id.as_str(),
             ToolTranscriptSurface::LiveArgumentPreview,
         )),
-        TranscriptItemKind::TerminalOutput { tool_call_id, .. } => {
-            Some((tool_call_id.as_str(), ToolTranscriptSurface::StreamOutput))
-        }
         TranscriptItemKind::ToolResult { tool_call_id, .. } => {
             Some((tool_call_id.as_str(), ToolTranscriptSurface::Result))
         }
@@ -313,65 +283,71 @@ impl TranscriptItem {
     /// Append text to this transcript item.
     pub fn append_text(&mut self, text: &str) {
         self.text.push_str(text);
-        match &mut self.kind {
-            TranscriptItemKind::ToolResult { result, .. }
-            | TranscriptItemKind::TerminalOutput { output: result, .. } => {
-                result.push_str(text);
+        if let TranscriptItemKind::ToolResult {
+            result, artifact, ..
+        } = &mut self.kind
+        {
+            result.push_str(text);
+            if let Some(artifact) = artifact.as_mut() {
+                append_terminal_artifact_output(artifact, text);
             }
-            _ => {}
         }
         self.bump_revision();
     }
 
     /// Mark a terminal output item as finished with final process metadata.
     #[allow(dead_code)]
-    pub const fn finish_terminal(
+    pub fn finish_terminal(
         &mut self,
         exit_code: Option<i32>,
         timed_out: bool,
         is_error: bool,
         finished_at_ms: Option<u64>,
     ) {
-        if let TranscriptItemKind::TerminalOutput {
-            finished_at_ms: terminal_finished_at_ms,
-            exit_code: terminal_exit_code,
-            timed_out: terminal_timed_out,
-            is_error: terminal_error,
+        if let TranscriptItemKind::ToolResult {
+            artifact,
+            is_error: tool_error,
             ..
         } = &mut self.kind
         {
-            if finished_at_ms.is_some() {
-                *terminal_finished_at_ms = finished_at_ms;
+            *tool_error = is_error;
+            if let Some(artifact) = artifact.as_mut() {
+                update_terminal_artifact_status(
+                    artifact,
+                    exit_code,
+                    timed_out,
+                    is_error,
+                    finished_at_ms,
+                );
             }
-            *terminal_exit_code = exit_code;
-            *terminal_timed_out = Some(timed_out);
-            *terminal_error = is_error;
         }
         self.streaming = false;
         self.bump_revision();
     }
 
     /// Mark a terminal output item as failed or successful.
-    pub const fn set_terminal_error(&mut self, is_error: bool) {
-        if let TranscriptItemKind::TerminalOutput {
-            is_error: terminal_error,
+    pub fn set_terminal_error(&mut self, is_error: bool) {
+        if let TranscriptItemKind::ToolResult {
+            artifact,
+            is_error: tool_error,
             ..
         } = &mut self.kind
         {
-            *terminal_error = is_error;
+            *tool_error = is_error;
+            if let Some(artifact) = artifact.as_mut() {
+                update_terminal_artifact_status(artifact, None, false, is_error, None);
+            }
             self.bump_revision();
         }
     }
 
     /// Set the terminal output finish timestamp.
     #[allow(dead_code)]
-    pub const fn set_terminal_finished_at(&mut self, finished_at_ms: Option<u64>) {
-        if let TranscriptItemKind::TerminalOutput {
-            finished_at_ms: terminal_finished_at_ms,
-            ..
-        } = &mut self.kind
-        {
-            *terminal_finished_at_ms = finished_at_ms;
+    pub fn set_terminal_finished_at(&mut self, finished_at_ms: Option<u64>) {
+        if let TranscriptItemKind::ToolResult { artifact, .. } = &mut self.kind {
+            if let Some(artifact) = artifact.as_mut() {
+                update_terminal_artifact_finished_at(artifact, finished_at_ms);
+            }
             self.bump_revision();
         }
     }
@@ -546,6 +522,106 @@ pub fn live_tool_preview_anchor_item(tool_call_id: &str, tool_name: &str) -> Tra
     )
 }
 
+fn terminal_output_artifact(
+    tool_call_id: &str,
+    tool_name: Option<&str>,
+    request_visual: Option<&bcode_session_models::PluginVisualDescriptor>,
+    text: &str,
+    columns: u16,
+    rows: u16,
+    started_at_ms: Option<u64>,
+) -> ToolArtifact {
+    let visual = request_visual;
+    let schema = visual.map_or("bcode.terminal.output", |visual| visual.schema.as_str());
+    let schema_version = visual.map_or(1, |visual| visual.schema_version);
+    let producer_plugin_id = visual
+        .and_then(|visual| visual.producer_plugin_id.clone())
+        .unwrap_or_else(|| "bcode.terminal".to_owned());
+    let title = visual
+        .and_then(|visual| visual.title.clone())
+        .or_else(|| tool_name.map(ToOwned::to_owned))
+        .unwrap_or_else(|| "Terminal output".to_owned());
+    let mut metadata =
+        visual.map_or_else(|| serde_json::json!({}), |visual| visual.payload.clone());
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert(
+            "_bcode_runtime".to_owned(),
+            serde_json::json!({
+                "surface": "terminal_output",
+                "output": text,
+                "columns": columns,
+                "rows": rows,
+                "started_at_ms": started_at_ms,
+                "finished_at_ms": null,
+                "exit_code": null,
+                "timed_out": null,
+                "is_error": false,
+                "streaming": true,
+            }),
+        );
+    }
+    ToolArtifact {
+        artifact_id: format!("{tool_call_id}-terminal-output"),
+        producer_plugin_id,
+        schema: schema.to_owned(),
+        schema_version,
+        tool_call_id: Some(tool_call_id.to_owned()),
+        title: Some(title),
+        metadata,
+        refs: Vec::new(),
+    }
+}
+
+fn terminal_artifact_runtime_mut(
+    artifact: &mut ToolArtifact,
+) -> Option<&mut serde_json::Map<String, serde_json::Value>> {
+    artifact.metadata.get_mut("_bcode_runtime")?.as_object_mut()
+}
+
+fn append_terminal_artifact_output(artifact: &mut ToolArtifact, text: &str) {
+    let Some(runtime) = terminal_artifact_runtime_mut(artifact) else {
+        return;
+    };
+    let output = runtime
+        .entry("output".to_owned())
+        .or_insert_with(|| serde_json::Value::String(String::new()));
+    if let serde_json::Value::String(output) = output {
+        output.push_str(text);
+    }
+}
+
+fn update_terminal_artifact_status(
+    artifact: &mut ToolArtifact,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    is_error: bool,
+    finished_at_ms: Option<u64>,
+) {
+    let Some(runtime) = terminal_artifact_runtime_mut(artifact) else {
+        return;
+    };
+    runtime.insert("exit_code".to_owned(), serde_json::json!(exit_code));
+    runtime.insert("timed_out".to_owned(), serde_json::json!(timed_out));
+    runtime.insert("is_error".to_owned(), serde_json::json!(is_error));
+    runtime.insert("streaming".to_owned(), serde_json::json!(false));
+    if finished_at_ms.is_some() {
+        runtime.insert(
+            "finished_at_ms".to_owned(),
+            serde_json::json!(finished_at_ms),
+        );
+    }
+}
+
+fn update_terminal_artifact_finished_at(artifact: &mut ToolArtifact, finished_at_ms: Option<u64>) {
+    let Some(runtime) = terminal_artifact_runtime_mut(artifact) else {
+        return;
+    };
+    runtime.insert(
+        "finished_at_ms".to_owned(),
+        serde_json::json!(finished_at_ms),
+    );
+}
+
 /// Build a streaming transcript item for live terminal output.
 #[must_use]
 pub fn streaming_terminal_output_item(
@@ -557,24 +633,46 @@ pub fn streaming_terminal_output_item(
     rows: u16,
     started_at_ms: Option<u64>,
 ) -> TranscriptItem {
+    let artifact = terminal_output_artifact(
+        tool_call_id,
+        tool_name,
+        request_visual,
+        text,
+        columns,
+        rows,
+        started_at_ms,
+    );
     TranscriptItem::with_kind(
-        "Terminal",
+        "Tool",
         text.to_owned(),
         true,
-        TranscriptItemKind::TerminalOutput {
+        TranscriptItemKind::ToolResult {
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.map(ToOwned::to_owned),
-            request_visual: request_visual.cloned(),
-            output: text.to_owned(),
-            columns,
-            rows,
-            started_at_ms,
-            finished_at_ms: None,
-            exit_code: None,
-            timed_out: None,
+            arguments_json: None,
+            result: text.to_owned(),
+            artifact: Some(Box::new(artifact)),
             is_error: false,
         },
     )
+}
+
+fn terminal_output_tool_call_id(item: &TranscriptItem) -> Option<&str> {
+    let TranscriptItemKind::ToolResult {
+        tool_call_id,
+        artifact: Some(artifact),
+        ..
+    } = item.kind()
+    else {
+        return None;
+    };
+    let is_terminal = artifact
+        .metadata
+        .get("_bcode_runtime")
+        .and_then(|runtime| runtime.get("surface"))
+        .and_then(serde_json::Value::as_str)
+        == Some("terminal_output");
+    is_terminal.then_some(tool_call_id.as_str())
 }
 
 /// Upsert a streaming terminal output item for a tool call.
@@ -583,23 +681,15 @@ pub fn streaming_terminal_output_item(
 /// replacing an existing request/preview placeholder instead of creating a
 /// second block for terminal output.
 pub fn upsert_terminal_output_item(items: &mut Vec<TranscriptItem>, item: TranscriptItem) -> usize {
-    let tool_call_id = if let TranscriptItemKind::TerminalOutput { tool_call_id, .. } = item.kind()
-    {
-        tool_call_id.clone()
-    } else {
+    let Some(tool_call_id) = terminal_output_tool_call_id(&item).map(ToOwned::to_owned) else {
         items.push(item);
         return items.len().saturating_sub(1);
     };
 
-    if let Some(index) = items.iter().position(|existing| {
-        matches!(
-            existing.kind(),
-            TranscriptItemKind::TerminalOutput {
-                tool_call_id: item_tool_call_id,
-                ..
-            } if item_tool_call_id == &tool_call_id
-        )
-    }) {
+    if let Some(index) = items
+        .iter()
+        .position(|existing| terminal_output_tool_call_id(existing) == Some(tool_call_id.as_str()))
+    {
         if !item.text().is_empty() {
             items[index].append_text(item.text());
         }

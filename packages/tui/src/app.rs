@@ -420,7 +420,7 @@ struct PermissionRequestInput<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FinishedStreamedToolOutput {
     PlainToolResult,
-    TerminalOutput,
+    TerminalVisual,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2530,18 +2530,26 @@ impl BmuxApp {
         now_system: SystemTime,
     ) -> impl Iterator<Item = InvalidationRequest> + '_ {
         self.transcript.iter().filter_map(move |item| {
-            let TranscriptItemKind::TerminalOutput {
+            let TranscriptItemKind::ToolResult {
                 tool_call_id,
-                started_at_ms: Some(started_at_ms),
-                finished_at_ms,
+                artifact: Some(artifact),
                 ..
             } = item.kind()
             else {
                 return None;
             };
+            let runtime = artifact.metadata.get("_bcode_runtime")?;
+            if runtime.get("surface").and_then(serde_json::Value::as_str) != Some("terminal_output")
+            {
+                return None;
+            }
+            let started_at_ms = runtime.get("started_at_ms")?.as_u64()?;
+            let finished_at_ms = runtime
+                .get("finished_at_ms")
+                .and_then(serde_json::Value::as_u64);
             next_elapsed_invalidation_capped(
-                *started_at_ms,
-                *finished_at_ms,
+                started_at_ms,
+                finished_at_ms,
                 now,
                 now_system,
                 TOOL_ELAPSED_INVALIDATION_FRAME,
@@ -2718,8 +2726,8 @@ impl BmuxApp {
         let output_kind = self.transcript.get(index).map_or(
             FinishedStreamedToolOutput::PlainToolResult,
             |item| {
-                if matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. }) {
-                    FinishedStreamedToolOutput::TerminalOutput
+                if is_terminal_visual_item(item) {
+                    FinishedStreamedToolOutput::TerminalVisual
                 } else {
                     FinishedStreamedToolOutput::PlainToolResult
                 }
@@ -2758,7 +2766,7 @@ impl BmuxApp {
         }
         if let Some(streamed_output) = self.finish_live_tool_output(tool_call_id, Some(is_error)) {
             if semantic_result.is_none()
-                || matches!(streamed_output, FinishedStreamedToolOutput::TerminalOutput)
+                || matches!(streamed_output, FinishedStreamedToolOutput::TerminalVisual)
             {
                 if application.live_activity() {
                     if is_error {
@@ -3171,13 +3179,7 @@ impl BmuxApp {
 
     fn remove_terminal_streamed_tool_result(&mut self, tool_call_id: &str) {
         self.transcript.retain(|item| {
-            !matches!(
-                item.kind(),
-                TranscriptItemKind::TerminalOutput {
-                    tool_call_id: item_tool_call_id,
-                    ..
-                } if item_tool_call_id == tool_call_id
-            )
+            !(is_terminal_visual_item(item) && item_is_tool_call(item, tool_call_id))
         });
     }
 
@@ -3980,6 +3982,32 @@ const fn event_breaks_sticky_entry_anchor(event: &SessionEvent) -> bool {
     )
 }
 
+fn is_terminal_visual_item(item: &TranscriptItem) -> bool {
+    let TranscriptItemKind::ToolResult {
+        artifact: Some(artifact),
+        ..
+    } = item.kind()
+    else {
+        return false;
+    };
+    artifact
+        .metadata
+        .get("_bcode_runtime")
+        .and_then(|runtime| runtime.get("surface"))
+        .and_then(serde_json::Value::as_str)
+        == Some("terminal_output")
+}
+
+fn item_is_tool_call(item: &TranscriptItem, tool_call_id: &str) -> bool {
+    matches!(
+        item.kind(),
+        TranscriptItemKind::ToolResult {
+            tool_call_id: item_tool_call_id,
+            ..
+        } if item_tool_call_id == tool_call_id
+    )
+}
+
 fn referenced_tool_call_ids(items: &[TranscriptItem]) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
     for item in items {
@@ -3987,7 +4015,6 @@ fn referenced_tool_call_ids(items: &[TranscriptItem]) -> BTreeSet<String> {
             TranscriptItemKind::ToolRequest { tool_call_id, .. }
             | TranscriptItemKind::LiveToolPreviewAnchor { tool_call_id, .. }
             | TranscriptItemKind::ToolResult { tool_call_id, .. }
-            | TranscriptItemKind::TerminalOutput { tool_call_id, .. }
             | TranscriptItemKind::InteractiveToolRequest { tool_call_id, .. }
             | TranscriptItemKind::InteractiveToolResolution { tool_call_id, .. }
             | TranscriptItemKind::PermissionRequest { tool_call_id, .. } => {

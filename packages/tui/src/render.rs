@@ -5,7 +5,6 @@ use std::time::{Duration, Instant};
 
 use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
 use bcode_plugin_sdk::tui::PluginTuiVisualRenderMode;
-use bcode_tui_components::terminal_viewer::{TerminalViewerInput, terminal_viewer_rows};
 use bmux_tui::chrome::{Border, Panel};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect};
@@ -567,16 +566,26 @@ pub fn transcript_item_signature(
 }
 
 pub fn terminal_elapsed_signature_fragment(item: &TranscriptItem) -> Option<String> {
-    let TranscriptItemKind::TerminalOutput {
-        started_at_ms: Some(started_at_ms),
-        finished_at_ms: None,
+    let TranscriptItemKind::ToolResult {
+        artifact: Some(artifact),
         ..
     } = item.kind()
     else {
         return None;
     };
+    let runtime = artifact.metadata.get("_bcode_runtime")?;
+    if runtime.get("surface").and_then(serde_json::Value::as_str) != Some("terminal_output") {
+        return None;
+    }
+    let started_at_ms = runtime.get("started_at_ms")?.as_u64()?;
+    if runtime
+        .get("finished_at_ms")
+        .is_some_and(|value| !value.is_null())
+    {
+        return None;
+    }
 
-    format_elapsed_millis(Some(*started_at_ms), None).map(|elapsed| format!("elapsed:{elapsed}"))
+    format_elapsed_millis(Some(started_at_ms), None).map(|elapsed| format!("elapsed:{elapsed}"))
 }
 
 pub fn pending_submission_signature(
@@ -660,9 +669,6 @@ fn push_transcript_item_rows(
                 width,
                 plugin_host,
             );
-        }
-        TranscriptItemKind::TerminalOutput { .. } => {
-            push_terminal_transcript_item_rows(rows, item, width, plugin_host);
         }
         TranscriptItemKind::InteractiveToolRequest {
             surface_kind,
@@ -1093,246 +1099,6 @@ fn push_degraded_tool_visual_rows(rows: &mut Vec<Line>, title: &str, message: &s
         muted_style(),
         muted_style(),
     );
-}
-
-fn push_terminal_transcript_item_rows(
-    rows: &mut Vec<Line>,
-    item: &TranscriptItem,
-    width: u16,
-    plugin_host: Option<&bcode_plugin::PluginHost>,
-) {
-    let TranscriptItemKind::TerminalOutput {
-        tool_call_id,
-        tool_name,
-        request_visual,
-        output,
-        columns,
-        rows: terminal_rows,
-        started_at_ms,
-        finished_at_ms,
-        exit_code,
-        timed_out,
-        is_error,
-    } = item.kind()
-    else {
-        return;
-    };
-    if let Some(request_visual) = request_visual {
-        let visual = terminal_output_plugin_visual(
-            request_visual,
-            TerminalRuntimeVisualContext {
-                output,
-                columns: *columns,
-                rows: *terminal_rows,
-                started_at_ms: *started_at_ms,
-                finished_at_ms: *finished_at_ms,
-                exit_code: *exit_code,
-                timed_out: *timed_out,
-                is_error: *is_error,
-                streaming: item.streaming(),
-            },
-        );
-        if matches!(
-            canonical_plugin_visual_render_mode(&visual, plugin_host),
-            Some(PluginTuiVisualRenderMode::FullBlock)
-        ) {
-            push_canonical_plugin_visual_rows(rows, &visual, width, plugin_host);
-            rows.push(Line::default());
-            return;
-        }
-        if matches!(
-            canonical_plugin_visual_render_mode(&visual, plugin_host),
-            Some(PluginTuiVisualRenderMode::TranscriptBlock)
-        ) {
-            let title = terminal_title(
-                tool_name.as_deref(),
-                *exit_code,
-                *timed_out,
-                *is_error,
-                item.streaming(),
-                *started_at_ms,
-                *finished_at_ms,
-            );
-            push_plugin_transcript_block_rows(
-                rows,
-                &title,
-                &visual,
-                width,
-                plugin_host,
-                item.streaming(),
-                *is_error,
-            );
-            return;
-        }
-    }
-    push_terminal_tool_result_rows(
-        rows,
-        TerminalToolRenderContext {
-            tool_call_id,
-            tool_name: tool_name.as_deref(),
-            output,
-            columns: *columns,
-            rows: *terminal_rows,
-            started_at_ms: *started_at_ms,
-            finished_at_ms: *finished_at_ms,
-            exit_code: *exit_code,
-            timed_out: *timed_out,
-            is_error: *is_error,
-            streaming: item.streaming(),
-        },
-        width,
-    );
-}
-
-#[derive(Clone, Copy)]
-struct TerminalRuntimeVisualContext<'a> {
-    output: &'a str,
-    columns: u16,
-    rows: u16,
-    started_at_ms: Option<u64>,
-    finished_at_ms: Option<u64>,
-    exit_code: Option<i32>,
-    timed_out: Option<bool>,
-    is_error: bool,
-    streaming: bool,
-}
-
-fn terminal_output_plugin_visual(
-    request_visual: &bcode_session_models::PluginVisualDescriptor,
-    context: TerminalRuntimeVisualContext<'_>,
-) -> CanonicalPluginVisual {
-    let mut payload = request_visual.payload.clone();
-    if let Some(object) = payload.as_object_mut() {
-        object.insert(
-            "_bcode_runtime".to_owned(),
-            serde_json::json!({
-                "surface": "terminal_output",
-                "output": context.output,
-                "columns": context.columns,
-                "rows": context.rows,
-                "started_at_ms": context.started_at_ms,
-                "finished_at_ms": context.finished_at_ms,
-                "exit_code": context.exit_code,
-                "timed_out": context.timed_out,
-                "is_error": context.is_error,
-                "streaming": context.streaming,
-            }),
-        );
-    }
-    CanonicalPluginVisual {
-        producer_plugin_id: request_visual.producer_plugin_id.clone(),
-        schema: request_visual.schema.clone(),
-        schema_version: request_visual.schema_version,
-        title: request_visual.title.clone(),
-        subtitle: request_visual.subtitle.clone(),
-        payload,
-        streaming: context.streaming,
-    }
-}
-
-#[derive(Clone, Copy)]
-struct TerminalToolRenderContext<'a> {
-    tool_call_id: &'a str,
-    tool_name: Option<&'a str>,
-    output: &'a str,
-    columns: u16,
-    rows: u16,
-    started_at_ms: Option<u64>,
-    finished_at_ms: Option<u64>,
-    exit_code: Option<i32>,
-    timed_out: Option<bool>,
-    is_error: bool,
-    streaming: bool,
-}
-
-fn push_terminal_tool_result_rows(
-    rows: &mut Vec<Line>,
-    context: TerminalToolRenderContext<'_>,
-    width: u16,
-) {
-    let title = terminal_title(
-        context.tool_name,
-        context.exit_code,
-        context.timed_out,
-        context.is_error,
-        context.streaming,
-        context.started_at_ms,
-        context.finished_at_ms,
-    );
-    push_wrapped_styled_text(
-        rows,
-        Vec::new(),
-        &title,
-        width,
-        if context.is_error {
-            Style::new().fg(Color::Red)
-        } else if context.streaming {
-            Style::new().fg(Color::Cyan)
-        } else {
-            Style::new().fg(Color::Yellow)
-        },
-        muted_style(),
-    );
-    push_terminal_output_rows(
-        rows,
-        &TerminalOutputTranscript {
-            exit_code: context.exit_code,
-            timed_out: context.timed_out,
-            elapsed: format_elapsed_millis(context.started_at_ms, context.finished_at_ms),
-            output: context.output.to_owned(),
-            output_truncated: false,
-            output_bytes: None,
-            retained_output_bytes: None,
-            columns: context.columns,
-            rows: context.rows,
-        },
-        width,
-    );
-    if context.is_error {
-        push_wrapped_styled_text(
-            rows,
-            vec![Span::styled("  ", muted_style())],
-            &format!("tool call {}", context.tool_call_id),
-            width,
-            muted_style(),
-            muted_style(),
-        );
-    }
-    rows.push(Line::default());
-}
-
-fn terminal_title(
-    tool_name: Option<&str>,
-    exit_code: Option<i32>,
-    timed_out: Option<bool>,
-    is_error: bool,
-    streaming: bool,
-    started_at_ms: Option<u64>,
-    finished_at_ms: Option<u64>,
-) -> String {
-    let status = if streaming || timed_out.is_none() {
-        "running".to_owned()
-    } else if timed_out == Some(true) {
-        "timed out".to_owned()
-    } else if let Some(code) = exit_code {
-        format!("exit {code}")
-    } else if is_error {
-        "signal".to_owned()
-    } else {
-        "completed".to_owned()
-    };
-    let timing_label = if streaming || timed_out.is_none() {
-        "elapsed"
-    } else {
-        "duration"
-    };
-    let timing = format_elapsed_millis(started_at_ms, finished_at_ms)
-        .map(|elapsed| format!(" · {timing_label} {elapsed}"))
-        .unwrap_or_default();
-    tool_name.map_or_else(
-        || format!("Terminal · {status}{timing}"),
-        |name| format!("Terminal · {name} · {status}{timing}"),
-    )
 }
 
 struct ToolResultRenderContext<'a> {
@@ -2003,33 +1769,4 @@ fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: 
 
 const fn muted_style() -> Style {
     Style::new().fg(Color::BrightBlack)
-}
-struct TerminalOutputTranscript {
-    exit_code: Option<i32>,
-    timed_out: Option<bool>,
-    elapsed: Option<String>,
-    output: String,
-    output_truncated: bool,
-    output_bytes: Option<u64>,
-    retained_output_bytes: Option<u64>,
-    columns: u16,
-    rows: u16,
-}
-
-fn push_terminal_output_rows(rows: &mut Vec<Line>, output: &TerminalOutputTranscript, width: u16) {
-    rows.extend(terminal_viewer_rows(
-        TerminalViewerInput {
-            output: &output.output,
-            columns: output.columns,
-            rows: output.rows,
-            exit_code: output.exit_code,
-            timed_out: output.timed_out,
-            elapsed: output.elapsed.as_deref(),
-            output_truncated: output.output_truncated,
-            output_bytes: output.output_bytes,
-            retained_output_bytes: output.retained_output_bytes,
-            show_status: true,
-        },
-        width,
-    ));
 }
