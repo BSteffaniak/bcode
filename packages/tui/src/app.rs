@@ -403,6 +403,7 @@ impl AssistantScrollAnchorState {
 struct ToolCallContext {
     tool_name: String,
     arguments_json: String,
+    request_visual: Option<bcode_session_models::PluginVisualDescriptor>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2106,12 +2107,18 @@ impl BmuxApp {
                 tool_call_id,
                 tool_name,
                 arguments_json,
+                request_visual,
                 legacy_request_presentation: _legacy_legacy_request_presentation,
                 ..
             } => {
                 self.active_tool_calls.insert(tool_call_id.clone());
                 self.tool_activity_seen = true;
-                self.push_tool_request(tool_call_id, tool_name, arguments_json);
+                self.push_tool_request(
+                    tool_call_id,
+                    tool_name,
+                    arguments_json,
+                    request_visual.as_ref(),
+                );
             }
             SessionEventKind::ToolCallFinished {
                 tool_call_id,
@@ -2634,12 +2641,19 @@ impl BmuxApp {
         }
     }
 
-    fn push_tool_request(&mut self, tool_call_id: &str, tool_name: &str, arguments_json: &str) {
+    fn push_tool_request(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments_json: &str,
+        request_visual: Option<&bcode_session_models::PluginVisualDescriptor>,
+    ) {
         self.tool_call_contexts.insert(
             tool_call_id.to_owned(),
             ToolCallContext {
                 tool_name: tool_name.to_owned(),
                 arguments_json: arguments_json.to_owned(),
+                request_visual: request_visual.cloned(),
             },
         );
         let has_live_preview_anchor = self
@@ -2664,6 +2678,7 @@ impl BmuxApp {
                         tool_call_id: tool_call_id.to_owned(),
                         tool_name: Some(tool_name.to_owned()),
                         arguments_json: Some(arguments_json.to_owned()),
+                        request_visual: request_visual.cloned(),
                         ..ToolInvocationProjection::default()
                     })
                 },
@@ -2929,6 +2944,7 @@ impl BmuxApp {
             self.transcript.push(streaming_terminal_output_item(
                 tool_call_id,
                 tool_context.map(|context| context.tool_name.as_str()),
+                tool_context.and_then(|context| context.request_visual.as_ref()),
                 text,
                 columns,
                 rows,
@@ -2944,6 +2960,7 @@ impl BmuxApp {
         self.transcript.push(streaming_terminal_output_item(
             tool_call_id,
             tool_context.map(|context| context.tool_name.as_str()),
+            tool_context.and_then(|context| context.request_visual.as_ref()),
             text,
             120,
             24,

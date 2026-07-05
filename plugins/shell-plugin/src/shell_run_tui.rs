@@ -48,17 +48,14 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
             _ => serde_json::to_string_pretty(payload).unwrap_or_default(),
         });
 
-        let mut lines = Vec::new();
-        lines.push(Line::from(shell_run_terminal_title(payload, mode)));
+        let mut lines =
+            shell_terminal_header_rows(payload, &shell_run_terminal_title(payload, mode));
         lines.extend(terminal_viewer_rows(
             TerminalViewerInput {
                 output: &output,
                 columns,
                 rows,
-                exit_code: payload
-                    .get("exit_code")
-                    .and_then(serde_json::Value::as_i64)
-                    .and_then(|value| i32::try_from(value).ok()),
+                exit_code: payload_exit_code(payload),
                 timed_out: payload
                     .get("timed_out")
                     .and_then(serde_json::Value::as_bool),
@@ -130,21 +127,94 @@ fn format_duration_millis(milliseconds: u64) -> String {
     }
 }
 
-fn shell_request_rows(payload: &serde_json::Value, _width: u16) -> Vec<Line> {
+fn shell_request_rows(payload: &serde_json::Value, width: u16) -> Vec<Line> {
+    let Some(runtime) = payload.get("_bcode_runtime") else {
+        return shell_terminal_header_rows(payload, "Terminal · shell.run · starting");
+    };
+    let output = runtime
+        .get("output")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let columns = payload_u16(runtime, "columns").unwrap_or(DEFAULT_TERMINAL_COLUMNS);
+    let rows = payload_u16(runtime, "rows").unwrap_or(DEFAULT_TERMINAL_ROWS);
+    let mut lines = shell_terminal_header_rows(payload, &shell_runtime_terminal_title(runtime));
+    lines.extend(terminal_viewer_rows(
+        TerminalViewerInput {
+            output,
+            columns,
+            rows,
+            exit_code: payload_exit_code(runtime),
+            timed_out: runtime
+                .get("timed_out")
+                .and_then(serde_json::Value::as_bool),
+            elapsed: None,
+            output_truncated: false,
+            output_bytes: None,
+            retained_output_bytes: None,
+        },
+        width,
+    ));
+    lines
+}
+
+fn shell_terminal_header_rows(payload: &serde_json::Value, title: &str) -> Vec<Line> {
     let arguments = payload.get("arguments").unwrap_or(payload);
     let command = arguments
         .get("command")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     let cwd = arguments.get("cwd").and_then(serde_json::Value::as_str);
-    let mut lines = vec![Line::from("Shell command")];
-    if !command.is_empty() {
-        lines.push(Line::from(format!("command: {command}")));
-    }
+    let mut lines = vec![Line::from(title.to_owned())];
     if let Some(cwd) = cwd {
-        lines.push(Line::from(format!("cwd: {cwd}")));
+        lines.push(Line::from(format!("  cwd {cwd}")));
+    }
+    if command.is_empty() {
+        lines.push(Line::from("  assembling command …"));
+    } else {
+        for (index, line) in command.lines().enumerate() {
+            let prefix = if index == 0 { "  $ " } else { "    " };
+            lines.push(Line::from(format!("{prefix}{line}")));
+        }
     }
     lines
+}
+
+fn shell_runtime_terminal_title(runtime: &serde_json::Value) -> String {
+    let streaming = runtime
+        .get("streaming")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let timed_out = runtime
+        .get("timed_out")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let is_error = runtime
+        .get("is_error")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let status = if streaming {
+        "running".to_owned()
+    } else if timed_out {
+        "timed out".to_owned()
+    } else if let Some(exit_code) = payload_exit_code(runtime) {
+        if exit_code == 0 {
+            "completed".to_owned()
+        } else {
+            format!("exit {exit_code}")
+        }
+    } else if is_error {
+        "failed".to_owned()
+    } else {
+        "completed".to_owned()
+    };
+    format!("Terminal · shell.run · {status}")
+}
+
+fn payload_exit_code(payload: &serde_json::Value) -> Option<i32> {
+    payload
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
 }
 
 fn terminal_replay_output(payload: &serde_json::Value) -> Option<String> {

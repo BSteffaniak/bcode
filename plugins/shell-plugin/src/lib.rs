@@ -274,6 +274,8 @@ struct TerminalCommandOutput {
     exit_code: Option<i32>,
     timed_out: bool,
     cancelled: bool,
+    command: String,
+    cwd: Option<String>,
     output: String,
     output_truncated: bool,
     output_bytes: u64,
@@ -514,6 +516,8 @@ fn wait_for_terminal_shell_status(
 }
 
 fn encode_terminal_output(
+    command: &str,
+    cwd: Option<&Path>,
     status: TerminalShellStatus,
     output: &LimitedOutput,
     columns: u16,
@@ -525,6 +529,8 @@ fn encode_terminal_output(
         exit_code: Some(status.exit_code),
         timed_out: status.timed_out,
         cancelled: status.cancelled,
+        command: command.to_owned(),
+        cwd: cwd.map(|cwd| cwd.display().to_string()),
         output: inline_output.text.clone(),
         output_truncated: inline_output.truncated,
         output_bytes: u64::try_from(inline_output.original_bytes).unwrap_or(u64::MAX),
@@ -537,6 +543,8 @@ fn encode_terminal_output(
         exit_code: Some(status.exit_code),
         timed_out: status.timed_out,
         cancelled: status.cancelled,
+        command: command.to_owned(),
+        cwd: cwd.map(|cwd| cwd.display().to_string()),
         output: output.text.clone(),
         output_truncated: output.truncated,
         output_bytes: u64::try_from(output.original_bytes).unwrap_or(u64::MAX),
@@ -624,22 +632,59 @@ fn run_terminal_shell_command_inner(
     )?;
     drop(pair.master);
     let stream_output = join_reader(reader_thread)?;
-    let (encoded, full_encoded, _clean_inline_output) =
-        encode_terminal_output(status, &stream_output.clean, columns, rows)?;
-    let raw_inline_output = limit_terminal_inline_output(&stream_output.raw);
+    terminal_shell_response(
+        tool_call_id,
+        TerminalShellResponseInput {
+            arguments,
+            cwd: cwd.as_deref(),
+            status,
+            started,
+            stream_output: &stream_output,
+            columns,
+            rows,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct TerminalShellResponseInput<'a> {
+    arguments: &'a ShellRunArguments,
+    cwd: Option<&'a Path>,
+    status: TerminalShellStatus,
+    started: Instant,
+    stream_output: &'a TerminalStreamOutput,
+    columns: u16,
+    rows: u16,
+}
+
+fn terminal_shell_response(
+    tool_call_id: &str,
+    input: TerminalShellResponseInput<'_>,
+) -> Result<ToolInvocationResponse, String> {
+    let (encoded, full_encoded, _clean_inline_output) = encode_terminal_output(
+        &input.arguments.command,
+        input.cwd,
+        input.status,
+        &input.stream_output.clean,
+        input.columns,
+        input.rows,
+    )?;
+    let raw_inline_output = limit_terminal_inline_output(&input.stream_output.raw);
     Ok(ToolInvocationResponse {
         output: encoded,
-        is_error: status.timed_out || status.cancelled || !status.success,
+        is_error: input.status.timed_out || input.status.cancelled || !input.status.success,
         content: Vec::new(),
         full_output: Some(full_encoded),
         host_action: None,
         result: Some(shell_run_artifact(
             tool_call_id,
             &ShellRunResult::Terminal {
-                exit_code: Some(status.exit_code),
-                timed_out: status.timed_out,
-                cancelled: status.cancelled,
-                duration_ms: Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
+                exit_code: Some(input.status.exit_code),
+                timed_out: input.status.timed_out,
+                cancelled: input.status.cancelled,
+                duration_ms: Some(
+                    u64::try_from(input.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                ),
                 output_tail: raw_inline_output.text,
                 output_truncated: raw_inline_output.truncated,
                 output_bytes: Some(
@@ -648,17 +693,21 @@ fn run_terminal_shell_command_inner(
                 retained_output_bytes: Some(
                     u64::try_from(raw_inline_output.retained_bytes).unwrap_or(u64::MAX),
                 ),
-                columns,
-                rows,
+                columns: input.columns,
+                rows: input.rows,
             },
-            stream_output
+            input
+                .stream_output
                 .clean_artifact_path
                 .as_deref()
-                .map(|path| clean_artifact_ref(path, &stream_output.clean)),
-            stream_output
+                .map(|path| clean_artifact_ref(path, &input.stream_output.clean)),
+            input
+                .stream_output
                 .raw_artifact_path
                 .as_deref()
-                .map(|path| raw_artifact_ref(path, &stream_output.raw, columns, rows)),
+                .map(|path| {
+                    raw_artifact_ref(path, &input.stream_output.raw, input.columns, input.rows)
+                }),
         )),
     })
 }
@@ -1290,6 +1339,8 @@ mod tests {
             truncated: false,
         };
         let (_encoded, full_encoded, inline_output) = encode_terminal_output(
+            "printf hello",
+            None,
             TerminalShellStatus {
                 exit_code: 0,
                 success: true,
@@ -1351,6 +1402,8 @@ mod tests {
             exit_code: Some(0),
             timed_out: false,
             cancelled: false,
+            command: "printf hello".to_owned(),
+            cwd: None,
             output: output.text,
             output_truncated: output.truncated,
             output_bytes: u64::try_from(output.original_bytes).unwrap_or(u64::MAX),

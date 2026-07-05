@@ -5657,8 +5657,11 @@ fn shell_live_preview_is_not_superseded_by_terminal_result() {
 
     let rendered = render_app_text(&mut app);
 
-    assert!(rendered.contains("Shell command"), "{rendered}");
-    assert!(rendered.contains("command: cargo test"), "{rendered}");
+    assert!(
+        rendered.contains("Terminal · shell.run · starting"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("$ cargo test"), "{rendered}");
     assert!(rendered.contains("Terminal · shell.run"), "{rendered}");
     assert!(rendered.contains("completed"), "{rendered}");
     assert!(rendered.contains("shell raw output"), "{rendered}");
@@ -6488,13 +6491,13 @@ fn replayed_shell_request_uses_shell_plugin_request_renderer_without_legacy_meta
 
     let rendered = render_app_text(&mut app);
 
-    assert!(rendered.contains("Shell command"), "{rendered}");
     assert!(
-        rendered.contains("command: cargo check --workspace"),
+        rendered.contains("Terminal · shell.run · starting"),
         "{rendered}"
     );
+    assert!(rendered.contains("$ cargo check --workspace"), "{rendered}");
     assert!(
-        rendered.contains("cwd: /Users/braden/GitHub/bcode"),
+        rendered.contains("cwd /Users/braden/GitHub/bcode"),
         "{rendered}"
     );
     assert!(!rendered.contains("Tool · shell.run"), "{rendered}");

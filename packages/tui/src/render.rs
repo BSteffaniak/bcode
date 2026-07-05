@@ -662,7 +662,7 @@ fn push_transcript_item_rows(
             );
         }
         TranscriptItemKind::TerminalOutput { .. } => {
-            push_terminal_transcript_item_rows(rows, item, width);
+            push_terminal_transcript_item_rows(rows, item, width, plugin_host);
         }
         TranscriptItemKind::InteractiveToolRequest {
             surface_kind,
@@ -1009,24 +1009,25 @@ fn push_plugin_visual_degraded_rows(
         );
     }
     if visual.streaming
-        && let Some(payload) = visual.payload.as_object() {
-            for (key, value) in payload {
-                if matches!(key.as_str(), "argument_bytes" | "truncated") {
-                    continue;
-                }
-                let rendered = value
-                    .as_str()
-                    .map_or_else(|| value.to_string(), ToOwned::to_owned);
-                push_wrapped_styled_text(
-                    rows,
-                    vec![Span::styled("  ", muted_style())],
-                    &format!("{key}: {rendered}"),
-                    width,
-                    muted_style(),
-                    muted_style(),
-                );
+        && let Some(payload) = visual.payload.as_object()
+    {
+        for (key, value) in payload {
+            if matches!(key.as_str(), "argument_bytes" | "truncated") {
+                continue;
             }
+            let rendered = value
+                .as_str()
+                .map_or_else(|| value.to_string(), ToOwned::to_owned);
+            push_wrapped_styled_text(
+                rows,
+                vec![Span::styled("  ", muted_style())],
+                &format!("{key}: {rendered}"),
+                width,
+                muted_style(),
+                muted_style(),
+            );
         }
+    }
 }
 
 fn push_degraded_tool_visual_rows(rows: &mut Vec<Line>, title: &str, message: &str, width: u16) {
@@ -1048,10 +1049,16 @@ fn push_degraded_tool_visual_rows(rows: &mut Vec<Line>, title: &str, message: &s
     );
 }
 
-fn push_terminal_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) {
+fn push_terminal_transcript_item_rows(
+    rows: &mut Vec<Line>,
+    item: &TranscriptItem,
+    width: u16,
+    plugin_host: Option<&bcode_plugin::PluginHost>,
+) {
     let TranscriptItemKind::TerminalOutput {
         tool_call_id,
         tool_name,
+        request_visual,
         output,
         columns,
         rows: terminal_rows,
@@ -1064,6 +1071,29 @@ fn push_terminal_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptIte
     else {
         return;
     };
+    if let Some(request_visual) = request_visual {
+        let visual = terminal_output_plugin_visual(
+            request_visual,
+            TerminalRuntimeVisualContext {
+                output,
+                columns: *columns,
+                rows: *terminal_rows,
+                started_at_ms: *started_at_ms,
+                finished_at_ms: *finished_at_ms,
+                exit_code: *exit_code,
+                timed_out: *timed_out,
+                is_error: *is_error,
+                streaming: item.streaming(),
+            },
+        );
+        if canonical_plugin_visual_render_mode(&visual, plugin_host)
+            == Some(PluginTuiVisualRenderMode::FullBlock)
+        {
+            push_canonical_plugin_visual_rows(rows, &visual, width, plugin_host);
+            rows.push(Line::default());
+            return;
+        }
+    }
     push_terminal_tool_result_rows(
         rows,
         TerminalToolRenderContext {
@@ -1081,6 +1111,52 @@ fn push_terminal_transcript_item_rows(rows: &mut Vec<Line>, item: &TranscriptIte
         },
         width,
     );
+}
+
+#[derive(Clone, Copy)]
+struct TerminalRuntimeVisualContext<'a> {
+    output: &'a str,
+    columns: u16,
+    rows: u16,
+    started_at_ms: Option<u64>,
+    finished_at_ms: Option<u64>,
+    exit_code: Option<i32>,
+    timed_out: Option<bool>,
+    is_error: bool,
+    streaming: bool,
+}
+
+fn terminal_output_plugin_visual(
+    request_visual: &bcode_session_models::PluginVisualDescriptor,
+    context: TerminalRuntimeVisualContext<'_>,
+) -> CanonicalPluginVisual {
+    let mut payload = request_visual.payload.clone();
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "_bcode_runtime".to_owned(),
+            serde_json::json!({
+                "surface": "terminal_output",
+                "output": context.output,
+                "columns": context.columns,
+                "rows": context.rows,
+                "started_at_ms": context.started_at_ms,
+                "finished_at_ms": context.finished_at_ms,
+                "exit_code": context.exit_code,
+                "timed_out": context.timed_out,
+                "is_error": context.is_error,
+                "streaming": context.streaming,
+            }),
+        );
+    }
+    CanonicalPluginVisual {
+        producer_plugin_id: request_visual.producer_plugin_id.clone(),
+        schema: request_visual.schema.clone(),
+        schema_version: request_visual.schema_version,
+        title: request_visual.title.clone(),
+        subtitle: request_visual.subtitle.clone(),
+        payload,
+        streaming: context.streaming,
+    }
 }
 
 #[derive(Clone, Copy)]

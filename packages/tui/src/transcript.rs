@@ -57,6 +57,8 @@ pub enum TranscriptItemKind {
         tool_call_id: String,
         /// Tool name, when the matching request is known.
         tool_name: Option<String>,
+        /// Plugin-owned request visual associated with this terminal output.
+        request_visual: Option<bcode_session_models::PluginVisualDescriptor>,
         /// Raw terminal stream decoded as UTF-8.
         output: String,
         /// Terminal columns used by the producer.
@@ -139,6 +141,7 @@ pub enum TranscriptItemKind {
 struct ToolCallContext {
     tool_name: String,
     arguments_json: String,
+    request_visual: Option<bcode_session_models::PluginVisualDescriptor>,
 }
 
 /// Lifecycle surface for a tool-related transcript item.
@@ -548,6 +551,7 @@ pub fn live_tool_preview_anchor_item(tool_call_id: &str, tool_name: &str) -> Tra
 pub fn streaming_terminal_output_item(
     tool_call_id: &str,
     tool_name: Option<&str>,
+    request_visual: Option<&bcode_session_models::PluginVisualDescriptor>,
     text: &str,
     columns: u16,
     rows: u16,
@@ -560,6 +564,7 @@ pub fn streaming_terminal_output_item(
         TranscriptItemKind::TerminalOutput {
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.map(ToOwned::to_owned),
+            request_visual: request_visual.cloned(),
             output: text.to_owned(),
             columns,
             rows,
@@ -1001,6 +1006,7 @@ fn non_streaming_transcript_item_from_event(
             tool_call_id,
             tool_name,
             arguments_json,
+            request_visual,
             legacy_request_presentation: _legacy_request_presentation,
             ..
         } => {
@@ -1009,12 +1015,14 @@ fn non_streaming_transcript_item_from_event(
                 ToolCallContext {
                     tool_name: tool_name.clone(),
                     arguments_json: arguments_json.clone(),
+                    request_visual: request_visual.clone(),
                 },
             );
             let projection = ToolInvocationProjection {
                 tool_call_id: tool_call_id.clone(),
                 tool_name: Some(tool_name.clone()),
                 arguments_json: Some(arguments_json.clone()),
+                request_visual: request_visual.clone(),
                 ..ToolInvocationProjection::default()
             };
             Some(tool_request_item_from_projection(&projection))
@@ -1274,6 +1282,7 @@ fn apply_tool_invocation_stream_event(
             items.push(streaming_terminal_output_item(
                 tool_call_id,
                 context.map(|context| context.tool_name.as_str()),
+                context.and_then(|context| context.request_visual.as_ref()),
                 text,
                 columns,
                 rows,
