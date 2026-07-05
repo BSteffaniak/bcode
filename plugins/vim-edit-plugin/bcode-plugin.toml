@@ -8,6 +8,15 @@ description  = "Model-callable Vim/Neovim editing tools"
 interface_id = "bcode.tool/v1"
 name         = "Vim Edit Tools"
 
+[[visual_adapters]]
+id                 = "vim-edit-playback-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+schema             = "bcode.vim-edit.playback"
+surfaces           = ["tui"]
+
 [concurrency]
 max  = 2
 type = "limited"

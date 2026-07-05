@@ -7,6 +7,9 @@
 //! This plugin exposes model-callable tools that drive the reusable
 //! `bcode_vim_edit` Neovim RPC editing engine.
 
+#[cfg(feature = "static-bundled")]
+mod vim_edit_playback_tui;
+
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID,
@@ -530,18 +533,30 @@ fn vim_edit_change_artifact(
     };
     ToolInvocationResult::Artifact {
         artifact: Box::new(ToolArtifact {
-            artifact_id: format!("{tool_call_id}-vim-edit-change"),
+            artifact_id: format!("{tool_call_id}-vim-edit-playback"),
             producer_plugin_id: "bcode.vim-edit".to_string(),
-            schema: "bcode.vim-edit.change".to_string(),
+            schema: "bcode.vim-edit.playback".to_string(),
             schema_version: 1,
             tool_call_id: Some(tool_call_id.to_string()),
-            title: Some("Vim edit change".to_string()),
+            title: Some("Vim edit playback".to_string()),
             metadata: json!({
+                "success": true,
+                "error": null,
                 "tool_name": tool_name,
                 "summary": summary,
                 "path": path,
                 "changed": result.changed,
                 "diff": result.diff,
+                "cursor": result.cursor,
+                "nvim_mode": result.nvim_mode,
+                "final_context": result.final_context,
+                "events": result.events,
+                "changed_ranges": [],
+                "selected_ranges": [],
+                "playback_controls": {
+                    "available": ["first", "previous", "next", "last"],
+                    "default_index": result.events.len()
+                },
             }),
             refs: Vec::new(),
         }),
@@ -784,7 +799,18 @@ fn json_tool_response<T: serde::Serialize>(value: &T, is_error: bool) -> ToolInv
 #[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> StaticPluginVtable {
-    static_plugin_vtable!(VimEditPlugin, include_str!("../bcode-plugin.toml"))
+    let mut vtable = static_plugin_vtable!(VimEditPlugin, include_str!("../bcode-plugin.toml"));
+    vtable.tui_registry = Some(vim_edit_tui_registry);
+    vtable
+}
+
+#[cfg(feature = "static-bundled")]
+fn vim_edit_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
+    let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
+    registry.register_visual_adapter(Box::new(
+        vim_edit_playback_tui::VimEditPlaybackTuiVisualAdapter,
+    ));
+    registry
 }
 
 export_plugin!(VimEditPlugin, include_str!("../bcode-plugin.toml"));
@@ -983,11 +1009,14 @@ mod tests {
         let Some(ToolInvocationResult::Artifact { artifact }) = response.result else {
             panic!("expected artifact result");
         };
-        assert_eq!(artifact.schema, "bcode.vim-edit.change");
+        assert_eq!(artifact.schema, "bcode.vim-edit.playback");
         assert_eq!(artifact.producer_plugin_id, "bcode.vim-edit");
         assert_eq!(artifact.metadata["tool_name"], "vim_edit.preview");
         assert_eq!(artifact.metadata["path"], "src/lib.rs");
         assert_eq!(artifact.metadata["summary"], "vim edit changed file");
+        assert_eq!(artifact.metadata["success"], true);
+        assert!(artifact.metadata.get("events").is_some());
+        assert!(artifact.metadata.get("final_context").is_some());
     }
 
     #[test]

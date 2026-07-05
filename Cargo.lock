@@ -2172,6 +2172,7 @@ dependencies = [
  "bcode_plugin_sdk",
  "bcode_tool",
  "bcode_vim_edit",
+ "bmux_tui",
  "serde",
  "serde_json",
  "tempfile",
