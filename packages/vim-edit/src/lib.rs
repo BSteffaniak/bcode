@@ -139,6 +139,19 @@ pub struct VimEditEvent {
     pub message: Option<String>,
 }
 
+/// State captured when one Vim edit step fails.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VimEditFailureState {
+    /// Zero-indexed failing step number.
+    pub step_index: usize,
+    /// Cursor at failure, when Neovim is still observable.
+    pub cursor: Option<CursorPosition>,
+    /// Neovim mode at failure, when Neovim is still observable.
+    pub nvim_mode: Option<String>,
+    /// Bounded context at failure, when Neovim is still observable.
+    pub context: Option<TextContext>,
+}
+
 /// Error returned while running a Vim edit operation.
 #[derive(Debug, Error)]
 pub enum VimEditError {
@@ -175,6 +188,17 @@ pub enum VimEditError {
     /// Neovim RPC failed.
     #[error("Neovim RPC error: {0}")]
     Rpc(String),
+    /// Neovim exited unexpectedly before or during RPC editing.
+    #[error("Neovim exited unexpectedly: {0}")]
+    UnexpectedExit(String),
+    /// A Vim edit step failed after Neovim reported an error.
+    #[error("step {state_step} failed: {message}", state_step = state.step_index)]
+    StepFailed {
+        /// Observable state at the failing step.
+        state: VimEditFailureState,
+        /// Model-readable failure message.
+        message: String,
+    },
     /// A Vim edit step was rejected by sandbox policy.
     #[error("step {step_index} rejected by sandbox: {reason}")]
     UnsafeCommand {
@@ -271,9 +295,20 @@ async fn run_vim_edit_session(
     let mut previous_buffer = session.buffer_text().await?;
     let mut events = Vec::with_capacity(request.steps.len());
     for (step_index, step) in request.steps.iter().enumerate() {
-        reject_unsafe_step(step, step_index, request.sandbox)?;
         let before_cursor = session.cursor().await?;
-        session.apply_step(step).await?;
+        if let Err(error) = reject_unsafe_step(step, step_index, request.sandbox) {
+            let state = session.failure_state(step_index).await;
+            return Err(VimEditError::StepFailed {
+                state,
+                message: error.to_string(),
+            });
+        }
+        let step_result = session.apply_step(step).await;
+        if let Err(error) = step_result {
+            let state = session.failure_state(step_index).await;
+            let message = classify_step_error(step, &error.to_string());
+            return Err(VimEditError::StepFailed { state, message });
+        }
         let after_cursor = session.cursor().await?;
         let nvim_mode = session.mode().await?;
         let context = session.context(DEFAULT_CONTEXT_RADIUS).await?;
@@ -288,7 +323,7 @@ async fn run_vim_edit_session(
             nvim_mode,
             context,
             changed,
-            message: None,
+            message: Some("step completed successfully".to_string()),
         });
     }
 
@@ -380,7 +415,7 @@ impl NeovimSession {
             .nvim
             .call_function("fnameescape", vec![Value::from(path_string)])
             .await
-            .map_err(|error| VimEditError::Rpc(error.to_string()))?
+            .map_err(rpc_call_error)?
             .as_str()
             .map(ToOwned::to_owned)
             .ok_or_else(|| VimEditError::Rpc("fnameescape did not return a string".to_string()))?;
@@ -388,58 +423,66 @@ impl NeovimSession {
     }
 
     async fn apply_step(&self, step: &VimEditStep) -> Result<(), VimEditError> {
+        self.clear_vim_error().await?;
         match step {
             VimEditStep::Keys { input } => {
                 let keys = self
                     .nvim
                     .replace_termcodes(input, true, true, true)
                     .await
-                    .map_err(|error| VimEditError::Rpc(error.to_string()))?;
+                    .map_err(rpc_call_error)?;
                 self.nvim
                     .feedkeys(&keys, "x", false)
                     .await
-                    .map_err(|error| VimEditError::Rpc(error.to_string()))
+                    .map_err(rpc_call_error)?;
             }
-            VimEditStep::Insert { text } => self
-                .nvim
-                .paste(text, false, -1)
-                .await
-                .map(|_| ())
-                .map_err(|error| VimEditError::Rpc(error.to_string())),
-            VimEditStep::Ex { command } => self.nvim_command(command).await,
+            VimEditStep::Insert { text } => {
+                self.nvim
+                    .paste(text, false, -1)
+                    .await
+                    .map(|_| ())
+                    .map_err(rpc_call_error)?;
+            }
+            VimEditStep::Ex { command } => self.nvim_command(command).await?,
+        }
+        self.fail_on_vim_error().await
+    }
+
+    async fn clear_vim_error(&self) -> Result<(), VimEditError> {
+        self.nvim
+            .command("let v:errmsg = ''")
+            .await
+            .map_err(rpc_call_error)
+    }
+
+    async fn fail_on_vim_error(&self) -> Result<(), VimEditError> {
+        let error = self.nvim.eval("v:errmsg").await.map_err(rpc_call_error)?;
+        let Some(message) = value_to_string(&error) else {
+            return Ok(());
+        };
+        if message.trim().is_empty() {
+            Ok(())
+        } else {
+            Err(VimEditError::Rpc(message))
         }
     }
 
     async fn nvim_command(&self, command: &str) -> Result<(), VimEditError> {
-        self.nvim
-            .command(command)
-            .await
-            .map_err(|error| VimEditError::Rpc(error.to_string()))
+        self.nvim.command(command).await.map_err(rpc_call_error)
     }
 
     async fn buffer_text(&self) -> Result<String, VimEditError> {
-        let buffer = self
-            .nvim
-            .get_current_buf()
-            .await
-            .map_err(|error| VimEditError::Rpc(error.to_string()))?;
+        let buffer = self.nvim.get_current_buf().await.map_err(rpc_call_error)?;
         let lines = buffer
             .get_lines(0, -1, false)
             .await
-            .map_err(|error| VimEditError::Rpc(error.to_string()))?;
+            .map_err(rpc_call_error)?;
         Ok(lines.join("\n"))
     }
 
     async fn cursor(&self) -> Result<CursorPosition, VimEditError> {
-        let window = self
-            .nvim
-            .get_current_win()
-            .await
-            .map_err(|error| VimEditError::Rpc(error.to_string()))?;
-        let (line, column) = window
-            .get_cursor()
-            .await
-            .map_err(|error| VimEditError::Rpc(error.to_string()))?;
+        let window = self.nvim.get_current_win().await.map_err(rpc_call_error)?;
+        let (line, column) = window.get_cursor().await.map_err(rpc_call_error)?;
         Ok(CursorPosition {
             line: nonnegative_i64_to_usize(line).saturating_add(0),
             column: nonnegative_i64_to_usize(column).saturating_add(1),
@@ -447,11 +490,7 @@ impl NeovimSession {
     }
 
     async fn mode(&self) -> Result<String, VimEditError> {
-        let values = self
-            .nvim
-            .get_mode()
-            .await
-            .map_err(|error| VimEditError::Rpc(error.to_string()))?;
+        let values = self.nvim.get_mode().await.map_err(rpc_call_error)?;
         values
             .into_iter()
             .find_map(|(key, value)| {
@@ -464,11 +503,7 @@ impl NeovimSession {
 
     async fn context(&self, radius: usize) -> Result<TextContext, VimEditError> {
         let cursor = self.cursor().await?;
-        let buffer = self
-            .nvim
-            .get_current_buf()
-            .await
-            .map_err(|error| VimEditError::Rpc(error.to_string()))?;
+        let buffer = self.nvim.get_current_buf().await.map_err(rpc_call_error)?;
         let start_line = cursor.line.saturating_sub(radius).max(1);
         let end_line = cursor.line.saturating_add(radius);
         let lines = buffer
@@ -478,8 +513,20 @@ impl NeovimSession {
                 false,
             )
             .await
-            .map_err(|error| VimEditError::Rpc(error.to_string()))?;
+            .map_err(rpc_call_error)?;
         Ok(TextContext { start_line, lines })
+    }
+
+    async fn failure_state(&self, step_index: usize) -> VimEditFailureState {
+        let cursor = self.cursor().await.ok();
+        let nvim_mode = self.mode().await.ok();
+        let context = self.context(DEFAULT_CONTEXT_RADIUS).await.ok();
+        VimEditFailureState {
+            step_index,
+            cursor,
+            nvim_mode,
+            context,
+        }
     }
 
     async fn shutdown(mut self) {
@@ -490,6 +537,45 @@ impl NeovimSession {
             Ok(None) | Err(_) => {
                 let _ = self.child.kill().await;
             }
+        }
+    }
+}
+
+fn rpc_call_error(error: impl std::fmt::Display) -> VimEditError {
+    let message = error.to_string();
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("channel closed") || lower.contains("broken pipe") || lower.contains("eof") {
+        VimEditError::UnexpectedExit(message)
+    } else {
+        VimEditError::Rpc(message)
+    }
+}
+
+fn classify_step_error(step: &VimEditStep, raw_error: &str) -> String {
+    let lower = raw_error.to_ascii_lowercase();
+    match step {
+        VimEditStep::Keys { input } if lower.contains("pattern not found") => {
+            format!(
+                "search pattern in key input `{input}` was not found; adjust the search text or move the cursor before retrying"
+            )
+        }
+        VimEditStep::Keys { input } if lower.contains("invalid") || lower.contains("key") => {
+            format!(
+                "key input `{input}` failed; verify the Vim key notation and retry: {raw_error}"
+            )
+        }
+        VimEditStep::Ex { command } => {
+            format!(
+                "Ex command `{command}` failed in Neovim; adjust or split the command before retrying: {raw_error}"
+            )
+        }
+        VimEditStep::Insert { .. } => {
+            format!("literal insert failed in Neovim; check buffer state and retry: {raw_error}")
+        }
+        VimEditStep::Keys { input } => {
+            format!(
+                "key input `{input}` failed in Neovim; inspect returned cursor/mode/context before retrying: {raw_error}"
+            )
         }
     }
 }
@@ -767,6 +853,148 @@ mod tests {
     }
 
     #[test]
+    fn failed_step_returns_recovery_state_and_stops_later_steps() {
+        if !nvim_available() {
+            eprintln!("skipping Neovim integration test because `nvim` is not available");
+            return;
+        }
+        let file = NamedTempFile::new().expect("temp file");
+        fs::write(file.path(), "foo bar").expect("write original");
+        let error = run_vim_edit(VimEditRequest {
+            path: file.path().to_path_buf(),
+            nvim_executable: None,
+            steps: vec![
+                VimEditStep::Keys {
+                    input: "/missing-pattern<CR>".to_string(),
+                },
+                VimEditStep::Ex {
+                    command: "%s/foo/SHOULD_NOT_RUN/".to_string(),
+                },
+            ],
+            mode: VimEditMode::Apply,
+            sandbox: VimEditSandbox::Default,
+            timeout: Duration::from_secs(5),
+        })
+        .expect_err("missing search pattern should fail");
+        let VimEditError::StepFailed { state, message } = error else {
+            panic!("expected step failure");
+        };
+        assert_eq!(state.step_index, 0);
+        assert!(state.cursor.is_some());
+        assert!(state.nvim_mode.is_some());
+        assert!(state.context.is_some());
+        assert!(message.contains("search pattern"));
+        assert_eq!(
+            fs::read_to_string(file.path()).expect("read original"),
+            "foo bar"
+        );
+    }
+
+    #[test]
+    fn successful_events_include_recovery_observations_and_messages() {
+        if !nvim_available() {
+            eprintln!("skipping Neovim integration test because `nvim` is not available");
+            return;
+        }
+        let file = NamedTempFile::new().expect("temp file");
+        fs::write(file.path(), "foo bar").expect("write original");
+        let result = run_vim_edit(VimEditRequest {
+            path: file.path().to_path_buf(),
+            nvim_executable: None,
+            steps: vec![VimEditStep::Ex {
+                command: "%s/foo/baz/".to_string(),
+            }],
+            mode: VimEditMode::Preview,
+            sandbox: VimEditSandbox::Default,
+            timeout: Duration::from_secs(5),
+        })
+        .expect("run vim edit");
+        let event = result.events.first().expect("event captured");
+        assert_eq!(event.step_index, 0);
+        assert_eq!(event.before_cursor.line, 1);
+        assert_eq!(event.after_cursor.line, 1);
+        assert!(!event.nvim_mode.is_empty());
+        assert_eq!(event.context.start_line, 1);
+        assert!(!event.context.lines.is_empty());
+        assert!(event.changed);
+        assert_eq!(
+            event.message.as_deref(),
+            Some("step completed successfully")
+        );
+    }
+
+    #[test]
+    fn invalid_ex_command_reports_unsupported_command_clearly() {
+        if !nvim_available() {
+            eprintln!("skipping Neovim integration test because `nvim` is not available");
+            return;
+        }
+        let file = NamedTempFile::new().expect("temp file");
+        fs::write(file.path(), "foo").expect("write original");
+        let error = run_vim_edit(VimEditRequest {
+            path: file.path().to_path_buf(),
+            nvim_executable: None,
+            steps: vec![VimEditStep::Ex {
+                command: "definitelynotavimcommand".to_string(),
+            }],
+            mode: VimEditMode::Preview,
+            sandbox: VimEditSandbox::DangerouslyDisabled,
+            timeout: Duration::from_secs(5),
+        })
+        .expect_err("invalid Ex command should fail");
+        let VimEditError::StepFailed { message, .. } = error else {
+            panic!("expected step failure");
+        };
+        assert!(message.contains("Ex command `definitelynotavimcommand` failed"));
+        assert!(message.contains("Not an editor command") || message.contains("E492"));
+    }
+
+    #[test]
+    fn timeout_error_is_clear() {
+        let error = VimEditError::Timeout { timeout_ms: 25 }.to_string();
+        assert!(error.contains("timed out"));
+        assert!(error.contains("25"));
+    }
+
+    #[test]
+    fn file_size_and_encoding_errors_are_clear() {
+        let too_large = VimEditError::FileTooLarge {
+            path: PathBuf::from("large.txt"),
+            bytes: MAX_FILE_BYTES + 1,
+            max_bytes: MAX_FILE_BYTES,
+        }
+        .to_string();
+        assert!(too_large.contains("large.txt"));
+        assert!(too_large.contains("exceeds"));
+
+        let non_utf8 = VimEditError::NonUtf8 {
+            path: PathBuf::from("binary.bin"),
+        }
+        .to_string();
+        assert!(non_utf8.contains("binary.bin"));
+        assert!(non_utf8.contains("UTF-8"));
+    }
+
+    #[test]
+    fn unexpected_exit_error_is_clear() {
+        let error = VimEditError::UnexpectedExit("channel closed".to_string()).to_string();
+        assert!(error.contains("unexpectedly"));
+        assert!(error.contains("channel closed"));
+    }
+
+    #[test]
+    fn invalid_key_notation_message_is_actionable() {
+        let message = classify_step_error(
+            &VimEditStep::Keys {
+                input: "<DefinitelyNotAKey>".to_string(),
+            },
+            "Invalid key notation",
+        );
+        assert!(message.contains("key input `<DefinitelyNotAKey>` failed"));
+        assert!(message.contains("verify the Vim key notation"));
+    }
+
+    #[test]
     fn default_sandbox_rejects_write_to_other_path_without_creating_file() {
         let other_path =
             std::env::temp_dir().join(format!("bcode-vim-edit-other-{}", std::process::id()));
@@ -1007,7 +1235,13 @@ mod tests {
             timeout: Duration::from_secs(5),
         })
         .expect_err("unsafe apply should fail");
-        assert!(matches!(error, VimEditError::UnsafeCommand { .. }));
+        assert!(matches!(
+            error,
+            VimEditError::StepFailed {
+                message,
+                ..
+            } if message.contains("rejected by sandbox")
+        ));
         assert_eq!(
             fs::read_to_string(file.path()).expect("read original"),
             "foo"
