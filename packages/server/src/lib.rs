@@ -13558,6 +13558,7 @@ fn runtime_work_progress_from_tool_stream_event(
             .to_string(),
         )),
         ToolInvocationStreamEvent::OutputDelta { .. }
+        | ToolInvocationStreamEvent::VisualUpdate { .. }
         | ToolInvocationStreamEvent::LegacyPresentation { .. } => None,
     }
 }
@@ -13570,6 +13571,7 @@ fn normalize_tool_stream_event_sequence(
     let tool_call_id = match &event {
         ToolInvocationStreamEvent::Started { tool_call_id, .. }
         | ToolInvocationStreamEvent::OutputDelta { tool_call_id, .. }
+        | ToolInvocationStreamEvent::VisualUpdate { tool_call_id, .. }
         | ToolInvocationStreamEvent::Status { tool_call_id, .. }
         | ToolInvocationStreamEvent::LegacyPresentation { tool_call_id, .. }
         | ToolInvocationStreamEvent::Finished { tool_call_id, .. } => tool_call_id.clone(),
@@ -13616,6 +13618,17 @@ fn set_tool_stream_event_sequence(
             sequence,
             text,
             byte_len,
+        },
+        ToolInvocationStreamEvent::VisualUpdate {
+            tool_call_id,
+            visual,
+            streaming,
+            ..
+        } => ToolInvocationStreamEvent::VisualUpdate {
+            tool_call_id,
+            sequence,
+            visual,
+            streaming,
         },
         ToolInvocationStreamEvent::Status {
             tool_call_id,
@@ -13680,6 +13693,24 @@ fn convert_tool_stream_event(event: ServiceToolInvocationStreamEvent) -> ToolInv
             sequence,
             text,
             byte_len,
+        },
+        ServiceToolInvocationStreamEvent::VisualUpdate {
+            tool_call_id,
+            sequence,
+            visual,
+            streaming,
+        } => ToolInvocationStreamEvent::VisualUpdate {
+            tool_call_id,
+            sequence,
+            visual: bcode_session_models::PluginVisualDescriptor {
+                producer_plugin_id: visual.producer_plugin_id,
+                schema: visual.schema,
+                schema_version: visual.schema_version,
+                title: visual.title,
+                subtitle: visual.subtitle,
+                payload: visual.payload,
+            },
+            streaming,
         },
         ServiceToolInvocationStreamEvent::Status {
             tool_call_id,

@@ -78,9 +78,9 @@ impl TranscriptDocument {
         self.bump_revision();
     }
 
-    /// Upsert a terminal output item and bump the collection revision.
-    pub fn upsert_terminal_output_item(&mut self, item: TranscriptItem) -> usize {
-        let index = super::transcript::upsert_terminal_output_item(&mut self.items, item);
+    /// Upsert a plugin visual item and bump the collection revision.
+    pub fn upsert_tool_visual_item(&mut self, item: TranscriptItem) -> usize {
+        let index = super::transcript::upsert_tool_visual_item(&mut self.items, item);
         self.bump_revision();
         index
     }

@@ -1,36 +1,9 @@
 //! Human-readable time and duration formatting helpers.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
-/// Return the current Unix timestamp in milliseconds.
-#[must_use]
-pub fn unix_time_millis_now() -> u64 {
-    unix_time_millis(SystemTime::now())
-}
-
-/// Return the Unix timestamp in milliseconds for `time`.
-#[must_use]
-pub fn unix_time_millis(time: SystemTime) -> u64 {
-    time.duration_since(UNIX_EPOCH).map_or(0, |duration| {
-        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-    })
-}
-
 /// Format a millisecond duration for display.
 #[must_use]
 pub fn format_millis(ms: u64) -> String {
     format_duration_nanos(u128::from(ms).saturating_mul(1_000_000))
-}
-
-/// Format an elapsed duration between optional Unix millisecond timestamps.
-#[must_use]
-pub fn format_elapsed_millis(
-    started_at_ms: Option<u64>,
-    finished_at_ms: Option<u64>,
-) -> Option<String> {
-    let started_at_ms = started_at_ms?;
-    let end_at_ms = finished_at_ms.unwrap_or_else(unix_time_millis_now);
-    Some(format_millis(end_at_ms.saturating_sub(started_at_ms)))
 }
 
 /// Format a nanosecond duration using compact, human-friendly units.

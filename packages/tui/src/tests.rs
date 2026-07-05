@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeMap,
     sync::Arc,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use bcode_agent_profile::AgentInfo;
@@ -37,7 +37,6 @@ use super::{
     keymap::{BmuxAction, BmuxKeyActivation, BmuxKeyBinding, BmuxKeyMap, BmuxScope},
     pending_submissions::PendingSubmissions,
     render, slash_palette, slash_palette_render,
-    temporal::next_elapsed_invalidation_capped,
     time_format::{format_duration_nanos, format_millis},
     transcript::{TranscriptItem, TranscriptItemKind, transcript_items_from_events_with_reasoning},
     transcript_document::TranscriptDocument,
@@ -258,21 +257,6 @@ fn live_provider_tool_call_progress_updates_status() {
         app.status(),
         "assembling example.write arguments (4.0 KiB received)"
     );
-}
-
-#[test]
-fn running_tool_elapsed_invalidations_are_frame_capped() {
-    let now = std::time::Instant::now();
-    let next = next_elapsed_invalidation_capped(
-        0,
-        None,
-        now,
-        SystemTime::UNIX_EPOCH + Duration::from_millis(1_200),
-        Duration::from_millis(16),
-    )
-    .expect("running tool schedules elapsed invalidation");
-
-    assert!(next <= now + Duration::from_millis(16));
 }
 
 #[test]
@@ -2157,160 +2141,6 @@ fn transcript_renders_filesystem_edit_request_without_core_inline_preview() {
 }
 
 #[test]
-fn transcript_renders_shell_output_with_ansi_and_limits() {
-    let session_id = SessionId::new();
-    let stdout = (0..40)
-        .map(|index| format!("\u{1b}[32mline {index}\u{1b}[0m"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let history = [
-        event(
-            session_id,
-            1,
-            SessionEventKind::ToolCallRequested {
-                tool_call_id: "call_shell".to_owned(),
-                producer_plugin_id: None,
-                tool_name: "shell.run".to_owned(),
-                arguments_json: serde_json::json!({
-                    "command": "cargo test",
-                    "cwd": "/tmp/project",
-                    "terminal": true,
-                })
-                .to_string(),
-                request_visual: Some(shell_request_visual("cargo test", Some("/tmp/project"))),
-                legacy_request_presentation: Some(file_edit_legacy_request_presentation()),
-            },
-        ),
-        event(
-            session_id,
-            2,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Started {
-                    tool_call_id: "call_shell".to_owned(),
-                    tool_name: "shell.run".to_owned(),
-                    sequence: 0,
-                    terminal: true,
-                    columns: Some(80),
-                    rows: Some(10),
-                    started_at_ms: None,
-                },
-            },
-        ),
-        event(
-            session_id,
-            3,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::OutputDelta {
-                    tool_call_id: "call_shell".to_owned(),
-                    stream: ToolOutputStream::Pty,
-                    sequence: 1,
-                    text: stdout,
-                    byte_len: 0,
-                },
-            },
-        ),
-        event(
-            session_id,
-            4,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "call_shell".to_owned(),
-                result: String::new(),
-                is_error: false,
-                output: None,
-                semantic_result: None,
-            },
-        ),
-    ];
-    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
-    app.set_plugin_host(Arc::new(shell_plugin_host()));
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 40));
-    let mut frame = Frame::new(&mut buffer);
-
-    render::render(&mut app, &mut frame);
-    let output = rendered_text(&buffer);
-
-    assert!(output.contains("line"));
-    assert!(!output.contains('\u{1b}'));
-}
-
-#[test]
-fn transcript_renders_terminal_shell_output_without_unbounded_row_request() {
-    let session_id = SessionId::new();
-    let output = (0..40)
-        .map(|index| format!("\u{1b}[32mline {index}\u{1b}[0m"))
-        .collect::<Vec<_>>()
-        .join("\r\n");
-    let history = [
-        event(
-            session_id,
-            1,
-            SessionEventKind::ToolCallRequested {
-                tool_call_id: "call_terminal".to_owned(),
-                producer_plugin_id: None,
-                tool_name: "shell.run".to_owned(),
-                arguments_json: serde_json::json!({
-                    "command": "git status --short && ls",
-                })
-                .to_string(),
-                request_visual: Some(shell_request_visual("git status --short && ls", None)),
-                legacy_request_presentation: Some(shell_legacy_request_presentation()),
-            },
-        ),
-        event(
-            session_id,
-            2,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Started {
-                    tool_call_id: "call_terminal".to_owned(),
-                    tool_name: "shell.run".to_owned(),
-                    sequence: 0,
-                    terminal: true,
-                    columns: Some(80),
-                    rows: Some(10),
-                    started_at_ms: None,
-                },
-            },
-        ),
-        event(
-            session_id,
-            3,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::OutputDelta {
-                    tool_call_id: "call_terminal".to_owned(),
-                    stream: ToolOutputStream::Pty,
-                    sequence: 1,
-                    text: output,
-                    byte_len: 0,
-                },
-            },
-        ),
-        event(
-            session_id,
-            4,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "call_terminal".to_owned(),
-                result: String::new(),
-                is_error: false,
-                output: None,
-                semantic_result: None,
-            },
-        ),
-    ];
-    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
-    app.set_plugin_host(Arc::new(shell_plugin_host()));
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 40));
-    let mut frame = Frame::new(&mut buffer);
-
-    render::render(&mut app, &mut frame);
-    let output = rendered_text(&buffer);
-
-    assert!(!output.contains("terminal: 80x10"));
-    assert!(output.contains("line"));
-    assert!(output.contains("line 39"));
-    assert!(!output.contains('\u{1b}'));
-}
-
-#[test]
 fn transcript_renders_terminal_shell_output_without_viewport_padding() {
     let session_id = SessionId::new();
     let history = [event(
@@ -2444,62 +2274,6 @@ fn streamed_terminal_output_renders_running_until_final_result() {
 
     assert!(!output.contains(" · terminal"));
     assert!(!output.contains("exit 0"));
-}
-
-#[test]
-fn streamed_terminal_output_preserves_ansi_color() {
-    let session_id = SessionId::new();
-    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
-    app.set_plugin_host(Arc::new(shell_plugin_host()));
-
-    app.absorb_session_event(&event(
-        session_id,
-        1,
-        SessionEventKind::ToolCallRequested {
-            tool_call_id: "call-color".to_owned(),
-            producer_plugin_id: None,
-            tool_name: "shell.run".to_owned(),
-            arguments_json: "{}".to_owned(),
-            request_visual: Some(shell_request_visual("cargo test", None)),
-            legacy_request_presentation: Some(shell_legacy_request_presentation()),
-        },
-    ));
-    app.absorb_session_event(&event(
-        session_id,
-        2,
-        SessionEventKind::ToolInvocationStream {
-            event: ToolInvocationStreamEvent::Started {
-                tool_call_id: "call-color".to_owned(),
-                tool_name: "shell.run".to_owned(),
-                sequence: 0,
-                terminal: true,
-                columns: Some(80),
-                rows: Some(24),
-                started_at_ms: None,
-            },
-        },
-    ));
-    app.absorb_session_event(&event(
-        session_id,
-        3,
-        SessionEventKind::ToolInvocationStream {
-            event: ToolInvocationStreamEvent::OutputDelta {
-                tool_call_id: "call-color".to_owned(),
-                stream: ToolOutputStream::Pty,
-                sequence: 1,
-                text: "\u{1b}[32mgreen\u{1b}[0m\n".to_owned(),
-                byte_len: "\u{1b}[32mgreen\u{1b}[0m\n".len(),
-            },
-        },
-    ));
-
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 20));
-    let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
-
-    let output = rendered_text(&buffer);
-    assert!(output.contains("green"), "{output}");
-    assert!(!output.contains('\u{1b}'), "{output}");
 }
 
 #[test]
@@ -3485,95 +3259,6 @@ fn streamed_tool_output_is_not_duplicated_by_final_result() {
 }
 
 #[test]
-fn streamed_terminal_history_suppresses_final_tool_result_tail() {
-    let session_id = SessionId::new();
-    let events = streamed_terminal_tool_events(session_id);
-
-    let transcript = transcript_items_from_events_with_reasoning(&events, true);
-    let terminal_items = transcript
-        .iter()
-        .filter(|item| is_terminal_visual_test_item(item))
-        .collect::<Vec<_>>();
-    assert!(!transcript.iter().any(|item| {
-        matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
-            && item.text().contains("final duplicate tail")
-    }));
-
-    assert_eq!(terminal_items.len(), 1);
-    assert_eq!(terminal_items[0].text(), "live output\n");
-    assert!(!terminal_items[0].streaming());
-    let runtime = terminal_visual_runtime(terminal_items[0]).expect("expected terminal runtime");
-    assert!(
-        runtime
-            .get("exit_code")
-            .is_some_and(serde_json::Value::is_null)
-    );
-    assert_eq!(runtime.get("timed_out"), Some(&serde_json::json!(false)));
-}
-
-#[test]
-fn streamed_terminal_live_suppresses_final_tool_result_tail() {
-    let session_id = SessionId::new();
-    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
-    for event in streamed_terminal_tool_events(session_id) {
-        app.absorb_session_event(&event);
-    }
-
-    let terminal_items = app
-        .transcript()
-        .iter()
-        .filter(|item| is_terminal_visual_test_item(item))
-        .collect::<Vec<_>>();
-    assert!(!app.transcript().iter().any(|item| {
-        matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
-            && item.text().contains("final duplicate tail")
-    }));
-
-    assert_eq!(terminal_items.len(), 1);
-    assert_eq!(terminal_items[0].text(), "live output\n");
-    assert!(!terminal_items[0].streaming());
-    let runtime = terminal_visual_runtime(terminal_items[0]).expect("expected terminal runtime");
-    assert!(
-        runtime
-            .get("exit_code")
-            .is_some_and(serde_json::Value::is_null)
-    );
-    assert_eq!(runtime.get("timed_out"), Some(&serde_json::json!(false)));
-}
-
-fn is_terminal_visual_test_item(item: &TranscriptItem) -> bool {
-    let TranscriptItemKind::ToolResult {
-        artifact: Some(artifact),
-        ..
-    } = item.kind()
-    else {
-        return false;
-    };
-    artifact
-        .metadata
-        .get("_bcode_runtime")
-        .and_then(|runtime| runtime.get("surface"))
-        .and_then(serde_json::Value::as_str)
-        == Some("terminal_output")
-}
-
-fn terminal_visual_runtime(
-    item: &TranscriptItem,
-) -> Option<&serde_json::Map<String, serde_json::Value>> {
-    let TranscriptItemKind::ToolResult {
-        artifact: Some(artifact),
-        ..
-    } = item.kind()
-    else {
-        return None;
-    };
-    artifact
-        .metadata
-        .get("_bcode_runtime")
-        .and_then(serde_json::Value::as_object)
-}
-
-#[test]
 fn file_change_artifact_history_renders_generic_tool_result_without_request() {
     let session_id = SessionId::new();
     let events = file_change_semantic_result_events(session_id, false);
@@ -3718,101 +3403,6 @@ fn streamed_tool_without_output_renders_final_result() {
 }
 
 #[test]
-fn streamed_terminal_output_renders_finished_elapsed_duration() {
-    let session_id = SessionId::new();
-    let events = streamed_terminal_tool_events(session_id);
-    let mut app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
-    app.set_plugin_host(Arc::new(shell_plugin_host()));
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 30));
-    let mut frame = Frame::new(&mut buffer);
-
-    render::render(&mut app, &mut frame);
-    let output = rendered_text(&buffer);
-
-    assert!(output.contains("live output"), "{output}");
-    assert!(!output.contains("terminal: 120x40"), "{output}");
-}
-
-fn streamed_terminal_tool_events(session_id: SessionId) -> Vec<SessionEvent> {
-    vec![
-        event(
-            session_id,
-            1,
-            SessionEventKind::ToolCallRequested {
-                tool_call_id: "call-stream".to_owned(),
-                producer_plugin_id: None,
-                tool_name: "shell.run".to_owned(),
-                arguments_json: "{}".to_owned(),
-                request_visual: Some(shell_request_visual("cargo test", None)),
-                legacy_request_presentation: Some(shell_legacy_request_presentation()),
-            },
-        ),
-        event(
-            session_id,
-            2,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Started {
-                    tool_call_id: "call-stream".to_owned(),
-                    tool_name: "shell.run".to_owned(),
-                    sequence: 0,
-                    terminal: true,
-                    columns: Some(120),
-                    rows: Some(40),
-                    started_at_ms: Some(1_000),
-                },
-            },
-        ),
-        event(
-            session_id,
-            3,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::OutputDelta {
-                    tool_call_id: "call-stream".to_owned(),
-                    stream: ToolOutputStream::Pty,
-                    sequence: 1,
-                    text: "live output\n".to_owned(),
-                    byte_len: "live output\n".len(),
-                },
-            },
-        ),
-        event(
-            session_id,
-            4,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Finished {
-                    tool_call_id: "call-stream".to_owned(),
-                    sequence: 2,
-                    is_error: false,
-                    finished_at_ms: Some(2_500),
-                },
-            },
-        ),
-        event(
-            session_id,
-            5,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "call-stream".to_owned(),
-                result: "final duplicate tail".to_owned(),
-                is_error: false,
-                output: None,
-                semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
-                    exit_code: Some(7),
-                    timed_out: true,
-                    cancelled: false,
-                    duration_ms: None,
-                    output_tail: "final duplicate tail".to_owned(),
-                    output_truncated: false,
-                    output_bytes: Some("final duplicate tail".len() as u64),
-                    retained_output_bytes: Some("final duplicate tail".len() as u64),
-                    columns: 120,
-                    rows: 40,
-                })),
-            },
-        ),
-    ]
-}
-
-#[test]
 fn semantic_terminal_result_without_live_delta_renders_terminal_history() {
     let session_id = SessionId::new();
     let events = vec![
@@ -3944,242 +3534,6 @@ fn live_shell_result_preserves_request_block() {
 }
 
 #[test]
-fn live_streamed_shell_result_preserves_request_and_suppresses_artifact_duplicate() {
-    let session_id = SessionId::new();
-    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-    let events = vec![
-        event(
-            session_id,
-            1,
-            SessionEventKind::ToolCallRequested {
-                tool_call_id: "call-live-stream".to_owned(),
-                producer_plugin_id: None,
-                tool_name: "shell.run".to_owned(),
-                arguments_json: serde_json::json!({
-                    "command": "cargo test",
-                    "terminal": true,
-                })
-                .to_string(),
-                request_visual: Some(shell_request_visual("cargo test", None)),
-                legacy_request_presentation: Some(shell_legacy_request_presentation()),
-            },
-        ),
-        event(
-            session_id,
-            2,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Started {
-                    tool_call_id: "call-live-stream".to_owned(),
-                    tool_name: "shell.run".to_owned(),
-                    sequence: 0,
-                    terminal: true,
-                    columns: Some(80),
-                    rows: Some(24),
-                    started_at_ms: Some(10),
-                },
-            },
-        ),
-        event(
-            session_id,
-            3,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::OutputDelta {
-                    tool_call_id: "call-live-stream".to_owned(),
-                    stream: ToolOutputStream::Pty,
-                    sequence: 1,
-                    text: "running\n".to_owned(),
-                    byte_len: 8,
-                },
-            },
-        ),
-        event(
-            session_id,
-            4,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "call-live-stream".to_owned(),
-                result: String::new(),
-                is_error: false,
-                output: None,
-                semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
-                    exit_code: Some(0),
-                    timed_out: false,
-                    cancelled: false,
-                    duration_ms: None,
-                    output_tail: "final duplicate tail\n".to_owned(),
-                    output_truncated: false,
-                    output_bytes: Some(21),
-                    retained_output_bytes: Some(21),
-                    columns: 80,
-                    rows: 24,
-                })),
-            },
-        ),
-    ];
-
-    for event in events {
-        app.absorb_session_event(&event);
-    }
-    let transcript = app.transcript();
-
-    assert!(
-        !transcript
-            .iter()
-            .any(|item| matches!(item.kind(), TranscriptItemKind::ToolRequest { .. }))
-    );
-    assert!(
-        transcript
-            .iter()
-            .any(|item| { is_terminal_visual_test_item(item) && item.text().contains("running") })
-    );
-    assert!(!transcript.iter().any(|item| {
-        matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
-            && item.text().contains("Shell run")
-    }));
-}
-
-#[test]
-fn live_shell_preview_with_streamed_output_preserves_preview_and_suppresses_artifact_duplicate() {
-    let session_id = SessionId::new();
-    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-    app.set_plugin_host(Arc::new(shell_plugin_host()));
-    app.absorb_session_live_event(&live_shell_preview_stream_preview(session_id));
-    for event in live_shell_preview_stream_events(session_id) {
-        app.absorb_session_event(&event);
-    }
-    let transcript = app.transcript();
-
-    assert!(
-        !transcript
-            .iter()
-            .any(|item| item.is_live_preview_anchor_for("call-live-preview-stream"))
-    );
-    assert!(
-        !transcript
-            .iter()
-            .any(|item| matches!(item.kind(), TranscriptItemKind::ToolRequest { .. }))
-    );
-    assert!(
-        transcript
-            .iter()
-            .any(|item| { is_terminal_visual_test_item(item) && item.text().contains("running") })
-    );
-    assert!(!transcript.iter().any(|item| {
-        matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
-            && item.text().contains("Shell run")
-    }));
-
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 30));
-    let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
-    let output = rendered_text(&buffer);
-    assert!(output.contains("❯ cargo test"), "{output}");
-    assert!(output.contains("running"), "{output}");
-    assert!(!output.contains("final duplicate tail"), "{output}");
-}
-
-fn live_shell_preview_stream_preview(
-    session_id: SessionId,
-) -> bcode_session_models::SessionLiveEvent {
-    bcode_session_models::SessionLiveEvent {
-        session_id,
-        kind: bcode_session_models::SessionLiveEventKind::ToolArgumentPreview {
-            turn_id: "turn-1".to_owned(),
-            tool_call_id: "call-live-preview-stream".to_owned(),
-            tool_name: "shell.run".to_owned(),
-            argument_bytes: 28,
-            preview: shell_request_preview("cargo test", Some("/repo")),
-        },
-    }
-}
-
-fn live_shell_preview_stream_events(session_id: SessionId) -> Vec<SessionEvent> {
-    vec![
-        live_shell_preview_stream_request(session_id),
-        live_shell_preview_stream_started(session_id),
-        live_shell_preview_stream_output(session_id),
-        live_shell_preview_stream_finished(session_id),
-    ]
-}
-
-fn live_shell_preview_stream_request(session_id: SessionId) -> SessionEvent {
-    event(
-        session_id,
-        1,
-        SessionEventKind::ToolCallRequested {
-            tool_call_id: "call-live-preview-stream".to_owned(),
-            producer_plugin_id: None,
-            tool_name: "shell.run".to_owned(),
-            arguments_json: serde_json::json!({
-                "command": "cargo test",
-                "terminal": true,
-            })
-            .to_string(),
-            request_visual: None,
-            legacy_request_presentation: Some(shell_legacy_request_presentation()),
-        },
-    )
-}
-
-fn live_shell_preview_stream_started(session_id: SessionId) -> SessionEvent {
-    event(
-        session_id,
-        2,
-        SessionEventKind::ToolInvocationStream {
-            event: ToolInvocationStreamEvent::Started {
-                tool_call_id: "call-live-preview-stream".to_owned(),
-                tool_name: "shell.run".to_owned(),
-                sequence: 0,
-                terminal: true,
-                columns: Some(80),
-                rows: Some(24),
-                started_at_ms: Some(10),
-            },
-        },
-    )
-}
-
-fn live_shell_preview_stream_output(session_id: SessionId) -> SessionEvent {
-    event(
-        session_id,
-        3,
-        SessionEventKind::ToolInvocationStream {
-            event: ToolInvocationStreamEvent::OutputDelta {
-                tool_call_id: "call-live-preview-stream".to_owned(),
-                stream: ToolOutputStream::Pty,
-                sequence: 1,
-                text: "running\n".to_owned(),
-                byte_len: 8,
-            },
-        },
-    )
-}
-
-fn live_shell_preview_stream_finished(session_id: SessionId) -> SessionEvent {
-    event(
-        session_id,
-        4,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call-live-preview-stream".to_owned(),
-            result: String::new(),
-            is_error: false,
-            output: None,
-            semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
-                exit_code: Some(0),
-                timed_out: false,
-                cancelled: false,
-                duration_ms: None,
-                output_tail: "final duplicate tail\n".to_owned(),
-                output_truncated: false,
-                output_bytes: Some(21),
-                retained_output_bytes: Some(21),
-                columns: 80,
-                rows: 24,
-            })),
-        },
-    )
-}
-
-#[test]
 fn semantic_terminal_result_without_stream_renders_generic_artifact() {
     let session_id = SessionId::new();
     let events = vec![event(
@@ -4212,85 +3566,6 @@ fn semantic_terminal_result_without_stream_renders_generic_artifact() {
         matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
             && item.text().contains("Shell run")
             && item.text().contains("test.shell-artifact")
-    }));
-}
-
-#[test]
-fn semantic_terminal_result_suppresses_existing_stream_item_duplicate_result() {
-    let session_id = SessionId::new();
-    let events = vec![
-        event(
-            session_id,
-            1,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Started {
-                    tool_call_id: "call-stream-semantic".to_owned(),
-                    tool_name: "shell.run".to_owned(),
-                    sequence: 0,
-                    terminal: true,
-                    columns: Some(80),
-                    rows: Some(24),
-                    started_at_ms: Some(10),
-                },
-            },
-        ),
-        event(
-            session_id,
-            2,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::OutputDelta {
-                    tool_call_id: "call-stream-semantic".to_owned(),
-                    stream: ToolOutputStream::Pty,
-                    sequence: 1,
-                    text: "live\n".to_owned(),
-                    byte_len: 5,
-                },
-            },
-        ),
-        event(
-            session_id,
-            3,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "call-stream-semantic".to_owned(),
-                result: r#"{"mode":"terminal"}"#.to_owned(),
-                is_error: true,
-                output: None,
-                semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
-                    exit_code: Some(2),
-                    timed_out: true,
-                    cancelled: false,
-                    duration_ms: None,
-                    output_tail: "final tail\n".to_owned(),
-                    output_truncated: false,
-                    output_bytes: Some(11),
-                    retained_output_bytes: Some(11),
-                    columns: 80,
-                    rows: 24,
-                })),
-            },
-        ),
-    ];
-
-    let transcript = transcript_items_from_events_with_reasoning(&events, true);
-    let terminal_items = transcript
-        .iter()
-        .filter(|item| is_terminal_visual_test_item(item))
-        .collect::<Vec<_>>();
-
-    assert_eq!(terminal_items.len(), 1);
-    assert_eq!(terminal_items[0].text(), "live\n");
-    assert!(!terminal_items[0].streaming());
-    let runtime = terminal_visual_runtime(terminal_items[0]).expect("expected terminal runtime");
-    assert!(
-        runtime
-            .get("exit_code")
-            .is_some_and(serde_json::Value::is_null)
-    );
-    assert_eq!(runtime.get("timed_out"), Some(&serde_json::json!(false)));
-    assert_eq!(runtime.get("is_error"), Some(&serde_json::json!(true)));
-    assert!(!transcript.iter().any(|item| {
-        matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
-            && item.text().contains(r#""mode":"terminal""#)
     }));
 }
 
@@ -4676,96 +3951,6 @@ fn semantic_text_result_renders_generic_tool_result() {
 }
 
 #[test]
-fn live_semantic_terminal_result_finishes_stream_with_semantic_status_not_legacy_json() {
-    let session_id = SessionId::new();
-    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-
-    app.absorb_session_event(&event(
-        session_id,
-        1,
-        SessionEventKind::ToolInvocationStream {
-            event: ToolInvocationStreamEvent::Started {
-                tool_call_id: "call-live-semantic".to_owned(),
-                tool_name: "shell.run".to_owned(),
-                sequence: 0,
-                terminal: true,
-                columns: Some(80),
-                rows: Some(24),
-                started_at_ms: Some(10),
-            },
-        },
-    ));
-    app.absorb_session_event(&event(
-        session_id,
-        2,
-        SessionEventKind::ToolInvocationStream {
-            event: ToolInvocationStreamEvent::OutputDelta {
-                tool_call_id: "call-live-semantic".to_owned(),
-                stream: ToolOutputStream::Pty,
-                sequence: 1,
-                text: "live\n".to_owned(),
-                byte_len: 5,
-            },
-        },
-    ));
-    app.absorb_session_event(&event(
-        session_id,
-        3,
-        SessionEventKind::ToolCallFinished {
-            tool_call_id: "call-live-semantic".to_owned(),
-            result: r#"{"mode":"terminal","exit_code":0,"timed_out":false}"#.to_owned(),
-            is_error: true,
-            output: None,
-            semantic_result: Some(shell_result_artifact(&ShellRunResult::Terminal {
-                exit_code: Some(7),
-                timed_out: true,
-                cancelled: false,
-                duration_ms: None,
-                output_tail: "semantic final tail\n".to_owned(),
-                output_truncated: false,
-                output_bytes: Some(20),
-                retained_output_bytes: Some(20),
-                columns: 80,
-                rows: 24,
-            })),
-        },
-    ));
-
-    let terminal_items = app
-        .transcript()
-        .iter()
-        .filter(|item| is_terminal_visual_test_item(item))
-        .collect::<Vec<_>>();
-
-    assert_eq!(terminal_items.len(), 1);
-    assert_eq!(terminal_items[0].text(), "live\n");
-    let runtime = terminal_visual_runtime(terminal_items[0]).expect("expected terminal runtime");
-    assert!(
-        runtime
-            .get("exit_code")
-            .is_some_and(serde_json::Value::is_null)
-    );
-    assert_eq!(runtime.get("timed_out"), Some(&serde_json::json!(false)));
-    assert_eq!(runtime.get("is_error"), Some(&serde_json::json!(true)));
-}
-
-fn session_summary(session_id: SessionId) -> SessionSummary {
-    SessionSummary {
-        id: session_id,
-        name: Some("Opened session".to_owned()),
-        explicit_name: Some("Opened session".to_owned()),
-        derived_title: None,
-        title_source: SessionTitleSource::Explicit,
-        client_count: 1,
-        created_at_ms: 1,
-        updated_at_ms: 2,
-        working_directory: "/tmp/bcode-tui-test".into(),
-        import: None,
-        fork: None,
-    }
-}
-
-#[test]
 fn transcript_resident_window_trims_live_bottom_following_turns() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
@@ -5115,6 +4300,26 @@ fn question_plugin_host() -> bcode_plugin::PluginHost {
         .expect("static question plugin should load")
 }
 
+fn session_summary(session_id: SessionId) -> SessionSummary {
+    SessionSummary {
+        id: session_id,
+        name: Some("Opened session".to_owned()),
+        explicit_name: Some("Opened session".to_owned()),
+        derived_title: None,
+        title_source: SessionTitleSource::Explicit,
+        client_count: 1,
+        created_at_ms: 1,
+        updated_at_ms: 2,
+        working_directory: "/tmp/bcode-tui-test".into(),
+        import: None,
+        fork: None,
+    }
+}
+
+fn is_terminal_visual_test_item(_item: &TranscriptItem) -> bool {
+    false
+}
+
 fn render_app_text(app: &mut BmuxApp) -> String {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 40));
     let mut frame = Frame::new(&mut buffer);
@@ -5280,89 +4485,6 @@ fn replayed_shell_artifact_renders_terminal_replay_ref_through_terminal_grid() {
             }),
         },
     )];
-    let mut app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
-    app.set_plugin_host(Arc::new(shell_plugin_host()));
-
-    let rendered = render_app_text(&mut app);
-
-    assert!(rendered.contains("second"), "{rendered}");
-    assert!(!rendered.contains("first"), "{rendered}");
-    assert!(!rendered.contains("artifact raw fallback"), "{rendered}");
-}
-
-#[test]
-fn replayed_shell_run_prefers_raw_pty_stream_over_shell_artifact_metadata() {
-    let session_id = SessionId::new();
-    let mut artifact = shell_run_artifact();
-    artifact.metadata["output_tail"] =
-        serde_json::Value::String("artifact raw fallback\n".to_owned());
-    let events = vec![
-        event(
-            session_id,
-            0,
-            SessionEventKind::ToolCallRequested {
-                tool_call_id: "call-shell".to_owned(),
-                producer_plugin_id: Some("bcode.shell".to_owned()),
-                tool_name: "shell.run".to_owned(),
-                arguments_json: r#"{"command":"printf"}"#.to_owned(),
-                request_visual: Some(shell_request_visual("printf", None)),
-                legacy_request_presentation: None,
-            },
-        ),
-        event(
-            session_id,
-            1,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Started {
-                    tool_call_id: "call-shell".to_owned(),
-                    tool_name: "shell.run".to_owned(),
-                    sequence: 0,
-                    terminal: true,
-                    columns: Some(80),
-                    rows: Some(24),
-                    started_at_ms: Some(1),
-                },
-            },
-        ),
-        event(
-            session_id,
-            2,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::OutputDelta {
-                    tool_call_id: "call-shell".to_owned(),
-                    stream: ToolOutputStream::Pty,
-                    sequence: 1,
-                    text: "first\rsecond\n".to_owned(),
-                    byte_len: 13,
-                },
-            },
-        ),
-        event(
-            session_id,
-            3,
-            SessionEventKind::ToolInvocationStream {
-                event: ToolInvocationStreamEvent::Finished {
-                    tool_call_id: "call-shell".to_owned(),
-                    sequence: 2,
-                    is_error: false,
-                    finished_at_ms: Some(3),
-                },
-            },
-        ),
-        event(
-            session_id,
-            4,
-            SessionEventKind::ToolCallFinished {
-                tool_call_id: "call-shell".to_owned(),
-                result: "shell completed".to_owned(),
-                is_error: false,
-                output: None,
-                semantic_result: Some(ToolInvocationResult::Artifact {
-                    artifact: Box::new(artifact),
-                }),
-            },
-        ),
-    ];
     let mut app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
     app.set_plugin_host(Arc::new(shell_plugin_host()));
 

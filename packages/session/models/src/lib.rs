@@ -136,7 +136,8 @@ fn apply_tool_invocation_stream_projection_event(
                 .output
                 .push_str(text);
         }
-        ToolInvocationStreamEvent::Status { .. } => {
+        ToolInvocationStreamEvent::VisualUpdate { .. }
+        | ToolInvocationStreamEvent::Status { .. } => {
             projection.status = ToolInvocationProjectionStatus::Running;
         }
         ToolInvocationStreamEvent::Finished { is_error, .. } => {
@@ -172,6 +173,7 @@ fn tool_projection_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &st
     match event {
         ToolInvocationStreamEvent::Started { tool_call_id, .. }
         | ToolInvocationStreamEvent::OutputDelta { tool_call_id, .. }
+        | ToolInvocationStreamEvent::VisualUpdate { tool_call_id, .. }
         | ToolInvocationStreamEvent::Status { tool_call_id, .. }
         | ToolInvocationStreamEvent::LegacyPresentation { tool_call_id, .. }
         | ToolInvocationStreamEvent::Finished { tool_call_id, .. } => tool_call_id,
@@ -985,6 +987,14 @@ pub enum ToolInvocationStreamEvent {
         text: String,
         #[serde(default)]
         byte_len: usize,
+    },
+    /// Plugin-owned visual update for transcript rendering.
+    VisualUpdate {
+        tool_call_id: String,
+        sequence: u64,
+        visual: PluginVisualDescriptor,
+        #[serde(default)]
+        streaming: bool,
     },
     /// Human-readable progress status from a long-running tool.
     Status {

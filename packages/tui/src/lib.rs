@@ -70,7 +70,6 @@ pub(crate) mod slash_palette;
 pub(crate) mod slash_palette_render;
 pub(crate) mod slash_registry;
 pub(crate) mod startup_action;
-pub(crate) mod temporal;
 pub(crate) mod terminal_events;
 #[cfg(test)]
 pub(crate) mod tests;

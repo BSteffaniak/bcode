@@ -558,6 +558,7 @@ fn tool_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &str {
     match event {
         ToolInvocationStreamEvent::Started { tool_call_id, .. }
         | ToolInvocationStreamEvent::OutputDelta { tool_call_id, .. }
+        | ToolInvocationStreamEvent::VisualUpdate { tool_call_id, .. }
         | ToolInvocationStreamEvent::Status { tool_call_id, .. }
         | ToolInvocationStreamEvent::LegacyPresentation { tool_call_id, .. }
         | ToolInvocationStreamEvent::Finished { tool_call_id, .. } => tool_call_id,
@@ -569,6 +570,9 @@ fn tool_stream_content_bytes(event: &ToolInvocationStreamEvent) -> usize {
         ToolInvocationStreamEvent::Started { tool_name, .. } => tool_name.len(),
         ToolInvocationStreamEvent::OutputDelta { text, .. }
         | ToolInvocationStreamEvent::Status { message: text, .. } => text.len(),
+        ToolInvocationStreamEvent::VisualUpdate { visual, .. } => {
+            serde_json::to_vec(visual).map_or(0, |encoded| encoded.len())
+        }
         ToolInvocationStreamEvent::LegacyPresentation { presentation, .. } => {
             legacy_tool_presentation_content_bytes(presentation)
         }

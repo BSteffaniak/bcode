@@ -17,7 +17,7 @@ use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, ShellRunResult, TOOL_SERVICE_INTERFACE_ID,
     ToolArtifact, ToolArtifactRef, ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
     ToolInvocationResult, ToolInvocationStreamEvent, ToolList, ToolOutputStream,
-    ToolPluginVisualMetadata, ToolSideEffect,
+    ToolPluginVisualMetadata, ToolSideEffect, ToolStreamVisualUpdate,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -71,7 +71,7 @@ fn invoke_shell_service(context: &NativeServiceContext) -> ServiceResponse {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ShellRunArguments {
     command: String,
     #[serde(default)]
@@ -227,6 +227,7 @@ fn run_shell_tool(
             result: None,
         };
     }
+    let arguments_json = serde_json::to_value(&arguments).unwrap_or_else(|_| json!({}));
     let now_ms = current_unix_millis();
     emit_tool_stream_event(
         events,
@@ -251,6 +252,7 @@ fn run_shell_tool(
         &context.cancellation,
         tool_call_id,
         &arguments,
+        arguments_json,
         TerminalRunPaths {
             session_cwd,
             ..paths
@@ -420,6 +422,7 @@ fn run_terminal_shell_command(
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
     tool_call_id: &str,
     arguments: &ShellRunArguments,
+    arguments_json: serde_json::Value,
     paths: TerminalRunPaths<'_>,
 ) -> ToolInvocationResponse {
     run_terminal_shell_command_with_environment(
@@ -427,6 +430,7 @@ fn run_terminal_shell_command(
         cancellation,
         tool_call_id,
         arguments,
+        arguments_json,
         paths,
         &bcode_config::ProcessConfigEnvironment,
     )
@@ -437,6 +441,7 @@ fn run_terminal_shell_command_with_environment(
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
     tool_call_id: &str,
     arguments: &ShellRunArguments,
+    arguments_json: serde_json::Value,
     paths: TerminalRunPaths<'_>,
     environment: &impl bcode_config::ConfigEnvironment,
 ) -> ToolInvocationResponse {
@@ -445,6 +450,7 @@ fn run_terminal_shell_command_with_environment(
         cancellation,
         tool_call_id,
         arguments,
+        arguments_json,
         paths,
         environment,
     ) {
@@ -563,6 +569,7 @@ fn run_terminal_shell_command_inner(
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
     tool_call_id: &str,
     arguments: &ShellRunArguments,
+    arguments_json: serde_json::Value,
     paths: TerminalRunPaths<'_>,
     environment: &impl bcode_config::ConfigEnvironment,
 ) -> Result<ToolInvocationResponse, String> {
@@ -610,13 +617,16 @@ fn run_terminal_shell_command_inner(
                 &mut reader,
                 events,
                 &tool_call_id,
-                ToolOutputStream::Pty,
+                ShellVisualStreamContext {
+                    arguments: &arguments_json,
+                    stream: ToolOutputStream::Pty,
+                    columns,
+                    rows,
+                },
                 TerminalStreamPaths {
                     clean_artifact_path,
                     raw_artifact_path,
                 },
-                columns,
-                rows,
             )
         }
     });
@@ -763,14 +773,20 @@ struct TerminalStreamPaths {
     raw_artifact_path: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy)]
+struct ShellVisualStreamContext<'a> {
+    arguments: &'a serde_json::Value,
+    stream: ToolOutputStream,
+    columns: u16,
+    rows: u16,
+}
+
 fn read_limited_streaming<R>(
     mut reader: R,
     events: ServiceEventEmitter,
     tool_call_id: &str,
-    stream: ToolOutputStream,
+    visual_context: ShellVisualStreamContext<'_>,
     paths: TerminalStreamPaths,
-    columns: u16,
-    rows: u16,
 ) -> Result<TerminalStreamOutput, String>
 where
     R: Read,
@@ -780,14 +796,15 @@ where
     let mut clean_writer = clean_artifact_writer(paths.clean_artifact_path.as_deref())?;
     let mut cleaner = terminal_clean::TerminalCleanWriter::new(
         &mut clean_writer,
-        columns,
-        rows,
+        visual_context.columns,
+        visual_context.rows,
         MAX_INLINE_TERMINAL_OUTPUT_BYTES,
     );
     let mut buffer = [0_u8; 4096];
     let mut sequence = 0_u64;
     let mut raw_original_bytes = 0_usize;
     let mut raw_truncated = false;
+    let mut visual_output = String::new();
     loop {
         let read = reader
             .read(&mut buffer)
@@ -797,7 +814,14 @@ where
         }
         sequence = sequence.saturating_add(1);
         raw_original_bytes = raw_original_bytes.saturating_add(read);
-        emit_tool_output_delta(events, tool_call_id, stream, sequence, &buffer[..read]);
+        visual_output.push_str(&String::from_utf8_lossy(&buffer[..read]));
+        emit_tool_output_delta(
+            events,
+            tool_call_id,
+            visual_context,
+            sequence,
+            visual_output.as_bytes(),
+        );
         cleaner
             .write_chunk(&buffer[..read])
             .map_err(|error| error.to_string())?;
@@ -899,20 +923,36 @@ fn current_unix_millis() -> u64 {
 fn emit_tool_output_delta(
     events: ServiceEventEmitter,
     tool_call_id: &str,
-    stream: ToolOutputStream,
+    visual_context: ShellVisualStreamContext<'_>,
     sequence: u64,
     bytes: &[u8],
 ) {
+    let text = String::from_utf8_lossy(bytes).into_owned();
     emit_tool_stream_event(
         events,
-        &ToolInvocationStreamEvent::OutputDelta {
+        &ToolInvocationStreamEvent::VisualUpdate {
             tool_call_id: tool_call_id.to_owned(),
-            stream,
             sequence,
-            text: String::from_utf8_lossy(bytes).into_owned(),
-            byte_len: bytes.len(),
+            visual: ToolStreamVisualUpdate {
+                producer_plugin_id: Some("bcode.shell".to_owned()),
+                schema: "bcode.tool.request.shell.run".to_owned(),
+                schema_version: 1,
+                title: Some("Shell command".to_owned()),
+                subtitle: None,
+                payload: json!({
+                    "arguments": visual_context.arguments,
+                    "_bcode_runtime": {
+                        "output": text,
+                        "columns": visual_context.columns,
+                        "rows": visual_context.rows,
+                        "streaming": true,
+                    }
+                }),
+            },
+            streaming: true,
         },
     );
+    let _ = visual_context.stream;
 }
 
 fn emit_tool_status(
@@ -1206,6 +1246,7 @@ mod tests {
                 columns: None,
                 rows: None,
             },
+            json!({}),
             TerminalRunPaths {
                 session_cwd: None,
                 artifact_dir: None,
@@ -1244,6 +1285,7 @@ mod tests {
                 columns: None,
                 rows: None,
             },
+            json!({}),
             TerminalRunPaths {
                 session_cwd: None,
                 artifact_dir: None,
@@ -1271,6 +1313,7 @@ mod tests {
                 columns: Some(80),
                 rows: Some(24),
             },
+            json!({}),
             TerminalRunPaths {
                 session_cwd: None,
                 artifact_dir: None,
@@ -1314,6 +1357,7 @@ mod tests {
                 columns: Some(80),
                 rows: Some(24),
             },
+            json!({}),
             TerminalRunPaths {
                 session_cwd: None,
                 artifact_dir: None,

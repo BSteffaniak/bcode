@@ -20,7 +20,6 @@ use super::pending_submission::{PendingSubmission, PendingSubmissionState};
 use super::tool_render_projection::{CanonicalPluginVisual, CanonicalToolVisual};
 use super::transcript::{TranscriptItem, TranscriptItemKind};
 use super::transcript_layout::TranscriptLayoutSignature;
-use crate::time_format::format_elapsed_millis;
 use bmux_tui::text_width::{display_width as text_display_width, truncate_to_display_width};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -565,27 +564,8 @@ pub fn transcript_item_signature(
     ))
 }
 
-pub fn terminal_elapsed_signature_fragment(item: &TranscriptItem) -> Option<String> {
-    let TranscriptItemKind::ToolResult {
-        artifact: Some(artifact),
-        ..
-    } = item.kind()
-    else {
-        return None;
-    };
-    let runtime = artifact.metadata.get("_bcode_runtime")?;
-    if runtime.get("surface").and_then(serde_json::Value::as_str) != Some("terminal_output") {
-        return None;
-    }
-    let started_at_ms = runtime.get("started_at_ms")?.as_u64()?;
-    if runtime
-        .get("finished_at_ms")
-        .is_some_and(|value| !value.is_null())
-    {
-        return None;
-    }
-
-    format_elapsed_millis(Some(started_at_ms), None).map(|elapsed| format!("elapsed:{elapsed}"))
+pub const fn terminal_elapsed_signature_fragment(_item: &TranscriptItem) -> Option<String> {
+    None
 }
 
 pub fn pending_submission_signature(

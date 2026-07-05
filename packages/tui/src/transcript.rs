@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use bcode_session_models::{
     SessionEvent, SessionEventKind, SessionTokenUsage, ToolArtifact, ToolInvocationProjection,
-    ToolInvocationResult, ToolInvocationStreamEvent, ToolOutputStream,
+    ToolInvocationResult, ToolInvocationStreamEvent,
 };
 
 /// Semantic transcript item type.
@@ -283,73 +283,10 @@ impl TranscriptItem {
     /// Append text to this transcript item.
     pub fn append_text(&mut self, text: &str) {
         self.text.push_str(text);
-        if let TranscriptItemKind::ToolResult {
-            result, artifact, ..
-        } = &mut self.kind
-        {
+        if let TranscriptItemKind::ToolResult { result, .. } = &mut self.kind {
             result.push_str(text);
-            if let Some(artifact) = artifact.as_mut() {
-                append_terminal_artifact_output(artifact, text);
-            }
         }
         self.bump_revision();
-    }
-
-    /// Mark a terminal output item as finished with final process metadata.
-    #[allow(dead_code)]
-    pub fn finish_terminal(
-        &mut self,
-        exit_code: Option<i32>,
-        timed_out: bool,
-        is_error: bool,
-        finished_at_ms: Option<u64>,
-    ) {
-        if let TranscriptItemKind::ToolResult {
-            artifact,
-            is_error: tool_error,
-            ..
-        } = &mut self.kind
-        {
-            *tool_error = is_error;
-            if let Some(artifact) = artifact.as_mut() {
-                update_terminal_artifact_status(
-                    artifact,
-                    exit_code,
-                    timed_out,
-                    is_error,
-                    finished_at_ms,
-                );
-            }
-        }
-        self.streaming = false;
-        self.bump_revision();
-    }
-
-    /// Mark a terminal output item as failed or successful.
-    pub fn set_terminal_error(&mut self, is_error: bool) {
-        if let TranscriptItemKind::ToolResult {
-            artifact,
-            is_error: tool_error,
-            ..
-        } = &mut self.kind
-        {
-            *tool_error = is_error;
-            if let Some(artifact) = artifact.as_mut() {
-                update_terminal_artifact_status(artifact, None, false, is_error, None);
-            }
-            self.bump_revision();
-        }
-    }
-
-    /// Set the terminal output finish timestamp.
-    #[allow(dead_code)]
-    pub fn set_terminal_finished_at(&mut self, finished_at_ms: Option<u64>) {
-        if let TranscriptItemKind::ToolResult { artifact, .. } = &mut self.kind {
-            if let Some(artifact) = artifact.as_mut() {
-                update_terminal_artifact_finished_at(artifact, finished_at_ms);
-            }
-            self.bump_revision();
-        }
     }
 
     /// Mark this transcript item as no longer streaming.
@@ -522,186 +459,56 @@ pub fn live_tool_preview_anchor_item(tool_call_id: &str, tool_name: &str) -> Tra
     )
 }
 
-fn terminal_output_artifact(
-    tool_call_id: &str,
-    tool_name: Option<&str>,
-    request_visual: Option<&bcode_session_models::PluginVisualDescriptor>,
-    arguments_json: Option<&str>,
-    text: &str,
-    dimensions: (u16, u16),
-    started_at_ms: Option<u64>,
-) -> ToolArtifact {
-    let visual = request_visual;
-    let schema = visual.map_or("bcode.terminal.output", |visual| visual.schema.as_str());
-    let schema_version = visual.map_or(1, |visual| visual.schema_version);
-    let producer_plugin_id = visual
-        .and_then(|visual| visual.producer_plugin_id.clone())
-        .unwrap_or_else(|| "bcode.terminal".to_owned());
-    let title = visual
-        .and_then(|visual| visual.title.clone())
-        .or_else(|| tool_name.map(ToOwned::to_owned))
-        .unwrap_or_else(|| "Terminal output".to_owned());
-    let mut metadata =
-        visual.map_or_else(|| serde_json::json!({}), |visual| visual.payload.clone());
-    if let Some(object) = metadata.as_object_mut() {
-        if !object.contains_key("arguments")
-            && let Some(arguments_json) = arguments_json
-            && let Ok(arguments) = serde_json::from_str::<serde_json::Value>(arguments_json)
-        {
-            object.insert("arguments".to_owned(), arguments);
-        }
-        object.insert(
-            "_bcode_runtime".to_owned(),
-            serde_json::json!({
-                "surface": "terminal_output",
-                "output": text,
-                "columns": dimensions.0,
-                "rows": dimensions.1,
-                "started_at_ms": started_at_ms,
-                "finished_at_ms": null,
-                "exit_code": null,
-                "timed_out": null,
-                "is_error": false,
-                "streaming": true,
-            }),
-        );
-    }
-    ToolArtifact {
-        artifact_id: format!("{tool_call_id}-terminal-output"),
-        producer_plugin_id,
-        schema: schema.to_owned(),
-        schema_version,
-        tool_call_id: Some(tool_call_id.to_owned()),
-        title: Some(title),
-        metadata,
-        refs: Vec::new(),
-    }
-}
-
-fn terminal_artifact_runtime_mut(
-    artifact: &mut ToolArtifact,
-) -> Option<&mut serde_json::Map<String, serde_json::Value>> {
-    artifact.metadata.get_mut("_bcode_runtime")?.as_object_mut()
-}
-
-fn append_terminal_artifact_output(artifact: &mut ToolArtifact, text: &str) {
-    let Some(runtime) = terminal_artifact_runtime_mut(artifact) else {
-        return;
-    };
-    let output = runtime
-        .entry("output".to_owned())
-        .or_insert_with(|| serde_json::Value::String(String::new()));
-    if let serde_json::Value::String(output) = output {
-        output.push_str(text);
-    }
-}
-
-fn update_terminal_artifact_status(
-    artifact: &mut ToolArtifact,
-    exit_code: Option<i32>,
-    timed_out: bool,
-    is_error: bool,
-    finished_at_ms: Option<u64>,
-) {
-    let Some(runtime) = terminal_artifact_runtime_mut(artifact) else {
-        return;
-    };
-    runtime.insert("exit_code".to_owned(), serde_json::json!(exit_code));
-    runtime.insert("timed_out".to_owned(), serde_json::json!(timed_out));
-    runtime.insert("is_error".to_owned(), serde_json::json!(is_error));
-    runtime.insert("streaming".to_owned(), serde_json::json!(false));
-    if finished_at_ms.is_some() {
-        runtime.insert(
-            "finished_at_ms".to_owned(),
-            serde_json::json!(finished_at_ms),
-        );
-    }
-}
-
-fn update_terminal_artifact_finished_at(artifact: &mut ToolArtifact, finished_at_ms: Option<u64>) {
-    let Some(runtime) = terminal_artifact_runtime_mut(artifact) else {
-        return;
-    };
-    runtime.insert(
-        "finished_at_ms".to_owned(),
-        serde_json::json!(finished_at_ms),
-    );
-}
-
-/// Build a streaming transcript item for live terminal output.
+/// Build a streaming transcript item for a plugin-owned visual update.
 #[must_use]
-pub fn streaming_terminal_output_item(
+pub fn streaming_tool_visual_item(
     tool_call_id: &str,
     tool_name: Option<&str>,
-    request_visual: Option<&bcode_session_models::PluginVisualDescriptor>,
-    arguments_json: Option<&str>,
-    text: &str,
-    dimensions: (u16, u16),
-    started_at_ms: Option<u64>,
+    visual: &bcode_session_models::PluginVisualDescriptor,
+    streaming: bool,
 ) -> TranscriptItem {
-    let artifact = terminal_output_artifact(
-        tool_call_id,
-        tool_name,
-        request_visual,
-        arguments_json,
-        text,
-        dimensions,
-        started_at_ms,
-    );
+    let artifact = ToolArtifact {
+        artifact_id: format!("{tool_call_id}-stream-visual"),
+        producer_plugin_id: visual
+            .producer_plugin_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_owned()),
+        schema: visual.schema.clone(),
+        schema_version: visual.schema_version,
+        tool_call_id: Some(tool_call_id.to_owned()),
+        title: visual.title.clone(),
+        metadata: visual.payload.clone(),
+        refs: Vec::new(),
+    };
     TranscriptItem::with_kind(
         "Tool",
-        text.to_owned(),
-        true,
+        artifact_summary_text(&artifact),
+        streaming,
         TranscriptItemKind::ToolResult {
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.map(ToOwned::to_owned),
             arguments_json: None,
-            result: text.to_owned(),
+            result: artifact_summary_text(&artifact),
             artifact: Some(Box::new(artifact)),
             is_error: false,
         },
     )
 }
 
-fn terminal_output_tool_call_id(item: &TranscriptItem) -> Option<&str> {
-    let TranscriptItemKind::ToolResult {
-        tool_call_id,
-        artifact: Some(artifact),
-        ..
-    } = item.kind()
-    else {
-        return None;
-    };
-    let is_terminal = artifact
-        .metadata
-        .get("_bcode_runtime")
-        .and_then(|runtime| runtime.get("surface"))
-        .and_then(serde_json::Value::as_str)
-        == Some("terminal_output");
-    is_terminal.then_some(tool_call_id.as_str())
-}
-
-/// Upsert a streaming terminal output item for a tool call.
-///
-/// Reuses the canonical terminal transcript item across live and replay paths by
-/// replacing an existing request/preview placeholder instead of creating a
-/// second block for terminal output.
-pub fn upsert_terminal_output_item(items: &mut Vec<TranscriptItem>, item: TranscriptItem) -> usize {
-    let Some(tool_call_id) = terminal_output_tool_call_id(&item).map(ToOwned::to_owned) else {
+/// Upsert a plugin-owned visual update item for a tool call.
+pub fn upsert_tool_visual_item(items: &mut Vec<TranscriptItem>, item: TranscriptItem) -> usize {
+    let Some((tool_call_id, schema)) = tool_visual_identity(&item) else {
         items.push(item);
         return items.len().saturating_sub(1);
     };
-
-    if let Some(index) = items
-        .iter()
-        .position(|existing| terminal_output_tool_call_id(existing) == Some(tool_call_id.as_str()))
-    {
-        if !item.text().is_empty() {
-            items[index].append_text(item.text());
-        }
+    let tool_call_id = tool_call_id.to_owned();
+    let schema = schema.to_owned();
+    if let Some(index) = items.iter().position(|existing| {
+        tool_visual_identity(existing) == Some((tool_call_id.as_str(), schema.as_str()))
+    }) {
+        items[index] = item;
         return index;
     }
-
     if let Some(index) = items.iter().position(|existing| {
         existing.is_live_preview_anchor_for(&tool_call_id)
             || matches!(
@@ -715,9 +522,20 @@ pub fn upsert_terminal_output_item(items: &mut Vec<TranscriptItem>, item: Transc
         items[index] = item;
         return index;
     }
-
     items.push(item);
     items.len().saturating_sub(1)
+}
+
+fn tool_visual_identity(item: &TranscriptItem) -> Option<(&str, &str)> {
+    let TranscriptItemKind::ToolResult {
+        tool_call_id,
+        artifact: Some(artifact),
+        ..
+    } = item.kind()
+    else {
+        return None;
+    };
+    Some((tool_call_id.as_str(), artifact.schema.as_str()))
 }
 
 /// Build a streaming transcript item for live tool output.
@@ -994,7 +812,7 @@ fn push_transcript_item_from_event(
                     );
                     if replay.saw_output {
                         if let Some(existing) = items.get_mut(index) {
-                            existing.finish_terminal(None, false, *is_error, replay.finished_at_ms);
+                            existing.finish_streaming();
                         }
                     } else if let Some(existing) = items.get_mut(index) {
                         *existing = item;
@@ -1017,7 +835,7 @@ fn push_transcript_item_from_event(
                     if let Some(index) = replay.index
                         && let Some(item) = items.get_mut(index)
                     {
-                        item.finish_terminal(None, false, *is_error, replay.finished_at_ms);
+                        item.finish_streaming();
                     }
                     !replay.saw_output
                 } else {
@@ -1404,99 +1222,32 @@ fn apply_tool_invocation_stream_event(
     streamed_tool_results: &mut BTreeMap<String, StreamedToolReplayContext>,
     event: &ToolInvocationStreamEvent,
 ) {
-    match event {
-        ToolInvocationStreamEvent::Started {
+    if let ToolInvocationStreamEvent::VisualUpdate {
+        tool_call_id,
+        visual,
+        streaming,
+        ..
+    } = event
+    {
+        let context = tool_calls.get(tool_call_id);
+        let item = streaming_tool_visual_item(
             tool_call_id,
-            terminal,
-            columns,
-            rows,
-            started_at_ms,
-            ..
-        } if *terminal => {
-            let context = tool_calls.get(tool_call_id);
-            let columns = columns.unwrap_or(120).max(1);
-            let rows = rows.unwrap_or(24).max(1);
-            let item = streaming_terminal_output_item(
-                tool_call_id,
-                context.map(|context| context.tool_name.as_str()),
-                context.and_then(|context| context.request_visual.as_ref()),
-                context.map(|context| context.arguments_json.as_str()),
-                "",
-                (columns, rows),
-                *started_at_ms,
-            );
-            let index = upsert_terminal_output_item(items, item);
-            streamed_tool_results.insert(
-                tool_call_id.clone(),
-                StreamedToolReplayContext {
-                    index: Some(index),
-                    columns,
-                    rows,
-                    started_at_ms: *started_at_ms,
-                    finished_at_ms: None,
-                    saw_output: false,
-                },
-            );
-        }
-        ToolInvocationStreamEvent::OutputDelta {
-            tool_call_id,
-            stream,
-            text,
-            ..
-        } if *stream == ToolOutputStream::Pty => {
-            if let Some(replay) = streamed_tool_results.get_mut(tool_call_id)
-                && let Some(index) = replay.index
-            {
-                replay.saw_output = true;
-                if let Some(item) = items.get_mut(index) {
-                    item.append_text(text);
-                }
-                return;
-            }
-            let replay = streamed_tool_results.get(tool_call_id).cloned();
-            let context = tool_calls.get(tool_call_id);
-            let (columns, rows) = replay
-                .as_ref()
-                .map_or((120, 24), |replay| (replay.columns, replay.rows));
-            let started_at_ms = replay.as_ref().and_then(|replay| replay.started_at_ms);
-            let finished_at_ms = replay.as_ref().and_then(|replay| replay.finished_at_ms);
-            let item = streaming_terminal_output_item(
-                tool_call_id,
-                context.map(|context| context.tool_name.as_str()),
-                context.and_then(|context| context.request_visual.as_ref()),
-                context.map(|context| context.arguments_json.as_str()),
-                text,
-                (columns, rows),
-                started_at_ms,
-            );
-            let index = upsert_terminal_output_item(items, item);
-            streamed_tool_results.insert(
-                tool_call_id.clone(),
-                StreamedToolReplayContext {
-                    index: Some(index),
-                    columns,
-                    rows,
-                    started_at_ms,
-                    finished_at_ms,
-                    saw_output: true,
-                },
-            );
-        }
-        ToolInvocationStreamEvent::Finished {
-            tool_call_id,
-            is_error,
-            finished_at_ms,
-            ..
-        } => {
-            if let Some(replay) = streamed_tool_results.get_mut(tool_call_id)
-                && let Some(index) = replay.index
-                && let Some(item) = items.get_mut(index)
-            {
-                item.finish_terminal(None, false, *is_error, *finished_at_ms);
-                replay.finished_at_ms = *finished_at_ms;
-            }
-        }
-        _ => {}
+            context.map(|context| context.tool_name.as_str()),
+            visual,
+            *streaming,
+        );
+        let index = upsert_tool_visual_item(items, item);
+        streamed_tool_results.insert(
+            tool_call_id.clone(),
+            StreamedToolReplayContext {
+                index: Some(index),
+                columns: 0,
+                rows: 0,
+                started_at_ms: None,
+                finished_at_ms: None,
+                saw_output: true,
+            },
+        );
     }
 }
 

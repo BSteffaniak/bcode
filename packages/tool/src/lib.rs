@@ -379,6 +379,19 @@ pub struct ToolInvocationRequest {
     pub cancellation_path: Option<PathBuf>,
 }
 
+/// Plugin-owned visual update emitted while a tool invocation is running.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolStreamVisualUpdate {
+    pub producer_plugin_id: Option<String>,
+    pub schema: String,
+    pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
+    pub payload: serde_json::Value,
+}
+
 /// Incremental event emitted while a tool invocation is running.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -406,6 +419,14 @@ pub enum ToolInvocationStreamEvent {
         text: String,
         #[serde(default)]
         byte_len: usize,
+    },
+    /// Plugin-owned visual update for transcript rendering.
+    VisualUpdate {
+        tool_call_id: String,
+        sequence: u64,
+        visual: ToolStreamVisualUpdate,
+        #[serde(default)]
+        streaming: bool,
     },
     /// A user-visible status line or progress update.
     Status {
