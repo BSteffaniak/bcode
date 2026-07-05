@@ -50,7 +50,7 @@ impl TuiDaemonHost {
             if let Err(error) =
                 bcode_server::run_with_static_bundled(endpoint, &static_plugins).await
             {
-                eprintln!("in-process daemon exited: {error}");
+                tracing::warn!(target: "bcode_tui::daemon_host", %error, "in-process daemon exited");
             }
         }));
         drop(task);

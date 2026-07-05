@@ -15686,7 +15686,7 @@ fn build_skill_registry(config: &bcode_config::BcodeConfig) -> Option<SkillRegis
             Some(registry)
         }
         Err(error) => {
-            eprintln!("failed to build skill registry: {error}");
+            tracing::warn!(target: "bcode_server::skills", %error, "failed to build skill registry");
             None
         }
     }
@@ -15706,23 +15706,28 @@ fn log_skill_registry_diagnostics(registry: &SkillRegistry) {
         .iter()
         .filter(|diagnostic| diagnostic.severity == SkillDiagnosticSeverity::Error)
         .count();
-    eprintln!(
-        "skill registry loaded with {} diagnostics ({warning_count} warnings, {error_count} errors); run `bcode skill check` for details",
-        diagnostics.len()
+    tracing::warn!(
+        target: "bcode_server::skills",
+        diagnostic_count = diagnostics.len(),
+        warning_count,
+        error_count,
+        "skill registry loaded with diagnostics; run `bcode skill check` for details"
     );
     for diagnostic in diagnostics.iter().take(5) {
         let path = diagnostic.path.as_deref().unwrap_or("<unknown>");
-        eprintln!(
-            "skill diagnostic: {}\t{}\t{}",
-            skill_diagnostic_severity_name(diagnostic.severity),
+        tracing::warn!(
+            target: "bcode_server::skills",
+            severity = skill_diagnostic_severity_name(diagnostic.severity),
             path,
-            diagnostic.message
+            message = diagnostic.message.as_str(),
+            "skill diagnostic"
         );
     }
     if diagnostics.len() > 5 {
-        eprintln!(
-            "skill diagnostic: ... {} additional diagnostics omitted",
-            diagnostics.len().saturating_sub(5)
+        tracing::warn!(
+            target: "bcode_server::skills",
+            omitted_count = diagnostics.len().saturating_sub(5),
+            "additional skill diagnostics omitted"
         );
     }
 }
