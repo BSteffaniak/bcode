@@ -3,7 +3,7 @@
 use std::io::Write;
 use std::sync::Arc;
 
-use bcode_client::BcodeClient;
+use bcode_client::{BcodeClient, DaemonAvailability};
 use bcode_session_models::SessionId;
 use bmux_tui::terminal::Terminal;
 use tokio::sync::mpsc;
@@ -68,7 +68,9 @@ pub async fn run_event_loop_with_startup_and_static_bundled<W: Write>(
     startup_action: StartupTuiAction,
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
 ) -> Result<(), TuiError> {
-    let client = BcodeClient::default_endpoint();
+    let client = BcodeClient::default_endpoint()
+        .with_daemon_availability(DaemonAvailability::RequireRunning);
+    let daemon_host = super::daemon_host::TuiDaemonHost::new(static_plugins);
     let mut terminal_events = TuiInput::start();
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
     let mut app = BmuxApp::new_with_history(session_id, &[], &[], false);
@@ -108,6 +110,7 @@ pub async fn run_event_loop_with_startup_and_static_bundled<W: Write>(
             &mut settings,
             &mut chat,
             startup_action,
+            daemon_host,
         )
         .await
     };

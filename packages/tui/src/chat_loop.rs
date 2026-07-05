@@ -15,6 +15,7 @@ use bmux_tui::terminal::Terminal;
 use super::activity::ActivityState;
 use super::clipboard_image;
 use super::command_palette::BmuxCommandPalette;
+use super::daemon_host::TuiDaemonHost;
 use super::daemon_issue;
 use super::effects::{DaemonObservation, TuiEffect, TuiEffectResult, TuiEffectRunner};
 use super::helpers;
@@ -122,11 +123,15 @@ struct ChatLoopState {
 }
 
 impl ChatLoopState {
-    fn new(foreground_client: &BcodeClient, passive_client: &BcodeClient) -> Self {
+    fn new(
+        foreground_client: &BcodeClient,
+        passive_client: &BcodeClient,
+        daemon_host: TuiDaemonHost,
+    ) -> Self {
         Self {
             palette: None,
             slash_palette: None,
-            effects: TuiEffectRunner::new(foreground_client, passive_client),
+            effects: TuiEffectRunner::new(foreground_client, passive_client, daemon_host),
             daemon_connection: DaemonConnectionMonitor::default(),
             permission_dialog: None,
             permission_poll: PermissionPollSchedule::new(Instant::now()),
@@ -278,9 +283,10 @@ pub async fn run_with_client<W: Write>(
     settings: &mut TuiRuntimeSettings,
     chat: &mut ActiveChat,
     startup_action: super::startup_action::StartupTuiAction,
+    daemon_host: TuiDaemonHost,
 ) -> Result<(), TuiError> {
     let passive_client = client.clone();
-    let mut loop_state = ChatLoopState::new(client, &passive_client);
+    let mut loop_state = ChatLoopState::new(client, &passive_client, daemon_host);
     loop_state.drain_pending_effects(chat);
     sync_chat_key_labels(chat, &settings.keymap);
     let mut draft_autosave = DraftAutosave::new(

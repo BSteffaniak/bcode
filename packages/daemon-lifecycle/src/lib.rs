@@ -387,12 +387,73 @@ impl DaemonStartError {
 /// Returns an error when stale-record cleanup fails, spawning the daemon fails,
 /// or the daemon does not pass bounded readiness checks.
 pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), DaemonStartError> {
-    if ping_ready(&options.endpoint).await {
-        if !options.quiet {
-            println!("server already running");
-            println!("namespace: {}", daemon_namespace());
-            println!("log: {}", options.log_path.display());
+    ensure_daemon_running_with_start(options, |options| {
+        let endpoint = options.endpoint.clone();
+        let log_path = options.log_path.clone();
+        async move {
+            if let Some(parent) = log_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut log_file = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&log_path)?;
+            writeln!(log_file, "--- bcode daemon start ---")?;
+            let stderr_log = log_file.try_clone()?;
+
+            let exe = std::env::current_exe()?;
+            let (endpoint_env_name, endpoint_env_value) =
+                bcode_ipc::endpoint_env_pair(&endpoint)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let mut child = tokio::process::Command::new(exe)
+                .args(["server", "run"])
+                .env(endpoint_env_name, endpoint_env_value)
+                .env("BCODE_DAEMON_LOG", &log_path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::from(log_file))
+                .stderr(std::process::Stdio::from(stderr_log))
+                .spawn()?;
+
+            wait_for_server_ready(&endpoint, &mut child, &log_path).await
         }
+    })
+    .await
+}
+
+/// Ensure the current namespace daemon is running using an in-process start callback.
+///
+/// # Errors
+///
+/// Returns an error when stale endpoint cleanup fails, the callback fails, or the daemon does not
+/// pass bounded readiness checks.
+pub async fn ensure_daemon_running_in_process(
+    options: &EnsureDaemonOptions,
+    mut start: impl FnMut() -> Result<(), DaemonStartError>,
+) -> Result<(), DaemonStartError> {
+    let log_path = options.log_path.clone();
+    ensure_daemon_running_with_start(options, move |options| {
+        let result = start();
+        let endpoint = options.endpoint.clone();
+        let log_path = log_path.clone();
+        async move {
+            result?;
+            wait_for_daemon_ready(&endpoint, &log_path).await
+        }
+    })
+    .await
+}
+
+async fn ensure_daemon_running_with_start<F, Fut>(
+    options: &EnsureDaemonOptions,
+    mut start: F,
+) -> Result<(), DaemonStartError>
+where
+    F: FnMut(&EnsureDaemonOptions) -> Fut,
+    Fut: std::future::Future<Output = Result<(), DaemonStartError>>,
+{
+    if ping_ready(&options.endpoint).await {
+        print_daemon_status(options, "server already running");
         return Ok(());
     }
 
@@ -403,49 +464,17 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
         cleanup_stale_endpoint(&options.endpoint)?;
         if ping_ready(&options.endpoint).await {
             drop(lock);
-            if !options.quiet {
-                println!("server already running");
-                println!("namespace: {}", daemon_namespace());
-                println!("log: {}", options.log_path.display());
-            }
+            print_daemon_status(options, "server already running");
             return Ok(());
         }
 
-        if let Some(parent) = options.log_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut log_file = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&options.log_path)?;
-        writeln!(log_file, "--- bcode daemon start ---")?;
-        let stderr_log = log_file.try_clone()?;
-
-        let exe = std::env::current_exe()?;
-        let (endpoint_env_name, endpoint_env_value) =
-            bcode_ipc::endpoint_env_pair(&options.endpoint)
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
-        let mut child = tokio::process::Command::new(exe)
-            .args(["server", "run"])
-            .env(endpoint_env_name, endpoint_env_value)
-            .env("BCODE_DAEMON_LOG", &options.log_path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::from(log_file))
-            .stderr(std::process::Stdio::from(stderr_log))
-            .spawn()?;
-
-        match wait_for_server_ready(&options.endpoint, &mut child, &options.log_path).await {
+        match start(options).await {
             Ok(()) => {
                 let _cleanup_task = tokio::spawn(async {
                     let _ = cleanup_stale_daemon_records().await;
                 });
                 drop(lock);
-                if !options.quiet {
-                    println!("server started");
-                    println!("namespace: {}", daemon_namespace());
-                    println!("log: {}", options.log_path.display());
-                }
+                print_daemon_status(options, "server started");
                 return Ok(());
             }
             Err(error) if error.is_existing_daemon_race() && startup_attempts < 3 => {
@@ -464,6 +493,14 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
             }
             Err(error) => return Err(error),
         }
+    }
+}
+
+fn print_daemon_status(options: &EnsureDaemonOptions, status: &str) {
+    if !options.quiet {
+        println!("{status}");
+        println!("namespace: {}", daemon_namespace());
+        println!("log: {}", options.log_path.display());
     }
 }
 
@@ -556,6 +593,23 @@ async fn wait_for_server_ready(
                 return Ok(());
             }
             return Err(error);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    Err(DaemonStartError::StartTimeout {
+        log_path: log_path.display().to_string(),
+        recent_log: recent_log_excerpt(log_path),
+    })
+}
+
+async fn wait_for_daemon_ready(
+    endpoint: &IpcEndpoint,
+    log_path: &Path,
+) -> Result<(), DaemonStartError> {
+    for _ in 0..50 {
+        if ping_ready(endpoint).await {
+            return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

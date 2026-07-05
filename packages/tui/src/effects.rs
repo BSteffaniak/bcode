@@ -15,7 +15,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::{
-    TuiError, clipboard_image, daemon_issue, history_flow,
+    TuiError, clipboard_image,
+    daemon_host::TuiDaemonHost,
+    daemon_issue, history_flow,
     session_flow::{self, AgentCatalog},
     slash_palette, thinking_flow,
 };
@@ -629,6 +631,124 @@ enum EffectDaemonIntent {
 }
 
 impl TuiEffect {
+    #[allow(clippy::too_many_lines)]
+    fn daemon_start_failed(
+        self,
+        error: bcode_daemon_lifecycle::DaemonStartError,
+    ) -> TuiEffectResult {
+        let client_error = ClientError::DaemonStart(error);
+        match self {
+            Self::OpenSession { session_id, .. } => TuiEffectResult::SessionOpened {
+                session_id,
+                has_older_history: true,
+                result: Err(TuiError::Client(client_error)),
+            },
+            Self::LoadDraftStatus { .. } => TuiEffectResult::DraftStatusLoaded {
+                daemon_connected: false,
+                model: None,
+                composer_draft: None,
+                error: Some(client_error.to_string()),
+            },
+            Self::LoadSessionStatus { session_id } => TuiEffectResult::SessionStatusLoaded {
+                daemon_connected: false,
+                session_id,
+                model: None,
+                active_skill_count: None,
+                runtime_work: None,
+                error: Some(client_error.to_string()),
+            },
+            Self::LoadAgentCatalog => TuiEffectResult::AgentCatalogLoaded {
+                agents: Err(client_error.to_string()),
+            },
+            Self::RenameSession { .. } => TuiEffectResult::RenameSession {
+                result: Err(client_error),
+            },
+            Self::DeleteSession { session_id } => TuiEffectResult::DeleteSession {
+                session_id,
+                result: Err(client_error),
+            },
+            Self::ForkSession {
+                switch_after_create,
+                install_draft,
+                draft,
+                initial_window_request,
+                ..
+            } => TuiEffectResult::ForkSession {
+                switch_after_create,
+                install_draft,
+                draft,
+                initial_window_request,
+                result: Err(client_error),
+            },
+            Self::CloneSession {
+                switch_after_create,
+                install_draft,
+                initial_window_request,
+                ..
+            } => TuiEffectResult::CloneSession {
+                switch_after_create,
+                install_draft,
+                initial_window_request,
+                result: Err(client_error),
+            },
+            Self::SubmitMessage { request } => TuiEffectResult::SubmitMessage {
+                message: request.message,
+                result: Box::new(Err(client_error)),
+            },
+            Self::SkillAction { request } => TuiEffectResult::SkillAction {
+                action: request.action,
+                skill_id: request.skill_id,
+                result: Box::new(Err(client_error)),
+            },
+            Self::SetSessionModel {
+                session_id,
+                provider_plugin_id,
+                model_id,
+            } => TuiEffectResult::SetSessionModel {
+                session_id,
+                provider_plugin_id,
+                model_id,
+                result: Err(client_error),
+            },
+            Self::SetSessionReasoning { status, .. } => TuiEffectResult::SetSessionReasoning {
+                status,
+                result: Err(client_error),
+            },
+            Self::CancelRuntimeWork { work_id, .. } => TuiEffectResult::CancelRuntimeWork {
+                work_id,
+                result: Err(client_error),
+            },
+            Self::CompactContext { session_id } => TuiEffectResult::CompactContext {
+                session_id,
+                result: Err(client_error),
+            },
+            Self::AttachWorktree { path, .. } => TuiEffectResult::AttachWorktree {
+                path,
+                result: Err(client_error),
+            },
+            Self::CreateWorktree { .. } => TuiEffectResult::CreateWorktree {
+                result: Err(client_error),
+            },
+            Self::CancelTurn { session_id } => TuiEffectResult::CancelTurn {
+                session_id,
+                result: Err(client_error),
+            },
+            Self::CycleThinkingEffort { session_id, .. } => TuiEffectResult::CycleThinkingEffort {
+                session_id,
+                result: Box::new(Err(client_error)),
+            },
+            Self::LoadConfig
+            | Self::ReconcileAuthSecurity { .. }
+            | Self::LoadOlderHistory { .. }
+            | Self::LoadNewerHistory { .. }
+            | Self::ListPermissions
+            | Self::SaveDraft { .. }
+            | Self::LoadSlashPalette { .. } => {
+                unreachable!("daemon start failure for non-foreground effect")
+            }
+        }
+    }
+
     const fn daemon_intent(&self) -> EffectDaemonIntent {
         match self {
             Self::OpenSession {
@@ -708,6 +828,7 @@ impl TuiEffectQueue {
 pub struct TuiEffectRunner {
     foreground_client: BcodeClient,
     passive_client: BcodeClient,
+    daemon_host: TuiDaemonHost,
     tasks: BTreeMap<EffectKey, tokio::task::JoinHandle<TuiEffectResult>>,
     queued_latest: BTreeMap<EffectKey, TuiEffect>,
 }
@@ -715,10 +836,15 @@ pub struct TuiEffectRunner {
 impl TuiEffectRunner {
     /// Create an effect runner using foreground and passive clients.
     #[must_use]
-    pub fn new(foreground_client: &BcodeClient, passive_client: &BcodeClient) -> Self {
+    pub fn new(
+        foreground_client: &BcodeClient,
+        passive_client: &BcodeClient,
+        daemon_host: TuiDaemonHost,
+    ) -> Self {
         Self {
             foreground_client: foreground_client.clone(),
             passive_client: passive_client.clone(),
+            daemon_host,
             tasks: BTreeMap::new(),
             queued_latest: BTreeMap::new(),
         }
@@ -763,11 +889,20 @@ impl TuiEffectRunner {
     }
 
     fn spawn(&mut self, key: EffectKey, effect: TuiEffect) {
-        let client = match effect.daemon_intent() {
+        let daemon_intent = effect.daemon_intent();
+        let client = match daemon_intent {
             EffectDaemonIntent::Background => self.passive_client.clone(),
             EffectDaemonIntent::Foreground => self.foreground_client.clone(),
         };
-        let task = tokio::spawn(async move { Box::pin(effect.run(client)).await });
+        let daemon_host = self.daemon_host.clone();
+        let task = tokio::spawn(async move {
+            if daemon_intent == EffectDaemonIntent::Foreground
+                && let Err(error) = daemon_host.ensure_available().await
+            {
+                return effect.daemon_start_failed(error);
+            }
+            Box::pin(effect.run(client)).await
+        });
         self.tasks.insert(key, task);
     }
 
