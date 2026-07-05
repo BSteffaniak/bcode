@@ -166,6 +166,8 @@ impl PluginTuiAction {
 pub enum PluginTuiVisualRenderMode {
     /// Rows are rendered inside the host-provided transcript block chrome/header.
     Inline,
+    /// Rows are rendered inside host transcript block chrome with a plugin-selected title.
+    TranscriptBlock,
     /// Rows replace the host-provided transcript block chrome/header.
     FullBlock,
 }

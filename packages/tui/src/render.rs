@@ -841,6 +841,21 @@ fn push_tool_request_rows(
     if let Some(request_visual) = context.request_visual {
         let visual = CanonicalToolVisual::from_plugin_descriptor(request_visual, false);
         if canonical_plugin_visual_available(&visual, context.plugin_host) {
+            if let CanonicalToolVisual::Plugin(plugin_visual) = &visual
+                && canonical_plugin_visual_render_mode(plugin_visual, context.plugin_host)
+                    == Some(PluginTuiVisualRenderMode::TranscriptBlock)
+            {
+                push_plugin_transcript_block_rows(
+                    rows,
+                    request_visual.title.as_deref().unwrap_or(context.tool_name),
+                    plugin_visual,
+                    width,
+                    context.plugin_host,
+                    item.streaming(),
+                    false,
+                );
+                return;
+            }
             push_canonical_tool_visual_rows(rows, &visual, width, context.plugin_host);
             rows.push(Line::default());
             return;
@@ -920,6 +935,9 @@ fn canonical_plugin_visual_render_mode(
     )?;
     Some(match route.render_mode {
         bcode_plugin::PluginVisualAdapterRenderMode::Inline => PluginTuiVisualRenderMode::Inline,
+        bcode_plugin::PluginVisualAdapterRenderMode::TranscriptBlock => {
+            PluginTuiVisualRenderMode::TranscriptBlock
+        }
         bcode_plugin::PluginVisualAdapterRenderMode::FullBlock => {
             PluginTuiVisualRenderMode::FullBlock
         }
@@ -988,6 +1006,34 @@ fn push_canonical_plugin_visual_rows(
         "TUI visual adapter could not render payload",
         width,
     );
+}
+
+fn push_plugin_transcript_block_rows(
+    rows: &mut Vec<Line>,
+    title: &str,
+    visual: &CanonicalPluginVisual,
+    width: u16,
+    plugin_host: Option<&bcode_plugin::PluginHost>,
+    streaming: bool,
+    is_error: bool,
+) {
+    let color = if is_error {
+        Color::Red
+    } else if streaming {
+        Color::Cyan
+    } else {
+        Color::Yellow
+    };
+    push_wrapped_styled_text(
+        rows,
+        Vec::new(),
+        title,
+        width,
+        Style::new().fg(color),
+        muted_style(),
+    );
+    push_canonical_plugin_visual_rows(rows, visual, width, plugin_host);
+    rows.push(Line::default());
 }
 
 fn push_plugin_visual_degraded_rows(
@@ -1086,11 +1132,36 @@ fn push_terminal_transcript_item_rows(
                 streaming: item.streaming(),
             },
         );
-        if canonical_plugin_visual_render_mode(&visual, plugin_host)
-            == Some(PluginTuiVisualRenderMode::FullBlock)
-        {
+        if matches!(
+            canonical_plugin_visual_render_mode(&visual, plugin_host),
+            Some(PluginTuiVisualRenderMode::FullBlock)
+        ) {
             push_canonical_plugin_visual_rows(rows, &visual, width, plugin_host);
             rows.push(Line::default());
+            return;
+        }
+        if matches!(
+            canonical_plugin_visual_render_mode(&visual, plugin_host),
+            Some(PluginTuiVisualRenderMode::TranscriptBlock)
+        ) {
+            let title = terminal_title(
+                tool_name.as_deref(),
+                *exit_code,
+                *timed_out,
+                *is_error,
+                item.streaming(),
+                *started_at_ms,
+                *finished_at_ms,
+            );
+            push_plugin_transcript_block_rows(
+                rows,
+                &title,
+                &visual,
+                width,
+                plugin_host,
+                item.streaming(),
+                *is_error,
+            );
             return;
         }
     }
@@ -1288,6 +1359,21 @@ fn push_tool_result_rows(
         {
             push_canonical_tool_visual_rows(rows, &visual, width, plugin_host);
             rows.push(Line::default());
+            return;
+        }
+        if let CanonicalToolVisual::Plugin(plugin_visual) = &visual
+            && canonical_plugin_visual_render_mode(plugin_visual, plugin_host)
+                == Some(PluginTuiVisualRenderMode::TranscriptBlock)
+        {
+            push_plugin_transcript_block_rows(
+                rows,
+                artifact.title.as_deref().unwrap_or("Tool result"),
+                plugin_visual,
+                width,
+                plugin_host,
+                item.streaming(),
+                context.is_error,
+            );
             return;
         }
     }
@@ -1942,6 +2028,7 @@ fn push_terminal_output_rows(rows: &mut Vec<Line>, output: &TerminalOutputTransc
             output_truncated: output.output_truncated,
             output_bytes: output.output_bytes,
             retained_output_bytes: output.retained_output_bytes,
+            show_status: true,
         },
         width,
     ));

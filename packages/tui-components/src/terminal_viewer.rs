@@ -25,6 +25,8 @@ pub struct TerminalViewerInput<'a> {
     pub timed_out: Option<bool>,
     /// Human-readable elapsed duration, when known.
     pub elapsed: Option<&'a str>,
+    /// Whether to render a status summary before terminal rows.
+    pub show_status: bool,
     /// Whether earlier output was omitted.
     pub output_truncated: bool,
     /// Original output byte length, when known.
@@ -37,14 +39,16 @@ pub struct TerminalViewerInput<'a> {
 #[must_use]
 pub fn terminal_viewer_rows(input: TerminalViewerInput<'_>, width: u16) -> Vec<Line> {
     let mut rows = Vec::new();
-    push_wrapped_styled_text(
-        &mut rows,
-        vec![Span::styled("  ", muted_style())],
-        &terminal_status(&input),
-        width,
-        terminal_status_style(&input),
-        muted_style(),
-    );
+    if input.show_status {
+        push_wrapped_styled_text(
+            &mut rows,
+            vec![Span::styled("  ", muted_style())],
+            &terminal_status(&input),
+            width,
+            terminal_status_style(&input),
+            muted_style(),
+        );
+    }
     if input.output_truncated {
         push_wrapped_styled_text(
             &mut rows,
@@ -313,6 +317,7 @@ mod tests {
                 output_truncated: false,
                 output_bytes: Some(13),
                 retained_output_bytes: Some(13),
+                show_status: true,
             },
             100,
         );

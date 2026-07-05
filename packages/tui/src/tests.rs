@@ -5190,8 +5190,7 @@ fn live_shell_artifact_renders_terminal_output_from_raw_run_metadata() {
 
     let rendered = render_app_text(&mut app);
 
-    assert!(rendered.contains("Terminal · shell.run"), "{rendered}");
-    assert!(rendered.contains("completed"), "{rendered}");
+    assert!(rendered.contains("Shell run"), "{rendered}");
     assert!(rendered.contains("shell raw output"), "{rendered}");
     assert!(!rendered.contains("bcode.shell.run"), "{rendered}");
 }
@@ -5217,8 +5216,7 @@ fn replayed_shell_artifact_renders_terminal_output_from_raw_run_metadata() {
 
     let rendered = render_app_text(&mut app);
 
-    assert!(rendered.contains("Terminal · shell.run"), "{rendered}");
-    assert!(rendered.contains("completed"), "{rendered}");
+    assert!(rendered.contains("Shell run"), "{rendered}");
     assert!(rendered.contains("shell raw output"), "{rendered}");
     assert!(!rendered.contains("bcode.shell.run"), "{rendered}");
 }
@@ -5657,13 +5655,8 @@ fn shell_live_preview_is_not_superseded_by_terminal_result() {
 
     let rendered = render_app_text(&mut app);
 
-    assert!(
-        rendered.contains("Terminal · shell.run · starting"),
-        "{rendered}"
-    );
-    assert!(rendered.contains("$ cargo test"), "{rendered}");
-    assert!(rendered.contains("Terminal · shell.run"), "{rendered}");
-    assert!(rendered.contains("completed"), "{rendered}");
+    assert!(rendered.contains("❯ cargo test"), "{rendered}");
+    assert!(rendered.contains("Shell run"), "{rendered}");
     assert!(rendered.contains("shell raw output"), "{rendered}");
 }
 
@@ -6491,15 +6484,9 @@ fn replayed_shell_request_uses_shell_plugin_request_renderer_without_legacy_meta
 
     let rendered = render_app_text(&mut app);
 
-    assert!(
-        rendered.contains("Terminal · shell.run · starting"),
-        "{rendered}"
-    );
-    assert!(rendered.contains("$ cargo check --workspace"), "{rendered}");
-    assert!(
-        rendered.contains("cwd /Users/braden/GitHub/bcode"),
-        "{rendered}"
-    );
+    assert!(rendered.contains("Shell command"), "{rendered}");
+    assert!(rendered.contains("❯ cargo check --workspace"), "{rendered}");
+    assert!(rendered.contains("…/GitHub/bcode"), "{rendered}");
     assert!(!rendered.contains("Tool · shell.run"), "{rendered}");
     assert!(!rendered.contains("arguments"), "{rendered}");
 }

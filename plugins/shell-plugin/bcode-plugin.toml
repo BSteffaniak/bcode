@@ -15,7 +15,7 @@ max_schema_version = 1
 min_schema_version = 1
 priority           = 100
 producer_default   = true
-render_mode        = "full_block"
+render_mode        = "transcript_block"
 surfaces           = ["tui"]
 
 [[visual_adapters]]
@@ -25,7 +25,7 @@ max_schema_version = 1
 min_schema_version = 1
 priority           = 100
 producer_default   = true
-render_mode        = "full_block"
+render_mode        = "transcript_block"
 surfaces           = ["tui"]
 
 [concurrency]

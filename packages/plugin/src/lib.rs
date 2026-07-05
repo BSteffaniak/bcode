@@ -107,6 +107,7 @@ fn default_tool_service_interface_id() -> String {
 pub enum PluginVisualAdapterRenderMode {
     #[default]
     Inline,
+    TranscriptBlock,
     FullBlock,
 }
 

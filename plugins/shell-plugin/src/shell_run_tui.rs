@@ -1,7 +1,7 @@
 //! Native TUI rendering for shell run artifacts.
 
 use bcode_tui_components::terminal_viewer::{TerminalViewerInput, terminal_viewer_rows};
-use bmux_tui::prelude::Line;
+use bmux_tui::prelude::{Color, Line, Span, Style};
 use std::fs;
 
 const DEFAULT_TERMINAL_COLUMNS: u16 = 120;
@@ -23,7 +23,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         _payload: &serde_json::Value,
     ) -> bcode_plugin_sdk::tui::PluginTuiVisualRenderMode {
         if matches!(kind, "bcode.shell.run" | "bcode.tool.request.shell.run") {
-            bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::FullBlock
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::TranscriptBlock
         } else {
             bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::Inline
         }
@@ -48,8 +48,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
             _ => serde_json::to_string_pretty(payload).unwrap_or_default(),
         });
 
-        let mut lines =
-            shell_terminal_header_rows(payload, &shell_run_terminal_title(payload, mode));
+        let mut lines = shell_terminal_prompt_rows(payload);
         lines.extend(terminal_viewer_rows(
             TerminalViewerInput {
                 output: &output,
@@ -72,6 +71,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
                 retained_output_bytes: payload
                     .get("retained_output_bytes")
                     .and_then(serde_json::Value::as_u64),
+                show_status: false,
             },
             width,
         ));
@@ -79,57 +79,9 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
     }
 }
 
-fn shell_run_terminal_title(payload: &serde_json::Value, mode: &str) -> String {
-    if mode != "terminal" {
-        return format!("Shell run · {mode}");
-    }
-    let status = if payload
-        .get("timed_out")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        "timed out".to_owned()
-    } else if payload
-        .get("cancelled")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        "cancelled".to_owned()
-    } else if let Some(exit_code) = payload.get("exit_code").and_then(serde_json::Value::as_i64) {
-        if exit_code == 0 {
-            "completed".to_owned()
-        } else {
-            format!("exit {exit_code}")
-        }
-    } else {
-        "completed".to_owned()
-    };
-    let duration = payload
-        .get("duration_ms")
-        .and_then(serde_json::Value::as_u64)
-        .map(format_duration_millis)
-        .map(|duration| format!(" · duration {duration}"))
-        .unwrap_or_default();
-    format!("Terminal · shell.run · {status}{duration}")
-}
-
-fn format_duration_millis(milliseconds: u64) -> String {
-    if milliseconds >= 1_000 {
-        let seconds = milliseconds / 1_000;
-        let tenths = (milliseconds % 1_000) / 100;
-        if tenths == 0 {
-            format!("{seconds}s")
-        } else {
-            format!("{seconds}.{tenths}s")
-        }
-    } else {
-        format!("{milliseconds}ms")
-    }
-}
-
 fn shell_request_rows(payload: &serde_json::Value, width: u16) -> Vec<Line> {
     let Some(runtime) = payload.get("_bcode_runtime") else {
-        return shell_terminal_header_rows(payload, "Terminal · shell.run · starting");
+        return shell_terminal_prompt_rows(payload);
     };
     let output = runtime
         .get("output")
@@ -137,7 +89,7 @@ fn shell_request_rows(payload: &serde_json::Value, width: u16) -> Vec<Line> {
         .unwrap_or_default();
     let columns = payload_u16(runtime, "columns").unwrap_or(DEFAULT_TERMINAL_COLUMNS);
     let rows = payload_u16(runtime, "rows").unwrap_or(DEFAULT_TERMINAL_ROWS);
-    let mut lines = shell_terminal_header_rows(payload, &shell_runtime_terminal_title(runtime));
+    let mut lines = shell_terminal_prompt_rows(payload);
     lines.extend(terminal_viewer_rows(
         TerminalViewerInput {
             output,
@@ -151,63 +103,102 @@ fn shell_request_rows(payload: &serde_json::Value, width: u16) -> Vec<Line> {
             output_truncated: false,
             output_bytes: None,
             retained_output_bytes: None,
+            show_status: false,
         },
         width,
     ));
     lines
 }
 
-fn shell_terminal_header_rows(payload: &serde_json::Value, title: &str) -> Vec<Line> {
+fn shell_terminal_prompt_rows(payload: &serde_json::Value) -> Vec<Line> {
     let arguments = payload.get("arguments").unwrap_or(payload);
     let command = arguments
         .get("command")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     let cwd = arguments.get("cwd").and_then(serde_json::Value::as_str);
-    let mut lines = vec![Line::from(title.to_owned())];
-    if let Some(cwd) = cwd {
-        lines.push(Line::from(format!("  cwd {cwd}")));
-    }
     if command.is_empty() {
-        lines.push(Line::from("  assembling command …"));
-    } else {
-        for (index, line) in command.lines().enumerate() {
-            let prefix = if index == 0 { "  $ " } else { "    " };
-            lines.push(Line::from(format!("{prefix}{line}")));
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    for (index, line) in command.lines().enumerate() {
+        let mut spans = Vec::new();
+        if index == 0 {
+            spans.push(Span::styled("  ", muted_style()));
+            if let Some(cwd) = cwd {
+                spans.push(Span::styled(short_cwd(cwd), path_style()));
+                spans.push(Span::styled(" ❯ ", prompt_style()));
+            } else {
+                spans.push(Span::styled("❯ ", prompt_style()));
+            }
+        } else {
+            spans.push(Span::styled("    ", muted_style()));
         }
+        spans.extend(shell_command_spans(line));
+        lines.push(Line::from_spans(spans));
     }
     lines
 }
 
-fn shell_runtime_terminal_title(runtime: &serde_json::Value) -> String {
-    let streaming = runtime
-        .get("streaming")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let timed_out = runtime
-        .get("timed_out")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let is_error = runtime
-        .get("is_error")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let status = if streaming {
-        "running".to_owned()
-    } else if timed_out {
-        "timed out".to_owned()
-    } else if let Some(exit_code) = payload_exit_code(runtime) {
-        if exit_code == 0 {
-            "completed".to_owned()
-        } else {
-            format!("exit {exit_code}")
+fn short_cwd(cwd: &str) -> String {
+    let mut components = cwd.rsplit('/').filter(|part| !part.is_empty());
+    let leaf = components.next().unwrap_or(cwd);
+    let parent = components.next();
+    parent.map_or_else(|| cwd.to_owned(), |parent| format!("…/{parent}/{leaf}"))
+}
+
+fn shell_command_spans(command: &str) -> Vec<Span> {
+    let mut spans = Vec::new();
+    for (index, token) in command.split_whitespace().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
         }
-    } else if is_error {
-        "failed".to_owned()
-    } else {
-        "completed".to_owned()
-    };
-    format!("Terminal · shell.run · {status}")
+        let style = if index == 0 {
+            command_style()
+        } else if token.starts_with('-') {
+            flag_style()
+        } else if token.starts_with('\'') || token.starts_with('"') {
+            string_style()
+        } else if matches!(token, "|" | "&&" | "||" | ";" | ">" | ">>" | "<") {
+            operator_style()
+        } else {
+            argument_style()
+        };
+        spans.push(Span::styled(token.to_owned(), style));
+    }
+    spans
+}
+
+const fn muted_style() -> Style {
+    Style::new().fg(Color::BrightBlack)
+}
+
+const fn path_style() -> Style {
+    Style::new().fg(Color::Blue)
+}
+
+const fn prompt_style() -> Style {
+    Style::new().fg(Color::Magenta)
+}
+
+const fn command_style() -> Style {
+    Style::new().fg(Color::Cyan)
+}
+
+const fn flag_style() -> Style {
+    Style::new().fg(Color::Yellow)
+}
+
+const fn string_style() -> Style {
+    Style::new().fg(Color::Green)
+}
+
+const fn operator_style() -> Style {
+    Style::new().fg(Color::BrightBlack)
+}
+
+const fn argument_style() -> Style {
+    Style::new()
 }
 
 fn payload_exit_code(payload: &serde_json::Value) -> Option<i32> {
@@ -293,8 +284,6 @@ mod tests {
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
-        assert!(rendered.contains("Terminal · shell.run"), "{rendered}");
-        assert!(rendered.contains("completed"), "{rendered}");
         assert!(rendered.contains("hello"), "{rendered}");
         assert!(rendered.contains("world"), "{rendered}");
     }
