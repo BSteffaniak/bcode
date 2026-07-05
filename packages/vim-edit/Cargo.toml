@@ -1,0 +1,23 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Neovim RPC backed Vim editing for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "neovim", "vim", "editing"]
+license     = { workspace = true }
+name        = "bcode_vim_edit"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_tui_components = { workspace = true, features = ["syntax"] }
+nvim-rs              = { workspace = true, features = ["use_tokio"] }
+serde                = { workspace = true, features = ["derive", "std"] }
+tempfile             = { workspace = true }
+thiserror            = { workspace = true }
+tokio                = { workspace = true, features = ["process", "rt", "sync", "time"] }
+
+[features]
+default          = []
+fail-on-warnings = []

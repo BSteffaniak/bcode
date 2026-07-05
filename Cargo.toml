@@ -62,6 +62,7 @@ members = [
     "packages/tool-runtime",
     "packages/tui",
     "packages/tui-components",
+    "packages/vim-edit",
     "packages/worktree",
     "packages/worktree/models",
     "plugins/worktree-plugin",
@@ -136,6 +137,7 @@ bcode_tool                              = { version = "0.0.1-alpha.0", default-f
 bcode_tool_runtime                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tool-runtime" }
 bcode_tui                               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui" }
 bcode_tui_components                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui-components" }
+bcode_vim_edit                          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/vim-edit" }
 bcode_web_search_plugin                 = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/web-search-plugin" }
 bcode_worktree                          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/worktree" }
 bcode_worktree_models                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/worktree/models" }
@@ -204,6 +206,7 @@ image = { version = "0.25.10", default-features = false, features = [
     "webp",
 ] }
 libloading = { version = "0.9.0", default-features = false }
+nvim-rs = { version = "0.9.2", default-features = false }
 pdf-extract = { version = "0.10.0", default-features = false }
 pkg-config = { version = "0.3.32", default-features = false }
 png = { version = "0.18.1", default-features = false }
