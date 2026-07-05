@@ -47,11 +47,11 @@ use super::theme::{PresentedTheme, ResolvedTheme};
 use super::timeline_dialog::TimelineEntry;
 use super::tool_render_projection::semantic_result_supersedes_live_preview;
 use super::transcript::{
-    ToolTranscriptSurface, TranscriptItem, TranscriptItemKind, display_tool_result_text,
-    generic_tool_result_item_from_projection, interactive_tool_request_item,
-    interactive_tool_resolution_item, item_is_tool_surface_for_tool_call,
-    live_tool_preview_anchor_item, model_usage_item, permission_request_item,
-    permission_result_item, semantic_tool_result_item_from_raw, streaming_terminal_output_item,
+    StreamingTerminalOutputInput, ToolTranscriptSurface, TranscriptItem, TranscriptItemKind,
+    display_tool_result_text, generic_tool_result_item_from_projection,
+    interactive_tool_request_item, interactive_tool_resolution_item,
+    item_is_tool_surface_for_tool_call, live_tool_preview_anchor_item, model_usage_item,
+    permission_request_item, permission_result_item, semantic_tool_result_item_from_raw,
     streaming_tool_output_item, tool_request_item_from_projection, tool_result_item,
     transcript_items_from_events_with_reasoning,
 };
@@ -2711,9 +2711,6 @@ impl BmuxApp {
         is_error: Option<bool>,
     ) -> Option<FinishedStreamedToolOutput> {
         let context = self.streamed_tool_results.get(tool_call_id)?;
-        if !context.saw_output {
-            return None;
-        }
         let index = context.index?;
         let output_kind = self.transcript.get(index).map_or(
             FinishedStreamedToolOutput::PlainToolResult,
@@ -2832,12 +2829,33 @@ impl BmuxApp {
                 self.active_tool_calls.insert(tool_call_id.clone());
                 self.tool_activity_seen = true;
                 if *terminal {
+                    let columns = columns.unwrap_or(120).max(1);
+                    let rows = rows.unwrap_or(24).max(1);
+                    let tool_context = self.tool_call_contexts.get(tool_call_id);
+                    let live_preview = self.live_tool_previews.get(tool_call_id);
+                    let index = self.transcript.upsert_streaming_terminal_output(
+                        StreamingTerminalOutputInput {
+                            tool_call_id,
+                            tool_name: tool_context
+                                .map(|context| context.tool_name.as_str())
+                                .or_else(|| live_preview.map(|state| state.tool_name.as_str())),
+                            request_visual: tool_context
+                                .and_then(|context| context.request_visual.as_ref())
+                                .or_else(|| live_preview.map(|state| &state.preview.visual)),
+                            text: "",
+                            columns,
+                            rows,
+                            started_at_ms: *started_at_ms,
+                        },
+                    );
+                    self.live_tool_previews.remove(tool_call_id);
+                    self.mark_live_preview_dirty();
                     self.streamed_tool_results.insert(
                         tool_call_id.clone(),
                         StreamedToolResultContext {
-                            index: None,
-                            columns: columns.unwrap_or(120).max(1),
-                            rows: rows.unwrap_or(24).max(1),
+                            index: Some(index),
+                            columns,
+                            rows,
                             started_at_ms: *started_at_ms,
                             saw_output: false,
                         },
@@ -2936,46 +2954,44 @@ impl BmuxApp {
                 return;
             }
         }
-        if let Some(context) = self.streamed_tool_results.get(tool_call_id) {
-            let tool_context = self.tool_call_contexts.get(tool_call_id);
-            let columns = context.columns;
-            let rows = context.rows;
-            let started_at_ms = context.started_at_ms;
-            self.transcript.push(streaming_terminal_output_item(
-                tool_call_id,
-                tool_context.map(|context| context.tool_name.as_str()),
-                tool_context.and_then(|context| context.request_visual.as_ref()),
-                text,
+        let (columns, rows, started_at_ms) = self
+            .streamed_tool_results
+            .get(tool_call_id)
+            .map_or((120, 24, None), |context| {
+                (context.columns, context.rows, context.started_at_ms)
+            });
+        let tool_context = self.tool_call_contexts.get(tool_call_id);
+        let live_preview = self.live_tool_previews.get(tool_call_id);
+        let index =
+            self.transcript
+                .upsert_streaming_terminal_output(StreamingTerminalOutputInput {
+                    tool_call_id,
+                    tool_name: tool_context
+                        .map(|context| context.tool_name.as_str())
+                        .or_else(|| live_preview.map(|state| state.tool_name.as_str())),
+                    request_visual: tool_context
+                        .and_then(|context| context.request_visual.as_ref())
+                        .or_else(|| live_preview.map(|state| &state.preview.visual)),
+                    text,
+                    columns,
+                    rows,
+                    started_at_ms,
+                });
+        self.live_tool_previews.remove(tool_call_id);
+        self.mark_live_preview_dirty();
+        self.streamed_tool_results
+            .entry(tool_call_id.to_owned())
+            .and_modify(|context| {
+                context.index = Some(index);
+                context.saw_output = true;
+            })
+            .or_insert(StreamedToolResultContext {
+                index: Some(index),
                 columns,
                 rows,
                 started_at_ms,
-            ));
-            let index = self.transcript.len().saturating_sub(1);
-            if let Some(context) = self.streamed_tool_results.get_mut(tool_call_id) {
-                context.index = Some(index);
-            }
-            return;
-        }
-        let tool_context = self.tool_call_contexts.get(tool_call_id);
-        self.transcript.push(streaming_terminal_output_item(
-            tool_call_id,
-            tool_context.map(|context| context.tool_name.as_str()),
-            tool_context.and_then(|context| context.request_visual.as_ref()),
-            text,
-            120,
-            24,
-            None,
-        ));
-        self.streamed_tool_results.insert(
-            tool_call_id.to_owned(),
-            StreamedToolResultContext {
-                index: Some(self.transcript.len().saturating_sub(1)),
-                columns: 120,
-                rows: 24,
-                started_at_ms: None,
                 saw_output: true,
-            },
-        );
+            });
     }
 
     fn resolve_interactive_protocol_tool_result(

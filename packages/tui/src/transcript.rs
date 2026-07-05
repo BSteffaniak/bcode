@@ -577,6 +577,76 @@ pub fn streaming_terminal_output_item(
     )
 }
 
+/// Input for upserting a streaming terminal output item.
+#[derive(Clone, Copy)]
+pub struct StreamingTerminalOutputInput<'a> {
+    /// Provider tool call identifier.
+    pub tool_call_id: &'a str,
+    /// Tool name, when known.
+    pub tool_name: Option<&'a str>,
+    /// Plugin-owned request visual associated with terminal output.
+    pub request_visual: Option<&'a bcode_session_models::PluginVisualDescriptor>,
+    /// Output delta or initial output.
+    pub text: &'a str,
+    /// Terminal columns.
+    pub columns: u16,
+    /// Terminal rows.
+    pub rows: u16,
+    /// Unix timestamp in milliseconds when execution started.
+    pub started_at_ms: Option<u64>,
+}
+
+/// Upsert a streaming terminal output item for a tool call.
+///
+/// Reuses the canonical terminal transcript item across live and replay paths by
+/// replacing an existing request/preview placeholder instead of creating a
+/// second block for terminal output.
+pub fn upsert_streaming_terminal_output_item(
+    items: &mut Vec<TranscriptItem>,
+    input: StreamingTerminalOutputInput<'_>,
+) -> usize {
+    if let Some(index) = items.iter().position(|item| {
+        matches!(
+            item.kind(),
+            TranscriptItemKind::TerminalOutput {
+                tool_call_id: item_tool_call_id,
+                ..
+            } if item_tool_call_id == input.tool_call_id
+        )
+    }) {
+        if !input.text.is_empty() {
+            items[index].append_text(input.text);
+        }
+        return index;
+    }
+
+    let item = streaming_terminal_output_item(
+        input.tool_call_id,
+        input.tool_name,
+        input.request_visual,
+        input.text,
+        input.columns,
+        input.rows,
+        input.started_at_ms,
+    );
+    if let Some(index) = items.iter().position(|existing| {
+        existing.is_live_preview_anchor_for(input.tool_call_id)
+            || matches!(
+                existing.kind(),
+                TranscriptItemKind::ToolRequest {
+                    tool_call_id: item_tool_call_id,
+                    ..
+                } if item_tool_call_id == input.tool_call_id
+            )
+    }) {
+        items[index] = item;
+        return index;
+    }
+
+    items.push(item);
+    items.len().saturating_sub(1)
+}
+
 /// Build a streaming transcript item for live tool output.
 #[must_use]
 pub fn streaming_tool_output_item(
@@ -832,10 +902,12 @@ fn push_transcript_item_from_event(
             ..
         } => {
             if let Some(semantic_result) = semantic_result {
-                if streamed_tool_results
-                    .get(tool_call_id)
-                    .is_some_and(|replay| replay.saw_output)
+                if let Some(replay) = streamed_tool_results.get_mut(tool_call_id)
+                    && let Some(index) = replay.index
                 {
+                    if let Some(item) = items.get_mut(index) {
+                        item.finish_terminal(None, false, *is_error, replay.finished_at_ms);
+                    }
                     return;
                 }
                 let item = semantic_tool_result_item(
@@ -1248,12 +1320,27 @@ fn apply_tool_invocation_stream_event(
             started_at_ms,
             ..
         } if *terminal => {
+            let context = tool_calls.get(tool_call_id);
+            let columns = columns.unwrap_or(120).max(1);
+            let rows = rows.unwrap_or(24).max(1);
+            let index = upsert_streaming_terminal_output_item(
+                items,
+                StreamingTerminalOutputInput {
+                    tool_call_id,
+                    tool_name: context.map(|context| context.tool_name.as_str()),
+                    request_visual: context.and_then(|context| context.request_visual.as_ref()),
+                    text: "",
+                    columns,
+                    rows,
+                    started_at_ms: *started_at_ms,
+                },
+            );
             streamed_tool_results.insert(
                 tool_call_id.clone(),
                 StreamedToolReplayContext {
-                    index: None,
-                    columns: columns.unwrap_or(120).max(1),
-                    rows: rows.unwrap_or(24).max(1),
+                    index: Some(index),
+                    columns,
+                    rows,
                     started_at_ms: *started_at_ms,
                     finished_at_ms: None,
                     saw_output: false,
@@ -1279,23 +1366,28 @@ fn apply_tool_invocation_stream_event(
             let (columns, rows) = replay
                 .as_ref()
                 .map_or((120, 24), |replay| (replay.columns, replay.rows));
-            items.push(streaming_terminal_output_item(
-                tool_call_id,
-                context.map(|context| context.tool_name.as_str()),
-                context.and_then(|context| context.request_visual.as_ref()),
-                text,
-                columns,
-                rows,
-                replay.as_ref().and_then(|replay| replay.started_at_ms),
-            ));
+            let started_at_ms = replay.as_ref().and_then(|replay| replay.started_at_ms);
+            let finished_at_ms = replay.as_ref().and_then(|replay| replay.finished_at_ms);
+            let index = upsert_streaming_terminal_output_item(
+                items,
+                StreamingTerminalOutputInput {
+                    tool_call_id,
+                    tool_name: context.map(|context| context.tool_name.as_str()),
+                    request_visual: context.and_then(|context| context.request_visual.as_ref()),
+                    text,
+                    columns,
+                    rows,
+                    started_at_ms,
+                },
+            );
             streamed_tool_results.insert(
                 tool_call_id.clone(),
                 StreamedToolReplayContext {
-                    index: Some(items.len().saturating_sub(1)),
+                    index: Some(index),
                     columns,
                     rows,
-                    started_at_ms: replay.as_ref().and_then(|replay| replay.started_at_ms),
-                    finished_at_ms: replay.as_ref().and_then(|replay| replay.finished_at_ms),
+                    started_at_ms,
+                    finished_at_ms,
                     saw_output: true,
                 },
             );

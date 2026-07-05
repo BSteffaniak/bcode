@@ -3842,8 +3842,8 @@ fn semantic_terminal_result_without_live_delta_renders_terminal_history() {
         .filter(|item| matches!(item.kind(), TranscriptItemKind::ToolResult { .. }))
         .count();
 
-    assert_eq!(terminal_count, 0);
-    assert_eq!(tool_result_count, 1);
+    assert_eq!(terminal_count, 1);
+    assert_eq!(tool_result_count, 0);
 }
 
 #[test]
@@ -3984,10 +3984,11 @@ fn live_streamed_shell_result_preserves_request_and_suppresses_artifact_duplicat
     }
     let transcript = app.transcript();
 
-    assert!(transcript.iter().any(|item| {
-        matches!(item.kind(), TranscriptItemKind::ToolRequest { .. })
-            && item.text().contains("cargo test")
-    }));
+    assert!(
+        !transcript
+            .iter()
+            .any(|item| matches!(item.kind(), TranscriptItemKind::ToolRequest { .. }))
+    );
     assert!(transcript.iter().any(|item| {
         matches!(item.kind(), TranscriptItemKind::TerminalOutput { .. })
             && item.text().contains("running")
@@ -4002,6 +4003,7 @@ fn live_streamed_shell_result_preserves_request_and_suppresses_artifact_duplicat
 fn live_shell_preview_with_streamed_output_preserves_preview_and_suppresses_artifact_duplicate() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
     app.absorb_session_live_event(&live_shell_preview_stream_preview(session_id));
     for event in live_shell_preview_stream_events(session_id) {
         app.absorb_session_event(&event);
@@ -4009,7 +4011,7 @@ fn live_shell_preview_with_streamed_output_preserves_preview_and_suppresses_arti
     let transcript = app.transcript();
 
     assert!(
-        transcript
+        !transcript
             .iter()
             .any(|item| item.is_live_preview_anchor_for("call-live-preview-stream"))
     );
@@ -4031,8 +4033,7 @@ fn live_shell_preview_with_streamed_output_preserves_preview_and_suppresses_arti
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
-    assert!(output.contains("Shell command"), "{output}");
-    assert!(output.contains("command: cargo test"), "{output}");
+    assert!(output.contains("❯ cargo test"), "{output}");
     assert!(output.contains("running"), "{output}");
     assert!(!output.contains("final duplicate tail"), "{output}");
 }
@@ -4243,7 +4244,7 @@ fn semantic_terminal_result_suppresses_existing_stream_item_duplicate_result() {
 
     assert_eq!(terminal_items.len(), 1);
     assert_eq!(terminal_items[0].text(), "live\n");
-    assert!(terminal_items[0].streaming());
+    assert!(!terminal_items[0].streaming());
     let TranscriptItemKind::TerminalOutput {
         exit_code,
         timed_out,
@@ -4254,8 +4255,8 @@ fn semantic_terminal_result_suppresses_existing_stream_item_duplicate_result() {
         panic!("expected terminal output");
     };
     assert_eq!(*exit_code, None);
-    assert_eq!(*timed_out, None);
-    assert!(!*is_error);
+    assert_eq!(*timed_out, Some(false));
+    assert!(*is_error);
     assert!(!transcript.iter().any(|item| {
         matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
             && item.text().contains(r#""mode":"terminal""#)
