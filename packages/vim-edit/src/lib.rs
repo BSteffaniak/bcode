@@ -839,14 +839,16 @@ async fn run_vim_multi_file_session(
                 });
             step_index = step_index.saturating_add(1);
         }
-        session.nvim_command("write").await?;
         previous_buffers.insert(entry.path.clone(), previous_buffer);
     }
 
     let mut output_files = Vec::with_capacity(files.len());
     for (path, (original, temp_file)) in files {
         session.edit_path(temp_file.path()).await?;
-        let final_text = session.buffer_text().await?;
+        let final_text = previous_buffers
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| original.clone());
         let cursor = session.cursor().await?;
         let nvim_mode = session.mode().await?;
         let final_context = session.context(DEFAULT_CONTEXT_RADIUS).await?;
@@ -1101,7 +1103,19 @@ impl NeovimSession {
             .get_lines(0, -1, false)
             .await
             .map_err(rpc_call_error)?;
-        Ok(lines.join("\n"))
+        let mut text = lines.join("\n");
+        let endofline = self
+            .nvim
+            .get_option_value("endofline", Vec::new())
+            .await
+            .map_err(rpc_call_error)
+            .ok()
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+        if endofline {
+            text.push('\n');
+        }
+        Ok(text)
     }
 
     async fn cursor(&self) -> Result<CursorPosition, VimEditError> {
@@ -2209,6 +2223,44 @@ mod tests {
         assert_eq!(
             fs::read_to_string(file.path()).expect("read original"),
             "foo qux baz"
+        );
+    }
+
+    #[test]
+    fn apply_preserves_final_newline_when_nvim_is_available() {
+        if !nvim_available() {
+            eprintln!("skipping Neovim integration test because `nvim` is not available");
+            return;
+        }
+        let file = NamedTempFile::new().expect("temp file");
+        fs::write(file.path(), "foo bar baz\n").expect("write original");
+        let result = run_vim_edit(VimEditRequest {
+            path: file.path().to_path_buf(),
+            nvim_executable: None,
+            steps: vec![
+                VimEditStep::Keys {
+                    input: "w".to_string(),
+                },
+                VimEditStep::Keys {
+                    input: "ciw".to_string(),
+                },
+                VimEditStep::Insert {
+                    text: "qux".to_string(),
+                },
+                VimEditStep::Keys {
+                    input: "<Esc>".to_string(),
+                },
+            ],
+            mode: VimEditMode::Apply,
+            sandbox: VimEditSandbox::Default,
+            timeout: Duration::from_secs(5),
+        })
+        .expect("run vim edit");
+
+        assert!(result.changed);
+        assert_eq!(
+            fs::read_to_string(file.path()).expect("read original"),
+            "foo qux baz\n"
         );
     }
 
