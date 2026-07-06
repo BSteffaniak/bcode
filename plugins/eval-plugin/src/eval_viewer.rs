@@ -14,7 +14,11 @@ use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowOutcome, ActionRowState};
+use bmux_tui_components::bar_chart::{
+    BarChart, BarChartItem, BarChartPolicy, BarChartStyles, BarChartValuePlacement,
+};
 use bmux_tui_components::button::ButtonStyles;
+use bmux_tui_components::sparkline::{Sparkline, SparklinePolicy, SparklineStyles};
 use bmux_tui_components::tab_bar::{TabBar, TabBarOutcome, TabBarState, TabBarStyles, TabItem};
 use bmux_tui_components::table::{
     Table, TableAlign, TableColumn, TableOutcome, TableRow, TableState, TableStyles,
@@ -37,6 +41,8 @@ const MUTED: Color = Color::Rgb(148, 163, 184);
 const SUCCESS: Color = Color::Rgb(34, 197, 94);
 const DANGER: Color = Color::Rgb(248, 113, 113);
 const WARNING: Color = Color::Rgb(251, 191, 36);
+const PURPLE: Color = Color::Rgb(167, 139, 250);
+const CARD_HEIGHT: u16 = 4;
 
 /// Eval run picker surface.
 pub struct EvalRunPickerSurface {
@@ -347,6 +353,7 @@ impl PluginTuiSurface for EvalRunViewerSurface {
             ViewerTab::Tools => self.render_tools(content_area, frame),
             ViewerTab::Repetitions => self.render_repetitions(content_area, frame),
             ViewerTab::Artifact => self.render_artifact(content_area, frame),
+            ViewerTab::Derivations => self.render_derivations(content_area, frame),
         }
         let actions = viewer_actions(self.selected_tab());
         themed_action_row(&actions).render_state(action_area, &self.action_state, frame);
@@ -424,7 +431,7 @@ impl EvalRunViewerSurface {
                         .handle_event(self.content_area, &mut self.rep_state, event),
                 )
             }
-            ViewerTab::Artifact => false,
+            ViewerTab::Artifact | ViewerTab::Derivations => false,
         }
     }
 
@@ -476,12 +483,124 @@ impl EvalRunViewerSurface {
     }
 
     fn render_overview(&self, area: Rect, frame: &mut Frame<'_>) {
-        render_panel_title(area, frame, "Run overview");
+        render_panel_title(area, frame, "Run command center");
         let area = inset_top(area, 1);
-        let (columns, rows) = overview_table(&self.data);
-        Table::new(&columns, &rows)
-            .styles(eval_table_styles())
-            .render(area, &self.overview_state, frame);
+        let card_area = Rect::new(area.x, area.y, area.width, CARD_HEIGHT);
+        self.render_kpi_cards(card_area, frame);
+
+        let charts_y = area.y.saturating_add(CARD_HEIGHT).saturating_add(1);
+        let charts_height = area.height.saturating_sub(CARD_HEIGHT).saturating_sub(1);
+        let chart_columns =
+            split_columns(Rect::new(area.x, charts_y, area.width, charts_height), 2, 2);
+        if let Some(left) = chart_columns.first().copied() {
+            self.render_variant_charts(left, frame);
+        }
+        if let Some(right) = chart_columns.get(1).copied() {
+            self.render_repetition_trends(right, frame);
+        }
+    }
+
+    fn render_kpi_cards(&self, area: Rect, frame: &mut Frame<'_>) {
+        let metrics = run_dashboard_metrics(&self.data);
+        let cards = split_columns(area, 4, 1);
+        if let Some(card) = cards.first().copied() {
+            render_kpi_card(
+                frame,
+                card,
+                "Pass rate",
+                &format!("{:.0}%", metrics.pass_rate * 100.0),
+                &format!(
+                    "{} / {} repetitions",
+                    metrics.passed_repetitions, metrics.total_repetitions
+                ),
+                if self.data.result.passed {
+                    SUCCESS
+                } else {
+                    DANGER
+                },
+            );
+        }
+        if let Some(card) = cards.get(1).copied() {
+            render_kpi_card(
+                frame,
+                card,
+                "Winner",
+                metrics.winner.as_deref().unwrap_or("none"),
+                "highest score / pass rate",
+                ACCENT,
+            );
+        }
+        if let Some(card) = cards.get(2).copied() {
+            render_kpi_card(
+                frame,
+                card,
+                "Tokens",
+                &format_number(metrics.total_tokens),
+                &format!("avg {} / repetition", format_number(metrics.avg_tokens)),
+                PURPLE,
+            );
+        }
+        if let Some(card) = cards.get(3).copied() {
+            render_kpi_card(
+                frame,
+                card,
+                "Risk",
+                &metrics.risk_label,
+                &format!("{} tool errors", format_number(metrics.tool_errors)),
+                metrics.risk_color,
+            );
+        }
+    }
+
+    fn render_variant_charts(&self, area: Rect, frame: &mut Frame<'_>) {
+        render_panel_title(area, frame, "Variant comparison");
+        let area = inset_top(area, 1);
+        let half = area.height / 2;
+        let pass_area = Rect::new(area.x, area.y, area.width, half);
+        let cost_area = Rect::new(
+            area.x,
+            area.y.saturating_add(half).saturating_add(1),
+            area.width,
+            area.height.saturating_sub(half).saturating_sub(1),
+        );
+        let pass_items = variant_pass_items(&self.data);
+        BarChart::new(&pass_items)
+            .policy(BarChartPolicy::with_values().value_placement(BarChartValuePlacement::Right))
+            .styles(eval_bar_chart_styles())
+            .empty("No variants")
+            .render(pass_area, frame);
+        let token_items = variant_token_items(&self.data);
+        BarChart::new(&token_items)
+            .policy(BarChartPolicy::with_values().value_placement(BarChartValuePlacement::Right))
+            .styles(eval_bar_chart_styles())
+            .empty("No token data")
+            .render(cost_area, frame);
+    }
+
+    fn render_repetition_trends(&self, area: Rect, frame: &mut Frame<'_>) {
+        render_panel_title(area, frame, "Repetition telemetry");
+        let area = inset_top(area, 1);
+        let latency = repetition_samples(&self.data, "wall_time_ms");
+        let tokens = repetition_samples(&self.data, "total_tokens");
+        let tools = repetition_samples(&self.data, "tool_call_count");
+        render_sparkline_block(
+            frame,
+            Rect::new(area.x, area.y, area.width, 3),
+            "Latency",
+            &latency,
+        );
+        render_sparkline_block(
+            frame,
+            Rect::new(area.x, area.y.saturating_add(4), area.width, 3),
+            "Tokens",
+            &tokens,
+        );
+        render_sparkline_block(
+            frame,
+            Rect::new(area.x, area.y.saturating_add(8), area.width, 3),
+            "Tool calls",
+            &tools,
+        );
     }
 
     fn render_cases(&self, area: Rect, frame: &mut Frame<'_>) {
@@ -540,6 +659,28 @@ impl EvalRunViewerSurface {
             );
         }
     }
+
+    fn render_derivations(&self, area: Rect, frame: &mut Frame<'_>) {
+        render_panel_title(area, frame, "Metric derivations and scoring model");
+        let metrics = run_dashboard_metrics(&self.data);
+        let lines = derivation_lines(&metrics);
+        for (row, line) in lines
+            .iter()
+            .take(usize::from(area.height.saturating_sub(1)))
+            .enumerate()
+        {
+            frame.write_line_with_fallback_style(
+                Rect::new(
+                    area.x,
+                    area.y.saturating_add(1).saturating_add(usize_to_u16(row)),
+                    area.width,
+                    1,
+                ),
+                line,
+                Style::new().bg(PANEL),
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -549,10 +690,11 @@ enum ViewerTab {
     Tools,
     Repetitions,
     Artifact,
+    Derivations,
 }
 
 impl ViewerTab {
-    const COUNT: usize = 5;
+    const COUNT: usize = 6;
 
     const fn index(self) -> usize {
         match self {
@@ -561,6 +703,7 @@ impl ViewerTab {
             Self::Tools => 2,
             Self::Repetitions => 3,
             Self::Artifact => 4,
+            Self::Derivations => 5,
         }
     }
 
@@ -570,6 +713,7 @@ impl ViewerTab {
             2 => Self::Tools,
             3 => Self::Repetitions,
             4 => Self::Artifact,
+            5 => Self::Derivations,
             _ => Self::Overview,
         }
     }
@@ -708,6 +852,377 @@ fn themed_action_row(actions: &[ActionButton]) -> ActionRow<'_> {
         .spacing(2)
 }
 
+const fn eval_bar_chart_styles() -> BarChartStyles {
+    BarChartStyles {
+        label: Style::new().fg(TEXT).bg(PANEL),
+        bar: Style::new()
+            .fg(ACCENT)
+            .bg(PANEL)
+            .add_modifier(Modifier::BOLD),
+        empty: Style::new().fg(BORDER).bg(PANEL),
+        value: Style::new().fg(MUTED).bg(PANEL),
+        empty_message: Style::new().fg(MUTED).bg(PANEL),
+    }
+}
+
+const fn eval_sparkline_styles() -> SparklineStyles {
+    SparklineStyles {
+        normal: Style::new().fg(ACCENT).bg(PANEL_ALT),
+        latest: Style::new()
+            .fg(WARNING)
+            .bg(PANEL_ALT)
+            .add_modifier(Modifier::BOLD),
+        first: Style::new().fg(PURPLE).bg(PANEL_ALT),
+        high: Style::new()
+            .fg(SUCCESS)
+            .bg(PANEL_ALT)
+            .add_modifier(Modifier::BOLD),
+        low: Style::new().fg(DANGER).bg(PANEL_ALT),
+        empty: Style::new().fg(MUTED).bg(PANEL_ALT),
+        background: Style::new().bg(PANEL_ALT),
+    }
+}
+
+fn render_kpi_card(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    label: &str,
+    value: &str,
+    detail: &str,
+    accent: Color,
+) {
+    frame.fill(area, " ", Style::new().bg(PANEL_ALT));
+    frame.write_line_with_fallback_style(
+        Rect::new(area.x, area.y, area.width, 1),
+        &Line::from_spans(vec![
+            Span::styled("  ", Style::new().bg(PANEL_ALT)),
+            Span::styled(
+                label,
+                Style::new()
+                    .fg(MUTED)
+                    .bg(PANEL_ALT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Style::new().bg(PANEL_ALT),
+    );
+    frame.write_line_with_fallback_style(
+        Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+        &Line::from_spans(vec![
+            Span::styled("  ", Style::new().bg(PANEL_ALT)),
+            Span::styled(
+                value,
+                Style::new()
+                    .fg(accent)
+                    .bg(PANEL_ALT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Style::new().bg(PANEL_ALT),
+    );
+    frame.write_line_with_fallback_style(
+        Rect::new(area.x, area.y.saturating_add(2), area.width, 1),
+        &Line::from_spans(vec![
+            Span::styled("  ", Style::new().bg(PANEL_ALT)),
+            Span::styled(detail, Style::new().fg(MUTED).bg(PANEL_ALT)),
+        ]),
+        Style::new().bg(PANEL_ALT),
+    );
+}
+
+fn split_columns(area: Rect, columns: u16, gap: u16) -> Vec<Rect> {
+    if columns == 0 {
+        return Vec::new();
+    }
+    let total_gap = gap.saturating_mul(columns.saturating_sub(1));
+    let width = area.width.saturating_sub(total_gap) / columns;
+    (0..columns)
+        .map(|index| {
+            Rect::new(
+                area.x
+                    .saturating_add(index.saturating_mul(width.saturating_add(gap))),
+                area.y,
+                if index + 1 == columns {
+                    area.right().saturating_sub(
+                        area.x
+                            .saturating_add(index.saturating_mul(width.saturating_add(gap))),
+                    )
+                } else {
+                    width
+                },
+                area.height,
+            )
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct DashboardMetrics {
+    pass_rate: f64,
+    passed_repetitions: usize,
+    total_repetitions: usize,
+    winner: Option<String>,
+    total_tokens: f64,
+    avg_tokens: f64,
+    tool_errors: f64,
+    avg_wall_time_ms: f64,
+    risk_label: String,
+    risk_color: Color,
+}
+
+fn run_dashboard_metrics(data: &EvalRunData) -> DashboardMetrics {
+    let repetitions = data.repetitions();
+    let total_repetitions = repetitions.len();
+    let passed_repetitions = repetitions
+        .iter()
+        .filter(|repetition| repetition.passed)
+        .count();
+    let pass_rate = if total_repetitions == 0 {
+        0.0
+    } else {
+        usize_as_f64(passed_repetitions) / usize_as_f64(total_repetitions)
+    };
+    let total_tokens = repetitions
+        .iter()
+        .map(|repetition| metric(repetition, "total_tokens"))
+        .sum::<f64>();
+    let tool_errors = repetitions
+        .iter()
+        .map(|repetition| metric(repetition, "tool_error_count"))
+        .sum::<f64>();
+    let wall_time = repetitions
+        .iter()
+        .map(|repetition| metric(repetition, "wall_time_ms"))
+        .sum::<f64>();
+    let avg_tokens = average(total_tokens, total_repetitions);
+    let avg_wall_time_ms = average(wall_time, total_repetitions);
+    let (risk_label, risk_color) = risk_badge(pass_rate, tool_errors, avg_wall_time_ms);
+    DashboardMetrics {
+        pass_rate,
+        passed_repetitions,
+        total_repetitions,
+        winner: best_variant(&data.result).map(|variant| variant.variant_id.clone()),
+        total_tokens,
+        avg_tokens,
+        tool_errors,
+        avg_wall_time_ms,
+        risk_label,
+        risk_color,
+    }
+}
+
+fn metric(repetition: &EvalRepetitionResult, key: &str) -> f64 {
+    repetition
+        .measurements
+        .get(key)
+        .copied()
+        .unwrap_or_else(|| {
+            if key == "wall_time_ms" {
+                repetition
+                    .wall_time_ms
+                    .to_string()
+                    .parse::<f64>()
+                    .unwrap_or(0.0)
+            } else {
+                0.0
+            }
+        })
+}
+
+fn average(total: f64, count: usize) -> f64 {
+    if count == 0 {
+        0.0
+    } else {
+        total / usize_as_f64(count)
+    }
+}
+
+fn usize_as_f64(value: usize) -> f64 {
+    f64::from(u32::try_from(value).unwrap_or(u32::MAX))
+}
+
+fn metric_to_u64(value: f64) -> u64 {
+    if !value.is_finite() || value <= 0.0 {
+        0
+    } else {
+        value.round().to_string().parse().unwrap_or(u64::MAX)
+    }
+}
+
+fn risk_badge(pass_rate: f64, tool_errors: f64, avg_wall_time_ms: f64) -> (String, Color) {
+    if pass_rate < 1.0 {
+        ("FAILING".to_string(), DANGER)
+    } else if tool_errors > 0.0 {
+        ("TOOL-RISK".to_string(), WARNING)
+    } else if avg_wall_time_ms > 30_000.0 {
+        ("SLOW".to_string(), WARNING)
+    } else {
+        ("HEALTHY".to_string(), SUCCESS)
+    }
+}
+
+fn variant_pass_items(data: &EvalRunData) -> Vec<BarChartItem<'_>> {
+    data.result
+        .variants
+        .iter()
+        .map(|variant| {
+            BarChartItem::new(
+                variant.variant_id.as_str(),
+                metric_to_u64(variant.pass_rate * 100.0),
+            )
+        })
+        .collect()
+}
+
+fn variant_token_items(data: &EvalRunData) -> Vec<BarChartItem<'_>> {
+    data.result
+        .variants
+        .iter()
+        .map(|variant| {
+            BarChartItem::new(
+                variant.variant_id.as_str(),
+                metric_to_u64(sum_variant_metric(variant, "total_tokens")),
+            )
+        })
+        .collect()
+}
+
+fn repetition_samples(data: &EvalRunData, metric_name: &str) -> Vec<u64> {
+    data.repetitions()
+        .iter()
+        .map(|repetition| metric_to_u64(metric(repetition, metric_name)))
+        .collect()
+}
+
+fn render_sparkline_block(frame: &mut Frame<'_>, area: Rect, title: &str, samples: &[u64]) {
+    if area.height == 0 {
+        return;
+    }
+    frame.write_line_with_fallback_style(
+        Rect::new(area.x, area.y, area.width, 1),
+        &Line::from_spans(vec![
+            Span::styled("  ", Style::new().bg(PANEL_ALT)),
+            Span::styled(
+                title,
+                Style::new()
+                    .fg(MUTED)
+                    .bg(PANEL_ALT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "  latest={} max={}",
+                    samples.last().copied().unwrap_or(0),
+                    samples.iter().copied().max().unwrap_or(0)
+                ),
+                Style::new().fg(MUTED).bg(PANEL_ALT),
+            ),
+        ]),
+        Style::new().bg(PANEL_ALT),
+    );
+    let mut policy = SparklinePolicy::compact();
+    policy.background = true;
+    policy.highlight_high = true;
+    policy.highlight_low = true;
+    Sparkline::new(samples)
+        .policy(policy)
+        .styles(eval_sparkline_styles())
+        .empty("No telemetry")
+        .render(
+            Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+            frame,
+        );
+}
+
+fn derivation_lines(metrics: &DashboardMetrics) -> Vec<Line> {
+    vec![
+        derivation_heading("Run health"),
+        derivation_line(
+            "Pass rate",
+            "passed repetitions / total repetitions",
+            &format!(
+                "{} / {} = {:.1}%",
+                metrics.passed_repetitions,
+                metrics.total_repetitions,
+                metrics.pass_rate * 100.0
+            ),
+        ),
+        derivation_line(
+            "Winner",
+            "best variant by aggregate score and pass quality",
+            metrics.winner.as_deref().unwrap_or("none"),
+        ),
+        derivation_line(
+            "Risk",
+            "failing runs, tool errors, or slow latency raise risk",
+            &metrics.risk_label,
+        ),
+        derivation_heading("Cost and latency"),
+        derivation_line(
+            "Total tokens",
+            "sum(total_tokens) across all repetitions",
+            &format_number(metrics.total_tokens),
+        ),
+        derivation_line(
+            "Average tokens",
+            "total_tokens / total repetitions",
+            &format_number(metrics.avg_tokens),
+        ),
+        derivation_line(
+            "Average wall time",
+            "sum(wall_time_ms) / total repetitions",
+            &format_duration_ms(metrics.avg_wall_time_ms),
+        ),
+        derivation_heading("Charts"),
+        derivation_line(
+            "Variant pass chart",
+            "variant.pass_rate * 100",
+            "higher is better",
+        ),
+        derivation_line(
+            "Variant token chart",
+            "sum(total_tokens) per variant",
+            "lower is cheaper",
+        ),
+        derivation_line(
+            "Telemetry sparklines",
+            "repetition metrics in execution order",
+            "shape shows variance and outliers",
+        ),
+    ]
+}
+
+fn derivation_heading(text: &str) -> Line {
+    Line::from_spans(vec![
+        Span::styled(
+            "  ▸ ",
+            Style::new()
+                .fg(ACCENT)
+                .bg(PANEL)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            text.to_string(),
+            Style::new().fg(TEXT).bg(PANEL).add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+fn derivation_line(label: &str, formula: &str, value: &str) -> Line {
+    Line::from_spans(vec![
+        Span::styled("    ", Style::new().bg(PANEL)),
+        Span::styled(
+            format!("{label:<18}"),
+            Style::new()
+                .fg(ACCENT)
+                .bg(PANEL)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("{formula:<58}"), Style::new().fg(MUTED).bg(PANEL)),
+        Span::styled(value.to_string(), Style::new().fg(TEXT).bg(PANEL)),
+    ])
+}
+
 fn pass_label(passed: bool) -> String {
     if passed { "PASS" } else { "FAIL" }.to_string()
 }
@@ -816,6 +1331,7 @@ fn viewer_tabs() -> Vec<TabItem<'static>> {
         TabItem::new("tools", "Tools"),
         TabItem::new("repetitions", "Repetitions"),
         TabItem::new("artifact", "Artifact"),
+        TabItem::new("derivations", "Derivations"),
     ]
 }
 
@@ -833,7 +1349,7 @@ fn viewer_actions(tab: ViewerTab) -> Vec<ActionButton> {
             ActionButton::new("refresh", "R Refresh"),
             ActionButton::new("close", "Esc Close"),
         ],
-        ViewerTab::Overview | ViewerTab::Cases | ViewerTab::Tools => vec![
+        ViewerTab::Overview | ViewerTab::Cases | ViewerTab::Tools | ViewerTab::Derivations => vec![
             ActionButton::new("repetitions", "Open Repetitions"),
             ActionButton::new("refresh", "R Refresh"),
             ActionButton::new("close", "Esc Close"),
