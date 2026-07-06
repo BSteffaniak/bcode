@@ -6876,6 +6876,11 @@ async fn apply_skill_model_policy(
         && skill_preferred_model_can_apply(state, session_id).await
     {
         apply_skill_model_request(state, session_id, skill_id, preferred, false).await?;
+    } else {
+        // Skill declares no required or preferred model.
+        // Explicitly ensure the turn uses the user's currently selected model
+        // and does not fall back to provider defaults such as default_codex_model_id.
+        ensure_skill_turn_respects_active_selection(state, session_id).await?;
     }
     Ok(())
 }
@@ -6891,6 +6896,51 @@ async fn skill_preferred_model_can_apply(state: &ServerState, session_id: Sessio
             .unwrap_or_default(),
         SessionModelSelectionOrigin::Default
     )
+}
+
+/// When a skill declares neither required nor preferred model, ensure the
+/// upcoming turn respects the user's active selection and does not resolve
+/// through provider defaults such as `default_codex_model_id`.
+async fn ensure_skill_turn_respects_active_selection(
+    state: &ServerState,
+    session_id: SessionId,
+) -> Result<(), ErrorResponse> {
+    // If the session already has an explicit user/model origin, nothing to do.
+    let origin = state
+        .session_model_selection_origins
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+        .unwrap_or_default();
+
+    if !matches!(origin, SessionModelSelectionOrigin::Default) {
+        return Ok(());
+    }
+
+    // Re-assert the current selection by emitting a model-changed event
+    // using the resolved provider/model from the active selection.
+    // This guarantees that Codex/default surfaces are not consulted later.
+    let selection = session_model_selection(state, session_id).await;
+    let provider = selection
+        .provider_plugin_id
+        .clone()
+        .unwrap_or_else(|| "<auto>".to_string());
+    let model = selection
+        .model_id
+        .clone()
+        .unwrap_or_else(|| "<default>".to_string());
+
+    // Only emit if we have a concrete model id to anchor on.
+    if selection.model_id.is_some()
+        && let Ok(event) = state
+            .sessions
+            .append_model_changed(session_id, provider, model)
+            .await
+    {
+        publish_session_event(state, &event).await;
+    }
+    Ok(())
 }
 
 async fn apply_skill_model_request(
