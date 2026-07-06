@@ -24,6 +24,8 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     plugins.push(default_agents_plugin());
     #[cfg(feature = "static-bundled-document-plugin")]
     plugins.push(document_plugin());
+    #[cfg(feature = "static-bundled-eval-plugin")]
+    plugins.push(eval_plugin());
     #[cfg(feature = "static-bundled-ocr-plugin")]
     plugins.push(ocr_plugin());
     #[cfg(feature = "static-bundled-fake-provider-plugin")]
@@ -95,6 +97,14 @@ fn document_plugin() -> bcode_plugin::StaticBundledPlugin {
     bcode_plugin::StaticBundledPlugin::new(
         include_str!("../../../plugins/document-plugin/bcode-plugin.toml"),
         bcode_document_plugin::static_plugin(),
+    )
+}
+
+#[cfg(feature = "static-bundled-eval-plugin")]
+fn eval_plugin() -> bcode_plugin::StaticBundledPlugin {
+    bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/eval-plugin/bcode-plugin.toml"),
+        bcode_eval_plugin::static_plugin(),
     )
 }
 

@@ -16,6 +16,7 @@ bcode_blims_plugin                      = { workspace = true, optional = true }
 bcode_code_review_plugin                = { workspace = true, optional = true }
 bcode_default_agents_plugin             = { workspace = true, optional = true }
 bcode_document_plugin                   = { workspace = true, optional = true }
+bcode_eval_plugin                       = { workspace = true, optional = true }
 bcode_fake_provider_plugin              = { workspace = true, optional = true }
 bcode_filesystem_plugin                 = { workspace = true, optional = true }
 bcode_git_plugin                        = { workspace = true, optional = true }
@@ -80,6 +81,10 @@ static-bundled-document-plugin = [
     "dep:bcode_document_plugin",
     "bcode_document_plugin/static-bundled",
 ]
+static-bundled-eval-plugin = [
+    "dep:bcode_eval_plugin",
+    "bcode_eval_plugin/static-bundled",
+]
 static-bundled-fake-provider-plugin = [
     "dep:bcode_fake_provider_plugin",
     "bcode_fake_provider_plugin/static-bundled",
@@ -122,6 +127,7 @@ static-bundled-plugins = [
     "static-bundled-code-review-plugin",
     "static-bundled-default-agents-plugin",
     "static-bundled-document-plugin",
+    "static-bundled-eval-plugin",
     "static-bundled-ocr-plugin",
     "static-bundled-fake-provider-plugin",
     "static-bundled-filesystem-plugin",

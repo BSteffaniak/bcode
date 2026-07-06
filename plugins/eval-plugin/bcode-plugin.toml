@@ -1,0 +1,22 @@
+id      = "bcode.eval"
+name    = "Bcode Eval Plugin"
+version = "0.0.1"
+
+categories = ["eval"]
+
+[[tui_surfaces]]
+description = "Full-screen eval run picker"
+kind        = "eval-run-picker"
+title       = "Eval Run Picker"
+
+[[tui_surfaces]]
+description = "Full-screen eval run viewer"
+kind        = "eval-run-viewer"
+title       = "Eval Run Viewer"
+
+[runtime]
+abi_version    = 1
+event_symbol   = "bcode_plugin_handle_event_v1"
+library        = "libbcode_eval_plugin.dylib"
+service_symbol = "bcode_plugin_invoke_service_v1"
+type           = "native"

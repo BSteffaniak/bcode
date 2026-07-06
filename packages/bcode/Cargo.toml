@@ -58,6 +58,9 @@ static-bundled-default-agents-plugin = [
 static-bundled-document-plugin = [
     "bcode_bundled_plugins/static-bundled-document-plugin",
 ]
+static-bundled-eval-plugin = [
+    "bcode_bundled_plugins/static-bundled-eval-plugin",
+]
 static-bundled-fake-provider-plugin = [
     "bcode_bundled_plugins/static-bundled-fake-provider-plugin",
 ]
