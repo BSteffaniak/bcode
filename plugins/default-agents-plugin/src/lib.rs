@@ -15,6 +15,7 @@ use bcode_agent_profile::{
 };
 use bcode_plugin_sdk::prelude::*;
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use toml::{Table, Value};
 
@@ -135,7 +136,9 @@ fn agent_context(request: &ServiceRequest) -> ServiceResponse {
         Err(error) => return invalid_request(&error),
     };
     let (config, _) = load_config();
-    let agent = agent_config(&config, &request.agent_id);
+    let mut agent = agent_config(&config, &request.agent_id);
+    let tools_config = load_tools_config();
+    apply_tool_selection(&mut agent, &tools_config, &request.available_tools);
     let enabled_tools = Some(enabled_tools_from_available_metadata(
         active_tools_for(&agent),
         &request.available_tools,
@@ -168,13 +171,65 @@ fn enabled_tools_from_available_metadata(
         .collect()
 }
 
+fn load_tools_config() -> bcode_config::ToolsConfig {
+    bcode_config::load_config()
+        .map(|config| config.tools)
+        .unwrap_or_default()
+}
+
+fn apply_tool_selection(
+    agent: &mut AgentConfig,
+    tools_config: &bcode_config::ToolsConfig,
+    available_tools: &[bcode_tool::ToolDefinition],
+) {
+    let mut selected = match tools_config.default {
+        bcode_config::ToolDefaultMode::Agent => active_tools_for(agent).into_iter().collect(),
+        bcode_config::ToolDefaultMode::None => BTreeSet::new(),
+        bcode_config::ToolDefaultMode::All => available_tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<BTreeSet<_>>(),
+    };
+    selected.extend(tools_config.enabled.iter().cloned());
+    for tool_id in &tools_config.disabled {
+        selected.remove(tool_id);
+    }
+
+    let mut known = agent.tools.keys().cloned().collect::<BTreeSet<_>>();
+    known.extend(selected.iter().cloned());
+    known.extend(tools_config.disabled.iter().cloned());
+    if tools_config.default == bcode_config::ToolDefaultMode::All {
+        known.extend(available_tools.iter().map(|tool| tool.name.clone()));
+    }
+    for tool_id in known {
+        agent
+            .tools
+            .insert(tool_id.clone(), selected.contains(&tool_id));
+    }
+}
+
+fn apply_tool_selection_for_evaluation(
+    agent: &mut AgentConfig,
+    tools_config: &bcode_config::ToolsConfig,
+    requested_tool: &str,
+) {
+    apply_tool_selection(agent, tools_config, &[]);
+    if tools_config.default == bcode_config::ToolDefaultMode::All
+        && !tools_config.disabled.contains(requested_tool)
+    {
+        agent.tools.insert(requested_tool.to_string(), true);
+    }
+}
+
 fn evaluate_tool(request: &ServiceRequest) -> ServiceResponse {
     let request = match request.payload_json::<EvaluateToolCallRequest>() {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
     let (config, _) = load_config();
-    let agent = agent_config(&config, &request.agent_id);
+    let mut agent = agent_config(&config, &request.agent_id);
+    let tools_config = load_tools_config();
+    apply_tool_selection_for_evaluation(&mut agent, &tools_config, &request.tool_name);
     let cwd = request.cwd.as_deref().map_or_else(
         || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         PathBuf::from,
@@ -185,8 +240,11 @@ fn evaluate_tool(request: &ServiceRequest) -> ServiceResponse {
 
 fn policy_status() -> PolicyStatusResponse {
     let (config, source) = load_config();
-    let build = agent_config(&config, BUILD_AGENT);
-    let plan = agent_config(&config, PLAN_AGENT);
+    let mut build = agent_config(&config, BUILD_AGENT);
+    let mut plan = agent_config(&config, PLAN_AGENT);
+    let tools_config = load_tools_config();
+    apply_tool_selection(&mut build, &tools_config, &[]);
+    apply_tool_selection(&mut plan, &tools_config, &[]);
     PolicyStatusResponse {
         using_default: source.using_default,
         source: source.label,

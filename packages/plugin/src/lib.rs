@@ -312,18 +312,42 @@ impl NativePluginRuntime {
     }
 }
 
+/// Plugin default selection mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PluginSelectionMode {
+    /// Enable all candidates unless disabled.
+    All,
+    /// Enable only explicitly selected plugin IDs.
+    #[default]
+    Explicit,
+}
+
 /// Plugin enable/disable selection policy.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginSelection {
+    pub mode: PluginSelectionMode,
     pub enabled: BTreeSet<String>,
     pub disabled: BTreeSet<String>,
+}
+
+impl Default for PluginSelection {
+    fn default() -> Self {
+        Self {
+            mode: PluginSelectionMode::Explicit,
+            enabled: BTreeSet::new(),
+            disabled: BTreeSet::new(),
+        }
+    }
 }
 
 impl PluginSelection {
     /// Return a policy where all discovered plugins are enabled unless disabled.
     #[must_use]
     pub fn all_enabled() -> Self {
-        Self::default()
+        Self {
+            mode: PluginSelectionMode::All,
+            ..Self::default()
+        }
     }
 
     /// Return true when the plugin ID is enabled by this selection policy.
@@ -332,7 +356,10 @@ impl PluginSelection {
         if self.disabled.contains(plugin_id) {
             return false;
         }
-        self.enabled.is_empty() || self.enabled.contains(plugin_id)
+        match self.mode {
+            PluginSelectionMode::All => true,
+            PluginSelectionMode::Explicit => self.enabled.contains(plugin_id),
+        }
     }
 }
 
@@ -3636,6 +3663,7 @@ library = "libdisabled.dylib"
             },
         )];
         let selection = PluginSelection {
+            mode: PluginSelectionMode::All,
             enabled: BTreeSet::new(),
             disabled: BTreeSet::from(["bcode.disabled".to_string()]),
         };

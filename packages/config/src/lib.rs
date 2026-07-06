@@ -1680,10 +1680,32 @@ impl Default for TuiThinkingConfig {
     }
 }
 
+/// Tool default exposure mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolDefaultMode {
+    /// Use active agent policy defaults.
+    #[default]
+    Agent,
+    /// Expose no tools unless explicitly listed in `enabled`.
+    None,
+    /// Expose all loaded tools unless disabled.
+    All,
+}
+
 /// Tool execution configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, ConfigDoc)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "tools")]
 pub struct ToolsConfig {
+    /// Default tool exposure posture.
+    #[serde(default)]
+    pub default: ToolDefaultMode,
+    /// Tool ids explicitly enabled in addition to default exposure, or as an allowlist when default is `none`.
+    #[serde(default)]
+    pub enabled: BTreeSet<String>,
+    /// Tool ids disabled even if exposed by the default posture.
+    #[serde(default)]
+    pub disabled: BTreeSet<String>,
     /// Shell tool configuration.
     #[config_doc(nested)]
     #[serde(default)]
@@ -1692,6 +1714,18 @@ pub struct ToolsConfig {
     #[config_doc(nested)]
     #[serde(default)]
     pub question: QuestionToolConfig,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            default: ToolDefaultMode::Agent,
+            enabled: BTreeSet::new(),
+            disabled: BTreeSet::new(),
+            shell: ShellToolConfig::default(),
+            question: QuestionToolConfig::default(),
+        }
+    }
 }
 
 /// Question/ask tool configuration.
@@ -2672,11 +2706,27 @@ pub struct ResolvedModelSelection {
     pub reasoning: ReasoningConfig,
 }
 
+/// Plugin default selection mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum PluginDefaultMode {
+    /// Enable Bcode's distribution-provided bundled defaults unless disabled.
+    #[default]
+    Bundled,
+    /// Enable no bundled/default plugins unless explicitly listed in `enabled`.
+    None,
+    /// Enable every discovered plugin unless disabled.
+    All,
+}
+
 /// Plugin configuration.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ConfigDoc)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "plugins")]
 pub struct PluginConfig {
-    /// Plugin ids explicitly enabled in addition to bundled defaults.
+    /// Default plugin selection posture.
+    #[serde(default)]
+    pub default: PluginDefaultMode,
+    /// Plugin ids explicitly enabled in addition to bundled defaults, or as an allowlist when default is `none`.
     #[serde(default)]
     pub enabled: BTreeSet<String>,
     /// Plugin ids disabled even if bundled or discovered.
@@ -2690,6 +2740,17 @@ pub struct PluginConfig {
     )]
     #[serde(default)]
     pub config: BTreeMap<String, toml::Value>,
+}
+
+impl Default for PluginConfig {
+    fn default() -> Self {
+        Self {
+            default: PluginDefaultMode::Bundled,
+            enabled: BTreeSet::new(),
+            disabled: BTreeSet::new(),
+            config: BTreeMap::new(),
+        }
+    }
 }
 
 fn merge_reasoning_config(base: &ReasoningConfig, overlay: &ReasoningConfig) -> ReasoningConfig {
@@ -2785,6 +2846,12 @@ fn insert_model_reasoning_settings(
 impl From<&PluginConfig> for PluginSelection {
     fn from(value: &PluginConfig) -> Self {
         Self {
+            mode: match value.default {
+                PluginDefaultMode::All => bcode_plugin::PluginSelectionMode::All,
+                PluginDefaultMode::Bundled | PluginDefaultMode::None => {
+                    bcode_plugin::PluginSelectionMode::Explicit
+                }
+            },
             enabled: value.enabled.clone(),
             disabled: value.disabled.clone(),
         }
@@ -2816,8 +2883,10 @@ where
         .or_else(|| resolved_provider.clone())
         .unwrap_or_else(|| DEFAULT_MODEL_PROVIDER_PLUGIN_ID.to_string());
 
-    for plugin_id in default_plugin_ids {
-        enable_plugin_unless_disabled(&mut selection, plugin_id.as_ref());
+    if value.plugins.default == PluginDefaultMode::Bundled {
+        for plugin_id in default_plugin_ids {
+            enable_plugin_unless_disabled(&mut selection, plugin_id.as_ref());
+        }
     }
     enable_default_model_provider_plugins(&mut selection);
     if !had_explicit_enabled_plugins {
