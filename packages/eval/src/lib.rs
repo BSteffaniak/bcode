@@ -506,6 +506,34 @@ impl Drop for EnvVarGuard {
     }
 }
 
+const DEFAULT_AGENT_TOOL_IDS: &[&str] = &[
+    "shell.run",
+    "filesystem.read",
+    "filesystem.exists",
+    "filesystem.list",
+    "filesystem.find",
+    "filesystem.grep",
+    "filesystem.stat",
+    "filesystem.write",
+    "filesystem.edit",
+    "vim_edit.preview",
+    "vim_edit.apply",
+    "web.search",
+    "web.fetch",
+    "web.status",
+    "web.inspect",
+    "git.clone",
+    "github.clone",
+    "worktree.list",
+    "worktree.create",
+    "worktree.remove",
+    "document.extract",
+    "ocr.extract",
+    "ocr.status",
+    "question",
+    "ask",
+];
+
 fn variant_artifact_dir(rep_dir: &Path) -> &Path {
     rep_dir.parent().and_then(Path::parent).unwrap_or(rep_dir)
 }
@@ -523,6 +551,8 @@ fn prepare_agent_daemon_isolation(
         return Ok(Vec::new());
     }
     let variant_dir = variant_artifact_dir(rep_dir);
+    let auth_subscriptions = bcode_config::runtime_auth_subscriptions_path();
+    let auth_vault = bcode_config::default_auth_vault_path();
     let state_dir = variant_dir.join("daemon-state");
     fs::create_dir_all(&state_dir)?;
     let socket_root = if Path::new("/tmp").exists() {
@@ -540,6 +570,8 @@ fn prepare_agent_daemon_isolation(
         .map_err(|error| EvalError::Validation(error.to_string()))?;
     Ok(vec![
         EnvVarGuard::set_path("BCODE_STATE_DIR", &state_dir),
+        EnvVarGuard::set_path("BCODE_AUTH_SUBSCRIPTIONS", &auth_subscriptions),
+        EnvVarGuard::set_path("BCODE_AUTH_VAULT", &auth_vault),
         EnvVarGuard::set_path("BCODE_SOCKET", &socket),
         EnvVarGuard::set_value(bcode_ipc::BCODE_IPC_ENDPOINT_ENV, endpoint_value),
     ])
@@ -564,10 +596,19 @@ fn prepare_agent_policy_overlay(
     let variant_dir = variant_artifact_dir(rep_dir);
     fs::create_dir_all(variant_dir)?;
     let path = variant_dir.join("permissions.toml");
-    let allowed = variant
+    let allowed_tools = variant
         .allowed_tools
         .iter()
-        .map(|tool| format!("{} = true", toml_key(tool)))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut tool_entries = DEFAULT_AGENT_TOOL_IDS
+        .iter()
+        .map(|tool| ((*tool).to_string(), allowed_tools.contains(*tool)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    tool_entries.extend(allowed_tools.into_iter().map(|tool| (tool, true)));
+    let allowed = tool_entries
+        .iter()
+        .map(|(tool, enabled)| format!("{} = {enabled}", toml_key(tool)))
         .collect::<Vec<_>>()
         .join("\n");
     let state = format!(
@@ -598,20 +639,30 @@ async fn validate_agent_policy_overlay(
     } else {
         &status.build_enabled_tools
     };
+    let allowed_tools = variant
+        .allowed_tools
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
     let missing = variant
         .allowed_tools
         .iter()
         .filter(|tool| !enabled.contains(tool))
         .cloned()
         .collect::<Vec<_>>();
-    if missing.is_empty() {
+    let extra = enabled
+        .iter()
+        .filter(|tool| !allowed_tools.contains(*tool))
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() && extra.is_empty() {
         Ok(Vec::new())
     } else {
         Ok(vec![EvalDiagnostic {
             severity: EvalDiagnosticSeverity::Warning,
             message: format!(
-                "agent policy overlay may not be active for variant {}; missing enabled tools {:?}; policy source: {}",
-                variant.id, missing, status.source
+                "agent policy overlay may not be active for variant {}; missing enabled tools {:?}; extra enabled tools {:?}; policy source: {}",
+                variant.id, missing, extra, status.source
             ),
         }])
     }
