@@ -1,10 +1,6 @@
-//! On-demand live model discovery for providers that support it.
-//!
-//! Provider plugins invoke these helpers during model listing when the user
-//! has configured an xAI (or similar) provider with an API key. The resulting
-//! `LiveCatalogSnapshot` is merged into the catalog so that `context_window`
-//! and `reasoning` metadata from the live provider API are available to the
-//! TUI without requiring a pre-generated snapshot file.
+//! On-demand live model discovery helpers for providers that support it.
+
+use bcode_model::ModelMetadataSource;
 
 /// Returns true if the given base URL or dialect indicates an xAI provider.
 #[must_use]
@@ -20,4 +16,17 @@ pub fn is_xai_provider(base_url: Option<&str>, dialect: Option<&str>) -> bool {
         return true;
     }
     false
+}
+
+/// Returns true if this provider supports live model discovery.
+#[must_use]
+pub fn is_discoverable_provider(base_url: Option<&str>, dialect: Option<&str>) -> bool {
+    is_xai_provider(base_url, dialect)
+}
+
+/// Tag a slice of `ModelInfo` entries with `ProviderLive` source.
+pub fn tag_as_live(models: &mut [bcode_model::ModelInfo]) {
+    for m in models {
+        m.metadata_source = Some(ModelMetadataSource::ProviderLive);
+    }
 }

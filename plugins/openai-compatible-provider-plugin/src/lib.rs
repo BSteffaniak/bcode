@@ -382,6 +382,9 @@ struct Settings {
     model_ids: Vec<String>,
     model_ids_are_explicit: bool,
     request_timeout: Option<Duration>,
+    /// When true, live model discovery is disabled even for discoverable providers.
+    /// Sourced from declarative provider config via context.settings.
+    live_discovery_disabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4492,6 +4495,29 @@ async fn resolve_model_candidates(
     selected_model_id: Option<&str>,
 ) -> Result<Vec<ModelInfo>, ProviderError> {
     let configured_model_ids = model_ids_with_selected(&settings.model_ids, selected_model_id);
+
+    // For discoverable providers (xAI etc.), always attempt live discovery first.
+    // Users can opt out by setting live_discovery=false via declarative provider config.
+    // The value is read from context.settings (populated from bcode.toml) during
+    // settings_for_context and stored in Settings.live_discovery_disabled.
+    let live_disabled = settings.live_discovery_disabled;
+
+    // Detect xAI via base_url or dialect metadata value
+    let dialect_str = settings.dialect.metadata_value();
+    let is_xai = discovery::is_discoverable_provider(Some(&settings.base_url), Some(dialect_str))
+        || settings.base_url.contains("x.ai");
+
+    if is_xai
+        && !live_disabled
+        && let Ok(live_items) = fetch_provider_model_items(settings, api_key).await
+    {
+        let mut models = model_infos_from_items(live_items, settings.default_model.as_deref());
+        discovery::tag_as_live(&mut models);
+        append_missing_model_items_from_ids(&mut models, &configured_model_ids);
+        return Ok(models);
+    }
+    // Live fetch failed – fall back to previous behavior
+
     if settings.model_ids_are_explicit {
         return Ok(model_infos_from_ids(
             &configured_model_ids,
@@ -4712,6 +4738,7 @@ fn settings() -> Settings {
     settings_for_context(&ProviderRequestContext::default())
 }
 
+#[allow(clippy::too_many_lines)]
 fn settings_for_context(context: &ProviderRequestContext) -> Settings {
     let saved = saved_openai_auth();
     let allow_saved_auth = context.auth.is_none();
@@ -4811,6 +4838,10 @@ fn settings_for_context(context: &ProviderRequestContext) -> Settings {
         model_ids,
         model_ids_are_explicit: model_ids_env.is_some(),
         request_timeout,
+        live_discovery_disabled: context
+            .settings
+            .get("live_discovery")
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("false") || v.trim() == "0"),
     }
 }
 
@@ -5602,6 +5633,27 @@ fn append_missing_model_items(models: &mut Vec<ModelResponseItem>, model_ids: &[
     }
 }
 
+/// Same as `append_missing_model_items` but operates on already-converted `ModelInfo` list.
+fn append_missing_model_items_from_ids(models: &mut Vec<ModelInfo>, model_ids: &[String]) {
+    for model_id in model_ids {
+        if models.iter().all(|m| m.model_id != *model_id) {
+            models.push(ModelInfo {
+                model_id: model_id.clone(),
+                display_name: model_id.clone(),
+                is_default: false,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: std::collections::BTreeSet::new(),
+                reasoning: None,
+                cache: bcode_model::ModelCacheInfo::default(),
+                metadata_source: Some(ModelMetadataSource::ProviderLive),
+                pricing: None,
+                visibility: bcode_model::ModelVisibility::Visible,
+            });
+        }
+    }
+}
+
 fn first_context_env<const N: usize>(
     context: &ProviderRequestContext,
     env_names: [&str; N],
@@ -5924,6 +5976,7 @@ mod tests {
             model_ids: vec!["model".to_string()],
             model_ids_are_explicit: true,
             request_timeout: None,
+            live_discovery_disabled: false,
         }
     }
 

@@ -379,6 +379,7 @@ pub enum ModelMetadataSource {
     BundledCatalog,
     PatternMatch,
     ProviderDefault,
+    ProviderLive,
     Unknown,
 }
 
