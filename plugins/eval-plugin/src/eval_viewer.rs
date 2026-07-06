@@ -68,7 +68,8 @@ impl EvalRunPickerSurface {
         self.status = format!("{} runs in {}", self.runs.len(), self.runs_root.display());
     }
 
-    fn open_selected(&mut self) {
+    /// Open the currently selected run, if any.
+    pub fn open_selected(&mut self) {
         let Some(index) = self.table_state.selected() else {
             self.status = "no run selected".to_string();
             return;

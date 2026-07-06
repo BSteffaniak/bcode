@@ -36,7 +36,17 @@ impl PluginTuiSurfaceFactory for EvalRunPickerSurfaceFactory {
                 .get("runs_root")
                 .and_then(serde_json::Value::as_str)
                 .map_or_else(|| PathBuf::from("target/bcode-evals/runs"), PathBuf::from);
-            Ok(Box::new(EvalRunPickerSurface::load(root)) as BoxedPluginTuiSurface)
+            let root = resolve_repo_relative(root, request.repo_path.as_deref());
+            let mut surface = EvalRunPickerSurface::load(root);
+            if request
+                .options
+                .get("open_latest")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                surface.open_selected();
+            }
+            Ok(Box::new(surface) as BoxedPluginTuiSurface)
         })
     }
 }
@@ -57,8 +67,19 @@ impl PluginTuiSurfaceFactory for EvalRunViewerSurfaceFactory {
                 .and_then(serde_json::Value::as_str)
                 .map(PathBuf::from)
                 .ok_or("eval run viewer requires run_path option")?;
+            let run_path = resolve_repo_relative(run_path, request.repo_path.as_deref());
             let surface = EvalRunViewerSurface::load(run_path)?;
             Ok(Box::new(surface) as BoxedPluginTuiSurface)
         })
+    }
+}
+
+fn resolve_repo_relative(path: PathBuf, repo_path: Option<&std::path::Path>) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    match repo_path {
+        Some(repo_path) => repo_path.join(path),
+        None => path,
     }
 }

@@ -1588,6 +1588,7 @@ dependencies = [
 name = "bcode_eval_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_command",
  "bcode_eval_models",
  "bcode_plugin_sdk",
  "bmux_keyboard",

@@ -4,6 +4,12 @@ version = "0.0.1"
 
 categories = ["eval"]
 
+[[services]]
+class        = "service"
+description  = "Eval viewer command contributions"
+interface_id = "bcode.command/v1"
+name         = "Eval Commands"
+
 [[tui_surfaces]]
 description = "Full-screen eval run picker"
 kind        = "eval-run-picker"

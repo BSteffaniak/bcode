@@ -84,6 +84,8 @@ pub struct EvalRunSummary {
     pub variants: usize,
     /// Best variant id.
     pub winner: Option<String>,
+    /// Directory modification time in milliseconds since Unix epoch, when available.
+    pub modified_ms: u128,
 }
 
 /// Discover eval runs below a root directory.
@@ -102,6 +104,12 @@ pub fn discover_runs(root: impl AsRef<Path>) -> Vec<EvalRunSummary> {
         let Ok(data) = EvalRunData::load(&path) else {
             continue;
         };
+        let modified_ms = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_millis());
         runs.push(EvalRunSummary {
             run_dir: path,
             run_id: data.result.manifest.run_id.clone(),
@@ -109,9 +117,15 @@ pub fn discover_runs(root: impl AsRef<Path>) -> Vec<EvalRunSummary> {
             passed: data.result.passed,
             variants: data.result.variants.len(),
             winner: best_variant(&data.result).map(|variant| variant.variant_id.clone()),
+            modified_ms,
         });
     }
-    runs.sort_by(|left, right| right.run_id.cmp(&left.run_id));
+    runs.sort_by(|left, right| {
+        right
+            .modified_ms
+            .cmp(&left.modified_ms)
+            .then_with(|| right.run_id.cmp(&left.run_id))
+    });
     runs
 }
 
