@@ -1293,6 +1293,7 @@ fn handle_eval_command(command: EvalCommand) -> Result<(), CliError> {
                     "summary: {}",
                     result.manifest.output_dir.join("summary.md").display()
                 );
+                print!("{}", bcode_eval::render_terminal_summary(&result));
                 println!("passed: {}", result.passed);
             }
             if let Some(threshold) = fail_under_pass_rate {
@@ -1315,16 +1316,9 @@ fn handle_eval_command(command: EvalCommand) -> Result<(), CliError> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
-                println!("eval run: {}", result.manifest.run_id);
-                println!("suite: {}", result.manifest.suite_id);
-                for variant in &result.variants {
-                    println!(
-                        "{}\tpass={:.2}%\tscore={:.3}",
-                        variant.variant_id,
-                        variant.pass_rate * 100.0,
-                        variant.score.overall
-                    );
-                }
+                let markdown = bcode_eval::render_summary_markdown(&result);
+                std::fs::write(result.manifest.output_dir.join("summary.md"), &markdown)?;
+                print!("{markdown}");
             }
         }
         EvalCommand::Compare {

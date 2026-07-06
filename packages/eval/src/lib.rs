@@ -1252,11 +1252,11 @@ struct SessionTelemetry {
 }
 
 fn add_cost_estimates(variant: &EvalVariant, measurements: &mut EvalMeasurementSet) {
-    let input_rate = variant
+    let input = variant
         .metadata
         .get("input_cost_per_million_tokens")
         .and_then(serde_json::Value::as_f64);
-    let output_rate = variant
+    let output = variant
         .metadata
         .get("output_cost_per_million_tokens")
         .and_then(serde_json::Value::as_f64);
@@ -1268,13 +1268,13 @@ fn add_cost_estimates(variant: &EvalVariant, measurements: &mut EvalMeasurementS
         .get("output_tokens")
         .copied()
         .unwrap_or_default();
-    if let Some(rate) = input_rate {
+    if let Some(rate) = input {
         measurements.insert(
             "estimated_input_cost".into(),
             (input_tokens / 1_000_000.0) * rate,
         );
     }
-    if let Some(rate) = output_rate {
+    if let Some(rate) = output {
         measurements.insert(
             "estimated_output_cost".into(),
             (output_tokens / 1_000_000.0) * rate,
@@ -1882,30 +1882,19 @@ pub fn render_comparison_markdown(report: &EvalComparisonReport) -> String {
     if let Some(winner) = &report.winner {
         out.push_str(&format!("Winner: `{winner}`\n\n"));
     }
-    out.push_str("| Variant | Pass rate | Score | Key metrics |\n|---|---:|---:|---|\n");
+    out.push_str("| Variant | Pass | Score | Avg Wall | Avg Tokens | Tool Calls/Rep | Tool Errors | Diff Bytes |\n");
+    out.push_str("|---|---:|---:|---:|---:|---:|---:|---:|\n");
     for variant in &report.variants {
-        let metrics = variant
-            .measurements
-            .iter()
-            .filter(|(key, _)| {
-                matches!(
-                    key.as_str(),
-                    "total_tokens"
-                        | "wall_time_ms"
-                        | "tool_call_count"
-                        | "diff_bytes"
-                        | "tool_error_count"
-                )
-            })
-            .map(|(key, value)| format!("{key}={value:.2}"))
-            .collect::<Vec<_>>()
-            .join(", ");
         out.push_str(&format!(
-            "| {} | {:.2}% | {:.3} | {} |\n",
+            "| {} | {:.2}% | {:.3} | {} | {} | {:.1} | {:.1} | {} |\n",
             variant.variant_id,
             variant.pass_rate * 100.0,
             variant.overall_score,
-            metrics
+            format_duration_ms(metric(&variant.measurements, "wall_time_ms")),
+            format_number(metric(&variant.measurements, "total_tokens")),
+            metric(&variant.measurements, "tool_call_count"),
+            metric(&variant.measurements, "tool_error_count"),
+            format_number(metric(&variant.measurements, "diff_bytes")),
         ));
     }
     if !report.diagnostics.is_empty() {
@@ -2009,9 +1998,25 @@ fn artifact_links(repetition: &EvalRepetitionResult) -> String {
     repetition
         .artifacts
         .iter()
-        .map(|artifact| format!("[{}]({})", artifact.kind, artifact.path.display()))
+        .map(|artifact| {
+            let path = report_artifact_path(repetition, artifact);
+            format!("[{}]({})", artifact.kind, path.display())
+        })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn report_artifact_path(repetition: &EvalRepetitionResult, artifact: &EvalArtifactRef) -> PathBuf {
+    if artifact.path.is_absolute() || artifact.path.components().count() > 1 {
+        return artifact.path.clone();
+    }
+    PathBuf::from("cases")
+        .join(&repetition.case_id)
+        .join("variants")
+        .join(&repetition.variant_id)
+        .join("repetitions")
+        .join(format!("{:04}", repetition.repetition))
+        .join(&artifact.path)
 }
 
 fn stable_text_hash(value: &str) -> u64 {
@@ -2496,19 +2501,499 @@ fn write_json(path: impl AsRef<Path>, value: &impl Serialize) -> Result<(), Eval
     Ok(())
 }
 
-fn render_summary_markdown(result: &EvalRunResult) -> String {
+/// Render a rich Markdown summary for one completed eval run.
+#[must_use]
+pub fn render_summary_markdown(result: &EvalRunResult) -> String {
+    let suite = load_suite_snapshot_from_run(result).ok();
+    let pricing = suite
+        .as_ref()
+        .map_or_else(BTreeMap::new, pricing_table_from_suite);
+    let variant_models = suite
+        .as_ref()
+        .map_or_else(BTreeMap::new, variant_model_table_from_suite);
+    let baseline = best_variant(result).map(|variant| variant.variant_id.as_str());
     let mut out = format!("# Eval Run {}\n\n", result.manifest.run_id);
     out.push_str(&format!("Suite: `{}`\n\n", result.manifest.suite_id));
-    out.push_str("| Variant | Pass rate | Score |\n|---|---:|---:|\n");
+    out.push_str(&format!("Passed: `{}`\n\n", result.passed));
+    out.push_str("## Variant Overview\n\n");
+    out.push_str("| Variant | Pass | Score | Reps | Avg Wall | Avg Agent | Avg Tokens | Total Tokens | Est Cost | Tool Calls/Rep | Tool Errors | Permission Prompts |\n");
+    out.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
     for variant in &result.variants {
+        let metrics = VariantReportMetrics::from_variant(variant, &pricing, &variant_models);
         out.push_str(&format!(
-            "| {} | {:.2}% | {:.3} |\n",
+            "| {} | {:.2}% | {:.3} | {} | {} | {} | {} | {} | {} | {:.1} | {:.0} | {:.0} |\n",
             variant.variant_id,
             variant.pass_rate * 100.0,
-            variant.score.overall
+            variant.score.overall,
+            metrics.repetitions,
+            format_duration_ms(metrics.avg_wall_ms),
+            format_duration_ms(metrics.avg_agent_ms),
+            format_number(metrics.avg_total_tokens),
+            format_number(metrics.total_tokens),
+            format_cost(metrics.estimated_cost),
+            metrics.avg_tool_calls,
+            metrics.tool_errors,
+            metrics.permission_prompts,
+        ));
+    }
+
+    if let Some(baseline) = baseline {
+        out.push_str("\n## Efficiency Deltas\n\n");
+        out.push_str(&format!("Baseline: `{baseline}`\n\n"));
+        out.push_str("| Variant | Score Δ | Token Δ | Cost Δ | Latency Δ | Tool Call Δ |\n");
+        out.push_str("|---|---:|---:|---:|---:|---:|\n");
+        if let Some(base_variant) = result
+            .variants
+            .iter()
+            .find(|variant| variant.variant_id == baseline)
+        {
+            let base = VariantReportMetrics::from_variant(base_variant, &pricing, &variant_models);
+            for variant in &result.variants {
+                let metrics =
+                    VariantReportMetrics::from_variant(variant, &pricing, &variant_models);
+                out.push_str(&format!(
+                    "| {} | {} | {} | {} | {} | {} |\n",
+                    variant.variant_id,
+                    format_signed_delta(variant.score.overall - base_variant.score.overall, 3),
+                    format_percent_delta(metrics.avg_total_tokens, base.avg_total_tokens),
+                    format_optional_percent_delta(metrics.estimated_cost, base.estimated_cost),
+                    format_percent_delta(metrics.avg_wall_ms, base.avg_wall_ms),
+                    format_signed_delta(metrics.avg_tool_calls - base.avg_tool_calls, 1),
+                ));
+            }
+        }
+    }
+
+    out.push_str("\n## Token and Cost Breakdown\n\n");
+    out.push_str("| Variant | Model | Input | Cached Input | Output | Reasoning | Total | Est Cost | Pricing |\n");
+    out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---|\n");
+    for variant in &result.variants {
+        let metrics = VariantReportMetrics::from_variant(variant, &pricing, &variant_models);
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            variant.variant_id,
+            metrics.model.as_deref().unwrap_or("unknown"),
+            format_number(metrics.input_tokens),
+            format_number(metrics.cached_input_tokens),
+            format_number(metrics.output_tokens),
+            format_number(metrics.reasoning_tokens),
+            format_number(metrics.total_tokens),
+            format_cost(metrics.estimated_cost),
+            if metrics.pricing_available {
+                "configured"
+            } else {
+                "unavailable"
+            },
+        ));
+    }
+    if pricing.is_empty() {
+        out.push_str("\n> Cost is unavailable because no eval pricing metadata was found. Add suite metadata pricing entries to estimate dollars.\n");
+    }
+
+    out.push_str("\n## Case Breakdown\n\n");
+    out.push_str("| Case | Variant | Pass | Reps | Avg Wall | Avg Tokens | Tool Calls/Rep | Tool Errors | Diff Variants |\n");
+    out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|\n");
+    for variant in &result.variants {
+        for case in &variant.cases {
+            let reps = case.repetitions.iter().collect::<Vec<_>>();
+            let avg = average_measurements(&reps);
+            out.push_str(&format!(
+                "| {} | {} | {:.2}% | {} | {} | {} | {:.1} | {:.0} | {} |\n",
+                case.case_id,
+                variant.variant_id,
+                case.pass_rate * 100.0,
+                case.repetitions.len(),
+                format_duration_ms(metric(&avg, "wall_time_ms")),
+                format_number(metric(&avg, "total_tokens")),
+                metric(&avg, "tool_call_count"),
+                sum_repetition_metric(&case.repetitions, "tool_error_count"),
+                diff_hash_count(&result.manifest.output_dir, &reps),
+            ));
+        }
+    }
+
+    out.push_str("\n## Tool Usage\n\n");
+    let tool_metrics = tool_metric_names(result);
+    if tool_metrics.is_empty() {
+        out.push_str("No tool-call metrics recorded.\n");
+    } else {
+        out.push_str("| Variant | Total Tool Calls | Tool Errors |");
+        for tool in &tool_metrics {
+            out.push_str(&format!(
+                " {} |",
+                tool.trim_start_matches("tool_call_count.")
+            ));
+        }
+        out.push_str("\n|---|---:|---:");
+        for _ in &tool_metrics {
+            out.push_str("|---:");
+        }
+        out.push_str("|\n");
+        for variant in &result.variants {
+            out.push_str(&format!(
+                "| {} | {} | {} |",
+                variant.variant_id,
+                format_integer(sum_variant_metric(variant, "tool_call_count")),
+                format_integer(sum_variant_metric(variant, "tool_error_count")),
+            ));
+            for tool in &tool_metrics {
+                out.push_str(&format!(
+                    " {} |",
+                    format_integer(sum_variant_metric(variant, tool))
+                ));
+            }
+            out.push('\n');
+        }
+    }
+
+    out.push_str("\n## Outliers\n\n");
+    for (label, metric_name) in [
+        ("Slowest repetition", "wall_time_ms"),
+        ("Most tokens", "total_tokens"),
+        ("Most tool errors", "tool_error_count"),
+    ] {
+        if let Some((variant, case, repetition, value)) = max_repetition_metric(result, metric_name)
+        {
+            out.push_str(&format!(
+                "* {label}: `{variant}` / `{case}` / rep {} — {} — {}\n",
+                repetition.repetition,
+                format_metric_value(metric_name, value),
+                artifact_links(repetition),
+            ));
+        }
+    }
+
+    out.push_str("\n## Repetition Artifacts\n\n");
+    for variant in &result.variants {
+        for case in &variant.cases {
+            for repetition in &case.repetitions {
+                out.push_str(&format!(
+                    "* `{}` / `{}` / rep {} — passed={} — {}\n",
+                    variant.variant_id,
+                    case.case_id,
+                    repetition.repetition,
+                    repetition.passed,
+                    artifact_links(repetition),
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Render a concise terminal summary for one completed eval run.
+#[must_use]
+pub fn render_terminal_summary(result: &EvalRunResult) -> String {
+    let suite = load_suite_snapshot_from_run(result).ok();
+    let pricing = suite
+        .as_ref()
+        .map_or_else(BTreeMap::new, pricing_table_from_suite);
+    let variant_models = suite
+        .as_ref()
+        .map_or_else(BTreeMap::new, variant_model_table_from_suite);
+    let winner = best_variant(result).map_or("none", |variant| variant.variant_id.as_str());
+    let mut out = format!("winner: {winner}\n");
+    for variant in &result.variants {
+        let metrics = VariantReportMetrics::from_variant(variant, &pricing, &variant_models);
+        out.push_str(&format!(
+            "{}: pass={:.2}% score={:.3} tokens={} avg_tokens={} cost={} avg_wall={} tools/rep={:.1} errors={:.0}\n",
+            variant.variant_id,
+            variant.pass_rate * 100.0,
+            variant.score.overall,
+            format_number(metrics.total_tokens),
+            format_number(metrics.avg_total_tokens),
+            format_cost(metrics.estimated_cost),
+            format_duration_ms(metrics.avg_wall_ms),
+            metrics.avg_tool_calls,
+            metrics.tool_errors,
         ));
     }
     out
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ModelPricing {
+    input: f64,
+    cached_input: f64,
+    output: f64,
+    reasoning: f64,
+}
+
+#[derive(Debug, Default)]
+struct VariantReportMetrics {
+    repetitions: usize,
+    model: Option<String>,
+    pricing_available: bool,
+    avg_wall_ms: f64,
+    avg_agent_ms: f64,
+    avg_total_tokens: f64,
+    total_tokens: f64,
+    input_tokens: f64,
+    cached_input_tokens: f64,
+    output_tokens: f64,
+    reasoning_tokens: f64,
+    estimated_cost: Option<f64>,
+    avg_tool_calls: f64,
+    tool_errors: f64,
+    permission_prompts: f64,
+}
+
+impl VariantReportMetrics {
+    fn from_variant(
+        variant: &EvalVariantRunResult,
+        pricing: &BTreeMap<String, ModelPricing>,
+        variant_models: &BTreeMap<String, String>,
+    ) -> Self {
+        let repetitions = variant_repetitions(variant);
+        let count = repetitions.len().max(1) as f64;
+        let model = variant_models.get(&variant.variant_id).cloned();
+        let input_tokens = sum_refs_metric(&repetitions, "input_tokens");
+        let cached_input_tokens = sum_refs_metric(&repetitions, "cached_input_tokens");
+        let output_tokens = sum_refs_metric(&repetitions, "output_tokens");
+        let reasoning_tokens = sum_refs_metric(&repetitions, "reasoning_tokens");
+        let total_tokens = sum_refs_metric(&repetitions, "total_tokens");
+        let price = model.as_ref().and_then(|model| pricing.get(model));
+        let estimated_cost = price.map(|price| {
+            (input_tokens / 1_000_000.0).mul_add(
+                price.input,
+                (cached_input_tokens / 1_000_000.0).mul_add(
+                    price.cached_input,
+                    (output_tokens / 1_000_000.0).mul_add(
+                        price.output,
+                        (reasoning_tokens / 1_000_000.0) * price.reasoning,
+                    ),
+                ),
+            )
+        });
+        Self {
+            repetitions: repetitions.len(),
+            model,
+            pricing_available: price.is_some(),
+            avg_wall_ms: sum_refs_metric(&repetitions, "wall_time_ms") / count,
+            avg_agent_ms: sum_refs_metric(&repetitions, "agent_wall_time_ms") / count,
+            avg_total_tokens: total_tokens / count,
+            total_tokens,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            reasoning_tokens,
+            estimated_cost,
+            avg_tool_calls: sum_refs_metric(&repetitions, "tool_call_count") / count,
+            tool_errors: sum_refs_metric(&repetitions, "tool_error_count"),
+            permission_prompts: sum_refs_metric(&repetitions, "permission_prompt_count"),
+        }
+    }
+}
+
+fn best_variant(result: &EvalRunResult) -> Option<&EvalVariantRunResult> {
+    result.variants.iter().max_by(|left, right| {
+        left.score
+            .overall
+            .partial_cmp(&right.score.overall)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
+}
+
+fn variant_repetitions(variant: &EvalVariantRunResult) -> Vec<&EvalRepetitionResult> {
+    variant
+        .cases
+        .iter()
+        .flat_map(|case| case.repetitions.iter())
+        .collect()
+}
+
+fn sum_refs_metric(repetitions: &[&EvalRepetitionResult], metric_name: &str) -> f64 {
+    repetitions
+        .iter()
+        .filter_map(|repetition| repetition.measurements.get(metric_name).copied())
+        .sum()
+}
+
+fn sum_repetition_metric(repetitions: &[EvalRepetitionResult], metric_name: &str) -> f64 {
+    repetitions
+        .iter()
+        .filter_map(|repetition| repetition.measurements.get(metric_name).copied())
+        .sum()
+}
+
+fn sum_variant_metric(variant: &EvalVariantRunResult, metric_name: &str) -> f64 {
+    variant
+        .cases
+        .iter()
+        .flat_map(|case| case.repetitions.iter())
+        .filter_map(|repetition| repetition.measurements.get(metric_name).copied())
+        .sum()
+}
+
+fn metric(measurements: &EvalMeasurementSet, metric_name: &str) -> f64 {
+    measurements.get(metric_name).copied().unwrap_or_default()
+}
+
+fn tool_metric_names(result: &EvalRunResult) -> Vec<String> {
+    let mut metrics = std::collections::BTreeSet::new();
+    for variant in &result.variants {
+        for repetition in variant
+            .cases
+            .iter()
+            .flat_map(|case| case.repetitions.iter())
+        {
+            for key in repetition.measurements.keys() {
+                if key.starts_with("tool_call_count.") {
+                    metrics.insert(key.clone());
+                }
+            }
+        }
+    }
+    metrics.into_iter().collect()
+}
+
+fn max_repetition_metric<'a>(
+    result: &'a EvalRunResult,
+    metric_name: &str,
+) -> Option<(&'a str, &'a str, &'a EvalRepetitionResult, f64)> {
+    let mut best = None;
+    for variant in &result.variants {
+        for case in &variant.cases {
+            for repetition in &case.repetitions {
+                let value = repetition
+                    .measurements
+                    .get(metric_name)
+                    .copied()
+                    .unwrap_or_default();
+                if best.is_none_or(|(_, _, _, best_value)| value > best_value) {
+                    best = Some((
+                        variant.variant_id.as_str(),
+                        case.case_id.as_str(),
+                        repetition,
+                        value,
+                    ));
+                }
+            }
+        }
+    }
+    best
+}
+
+fn variant_model_table_from_suite(suite: &EvalSuite) -> BTreeMap<String, String> {
+    suite
+        .variants
+        .iter()
+        .filter_map(|variant| {
+            variant
+                .model
+                .clone()
+                .or_else(|| {
+                    variant
+                        .metadata
+                        .get("model")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .map(|model| (variant.id.clone(), model))
+        })
+        .collect()
+}
+
+fn pricing_table_from_suite(suite: &EvalSuite) -> BTreeMap<String, ModelPricing> {
+    let mut table = BTreeMap::new();
+    for root in [
+        suite.metadata.get("pricing"),
+        suite
+            .metadata
+            .get("report")
+            .and_then(|value| value.get("pricing")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let Some(models) = root.as_object() else {
+            continue;
+        };
+        for (model, value) in models {
+            if let Some(pricing) = model_pricing_from_value(value) {
+                table.insert(model.clone(), pricing);
+            }
+        }
+    }
+    table
+}
+
+fn model_pricing_from_value(value: &serde_json::Value) -> Option<ModelPricing> {
+    Some(ModelPricing {
+        input: value.get("input_per_million")?.as_f64()?,
+        cached_input: value
+            .get("cached_input_per_million")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_default(),
+        output: value.get("output_per_million")?.as_f64()?,
+        reasoning: value
+            .get("reasoning_per_million")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_else(|| {
+                value
+                    .get("output_per_million")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or_default()
+            }),
+    })
+}
+
+fn format_number(value: f64) -> String {
+    if value >= 1_000_000.0 {
+        format!("{:.2}M", value / 1_000_000.0)
+    } else if value >= 1_000.0 {
+        format!("{:.1}k", value / 1_000.0)
+    } else {
+        format!("{value:.0}")
+    }
+}
+
+fn format_duration_ms(value: f64) -> String {
+    if value >= 1_000.0 {
+        format!("{:.1}s", value / 1_000.0)
+    } else {
+        format!("{value:.0}ms")
+    }
+}
+
+fn format_cost(value: Option<f64>) -> String {
+    value.map_or_else(|| "n/a".to_string(), |value| format!("${value:.4}"))
+}
+
+fn format_signed_delta(value: f64, precision: usize) -> String {
+    format!("{value:+.precision$}")
+}
+
+fn format_percent_delta(value: f64, baseline: f64) -> String {
+    if baseline.abs() <= f64::EPSILON {
+        return "n/a".to_string();
+    }
+    format!("{:+.1}%", ((value - baseline) / baseline) * 100.0)
+}
+
+fn format_optional_percent_delta(value: Option<f64>, baseline: Option<f64>) -> String {
+    match (value, baseline) {
+        (Some(value), Some(baseline)) => format_percent_delta(value, baseline),
+        _ => "n/a".to_string(),
+    }
+}
+
+fn format_integer(value: f64) -> String {
+    if value.abs() < 0.5 {
+        "0".to_string()
+    } else {
+        format!("{value:.0}")
+    }
+}
+
+fn format_metric_value(metric_name: &str, value: f64) -> String {
+    if metric_name.ends_with("_ms") {
+        format_duration_ms(value)
+    } else if metric_name.contains("token") {
+        format_number(value)
+    } else {
+        format!("{value:.0}")
+    }
 }
 
 fn validate_id(kind: &str, id: &str) -> Result<(), EvalError> {
