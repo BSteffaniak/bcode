@@ -3,7 +3,6 @@
 use crate::eval_data::{
     EvalRunData, EvalRunSummary, best_variant, case_avg_metric, diff_variant_count, discover_runs,
     format_duration_ms, format_number, load_repetition_artifact, sum_variant_metric,
-    variant_metrics,
 };
 use bcode_eval_models::EvalRepetitionResult;
 use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface};
@@ -146,9 +145,7 @@ impl PluginTuiSurface for EvalRunPickerSurface {
         render_panel_title(table_area, frame, "Recent eval runs");
         let columns = picker_columns();
         let rows = picker_rows(&self.runs);
-        Table::new(&columns, &rows)
-            .styles(eval_table_styles())
-            .render(self.table_area, &self.table_state, frame);
+        render_eval_table(frame, self.table_area, &columns, &rows, &self.table_state);
         let actions = picker_actions();
         themed_action_row(&actions).render_state(action_area, &self.action_state, frame);
         render_status(
@@ -169,12 +166,14 @@ impl PluginTuiSurface for EvalRunPickerSurface {
         }
         let columns = picker_columns();
         let rows = picker_rows(&self.runs);
-        let table = Table::new(&columns, &rows).styles(eval_table_styles());
-        match table.handle_event(self.table_area, &mut self.table_state, event) {
-            TableOutcome::Selected(_) | TableOutcome::Focused(_) | TableOutcome::Redraw => {
-                return PluginTuiAction::Redraw;
-            }
-            TableOutcome::Ignored => {}
+        if handle_eval_table_event(
+            self.table_area,
+            &columns,
+            &rows,
+            &mut self.table_state,
+            event,
+        ) {
+            return PluginTuiAction::Redraw;
         }
         let actions = picker_actions();
         match themed_action_row(&actions).handle_event(
@@ -210,7 +209,6 @@ impl PluginTuiSurface for EvalRunPickerSurface {
 pub struct EvalRunViewerSurface {
     data: EvalRunData,
     tab_state: TabBarState,
-    overview_state: TableState,
     case_state: TableState,
     tool_state: TableState,
     rep_state: TableState,
@@ -242,7 +240,6 @@ impl EvalRunViewerSurface {
         Ok(Self {
             data,
             tab_state: TabBarState::new(Some(0)),
-            overview_state: TableState::new(Some(0)),
             case_state: TableState::new(Some(0)),
             tool_state: TableState::new(Some(0)),
             rep_state: TableState::new(Some(0)),
@@ -399,39 +396,37 @@ impl PluginTuiSurface for EvalRunViewerSurface {
 impl EvalRunViewerSurface {
     fn handle_selected_table_event(&mut self, event: &Event) -> bool {
         match self.selected_tab() {
-            ViewerTab::Overview => {
-                let (columns, rows) = overview_table(&self.data);
-                table_action(
-                    Table::new(&columns, &rows)
-                        .styles(eval_table_styles())
-                        .handle_event(self.content_area, &mut self.overview_state, event),
-                )
-            }
+            ViewerTab::Overview | ViewerTab::Artifact | ViewerTab::Derivations => false,
             ViewerTab::Cases => {
                 let (columns, rows) = case_table(&self.data);
-                table_action(
-                    Table::new(&columns, &rows)
-                        .styles(eval_table_styles())
-                        .handle_event(self.content_area, &mut self.case_state, event),
+                handle_eval_table_event(
+                    self.content_area,
+                    &columns,
+                    &rows,
+                    &mut self.case_state,
+                    event,
                 )
             }
             ViewerTab::Tools => {
                 let (columns, rows) = tool_table(&self.data);
-                table_action(
-                    Table::new(&columns, &rows)
-                        .styles(eval_table_styles())
-                        .handle_event(self.content_area, &mut self.tool_state, event),
+                handle_eval_table_event(
+                    self.content_area,
+                    &columns,
+                    &rows,
+                    &mut self.tool_state,
+                    event,
                 )
             }
             ViewerTab::Repetitions => {
                 let (columns, rows) = repetition_table(&self.data);
-                table_action(
-                    Table::new(&columns, &rows)
-                        .styles(eval_table_styles())
-                        .handle_event(self.content_area, &mut self.rep_state, event),
+                handle_eval_table_event(
+                    self.content_area,
+                    &columns,
+                    &rows,
+                    &mut self.rep_state,
+                    event,
                 )
             }
-            ViewerTab::Artifact | ViewerTab::Derivations => false,
         }
     }
 
@@ -607,18 +602,14 @@ impl EvalRunViewerSurface {
         render_panel_title(area, frame, "Case performance");
         let area = inset_top(area, 1);
         let (columns, rows) = case_table(&self.data);
-        Table::new(&columns, &rows)
-            .styles(eval_table_styles())
-            .render(area, &self.case_state, frame);
+        render_eval_table(frame, area, &columns, &rows, &self.case_state);
     }
 
     fn render_tools(&self, area: Rect, frame: &mut Frame<'_>) {
         render_panel_title(area, frame, "Tool usage");
         let area = inset_top(area, 1);
         let (columns, rows) = tool_table(&self.data);
-        Table::new(&columns, &rows)
-            .styles(eval_table_styles())
-            .render(area, &self.tool_state, frame);
+        render_eval_table(frame, area, &columns, &rows, &self.tool_state);
     }
 
     fn render_repetitions(&self, area: Rect, frame: &mut Frame<'_>) {
@@ -629,9 +620,7 @@ impl EvalRunViewerSurface {
         );
         let area = inset_top(area, 1);
         let (columns, rows) = repetition_table(&self.data);
-        Table::new(&columns, &rows)
-            .styles(eval_table_styles())
-            .render(area, &self.rep_state, frame);
+        render_eval_table(frame, area, &columns, &rows, &self.rep_state);
     }
 
     fn render_artifact(&self, area: Rect, frame: &mut Frame<'_>) {
@@ -850,6 +839,30 @@ fn themed_action_row(actions: &[ActionButton]) -> ActionRow<'_> {
     ActionRow::new(actions)
         .styles(eval_button_styles())
         .spacing(2)
+}
+
+const fn eval_table<'a>(columns: &'a [TableColumn<'a>], rows: &'a [TableRow]) -> Table<'a> {
+    Table::new(columns, rows).styles(eval_table_styles())
+}
+
+fn render_eval_table(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    columns: &[TableColumn<'_>],
+    rows: &[TableRow],
+    state: &TableState,
+) {
+    eval_table(columns, rows).render(area, state, frame);
+}
+
+fn handle_eval_table_event(
+    area: Rect,
+    columns: &[TableColumn<'_>],
+    rows: &[TableRow],
+    state: &mut TableState,
+    event: &Event,
+) -> bool {
+    table_action(eval_table(columns, rows).handle_event(area, state, event))
 }
 
 const fn eval_bar_chart_styles() -> BarChartStyles {
@@ -1355,46 +1368,6 @@ fn viewer_actions(tab: ViewerTab) -> Vec<ActionButton> {
             ActionButton::new("close", "Esc Close"),
         ],
     }
-}
-
-fn overview_table(data: &EvalRunData) -> (Vec<TableColumn<'static>>, Vec<TableRow>) {
-    let columns = vec![
-        TableColumn::new("Variant").flex(2),
-        TableColumn::new("Pass").fixed(8).align(TableAlign::Right),
-        TableColumn::new("Score").fixed(8).align(TableAlign::Right),
-        TableColumn::new("Avg Wall")
-            .fixed(10)
-            .align(TableAlign::Right),
-        TableColumn::new("Avg Tokens")
-            .fixed(11)
-            .align(TableAlign::Right),
-        TableColumn::new("Total Tokens")
-            .fixed(12)
-            .align(TableAlign::Right),
-        TableColumn::new("Tools/Rep")
-            .fixed(10)
-            .align(TableAlign::Right),
-        TableColumn::new("Errors").fixed(8).align(TableAlign::Right),
-    ];
-    let rows = data
-        .result
-        .variants
-        .iter()
-        .map(|variant| {
-            let metrics = variant_metrics(variant);
-            string_row(vec![
-                variant.variant_id.clone(),
-                format!("{:.1}%", variant.pass_rate * 100.0),
-                format!("{:.3}", variant.score.overall),
-                format_duration_ms(metrics.avg_wall_ms),
-                format_number(metrics.avg_tokens),
-                format_number(metrics.total_tokens),
-                format!("{:.1}", metrics.avg_tool_calls),
-                format_number(metrics.tool_errors),
-            ])
-        })
-        .collect();
-    (columns, rows)
 }
 
 fn case_table(data: &EvalRunData) -> (Vec<TableColumn<'static>>, Vec<TableRow>) {
