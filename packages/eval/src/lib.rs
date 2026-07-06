@@ -53,6 +53,12 @@ pub enum EvalError {
     /// A command failed before producing an exit status.
     #[error("command failed: {0}")]
     Command(String),
+    /// Client operation failed.
+    #[error("client error: {0}")]
+    Client(String),
+    /// Config override failed.
+    #[error("config error: {0}")]
+    Config(String),
     /// Regex compilation failed.
     #[error("regex error: {0}")]
     Regex(#[from] regex::Error),
@@ -109,6 +115,11 @@ pub fn validate_suite(suite: &EvalSuite) -> Result<(), EvalError> {
     if suite.variants.is_empty() {
         return Err(EvalError::Validation(
             "suite must define at least one variant".into(),
+        ));
+    }
+    if suite.run.repetitions == 0 {
+        return Err(EvalError::Validation(
+            "run.repetitions must be at least 1".into(),
         ));
     }
     if suite.cases.is_empty() {
@@ -343,12 +354,28 @@ fn execute_variant(
     rep_dir: &Path,
     workspace: &Path,
 ) -> Result<ExecutionOutput, EvalError> {
-    if variant.executor != EvalExecutorKind::Command {
-        return Err(EvalError::UnsupportedExecutor {
+    match variant.executor {
+        EvalExecutorKind::Command => {
+            execute_command_variant(suite, case, variant, repetition, rep_dir, workspace)
+        }
+        EvalExecutorKind::Agent => {
+            execute_agent_variant(suite, case, variant, repetition, rep_dir, workspace)
+        }
+        EvalExecutorKind::DirectTool | EvalExecutorKind::Replay => Err(EvalError::UnsupportedExecutor {
             variant_id: variant.id.clone(),
-            reason: "use executor = \"command\" with a command template; agent/direct-tool/replay adapters must be expressed through public commands until native adapters are added".into(),
-        });
+            reason: "direct_tool and replay executors require suite-specific public command adapters in this implementation; use executor = \"command\" to run those adapters reproducibly".into(),
+        }),
     }
+}
+
+fn execute_command_variant(
+    suite: &EvalSuite,
+    case: &EvalCase,
+    variant: &EvalVariant,
+    repetition: u32,
+    rep_dir: &Path,
+    workspace: &Path,
+) -> Result<ExecutionOutput, EvalError> {
     let template = case
         .command
         .as_ref()
@@ -427,6 +454,332 @@ fn execute_variant(
     })
 }
 
+fn execute_agent_variant(
+    suite: &EvalSuite,
+    case: &EvalCase,
+    variant: &EvalVariant,
+    repetition: u32,
+    rep_dir: &Path,
+    workspace: &Path,
+) -> Result<ExecutionOutput, EvalError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()?;
+    runtime.block_on(execute_agent_variant_async(
+        suite, case, variant, repetition, rep_dir, workspace,
+    ))
+}
+
+async fn execute_agent_variant_async(
+    suite: &EvalSuite,
+    case: &EvalCase,
+    variant: &EvalVariant,
+    repetition: u32,
+    rep_dir: &Path,
+    workspace: &Path,
+) -> Result<ExecutionOutput, EvalError> {
+    let prompt = rendered_prompt(case, variant);
+    let _config_guard = variant.profile.as_deref().map(|profile| {
+        bcode_config::push_process_config_overrides(
+            bcode_config::ConfigLoadOverrides::from_env_with_cli(
+                None,
+                Some(bcode_config::model_profile_override_toml(profile)),
+            ),
+        )
+    });
+    let client = bcode_client::BcodeClient::default_endpoint();
+    client
+        .ensure_daemon_available()
+        .await
+        .map_err(|error| EvalError::Client(error.to_string()))?;
+    let session = client
+        .create_session_in_working_directory(
+            Some(format!("eval:{}:{}:{}", suite.id, case.id, variant.id)),
+            workspace.to_path_buf(),
+        )
+        .await
+        .map_err(|error| EvalError::Client(error.to_string()))?;
+    if let Some(agent_id) = variant
+        .metadata
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+    {
+        client
+            .set_session_agent(session.id, agent_id.to_string())
+            .await
+            .map_err(|error| EvalError::Client(error.to_string()))?;
+    }
+    if let Some(model) = &variant.model {
+        client
+            .set_session_model(session.id, None, model.clone())
+            .await
+            .map_err(|error| EvalError::Client(error.to_string()))?;
+    }
+    let start_sequence = latest_session_sequence(&client, session.id).await?;
+    append_observation(
+        rep_dir,
+        &EvalObservation {
+            unix_ms: unix_ms(),
+            source: "agent_session_started".into(),
+            payload: serde_json::json!({
+                "session_id": session.id,
+                "start_sequence": start_sequence,
+                "repetition": repetition,
+                "allowed_tools": variant.allowed_tools,
+            }),
+        },
+    )?;
+    let start = Instant::now();
+    client
+        .send_user_message(session.id, prompt, bcode_ipc::PromptPlacement::FollowUp)
+        .await
+        .map_err(|error| EvalError::Client(error.to_string()))?;
+    let timeout = std::time::Duration::from_millis(case.timeout_ms.unwrap_or(suite.run.timeout_ms));
+    let events = wait_for_agent_turn(&client, session.id, start_sequence, timeout).await?;
+    let transcript_path = rep_dir.join("transcript.jsonl");
+    let tool_calls_path = rep_dir.join("tool-calls.jsonl");
+    write_session_events_jsonl(&transcript_path, &events)?;
+    write_tool_calls_jsonl(&tool_calls_path, &events)?;
+    let telemetry = session_telemetry(&events);
+    let mut measurements = telemetry.measurements;
+    measurements.insert(
+        "agent_wall_time_ms".into(),
+        start.elapsed().as_millis() as f64,
+    );
+    let mut diagnostics = telemetry.diagnostics;
+    if telemetry.timed_out {
+        diagnostics.push(EvalDiagnostic {
+            severity: EvalDiagnosticSeverity::Error,
+            message: "agent turn timed out before ModelTurnFinished".into(),
+        });
+    }
+    append_observation(
+        rep_dir,
+        &EvalObservation {
+            unix_ms: unix_ms(),
+            source: "agent_session_finished".into(),
+            payload: serde_json::json!({
+                "session_id": session.id,
+                "event_count": events.len(),
+                "timed_out": telemetry.timed_out,
+            }),
+        },
+    )?;
+    Ok(ExecutionOutput {
+        exit_code: Some(if telemetry.timed_out { 124 } else { 0 }),
+        measurements,
+        diagnostics,
+        artifacts: vec![
+            EvalArtifactRef {
+                kind: "transcript".into(),
+                path: PathBuf::from("transcript.jsonl"),
+            },
+            EvalArtifactRef {
+                kind: "tool_calls".into(),
+                path: PathBuf::from("tool-calls.jsonl"),
+            },
+        ],
+    })
+}
+
+async fn latest_session_sequence(
+    client: &bcode_client::BcodeClient,
+    session_id: bcode_session_models::SessionId,
+) -> Result<u64, EvalError> {
+    let page = client
+        .session_history_page(
+            session_id,
+            bcode_session_models::SessionHistoryQuery {
+                cursor: None,
+                limit: 1,
+                direction: bcode_session_models::SessionHistoryDirection::Backward,
+            },
+        )
+        .await
+        .map_err(|error| EvalError::Client(error.to_string()))?;
+    Ok(page.events.first().map_or(0, |event| event.sequence))
+}
+
+async fn wait_for_agent_turn(
+    client: &bcode_client::BcodeClient,
+    session_id: bcode_session_models::SessionId,
+    start_sequence: u64,
+    timeout: std::time::Duration,
+) -> Result<Vec<bcode_session_models::SessionEvent>, EvalError> {
+    let start = Instant::now();
+    let mut cursor = Some(bcode_session_models::SessionHistoryCursor {
+        sequence: start_sequence,
+    });
+    let mut events = Vec::new();
+    let mut saw_turn_started = false;
+    loop {
+        let page = client
+            .session_history_page(
+                session_id,
+                bcode_session_models::SessionHistoryQuery {
+                    cursor,
+                    limit: 500,
+                    direction: bcode_session_models::SessionHistoryDirection::Forward,
+                },
+            )
+            .await
+            .map_err(|error| EvalError::Client(error.to_string()))?;
+        for event in page.events {
+            cursor = Some(bcode_session_models::SessionHistoryCursor {
+                sequence: event.sequence,
+            });
+            match &event.kind {
+                bcode_session_models::SessionEventKind::ModelTurnStarted { .. } => {
+                    saw_turn_started = true;
+                }
+                bcode_session_models::SessionEventKind::ModelTurnFinished { .. }
+                    if saw_turn_started =>
+                {
+                    events.push(event);
+                    return Ok(events);
+                }
+                _ => {}
+            }
+            events.push(event);
+        }
+        if start.elapsed() >= timeout {
+            return Ok(events);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+fn write_session_events_jsonl(
+    path: &Path,
+    events: &[bcode_session_models::SessionEvent],
+) -> Result<(), EvalError> {
+    let mut file = File::create(path)?;
+    for event in events {
+        writeln!(file, "{}", serde_json::to_string(event)?)?;
+    }
+    Ok(())
+}
+
+fn write_tool_calls_jsonl(
+    path: &Path,
+    events: &[bcode_session_models::SessionEvent],
+) -> Result<(), EvalError> {
+    let mut file = File::create(path)?;
+    for event in events {
+        if matches!(
+            event.kind,
+            bcode_session_models::SessionEventKind::ToolCallRequested { .. }
+                | bcode_session_models::SessionEventKind::ToolCallFinished { .. }
+                | bcode_session_models::SessionEventKind::PermissionRequested { .. }
+                | bcode_session_models::SessionEventKind::PermissionResolved { .. }
+        ) {
+            writeln!(file, "{}", serde_json::to_string(event)?)?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct SessionTelemetry {
+    measurements: EvalMeasurementSet,
+    diagnostics: Vec<EvalDiagnostic>,
+    timed_out: bool,
+}
+
+fn session_telemetry(events: &[bcode_session_models::SessionEvent]) -> SessionTelemetry {
+    let mut telemetry = SessionTelemetry::default();
+    let mut tool_counts: BTreeMap<String, u32> = BTreeMap::new();
+    let mut tool_errors = 0_u32;
+    let mut permissions = 0_u32;
+    let mut input_tokens = 0_u32;
+    let mut output_tokens = 0_u32;
+    let mut total_tokens = 0_u32;
+    let mut cached_input_tokens = 0_u32;
+    let mut cache_write_input_tokens = 0_u32;
+    let mut reasoning_tokens = 0_u32;
+    let mut turn_finished = false;
+    for event in events {
+        match &event.kind {
+            bcode_session_models::SessionEventKind::ToolCallRequested { tool_name, .. } => {
+                *tool_counts.entry(tool_name.clone()).or_default() += 1;
+            }
+            bcode_session_models::SessionEventKind::ToolCallFinished { is_error: true, .. } => {
+                tool_errors += 1;
+            }
+            bcode_session_models::SessionEventKind::PermissionRequested { .. } => {
+                permissions += 1;
+            }
+            bcode_session_models::SessionEventKind::ModelUsage { usage, .. } => {
+                input_tokens = input_tokens.saturating_add(usage.input_tokens.unwrap_or_default());
+                output_tokens =
+                    output_tokens.saturating_add(usage.output_tokens.unwrap_or_default());
+                total_tokens =
+                    total_tokens.saturating_add(usage.metered_total_tokens().unwrap_or_default());
+                cached_input_tokens = cached_input_tokens
+                    .saturating_add(usage.cached_input_tokens.unwrap_or_default());
+                cache_write_input_tokens = cache_write_input_tokens
+                    .saturating_add(usage.cache_write_input_tokens.unwrap_or_default());
+                reasoning_tokens =
+                    reasoning_tokens.saturating_add(usage.reasoning_tokens.unwrap_or_default());
+            }
+            bcode_session_models::SessionEventKind::ModelTurnFinished {
+                outcome, message, ..
+            } => {
+                turn_finished = true;
+                if !matches!(outcome, bcode_session_models::ModelTurnOutcome::Completed) {
+                    telemetry.diagnostics.push(EvalDiagnostic {
+                        severity: EvalDiagnosticSeverity::Error,
+                        message: format!(
+                            "model turn finished with outcome {outcome:?}: {}",
+                            message.clone().unwrap_or_default()
+                        ),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    telemetry.timed_out = !turn_finished;
+    telemetry
+        .measurements
+        .insert("session_event_count".into(), events.len() as f64);
+    telemetry.measurements.insert(
+        "tool_call_count".into(),
+        tool_counts.values().copied().sum::<u32>().into(),
+    );
+    for (tool, count) in tool_counts {
+        telemetry
+            .measurements
+            .insert(format!("tool_call_count.{tool}"), f64::from(count));
+    }
+    telemetry
+        .measurements
+        .insert("tool_error_count".into(), f64::from(tool_errors));
+    telemetry
+        .measurements
+        .insert("permission_prompt_count".into(), f64::from(permissions));
+    telemetry
+        .measurements
+        .insert("input_tokens".into(), f64::from(input_tokens));
+    telemetry
+        .measurements
+        .insert("output_tokens".into(), f64::from(output_tokens));
+    telemetry
+        .measurements
+        .insert("total_tokens".into(), f64::from(total_tokens));
+    telemetry
+        .measurements
+        .insert("cached_input_tokens".into(), f64::from(cached_input_tokens));
+    telemetry.measurements.insert(
+        "cache_write_input_tokens".into(),
+        f64::from(cache_write_input_tokens),
+    );
+    telemetry
+        .measurements
+        .insert("reasoning_tokens".into(), f64::from(reasoning_tokens));
+    telemetry
+}
+
 fn run_judge(
     judge: &EvalJudgeConfig,
     suite_dir: &Path,
@@ -443,7 +796,8 @@ fn run_judge(
             required,
         } => {
             let expected = fs::read_to_string(suite_dir.join(expected_patch))?;
-            let passed = normalize_newlines(&expected).trim() == normalize_newlines(diff).trim();
+            let passed =
+                normalize_patch_for_compare(&expected) == normalize_patch_for_compare(diff);
             EvalJudgeResult {
                 kind: "exact_diff".into(),
                 passed,
@@ -775,6 +1129,7 @@ fn prepare_workspace(
         EvalIsolation::TempCopy => {
             if let Some(fixture) = &case.fixture {
                 copy_dir_all(&suite_dir.join(fixture), &workspace)?;
+                initialize_workspace_git(&workspace);
             }
         }
         EvalIsolation::InPlace => {
@@ -799,6 +1154,34 @@ fn copy_dir_all(source: &Path, destination: &Path) -> Result<(), EvalError> {
         }
     }
     Ok(())
+}
+
+fn initialize_workspace_git(workspace: &Path) {
+    if workspace.join(".git").exists() {
+        return;
+    }
+    let init = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(workspace)
+        .status();
+    let Ok(status) = init else {
+        return;
+    };
+    if !status.success() {
+        return;
+    }
+    let _ = Command::new("git")
+        .args(["add", "."])
+        .current_dir(workspace)
+        .status();
+    let _ = Command::new("git")
+        .args(["commit", "--quiet", "--message", "eval fixture baseline"])
+        .current_dir(workspace)
+        .env("GIT_AUTHOR_NAME", "Bcode Eval")
+        .env("GIT_AUTHOR_EMAIL", "eval@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Bcode Eval")
+        .env("GIT_COMMITTER_EMAIL", "eval@example.invalid")
+        .status();
 }
 
 fn git_diff(workspace: &Path) -> Result<String, EvalError> {
@@ -856,7 +1239,7 @@ struct DiffStats {
 fn diff_stats(diff: &str) -> DiffStats {
     let mut stats = DiffStats::default();
     for line in diff.lines() {
-        if line.starts_with("diff --git") || line.starts_with("--- ") {
+        if line.starts_with("diff --git") {
             stats.files_changed += 1;
         } else if line.starts_with('+') && !line.starts_with("+++") {
             stats.additions += 1;
@@ -1061,6 +1444,17 @@ fn diagnostic_if_failed(passed: bool, message: &str) -> Vec<EvalDiagnostic> {
             message: message.into(),
         }]
     }
+}
+
+fn normalize_patch_for_compare(value: &str) -> String {
+    normalize_newlines(value)
+        .lines()
+        .filter(|line| !line.starts_with("index "))
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 fn normalize_newlines(value: &str) -> String {

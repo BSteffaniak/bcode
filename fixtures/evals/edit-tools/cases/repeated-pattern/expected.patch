@@ -1,0 +1,20 @@
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -2,14 +2,14 @@ pub fn normalize_status(status: &str) -> &'static str {
+     match status {
+         "queued" => "pending",
+         "running" => "active",
+-        "finished" => "done",
++        "finished" => "complete",
+         "failed" => "failed",
+         _ => "unknown",
+     }
+ }
+ 
+ pub fn visible_statuses() -> Vec<&'static str> {
+-    vec!["pending", "active", "done", "failed"]
++    vec!["pending", "active", "complete", "failed"]
+ }
+ 
+ #[cfg(test)]

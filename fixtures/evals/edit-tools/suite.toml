@@ -1,0 +1,87 @@
+schema_version = 1
+id = "edit-tools"
+name = "Edit Tool Comparison"
+description = "Compare editing strategies on deterministic Rust code-editing tasks."
+
+[run]
+repetitions = 1
+timeout_ms = 120000
+isolation = "temp_copy"
+randomize_case_order = false
+fail_fast = false
+
+[environment]
+capture_git = true
+capture_bcode_version = true
+capture_tool_versions = true
+
+[score]
+correctness = 0.70
+efficiency = 0.15
+speed = 0.10
+cost = 0.0
+stability = 0.05
+correctness_required = true
+
+[[variants]]
+id = "filesystem-command"
+name = "Filesystem command edit"
+executor = "command"
+allowed_tools = ["filesystem_edit"]
+command = "python3 - <<'PY'\nfrom pathlib import Path\np=Path('src/lib.rs')\ns=p.read_text()\ns=s.replace('old_name', 'new_name')\ns=s.replace('\\\"done\\\"', '\\\"complete\\\"')\np.write_text(s)\nPY"
+
+[[variants]]
+id = "perl-command"
+name = "Perl command edit"
+executor = "command"
+allowed_tools = ["shell_run"]
+command = "perl -0pi -e 's/old_name/new_name/g; s/\\\"done\\\"/\\\"complete\\\"/g' src/lib.rs"
+
+[[cases]]
+id = "rename-symbol"
+name = "Rename symbol and update call sites"
+fixture = "cases/rename-symbol/input"
+prompt = "Rename function old_name to new_name and update all call sites."
+timeout_ms = 60000
+
+[[cases.judges]]
+type = "exact_diff"
+expected_patch = "cases/rename-symbol/expected.patch"
+required = true
+
+[[cases.judges]]
+type = "command"
+command = "cargo test --quiet"
+expected_exit_code = 0
+required = true
+
+[[cases.judges]]
+type = "metric_threshold"
+metric = "diff_files_changed"
+max = 1
+required = true
+
+[[cases]]
+id = "repeated-pattern"
+name = "Change only semantic status string occurrences"
+fixture = "cases/repeated-pattern/input"
+prompt = "Change the user-visible completed status from done to complete, preserving behavior and tests."
+timeout_ms = 60000
+
+[[cases.judges]]
+type = "exact_diff"
+expected_patch = "cases/repeated-pattern/expected.patch"
+required = true
+
+[[cases.judges]]
+type = "command"
+command = "cargo test --quiet"
+expected_exit_code = 0
+required = true
+
+[[cases.judges]]
+type = "regex"
+target = "diff"
+pattern = "complete"
+should_match = true
+required = true

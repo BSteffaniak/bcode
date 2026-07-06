@@ -1561,11 +1561,16 @@ dependencies = [
 name = "bcode_eval"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_client",
+ "bcode_config",
  "bcode_eval_models",
+ "bcode_ipc",
+ "bcode_session_models",
  "regex",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
  "toml 1.1.2+spec-1.1.0",
 ]
 

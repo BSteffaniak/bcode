@@ -11,12 +11,17 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_eval_models = { workspace = true }
-regex             = { workspace = true, features = ["std"] }
-serde             = { workspace = true, features = ["derive", "std"] }
-serde_json        = { workspace = true }
-thiserror         = { workspace = true, features = ["std"] }
-toml              = { workspace = true, features = ["parse", "display", "serde"] }
+bcode_client         = { workspace = true }
+bcode_config         = { workspace = true }
+bcode_eval_models    = { workspace = true }
+bcode_ipc            = { workspace = true }
+bcode_session_models = { workspace = true }
+regex                = { workspace = true, features = ["std"] }
+serde                = { workspace = true, features = ["derive", "std"] }
+serde_json           = { workspace = true }
+thiserror            = { workspace = true, features = ["std"] }
+tokio                = { workspace = true, features = ["rt", "time"] }
+toml                 = { workspace = true, features = ["parse", "display", "serde"] }
 
 [features]
 default          = []
