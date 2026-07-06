@@ -17,6 +17,10 @@ use bmux_tui_components::bar_chart::{
     BarChart, BarChartItem, BarChartPolicy, BarChartStyles, BarChartValuePlacement,
 };
 use bmux_tui_components::button::ButtonStyles;
+use bmux_tui_components::chart::{
+    Chart, ChartAxes, ChartAxis, ChartAxisVisibility, ChartBounds, ChartDataset, ChartPoint,
+    ChartPolicy, ChartStyles,
+};
 use bmux_tui_components::sparkline::{Sparkline, SparklinePolicy, SparklineStyles};
 use bmux_tui_components::tab_bar::{TabBar, TabBarOutcome, TabBarState, TabBarStyles, TabItem};
 use bmux_tui_components::table::{
@@ -346,6 +350,7 @@ impl PluginTuiSurface for EvalRunViewerSurface {
         self.action_area = action_area;
         match self.selected_tab() {
             ViewerTab::Overview => self.render_overview(content_area, frame),
+            ViewerTab::Analysis => self.render_analysis(content_area, frame),
             ViewerTab::Cases => self.render_cases(content_area, frame),
             ViewerTab::Tools => self.render_tools(content_area, frame),
             ViewerTab::Repetitions => self.render_repetitions(content_area, frame),
@@ -396,7 +401,10 @@ impl PluginTuiSurface for EvalRunViewerSurface {
 impl EvalRunViewerSurface {
     fn handle_selected_table_event(&mut self, event: &Event) -> bool {
         match self.selected_tab() {
-            ViewerTab::Overview | ViewerTab::Artifact | ViewerTab::Derivations => false,
+            ViewerTab::Overview
+            | ViewerTab::Analysis
+            | ViewerTab::Artifact
+            | ViewerTab::Derivations => false,
             ViewerTab::Cases => {
                 let (columns, rows) = case_table(&self.data);
                 handle_eval_table_event(
@@ -598,6 +606,143 @@ impl EvalRunViewerSurface {
         );
     }
 
+    fn render_analysis(&self, area: Rect, frame: &mut Frame<'_>) {
+        render_panel_title(area, frame, "Deep analysis and recommendations");
+        let area = inset_top(area, 1);
+        let top_height = area.height.min(6);
+        self.render_recommendations(Rect::new(area.x, area.y, area.width, top_height), frame);
+
+        let lower_y = area.y.saturating_add(top_height).saturating_add(1);
+        let lower = Rect::new(
+            area.x,
+            lower_y,
+            area.width,
+            area.height.saturating_sub(top_height).saturating_sub(1),
+        );
+        let columns = split_columns(lower, 2, 2);
+        if let Some(left) = columns.first().copied() {
+            self.render_analysis_charts(left, frame);
+        }
+        if let Some(right) = columns.get(1).copied() {
+            self.render_analysis_tables(right, frame);
+        }
+    }
+
+    fn render_recommendations(&self, area: Rect, frame: &mut Frame<'_>) {
+        frame.fill(area, " ", Style::new().bg(PANEL_ALT));
+        let lines = recommendation_lines(&self.data);
+        for (row, line) in lines.iter().take(usize::from(area.height)).enumerate() {
+            frame.write_line_with_fallback_style(
+                Rect::new(
+                    area.x,
+                    area.y.saturating_add(usize_to_u16(row)),
+                    area.width,
+                    1,
+                ),
+                line,
+                Style::new().bg(PANEL_ALT),
+            );
+        }
+    }
+
+    fn render_analysis_charts(&self, area: Rect, frame: &mut Frame<'_>) {
+        render_panel_title(area, frame, "Prediction surfaces");
+        let area = inset_top(area, 1);
+        let half = area.height / 2;
+        self.render_variant_scatter(
+            Rect::new(area.x, area.y, area.width, half),
+            frame,
+            "Cost vs correctness",
+            ScatterKind::CostCorrectness,
+        );
+        self.render_variant_scatter(
+            Rect::new(
+                area.x,
+                area.y.saturating_add(half).saturating_add(1),
+                area.width,
+                area.height.saturating_sub(half).saturating_sub(1),
+            ),
+            frame,
+            "Latency vs reliability",
+            ScatterKind::LatencyReliability,
+        );
+    }
+
+    fn render_variant_scatter(
+        &self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        title: &str,
+        kind: ScatterKind,
+    ) {
+        render_panel_title(area, frame, title);
+        let area = inset_top(area, 1);
+        let points = variant_scatter_points(&self.data, kind);
+        let bounds = scatter_bounds(&points);
+        let dataset = [ChartDataset::scatter("variants", &points)
+            .marker("◆")
+            .style(
+                Style::new()
+                    .fg(ACCENT)
+                    .bg(PANEL)
+                    .add_modifier(Modifier::BOLD),
+            )];
+        Chart::new(&dataset, bounds)
+            .axes(
+                ChartAxes::empty()
+                    .x(ChartAxis::empty().title(kind.x_title()))
+                    .y(ChartAxis::empty().title(kind.y_title()))
+                    .legend(false),
+            )
+            .policy(ChartPolicy::compact().axes(ChartAxisVisibility::Visible))
+            .styles(eval_chart_styles())
+            .empty("No variant points")
+            .render(area, frame);
+    }
+
+    fn render_analysis_tables(&self, area: Rect, frame: &mut Frame<'_>) {
+        render_panel_title(area, frame, "Failure intelligence");
+        let area = inset_top(area, 1);
+        let half = area.height / 2;
+        let (flaky_columns, flaky_rows) = flakiness_table(&self.data);
+        render_panel_title(
+            Rect::new(area.x, area.y, area.width, 1),
+            frame,
+            "Most flaky cases",
+        );
+        render_eval_table(
+            frame,
+            Rect::new(
+                area.x,
+                area.y.saturating_add(1),
+                area.width,
+                half.saturating_sub(1),
+            ),
+            &flaky_columns,
+            &flaky_rows,
+            &TableState::new(None),
+        );
+        let (outlier_columns, outlier_rows) = outlier_table(&self.data);
+        let outlier_y = area.y.saturating_add(half).saturating_add(1);
+        render_panel_title(
+            Rect::new(area.x, outlier_y, area.width, 1),
+            frame,
+            "Outliers",
+        );
+        render_eval_table(
+            frame,
+            Rect::new(
+                area.x,
+                outlier_y.saturating_add(1),
+                area.width,
+                area.height.saturating_sub(half).saturating_sub(2),
+            ),
+            &outlier_columns,
+            &outlier_rows,
+            &TableState::new(None),
+        );
+    }
+
     fn render_cases(&self, area: Rect, frame: &mut Frame<'_>) {
         render_panel_title(area, frame, "Case performance");
         let area = inset_top(area, 1);
@@ -675,6 +820,7 @@ impl EvalRunViewerSurface {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewerTab {
     Overview,
+    Analysis,
     Cases,
     Tools,
     Repetitions,
@@ -683,26 +829,28 @@ enum ViewerTab {
 }
 
 impl ViewerTab {
-    const COUNT: usize = 6;
+    const COUNT: usize = 7;
 
     const fn index(self) -> usize {
         match self {
             Self::Overview => 0,
-            Self::Cases => 1,
-            Self::Tools => 2,
-            Self::Repetitions => 3,
-            Self::Artifact => 4,
-            Self::Derivations => 5,
+            Self::Analysis => 1,
+            Self::Cases => 2,
+            Self::Tools => 3,
+            Self::Repetitions => 4,
+            Self::Artifact => 5,
+            Self::Derivations => 6,
         }
     }
 
     const fn from_index(index: usize) -> Self {
         match index {
-            1 => Self::Cases,
-            2 => Self::Tools,
-            3 => Self::Repetitions,
-            4 => Self::Artifact,
-            5 => Self::Derivations,
+            1 => Self::Analysis,
+            2 => Self::Cases,
+            3 => Self::Tools,
+            4 => Self::Repetitions,
+            5 => Self::Artifact,
+            6 => Self::Derivations,
             _ => Self::Overview,
         }
     }
@@ -893,6 +1041,13 @@ const fn eval_sparkline_styles() -> SparklineStyles {
         low: Style::new().fg(DANGER).bg(PANEL_ALT),
         empty: Style::new().fg(MUTED).bg(PANEL_ALT),
         background: Style::new().bg(PANEL_ALT),
+    }
+}
+
+const fn eval_chart_styles() -> ChartStyles {
+    ChartStyles {
+        dataset: Style::new().fg(ACCENT).bg(PANEL),
+        empty: Style::new().fg(MUTED).bg(PANEL),
     }
 }
 
@@ -1236,6 +1391,274 @@ fn derivation_line(label: &str, formula: &str, value: &str) -> Line {
     ])
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ScatterKind {
+    CostCorrectness,
+    LatencyReliability,
+}
+
+impl ScatterKind {
+    const fn x_title(self) -> &'static str {
+        match self {
+            Self::CostCorrectness => "tokens",
+            Self::LatencyReliability => "avg wall ms",
+        }
+    }
+
+    const fn y_title(self) -> &'static str {
+        match self {
+            Self::CostCorrectness | Self::LatencyReliability => "pass %",
+        }
+    }
+}
+
+fn recommendation_lines(data: &EvalRunData) -> Vec<Line> {
+    let metrics = run_dashboard_metrics(data);
+    let winner = metrics.winner.as_deref().unwrap_or("none");
+    let cheapest = cheapest_variant(data).unwrap_or_else(|| "none".to_string());
+    let fastest = fastest_variant(data).unwrap_or_else(|| "none".to_string());
+    let flaky = flakiness_records(data).into_iter().next();
+    vec![
+        Line::from_spans(vec![
+            Span::styled(
+                "  ◆ Recommendation  ",
+                Style::new()
+                    .fg(ACCENT)
+                    .bg(PANEL_ALT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("winner={winner}"),
+                Style::new()
+                    .fg(TEXT)
+                    .bg(PANEL_ALT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  risk={}", metrics.risk_label),
+                Style::new()
+                    .fg(metrics.risk_color)
+                    .bg(PANEL_ALT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from_spans(vec![
+            Span::styled("  Why: ", Style::new().fg(MUTED).bg(PANEL_ALT)),
+            Span::styled(
+                format!(
+                    "pass rate {:.1}%, avg {}, {} total tokens",
+                    metrics.pass_rate * 100.0,
+                    format_duration_ms(metrics.avg_wall_time_ms),
+                    format_number(metrics.total_tokens)
+                ),
+                Style::new().fg(TEXT).bg(PANEL_ALT),
+            ),
+        ]),
+        Line::from_spans(vec![
+            Span::styled("  Frontier: ", Style::new().fg(MUTED).bg(PANEL_ALT)),
+            Span::styled(
+                format!("cheapest={cheapest}  fastest={fastest}"),
+                Style::new().fg(TEXT).bg(PANEL_ALT),
+            ),
+        ]),
+        Line::from_spans(vec![
+            Span::styled(
+                "  Watch: ",
+                Style::new()
+                    .fg(WARNING)
+                    .bg(PANEL_ALT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                flaky.map_or_else(
+                    || "no flaky case detected from repetitions".to_string(),
+                    |record| {
+                        format!(
+                            "{} / {} has {:.0}% disagreement",
+                            record.case_id,
+                            record.variant_id,
+                            record.flakiness * 100.0
+                        )
+                    },
+                ),
+                Style::new().fg(TEXT).bg(PANEL_ALT),
+            ),
+        ]),
+    ]
+}
+
+fn variant_scatter_points(data: &EvalRunData, kind: ScatterKind) -> Vec<ChartPoint> {
+    data.result
+        .variants
+        .iter()
+        .map(|variant| {
+            let x = match kind {
+                ScatterKind::CostCorrectness => sum_variant_metric(variant, "total_tokens"),
+                ScatterKind::LatencyReliability => avg_variant_metric(variant, "wall_time_ms"),
+            };
+            ChartPoint::new(x, variant.pass_rate * 100.0)
+        })
+        .collect()
+}
+
+fn scatter_bounds(points: &[ChartPoint]) -> ChartBounds {
+    let x_max = points.iter().map(|point| point.x).fold(1.0_f64, f64::max);
+    let y_max = points.iter().map(|point| point.y).fold(100.0_f64, f64::max);
+    ChartBounds::new(0.0, x_max.max(1.0), 0.0, y_max.max(100.0))
+}
+
+fn cheapest_variant(data: &EvalRunData) -> Option<String> {
+    data.result
+        .variants
+        .iter()
+        .min_by(|left, right| {
+            sum_variant_metric(left, "total_tokens")
+                .total_cmp(&sum_variant_metric(right, "total_tokens"))
+        })
+        .map(|variant| variant.variant_id.clone())
+}
+
+fn fastest_variant(data: &EvalRunData) -> Option<String> {
+    data.result
+        .variants
+        .iter()
+        .min_by(|left, right| {
+            avg_variant_metric(left, "wall_time_ms")
+                .total_cmp(&avg_variant_metric(right, "wall_time_ms"))
+        })
+        .map(|variant| variant.variant_id.clone())
+}
+
+fn avg_variant_metric(variant: &bcode_eval_models::EvalVariantRunResult, metric_name: &str) -> f64 {
+    let mut total = 0.0;
+    let mut count = 0_usize;
+    for repetition in variant
+        .cases
+        .iter()
+        .flat_map(|case| case.repetitions.iter())
+    {
+        total += metric(repetition, metric_name);
+        count = count.saturating_add(1);
+    }
+    average(total, count)
+}
+
+#[derive(Debug, Clone)]
+struct FlakinessRecord {
+    case_id: String,
+    variant_id: String,
+    pass_pattern: String,
+    flakiness: f64,
+}
+
+fn flakiness_records(data: &EvalRunData) -> Vec<FlakinessRecord> {
+    let mut records = Vec::new();
+    for variant in &data.result.variants {
+        for case in &variant.cases {
+            if case.repetitions.is_empty() {
+                continue;
+            }
+            let passed = case
+                .repetitions
+                .iter()
+                .filter(|repetition| repetition.passed)
+                .count();
+            let pass_rate = usize_as_f64(passed) / usize_as_f64(case.repetitions.len());
+            let flakiness = pass_rate.min(1.0 - pass_rate) * 2.0;
+            let pass_pattern = case
+                .repetitions
+                .iter()
+                .map(|repetition| if repetition.passed { '✓' } else { '✗' })
+                .collect();
+            records.push(FlakinessRecord {
+                case_id: case.case_id.clone(),
+                variant_id: variant.variant_id.clone(),
+                pass_pattern,
+                flakiness,
+            });
+        }
+    }
+    records.sort_by(|left, right| right.flakiness.total_cmp(&left.flakiness));
+    records
+}
+
+fn flakiness_table(data: &EvalRunData) -> (Vec<TableColumn<'static>>, Vec<TableRow>) {
+    let columns = vec![
+        TableColumn::new("Case").flex(2),
+        TableColumn::new("Variant").flex(2),
+        TableColumn::new("Pattern").flex(1),
+        TableColumn::new("Flaky").fixed(8).align(TableAlign::Right),
+    ];
+    let rows = flakiness_records(data)
+        .into_iter()
+        .take(8)
+        .map(|record| {
+            string_row(vec![
+                record.case_id,
+                record.variant_id,
+                record.pass_pattern,
+                format!("{:.0}%", record.flakiness * 100.0),
+            ])
+        })
+        .collect();
+    (columns, rows)
+}
+
+fn outlier_table(data: &EvalRunData) -> (Vec<TableColumn<'static>>, Vec<TableRow>) {
+    let repetitions = data.repetitions();
+    let median_latency = median_metric(&repetitions, "wall_time_ms");
+    let median_tokens = median_metric(&repetitions, "total_tokens");
+    let columns = vec![
+        TableColumn::new("Case").flex(2),
+        TableColumn::new("Variant").flex(2),
+        TableColumn::new("Rep").fixed(5).align(TableAlign::Right),
+        TableColumn::new("Signal").flex(2),
+        TableColumn::new("Ratio").fixed(8).align(TableAlign::Right),
+    ];
+    let mut rows = Vec::new();
+    for repetition in repetitions {
+        let latency_ratio = ratio(metric(repetition, "wall_time_ms"), median_latency);
+        let token_ratio = ratio(metric(repetition, "total_tokens"), median_tokens);
+        let (signal, ratio_value) = if latency_ratio >= token_ratio {
+            ("latency", latency_ratio)
+        } else {
+            ("tokens", token_ratio)
+        };
+        if ratio_value >= 1.5 {
+            rows.push(string_row(vec![
+                repetition.case_id.clone(),
+                repetition.variant_id.clone(),
+                repetition.repetition.to_string(),
+                signal.to_string(),
+                format!("{ratio_value:.1}x"),
+            ]));
+        }
+    }
+    rows.truncate(8);
+    (columns, rows)
+}
+
+fn median_metric(repetitions: &[&EvalRepetitionResult], metric_name: &str) -> f64 {
+    let mut values = repetitions
+        .iter()
+        .map(|repetition| metric(repetition, metric_name))
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(f64::total_cmp);
+    values[values.len() / 2]
+}
+
+fn ratio(value: f64, baseline: f64) -> f64 {
+    if baseline <= 0.0 {
+        0.0
+    } else {
+        value / baseline
+    }
+}
+
 fn pass_label(passed: bool) -> String {
     if passed { "PASS" } else { "FAIL" }.to_string()
 }
@@ -1340,6 +1763,7 @@ fn picker_actions() -> Vec<ActionButton> {
 fn viewer_tabs() -> Vec<TabItem<'static>> {
     vec![
         TabItem::new("overview", "Overview"),
+        TabItem::new("analysis", "Analysis"),
         TabItem::new("cases", "Cases"),
         TabItem::new("tools", "Tools"),
         TabItem::new("repetitions", "Repetitions"),
@@ -1362,7 +1786,11 @@ fn viewer_actions(tab: ViewerTab) -> Vec<ActionButton> {
             ActionButton::new("refresh", "R Refresh"),
             ActionButton::new("close", "Esc Close"),
         ],
-        ViewerTab::Overview | ViewerTab::Cases | ViewerTab::Tools | ViewerTab::Derivations => vec![
+        ViewerTab::Overview
+        | ViewerTab::Analysis
+        | ViewerTab::Cases
+        | ViewerTab::Tools
+        | ViewerTab::Derivations => vec![
             ActionButton::new("repetitions", "Open Repetitions"),
             ActionButton::new("refresh", "R Refresh"),
             ActionButton::new("close", "Esc Close"),
