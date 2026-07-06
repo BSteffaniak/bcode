@@ -512,7 +512,16 @@ fn prepare_agent_daemon_isolation(
     }
     let state_dir = rep_dir.join("daemon-state");
     fs::create_dir_all(&state_dir)?;
-    let socket = rep_dir.join("bcode-agent-eval.sock");
+    let socket_root = if Path::new("/tmp").exists() {
+        PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    let socket = socket_root.join(format!(
+        "bcode-eval-{}-{:016x}.sock",
+        std::process::id(),
+        stable_text_hash(&rep_dir.display().to_string())
+    ));
     Ok(vec![
         EnvVarGuard::set("BCODE_STATE_DIR", &state_dir),
         EnvVarGuard::set("BCODE_SOCKET", &socket),
