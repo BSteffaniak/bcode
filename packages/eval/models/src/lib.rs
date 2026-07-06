@@ -32,6 +32,12 @@ pub struct EvalSuite {
     /// Score aggregation weights.
     #[serde(default)]
     pub score: EvalScoreConfig,
+    /// Regression threshold configuration.
+    #[serde(default)]
+    pub regression: EvalRegressionConfig,
+    /// Arbitrary suite metadata.
+    #[serde(default)]
+    pub metadata: BTreeMap<String, serde_json::Value>,
     /// Variant definitions.
     #[serde(default)]
     pub variants: Vec<EvalVariant>,
@@ -116,6 +122,9 @@ pub struct EvalScoreConfig {
     pub stability: f64,
     /// Whether failed correctness gates the overall score to zero.
     pub correctness_required: bool,
+    /// Metric-specific scoring rules.
+    #[serde(default)]
+    pub metrics: Vec<EvalMetricScoreConfig>,
 }
 
 impl Default for EvalScoreConfig {
@@ -127,8 +136,81 @@ impl Default for EvalScoreConfig {
             cost: 0.0,
             stability: 0.10,
             correctness_required: true,
+            metrics: Vec::new(),
         }
     }
+}
+
+/// Suite-level metric scoring rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvalMetricScoreConfig {
+    /// Metric key.
+    pub metric: String,
+    /// Direction considered better.
+    pub direction: EvalMetricDirection,
+    /// Weight for this metric in efficiency scoring.
+    pub weight: u32,
+    /// Optional target used to normalize the metric.
+    #[serde(default)]
+    pub target: Option<u64>,
+}
+
+/// Metric optimization direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvalMetricDirection {
+    /// Lower values are better.
+    LowerIsBetter,
+    /// Higher values are better.
+    HigherIsBetter,
+}
+
+/// Regression thresholds for baseline comparisons.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvalRegressionConfig {
+    /// Minimum acceptable candidate pass rate.
+    #[serde(default)]
+    pub min_pass_rate: Option<f64>,
+    /// Maximum allowed token increase in percent.
+    #[serde(default)]
+    pub max_token_increase_percent: Option<f64>,
+    /// Maximum allowed latency increase in percent.
+    #[serde(default)]
+    pub max_latency_increase_percent: Option<f64>,
+    /// Treat newly failed variants as regressions.
+    #[serde(default = "default_true")]
+    pub fail_on_new_failure: bool,
+}
+
+impl Default for EvalRegressionConfig {
+    fn default() -> Self {
+        Self {
+            min_pass_rate: None,
+            max_token_increase_percent: Some(15.0),
+            max_latency_increase_percent: Some(25.0),
+            fail_on_new_failure: true,
+        }
+    }
+}
+
+/// Direct model-callable tool invocation configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvalDirectToolConfig {
+    /// Optional explicit producer plugin id.
+    #[serde(default)]
+    pub plugin_id: Option<String>,
+    /// Tool name.
+    pub tool_name: String,
+    /// Tool arguments.
+    #[serde(default)]
+    pub arguments: serde_json::Value,
+}
+
+/// Replay configuration for analyzing existing session/event artifacts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvalReplayConfig {
+    /// JSONL transcript path relative to the suite directory.
+    pub transcript: PathBuf,
 }
 
 /// A suite variant describing what changes between comparable runs.
@@ -163,6 +245,12 @@ pub struct EvalVariant {
     /// Arbitrary variant metadata.
     #[serde(default)]
     pub metadata: BTreeMap<String, serde_json::Value>,
+    /// Direct tool invocation settings for `direct_tool` variants.
+    #[serde(default)]
+    pub direct_tool: Option<EvalDirectToolConfig>,
+    /// Replay settings for `replay` variants.
+    #[serde(default)]
+    pub replay: Option<EvalReplayConfig>,
 }
 
 /// Executor kind.
@@ -223,6 +311,12 @@ pub struct EvalCase {
     /// Arbitrary case metadata.
     #[serde(default)]
     pub metadata: BTreeMap<String, serde_json::Value>,
+    /// Direct tool invocation settings for this case.
+    #[serde(default)]
+    pub direct_tool: Option<EvalDirectToolConfig>,
+    /// Replay settings for this case.
+    #[serde(default)]
+    pub replay: Option<EvalReplayConfig>,
 }
 
 /// Judge configuration.

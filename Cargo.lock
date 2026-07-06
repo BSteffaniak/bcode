@@ -1566,6 +1566,7 @@ dependencies = [
  "bcode_eval_models",
  "bcode_ipc",
  "bcode_session_models",
+ "bcode_tool",
  "regex",
  "serde",
  "serde_json",

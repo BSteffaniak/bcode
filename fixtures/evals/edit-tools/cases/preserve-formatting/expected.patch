@@ -1,0 +1,12 @@
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,7 +1,7 @@
+ pub fn table() -> Vec<(&'static str, i32)> {
+     vec![
+         ("alpha",   1),
+-        ("beta",   2),
++        ("beta",  20),
+         ("gamma",  3),
+     ]
+ }

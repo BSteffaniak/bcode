@@ -1166,6 +1166,9 @@ enum EvalCommand {
         /// Optional output JSON path.
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Optional Markdown output path.
+        #[arg(long)]
+        markdown: Option<PathBuf>,
     },
     /// Set a baseline for a suite from a completed run.
     Baseline {
@@ -1184,6 +1187,24 @@ enum EvalCommand {
         /// Print JSON output.
         #[arg(long)]
         json: bool,
+    },
+    /// Create a new eval suite skeleton.
+    InitSuite {
+        /// Destination directory.
+        directory: PathBuf,
+        /// Suite id.
+        #[arg(long)]
+        id: String,
+        /// Suite name.
+        #[arg(long)]
+        name: String,
+    },
+    /// Bless an expected patch from a completed repetition diff.
+    Bless {
+        /// Source diff.patch path from a run artifact.
+        diff: PathBuf,
+        /// Destination expected patch path.
+        expected_patch: PathBuf,
     },
 }
 
@@ -1233,7 +1254,11 @@ fn handle_eval_command(command: EvalCommand) -> Result<(), CliError> {
                 }
             }
         }
-        EvalCommand::Compare { runs, output } => {
+        EvalCommand::Compare {
+            runs,
+            output,
+            markdown,
+        } => {
             let results = runs
                 .iter()
                 .map(bcode_eval::load_run_result)
@@ -1241,6 +1266,9 @@ fn handle_eval_command(command: EvalCommand) -> Result<(), CliError> {
             let report = bcode_eval::compare_runs(&results);
             if let Some(output) = output {
                 bcode_eval::write_comparison_report(&report, output)?;
+            }
+            if let Some(markdown) = markdown {
+                std::fs::write(markdown, bcode_eval::render_comparison_markdown(&report))?;
             }
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
@@ -1262,6 +1290,21 @@ fn handle_eval_command(command: EvalCommand) -> Result<(), CliError> {
                     println!("{:?}: {}", diagnostic.severity, diagnostic.message);
                 }
             }
+        }
+        EvalCommand::InitSuite {
+            directory,
+            id,
+            name,
+        } => {
+            bcode_eval::init_suite(directory, &id, &name)?;
+            println!("created eval suite {id}");
+        }
+        EvalCommand::Bless {
+            diff,
+            expected_patch,
+        } => {
+            bcode_eval::bless_expected_patch(diff, expected_patch)?;
+            println!("blessed expected patch");
         }
     }
     Ok(())

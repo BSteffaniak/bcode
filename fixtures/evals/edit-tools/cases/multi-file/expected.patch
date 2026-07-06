@@ -1,0 +1,17 @@
+diff --git a/src/math.rs b/src/math.rs
+--- a/src/math.rs
++++ b/src/math.rs
+@@ -1,3 +1,3 @@
+-pub fn add(values: &[i32]) -> i32 {
++pub fn sum(values: &[i32]) -> i32 {
+     values.iter().sum()
+ }
+diff --git a/src/report.rs b/src/report.rs
+--- a/src/report.rs
++++ b/src/report.rs
+@@ -1,3 +1,3 @@
+-pub fn format_result(value: i32) -> String {
+-    format!("result={value}")
++pub fn format_total(value: i32) -> String {
++    format!("total={value}")
+ }

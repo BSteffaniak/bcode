@@ -15,8 +15,9 @@ use bcode_eval_models::{
     CURRENT_SCHEMA_VERSION, EvalArtifactRef, EvalBaseline, EvalCase, EvalCaseRunResult,
     EvalComparisonReport, EvalComparisonVariant, EvalDiagnostic, EvalDiagnosticSeverity,
     EvalExecutorKind, EvalIsolation, EvalJudgeConfig, EvalJudgeResult, EvalMeasurementSet,
-    EvalObservation, EvalRegexTarget, EvalRegressionReport, EvalRepetitionResult, EvalRunManifest,
-    EvalRunResult, EvalSuite, EvalVariant, EvalVariantRunResult,
+    EvalMetricDirection, EvalObservation, EvalRegexTarget, EvalRegressionReport,
+    EvalRepetitionResult, EvalRunManifest, EvalRunResult, EvalSuite, EvalVariant,
+    EvalVariantRunResult,
 };
 use regex::Regex;
 use serde::Serialize;
@@ -168,11 +169,16 @@ pub fn validate_suite(suite: &EvalSuite) -> Result<(), EvalError> {
 ///
 /// Returns an error when suite loading, execution, judging, or report writing fails.
 pub fn run_suite(options: &EvalRunOptions) -> Result<EvalRunResult, EvalError> {
-    let suite = load_suite(&options.suite_path)?;
+    let mut suite = load_suite(&options.suite_path)?;
     let suite_dir = options
         .suite_path
         .parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+        .canonicalize()?;
+    suite.metadata.insert(
+        "suite_dir".into(),
+        serde_json::Value::String(suite_dir.display().to_string()),
+    );
     let run_id = options
         .run_id
         .clone()
@@ -361,10 +367,12 @@ fn execute_variant(
         EvalExecutorKind::Agent => {
             execute_agent_variant(suite, case, variant, repetition, rep_dir, workspace)
         }
-        EvalExecutorKind::DirectTool | EvalExecutorKind::Replay => Err(EvalError::UnsupportedExecutor {
-            variant_id: variant.id.clone(),
-            reason: "direct_tool and replay executors require suite-specific public command adapters in this implementation; use executor = \"command\" to run those adapters reproducibly".into(),
-        }),
+        EvalExecutorKind::DirectTool => {
+            execute_direct_tool_variant(suite, case, variant, repetition, rep_dir, workspace)
+        }
+        EvalExecutorKind::Replay => {
+            execute_replay_variant(suite, case, variant, repetition, rep_dir, workspace)
+        }
     }
 }
 
@@ -413,6 +421,14 @@ fn execute_command_variant(
         .env("BCODE_EVAL_WORKSPACE", workspace)
         .env("BCODE_EVAL_PROMPT", &prompt)
         .env("BCODE_EVAL_ARTIFACT_DIR", rep_dir)
+        .env(
+            "BCODE_EVAL_SUITE_DIR",
+            suite
+                .metadata
+                .get("suite_dir")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;
@@ -451,6 +467,164 @@ fn execute_command_variant(
         measurements,
         diagnostics: Vec::new(),
         artifacts,
+    })
+}
+
+fn execute_direct_tool_variant(
+    suite: &EvalSuite,
+    case: &EvalCase,
+    variant: &EvalVariant,
+    _repetition: u32,
+    rep_dir: &Path,
+    workspace: &Path,
+) -> Result<ExecutionOutput, EvalError> {
+    let config = case
+        .direct_tool
+        .as_ref()
+        .or(variant.direct_tool.as_ref())
+        .ok_or_else(|| {
+            EvalError::Validation(format!(
+                "direct_tool executor requires direct_tool config for case {} or variant {}",
+                case.id, variant.id
+            ))
+        })?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()?;
+    runtime.block_on(async {
+        let client = bcode_client::BcodeClient::default_endpoint();
+        client
+            .ensure_daemon_available()
+            .await
+            .map_err(|error| EvalError::Client(error.to_string()))?;
+        let request = bcode_tool::ToolInvocationRequest {
+            tool_call_id: format!("eval-{}-{}-{}", suite.id, case.id, variant.id),
+            name: config.tool_name.clone(),
+            arguments: config.arguments.clone(),
+            cwd: Some(workspace.to_path_buf()),
+            artifact_dir: Some(rep_dir.to_path_buf()),
+            cancellation_path: None,
+        };
+        let payload = serde_json::to_vec(&request)?;
+        let start = Instant::now();
+        let response = if let Some(plugin_id) = &config.plugin_id {
+            client
+                .invoke_plugin_service(
+                    plugin_id.clone(),
+                    bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_string(),
+                    bcode_tool::OP_INVOKE_TOOL.to_string(),
+                    payload,
+                )
+                .await
+        } else {
+            client
+                .call_plugin_service(
+                    bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_string(),
+                    bcode_tool::OP_INVOKE_TOOL.to_string(),
+                    payload,
+                )
+                .await
+        }
+        .map_err(|error| EvalError::Client(error.to_string()))?;
+        let stdout_path = rep_dir.join("direct-tool-response.json");
+        let mut measurements = EvalMeasurementSet::new();
+        measurements.insert(
+            "direct_tool_wall_time_ms".into(),
+            start.elapsed().as_millis() as f64,
+        );
+        measurements.insert(
+            "direct_tool_response_bytes".into(),
+            response.payload.len() as f64,
+        );
+        if let Some(error) = response.error {
+            fs::write(&stdout_path, serde_json::to_string_pretty(&error)?)?;
+            return Ok(ExecutionOutput {
+                exit_code: Some(1),
+                measurements,
+                diagnostics: vec![EvalDiagnostic {
+                    severity: EvalDiagnosticSeverity::Error,
+                    message: format!("tool service error {}: {}", error.code, error.message),
+                }],
+                artifacts: vec![EvalArtifactRef {
+                    kind: "direct_tool_response".into(),
+                    path: PathBuf::from("direct-tool-response.json"),
+                }],
+            });
+        }
+        fs::write(&stdout_path, &response.payload)?;
+        let tool_response =
+            serde_json::from_slice::<bcode_tool::ToolInvocationResponse>(&response.payload)?;
+        measurements.insert(
+            "tool_output_bytes".into(),
+            tool_response.output.len() as f64,
+        );
+        let is_error = tool_response.is_error;
+        let diagnostics = if is_error {
+            vec![EvalDiagnostic {
+                severity: EvalDiagnosticSeverity::Error,
+                message: tool_response.output,
+            }]
+        } else {
+            Vec::new()
+        };
+        Ok(ExecutionOutput {
+            exit_code: Some(i32::from(is_error)),
+            measurements,
+            diagnostics,
+            artifacts: vec![EvalArtifactRef {
+                kind: "direct_tool_response".into(),
+                path: PathBuf::from("direct-tool-response.json"),
+            }],
+        })
+    })
+}
+
+fn execute_replay_variant(
+    suite: &EvalSuite,
+    case: &EvalCase,
+    variant: &EvalVariant,
+    _repetition: u32,
+    rep_dir: &Path,
+    _workspace: &Path,
+) -> Result<ExecutionOutput, EvalError> {
+    let config = case
+        .replay
+        .as_ref()
+        .or(variant.replay.as_ref())
+        .ok_or_else(|| {
+            EvalError::Validation(format!(
+                "replay executor requires replay config for case {} or variant {}",
+                case.id, variant.id
+            ))
+        })?;
+    let suite_dir = suite
+        .metadata
+        .get("suite_dir")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(PathBuf::new, PathBuf::from);
+    let transcript_path = if config.transcript.is_absolute() {
+        config.transcript.clone()
+    } else {
+        suite_dir.join(&config.transcript)
+    };
+    let text = fs::read_to_string(&transcript_path)?;
+    let mut events = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        events.push(serde_json::from_str::<bcode_session_models::SessionEvent>(
+            line,
+        )?);
+    }
+    let copied = rep_dir.join("transcript.jsonl");
+    fs::write(&copied, text)?;
+    let telemetry = session_telemetry(&events);
+    Ok(ExecutionOutput {
+        exit_code: Some(i32::from(telemetry.timed_out)),
+        measurements: telemetry.measurements,
+        diagnostics: telemetry.diagnostics,
+        artifacts: vec![EvalArtifactRef {
+            kind: "replay_transcript".into(),
+            path: PathBuf::from("transcript.jsonl"),
+        }],
     })
 }
 
@@ -925,6 +1099,118 @@ fn run_judge(
     Ok(result)
 }
 
+/// Create a useful eval suite skeleton on disk.
+///
+/// # Errors
+///
+/// Returns an error when the destination already contains conflicting files or writing fails.
+pub fn init_suite(directory: impl AsRef<Path>, id: &str, name: &str) -> Result<(), EvalError> {
+    validate_id("suite", id)?;
+    let directory = directory.as_ref();
+    fs::create_dir_all(directory.join("cases/example/input"))?;
+    let suite_path = directory.join("suite.toml");
+    if suite_path.exists() {
+        return Err(EvalError::Validation(format!(
+            "suite already exists: {}",
+            suite_path.display()
+        )));
+    }
+    let suite = format!(
+        r#"schema_version = 1
+id = "{id}"
+name = "{name}"
+description = "TODO: describe what this suite evaluates."
+
+[run]
+repetitions = 3
+timeout_ms = 120000
+isolation = "temp_copy"
+randomize_case_order = false
+fail_fast = false
+
+[score]
+correctness = 0.70
+efficiency = 0.15
+speed = 0.10
+cost = 0.0
+stability = 0.05
+correctness_required = true
+
+[[score.metrics]]
+metric = "total_tokens"
+direction = "lower_is_better"
+weight = 2
+target = 50000
+
+[[score.metrics]]
+metric = "wall_time_ms"
+direction = "lower_is_better"
+weight = 1
+target = 60000
+
+[regression]
+min_pass_rate = 0.95
+max_token_increase_percent = 15.0
+max_latency_increase_percent = 25.0
+fail_on_new_failure = true
+
+[[variants]]
+id = "baseline"
+name = "Baseline command"
+executor = "command"
+command = "echo TODO: implement variant command using $BCODE_EVAL_PROMPT"
+
+[[cases]]
+id = "example"
+name = "Example case"
+fixture = "cases/example/input"
+prompt = "TODO: describe the task."
+timeout_ms = 60000
+
+[[cases.judges]]
+type = "regex"
+target = "stdout"
+pattern = "TODO"
+should_match = true
+required = true
+"#
+    );
+    fs::write(suite_path, suite)?;
+    fs::write(
+        directory.join("cases/example/input/README.md"),
+        "# Example eval fixture\n\nReplace this with a real fixture.\n",
+    )?;
+    Ok(())
+}
+
+/// Bless an expected patch by copying and normalizing a run diff.
+///
+/// # Errors
+///
+/// Returns an error when reading or writing fails.
+pub fn bless_expected_patch(
+    diff_path: impl AsRef<Path>,
+    expected_patch_path: impl AsRef<Path>,
+) -> Result<(), EvalError> {
+    let diff = fs::read_to_string(diff_path)?;
+    if let Some(parent) = expected_patch_path.as_ref().parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(expected_patch_path, normalize_patch_for_bless(&diff))?;
+    Ok(())
+}
+
+fn normalize_patch_for_bless(value: &str) -> String {
+    let mut normalized = normalize_newlines(value)
+        .lines()
+        .filter(|line| !line.starts_with("index "))
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    normalized.push('\n');
+    normalized
+}
+
 /// Load an eval run result from `summary.json` or a run directory.
 ///
 /// # Errors
@@ -968,6 +1254,51 @@ pub fn compare_runs(runs: &[EvalRunResult]) -> EvalComparisonReport {
         variants,
         diagnostics: Vec::new(),
     }
+}
+
+/// Render a comparison report as Markdown.
+#[must_use]
+pub fn render_comparison_markdown(report: &EvalComparisonReport) -> String {
+    let mut out = String::from("# Eval Comparison\n\n");
+    if let Some(winner) = &report.winner {
+        out.push_str(&format!("Winner: `{winner}`\n\n"));
+    }
+    out.push_str("| Variant | Pass rate | Score | Key metrics |\n|---|---:|---:|---|\n");
+    for variant in &report.variants {
+        let metrics = variant
+            .measurements
+            .iter()
+            .filter(|(key, _)| {
+                matches!(
+                    key.as_str(),
+                    "total_tokens"
+                        | "wall_time_ms"
+                        | "tool_call_count"
+                        | "diff_bytes"
+                        | "tool_error_count"
+                )
+            })
+            .map(|(key, value)| format!("{key}={value:.2}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!(
+            "| {} | {:.2}% | {:.3} | {} |\n",
+            variant.variant_id,
+            variant.pass_rate * 100.0,
+            variant.overall_score,
+            metrics
+        ));
+    }
+    if !report.diagnostics.is_empty() {
+        out.push_str("\n## Diagnostics\n\n");
+        for diagnostic in &report.diagnostics {
+            out.push_str(&format!(
+                "* {:?}: {}\n",
+                diagnostic.severity, diagnostic.message
+            ));
+        }
+    }
+    out
 }
 
 /// Write a comparison report.
@@ -1078,10 +1409,12 @@ fn aggregate_variant(
             .unwrap_or_default(),
         60_000.0,
     );
-    let efficiency = inverse_score(
-        measurements.get("diff_bytes").copied().unwrap_or_default(),
-        50_000.0,
-    );
+    let efficiency = metric_efficiency_score(suite, &measurements).unwrap_or_else(|| {
+        inverse_score(
+            measurements.get("diff_bytes").copied().unwrap_or_default(),
+            50_000.0,
+        )
+    });
     let stability = 1.0 - pass_rate_variance(&cases);
     let cost = 1.0;
     let mut overall = suite.score.correctness.mul_add(
@@ -1413,6 +1746,29 @@ fn average_measurements(repetitions: &[&EvalRepetitionResult]) -> EvalMeasuremen
     sums.into_iter()
         .map(|(key, (sum, count))| (key, sum / f64::from(count)))
         .collect()
+}
+
+fn metric_efficiency_score(suite: &EvalSuite, measurements: &EvalMeasurementSet) -> Option<f64> {
+    if suite.score.metrics.is_empty() {
+        return None;
+    }
+    let mut weighted = 0.0;
+    let mut total_weight = 0_u32;
+    for rule in &suite.score.metrics {
+        let Some(value) = measurements.get(&rule.metric).copied() else {
+            continue;
+        };
+        let target = rule
+            .target
+            .map_or_else(|| value.max(1.0), |target| target as f64);
+        let score = match rule.direction {
+            EvalMetricDirection::LowerIsBetter => inverse_score(value, target),
+            EvalMetricDirection::HigherIsBetter => (value / target).clamp(0.0, 1.0),
+        };
+        weighted += score * f64::from(rule.weight);
+        total_weight = total_weight.saturating_add(rule.weight);
+    }
+    (total_weight > 0).then_some(weighted / f64::from(total_weight))
 }
 
 fn inverse_score(value: f64, target: f64) -> f64 {

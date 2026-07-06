@@ -1,0 +1,12 @@
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -137,7 +137,7 @@ pub fn value_for(index: usize) -> usize {
+         134 => 134,
+         135 => 135,
+         136 => 136,
+-        137 => 999,
++        137 => 137,
+         138 => 138,
+         139 => 139,
+         140 => 140,

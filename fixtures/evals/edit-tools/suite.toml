@@ -23,19 +23,55 @@ cost = 0.0
 stability = 0.05
 correctness_required = true
 
+[[score.metrics]]
+metric = "diff_bytes"
+direction = "lower_is_better"
+weight = 1
+target = 50000
+
+[[score.metrics]]
+metric = "wall_time_ms"
+direction = "lower_is_better"
+weight = 1
+target = 60000
+
+[regression]
+min_pass_rate = 0.95
+max_token_increase_percent = 15.0
+max_latency_increase_percent = 25.0
+fail_on_new_failure = true
+
 [[variants]]
 id = "filesystem-command"
 name = "Filesystem command edit"
 executor = "command"
 allowed_tools = ["filesystem_edit"]
-command = "python3 - <<'PY'\nfrom pathlib import Path\np=Path('src/lib.rs')\ns=p.read_text()\ns=s.replace('old_name', 'new_name')\ns=s.replace('\\\"done\\\"', '\\\"complete\\\"')\np.write_text(s)\nPY"
+command = "python3 $BCODE_EVAL_SUITE_DIR/edit_adapter.py"
 
 [[variants]]
 id = "perl-command"
 name = "Perl command edit"
 executor = "command"
 allowed_tools = ["shell_run"]
-command = "perl -0pi -e 's/old_name/new_name/g; s/\\\"done\\\"/\\\"complete\\\"/g' src/lib.rs"
+command = "python3 $BCODE_EVAL_SUITE_DIR/edit_adapter.py"
+
+[[cases]]
+id = "one-line"
+name = "Surgical one-line edit"
+fixture = "cases/one-line/input"
+prompt = "Change TIMEOUT_MS from 1000 to 1500."
+timeout_ms = 60000
+
+[[cases.judges]]
+type = "exact_diff"
+expected_patch = "cases/one-line/expected.patch"
+required = true
+
+[[cases.judges]]
+type = "command"
+command = "cargo test --quiet"
+expected_exit_code = 0
+required = true
 
 [[cases]]
 id = "rename-symbol"
@@ -53,12 +89,6 @@ required = true
 type = "command"
 command = "cargo test --quiet"
 expected_exit_code = 0
-required = true
-
-[[cases.judges]]
-type = "metric_threshold"
-metric = "diff_files_changed"
-max = 1
 required = true
 
 [[cases]]
@@ -79,9 +109,135 @@ command = "cargo test --quiet"
 expected_exit_code = 0
 required = true
 
+[[cases]]
+id = "multi-file"
+name = "Multi-file rename and call-site update"
+fixture = "cases/multi-file/input"
+prompt = "Rename add to sum and format_result to format_total across modules."
+timeout_ms = 60000
+
+[[cases.judges]]
+type = "exact_diff"
+expected_patch = "cases/multi-file/expected.patch"
+required = true
+
+[[cases.judges]]
+type = "command"
+command = "cargo test --quiet"
+expected_exit_code = 0
+required = true
+
+[[cases]]
+id = "update-tests"
+name = "Update implementation to match existing tests"
+fixture = "cases/update-tests/input"
+prompt = "Make greeting return the loud uppercase greeting expected by tests."
+timeout_ms = 60000
+
+[[cases.judges]]
+type = "exact_diff"
+expected_patch = "cases/update-tests/expected.patch"
+required = true
+
+[[cases.judges]]
+type = "command"
+command = "cargo test --quiet"
+expected_exit_code = 0
+required = true
+
+[[cases]]
+id = "error-handling"
+name = "Add Result-based error handling"
+fixture = "cases/error-handling/input"
+prompt = "Change parse_port to return Result<u16, std::num::ParseIntError> instead of panicking."
+timeout_ms = 60000
+
+[[cases.judges]]
+type = "exact_diff"
+expected_patch = "cases/error-handling/expected.patch"
+required = true
+
+[[cases.judges]]
+type = "command"
+command = "cargo test --quiet"
+expected_exit_code = 0
+required = true
+
+[[cases]]
+id = "preserve-formatting"
+name = "Preserve aligned formatting"
+fixture = "cases/preserve-formatting/input"
+prompt = "Change only beta's value from 2 to 20 while preserving alignment."
+timeout_ms = 60000
+
+[[cases.judges]]
+type = "exact_diff"
+expected_patch = "cases/preserve-formatting/expected.patch"
+required = true
+
+[[cases.judges]]
+type = "command"
+command = "cargo test --quiet"
+expected_exit_code = 0
+required = true
+
+[[cases]]
+id = "large-file"
+name = "Large file surgical edit"
+fixture = "cases/large-file/input"
+prompt = "In the large match table, change only entry 137 from 999 to 137."
+timeout_ms = 60000
+
+[[cases.judges]]
+type = "exact_diff"
+expected_patch = "cases/large-file/expected.patch"
+required = true
+
+[[cases.judges]]
+type = "command"
+command = "cargo test --quiet"
+expected_exit_code = 0
+required = true
+
+[[cases]]
+id = "ambiguous"
+name = "Ambiguous request should avoid edits"
+fixture = "cases/ambiguous/input"
+prompt = "Fix the function."
+timeout_ms = 60000
+
+[[cases.judges]]
+type = "exact_diff"
+expected_patch = "cases/ambiguous/expected.patch"
+required = true
+
+[[cases.judges]]
+type = "metric_threshold"
+metric = "diff_bytes"
+max = 0
+required = true
+
+[[cases]]
+id = "no-generated"
+name = "Do not edit generated files"
+fixture = "cases/no-generated/input"
+prompt = "Make generated_value return source-owned without editing files under generated/."
+timeout_ms = 60000
+
+[[cases.judges]]
+type = "exact_diff"
+expected_patch = "cases/no-generated/expected.patch"
+required = true
+
+[[cases.judges]]
+type = "command"
+command = "cargo test --quiet"
+expected_exit_code = 0
+required = true
+
 [[cases.judges]]
 type = "regex"
 target = "diff"
-pattern = "complete"
-should_match = true
+pattern = "diff --git a/generated/value.txt"
+should_match = false
 required = true
