@@ -3827,6 +3827,7 @@ fn writable_config_path() -> PathBuf {
 fn config_to_toml(config: &BcodeConfig) -> String {
     let mut output = String::new();
     write_plugins_toml(&mut output, &config.plugins);
+    write_tools_toml(&mut output, &config.tools);
     write_model_toml(&mut output, &config.model);
     write_agents_toml(&mut output, &config.agent);
     write_auth_toml(&mut output, &config.auth);
@@ -4713,6 +4714,14 @@ fn write_plugins_toml(output: &mut String, plugins: &PluginConfig) {
         return;
     }
     output.push_str("[plugins]\n");
+    if plugins.default != PluginDefaultMode::Bundled {
+        writeln!(
+            output,
+            "default = {}",
+            toml_string(plugin_default_mode_name(plugins.default))
+        )
+        .expect("writing to string should not fail");
+    }
     write_string_set(output, "enabled", &plugins.enabled);
     write_string_set(output, "disabled", &plugins.disabled);
     output.push('\n');
@@ -4725,6 +4734,40 @@ fn write_plugins_toml(output: &mut String, plugins: &PluginConfig) {
             }
             output.push('\n');
         }
+    }
+}
+
+fn write_tools_toml(output: &mut String, tools: &ToolsConfig) {
+    if tools == &ToolsConfig::default() {
+        return;
+    }
+    output.push_str("[tools]\n");
+    if tools.default != ToolDefaultMode::Agent {
+        writeln!(
+            output,
+            "default = {}",
+            toml_string(tool_default_mode_name(tools.default))
+        )
+        .expect("writing to string should not fail");
+    }
+    write_string_set(output, "enabled", &tools.enabled);
+    write_string_set(output, "disabled", &tools.disabled);
+    output.push('\n');
+}
+
+const fn plugin_default_mode_name(mode: PluginDefaultMode) -> &'static str {
+    match mode {
+        PluginDefaultMode::Bundled => "bundled",
+        PluginDefaultMode::None => "none",
+        PluginDefaultMode::All => "all",
+    }
+}
+
+const fn tool_default_mode_name(mode: ToolDefaultMode) -> &'static str {
+    match mode {
+        ToolDefaultMode::Agent => "agent",
+        ToolDefaultMode::None => "none",
+        ToolDefaultMode::All => "all",
     }
 }
 
@@ -5172,7 +5215,7 @@ mod tests {
         plugin_selection_with_default_plugin_ids, upsert_agent_permission_rule,
     };
     use bcode_agent_policy_models::Action;
-    use bcode_plugin::PluginSelection;
+    use bcode_plugin::{PluginSelection, PluginSelectionMode};
     use std::collections::BTreeMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -5272,7 +5315,15 @@ mod tests {
             ],
         );
         assert_section_defaults(&fields, "model", &[]);
-        assert_section_defaults(&fields, "plugins", &[("enabled", "[]"), ("disabled", "[]")]);
+        assert_section_defaults(
+            &fields,
+            "plugins",
+            &[
+                ("default", "bundled"),
+                ("enabled", "[]"),
+                ("disabled", "[]"),
+            ],
+        );
     }
 
     #[test]
@@ -5869,6 +5920,116 @@ edit = { "src/**" = "ask" }
         );
 
         std::fs::remove_dir_all(root).expect("temp root should clean up");
+    }
+
+    #[test]
+    fn plugin_default_none_only_enables_explicit_and_provider_plugins() {
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[plugins]
+default = "none"
+enabled = ["bcode.filesystem"]
+"#,
+        )
+        .expect("config parses");
+        let selection = plugin_selection_with_default_plugin_ids(
+            &config,
+            ["bcode.default-agents", "bcode.vim-edit"],
+        );
+
+        assert_eq!(selection.mode, PluginSelectionMode::Explicit);
+        assert!(selection.enabled.contains("bcode.filesystem"));
+        assert!(!selection.enabled.contains("bcode.default-agents"));
+        assert!(!selection.enabled.contains("bcode.vim-edit"));
+        assert!(selection.enabled.contains("bcode.openai-compatible"));
+    }
+
+    #[test]
+    fn plugin_default_bundled_enables_bundled_unless_disabled() {
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[plugins]
+disabled = ["bcode.vim-edit"]
+"#,
+        )
+        .expect("config parses");
+        let selection = plugin_selection_with_default_plugin_ids(
+            &config,
+            ["bcode.default-agents", "bcode.vim-edit"],
+        );
+
+        assert_eq!(selection.mode, PluginSelectionMode::Explicit);
+        assert!(selection.is_enabled("bcode.default-agents"));
+        assert!(!selection.is_enabled("bcode.vim-edit"));
+    }
+
+    #[test]
+    fn plugin_default_all_enables_discovered_unless_disabled() {
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[plugins]
+default = "all"
+disabled = ["bcode.vim-edit"]
+"#,
+        )
+        .expect("config parses");
+        let selection = plugin_selection_with_default_plugin_ids(&config, ["bcode.default-agents"]);
+
+        assert_eq!(selection.mode, PluginSelectionMode::All);
+        assert!(selection.is_enabled("bcode.any-discovered-plugin"));
+        assert!(!selection.is_enabled("bcode.vim-edit"));
+    }
+
+    #[test]
+    fn tool_config_parses_default_enabled_and_disabled() {
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[tools]
+default = "none"
+enabled = ["filesystem.read", "vim_edit.preview"]
+disabled = ["shell.run"]
+"#,
+        )
+        .expect("config parses");
+
+        assert_eq!(config.tools.default, super::ToolDefaultMode::None);
+        assert!(config.tools.enabled.contains("filesystem.read"));
+        assert!(config.tools.enabled.contains("vim_edit.preview"));
+        assert!(config.tools.disabled.contains("shell.run"));
+    }
+
+    #[test]
+    fn config_to_toml_writes_plugin_and_tool_selection_modes() {
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[plugins]
+default = "none"
+enabled = ["bcode.vim-edit"]
+
+[tools]
+default = "none"
+enabled = ["vim_edit.preview"]
+disabled = ["vim_edit.apply"]
+"#,
+        )
+        .expect("config parses");
+        let rendered = super::config_to_toml(&config);
+
+        assert!(rendered.contains("[plugins]"), "{rendered}");
+        assert!(rendered.contains("default = \"none\""), "{rendered}");
+        assert!(
+            rendered.contains("enabled = [\"bcode.vim-edit\"]"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("[tools]"), "{rendered}");
+        assert!(
+            rendered.contains("enabled = [\"vim_edit.preview\"]"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("disabled = [\"vim_edit.apply\"]"),
+            "{rendered}"
+        );
     }
 
     #[test]

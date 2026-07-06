@@ -529,6 +529,76 @@ command = { "python3 *" = "allow" }
         restore_env("BCODE_PERMISSIONS_STATE", previous_state);
     }
 
+    #[test]
+    fn tool_selection_none_exposes_only_explicit_tools() {
+        let mut agent = agent_config(&default_config(), BUILD_AGENT);
+        let tools_config = bcode_config::ToolsConfig {
+            default: bcode_config::ToolDefaultMode::None,
+            enabled: BTreeSet::from(["filesystem.read".to_string()]),
+            disabled: BTreeSet::new(),
+            ..bcode_config::ToolsConfig::default()
+        };
+
+        apply_tool_selection(&mut agent, &tools_config, &[]);
+        let tools = active_tools_for(&agent);
+
+        assert_eq!(tools, vec!["filesystem.read".to_string()]);
+    }
+
+    #[test]
+    fn tool_selection_disabled_wins_over_enabled_and_agent_defaults() {
+        let mut agent = agent_config(&default_config(), BUILD_AGENT);
+        let tools_config = bcode_config::ToolsConfig {
+            default: bcode_config::ToolDefaultMode::Agent,
+            enabled: BTreeSet::from(["shell.run".to_string()]),
+            disabled: BTreeSet::from(["shell.run".to_string()]),
+            ..bcode_config::ToolsConfig::default()
+        };
+
+        apply_tool_selection(&mut agent, &tools_config, &[]);
+        let tools = active_tools_for(&agent);
+
+        assert!(!tools.contains(&"shell.run".to_string()));
+    }
+
+    #[test]
+    fn tool_selection_all_uses_available_tool_metadata() {
+        let mut agent = agent_config(&default_config(), BUILD_AGENT);
+        let tools_config = bcode_config::ToolsConfig {
+            default: bcode_config::ToolDefaultMode::All,
+            enabled: BTreeSet::new(),
+            disabled: BTreeSet::from(["filesystem.write".to_string()]),
+            ..bcode_config::ToolsConfig::default()
+        };
+        let available_tools = vec![
+            bcode_tool::ToolDefinition {
+                name: "filesystem.read".to_string(),
+                description: String::new(),
+                input_schema: json!({}),
+                side_effect: ToolSideEffect::ReadOnly,
+                requires_permission: false,
+                policy: bcode_tool::ToolPolicyMetadata::default(),
+                ui: bcode_tool::ToolUiMetadata::default(),
+            },
+            bcode_tool::ToolDefinition {
+                name: "filesystem.write".to_string(),
+                description: String::new(),
+                input_schema: json!({}),
+                side_effect: ToolSideEffect::WriteFiles,
+                requires_permission: true,
+                policy: bcode_tool::ToolPolicyMetadata::default(),
+                ui: bcode_tool::ToolUiMetadata::default(),
+            },
+        ];
+
+        apply_tool_selection(&mut agent, &tools_config, &available_tools);
+        let tools = active_tools_for(&agent);
+
+        assert!(tools.contains(&"filesystem.read".to_string()));
+        assert!(!tools.contains(&"filesystem.write".to_string()));
+        assert!(!tools.contains(&"shell.run".to_string()));
+    }
+
     fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
         unsafe {
             if let Some(value) = value {

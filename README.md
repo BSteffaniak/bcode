@@ -63,6 +63,30 @@ Permission prompts are modal by default: permission actions only apply in the pe
 
 Bcode uses an agent-scoped permission model with `allow` / `ask` / `deny` rules under `[agent.<id>.permission]` in `bcode.toml`. See [`docs/permissions.md`](docs/permissions.md) for the full shape, category list, and built-in defaults for the `plan` and `build` agents.
 
+### Plugin and tool selection
+
+Bcode separates plugin loading from model-callable tool exposure. Statically bundled plugins are compiled into the Bcode binary, but users can still opt out of bundled defaults or opt in to individual plugins.
+
+```toml
+[plugins]
+default = "none"
+enabled = ["bcode.default-agents", "bcode.filesystem", "bcode.vim-edit"]
+
+[tools]
+default = "none"
+enabled = ["filesystem.read", "vim_edit.preview"]
+```
+
+Use `default = "bundled"` under `[plugins]` to enable Bcode's bundled defaults unless disabled, `default = "none"` to start with no default plugins, or `default = "all"` to enable every discovered plugin unless disabled. Under `[tools]`, `default = "agent"` uses the active agent's normal tool policy, `default = "none"` exposes only explicitly enabled tools, and `default = "all"` exposes all loaded tools except those in `disabled`.
+
+```toml
+[plugins]
+disabled = ["bcode.vim-edit"]
+
+[tools]
+disabled = ["vim_edit.apply"]
+```
+
 ## Auth vault device seals
 
 Bcode stores provider secrets in sshenv-backed auth vault profiles. By default, Bcode prefers a strict transparent device-only seal for those profiles: macOS uses a non-syncing `ThisDeviceOnly` Keychain item, Windows uses current-user DPAPI, and Linux uses TPM when available. If the seal cannot be applied and `device_seal = "preferred"`, Bcode continues with a warning; `device_seal = "required"` turns that into an error.
