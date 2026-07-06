@@ -498,6 +498,27 @@ impl Drop for EnvVarGuard {
     }
 }
 
+fn prepare_agent_daemon_isolation(
+    variant: &EvalVariant,
+    rep_dir: &Path,
+) -> Result<Vec<EnvVarGuard>, EvalError> {
+    let mode = variant
+        .metadata
+        .get("daemon_isolation")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("isolated");
+    if mode == "shared" {
+        return Ok(Vec::new());
+    }
+    let state_dir = rep_dir.join("daemon-state");
+    fs::create_dir_all(&state_dir)?;
+    let socket = rep_dir.join("bcode-agent-eval.sock");
+    Ok(vec![
+        EnvVarGuard::set("BCODE_STATE_DIR", &state_dir),
+        EnvVarGuard::set("BCODE_SOCKET", &socket),
+    ])
+}
+
 fn prepare_agent_policy_overlay(
     variant: &EvalVariant,
     rep_dir: &Path,
@@ -747,6 +768,7 @@ async fn execute_agent_variant_async(
     workspace: &Path,
 ) -> Result<ExecutionOutput, EvalError> {
     let prompt = rendered_prompt(case, variant);
+    let _daemon_env = prepare_agent_daemon_isolation(variant, rep_dir)?;
     let policy_overlay = prepare_agent_policy_overlay(variant, rep_dir)?;
     let _policy_env = policy_overlay
         .as_ref()
@@ -819,6 +841,7 @@ async fn execute_agent_variant_async(
         "agent_wall_time_ms".into(),
         start.elapsed().as_millis() as f64,
     );
+    add_cost_estimates(variant, &mut measurements);
     let mut diagnostics = telemetry.diagnostics;
     diagnostics.append(&mut policy_diagnostics);
     if telemetry.timed_out {
@@ -958,6 +981,48 @@ struct SessionTelemetry {
     measurements: EvalMeasurementSet,
     diagnostics: Vec<EvalDiagnostic>,
     timed_out: bool,
+}
+
+fn add_cost_estimates(variant: &EvalVariant, measurements: &mut EvalMeasurementSet) {
+    let input_rate = variant
+        .metadata
+        .get("input_cost_per_million_tokens")
+        .and_then(serde_json::Value::as_f64);
+    let output_rate = variant
+        .metadata
+        .get("output_cost_per_million_tokens")
+        .and_then(serde_json::Value::as_f64);
+    let input_tokens = measurements
+        .get("input_tokens")
+        .copied()
+        .unwrap_or_default();
+    let output_tokens = measurements
+        .get("output_tokens")
+        .copied()
+        .unwrap_or_default();
+    if let Some(rate) = input_rate {
+        measurements.insert(
+            "estimated_input_cost".into(),
+            (input_tokens / 1_000_000.0) * rate,
+        );
+    }
+    if let Some(rate) = output_rate {
+        measurements.insert(
+            "estimated_output_cost".into(),
+            (output_tokens / 1_000_000.0) * rate,
+        );
+    }
+    let total = measurements
+        .get("estimated_input_cost")
+        .copied()
+        .unwrap_or_default()
+        + measurements
+            .get("estimated_output_cost")
+            .copied()
+            .unwrap_or_default();
+    if total > 0.0 {
+        measurements.insert("estimated_total_cost".into(), total);
+    }
 }
 
 fn session_telemetry(events: &[bcode_session_models::SessionEvent]) -> SessionTelemetry {
@@ -1309,6 +1374,57 @@ fn normalize_patch_for_bless(value: &str) -> String {
         .join("\n");
     normalized.push('\n');
     normalized
+}
+
+/// Export a session history as replay JSONL.
+///
+/// # Errors
+///
+/// Returns an error when the daemon/session cannot be read or writing fails.
+pub fn export_session_replay(
+    session_id: &str,
+    output_path: impl AsRef<Path>,
+) -> Result<(), EvalError> {
+    let session_id = session_id
+        .parse::<bcode_session_models::SessionId>()
+        .map_err(|error| EvalError::Validation(format!("invalid session id: {error}")))?;
+    let output_path = output_path.as_ref();
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()?;
+    runtime.block_on(async {
+        let client = bcode_client::BcodeClient::default_endpoint();
+        client
+            .ensure_daemon_available()
+            .await
+            .map_err(|error| EvalError::Client(error.to_string()))?;
+        let mut file = File::create(output_path)?;
+        let mut cursor = None;
+        loop {
+            let page = client
+                .session_history_page(
+                    session_id,
+                    bcode_session_models::SessionHistoryQuery {
+                        cursor,
+                        limit: 500,
+                        direction: bcode_session_models::SessionHistoryDirection::Forward,
+                    },
+                )
+                .await
+                .map_err(|error| EvalError::Client(error.to_string()))?;
+            for event in &page.events {
+                writeln!(file, "{}", serde_json::to_string(event)?)?;
+            }
+            if !page.has_more {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+        Ok(())
+    })
 }
 
 /// Discover suite manifests below a root directory.

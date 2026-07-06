@@ -1246,6 +1246,13 @@ enum EvalCommand {
         /// Case id to update.
         case_id: String,
     },
+    /// Export an existing session history to replay JSONL.
+    ReplaySession {
+        /// Session id to export.
+        session_id: String,
+        /// Output JSONL path.
+        output: PathBuf,
+    },
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1336,14 +1343,14 @@ fn handle_eval_command(command: EvalCommand) -> Result<(), CliError> {
                     .variants
                     .iter()
                     .find(|variant| variant.pass_rate < threshold)
-                {
-                    return Err(CliError::EvalCheckFailed(format!(
-                        "variant {} pass rate {:.2}% is below threshold {:.2}%",
-                        variant.variant_id,
-                        variant.pass_rate * 100.0,
-                        threshold * 100.0
-                    )));
-                }
+            {
+                return Err(CliError::EvalCheckFailed(format!(
+                    "variant {} pass rate {:.2}% is below threshold {:.2}%",
+                    variant.variant_id,
+                    variant.pass_rate * 100.0,
+                    threshold * 100.0
+                )));
+            }
         }
         EvalCommand::Baseline { output_root, run } => {
             let baseline = bcode_eval::set_baseline(output_root, run)?;
@@ -1407,6 +1414,10 @@ fn handle_eval_command(command: EvalCommand) -> Result<(), CliError> {
         } => {
             bcode_eval::capture_expected_patch(diff, suite_dir, &case_id)?;
             println!("captured expected patch for {case_id}");
+        }
+        EvalCommand::ReplaySession { session_id, output } => {
+            bcode_eval::export_session_replay(&session_id, &output)?;
+            println!("exported replay transcript to {}", output.display());
         }
     }
     Ok(())

@@ -1,0 +1,64 @@
+schema_version = 1
+id = "direct-tools"
+name = "Direct Tool Examples"
+description = "Example direct-tool evals for measuring tool behavior independent of model choice."
+
+[run]
+repetitions = 1
+timeout_ms = 60000
+isolation = "empty_temp"
+randomize_case_order = false
+fail_fast = false
+
+[score]
+correctness = 0.8
+efficiency = 0.1
+speed = 0.1
+cost = 0.0
+stability = 0.0
+correctness_required = true
+
+# These examples intentionally document the direct_tool schema. Adjust tool_name
+# and arguments to the model-callable IDs exposed by your loaded plugins.
+
+[[variants]]
+id = "filesystem-read-direct"
+name = "Direct filesystem read"
+executor = "direct_tool"
+
+[variants.direct_tool]
+tool_name = "filesystem.read"
+arguments = { path = "README.md", limit = 5 }
+
+[[cases]]
+id = "read-readme"
+name = "Read repository README directly"
+prompt = "Read the README without involving a model."
+timeout_ms = 30000
+
+[[cases.judges]]
+type = "metric_threshold"
+metric = "direct_tool_response_bytes"
+min = 1
+required = true
+
+[[variants]]
+id = "vim-edit-preview-direct"
+name = "Direct vim edit preview example"
+executor = "direct_tool"
+
+[variants.direct_tool]
+tool_name = "vim_edit.preview"
+arguments = { path = "example.txt", steps = [] }
+
+[[cases]]
+id = "vim-preview-schema"
+name = "Vim edit preview schema example"
+prompt = "Example only; adjust arguments for a real fixture."
+timeout_ms = 30000
+
+[[cases.judges]]
+type = "metric_threshold"
+metric = "direct_tool_wall_time_ms"
+max = 30000
+required = true
