@@ -96,6 +96,8 @@ pub enum CliError {
     Blims(String),
     #[error("eval error: {0}")]
     Eval(#[from] bcode_eval::EvalError),
+    #[error("eval check failed: {0}")]
+    EvalCheckFailed(String),
     #[error("bundled plugin install failed: {0}")]
     BundledPluginInstallFailed(String),
     #[error("plugin service error {code}: {message}")]
@@ -1150,6 +1152,9 @@ enum EvalCommand {
         /// Print the full JSON summary.
         #[arg(long)]
         json: bool,
+        /// Exit non-zero if overall pass rate is below this threshold.
+        #[arg(long)]
+        fail_under_pass_rate: Option<f64>,
     },
     /// Print a run summary.
     Report {
@@ -1169,6 +1174,9 @@ enum EvalCommand {
         /// Optional Markdown output path.
         #[arg(long)]
         markdown: Option<PathBuf>,
+        /// Exit non-zero if any variant is below this pass-rate threshold.
+        #[arg(long)]
+        fail_under_pass_rate: Option<f64>,
     },
     /// Set a baseline for a suite from a completed run.
     Baseline {
@@ -1187,6 +1195,9 @@ enum EvalCommand {
         /// Print JSON output.
         #[arg(long)]
         json: bool,
+        /// Exit non-zero when regressions are detected.
+        #[arg(long)]
+        fail_on_regression: bool,
     },
     /// Create a new eval suite skeleton.
     InitSuite {
@@ -1206,8 +1217,38 @@ enum EvalCommand {
         /// Destination expected patch path.
         expected_patch: PathBuf,
     },
+    /// List eval suites under a root directory.
+    List {
+        /// Root directory to scan.
+        #[arg(default_value = "fixtures/evals")]
+        root: PathBuf,
+    },
+    /// Add a fixture-backed case skeleton to a suite directory.
+    AddCase {
+        /// Suite directory containing suite.toml.
+        suite_dir: PathBuf,
+        /// Case id.
+        #[arg(long)]
+        id: String,
+        /// Case name.
+        #[arg(long)]
+        name: String,
+        /// Optional fixture directory to copy.
+        #[arg(long)]
+        from_dir: Option<PathBuf>,
+    },
+    /// Capture expected.patch from a run artifact diff path.
+    CaptureExpected {
+        /// Source diff.patch path.
+        diff: PathBuf,
+        /// Suite directory.
+        suite_dir: PathBuf,
+        /// Case id to update.
+        case_id: String,
+    },
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle_eval_command(command: EvalCommand) -> Result<(), CliError> {
     match command {
         EvalCommand::Validate { suite } => {
@@ -1219,6 +1260,7 @@ fn handle_eval_command(command: EvalCommand) -> Result<(), CliError> {
             output_root,
             run_id,
             json,
+            fail_under_pass_rate,
         } => {
             let options = bcode_eval::EvalRunOptions {
                 suite_path: suite,
@@ -1235,6 +1277,20 @@ fn handle_eval_command(command: EvalCommand) -> Result<(), CliError> {
                     result.manifest.output_dir.join("summary.md").display()
                 );
                 println!("passed: {}", result.passed);
+            }
+            if let Some(threshold) = fail_under_pass_rate {
+                let pass_rate = result
+                    .variants
+                    .iter()
+                    .map(|variant| variant.pass_rate)
+                    .fold(1.0_f64, f64::min);
+                if pass_rate < threshold {
+                    return Err(CliError::EvalCheckFailed(format!(
+                        "minimum variant pass rate {:.2}% is below threshold {:.2}%",
+                        pass_rate * 100.0,
+                        threshold * 100.0
+                    )));
+                }
             }
         }
         EvalCommand::Report { run, json } => {
@@ -1258,6 +1314,7 @@ fn handle_eval_command(command: EvalCommand) -> Result<(), CliError> {
             runs,
             output,
             markdown,
+            fail_under_pass_rate,
         } => {
             let results = runs
                 .iter()
@@ -1268,9 +1325,25 @@ fn handle_eval_command(command: EvalCommand) -> Result<(), CliError> {
                 bcode_eval::write_comparison_report(&report, output)?;
             }
             if let Some(markdown) = markdown {
-                std::fs::write(markdown, bcode_eval::render_comparison_markdown(&report))?;
+                std::fs::write(
+                    markdown,
+                    bcode_eval::render_runs_comparison_markdown(&results),
+                )?;
             }
             println!("{}", serde_json::to_string_pretty(&report)?);
+            if let Some(threshold) = fail_under_pass_rate
+                && let Some(variant) = report
+                    .variants
+                    .iter()
+                    .find(|variant| variant.pass_rate < threshold)
+                {
+                    return Err(CliError::EvalCheckFailed(format!(
+                        "variant {} pass rate {:.2}% is below threshold {:.2}%",
+                        variant.variant_id,
+                        variant.pass_rate * 100.0,
+                        threshold * 100.0
+                    )));
+                }
         }
         EvalCommand::Baseline { output_root, run } => {
             let baseline = bcode_eval::set_baseline(output_root, run)?;
@@ -1280,15 +1353,21 @@ fn handle_eval_command(command: EvalCommand) -> Result<(), CliError> {
             baseline,
             candidate,
             json,
+            fail_on_regression,
         } => {
             let report = bcode_eval::regression_report(baseline, candidate)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 println!("regressed: {}", report.regressed);
-                for diagnostic in report.diagnostics {
+                for diagnostic in &report.diagnostics {
                     println!("{:?}: {}", diagnostic.severity, diagnostic.message);
                 }
+            }
+            if fail_on_regression && report.regressed {
+                return Err(CliError::EvalCheckFailed(
+                    "candidate run regressed against baseline".to_string(),
+                ));
             }
         }
         EvalCommand::InitSuite {
@@ -1305,6 +1384,29 @@ fn handle_eval_command(command: EvalCommand) -> Result<(), CliError> {
         } => {
             bcode_eval::bless_expected_patch(diff, expected_patch)?;
             println!("blessed expected patch");
+        }
+        EvalCommand::List { root } => {
+            for suite in bcode_eval::list_suites(root)? {
+                let loaded = bcode_eval::load_suite(&suite)?;
+                println!("{}\t{}\t{}", loaded.id, loaded.name, suite.display());
+            }
+        }
+        EvalCommand::AddCase {
+            suite_dir,
+            id,
+            name,
+            from_dir,
+        } => {
+            bcode_eval::add_case(suite_dir, &id, &name, from_dir.as_deref())?;
+            println!("added eval case {id}");
+        }
+        EvalCommand::CaptureExpected {
+            diff,
+            suite_dir,
+            case_id,
+        } => {
+            bcode_eval::capture_expected_patch(diff, suite_dir, &case_id)?;
+            println!("captured expected patch for {case_id}");
         }
     }
     Ok(())

@@ -470,6 +470,100 @@ fn execute_command_variant(
     })
 }
 
+#[derive(Debug)]
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &Path) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+}
+
+fn prepare_agent_policy_overlay(
+    variant: &EvalVariant,
+    rep_dir: &Path,
+) -> Result<Option<PathBuf>, EvalError> {
+    if variant.allowed_tools.is_empty() {
+        return Ok(None);
+    }
+    let agent_id = variant
+        .metadata
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("build");
+    let path = rep_dir.join("permissions.toml");
+    let allowed = variant
+        .allowed_tools
+        .iter()
+        .map(|tool| format!("{tool} = true"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let state = format!(
+        "[agent.{agent_id}.tools]\n{allowed}\n\n[agent.{agent_id}.permission.command]\n\"*\" = \"ask\"\n\n[agent.{agent_id}.permission.read]\n\"*\" = \"allow\"\n\n[agent.{agent_id}.permission.write]\n\"*\" = \"ask\"\n\n[agent.{agent_id}.permission.edit]\n\"*\" = \"ask\"\n"
+    );
+    fs::write(&path, state)?;
+    Ok(Some(path))
+}
+
+async fn validate_agent_policy_overlay(
+    client: &bcode_client::BcodeClient,
+    variant: &EvalVariant,
+) -> Result<Vec<EvalDiagnostic>, EvalError> {
+    if variant.allowed_tools.is_empty() {
+        return Ok(Vec::new());
+    }
+    let status = client
+        .agent_policy_status()
+        .await
+        .map_err(|error| EvalError::Client(error.to_string()))?;
+    let agent_id = variant
+        .metadata
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("build");
+    let enabled = if agent_id == "plan" {
+        &status.plan_enabled_tools
+    } else {
+        &status.build_enabled_tools
+    };
+    let missing = variant
+        .allowed_tools
+        .iter()
+        .filter(|tool| !enabled.contains(tool))
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(Vec::new())
+    } else {
+        Ok(vec![EvalDiagnostic {
+            severity: EvalDiagnosticSeverity::Warning,
+            message: format!(
+                "agent policy overlay may not be active for variant {}; missing enabled tools {:?}; policy source: {}",
+                variant.id, missing, status.source
+            ),
+        }])
+    }
+}
+
 fn execute_direct_tool_variant(
     suite: &EvalSuite,
     case: &EvalCase,
@@ -653,6 +747,10 @@ async fn execute_agent_variant_async(
     workspace: &Path,
 ) -> Result<ExecutionOutput, EvalError> {
     let prompt = rendered_prompt(case, variant);
+    let policy_overlay = prepare_agent_policy_overlay(variant, rep_dir)?;
+    let _policy_env = policy_overlay
+        .as_ref()
+        .map(|path| EnvVarGuard::set("BCODE_PERMISSIONS_STATE", path));
     let _config_guard = variant.profile.as_deref().map(|profile| {
         bcode_config::push_process_config_overrides(
             bcode_config::ConfigLoadOverrides::from_env_with_cli(
@@ -666,6 +764,7 @@ async fn execute_agent_variant_async(
         .ensure_daemon_available()
         .await
         .map_err(|error| EvalError::Client(error.to_string()))?;
+    let mut policy_diagnostics = validate_agent_policy_overlay(&client, variant).await?;
     let session = client
         .create_session_in_working_directory(
             Some(format!("eval:{}:{}:{}", suite.id, case.id, variant.id)),
@@ -721,6 +820,7 @@ async fn execute_agent_variant_async(
         start.elapsed().as_millis() as f64,
     );
     let mut diagnostics = telemetry.diagnostics;
+    diagnostics.append(&mut policy_diagnostics);
     if telemetry.timed_out {
         diagnostics.push(EvalDiagnostic {
             severity: EvalDiagnosticSeverity::Error,
@@ -1211,6 +1311,93 @@ fn normalize_patch_for_bless(value: &str) -> String {
     normalized
 }
 
+/// Discover suite manifests below a root directory.
+///
+/// # Errors
+///
+/// Returns an error when directory traversal fails.
+pub fn list_suites(root: impl AsRef<Path>) -> Result<Vec<PathBuf>, EvalError> {
+    let mut suites = Vec::new();
+    collect_suites(root.as_ref(), &mut suites)?;
+    suites.sort();
+    Ok(suites)
+}
+
+fn collect_suites(path: &Path, suites: &mut Vec<PathBuf>) -> Result<(), EvalError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    if path.join("suite.toml").exists() {
+        suites.push(path.join("suite.toml"));
+        return Ok(());
+    }
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_suites(&entry.path(), suites)?;
+        }
+    }
+    Ok(())
+}
+
+/// Add a case fixture skeleton to a suite directory.
+///
+/// # Errors
+///
+/// Returns an error when the case already exists or writing fails.
+pub fn add_case(
+    suite_dir: impl AsRef<Path>,
+    case_id: &str,
+    case_name: &str,
+    from_dir: Option<&Path>,
+) -> Result<(), EvalError> {
+    validate_id("case", case_id)?;
+    let suite_dir = suite_dir.as_ref();
+    let case_dir = suite_dir.join("cases").join(case_id);
+    if case_dir.exists() {
+        return Err(EvalError::Validation(format!(
+            "case already exists: {}",
+            case_dir.display()
+        )));
+    }
+    let input = case_dir.join("input");
+    if let Some(from_dir) = from_dir {
+        copy_dir_all(from_dir, &input)?;
+    } else {
+        fs::create_dir_all(&input)?;
+        fs::write(input.join("README.md"), "# Eval fixture\n")?;
+    }
+    fs::write(case_dir.join("expected.patch"), "")?;
+    let suite_path = suite_dir.join("suite.toml");
+    let mut suite = fs::read_to_string(&suite_path)?;
+    suite.push_str(&format!(
+        "\n[[cases]]\nid = \"{case_id}\"\nname = \"{case_name}\"\nfixture = \"cases/{case_id}/input\"\nprompt = \"TODO: describe the task.\"\ntimeout_ms = 60000\n\n[[cases.judges]]\ntype = \"exact_diff\"\nexpected_patch = \"cases/{case_id}/expected.patch\"\nrequired = true\n"
+    ));
+    fs::write(suite_path, suite)?;
+    Ok(())
+}
+
+/// Capture a case expected patch from a run diff.
+///
+/// # Errors
+///
+/// Returns an error when reading or writing fails.
+pub fn capture_expected_patch(
+    diff_path: impl AsRef<Path>,
+    suite_dir: impl AsRef<Path>,
+    case_id: &str,
+) -> Result<(), EvalError> {
+    bless_expected_patch(
+        diff_path,
+        suite_dir
+            .as_ref()
+            .join("cases")
+            .join(case_id)
+            .join("expected.patch"),
+    )
+}
+
 /// Load an eval run result from `summary.json` or a run directory.
 ///
 /// # Errors
@@ -1301,6 +1488,66 @@ pub fn render_comparison_markdown(report: &EvalComparisonReport) -> String {
     out
 }
 
+/// Render full run comparison Markdown with per-case details.
+#[must_use]
+pub fn render_runs_comparison_markdown(runs: &[EvalRunResult]) -> String {
+    let report = compare_runs(runs);
+    let mut out = render_comparison_markdown(&report);
+    out.push_str("\n## Case Matrix\n\n");
+    out.push_str("| Run | Variant | Case | Pass rate | Avg wall ms | Wall stddev | Avg tokens | Tool calls | Flaky |\n|---|---|---|---:|---:|---:|---:|---:|---|\n");
+    for run in runs {
+        for variant in &run.variants {
+            for case in &variant.cases {
+                let reps = case.repetitions.iter().collect::<Vec<_>>();
+                let metrics = average_measurements(&reps);
+                let wall_values = reps
+                    .iter()
+                    .filter_map(|rep| rep.measurements.get("wall_time_ms").copied())
+                    .collect::<Vec<_>>();
+                let wall_stddev = stddev(&wall_values);
+                let flaky = case.pass_rate > 0.0 && case.pass_rate < 1.0;
+                out.push_str(&format!(
+                    "| {} | {} | {} | {:.2}% | {:.2} | {:.2} | {:.2} | {:.2} | {} |\n",
+                    run.manifest.run_id,
+                    variant.variant_id,
+                    case.case_id,
+                    case.pass_rate * 100.0,
+                    metrics.get("wall_time_ms").copied().unwrap_or_default(),
+                    wall_stddev,
+                    metrics.get("total_tokens").copied().unwrap_or_default(),
+                    metrics.get("tool_call_count").copied().unwrap_or_default(),
+                    if flaky { "yes" } else { "no" },
+                ));
+            }
+        }
+    }
+    out.push_str("\n## Artifact Roots\n\n");
+    for run in runs {
+        out.push_str(&format!(
+            "* `{}`: `{}`\n",
+            run.manifest.run_id,
+            run.manifest.output_dir.display()
+        ));
+    }
+    out
+}
+
+fn stddev(values: &[f64]) -> f64 {
+    if values.len() < 2 {
+        return 0.0;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let variance = values
+        .iter()
+        .map(|value| {
+            let delta = value - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / values.len() as f64;
+    variance.sqrt()
+}
+
 /// Write a comparison report.
 ///
 /// # Errors
@@ -1349,6 +1596,9 @@ pub fn regression_report(
         Err(_) => serde_json::from_str::<EvalRunResult>(&baseline_text)?,
     };
     let candidate = load_run_result(candidate_path)?;
+    let regression_config = load_suite_snapshot_from_run(&candidate)
+        .map(|suite| suite.regression)
+        .unwrap_or_default();
     let mut diagnostics = Vec::new();
     for candidate_variant in &candidate.variants {
         if let Some(base_variant) = baseline_run
@@ -1356,7 +1606,22 @@ pub fn regression_report(
             .iter()
             .find(|variant| variant.variant_id == candidate_variant.variant_id)
         {
-            if candidate_variant.pass_rate < base_variant.pass_rate {
+            if let Some(min_pass_rate) = regression_config.min_pass_rate
+                && candidate_variant.pass_rate < min_pass_rate
+            {
+                diagnostics.push(EvalDiagnostic {
+                    severity: EvalDiagnosticSeverity::Error,
+                    message: format!(
+                        "variant {} pass rate {:.2}% is below threshold {:.2}%",
+                        candidate_variant.variant_id,
+                        candidate_variant.pass_rate * 100.0,
+                        min_pass_rate * 100.0
+                    ),
+                });
+            }
+            if candidate_variant.pass_rate < base_variant.pass_rate
+                && regression_config.fail_on_new_failure
+            {
                 diagnostics.push(EvalDiagnostic {
                     severity: EvalDiagnosticSeverity::Error,
                     message: format!(
@@ -1378,6 +1643,22 @@ pub fn regression_report(
                     ),
                 });
             }
+            check_metric_percent_regression(
+                &mut diagnostics,
+                &candidate_variant.variant_id,
+                "total_tokens",
+                base_variant.measurements.get("total_tokens").copied(),
+                candidate_variant.measurements.get("total_tokens").copied(),
+                regression_config.max_token_increase_percent,
+            );
+            check_metric_percent_regression(
+                &mut diagnostics,
+                &candidate_variant.variant_id,
+                "wall_time_ms",
+                base_variant.measurements.get("wall_time_ms").copied(),
+                candidate_variant.measurements.get("wall_time_ms").copied(),
+                regression_config.max_latency_increase_percent,
+            );
         }
     }
     Ok(EvalRegressionReport {
@@ -1388,6 +1669,40 @@ pub fn regression_report(
             .any(|diag| diag.severity == EvalDiagnosticSeverity::Error),
         diagnostics,
     })
+}
+
+fn load_suite_snapshot_from_run(run: &EvalRunResult) -> Result<EvalSuite, EvalError> {
+    let suite_path = run.manifest.output_dir.join("suite.snapshot.toml");
+    let suite = toml::from_str::<EvalSuite>(&fs::read_to_string(suite_path)?)?;
+    Ok(suite)
+}
+
+fn check_metric_percent_regression(
+    diagnostics: &mut Vec<EvalDiagnostic>,
+    variant_id: &str,
+    metric: &str,
+    baseline: Option<f64>,
+    candidate: Option<f64>,
+    max_increase_percent: Option<f64>,
+) {
+    let Some(limit) = max_increase_percent else {
+        return;
+    };
+    let (Some(baseline), Some(candidate)) = (baseline, candidate) else {
+        return;
+    };
+    if baseline <= 0.0 {
+        return;
+    }
+    let increase = ((candidate - baseline) / baseline) * 100.0;
+    if increase > limit {
+        diagnostics.push(EvalDiagnostic {
+            severity: EvalDiagnosticSeverity::Error,
+            message: format!(
+                "variant {variant_id} metric {metric} increased by {increase:.2}% from {baseline:.2} to {candidate:.2}; limit {limit:.2}%"
+            ),
+        });
+    }
 }
 
 fn aggregate_variant(
