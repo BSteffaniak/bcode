@@ -16,6 +16,7 @@ pub(crate) mod cursor_blink;
 pub(crate) mod daemon_host;
 pub(crate) mod daemon_issue;
 pub(crate) mod effects;
+pub mod eval_launcher;
 pub(crate) mod exit_state;
 pub(crate) mod filtered_list;
 pub(crate) mod helpers;
@@ -526,4 +527,53 @@ pub async fn run_code_review(
         }
         Err(error) => Err(error),
     }
+}
+
+/// Run the eval run picker TUI.
+///
+/// # Errors
+///
+/// Returns I/O or plugin service errors.
+#[allow(clippy::future_not_send)]
+pub async fn run_eval_viewer_picker(repo_path: std::path::PathBuf) -> Result<(), TuiError> {
+    let stdout = io::stdout();
+    let mut guard = CrosstermTerminalGuard::enter(stdout)?;
+    let result = {
+        let mut terminal = Terminal::new(
+            guard.writer_mut().ok_or_else(|| {
+                std::io::Error::other("terminal guard writer unavailable after entering terminal")
+            })?,
+            helpers::terminal_area()?,
+        );
+        eval_launcher::run_picker(&mut terminal, repo_path).await
+    };
+    let _writer = guard.leave()?;
+    result
+}
+
+/// Run the eval run viewer TUI for an optional run path.
+///
+/// When `run` is `None`, the picker is opened instead.
+///
+/// # Errors
+///
+/// Returns I/O or plugin service errors.
+#[allow(clippy::future_not_send)]
+pub async fn run_eval_viewer(
+    repo_path: std::path::PathBuf,
+    run: Option<std::path::PathBuf>,
+) -> Result<(), TuiError> {
+    let stdout = io::stdout();
+    let mut guard = CrosstermTerminalGuard::enter(stdout)?;
+    let result = {
+        let mut terminal = Terminal::new(
+            guard.writer_mut().ok_or_else(|| {
+                std::io::Error::other("terminal guard writer unavailable after entering terminal")
+            })?,
+            helpers::terminal_area()?,
+        );
+        eval_launcher::run_viewer(&mut terminal, repo_path, run).await
+    };
+    let _writer = guard.leave()?;
+    result
 }

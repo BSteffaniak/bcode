@@ -199,11 +199,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Session { command } => handle_session_command(command).await?,
         Commands::Worktree { command } => handle_worktree_command(command).await?,
         Commands::Blims { command } => blims::handle_blims_command(command).await?,
-        Commands::Eval { command } => {
-            tokio::task::spawn_blocking(move || handle_eval_command(command))
-                .await
-                .map_err(|error| CliError::EvalCheckFailed(error.to_string()))??;
-        }
+        Commands::Eval { command } => Box::pin(handle_eval_command(command)).await?,
         Commands::Review { command } => Box::pin(handle_review_command(command)).await?,
         Commands::Ralph { repo } => handle_ralph_command(repo).await?,
         Commands::Plugin { command } => handle_plugin_command(command).await?,
@@ -1263,10 +1259,18 @@ enum EvalCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Open the eval run viewer TUI.
+    Viewer {
+        /// Optional run directory or summary.json path.
+        /// When omitted, the run picker is opened.
+        run: Option<PathBuf>,
+    },
+    /// Open the eval run picker TUI directly.
+    ViewerPicker,
 }
 
 #[allow(clippy::too_many_lines)]
-fn handle_eval_command(command: EvalCommand) -> Result<(), CliError> {
+async fn handle_eval_command(command: EvalCommand) -> Result<(), CliError> {
     match command {
         EvalCommand::Validate { suite } => {
             let suite = bcode_eval::load_suite(suite)?;
@@ -1435,6 +1439,12 @@ fn handle_eval_command(command: EvalCommand) -> Result<(), CliError> {
                     );
                 }
             }
+        }
+        EvalCommand::Viewer { run } => {
+            bcode_tui::run_eval_viewer(PathBuf::from("."), run).await?;
+        }
+        EvalCommand::ViewerPicker => {
+            bcode_tui::run_eval_viewer_picker(PathBuf::from(".")).await?;
         }
     }
     Ok(())
