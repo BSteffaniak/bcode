@@ -200,6 +200,17 @@ pub fn run_suite(options: &EvalRunOptions) -> Result<EvalRunResult, EvalError> {
         toml::to_string_pretty(&suite)?,
     )?;
     append_event(&output_dir, "run_started", &manifest)?;
+    let total_repetitions =
+        suite.variants.len() * suite.cases.len() * suite.run.repetitions as usize;
+    progress(format!(
+        "eval run started: {} ({}) — {} variants × {} cases × {} reps = {} repetitions",
+        manifest.run_id,
+        suite.name,
+        suite.variants.len(),
+        suite.cases.len(),
+        suite.run.repetitions,
+        total_repetitions
+    ));
 
     let mut variants = Vec::new();
     for variant in &suite.variants {
@@ -231,6 +242,12 @@ pub fn run_suite(options: &EvalRunOptions) -> Result<EvalRunResult, EvalError> {
         render_summary_markdown(&result),
     )?;
     append_event(&output_dir, "run_finished", &result)?;
+    progress(format!(
+        "eval run finished: {} — passed={} summary={}",
+        result.manifest.run_id,
+        result.passed,
+        output_dir.join("summary.md").display()
+    ));
     Ok(result)
 }
 
@@ -251,6 +268,14 @@ fn run_case_variant(
             .join("repetitions")
             .join(format!("{repetition:04}"));
         fs::create_dir_all(&rep_dir)?;
+        progress(format!(
+            "starting repetition: variant={} case={} rep={}/{} artifact_dir={}",
+            variant.id,
+            case.id,
+            repetition,
+            suite.run.repetitions,
+            rep_dir.display()
+        ));
         let result = run_repetition(
             suite, suite_dir, output_dir, &rep_dir, case, variant, repetition,
         )?;
@@ -265,6 +290,10 @@ fn run_case_variant(
             },
         )?;
         let failed = !result.passed;
+        progress(format!(
+            "finished repetition: variant={} case={} rep={} passed={} wall={}ms",
+            variant.id, case.id, repetition, result.passed, result.wall_time_ms
+        ));
         repetitions.push(result);
         if failed && suite.run.fail_fast {
             break;
@@ -293,6 +322,10 @@ fn run_repetition(
     let mut measurements = EvalMeasurementSet::new();
     let mut diagnostics = Vec::new();
     let mut artifacts = Vec::new();
+    progress(format!(
+        "executing: variant={} case={} rep={} executor={:?}",
+        variant.id, case.id, repetition, variant.executor
+    ));
     let execution = execute_variant(suite, case, variant, repetition, rep_dir, &workspace)?;
     measurements.extend(execution.measurements);
     diagnostics.extend(execution.diagnostics);
@@ -308,15 +341,25 @@ fn run_repetition(
     artifacts.push(relative_artifact(run_dir, "diff", &diff_path));
 
     let mut judges = Vec::new();
+    progress(format!(
+        "judging: variant={} case={} rep={} judges={}",
+        variant.id,
+        case.id,
+        repetition,
+        case.judges.len()
+    ));
     for judge in &case.judges {
-        judges.push(run_judge(
-            judge,
-            suite_dir,
-            rep_dir,
-            &workspace,
-            &diff,
-            &measurements,
-        )?);
+        let judge_result = run_judge(judge, suite_dir, rep_dir, &workspace, &diff, &measurements)?;
+        progress(format!(
+            "judge finished: variant={} case={} rep={} kind={} passed={} required={}",
+            variant.id,
+            case.id,
+            repetition,
+            judge_result.kind,
+            judge_result.passed,
+            judge_result.required
+        ));
+        judges.push(judge_result);
     }
     for judge in &judges {
         for (key, value) in &judge.measurements {
@@ -902,11 +945,19 @@ async fn execute_agent_variant_async(
         )
     });
     let client = bcode_client::BcodeClient::default_endpoint();
+    progress(format!(
+        "agent setup: variant={} case={} rep={} ensuring daemon",
+        variant.id, case.id, repetition
+    ));
     client
         .ensure_daemon_available()
         .await
         .map_err(|error| EvalError::Client(error.to_string()))?;
     let mut policy_diagnostics = validate_agent_policy_overlay(&client, variant).await?;
+    progress(format!(
+        "agent setup: variant={} case={} rep={} creating session",
+        variant.id, case.id, repetition
+    ));
     let session = client
         .create_session_in_working_directory(
             Some(format!("eval:{}:{}:{}", suite.id, case.id, variant.id)),
@@ -945,6 +996,10 @@ async fn execute_agent_variant_async(
         },
     )?;
     let start = Instant::now();
+    progress(format!(
+        "agent turn: variant={} case={} rep={} session={} sending prompt",
+        variant.id, case.id, repetition, session.id
+    ));
     client
         .send_user_message(session.id, prompt, bcode_ipc::PromptPlacement::FollowUp)
         .await
@@ -1039,6 +1094,7 @@ async fn wait_for_agent_turn(
     });
     let mut events = Vec::new();
     let mut saw_turn_started = false;
+    let mut last_progress = Instant::now();
     loop {
         let page = client
             .session_history_page(
@@ -1068,6 +1124,17 @@ async fn wait_for_agent_turn(
                 _ => {}
             }
             events.push(event);
+        }
+        if last_progress.elapsed() >= std::time::Duration::from_secs(10) {
+            progress(format!(
+                "agent turn waiting: variant={} session={} elapsed={}s events={} saw_turn_started={}",
+                variant.id,
+                session_id,
+                start.elapsed().as_secs(),
+                events.len(),
+                saw_turn_started
+            ));
+            last_progress = Instant::now();
         }
         if start.elapsed() >= timeout {
             let cancelled = client
@@ -2558,6 +2625,10 @@ fn normalize_newlines(value: &str) -> String {
 
 fn default_run_id(suite_id: &str) -> String {
     format!("{}-{suite_id}", unix_ms())
+}
+
+fn progress(message: impl AsRef<str>) {
+    eprintln!("[eval] {}", message.as_ref());
 }
 
 fn unix_ms() -> u128 {
