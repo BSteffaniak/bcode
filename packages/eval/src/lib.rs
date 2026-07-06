@@ -477,7 +477,15 @@ struct EnvVarGuard {
 }
 
 impl EnvVarGuard {
-    fn set(key: &'static str, value: &Path) -> Self {
+    fn set_path(key: &'static str, value: &Path) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, previous }
+    }
+
+    fn set_value(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
         let previous = std::env::var_os(key);
         unsafe {
             std::env::set_var(key, value);
@@ -498,6 +506,10 @@ impl Drop for EnvVarGuard {
     }
 }
 
+fn variant_artifact_dir(rep_dir: &Path) -> &Path {
+    rep_dir.parent().and_then(Path::parent).unwrap_or(rep_dir)
+}
+
 fn prepare_agent_daemon_isolation(
     variant: &EvalVariant,
     rep_dir: &Path,
@@ -510,7 +522,8 @@ fn prepare_agent_daemon_isolation(
     if mode == "shared" {
         return Ok(Vec::new());
     }
-    let state_dir = rep_dir.join("daemon-state");
+    let variant_dir = variant_artifact_dir(rep_dir);
+    let state_dir = variant_dir.join("daemon-state");
     fs::create_dir_all(&state_dir)?;
     let socket_root = if Path::new("/tmp").exists() {
         PathBuf::from("/tmp")
@@ -520,12 +533,20 @@ fn prepare_agent_daemon_isolation(
     let socket = socket_root.join(format!(
         "bcode-eval-{}-{:016x}.sock",
         std::process::id(),
-        stable_text_hash(&rep_dir.display().to_string())
+        stable_text_hash(&variant_dir.display().to_string())
     ));
+    let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket.clone());
+    let endpoint_value = bcode_ipc::endpoint_env_value(&endpoint)
+        .map_err(|error| EvalError::Validation(error.to_string()))?;
     Ok(vec![
-        EnvVarGuard::set("BCODE_STATE_DIR", &state_dir),
-        EnvVarGuard::set("BCODE_SOCKET", &socket),
+        EnvVarGuard::set_path("BCODE_STATE_DIR", &state_dir),
+        EnvVarGuard::set_path("BCODE_SOCKET", &socket),
+        EnvVarGuard::set_value(bcode_ipc::BCODE_IPC_ENDPOINT_ENV, endpoint_value),
     ])
+}
+
+fn toml_key(key: &str) -> String {
+    format!("\"{}\"", key.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn prepare_agent_policy_overlay(
@@ -540,11 +561,13 @@ fn prepare_agent_policy_overlay(
         .get("agent_id")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("build");
-    let path = rep_dir.join("permissions.toml");
+    let variant_dir = variant_artifact_dir(rep_dir);
+    fs::create_dir_all(variant_dir)?;
+    let path = variant_dir.join("permissions.toml");
     let allowed = variant
         .allowed_tools
         .iter()
-        .map(|tool| format!("{tool} = true"))
+        .map(|tool| format!("{} = true", toml_key(tool)))
         .collect::<Vec<_>>()
         .join("\n");
     let state = format!(
@@ -818,7 +841,7 @@ async fn execute_agent_variant_async(
     let policy_overlay = prepare_agent_policy_overlay(variant, rep_dir)?;
     let _policy_env = policy_overlay
         .as_ref()
-        .map(|path| EnvVarGuard::set("BCODE_PERMISSIONS_STATE", path));
+        .map(|path| EnvVarGuard::set_path("BCODE_PERMISSIONS_STATE", path));
     let _config_guard = variant.profile.as_deref().map(|profile| {
         bcode_config::push_process_config_overrides(
             bcode_config::ConfigLoadOverrides::from_env_with_cli(
