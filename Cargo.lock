@@ -1373,6 +1373,7 @@ dependencies = [
  "bcode_code_review_models",
  "bcode_config",
  "bcode_daemon_lifecycle",
+ "bcode_eval",
  "bcode_ipc",
  "bcode_metrics",
  "bcode_model",
@@ -1554,6 +1555,26 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "bcode_eval"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_eval_models",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "toml 1.1.2+spec-1.1.0",
+]
+
+[[package]]
+name = "bcode_eval_models"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

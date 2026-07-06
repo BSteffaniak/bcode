@@ -94,6 +94,8 @@ pub enum CliError {
     LoginProfile(String),
     #[error("Blims error: {0}")]
     Blims(String),
+    #[error("eval error: {0}")]
+    Eval(#[from] bcode_eval::EvalError),
     #[error("bundled plugin install failed: {0}")]
     BundledPluginInstallFailed(String),
     #[error("plugin service error {code}: {message}")]
@@ -195,6 +197,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Session { command } => handle_session_command(command).await?,
         Commands::Worktree { command } => handle_worktree_command(command).await?,
         Commands::Blims { command } => blims::handle_blims_command(command).await?,
+        Commands::Eval { command } => handle_eval_command(command)?,
         Commands::Review { command } => Box::pin(handle_review_command(command)).await?,
         Commands::Ralph { repo } => handle_ralph_command(repo).await?,
         Commands::Plugin { command } => handle_plugin_command(command).await?,
@@ -479,6 +482,7 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
         | Commands::Session { .. }
         | Commands::Worktree { .. }
         | Commands::Blims { .. }
+        | Commands::Eval { .. }
         | Commands::Review { .. }
         | Commands::Ralph { .. }
         | Commands::Plugin { .. }
@@ -964,6 +968,10 @@ enum Commands {
         #[command(subcommand)]
         command: blims::BlimsCommand,
     },
+    Eval {
+        #[command(subcommand)]
+        command: EvalCommand,
+    },
     Review {
         #[command(subcommand)]
         command: Option<ReviewCommand>,
@@ -1120,6 +1128,143 @@ impl GithubSubmitEvent {
             Self::Approve => "APPROVE",
         }
     }
+}
+
+#[derive(Debug, Subcommand)]
+enum EvalCommand {
+    /// Validate an eval suite manifest.
+    Validate {
+        /// Suite TOML path.
+        suite: PathBuf,
+    },
+    /// Run an eval suite.
+    Run {
+        /// Suite TOML path.
+        suite: PathBuf,
+        /// Output root for run directories.
+        #[arg(long, default_value = "target/bcode-evals/runs")]
+        output_root: PathBuf,
+        /// Optional explicit run id.
+        #[arg(long)]
+        run_id: Option<String>,
+        /// Print the full JSON summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a run summary.
+    Report {
+        /// Run directory or summary.json path.
+        run: PathBuf,
+        /// Print JSON instead of Markdown-ish text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compare runs.
+    Compare {
+        /// Run directories or summary.json paths.
+        runs: Vec<PathBuf>,
+        /// Optional output JSON path.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Set a baseline for a suite from a completed run.
+    Baseline {
+        /// Eval output root.
+        #[arg(long, default_value = "target/bcode-evals")]
+        output_root: PathBuf,
+        /// Run directory or summary.json path.
+        run: PathBuf,
+    },
+    /// Check a candidate run for regressions against a baseline.
+    Regressions {
+        /// Baseline JSON path or baseline run summary.
+        baseline: PathBuf,
+        /// Candidate run directory or summary.json path.
+        candidate: PathBuf,
+        /// Print JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+fn handle_eval_command(command: EvalCommand) -> Result<(), CliError> {
+    match command {
+        EvalCommand::Validate { suite } => {
+            let suite = bcode_eval::load_suite(suite)?;
+            println!("valid eval suite: {} ({})", suite.id, suite.name);
+        }
+        EvalCommand::Run {
+            suite,
+            output_root,
+            run_id,
+            json,
+        } => {
+            let options = bcode_eval::EvalRunOptions {
+                suite_path: suite,
+                output_root,
+                run_id,
+            };
+            let result = bcode_eval::run_suite(&options)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("eval run: {}", result.manifest.run_id);
+                println!(
+                    "summary: {}",
+                    result.manifest.output_dir.join("summary.md").display()
+                );
+                println!("passed: {}", result.passed);
+            }
+        }
+        EvalCommand::Report { run, json } => {
+            let result = bcode_eval::load_run_result(run)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("eval run: {}", result.manifest.run_id);
+                println!("suite: {}", result.manifest.suite_id);
+                for variant in &result.variants {
+                    println!(
+                        "{}\tpass={:.2}%\tscore={:.3}",
+                        variant.variant_id,
+                        variant.pass_rate * 100.0,
+                        variant.score.overall
+                    );
+                }
+            }
+        }
+        EvalCommand::Compare { runs, output } => {
+            let results = runs
+                .iter()
+                .map(bcode_eval::load_run_result)
+                .collect::<Result<Vec<_>, _>>()?;
+            let report = bcode_eval::compare_runs(&results);
+            if let Some(output) = output {
+                bcode_eval::write_comparison_report(&report, output)?;
+            }
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        EvalCommand::Baseline { output_root, run } => {
+            let baseline = bcode_eval::set_baseline(output_root, run)?;
+            println!("baseline {} -> {}", baseline.suite_id, baseline.run_id);
+        }
+        EvalCommand::Regressions {
+            baseline,
+            candidate,
+            json,
+        } => {
+            let report = bcode_eval::regression_report(baseline, candidate)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("regressed: {}", report.regressed);
+                for diagnostic in report.diagnostics {
+                    println!("{:?}: {}", diagnostic.severity, diagnostic.message);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
