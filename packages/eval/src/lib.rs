@@ -604,7 +604,7 @@ fn execute_direct_tool_variant(
             ))
         })?;
     let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
+        .enable_all()
         .build()?;
     runtime.block_on(async {
         let client = bcode_client::BcodeClient::default_endpoint();
@@ -622,25 +622,20 @@ fn execute_direct_tool_variant(
         };
         let payload = serde_json::to_vec(&request)?;
         let start = Instant::now();
-        let response = if let Some(plugin_id) = &config.plugin_id {
-            client
-                .invoke_plugin_service(
-                    plugin_id.clone(),
-                    bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_string(),
-                    bcode_tool::OP_INVOKE_TOOL.to_string(),
-                    payload,
-                )
-                .await
+        let plugin_id = if let Some(plugin_id) = &config.plugin_id {
+            plugin_id.clone()
         } else {
-            client
-                .call_plugin_service(
-                    bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_string(),
-                    bcode_tool::OP_INVOKE_TOOL.to_string(),
-                    payload,
-                )
-                .await
-        }
-        .map_err(|error| EvalError::Client(error.to_string()))?;
+            resolve_tool_plugin_id(&client, &config.tool_name).await?
+        };
+        let response = client
+            .invoke_plugin_service(
+                plugin_id,
+                bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_string(),
+                bcode_tool::OP_INVOKE_TOOL.to_string(),
+                payload,
+            )
+            .await
+            .map_err(|error| EvalError::Client(error.to_string()))?;
         let stdout_path = rep_dir.join("direct-tool-response.json");
         let mut measurements = EvalMeasurementSet::new();
         measurements.insert(
@@ -692,6 +687,48 @@ fn execute_direct_tool_variant(
             }],
         })
     })
+}
+
+async fn resolve_tool_plugin_id(
+    client: &bcode_client::BcodeClient,
+    tool_name: &str,
+) -> Result<String, EvalError> {
+    let services = client
+        .plugin_services()
+        .await
+        .map_err(|error| EvalError::Client(error.to_string()))?;
+    let mut matches = Vec::new();
+    for service in services
+        .into_iter()
+        .filter(|service| service.interface_id == bcode_tool::TOOL_SERVICE_INTERFACE_ID)
+    {
+        let payload = serde_json::to_vec(&bcode_tool::ListToolsRequest::default())?;
+        let response = client
+            .invoke_plugin_service(
+                service.plugin_id.clone(),
+                bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_string(),
+                bcode_tool::OP_LIST_TOOLS.to_string(),
+                payload,
+            )
+            .await
+            .map_err(|error| EvalError::Client(error.to_string()))?;
+        if response.error.is_some() {
+            continue;
+        }
+        let list = serde_json::from_slice::<bcode_tool::ToolList>(&response.payload)?;
+        if list.tools.iter().any(|tool| tool.name == tool_name) {
+            matches.push(service.plugin_id);
+        }
+    }
+    match matches.as_slice() {
+        [plugin_id] => Ok(plugin_id.clone()),
+        [] => Err(EvalError::Validation(format!(
+            "no loaded tool provider exposes tool {tool_name:?}"
+        ))),
+        many => Err(EvalError::Validation(format!(
+            "multiple tool providers expose tool {tool_name:?}: {many:?}; set direct_tool.plugin_id"
+        ))),
+    }
 }
 
 fn execute_replay_variant(
@@ -752,7 +789,7 @@ fn execute_agent_variant(
     workspace: &Path,
 ) -> Result<ExecutionOutput, EvalError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
+        .enable_all()
         .build()?;
     runtime.block_on(execute_agent_variant_async(
         suite, case, variant, repetition, rep_dir, workspace,
@@ -830,7 +867,15 @@ async fn execute_agent_variant_async(
         .await
         .map_err(|error| EvalError::Client(error.to_string()))?;
     let timeout = std::time::Duration::from_millis(case.timeout_ms.unwrap_or(suite.run.timeout_ms));
-    let events = wait_for_agent_turn(&client, session.id, start_sequence, timeout).await?;
+    let events = wait_for_agent_turn(
+        &client,
+        session.id,
+        start_sequence,
+        timeout,
+        variant,
+        rep_dir,
+    )
+    .await?;
     let transcript_path = rep_dir.join("transcript.jsonl");
     let tool_calls_path = rep_dir.join("tool-calls.jsonl");
     write_session_events_jsonl(&transcript_path, &events)?;
@@ -902,6 +947,8 @@ async fn wait_for_agent_turn(
     session_id: bcode_session_models::SessionId,
     start_sequence: u64,
     timeout: std::time::Duration,
+    variant: &EvalVariant,
+    rep_dir: &Path,
 ) -> Result<Vec<bcode_session_models::SessionEvent>, EvalError> {
     let start = Instant::now();
     let mut cursor = Some(bcode_session_models::SessionHistoryCursor {
@@ -940,10 +987,81 @@ async fn wait_for_agent_turn(
             events.push(event);
         }
         if start.elapsed() >= timeout {
+            let cancelled = client
+                .cancel_session_turn(session_id)
+                .await
+                .map_err(|error| EvalError::Client(error.to_string()))?;
+            append_observation(
+                rep_dir,
+                &EvalObservation {
+                    unix_ms: unix_ms(),
+                    source: "agent_turn_timeout_cancel".into(),
+                    payload: serde_json::json!({"cancelled": cancelled}),
+                },
+            )?;
             return Ok(events);
         }
+        handle_eval_permissions(client, variant, rep_dir).await?;
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
+}
+
+async fn handle_eval_permissions(
+    client: &bcode_client::BcodeClient,
+    variant: &EvalVariant,
+    rep_dir: &Path,
+) -> Result<(), EvalError> {
+    let mode = variant
+        .metadata
+        .get("permission_mode")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("fail");
+    let permissions = client
+        .list_permissions()
+        .await
+        .map_err(|error| EvalError::Client(error.to_string()))?;
+    if permissions.is_empty() {
+        return Ok(());
+    }
+    append_observation(
+        rep_dir,
+        &EvalObservation {
+            unix_ms: unix_ms(),
+            source: "agent_permission_checkpoint".into(),
+            payload: serde_json::to_value(&permissions)?,
+        },
+    )?;
+    match mode {
+        "approve" => {
+            for permission in permissions {
+                client
+                    .resolve_permission(permission.permission_id, true)
+                    .await
+                    .map_err(|error| EvalError::Client(error.to_string()))?;
+            }
+        }
+        "deny" => {
+            for permission in permissions {
+                client
+                    .resolve_permission(permission.permission_id, false)
+                    .await
+                    .map_err(|error| EvalError::Client(error.to_string()))?;
+            }
+        }
+        "fail" => {
+            return Err(EvalError::Validation(format!(
+                "agent variant {} hit {} permission prompt(s); set metadata.permission_mode to approve or deny for unattended runs",
+                variant.id,
+                permissions.len()
+            )));
+        }
+        other => {
+            return Err(EvalError::Validation(format!(
+                "unknown permission_mode {other:?}; expected fail, approve, or deny"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn write_session_events_jsonl(
@@ -1376,6 +1494,54 @@ fn normalize_patch_for_bless(value: &str) -> String {
     normalized
 }
 
+/// List model-callable tools exposed by loaded tool-provider plugins.
+///
+/// # Errors
+///
+/// Returns an error when the daemon or a tool provider rejects the request.
+pub fn list_loaded_tools() -> Result<Vec<bcode_tool::ToolDefinition>, EvalError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let client = bcode_client::BcodeClient::default_endpoint();
+        client
+            .ensure_daemon_available()
+            .await
+            .map_err(|error| EvalError::Client(error.to_string()))?;
+        let services = client
+            .plugin_services()
+            .await
+            .map_err(|error| EvalError::Client(error.to_string()))?;
+        let mut tools = Vec::new();
+        for service in services
+            .into_iter()
+            .filter(|service| service.interface_id == bcode_tool::TOOL_SERVICE_INTERFACE_ID)
+        {
+            let payload = serde_json::to_vec(&bcode_tool::ListToolsRequest::default())?;
+            let response = client
+                .invoke_plugin_service(
+                    service.plugin_id,
+                    bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_string(),
+                    bcode_tool::OP_LIST_TOOLS.to_string(),
+                    payload,
+                )
+                .await
+                .map_err(|error| EvalError::Client(error.to_string()))?;
+            if let Some(error) = response.error {
+                return Err(EvalError::Client(format!(
+                    "tool provider returned {}: {}",
+                    error.code, error.message
+                )));
+            }
+            let list = serde_json::from_slice::<bcode_tool::ToolList>(&response.payload)?;
+            tools.extend(list.tools);
+        }
+        tools.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(tools)
+    })
+}
+
 /// Export a session history as replay JSONL.
 ///
 /// # Errors
@@ -1393,7 +1559,7 @@ pub fn export_session_replay(
         fs::create_dir_all(parent)?;
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
+        .enable_all()
         .build()?;
     runtime.block_on(async {
         let client = bcode_client::BcodeClient::default_endpoint();
@@ -1610,7 +1776,7 @@ pub fn render_runs_comparison_markdown(runs: &[EvalRunResult]) -> String {
     let report = compare_runs(runs);
     let mut out = render_comparison_markdown(&report);
     out.push_str("\n## Case Matrix\n\n");
-    out.push_str("| Run | Variant | Case | Pass rate | Avg wall ms | Wall stddev | Avg tokens | Tool calls | Flaky |\n|---|---|---|---:|---:|---:|---:|---:|---|\n");
+    out.push_str("| Run | Variant | Case | Pass rate | Avg wall ms | Wall stddev | Avg tokens | Tool calls | Flaky | Diff variance |\n|---|---|---|---:|---:|---:|---:|---:|---|---|\n");
     for run in runs {
         for variant in &run.variants {
             for case in &variant.cases {
@@ -1622,8 +1788,9 @@ pub fn render_runs_comparison_markdown(runs: &[EvalRunResult]) -> String {
                     .collect::<Vec<_>>();
                 let wall_stddev = stddev(&wall_values);
                 let flaky = case.pass_rate > 0.0 && case.pass_rate < 1.0;
+                let diff_variance = diff_hash_count(&run.manifest.output_dir, &reps);
                 out.push_str(&format!(
-                    "| {} | {} | {} | {:.2}% | {:.2} | {:.2} | {:.2} | {:.2} | {} |\n",
+                    "| {} | {} | {} | {:.2}% | {:.2} | {:.2} | {:.2} | {:.2} | {} | {} |\n",
                     run.manifest.run_id,
                     variant.variant_id,
                     case.case_id,
@@ -1633,6 +1800,7 @@ pub fn render_runs_comparison_markdown(runs: &[EvalRunResult]) -> String {
                     metrics.get("total_tokens").copied().unwrap_or_default(),
                     metrics.get("tool_call_count").copied().unwrap_or_default(),
                     if flaky { "yes" } else { "no" },
+                    diff_variance,
                 ));
             }
         }
@@ -1645,7 +1813,64 @@ pub fn render_runs_comparison_markdown(runs: &[EvalRunResult]) -> String {
             run.manifest.output_dir.display()
         ));
     }
+    out.push_str("\n## Repetition Artifacts\n\n");
+    for run in runs {
+        for variant in &run.variants {
+            for case in &variant.cases {
+                for repetition in &case.repetitions {
+                    out.push_str(&format!(
+                        "* `{}` / `{}` / `{}` / rep {}: {}\n",
+                        run.manifest.run_id,
+                        variant.variant_id,
+                        case.case_id,
+                        repetition.repetition,
+                        artifact_links(repetition)
+                    ));
+                }
+            }
+        }
+    }
     out
+}
+
+fn diff_hash_count(run_dir: &Path, repetitions: &[&EvalRepetitionResult]) -> usize {
+    let mut hashes = std::collections::BTreeSet::new();
+    for repetition in repetitions {
+        for artifact in &repetition.artifacts {
+            if artifact.kind == "diff" {
+                let path = if artifact.path.is_absolute() {
+                    artifact.path.clone()
+                } else {
+                    run_dir.join(&artifact.path)
+                };
+                if let Ok(text) = fs::read_to_string(path) {
+                    hashes.insert(stable_text_hash(&text));
+                }
+            }
+        }
+    }
+    hashes.len()
+}
+
+fn artifact_links(repetition: &EvalRepetitionResult) -> String {
+    if repetition.artifacts.is_empty() {
+        return "no artifacts".to_string();
+    }
+    repetition
+        .artifacts
+        .iter()
+        .map(|artifact| format!("[{}]({})", artifact.kind, artifact.path.display()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn stable_text_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn stddev(values: &[f64]) -> f64 {

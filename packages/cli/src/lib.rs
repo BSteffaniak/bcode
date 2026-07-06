@@ -199,7 +199,11 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Session { command } => handle_session_command(command).await?,
         Commands::Worktree { command } => handle_worktree_command(command).await?,
         Commands::Blims { command } => blims::handle_blims_command(command).await?,
-        Commands::Eval { command } => handle_eval_command(command)?,
+        Commands::Eval { command } => {
+            tokio::task::spawn_blocking(move || handle_eval_command(command))
+                .await
+                .map_err(|error| CliError::EvalCheckFailed(error.to_string()))??;
+        }
         Commands::Review { command } => Box::pin(handle_review_command(command)).await?,
         Commands::Ralph { repo } => handle_ralph_command(repo).await?,
         Commands::Plugin { command } => handle_plugin_command(command).await?,
@@ -1253,6 +1257,12 @@ enum EvalCommand {
         /// Output JSONL path.
         output: PathBuf,
     },
+    /// List model-callable tools exposed by loaded plugins.
+    Tools {
+        /// Print JSON output.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1418,6 +1428,19 @@ fn handle_eval_command(command: EvalCommand) -> Result<(), CliError> {
         EvalCommand::ReplaySession { session_id, output } => {
             bcode_eval::export_session_replay(&session_id, &output)?;
             println!("exported replay transcript to {}", output.display());
+        }
+        EvalCommand::Tools { json } => {
+            let tools = bcode_eval::list_loaded_tools()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&tools)?);
+            } else {
+                for tool in tools {
+                    println!(
+                        "{}\t{:?}\t{}",
+                        tool.name, tool.side_effect, tool.description
+                    );
+                }
+            }
         }
     }
     Ok(())

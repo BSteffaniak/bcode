@@ -1,0 +1,115 @@
+schema_version = 1
+id = "agent-edit-tools"
+name = "Agent Edit Tool Comparison"
+description = "Compare real Bcode agents using vim-edit versus filesystem-edit tools. Requires a configured model/provider."
+
+[run]
+repetitions = 3
+timeout_ms = 180000
+isolation = "temp_copy"
+randomize_case_order = false
+fail_fast = false
+
+[score]
+correctness = 0.70
+efficiency = 0.15
+speed = 0.10
+cost = 0.0
+stability = 0.05
+correctness_required = true
+
+[[score.metrics]]
+metric = "total_tokens"
+direction = "lower_is_better"
+weight = 2
+target = 50000
+
+[[score.metrics]]
+metric = "wall_time_ms"
+direction = "lower_is_better"
+weight = 1
+target = 120000
+
+[regression]
+min_pass_rate = 0.95
+max_token_increase_percent = 15.0
+max_latency_increase_percent = 25.0
+fail_on_new_failure = true
+
+[[variants]]
+id = "vim-edit-agent"
+name = "Vim edit agent"
+executor = "agent"
+profile = "build"
+allowed_tools = ["filesystem.read", "vim_edit.preview", "vim_edit.apply", "shell.run"]
+metadata = { agent_id = "build", permission_mode = "approve" }
+
+[[variants]]
+id = "filesystem-edit-agent"
+name = "Filesystem edit agent"
+executor = "agent"
+profile = "build"
+allowed_tools = ["filesystem.read", "filesystem.edit", "shell.run"]
+metadata = { agent_id = "build", permission_mode = "approve" }
+
+[[variants]]
+id = "mixed-edit-agent"
+name = "Mixed edit agent"
+executor = "agent"
+profile = "build"
+allowed_tools = ["filesystem.read", "filesystem.edit", "vim_edit.preview", "vim_edit.apply", "shell.run"]
+metadata = { agent_id = "build", permission_mode = "approve" }
+
+[[cases]]
+id = "one-line"
+name = "Surgical one-line edit"
+fixture = "../edit-tools/cases/one-line/input"
+prompt = "Change TIMEOUT_MS from 1000 to 1500. Make the smallest correct edit, then run tests."
+timeout_ms = 180000
+
+[[cases.judges]]
+type = "exact_diff"
+expected_patch = "../edit-tools/cases/one-line/expected.patch"
+required = true
+
+[[cases.judges]]
+type = "command"
+command = "cargo test --quiet"
+expected_exit_code = 0
+required = true
+
+[[cases]]
+id = "rename-symbol"
+name = "Rename symbol and update call sites"
+fixture = "../edit-tools/cases/rename-symbol/input"
+prompt = "Rename function old_name to new_name and update all call sites. Make the smallest correct edit, then run tests."
+timeout_ms = 180000
+
+[[cases.judges]]
+type = "exact_diff"
+expected_patch = "../edit-tools/cases/rename-symbol/expected.patch"
+required = true
+
+[[cases.judges]]
+type = "command"
+command = "cargo test --quiet"
+expected_exit_code = 0
+required = true
+
+[[cases]]
+id = "repeated-pattern"
+name = "Change only semantic status string occurrences"
+fixture = "../edit-tools/cases/repeated-pattern/input"
+prompt = "Change the user-visible completed status from done to complete, preserving behavior and tests. Make the smallest correct edit."
+timeout_ms = 180000
+
+[[cases.judges]]
+type = "exact_diff"
+expected_patch = "../edit-tools/cases/repeated-pattern/expected.patch"
+required = true
+
+[[cases.judges]]
+type = "command"
+command = "cargo test --quiet"
+expected_exit_code = 0
+required = true
