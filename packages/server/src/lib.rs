@@ -93,7 +93,13 @@ const CLIENT_EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const CATALOG_EVENT_BROADCAST_BATCH_SIZE: usize = 16;
 
 /// Shared client writer.
-type SharedWriter = Arc<Mutex<WriteHalf<LocalIpcStream>>>;
+#[derive(Debug)]
+struct ResponseWriter {
+    writer: Mutex<WriteHalf<LocalIpcStream>>,
+    metrics: MetricsRegistry,
+}
+
+pub(crate) type SharedWriter = Arc<ResponseWriter>;
 
 /// Plugin event topic published for every session event appended by the server.
 pub const SESSION_EVENT_PLUGIN_TOPIC: &str = "bcode.session.event";
@@ -221,7 +227,7 @@ impl ClientEventSink {
         let envelope = event_envelope(&event)?;
         let started_at = Instant::now();
         let result = {
-            let mut writer = self.writer.lock().await;
+            let mut writer = self.writer.writer.lock().await;
             tokio::time::timeout(
                 CLIENT_EVENT_SEND_TIMEOUT,
                 send_envelope(&mut *writer, &envelope),
@@ -1807,7 +1813,10 @@ async fn handle_registered_client(
     client_id: ClientId,
 ) -> Result<(), ServerError> {
     let (mut reader, writer) = split(stream);
-    let writer = Arc::new(Mutex::new(writer));
+    let writer = Arc::new(ResponseWriter {
+        writer: Mutex::new(writer),
+        metrics: state.metrics.clone(),
+    });
     let mut attached_session: Option<SessionId> = None;
 
     loop {
@@ -12039,9 +12048,10 @@ async fn build_model_turn_request(
             .and_then(|context| context.system_prompt_suffix.as_deref()),
         Some(&skill_catalog),
     );
-    state.metrics.record_histogram(
+    state.metrics.record_histogram_with_labels(
         "model.request_build.system_prompt_duration_ms",
         system_prompt_timer.elapsed_ms(),
+        metric_labels.clone(),
     );
     let mut system_prefix_len = 0;
     if !dynamic_system_context.trim().is_empty() {
@@ -12072,13 +12082,15 @@ async fn build_model_turn_request(
     }
     let skill_context_timer = state.metrics.timer();
     let skill_contexts = turn_skill_contexts(state, session_id, trigger_event.sequence).await;
-    state.metrics.record_histogram(
+    state.metrics.record_histogram_with_labels(
         "model.request_build.skill_context_duration_ms",
         skill_context_timer.elapsed_ms(),
+        metric_labels.clone(),
     );
-    state.metrics.record_histogram(
+    state.metrics.record_histogram_with_labels(
         "model.context.skill_context_count",
         skill_contexts.len() as u64,
+        metric_labels.clone(),
     );
     for skill_context in skill_contexts {
         let preview = skill_context_preview(&skill_context.context);
@@ -12112,13 +12124,16 @@ async fn build_model_turn_request(
         .and_then(|context| context.enabled_tools.clone());
     let tool_collection_timer = state.metrics.timer();
     let tools = collect_model_tools(state, enabled_tools).await;
-    state.metrics.record_histogram(
+    state.metrics.record_histogram_with_labels(
         "model.request_build.tool_collection_duration_ms",
         tool_collection_timer.elapsed_ms(),
+        metric_labels.clone(),
     );
-    state
-        .metrics
-        .record_histogram("model.context.tool_count", tools.len() as u64);
+    state.metrics.record_histogram_with_labels(
+        "model.context.tool_count",
+        tools.len() as u64,
+        metric_labels.clone(),
+    );
     let model_id = model_id_for_provider_request(selected_model_id);
     let reasoning_capabilities = resolve_model_reasoning_info(
         state,
@@ -12146,9 +12161,10 @@ async fn build_model_turn_request(
         }
         p
     };
-    state.metrics.record_histogram(
+    state.metrics.record_histogram_with_labels(
         "model.request_build.parameters_duration_ms",
         parameters_timer.elapsed_ms(),
+        metric_labels.clone(),
     );
     let mut provider_context = selection.provider_context.clone();
     select_host_auth_pool_candidate(state, provider_plugin_id, &mut provider_context).await;
@@ -12163,15 +12179,17 @@ async fn build_model_turn_request(
         parameters: &parameters,
         messages: &messages,
     });
-    state.metrics.record_histogram(
+    state.metrics.record_histogram_with_labels(
         "model.request_build.conversation_projection_duration_ms",
         projection_timer.elapsed_ms(),
+        metric_labels.clone(),
     );
     let conversation_reuse_timer = state.metrics.timer();
     let conversation_reuse = plan_conversation_reuse(state, &projection, messages.len()).await;
-    state.metrics.record_histogram(
+    state.metrics.record_histogram_with_labels(
         "model.request_build.conversation_reuse_plan_duration_ms",
         conversation_reuse_timer.elapsed_ms(),
+        metric_labels.clone(),
     );
     let metadata_timer = state.metrics.timer();
     let mut metadata = projection.metadata();
@@ -12181,9 +12199,10 @@ async fn build_model_turn_request(
     {
         insert_model_cache_metadata(&mut metadata, &cache_info);
     }
-    state.metrics.record_histogram(
+    state.metrics.record_histogram_with_labels(
         "model.request_build.metadata_duration_ms",
         metadata_timer.elapsed_ms(),
+        metric_labels.clone(),
     );
     let request_assembly_timer = state.metrics.timer();
     let request = ModelTurnRequest {
@@ -14329,6 +14348,11 @@ async fn request_tool_permission(
     policy_context: PermissionPolicyContext,
 ) -> bool {
     let permission_id = next_permission_id(state).await;
+    state.metrics.add_counter_with_labels(
+        "tool.permission.request_total",
+        1,
+        tool_permission_metric_labels(&definition.name, "requested"),
+    );
     let arguments_json = serde_json::to_string(&call.arguments).unwrap_or_default();
     let agent_id = session_agent_selection(state, session_id).await;
     append_permission_requested_event(
@@ -14384,6 +14408,23 @@ async fn request_tool_permission(
     loop {
         let decision = *pending.decision.lock().await;
         if let Some(decision) = decision {
+            let duration_ms = elapsed_ms(wait_start);
+            state.metrics.record_histogram_with_labels(
+                "tool.permission.wait_duration_ms",
+                duration_ms,
+                tool_permission_metric_labels(
+                    &pending.summary.tool_name,
+                    if decision { "approved" } else { "denied" },
+                ),
+            );
+            state.metrics.add_counter_with_labels(
+                "tool.permission.decision_total",
+                1,
+                tool_permission_metric_labels(
+                    &pending.summary.tool_name,
+                    if decision { "approved" } else { "denied" },
+                ),
+            );
             append_trace_event(
                 state,
                 session_id,
@@ -14393,7 +14434,7 @@ async fn request_tool_permission(
                     permission_id: pending.summary.permission_id.clone(),
                     tool_call_id: pending.summary.tool_call_id.clone(),
                     approved: Some(decision),
-                    duration_ms: Some(elapsed_ms(wait_start)),
+                    duration_ms: Some(duration_ms),
                 },
             )
             .await;
@@ -14402,6 +14443,17 @@ async fn request_tool_permission(
         tokio::select! {
             () = pending.notify.notified() => {}
             () = cancel_state.cancelled() => {
+                let duration_ms = elapsed_ms(wait_start);
+                state.metrics.record_histogram_with_labels(
+                    "tool.permission.wait_duration_ms",
+                    duration_ms,
+                    tool_permission_metric_labels(&pending.summary.tool_name, "cancelled"),
+                );
+                state.metrics.add_counter_with_labels(
+                    "tool.permission.decision_total",
+                    1,
+                    tool_permission_metric_labels(&pending.summary.tool_name, "cancelled"),
+                );
                 append_trace_event(
                     state,
                     session_id,
@@ -14411,7 +14463,7 @@ async fn request_tool_permission(
                         permission_id: pending.summary.permission_id.clone(),
                         tool_call_id: pending.summary.tool_call_id.clone(),
                         approved: Some(false),
-                        duration_ms: Some(elapsed_ms(wait_start)),
+                        duration_ms: Some(duration_ms),
                     },
                 )
                 .await;
@@ -14431,6 +14483,13 @@ async fn request_tool_permission(
             }
         }
     }
+}
+
+fn tool_permission_metric_labels(tool_name: &str, outcome: &str) -> MetricLabels {
+    let mut labels = MetricLabels::new();
+    labels.insert("tool_name".to_owned(), tool_name.to_owned());
+    labels.insert("outcome".to_owned(), outcome.to_owned());
+    labels
 }
 
 async fn next_permission_id(state: &ServerState) -> String {
@@ -16050,11 +16109,47 @@ pub(crate) async fn send_response(
     request_id: u64,
     response: Response,
 ) -> Result<(), ServerError> {
+    let serialize_started_at = Instant::now();
     let envelope = response_envelope(request_id, &response)?;
-    let mut writer = writer.lock().await;
-    send_envelope(&mut *writer, &envelope).await?;
-    drop(writer);
+    let mut labels = MetricLabels::new();
+    labels.insert(
+        "response_kind".to_owned(),
+        response_kind(&response).to_owned(),
+    );
+    writer.metrics.record_histogram_with_labels(
+        "ipc.response.serialize_duration_ms",
+        elapsed_ms(serialize_started_at),
+        labels.clone(),
+    );
+    writer.metrics.record_histogram_with_labels(
+        "ipc.response.payload_bytes",
+        usize_to_u64(envelope.payload.len()),
+        labels.clone(),
+    );
+    let write_started_at = Instant::now();
+    let result = {
+        let mut writer_guard = writer.writer.lock().await;
+        send_envelope(&mut *writer_guard, &envelope).await
+    };
+    writer.metrics.record_histogram_with_labels(
+        "ipc.response.write_duration_ms",
+        elapsed_ms(write_started_at),
+        labels.clone(),
+    );
+    if result.is_err() {
+        writer
+            .metrics
+            .add_counter_with_labels("ipc.response.write_errors_total", 1, labels);
+    }
+    result?;
     Ok(())
+}
+
+const fn response_kind(response: &Response) -> &'static str {
+    match response {
+        Response::Ok(_) => "ok",
+        Response::Err(_) => "error",
+    }
 }
 
 fn build_skill_registry(config: &bcode_config::BcodeConfig) -> Option<SkillRegistry> {

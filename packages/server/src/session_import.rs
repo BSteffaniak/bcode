@@ -1,7 +1,6 @@
 //! Session import orchestration for the local server.
 
-use crate::{ErrorResponse, ServerError, ServerState, send_response};
-use bcode_ipc::LocalIpcStream;
+use crate::{ErrorResponse, ServerError, ServerState, SharedWriter, send_response};
 use bcode_ipc::{Response, ResponsePayload, SessionImportWarning};
 use bcode_session_import::{
     DiscoverImportableSessionsRequest, DiscoverImportableSessionsResponse, ImportableSessionEvent,
@@ -15,12 +14,7 @@ use sha2::{Digest as _, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::WriteHalf;
-use tokio::sync::Mutex;
 use uuid::Uuid;
-
-/// Shared client writer.
-type SharedWriter = Arc<Mutex<WriteHalf<LocalIpcStream>>>;
 
 async fn all_cached_sessions(state: &ServerState) -> Vec<bcode_session_models::SessionSummary> {
     state.sessions.all_session_summaries().await
