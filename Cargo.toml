@@ -29,6 +29,7 @@ members = [
     "packages/agent-policy/models",
     "packages/code-review/models",
     "packages/agent-profile",
+    "packages/agent-runtime",
     "packages/bcode",
     "packages/bundled-plugins",
     "packages/cli",
@@ -88,6 +89,7 @@ version    = "0.0.1-alpha.0"
 bcode_agent_policy                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/agent-policy" }
 bcode_agent_policy_models               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/agent-policy/models" }
 bcode_agent_profile                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/agent-profile" }
+bcode_agent_runtime                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/agent-runtime" }
 bcode_bedrock_provider_plugin           = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/bedrock-provider-plugin" }
 bcode_blims_plugin                      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/blims-plugin" }
 bcode_bundled_plugins                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/bundled-plugins" }

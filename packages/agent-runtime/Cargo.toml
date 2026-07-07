@@ -1,0 +1,23 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Reusable agent turn runtime for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "agent", "runtime"]
+license     = { workspace = true }
+name        = "bcode_agent_runtime"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_model          = { workspace = true }
+bcode_session_models = { workspace = true }
+bcode_tool           = { workspace = true }
+serde_json           = { workspace = true }
+thiserror            = { workspace = true }
+tokio                = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[features]
+default          = []
+fail-on-warnings = []

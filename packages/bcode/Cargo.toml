@@ -15,9 +15,12 @@ name = "bcode"
 path = "src/main.rs"
 
 [dependencies]
+bcode_agent_runtime   = { workspace = true }
 bcode_bundled_plugins = { workspace = true }
 bcode_cli             = { workspace = true }
-tokio                 = { workspace = true, features = ["macros", "rt-multi-thread"] }
+bcode_model           = { workspace = true }
+thiserror             = { workspace = true }
+tokio                 = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 
 [features]
 bundled-ocr-tesseract = ["bundled-ocr-tesseract-default"]
