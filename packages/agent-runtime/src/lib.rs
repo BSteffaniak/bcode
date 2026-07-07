@@ -12,10 +12,13 @@ use bcode_model::{
     AckResponse, CancelTurnRequest, ContentBlock, FinishTurnRequest, MessageRole, ModelMessage,
     ModelParameters, ModelTurnRequest, PollTurnEventsRequest, PollTurnEventsResponse,
     ProviderError, ProviderRequestContext, ProviderRequestProjection, ProviderTurnEvent,
-    StartTurnResponse, StopReason, TokenUsage, ToolCall,
+    StartTurnResponse, StopReason, TokenUsage, ToolCall, ToolResult,
 };
 use bcode_session_models::SessionId;
-use bcode_tool::ToolDefinition;
+use bcode_tool::{
+    ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
+    ToolResultContent as InvocationToolResultContent,
+};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -62,6 +65,14 @@ pub enum RuntimeError {
     /// A tool was requested but no executor could handle it.
     #[error("tool not found: {0}")]
     ToolNotFound(String),
+    /// Tool execution failed.
+    #[error("tool execution failed for {tool_name}: {message}")]
+    ToolExecution {
+        /// Tool name.
+        tool_name: String,
+        /// Human-readable error message.
+        message: String,
+    },
     /// Tool execution was denied by policy.
     #[error("tool execution denied: {0}")]
     PermissionDenied(String),
@@ -274,10 +285,87 @@ pub trait ModelProviderInvoker: Send {
     ) -> RuntimeFuture<'a, AckResponse>;
 }
 
+/// Source used to route a registered model-callable tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolSource {
+    /// Tool is implemented by an SDK caller in-process.
+    Inline,
+    /// Tool is implemented by a plugin service.
+    Plugin {
+        /// Plugin ID that owns the tool implementation.
+        plugin_id: String,
+    },
+}
+
+/// Model-callable tool with routing metadata attached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredTool {
+    /// Model-visible tool definition.
+    pub definition: ToolDefinition,
+    /// Runtime routing source.
+    pub source: ToolSource,
+}
+
+impl RegisteredTool {
+    /// Create an inline tool registration.
+    #[must_use]
+    pub const fn inline(definition: ToolDefinition) -> Self {
+        Self {
+            definition,
+            source: ToolSource::Inline,
+        }
+    }
+
+    /// Create a plugin-owned tool registration.
+    #[must_use]
+    pub fn plugin(definition: ToolDefinition, plugin_id: impl Into<String>) -> Self {
+        Self {
+            definition,
+            source: ToolSource::Plugin {
+                plugin_id: plugin_id.into(),
+            },
+        }
+    }
+}
+
+/// Tool execution output normalized for model feedback and host/UI consumers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolExecutionOutput {
+    /// Model-visible tool result.
+    pub model_result: ToolResult,
+    /// Full typed invocation response returned by the executor.
+    pub invocation: ToolInvocationResponse,
+}
+
+/// Abstract execution boundary for model-callable tools.
+pub trait ToolExecutor: Send + Sync {
+    /// Execute one requested tool invocation.
+    fn execute_tool<'a>(
+        &'a self,
+        tool: &'a RegisteredTool,
+        request: &'a ToolInvocationRequest,
+    ) -> RuntimeFuture<'a, ToolInvocationResponse>;
+}
+
 /// Tool catalog visible to the runtime.
 pub trait ToolCatalog: Send + Sync {
+    /// Return registered model-callable tools with routing metadata.
+    fn tools(&self) -> Vec<RegisteredTool>;
+
     /// Return model-callable tool definitions.
-    fn definitions(&self) -> Vec<ToolDefinition>;
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        self.tools()
+            .into_iter()
+            .map(|tool| tool.definition)
+            .collect()
+    }
+
+    /// Return the registered tool with the requested name, when present.
+    fn find_tool(&self, name: &str) -> Option<RegisteredTool> {
+        self.tools()
+            .into_iter()
+            .find(|tool| tool.definition.name == name)
+    }
 }
 
 /// Empty tool catalog for stateless turns without tools.
@@ -285,7 +373,7 @@ pub trait ToolCatalog: Send + Sync {
 pub struct EmptyToolCatalog;
 
 impl ToolCatalog for EmptyToolCatalog {
-    fn definitions(&self) -> Vec<ToolDefinition> {
+    fn tools(&self) -> Vec<RegisteredTool> {
         Vec::new()
     }
 }
@@ -306,6 +394,53 @@ pub trait PermissionPolicy: Send + Sync {
         &'a self,
         call: &'a ToolCall,
     ) -> RuntimeFuture<'a, PermissionDecision>;
+}
+
+/// In-memory source-aware tool catalog.
+#[derive(Debug, Clone, Default)]
+pub struct UnifiedToolCatalog {
+    tools: BTreeMap<String, RegisteredTool>,
+}
+
+impl UnifiedToolCatalog {
+    /// Create an empty unified tool catalog.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register an inline SDK tool definition.
+    #[must_use]
+    pub fn with_inline_tool(mut self, definition: ToolDefinition) -> Self {
+        self.insert(RegisteredTool::inline(definition));
+        self
+    }
+
+    /// Register a plugin-backed tool definition.
+    #[must_use]
+    pub fn with_plugin_tool(
+        mut self,
+        definition: ToolDefinition,
+        plugin_id: impl Into<String>,
+    ) -> Self {
+        self.insert(RegisteredTool::plugin(definition, plugin_id));
+        self
+    }
+
+    /// Insert a fully specified registered tool.
+    pub fn insert(&mut self, tool: RegisteredTool) {
+        self.tools.insert(tool.definition.name.clone(), tool);
+    }
+}
+
+impl ToolCatalog for UnifiedToolCatalog {
+    fn tools(&self) -> Vec<RegisteredTool> {
+        self.tools.values().cloned().collect()
+    }
+
+    fn find_tool(&self, name: &str) -> Option<RegisteredTool> {
+        self.tools.get(name).cloned()
+    }
 }
 
 /// Permission policy that allows every tool call.
@@ -347,6 +482,62 @@ impl AgentRuntime {
     pub const fn with_poll_interval(mut self, poll_interval: Duration) -> Self {
         self.poll_interval = poll_interval;
         self
+    }
+
+    /// Execute a tool call through a catalog, policy, and executor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tool is unknown, permission policy denies execution, or the
+    /// executor fails.
+    pub async fn execute_tool_call<C, P, E>(
+        &self,
+        catalog: &C,
+        policy: &P,
+        executor: &E,
+        call: &ToolCall,
+    ) -> Result<ToolExecutionOutput>
+    where
+        C: ToolCatalog,
+        P: PermissionPolicy,
+        E: ToolExecutor,
+    {
+        let tool = catalog
+            .find_tool(&call.name)
+            .ok_or_else(|| RuntimeError::ToolNotFound(call.name.clone()))?;
+        match policy.evaluate_tool_call(call).await? {
+            PermissionDecision::Allow => {}
+            PermissionDecision::Deny(reason) => return Err(RuntimeError::PermissionDenied(reason)),
+        }
+        let request = ToolInvocationRequest {
+            tool_call_id: call.id.clone(),
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+            cwd: None,
+            artifact_dir: None,
+            cancellation_path: None,
+        };
+        let invocation = executor
+            .execute_tool(&tool, &request)
+            .await
+            .map_err(|error| RuntimeError::ToolExecution {
+                tool_name: call.name.clone(),
+                message: error.to_string(),
+            })?;
+        Ok(ToolExecutionOutput {
+            model_result: ToolResult {
+                call_id: call.id.clone(),
+                output: invocation.output.clone(),
+                is_error: invocation.is_error,
+                content: invocation
+                    .content
+                    .iter()
+                    .cloned()
+                    .map(model_tool_result_content)
+                    .collect(),
+            },
+            invocation,
+        })
     }
 
     /// Run a stateless text-generation turn through a provider invoker.
@@ -574,6 +765,39 @@ fn finished_event(
     }
 }
 
+fn model_tool_result_content(
+    content: InvocationToolResultContent,
+) -> bcode_model::ToolResultContent {
+    match content {
+        InvocationToolResultContent::Text { text } => bcode_model::ToolResultContent::Text { text },
+        InvocationToolResultContent::Image { image } => bcode_model::ToolResultContent::Image {
+            image: bcode_model::ImageContent {
+                mime_type: image.mime_type,
+                data_base64: image.data_base64,
+                metadata: model_image_metadata(image.metadata),
+            },
+        },
+        InvocationToolResultContent::ImageRef { image } => {
+            bcode_model::ToolResultContent::ImageRef {
+                image: bcode_model::ImageRefContent {
+                    path: image.path,
+                    mime_type: image.mime_type,
+                    metadata: model_image_metadata(image.metadata),
+                },
+            }
+        }
+    }
+}
+
+fn model_image_metadata(metadata: bcode_tool::ImageMetadata) -> bcode_model::ImageMetadata {
+    bcode_model::ImageMetadata {
+        width: metadata.width,
+        height: metadata.height,
+        byte_len: metadata.byte_len,
+        source_path: metadata.source_path,
+    }
+}
+
 fn model_turn_request(request: &AgentTurnRequest) -> ModelTurnRequest {
     let session_id = SessionId::new();
     ModelTurnRequest {
@@ -663,6 +887,7 @@ fn normalize_provider_event(
 mod tests {
     use super::*;
     use bcode_model::{ProviderTurnEvent, StopReason};
+    use bcode_tool::{ToolPolicyMetadata, ToolSideEffect, ToolUiMetadata};
     use std::collections::VecDeque;
 
     struct FakeProvider {
@@ -720,6 +945,99 @@ mod tests {
             self.finished = true;
             Box::pin(async { Ok(AckResponse::default()) })
         }
+    }
+
+    struct FakeToolExecutor;
+
+    impl ToolExecutor for FakeToolExecutor {
+        fn execute_tool<'a>(
+            &'a self,
+            _tool: &'a RegisteredTool,
+            request: &'a ToolInvocationRequest,
+        ) -> RuntimeFuture<'a, ToolInvocationResponse> {
+            Box::pin(async move {
+                Ok(ToolInvocationResponse {
+                    output: format!("called {}", request.name),
+                    is_error: false,
+                    content: vec![InvocationToolResultContent::Text {
+                        text: "structured".to_string(),
+                    }],
+                    full_output: None,
+                    host_action: None,
+                    result: None,
+                })
+            })
+        }
+    }
+
+    fn tool_definition(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: "test tool".to_string(),
+            input_schema: serde_json::json!({ "type": "object" }),
+            side_effect: ToolSideEffect::ReadOnly,
+            requires_permission: false,
+            policy: ToolPolicyMetadata::default(),
+            ui: ToolUiMetadata::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn unified_tool_catalog_routes_inline_tool_execution() {
+        let catalog = UnifiedToolCatalog::new().with_inline_tool(tool_definition("echo"));
+        let call = ToolCall {
+            id: "call-1".to_string(),
+            name: "echo".to_string(),
+            arguments: serde_json::json!({ "text": "hi" }),
+        };
+        let output = AgentRuntime::new()
+            .execute_tool_call(&catalog, &AllowAllPolicy, &FakeToolExecutor, &call)
+            .await
+            .expect("tool should execute");
+
+        assert_eq!(output.model_result.call_id, "call-1");
+        assert_eq!(output.model_result.output, "called echo");
+        assert_eq!(output.model_result.content.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unified_tool_catalog_preserves_plugin_routing_source() {
+        let catalog = UnifiedToolCatalog::new()
+            .with_plugin_tool(tool_definition("search"), "web-search-plugin");
+        let tool = catalog
+            .find_tool("search")
+            .expect("plugin tool should be registered");
+
+        assert!(matches!(
+            tool.source,
+            ToolSource::Plugin { ref plugin_id } if plugin_id == "web-search-plugin"
+        ));
+    }
+
+    #[tokio::test]
+    async fn tool_permission_denial_is_actionable() {
+        struct DenyPolicy;
+        impl PermissionPolicy for DenyPolicy {
+            fn evaluate_tool_call<'a>(
+                &'a self,
+                _call: &'a ToolCall,
+            ) -> RuntimeFuture<'a, PermissionDecision> {
+                Box::pin(async { Ok(PermissionDecision::Deny("blocked".to_string())) })
+            }
+        }
+
+        let catalog = UnifiedToolCatalog::new().with_inline_tool(tool_definition("echo"));
+        let call = ToolCall {
+            id: "call-1".to_string(),
+            name: "echo".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        let error = AgentRuntime::new()
+            .execute_tool_call(&catalog, &DenyPolicy, &FakeToolExecutor, &call)
+            .await
+            .expect_err("policy should deny tool");
+
+        assert!(matches!(error, RuntimeError::PermissionDenied(reason) if reason == "blocked"));
     }
 
     #[tokio::test]
