@@ -328,8 +328,10 @@ struct LimitedOutput {
 #[derive(Debug, Clone)]
 struct TerminalStreamOutput {
     raw: LimitedOutput,
+    filtered: LimitedOutput,
     clean: LimitedOutput,
     raw_artifact_path: Option<PathBuf>,
+    filtered_artifact_path: Option<PathBuf>,
     clean_artifact_path: Option<PathBuf>,
     direnv_prelude_suppressed: bool,
 }
@@ -699,6 +701,7 @@ fn run_terminal_shell_command_inner(
         .map_err(|error| error.to_string())?;
     let clean_artifact_path = clean_artifact_path(paths.artifact_dir, tool_call_id)?;
     let raw_artifact_path = raw_artifact_path(paths.artifact_dir, tool_call_id)?;
+    let filtered_artifact_path = filtered_artifact_path(paths.artifact_dir, tool_call_id)?;
     let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
     let reader_thread = std::thread::spawn({
         let tool_call_id = tool_call_id.to_owned();
@@ -716,8 +719,9 @@ fn run_terminal_shell_command_inner(
                     direnv_prelude_marker: direnv_prelude_marker.as_deref(),
                 },
                 TerminalStreamPaths {
-                    clean_artifact_path,
-                    raw_artifact_path,
+                    clean: clean_artifact_path,
+                    raw: raw_artifact_path,
+                    filtered: filtered_artifact_path,
                 },
             )
         }
@@ -763,7 +767,7 @@ fn terminal_shell_response(
     tool_call_id: &str,
     input: TerminalShellResponseInput<'_>,
 ) -> Result<ToolInvocationResponse, String> {
-    let (encoded, full_encoded, clean_inline_output) = encode_terminal_output(
+    let (encoded, full_encoded, _clean_inline_output) = encode_terminal_output(
         &input.arguments.command,
         input.cwd,
         input.status,
@@ -772,20 +776,24 @@ fn terminal_shell_response(
         input.rows,
     )?;
     let raw_inline_output = limit_terminal_inline_output(&input.stream_output.raw);
+    let filtered_inline_output = limit_terminal_inline_output(&input.stream_output.filtered);
     let artifact_inline_output = if input.stream_output.direnv_prelude_suppressed {
-        &clean_inline_output
+        &filtered_inline_output
     } else {
         &raw_inline_output
     };
-    let raw_ref = if input.stream_output.direnv_prelude_suppressed {
-        None
+    let replay_output = if input.stream_output.direnv_prelude_suppressed {
+        &input.stream_output.filtered
     } else {
-        input
-            .stream_output
-            .raw_artifact_path
-            .as_deref()
-            .map(|path| raw_artifact_ref(path, &input.stream_output.raw, input.columns, input.rows))
+        &input.stream_output.raw
     };
+    let replay_path = if input.stream_output.direnv_prelude_suppressed {
+        input.stream_output.filtered_artifact_path.as_deref()
+    } else {
+        input.stream_output.raw_artifact_path.as_deref()
+    };
+    let replay_ref =
+        replay_path.map(|path| raw_artifact_ref(path, replay_output, input.columns, input.rows));
     Ok(ToolInvocationResponse {
         output: encoded,
         is_error: input.status.timed_out || input.status.cancelled || !input.status.success,
@@ -817,7 +825,7 @@ fn terminal_shell_response(
                 .clean_artifact_path
                 .as_deref()
                 .map(|path| clean_artifact_ref(path, &input.stream_output.clean)),
-            raw_ref,
+            replay_ref,
         )),
     })
 }
@@ -869,8 +877,9 @@ fn shell_args(command: &str) -> Vec<String> {
 }
 
 struct TerminalStreamPaths {
-    clean_artifact_path: Option<PathBuf>,
-    raw_artifact_path: Option<PathBuf>,
+    clean: Option<PathBuf>,
+    raw: Option<PathBuf>,
+    filtered: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -953,6 +962,52 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+struct RetainedStream {
+    bytes: Vec<u8>,
+    original_bytes: usize,
+    truncated: bool,
+}
+
+impl RetainedStream {
+    const fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            original_bytes: 0,
+            truncated: false,
+        }
+    }
+
+    fn write_chunk(
+        &mut self,
+        writer: &mut dyn Write,
+        chunk: &[u8],
+        max_bytes: usize,
+    ) -> Result<(), String> {
+        self.original_bytes = self.original_bytes.saturating_add(chunk.len());
+        let remaining = max_bytes.saturating_sub(self.bytes.len());
+        if remaining == 0 {
+            self.truncated = true;
+            return Ok(());
+        }
+        let retained = chunk.len().min(remaining);
+        writer
+            .write_all(&chunk[..retained])
+            .map_err(|error| error.to_string())?;
+        self.bytes.extend_from_slice(&chunk[..retained]);
+        self.truncated = self.truncated || retained < chunk.len();
+        Ok(())
+    }
+
+    fn limited_output(&self, max_bytes: usize) -> LimitedOutput {
+        limit_output_bytes_with_original(
+            &self.bytes,
+            self.original_bytes,
+            max_bytes,
+            self.truncated,
+        )
+    }
+}
+
 fn read_limited_streaming<R>(
     mut reader: R,
     events: ServiceEventEmitter,
@@ -963,9 +1018,11 @@ fn read_limited_streaming<R>(
 where
     R: Read,
 {
-    let mut raw_bytes = Vec::new();
-    let mut raw_writer = raw_artifact_writer(paths.raw_artifact_path.as_deref())?;
-    let mut clean_writer = clean_artifact_writer(paths.clean_artifact_path.as_deref())?;
+    let mut raw = RetainedStream::new();
+    let mut filtered = RetainedStream::new();
+    let mut raw_writer = raw_artifact_writer(paths.raw.as_deref())?;
+    let mut filtered_writer = raw_artifact_writer(paths.filtered.as_deref())?;
+    let mut clean_writer = clean_artifact_writer(paths.clean.as_deref())?;
     let mut cleaner = terminal_clean::TerminalCleanWriter::new(
         &mut clean_writer,
         visual_context.columns,
@@ -974,8 +1031,6 @@ where
     );
     let mut buffer = [0_u8; 4096];
     let mut sequence = 0_u64;
-    let mut raw_original_bytes = 0_usize;
-    let mut raw_truncated = false;
     let mut visual_output = String::new();
     let mut prelude_filter = DirenvPreludeFilter::new(visual_context.direnv_prelude_marker);
     loop {
@@ -986,70 +1041,90 @@ where
             break;
         }
         sequence = sequence.saturating_add(1);
-        raw_original_bytes = raw_original_bytes.saturating_add(read);
-        let filtered = prelude_filter.write(&buffer[..read]);
-        if !filtered.is_empty() {
-            visual_output.push_str(&String::from_utf8_lossy(&filtered));
-            emit_tool_output_delta(
-                events,
-                tool_call_id,
-                visual_context,
+        raw.write_chunk(&mut *raw_writer, &buffer[..read], DEFAULT_MAX_OUTPUT_BYTES)?;
+        let filtered_chunk = prelude_filter.write(&buffer[..read]);
+        if !filtered_chunk.is_empty() {
+            write_filtered_chunk(
+                &filtered_chunk,
+                &mut filtered,
+                &mut *filtered_writer,
+                &mut cleaner,
+                &mut visual_output,
+                FilteredVisualEmit {
+                    events,
+                    tool_call_id,
+                    visual_context,
+                },
                 sequence,
-                visual_output.as_bytes(),
-            );
-            cleaner
-                .write_chunk(&filtered)
-                .map_err(|error| error.to_string())?;
+            )?;
         }
-
-        let remaining = DEFAULT_MAX_OUTPUT_BYTES.saturating_sub(raw_bytes.len());
-        if remaining == 0 {
-            raw_truncated = true;
-            continue;
-        }
-        let retained = read.min(remaining);
-        raw_writer
-            .write_all(&buffer[..retained])
-            .map_err(|error| error.to_string())?;
-        raw_bytes.extend_from_slice(&buffer[..retained]);
-        raw_truncated = raw_truncated || retained < read;
     }
     let final_filtered = prelude_filter.finish();
     if !final_filtered.is_empty() {
         sequence = sequence.saturating_add(1);
-        visual_output.push_str(&String::from_utf8_lossy(&final_filtered));
-        emit_tool_output_delta(
-            events,
-            tool_call_id,
-            visual_context,
+        write_filtered_chunk(
+            &final_filtered,
+            &mut filtered,
+            &mut *filtered_writer,
+            &mut cleaner,
+            &mut visual_output,
+            FilteredVisualEmit {
+                events,
+                tool_call_id,
+                visual_context,
+            },
             sequence,
-            visual_output.as_bytes(),
-        );
-        cleaner
-            .write_chunk(&final_filtered)
-            .map_err(|error| error.to_string())?;
+        )?;
     }
     let direnv_prelude_suppressed = prelude_filter.suppressed_prelude();
     raw_writer.flush().map_err(|error| error.to_string())?;
+    filtered_writer.flush().map_err(|error| error.to_string())?;
     let clean_summary = cleaner.finish().map_err(|error| error.to_string())?;
     let clean_bytes = clean_summary.tail.into_bytes();
     Ok(TerminalStreamOutput {
-        raw: limit_output_bytes_with_original(
-            &raw_bytes,
-            raw_original_bytes,
-            DEFAULT_MAX_OUTPUT_BYTES,
-            raw_truncated,
-        ),
+        raw: raw.limited_output(DEFAULT_MAX_OUTPUT_BYTES),
+        filtered: filtered.limited_output(DEFAULT_MAX_OUTPUT_BYTES),
         clean: limit_output_bytes_with_original(
             &clean_bytes,
             usize::try_from(clean_summary.bytes_written).unwrap_or(usize::MAX),
             MAX_INLINE_TERMINAL_OUTPUT_BYTES,
             clean_summary.tail_truncated,
         ),
-        raw_artifact_path: paths.raw_artifact_path,
-        clean_artifact_path: paths.clean_artifact_path,
+        raw_artifact_path: paths.raw,
+        filtered_artifact_path: paths.filtered,
+        clean_artifact_path: paths.clean,
         direnv_prelude_suppressed,
     })
+}
+
+#[derive(Clone, Copy)]
+struct FilteredVisualEmit<'a> {
+    events: ServiceEventEmitter,
+    tool_call_id: &'a str,
+    visual_context: ShellVisualStreamContext<'a>,
+}
+
+fn write_filtered_chunk<W: Write>(
+    chunk: &[u8],
+    retained: &mut RetainedStream,
+    artifact_writer: &mut dyn Write,
+    cleaner: &mut terminal_clean::TerminalCleanWriter<&mut W>,
+    visual_output: &mut String,
+    emit: FilteredVisualEmit<'_>,
+    sequence: u64,
+) -> Result<(), String> {
+    retained.write_chunk(artifact_writer, chunk, DEFAULT_MAX_OUTPUT_BYTES)?;
+    visual_output.push_str(&String::from_utf8_lossy(chunk));
+    emit_tool_output_delta(
+        emit.events,
+        emit.tool_call_id,
+        emit.visual_context,
+        sequence,
+        visual_output.as_bytes(),
+    );
+    cleaner
+        .write_chunk(chunk)
+        .map_err(|error| error.to_string())
 }
 
 fn raw_artifact_path(
@@ -1058,6 +1133,15 @@ fn raw_artifact_path(
 ) -> Result<Option<PathBuf>, String> {
     artifact_path(artifact_dir, tool_call_id, |safe_tool_call_id| {
         format!("tool-output-{safe_tool_call_id}-pty.txt")
+    })
+}
+
+fn filtered_artifact_path(
+    artifact_dir: Option<&Path>,
+    tool_call_id: &str,
+) -> Result<Option<PathBuf>, String> {
+    artifact_path(artifact_dir, tool_call_id, |safe_tool_call_id| {
+        format!("tool-output-{safe_tool_call_id}-filtered-pty.txt")
     })
 }
 
@@ -1666,11 +1750,18 @@ mod tests {
     }
 
     #[test]
-    fn terminal_response_uses_clean_artifact_when_direnv_prelude_was_suppressed() {
+    fn terminal_response_uses_filtered_pty_artifact_when_direnv_prelude_was_suppressed() {
         let raw = LimitedOutput {
-            text: "direnv: loading\n__BCODE_DIRENV_READY_call__\nhello\n".to_string(),
-            original_bytes: 51,
-            retained_bytes: 51,
+            text: "direnv: loading\n__BCODE_DIRENV_READY_call__\n\u{1b}[31mhello\u{1b}[0m\n"
+                .to_string(),
+            original_bytes: 61,
+            retained_bytes: 61,
+            truncated: false,
+        };
+        let filtered = LimitedOutput {
+            text: "\u{1b}[31mhello\u{1b}[0m\n".to_string(),
+            original_bytes: 15,
+            retained_bytes: 15,
             truncated: false,
         };
         let clean = LimitedOutput {
@@ -1699,8 +1790,10 @@ mod tests {
                 started: Instant::now(),
                 stream_output: &TerminalStreamOutput {
                     raw,
+                    filtered,
                     clean,
                     raw_artifact_path: Some(PathBuf::from("/tmp/raw.txt")),
+                    filtered_artifact_path: Some(PathBuf::from("/tmp/filtered.txt")),
                     clean_artifact_path: Some(PathBuf::from("/tmp/clean.txt")),
                     direnv_prelude_suppressed: true,
                 },
@@ -1715,7 +1808,9 @@ mod tests {
         else {
             panic!("expected semantic terminal shell result");
         };
-        assert_eq!(output_tail, "hello\n");
+        assert_eq!(output_tail, "\u{1b}[31mhello\u{1b}[0m\n");
+        assert!(!output_tail.contains("direnv:"));
+        assert!(!output_tail.contains("__BCODE_DIRENV_READY_"));
         let Some(ToolInvocationResult::Artifact { artifact }) = response.result else {
             panic!("expected artifact result");
         };
@@ -1725,11 +1820,14 @@ mod tests {
                 .iter()
                 .any(|reference| reference.key == "clean_output")
         );
-        assert!(
-            artifact
-                .refs
-                .iter()
-                .all(|reference| reference.key != TERMINAL_PTY_STREAM_REF_KEY)
+        let replay_ref = artifact
+            .refs
+            .iter()
+            .find(|reference| reference.key == TERMINAL_PTY_STREAM_REF_KEY)
+            .expect("filtered pty replay ref should exist");
+        assert_eq!(
+            replay_ref.storage_uri.as_deref(),
+            Some("file:///tmp/filtered.txt")
         );
     }
 
@@ -1741,6 +1839,7 @@ mod tests {
             retained_bytes: 13,
             truncated: false,
         };
+        let filtered = raw.clone();
         let clean = raw.clone();
         let response = terminal_shell_response(
             "call",
@@ -1762,8 +1861,10 @@ mod tests {
                 started: Instant::now(),
                 stream_output: &TerminalStreamOutput {
                     raw,
+                    filtered,
                     clean,
                     raw_artifact_path: Some(PathBuf::from("/tmp/raw.txt")),
+                    filtered_artifact_path: Some(PathBuf::from("/tmp/filtered.txt")),
                     clean_artifact_path: Some(PathBuf::from("/tmp/clean.txt")),
                     direnv_prelude_suppressed: false,
                 },
