@@ -11,8 +11,8 @@
 use bcode_model::{
     AckResponse, CancelTurnRequest, ContentBlock, FinishTurnRequest, MessageRole, ModelMessage,
     ModelParameters, ModelTurnRequest, PollTurnEventsRequest, PollTurnEventsResponse,
-    PromptCacheHints, ProviderRequestContext, ProviderTurnEvent, StartTurnResponse, StopReason,
-    TokenUsage, ToolCall,
+    ProviderError, ProviderRequestContext, ProviderRequestProjection, ProviderTurnEvent,
+    StartTurnResponse, StopReason, TokenUsage, ToolCall,
 };
 use bcode_session_models::SessionId;
 use bcode_tool::ToolDefinition;
@@ -47,6 +47,8 @@ pub enum RuntimeError {
         code: String,
         /// Human-readable provider error message.
         message: String,
+        /// Full provider-reported error metadata.
+        error: Box<ProviderError>,
     },
     /// The turn was cancelled before completion.
     #[error("agent turn cancelled")]
@@ -179,6 +181,22 @@ pub enum AgentRuntimeEvent {
     ToolCallFinished(ToolCall),
     /// Token usage snapshot.
     Usage(TokenUsage),
+    /// Provider reported actual request projection metadata.
+    RequestProjection(ProviderRequestProjection),
+    /// Provider-specific metadata used for invisible optimization state.
+    ProviderMetadata {
+        /// Metadata key.
+        key: String,
+        /// Metadata value.
+        value: String,
+    },
+    /// Provider scheduled a retry.
+    RetryScheduled {
+        /// Human-readable retry message.
+        message: String,
+        /// Unix timestamp when retry is scheduled.
+        retry_at_unix: u64,
+    },
     /// Provider warning.
     Warning(String),
     /// Provider error.
@@ -572,7 +590,7 @@ fn model_turn_request(request: &AgentTurnRequest) -> ModelTurnRequest {
         }],
         tools: Vec::new(),
         parameters: request.parameters.clone(),
-        prompt_cache: PromptCacheHints::default(),
+        prompt_cache: bcode_model::PromptCacheHints::default(),
         conversation_reuse: bcode_model::ConversationReuseHints::default(),
         metadata: request.metadata.clone(),
     }
@@ -609,19 +627,28 @@ fn normalize_provider_event(
             *usage_buffer = Some(usage.clone());
             Ok(EventDisposition::Continue(AgentRuntimeEvent::Usage(usage)))
         }
-        ProviderTurnEvent::RequestProjection { .. }
-        | ProviderTurnEvent::ProviderMetadata { .. }
-        | ProviderTurnEvent::RetryScheduled { .. } => {
-            Ok(EventDisposition::Continue(AgentRuntimeEvent::Warning(
-                "provider metadata event ignored by text runtime".to_string(),
-            )))
-        }
+        ProviderTurnEvent::RequestProjection { projection } => Ok(EventDisposition::Continue(
+            AgentRuntimeEvent::RequestProjection(projection),
+        )),
+        ProviderTurnEvent::ProviderMetadata { key, value } => Ok(EventDisposition::Continue(
+            AgentRuntimeEvent::ProviderMetadata { key, value },
+        )),
+        ProviderTurnEvent::RetryScheduled {
+            message,
+            retry_at_unix,
+        } => Ok(EventDisposition::Continue(
+            AgentRuntimeEvent::RetryScheduled {
+                message,
+                retry_at_unix,
+            },
+        )),
         ProviderTurnEvent::Warning { message } => Ok(EventDisposition::Continue(
             AgentRuntimeEvent::Warning(message),
         )),
         ProviderTurnEvent::Error { error } => Err(RuntimeError::Provider {
-            code: error.code,
-            message: error.message,
+            code: error.code.clone(),
+            message: error.message.clone(),
+            error: Box::new(error),
         }),
         ProviderTurnEvent::TurnFinished { stop_reason } => {
             Ok(EventDisposition::Finished { stop_reason })
@@ -760,5 +787,81 @@ mod tests {
         assert_eq!(text_delta.as_deref(), Some("hello"));
         assert_eq!(reasoning_delta.as_deref(), Some("thinking"));
         assert_eq!(final_text.as_deref(), Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn streaming_text_turn_preserves_provider_metadata_events() {
+        let provider = FakeProvider::new([
+            ProviderTurnEvent::RequestProjection {
+                projection: ProviderRequestProjection {
+                    provider: Some("example-provider".to_string()),
+                    ..ProviderRequestProjection::default()
+                },
+            },
+            ProviderTurnEvent::ProviderMetadata {
+                key: "conversation".to_string(),
+                value: "reused".to_string(),
+            },
+            ProviderTurnEvent::RetryScheduled {
+                message: "retrying".to_string(),
+                retry_at_unix: 42,
+            },
+            ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::EndTurn,
+            },
+        ]);
+        let runtime = AgentRuntime::new();
+        let mut stream =
+            runtime.run_streaming_text_turn(provider, AgentTurnRequest::new("test-model", "hello"));
+        let mut saw_projection = false;
+        let mut saw_metadata = false;
+        let mut saw_retry = false;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                AgentRuntimeStreamItem::Event(AgentRuntimeEvent::RequestProjection(projection)) => {
+                    saw_projection = projection.provider.as_deref() == Some("example-provider");
+                }
+                AgentRuntimeStreamItem::Event(AgentRuntimeEvent::ProviderMetadata {
+                    key,
+                    value,
+                }) => {
+                    saw_metadata = key == "conversation" && value == "reused";
+                }
+                AgentRuntimeStreamItem::Event(AgentRuntimeEvent::RetryScheduled {
+                    message,
+                    retry_at_unix,
+                }) => {
+                    saw_retry = message == "retrying" && retry_at_unix == 42;
+                }
+                AgentRuntimeStreamItem::Finished(_) => break,
+                AgentRuntimeStreamItem::Error(error) => panic!("unexpected stream error: {error}"),
+                AgentRuntimeStreamItem::Event(_) => {}
+            }
+        }
+
+        assert!(saw_projection);
+        assert!(saw_metadata);
+        assert!(saw_retry);
+    }
+
+    #[tokio::test]
+    async fn streaming_turn_uses_explicit_cancellation_token() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let mut request = AgentTurnRequest::new("test-model", "hello");
+        request.cancellation = cancellation;
+        let runtime = AgentRuntime::new();
+        let mut stream = runtime.run_streaming_text_turn(FakeProvider::new([]), request);
+
+        let mut cancelled = false;
+        while let Some(item) = stream.next().await {
+            if matches!(item, AgentRuntimeStreamItem::Error(RuntimeError::Cancelled)) {
+                cancelled = true;
+                break;
+            }
+        }
+
+        assert!(cancelled);
     }
 }

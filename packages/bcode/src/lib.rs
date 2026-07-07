@@ -11,7 +11,7 @@
 #[cfg(feature = "embedded-plugins")]
 use bcode_agent_runtime::RuntimeFuture;
 use bcode_agent_runtime::{
-    AgentRuntime, AgentTurnRequest, AgentTurnResponse, CancellationToken, ModelProviderInvoker,
+    AgentRuntime, AgentTurnRequest, AgentTurnResponse, ModelProviderInvoker,
 };
 #[cfg(feature = "embedded-plugins")]
 use bcode_model::{
@@ -26,7 +26,7 @@ use thiserror::Error;
 
 pub use bcode_agent_runtime::{
     AgentRuntimeEvent as AgentEvent, AgentRuntimeStream as AgentStream,
-    AgentRuntimeStreamItem as AgentStreamItem, RuntimeError,
+    AgentRuntimeStreamItem as AgentStreamItem, CancellationToken, RuntimeError,
 };
 
 /// Result alias for Bcode SDK operations.
@@ -340,6 +340,23 @@ impl Agent {
             .run_streaming_text_turn(provider, self.turn_request(prompt.into())))
     }
 
+    /// Stream text using the agent's configured embedded provider and cancellation token.
+    ///
+    /// Cancelling the token requests provider cancellation and terminates the stream with a
+    /// [`RuntimeError::Cancelled`] item.
+    #[cfg(feature = "embedded-plugins")]
+    pub fn stream_text_with_cancellation(
+        &self,
+        prompt: impl Into<String>,
+        cancellation: CancellationToken,
+    ) -> Result<AgentStream> {
+        let provider = self.provider.clone().ok_or(BcodeError::MissingProvider)?;
+        Ok(self.runtime.run_streaming_text_turn(
+            provider,
+            self.turn_request_with_cancellation(prompt.into(), cancellation),
+        ))
+    }
+
     /// Stream text using a caller-supplied provider invoker.
     ///
     /// The returned stream yields text deltas, reasoning deltas, tool-call events, warnings, usage,
@@ -353,11 +370,38 @@ impl Agent {
     where
         P: ModelProviderInvoker + 'static,
     {
-        self.runtime
-            .run_streaming_text_turn(provider, self.turn_request(prompt.into()))
+        self.stream_text_with_provider_and_cancellation(provider, prompt, CancellationToken::new())
+    }
+
+    /// Stream text using a caller-supplied provider invoker and cancellation token.
+    ///
+    /// Cancelling the token requests provider cancellation and terminates the stream with a
+    /// [`RuntimeError::Cancelled`] item.
+    #[must_use]
+    pub fn stream_text_with_provider_and_cancellation<P>(
+        &self,
+        provider: P,
+        prompt: impl Into<String>,
+        cancellation: CancellationToken,
+    ) -> AgentStream
+    where
+        P: ModelProviderInvoker + 'static,
+    {
+        self.runtime.run_streaming_text_turn(
+            provider,
+            self.turn_request_with_cancellation(prompt.into(), cancellation),
+        )
     }
 
     fn turn_request(&self, prompt: String) -> AgentTurnRequest {
+        self.turn_request_with_cancellation(prompt, CancellationToken::new())
+    }
+
+    fn turn_request_with_cancellation(
+        &self,
+        prompt: String,
+        cancellation: CancellationToken,
+    ) -> AgentTurnRequest {
         AgentTurnRequest {
             provider_plugin_id: self.provider_plugin_id.clone(),
             model_id: self.model_id.clone(),
@@ -368,7 +412,7 @@ impl Agent {
             metadata: self.metadata.clone(),
             timeout: self.timeout,
             max_tool_rounds: self.max_tool_rounds,
-            cancellation: CancellationToken::new(),
+            cancellation,
         }
     }
 
