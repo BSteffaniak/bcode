@@ -2080,6 +2080,7 @@ pub struct PluginRuntimeHost {
     command_registry: Arc<bcode_command::CommandRegistry>,
     tui_registries: Arc<BTreeMap<String, PluginTuiRegistry>>,
     resources: Arc<PluginResourceLimiter>,
+    metrics: bcode_metrics::MetricsRegistry,
 }
 
 impl PluginRuntimeHost {
@@ -2222,6 +2223,13 @@ impl PluginRuntimeHost {
             .collect()
     }
 
+    /// Return a clone of this runtime host that emits runtime metrics to `metrics`.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: bcode_metrics::MetricsRegistry) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
     /// Invoke a service operation on a loaded plugin by ID.
     ///
     /// # Errors
@@ -2270,6 +2278,13 @@ impl PluginRuntimeHost {
             .and_then(|policy| policy.class)
             .unwrap_or_else(|| classify_invocation(&interface_id, &operation));
         let resource_permit = self.resources.acquire(&scope).await?;
+        let metric_labels =
+            plugin_runtime_metric_labels(plugin_id, &interface_id, &operation, class, &scope);
+        self.metrics.record_histogram_with_labels(
+            "plugin.resource_wait.duration_ms",
+            u128_to_u64(resource_permit.wait_ms),
+            metric_labels.clone(),
+        );
         tracing::debug!(
             target: "bcode_plugin::resources",
             plugin_id = %plugin_id,
@@ -2281,9 +2296,14 @@ impl PluginRuntimeHost {
             active_session = ?resource_permit.active_session,
             "plugin resource slot acquired"
         );
-        executor
+        let result = executor
             .invoke_service_scoped(interface_id, operation, payload, class, scope, None)
-            .await
+            .await;
+        self.metrics
+            .span("plugin.invocation")
+            .labels(metric_labels)
+            .finish_result(&result);
+        result
     }
 
     /// Invoke a service operation on a loaded plugin by ID and collect incremental events.
@@ -2341,6 +2361,13 @@ impl PluginRuntimeHost {
             cancelled: Arc::new(AtomicBool::new(false)),
         };
         let resource_permit = self.resources.acquire(&scope).await?;
+        let metric_labels =
+            plugin_runtime_metric_labels(plugin_id, &interface_id, &operation, class, &scope);
+        self.metrics.record_histogram_with_labels(
+            "plugin.resource_wait.duration_ms",
+            u128_to_u64(resource_permit.wait_ms),
+            metric_labels.clone(),
+        );
         tracing::debug!(
             target: "bcode_plugin::resources",
             plugin_id = %plugin_id,
@@ -2352,7 +2379,7 @@ impl PluginRuntimeHost {
             active_session = ?resource_permit.active_session,
             "plugin resource slot acquired"
         );
-        let mut invocation = executor
+        let result = executor
             .start_service_with_events_scoped(
                 interface_id,
                 operation,
@@ -2366,7 +2393,12 @@ impl PluginRuntimeHost {
                 response_receiver,
                 event_receiver,
             )
-            .await?;
+            .await;
+        self.metrics
+            .span("plugin.invocation.start")
+            .labels(metric_labels)
+            .finish_result(&result);
+        let mut invocation = result?;
         invocation.resource_permit = Some(Arc::new(resource_permit));
         Ok(invocation)
     }
@@ -2616,8 +2648,53 @@ impl From<PluginHost> for PluginRuntimeHost {
             tui_registries: Arc::new(tui_registries),
             command_registry: Arc::new(std::mem::take(&mut host.command_registry)),
             resources: Arc::default(),
+            metrics: bcode_metrics::MetricsRegistry::disabled(),
         }
     }
+}
+
+fn plugin_runtime_metric_labels(
+    plugin_id: &str,
+    interface_id: &str,
+    operation: &str,
+    class: PluginInvocationClass,
+    scope: &PluginInvocationScope,
+) -> bcode_metrics::MetricLabels {
+    let mut labels = bcode_metrics::MetricLabels::new();
+    labels.insert("plugin_id".to_owned(), plugin_id.to_owned());
+    labels.insert("interface_id".to_owned(), interface_id.to_owned());
+    labels.insert("operation".to_owned(), operation.to_owned());
+    labels.insert(
+        "class".to_owned(),
+        plugin_invocation_class_label(class).to_owned(),
+    );
+    labels.insert(
+        "scope".to_owned(),
+        plugin_invocation_scope_label(scope).to_owned(),
+    );
+    labels
+}
+
+const fn plugin_invocation_class_label(class: PluginInvocationClass) -> &'static str {
+    match class {
+        PluginInvocationClass::Control => "control",
+        PluginInvocationClass::Query => "query",
+        PluginInvocationClass::ToolExecution => "tool_execution",
+        PluginInvocationClass::ModelProvider => "model_provider",
+        PluginInvocationClass::EventDelivery => "event_delivery",
+        PluginInvocationClass::Service => "service",
+    }
+}
+
+const fn plugin_invocation_scope_label(scope: &PluginInvocationScope) -> &'static str {
+    match scope {
+        PluginInvocationScope::Global => "global",
+        PluginInvocationScope::Session { .. } => "session",
+    }
+}
+
+fn u128_to_u64(value: u128) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn spawn_plugin_event_dispatcher(

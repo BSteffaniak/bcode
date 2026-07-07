@@ -200,11 +200,16 @@ impl CatalogEventSubscription {
 struct ClientEventSink {
     client_id: ClientId,
     writer: SharedWriter,
+    metrics: MetricsRegistry,
 }
 
 impl ClientEventSink {
-    const fn new(client_id: ClientId, writer: SharedWriter) -> Self {
-        Self { client_id, writer }
+    const fn new(client_id: ClientId, writer: SharedWriter, metrics: MetricsRegistry) -> Self {
+        Self {
+            client_id,
+            writer,
+            metrics,
+        }
     }
 
     const fn client_id(&self) -> ClientId {
@@ -230,6 +235,17 @@ impl ClientEventSink {
             })
         };
         let elapsed = started_at.elapsed();
+        let mut labels = MetricLabels::new();
+        labels.insert("event_kind".to_owned(), event_kind.to_owned());
+        self.metrics.record_histogram_with_labels(
+            "ipc.event_send.duration_ms",
+            elapsed_ms(started_at),
+            labels.clone(),
+        );
+        if result.is_err() {
+            self.metrics
+                .add_counter_with_labels("ipc.event_send.errors_total", 1, labels);
+        }
         if elapsed >= CLIENT_EVENT_SEND_TIMEOUT {
             tracing::warn!(
                 target: "bcode_server::client_events",
@@ -1199,7 +1215,11 @@ impl ServerState {
     async fn register_catalog_event_client(&self, client_id: ClientId, writer: SharedWriter) {
         self.event_clients.lock().await.insert(
             client_id,
-            CatalogEventSubscription::new(ClientEventSink::new(client_id, writer)),
+            CatalogEventSubscription::new(ClientEventSink::new(
+                client_id,
+                writer,
+                self.metrics.clone(),
+            )),
         );
     }
 
@@ -1601,6 +1621,7 @@ pub async fn run_with_static_bundled(
     } else {
         MetricsRegistry::disabled()
     };
+    let plugins = plugins.with_metrics(metrics.clone());
     let sessions = SessionManager::persistent_lazy_with_metrics_and_lease_owner(
         default_session_store_dir(),
         metrics.clone(),
@@ -4974,7 +4995,7 @@ async fn handle_attach_session(
             )
             .await?;
             let handle = forward_session_events(
-                ClientEventSink::new(client_id, writer.clone()),
+                ClientEventSink::new(client_id, writer.clone(), state.metrics.clone()),
                 attachment.events,
                 attachment.live_events,
             );
@@ -5245,7 +5266,11 @@ async fn finish_attach_session_projection_window_success(
         elapsed_ms(timings.total_started_at),
     );
     let handle = forward_session_events(
-        ClientEventSink::new(context.client_id, context.writer.clone()),
+        ClientEventSink::new(
+            context.client_id,
+            context.writer.clone(),
+            state.metrics.clone(),
+        ),
         attachment.events,
         attachment.live_events,
     );
@@ -5331,7 +5356,11 @@ async fn finish_attach_session_recent_success(
         elapsed_ms(timings.total_started_at),
     );
     let handle = forward_session_events(
-        ClientEventSink::new(context.client_id, context.writer.clone()),
+        ClientEventSink::new(
+            context.client_id,
+            context.writer.clone(),
+            state.metrics.clone(),
+        ),
         attachment.events,
         attachment.live_events,
     );
@@ -7657,7 +7686,7 @@ async fn handle_subscribe_runtime_work(
     let subscription = state.sessions.subscribe_session_events(session_id).await?;
     let runtime_work = state.sessions.active_runtime_work(session_id).await?;
     let handle = forward_runtime_work_events(
-        ClientEventSink::new(client_id, writer.clone()),
+        ClientEventSink::new(client_id, writer.clone(), state.metrics.clone()),
         runtime_work
             .into_iter()
             .flat_map(|work| runtime_work_projection_to_events(session_id, work))
