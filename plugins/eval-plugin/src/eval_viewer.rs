@@ -17,10 +17,6 @@ use bmux_tui_components::bar_chart::{
     BarChart, BarChartItem, BarChartPolicy, BarChartStyles, BarChartValuePlacement,
 };
 use bmux_tui_components::button::ButtonStyles;
-use bmux_tui_components::chart::{
-    Chart, ChartAxes, ChartAxis, ChartAxisVisibility, ChartBounds, ChartDataset, ChartPoint,
-    ChartPolicy, ChartStyles,
-};
 use bmux_tui_components::sparkline::{Sparkline, SparklinePolicy, SparklineStyles};
 use bmux_tui_components::tab_bar::{TabBar, TabBarOutcome, TabBarState, TabBarStyles, TabItem};
 use bmux_tui_components::table::{
@@ -646,57 +642,68 @@ impl EvalRunViewerSurface {
     }
 
     fn render_analysis_charts(&self, area: Rect, frame: &mut Frame<'_>) {
-        render_panel_title(area, frame, "Prediction surfaces");
+        render_panel_title(area, frame, "Core graph stack");
         let area = inset_top(area, 1);
-        let half = area.height / 2;
-        self.render_variant_scatter(
-            Rect::new(area.x, area.y, area.width, half),
-            frame,
-            "Cost vs correctness",
-            ScatterKind::CostCorrectness,
-        );
-        self.render_variant_scatter(
-            Rect::new(
-                area.x,
-                area.y.saturating_add(half).saturating_add(1),
-                area.width,
-                area.height.saturating_sub(half).saturating_sub(1),
-            ),
-            frame,
-            "Latency vs reliability",
-            ScatterKind::LatencyReliability,
-        );
+        let sections = split_rows(area, 4, 1);
+        if let Some(section) = sections.first().copied() {
+            self.render_score_profile(section, frame);
+        }
+        if let Some(section) = sections.get(1).copied() {
+            Self::render_dense_bar_panel(
+                section,
+                frame,
+                "Pass rate by variant",
+                &variant_pass_items(&self.data),
+                Some(100),
+            );
+        }
+        if let Some(section) = sections.get(2).copied() {
+            Self::render_dense_bar_panel(
+                section,
+                frame,
+                "Cost frontier — total tokens",
+                &variant_token_items(&self.data),
+                None,
+            );
+        }
+        if let Some(section) = sections.get(3).copied() {
+            Self::render_dense_bar_panel(
+                section,
+                frame,
+                "Latency frontier — avg wall time",
+                &variant_latency_items(&self.data),
+                None,
+            );
+        }
     }
 
-    fn render_variant_scatter(
-        &self,
+    fn render_score_profile(&self, area: Rect, frame: &mut Frame<'_>) {
+        let title = best_variant(&self.data.result).map_or_else(
+            || "Score profile".to_string(),
+            |variant| format!("Score profile — {}", variant.variant_id),
+        );
+        let items = score_profile_items(&self.data);
+        Self::render_dense_bar_panel(area, frame, &title, &items, Some(100));
+    }
+
+    fn render_dense_bar_panel(
         area: Rect,
         frame: &mut Frame<'_>,
         title: &str,
-        kind: ScatterKind,
+        items: &[BarChartItem<'_>],
+        max: Option<u64>,
     ) {
+        frame.fill(area, " ", Style::new().bg(PANEL));
         render_panel_title(area, frame, title);
         let area = inset_top(area, 1);
-        let points = variant_scatter_points(&self.data, kind);
-        let bounds = scatter_bounds(&points);
-        let dataset = [ChartDataset::scatter("variants", &points)
-            .marker("◆")
-            .style(
-                Style::new()
-                    .fg(ACCENT)
-                    .bg(PANEL)
-                    .add_modifier(Modifier::BOLD),
-            )];
-        Chart::new(&dataset, bounds)
-            .axes(
-                ChartAxes::empty()
-                    .x(ChartAxis::empty().title(kind.x_title()))
-                    .y(ChartAxis::empty().title(kind.y_title()))
-                    .legend(false),
+        BarChart::new(items)
+            .policy(
+                BarChartPolicy::with_values()
+                    .max(max)
+                    .value_placement(BarChartValuePlacement::Right),
             )
-            .policy(ChartPolicy::compact().axes(ChartAxisVisibility::Visible))
-            .styles(eval_chart_styles())
-            .empty("No variant points")
+            .styles(eval_bar_chart_styles())
+            .empty("No graph data")
             .render(area, frame);
     }
 
@@ -1044,13 +1051,6 @@ const fn eval_sparkline_styles() -> SparklineStyles {
     }
 }
 
-const fn eval_chart_styles() -> ChartStyles {
-    ChartStyles {
-        dataset: Style::new().fg(ACCENT).bg(PANEL),
-        empty: Style::new().fg(MUTED).bg(PANEL),
-    }
-}
-
 fn render_kpi_card(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1119,6 +1119,31 @@ fn split_columns(area: Rect, columns: u16, gap: u16) -> Vec<Rect> {
                     width
                 },
                 area.height,
+            )
+        })
+        .collect()
+}
+
+fn split_rows(area: Rect, rows: u16, gap: u16) -> Vec<Rect> {
+    if rows == 0 {
+        return Vec::new();
+    }
+    let total_gap = gap.saturating_mul(rows.saturating_sub(1));
+    let height = area.height.saturating_sub(total_gap) / rows;
+    (0..rows)
+        .map(|index| {
+            let y = area
+                .y
+                .saturating_add(index.saturating_mul(height.saturating_add(gap)));
+            Rect::new(
+                area.x,
+                y,
+                area.width,
+                if index + 1 == rows {
+                    area.bottom().saturating_sub(y)
+                } else {
+                    height
+                },
             )
         })
         .collect()
@@ -1253,6 +1278,37 @@ fn variant_token_items(data: &EvalRunData) -> Vec<BarChartItem<'_>> {
             )
         })
         .collect()
+}
+
+fn variant_latency_items(data: &EvalRunData) -> Vec<BarChartItem<'_>> {
+    data.result
+        .variants
+        .iter()
+        .map(|variant| {
+            BarChartItem::new(
+                variant.variant_id.as_str(),
+                metric_to_u64(avg_variant_metric(variant, "wall_time_ms")),
+            )
+        })
+        .collect()
+}
+
+fn score_profile_items(data: &EvalRunData) -> Vec<BarChartItem<'static>> {
+    let Some(variant) = best_variant(&data.result) else {
+        return Vec::new();
+    };
+    vec![
+        BarChartItem::new("overall", score_percent(variant.score.overall)),
+        BarChartItem::new("correct", score_percent(variant.score.correctness)),
+        BarChartItem::new("speed", score_percent(variant.score.speed)),
+        BarChartItem::new("cost", score_percent(variant.score.cost)),
+        BarChartItem::new("stable", score_percent(variant.score.stability)),
+        BarChartItem::new("efficient", score_percent(variant.score.efficiency)),
+    ]
+}
+
+fn score_percent(score: f64) -> u64 {
+    metric_to_u64(score * 100.0)
 }
 
 fn repetition_samples(data: &EvalRunData, metric_name: &str) -> Vec<u64> {
@@ -1391,27 +1447,6 @@ fn derivation_line(label: &str, formula: &str, value: &str) -> Line {
     ])
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ScatterKind {
-    CostCorrectness,
-    LatencyReliability,
-}
-
-impl ScatterKind {
-    const fn x_title(self) -> &'static str {
-        match self {
-            Self::CostCorrectness => "tokens",
-            Self::LatencyReliability => "avg wall ms",
-        }
-    }
-
-    const fn y_title(self) -> &'static str {
-        match self {
-            Self::CostCorrectness | Self::LatencyReliability => "pass %",
-        }
-    }
-}
-
 fn recommendation_lines(data: &EvalRunData) -> Vec<Line> {
     let metrics = run_dashboard_metrics(data);
     let winner = metrics.winner.as_deref().unwrap_or("none");
@@ -1485,26 +1520,6 @@ fn recommendation_lines(data: &EvalRunData) -> Vec<Line> {
             ),
         ]),
     ]
-}
-
-fn variant_scatter_points(data: &EvalRunData, kind: ScatterKind) -> Vec<ChartPoint> {
-    data.result
-        .variants
-        .iter()
-        .map(|variant| {
-            let x = match kind {
-                ScatterKind::CostCorrectness => sum_variant_metric(variant, "total_tokens"),
-                ScatterKind::LatencyReliability => avg_variant_metric(variant, "wall_time_ms"),
-            };
-            ChartPoint::new(x, variant.pass_rate * 100.0)
-        })
-        .collect()
-}
-
-fn scatter_bounds(points: &[ChartPoint]) -> ChartBounds {
-    let x_max = points.iter().map(|point| point.x).fold(1.0_f64, f64::max);
-    let y_max = points.iter().map(|point| point.y).fold(100.0_f64, f64::max);
-    ChartBounds::new(0.0, x_max.max(1.0), 0.0, y_max.max(100.0))
 }
 
 fn cheapest_variant(data: &EvalRunData) -> Option<String> {
