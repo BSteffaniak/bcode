@@ -1302,11 +1302,14 @@ dependencies = [
 name = "bcode"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_agent_policy",
+ "bcode_agent_profile",
  "bcode_agent_runtime",
  "bcode_bundled_plugins",
  "bcode_cli",
  "bcode_model",
  "bcode_plugin",
+ "bcode_session_models",
  "bcode_tool",
  "serde_json",
  "thiserror 2.0.18",

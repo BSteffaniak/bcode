@@ -8,6 +8,10 @@
 //! The facade is intentionally small and delegates reusable turn behavior to
 //! `bcode_agent_runtime`.
 
+use bcode_agent_policy::{
+    Action, AgentConfig, AgentPermissionConfig, PermissionConfig, evaluate_tool_call,
+};
+use bcode_agent_profile::{AgentDecision, EvaluateToolCallRequest};
 #[cfg(feature = "embedded-plugins")]
 use bcode_agent_runtime::RuntimeFuture;
 use bcode_agent_runtime::{AgentRuntime, AgentTurnRequest, AgentTurnResponse};
@@ -18,19 +22,26 @@ use bcode_model::{
     PollTurnEventsRequest, PollTurnEventsResponse, StartTurnResponse,
 };
 use bcode_model::{ModelParameters, ProviderRequestContext};
+use bcode_session_models::SessionId;
 use bcode_tool::{ToolDefinition, ToolInvocationRequest, ToolInvocationResponse};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
+pub use bcode_agent_policy::{
+    Action as PermissionAction, AgentConfig as PermissionAgentConfig,
+    AgentPermissionConfig as PermissionConfigSet, PermissionConfig as AgentPermissionRules,
+};
+pub use bcode_agent_profile::{AgentDecision as PermissionAgentDecision, EvaluateToolCallResponse};
 pub use bcode_agent_runtime::{
     AgentRuntimeEvent as AgentEvent, AgentRuntimeStream as AgentStream,
     AgentRuntimeStreamItem as AgentStreamItem, AllowAllPolicy, CancellationToken,
     ModelProviderInvoker, PermissionDecision, PermissionPolicy, RegisteredTool, RuntimeError,
-    RuntimeFuture, ToolExecutionOutput, ToolExecutor, ToolRoundState, ToolSource,
-    UnifiedToolCatalog,
+    RuntimeFuture, RuntimePermissionContext, RuntimePermissionRequest, ToolExecutionOutput,
+    ToolExecutor, ToolRoundState, ToolSource, UnifiedToolCatalog,
 };
 pub use bcode_model::ToolCall;
 
@@ -199,98 +210,123 @@ impl AgentHooks {
     }
 }
 
-/// Simple configurable tool permission policy for SDK callers.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SimplePermissionPolicy {
-    default: PermissionDecision,
-    tool_decisions: BTreeMap<String, PermissionDecision>,
+/// Callback used to resolve `ask` decisions from the shared agent policy model.
+type PermissionAskCallback = Arc<
+    dyn Fn(&RuntimePermissionRequest, &EvaluateToolCallResponse) -> PermissionDecision
+        + Send
+        + Sync,
+>;
+
+/// SDK permission policy backed by Bcode's shared agent policy evaluator.
+#[derive(Clone)]
+pub struct AgentPermissionPolicy {
+    config: AgentConfig,
+    ask_callback: Option<PermissionAskCallback>,
 }
 
-impl SimplePermissionPolicy {
-    /// Create a policy with a default decision.
+impl fmt::Debug for AgentPermissionPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentPermissionPolicy")
+            .field("config", &self.config)
+            .field("ask_callback", &self.ask_callback.is_some())
+            .finish()
+    }
+}
+
+impl AgentPermissionPolicy {
+    /// Create a permission policy from one resolved agent configuration.
     #[must_use]
-    pub const fn new(default: PermissionDecision) -> Self {
+    pub fn new(config: AgentConfig) -> Self {
         Self {
-            default,
-            tool_decisions: BTreeMap::new(),
+            config,
+            ask_callback: None,
         }
     }
 
-    /// Create a policy that allows tools by default.
+    /// Create a permission policy from a multi-agent configuration and selected agent ID.
     #[must_use]
-    pub const fn allow_all() -> Self {
-        Self::new(PermissionDecision::Allow)
+    pub fn from_permission_config(config: &AgentPermissionConfig, agent_id: &str) -> Self {
+        Self::new(bcode_agent_policy::agent_config(config, agent_id))
     }
 
-    /// Create a policy that denies tools by default.
+    /// Attach a callback used only when core policy returns [`AgentDecision::Ask`].
     #[must_use]
-    pub fn deny_all(reason: impl Into<String>) -> Self {
-        Self::new(PermissionDecision::Deny(reason.into()))
-    }
-
-    /// Set the decision for one tool name.
-    #[must_use]
-    pub fn with_tool_decision(
-        mut self,
-        tool_name: impl Into<String>,
-        decision: PermissionDecision,
-    ) -> Self {
-        self.tool_decisions.insert(tool_name.into(), decision);
+    pub fn on_ask<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&RuntimePermissionRequest, &EvaluateToolCallResponse) -> PermissionDecision
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.ask_callback = Some(Arc::new(callback));
         self
     }
 }
 
-impl PermissionPolicy for SimplePermissionPolicy {
+impl PermissionPolicy for AgentPermissionPolicy {
     fn evaluate_tool_call<'a>(
         &'a self,
-        call: &'a ToolCall,
+        request: &'a RuntimePermissionRequest,
     ) -> bcode_agent_runtime::RuntimeFuture<'a, PermissionDecision> {
         Box::pin(async move {
-            Ok(self
-                .tool_decisions
-                .get(&call.name)
-                .cloned()
-                .unwrap_or_else(|| self.default.clone()))
+            let cwd = request
+                .context
+                .cwd
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("."));
+            let profile_request = EvaluateToolCallRequest {
+                session_id: request.context.session_id,
+                agent_id: request.context.agent_id.clone(),
+                tool_name: request.call.name.clone(),
+                side_effect: request.tool.definition.side_effect,
+                policy: request.tool.definition.policy.clone(),
+                arguments: request.call.arguments.clone(),
+                cwd: request
+                    .context
+                    .cwd
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+            };
+            let evaluation = evaluate_tool_call(&self.config, &profile_request, &cwd).response;
+            let decision = match evaluation.decision {
+                AgentDecision::Allow => PermissionDecision::Allow,
+                AgentDecision::Deny => PermissionDecision::Deny(
+                    evaluation
+                        .reason
+                        .unwrap_or_else(|| "tool call denied by agent policy".to_string()),
+                ),
+                AgentDecision::Ask => {
+                    if let Some(callback) = self.ask_callback.as_ref() {
+                        callback(request, &evaluation)
+                    } else {
+                        PermissionDecision::Deny(evaluation.reason.unwrap_or_else(|| {
+                            "tool call requires permission but no ask handler is configured"
+                                .to_string()
+                        }))
+                    }
+                }
+            };
+            Ok(decision)
         })
     }
 }
 
-type PermissionCallback = Arc<dyn Fn(&ToolCall) -> PermissionDecision + Send + Sync>;
-
-/// Callback-backed permission policy for interactive SDK applications.
-#[derive(Clone)]
-pub struct CallbackPermissionPolicy {
-    callback: PermissionCallback,
-}
-
-impl fmt::Debug for CallbackPermissionPolicy {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("CallbackPermissionPolicy")
-            .finish_non_exhaustive()
-    }
-}
-
-impl CallbackPermissionPolicy {
-    /// Create a callback-backed permission policy.
-    #[must_use]
-    pub fn new<F>(callback: F) -> Self
-    where
-        F: Fn(&ToolCall) -> PermissionDecision + Send + Sync + 'static,
-    {
-        Self {
-            callback: Arc::new(callback),
-        }
-    }
-}
-
-impl PermissionPolicy for CallbackPermissionPolicy {
-    fn evaluate_tool_call<'a>(
-        &'a self,
-        call: &'a ToolCall,
-    ) -> bcode_agent_runtime::RuntimeFuture<'a, PermissionDecision> {
-        Box::pin(async move { Ok((self.callback)(call)) })
-    }
+/// Build an agent policy that allows all tool calls without prompting.
+#[must_use]
+pub fn allow_all_agent_policy() -> AgentPermissionPolicy {
+    let config = AgentConfig {
+        permission: PermissionConfig {
+            command: BTreeMap::from([("*".to_string(), Action::Allow)]),
+            read: BTreeMap::from([("*".to_string(), Action::Allow)]),
+            write: BTreeMap::from([("*".to_string(), Action::Allow)]),
+            edit: BTreeMap::from([("*".to_string(), Action::Allow)]),
+            web: BTreeMap::from([("*".to_string(), Action::Allow)]),
+            external_directory: Action::Allow,
+        },
+        ..AgentConfig::default()
+    };
+    AgentPermissionPolicy::new(config)
 }
 
 type InlineToolHandler = Arc<
@@ -637,6 +673,9 @@ impl BcodeBuilder {
 pub struct Agent {
     runtime: AgentRuntime,
     name: Option<String>,
+    profile_id: String,
+    session_id: SessionId,
+    cwd: Option<PathBuf>,
     provider_plugin_id: Option<String>,
     model_id: String,
     provider_context: ProviderRequestContext,
@@ -661,6 +700,9 @@ impl fmt::Debug for Agent {
         debug
             .field("runtime", &self.runtime)
             .field("name", &self.name)
+            .field("profile_id", &self.profile_id)
+            .field("session_id", &self.session_id)
+            .field("cwd", &self.cwd)
             .field("provider_plugin_id", &self.provider_plugin_id)
             .field("model_id", &self.model_id)
             .field("provider_context", &self.provider_context)
@@ -832,11 +874,12 @@ impl Agent {
         self.hooks.run_before_tool(&context)?;
         let output = self
             .runtime
-            .execute_tool_call(
+            .execute_tool_call_with_context(
                 &self.tool_catalog,
                 self.permission_policy.as_ref(),
                 &executor,
                 call,
+                &self.permission_context(),
             )
             .await?;
         self.hooks.run_after_tool(
@@ -871,12 +914,13 @@ impl Agent {
         self.hooks.run_before_tool(&context)?;
         let output = self
             .runtime
-            .execute_tool_call_with_round_state(
+            .execute_tool_call_with_round_state_and_context(
                 &self.tool_catalog,
                 self.permission_policy.as_ref(),
                 &executor,
                 call,
                 rounds,
+                &self.permission_context(),
             )
             .await?;
         self.hooks.run_after_tool(
@@ -886,6 +930,14 @@ impl Agent {
             },
         )?;
         Ok(output)
+    }
+
+    fn permission_context(&self) -> RuntimePermissionContext {
+        RuntimePermissionContext {
+            session_id: self.session_id,
+            agent_id: self.profile_id.clone(),
+            cwd: self.cwd.clone(),
+        }
     }
 
     fn model_call_context(&self, prompt: String) -> ModelCallContext {
@@ -938,6 +990,9 @@ impl Agent {
 pub struct AgentBuilder {
     runtime: AgentRuntime,
     name: Option<String>,
+    profile_id: String,
+    session_id: SessionId,
+    cwd: Option<PathBuf>,
     provider_plugin_id: Option<String>,
     model_id: Option<String>,
     provider_context: ProviderRequestContext,
@@ -962,6 +1017,9 @@ impl fmt::Debug for AgentBuilder {
         debug
             .field("runtime", &self.runtime)
             .field("name", &self.name)
+            .field("profile_id", &self.profile_id)
+            .field("session_id", &self.session_id)
+            .field("cwd", &self.cwd)
             .field("provider_plugin_id", &self.provider_plugin_id)
             .field("model_id", &self.model_id)
             .field("provider_context", &self.provider_context)
@@ -990,6 +1048,9 @@ impl Default for AgentBuilder {
         Self {
             runtime: AgentRuntime::new(),
             name: None,
+            profile_id: bcode_agent_policy::BUILD_AGENT.to_string(),
+            session_id: SessionId::default(),
+            cwd: std::env::current_dir().ok(),
             provider_plugin_id: None,
             model_id: None,
             provider_context: ProviderRequestContext::default(),
@@ -1001,7 +1062,7 @@ impl Default for AgentBuilder {
             tool_catalog: UnifiedToolCatalog::new(),
             inline_tool_handlers: BTreeMap::new(),
             hooks: AgentHooks::new(),
-            permission_policy: Arc::new(SimplePermissionPolicy::allow_all()),
+            permission_policy: Arc::new(allow_all_agent_policy()),
             #[cfg(feature = "embedded-plugins")]
             provider: None,
             #[cfg(feature = "embedded-plugins")]
@@ -1171,20 +1232,92 @@ impl AgentBuilder {
         self
     }
 
-    /// Configure a simple permission policy.
+    /// Configure the active agent/profile ID used by shared policy evaluation.
     #[must_use]
-    pub fn permission_policy(mut self, policy: SimplePermissionPolicy) -> Self {
-        self.permission_policy = Arc::new(policy);
+    pub fn agent_id(mut self, agent_id: impl Into<String>) -> Self {
+        self.profile_id = agent_id.into();
         self
     }
 
-    /// Configure a callback-backed permission policy.
+    /// Configure the session ID used by shared policy evaluation.
     #[must_use]
-    pub fn permission_callback<F>(mut self, callback: F) -> Self
+    pub const fn session_id(mut self, session_id: SessionId) -> Self {
+        self.session_id = session_id;
+        self
+    }
+
+    /// Configure the working directory used by shared path-boundary policy evaluation.
+    #[must_use]
+    pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    /// Configure a resolved agent policy from the shared Bcode permission model.
+    #[must_use]
+    pub fn agent_config(mut self, config: AgentConfig) -> Self {
+        self.permission_policy = Arc::new(AgentPermissionPolicy::new(config));
+        self
+    }
+
+    /// Configure a resolved agent policy and ask callback from the shared Bcode permission model.
+    #[must_use]
+    pub fn agent_config_with_ask<F>(mut self, config: AgentConfig, callback: F) -> Self
     where
-        F: Fn(&ToolCall) -> PermissionDecision + Send + Sync + 'static,
+        F: Fn(&RuntimePermissionRequest, &EvaluateToolCallResponse) -> PermissionDecision
+            + Send
+            + Sync
+            + 'static,
     {
-        self.permission_policy = Arc::new(CallbackPermissionPolicy::new(callback));
+        self.permission_policy = Arc::new(AgentPermissionPolicy::new(config).on_ask(callback));
+        self
+    }
+
+    /// Configure a multi-agent policy config from the shared Bcode permission model.
+    #[must_use]
+    pub fn agent_permission_config(mut self, config: &AgentPermissionConfig) -> Self {
+        self.permission_policy = Arc::new(AgentPermissionPolicy::from_permission_config(
+            config,
+            &self.profile_id,
+        ));
+        self
+    }
+
+    /// Configure a multi-agent policy config and ask callback from the shared Bcode permission model.
+    #[must_use]
+    pub fn agent_permission_config_with_ask<F>(
+        mut self,
+        config: &AgentPermissionConfig,
+        callback: F,
+    ) -> Self
+    where
+        F: Fn(&RuntimePermissionRequest, &EvaluateToolCallResponse) -> PermissionDecision
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.permission_policy = Arc::new(
+            AgentPermissionPolicy::from_permission_config(config, &self.profile_id)
+                .on_ask(callback),
+        );
+        self
+    }
+
+    /// Configure a callback used only when shared policy returns `ask`.
+    #[must_use]
+    pub fn on_permission_request<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&RuntimePermissionRequest, &EvaluateToolCallResponse) -> PermissionDecision
+            + Send
+            + Sync
+            + 'static,
+    {
+        let policy = AgentPermissionPolicy::from_permission_config(
+            &bcode_agent_policy::default_config(),
+            &self.profile_id,
+        )
+        .on_ask(callback);
+        self.permission_policy = Arc::new(policy);
         self
     }
 
@@ -1238,6 +1371,9 @@ impl AgentBuilder {
         Agent {
             runtime: self.runtime,
             name: self.name,
+            profile_id: self.profile_id,
+            session_id: self.session_id,
+            cwd: self.cwd,
             provider_plugin_id: self.provider_plugin_id,
             model_id: self.model_id.unwrap_or_default(),
             provider_context: self.provider_context,

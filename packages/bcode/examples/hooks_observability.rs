@@ -1,6 +1,6 @@
 use bcode::{
-    Agent, AgentEvent, BcodeError, ModelCallContext, ModelProviderInvoker, PermissionDecision,
-    RuntimeFuture, ToolCall, ToolCallContext,
+    Agent, AgentEvent, BcodeError, ModelCallContext, ModelProviderInvoker, PermissionAction,
+    PermissionAgentConfig, PermissionDecision, RuntimeFuture, ToolCall, ToolCallContext,
 };
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, ModelTurnRequest, PollTurnEventsRequest,
@@ -10,7 +10,7 @@ use bcode_tool::{
     ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolPolicyMetadata,
     ToolSideEffect, ToolUiMetadata,
 };
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -118,9 +118,21 @@ async fn main() -> bcode::Result<()> {
     let before_tool = Arc::clone(&tool_hooks);
     let after_tool = Arc::clone(&tool_hooks);
 
+    let mut agent_config = PermissionAgentConfig::default();
+    agent_config.tools.insert("echo".to_string(), true);
+    agent_config.permission.read = BTreeMap::from([("*".to_string(), PermissionAction::Ask)]);
+
     let agent = Agent::builder()
         .name("observability-example")
+        .agent_id("build")
         .model("example-model")
+        .agent_config_with_ask(agent_config, |_request, evaluation| {
+            println!(
+                "permission requested: {}",
+                evaluation.reason.as_deref().unwrap_or("policy asked")
+            );
+            PermissionDecision::Allow
+        })
         .on_before_model(move |context: &ModelCallContext| {
             before_model.fetch_add(1, Ordering::Relaxed);
             if context.prompt.len() > 10_000 {
@@ -146,13 +158,6 @@ async fn main() -> bcode::Result<()> {
             after_tool.fetch_add(1, Ordering::Relaxed);
             println!("tool done: {}", outcome.output.model_result.output);
             Ok(())
-        })
-        .permission_callback(|call| {
-            if call.name == "echo" {
-                PermissionDecision::Allow
-            } else {
-                PermissionDecision::Deny("only echo is allowed".to_string())
-            }
         })
         .inline_tool(echo_definition(), echo)
         .build();

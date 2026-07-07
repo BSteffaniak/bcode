@@ -21,6 +21,7 @@ use bcode_tool::{
 };
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{
     Arc,
@@ -429,12 +430,44 @@ pub enum PermissionDecision {
     Deny(String),
 }
 
+/// Stable context used while evaluating tool permissions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimePermissionContext {
+    /// Session that owns the tool call.
+    pub session_id: SessionId,
+    /// Active agent/profile ID.
+    pub agent_id: String,
+    /// Current working directory used for path-boundary checks.
+    pub cwd: Option<PathBuf>,
+}
+
+impl Default for RuntimePermissionContext {
+    fn default() -> Self {
+        Self {
+            session_id: SessionId::default(),
+            agent_id: "build".to_string(),
+            cwd: None,
+        }
+    }
+}
+
+/// Complete permission evaluation request for one resolved tool call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimePermissionRequest {
+    /// Stable permission context for this execution path.
+    pub context: RuntimePermissionContext,
+    /// Requested provider tool call.
+    pub call: ToolCall,
+    /// Resolved tool registration and metadata.
+    pub tool: RegisteredTool,
+}
+
 /// Tool permission hook used before sensitive execution.
 pub trait PermissionPolicy: Send + Sync {
     /// Evaluate one requested tool call.
     fn evaluate_tool_call<'a>(
         &'a self,
-        call: &'a ToolCall,
+        request: &'a RuntimePermissionRequest,
     ) -> RuntimeFuture<'a, PermissionDecision>;
 }
 
@@ -492,7 +525,7 @@ pub struct AllowAllPolicy;
 impl PermissionPolicy for AllowAllPolicy {
     fn evaluate_tool_call<'a>(
         &'a self,
-        _call: &'a ToolCall,
+        _request: &'a RuntimePermissionRequest,
     ) -> RuntimeFuture<'a, PermissionDecision> {
         Box::pin(async { Ok(PermissionDecision::Allow) })
     }
@@ -544,9 +577,40 @@ impl AgentRuntime {
         P: PermissionPolicy + ?Sized,
         E: ToolExecutor,
     {
-        let mut rounds = ToolRoundState::new(u32::MAX);
-        self.execute_tool_call_with_round_state(catalog, policy, executor, call, &mut rounds)
+        let context = RuntimePermissionContext::default();
+        self.execute_tool_call_with_context(catalog, policy, executor, call, &context)
             .await
+    }
+
+    /// Execute a tool call with explicit permission context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tool is unknown, permission policy denies execution, or the
+    /// executor fails.
+    pub async fn execute_tool_call_with_context<C, P, E>(
+        &self,
+        catalog: &C,
+        policy: &P,
+        executor: &E,
+        call: &ToolCall,
+        context: &RuntimePermissionContext,
+    ) -> Result<ToolExecutionOutput>
+    where
+        C: ToolCatalog,
+        P: PermissionPolicy + ?Sized,
+        E: ToolExecutor,
+    {
+        let mut rounds = ToolRoundState::new(u32::MAX);
+        self.execute_tool_call_with_round_state_and_context(
+            catalog,
+            policy,
+            executor,
+            call,
+            &mut rounds,
+            context,
+        )
+        .await
     }
 
     /// Execute a tool call and enforce a mutable tool-round budget.
@@ -568,11 +632,43 @@ impl AgentRuntime {
         P: PermissionPolicy + ?Sized,
         E: ToolExecutor,
     {
+        let context = RuntimePermissionContext::default();
+        self.execute_tool_call_with_round_state_and_context(
+            catalog, policy, executor, call, rounds, &context,
+        )
+        .await
+    }
+
+    /// Execute a tool call with explicit round and permission context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the maximum number of tool rounds is exhausted, the tool is unknown,
+    /// permission policy denies execution, or the executor fails.
+    pub async fn execute_tool_call_with_round_state_and_context<C, P, E>(
+        &self,
+        catalog: &C,
+        policy: &P,
+        executor: &E,
+        call: &ToolCall,
+        rounds: &mut ToolRoundState,
+        context: &RuntimePermissionContext,
+    ) -> Result<ToolExecutionOutput>
+    where
+        C: ToolCatalog,
+        P: PermissionPolicy + ?Sized,
+        E: ToolExecutor,
+    {
         rounds.begin_round()?;
         let tool = catalog
             .find_tool(&call.name)
             .ok_or_else(|| RuntimeError::ToolNotFound(call.name.clone()))?;
-        match policy.evaluate_tool_call(call).await? {
+        let permission_request = RuntimePermissionRequest {
+            context: context.clone(),
+            call: call.clone(),
+            tool: tool.clone(),
+        };
+        match policy.evaluate_tool_call(&permission_request).await? {
             PermissionDecision::Allow => {}
             PermissionDecision::Deny(reason) => return Err(RuntimeError::PermissionDenied(reason)),
         }
@@ -1134,7 +1230,7 @@ mod tests {
         impl PermissionPolicy for DenyPolicy {
             fn evaluate_tool_call<'a>(
                 &'a self,
-                _call: &'a ToolCall,
+                _request: &'a RuntimePermissionRequest,
             ) -> RuntimeFuture<'a, PermissionDecision> {
                 Box::pin(async { Ok(PermissionDecision::Deny("blocked".to_string())) })
             }
