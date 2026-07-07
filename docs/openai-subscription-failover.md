@@ -53,6 +53,7 @@ Inspect banked reset credits:
 ```sh
 bcode auth resets status openai
 bcode auth resets status openai --profile openai-2
+bcode auth resets status openai --profile openai-2 --verbose
 ```
 
 Spend one banked reset credit explicitly:

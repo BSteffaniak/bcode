@@ -1821,6 +1821,9 @@ enum AuthResetsCommand {
         /// Exclude the primary auth profile.
         #[arg(long)]
         no_primary: bool,
+        /// Print detailed provider fields.
+        #[arg(long)]
+        verbose: bool,
         /// Print JSON output.
         #[arg(long)]
         json: bool,
@@ -2610,8 +2613,9 @@ fn handle_auth_resets_command(command: AuthResetsCommand) -> Result<(), CliError
             pool,
             profile,
             no_primary,
+            verbose,
             json,
-        } => auth_resets_status(&pool, profile.as_deref(), !no_primary, json),
+        } => auth_resets_status(&pool, profile.as_deref(), !no_primary, verbose, json),
         AuthResetsCommand::Use {
             pool,
             profile,
@@ -2797,6 +2801,7 @@ fn auth_resets_status(
     pool: &str,
     profile: Option<&str>,
     include_primary: bool,
+    verbose: bool,
     json: bool,
 ) -> Result<(), CliError> {
     let plan = auth_prime_plan(pool, profile, include_primary)?;
@@ -2821,6 +2826,7 @@ fn auth_resets_status(
             provider_plugin_id: plan.provider_plugin_id,
             profiles,
         },
+        verbose,
         json,
     )
 }
@@ -3743,34 +3749,181 @@ fn usage_detail(
     }
 }
 
-fn print_auth_resets_report(report: &AuthResetsReport, json: bool) -> Result<(), CliError> {
+fn print_auth_resets_report(
+    report: &AuthResetsReport,
+    verbose: bool,
+    json: bool,
+) -> Result<(), CliError> {
     if json {
         println!("{}", serde_json::to_string_pretty(report)?);
         return Ok(());
     }
-    println!("Auth reset credits: {}", report.pool);
-    println!("Provider plugin: {}", report.provider_plugin_id);
+
+    if report.profiles.len() == 1 {
+        print_single_auth_resets_profile(report, &report.profiles[0], verbose);
+    } else {
+        print_auth_resets_profile_summary(report);
+    }
+    Ok(())
+}
+
+fn print_auth_resets_profile_summary(report: &AuthResetsReport) {
+    println!("Banked Codex resets: {}", report.pool);
     println!();
-    println!("PROFILE\tSTATUS\tAVAILABLE\tDETAIL");
+    println!("PROFILE\tAVAILABLE\tNEXT EXPIRY\tSTATUS");
     for profile in &report.profiles {
         let available = profile
             .available_count
             .map_or_else(|| "-".to_string(), |count| count.to_string());
-        let detail = profile.reason.as_deref().unwrap_or("-");
+        let next_expiry = next_reset_credit_expiry(profile).map_or_else(
+            || "-".to_string(),
+            |expiry| format_reset_credit_date(Some(expiry)),
+        );
         println!(
             "{}\t{}\t{}\t{}",
-            profile.profile, profile.status, available, detail
+            profile.profile, available, next_expiry, profile.status
         );
-        for credit in &profile.credits {
-            let expires = credit.expires_at.as_deref().unwrap_or("-");
-            let title = credit.title.as_deref().unwrap_or("-");
-            println!(
-                "  {}\t{}\t{}\t{}\t{}",
-                credit.credit_id, credit.reset_type, credit.status, expires, title
-            );
+        if let Some(reason) = &profile.reason {
+            println!("  {reason}");
         }
     }
-    Ok(())
+    println!();
+    println!("Run with --profile <name> to see individual reset credits.");
+}
+
+fn print_single_auth_resets_profile(
+    report: &AuthResetsReport,
+    profile: &AuthResetsProfileReport,
+    verbose: bool,
+) {
+    println!("Banked Codex resets: {} / {}", report.pool, profile.profile);
+    if profile.status == "unsupported" {
+        println!();
+        println!("Banked Codex resets are not supported for this auth profile.");
+        if let Some(reason) = &profile.reason {
+            println!("Reason: {reason}");
+        }
+        return;
+    }
+    if profile.status == "error" {
+        println!();
+        println!("Could not load reset credits for {}.", profile.profile);
+        if let Some(reason) = &profile.reason {
+            println!("Error: {reason}");
+        }
+        return;
+    }
+
+    let available = profile.available_count.unwrap_or(0);
+    println!();
+    println!("Available resets: {available}");
+    if available == 0 || profile.credits.is_empty() {
+        println!();
+        println!("No banked Codex resets are available for this profile.");
+        return;
+    }
+
+    println!();
+    if verbose || reset_credit_output_should_use_blocks() {
+        print_auth_reset_credit_blocks(profile, verbose);
+    } else {
+        print_auth_reset_credit_table(profile);
+    }
+
+    println!();
+    println!("Use one:");
+    println!(
+        "  bcode auth resets use {} --profile {}",
+        report.pool, profile.profile
+    );
+    println!();
+    println!("Use a specific reset:");
+    println!(
+        "  bcode auth resets use {} --profile {} --credit <id>",
+        report.pool, profile.profile
+    );
+}
+
+fn print_auth_reset_credit_table(profile: &AuthResetsProfileReport) {
+    println!("RESET\tEXPIRES\tSTATUS\tDESCRIPTION");
+    for (index, credit) in profile.credits.iter().enumerate() {
+        println!(
+            "#{}\t{}\t{}\t{}",
+            index + 1,
+            format_reset_credit_date(credit.expires_at.as_deref()),
+            credit.status,
+            reset_credit_description(credit)
+        );
+    }
+}
+
+fn print_auth_reset_credit_blocks(profile: &AuthResetsProfileReport, verbose: bool) {
+    for (index, credit) in profile.credits.iter().enumerate() {
+        println!("#{} {}", index + 1, credit.status);
+        println!(
+            "  Expires: {}",
+            format_reset_credit_date(credit.expires_at.as_deref())
+        );
+        println!("  Description: {}", reset_credit_description(credit));
+        println!("  ID: {}", credit.credit_id);
+        if verbose {
+            println!("  Type: {}", credit.reset_type);
+            println!(
+                "  Granted: {}",
+                format_reset_credit_date(Some(&credit.granted_at))
+            );
+        } else if reset_credit_type_label(&credit.reset_type).is_some() {
+            println!("  Type: {}", credit.reset_type);
+        }
+        println!();
+    }
+}
+
+fn reset_credit_output_should_use_blocks() -> bool {
+    terminal_width().is_some_and(|width| width < 90)
+}
+
+fn terminal_width() -> Option<u16> {
+    crossterm::terminal::size().ok().map(|(columns, _)| columns)
+}
+
+fn next_reset_credit_expiry(profile: &AuthResetsProfileReport) -> Option<&str> {
+    profile
+        .credits
+        .iter()
+        .filter_map(|credit| credit.expires_at.as_deref())
+        .min()
+}
+
+fn format_reset_credit_date(timestamp: Option<&str>) -> String {
+    let Some(timestamp) = timestamp else {
+        return "-".to_string();
+    };
+    timestamp
+        .get(..10)
+        .filter(|date| {
+            let bytes = date.as_bytes();
+            bytes.len() == 10
+                && bytes[4] == b'-'
+                && bytes[7] == b'-'
+                && bytes
+                    .iter()
+                    .enumerate()
+                    .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+        })
+        .map_or_else(|| timestamp.to_string(), ToString::to_string)
+}
+
+fn reset_credit_description(credit: &AuthResetCreditReport) -> &str {
+    credit
+        .title
+        .as_deref()
+        .or(credit.description.as_deref())
+        .unwrap_or("-")
+}
+
+fn reset_credit_type_label(reset_type: &str) -> Option<&str> {
+    (reset_type != "codex_rate_limits").then_some(reset_type)
 }
 
 fn print_auth_reset_consume_report(
@@ -3781,21 +3934,48 @@ fn print_auth_reset_consume_report(
         println!("{}", serde_json::to_string_pretty(report)?);
         return Ok(());
     }
-    println!("Auth reset consume: {}", report.pool);
-    println!("Provider plugin: {}", report.provider_plugin_id);
-    println!("Profile: {}", report.profile);
     if report.dry_run {
-        println!("Mode: dry run");
+        println!("Dry run: no reset was consumed.");
+        println!();
+        println!("Would use:");
+        println!("  Profile: {}", report.profile);
+        println!(
+            "  Credit: {}",
+            report.credit_id.as_deref().unwrap_or("provider-selected")
+        );
+        return Ok(());
     }
-    println!("Status: {}", report.status);
-    if let Some(code) = &report.provider_code {
-        println!("Provider code: {code}");
-    }
-    if let Some(windows_reset) = report.windows_reset {
-        println!("Windows reset: {windows_reset}");
-    }
-    if let Some(message) = &report.message {
-        println!("Detail: {message}");
+
+    match report.status.as_str() {
+        "reset" => {
+            println!("Used one banked Codex reset for {}.", report.profile);
+            println!();
+            if let Some(windows_reset) = report.windows_reset {
+                println!("Windows reset: {windows_reset}");
+            }
+            println!("Provider result: reset");
+        }
+        "nothing_to_reset" => {
+            println!("No reset was used.");
+            println!();
+            println!("Reason: no current rate-limit window is eligible for reset.");
+            println!("Your banked reset should still be available.");
+        }
+        "no_credit" => {
+            println!("No banked reset is available for {}.", report.profile);
+        }
+        "already_redeemed" => {
+            println!(
+                "This reset request already completed successfully for {}.",
+                report.profile
+            );
+        }
+        _ => {
+            println!("Reset consume status: {}", report.status);
+            if let Some(message) = &report.message {
+                println!("Detail: {message}");
+            }
+        }
     }
     Ok(())
 }
