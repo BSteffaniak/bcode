@@ -1058,9 +1058,8 @@ fn linked_version() -> String {
         feature = "bundled-tesseract-v5-5-1",
         feature = "bundled-tesseract-v5-5-2"
     )))]
-    {
-        let version = unsafe { bcode_tesseract_sys::TessVersion() };
-        return c_string_lossy(version);
+    unsafe {
+        c_string_lossy(bcode_tesseract_sys::TessVersion())
     }
     #[cfg(any(
         feature = "bundled-tesseract",

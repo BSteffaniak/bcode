@@ -8,8 +8,16 @@
 //! The facade is intentionally small and delegates reusable turn behavior to
 //! `bcode_agent_runtime`.
 
+#[cfg(feature = "embedded-plugins")]
+use bcode_agent_runtime::RuntimeFuture;
 use bcode_agent_runtime::{
     AgentRuntime, AgentTurnRequest, AgentTurnResponse, CancellationToken, ModelProviderInvoker,
+};
+#[cfg(feature = "embedded-plugins")]
+use bcode_model::{
+    AckResponse, CancelTurnRequest, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID,
+    ModelTurnRequest, OP_CANCEL_TURN, OP_FINISH_TURN, OP_POLL_TURN_EVENTS, OP_START_TURN,
+    PollTurnEventsRequest, PollTurnEventsResponse, StartTurnResponse,
 };
 use bcode_model::{ModelParameters, ProviderRequestContext};
 use std::collections::BTreeMap;
@@ -27,6 +35,125 @@ pub enum BcodeError {
     /// Agent runtime failed.
     #[error("agent runtime error: {0}")]
     Runtime(#[from] RuntimeError),
+    /// No provider is configured for a requested model operation.
+    #[error("no provider configured")]
+    MissingProvider,
+}
+
+/// Provider invoker backed by a loaded Bcode plugin runtime.
+#[cfg(feature = "embedded-plugins")]
+#[derive(Debug, Clone)]
+pub struct PluginModelProviderInvoker {
+    plugins: bcode_plugin::PluginRuntimeHost,
+}
+
+#[cfg(feature = "embedded-plugins")]
+impl PluginModelProviderInvoker {
+    /// Create a provider invoker from a loaded plugin runtime host.
+    #[must_use]
+    pub const fn new(plugins: bcode_plugin::PluginRuntimeHost) -> Self {
+        Self { plugins }
+    }
+
+    fn resolve_provider(
+        &self,
+        provider_plugin_id: Option<&str>,
+    ) -> std::result::Result<String, RuntimeError> {
+        provider_plugin_id.map_or_else(
+            || {
+                self.plugins
+                    .registry()
+                    .service_registry()
+                    .unique_provider(MODEL_PROVIDER_INTERFACE_ID)
+                    .map(str::to_string)
+                    .map_err(|error| RuntimeError::ProviderInvocation(error.to_string()))
+            },
+            |provider_plugin_id| Ok(provider_plugin_id.to_string()),
+        )
+    }
+}
+
+#[cfg(feature = "embedded-plugins")]
+impl ModelProviderInvoker for PluginModelProviderInvoker {
+    fn start_turn<'a>(
+        &'a mut self,
+        provider_plugin_id: Option<&'a str>,
+        request: &'a ModelTurnRequest,
+    ) -> RuntimeFuture<'a, StartTurnResponse> {
+        Box::pin(async move {
+            let provider_plugin_id = self.resolve_provider(provider_plugin_id)?;
+            self.plugins
+                .invoke_service_json_scoped(
+                    &provider_plugin_id,
+                    MODEL_PROVIDER_INTERFACE_ID,
+                    OP_START_TURN,
+                    request,
+                    bcode_plugin::PluginInvocationScope::Global,
+                )
+                .await
+                .map_err(|error| RuntimeError::ProviderInvocation(error.to_string()))
+        })
+    }
+
+    fn poll_turn_events<'a>(
+        &'a mut self,
+        provider_plugin_id: Option<&'a str>,
+        request: &'a PollTurnEventsRequest,
+    ) -> RuntimeFuture<'a, PollTurnEventsResponse> {
+        Box::pin(async move {
+            let provider_plugin_id = self.resolve_provider(provider_plugin_id)?;
+            self.plugins
+                .invoke_service_json_scoped(
+                    &provider_plugin_id,
+                    MODEL_PROVIDER_INTERFACE_ID,
+                    OP_POLL_TURN_EVENTS,
+                    request,
+                    bcode_plugin::PluginInvocationScope::Global,
+                )
+                .await
+                .map_err(|error| RuntimeError::ProviderInvocation(error.to_string()))
+        })
+    }
+
+    fn cancel_turn<'a>(
+        &'a mut self,
+        provider_plugin_id: Option<&'a str>,
+        request: &'a CancelTurnRequest,
+    ) -> RuntimeFuture<'a, AckResponse> {
+        Box::pin(async move {
+            let provider_plugin_id = self.resolve_provider(provider_plugin_id)?;
+            self.plugins
+                .invoke_service_json_scoped(
+                    &provider_plugin_id,
+                    MODEL_PROVIDER_INTERFACE_ID,
+                    OP_CANCEL_TURN,
+                    request,
+                    bcode_plugin::PluginInvocationScope::Global,
+                )
+                .await
+                .map_err(|error| RuntimeError::ProviderInvocation(error.to_string()))
+        })
+    }
+
+    fn finish_turn<'a>(
+        &'a mut self,
+        provider_plugin_id: Option<&'a str>,
+        request: &'a FinishTurnRequest,
+    ) -> RuntimeFuture<'a, AckResponse> {
+        Box::pin(async move {
+            let provider_plugin_id = self.resolve_provider(provider_plugin_id)?;
+            self.plugins
+                .invoke_service_json_scoped(
+                    &provider_plugin_id,
+                    MODEL_PROVIDER_INTERFACE_ID,
+                    OP_FINISH_TURN,
+                    request,
+                    bcode_plugin::PluginInvocationScope::Global,
+                )
+                .await
+                .map_err(|error| RuntimeError::ProviderInvocation(error.to_string()))
+        })
+    }
 }
 
 /// Bcode SDK runtime mode.
@@ -44,6 +171,8 @@ pub enum BcodeMode {
 pub struct Bcode {
     mode: BcodeMode,
     runtime: AgentRuntime,
+    #[cfg(feature = "embedded-plugins")]
+    provider: Option<PluginModelProviderInvoker>,
 }
 
 impl Bcode {
@@ -56,7 +185,14 @@ impl Bcode {
     /// Start building an agent attached to this SDK handle.
     #[must_use]
     pub fn agent(&self) -> AgentBuilder {
-        AgentBuilder::default().runtime(self.runtime.clone())
+        let builder = AgentBuilder::default().runtime(self.runtime.clone());
+        #[cfg(feature = "embedded-plugins")]
+        let builder = if let Some(provider) = self.provider.clone() {
+            builder.provider_invoker(provider)
+        } else {
+            builder
+        };
+        builder
     }
 
     /// Return the configured runtime mode.
@@ -71,6 +207,8 @@ impl Bcode {
 pub struct BcodeBuilder {
     mode: BcodeMode,
     runtime: AgentRuntime,
+    #[cfg(feature = "embedded-plugins")]
+    provider: Option<PluginModelProviderInvoker>,
 }
 
 impl Default for BcodeBuilder {
@@ -78,6 +216,8 @@ impl Default for BcodeBuilder {
         Self {
             mode: BcodeMode::Embedded,
             runtime: AgentRuntime::new(),
+            #[cfg(feature = "embedded-plugins")]
+            provider: None,
         }
     }
 }
@@ -97,12 +237,32 @@ impl BcodeBuilder {
         self
     }
 
+    /// Configure a plugin-backed embedded provider invoker.
+    #[cfg(feature = "embedded-plugins")]
+    #[must_use]
+    pub fn plugin_runtime(mut self, plugins: bcode_plugin::PluginRuntimeHost) -> Self {
+        self.provider = Some(PluginModelProviderInvoker::new(plugins));
+        self
+    }
+
     /// Build the SDK handle.
+    #[cfg(not(feature = "embedded-plugins"))]
     #[must_use]
     pub const fn build(self) -> Bcode {
         Bcode {
             mode: self.mode,
             runtime: self.runtime,
+        }
+    }
+
+    /// Build the SDK handle.
+    #[cfg(feature = "embedded-plugins")]
+    #[must_use]
+    pub fn build(self) -> Bcode {
+        Bcode {
+            mode: self.mode,
+            runtime: self.runtime,
+            provider: self.provider,
         }
     }
 }
@@ -120,6 +280,8 @@ pub struct Agent {
     metadata: BTreeMap<String, String>,
     timeout: Duration,
     max_tool_rounds: u32,
+    #[cfg(feature = "embedded-plugins")]
+    provider: Option<PluginModelProviderInvoker>,
 }
 
 impl Agent {
@@ -127,6 +289,19 @@ impl Agent {
     #[must_use]
     pub fn builder() -> AgentBuilder {
         AgentBuilder::default()
+    }
+
+    /// Generate text using the agent's configured embedded provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no embedded provider is configured, provider invocation fails, the
+    /// runtime is cancelled, or the provider reports an error.
+    #[cfg(feature = "embedded-plugins")]
+    pub async fn generate_text(&self, prompt: impl Into<String>) -> Result<GenerateTextResponse> {
+        let mut provider = self.provider.clone().ok_or(BcodeError::MissingProvider)?;
+        self.generate_text_with_provider(&mut provider, prompt)
+            .await
     }
 
     /// Generate text using a caller-supplied provider invoker.
@@ -191,6 +366,8 @@ pub struct AgentBuilder {
     metadata: BTreeMap<String, String>,
     timeout: Duration,
     max_tool_rounds: u32,
+    #[cfg(feature = "embedded-plugins")]
+    provider: Option<PluginModelProviderInvoker>,
 }
 
 impl Default for AgentBuilder {
@@ -206,6 +383,8 @@ impl Default for AgentBuilder {
             metadata: BTreeMap::new(),
             timeout: Duration::from_mins(2),
             max_tool_rounds: 8,
+            #[cfg(feature = "embedded-plugins")]
+            provider: None,
         }
     }
 }
@@ -215,6 +394,14 @@ impl AgentBuilder {
     #[must_use]
     pub const fn runtime(mut self, runtime: AgentRuntime) -> Self {
         self.runtime = runtime;
+        self
+    }
+
+    /// Configure the embedded provider invoker for this agent.
+    #[cfg(feature = "embedded-plugins")]
+    #[must_use]
+    pub fn provider_invoker(mut self, provider: PluginModelProviderInvoker) -> Self {
+        self.provider = Some(provider);
         self
     }
 
@@ -295,6 +482,8 @@ impl AgentBuilder {
             metadata: self.metadata,
             timeout: self.timeout,
             max_tool_rounds: self.max_tool_rounds,
+            #[cfg(feature = "embedded-plugins")]
+            provider: self.provider,
         }
     }
 }

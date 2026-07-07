@@ -1,5 +1,6 @@
 use std::env;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "bundled-tesseract-build")]
 use std::process::Command;
 
 #[cfg(feature = "bundled-tesseract-build")]
@@ -33,6 +34,7 @@ fn main() {
         "system" => link_system(),
         "vendored" => link_vendored(),
         "bundled" | "download" => link_bundled(),
+        "none" => {}
         other => panic!("unsupported BCODE_TESSERACT_LINK_MODE: {other}"),
     }
 }
@@ -53,9 +55,7 @@ fn default_link_mode() -> String {
             "bundled".to_string()
         }
         (false, true) => "system".to_string(),
-        (false, false) => panic!(
-            "no Tesseract link mode selected; enable either the system-tesseract or bundled-tesseract feature, or set BCODE_TESSERACT_LINK_MODE"
-        ),
+        (false, false) => "none".to_string(),
         (true, true) => panic!(
             "both system-tesseract and bundled-tesseract features are enabled; choose one, or set BCODE_TESSERACT_LINK_MODE explicitly"
         ),
@@ -331,6 +331,7 @@ fn build_and_link(leptonica_source: &Path, tesseract_source: &Path) {
     link_cpp_runtime();
 }
 
+#[cfg(feature = "bundled-tesseract-build")]
 fn build_runtime(
     tesseract: &TesseractCatalogEntry,
     leptonica_source: &Path,
@@ -383,6 +384,7 @@ fn build_runtime(
     patch_runtime_libraries(&runtime_lib);
 }
 
+#[cfg(feature = "bundled-tesseract-build")]
 fn runtime_rpath() -> &'static str {
     if cfg!(target_os = "macos") {
         "@loader_path"
@@ -393,6 +395,7 @@ fn runtime_rpath() -> &'static str {
     }
 }
 
+#[cfg(feature = "bundled-tesseract-build")]
 fn find_dynamic_library(lib_dir: &Path, name: &str) -> PathBuf {
     let expected = lib_dir.join(dynamic_library_name(name));
     if expected.exists() {
@@ -420,6 +423,7 @@ fn find_dynamic_library(lib_dir: &Path, name: &str) -> PathBuf {
         })
 }
 
+#[cfg(feature = "bundled-tesseract-build")]
 fn copy_runtime_libraries(source_lib_dir: &Path, runtime_lib: &Path, name: &str) {
     for path in dynamic_libraries(source_lib_dir, name) {
         fs::copy(
@@ -436,6 +440,7 @@ fn copy_runtime_libraries(source_lib_dir: &Path, runtime_lib: &Path, name: &str)
     }
 }
 
+#[cfg(feature = "bundled-tesseract-build")]
 fn dynamic_libraries(lib_dir: &Path, name: &str) -> Vec<PathBuf> {
     let mut libraries: Vec<_> = fs::read_dir(lib_dir)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", lib_dir.display()))
@@ -457,6 +462,7 @@ fn dynamic_libraries(lib_dir: &Path, name: &str) -> Vec<PathBuf> {
     libraries
 }
 
+#[cfg(feature = "bundled-tesseract-build")]
 fn patch_runtime_libraries(runtime_lib: &Path) {
     if cfg!(target_os = "macos") {
         patch_macos_runtime_libraries(runtime_lib);
@@ -465,6 +471,7 @@ fn patch_runtime_libraries(runtime_lib: &Path) {
     }
 }
 
+#[cfg(feature = "bundled-tesseract-build")]
 fn patch_macos_runtime_libraries(runtime_lib: &Path) {
     let tesseract = runtime_lib.join(dynamic_library_name("tesseract"));
     let leptonica = runtime_lib.join(dynamic_library_name("leptonica"));
@@ -483,14 +490,17 @@ fn patch_macos_runtime_libraries(runtime_lib: &Path) {
     verify_otool_contains(&tesseract, "@loader_path/libleptonica.dylib");
 }
 
+#[cfg(feature = "bundled-tesseract-build")]
 fn patch_id(library: &Path, id: &str) {
     run_install_name_tool(library, &["-id", id]);
 }
 
+#[cfg(feature = "bundled-tesseract-build")]
 fn patch_change(library: &Path, old: &str, new: &str) {
     run_install_name_tool(library, &["-change", old, new]);
 }
 
+#[cfg(feature = "bundled-tesseract-build")]
 fn patch_add_rpath(library: &Path, rpath: &str) {
     if otool_contains(library, rpath) {
         return;
@@ -498,6 +508,7 @@ fn patch_add_rpath(library: &Path, rpath: &str) {
     run_install_name_tool(library, &["-add_rpath", rpath]);
 }
 
+#[cfg(feature = "bundled-tesseract-build")]
 fn run_install_name_tool(library: &Path, args: &[&str]) {
     let status = Command::new("install_name_tool")
         .args(args)
@@ -518,6 +529,7 @@ fn run_install_name_tool(library: &Path, args: &[&str]) {
     }
 }
 
+#[cfg(feature = "bundled-tesseract-build")]
 fn verify_otool_contains(library: &Path, needle: &str) {
     if !otool_contains(library, needle) {
         let output = Command::new("otool")
@@ -535,6 +547,7 @@ fn verify_otool_contains(library: &Path, needle: &str) {
     }
 }
 
+#[cfg(feature = "bundled-tesseract-build")]
 fn otool_contains(library: &Path, needle: &str) -> bool {
     let output = Command::new("otool")
         .arg("-l")
@@ -548,6 +561,7 @@ fn otool_contains(library: &Path, needle: &str) -> bool {
     String::from_utf8_lossy(&output.stdout).contains(needle)
 }
 
+#[cfg(feature = "bundled-tesseract-build")]
 fn validate_linux_runtime_libraries(runtime_lib: &Path) {
     for library in dynamic_libraries(runtime_lib, "") {
         if let Some(output) = command_stdout("readelf", &["-d", &library.display().to_string()])
@@ -561,6 +575,7 @@ fn validate_linux_runtime_libraries(runtime_lib: &Path) {
     }
 }
 
+#[cfg(feature = "bundled-tesseract-build")]
 fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
     let output = Command::new(program).args(args).output().ok()?;
     output
@@ -569,6 +584,7 @@ fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+#[cfg(feature = "bundled-tesseract-build")]
 fn dynamic_library_name(name: &str) -> String {
     if cfg!(target_os = "macos") {
         format!("lib{name}.dylib")
@@ -589,6 +605,7 @@ fn link_cpp_runtime() {
     }
 }
 
+#[cfg(feature = "bundled-tesseract-build")]
 #[cfg(feature = "bundled-tesseract-build")]
 fn download_and_extract(
     url: &str,
@@ -638,6 +655,7 @@ fn download_and_extract(
 }
 
 #[cfg(feature = "bundled-tesseract-build")]
+#[cfg(feature = "bundled-tesseract-build")]
 fn download_runtime_tessdata(catalog: &BundledCatalog, versions: &[String], runtimes_dir: &Path) {
     if env::var_os("BCODE_TESSDATA_PREFIX").is_some() {
         return;
@@ -655,6 +673,7 @@ fn download_runtime_tessdata(catalog: &BundledCatalog, versions: &[String], runt
     }
 }
 
+#[cfg(feature = "bundled-tesseract-build")]
 #[cfg(feature = "bundled-tesseract-build")]
 fn download_file_to(url: &str, expected_sha256: &str, path: &Path) {
     if path.is_file() {
@@ -679,6 +698,7 @@ fn download_file_to(url: &str, expected_sha256: &str, path: &Path) {
     });
 }
 
+#[cfg(feature = "bundled-tesseract-build")]
 #[cfg(feature = "bundled-tesseract-build")]
 fn download_verified(url: &str, expected_sha256: &str) -> Vec<u8> {
     let cache_path = artifact_cache_path(url, expected_sha256);
@@ -720,6 +740,7 @@ fn download_verified(url: &str, expected_sha256: &str) -> Vec<u8> {
 }
 
 #[cfg(feature = "bundled-tesseract-build")]
+#[cfg(feature = "bundled-tesseract-build")]
 fn download_attempt(
     client: &reqwest::blocking::Client,
     url: &str,
@@ -746,6 +767,7 @@ fn download_attempt(
 }
 
 #[cfg(feature = "bundled-tesseract-build")]
+#[cfg(feature = "bundled-tesseract-build")]
 fn read_valid_cached_artifact(path: &Path, expected_sha256: &str) -> Option<Vec<u8>> {
     if !path.is_file() {
         return None;
@@ -764,6 +786,7 @@ fn read_valid_cached_artifact(path: &Path, expected_sha256: &str) -> Option<Vec<
     }
 }
 
+#[cfg(feature = "bundled-tesseract-build")]
 #[cfg(feature = "bundled-tesseract-build")]
 fn write_cached_artifact(path: &Path, bytes: &[u8]) {
     if let Some(parent) = path.parent() {
@@ -794,10 +817,12 @@ fn write_cached_artifact(path: &Path, bytes: &[u8]) {
 }
 
 #[cfg(feature = "bundled-tesseract-build")]
+#[cfg(feature = "bundled-tesseract-build")]
 fn artifact_cache_path(url: &str, expected_sha256: &str) -> PathBuf {
     artifact_cache_dir().join(format!("{}{}", expected_sha256, artifact_extension(url)))
 }
 
+#[cfg(feature = "bundled-tesseract-build")]
 #[cfg(feature = "bundled-tesseract-build")]
 fn artifact_extension(url: &str) -> &'static str {
     if url.ends_with(".zip") {
@@ -810,6 +835,7 @@ fn artifact_extension(url: &str) -> &'static str {
 }
 
 #[cfg(feature = "bundled-tesseract-build")]
+#[cfg(feature = "bundled-tesseract-build")]
 fn artifact_cache_dir() -> PathBuf {
     if let Some(path) = env::var_os("BCODE_TESSERACT_ARTIFACT_CACHE") {
         return PathBuf::from(path);
@@ -818,6 +844,7 @@ fn artifact_cache_dir() -> PathBuf {
 }
 
 #[cfg(feature = "bundled-tesseract-build")]
+#[cfg(feature = "bundled-tesseract-build")]
 fn source_cache_dir() -> PathBuf {
     if let Some(path) = env::var_os("BCODE_TESSERACT_SOURCE_CACHE") {
         return PathBuf::from(path);
@@ -825,6 +852,7 @@ fn source_cache_dir() -> PathBuf {
     cache_root().join("tesseract-sources")
 }
 
+#[cfg(feature = "bundled-tesseract-build")]
 #[cfg(feature = "bundled-tesseract-build")]
 fn cache_root() -> PathBuf {
     if let Some(path) = env::var_os("XDG_CACHE_HOME") {
@@ -836,6 +864,7 @@ fn cache_root() -> PathBuf {
     out_dir().join("cache")
 }
 
+#[cfg(feature = "bundled-tesseract-build")]
 #[cfg(feature = "bundled-tesseract-build")]
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -863,6 +892,7 @@ fn static_library_name(name: &str) -> String {
 }
 
 #[cfg(feature = "bundled-tesseract-build")]
+#[cfg(feature = "bundled-tesseract-build")]
 fn single_child_dir(path: &Path) -> Option<PathBuf> {
     let mut entries = fs::read_dir(path).ok()?.filter_map(Result::ok);
     let first = entries.next()?.path();
@@ -873,6 +903,7 @@ fn single_child_dir(path: &Path) -> Option<PathBuf> {
     }
 }
 
+#[cfg(feature = "bundled-tesseract-build")]
 #[cfg(feature = "bundled-tesseract-build")]
 fn copy_dir_all(from: &Path, to: &Path) -> io::Result<()> {
     fs::create_dir_all(to)?;
