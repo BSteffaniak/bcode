@@ -24,7 +24,10 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 use thiserror::Error;
 
-pub use bcode_agent_runtime::{AgentRuntimeEvent as AgentEvent, RuntimeError};
+pub use bcode_agent_runtime::{
+    AgentRuntimeEvent as AgentEvent, AgentRuntimeStream as AgentStream,
+    AgentRuntimeStreamItem as AgentStreamItem, RuntimeError,
+};
 
 /// Result alias for Bcode SDK operations.
 pub type Result<T> = std::result::Result<T, BcodeError>;
@@ -323,6 +326,35 @@ impl Agent {
             .run_text_turn(provider, self.turn_request(prompt.into()))
             .await?;
         Ok(response.into())
+    }
+
+    /// Stream text using the agent's configured embedded provider.
+    ///
+    /// The returned stream yields normalized [`AgentStreamItem`] values and does not require the
+    /// TUI or daemon when an embedded plugin provider is configured.
+    #[cfg(feature = "embedded-plugins")]
+    pub fn stream_text(&self, prompt: impl Into<String>) -> Result<AgentStream> {
+        let provider = self.provider.clone().ok_or(BcodeError::MissingProvider)?;
+        Ok(self
+            .runtime
+            .run_streaming_text_turn(provider, self.turn_request(prompt.into())))
+    }
+
+    /// Stream text using a caller-supplied provider invoker.
+    ///
+    /// The returned stream yields text deltas, reasoning deltas, tool-call events, warnings, usage,
+    /// a final response, or an error.
+    #[must_use]
+    pub fn stream_text_with_provider<P>(
+        &self,
+        provider: P,
+        prompt: impl Into<String>,
+    ) -> AgentStream
+    where
+        P: ModelProviderInvoker + 'static,
+    {
+        self.runtime
+            .run_streaming_text_turn(provider, self.turn_request(prompt.into()))
     }
 
     fn turn_request(&self, prompt: String) -> AgentTurnRequest {

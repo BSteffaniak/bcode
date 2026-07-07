@@ -25,6 +25,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use tokio::sync::mpsc;
 
 /// Boxed future returned by runtime extension traits.
 pub type RuntimeFuture<'a, T> =
@@ -191,9 +192,37 @@ pub enum AgentRuntimeEvent {
     Finished {
         /// Provider stop reason.
         stop_reason: StopReason,
+        /// Last provider-reported token usage snapshot, when available.
+        usage: Option<TokenUsage>,
+        /// Total turn latency in milliseconds when the finish event was emitted.
+        latency_ms: u128,
     },
     /// Turn was cancelled.
     Cancelled,
+}
+
+/// Item produced by a streaming text-generation turn.
+#[derive(Debug)]
+pub enum AgentRuntimeStreamItem {
+    /// Normalized runtime event.
+    Event(AgentRuntimeEvent),
+    /// Completed turn response.
+    Finished(AgentTurnResponse),
+    /// Runtime error that terminated the stream.
+    Error(RuntimeError),
+}
+
+/// Typed asynchronous stream of agent runtime events.
+#[derive(Debug)]
+pub struct AgentRuntimeStream {
+    receiver: mpsc::Receiver<AgentRuntimeStreamItem>,
+}
+
+impl AgentRuntimeStream {
+    /// Receive the next stream item.
+    pub async fn next(&mut self) -> Option<AgentRuntimeStreamItem> {
+        self.receiver.recv().await
+    }
 }
 
 /// Abstract provider invocation boundary used by the runtime.
@@ -316,6 +345,44 @@ impl AgentRuntime {
     where
         P: ModelProviderInvoker,
     {
+        self.run_text_turn_internal(provider, request, None).await
+    }
+
+    /// Run a stateless text-generation turn and stream normalized events as they arrive.
+    #[must_use]
+    pub fn run_streaming_text_turn<P>(
+        &self,
+        provider: P,
+        request: AgentTurnRequest,
+    ) -> AgentRuntimeStream
+    where
+        P: ModelProviderInvoker + 'static,
+    {
+        let (sender, receiver) = mpsc::channel(64);
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let mut provider = provider;
+            let result = runtime
+                .run_text_turn_internal(&mut provider, request, Some(&sender))
+                .await;
+            let item = match result {
+                Ok(response) => AgentRuntimeStreamItem::Finished(response),
+                Err(error) => AgentRuntimeStreamItem::Error(error),
+            };
+            let _ = sender.send(item).await;
+        });
+        AgentRuntimeStream { receiver }
+    }
+
+    async fn run_text_turn_internal<P>(
+        &self,
+        provider: &mut P,
+        request: AgentTurnRequest,
+        stream: Option<&mpsc::Sender<AgentRuntimeStreamItem>>,
+    ) -> Result<AgentTurnResponse>
+    where
+        P: ModelProviderInvoker,
+    {
         let start = Instant::now();
         let model_request = model_turn_request(&request);
         let provider_plugin_id = request.provider_plugin_id.as_deref();
@@ -335,49 +402,62 @@ impl AgentRuntime {
         let mut text = String::new();
         let mut usage = None;
 
+        let turn_started = AgentRuntimeEvent::TurnStarted;
+        if !emit_stream_event(stream, &turn_started).await {
+            cancel_and_finish(
+                provider,
+                provider_plugin_id,
+                &cancel_request,
+                &finish_request,
+            )
+            .await;
+            return Err(RuntimeError::Cancelled);
+        }
+        events.push(turn_started);
+
         loop {
-            if request.cancellation.is_cancelled() {
-                let _ = provider
-                    .cancel_turn(provider_plugin_id, &cancel_request)
-                    .await;
-                let _ = provider
-                    .finish_turn(provider_plugin_id, &finish_request)
-                    .await;
-                return Err(RuntimeError::Cancelled);
-            }
-            if start.elapsed() >= request.timeout {
-                let _ = provider
-                    .cancel_turn(provider_plugin_id, &cancel_request)
-                    .await;
-                let _ = provider
-                    .finish_turn(provider_plugin_id, &finish_request)
-                    .await;
-                return Err(RuntimeError::Timeout {
-                    timeout: request.timeout,
-                });
+            if let Some(error) = terminal_control_error(
+                provider,
+                provider_plugin_id,
+                &cancel_request,
+                &finish_request,
+                &request,
+                start,
+            )
+            .await
+            {
+                return Err(error);
             }
 
             let poll = provider
                 .poll_turn_events(provider_plugin_id, &poll_request)
                 .await?;
-            let mut should_sleep = poll.events.is_empty();
+            let should_sleep = poll.events.is_empty();
             for event in poll.events {
-                should_sleep = false;
-                match normalize_provider_event(event)? {
+                match normalize_provider_event(event, &mut text, &mut usage)? {
                     EventDisposition::Continue(event) => {
-                        if let AgentRuntimeEvent::TextDelta(delta) = &event {
-                            text.push_str(delta);
-                        }
-                        if let AgentRuntimeEvent::Usage(event_usage) = &event {
-                            usage = Some(event_usage.clone());
+                        if !emit_stream_event(stream, &event).await {
+                            cancel_and_finish(
+                                provider,
+                                provider_plugin_id,
+                                &cancel_request,
+                                &finish_request,
+                            )
+                            .await;
+                            return Err(RuntimeError::Cancelled);
                         }
                         events.push(event);
                     }
-                    EventDisposition::Finished { event, stop_reason } => {
-                        events.push(event);
+                    EventDisposition::Finished { stop_reason } => {
                         provider
                             .finish_turn(provider_plugin_id, &finish_request)
                             .await?;
+                        let finished_event =
+                            finished_event(usage.as_ref(), start.elapsed(), stop_reason);
+                        if !emit_stream_event(stream, &finished_event).await {
+                            return Err(RuntimeError::Cancelled);
+                        }
+                        events.push(finished_event);
                         return Ok(AgentTurnResponse {
                             text,
                             stop_reason: Some(stop_reason),
@@ -387,6 +467,9 @@ impl AgentRuntime {
                         });
                     }
                     EventDisposition::Cancelled(event) => {
+                        if !emit_stream_event(stream, &event).await {
+                            return Err(RuntimeError::Cancelled);
+                        }
                         events.push(event);
                         provider
                             .finish_turn(provider_plugin_id, &finish_request)
@@ -404,11 +487,73 @@ impl AgentRuntime {
 
 enum EventDisposition {
     Continue(AgentRuntimeEvent),
-    Finished {
-        event: AgentRuntimeEvent,
-        stop_reason: StopReason,
-    },
+    Finished { stop_reason: StopReason },
     Cancelled(AgentRuntimeEvent),
+}
+
+async fn emit_stream_event(
+    stream: Option<&mpsc::Sender<AgentRuntimeStreamItem>>,
+    event: &AgentRuntimeEvent,
+) -> bool {
+    let Some(stream) = stream else {
+        return true;
+    };
+    stream
+        .send(AgentRuntimeStreamItem::Event(event.clone()))
+        .await
+        .is_ok()
+}
+
+async fn terminal_control_error<P>(
+    provider: &mut P,
+    provider_plugin_id: Option<&str>,
+    cancel_request: &CancelTurnRequest,
+    finish_request: &FinishTurnRequest,
+    request: &AgentTurnRequest,
+    start: Instant,
+) -> Option<RuntimeError>
+where
+    P: ModelProviderInvoker,
+{
+    if request.cancellation.is_cancelled() {
+        cancel_and_finish(provider, provider_plugin_id, cancel_request, finish_request).await;
+        return Some(RuntimeError::Cancelled);
+    }
+    if start.elapsed() >= request.timeout {
+        cancel_and_finish(provider, provider_plugin_id, cancel_request, finish_request).await;
+        return Some(RuntimeError::Timeout {
+            timeout: request.timeout,
+        });
+    }
+    None
+}
+
+async fn cancel_and_finish<P>(
+    provider: &mut P,
+    provider_plugin_id: Option<&str>,
+    cancel_request: &CancelTurnRequest,
+    finish_request: &FinishTurnRequest,
+) where
+    P: ModelProviderInvoker,
+{
+    let _ = provider
+        .cancel_turn(provider_plugin_id, cancel_request)
+        .await;
+    let _ = provider
+        .finish_turn(provider_plugin_id, finish_request)
+        .await;
+}
+
+fn finished_event(
+    usage: Option<&TokenUsage>,
+    latency: Duration,
+    stop_reason: StopReason,
+) -> AgentRuntimeEvent {
+    AgentRuntimeEvent::Finished {
+        stop_reason,
+        usage: usage.cloned(),
+        latency_ms: latency.as_millis(),
+    }
 }
 
 fn model_turn_request(request: &AgentTurnRequest) -> ModelTurnRequest {
@@ -433,14 +578,21 @@ fn model_turn_request(request: &AgentTurnRequest) -> ModelTurnRequest {
     }
 }
 
-fn normalize_provider_event(event: ProviderTurnEvent) -> Result<EventDisposition> {
+fn normalize_provider_event(
+    event: ProviderTurnEvent,
+    text_buffer: &mut String,
+    usage_buffer: &mut Option<TokenUsage>,
+) -> Result<EventDisposition> {
     match event {
         ProviderTurnEvent::TurnStarted => {
             Ok(EventDisposition::Continue(AgentRuntimeEvent::TurnStarted))
         }
-        ProviderTurnEvent::TextDelta { text } => Ok(EventDisposition::Continue(
-            AgentRuntimeEvent::TextDelta(text),
-        )),
+        ProviderTurnEvent::TextDelta { text } => {
+            text_buffer.push_str(&text);
+            Ok(EventDisposition::Continue(AgentRuntimeEvent::TextDelta(
+                text,
+            )))
+        }
         ProviderTurnEvent::ReasoningDelta { text } => Ok(EventDisposition::Continue(
             AgentRuntimeEvent::ReasoningDelta(text),
         )),
@@ -454,6 +606,7 @@ fn normalize_provider_event(event: ProviderTurnEvent) -> Result<EventDisposition
             AgentRuntimeEvent::ToolCallFinished(call),
         )),
         ProviderTurnEvent::Usage { usage } => {
+            *usage_buffer = Some(usage.clone());
             Ok(EventDisposition::Continue(AgentRuntimeEvent::Usage(usage)))
         }
         ProviderTurnEvent::RequestProjection { .. }
@@ -470,10 +623,9 @@ fn normalize_provider_event(event: ProviderTurnEvent) -> Result<EventDisposition
             code: error.code,
             message: error.message,
         }),
-        ProviderTurnEvent::TurnFinished { stop_reason } => Ok(EventDisposition::Finished {
-            event: AgentRuntimeEvent::Finished { stop_reason },
-            stop_reason,
-        }),
+        ProviderTurnEvent::TurnFinished { stop_reason } => {
+            Ok(EventDisposition::Finished { stop_reason })
+        }
         ProviderTurnEvent::Cancelled => {
             Ok(EventDisposition::Cancelled(AgentRuntimeEvent::Cancelled))
         }
@@ -569,16 +721,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_provider_event_returns_cancelled_error() {
-        let mut provider = FakeProvider::new([ProviderTurnEvent::Cancelled]);
+    async fn streaming_text_turn_emits_deltas_and_final_response() {
+        let provider = FakeProvider::new([
+            ProviderTurnEvent::TextDelta {
+                text: "hello".to_string(),
+            },
+            ProviderTurnEvent::ReasoningDelta {
+                text: "thinking".to_string(),
+            },
+            ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::EndTurn,
+            },
+        ]);
         let runtime = AgentRuntime::new();
+        let mut stream =
+            runtime.run_streaming_text_turn(provider, AgentTurnRequest::new("test-model", "hello"));
+        let mut text_delta = None;
+        let mut reasoning_delta = None;
+        let mut final_text = None;
 
-        let error = runtime
-            .run_text_turn(&mut provider, AgentTurnRequest::new("test-model", "hello"))
-            .await
-            .expect_err("turn should cancel");
+        while let Some(item) = stream.next().await {
+            match item {
+                AgentRuntimeStreamItem::Event(AgentRuntimeEvent::TextDelta(text)) => {
+                    text_delta = Some(text);
+                }
+                AgentRuntimeStreamItem::Event(AgentRuntimeEvent::ReasoningDelta(text)) => {
+                    reasoning_delta = Some(text);
+                }
+                AgentRuntimeStreamItem::Finished(response) => {
+                    final_text = Some(response.text);
+                    break;
+                }
+                AgentRuntimeStreamItem::Error(error) => panic!("unexpected stream error: {error}"),
+                AgentRuntimeStreamItem::Event(_) => {}
+            }
+        }
 
-        assert!(matches!(error, RuntimeError::Cancelled));
-        assert!(provider.finished);
+        assert_eq!(text_delta.as_deref(), Some("hello"));
+        assert_eq!(reasoning_delta.as_deref(), Some("thinking"));
+        assert_eq!(final_text.as_deref(), Some("hello"));
     }
 }

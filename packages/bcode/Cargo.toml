@@ -27,6 +27,9 @@ tokio = { workspace = true, features = [
     "rt-multi-thread",
 ], optional = true }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
 [features]
 app = ["cli", "static-bundled-plugins", "bundled-ocr-tesseract"]
 bundled-ocr-tesseract = ["bundled-ocr-tesseract-default"]
