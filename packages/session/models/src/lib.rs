@@ -38,6 +38,10 @@ pub struct ToolInvocationProjection {
     pub terminal_output: Option<ToolInvocationProjectionTerminalOutput>,
     /// Legacy persisted presentation events, retained only as compatibility facts.
     pub legacy_presentations: Vec<LegacyToolPresentationEvent>,
+    /// Tool start time as UNIX epoch milliseconds, when known.
+    pub started_at_ms: Option<u64>,
+    /// Tool finish time as UNIX epoch milliseconds, when known.
+    pub finished_at_ms: Option<u64>,
 }
 
 /// Renderer-neutral tool invocation lifecycle status.
@@ -120,8 +124,14 @@ fn apply_tool_invocation_stream_projection_event(
     let tool_call_id = tool_projection_stream_tool_call_id(event);
     let projection = tool_invocation_projection_mut(projections, tool_call_id);
     match event {
-        ToolInvocationStreamEvent::Started { columns, rows, .. } => {
+        ToolInvocationStreamEvent::Started {
+            columns,
+            rows,
+            started_at_ms,
+            ..
+        } => {
             projection.status = ToolInvocationProjectionStatus::Running;
+            projection.started_at_ms = *started_at_ms;
             let terminal_output = projection
                 .terminal_output
                 .get_or_insert_with(Default::default);
@@ -140,9 +150,14 @@ fn apply_tool_invocation_stream_projection_event(
         | ToolInvocationStreamEvent::Status { .. } => {
             projection.status = ToolInvocationProjectionStatus::Running;
         }
-        ToolInvocationStreamEvent::Finished { is_error, .. } => {
+        ToolInvocationStreamEvent::Finished {
+            is_error,
+            finished_at_ms,
+            ..
+        } => {
             projection.status = ToolInvocationProjectionStatus::Finished;
             projection.is_error = Some(*is_error);
+            projection.finished_at_ms = *finished_at_ms;
         }
         ToolInvocationStreamEvent::LegacyPresentation { presentation, .. } => {
             legacy_record_tool_presentation(projection, presentation);

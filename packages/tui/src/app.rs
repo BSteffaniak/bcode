@@ -69,6 +69,8 @@ const LATEST_BAR_ANIMATION_INVALIDATION_KEY: &str = "latest-bar-animation";
 const THEME_TRANSITION_INVALIDATION_KEY: &str = "theme-transition";
 const THEME_TRANSITION_FRAME: Duration = Duration::from_millis(16);
 const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(420);
+const TOOL_ELAPSED_INVALIDATION_PREFIX: &str = "tool-elapsed";
+const TOOL_ELAPSED_INVALIDATION_MAX_INTERVAL: Duration = Duration::from_secs(1);
 const RESIDENT_TRANSCRIPT_MAX_EVENTS: usize = 1_024;
 const RESIDENT_TRANSCRIPT_TARGET_EVENTS: usize = 512;
 
@@ -2392,7 +2394,7 @@ impl BmuxApp {
                 now + THEME_TRANSITION_FRAME,
             ));
         }
-        requests.extend(Self::tool_elapsed_invalidation_requests(now, now_system));
+        requests.extend(self.tool_elapsed_invalidation_requests(now, now_system));
         requests
     }
 
@@ -2426,6 +2428,8 @@ impl BmuxApp {
                     };
                 }
                 invalidation.merge(UiInvalidation::Paint)
+            } else if is_tool_elapsed_invalidation(key) {
+                invalidation.merge(UiInvalidation::Layout)
             } else {
                 invalidation
             }
@@ -2522,10 +2526,35 @@ impl BmuxApp {
     }
 
     fn tool_elapsed_invalidation_requests(
-        _now: Instant,
-        _now_system: SystemTime,
+        &self,
+        now: Instant,
+        now_system: SystemTime,
     ) -> impl Iterator<Item = InvalidationRequest> {
-        std::iter::empty()
+        self.transcript
+            .iter()
+            .filter_map(move |item| {
+                let timing = item.tool_timing()?;
+                if !item.streaming() || timing.finished_at_ms.is_some() {
+                    return None;
+                }
+                let started_at_ms = timing.started_at_ms?;
+                let at = super::temporal::next_elapsed_invalidation_capped(
+                    started_at_ms,
+                    timing.finished_at_ms,
+                    now,
+                    now_system,
+                    TOOL_ELAPSED_INVALIDATION_MAX_INTERVAL,
+                )?;
+                Some(InvalidationRequest::new(
+                    InvalidationKey::new(format!(
+                        "{TOOL_ELAPSED_INVALIDATION_PREFIX}:{}",
+                        item.id().get()
+                    )),
+                    at,
+                ))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     fn extend_composer_selection_to_visual_delta(&mut self, width: usize, delta: isize) {
@@ -2862,6 +2891,10 @@ impl BmuxApp {
             },
         );
         if let Some(item) = self.transcript.get_mut(index) {
+            if let Some(projection) = self.tool_invocation_projections.get(tool_call_id) {
+                item.set_tool_started_at_ms(projection.started_at_ms);
+                item.set_tool_finished_at_ms(projection.finished_at_ms);
+            }
             item.finish_streaming();
         }
         Some(output_kind)
@@ -2911,7 +2944,7 @@ impl BmuxApp {
             self.remove_plain_streamed_tool_result(tool_call_id);
         }
         self.supersede_matching_live_preview(tool_call_id, semantic_result);
-        let item = if let Some(semantic_result) = semantic_result {
+        let mut item = if let Some(semantic_result) = semantic_result {
             semantic_tool_result_item_from_raw(
                 tool_call_id,
                 tool_name.as_deref(),
@@ -2933,6 +2966,10 @@ impl BmuxApp {
                     )
                 })
         };
+        if let Some(projection) = self.tool_invocation_projections.get(tool_call_id) {
+            item.set_tool_started_at_ms(projection.started_at_ms);
+            item.set_tool_finished_at_ms(projection.finished_at_ms);
+        }
         self.transcript.push(item);
         if is_error {
             if application.live_activity() {
@@ -2970,73 +3007,126 @@ impl BmuxApp {
                 visual,
                 streaming,
                 ..
-            } => {
-                let tool_name = self
-                    .tool_call_contexts
-                    .get(tool_call_id)
-                    .map(|context| context.tool_name.as_str());
-                let item = streaming_tool_visual_item(tool_call_id, tool_name, visual, *streaming);
-                let index = self.transcript.upsert_tool_visual_item(item);
-                self.live_tool_previews.remove(tool_call_id);
-                self.mark_live_preview_dirty();
-                self.streamed_tool_results.insert(
-                    tool_call_id.clone(),
-                    StreamedToolResultContext {
-                        index: Some(index),
-                        columns: 0,
-                        rows: 0,
-                        started_at_ms: None,
-                        saw_output: true,
-                    },
-                );
-            }
+            } => self.apply_tool_visual_update(tool_call_id, visual, *streaming),
             ToolInvocationStreamEvent::Started {
                 tool_call_id,
                 tool_name,
+                columns,
+                rows,
+                started_at_ms,
                 ..
-            } => {
-                self.active_tool_calls.insert(tool_call_id.clone());
-                self.tool_activity_seen = true;
-                if application.live_activity() {
-                    self.set_activity_for_tool_call(tool_call_id, tool_name);
-                }
-                if application.live_activity() {
-                    if let Some(status) = Self::tool_call_file_status(tool_call_id) {
-                        self.status = status;
-                    } else {
-                        tool_name.clone_into(&mut self.status);
-                    }
-                }
-            }
+            } => self.apply_tool_started(
+                tool_call_id,
+                tool_name,
+                *columns,
+                *rows,
+                *started_at_ms,
+                application,
+            ),
             ToolInvocationStreamEvent::LegacyPresentation { .. } => {
                 Self::legacy_discard_tool_presentation_stream_event();
             }
             ToolInvocationStreamEvent::Finished {
                 tool_call_id,
                 is_error,
-                finished_at_ms: _,
+                finished_at_ms,
                 ..
-            } => {
-                self.active_tool_calls.remove(tool_call_id);
-                if let Some(context) = self.streamed_tool_results.get_mut(tool_call_id)
-                    && let Some(index) = context.index
-                    && let Some(item) = self.transcript.get_mut(index)
-                {
-                    item.finish_streaming();
-                }
-                self.finish_tool_request_preview(tool_call_id);
-                if *is_error {
-                    if application.live_activity() {
-                        "failed".clone_into(&mut self.status);
-                    }
-                } else if let Some(status) = Self::tool_call_file_status(tool_call_id) {
-                    if application.live_activity() {
-                        self.status = format!("applied · {status}");
-                    }
-                } else if application.live_activity() {
-                    "finished".clone_into(&mut self.status);
-                }
+            } => self.apply_tool_finished(tool_call_id, *is_error, *finished_at_ms, application),
+        }
+    }
+
+    fn apply_tool_visual_update(
+        &mut self,
+        tool_call_id: &str,
+        visual: &bcode_session_models::PluginVisualDescriptor,
+        streaming: bool,
+    ) {
+        let tool_name = self
+            .tool_call_contexts
+            .get(tool_call_id)
+            .map(|context| context.tool_name.as_str());
+        let mut item = streaming_tool_visual_item(tool_call_id, tool_name, visual, streaming);
+        if let Some(context) = self.streamed_tool_results.get(tool_call_id) {
+            item.set_tool_started_at_ms(context.started_at_ms);
+        }
+        let index = self.transcript.upsert_tool_visual_item(item);
+        self.live_tool_previews.remove(tool_call_id);
+        self.mark_live_preview_dirty();
+        let context = self
+            .streamed_tool_results
+            .entry(tool_call_id.to_owned())
+            .or_insert_with(|| StreamedToolResultContext {
+                index: Some(index),
+                columns: 0,
+                rows: 0,
+                started_at_ms: None,
+                saw_output: true,
+            });
+        context.index = Some(index);
+        context.saw_output = true;
+    }
+
+    fn apply_tool_started(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        columns: Option<u16>,
+        rows: Option<u16>,
+        started_at_ms: Option<u64>,
+        application: SessionEventApplication,
+    ) {
+        let context = self
+            .streamed_tool_results
+            .entry(tool_call_id.to_owned())
+            .or_insert_with(|| StreamedToolResultContext {
+                index: None,
+                columns: columns.unwrap_or(0),
+                rows: rows.unwrap_or(0),
+                started_at_ms,
+                saw_output: false,
+            });
+        context.columns = columns.unwrap_or(context.columns);
+        context.rows = rows.unwrap_or(context.rows);
+        context.started_at_ms = started_at_ms;
+        self.active_tool_calls.insert(tool_call_id.to_owned());
+        self.tool_activity_seen = true;
+        if application.live_activity() {
+            self.set_activity_for_tool_call(tool_call_id, tool_name);
+            if let Some(status) = Self::tool_call_file_status(tool_call_id) {
+                self.status = status;
+            } else {
+                tool_name.clone_into(&mut self.status);
             }
+        }
+    }
+
+    fn apply_tool_finished(
+        &mut self,
+        tool_call_id: &str,
+        is_error: bool,
+        finished_at_ms: Option<u64>,
+        application: SessionEventApplication,
+    ) {
+        self.active_tool_calls.remove(tool_call_id);
+        if let Some(context) = self.streamed_tool_results.get_mut(tool_call_id)
+            && let Some(index) = context.index
+            && let Some(item) = self.transcript.get_mut(index)
+        {
+            item.set_tool_started_at_ms(context.started_at_ms);
+            item.set_tool_finished_at_ms(finished_at_ms);
+            item.finish_streaming();
+        }
+        self.finish_tool_request_preview(tool_call_id);
+        if is_error {
+            if application.live_activity() {
+                "failed".clone_into(&mut self.status);
+            }
+        } else if let Some(status) = Self::tool_call_file_status(tool_call_id) {
+            if application.live_activity() {
+                self.status = format!("applied · {status}");
+            }
+        } else if application.live_activity() {
+            "finished".clone_into(&mut self.status);
         }
     }
 
@@ -3502,6 +3592,10 @@ fn latest_bar_active_frame_duration(burst: u8) -> Duration {
             .saturating_sub(u64::from(burst).saturating_mul(21))
             .max(36),
     )
+}
+
+fn is_tool_elapsed_invalidation(key: &InvalidationKey) -> bool {
+    key.as_str().starts_with(TOOL_ELAPSED_INVALIDATION_PREFIX)
 }
 
 fn is_latest_bar_animation_invalidation(key: &InvalidationKey) -> bool {

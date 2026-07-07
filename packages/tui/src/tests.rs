@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeMap,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use bcode_agent_profile::AgentInfo;
@@ -4257,6 +4257,117 @@ fn web_search_request_preview(query: &str) -> LiveToolArgumentPreview {
     }
 }
 
+#[test]
+fn live_shell_transcript_block_renders_generic_elapsed() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
+    let started_at_ms =
+        super::time_format::unix_time_millis(SystemTime::now()).saturating_sub(1_200);
+
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolInvocationStream {
+            event: ToolInvocationStreamEvent::Started {
+                tool_call_id: "call-shell".to_owned(),
+                tool_name: "shell.run".to_owned(),
+                sequence: 0,
+                terminal: true,
+                columns: Some(80),
+                rows: Some(24),
+                started_at_ms: Some(started_at_ms),
+            },
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::ToolInvocationStream {
+            event: ToolInvocationStreamEvent::VisualUpdate {
+                tool_call_id: "call-shell".to_owned(),
+                sequence: 1,
+                visual: PluginVisualDescriptor {
+                    producer_plugin_id: Some("bcode.shell".to_owned()),
+                    schema: "bcode.tool.request.shell.run".to_owned(),
+                    schema_version: 1,
+                    title: Some("Shell command".to_owned()),
+                    subtitle: None,
+                    payload: serde_json::json!({
+                        "arguments": {"command": "echo hi"},
+                        "_bcode_runtime": {"output": "hi\n", "columns": 80, "rows": 24, "streaming": true}
+                    }),
+                },
+                streaming: true,
+            },
+        },
+    ));
+
+    let rendered = render_app_text(&mut app);
+
+    assert!(rendered.contains("Shell command · elapsed"), "{rendered}");
+    assert!(rendered.contains("hi"), "{rendered}");
+    assert!(
+        app.invalidation_requests(Instant::now(), SystemTime::now())
+            .len()
+            > 1
+    );
+}
+
+#[test]
+fn replayed_shell_transcript_block_renders_generic_duration() {
+    let session_id = SessionId::new();
+    let events = vec![
+        event(
+            session_id,
+            1,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Started {
+                    tool_call_id: "call-shell".to_owned(),
+                    tool_name: "shell.run".to_owned(),
+                    sequence: 0,
+                    terminal: true,
+                    columns: Some(80),
+                    rows: Some(24),
+                    started_at_ms: Some(1_000),
+                },
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationStream {
+                event: ToolInvocationStreamEvent::Finished {
+                    tool_call_id: "call-shell".to_owned(),
+                    sequence: 1,
+                    is_error: false,
+                    finished_at_ms: Some(1_012),
+                },
+            },
+        ),
+        event(
+            session_id,
+            3,
+            SessionEventKind::ToolCallFinished {
+                tool_call_id: "call-shell".to_owned(),
+                result: "shell completed".to_owned(),
+                is_error: false,
+                output: None,
+                semantic_result: Some(ToolInvocationResult::Artifact {
+                    artifact: Box::new(shell_run_artifact()),
+                }),
+            },
+        ),
+    ];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
+
+    let rendered = render_app_text(&mut app);
+
+    assert!(rendered.contains("Shell run · duration 12ms"), "{rendered}");
+    assert!(rendered.contains("exit code 0"), "{rendered}");
+}
+
 fn shell_run_artifact() -> bcode_session_models::ToolArtifact {
     bcode_session_models::ToolArtifact {
         artifact_id: "call-shell-shell-run".to_owned(),
@@ -4454,6 +4565,7 @@ fn live_shell_artifact_renders_terminal_output_from_raw_run_metadata() {
     let rendered = render_app_text(&mut app);
 
     assert!(rendered.contains("Shell run"), "{rendered}");
+    assert!(rendered.contains("exit code 0"), "{rendered}");
     assert!(rendered.contains("shell raw output"), "{rendered}");
     assert!(!rendered.contains("bcode.shell.run"), "{rendered}");
 }
@@ -4480,6 +4592,7 @@ fn replayed_shell_artifact_renders_terminal_output_from_raw_run_metadata() {
     let rendered = render_app_text(&mut app);
 
     assert!(rendered.contains("Shell run"), "{rendered}");
+    assert!(rendered.contains("exit code 0"), "{rendered}");
     assert!(rendered.contains("shell raw output"), "{rendered}");
     assert!(!rendered.contains("bcode.shell.run"), "{rendered}");
 }

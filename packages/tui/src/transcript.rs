@@ -7,6 +7,15 @@ use bcode_session_models::{
     ToolInvocationResult, ToolInvocationStreamEvent,
 };
 
+/// Generic timing metadata for a tool invocation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ToolTiming {
+    /// Tool start time as UNIX epoch milliseconds.
+    pub started_at_ms: Option<u64>,
+    /// Tool finish time as UNIX epoch milliseconds.
+    pub finished_at_ms: Option<u64>,
+}
+
 /// Semantic transcript item type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptItemKind {
@@ -50,6 +59,8 @@ pub enum TranscriptItemKind {
         artifact: Option<Box<ToolArtifact>>,
         /// Whether the tool failed.
         is_error: bool,
+        /// Generic timing metadata for the tool invocation.
+        timing: ToolTiming,
     },
     /// Token usage telemetry for a model turn.
     Usage {
@@ -295,6 +306,41 @@ impl TranscriptItem {
         self.bump_revision();
     }
 
+    /// Return generic tool timing metadata, when this item represents a tool result.
+    #[must_use]
+    pub const fn tool_timing(&self) -> Option<ToolTiming> {
+        match &self.kind {
+            TranscriptItemKind::ToolResult { timing, .. } => Some(*timing),
+            _ => None,
+        }
+    }
+
+    /// Set generic tool start time metadata on a tool result item.
+    pub const fn set_tool_started_at_ms(&mut self, started_at_ms: Option<u64>) {
+        if let TranscriptItemKind::ToolResult { timing, .. } = &mut self.kind {
+            timing.started_at_ms = started_at_ms;
+            self.bump_revision();
+        }
+    }
+
+    /// Set generic tool finish time metadata on a tool result item.
+    pub const fn set_tool_finished_at_ms(&mut self, finished_at_ms: Option<u64>) {
+        if let TranscriptItemKind::ToolResult { timing, .. } = &mut self.kind {
+            timing.finished_at_ms = finished_at_ms;
+            self.bump_revision();
+        }
+    }
+
+    /// Copy generic tool timing from another tool item.
+    pub const fn copy_tool_timing_from(&mut self, other: &Self) {
+        if let Some(source_timing) = other.tool_timing()
+            && let TranscriptItemKind::ToolResult { timing, .. } = &mut self.kind
+        {
+            *timing = source_timing;
+            self.bump_revision();
+        }
+    }
+
     /// Return whether this item is a live preview anchor for `tool_call_id`.
     #[must_use]
     pub fn is_live_preview_anchor_for(&self, tool_call_id: &str) -> bool {
@@ -333,7 +379,7 @@ pub fn transcript_items_from_events_with_reasoning(
     projector.finish()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct StreamedToolReplayContext {
     index: Option<usize>,
     columns: u16,
@@ -413,13 +459,16 @@ pub fn tool_request_item_from_projection(projection: &ToolInvocationProjection) 
 pub fn generic_tool_result_item_from_projection(
     projection: &ToolInvocationProjection,
 ) -> Option<TranscriptItem> {
-    Some(tool_result_item(
+    let mut item = tool_result_item(
         &projection.tool_call_id,
         projection.tool_name.as_deref(),
         projection.arguments_json.as_deref(),
         &display_tool_result_text(projection.result_text.as_deref()?),
         projection.is_error.unwrap_or(false),
-    ))
+    );
+    item.set_tool_started_at_ms(projection.started_at_ms);
+    item.set_tool_finished_at_ms(projection.finished_at_ms);
+    Some(item)
 }
 
 /// Build a transcript item for a tool request.
@@ -491,6 +540,7 @@ pub fn streaming_tool_visual_item(
             result: artifact_summary_text(&artifact),
             artifact: Some(Box::new(artifact)),
             is_error: false,
+            timing: ToolTiming::default(),
         },
     )
 }
@@ -506,6 +556,8 @@ pub fn upsert_tool_visual_item(items: &mut Vec<TranscriptItem>, item: Transcript
     if let Some(index) = items.iter().position(|existing| {
         tool_visual_identity(existing) == Some((tool_call_id.as_str(), schema.as_str()))
     }) {
+        let mut item = item;
+        item.copy_tool_timing_from(&items[index]);
         items[index] = item;
         return index;
     }
@@ -519,6 +571,8 @@ pub fn upsert_tool_visual_item(items: &mut Vec<TranscriptItem>, item: Transcript
                 } if item_tool_call_id == &tool_call_id
             )
     }) {
+        let mut item = item;
+        item.copy_tool_timing_from(&items[index]);
         items[index] = item;
         return index;
     }
@@ -557,6 +611,7 @@ pub fn streaming_tool_output_item(
             result: text.to_owned(),
             artifact: None,
             is_error: false,
+            timing: ToolTiming::default(),
         },
     )
 }
@@ -581,6 +636,7 @@ pub fn tool_result_item(
             result: result.to_owned(),
             artifact: None,
             is_error,
+            timing: ToolTiming::default(),
         },
     )
 }
@@ -614,6 +670,7 @@ pub fn artifact_tool_result_item(
             result,
             artifact: Some(Box::new(artifact)),
             is_error,
+            timing: ToolTiming::default(),
         },
     )
 }
@@ -804,14 +861,17 @@ fn push_transcript_item_from_event(
                 if let Some(replay) = streamed_tool_results.get_mut(tool_call_id)
                     && let Some(index) = replay.index
                 {
-                    let item = semantic_tool_result_item(
+                    let mut item = semantic_tool_result_item(
                         tool_call_id,
                         tool_calls.get(tool_call_id),
                         semantic_result,
                         *is_error,
                     );
+                    apply_replay_timing(&mut item, replay);
                     if replay.saw_output {
                         if let Some(existing) = items.get_mut(index) {
+                            existing.set_tool_started_at_ms(replay.started_at_ms);
+                            existing.set_tool_finished_at_ms(replay.finished_at_ms);
                             existing.finish_streaming();
                         }
                     } else if let Some(existing) = items.get_mut(index) {
@@ -821,12 +881,15 @@ fn push_transcript_item_from_event(
                     }
                     return;
                 }
-                let item = semantic_tool_result_item(
+                let mut item = semantic_tool_result_item(
                     tool_call_id,
                     tool_calls.get(tool_call_id),
                     semantic_result,
                     *is_error,
                 );
+                if let Some(replay) = streamed_tool_results.get(tool_call_id) {
+                    apply_replay_timing(&mut item, replay);
+                }
                 items.push(item);
                 return;
             }
@@ -835,6 +898,8 @@ fn push_transcript_item_from_event(
                     if let Some(index) = replay.index
                         && let Some(item) = items.get_mut(index)
                     {
+                        item.set_tool_started_at_ms(replay.started_at_ms);
+                        item.set_tool_finished_at_ms(replay.finished_at_ms);
                         item.finish_streaming();
                     }
                     !replay.saw_output
@@ -842,12 +907,15 @@ fn push_transcript_item_from_event(
                     true
                 };
             if should_render_final
-                && let Some(item) = non_streaming_transcript_item_from_event(
+                && let Some(mut item) = non_streaming_transcript_item_from_event(
                     event,
                     tool_calls,
                     streamed_tool_results,
                 )
             {
+                if let Some(replay) = streamed_tool_results.get(tool_call_id) {
+                    apply_replay_timing(&mut item, replay);
+                }
                 items.push(item);
             }
         }
@@ -1216,38 +1284,70 @@ pub fn artifact_summary_text(artifact: &ToolArtifact) -> String {
     format!("{title}\n{text}")
 }
 
+const fn apply_replay_timing(item: &mut TranscriptItem, replay: &StreamedToolReplayContext) {
+    item.set_tool_started_at_ms(replay.started_at_ms);
+    item.set_tool_finished_at_ms(replay.finished_at_ms);
+}
+
 fn apply_tool_invocation_stream_event(
     items: &mut Vec<TranscriptItem>,
     tool_calls: &BTreeMap<String, ToolCallContext>,
     streamed_tool_results: &mut BTreeMap<String, StreamedToolReplayContext>,
     event: &ToolInvocationStreamEvent,
 ) {
-    if let ToolInvocationStreamEvent::VisualUpdate {
-        tool_call_id,
-        visual,
-        streaming,
-        ..
-    } = event
-    {
-        let context = tool_calls.get(tool_call_id);
-        let item = streaming_tool_visual_item(
+    match event {
+        ToolInvocationStreamEvent::Started {
             tool_call_id,
-            context.map(|context| context.tool_name.as_str()),
+            started_at_ms,
+            ..
+        } => {
+            let replay = streamed_tool_results
+                .entry(tool_call_id.clone())
+                .or_default();
+            replay.started_at_ms = *started_at_ms;
+        }
+        ToolInvocationStreamEvent::VisualUpdate {
+            tool_call_id,
             visual,
-            *streaming,
-        );
-        let index = upsert_tool_visual_item(items, item);
-        streamed_tool_results.insert(
-            tool_call_id.clone(),
-            StreamedToolReplayContext {
-                index: Some(index),
-                columns: 0,
-                rows: 0,
-                started_at_ms: None,
-                finished_at_ms: None,
-                saw_output: true,
-            },
-        );
+            streaming,
+            ..
+        } => {
+            let context = tool_calls.get(tool_call_id);
+            let mut item = streaming_tool_visual_item(
+                tool_call_id,
+                context.map(|context| context.tool_name.as_str()),
+                visual,
+                *streaming,
+            );
+            let replay = streamed_tool_results
+                .entry(tool_call_id.clone())
+                .or_default();
+            item.set_tool_started_at_ms(replay.started_at_ms);
+            item.set_tool_finished_at_ms(replay.finished_at_ms);
+            let index = upsert_tool_visual_item(items, item);
+            replay.index = Some(index);
+            replay.saw_output = true;
+        }
+        ToolInvocationStreamEvent::Finished {
+            tool_call_id,
+            finished_at_ms,
+            ..
+        } => {
+            let replay = streamed_tool_results
+                .entry(tool_call_id.clone())
+                .or_default();
+            replay.finished_at_ms = *finished_at_ms;
+            if let Some(index) = replay.index
+                && let Some(item) = items.get_mut(index)
+            {
+                item.set_tool_started_at_ms(replay.started_at_ms);
+                item.set_tool_finished_at_ms(replay.finished_at_ms);
+                item.finish_streaming();
+            }
+        }
+        ToolInvocationStreamEvent::OutputDelta { .. }
+        | ToolInvocationStreamEvent::Status { .. }
+        | ToolInvocationStreamEvent::LegacyPresentation { .. } => {}
     }
 }
 

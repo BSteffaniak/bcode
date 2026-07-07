@@ -49,6 +49,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         });
 
         let mut lines = shell_terminal_prompt_rows(payload);
+        lines.extend(shell_status_rows(payload));
         lines.extend(terminal_viewer_rows(
             TerminalViewerInput {
                 output: &output,
@@ -90,6 +91,7 @@ fn shell_request_rows(payload: &serde_json::Value, width: u16) -> Vec<Line> {
     let columns = payload_u16(runtime, "columns").unwrap_or(DEFAULT_TERMINAL_COLUMNS);
     let rows = payload_u16(runtime, "rows").unwrap_or(DEFAULT_TERMINAL_ROWS);
     let mut lines = shell_terminal_prompt_rows(payload);
+    lines.extend(shell_status_rows(runtime));
     lines.extend(terminal_viewer_rows(
         TerminalViewerInput {
             output,
@@ -108,6 +110,34 @@ fn shell_request_rows(payload: &serde_json::Value, width: u16) -> Vec<Line> {
         width,
     ));
     lines
+}
+
+fn shell_status_rows(payload: &serde_json::Value) -> Vec<Line> {
+    let mut parts = Vec::new();
+    if payload
+        .get("timed_out")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        parts.push("timed out".to_owned());
+    }
+    if payload
+        .get("cancelled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        parts.push("cancelled".to_owned());
+    }
+    if let Some(exit_code) = payload_exit_code(payload) {
+        parts.push(format!("exit code {exit_code}"));
+    }
+    if parts.is_empty() {
+        return Vec::new();
+    }
+    vec![Line::from_spans(vec![
+        Span::styled("  ", muted_style()),
+        Span::styled(parts.join(" · "), muted_style()),
+    ])]
 }
 
 fn shell_terminal_prompt_rows(payload: &serde_json::Value) -> Vec<Line> {

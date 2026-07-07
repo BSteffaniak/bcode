@@ -17,8 +17,9 @@ use bmux_tui_components::text_input::TextInputControl;
 use super::activity::ActivityState;
 use super::app::{BmuxApp, DaemonConnectionState, LiveToolPreviewState, composer_policy};
 use super::pending_submission::{PendingSubmission, PendingSubmissionState};
+use super::time_format::{format_millis, unix_time_millis};
 use super::tool_render_projection::{CanonicalPluginVisual, CanonicalToolVisual};
-use super::transcript::{TranscriptItem, TranscriptItemKind};
+use super::transcript::{ToolTiming, TranscriptItem, TranscriptItemKind};
 use super::transcript_layout::TranscriptLayoutSignature;
 use bmux_tui::text_width::{display_width as text_display_width, truncate_to_display_width};
 use unicode_segmentation::UnicodeSegmentation;
@@ -564,8 +565,14 @@ pub fn transcript_item_signature(
     ))
 }
 
-pub const fn terminal_elapsed_signature_fragment(_item: &TranscriptItem) -> Option<String> {
-    None
+pub fn terminal_elapsed_signature_fragment(item: &TranscriptItem) -> Option<String> {
+    let timing = item.tool_timing()?;
+    if !item.streaming() {
+        return None;
+    }
+    let started_at_ms = timing.started_at_ms?;
+    let elapsed_ms = unix_time_millis(std::time::SystemTime::now()).saturating_sub(started_at_ms);
+    Some(format_millis(elapsed_ms))
 }
 
 pub fn pending_submission_signature(
@@ -634,6 +641,7 @@ fn push_transcript_item_rows(
             result,
             artifact,
             is_error,
+            ..
         } => {
             push_tool_result_rows(
                 rows,
@@ -833,12 +841,15 @@ fn push_tool_request_rows(
             {
                 push_plugin_transcript_block_rows(
                     rows,
-                    request_visual.title.as_deref().unwrap_or(context.tool_name),
-                    plugin_visual,
+                    PluginTranscriptBlockContext {
+                        title: request_visual.title.as_deref().unwrap_or(context.tool_name),
+                        visual: plugin_visual,
+                        plugin_host: context.plugin_host,
+                        streaming: item.streaming(),
+                        is_error: false,
+                        timing: item.tool_timing(),
+                    },
                     width,
-                    context.plugin_host,
-                    item.streaming(),
-                    false,
                 );
                 return;
             }
@@ -994,32 +1005,64 @@ fn push_canonical_plugin_visual_rows(
     );
 }
 
-fn push_plugin_transcript_block_rows(
-    rows: &mut Vec<Line>,
-    title: &str,
-    visual: &CanonicalPluginVisual,
-    width: u16,
-    plugin_host: Option<&bcode_plugin::PluginHost>,
+#[derive(Clone, Copy)]
+struct PluginTranscriptBlockContext<'a> {
+    title: &'a str,
+    visual: &'a CanonicalPluginVisual,
+    plugin_host: Option<&'a bcode_plugin::PluginHost>,
     streaming: bool,
     is_error: bool,
+    timing: Option<ToolTiming>,
+}
+
+fn push_plugin_transcript_block_rows(
+    rows: &mut Vec<Line>,
+    context: PluginTranscriptBlockContext<'_>,
+    width: u16,
 ) {
-    let color = if is_error {
+    let color = if context.is_error {
         Color::Red
-    } else if streaming {
+    } else if context.streaming {
         Color::Cyan
     } else {
         Color::Yellow
     };
+    let title = tool_block_title_with_timing(context.title, context.timing, context.streaming);
     push_wrapped_styled_text(
         rows,
         Vec::new(),
-        title,
+        &title,
         width,
         Style::new().fg(color),
         muted_style(),
     );
-    push_canonical_plugin_visual_rows(rows, visual, width, plugin_host);
+    push_canonical_plugin_visual_rows(rows, context.visual, width, context.plugin_host);
     rows.push(Line::default());
+}
+
+fn tool_block_title_with_timing(
+    title: &str,
+    timing: Option<ToolTiming>,
+    streaming: bool,
+) -> String {
+    let Some(timing) = timing else {
+        return title.to_owned();
+    };
+    if streaming {
+        if let Some(started_at_ms) = timing.started_at_ms {
+            let elapsed_ms =
+                unix_time_millis(std::time::SystemTime::now()).saturating_sub(started_at_ms);
+            return format!("{title} · elapsed {}", format_millis(elapsed_ms));
+        }
+    } else if let (Some(started_at_ms), Some(finished_at_ms)) =
+        (timing.started_at_ms, timing.finished_at_ms)
+    {
+        return format!(
+            "{title} · duration {}",
+            format_millis(finished_at_ms.saturating_sub(started_at_ms))
+        );
+    }
+    title.to_owned()
 }
 
 fn push_plugin_visual_degraded_rows(
@@ -1113,12 +1156,15 @@ fn push_tool_result_rows(
         {
             push_plugin_transcript_block_rows(
                 rows,
-                artifact.title.as_deref().unwrap_or("Tool result"),
-                plugin_visual,
+                PluginTranscriptBlockContext {
+                    title: artifact.title.as_deref().unwrap_or("Tool result"),
+                    visual: plugin_visual,
+                    plugin_host,
+                    streaming: item.streaming(),
+                    is_error: context.is_error,
+                    timing: item.tool_timing(),
+                },
                 width,
-                plugin_host,
-                item.streaming(),
-                context.is_error,
             );
             return;
         }

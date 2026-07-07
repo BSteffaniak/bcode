@@ -1,5 +1,15 @@
 //! Human-readable time and duration formatting helpers.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Return current UNIX epoch time in milliseconds, saturating on overflow.
+#[must_use]
+pub fn unix_time_millis(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH).map_or(0, |duration| {
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+    })
+}
+
 /// Format a millisecond duration for display.
 #[must_use]
 pub fn format_millis(ms: u64) -> String {
