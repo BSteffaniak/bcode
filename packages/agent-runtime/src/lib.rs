@@ -541,7 +541,7 @@ impl AgentRuntime {
     ) -> Result<ToolExecutionOutput>
     where
         C: ToolCatalog,
-        P: PermissionPolicy,
+        P: PermissionPolicy + ?Sized,
         E: ToolExecutor,
     {
         let mut rounds = ToolRoundState::new(u32::MAX);
@@ -565,7 +565,7 @@ impl AgentRuntime {
     ) -> Result<ToolExecutionOutput>
     where
         C: ToolCatalog,
-        P: PermissionPolicy,
+        P: PermissionPolicy + ?Sized,
         E: ToolExecutor,
     {
         rounds.begin_round()?;

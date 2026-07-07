@@ -10,9 +10,7 @@
 
 #[cfg(feature = "embedded-plugins")]
 use bcode_agent_runtime::RuntimeFuture;
-use bcode_agent_runtime::{
-    AgentRuntime, AgentTurnRequest, AgentTurnResponse, ModelProviderInvoker,
-};
+use bcode_agent_runtime::{AgentRuntime, AgentTurnRequest, AgentTurnResponse};
 #[cfg(feature = "embedded-plugins")]
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID,
@@ -30,8 +28,9 @@ use thiserror::Error;
 pub use bcode_agent_runtime::{
     AgentRuntimeEvent as AgentEvent, AgentRuntimeStream as AgentStream,
     AgentRuntimeStreamItem as AgentStreamItem, AllowAllPolicy, CancellationToken,
-    PermissionDecision, PermissionPolicy, RegisteredTool, RuntimeError, ToolExecutionOutput,
-    ToolExecutor, ToolRoundState, ToolSource, UnifiedToolCatalog,
+    ModelProviderInvoker, PermissionDecision, PermissionPolicy, RegisteredTool, RuntimeError,
+    RuntimeFuture, ToolExecutionOutput, ToolExecutor, ToolRoundState, ToolSource,
+    UnifiedToolCatalog,
 };
 pub use bcode_model::ToolCall;
 
@@ -50,9 +49,248 @@ pub enum BcodeError {
     /// Embedded plugin runtime is required for this operation.
     #[error("embedded plugin runtime is not configured")]
     MissingPluginRuntime,
+    /// Hook callback failed.
+    #[error("hook error: {0}")]
+    Hook(String),
     /// Tool execution failed.
     #[error("tool execution error: {0}")]
     ToolExecution(String),
+}
+
+/// Context supplied to model-call hooks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelCallContext {
+    /// Agent name, when configured.
+    pub agent_name: Option<String>,
+    /// Selected provider plugin ID, when configured.
+    pub provider_plugin_id: Option<String>,
+    /// Selected model ID.
+    pub model_id: String,
+    /// User prompt for the model call.
+    pub prompt: String,
+}
+
+/// Context supplied after a successful model call.
+#[derive(Debug, Clone)]
+pub struct ModelCallOutcome {
+    /// Generated text response and runtime metadata.
+    pub response: GenerateTextResponse,
+}
+
+/// Context supplied to tool-call hooks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallContext {
+    /// Agent name, when configured.
+    pub agent_name: Option<String>,
+    /// Requested tool call.
+    pub call: ToolCall,
+}
+
+/// Context supplied after a successful tool call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallOutcome {
+    /// Tool execution output including model result and normalized events.
+    pub output: ToolExecutionOutput,
+}
+
+type ModelBeforeHook = Arc<dyn Fn(&ModelCallContext) -> Result<()> + Send + Sync>;
+type ModelAfterHook = Arc<dyn Fn(&ModelCallContext, &ModelCallOutcome) -> Result<()> + Send + Sync>;
+type ToolBeforeHook = Arc<dyn Fn(&ToolCallContext) -> Result<()> + Send + Sync>;
+type ToolAfterHook = Arc<dyn Fn(&ToolCallContext, &ToolCallOutcome) -> Result<()> + Send + Sync>;
+
+/// Typed SDK hook callbacks for logging, tracing, budgets, and safety checks.
+#[derive(Clone, Default)]
+pub struct AgentHooks {
+    before_model: Vec<ModelBeforeHook>,
+    after_model: Vec<ModelAfterHook>,
+    before_tool: Vec<ToolBeforeHook>,
+    after_tool: Vec<ToolAfterHook>,
+}
+
+impl fmt::Debug for AgentHooks {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentHooks")
+            .field("before_model", &self.before_model.len())
+            .field("after_model", &self.after_model.len())
+            .field("before_tool", &self.before_tool.len())
+            .field("after_tool", &self.after_tool.len())
+            .finish()
+    }
+}
+
+impl AgentHooks {
+    /// Create an empty hook set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a hook that runs before model calls.
+    #[must_use]
+    pub fn on_before_model<F>(mut self, hook: F) -> Self
+    where
+        F: Fn(&ModelCallContext) -> Result<()> + Send + Sync + 'static,
+    {
+        self.before_model.push(Arc::new(hook));
+        self
+    }
+
+    /// Add a hook that runs after successful model calls.
+    #[must_use]
+    pub fn on_after_model<F>(mut self, hook: F) -> Self
+    where
+        F: Fn(&ModelCallContext, &ModelCallOutcome) -> Result<()> + Send + Sync + 'static,
+    {
+        self.after_model.push(Arc::new(hook));
+        self
+    }
+
+    /// Add a hook that runs before tool calls.
+    #[must_use]
+    pub fn on_before_tool<F>(mut self, hook: F) -> Self
+    where
+        F: Fn(&ToolCallContext) -> Result<()> + Send + Sync + 'static,
+    {
+        self.before_tool.push(Arc::new(hook));
+        self
+    }
+
+    /// Add a hook that runs after successful tool calls.
+    #[must_use]
+    pub fn on_after_tool<F>(mut self, hook: F) -> Self
+    where
+        F: Fn(&ToolCallContext, &ToolCallOutcome) -> Result<()> + Send + Sync + 'static,
+    {
+        self.after_tool.push(Arc::new(hook));
+        self
+    }
+
+    fn run_before_model(&self, context: &ModelCallContext) -> Result<()> {
+        for hook in &self.before_model {
+            hook(context)?;
+        }
+        Ok(())
+    }
+
+    fn run_after_model(
+        &self,
+        context: &ModelCallContext,
+        outcome: &ModelCallOutcome,
+    ) -> Result<()> {
+        for hook in &self.after_model {
+            hook(context, outcome)?;
+        }
+        Ok(())
+    }
+
+    fn run_before_tool(&self, context: &ToolCallContext) -> Result<()> {
+        for hook in &self.before_tool {
+            hook(context)?;
+        }
+        Ok(())
+    }
+
+    fn run_after_tool(&self, context: &ToolCallContext, outcome: &ToolCallOutcome) -> Result<()> {
+        for hook in &self.after_tool {
+            hook(context, outcome)?;
+        }
+        Ok(())
+    }
+}
+
+/// Simple configurable tool permission policy for SDK callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimplePermissionPolicy {
+    default: PermissionDecision,
+    tool_decisions: BTreeMap<String, PermissionDecision>,
+}
+
+impl SimplePermissionPolicy {
+    /// Create a policy with a default decision.
+    #[must_use]
+    pub const fn new(default: PermissionDecision) -> Self {
+        Self {
+            default,
+            tool_decisions: BTreeMap::new(),
+        }
+    }
+
+    /// Create a policy that allows tools by default.
+    #[must_use]
+    pub const fn allow_all() -> Self {
+        Self::new(PermissionDecision::Allow)
+    }
+
+    /// Create a policy that denies tools by default.
+    #[must_use]
+    pub fn deny_all(reason: impl Into<String>) -> Self {
+        Self::new(PermissionDecision::Deny(reason.into()))
+    }
+
+    /// Set the decision for one tool name.
+    #[must_use]
+    pub fn with_tool_decision(
+        mut self,
+        tool_name: impl Into<String>,
+        decision: PermissionDecision,
+    ) -> Self {
+        self.tool_decisions.insert(tool_name.into(), decision);
+        self
+    }
+}
+
+impl PermissionPolicy for SimplePermissionPolicy {
+    fn evaluate_tool_call<'a>(
+        &'a self,
+        call: &'a ToolCall,
+    ) -> bcode_agent_runtime::RuntimeFuture<'a, PermissionDecision> {
+        Box::pin(async move {
+            Ok(self
+                .tool_decisions
+                .get(&call.name)
+                .cloned()
+                .unwrap_or_else(|| self.default.clone()))
+        })
+    }
+}
+
+type PermissionCallback = Arc<dyn Fn(&ToolCall) -> PermissionDecision + Send + Sync>;
+
+/// Callback-backed permission policy for interactive SDK applications.
+#[derive(Clone)]
+pub struct CallbackPermissionPolicy {
+    callback: PermissionCallback,
+}
+
+impl fmt::Debug for CallbackPermissionPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CallbackPermissionPolicy")
+            .finish_non_exhaustive()
+    }
+}
+
+impl CallbackPermissionPolicy {
+    /// Create a callback-backed permission policy.
+    #[must_use]
+    pub fn new<F>(callback: F) -> Self
+    where
+        F: Fn(&ToolCall) -> PermissionDecision + Send + Sync + 'static,
+    {
+        Self {
+            callback: Arc::new(callback),
+        }
+    }
+}
+
+impl PermissionPolicy for CallbackPermissionPolicy {
+    fn evaluate_tool_call<'a>(
+        &'a self,
+        call: &'a ToolCall,
+    ) -> bcode_agent_runtime::RuntimeFuture<'a, PermissionDecision> {
+        Box::pin(async move { Ok((self.callback)(call)) })
+    }
 }
 
 type InlineToolHandler = Arc<
@@ -409,6 +647,8 @@ pub struct Agent {
     max_tool_rounds: u32,
     tool_catalog: UnifiedToolCatalog,
     inline_tool_handlers: BTreeMap<String, InlineToolHandler>,
+    hooks: AgentHooks,
+    permission_policy: Arc<dyn PermissionPolicy>,
     #[cfg(feature = "embedded-plugins")]
     provider: Option<PluginModelProviderInvoker>,
     #[cfg(feature = "embedded-plugins")]
@@ -433,7 +673,9 @@ impl fmt::Debug for Agent {
             .field(
                 "inline_tool_handlers",
                 &self.inline_tool_handlers.keys().collect::<Vec<_>>(),
-            );
+            )
+            .field("hooks", &self.hooks)
+            .field("permission_policy", &"<policy>");
         #[cfg(feature = "embedded-plugins")]
         debug
             .field("provider", &self.provider)
@@ -476,11 +718,21 @@ impl Agent {
     where
         P: ModelProviderInvoker,
     {
+        let prompt = prompt.into();
+        let context = self.model_call_context(prompt.clone());
+        self.hooks.run_before_model(&context)?;
         let response = self
             .runtime
-            .run_text_turn(provider, self.turn_request(prompt.into()))
+            .run_text_turn(provider, self.turn_request(prompt))
             .await?;
-        Ok(response.into())
+        let response = GenerateTextResponse::from(response);
+        self.hooks.run_after_model(
+            &context,
+            &ModelCallOutcome {
+                response: response.clone(),
+            },
+        )?;
+        Ok(response)
     }
 
     /// Stream text using the agent's configured embedded provider.
@@ -573,10 +825,27 @@ impl Agent {
             #[cfg(feature = "embedded-plugins")]
             plugins: self.plugins.clone(),
         };
-        Ok(self
+        let context = ToolCallContext {
+            agent_name: self.name.clone(),
+            call: call.clone(),
+        };
+        self.hooks.run_before_tool(&context)?;
+        let output = self
             .runtime
-            .execute_tool_call(&self.tool_catalog, &AllowAllPolicy, &executor, call)
-            .await?)
+            .execute_tool_call(
+                &self.tool_catalog,
+                self.permission_policy.as_ref(),
+                &executor,
+                call,
+            )
+            .await?;
+        self.hooks.run_after_tool(
+            &context,
+            &ToolCallOutcome {
+                output: output.clone(),
+            },
+        )?;
+        Ok(output)
     }
 
     /// Execute a registered tool call through this agent's unified tool catalog and round budget.
@@ -595,16 +864,37 @@ impl Agent {
             #[cfg(feature = "embedded-plugins")]
             plugins: self.plugins.clone(),
         };
-        Ok(self
+        let context = ToolCallContext {
+            agent_name: self.name.clone(),
+            call: call.clone(),
+        };
+        self.hooks.run_before_tool(&context)?;
+        let output = self
             .runtime
             .execute_tool_call_with_round_state(
                 &self.tool_catalog,
-                &AllowAllPolicy,
+                self.permission_policy.as_ref(),
                 &executor,
                 call,
                 rounds,
             )
-            .await?)
+            .await?;
+        self.hooks.run_after_tool(
+            &context,
+            &ToolCallOutcome {
+                output: output.clone(),
+            },
+        )?;
+        Ok(output)
+    }
+
+    fn model_call_context(&self, prompt: String) -> ModelCallContext {
+        ModelCallContext {
+            agent_name: self.name.clone(),
+            provider_plugin_id: self.provider_plugin_id.clone(),
+            model_id: self.model_id.clone(),
+            prompt,
+        }
     }
 
     fn turn_request(&self, prompt: String) -> AgentTurnRequest {
@@ -658,6 +948,8 @@ pub struct AgentBuilder {
     max_tool_rounds: u32,
     tool_catalog: UnifiedToolCatalog,
     inline_tool_handlers: BTreeMap<String, InlineToolHandler>,
+    hooks: AgentHooks,
+    permission_policy: Arc<dyn PermissionPolicy>,
     #[cfg(feature = "embedded-plugins")]
     provider: Option<PluginModelProviderInvoker>,
     #[cfg(feature = "embedded-plugins")]
@@ -682,7 +974,9 @@ impl fmt::Debug for AgentBuilder {
             .field(
                 "inline_tool_handlers",
                 &self.inline_tool_handlers.keys().collect::<Vec<_>>(),
-            );
+            )
+            .field("hooks", &self.hooks)
+            .field("permission_policy", &"<policy>");
         #[cfg(feature = "embedded-plugins")]
         debug
             .field("provider", &self.provider)
@@ -706,6 +1000,8 @@ impl Default for AgentBuilder {
             max_tool_rounds: 8,
             tool_catalog: UnifiedToolCatalog::new(),
             inline_tool_handlers: BTreeMap::new(),
+            hooks: AgentHooks::new(),
+            permission_policy: Arc::new(SimplePermissionPolicy::allow_all()),
             #[cfg(feature = "embedded-plugins")]
             provider: None,
             #[cfg(feature = "embedded-plugins")]
@@ -828,6 +1124,80 @@ impl AgentBuilder {
         self
     }
 
+    /// Configure hooks for model and tool calls.
+    #[must_use]
+    pub fn hooks(mut self, hooks: AgentHooks) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
+    /// Add a hook that runs before model calls.
+    #[must_use]
+    pub fn on_before_model<F>(mut self, hook: F) -> Self
+    where
+        F: Fn(&ModelCallContext) -> Result<()> + Send + Sync + 'static,
+    {
+        self.hooks = self.hooks.on_before_model(hook);
+        self
+    }
+
+    /// Add a hook that runs after successful model calls.
+    #[must_use]
+    pub fn on_after_model<F>(mut self, hook: F) -> Self
+    where
+        F: Fn(&ModelCallContext, &ModelCallOutcome) -> Result<()> + Send + Sync + 'static,
+    {
+        self.hooks = self.hooks.on_after_model(hook);
+        self
+    }
+
+    /// Add a hook that runs before tool calls.
+    #[must_use]
+    pub fn on_before_tool<F>(mut self, hook: F) -> Self
+    where
+        F: Fn(&ToolCallContext) -> Result<()> + Send + Sync + 'static,
+    {
+        self.hooks = self.hooks.on_before_tool(hook);
+        self
+    }
+
+    /// Add a hook that runs after successful tool calls.
+    #[must_use]
+    pub fn on_after_tool<F>(mut self, hook: F) -> Self
+    where
+        F: Fn(&ToolCallContext, &ToolCallOutcome) -> Result<()> + Send + Sync + 'static,
+    {
+        self.hooks = self.hooks.on_after_tool(hook);
+        self
+    }
+
+    /// Configure a simple permission policy.
+    #[must_use]
+    pub fn permission_policy(mut self, policy: SimplePermissionPolicy) -> Self {
+        self.permission_policy = Arc::new(policy);
+        self
+    }
+
+    /// Configure a callback-backed permission policy.
+    #[must_use]
+    pub fn permission_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&ToolCall) -> PermissionDecision + Send + Sync + 'static,
+    {
+        self.permission_policy = Arc::new(CallbackPermissionPolicy::new(callback));
+        self
+    }
+
+    /// Configure a custom permission policy implementation.
+    #[must_use]
+    pub fn custom_permission_policy<P>(mut self, policy: P) -> Self
+    where
+        P: PermissionPolicy + 'static,
+    {
+        self.permission_policy = Arc::new(policy);
+        self
+    }
+
     /// Discover plugin-backed tools from the configured embedded plugin runtime.
     ///
     /// # Errors
@@ -878,6 +1248,8 @@ impl AgentBuilder {
             max_tool_rounds: self.max_tool_rounds,
             tool_catalog: self.tool_catalog,
             inline_tool_handlers: self.inline_tool_handlers,
+            hooks: self.hooks,
+            permission_policy: self.permission_policy,
             #[cfg(feature = "embedded-plugins")]
             provider: self.provider,
             #[cfg(feature = "embedded-plugins")]
