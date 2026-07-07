@@ -10549,6 +10549,12 @@ async fn run_model_turn_round(
 ) -> Result<ModelPollOutcome, ModelTurnCompletion> {
     let round_start = Instant::now();
     let provider_label = provider_plugin_id.unwrap_or("<auto>").to_string();
+    let provider_labels = provider_lifecycle_metric_labels(
+        session_id,
+        provider_plugin_id,
+        &request.model_id,
+        &request.turn_id,
+    );
     if cancel_state.is_cancelled() {
         return Err(ModelTurnCompletion::with_message(
             ModelTurnOutcome::Cancelled,
@@ -10575,9 +10581,10 @@ async fn run_model_turn_round(
         )),
     )
     .await;
-    state.metrics.record_histogram(
+    state.metrics.record_histogram_with_labels(
         "model.provider.start_turn_duration_ms",
         start_timer.elapsed_ms(),
+        provider_labels.clone(),
     );
     let start = match start {
         ProviderCallWait::Completed(Ok(start)) => start,
@@ -10700,7 +10707,38 @@ async fn run_model_turn_round(
         )
         .await;
     }
+    state.metrics.record_histogram_with_labels(
+        "model.provider.round_duration_ms",
+        elapsed_ms(round_start),
+        provider_labels,
+    );
     Ok(outcome)
+}
+
+fn provider_lifecycle_metric_labels(
+    session_id: SessionId,
+    provider_plugin_id: Option<&str>,
+    model_id: &str,
+    turn_id: &str,
+) -> MetricLabels {
+    let mut labels = provider_poll_metric_labels(session_id, provider_plugin_id, turn_id);
+    labels.insert("model_id".to_owned(), model_id.to_owned());
+    labels
+}
+
+fn provider_poll_metric_labels(
+    session_id: SessionId,
+    provider_plugin_id: Option<&str>,
+    turn_id: &str,
+) -> MetricLabels {
+    let mut labels = MetricLabels::new();
+    labels.insert("session_id".to_owned(), session_id.to_string());
+    labels.insert(
+        "provider_plugin_id".to_owned(),
+        provider_plugin_id.unwrap_or("<auto>").to_owned(),
+    );
+    labels.insert("turn_id".to_owned(), turn_id.to_owned());
+    labels
 }
 
 async fn ensure_terminal_poll_outcome(
@@ -10802,9 +10840,10 @@ async fn poll_model_turn_events(
             )),
         )
         .await;
-        state.metrics.record_histogram(
+        state.metrics.record_histogram_with_labels(
             "model.provider.poll_turn_events_duration_ms",
             poll_timer.elapsed_ms(),
+            provider_poll_metric_labels(session_id, provider_plugin_id, turn_id),
         );
         let response = match response {
             ProviderCallWait::Completed(Ok(response)) => response,

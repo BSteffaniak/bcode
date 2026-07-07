@@ -1441,6 +1441,7 @@ impl Default for PluginResourceLimiter {
 
 #[derive(Debug, Default)]
 struct PluginExecutorMetrics {
+    registry: Mutex<bcode_metrics::MetricsRegistry>,
     running: AtomicUsize,
     queued: AtomicUsize,
     queued_control: AtomicUsize,
@@ -1454,6 +1455,20 @@ struct PluginExecutorMetrics {
 }
 
 impl PluginExecutorMetrics {
+    fn set_registry(&self, registry: bcode_metrics::MetricsRegistry) {
+        let Ok(mut metrics) = self.registry.lock() else {
+            return;
+        };
+        *metrics = registry;
+    }
+
+    fn registry(&self) -> bcode_metrics::MetricsRegistry {
+        self.registry.lock().map_or_else(
+            |_| bcode_metrics::MetricsRegistry::disabled(),
+            |metrics| metrics.clone(),
+        )
+    }
+
     fn snapshot(&self, plugin_id: String, concurrency: PluginConcurrency) -> PluginExecutorStatus {
         PluginExecutorStatus {
             plugin_id,
@@ -2226,6 +2241,9 @@ impl PluginRuntimeHost {
     /// Return a clone of this runtime host that emits runtime metrics to `metrics`.
     #[must_use]
     pub fn with_metrics(mut self, metrics: bcode_metrics::MetricsRegistry) -> Self {
+        for executor in self.executors.values() {
+            executor.metrics.set_registry(metrics.clone());
+        }
         self.metrics = metrics;
         self
     }
@@ -2693,6 +2711,10 @@ const fn plugin_invocation_scope_label(scope: &PluginInvocationScope) -> &'stati
     }
 }
 
+fn elapsed_ms(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 fn u128_to_u64(value: u128) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
@@ -2802,6 +2824,7 @@ fn execute_plugin_event_invocation(
     response
 }
 
+#[allow(clippy::too_many_lines)]
 fn spawn_exclusive_plugin_executor(
     plugin: LoadedPlugin,
     mut receiver: mpsc::Receiver<PluginExecutorMessage>,
@@ -2815,6 +2838,18 @@ fn spawn_exclusive_plugin_executor(
                     metrics.dequeue(invocation.class);
                     metrics.running.fetch_add(1, Ordering::Relaxed);
                     let started_at = Instant::now();
+                    let queue_wait_ms = elapsed_ms(invocation.enqueued_at);
+                    metrics.registry().record_histogram_with_labels(
+                        "plugin.queue_wait.duration_ms",
+                        queue_wait_ms,
+                        plugin_runtime_metric_labels(
+                            &plugin.manifest.id,
+                            &invocation.interface_id,
+                            &invocation.operation,
+                            invocation.class,
+                            &invocation.scope,
+                        ),
+                    );
                     tracing::debug!(
                         target: "bcode_plugin::runtime",
                         plugin_id = %plugin.manifest.id,
