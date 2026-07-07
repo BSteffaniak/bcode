@@ -166,7 +166,7 @@ pub struct AgentTurnResponse {
 }
 
 /// Normalized runtime event exposed independently from provider-specific details.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentRuntimeEvent {
     /// The provider accepted the turn.
     TurnStarted,
@@ -190,6 +190,8 @@ pub enum AgentRuntimeEvent {
     },
     /// Provider completed a tool call request.
     ToolCallFinished(ToolCall),
+    /// Runtime completed a tool call and produced a model-visible result.
+    ToolResult(ToolResult),
     /// Token usage snapshot.
     Usage(TokenUsage),
     /// Provider reported actual request projection metadata.
@@ -335,6 +337,46 @@ pub struct ToolExecutionOutput {
     pub model_result: ToolResult,
     /// Full typed invocation response returned by the executor.
     pub invocation: ToolInvocationResponse,
+    /// Normalized runtime events emitted for this execution.
+    pub events: Vec<AgentRuntimeEvent>,
+}
+
+/// Mutable state that enforces a maximum number of tool rounds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolRoundState {
+    max_tool_rounds: u32,
+    completed_rounds: u32,
+}
+
+impl ToolRoundState {
+    /// Create tool-round state with a maximum number of permitted rounds.
+    #[must_use]
+    pub const fn new(max_tool_rounds: u32) -> Self {
+        Self {
+            max_tool_rounds,
+            completed_rounds: 0,
+        }
+    }
+
+    /// Return configured maximum tool rounds.
+    #[must_use]
+    pub const fn max_tool_rounds(&self) -> u32 {
+        self.max_tool_rounds
+    }
+
+    /// Return completed tool rounds.
+    #[must_use]
+    pub const fn completed_rounds(&self) -> u32 {
+        self.completed_rounds
+    }
+
+    const fn begin_round(&mut self) -> Result<()> {
+        if self.completed_rounds >= self.max_tool_rounds {
+            return Err(RuntimeError::MaxToolRounds(self.max_tool_rounds));
+        }
+        self.completed_rounds = self.completed_rounds.saturating_add(1);
+        Ok(())
+    }
 }
 
 /// Abstract execution boundary for model-callable tools.
@@ -502,6 +544,31 @@ impl AgentRuntime {
         P: PermissionPolicy,
         E: ToolExecutor,
     {
+        let mut rounds = ToolRoundState::new(u32::MAX);
+        self.execute_tool_call_with_round_state(catalog, policy, executor, call, &mut rounds)
+            .await
+    }
+
+    /// Execute a tool call and enforce a mutable tool-round budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the maximum number of tool rounds is exhausted, the tool is unknown,
+    /// permission policy denies execution, or the executor fails.
+    pub async fn execute_tool_call_with_round_state<C, P, E>(
+        &self,
+        catalog: &C,
+        policy: &P,
+        executor: &E,
+        call: &ToolCall,
+        rounds: &mut ToolRoundState,
+    ) -> Result<ToolExecutionOutput>
+    where
+        C: ToolCatalog,
+        P: PermissionPolicy,
+        E: ToolExecutor,
+    {
+        rounds.begin_round()?;
         let tool = catalog
             .find_tool(&call.name)
             .ok_or_else(|| RuntimeError::ToolNotFound(call.name.clone()))?;
@@ -524,19 +591,24 @@ impl AgentRuntime {
                 tool_name: call.name.clone(),
                 message: error.to_string(),
             })?;
+        let model_result = ToolResult {
+            call_id: call.id.clone(),
+            output: invocation.output.clone(),
+            is_error: invocation.is_error,
+            content: invocation
+                .content
+                .iter()
+                .cloned()
+                .map(model_tool_result_content)
+                .collect(),
+        };
         Ok(ToolExecutionOutput {
-            model_result: ToolResult {
-                call_id: call.id.clone(),
-                output: invocation.output.clone(),
-                is_error: invocation.is_error,
-                content: invocation
-                    .content
-                    .iter()
-                    .cloned()
-                    .map(model_tool_result_content)
-                    .collect(),
-            },
+            model_result: model_result.clone(),
             invocation,
+            events: vec![
+                AgentRuntimeEvent::ToolCallFinished(call.clone()),
+                AgentRuntimeEvent::ToolResult(model_result),
+            ],
         })
     }
 
@@ -998,6 +1070,48 @@ mod tests {
         assert_eq!(output.model_result.call_id, "call-1");
         assert_eq!(output.model_result.output, "called echo");
         assert_eq!(output.model_result.content.len(), 1);
+        assert!(matches!(
+            output.events.as_slice(),
+            [
+                AgentRuntimeEvent::ToolCallFinished(call),
+                AgentRuntimeEvent::ToolResult(result)
+            ] if call.id == "call-1" && result.call_id == "call-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn tool_round_state_enforces_max_tool_rounds() {
+        let catalog = UnifiedToolCatalog::new().with_inline_tool(tool_definition("echo"));
+        let call = ToolCall {
+            id: "call-1".to_string(),
+            name: "echo".to_string(),
+            arguments: serde_json::json!({ "text": "hi" }),
+        };
+        let runtime = AgentRuntime::new();
+        let mut rounds = ToolRoundState::new(1);
+
+        runtime
+            .execute_tool_call_with_round_state(
+                &catalog,
+                &AllowAllPolicy,
+                &FakeToolExecutor,
+                &call,
+                &mut rounds,
+            )
+            .await
+            .expect("first tool round should execute");
+        let error = runtime
+            .execute_tool_call_with_round_state(
+                &catalog,
+                &AllowAllPolicy,
+                &FakeToolExecutor,
+                &call,
+                &mut rounds,
+            )
+            .await
+            .expect_err("second tool round should exceed max");
+
+        assert!(matches!(error, RuntimeError::MaxToolRounds(1)));
     }
 
     #[tokio::test]

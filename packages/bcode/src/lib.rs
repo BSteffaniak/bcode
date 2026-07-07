@@ -31,7 +31,7 @@ pub use bcode_agent_runtime::{
     AgentRuntimeEvent as AgentEvent, AgentRuntimeStream as AgentStream,
     AgentRuntimeStreamItem as AgentStreamItem, AllowAllPolicy, CancellationToken,
     PermissionDecision, PermissionPolicy, RegisteredTool, RuntimeError, ToolExecutionOutput,
-    ToolExecutor, ToolSource, UnifiedToolCatalog,
+    ToolExecutor, ToolRoundState, ToolSource, UnifiedToolCatalog,
 };
 pub use bcode_model::ToolCall;
 
@@ -556,7 +556,13 @@ impl Agent {
         )
     }
 
-    /// Execute a registered tool call through this agent's inline tool catalog.
+    /// Create mutable tool-round state using this agent's configured maximum.
+    #[must_use]
+    pub const fn tool_round_state(&self) -> ToolRoundState {
+        ToolRoundState::new(self.max_tool_rounds)
+    }
+
+    /// Execute a registered tool call through this agent's unified tool catalog.
     ///
     /// # Errors
     ///
@@ -570,6 +576,34 @@ impl Agent {
         Ok(self
             .runtime
             .execute_tool_call(&self.tool_catalog, &AllowAllPolicy, &executor, call)
+            .await?)
+    }
+
+    /// Execute a registered tool call through this agent's unified tool catalog and round budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the maximum number of tool rounds is exhausted, the tool is unknown,
+    /// denied, or its handler fails.
+    pub async fn execute_tool_call_with_round_state(
+        &self,
+        call: &ToolCall,
+        rounds: &mut ToolRoundState,
+    ) -> Result<ToolExecutionOutput> {
+        let executor = InlineToolExecutor {
+            handlers: self.inline_tool_handlers.clone(),
+            #[cfg(feature = "embedded-plugins")]
+            plugins: self.plugins.clone(),
+        };
+        Ok(self
+            .runtime
+            .execute_tool_call_with_round_state(
+                &self.tool_catalog,
+                &AllowAllPolicy,
+                &executor,
+                call,
+                rounds,
+            )
             .await?)
     }
 
