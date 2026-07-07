@@ -1,4 +1,11 @@
-//! SDK adapters for Bcode's shared agent permission policy model.
+#![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
+#![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
+#![allow(clippy::multiple_crate_versions)]
+
+//! Shared agent permission orchestration for SDK, daemon, TUI, and plugin surfaces.
+//!
+//! This crate adapts runtime tool-permission requests to Bcode's shared agent policy evaluator
+//! without making the pure `bcode_agent_policy` crate depend on runtime execution types.
 
 use bcode_agent_policy::{
     Action, AgentConfig, AgentPermissionConfig, PermissionConfig, evaluate_tool_call,
@@ -17,7 +24,7 @@ pub type PermissionAskCallback = Arc<
         + Sync,
 >;
 
-/// SDK permission policy backed by Bcode's shared agent policy evaluator.
+/// Runtime permission policy backed by Bcode's shared agent policy evaluator.
 #[derive(Clone)]
 pub struct AgentPermissionPolicy {
     config: AgentConfig,
@@ -65,9 +72,15 @@ impl AgentPermissionPolicy {
 
     /// Attach a pre-built ask callback.
     #[must_use]
-    pub(crate) fn with_ask_callback(mut self, callback: Option<PermissionAskCallback>) -> Self {
+    pub fn with_ask_callback(mut self, callback: Option<PermissionAskCallback>) -> Self {
         self.ask_callback = callback;
         self
+    }
+
+    /// Return the resolved agent config used by this policy.
+    #[must_use]
+    pub const fn config(&self) -> &AgentConfig {
+        &self.config
     }
 }
 
@@ -82,41 +95,67 @@ impl PermissionPolicy for AgentPermissionPolicy {
                 .cwd
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("."));
-            let profile_request = EvaluateToolCallRequest {
-                session_id: request.context.session_id,
-                agent_id: request.context.agent_id.clone(),
-                tool_name: request.call.name.clone(),
-                side_effect: request.tool.definition.side_effect,
-                policy: request.tool.definition.policy.clone(),
-                arguments: request.call.arguments.clone(),
-                cwd: request
-                    .context
-                    .cwd
-                    .as_ref()
-                    .map(|path| path.to_string_lossy().into_owned()),
-            };
-            let evaluation = evaluate_tool_call(&self.config, &profile_request, &cwd).response;
-            let decision = match evaluation.decision {
-                AgentDecision::Allow => PermissionDecision::Allow,
-                AgentDecision::Deny => PermissionDecision::Deny(
-                    evaluation
-                        .reason
-                        .unwrap_or_else(|| "tool call denied by agent policy".to_string()),
-                ),
-                AgentDecision::Ask => {
-                    if let Some(callback) = self.ask_callback.as_ref() {
-                        callback(request, &evaluation)
-                    } else {
-                        PermissionDecision::Ask(evaluation.reason.unwrap_or_else(|| {
-                            "tool call requires permission but no ask handler is configured"
-                                .to_string()
-                        }))
-                    }
-                }
-            };
-            Ok(decision)
+            let profile_request = runtime_permission_request_to_profile_request(request);
+            let evaluation = evaluate_profile_tool_call(&self.config, &profile_request, &cwd);
+            Ok(self.runtime_decision(request, evaluation))
         })
     }
+}
+
+impl AgentPermissionPolicy {
+    fn runtime_decision(
+        &self,
+        request: &RuntimePermissionRequest,
+        evaluation: EvaluateToolCallResponse,
+    ) -> PermissionDecision {
+        match evaluation.decision {
+            AgentDecision::Allow => PermissionDecision::Allow,
+            AgentDecision::Deny => PermissionDecision::Deny(
+                evaluation
+                    .reason
+                    .unwrap_or_else(|| "tool call denied by agent policy".to_string()),
+            ),
+            AgentDecision::Ask => {
+                if let Some(callback) = self.ask_callback.as_ref() {
+                    callback(request, &evaluation)
+                } else {
+                    PermissionDecision::Ask(evaluation.reason.unwrap_or_else(|| {
+                        "tool call requires permission but no ask handler is configured".to_string()
+                    }))
+                }
+            }
+        }
+    }
+}
+
+/// Convert a runtime permission request into the shared agent-profile policy request.
+#[must_use]
+pub fn runtime_permission_request_to_profile_request(
+    request: &RuntimePermissionRequest,
+) -> EvaluateToolCallRequest {
+    EvaluateToolCallRequest {
+        session_id: request.context.session_id,
+        agent_id: request.context.agent_id.clone(),
+        tool_name: request.call.name.clone(),
+        side_effect: request.tool.definition.side_effect,
+        policy: request.tool.definition.policy.clone(),
+        arguments: request.call.arguments.clone(),
+        cwd: request
+            .context
+            .cwd
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+    }
+}
+
+/// Evaluate an agent-profile tool-call request against a resolved agent config.
+#[must_use]
+pub fn evaluate_profile_tool_call(
+    config: &AgentConfig,
+    request: &EvaluateToolCallRequest,
+    cwd: &std::path::Path,
+) -> EvaluateToolCallResponse {
+    evaluate_tool_call(config, request, cwd).response
 }
 
 /// Build an agent policy that allows all tool calls without prompting.
@@ -137,6 +176,7 @@ pub fn allow_all_agent_policy() -> AgentPermissionPolicy {
 }
 
 /// Box an ask callback for builder storage.
+#[must_use]
 pub fn ask_callback<F>(callback: F) -> PermissionAskCallback
 where
     F: Fn(&RuntimePermissionRequest, &EvaluateToolCallResponse) -> PermissionDecision

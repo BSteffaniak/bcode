@@ -1,0 +1,20 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Shared agent permission orchestration for bcode"
+edition     = { workspace = true }
+keywords    = ["agent", "bcode", "permissions", "policy"]
+license     = { workspace = true }
+name        = "bcode_agent_permissions"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_agent_policy  = { workspace = true }
+bcode_agent_profile = { workspace = true }
+bcode_agent_runtime = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

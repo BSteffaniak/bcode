@@ -8,6 +8,7 @@
 //! The facade is intentionally small and delegates reusable turn behavior to
 //! `bcode_agent_runtime`.
 
+use bcode_agent_permissions::{PermissionAskCallback, ask_callback};
 use bcode_agent_policy::active_tools_for;
 #[cfg(feature = "embedded-plugins")]
 use bcode_agent_runtime::RuntimeFuture;
@@ -28,8 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
-mod policy;
-
+pub use bcode_agent_permissions::{AgentPermissionPolicy, allow_all_agent_policy};
 pub use bcode_agent_policy::{Action, AgentConfig, AgentPermissionConfig, PermissionConfig};
 pub use bcode_agent_profile::{AgentDecision, EvaluateToolCallResponse};
 pub use bcode_agent_runtime::{
@@ -40,7 +40,6 @@ pub use bcode_agent_runtime::{
     ToolExecutionOutput, ToolExecutor, ToolRoundState, ToolSource, UnifiedToolCatalog,
 };
 pub use bcode_model::ToolCall;
-pub use policy::{AgentPermissionPolicy, allow_all_agent_policy};
 
 /// Result alias for Bcode SDK operations.
 pub type Result<T> = std::result::Result<T, BcodeError>;
@@ -895,7 +894,7 @@ pub struct AgentBuilder {
     inline_tool_handlers: BTreeMap<String, InlineToolHandler>,
     hooks: AgentHooks,
     policy_config: AgentConfig,
-    permission_ask_callback: Option<policy::PermissionAskCallback>,
+    permission_ask_callback: Option<PermissionAskCallback>,
     custom_permission_policy: Option<Arc<dyn PermissionPolicy>>,
     #[cfg(feature = "embedded-plugins")]
     provider: Option<PluginModelProviderInvoker>,
@@ -1181,7 +1180,7 @@ impl AgentBuilder {
             + 'static,
     {
         self.policy_config = config;
-        self.permission_ask_callback = Some(policy::ask_callback(callback));
+        self.permission_ask_callback = Some(ask_callback(callback));
         self.custom_permission_policy = None;
         self
     }
@@ -1208,7 +1207,7 @@ impl AgentBuilder {
             + 'static,
     {
         self.policy_config = bcode_agent_policy::agent_config(config, &self.profile_id);
-        self.permission_ask_callback = Some(policy::ask_callback(callback));
+        self.permission_ask_callback = Some(ask_callback(callback));
         self.custom_permission_policy = None;
         self
     }
@@ -1222,7 +1221,7 @@ impl AgentBuilder {
             + Sync
             + 'static,
     {
-        self.permission_ask_callback = Some(policy::ask_callback(callback));
+        self.permission_ask_callback = Some(ask_callback(callback));
         self
     }
 

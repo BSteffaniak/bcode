@@ -4,9 +4,10 @@
 
 //! default agent profile policy plugin.
 
+use bcode_agent_permissions::evaluate_profile_tool_call;
 use bcode_agent_policy::{
     AgentConfig, AgentPermissionConfig, BUILD_AGENT, PLAN_AGENT, active_tools_for, agent_config,
-    default_config as policy_default_config, evaluate_tool_call,
+    default_config as policy_default_config,
 };
 use bcode_agent_profile::{
     AGENT_PROFILE_INTERFACE_ID, AgentContextRequest, AgentContextResponse, AgentInfo, AgentList,
@@ -234,8 +235,8 @@ fn evaluate_tool(request: &ServiceRequest) -> ServiceResponse {
         || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         PathBuf::from,
     );
-    let evaluation = evaluate_tool_call(&agent, &request, &cwd);
-    json_response(&evaluation.response)
+    let evaluation = evaluate_profile_tool_call(&agent, &request, &cwd);
+    json_response(&evaluation)
 }
 
 fn policy_status() -> PolicyStatusResponse {
@@ -456,9 +457,9 @@ mod tests {
             cwd: Some("/tmp/project".to_string()),
         };
 
-        let result = evaluate_tool_call(&agent, &request, Path::new("/tmp/project"));
+        let result = evaluate_profile_tool_call(&agent, &request, Path::new("/tmp/project"));
 
-        assert_eq!(result.response.decision, AgentDecision::Deny);
+        assert_eq!(result.decision, AgentDecision::Deny);
     }
 
     #[test]

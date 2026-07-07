@@ -16,6 +16,7 @@ path              = "src/main.rs"
 required-features = ["app"]
 
 [dependencies]
+bcode_agent_permissions = { workspace = true }
 bcode_agent_policy = { workspace = true }
 bcode_agent_profile = { workspace = true }
 bcode_agent_runtime = { workspace = true }

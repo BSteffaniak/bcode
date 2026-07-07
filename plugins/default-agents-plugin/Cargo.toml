@@ -14,15 +14,16 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bcode_agent_policy   = { workspace = true }
-bcode_agent_profile  = { workspace = true }
-bcode_config         = { workspace = true }
-bcode_plugin_sdk     = { workspace = true }
-bcode_session_models = { workspace = true }
-bcode_tool           = { workspace = true }
-serde                = { workspace = true, features = ["derive", "std"] }
-serde_json           = { workspace = true }
-toml                 = { workspace = true }
+bcode_agent_permissions = { workspace = true }
+bcode_agent_policy      = { workspace = true }
+bcode_agent_profile     = { workspace = true }
+bcode_config            = { workspace = true }
+bcode_plugin_sdk        = { workspace = true }
+bcode_session_models    = { workspace = true }
+bcode_tool              = { workspace = true }
+serde                   = { workspace = true, features = ["derive", "std"] }
+serde_json              = { workspace = true }
+toml                    = { workspace = true }
 
 [features]
 default          = []

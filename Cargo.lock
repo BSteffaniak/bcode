@@ -1302,6 +1302,7 @@ dependencies = [
 name = "bcode"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_agent_permissions",
  "bcode_agent_policy",
  "bcode_agent_profile",
  "bcode_agent_runtime",
@@ -1314,6 +1315,15 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "bcode_agent_permissions"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_agent_policy",
+ "bcode_agent_profile",
+ "bcode_agent_runtime",
 ]
 
 [[package]]
@@ -1568,6 +1578,7 @@ dependencies = [
 name = "bcode_default_agents_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_agent_permissions",
  "bcode_agent_policy",
  "bcode_agent_profile",
  "bcode_config",
