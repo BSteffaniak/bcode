@@ -45,6 +45,12 @@ pub const OP_AUTH_USAGE: &str = "auth_usage";
 /// Operation for explicitly priming provider auth usage windows.
 pub const OP_AUTH_PRIME: &str = "auth_prime";
 
+/// Operation for listing provider auth rate-limit reset credits.
+pub const OP_AUTH_RESET_CREDITS: &str = "auth_reset_credits";
+
+/// Operation for consuming one provider auth rate-limit reset credit.
+pub const OP_AUTH_RESET_CREDIT_CONSUME: &str = "auth_reset_credit_consume";
+
 /// Provider-level capability report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderCapabilities {
@@ -657,6 +663,9 @@ pub struct AuthUsageResponse {
     /// Usage meters returned by the provider.
     #[serde(default)]
     pub meters: Vec<AuthUsageMeterSnapshot>,
+    /// Summary of banked rate-limit reset credits returned with usage, when available.
+    #[serde(default)]
+    pub reset_credits: Option<AuthResetCreditsSummary>,
 }
 
 /// Provider capability metadata for auth usage discovery.
@@ -681,6 +690,8 @@ pub enum AuthUsageCapability {
     AbsoluteAmounts,
     /// The provider also supports explicit auth priming.
     Priming,
+    /// The provider can report banked rate-limit reset credits.
+    ResetCredits,
 }
 
 /// Provider usage meter containing one or more windows.
@@ -722,6 +733,121 @@ pub struct AuthUsageWindowSnapshot {
     /// Provider/source identifier for this observation.
     #[serde(default)]
     pub source: Option<String>,
+}
+
+/// Summary of banked rate-limit reset credits.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthResetCreditsSummary {
+    /// Number of reset credits currently available.
+    #[serde(default)]
+    pub available_count: u32,
+}
+
+/// Request for listing provider auth rate-limit reset credits.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthResetCreditsRequest {
+    /// Provider context identifying the auth profile to inspect.
+    #[serde(default)]
+    pub provider_context: ProviderRequestContext,
+}
+
+/// Provider auth rate-limit reset credit listing response.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthResetCreditsResponse {
+    /// Whether this provider/auth mode supports reset credits.
+    #[serde(default)]
+    pub supported: bool,
+    /// Optional degraded-state explanation when discovery could not produce complete data.
+    #[serde(default)]
+    pub degraded_reason: Option<String>,
+    /// Number of reset credits currently available.
+    #[serde(default)]
+    pub available_count: u32,
+    /// Detailed reset credit rows when available.
+    #[serde(default)]
+    pub credits: Vec<AuthResetCreditSnapshot>,
+    /// Optional debug metadata useful for provider integration diagnostics.
+    #[serde(default)]
+    pub debug: BTreeMap<String, String>,
+}
+
+/// One banked rate-limit reset credit.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthResetCreditSnapshot {
+    /// Opaque provider credit id.
+    pub credit_id: String,
+    /// Provider reset type, for example `codex_rate_limits`.
+    pub reset_type: String,
+    /// Provider status, for example `available`, `redeeming`, or `redeemed`.
+    pub status: String,
+    /// Provider-granted timestamp, usually RFC 3339.
+    pub granted_at: String,
+    /// Provider expiration timestamp, usually RFC 3339.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// Provider display title.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Provider display description.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// Request for consuming one provider auth rate-limit reset credit.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthResetCreditConsumeRequest {
+    /// Provider context identifying the auth profile to mutate.
+    #[serde(default)]
+    pub provider_context: ProviderRequestContext,
+    /// Idempotency key for one logical reset attempt.
+    pub redeem_request_id: String,
+    /// Optional opaque provider credit id to consume.
+    #[serde(default)]
+    pub credit_id: Option<String>,
+}
+
+/// Result of consuming one provider auth rate-limit reset credit.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthResetCreditConsumeResponse {
+    /// Consume operation status.
+    pub status: AuthResetCreditConsumeStatus,
+    /// Provider code returned by the consume endpoint.
+    #[serde(default)]
+    pub provider_code: Option<String>,
+    /// Number of rate-limit windows reset by the provider.
+    #[serde(default)]
+    pub windows_reset: Option<u32>,
+    /// Optional human-readable detail.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// Optional reset credits after consuming one, when refresh succeeds.
+    #[serde(default)]
+    pub after: Option<AuthResetCreditsResponse>,
+    /// Optional usage snapshot after consuming one, when refresh succeeds.
+    #[serde(default)]
+    pub usage_after: Option<AuthUsageResponse>,
+    /// Optional debug metadata useful for provider integration diagnostics.
+    #[serde(default)]
+    pub debug: BTreeMap<String, String>,
+}
+
+/// Consume operation status.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthResetCreditConsumeStatus {
+    /// Provider/auth mode does not support reset credits.
+    #[default]
+    Unsupported,
+    /// A reset credit was consumed and one or more windows were reset.
+    Reset,
+    /// No current rate-limit window is eligible for reset.
+    NothingToReset,
+    /// No earned reset credits are available.
+    NoCredit,
+    /// The idempotency key already completed a reset successfully.
+    AlreadyRedeemed,
+    /// Provider returned an unknown result.
+    Failed,
 }
 
 /// Request for explicitly priming provider auth usage windows.

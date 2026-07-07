@@ -48,6 +48,23 @@ bcode login openai --add-subscription --profile openai-2
 
 Without `--profile`, `--add-subscription` registers the next new runtime profile, such as `openai-3`.
 
+Inspect banked reset credits:
+
+```sh
+bcode auth resets status openai
+bcode auth resets status openai --profile openai-2
+```
+
+Spend one banked reset credit explicitly:
+
+```sh
+bcode auth resets use openai --profile openai-2
+# optionally target a specific provider credit id
+bcode auth resets use openai --profile openai-2 --credit credit-123
+```
+
+`use` prompts for confirmation unless `--yes` is passed. To inspect what would be sent without calling the consume endpoint, use `--dry-run`.
+
 ## Declarative config
 
 The CLI writes ordinary declarative config. You can also author it directly:

@@ -84,6 +84,8 @@ pub enum CliError {
     Tui(#[from] bcode_tui::TuiError),
     #[error("plugin error: {0}")]
     Plugin(#[from] bcode_plugin::PluginLoadError),
+    #[error("plugin service call error: {0}")]
+    PluginServiceCall(#[from] bcode_plugin::PluginServiceCallError),
     #[error("sshenv error: {0}")]
     Sshenv(String),
     #[error("interrupted: {0}")]
@@ -1744,6 +1746,10 @@ enum AuthCommand {
         #[command(subcommand)]
         command: AuthPrimeCommand,
     },
+    Resets {
+        #[command(subcommand)]
+        command: AuthResetsCommand,
+    },
     Usage {
         #[command(subcommand)]
         command: AuthUsageCommand,
@@ -1797,6 +1803,44 @@ enum AuthUsageCommand {
         /// Refresh provider usage windows before reporting.
         #[arg(long)]
         refresh: bool,
+        /// Print JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthResetsCommand {
+    /// Report banked rate-limit reset credits for a provider/auth pool.
+    Status {
+        #[arg(default_value = "openai")]
+        pool: String,
+        /// Only report one auth profile.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Exclude the primary auth profile.
+        #[arg(long)]
+        no_primary: bool,
+        /// Print JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Consume one banked rate-limit reset credit.
+    Use {
+        #[arg(default_value = "openai")]
+        pool: String,
+        /// Auth profile whose reset credit should be consumed.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Opaque reset credit id to consume. When omitted, the provider chooses one.
+        #[arg(long)]
+        credit: Option<String>,
+        /// Show the request that would be sent without consuming a credit.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip confirmation prompt.
+        #[arg(long)]
+        yes: bool,
         /// Print JSON output.
         #[arg(long)]
         json: bool,
@@ -2538,6 +2582,7 @@ fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
             }
         },
         AuthCommand::Prime { command } => handle_auth_prime_command(command),
+        AuthCommand::Resets { command } => handle_auth_resets_command(command),
         AuthCommand::Usage { command } => handle_auth_usage_command(command),
         AuthCommand::Login {
             profile,
@@ -2556,6 +2601,32 @@ fn handle_auth_usage_command(command: AuthUsageCommand) -> Result<(), CliError> 
             refresh,
             json,
         } => auth_usage_status(&pool, profile.as_deref(), !no_primary, refresh, json),
+    }
+}
+
+fn handle_auth_resets_command(command: AuthResetsCommand) -> Result<(), CliError> {
+    match command {
+        AuthResetsCommand::Status {
+            pool,
+            profile,
+            no_primary,
+            json,
+        } => auth_resets_status(&pool, profile.as_deref(), !no_primary, json),
+        AuthResetsCommand::Use {
+            pool,
+            profile,
+            credit,
+            dry_run,
+            yes,
+            json,
+        } => auth_resets_use(
+            &pool,
+            profile.as_deref(),
+            credit.as_deref(),
+            dry_run,
+            yes,
+            json,
+        ),
     }
 }
 
@@ -2624,6 +2695,53 @@ struct AuthPrimeReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct AuthResetsReport {
+    pool: String,
+    provider_plugin_id: String,
+    profiles: Vec<AuthResetsProfileReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AuthResetsProfileReport {
+    profile: String,
+    source: String,
+    primary: bool,
+    status: String,
+    available_count: Option<u32>,
+    reason: Option<String>,
+    credits: Vec<AuthResetCreditReport>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    debug: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AuthResetCreditReport {
+    credit_id: String,
+    reset_type: String,
+    status: String,
+    granted_at: String,
+    expires_at: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AuthResetConsumeReport {
+    pool: String,
+    provider_plugin_id: String,
+    profile: String,
+    dry_run: bool,
+    credit_id: Option<String>,
+    redeem_request_id: String,
+    status: String,
+    provider_code: Option<String>,
+    windows_reset: Option<u32>,
+    message: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    debug: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct AuthUsageReport {
     pool: String,
     provider_plugin_id: String,
@@ -2673,6 +2791,193 @@ struct AuthPrimeWindowReport {
     primed_at_unix: Option<u64>,
     source: Option<String>,
     detail: String,
+}
+
+fn auth_resets_status(
+    pool: &str,
+    profile: Option<&str>,
+    include_primary: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    let plan = auth_prime_plan(pool, profile, include_primary)?;
+    let mut host = load_cli_plugin_host()?;
+    let mut profiles = Vec::new();
+    for target in &plan.targets {
+        let request = bcode_model::AuthResetCreditsRequest {
+            provider_context: provider_context_for_prime_target(&plan, target),
+        };
+        let response = host.invoke_service_json::<_, bcode_model::AuthResetCreditsResponse>(
+            &plan.provider_plugin_id,
+            bcode_model::MODEL_PROVIDER_INTERFACE_ID,
+            bcode_model::OP_AUTH_RESET_CREDITS,
+            &request,
+        );
+        profiles.push(auth_resets_profile_report(target, response));
+    }
+    host.deactivate_all()?;
+    print_auth_resets_report(
+        &AuthResetsReport {
+            pool: plan.pool,
+            provider_plugin_id: plan.provider_plugin_id,
+            profiles,
+        },
+        json,
+    )
+}
+
+#[allow(clippy::fn_params_excessive_bools)]
+fn auth_resets_use(
+    pool: &str,
+    profile: Option<&str>,
+    credit_id: Option<&str>,
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    let plan = auth_prime_plan(pool, profile, true)?;
+    let target = match (profile, plan.targets.as_slice()) {
+        (Some(profile), targets) => targets
+            .iter()
+            .find(|target| target.profile == profile)
+            .ok_or_else(|| {
+                CliError::AuthPrimeFailed(format!(
+                    "auth profile '{profile}' is not in pool '{pool}'"
+                ))
+            })?,
+        (None, [target]) => target,
+        (None, []) => {
+            return Err(CliError::AuthPrimeFailed(format!(
+                "auth pool '{pool}' has no profiles to use reset credits for"
+            )));
+        }
+        (None, _) => {
+            return Err(CliError::AuthPrimeFailed(
+                "--profile is required when a pool has multiple profiles".to_string(),
+            ));
+        }
+    };
+    let redeem_request_id = random_urlsafe(18)?;
+    if dry_run {
+        return print_auth_reset_consume_report(
+            &AuthResetConsumeReport {
+                pool: plan.pool,
+                provider_plugin_id: plan.provider_plugin_id,
+                profile: target.profile.clone(),
+                dry_run,
+                credit_id: credit_id.map(str::to_string),
+                redeem_request_id,
+                status: "dry_run".to_string(),
+                provider_code: None,
+                windows_reset: None,
+                message: Some("no reset credit was consumed".to_string()),
+                debug: BTreeMap::new(),
+            },
+            json,
+        );
+    }
+    if !yes && !confirm_auth_reset_use(&target.profile, credit_id)? {
+        return Err(CliError::AuthPrimeFailed(
+            "reset credit consume cancelled".to_string(),
+        ));
+    }
+    let request = bcode_model::AuthResetCreditConsumeRequest {
+        provider_context: provider_context_for_prime_target(&plan, target),
+        redeem_request_id: redeem_request_id.clone(),
+        credit_id: credit_id.map(str::to_string),
+    };
+    let mut host = load_cli_plugin_host()?;
+    let mut response = host.invoke_service_json::<_, bcode_model::AuthResetCreditConsumeResponse>(
+        &plan.provider_plugin_id,
+        bcode_model::MODEL_PROVIDER_INTERFACE_ID,
+        bcode_model::OP_AUTH_RESET_CREDIT_CONSUME,
+        &request,
+    )?;
+    host.deactivate_all()?;
+    print_auth_reset_consume_report(
+        &AuthResetConsumeReport {
+            pool: plan.pool,
+            provider_plugin_id: plan.provider_plugin_id,
+            profile: target.profile.clone(),
+            dry_run,
+            credit_id: credit_id.map(str::to_string),
+            redeem_request_id,
+            status: auth_reset_consume_status_label(response.status).to_string(),
+            provider_code: response.provider_code.take(),
+            windows_reset: response.windows_reset,
+            message: response.message.take(),
+            debug: response.debug,
+        },
+        json,
+    )
+}
+
+fn auth_resets_profile_report(
+    target: &AuthPrimeProfileTarget,
+    response: Result<bcode_model::AuthResetCreditsResponse, bcode_plugin::PluginServiceCallError>,
+) -> AuthResetsProfileReport {
+    match response {
+        Ok(response) => AuthResetsProfileReport {
+            profile: target.profile.clone(),
+            source: target.source.clone(),
+            primary: target.primary,
+            status: if response.supported {
+                "available"
+            } else {
+                "unsupported"
+            }
+            .to_string(),
+            available_count: response.supported.then_some(response.available_count),
+            reason: response.degraded_reason,
+            credits: response
+                .credits
+                .into_iter()
+                .map(|credit| AuthResetCreditReport {
+                    credit_id: credit.credit_id,
+                    reset_type: credit.reset_type,
+                    status: credit.status,
+                    granted_at: credit.granted_at,
+                    expires_at: credit.expires_at,
+                    title: credit.title,
+                    description: credit.description,
+                })
+                .collect(),
+            debug: response.debug,
+        },
+        Err(error) => AuthResetsProfileReport {
+            profile: target.profile.clone(),
+            source: target.source.clone(),
+            primary: target.primary,
+            status: "error".to_string(),
+            available_count: None,
+            reason: Some(error.to_string()),
+            credits: Vec::new(),
+            debug: BTreeMap::new(),
+        },
+    }
+}
+
+const fn auth_reset_consume_status_label(
+    status: bcode_model::AuthResetCreditConsumeStatus,
+) -> &'static str {
+    match status {
+        bcode_model::AuthResetCreditConsumeStatus::Unsupported => "unsupported",
+        bcode_model::AuthResetCreditConsumeStatus::Reset => "reset",
+        bcode_model::AuthResetCreditConsumeStatus::NothingToReset => "nothing_to_reset",
+        bcode_model::AuthResetCreditConsumeStatus::NoCredit => "no_credit",
+        bcode_model::AuthResetCreditConsumeStatus::AlreadyRedeemed => "already_redeemed",
+        bcode_model::AuthResetCreditConsumeStatus::Failed => "failed",
+    }
+}
+
+fn confirm_auth_reset_use(profile: &str, credit_id: Option<&str>) -> Result<bool, CliError> {
+    let credit = credit_id.unwrap_or("provider-selected credit");
+    print!(
+        "Consume one banked rate-limit reset for auth profile '{profile}' ({credit})? Type 'yes' to continue: "
+    );
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    Ok(input.trim() == "yes")
 }
 
 fn auth_usage_status(
@@ -3436,6 +3741,63 @@ fn usage_detail(
     } else {
         parts.join(", ")
     }
+}
+
+fn print_auth_resets_report(report: &AuthResetsReport, json: bool) -> Result<(), CliError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    println!("Auth reset credits: {}", report.pool);
+    println!("Provider plugin: {}", report.provider_plugin_id);
+    println!();
+    println!("PROFILE\tSTATUS\tAVAILABLE\tDETAIL");
+    for profile in &report.profiles {
+        let available = profile
+            .available_count
+            .map_or_else(|| "-".to_string(), |count| count.to_string());
+        let detail = profile.reason.as_deref().unwrap_or("-");
+        println!(
+            "{}\t{}\t{}\t{}",
+            profile.profile, profile.status, available, detail
+        );
+        for credit in &profile.credits {
+            let expires = credit.expires_at.as_deref().unwrap_or("-");
+            let title = credit.title.as_deref().unwrap_or("-");
+            println!(
+                "  {}\t{}\t{}\t{}\t{}",
+                credit.credit_id, credit.reset_type, credit.status, expires, title
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_auth_reset_consume_report(
+    report: &AuthResetConsumeReport,
+    json: bool,
+) -> Result<(), CliError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    println!("Auth reset consume: {}", report.pool);
+    println!("Provider plugin: {}", report.provider_plugin_id);
+    println!("Profile: {}", report.profile);
+    if report.dry_run {
+        println!("Mode: dry run");
+    }
+    println!("Status: {}", report.status);
+    if let Some(code) = &report.provider_code {
+        println!("Provider code: {code}");
+    }
+    if let Some(windows_reset) = report.windows_reset {
+        println!("Windows reset: {windows_reset}");
+    }
+    if let Some(message) = &report.message {
+        println!("Detail: {message}");
+    }
+    Ok(())
 }
 
 fn print_auth_usage_report(report: &AuthUsageReport, json: bool) -> Result<(), CliError> {

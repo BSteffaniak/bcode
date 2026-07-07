@@ -15,7 +15,8 @@ Response type: `bcode_model::AuthUsageResponse`
 * `supported` is `true` when the provider/auth mode supports usage discovery.
 * `degraded_reason` explains unsupported or incomplete data.
 * `debug` contains provider-owned diagnostic strings. Do not include secrets.
-* `capabilities.features` lists capability flags such as `refresh`, `window_reset`, `used_percent`, `absolute_amounts`, and `priming`.
+* `capabilities.features` lists capability flags such as `refresh`, `window_reset`, `used_percent`, `absolute_amounts`, `priming`, and `reset_credits`.
+* `reset_credits` optionally contains a summary of banked provider reset credits when the usage endpoint returns one.
 * `meters` contains normalized provider usage data.
 
 ## Meter and window semantics
@@ -41,6 +42,26 @@ Each `AuthUsageWindowSnapshot` is one stable window inside a meter.
 `OP_AUTH_PRIME` is optional and separate from usage discovery. Providers that support usage inspection but cannot intentionally touch usage windows should return `supported: true` from `OP_AUTH_USAGE` and `Unsupported` from `OP_AUTH_PRIME`.
 
 Routing and status code should treat usage discovery as reporting provider state, while priming policy decides whether a synthetic request is useful for a specific provider/pool.
+
+## Banked rate-limit resets
+
+Some providers expose banked rate-limit reset credits. Bcode exposes these through separate read and consume operations so spending a reset is always explicit.
+
+Read operation: `OP_AUTH_RESET_CREDITS`
+
+* Request type: `bcode_model::AuthResetCreditsRequest`
+* Response type: `bcode_model::AuthResetCreditsResponse`
+* Providers should return `supported: false` rather than failing when the auth mode cannot list reset credits.
+
+Consume operation: `OP_AUTH_RESET_CREDIT_CONSUME`
+
+* Request type: `bcode_model::AuthResetCreditConsumeRequest`
+* Response type: `bcode_model::AuthResetCreditConsumeResponse`
+* `redeem_request_id` is an idempotency key for one logical reset attempt.
+* `credit_id` optionally selects a provider credit; when omitted, providers may choose the next available credit.
+* Normal routing, failover, status, and priming paths must not consume reset credits automatically.
+
+OpenAI/Codex-compatible providers use the ChatGPT backend reset-credit endpoints when ChatGPT Codex auth is active.
 
 ## Example
 
@@ -70,5 +91,8 @@ Ok(bcode_model::AuthUsageResponse {
             source: Some("provider_usage_api".to_string()),
         }],
     }],
+    reset_credits: Some(bcode_model::AuthResetCreditsSummary {
+        available_count: 1,
+    }),
 })
 ```

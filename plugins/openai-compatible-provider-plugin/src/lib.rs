@@ -14,13 +14,13 @@ use bcode_model::{
     MessageRole, ModelCapability, ModelInfo, ModelList, ModelListRequest, ModelMessage,
     ModelMetadataSource, ModelPricingInfo, ModelPricingSource, ModelPricingUnit,
     ModelReasoningCapabilitySource, ModelTokenPrice, ModelTurnRequest, NativeWebSearchRequest,
-    NativeWebSearchResponse, NativeWebSearchResult, OP_AUTH_PRIME, OP_AUTH_USAGE, OP_CANCEL_TURN,
-    OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS, OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS,
-    OP_START_TURN, OP_VALIDATE_CONFIG, OP_VERIFY_MODEL, PollTurnEventsRequest,
-    PollTurnEventsResponse, ProviderAuthCandidate, ProviderCapabilities, ProviderCapability,
-    ProviderError, ProviderErrorCategory, ProviderRequestContext, ProviderRequestProjection,
-    ProviderRetryRule, ProviderRetryRuleMatch, ProviderTurnEvent, StartTurnResponse, StopReason,
-    TokenUsage, ToolCall, ValidateConfigResponse,
+    NativeWebSearchResponse, NativeWebSearchResult, OP_AUTH_PRIME, OP_AUTH_RESET_CREDIT_CONSUME,
+    OP_AUTH_RESET_CREDITS, OP_AUTH_USAGE, OP_CANCEL_TURN, OP_CAPABILITIES, OP_FINISH_TURN,
+    OP_MODELS, OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG,
+    OP_VERIFY_MODEL, PollTurnEventsRequest, PollTurnEventsResponse, ProviderAuthCandidate,
+    ProviderCapabilities, ProviderCapability, ProviderError, ProviderErrorCategory,
+    ProviderRequestContext, ProviderRequestProjection, ProviderRetryRule, ProviderRetryRuleMatch,
+    ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage, ToolCall, ValidateConfigResponse,
 };
 use bcode_model_catalog_models::ModelSupportTarget;
 use bcode_model_provider_runtime::{
@@ -215,6 +215,8 @@ impl OpenAiCompatibleProviderPlugin {
             OP_VERIFY_MODEL => self.verify_model(&context.request),
             OP_AUTH_USAGE => self.auth_usage(&context.request),
             OP_AUTH_PRIME => self.auth_prime(&context.request),
+            OP_AUTH_RESET_CREDITS => self.auth_reset_credits(&context.request),
+            OP_AUTH_RESET_CREDIT_CONSUME => self.auth_reset_credit_consume(&context.request),
             OP_NATIVE_WEB_SEARCH => self.native_web_search(&context.request),
             OP_START_TURN => self.start_turn(&context.request),
             OP_POLL_TURN_EVENTS => self.poll_turn_events(&context.request),
@@ -268,6 +270,36 @@ impl OpenAiCompatibleProviderPlugin {
         };
         match &self.runtime {
             Ok(runtime) => match runtime.block_on(auth_prime_inner(request)) {
+                Ok(Ok(response)) => json_response(&response),
+                Ok(Err(error)) => ServiceResponse::error(error.code, error.message),
+                Err(error) => ServiceResponse::error("runtime_error", error.to_string()),
+            },
+            Err(error) => ServiceResponse::error("runtime_error", error),
+        }
+    }
+
+    fn auth_reset_credits(&self, request: &ServiceRequest) -> ServiceResponse {
+        let request = match request.payload_json::<bcode_model::AuthResetCreditsRequest>() {
+            Ok(request) => request,
+            Err(error) => return invalid_request(&error),
+        };
+        match &self.runtime {
+            Ok(runtime) => match runtime.block_on(auth_reset_credits_inner(request)) {
+                Ok(Ok(response)) => json_response(&response),
+                Ok(Err(error)) => ServiceResponse::error(error.code, error.message),
+                Err(error) => ServiceResponse::error("runtime_error", error.to_string()),
+            },
+            Err(error) => ServiceResponse::error("runtime_error", error),
+        }
+    }
+
+    fn auth_reset_credit_consume(&self, request: &ServiceRequest) -> ServiceResponse {
+        let request = match request.payload_json::<bcode_model::AuthResetCreditConsumeRequest>() {
+            Ok(request) => request,
+            Err(error) => return invalid_request(&error),
+        };
+        match &self.runtime {
+            Ok(runtime) => match runtime.block_on(auth_reset_credit_consume_inner(request)) {
                 Ok(Ok(response)) => json_response(&response),
                 Ok(Err(error)) => ServiceResponse::error(error.code, error.message),
                 Err(error) => ServiceResponse::error("runtime_error", error.to_string()),
@@ -1082,6 +1114,57 @@ struct CodexUsagePayload {
     rate_limit: Option<CodexRateLimitStatusDetails>,
     #[serde(default)]
     additional_rate_limits: Option<Vec<CodexAdditionalRateLimitDetails>>,
+    #[serde(default)]
+    rate_limit_reset_credits: Option<CodexRateLimitResetCreditsSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexRateLimitResetCreditsSummary {
+    available_count: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexRateLimitResetCreditsPayload {
+    #[serde(default)]
+    credits: Vec<CodexRateLimitResetCreditDetails>,
+    available_count: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexRateLimitResetCreditDetails {
+    id: String,
+    reset_type: String,
+    status: String,
+    granted_at: String,
+    #[serde(default)]
+    expires_at: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexRateLimitResetCreditConsumeRequest<'a> {
+    redeem_request_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credit_id: Option<&'a str>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexRateLimitResetCreditConsumePayload {
+    code: CodexRateLimitResetCreditConsumeCode,
+    #[serde(default)]
+    windows_reset: i64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CodexRateLimitResetCreditConsumeCode {
+    Reset,
+    NothingToReset,
+    NoCredit,
+    AlreadyRedeemed,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1131,6 +1214,7 @@ async fn auth_usage_inner(
             )]),
             capabilities: bcode_model::AuthUsageCapabilities::default(),
             meters: Vec::new(),
+            reset_credits: None,
         });
     }
     let AuthSettings::ChatGpt { access_token, .. } = &settings.auth else {
@@ -1143,6 +1227,7 @@ async fn auth_usage_inner(
             )]),
             capabilities: bcode_model::AuthUsageCapabilities::default(),
             meters: Vec::new(),
+            reset_credits: None,
         });
     };
     let client = Client::new();
@@ -1191,9 +1276,14 @@ async fn auth_usage_inner(
                 bcode_model::AuthUsageCapability::WindowReset,
                 bcode_model::AuthUsageCapability::UsedPercent,
                 bcode_model::AuthUsageCapability::Priming,
+                bcode_model::AuthUsageCapability::ResetCredits,
             ]),
         },
         meters,
+        reset_credits: payload
+            .rate_limit_reset_credits
+            .as_ref()
+            .and_then(codex_reset_credits_summary),
     })
 }
 
@@ -1203,17 +1293,7 @@ async fn send_codex_usage_request(
     url: &str,
     access_token: &str,
 ) -> Result<reqwest::Response, ProviderError> {
-    let mut builder = client
-        .get(url)
-        .bearer_auth(access_token)
-        .header("Accept", "application/json")
-        .header("Origin", "https://chatgpt.com")
-        .header("Referer", "https://chatgpt.com/codex")
-        .header("originator", "bcode")
-        .header("User-Agent", "bcode/0.0.1");
-    if let Some(account_id) = chatgpt_account_id(settings) {
-        builder = builder.header("ChatGPT-Account-Id", account_id);
-    }
+    let builder = codex_authenticated_request(client.get(url), settings, access_token);
     builder.send().await.map_err(|error| {
         provider_error(
             "auth_usage_request_failed",
@@ -1227,6 +1307,24 @@ async fn send_codex_usage_request(
     })
 }
 
+fn codex_authenticated_request(
+    builder: reqwest::RequestBuilder,
+    settings: &Settings,
+    access_token: &str,
+) -> reqwest::RequestBuilder {
+    let mut builder = builder
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .header("Origin", "https://chatgpt.com")
+        .header("Referer", "https://chatgpt.com/codex")
+        .header("originator", "bcode")
+        .header("User-Agent", "bcode/0.0.1");
+    if let Some(account_id) = chatgpt_account_id(settings) {
+        builder = builder.header("ChatGPT-Account-Id", account_id);
+    }
+    builder
+}
+
 fn chatgpt_account_id(settings: &Settings) -> Option<&str> {
     match &settings.auth {
         AuthSettings::ChatGpt { account_id, .. } => account_id.as_deref(),
@@ -1234,23 +1332,335 @@ fn chatgpt_account_id(settings: &Settings) -> Option<&str> {
     }
 }
 
-fn codex_usage_endpoint_style(settings: &Settings) -> &'static str {
-    let trimmed = settings.base_url.trim_end_matches('/');
-    if trimmed.ends_with("/backend-api/codex") {
-        "codex_api"
-    } else {
-        "chatgpt_wham"
+#[derive(Debug, Clone, Copy)]
+enum CodexBackendPathStyle {
+    CodexApi,
+    ChatGptApi,
+}
+
+impl CodexBackendPathStyle {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::CodexApi => "codex_api",
+            Self::ChatGptApi => "chatgpt_wham",
+        }
     }
 }
 
-fn codex_usage_endpoint(settings: &Settings) -> String {
+fn codex_backend_base_and_style(settings: &Settings) -> (String, CodexBackendPathStyle) {
     let trimmed = settings.base_url.trim_end_matches('/');
-    if trimmed.ends_with("/backend-api/codex") {
-        format!("{trimmed}/usage")
-    } else if trimmed.ends_with("/backend-api") || trimmed.ends_with("/backend-api/") {
-        format!("{trimmed}/wham/usage")
+    if let Some(base) = trimmed.strip_suffix("/codex/responses") {
+        return (
+            base.trim_end_matches('/').to_string(),
+            CodexBackendPathStyle::CodexApi,
+        );
+    }
+    if let Some(base) = trimmed.strip_suffix("/api/codex/responses") {
+        return (
+            base.trim_end_matches('/').to_string(),
+            CodexBackendPathStyle::CodexApi,
+        );
+    }
+    if let Some(base) = trimmed.strip_suffix("/backend-api/codex/responses") {
+        return (
+            format!("{base}/backend-api"),
+            CodexBackendPathStyle::CodexApi,
+        );
+    }
+    if let Some(base) = trimmed.strip_suffix("/backend-api/codex") {
+        return (
+            format!("{base}/backend-api"),
+            CodexBackendPathStyle::CodexApi,
+        );
+    }
+    if trimmed.ends_with("/backend-api") {
+        (trimmed.to_string(), CodexBackendPathStyle::ChatGptApi)
     } else {
-        "https://chatgpt.com/backend-api/wham/usage".to_string()
+        (
+            "https://chatgpt.com/backend-api".to_string(),
+            CodexBackendPathStyle::ChatGptApi,
+        )
+    }
+}
+
+fn codex_usage_endpoint_style(settings: &Settings) -> &'static str {
+    let (_, style) = codex_backend_base_and_style(settings);
+    style.label()
+}
+
+fn codex_usage_endpoint(settings: &Settings) -> String {
+    let (base, style) = codex_backend_base_and_style(settings);
+    match style {
+        CodexBackendPathStyle::CodexApi => format!("{base}/api/codex/usage"),
+        CodexBackendPathStyle::ChatGptApi => format!("{base}/wham/usage"),
+    }
+}
+
+fn codex_reset_credits_endpoint(settings: &Settings) -> String {
+    let (base, style) = codex_backend_base_and_style(settings);
+    match style {
+        CodexBackendPathStyle::CodexApi => format!("{base}/api/codex/rate-limit-reset-credits"),
+        CodexBackendPathStyle::ChatGptApi => format!("{base}/wham/rate-limit-reset-credits"),
+    }
+}
+
+fn codex_reset_credit_consume_endpoint(settings: &Settings) -> String {
+    let (base, style) = codex_backend_base_and_style(settings);
+    match style {
+        CodexBackendPathStyle::CodexApi => {
+            format!("{base}/api/codex/rate-limit-reset-credits/consume")
+        }
+        CodexBackendPathStyle::ChatGptApi => {
+            format!("{base}/wham/rate-limit-reset-credits/consume")
+        }
+    }
+}
+
+async fn auth_reset_credits_inner(
+    request: bcode_model::AuthResetCreditsRequest,
+) -> Result<bcode_model::AuthResetCreditsResponse, ProviderError> {
+    let mut settings = settings_for_context(&request.provider_context);
+    refresh_chatgpt_auth_if_needed(&mut settings).await?;
+    if !settings.dialect.uses_codex_request_shape() {
+        return Ok(bcode_model::AuthResetCreditsResponse {
+            supported: false,
+            degraded_reason: Some(
+                "rate-limit reset credits are currently implemented for ChatGPT Codex auth only"
+                    .to_string(),
+            ),
+            debug: BTreeMap::from([(
+                "dialect".to_string(),
+                settings.dialect.metadata_value().to_string(),
+            )]),
+            ..bcode_model::AuthResetCreditsResponse::default()
+        });
+    }
+    let AuthSettings::ChatGpt { access_token, .. } = &settings.auth else {
+        return Ok(bcode_model::AuthResetCreditsResponse {
+            supported: false,
+            degraded_reason: Some(
+                "ChatGPT auth is required for Codex rate-limit reset credits".to_string(),
+            ),
+            debug: BTreeMap::from([(
+                "auth_mode".to_string(),
+                settings.auth_diagnostics.mode.clone(),
+            )]),
+            ..bcode_model::AuthResetCreditsResponse::default()
+        });
+    };
+    let client = Client::new();
+    let url = codex_reset_credits_endpoint(&settings);
+    let endpoint_style = codex_usage_endpoint_style(&settings);
+    let account_id_present = chatgpt_account_id(&settings).is_some();
+    let response = codex_authenticated_request(client.get(&url), &settings, access_token)
+        .send()
+        .await
+        .map_err(|error| {
+            provider_error(
+                "auth_reset_credits_request_failed",
+                if error.is_timeout() {
+                    ProviderErrorCategory::Timeout
+                } else {
+                    ProviderErrorCategory::Network
+                },
+                error.to_string(),
+            )
+        })?;
+    let status = response.status();
+    let body = response.text().await.map_err(|error| {
+        provider_error(
+            "auth_reset_credits_response_read_failed",
+            ProviderErrorCategory::Network,
+            error.to_string(),
+        )
+    })?;
+    if !status.is_success() {
+        return Err(error_from_status(status.as_u16(), &body));
+    }
+    let payload =
+        serde_json::from_str::<CodexRateLimitResetCreditsPayload>(&body).map_err(|error| {
+            provider_error(
+                "auth_reset_credits_response_decode_failed",
+                ProviderErrorCategory::ProviderInternal,
+                error.to_string(),
+            )
+        })?;
+    let mut response = codex_reset_credits_response(payload);
+    response.debug = BTreeMap::from([
+        ("endpoint".to_string(), url),
+        ("endpoint_style".to_string(), endpoint_style.to_string()),
+        (
+            "chatgpt_account_id_present".to_string(),
+            account_id_present.to_string(),
+        ),
+        ("http_status".to_string(), status.as_u16().to_string()),
+        ("response_body_bytes".to_string(), body.len().to_string()),
+    ]);
+    Ok(response)
+}
+
+async fn auth_reset_credit_consume_inner(
+    request: bcode_model::AuthResetCreditConsumeRequest,
+) -> Result<bcode_model::AuthResetCreditConsumeResponse, ProviderError> {
+    if request.redeem_request_id.is_empty() {
+        return Ok(bcode_model::AuthResetCreditConsumeResponse {
+            status: bcode_model::AuthResetCreditConsumeStatus::Failed,
+            message: Some("redeem_request_id must not be empty".to_string()),
+            ..bcode_model::AuthResetCreditConsumeResponse::default()
+        });
+    }
+    if request.credit_id.as_deref().is_some_and(str::is_empty) {
+        return Ok(bcode_model::AuthResetCreditConsumeResponse {
+            status: bcode_model::AuthResetCreditConsumeStatus::Failed,
+            message: Some("credit_id must not be empty".to_string()),
+            ..bcode_model::AuthResetCreditConsumeResponse::default()
+        });
+    }
+    let mut settings = settings_for_context(&request.provider_context);
+    refresh_chatgpt_auth_if_needed(&mut settings).await?;
+    if !settings.dialect.uses_codex_request_shape() {
+        return Ok(bcode_model::AuthResetCreditConsumeResponse {
+            status: bcode_model::AuthResetCreditConsumeStatus::Unsupported,
+            message: Some(
+                "rate-limit reset credits are currently implemented for ChatGPT Codex auth only"
+                    .to_string(),
+            ),
+            ..bcode_model::AuthResetCreditConsumeResponse::default()
+        });
+    }
+    let AuthSettings::ChatGpt { access_token, .. } = &settings.auth else {
+        return Ok(bcode_model::AuthResetCreditConsumeResponse {
+            status: bcode_model::AuthResetCreditConsumeStatus::Unsupported,
+            message: Some(
+                "ChatGPT auth is required for Codex rate-limit reset credits".to_string(),
+            ),
+            ..bcode_model::AuthResetCreditConsumeResponse::default()
+        });
+    };
+    let client = Client::new();
+    let url = codex_reset_credit_consume_endpoint(&settings);
+    let account_id_present = chatgpt_account_id(&settings).is_some();
+    let response = codex_authenticated_request(client.post(&url), &settings, access_token)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .json(&CodexRateLimitResetCreditConsumeRequest {
+            redeem_request_id: &request.redeem_request_id,
+            credit_id: request.credit_id.as_deref(),
+        })
+        .send()
+        .await
+        .map_err(|error| {
+            provider_error(
+                "auth_reset_credit_consume_request_failed",
+                if error.is_timeout() {
+                    ProviderErrorCategory::Timeout
+                } else {
+                    ProviderErrorCategory::Network
+                },
+                error.to_string(),
+            )
+        })?;
+    let status = response.status();
+    let body = response.text().await.map_err(|error| {
+        provider_error(
+            "auth_reset_credit_consume_response_read_failed",
+            ProviderErrorCategory::Network,
+            error.to_string(),
+        )
+    })?;
+    if !status.is_success() {
+        return Err(error_from_status(status.as_u16(), &body));
+    }
+    let payload = serde_json::from_str::<CodexRateLimitResetCreditConsumePayload>(&body).map_err(
+        |error| {
+            provider_error(
+                "auth_reset_credit_consume_response_decode_failed",
+                ProviderErrorCategory::ProviderInternal,
+                error.to_string(),
+            )
+        },
+    )?;
+    let mut response = codex_reset_credit_consume_response(&payload);
+    response.debug = BTreeMap::from([
+        ("endpoint".to_string(), url),
+        (
+            "endpoint_style".to_string(),
+            codex_usage_endpoint_style(&settings).to_string(),
+        ),
+        (
+            "chatgpt_account_id_present".to_string(),
+            account_id_present.to_string(),
+        ),
+        ("http_status".to_string(), status.as_u16().to_string()),
+        ("response_body_bytes".to_string(), body.len().to_string()),
+    ]);
+    Ok(response)
+}
+
+fn codex_reset_credits_summary(
+    summary: &CodexRateLimitResetCreditsSummary,
+) -> Option<bcode_model::AuthResetCreditsSummary> {
+    Some(bcode_model::AuthResetCreditsSummary {
+        available_count: u32::try_from(summary.available_count).ok()?,
+    })
+}
+
+fn codex_reset_credits_response(
+    payload: CodexRateLimitResetCreditsPayload,
+) -> bcode_model::AuthResetCreditsResponse {
+    bcode_model::AuthResetCreditsResponse {
+        supported: true,
+        degraded_reason: None,
+        available_count: u32::try_from(payload.available_count).unwrap_or_default(),
+        credits: payload
+            .credits
+            .into_iter()
+            .map(|credit| bcode_model::AuthResetCreditSnapshot {
+                credit_id: credit.id,
+                reset_type: credit.reset_type,
+                status: credit.status,
+                granted_at: credit.granted_at,
+                expires_at: credit.expires_at,
+                title: credit.title,
+                description: credit.description,
+            })
+            .collect(),
+        debug: BTreeMap::new(),
+    }
+}
+
+fn codex_reset_credit_consume_response(
+    payload: &CodexRateLimitResetCreditConsumePayload,
+) -> bcode_model::AuthResetCreditConsumeResponse {
+    let (status, provider_code, message) = match payload.code {
+        CodexRateLimitResetCreditConsumeCode::Reset => (
+            bcode_model::AuthResetCreditConsumeStatus::Reset,
+            "reset",
+            Some("rate-limit reset credit consumed".to_string()),
+        ),
+        CodexRateLimitResetCreditConsumeCode::NothingToReset => (
+            bcode_model::AuthResetCreditConsumeStatus::NothingToReset,
+            "nothing_to_reset",
+            Some("no current rate-limit window is eligible for reset".to_string()),
+        ),
+        CodexRateLimitResetCreditConsumeCode::NoCredit => (
+            bcode_model::AuthResetCreditConsumeStatus::NoCredit,
+            "no_credit",
+            Some("no earned reset credits are available".to_string()),
+        ),
+        CodexRateLimitResetCreditConsumeCode::AlreadyRedeemed => (
+            bcode_model::AuthResetCreditConsumeStatus::AlreadyRedeemed,
+            "already_redeemed",
+            Some("this reset request already completed successfully".to_string()),
+        ),
+    };
+    bcode_model::AuthResetCreditConsumeResponse {
+        status,
+        provider_code: Some(provider_code.to_string()),
+        windows_reset: u32::try_from(payload.windows_reset).ok(),
+        message,
+        after: None,
+        usage_after: None,
+        debug: BTreeMap::new(),
     }
 }
 
