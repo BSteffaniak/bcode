@@ -25,7 +25,8 @@ use bcode_ipc::{
     RalphStatusRequest, RalphStatusResponse, RalphStatusSummary, RalphValidationSummary, Request,
     Response, ResponsePayload, ServerStatus, ServerStopMode, SessionCatalogSourceStatus,
     SessionCatalogStatus, WorktreeCreateRequest, WorktreeListRequest, WorktreeRemoveRequest,
-    decode_request, event_envelope, recv_envelope, response_envelope, send_envelope,
+    decode_request, envelope_frame_count, event_envelope, recv_envelope, response_envelope,
+    send_envelope,
 };
 use bcode_metrics::{MetricLabels, MetricsEventLogConfig, MetricsRegistry};
 use bcode_model::{
@@ -16155,6 +16156,10 @@ pub(crate) async fn send_response(
         "response_kind".to_owned(),
         response_kind(&response).to_owned(),
     );
+    labels.insert(
+        "payload_kind".to_owned(),
+        response_payload_kind(&response).to_owned(),
+    );
     writer.metrics.record_histogram_with_labels(
         "ipc.response.serialize_duration_ms",
         elapsed_ms(serialize_started_at),
@@ -16165,6 +16170,17 @@ pub(crate) async fn send_response(
         usize_to_u64(envelope.payload.len()),
         labels.clone(),
     );
+    let frame_count = envelope_frame_count(&envelope)?;
+    writer.metrics.record_histogram_with_labels(
+        "ipc.response.frame_count",
+        u64::from(frame_count),
+        labels.clone(),
+    );
+    if frame_count > 1 {
+        writer
+            .metrics
+            .add_counter_with_labels("ipc.response.chunked_total", 1, labels.clone());
+    }
     let write_started_at = Instant::now();
     let result = {
         let mut writer_guard = writer.writer.lock().await;
@@ -16187,6 +16203,26 @@ pub(crate) async fn send_response(
 const fn response_kind(response: &Response) -> &'static str {
     match response {
         Response::Ok(_) => "ok",
+        Response::Err(_) => "error",
+    }
+}
+
+const fn response_payload_kind(response: &Response) -> &'static str {
+    match response {
+        Response::Ok(payload) => match payload {
+            ResponsePayload::Attached { .. } => "attached",
+            ResponsePayload::SessionHistory { .. } => "session_history",
+            ResponsePayload::SessionHistoryPage { .. } => "session_history_page",
+            ResponsePayload::SessionList { .. } => "session_list",
+            ResponsePayload::SessionCatalogRefreshed { .. } => "session_catalog_refreshed",
+            ResponsePayload::PermissionList { .. } => "permission_list",
+            ResponsePayload::ServerStatus { .. } => "server_status",
+            ResponsePayload::PluginServiceResult { .. } => "plugin_service_result",
+            ResponsePayload::RuntimeWorkList { .. } => "runtime_work_list",
+            ResponsePayload::SkillList { .. } => "skill_list",
+            ResponsePayload::ActiveSkills { .. } => "active_skills",
+            _ => "other",
+        },
         Response::Err(_) => "error",
     }
 }

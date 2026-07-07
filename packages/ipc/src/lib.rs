@@ -1320,7 +1320,7 @@ where
 {
     let payload = encode(envelope)?;
     if payload.len() <= MAX_FRAME_PAYLOAD_SIZE {
-        return write_envelope_frame(writer, envelope).await;
+        return write_envelope_frame(writer, envelope, true).await;
     }
     send_chunked_envelope(writer, envelope.request_id, &payload).await
 }
@@ -1355,12 +1355,35 @@ where
         };
         let chunk_envelope =
             Envelope::new(request_id, EnvelopeKind::Chunk, encode(&chunk_payload)?);
-        write_envelope_frame(writer, &chunk_envelope).await?;
+        write_envelope_frame(writer, &chunk_envelope, false).await?;
     }
+    writer.flush().await?;
     Ok(())
 }
 
-async fn write_envelope_frame<W>(writer: &mut W, envelope: &Envelope) -> Result<(), CodecError>
+/// Return how many physical frames would be written for a logical envelope.
+///
+/// # Errors
+///
+/// Returns an error when envelope serialization fails or the frame count exceeds wire limits.
+pub fn envelope_frame_count(envelope: &Envelope) -> Result<u32, CodecError> {
+    let payload = encode(envelope)?;
+    if payload.len() <= MAX_FRAME_PAYLOAD_SIZE {
+        return Ok(1);
+    }
+    u32::try_from(payload.len().div_ceil(MAX_CHUNK_DATA_SIZE)).map_err(|_| {
+        CodecError::PayloadTooLarge {
+            actual: payload.len(),
+            max: MAX_FRAME_PAYLOAD_SIZE,
+        }
+    })
+}
+
+async fn write_envelope_frame<W>(
+    writer: &mut W,
+    envelope: &Envelope,
+    flush: bool,
+) -> Result<(), CodecError>
 where
     W: AsyncWrite + Unpin,
 {
@@ -1377,7 +1400,9 @@ where
     })?;
     writer.write_all(&payload_len.to_le_bytes()).await?;
     writer.write_all(&payload).await?;
-    writer.flush().await?;
+    if flush {
+        writer.flush().await?;
+    }
     Ok(())
 }
 

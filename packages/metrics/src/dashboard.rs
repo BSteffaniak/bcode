@@ -180,7 +180,12 @@ fn summarize_domain(
         .iter()
         .filter(|event| event.name.ends_with("errors_total") && event.value > 0)
         .count();
-    let slowest = rows.iter().map(|row| row.max).max().unwrap_or(0);
+    let slowest = rows
+        .iter()
+        .filter(|row| is_duration_metric(&row.metric))
+        .map(|row| row.max)
+        .max()
+        .unwrap_or(0);
     let health = if error_count > 0 || slowest >= 30_000 {
         MetricsHealth::Warning
     } else {
@@ -205,7 +210,11 @@ fn summarize_domain(
         },
         MetricCard {
             title: "Slowest".to_owned(),
-            value: format_ms(slowest),
+            value: if slowest == 0 {
+                "none".to_owned()
+            } else {
+                format_ms(slowest)
+            },
             detail: "max sample".to_owned(),
             health: if slowest >= 10_000 {
                 MetricsHealth::Warning
@@ -326,20 +335,26 @@ fn series_for_domain(events: &[&MetricEvent]) -> Vec<MetricSeries> {
 
 fn recommendations_for_rows(rows: &[MetricTableRow]) -> Vec<MetricRecommendation> {
     rows.iter()
-        .filter(|row| row.max >= 10_000 || row.metric.ends_with("errors_total"))
+        .filter(|row| {
+            (is_duration_metric(&row.metric) && row.max >= 10_000)
+                || row.metric.ends_with("errors_total")
+                || (is_bytes_metric(&row.metric) && row.max >= 10 * 1024 * 1024)
+        })
         .take(8)
         .map(|row| MetricRecommendation {
             health: MetricsHealth::Warning,
             title: if row.metric.ends_with("errors_total") {
                 "Errors observed".to_owned()
+            } else if is_bytes_metric(&row.metric) {
+                "Large payload".to_owned()
             } else {
                 "Slow metric group".to_owned()
             },
             detail: format!(
                 "{} max={} avg={} count={} labels={}",
                 row.metric,
-                format_ms(row.max),
-                format_ms(row.average),
+                format_dashboard_value(&row.metric, row.max),
+                format_dashboard_value(&row.metric, row.average),
                 row.count,
                 row.group
             ),
@@ -359,6 +374,38 @@ fn label_summary(labels: &MetricLabels) -> String {
         .map(|(key, value)| format!("{key}={value}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn format_dashboard_value(metric: &str, value: u64) -> String {
+    if is_duration_metric(metric) {
+        format_ms(value)
+    } else if is_bytes_metric(metric) {
+        format_bytes(value)
+    } else {
+        value.to_string()
+    }
+}
+
+fn is_duration_metric(metric: &str) -> bool {
+    metric.ends_with("duration_ms")
+}
+
+fn is_bytes_metric(metric: &str) -> bool {
+    metric.ends_with("bytes")
+        || metric.ends_with("payload_bytes")
+        || metric.ends_with("output_bytes")
+}
+
+fn format_bytes(value: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    if value >= MIB {
+        format!("{}.{}MiB", value / MIB, (value % MIB) / (MIB / 10))
+    } else if value >= KIB {
+        format!("{}.{}KiB", value / KIB, (value % KIB) / (KIB / 10))
+    } else {
+        format!("{value}B")
+    }
 }
 
 fn format_ms(value: u64) -> String {

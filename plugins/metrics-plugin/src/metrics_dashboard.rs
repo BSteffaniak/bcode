@@ -248,8 +248,8 @@ impl MetricsDashboardSurface {
                     row.metric.clone(),
                     row.group.clone(),
                     row.count.to_string(),
-                    format_value(row.average),
-                    format_value(row.max),
+                    format_metric_value(&row.metric, row.average),
+                    format_metric_value(&row.metric, row.max),
                 ])
             })
             .collect::<Vec<_>>();
@@ -853,7 +853,40 @@ const fn health_color(health: MetricsHealth) -> Color {
     }
 }
 
-fn format_value(value: u64) -> String {
+fn format_metric_value(metric: &str, value: u64) -> String {
+    if metric.ends_with("duration_ms") {
+        format_duration(value)
+    } else if metric.ends_with("bytes")
+        || metric.ends_with("payload_bytes")
+        || metric.ends_with("output_bytes")
+    {
+        format_bytes(value)
+    } else {
+        format_count(value)
+    }
+}
+
+fn format_duration(value: u64) -> String {
+    if value >= 1_000 {
+        format!("{}.{}s", value / 1_000, (value % 1_000) / 100)
+    } else {
+        format!("{value}ms")
+    }
+}
+
+fn format_bytes(value: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    if value >= MIB {
+        format!("{}.{}MiB", value / MIB, (value % MIB) / (MIB / 10))
+    } else if value >= KIB {
+        format!("{}.{}KiB", value / KIB, (value % KIB) / (KIB / 10))
+    } else {
+        format!("{value}B")
+    }
+}
+
+fn format_count(value: u64) -> String {
     if value >= 1_000_000 {
         format!("{}.{}m", value / 1_000_000, (value % 1_000_000) / 100_000)
     } else if value >= 1_000 {
