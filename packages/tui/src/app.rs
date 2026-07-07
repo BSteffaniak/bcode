@@ -2961,7 +2961,7 @@ impl BmuxApp {
             .finish_live_tool_output(tool_call_id, Some(is_error))
             .is_some()
         {
-            if semantic_result.is_some_and(tool_result_replaces_streamed_visual) {
+            if semantic_result.is_some_and(artifact_result_replaces_streamed_visual) {
                 self.remove_streamed_tool_result(tool_call_id);
             } else {
                 self.update_tool_result_status(tool_call_id, is_error, application);
@@ -3605,7 +3605,7 @@ impl BmuxApp {
     }
 }
 
-const fn tool_result_replaces_streamed_visual(result: &ToolInvocationResult) -> bool {
+const fn artifact_result_replaces_streamed_visual(result: &ToolInvocationResult) -> bool {
     matches!(result, ToolInvocationResult::Artifact { .. })
 }
 
