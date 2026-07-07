@@ -575,6 +575,11 @@ impl SessionActor {
         provenance: Option<SessionEventProvenance>,
         activity_timestamp_ms: u64,
     ) -> Result<SessionEvent, SessionError> {
+        let total_started_at = Instant::now();
+        let metrics = self.store.as_ref().map(SessionStoreExecutor::metrics);
+        if let Some(metrics) = &metrics {
+            metrics.increment_counter("session.actor.append_event.total");
+        }
         let event_timestamp_ms = provenance
             .as_ref()
             .and_then(|provenance| provenance.source_timestamp_ms)
@@ -591,10 +596,12 @@ impl SessionActor {
             let db_append_started_at = Instant::now();
             db.append_event_with_activity_timestamp(&event, Some(event_timestamp_ms))
                 .await?;
-            store.metrics().record_histogram(
-                "session.actor.append_event.db_append_duration_ms",
-                elapsed_ms(db_append_started_at),
-            );
+            if let Some(metrics) = &metrics {
+                metrics.record_histogram(
+                    "session.actor.append_event.db_append_duration_ms",
+                    elapsed_ms(db_append_started_at),
+                );
+            }
             event
         } else {
             let mut event = self.state.build_next_event(kind, event_timestamp_ms);
@@ -650,6 +657,12 @@ impl SessionActor {
         }
         self.state.load_status = SessionLoadStatusKind::Current;
         self.refresh_snapshot();
+        if let Some(metrics) = &metrics {
+            metrics.record_histogram(
+                "session.actor.append_event.duration_ms",
+                elapsed_ms(total_started_at),
+            );
+        }
         Ok(event)
     }
 
@@ -1011,11 +1024,35 @@ impl SessionActor {
     }
 
     async fn model_context_events(&mut self) -> Result<Vec<SessionEvent>, SessionError> {
+        let started_at = Instant::now();
+        let metrics = self.store.as_ref().map(SessionStoreExecutor::metrics);
         if let Some(db) = self.existing_session_db().await? {
-            return Ok(db.model_context_events().await?);
+            let events = db.model_context_events().await?;
+            if let Some(metrics) = &metrics {
+                metrics.record_histogram(
+                    "session.actor.model_context_events.duration_ms",
+                    elapsed_ms(started_at),
+                );
+                metrics.record_histogram(
+                    "session.actor.model_context_events.event_count",
+                    usize_to_u64(events.len()),
+                );
+            }
+            return Ok(events);
         }
         if let Some(events) = &self.state.events {
-            return Ok(model_context_events_from_history(events));
+            let events = model_context_events_from_history(events);
+            if let Some(metrics) = &metrics {
+                metrics.record_histogram(
+                    "session.actor.model_context_events.duration_ms",
+                    elapsed_ms(started_at),
+                );
+                metrics.record_histogram(
+                    "session.actor.model_context_events.event_count",
+                    usize_to_u64(events.len()),
+                );
+            }
+            return Ok(events);
         }
         if self.store.is_some() {
             return Err(SessionError::NotFound(self.state.summary.id));

@@ -990,6 +990,9 @@ impl SessionManager {
         name: Option<String>,
         working_directory: PathBuf,
     ) -> Result<SessionSummary, SessionError> {
+        let started_at = std::time::Instant::now();
+        self.metrics
+            .increment_counter("session.manager.create.total");
         let working_directory = normalize_working_directory(&working_directory);
         let id = SessionId::new();
         let (sender, _) = broadcast::channel(512);
@@ -1055,6 +1058,8 @@ impl SessionManager {
         }
         self.release_persistent_idle_session_resources(id).await;
         self.publish_committed_mutation(event, summary.clone());
+        self.metrics
+            .record_histogram("session.manager.create.duration_ms", elapsed_ms(started_at));
         Ok(summary)
     }
 

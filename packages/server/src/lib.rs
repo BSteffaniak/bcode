@@ -15282,6 +15282,11 @@ async fn append_system_event(state: &ServerState, session_id: SessionId, text: S
 async fn register_runtime_work(state: &ServerState, session_id: SessionId, spec: RuntimeWorkSpec) {
     let work_id = spec.work_id.clone();
     let kind = spec.kind;
+    state.metrics.add_counter_with_labels(
+        "runtime_work.started_total",
+        1,
+        runtime_work_metric_labels(kind, None),
+    );
     let label = spec.label.clone();
     let tool_call_id = spec.tool_call_id.clone();
     let plugin_id = spec.plugin_id.clone();
@@ -15414,6 +15419,11 @@ async fn append_runtime_work_finished_event(
     status: RuntimeWorkStatus,
     message: Option<String>,
 ) {
+    state.metrics.add_counter_with_labels(
+        "runtime_work.finished_total",
+        1,
+        runtime_work_status_metric_labels(status),
+    );
     match state
         .sessions
         .append_runtime_work_finished(
@@ -15427,6 +15437,51 @@ async fn append_runtime_work_finished_event(
     {
         Ok(event) => publish_session_event(state, &event).await,
         Err(error) => eprintln!("failed to append runtime work finish: {error}"),
+    }
+}
+
+fn runtime_work_status_metric_labels(status: RuntimeWorkStatus) -> MetricLabels {
+    let mut labels = MetricLabels::new();
+    labels.insert(
+        "status".to_owned(),
+        runtime_work_status_label(status).to_owned(),
+    );
+    labels
+}
+
+fn runtime_work_metric_labels(
+    kind: RuntimeWorkKind,
+    status: Option<RuntimeWorkStatus>,
+) -> MetricLabels {
+    let mut labels = MetricLabels::new();
+    labels.insert("kind".to_owned(), runtime_work_kind_label(kind).to_owned());
+    if let Some(status) = status {
+        labels.insert(
+            "status".to_owned(),
+            runtime_work_status_label(status).to_owned(),
+        );
+    }
+    labels
+}
+
+const fn runtime_work_kind_label(kind: RuntimeWorkKind) -> &'static str {
+    match kind {
+        RuntimeWorkKind::Tool => "tool",
+        RuntimeWorkKind::PluginInvocation => "plugin_invocation",
+        RuntimeWorkKind::ModelTurn => "model_turn",
+        RuntimeWorkKind::EventDelivery => "event_delivery",
+    }
+}
+
+const fn runtime_work_status_label(status: RuntimeWorkStatus) -> &'static str {
+    match status {
+        RuntimeWorkStatus::Queued => "queued",
+        RuntimeWorkStatus::Running => "running",
+        RuntimeWorkStatus::Cancelling => "cancelling",
+        RuntimeWorkStatus::Completed => "completed",
+        RuntimeWorkStatus::Failed => "failed",
+        RuntimeWorkStatus::Cancelled => "cancelled",
+        RuntimeWorkStatus::TimedOut => "timed_out",
     }
 }
 
