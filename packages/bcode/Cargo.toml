@@ -21,6 +21,8 @@ bcode_bundled_plugins = { workspace = true, optional = true }
 bcode_cli = { workspace = true, optional = true }
 bcode_model = { workspace = true }
 bcode_plugin = { workspace = true, optional = true }
+bcode_tool = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = [
     "macros",

@@ -1307,6 +1307,8 @@ dependencies = [
  "bcode_cli",
  "bcode_model",
  "bcode_plugin",
+ "bcode_tool",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
 ]

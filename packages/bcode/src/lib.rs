@@ -20,14 +20,20 @@ use bcode_model::{
     PollTurnEventsRequest, PollTurnEventsResponse, StartTurnResponse,
 };
 use bcode_model::{ModelParameters, ProviderRequestContext};
+use bcode_tool::{ToolDefinition, ToolInvocationRequest, ToolInvocationResponse};
 use std::collections::BTreeMap;
+use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
 pub use bcode_agent_runtime::{
     AgentRuntimeEvent as AgentEvent, AgentRuntimeStream as AgentStream,
-    AgentRuntimeStreamItem as AgentStreamItem, CancellationToken, RuntimeError,
+    AgentRuntimeStreamItem as AgentStreamItem, AllowAllPolicy, CancellationToken,
+    PermissionDecision, PermissionPolicy, RegisteredTool, RuntimeError, ToolExecutionOutput,
+    ToolExecutor, ToolSource, UnifiedToolCatalog,
 };
+pub use bcode_model::ToolCall;
 
 /// Result alias for Bcode SDK operations.
 pub type Result<T> = std::result::Result<T, BcodeError>;
@@ -41,6 +47,60 @@ pub enum BcodeError {
     /// No provider is configured for a requested model operation.
     #[error("no provider configured")]
     MissingProvider,
+    /// Tool execution failed.
+    #[error("tool execution error: {0}")]
+    ToolExecution(String),
+}
+
+type InlineToolHandler = Arc<
+    dyn Fn(ToolInvocationRequest) -> std::result::Result<ToolInvocationResponse, String>
+        + Send
+        + Sync,
+>;
+
+#[derive(Clone)]
+struct InlineToolExecutor {
+    handlers: BTreeMap<String, InlineToolHandler>,
+}
+
+impl fmt::Debug for InlineToolExecutor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InlineToolExecutor")
+            .field("tools", &self.handlers.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl ToolExecutor for InlineToolExecutor {
+    fn execute_tool<'a>(
+        &'a self,
+        tool: &'a RegisteredTool,
+        request: &'a ToolInvocationRequest,
+    ) -> bcode_agent_runtime::RuntimeFuture<'a, ToolInvocationResponse> {
+        Box::pin(async move {
+            match &tool.source {
+                ToolSource::Inline => {
+                    let handler = self.handlers.get(&tool.definition.name).ok_or_else(|| {
+                        RuntimeError::ToolExecution {
+                            tool_name: tool.definition.name.clone(),
+                            message: "inline tool handler not found".to_string(),
+                        }
+                    })?;
+                    handler(request.clone()).map_err(|message| RuntimeError::ToolExecution {
+                        tool_name: tool.definition.name.clone(),
+                        message,
+                    })
+                }
+                ToolSource::Plugin { plugin_id } => Err(RuntimeError::ToolExecution {
+                    tool_name: tool.definition.name.clone(),
+                    message: format!(
+                        "plugin-backed tool routing for plugin '{plugin_id}' is not configured"
+                    ),
+                }),
+            }
+        })
+    }
 }
 
 /// Provider invoker backed by a loaded Bcode plugin runtime.
@@ -271,7 +331,7 @@ impl BcodeBuilder {
 }
 
 /// Configured agent facade.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Agent {
     runtime: AgentRuntime,
     name: Option<String>,
@@ -283,8 +343,33 @@ pub struct Agent {
     metadata: BTreeMap<String, String>,
     timeout: Duration,
     max_tool_rounds: u32,
+    tool_catalog: UnifiedToolCatalog,
+    inline_tool_handlers: BTreeMap<String, InlineToolHandler>,
     #[cfg(feature = "embedded-plugins")]
     provider: Option<PluginModelProviderInvoker>,
+}
+
+impl fmt::Debug for Agent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Agent")
+            .field("runtime", &self.runtime)
+            .field("name", &self.name)
+            .field("provider_plugin_id", &self.provider_plugin_id)
+            .field("model_id", &self.model_id)
+            .field("provider_context", &self.provider_context)
+            .field("system_prompt", &self.system_prompt)
+            .field("parameters", &self.parameters)
+            .field("metadata", &self.metadata)
+            .field("timeout", &self.timeout)
+            .field("max_tool_rounds", &self.max_tool_rounds)
+            .field("tool_catalog", &self.tool_catalog)
+            .field(
+                "inline_tool_handlers",
+                &self.inline_tool_handlers.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl Agent {
@@ -393,6 +478,21 @@ impl Agent {
         )
     }
 
+    /// Execute a registered tool call through this agent's inline tool catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tool is unknown, denied, or its handler fails.
+    pub async fn execute_tool_call(&self, call: &ToolCall) -> Result<ToolExecutionOutput> {
+        let executor = InlineToolExecutor {
+            handlers: self.inline_tool_handlers.clone(),
+        };
+        Ok(self
+            .runtime
+            .execute_tool_call(&self.tool_catalog, &AllowAllPolicy, &executor, call)
+            .await?)
+    }
+
     fn turn_request(&self, prompt: String) -> AgentTurnRequest {
         self.turn_request_with_cancellation(prompt, CancellationToken::new())
     }
@@ -430,7 +530,7 @@ impl Agent {
 }
 
 /// Builder for [`Agent`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentBuilder {
     runtime: AgentRuntime,
     name: Option<String>,
@@ -442,8 +542,33 @@ pub struct AgentBuilder {
     metadata: BTreeMap<String, String>,
     timeout: Duration,
     max_tool_rounds: u32,
+    tool_catalog: UnifiedToolCatalog,
+    inline_tool_handlers: BTreeMap<String, InlineToolHandler>,
     #[cfg(feature = "embedded-plugins")]
     provider: Option<PluginModelProviderInvoker>,
+}
+
+impl fmt::Debug for AgentBuilder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentBuilder")
+            .field("runtime", &self.runtime)
+            .field("name", &self.name)
+            .field("provider_plugin_id", &self.provider_plugin_id)
+            .field("model_id", &self.model_id)
+            .field("provider_context", &self.provider_context)
+            .field("system_prompt", &self.system_prompt)
+            .field("parameters", &self.parameters)
+            .field("metadata", &self.metadata)
+            .field("timeout", &self.timeout)
+            .field("max_tool_rounds", &self.max_tool_rounds)
+            .field("tool_catalog", &self.tool_catalog)
+            .field(
+                "inline_tool_handlers",
+                &self.inline_tool_handlers.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl Default for AgentBuilder {
@@ -459,6 +584,8 @@ impl Default for AgentBuilder {
             metadata: BTreeMap::new(),
             timeout: Duration::from_mins(2),
             max_tool_rounds: 8,
+            tool_catalog: UnifiedToolCatalog::new(),
+            inline_tool_handlers: BTreeMap::new(),
             #[cfg(feature = "embedded-plugins")]
             provider: None,
         }
@@ -544,6 +671,32 @@ impl AgentBuilder {
         self
     }
 
+    /// Register an inline SDK tool.
+    ///
+    /// The supplied definition is exposed to providers as a normal [`ToolDefinition`], while the
+    /// handler executes in-process when the runtime routes a matching tool call.
+    #[must_use]
+    pub fn inline_tool<F>(mut self, definition: ToolDefinition, handler: F) -> Self
+    where
+        F: Fn(ToolInvocationRequest) -> std::result::Result<ToolInvocationResponse, String>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let name = definition.name.clone();
+        self.tool_catalog.insert(RegisteredTool::inline(definition));
+        self.inline_tool_handlers.insert(name, Arc::new(handler));
+        self
+    }
+
+    /// Register a plugin-backed tool definition with routing metadata.
+    #[must_use]
+    pub fn plugin_tool(mut self, definition: ToolDefinition, plugin_id: impl Into<String>) -> Self {
+        self.tool_catalog
+            .insert(RegisteredTool::plugin(definition, plugin_id));
+        self
+    }
+
     /// Build the agent.
     #[must_use]
     pub fn build(self) -> Agent {
@@ -558,6 +711,8 @@ impl AgentBuilder {
             metadata: self.metadata,
             timeout: self.timeout,
             max_tool_rounds: self.max_tool_rounds,
+            tool_catalog: self.tool_catalog,
+            inline_tool_handlers: self.inline_tool_handlers,
             #[cfg(feature = "embedded-plugins")]
             provider: self.provider,
         }
