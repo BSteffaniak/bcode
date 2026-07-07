@@ -331,6 +331,7 @@ struct TerminalStreamOutput {
     clean: LimitedOutput,
     raw_artifact_path: Option<PathBuf>,
     clean_artifact_path: Option<PathBuf>,
+    direnv_prelude_suppressed: bool,
 }
 
 fn resolve_effective_cwd(
@@ -763,7 +764,7 @@ fn terminal_shell_response(
     tool_call_id: &str,
     input: TerminalShellResponseInput<'_>,
 ) -> Result<ToolInvocationResponse, String> {
-    let (encoded, full_encoded, _clean_inline_output) = encode_terminal_output(
+    let (encoded, full_encoded, clean_inline_output) = encode_terminal_output(
         &input.arguments.command,
         input.cwd,
         input.status,
@@ -772,6 +773,20 @@ fn terminal_shell_response(
         input.rows,
     )?;
     let raw_inline_output = limit_terminal_inline_output(&input.stream_output.raw);
+    let artifact_inline_output = if input.stream_output.direnv_prelude_suppressed {
+        &clean_inline_output
+    } else {
+        &raw_inline_output
+    };
+    let raw_ref = if input.stream_output.direnv_prelude_suppressed {
+        None
+    } else {
+        input
+            .stream_output
+            .raw_artifact_path
+            .as_deref()
+            .map(|path| raw_artifact_ref(path, &input.stream_output.raw, input.columns, input.rows))
+    };
     Ok(ToolInvocationResponse {
         output: encoded,
         is_error: input.status.timed_out || input.status.cancelled || !input.status.success,
@@ -787,13 +802,13 @@ fn terminal_shell_response(
                 duration_ms: Some(
                     u64::try_from(input.started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 ),
-                output_tail: raw_inline_output.text,
-                output_truncated: raw_inline_output.truncated,
+                output_tail: artifact_inline_output.text.clone(),
+                output_truncated: artifact_inline_output.truncated,
                 output_bytes: Some(
-                    u64::try_from(raw_inline_output.original_bytes).unwrap_or(u64::MAX),
+                    u64::try_from(artifact_inline_output.original_bytes).unwrap_or(u64::MAX),
                 ),
                 retained_output_bytes: Some(
-                    u64::try_from(raw_inline_output.retained_bytes).unwrap_or(u64::MAX),
+                    u64::try_from(artifact_inline_output.retained_bytes).unwrap_or(u64::MAX),
                 ),
                 columns: input.columns,
                 rows: input.rows,
@@ -803,13 +818,7 @@ fn terminal_shell_response(
                 .clean_artifact_path
                 .as_deref()
                 .map(|path| clean_artifact_ref(path, &input.stream_output.clean)),
-            input
-                .stream_output
-                .raw_artifact_path
-                .as_deref()
-                .map(|path| {
-                    raw_artifact_ref(path, &input.stream_output.raw, input.columns, input.rows)
-                }),
+            raw_ref,
         )),
     })
 }
@@ -930,6 +939,10 @@ impl DirenvPreludeFilter {
             std::mem::take(&mut self.buffer)
         }
     }
+
+    const fn suppressed_prelude(&self) -> bool {
+        self.marker.is_some() && self.passed && !self.failed_open
+    }
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1017,6 +1030,7 @@ where
             .write_chunk(&final_filtered)
             .map_err(|error| error.to_string())?;
     }
+    let direnv_prelude_suppressed = prelude_filter.suppressed_prelude();
     raw_writer.flush().map_err(|error| error.to_string())?;
     let clean_summary = cleaner.finish().map_err(|error| error.to_string())?;
     let clean_bytes = clean_summary.tail.into_bytes();
@@ -1035,6 +1049,7 @@ where
         ),
         raw_artifact_path: paths.raw_artifact_path,
         clean_artifact_path: paths.clean_artifact_path,
+        direnv_prelude_suppressed,
     })
 }
 
@@ -1649,6 +1664,125 @@ mod tests {
 
         assert_eq!(filter.write(b"hello"), b"hello");
         assert!(filter.finish().is_empty());
+    }
+
+    #[test]
+    fn terminal_response_uses_clean_artifact_when_direnv_prelude_was_suppressed() {
+        let raw = LimitedOutput {
+            text: "direnv: loading\n__BCODE_DIRENV_READY_call__\nhello\n".to_string(),
+            original_bytes: 51,
+            retained_bytes: 51,
+            truncated: false,
+        };
+        let clean = LimitedOutput {
+            text: "hello\n".to_string(),
+            original_bytes: 6,
+            retained_bytes: 6,
+            truncated: false,
+        };
+        let response = terminal_shell_response(
+            "call",
+            TerminalShellResponseInput {
+                arguments: &ShellRunArguments {
+                    command: "echo hello".to_string(),
+                    cwd: None,
+                    timeout_ms: None,
+                    columns: Some(80),
+                    rows: Some(24),
+                },
+                cwd: None,
+                status: TerminalShellStatus {
+                    exit_code: 0,
+                    success: true,
+                    timed_out: false,
+                    cancelled: false,
+                },
+                started: Instant::now(),
+                stream_output: &TerminalStreamOutput {
+                    raw,
+                    clean,
+                    raw_artifact_path: Some(PathBuf::from("/tmp/raw.txt")),
+                    clean_artifact_path: Some(PathBuf::from("/tmp/clean.txt")),
+                    direnv_prelude_suppressed: true,
+                },
+                columns: 80,
+                rows: 24,
+            },
+        )
+        .expect("terminal response should encode");
+
+        let ShellRunResult::Terminal { output_tail, .. } =
+            shell_result_from_artifact(&response).expect("expected shell artifact")
+        else {
+            panic!("expected semantic terminal shell result");
+        };
+        assert_eq!(output_tail, "hello\n");
+        let Some(ToolInvocationResult::Artifact { artifact }) = response.result else {
+            panic!("expected artifact result");
+        };
+        assert!(
+            artifact
+                .refs
+                .iter()
+                .any(|reference| reference.key == "clean_output")
+        );
+        assert!(
+            artifact
+                .refs
+                .iter()
+                .all(|reference| reference.key != TERMINAL_PTY_STREAM_REF_KEY)
+        );
+    }
+
+    #[test]
+    fn terminal_response_keeps_raw_artifact_when_direnv_marker_was_absent() {
+        let raw = LimitedOutput {
+            text: "direnv error\n".to_string(),
+            original_bytes: 13,
+            retained_bytes: 13,
+            truncated: false,
+        };
+        let clean = raw.clone();
+        let response = terminal_shell_response(
+            "call",
+            TerminalShellResponseInput {
+                arguments: &ShellRunArguments {
+                    command: "echo hello".to_string(),
+                    cwd: None,
+                    timeout_ms: None,
+                    columns: Some(80),
+                    rows: Some(24),
+                },
+                cwd: None,
+                status: TerminalShellStatus {
+                    exit_code: 1,
+                    success: false,
+                    timed_out: false,
+                    cancelled: false,
+                },
+                started: Instant::now(),
+                stream_output: &TerminalStreamOutput {
+                    raw,
+                    clean,
+                    raw_artifact_path: Some(PathBuf::from("/tmp/raw.txt")),
+                    clean_artifact_path: Some(PathBuf::from("/tmp/clean.txt")),
+                    direnv_prelude_suppressed: false,
+                },
+                columns: 80,
+                rows: 24,
+            },
+        )
+        .expect("terminal response should encode");
+
+        let Some(ToolInvocationResult::Artifact { artifact }) = response.result else {
+            panic!("expected artifact result");
+        };
+        assert!(
+            artifact
+                .refs
+                .iter()
+                .any(|reference| reference.key == TERMINAL_PTY_STREAM_REF_KEY)
+        );
     }
 
     #[test]
