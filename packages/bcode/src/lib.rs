@@ -47,6 +47,9 @@ pub enum BcodeError {
     /// No provider is configured for a requested model operation.
     #[error("no provider configured")]
     MissingProvider,
+    /// Embedded plugin runtime is required for this operation.
+    #[error("embedded plugin runtime is not configured")]
+    MissingPluginRuntime,
     /// Tool execution failed.
     #[error("tool execution error: {0}")]
     ToolExecution(String),
@@ -61,14 +64,19 @@ type InlineToolHandler = Arc<
 #[derive(Clone)]
 struct InlineToolExecutor {
     handlers: BTreeMap<String, InlineToolHandler>,
+    #[cfg(feature = "embedded-plugins")]
+    plugins: Option<bcode_plugin::PluginRuntimeHost>,
 }
 
 impl fmt::Debug for InlineToolExecutor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("InlineToolExecutor")
-            .field("tools", &self.handlers.keys().collect::<Vec<_>>())
-            .finish()
+        let mut debug = formatter.debug_struct("InlineToolExecutor");
+        debug.field("tools", &self.handlers.keys().collect::<Vec<_>>());
+        #[cfg(feature = "embedded-plugins")]
+        debug.field("plugins", &self.plugins.is_some());
+        #[cfg(not(feature = "embedded-plugins"))]
+        debug.field("plugins", &false);
+        debug.finish()
     }
 }
 
@@ -92,15 +100,57 @@ impl ToolExecutor for InlineToolExecutor {
                         message,
                     })
                 }
-                ToolSource::Plugin { plugin_id } => Err(RuntimeError::ToolExecution {
-                    tool_name: tool.definition.name.clone(),
-                    message: format!(
-                        "plugin-backed tool routing for plugin '{plugin_id}' is not configured"
-                    ),
-                }),
+                ToolSource::Plugin { plugin_id } => {
+                    #[cfg(feature = "embedded-plugins")]
+                    {
+                        execute_plugin_tool(self.plugins.as_ref(), plugin_id, request).await
+                    }
+                    #[cfg(not(feature = "embedded-plugins"))]
+                    {
+                        execute_plugin_tool(plugin_id, request)
+                    }
+                }
             }
         })
     }
+}
+
+#[cfg(feature = "embedded-plugins")]
+async fn execute_plugin_tool(
+    plugins: Option<&bcode_plugin::PluginRuntimeHost>,
+    plugin_id: &str,
+    request: &ToolInvocationRequest,
+) -> std::result::Result<ToolInvocationResponse, RuntimeError> {
+    let plugins = plugins.ok_or_else(|| RuntimeError::ToolExecution {
+        tool_name: request.name.clone(),
+        message: "embedded plugin runtime is not configured".to_string(),
+    })?;
+    plugins
+        .invoke_service_json_scoped(
+            plugin_id,
+            bcode_tool::TOOL_SERVICE_INTERFACE_ID,
+            bcode_tool::OP_INVOKE_TOOL,
+            request,
+            bcode_plugin::PluginInvocationScope::Global,
+        )
+        .await
+        .map_err(|error| RuntimeError::ToolExecution {
+            tool_name: request.name.clone(),
+            message: error.to_string(),
+        })
+}
+
+#[cfg(not(feature = "embedded-plugins"))]
+fn execute_plugin_tool(
+    plugin_id: &str,
+    request: &ToolInvocationRequest,
+) -> std::result::Result<ToolInvocationResponse, RuntimeError> {
+    Err(RuntimeError::ToolExecution {
+        tool_name: request.name.clone(),
+        message: format!(
+            "plugin-backed tool routing for plugin '{plugin_id}' requires embedded-plugins"
+        ),
+    })
 }
 
 /// Provider invoker backed by a loaded Bcode plugin runtime.
@@ -236,6 +286,8 @@ pub struct Bcode {
     runtime: AgentRuntime,
     #[cfg(feature = "embedded-plugins")]
     provider: Option<PluginModelProviderInvoker>,
+    #[cfg(feature = "embedded-plugins")]
+    plugins: Option<bcode_plugin::PluginRuntimeHost>,
 }
 
 impl Bcode {
@@ -252,6 +304,12 @@ impl Bcode {
         #[cfg(feature = "embedded-plugins")]
         let builder = if let Some(provider) = self.provider.clone() {
             builder.provider_invoker(provider)
+        } else {
+            builder
+        };
+        #[cfg(feature = "embedded-plugins")]
+        let builder = if let Some(plugins) = self.plugins.clone() {
+            builder.plugin_runtime(plugins)
         } else {
             builder
         };
@@ -272,6 +330,8 @@ pub struct BcodeBuilder {
     runtime: AgentRuntime,
     #[cfg(feature = "embedded-plugins")]
     provider: Option<PluginModelProviderInvoker>,
+    #[cfg(feature = "embedded-plugins")]
+    plugins: Option<bcode_plugin::PluginRuntimeHost>,
 }
 
 impl Default for BcodeBuilder {
@@ -281,6 +341,8 @@ impl Default for BcodeBuilder {
             runtime: AgentRuntime::new(),
             #[cfg(feature = "embedded-plugins")]
             provider: None,
+            #[cfg(feature = "embedded-plugins")]
+            plugins: None,
         }
     }
 }
@@ -304,7 +366,8 @@ impl BcodeBuilder {
     #[cfg(feature = "embedded-plugins")]
     #[must_use]
     pub fn plugin_runtime(mut self, plugins: bcode_plugin::PluginRuntimeHost) -> Self {
-        self.provider = Some(PluginModelProviderInvoker::new(plugins));
+        self.provider = Some(PluginModelProviderInvoker::new(plugins.clone()));
+        self.plugins = Some(plugins);
         self
     }
 
@@ -326,6 +389,7 @@ impl BcodeBuilder {
             mode: self.mode,
             runtime: self.runtime,
             provider: self.provider,
+            plugins: self.plugins,
         }
     }
 }
@@ -347,12 +411,14 @@ pub struct Agent {
     inline_tool_handlers: BTreeMap<String, InlineToolHandler>,
     #[cfg(feature = "embedded-plugins")]
     provider: Option<PluginModelProviderInvoker>,
+    #[cfg(feature = "embedded-plugins")]
+    plugins: Option<bcode_plugin::PluginRuntimeHost>,
 }
 
 impl fmt::Debug for Agent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("Agent")
+        let mut debug = formatter.debug_struct("Agent");
+        debug
             .field("runtime", &self.runtime)
             .field("name", &self.name)
             .field("provider_plugin_id", &self.provider_plugin_id)
@@ -367,8 +433,12 @@ impl fmt::Debug for Agent {
             .field(
                 "inline_tool_handlers",
                 &self.inline_tool_handlers.keys().collect::<Vec<_>>(),
-            )
-            .finish()
+            );
+        #[cfg(feature = "embedded-plugins")]
+        debug
+            .field("provider", &self.provider)
+            .field("plugins", &self.plugins.is_some());
+        debug.finish()
     }
 }
 
@@ -417,6 +487,10 @@ impl Agent {
     ///
     /// The returned stream yields normalized [`AgentStreamItem`] values and does not require the
     /// TUI or daemon when an embedded plugin provider is configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no embedded provider is configured.
     #[cfg(feature = "embedded-plugins")]
     pub fn stream_text(&self, prompt: impl Into<String>) -> Result<AgentStream> {
         let provider = self.provider.clone().ok_or(BcodeError::MissingProvider)?;
@@ -429,6 +503,10 @@ impl Agent {
     ///
     /// Cancelling the token requests provider cancellation and terminates the stream with a
     /// [`RuntimeError::Cancelled`] item.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no embedded provider is configured.
     #[cfg(feature = "embedded-plugins")]
     pub fn stream_text_with_cancellation(
         &self,
@@ -486,6 +564,8 @@ impl Agent {
     pub async fn execute_tool_call(&self, call: &ToolCall) -> Result<ToolExecutionOutput> {
         let executor = InlineToolExecutor {
             handlers: self.inline_tool_handlers.clone(),
+            #[cfg(feature = "embedded-plugins")]
+            plugins: self.plugins.clone(),
         };
         Ok(self
             .runtime
@@ -546,12 +626,14 @@ pub struct AgentBuilder {
     inline_tool_handlers: BTreeMap<String, InlineToolHandler>,
     #[cfg(feature = "embedded-plugins")]
     provider: Option<PluginModelProviderInvoker>,
+    #[cfg(feature = "embedded-plugins")]
+    plugins: Option<bcode_plugin::PluginRuntimeHost>,
 }
 
 impl fmt::Debug for AgentBuilder {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AgentBuilder")
+        let mut debug = formatter.debug_struct("AgentBuilder");
+        debug
             .field("runtime", &self.runtime)
             .field("name", &self.name)
             .field("provider_plugin_id", &self.provider_plugin_id)
@@ -566,8 +648,12 @@ impl fmt::Debug for AgentBuilder {
             .field(
                 "inline_tool_handlers",
                 &self.inline_tool_handlers.keys().collect::<Vec<_>>(),
-            )
-            .finish()
+            );
+        #[cfg(feature = "embedded-plugins")]
+        debug
+            .field("provider", &self.provider)
+            .field("plugins", &self.plugins.is_some());
+        debug.finish()
     }
 }
 
@@ -588,6 +674,8 @@ impl Default for AgentBuilder {
             inline_tool_handlers: BTreeMap::new(),
             #[cfg(feature = "embedded-plugins")]
             provider: None,
+            #[cfg(feature = "embedded-plugins")]
+            plugins: None,
         }
     }
 }
@@ -605,6 +693,15 @@ impl AgentBuilder {
     #[must_use]
     pub fn provider_invoker(mut self, provider: PluginModelProviderInvoker) -> Self {
         self.provider = Some(provider);
+        self
+    }
+
+    /// Configure the embedded plugin runtime for provider and plugin-backed tool calls.
+    #[cfg(feature = "embedded-plugins")]
+    #[must_use]
+    pub fn plugin_runtime(mut self, plugins: bcode_plugin::PluginRuntimeHost) -> Self {
+        self.provider = Some(PluginModelProviderInvoker::new(plugins.clone()));
+        self.plugins = Some(plugins);
         self
     }
 
@@ -697,6 +794,40 @@ impl AgentBuilder {
         self
     }
 
+    /// Discover plugin-backed tools from the configured embedded plugin runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no plugin runtime is configured or a plugin tool service fails.
+    #[cfg(feature = "embedded-plugins")]
+    pub async fn discover_plugin_tools(mut self) -> Result<Self> {
+        let plugins = self
+            .plugins
+            .clone()
+            .ok_or(BcodeError::MissingPluginRuntime)?;
+        let registry = plugins.registry().service_registry();
+        let Some(providers) = registry.providers_for(bcode_tool::TOOL_SERVICE_INTERFACE_ID) else {
+            return Ok(self);
+        };
+        for plugin_id in providers {
+            let list: bcode_tool::ToolList = plugins
+                .invoke_service_json_scoped(
+                    plugin_id,
+                    bcode_tool::TOOL_SERVICE_INTERFACE_ID,
+                    bcode_tool::OP_LIST_TOOLS,
+                    &bcode_tool::ListToolsRequest::default(),
+                    bcode_plugin::PluginInvocationScope::Global,
+                )
+                .await
+                .map_err(|error| BcodeError::ToolExecution(error.to_string()))?;
+            for definition in list.tools {
+                self.tool_catalog
+                    .insert(RegisteredTool::plugin(definition, plugin_id.clone()));
+            }
+        }
+        Ok(self)
+    }
+
     /// Build the agent.
     #[must_use]
     pub fn build(self) -> Agent {
@@ -715,6 +846,8 @@ impl AgentBuilder {
             inline_tool_handlers: self.inline_tool_handlers,
             #[cfg(feature = "embedded-plugins")]
             provider: self.provider,
+            #[cfg(feature = "embedded-plugins")]
+            plugins: self.plugins,
         }
     }
 }
