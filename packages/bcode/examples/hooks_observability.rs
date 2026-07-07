@@ -1,6 +1,6 @@
 use bcode::{
-    Agent, AgentEvent, BcodeError, ModelCallContext, ModelProviderInvoker, PermissionAction,
-    PermissionAgentConfig, PermissionDecision, RuntimeFuture, ToolCall, ToolCallContext,
+    Action, Agent, AgentConfig, AgentEvent, BcodeError, ModelCallContext, ModelProviderInvoker,
+    PermissionDecision, RuntimeFuture, ToolCall, ToolCallContext,
 };
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, ModelTurnRequest, PollTurnEventsRequest,
@@ -118,9 +118,9 @@ async fn main() -> bcode::Result<()> {
     let before_tool = Arc::clone(&tool_hooks);
     let after_tool = Arc::clone(&tool_hooks);
 
-    let mut agent_config = PermissionAgentConfig::default();
+    let mut agent_config = AgentConfig::default();
     agent_config.tools.insert("echo".to_string(), true);
-    agent_config.permission.read = BTreeMap::from([("*".to_string(), PermissionAction::Ask)]);
+    agent_config.permission.read = BTreeMap::from([("*".to_string(), Action::Ask)]);
 
     let agent = Agent::builder()
         .name("observability-example")

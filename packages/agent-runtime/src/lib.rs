@@ -74,6 +74,9 @@ pub enum RuntimeError {
         /// Human-readable error message.
         message: String,
     },
+    /// Tool execution requires user permission.
+    #[error("tool execution requires permission: {0}")]
+    PermissionRequired(String),
     /// Tool execution was denied by policy.
     #[error("tool execution denied: {0}")]
     PermissionDenied(String),
@@ -120,6 +123,8 @@ pub struct AgentTurnRequest {
     pub system_prompt: Option<String>,
     /// User prompt for this turn.
     pub prompt: String,
+    /// Model-callable tool definitions available to the provider.
+    pub tools: Vec<ToolDefinition>,
     /// Model parameters.
     pub parameters: ModelParameters,
     /// Host-defined metadata forwarded to the provider.
@@ -142,6 +147,7 @@ impl AgentTurnRequest {
             provider_context: ProviderRequestContext::default(),
             system_prompt: None,
             prompt: prompt.into(),
+            tools: Vec::new(),
             parameters: ModelParameters::default(),
             metadata: BTreeMap::new(),
             timeout: Duration::from_mins(2),
@@ -426,6 +432,8 @@ impl ToolCatalog for EmptyToolCatalog {
 pub enum PermissionDecision {
     /// Permit tool execution.
     Allow,
+    /// Ask the host/user whether tool execution should proceed.
+    Ask(String),
     /// Deny tool execution with a reason.
     Deny(String),
 }
@@ -670,6 +678,9 @@ impl AgentRuntime {
         };
         match policy.evaluate_tool_call(&permission_request).await? {
             PermissionDecision::Allow => {}
+            PermissionDecision::Ask(reason) => {
+                return Err(RuntimeError::PermissionRequired(reason));
+            }
             PermissionDecision::Deny(reason) => return Err(RuntimeError::PermissionDenied(reason)),
         }
         let request = ToolInvocationRequest {
@@ -980,11 +991,36 @@ fn model_turn_request(request: &AgentTurnRequest) -> ModelTurnRequest {
                 text: request.prompt.clone(),
             }],
         }],
-        tools: Vec::new(),
+        tools: request
+            .tools
+            .iter()
+            .cloned()
+            .map(model_tool_definition)
+            .collect(),
         parameters: request.parameters.clone(),
         prompt_cache: bcode_model::PromptCacheHints::default(),
         conversation_reuse: bcode_model::ConversationReuseHints::default(),
         metadata: request.metadata.clone(),
+    }
+}
+
+fn model_tool_definition(definition: ToolDefinition) -> bcode_model::ToolDefinition {
+    bcode_model::ToolDefinition {
+        name: definition.name,
+        description: definition.description,
+        input_schema: definition.input_schema,
+        side_effect: model_tool_side_effect(definition.side_effect),
+        requires_permission: definition.requires_permission,
+    }
+}
+
+const fn model_tool_side_effect(
+    side_effect: bcode_tool::ToolSideEffect,
+) -> bcode_model::ToolSideEffect {
+    match side_effect {
+        bcode_tool::ToolSideEffect::ReadOnly => bcode_model::ToolSideEffect::ReadOnly,
+        bcode_tool::ToolSideEffect::WriteFiles => bcode_model::ToolSideEffect::WriteFiles,
+        bcode_tool::ToolSideEffect::ExecuteProcess => bcode_model::ToolSideEffect::ExecuteProcess,
     }
 }
 

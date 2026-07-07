@@ -8,10 +8,7 @@
 //! The facade is intentionally small and delegates reusable turn behavior to
 //! `bcode_agent_runtime`.
 
-use bcode_agent_policy::{
-    Action, AgentConfig, AgentPermissionConfig, PermissionConfig, evaluate_tool_call,
-};
-use bcode_agent_profile::{AgentDecision, EvaluateToolCallRequest};
+use bcode_agent_policy::active_tools_for;
 #[cfg(feature = "embedded-plugins")]
 use bcode_agent_runtime::RuntimeFuture;
 use bcode_agent_runtime::{AgentRuntime, AgentTurnRequest, AgentTurnResponse};
@@ -31,19 +28,19 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
-pub use bcode_agent_policy::{
-    Action as PermissionAction, AgentConfig as PermissionAgentConfig,
-    AgentPermissionConfig as PermissionConfigSet, PermissionConfig as AgentPermissionRules,
-};
-pub use bcode_agent_profile::{AgentDecision as PermissionAgentDecision, EvaluateToolCallResponse};
+mod policy;
+
+pub use bcode_agent_policy::{Action, AgentConfig, AgentPermissionConfig, PermissionConfig};
+pub use bcode_agent_profile::{AgentDecision, EvaluateToolCallResponse};
 pub use bcode_agent_runtime::{
     AgentRuntimeEvent as AgentEvent, AgentRuntimeStream as AgentStream,
     AgentRuntimeStreamItem as AgentStreamItem, AllowAllPolicy, CancellationToken,
     ModelProviderInvoker, PermissionDecision, PermissionPolicy, RegisteredTool, RuntimeError,
-    RuntimeFuture, RuntimePermissionContext, RuntimePermissionRequest, ToolExecutionOutput,
-    ToolExecutor, ToolRoundState, ToolSource, UnifiedToolCatalog,
+    RuntimeFuture, RuntimePermissionContext, RuntimePermissionRequest, ToolCatalog,
+    ToolExecutionOutput, ToolExecutor, ToolRoundState, ToolSource, UnifiedToolCatalog,
 };
 pub use bcode_model::ToolCall;
+pub use policy::{AgentPermissionPolicy, allow_all_agent_policy};
 
 /// Result alias for Bcode SDK operations.
 pub type Result<T> = std::result::Result<T, BcodeError>;
@@ -208,125 +205,6 @@ impl AgentHooks {
         }
         Ok(())
     }
-}
-
-/// Callback used to resolve `ask` decisions from the shared agent policy model.
-type PermissionAskCallback = Arc<
-    dyn Fn(&RuntimePermissionRequest, &EvaluateToolCallResponse) -> PermissionDecision
-        + Send
-        + Sync,
->;
-
-/// SDK permission policy backed by Bcode's shared agent policy evaluator.
-#[derive(Clone)]
-pub struct AgentPermissionPolicy {
-    config: AgentConfig,
-    ask_callback: Option<PermissionAskCallback>,
-}
-
-impl fmt::Debug for AgentPermissionPolicy {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AgentPermissionPolicy")
-            .field("config", &self.config)
-            .field("ask_callback", &self.ask_callback.is_some())
-            .finish()
-    }
-}
-
-impl AgentPermissionPolicy {
-    /// Create a permission policy from one resolved agent configuration.
-    #[must_use]
-    pub fn new(config: AgentConfig) -> Self {
-        Self {
-            config,
-            ask_callback: None,
-        }
-    }
-
-    /// Create a permission policy from a multi-agent configuration and selected agent ID.
-    #[must_use]
-    pub fn from_permission_config(config: &AgentPermissionConfig, agent_id: &str) -> Self {
-        Self::new(bcode_agent_policy::agent_config(config, agent_id))
-    }
-
-    /// Attach a callback used only when core policy returns [`AgentDecision::Ask`].
-    #[must_use]
-    pub fn on_ask<F>(mut self, callback: F) -> Self
-    where
-        F: Fn(&RuntimePermissionRequest, &EvaluateToolCallResponse) -> PermissionDecision
-            + Send
-            + Sync
-            + 'static,
-    {
-        self.ask_callback = Some(Arc::new(callback));
-        self
-    }
-}
-
-impl PermissionPolicy for AgentPermissionPolicy {
-    fn evaluate_tool_call<'a>(
-        &'a self,
-        request: &'a RuntimePermissionRequest,
-    ) -> bcode_agent_runtime::RuntimeFuture<'a, PermissionDecision> {
-        Box::pin(async move {
-            let cwd = request
-                .context
-                .cwd
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("."));
-            let profile_request = EvaluateToolCallRequest {
-                session_id: request.context.session_id,
-                agent_id: request.context.agent_id.clone(),
-                tool_name: request.call.name.clone(),
-                side_effect: request.tool.definition.side_effect,
-                policy: request.tool.definition.policy.clone(),
-                arguments: request.call.arguments.clone(),
-                cwd: request
-                    .context
-                    .cwd
-                    .as_ref()
-                    .map(|path| path.to_string_lossy().into_owned()),
-            };
-            let evaluation = evaluate_tool_call(&self.config, &profile_request, &cwd).response;
-            let decision = match evaluation.decision {
-                AgentDecision::Allow => PermissionDecision::Allow,
-                AgentDecision::Deny => PermissionDecision::Deny(
-                    evaluation
-                        .reason
-                        .unwrap_or_else(|| "tool call denied by agent policy".to_string()),
-                ),
-                AgentDecision::Ask => {
-                    if let Some(callback) = self.ask_callback.as_ref() {
-                        callback(request, &evaluation)
-                    } else {
-                        PermissionDecision::Deny(evaluation.reason.unwrap_or_else(|| {
-                            "tool call requires permission but no ask handler is configured"
-                                .to_string()
-                        }))
-                    }
-                }
-            };
-            Ok(decision)
-        })
-    }
-}
-
-/// Build an agent policy that allows all tool calls without prompting.
-#[must_use]
-pub fn allow_all_agent_policy() -> AgentPermissionPolicy {
-    let config = AgentConfig {
-        permission: PermissionConfig {
-            command: BTreeMap::from([("*".to_string(), Action::Allow)]),
-            read: BTreeMap::from([("*".to_string(), Action::Allow)]),
-            write: BTreeMap::from([("*".to_string(), Action::Allow)]),
-            edit: BTreeMap::from([("*".to_string(), Action::Allow)]),
-            web: BTreeMap::from([("*".to_string(), Action::Allow)]),
-            external_directory: Action::Allow,
-        },
-        ..AgentConfig::default()
-    };
-    AgentPermissionPolicy::new(config)
 }
 
 type InlineToolHandler = Arc<
@@ -687,6 +565,7 @@ pub struct Agent {
     tool_catalog: UnifiedToolCatalog,
     inline_tool_handlers: BTreeMap<String, InlineToolHandler>,
     hooks: AgentHooks,
+    policy_config: AgentConfig,
     permission_policy: Arc<dyn PermissionPolicy>,
     #[cfg(feature = "embedded-plugins")]
     provider: Option<PluginModelProviderInvoker>,
@@ -717,6 +596,7 @@ impl fmt::Debug for Agent {
                 &self.inline_tool_handlers.keys().collect::<Vec<_>>(),
             )
             .field("hooks", &self.hooks)
+            .field("policy_config", &self.policy_config)
             .field("permission_policy", &"<policy>");
         #[cfg(feature = "embedded-plugins")]
         debug
@@ -940,6 +820,15 @@ impl Agent {
         }
     }
 
+    fn enabled_tool_definitions(&self) -> Vec<ToolDefinition> {
+        let active_tools = active_tools_for(&self.policy_config);
+        self.tool_catalog
+            .definitions()
+            .into_iter()
+            .filter(|definition| active_tools.is_empty() || active_tools.contains(&definition.name))
+            .collect()
+    }
+
     fn model_call_context(&self, prompt: String) -> ModelCallContext {
         ModelCallContext {
             agent_name: self.name.clone(),
@@ -964,6 +853,7 @@ impl Agent {
             provider_context: self.provider_context.clone(),
             system_prompt: self.system_prompt.clone(),
             prompt,
+            tools: self.enabled_tool_definitions(),
             parameters: self.parameters.clone(),
             metadata: self.metadata.clone(),
             timeout: self.timeout,
@@ -1004,7 +894,9 @@ pub struct AgentBuilder {
     tool_catalog: UnifiedToolCatalog,
     inline_tool_handlers: BTreeMap<String, InlineToolHandler>,
     hooks: AgentHooks,
-    permission_policy: Arc<dyn PermissionPolicy>,
+    policy_config: AgentConfig,
+    permission_ask_callback: Option<policy::PermissionAskCallback>,
+    custom_permission_policy: Option<Arc<dyn PermissionPolicy>>,
     #[cfg(feature = "embedded-plugins")]
     provider: Option<PluginModelProviderInvoker>,
     #[cfg(feature = "embedded-plugins")]
@@ -1034,7 +926,15 @@ impl fmt::Debug for AgentBuilder {
                 &self.inline_tool_handlers.keys().collect::<Vec<_>>(),
             )
             .field("hooks", &self.hooks)
-            .field("permission_policy", &"<policy>");
+            .field("policy_config", &self.policy_config)
+            .field(
+                "permission_ask_callback",
+                &self.permission_ask_callback.is_some(),
+            )
+            .field(
+                "custom_permission_policy",
+                &self.custom_permission_policy.is_some(),
+            );
         #[cfg(feature = "embedded-plugins")]
         debug
             .field("provider", &self.provider)
@@ -1062,7 +962,12 @@ impl Default for AgentBuilder {
             tool_catalog: UnifiedToolCatalog::new(),
             inline_tool_handlers: BTreeMap::new(),
             hooks: AgentHooks::new(),
-            permission_policy: Arc::new(allow_all_agent_policy()),
+            policy_config: bcode_agent_policy::agent_config(
+                &bcode_agent_policy::default_config(),
+                bcode_agent_policy::BUILD_AGENT,
+            ),
+            permission_ask_callback: None,
+            custom_permission_policy: None,
             #[cfg(feature = "embedded-plugins")]
             provider: None,
             #[cfg(feature = "embedded-plugins")]
@@ -1236,6 +1141,11 @@ impl AgentBuilder {
     #[must_use]
     pub fn agent_id(mut self, agent_id: impl Into<String>) -> Self {
         self.profile_id = agent_id.into();
+        self.policy_config = bcode_agent_policy::agent_config(
+            &bcode_agent_policy::default_config(),
+            &self.profile_id,
+        );
+        self.custom_permission_policy = None;
         self
     }
 
@@ -1256,7 +1166,8 @@ impl AgentBuilder {
     /// Configure a resolved agent policy from the shared Bcode permission model.
     #[must_use]
     pub fn agent_config(mut self, config: AgentConfig) -> Self {
-        self.permission_policy = Arc::new(AgentPermissionPolicy::new(config));
+        self.policy_config = config;
+        self.custom_permission_policy = None;
         self
     }
 
@@ -1269,17 +1180,17 @@ impl AgentBuilder {
             + Sync
             + 'static,
     {
-        self.permission_policy = Arc::new(AgentPermissionPolicy::new(config).on_ask(callback));
+        self.policy_config = config;
+        self.permission_ask_callback = Some(policy::ask_callback(callback));
+        self.custom_permission_policy = None;
         self
     }
 
     /// Configure a multi-agent policy config from the shared Bcode permission model.
     #[must_use]
     pub fn agent_permission_config(mut self, config: &AgentPermissionConfig) -> Self {
-        self.permission_policy = Arc::new(AgentPermissionPolicy::from_permission_config(
-            config,
-            &self.profile_id,
-        ));
+        self.policy_config = bcode_agent_policy::agent_config(config, &self.profile_id);
+        self.custom_permission_policy = None;
         self
     }
 
@@ -1296,10 +1207,9 @@ impl AgentBuilder {
             + Sync
             + 'static,
     {
-        self.permission_policy = Arc::new(
-            AgentPermissionPolicy::from_permission_config(config, &self.profile_id)
-                .on_ask(callback),
-        );
+        self.policy_config = bcode_agent_policy::agent_config(config, &self.profile_id);
+        self.permission_ask_callback = Some(policy::ask_callback(callback));
+        self.custom_permission_policy = None;
         self
     }
 
@@ -1312,12 +1222,7 @@ impl AgentBuilder {
             + Sync
             + 'static,
     {
-        let policy = AgentPermissionPolicy::from_permission_config(
-            &bcode_agent_policy::default_config(),
-            &self.profile_id,
-        )
-        .on_ask(callback);
-        self.permission_policy = Arc::new(policy);
+        self.permission_ask_callback = Some(policy::ask_callback(callback));
         self
     }
 
@@ -1327,7 +1232,7 @@ impl AgentBuilder {
     where
         P: PermissionPolicy + 'static,
     {
-        self.permission_policy = Arc::new(policy);
+        self.custom_permission_policy = Some(Arc::new(policy));
         self
     }
 
@@ -1365,9 +1270,19 @@ impl AgentBuilder {
         Ok(self)
     }
 
+    fn permission_policy(&self) -> Arc<dyn PermissionPolicy> {
+        self.custom_permission_policy.clone().unwrap_or_else(|| {
+            Arc::new(
+                AgentPermissionPolicy::new(self.policy_config.clone())
+                    .with_ask_callback(self.permission_ask_callback.clone()),
+            )
+        })
+    }
+
     /// Build the agent.
     #[must_use]
     pub fn build(self) -> Agent {
+        let permission_policy = self.permission_policy();
         Agent {
             runtime: self.runtime,
             name: self.name,
@@ -1385,7 +1300,8 @@ impl AgentBuilder {
             tool_catalog: self.tool_catalog,
             inline_tool_handlers: self.inline_tool_handlers,
             hooks: self.hooks,
-            permission_policy: self.permission_policy,
+            policy_config: self.policy_config,
+            permission_policy,
             #[cfg(feature = "embedded-plugins")]
             provider: self.provider,
             #[cfg(feature = "embedded-plugins")]
