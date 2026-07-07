@@ -699,8 +699,7 @@ fn run_terminal_shell_command_inner(
         .map_err(|error| error.to_string())?;
     let clean_artifact_path = clean_artifact_path(paths.artifact_dir, tool_call_id)?;
     let raw_artifact_path = raw_artifact_path(paths.artifact_dir, tool_call_id)?;
-    let timeout_at_ms = current_unix_millis()
-        .saturating_add(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX));
+    let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
     let reader_thread = std::thread::spawn({
         let tool_call_id = tool_call_id.to_owned();
         move || {
@@ -713,7 +712,7 @@ fn run_terminal_shell_command_inner(
                     stream: ToolOutputStream::Pty,
                     columns,
                     rows,
-                    timeout_at_ms: Some(timeout_at_ms),
+                    timeout_ms: Some(timeout_ms),
                     direnv_prelude_marker: direnv_prelude_marker.as_deref(),
                 },
                 TerminalStreamPaths {
@@ -880,7 +879,7 @@ struct ShellVisualStreamContext<'a> {
     stream: ToolOutputStream,
     columns: u16,
     rows: u16,
-    timeout_at_ms: Option<u64>,
+    timeout_ms: Option<u64>,
     direnv_prelude_marker: Option<&'a str>,
 }
 
@@ -1139,7 +1138,7 @@ fn emit_tool_output_delta(
                         "output": text,
                         "columns": visual_context.columns,
                         "rows": visual_context.rows,
-                        "timeout_at_ms": visual_context.timeout_at_ms,
+                        "timeout_ms": visual_context.timeout_ms,
                         "streaming": true,
                     }
                 }),

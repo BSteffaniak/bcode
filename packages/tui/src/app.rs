@@ -2534,22 +2534,16 @@ impl BmuxApp {
             .iter()
             .filter_map(move |item| {
                 let timing = item.tool_timing()?;
-                if !item.streaming()
-                    || (timing.started_at_ms.is_none() && timing.timeout_at_ms.is_none())
-                {
+                if !item.streaming() || timing.started_at_ms.is_none() {
                     return None;
                 }
-                let at = if timing.timeout_at_ms.is_some() {
-                    now + TOOL_ELAPSED_INVALIDATION_MAX_INTERVAL
-                } else {
-                    super::temporal::next_elapsed_invalidation_capped(
-                        timing.started_at_ms?,
-                        timing.finished_at_ms,
-                        now,
-                        now_system,
-                        TOOL_ELAPSED_INVALIDATION_MAX_INTERVAL,
-                    )?
-                };
+                let at = super::temporal::next_elapsed_invalidation_capped(
+                    timing.started_at_ms?,
+                    timing.finished_at_ms,
+                    now,
+                    now_system,
+                    TOOL_ELAPSED_INVALIDATION_MAX_INTERVAL,
+                )?;
                 Some(InvalidationRequest::new(
                     InvalidationKey::new(format!(
                         "{TOOL_ELAPSED_INVALIDATION_PREFIX}:{}",
@@ -3072,7 +3066,7 @@ impl BmuxApp {
         if let Some(context) = self.streamed_tool_results.get(tool_call_id) {
             item.set_tool_started_at_ms(context.started_at_ms);
         }
-        item.set_tool_timeout_at_ms(tool_visual_timeout_at_ms(visual));
+        item.set_tool_timeout_ms(tool_visual_timeout_ms(visual));
         let index = self.transcript.upsert_tool_visual_item(item);
         self.live_tool_previews.remove(tool_call_id);
         self.mark_live_preview_dirty();
@@ -3619,11 +3613,11 @@ fn tool_result_timed_out(result: &ToolInvocationResult) -> Option<bool> {
         .and_then(serde_json::Value::as_bool)
 }
 
-fn tool_visual_timeout_at_ms(visual: &bcode_session_models::PluginVisualDescriptor) -> Option<u64> {
+fn tool_visual_timeout_ms(visual: &bcode_session_models::PluginVisualDescriptor) -> Option<u64> {
     visual
         .payload
         .get("_bcode_runtime")
-        .and_then(|runtime| runtime.get("timeout_at_ms"))
+        .and_then(|runtime| runtime.get("timeout_ms"))
         .and_then(serde_json::Value::as_u64)
 }
 

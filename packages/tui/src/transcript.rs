@@ -14,8 +14,8 @@ pub struct ToolTiming {
     pub started_at_ms: Option<u64>,
     /// Tool finish time as UNIX epoch milliseconds.
     pub finished_at_ms: Option<u64>,
-    /// Tool timeout deadline as UNIX epoch milliseconds, when known.
-    pub timeout_at_ms: Option<u64>,
+    /// Tool timeout duration in milliseconds, when known.
+    pub timeout_ms: Option<u64>,
     /// Whether the tool timed out, when known.
     pub timed_out: Option<bool>,
 }
@@ -335,10 +335,10 @@ impl TranscriptItem {
         }
     }
 
-    /// Set generic tool timeout deadline metadata on a tool result item.
-    pub const fn set_tool_timeout_at_ms(&mut self, timeout_at_ms: Option<u64>) {
+    /// Set generic tool timeout duration metadata on a tool result item.
+    pub const fn set_tool_timeout_ms(&mut self, timeout_ms: Option<u64>) {
         if let TranscriptItemKind::ToolResult { timing, .. } = &mut self.kind {
-            timing.timeout_at_ms = timeout_at_ms;
+            timing.timeout_ms = timeout_ms;
             self.bump_revision();
         }
     }
@@ -1354,7 +1354,7 @@ fn apply_tool_invocation_stream_event(
                 .or_default();
             item.set_tool_started_at_ms(replay.started_at_ms);
             item.set_tool_finished_at_ms(replay.finished_at_ms);
-            item.set_tool_timeout_at_ms(tool_visual_timeout_at_ms(visual));
+            item.set_tool_timeout_ms(tool_visual_timeout_ms(visual));
             let index = upsert_tool_visual_item(items, item);
             replay.index = Some(index);
             replay.saw_output = true;
@@ -1382,11 +1382,11 @@ fn apply_tool_invocation_stream_event(
     }
 }
 
-fn tool_visual_timeout_at_ms(visual: &bcode_session_models::PluginVisualDescriptor) -> Option<u64> {
+fn tool_visual_timeout_ms(visual: &bcode_session_models::PluginVisualDescriptor) -> Option<u64> {
     visual
         .payload
         .get("_bcode_runtime")
-        .and_then(|runtime| runtime.get("timeout_at_ms"))
+        .and_then(|runtime| runtime.get("timeout_ms"))
         .and_then(serde_json::Value::as_u64)
 }
 

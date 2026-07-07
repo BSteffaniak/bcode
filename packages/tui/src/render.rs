@@ -575,10 +575,7 @@ pub fn terminal_elapsed_signature_fragment(item: &TranscriptItem) -> Option<Stri
         .started_at_ms
         .map(|started_at_ms| format_millis(now_ms.saturating_sub(started_at_ms)))
         .unwrap_or_default();
-    let timeout = timing
-        .timeout_at_ms
-        .map(|timeout_at_ms| format_millis(timeout_at_ms.saturating_sub(now_ms)))
-        .unwrap_or_default();
+    let timeout = timing.timeout_ms.map(format_millis).unwrap_or_default();
     Some(format!("{elapsed}:{timeout}"))
 }
 
@@ -1067,12 +1064,8 @@ fn tool_block_title_with_timing(
                 format_millis(now_ms.saturating_sub(started_at_ms))
             ));
         }
-        if let Some(timeout_at_ms) = timing.timeout_at_ms {
-            parts.push(if timeout_at_ms > now_ms {
-                format!("timeout in {}", format_millis(timeout_at_ms - now_ms))
-            } else {
-                "timeout due".to_owned()
-            });
+        if let Some(timeout_ms) = timing.timeout_ms {
+            parts.push(format!("timeout {}", format_millis(timeout_ms)));
         }
     } else if let (Some(started_at_ms), Some(finished_at_ms)) =
         (timing.started_at_ms, timing.finished_at_ms)
