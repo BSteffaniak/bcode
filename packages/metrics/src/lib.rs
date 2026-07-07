@@ -5,6 +5,8 @@
 
 //! Lightweight in-process metrics for Bcode runtime diagnostics.
 
+pub mod dashboard;
+
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -302,6 +304,23 @@ impl Default for Histogram {
 }
 
 impl MetricsRegistry {
+    /// Load a metrics report from a persisted metrics event-log directory or legacy file hint.
+    #[must_use]
+    pub fn report_from_event_log_path(
+        event_log_path: impl AsRef<Path>,
+        config: MetricsEventLogConfig,
+        max_events: usize,
+    ) -> MetricsReport {
+        let log = MetricsEventLog::new(metrics_event_log_root(event_log_path.as_ref()), config);
+        let events = log.read_recent_events(max_events);
+        MetricsReport {
+            generated_at_unix_ms: current_unix_millis(),
+            snapshot: snapshot_from_events(&events),
+            descriptors: descriptors_from_events(&events),
+            events,
+        }
+    }
+
     /// Create a disabled metrics registry. Recording calls become cheap no-ops.
     #[must_use]
     pub const fn disabled() -> Self {
@@ -1005,6 +1024,63 @@ impl Histogram {
                 .collect(),
         }
     }
+}
+
+fn snapshot_from_events(events: &[MetricEvent]) -> MetricsSnapshot {
+    let mut counters = BTreeMap::new();
+    let mut gauges = BTreeMap::new();
+    let mut histograms = BTreeMap::<String, Histogram>::new();
+    for event in events {
+        match event.kind {
+            MetricKind::Counter => {
+                let value = u64::try_from(event.value).unwrap_or_default();
+                let counter = counters.entry(event.name.clone()).or_insert(0_u64);
+                *counter = counter.saturating_add(value);
+            }
+            MetricKind::Gauge => {
+                gauges.insert(event.name.clone(), event.value);
+            }
+            MetricKind::Histogram => {
+                if let Ok(value) = u64::try_from(event.value) {
+                    histograms
+                        .entry(event.name.clone())
+                        .or_default()
+                        .record(value);
+                }
+            }
+            MetricKind::Event => {}
+        }
+    }
+    MetricsSnapshot {
+        counters,
+        gauges,
+        histograms: histograms
+            .into_iter()
+            .map(|(name, histogram)| (name, histogram.snapshot()))
+            .collect(),
+    }
+}
+
+fn descriptors_from_events(events: &[MetricEvent]) -> BTreeMap<String, MetricDescriptor> {
+    let mut descriptors = BTreeMap::new();
+    for event in events {
+        let descriptor =
+            descriptors
+                .entry(event.name.clone())
+                .or_insert_with(|| MetricDescriptor {
+                    name: event.name.clone(),
+                    kind: event.kind,
+                    unit: infer_unit(&event.name),
+                    description: None,
+                    label_keys: Vec::new(),
+                });
+        for key in event.labels.keys() {
+            if !descriptor.label_keys.contains(key) {
+                descriptor.label_keys.push(key.clone());
+            }
+        }
+    }
+    descriptors
 }
 
 fn metrics_event_log_root(path: &Path) -> PathBuf {

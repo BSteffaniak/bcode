@@ -1,0 +1,23 @@
+id      = "bcode.metrics"
+name    = "Bcode Metrics Plugin"
+version = "0.0.1"
+
+categories = ["metrics", "observability"]
+
+[[services]]
+class        = "service"
+description  = "Metrics dashboard command contributions"
+interface_id = "bcode.command/v1"
+name         = "Metrics Commands"
+
+[[tui_surfaces]]
+description = "Full-screen persisted metrics dashboard"
+kind        = "metrics-dashboard"
+title       = "Metrics Dashboard"
+
+[runtime]
+abi_version    = 1
+event_symbol   = "bcode_plugin_handle_event_v1"
+library        = "libbcode_metrics_plugin.dylib"
+service_symbol = "bcode_plugin_invoke_service_v1"
+type           = "native"

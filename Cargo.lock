@@ -1349,6 +1349,7 @@ dependencies = [
  "bcode_filesystem_plugin",
  "bcode_git_plugin",
  "bcode_github_review_publisher_plugin",
+ "bcode_metrics_plugin",
  "bcode_model_plugin",
  "bcode_ocr_plugin",
  "bcode_openai_compatible_provider_plugin",
@@ -1697,6 +1698,20 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "bcode_metrics_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_command",
+ "bcode_metrics",
+ "bcode_plugin_sdk",
+ "bmux_keyboard",
+ "bmux_tui",
+ "bmux_tui_components",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

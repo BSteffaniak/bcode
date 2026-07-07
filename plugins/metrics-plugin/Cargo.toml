@@ -1,0 +1,29 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "metrics dashboard plugin for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "metrics", "tui", "plugin"]
+license     = { workspace = true }
+name        = "bcode_metrics_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bcode_command       = { workspace = true }
+bcode_metrics       = { workspace = true }
+bcode_plugin_sdk    = { workspace = true }
+bmux_keyboard       = { workspace = true }
+bmux_tui            = { workspace = true }
+bmux_tui_components = { workspace = true }
+serde               = { workspace = true }
+serde_json          = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
+static-bundled   = []
