@@ -1817,8 +1817,113 @@ async fn handle_registered_client(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines, clippy::large_stack_frames)]
+fn request_metric_labels(request: &Request) -> MetricLabels {
+    let mut labels = MetricLabels::new();
+    labels.insert("request_type".to_owned(), request_kind(request).to_owned());
+    labels
+}
+
+#[allow(clippy::too_many_lines)]
+const fn request_kind(request: &Request) -> &'static str {
+    match request {
+        Request::Hello { .. } => "hello",
+        Request::Ping => "ping",
+        Request::ServerStatus => "server_status",
+        Request::ServerStop { .. } => "server_stop",
+        Request::CreateSession { .. } => "create_session",
+        Request::ListSessions { .. } => "list_sessions",
+        Request::RenameSession { .. } => "rename_session",
+        Request::DeleteSession { .. } => "delete_session",
+        Request::SessionHistory { .. } => "session_history",
+        Request::SessionHistoryPage { .. } => "session_history_page",
+        Request::AttachSession { .. } => "attach_session",
+        Request::AttachSessionRecent { .. } => "attach_session_recent",
+        Request::SendUserMessage { .. } => "send_user_message",
+        Request::SendUserMessageWithPlacement { .. } => "send_user_message_with_placement",
+        Request::InvokeSkill { .. } => "invoke_skill",
+        Request::CancelSessionTurn { .. } => "cancel_session_turn",
+        Request::ListPermissions => "list_permissions",
+        Request::ResolvePermission { .. } => "resolve_permission",
+        Request::AddPermissionRule { .. } => "add_permission_rule",
+        Request::ListPluginServices => "list_plugin_services",
+        Request::ListPluginContributions => "list_plugin_contributions",
+        Request::InvokePluginService { .. } => "invoke_plugin_service",
+        Request::CallPluginService { .. } => "call_plugin_service",
+        Request::PublishPluginEvent { .. } => "publish_plugin_event",
+        Request::UpdateClientRuntimeContext { .. } => "update_client_runtime_context",
+        Request::ChangeSessionWorkingDirectory { .. } => "change_session_working_directory",
+        Request::ListWorktrees(_) => "list_worktrees",
+        Request::CreateWorktree(_) => "create_worktree",
+        Request::RemoveWorktree(_) => "remove_worktree",
+        Request::RalphStatus(_) => "ralph_status",
+        Request::RunRalphLoop(_) => "run_ralph_loop",
+        Request::CancelRalphLoop(_) => "cancel_ralph_loop",
+        Request::ListRalphRuns(_) => "list_ralph_runs",
+        Request::ListRalphIterations(_) => "list_ralph_iterations",
+        Request::ResumeRalphRun(_) => "resume_ralph_run",
+        Request::ApproveRalphRun(_) => "approve_ralph_run",
+        Request::RalphRunStatus(_) => "ralph_run_status",
+        Request::RecordRalphLifecycle(_) => "record_ralph_lifecycle",
+        Request::ImportExternalSession { .. } => "import_external_session",
+        Request::ForkSession { .. } => "fork_session",
+        Request::CloneSession { .. } => "clone_session",
+        Request::RefreshSessionCatalog { .. } => "refresh_session_catalog",
+        Request::AttachSessionProjectionWindow { .. } => "attach_session_projection_window",
+        Request::ListInteractiveToolRequests => "list_interactive_tool_requests",
+        Request::ResolveInteractiveToolRequest { .. } => "resolve_interactive_tool_request",
+        Request::RuntimeWorkHistory { .. } => "runtime_work_history",
+        Request::ListRuntimeWork { .. } => "list_runtime_work",
+        Request::CancelRuntimeWork { .. } => "cancel_runtime_work",
+        Request::SubscribeRuntimeWork { .. } => "subscribe_runtime_work",
+        Request::SubscribeCatalogUpdates => "subscribe_catalog_updates",
+        Request::SetComposerDraft { .. } => "set_composer_draft",
+        Request::ComposerDraft { .. } => "composer_draft",
+        Request::CompactSession { .. } => "compact_session",
+        Request::SetSessionModel { .. } => "set_session_model",
+        Request::SetSessionReasoning { .. } => "set_session_reasoning",
+        Request::SessionModelStatus { .. } => "session_model_status",
+        Request::DefaultModelStatus => "default_model_status",
+        Request::SessionModelList { .. } => "session_model_list",
+        Request::ListAgents => "list_agents",
+        Request::ListSkills => "list_skills",
+        Request::DescribeSkill { .. } => "describe_skill",
+        Request::ActivateSkill { .. } => "activate_skill",
+        Request::DeactivateSkill { .. } => "deactivate_skill",
+        Request::ActiveSkills { .. } => "active_skills",
+        Request::AgentPolicyStatus => "agent_policy_status",
+        Request::SetSessionAgent { .. } => "set_session_agent",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_request(
+    request: Request,
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    attached_session: &mut Option<SessionId>,
+) -> Result<(), ServerError> {
+    let labels = request_metric_labels(&request);
+    let result = handle_request_inner(
+        request,
+        request_id,
+        client_id,
+        state,
+        writer,
+        attached_session,
+    )
+    .await;
+    state
+        .metrics
+        .span("ipc.request")
+        .labels(labels)
+        .finish_result(&result);
+    result
+}
+
+#[allow(clippy::too_many_lines, clippy::large_stack_frames)]
+async fn handle_request_inner(
     request: Request,
     request_id: u64,
     client_id: ClientId,

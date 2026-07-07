@@ -6,8 +6,10 @@
 //! Lightweight in-process metrics for Bcode runtime diagnostics.
 
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
+use std::future::Future;
 use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -74,6 +76,49 @@ pub struct MetricsSnapshot {
     pub gauges: BTreeMap<String, i64>,
     /// Duration/value distributions by metric key.
     pub histograms: BTreeMap<String, HistogramSnapshot>,
+}
+
+/// Derived performance analysis for a metrics report.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetricsAnalysis {
+    /// Slowest histogram metrics by cumulative observed value.
+    pub hotspots: Vec<MetricHotspot>,
+    /// Metrics that look suspicious based on simple threshold heuristics.
+    pub anomalies: Vec<MetricAnomaly>,
+}
+
+/// Aggregate hotspot for one histogram metric.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetricHotspot {
+    /// Metric name.
+    pub name: String,
+    /// Number of observations.
+    pub count: u64,
+    /// Sum of observed values.
+    pub total: u64,
+    /// Average observed value.
+    pub average: u64,
+    /// Maximum observed value.
+    pub max: u64,
+    /// Approximate p95 from fixed histogram buckets.
+    #[serde(default)]
+    pub p95: Option<u64>,
+}
+
+/// Potential metrics anomaly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetricAnomaly {
+    /// Severity, for example `info`, `warning`, or `critical`.
+    pub severity: String,
+    /// Stable anomaly code.
+    pub code: String,
+    /// Human-readable summary.
+    pub message: String,
+    /// Metric name associated with this anomaly.
+    pub metric: String,
+    /// Supporting labels or dimensions.
+    #[serde(default)]
+    pub labels: MetricLabels,
 }
 
 /// Rich metrics report suitable for dashboards and offline analysis.
@@ -318,6 +363,42 @@ impl MetricsRegistry {
         self.add_counter(key, 1);
     }
 
+    /// Time an async operation and record its duration with the supplied labels.
+    pub async fn time_async<F, T>(
+        &self,
+        name: impl Into<String>,
+        labels: MetricLabels,
+        future: F,
+    ) -> T
+    where
+        F: Future<Output = T>,
+    {
+        let span = self.span(name).labels(labels);
+        let output = future.await;
+        span.finish();
+        output
+    }
+
+    /// Time an async operation returning `Result` and record an outcome label.
+    ///
+    /// # Errors
+    ///
+    /// Returns the wrapped future's error unchanged.
+    pub async fn time_result_async<F, T, E>(
+        &self,
+        name: impl Into<String>,
+        labels: MetricLabels,
+        future: F,
+    ) -> Result<T, E>
+    where
+        F: Future<Output = Result<T, E>>,
+    {
+        let span = self.span(name).labels(labels);
+        let output = future.await;
+        span.finish_result(&output);
+        output
+    }
+
     /// Add `value` to a counter.
     pub fn add_counter(&self, key: impl Into<String>, value: u64) {
         self.add_counter_with_labels(key, value, MetricLabels::new());
@@ -467,6 +548,89 @@ impl MetricsRegistry {
             descriptors: state.descriptors.clone(),
         }
     }
+    /// Analyze the current metrics report for hotspots and simple anomalies.
+    #[must_use]
+    pub fn analysis(&self) -> MetricsAnalysis {
+        analyze_metrics_report(&self.report())
+    }
+}
+
+/// Analyze a metrics report for hotspots and simple anomalies.
+#[must_use]
+pub fn analyze_metrics_report(report: &MetricsReport) -> MetricsAnalysis {
+    let mut hotspots: Vec<MetricHotspot> = report
+        .snapshot
+        .histograms
+        .iter()
+        .map(|(name, histogram)| histogram_hotspot(name, histogram))
+        .collect();
+    hotspots.sort_by_key(|hotspot| Reverse(hotspot.total));
+    hotspots.truncate(25);
+
+    let mut anomalies = Vec::new();
+    for hotspot in &hotspots {
+        if hotspot.max >= 30_000 || hotspot.p95.is_some_and(|p95| p95 >= 10_000) {
+            anomalies.push(MetricAnomaly {
+                severity: "warning".to_owned(),
+                code: "slow_metric".to_owned(),
+                message: format!(
+                    "{} is slow: avg={} max={} p95={}",
+                    hotspot.name,
+                    hotspot.average,
+                    hotspot.max,
+                    hotspot
+                        .p95
+                        .map_or_else(|| "<unknown>".to_owned(), |value| value.to_string())
+                ),
+                metric: hotspot.name.clone(),
+                labels: MetricLabels::new(),
+            });
+        }
+    }
+    for (name, value) in &report.snapshot.counters {
+        if name.ends_with("errors_total") && *value > 0 {
+            anomalies.push(MetricAnomaly {
+                severity: "warning".to_owned(),
+                code: "metric_errors".to_owned(),
+                message: format!("{name} has recorded {value} errors"),
+                metric: name.clone(),
+                labels: MetricLabels::new(),
+            });
+        }
+    }
+    MetricsAnalysis {
+        hotspots,
+        anomalies,
+    }
+}
+
+fn histogram_hotspot(name: &str, histogram: &HistogramSnapshot) -> MetricHotspot {
+    let average = histogram.sum.checked_div(histogram.count).unwrap_or(0);
+    MetricHotspot {
+        name: name.to_owned(),
+        count: histogram.count,
+        total: histogram.sum,
+        average,
+        max: histogram.max.unwrap_or(0),
+        p95: histogram_percentile(histogram, 95),
+    }
+}
+
+fn histogram_percentile(histogram: &HistogramSnapshot, percentile: u64) -> Option<u64> {
+    if histogram.count == 0 {
+        return None;
+    }
+    let target = histogram
+        .count
+        .saturating_mul(percentile)
+        .saturating_add(99)
+        / 100;
+    histogram
+        .buckets
+        .iter()
+        .find(|bucket| bucket.count >= target)
+        .map(|bucket| bucket.le)
+        .or(histogram.max)
 }
 
 impl MetricsTimer {
@@ -513,6 +677,15 @@ impl MetricsSpan {
     /// Finish this span with an `error` outcome.
     pub fn finish_err(mut self) {
         self.finish_with_outcome(&"error");
+    }
+
+    /// Finish this span based on a `Result` outcome.
+    pub fn finish_result<T, E>(mut self, result: &Result<T, E>) {
+        if result.is_ok() {
+            self.finish_with_outcome(&"ok");
+        } else {
+            self.finish_with_outcome(&"error");
+        }
     }
 
     /// Finish this span with an outcome label.

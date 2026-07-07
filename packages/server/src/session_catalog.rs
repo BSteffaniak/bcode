@@ -222,7 +222,22 @@ impl SessionCatalog {
         tokio::spawn(async move {
             let key = plan.key();
             let metadata = plan.metadata();
-            let result = load_source(&state, &plan).await;
+            let labels = catalog_source_metric_labels(&key);
+            let result = state
+                .metrics
+                .time_result_async(
+                    "session.catalog.source_load",
+                    labels.clone(),
+                    load_source(&state, &plan),
+                )
+                .await;
+            if let Ok(source) = &result {
+                state.metrics.record_histogram_with_labels(
+                    "session.catalog.source_load.sessions",
+                    source.sessions.len() as u64,
+                    labels,
+                );
+            }
             catalog.apply_source_result(key, metadata, result).await;
         });
     }
@@ -334,6 +349,19 @@ impl CatalogSourcePlan {
             },
         }
     }
+}
+
+fn catalog_source_metric_labels(key: &CatalogSourceKey) -> bcode_metrics::MetricLabels {
+    let mut labels = bcode_metrics::MetricLabels::new();
+    labels.insert("source_id".to_owned(), key.source_id.clone());
+    labels.insert(
+        "scope".to_owned(),
+        match &key.scope {
+            CatalogSourceScope::Global => "global".to_owned(),
+            CatalogSourceScope::WorkingDirectory(_) => "working_directory".to_owned(),
+        },
+    );
+    labels
 }
 
 fn native_source_key() -> CatalogSourceKey {

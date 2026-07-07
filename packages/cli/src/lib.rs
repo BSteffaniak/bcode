@@ -1507,6 +1507,8 @@ enum ServerCommand {
         #[arg(long)]
         report: bool,
         #[arg(long)]
+        analyze: bool,
+        #[arg(long)]
         dashboard: Option<PathBuf>,
     },
     Diagnose {
@@ -2398,8 +2400,9 @@ async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {
         ServerCommand::Metrics {
             json,
             report,
+            analyze,
             dashboard,
-        } => server_metrics(json, report, dashboard).await?,
+        } => server_metrics(json, report, analyze, dashboard).await?,
         ServerCommand::Diagnose { json } => server_diagnose(json).await?,
         ServerCommand::Stop => server_stop().await?,
         ServerCommand::Cleanup => server_cleanup(false).await?,
@@ -6813,6 +6816,7 @@ async fn server_status(verbose: bool) -> Result<(), CliError> {
 async fn server_metrics(
     json: bool,
     report: bool,
+    analyze: bool,
     dashboard: Option<PathBuf>,
 ) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
@@ -6821,6 +6825,13 @@ async fn server_metrics(
         let html = metrics_dashboard_html(&status.metrics_report)?;
         std::fs::write(&path, html)?;
         println!("metrics dashboard: {}", path.display());
+    } else if analyze {
+        let analysis = bcode_metrics::analyze_metrics_report(&status.metrics_report);
+        if json {
+            println!("{}", serde_json::to_string_pretty(&analysis)?);
+        } else {
+            print_metrics_analysis(&analysis);
+        }
     } else if json || report {
         if report {
             println!("{}", serde_json::to_string_pretty(&status.metrics_report)?);
@@ -7115,6 +7126,39 @@ render();
 </body>
 </html>"##
     ))
+}
+
+fn print_metrics_analysis(analysis: &bcode_metrics::MetricsAnalysis) {
+    println!(
+        "metrics analysis: {} hotspots, {} anomalies",
+        analysis.hotspots.len(),
+        analysis.anomalies.len()
+    );
+    if !analysis.anomalies.is_empty() {
+        println!("anomalies:");
+        for anomaly in &analysis.anomalies {
+            println!(
+                "  {}\t{}\t{}\t{}",
+                anomaly.severity, anomaly.code, anomaly.metric, anomaly.message
+            );
+        }
+    }
+    if !analysis.hotspots.is_empty() {
+        println!("hotspots:");
+        for hotspot in &analysis.hotspots {
+            println!(
+                "  {}\tcount={} total={} avg={} p95={} max={}",
+                hotspot.name,
+                hotspot.count,
+                hotspot.total,
+                hotspot.average,
+                hotspot
+                    .p95
+                    .map_or_else(|| "<none>".to_string(), |value| value.to_string()),
+                hotspot.max
+            );
+        }
+    }
 }
 
 fn print_metrics_summary(metrics: &bcode_metrics::MetricsSnapshot) {
