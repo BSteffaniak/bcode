@@ -11894,17 +11894,35 @@ where
             .unique_provider(MODEL_PROVIDER_INTERFACE_ID)
             .map_err(|error| error.to_string())?
     };
+    let mut labels = MetricLabels::new();
+    labels.insert(
+        "provider_plugin_id".to_owned(),
+        provider_plugin_id.to_owned(),
+    );
+    labels.insert("operation".to_owned(), operation.to_owned());
+    labels.insert("scope".to_owned(), plugin_scope_kind(&scope).to_owned());
     state
-        .plugins
-        .invoke_service_json_scoped::<_, R>(
-            provider_plugin_id,
-            MODEL_PROVIDER_INTERFACE_ID,
-            operation,
-            &request,
-            scope,
+        .metrics
+        .time_result_async(
+            "model.provider.service",
+            labels,
+            state.plugins.invoke_service_json_scoped::<_, R>(
+                provider_plugin_id,
+                MODEL_PROVIDER_INTERFACE_ID,
+                operation,
+                &request,
+                scope,
+            ),
         )
         .await
         .map_err(|error| error.to_string())
+}
+
+const fn plugin_scope_kind(scope: &PluginInvocationScope) -> &'static str {
+    match scope {
+        PluginInvocationScope::Global => "global",
+        PluginInvocationScope::Session { .. } => "session",
+    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -15533,9 +15551,16 @@ async fn handle_invoke_plugin_service(
 ) -> Result<(), ServerError> {
     let plugin_id = plugin_id.to_string();
     let interface_id = interface_id.to_string();
+    let labels = plugin_service_metric_labels(Some(&plugin_id), &interface_id, &operation);
     let response = state
-        .plugins
-        .invoke_service(&plugin_id, interface_id, operation, payload)
+        .metrics
+        .time_result_async(
+            "plugin.service",
+            labels,
+            state
+                .plugins
+                .invoke_service(&plugin_id, interface_id, operation, payload),
+        )
         .await;
     send_plugin_service_response(writer, request_id, response).await
 }
@@ -15549,9 +15574,16 @@ async fn handle_call_plugin_service(
     payload: Vec<u8>,
 ) -> Result<(), ServerError> {
     let interface_id = interface_id.to_string();
+    let labels = plugin_service_metric_labels(None, &interface_id, &operation);
     let response = state
-        .plugins
-        .invoke_service_by_interface(&interface_id, operation, payload)
+        .metrics
+        .time_result_async(
+            "plugin.service",
+            labels,
+            state
+                .plugins
+                .invoke_service_by_interface(&interface_id, operation, payload),
+        )
         .await;
     send_plugin_service_response(writer, request_id, response).await
 }
@@ -15565,7 +15597,14 @@ async fn handle_publish_plugin_event(
 ) -> Result<(), ServerError> {
     let topic = topic.to_string();
     let payload = payload.to_vec();
-    let response = state.plugins.publish_event(&topic, &payload).await;
+    let response = state
+        .metrics
+        .time_result_async(
+            "plugin.event_delivery",
+            plugin_event_metric_labels(&topic),
+            state.plugins.publish_event(&topic, &payload),
+        )
+        .await;
     match response {
         Ok(delivered) => {
             send_response(
@@ -15584,6 +15623,26 @@ async fn handle_publish_plugin_event(
             .await
         }
     }
+}
+
+fn plugin_event_metric_labels(topic: &str) -> MetricLabels {
+    let mut labels = MetricLabels::new();
+    labels.insert("topic".to_owned(), topic.to_owned());
+    labels
+}
+
+fn plugin_service_metric_labels(
+    plugin_id: Option<&str>,
+    interface_id: &str,
+    operation: &str,
+) -> MetricLabels {
+    let mut labels = MetricLabels::new();
+    if let Some(plugin_id) = plugin_id {
+        labels.insert("plugin_id".to_owned(), plugin_id.to_owned());
+    }
+    labels.insert("interface_id".to_owned(), interface_id.to_owned());
+    labels.insert("operation".to_owned(), operation.to_owned());
+    labels
 }
 
 async fn send_plugin_service_response(
