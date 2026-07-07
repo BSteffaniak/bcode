@@ -14,6 +14,10 @@ pub struct ToolTiming {
     pub started_at_ms: Option<u64>,
     /// Tool finish time as UNIX epoch milliseconds.
     pub finished_at_ms: Option<u64>,
+    /// Tool timeout deadline as UNIX epoch milliseconds, when known.
+    pub timeout_at_ms: Option<u64>,
+    /// Whether the tool timed out, when known.
+    pub timed_out: Option<bool>,
 }
 
 /// Semantic transcript item type.
@@ -327,6 +331,22 @@ impl TranscriptItem {
     pub const fn set_tool_finished_at_ms(&mut self, finished_at_ms: Option<u64>) {
         if let TranscriptItemKind::ToolResult { timing, .. } = &mut self.kind {
             timing.finished_at_ms = finished_at_ms;
+            self.bump_revision();
+        }
+    }
+
+    /// Set generic tool timeout deadline metadata on a tool result item.
+    pub const fn set_tool_timeout_at_ms(&mut self, timeout_at_ms: Option<u64>) {
+        if let TranscriptItemKind::ToolResult { timing, .. } = &mut self.kind {
+            timing.timeout_at_ms = timeout_at_ms;
+            self.bump_revision();
+        }
+    }
+
+    /// Set generic tool timeout result metadata on a tool result item.
+    pub const fn set_tool_timed_out(&mut self, timed_out: Option<bool>) {
+        if let TranscriptItemKind::ToolResult { timing, .. } = &mut self.kind {
+            timing.timed_out = timed_out;
             self.bump_revision();
         }
     }
@@ -668,11 +688,21 @@ pub fn artifact_tool_result_item(
             tool_name: tool_name.map(ToOwned::to_owned),
             arguments_json: arguments_json.map(ToOwned::to_owned),
             result,
-            artifact: Some(Box::new(artifact)),
+            artifact: Some(Box::new(artifact.clone())),
             is_error,
-            timing: ToolTiming::default(),
+            timing: tool_timing_from_artifact(&artifact),
         },
     )
+}
+
+fn tool_timing_from_artifact(artifact: &ToolArtifact) -> ToolTiming {
+    ToolTiming {
+        timed_out: artifact
+            .metadata
+            .get("timed_out")
+            .and_then(serde_json::Value::as_bool),
+        ..ToolTiming::default()
+    }
 }
 
 /// Build an interactive tool request item.
@@ -1324,6 +1354,7 @@ fn apply_tool_invocation_stream_event(
                 .or_default();
             item.set_tool_started_at_ms(replay.started_at_ms);
             item.set_tool_finished_at_ms(replay.finished_at_ms);
+            item.set_tool_timeout_at_ms(tool_visual_timeout_at_ms(visual));
             let index = upsert_tool_visual_item(items, item);
             replay.index = Some(index);
             replay.saw_output = true;
@@ -1349,6 +1380,14 @@ fn apply_tool_invocation_stream_event(
         | ToolInvocationStreamEvent::Status { .. }
         | ToolInvocationStreamEvent::LegacyPresentation { .. } => {}
     }
+}
+
+fn tool_visual_timeout_at_ms(visual: &bcode_session_models::PluginVisualDescriptor) -> Option<u64> {
+    visual
+        .payload
+        .get("_bcode_runtime")
+        .and_then(|runtime| runtime.get("timeout_at_ms"))
+        .and_then(serde_json::Value::as_u64)
 }
 
 fn kind_for_role(role: &str) -> TranscriptItemKind {

@@ -570,9 +570,16 @@ pub fn terminal_elapsed_signature_fragment(item: &TranscriptItem) -> Option<Stri
     if !item.streaming() {
         return None;
     }
-    let started_at_ms = timing.started_at_ms?;
-    let elapsed_ms = unix_time_millis(std::time::SystemTime::now()).saturating_sub(started_at_ms);
-    Some(format_millis(elapsed_ms))
+    let now_ms = unix_time_millis(std::time::SystemTime::now());
+    let elapsed = timing
+        .started_at_ms
+        .map(|started_at_ms| format_millis(now_ms.saturating_sub(started_at_ms)))
+        .unwrap_or_default();
+    let timeout = timing
+        .timeout_at_ms
+        .map(|timeout_at_ms| format_millis(timeout_at_ms.saturating_sub(now_ms)))
+        .unwrap_or_default();
+    Some(format!("{elapsed}:{timeout}"))
 }
 
 pub fn pending_submission_signature(
@@ -1048,21 +1055,38 @@ fn tool_block_title_with_timing(
     let Some(timing) = timing else {
         return title.to_owned();
     };
+    let now_ms = unix_time_millis(std::time::SystemTime::now());
+    let mut parts = Vec::new();
+    if timing.timed_out == Some(true) {
+        parts.push("timed out".to_owned());
+    }
     if streaming {
         if let Some(started_at_ms) = timing.started_at_ms {
-            let elapsed_ms =
-                unix_time_millis(std::time::SystemTime::now()).saturating_sub(started_at_ms);
-            return format!("{title} · elapsed {}", format_millis(elapsed_ms));
+            parts.push(format!(
+                "elapsed {}",
+                format_millis(now_ms.saturating_sub(started_at_ms))
+            ));
+        }
+        if let Some(timeout_at_ms) = timing.timeout_at_ms {
+            parts.push(if timeout_at_ms > now_ms {
+                format!("timeout in {}", format_millis(timeout_at_ms - now_ms))
+            } else {
+                "timeout due".to_owned()
+            });
         }
     } else if let (Some(started_at_ms), Some(finished_at_ms)) =
         (timing.started_at_ms, timing.finished_at_ms)
     {
-        return format!(
-            "{title} · duration {}",
+        parts.push(format!(
+            "duration {}",
             format_millis(finished_at_ms.saturating_sub(started_at_ms))
-        );
+        ));
     }
-    title.to_owned()
+    if parts.is_empty() {
+        title.to_owned()
+    } else {
+        format!("{title} · {}", parts.join(" · "))
+    }
 }
 
 fn push_plugin_visual_degraded_rows(

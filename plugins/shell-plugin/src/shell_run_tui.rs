@@ -115,13 +115,6 @@ fn shell_request_rows(payload: &serde_json::Value, width: u16) -> Vec<Line> {
 fn shell_status_rows(payload: &serde_json::Value) -> Vec<Line> {
     let mut parts = Vec::new();
     if payload
-        .get("timed_out")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        parts.push("timed out".to_owned());
-    }
-    if payload
         .get("cancelled")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)

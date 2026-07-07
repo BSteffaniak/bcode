@@ -2534,17 +2534,22 @@ impl BmuxApp {
             .iter()
             .filter_map(move |item| {
                 let timing = item.tool_timing()?;
-                if !item.streaming() || timing.finished_at_ms.is_some() {
+                if !item.streaming()
+                    || (timing.started_at_ms.is_none() && timing.timeout_at_ms.is_none())
+                {
                     return None;
                 }
-                let started_at_ms = timing.started_at_ms?;
-                let at = super::temporal::next_elapsed_invalidation_capped(
-                    started_at_ms,
-                    timing.finished_at_ms,
-                    now,
-                    now_system,
-                    TOOL_ELAPSED_INVALIDATION_MAX_INTERVAL,
-                )?;
+                let at = if timing.timeout_at_ms.is_some() {
+                    now + TOOL_ELAPSED_INVALIDATION_MAX_INTERVAL
+                } else {
+                    super::temporal::next_elapsed_invalidation_capped(
+                        timing.started_at_ms?,
+                        timing.finished_at_ms,
+                        now,
+                        now_system,
+                        TOOL_ELAPSED_INVALIDATION_MAX_INTERVAL,
+                    )?
+                };
                 Some(InvalidationRequest::new(
                     InvalidationKey::new(format!(
                         "{TOOL_ELAPSED_INVALIDATION_PREFIX}:{}",
@@ -2900,6 +2905,24 @@ impl BmuxApp {
         Some(output_kind)
     }
 
+    fn update_tool_result_status(
+        &mut self,
+        tool_call_id: &str,
+        is_error: bool,
+        application: SessionEventApplication,
+    ) {
+        if !application.live_activity() {
+            return;
+        }
+        if is_error {
+            "failed".clone_into(&mut self.status);
+        } else if let Some(status) = Self::tool_call_file_status(tool_call_id) {
+            self.status = format!("applied · {status}");
+        } else {
+            "finished".clone_into(&mut self.status);
+        }
+    }
+
     fn push_tool_result(
         &mut self,
         tool_call_id: &str,
@@ -2922,26 +2945,29 @@ impl BmuxApp {
                 .get(tool_call_id)
                 .is_some_and(|context| context.index.is_some() && !context.saw_output)
         {
-            self.remove_plain_streamed_tool_result(tool_call_id);
+            self.remove_streamed_tool_result(tool_call_id);
             self.streamed_tool_results.remove(tool_call_id);
         }
-        if let Some(streamed_output) = self.finish_live_tool_output(tool_call_id, Some(is_error)) {
-            if semantic_result.is_none()
-                || matches!(streamed_output, FinishedStreamedToolOutput::Visual)
+        if semantic_result.is_none() {
+            if self
+                .finish_live_tool_output(tool_call_id, Some(is_error))
+                .is_some()
             {
-                if application.live_activity() {
-                    if is_error {
-                        "failed".clone_into(&mut self.status);
-                    } else if let Some(status) = Self::tool_call_file_status(tool_call_id) {
-                        self.status = format!("applied · {status}");
-                    } else {
-                        "finished".clone_into(&mut self.status);
-                    }
-                }
+                self.update_tool_result_status(tool_call_id, is_error, application);
                 self.finish_tool_request_preview(tool_call_id);
                 return;
             }
-            self.remove_plain_streamed_tool_result(tool_call_id);
+        } else if self
+            .finish_live_tool_output(tool_call_id, Some(is_error))
+            .is_some()
+        {
+            if semantic_result.is_some_and(tool_result_replaces_streamed_visual) {
+                self.remove_streamed_tool_result(tool_call_id);
+            } else {
+                self.update_tool_result_status(tool_call_id, is_error, application);
+                self.finish_tool_request_preview(tool_call_id);
+                return;
+            }
         }
         self.supersede_matching_live_preview(tool_call_id, semantic_result);
         let mut item = if let Some(semantic_result) = semantic_result {
@@ -2970,18 +2996,15 @@ impl BmuxApp {
             item.set_tool_started_at_ms(projection.started_at_ms);
             item.set_tool_finished_at_ms(projection.finished_at_ms);
         }
-        self.transcript.push(item);
-        if is_error {
-            if application.live_activity() {
-                "failed".clone_into(&mut self.status);
-            }
-        } else if let Some(status) = Self::tool_call_file_status(tool_call_id) {
-            if application.live_activity() {
-                self.status = format!("applied · {status}");
-            }
-        } else if application.live_activity() {
-            "finished".clone_into(&mut self.status);
+        if item
+            .tool_timing()
+            .and_then(|timing| timing.timed_out)
+            .is_none()
+        {
+            item.set_tool_timed_out(semantic_result.and_then(tool_result_timed_out));
         }
+        self.transcript.push(item);
+        self.update_tool_result_status(tool_call_id, is_error, application);
         self.finish_tool_request_preview(tool_call_id);
     }
 
@@ -3049,6 +3072,7 @@ impl BmuxApp {
         if let Some(context) = self.streamed_tool_results.get(tool_call_id) {
             item.set_tool_started_at_ms(context.started_at_ms);
         }
+        item.set_tool_timeout_at_ms(tool_visual_timeout_at_ms(visual));
         let index = self.transcript.upsert_tool_visual_item(item);
         self.live_tool_previews.remove(tool_call_id);
         self.mark_live_preview_dirty();
@@ -3169,13 +3193,12 @@ impl BmuxApp {
         );
     }
 
-    fn remove_plain_streamed_tool_result(&mut self, tool_call_id: &str) {
+    fn remove_streamed_tool_result(&mut self, tool_call_id: &str) {
         self.transcript.retain(|item| {
             !matches!(
                 item.kind(),
                 TranscriptItemKind::ToolResult {
                     tool_call_id: item_tool_call_id,
-                    artifact: None,
                     ..
                 } if item_tool_call_id == tool_call_id
             )
@@ -3580,6 +3603,28 @@ impl BmuxApp {
             format!("{skill_id}: {error}"),
         ));
     }
+}
+
+const fn tool_result_replaces_streamed_visual(result: &ToolInvocationResult) -> bool {
+    matches!(result, ToolInvocationResult::Artifact { .. })
+}
+
+fn tool_result_timed_out(result: &ToolInvocationResult) -> Option<bool> {
+    let ToolInvocationResult::Artifact { artifact } = result else {
+        return None;
+    };
+    artifact
+        .metadata
+        .get("timed_out")
+        .and_then(serde_json::Value::as_bool)
+}
+
+fn tool_visual_timeout_at_ms(visual: &bcode_session_models::PluginVisualDescriptor) -> Option<u64> {
+    visual
+        .payload
+        .get("_bcode_runtime")
+        .and_then(|runtime| runtime.get("timeout_at_ms"))
+        .and_then(serde_json::Value::as_u64)
 }
 
 pub const fn composer_policy() -> TextInputPolicy {

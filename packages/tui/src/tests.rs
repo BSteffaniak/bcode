@@ -4295,7 +4295,7 @@ fn live_shell_transcript_block_renders_generic_elapsed() {
                     subtitle: None,
                     payload: serde_json::json!({
                         "arguments": {"command": "echo hi"},
-                        "_bcode_runtime": {"output": "hi\n", "columns": 80, "rows": 24, "streaming": true}
+                        "_bcode_runtime": {"output": "hi\n", "columns": 80, "rows": 24, "streaming": true, "timeout_at_ms": started_at_ms + 60_000}
                     }),
                 },
                 streaming: true,
@@ -4306,6 +4306,7 @@ fn live_shell_transcript_block_renders_generic_elapsed() {
     let rendered = render_app_text(&mut app);
 
     assert!(rendered.contains("Shell command · elapsed"), "{rendered}");
+    assert!(rendered.contains("timeout in"), "{rendered}");
     assert!(rendered.contains("hi"), "{rendered}");
     assert!(
         app.invalidation_requests(Instant::now(), SystemTime::now())
