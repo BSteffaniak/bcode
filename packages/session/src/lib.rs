@@ -19,7 +19,7 @@ pub mod semantic_migration;
 mod store_executor;
 
 use actor::{AttachMode, SessionHandle};
-use bcode_metrics::MetricsRegistry;
+use bcode_metrics::{MetricLabels, MetricsRegistry};
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, ProjectionWindow,
     ProjectionWindowRequest, SessionEvent, SessionEventKind, SessionEventProvenance,
@@ -43,6 +43,20 @@ use store_executor::SessionStoreExecutor;
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast, watch};
 use tokio::task::spawn_blocking;
+
+fn ensure_loaded_metric_labels(result: &str) -> MetricLabels {
+    let mut labels = MetricLabels::new();
+    labels.insert("result".to_owned(), result.to_owned());
+    labels
+}
+
+fn record_ensure_loaded_duration(metrics: &MetricsRegistry, result: &str, elapsed_ms: u64) {
+    metrics.record_histogram_with_labels(
+        "session.manager.ensure_loaded.duration_ms",
+        elapsed_ms,
+        ensure_loaded_metric_labels(result),
+    );
+}
 
 /// Runtime model and reasoning selections restored from a session.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -748,17 +762,11 @@ impl SessionManager {
         let cached_handle = self.inner.lock().await.sessions.get(&session_id).cloned();
         if let Some(handle) = cached_handle {
             let Some(store) = &self.store else {
-                self.metrics.record_histogram(
-                    "session.manager.ensure_loaded.cached_total_duration_ms",
-                    total_timer.elapsed_ms(),
-                );
+                record_ensure_loaded_duration(&self.metrics, "cached", total_timer.elapsed_ms());
                 return Ok(());
             };
             if !db::session_db_path(&store.root_path(), session_id).exists() {
-                self.metrics.record_histogram(
-                    "session.manager.ensure_loaded.cached_total_duration_ms",
-                    total_timer.elapsed_ms(),
-                );
+                record_ensure_loaded_duration(&self.metrics, "cached", total_timer.elapsed_ms());
                 return Ok(());
             }
             let snapshot = handle.snapshot();
@@ -778,7 +786,8 @@ impl SessionManager {
                     false
                 }
             };
-            if snapshot.load_status == SessionLoadStatusKind::SummaryOnly {
+            let refreshed_summary = snapshot.load_status == SessionLoadStatusKind::SummaryOnly;
+            if refreshed_summary {
                 let result = async {
                     let db =
                         db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
@@ -792,8 +801,13 @@ impl SessionManager {
                 }
                 result?;
             }
-            self.metrics.record_histogram(
-                "session.manager.ensure_loaded.cached_total_duration_ms",
+            record_ensure_loaded_duration(
+                &self.metrics,
+                if refreshed_summary {
+                    "summary_refreshed"
+                } else {
+                    "cached"
+                },
                 total_timer.elapsed_ms(),
             );
             return Ok(());
@@ -816,16 +830,10 @@ impl SessionManager {
                 .sessions
                 .insert(session_id, SessionHandle::new(state, Some(store.clone())));
             inner.leases.insert(session_id, lease);
-            self.metrics.record_histogram(
-                "session.manager.ensure_loaded.total_duration_ms",
-                total_timer.elapsed_ms(),
-            );
+            record_ensure_loaded_duration(&self.metrics, "db_loaded", total_timer.elapsed_ms());
             return Ok(());
         }
-        self.metrics.record_histogram(
-            "session.manager.ensure_loaded.total_duration_ms",
-            total_timer.elapsed_ms(),
-        );
+        record_ensure_loaded_duration(&self.metrics, "missing", total_timer.elapsed_ms());
         Err(SessionError::NotFound(session_id))
     }
 
@@ -1937,6 +1945,7 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<bool, SessionError> {
+        let started_at = Instant::now();
         let handle = self
             .inner
             .lock()
@@ -1948,6 +1957,14 @@ impl SessionManager {
         let released = handle.release_idle_resources().await?;
         if released {
             self.inner.lock().await.leases.remove(&session_id);
+        }
+        self.metrics.record_histogram(
+            "session.manager.release_idle.duration_ms",
+            elapsed_ms(started_at),
+        );
+        if released {
+            self.metrics
+                .increment_counter("session.manager.release_idle.released_total");
         }
         Ok(released)
     }

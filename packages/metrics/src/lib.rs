@@ -83,8 +83,26 @@ pub struct MetricsSnapshot {
 pub struct MetricsAnalysis {
     /// Slowest histogram metrics by cumulative observed value.
     pub hotspots: Vec<MetricHotspot>,
+    /// Slowest recent metric streams grouped by metric name and exact label set.
+    #[serde(default)]
+    pub label_hotspots: Vec<MetricLabelHotspot>,
     /// Metrics that look suspicious based on simple threshold heuristics.
     pub anomalies: Vec<MetricAnomaly>,
+}
+
+/// Recent-event hotspot for one metric plus label set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetricLabelHotspot {
+    /// Metric name.
+    pub name: String,
+    /// Labels attached to the grouped events.
+    pub labels: MetricLabels,
+    /// Number of recent samples.
+    pub count: u64,
+    /// Sum of recent sample values.
+    pub total: u64,
+    /// Maximum recent sample value.
+    pub max: u64,
 }
 
 /// Aggregate hotspot for one histogram metric.
@@ -567,6 +585,8 @@ pub fn analyze_metrics_report(report: &MetricsReport) -> MetricsAnalysis {
     hotspots.sort_by_key(|hotspot| Reverse(hotspot.total));
     hotspots.truncate(25);
 
+    let label_hotspots = label_hotspots(report);
+
     let mut anomalies = Vec::new();
     for hotspot in &hotspots {
         if hotspot.max >= 30_000 || hotspot.p95.is_some_and(|p95| p95 >= 10_000) {
@@ -598,10 +618,51 @@ pub fn analyze_metrics_report(report: &MetricsReport) -> MetricsAnalysis {
             });
         }
     }
+    for label_hotspot in &label_hotspots {
+        if label_hotspot.max >= 10_000 {
+            anomalies.push(MetricAnomaly {
+                severity: "warning".to_owned(),
+                code: "slow_label_group".to_owned(),
+                message: format!(
+                    "{} label group is slow: count={} total={} max={}",
+                    label_hotspot.name, label_hotspot.count, label_hotspot.total, label_hotspot.max
+                ),
+                metric: label_hotspot.name.clone(),
+                labels: label_hotspot.labels.clone(),
+            });
+        }
+    }
     MetricsAnalysis {
         hotspots,
+        label_hotspots,
         anomalies,
     }
+}
+
+fn label_hotspots(report: &MetricsReport) -> Vec<MetricLabelHotspot> {
+    let mut grouped: BTreeMap<(String, MetricLabels), MetricLabelHotspot> = BTreeMap::new();
+    for event in &report.events {
+        if !matches!(event.kind, MetricKind::Histogram) || event.value < 0 {
+            continue;
+        }
+        let value = u64::try_from(event.value).unwrap_or(u64::MAX);
+        let entry = grouped
+            .entry((event.name.clone(), event.labels.clone()))
+            .or_insert_with(|| MetricLabelHotspot {
+                name: event.name.clone(),
+                labels: event.labels.clone(),
+                count: 0,
+                total: 0,
+                max: 0,
+            });
+        entry.count = entry.count.saturating_add(1);
+        entry.total = entry.total.saturating_add(value);
+        entry.max = entry.max.max(value);
+    }
+    let mut hotspots = grouped.into_values().collect::<Vec<_>>();
+    hotspots.sort_by_key(|hotspot| Reverse(hotspot.total));
+    hotspots.truncate(25);
+    hotspots
 }
 
 fn histogram_hotspot(name: &str, histogram: &HistogramSnapshot) -> MetricHotspot {

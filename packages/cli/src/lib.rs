@@ -7130,8 +7130,9 @@ render();
 
 fn print_metrics_analysis(analysis: &bcode_metrics::MetricsAnalysis) {
     println!(
-        "metrics analysis: {} hotspots, {} anomalies",
+        "metrics analysis: {} hotspots, {} label hotspots, {} anomalies",
         analysis.hotspots.len(),
+        analysis.label_hotspots.len(),
         analysis.anomalies.len()
     );
     if !analysis.anomalies.is_empty() {
@@ -7156,6 +7157,15 @@ fn print_metrics_analysis(analysis: &bcode_metrics::MetricsAnalysis) {
                     .p95
                     .map_or_else(|| "<none>".to_string(), |value| value.to_string()),
                 hotspot.max
+            );
+        }
+    }
+    if !analysis.label_hotspots.is_empty() {
+        println!("label hotspots:");
+        for hotspot in &analysis.label_hotspots {
+            println!(
+                "  {}\tcount={} total={} max={} labels={:?}",
+                hotspot.name, hotspot.count, hotspot.total, hotspot.max, hotspot.labels
             );
         }
     }

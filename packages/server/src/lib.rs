@@ -11965,51 +11965,63 @@ async fn build_model_turn_request(
     retry_instruction: Option<&str>,
     selection: &SessionModelSelection,
 ) -> Result<ModelTurnRequest, bcode_session::SessionError> {
+    let metric_labels =
+        model_request_metric_labels(session_id, provider_plugin_id, selected_model_id, round);
     let build_timer = state.metrics.timer();
     let history_timer = state.metrics.timer();
     let history = state.sessions.model_context_events(session_id).await?;
-    state.metrics.record_histogram(
+    state.metrics.record_histogram_with_labels(
         "model.request_build.load_context_events_duration_ms",
         history_timer.elapsed_ms(),
+        metric_labels.clone(),
     );
-    state
-        .metrics
-        .record_histogram("model.context.event_count", history.len() as u64);
+    state.metrics.record_histogram_with_labels(
+        "model.context.event_count",
+        history.len() as u64,
+        metric_labels.clone(),
+    );
     let convert_timer = state.metrics.timer();
     let mut messages =
         session_events_to_model_messages_with_limit(&history, state.tool_output_context_chars);
-    state.metrics.record_histogram(
+    state.metrics.record_histogram_with_labels(
         "model.request_build.convert_events_duration_ms",
         convert_timer.elapsed_ms(),
+        metric_labels.clone(),
     );
-    state
-        .metrics
-        .record_histogram("model.context.message_count", messages.len() as u64);
-    state.metrics.record_histogram(
+    state.metrics.record_histogram_with_labels(
+        "model.context.message_count",
+        messages.len() as u64,
+        metric_labels.clone(),
+    );
+    state.metrics.record_histogram_with_labels(
         "model.context.message_chars",
         messages
             .iter()
             .map(model_message_context_chars)
             .sum::<usize>() as u64,
+        metric_labels.clone(),
     );
     let prompt_cache_timer = state.metrics.timer();
     let prompt_cache = plan_prompt_cache(&mut messages, state.prompt_cache_mode);
-    state.metrics.record_histogram(
+    state.metrics.record_histogram_with_labels(
         "model.request_build.prompt_cache_plan_duration_ms",
         prompt_cache_timer.elapsed_ms(),
+        metric_labels.clone(),
     );
     let agent_timer = state.metrics.timer();
     let agent_id = session_agent_selection(state, session_id).await;
     let agent_context = agent_context(state, session_id, &agent_id).await;
-    state.metrics.record_histogram(
+    state.metrics.record_histogram_with_labels(
         "model.request_build.agent_context_duration_ms",
         agent_timer.elapsed_ms(),
+        metric_labels.clone(),
     );
     let working_directory_timer = state.metrics.timer();
     let working_directory = state.sessions.session_working_directory(session_id).await?;
-    state.metrics.record_histogram(
+    state.metrics.record_histogram_with_labels(
         "model.request_build.working_directory_duration_ms",
         working_directory_timer.elapsed_ms(),
+        metric_labels.clone(),
     );
     let system_prompt_timer = state.metrics.timer();
     let skill_catalog = if state.system_prompt.sections.skill_catalog {
@@ -12187,14 +12199,37 @@ async fn build_model_turn_request(
         conversation_reuse,
         metadata,
     };
-    state.metrics.record_histogram(
+    state.metrics.record_histogram_with_labels(
         "model.request_build.request_assembly_duration_ms",
         request_assembly_timer.elapsed_ms(),
+        metric_labels.clone(),
     );
-    state
-        .metrics
-        .record_histogram("model.request_build_duration_ms", build_timer.elapsed_ms());
+    state.metrics.record_histogram_with_labels(
+        "model.request_build_duration_ms",
+        build_timer.elapsed_ms(),
+        metric_labels,
+    );
     Ok(request)
+}
+
+fn model_request_metric_labels(
+    session_id: SessionId,
+    provider_plugin_id: Option<&str>,
+    selected_model_id: Option<&str>,
+    round: u32,
+) -> MetricLabels {
+    let mut labels = MetricLabels::new();
+    labels.insert("session_id".to_owned(), session_id.to_string());
+    labels.insert(
+        "provider_plugin_id".to_owned(),
+        provider_plugin_id.unwrap_or("<auto>").to_owned(),
+    );
+    labels.insert(
+        "model_id".to_owned(),
+        selected_model_id.unwrap_or("<default>").to_owned(),
+    );
+    labels.insert("round".to_owned(), round.to_string());
+    labels
 }
 
 async fn select_host_auth_pool_candidate(

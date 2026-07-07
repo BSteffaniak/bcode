@@ -695,6 +695,14 @@ impl SessionActor {
         Ok(events)
     }
 
+    const fn attach_mode_label(mode: &AttachMode) -> &'static str {
+        match mode {
+            AttachMode::Full => "full",
+            AttachMode::Recent { .. } => "recent",
+            AttachMode::ProjectionWindow { .. } => "projection_window",
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn attach(
         &mut self,
@@ -705,10 +713,13 @@ impl SessionActor {
         let total_started_at = Instant::now();
         let metrics = self.store.as_ref().map(SessionStoreExecutor::metrics);
         if let Some(metrics) = &metrics {
-            metrics.increment_counter("session.actor.attach.total");
-            metrics.record_histogram(
+            let mut labels = bcode_metrics::MetricLabels::new();
+            labels.insert("mode".to_owned(), Self::attach_mode_label(&mode).to_owned());
+            metrics.add_counter_with_labels("session.actor.attach.total", 1, labels.clone());
+            metrics.record_histogram_with_labels(
                 "session.actor.attach.queue_wait_duration_ms",
                 elapsed_ms(queued_at),
+                labels,
             );
         }
         let writable_started_at = Instant::now();
