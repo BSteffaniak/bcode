@@ -120,6 +120,9 @@ pub fn create_worktree(
     } else {
         false
     };
+    if config.worktree.setup.direnv_allow && !request.no_setup {
+        allow_direnv_for_worktree(&path)?;
+    }
     Ok(WorktreeCreateResponse {
         repo_root,
         path,
@@ -282,6 +285,45 @@ fn run_git(cwd: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+fn direnv_file_for(cwd: &Path) -> Option<PathBuf> {
+    let mut current = cwd.to_path_buf();
+    loop {
+        let envrc = current.join(".envrc");
+        if envrc.exists() {
+            return Some(envrc);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+fn allow_direnv_for_worktree(path: &Path) -> Result<(), WorktreeError> {
+    let Some(envrc) = direnv_file_for(path) else {
+        return Ok(());
+    };
+    let output = Command::new("direnv")
+        .arg("allow")
+        .arg(&envrc)
+        .current_dir(path)
+        .output()
+        .map_err(|error| {
+            WorktreeError::Setup(format!(
+                "direnv_allow is enabled, but `direnv allow {}` could not run: {error}",
+                envrc.display()
+            ))
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(WorktreeError::Setup(format!(
+        "direnv_allow is enabled, but `direnv allow {}` failed with status {}: {}",
+        envrc.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
+}
+
 fn apply_setup(config: &BcodeConfig, repo_root: &Path, path: &Path) -> Result<(), WorktreeError> {
     let config_paths =
         discover_configs(repo_root).map_err(|error| WorktreeError::Setup(error.to_string()))?;
@@ -368,7 +410,7 @@ fn slugify(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{create_worktree, list_worktrees, remove_worktree, slugify};
+    use super::{create_worktree, direnv_file_for, list_worktrees, remove_worktree, slugify};
     use bcode_worktree_models::WorktreeCreateRequest;
     use std::path::Path;
     use std::process::Command;
@@ -589,6 +631,24 @@ mod tests {
             std::fs::read_to_string(response.path.join(".env")).expect("env should be copied"),
             "TOKEN=test\n"
         );
+    }
+
+    #[test]
+    fn direnv_file_for_finds_parent_envrc() {
+        let temp = TempDir::new().expect("tempdir");
+        let nested = temp.path().join("a/b");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        let envrc = temp.path().join(".envrc");
+        std::fs::write(&envrc, "use flake\n").expect("envrc");
+
+        assert_eq!(direnv_file_for(&nested), Some(envrc));
+    }
+
+    #[test]
+    fn direnv_file_for_returns_none_without_envrc() {
+        let temp = TempDir::new().expect("tempdir");
+
+        assert_eq!(direnv_file_for(temp.path()), None);
     }
 
     #[test]

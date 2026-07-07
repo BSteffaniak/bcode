@@ -1602,6 +1602,9 @@ pub struct WorktreeSetupConfig {
     /// Setup profile name for future profile-aware setup flows.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Whether Bcode-created worktrees should automatically trust detected `.envrc` files.
+    #[serde(default)]
+    pub direnv_allow: bool,
 }
 
 impl Default for WorktreeSetupConfig {
@@ -1609,6 +1612,7 @@ impl Default for WorktreeSetupConfig {
         Self {
             enabled: default_worktree_setup_enabled(),
             profile: None,
+            direnv_allow: false,
         }
     }
 }
@@ -1857,6 +1861,9 @@ pub struct ShellToolEnvConfig {
     /// Fallback behavior when `auto` detects an environment manager but cannot apply it.
     #[serde(default)]
     pub auto_fallback: ShellToolEnvAutoFallback,
+    /// Hide direnv startup output before the requested shell command begins.
+    #[serde(default = "default_hide_direnv_prelude")]
+    pub hide_direnv_prelude: bool,
 }
 
 impl Default for ShellToolEnvConfig {
@@ -1864,8 +1871,13 @@ impl Default for ShellToolEnvConfig {
         Self {
             mode: ShellToolEnvMode::Auto,
             auto_fallback: ShellToolEnvAutoFallback::Error,
+            hide_direnv_prelude: default_hide_direnv_prelude(),
         }
     }
+}
+
+const fn default_hide_direnv_prelude() -> bool {
+    true
 }
 
 /// Shell tool environment resolver mode.

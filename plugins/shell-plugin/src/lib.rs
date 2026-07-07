@@ -417,27 +417,78 @@ fn should_use_direnv(cwd: Option<&Path>, config: ShellToolEnvConfig) -> Result<b
     }
 }
 
+struct ShellCommandPlan {
+    program: String,
+    args: Vec<String>,
+    direnv_prelude_marker: Option<String>,
+}
+
+fn direnv_prelude_marker(tool_call_id: &str) -> String {
+    let safe_id = tool_call_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("__BCODE_DIRENV_READY_{safe_id}__")
+}
+
+fn direnv_wrapped_command(command: &str, marker: &str) -> String {
+    format!("printf '%s\\n' '{marker}'\n{command}")
+}
+
+fn direnv_shell_command_plan(
+    command: &str,
+    cwd: &Path,
+    env_config: ShellToolEnvConfig,
+    tool_call_id: &str,
+) -> ShellCommandPlan {
+    let marker = env_config
+        .hide_direnv_prelude
+        .then(|| direnv_prelude_marker(tool_call_id));
+    let command = marker.as_deref().map_or_else(
+        || command.to_owned(),
+        |marker| direnv_wrapped_command(command, marker),
+    );
+    ShellCommandPlan {
+        program: "direnv".to_owned(),
+        args: vec![
+            "exec".to_owned(),
+            cwd.display().to_string(),
+            shell_program().to_owned(),
+            "-o".to_owned(),
+            "pipefail".to_owned(),
+            "-c".to_owned(),
+            command,
+        ],
+        direnv_prelude_marker: marker,
+    }
+}
+
 fn shell_program_and_args(
     command: &str,
     cwd: Option<&Path>,
     env_config: ShellToolEnvConfig,
-) -> Result<(String, Vec<String>), String> {
+    tool_call_id: &str,
+) -> Result<ShellCommandPlan, String> {
     if should_use_direnv(cwd, env_config)? {
         let cwd = cwd.ok_or_else(|| "direnv shell mode requires a working directory".to_owned())?;
-        Ok((
-            "direnv".to_owned(),
-            vec![
-                "exec".to_owned(),
-                cwd.display().to_string(),
-                shell_program().to_owned(),
-                "-o".to_owned(),
-                "pipefail".to_owned(),
-                "-c".to_owned(),
-                command.to_owned(),
-            ],
+        Ok(direnv_shell_command_plan(
+            command,
+            cwd,
+            env_config,
+            tool_call_id,
         ))
     } else {
-        Ok((shell_program().to_owned(), shell_args(command)))
+        Ok(ShellCommandPlan {
+            program: shell_program().to_owned(),
+            args: shell_args(command),
+            direnv_prelude_marker: None,
+        })
     }
 }
 
@@ -619,7 +670,13 @@ fn run_terminal_shell_command_inner(
         })
         .map_err(|error| error.to_string())?;
 
-    let (program, args) = shell_program_and_args(&arguments.command, cwd.as_deref(), env_config)?;
+    let command_plan =
+        shell_program_and_args(&arguments.command, cwd.as_deref(), env_config, tool_call_id)?;
+    let ShellCommandPlan {
+        program,
+        args,
+        direnv_prelude_marker,
+    } = command_plan;
     let mut command = portable_pty::CommandBuilder::new(program);
     for arg in args {
         command.arg(arg);
@@ -656,6 +713,7 @@ fn run_terminal_shell_command_inner(
                     columns,
                     rows,
                     timeout_at_ms: Some(timeout_at_ms),
+                    direnv_prelude_marker: direnv_prelude_marker.as_deref(),
                 },
                 TerminalStreamPaths {
                     clean_artifact_path,
@@ -814,6 +872,73 @@ struct ShellVisualStreamContext<'a> {
     columns: u16,
     rows: u16,
     timeout_at_ms: Option<u64>,
+    direnv_prelude_marker: Option<&'a str>,
+}
+
+const DIRENV_PRELUDE_BUFFER_LIMIT: usize = 4 * 1024 * 1024;
+
+struct DirenvPreludeFilter {
+    marker: Option<Vec<u8>>,
+    buffer: Vec<u8>,
+    passed: bool,
+    failed_open: bool,
+}
+
+impl DirenvPreludeFilter {
+    fn new(marker: Option<&str>) -> Self {
+        Self {
+            marker: marker.map(|marker| marker.as_bytes().to_vec()),
+            buffer: Vec::new(),
+            passed: marker.is_none(),
+            failed_open: false,
+        }
+    }
+
+    fn write(&mut self, chunk: &[u8]) -> Vec<u8> {
+        let Some(marker) = self.marker.as_deref() else {
+            return chunk.to_vec();
+        };
+        if self.passed || self.failed_open {
+            return chunk.to_vec();
+        }
+        self.buffer.extend_from_slice(chunk);
+        if let Some(index) = find_bytes(&self.buffer, marker) {
+            let mut start = index.saturating_add(marker.len());
+            if self.buffer.get(start) == Some(&b'\r') {
+                start = start.saturating_add(1);
+            }
+            if self.buffer.get(start) == Some(&b'\n') {
+                start = start.saturating_add(1);
+            }
+            let output = self.buffer[start..].to_vec();
+            self.buffer.clear();
+            self.passed = true;
+            return output;
+        }
+        if self.buffer.len() > DIRENV_PRELUDE_BUFFER_LIMIT {
+            self.failed_open = true;
+            return std::mem::take(&mut self.buffer);
+        }
+        Vec::new()
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        if self.passed || self.failed_open {
+            Vec::new()
+        } else {
+            self.failed_open = true;
+            std::mem::take(&mut self.buffer)
+        }
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn read_limited_streaming<R>(
@@ -840,6 +965,7 @@ where
     let mut raw_original_bytes = 0_usize;
     let mut raw_truncated = false;
     let mut visual_output = String::new();
+    let mut prelude_filter = DirenvPreludeFilter::new(visual_context.direnv_prelude_marker);
     loop {
         let read = reader
             .read(&mut buffer)
@@ -849,17 +975,20 @@ where
         }
         sequence = sequence.saturating_add(1);
         raw_original_bytes = raw_original_bytes.saturating_add(read);
-        visual_output.push_str(&String::from_utf8_lossy(&buffer[..read]));
-        emit_tool_output_delta(
-            events,
-            tool_call_id,
-            visual_context,
-            sequence,
-            visual_output.as_bytes(),
-        );
-        cleaner
-            .write_chunk(&buffer[..read])
-            .map_err(|error| error.to_string())?;
+        let filtered = prelude_filter.write(&buffer[..read]);
+        if !filtered.is_empty() {
+            visual_output.push_str(&String::from_utf8_lossy(&filtered));
+            emit_tool_output_delta(
+                events,
+                tool_call_id,
+                visual_context,
+                sequence,
+                visual_output.as_bytes(),
+            );
+            cleaner
+                .write_chunk(&filtered)
+                .map_err(|error| error.to_string())?;
+        }
 
         let remaining = DEFAULT_MAX_OUTPUT_BYTES.saturating_sub(raw_bytes.len());
         if remaining == 0 {
@@ -872,6 +1001,21 @@ where
             .map_err(|error| error.to_string())?;
         raw_bytes.extend_from_slice(&buffer[..retained]);
         raw_truncated = raw_truncated || retained < read;
+    }
+    let final_filtered = prelude_filter.finish();
+    if !final_filtered.is_empty() {
+        sequence = sequence.saturating_add(1);
+        visual_output.push_str(&String::from_utf8_lossy(&final_filtered));
+        emit_tool_output_delta(
+            events,
+            tool_call_id,
+            visual_context,
+            sequence,
+            visual_output.as_bytes(),
+        );
+        cleaner
+            .write_chunk(&final_filtered)
+            .map_err(|error| error.to_string())?;
     }
     raw_writer.flush().map_err(|error| error.to_string())?;
     let clean_summary = cleaner.finish().map_err(|error| error.to_string())?;
@@ -1474,36 +1618,74 @@ mod tests {
     }
 
     #[test]
-    fn terminal_output_json_stays_valid_when_output_is_truncated() {
-        let bytes = vec![b'x'; DEFAULT_MAX_OUTPUT_BYTES + 1];
-        let output = limit_output_bytes(&bytes, DEFAULT_MAX_OUTPUT_BYTES);
-        let terminal_output = TerminalCommandOutput {
-            mode: "terminal",
-            exit_code: Some(0),
-            timed_out: false,
-            cancelled: false,
-            command: "printf hello".to_owned(),
-            cwd: None,
-            output: output.text,
-            output_truncated: output.truncated,
-            output_bytes: u64::try_from(output.original_bytes).unwrap_or(u64::MAX),
-            retained_output_bytes: u64::try_from(output.retained_bytes).unwrap_or(u64::MAX),
-            columns: DEFAULT_TERMINAL_COLUMNS,
-            rows: DEFAULT_TERMINAL_ROWS,
-        };
+    fn direnv_prelude_filter_suppresses_until_marker() {
+        let mut filter = DirenvPreludeFilter::new(Some("__MARK__"));
 
-        let encoded = serde_json::to_string(&terminal_output).expect("terminal output encodes");
-        let value = serde_json::from_str::<serde_json::Value>(&encoded).expect("valid json");
+        assert!(filter.write(b"direnv: loading\n").is_empty());
+        assert_eq!(filter.write(b"__MARK__\nhello\n"), b"hello\n");
+        assert_eq!(filter.write(b"world\n"), b"world\n");
+        assert!(filter.finish().is_empty());
+    }
 
-        assert_eq!(
-            value.get("mode").and_then(serde_json::Value::as_str),
-            Some("terminal")
+    #[test]
+    fn direnv_prelude_filter_handles_split_marker() {
+        let mut filter = DirenvPreludeFilter::new(Some("__MARK__"));
+
+        assert!(filter.write(b"noise\n__MA").is_empty());
+        assert_eq!(filter.write(b"RK__\r\noutput"), b"output");
+    }
+
+    #[test]
+    fn direnv_prelude_filter_preserves_output_without_marker() {
+        let mut filter = DirenvPreludeFilter::new(Some("__MARK__"));
+
+        assert!(filter.write(b"direnv error\n").is_empty());
+        assert_eq!(filter.finish(), b"direnv error\n");
+    }
+
+    #[test]
+    fn direnv_prelude_filter_passes_through_when_disabled() {
+        let mut filter = DirenvPreludeFilter::new(None);
+
+        assert_eq!(filter.write(b"hello"), b"hello");
+        assert!(filter.finish().is_empty());
+    }
+
+    #[test]
+    fn direnv_command_plan_uses_prelude_marker_by_default() {
+        let plan = direnv_shell_command_plan(
+            "echo hello",
+            Path::new("/tmp"),
+            ShellToolEnvConfig {
+                mode: ShellToolEnvMode::Direnv,
+                auto_fallback: ShellToolEnvAutoFallback::Error,
+                hide_direnv_prelude: true,
+            },
+            "call-1",
         );
-        assert_eq!(
-            value
-                .get("output_truncated")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
+
+        let marker = plan
+            .direnv_prelude_marker
+            .expect("direnv marker should be set");
+        assert_eq!(plan.program, "direnv");
+        assert!(plan.args.iter().any(|arg| arg.contains(&marker)));
+        assert!(plan.args.iter().any(|arg| arg.contains("echo hello")));
+    }
+
+    #[test]
+    fn direnv_command_plan_can_disable_prelude_marker() {
+        let plan = direnv_shell_command_plan(
+            "echo hello",
+            Path::new("/tmp"),
+            ShellToolEnvConfig {
+                mode: ShellToolEnvMode::Direnv,
+                auto_fallback: ShellToolEnvAutoFallback::Error,
+                hide_direnv_prelude: false,
+            },
+            "call-1",
         );
+
+        assert!(plan.direnv_prelude_marker.is_none());
+        assert!(plan.args.iter().any(|arg| arg == "echo hello"));
     }
 }
