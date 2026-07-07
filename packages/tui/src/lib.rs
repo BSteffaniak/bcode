@@ -25,6 +25,7 @@ pub(crate) mod input;
 pub(crate) mod input_history;
 pub(crate) mod invalidation;
 pub(crate) mod keymap;
+pub mod metrics_launcher;
 pub(crate) mod model_flow;
 pub(crate) mod model_picker;
 pub(crate) mod model_picker_render;
@@ -547,6 +548,31 @@ pub async fn run_eval_viewer_picker(repo_path: std::path::PathBuf) -> Result<(),
             helpers::terminal_area()?,
         );
         eval_launcher::run_picker(&mut terminal, repo_path).await
+    };
+    let _writer = guard.leave()?;
+    result
+}
+
+/// Run the persisted metrics dashboard TUI.
+///
+/// # Errors
+///
+/// Returns I/O or plugin service errors.
+#[allow(clippy::future_not_send)]
+pub async fn run_metrics_dashboard(
+    repo_path: std::path::PathBuf,
+    metrics_path: Option<std::path::PathBuf>,
+) -> Result<(), TuiError> {
+    let stdout = io::stdout();
+    let mut guard = CrosstermTerminalGuard::enter(stdout)?;
+    let result = {
+        let mut terminal = Terminal::new(
+            guard.writer_mut().ok_or_else(|| {
+                std::io::Error::other("terminal guard writer unavailable after entering terminal")
+            })?,
+            helpers::terminal_area()?,
+        );
+        metrics_launcher::run_dashboard(&mut terminal, repo_path, metrics_path).await
     };
     let _writer = guard.leave()?;
     result

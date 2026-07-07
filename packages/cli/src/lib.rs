@@ -202,6 +202,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Worktree { command } => handle_worktree_command(command).await?,
         Commands::Blims { command } => blims::handle_blims_command(command).await?,
         Commands::Eval { command } => Box::pin(handle_eval_command(command)).await?,
+        Commands::Metrics { path, repo } => bcode_tui::run_metrics_dashboard(repo, path).await?,
         Commands::Review { command } => Box::pin(handle_review_command(command)).await?,
         Commands::Ralph { repo } => handle_ralph_command(repo).await?,
         Commands::Plugin { command } => handle_plugin_command(command).await?,
@@ -487,6 +488,7 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
         | Commands::Worktree { .. }
         | Commands::Blims { .. }
         | Commands::Eval { .. }
+        | Commands::Metrics { .. }
         | Commands::Review { .. }
         | Commands::Ralph { .. }
         | Commands::Plugin { .. }
@@ -975,6 +977,15 @@ enum Commands {
     Eval {
         #[command(subcommand)]
         command: EvalCommand,
+    },
+    /// Open the persisted performance metrics dashboard.
+    Metrics {
+        /// Metrics event log path. Defaults to Bcode's persisted metrics store.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Repository path used for plugin surface context.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
     },
     Review {
         #[command(subcommand)]
