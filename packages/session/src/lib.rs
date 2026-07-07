@@ -761,80 +761,148 @@ impl SessionManager {
         let total_timer = self.metrics.timer();
         let cached_handle = self.inner.lock().await.sessions.get(&session_id).cloned();
         if let Some(handle) = cached_handle {
-            let Some(store) = &self.store else {
-                record_ensure_loaded_duration(&self.metrics, "cached", total_timer.elapsed_ms());
-                return Ok(());
-            };
-            if !db::session_db_path(&store.root_path(), session_id).exists() {
-                record_ensure_loaded_duration(&self.metrics, "cached", total_timer.elapsed_ms());
-                return Ok(());
-            }
-            let snapshot = handle.snapshot();
-            let inserted_lease = {
-                let mut inner = self.inner.lock().await;
-                if let std::collections::btree_map::Entry::Vacant(entry) =
-                    inner.leases.entry(session_id)
-                {
-                    let lease = lease::acquire_session_lease(
-                        &store.root_path(),
-                        session_id,
-                        store.lease_owner(),
-                    )?;
-                    entry.insert(lease);
-                    true
-                } else {
-                    false
-                }
-            };
-            let refreshed_summary = snapshot.load_status == SessionLoadStatusKind::SummaryOnly;
-            if refreshed_summary {
-                let result = async {
-                    let db =
-                        db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
-                    let state = self.load_db_session_state(session_id, &db).await?;
-                    handle.replace_state(state).await?;
-                    Ok::<(), SessionError>(())
-                }
+            return self
+                .ensure_cached_session_loaded(session_id, handle, total_timer)
                 .await;
-                if result.is_err() && inserted_lease {
-                    self.inner.lock().await.leases.remove(&session_id);
-                }
-                result?;
-            }
-            record_ensure_loaded_duration(
-                &self.metrics,
-                if refreshed_summary {
-                    "summary_refreshed"
-                } else {
-                    "cached"
-                },
-                total_timer.elapsed_ms(),
-            );
-            return Ok(());
         }
         let Some(store) = &self.store else {
+            record_ensure_loaded_duration(&self.metrics, "missing", total_timer.elapsed_ms());
             return Err(SessionError::NotFound(session_id));
         };
-        let load_timer = self.metrics.timer();
         if db::session_db_path(&store.root_path(), session_id).exists() {
-            let lease =
-                lease::acquire_session_lease(&store.root_path(), session_id, store.lease_owner())?;
-            let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
-            let state = self.load_db_session_state(session_id, &db).await?;
-            self.metrics.record_histogram(
-                "session.manager.ensure_loaded.load_db_session_duration_ms",
-                load_timer.elapsed_ms(),
-            );
-            let mut inner = self.inner.lock().await;
-            inner
-                .sessions
-                .insert(session_id, SessionHandle::new(state, Some(store.clone())));
-            inner.leases.insert(session_id, lease);
-            record_ensure_loaded_duration(&self.metrics, "db_loaded", total_timer.elapsed_ms());
+            self.load_persistent_session(session_id, store, total_timer)
+                .await?;
             return Ok(());
         }
         record_ensure_loaded_duration(&self.metrics, "missing", total_timer.elapsed_ms());
         Err(SessionError::NotFound(session_id))
+    }
+
+    async fn ensure_cached_session_loaded(
+        &self,
+        session_id: SessionId,
+        handle: SessionHandle,
+        total_timer: bcode_metrics::MetricsTimer,
+    ) -> Result<(), SessionError> {
+        let Some(store) = &self.store else {
+            record_ensure_loaded_duration(&self.metrics, "cached", total_timer.elapsed_ms());
+            return Ok(());
+        };
+        if !db::session_db_path(&store.root_path(), session_id).exists() {
+            record_ensure_loaded_duration(&self.metrics, "cached", total_timer.elapsed_ms());
+            return Ok(());
+        }
+        let snapshot = handle.snapshot();
+        let inserted_lease = self
+            .acquire_missing_session_lease(session_id, store)
+            .await?;
+        let refreshed_summary = snapshot.load_status == SessionLoadStatusKind::SummaryOnly;
+        if refreshed_summary {
+            let result = self
+                .refresh_summary_session(session_id, store, &handle)
+                .await;
+            if result.is_err() && inserted_lease {
+                self.inner.lock().await.leases.remove(&session_id);
+            }
+            result?;
+        }
+        record_ensure_loaded_duration(
+            &self.metrics,
+            if refreshed_summary {
+                "summary_refreshed"
+            } else {
+                "cached"
+            },
+            total_timer.elapsed_ms(),
+        );
+        Ok(())
+    }
+
+    async fn acquire_missing_session_lease(
+        &self,
+        session_id: SessionId,
+        store: &SessionStoreExecutor,
+    ) -> Result<bool, SessionError> {
+        let mut inner = self.inner.lock().await;
+        if let std::collections::btree_map::Entry::Vacant(entry) = inner.leases.entry(session_id) {
+            let lease =
+                lease::acquire_session_lease(&store.root_path(), session_id, store.lease_owner())?;
+            entry.insert(lease);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn refresh_summary_session(
+        &self,
+        session_id: SessionId,
+        store: &SessionStoreExecutor,
+        handle: &SessionHandle,
+    ) -> Result<(), SessionError> {
+        let db_open_timer = self.metrics.timer();
+        let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
+        self.metrics.record_histogram(
+            "session.manager.ensure_loaded.summary_refresh_db_open_duration_ms",
+            db_open_timer.elapsed_ms(),
+        );
+        let state_load_timer = self.metrics.timer();
+        let state = self.load_db_session_state(session_id, &db).await?;
+        self.metrics.record_histogram(
+            "session.manager.ensure_loaded.summary_refresh_state_load_duration_ms",
+            state_load_timer.elapsed_ms(),
+        );
+        let replace_timer = self.metrics.timer();
+        handle.replace_state(state).await?;
+        self.metrics.record_histogram(
+            "session.manager.ensure_loaded.summary_refresh_replace_state_duration_ms",
+            replace_timer.elapsed_ms(),
+        );
+        Ok(())
+    }
+
+    async fn load_persistent_session(
+        &self,
+        session_id: SessionId,
+        store: &SessionStoreExecutor,
+        total_timer: bcode_metrics::MetricsTimer,
+    ) -> Result<(), SessionError> {
+        let load_timer = self.metrics.timer();
+        let lease_timer = self.metrics.timer();
+        let lease =
+            lease::acquire_session_lease(&store.root_path(), session_id, store.lease_owner())?;
+        self.metrics.record_histogram(
+            "session.manager.ensure_loaded.lease_acquire_duration_ms",
+            lease_timer.elapsed_ms(),
+        );
+        let db_open_timer = self.metrics.timer();
+        let db = db::SessionDb::open_turso_in_root(session_id, &store.root_path()).await?;
+        self.metrics.record_histogram(
+            "session.manager.ensure_loaded.db_open_duration_ms",
+            db_open_timer.elapsed_ms(),
+        );
+        let state_load_timer = self.metrics.timer();
+        let state = self.load_db_session_state(session_id, &db).await?;
+        self.metrics.record_histogram(
+            "session.manager.ensure_loaded.state_load_duration_ms",
+            state_load_timer.elapsed_ms(),
+        );
+        self.metrics.record_histogram(
+            "session.manager.ensure_loaded.load_db_session_duration_ms",
+            load_timer.elapsed_ms(),
+        );
+        let insert_timer = self.metrics.timer();
+        let mut inner = self.inner.lock().await;
+        inner
+            .sessions
+            .insert(session_id, SessionHandle::new(state, Some(store.clone())));
+        inner.leases.insert(session_id, lease);
+        self.metrics.record_histogram(
+            "session.manager.ensure_loaded.insert_handle_duration_ms",
+            insert_timer.elapsed_ms(),
+        );
+        record_ensure_loaded_duration(&self.metrics, "db_loaded", total_timer.elapsed_ms());
+        Ok(())
     }
 
     async fn release_persistent_idle_session_resources(&self, session_id: SessionId) {

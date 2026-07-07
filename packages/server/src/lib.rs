@@ -25,8 +25,8 @@ use bcode_ipc::{
     RalphStatusRequest, RalphStatusResponse, RalphStatusSummary, RalphValidationSummary, Request,
     Response, ResponsePayload, ServerStatus, ServerStopMode, SessionCatalogSourceStatus,
     SessionCatalogStatus, WorktreeCreateRequest, WorktreeListRequest, WorktreeRemoveRequest,
-    decode_request, envelope_frame_count, event_envelope, recv_envelope, response_envelope,
-    send_envelope,
+    decode_request, encode_envelope_frames, event_envelope, recv_envelope, response_envelope,
+    write_encoded_envelope_frames,
 };
 use bcode_metrics::{MetricLabels, MetricsEventLogConfig, MetricsRegistry};
 use bcode_model::{
@@ -226,12 +226,14 @@ impl ClientEventSink {
     async fn send(&self, event: Event) -> Result<(), CodecError> {
         let event_kind = client_event_kind(&event);
         let envelope = event_envelope(&event)?;
+        let encode_started_at = Instant::now();
+        let frames = encode_envelope_frames(&envelope)?;
         let started_at = Instant::now();
         let result = {
             let mut writer = self.writer.writer.lock().await;
             tokio::time::timeout(
                 CLIENT_EVENT_SEND_TIMEOUT,
-                send_envelope(&mut *writer, &envelope),
+                write_encoded_envelope_frames(&mut *writer, &frames),
             )
             .await
             .unwrap_or_else(|_| {
@@ -244,6 +246,11 @@ impl ClientEventSink {
         let elapsed = started_at.elapsed();
         let mut labels = MetricLabels::new();
         labels.insert("event_kind".to_owned(), event_kind.to_owned());
+        self.metrics.record_histogram_with_labels(
+            "ipc.event_send.encode_duration_ms",
+            elapsed_ms(encode_started_at),
+            labels.clone(),
+        );
         self.metrics.record_histogram_with_labels(
             "ipc.event_send.duration_ms",
             elapsed_ms(started_at),
@@ -5251,22 +5258,29 @@ async fn finish_attach_session_projection_window_success(
         "server.attach_projection_window.compacted_history_event_count",
         usize_to_u64(compacted_history.len()),
     );
-    let send_started_at = Instant::now();
+    let draft_started_at = Instant::now();
     let draft = state.sessions.session_composer_draft(session_id).await?;
-    send_response(
-        context.writer,
-        context.request_id,
-        Response::Ok(ResponsePayload::Attached {
-            session_id,
-            session: attachment.session,
-            history: compacted_history,
-            input_history: attachment.input_history,
-            import_warnings: Vec::new(),
-            draft,
-            runtime_selection: session_runtime_selection_payload(state, session_id).await,
-        }),
-    )
-    .await?;
+    state.metrics.record_histogram(
+        "server.attach_projection_window.load_draft_duration_ms",
+        elapsed_ms(draft_started_at),
+    );
+    let runtime_selection_started_at = Instant::now();
+    let runtime_selection = session_runtime_selection_payload(state, session_id).await;
+    state.metrics.record_histogram(
+        "server.attach_projection_window.runtime_selection_duration_ms",
+        elapsed_ms(runtime_selection_started_at),
+    );
+    let response = Response::Ok(ResponsePayload::Attached {
+        session_id,
+        session: attachment.session,
+        history: compacted_history,
+        input_history: attachment.input_history,
+        import_warnings: Vec::new(),
+        draft,
+        runtime_selection,
+    });
+    let send_started_at = Instant::now();
+    send_response(context.writer, context.request_id, response).await?;
     state.metrics.record_histogram(
         "server.attach_projection_window.response_send_duration_ms",
         elapsed_ms(send_started_at),
@@ -16170,10 +16184,17 @@ pub(crate) async fn send_response(
         usize_to_u64(envelope.payload.len()),
         labels.clone(),
     );
-    let frame_count = envelope_frame_count(&envelope)?;
+    let frame_encode_started_at = Instant::now();
+    let frames = encode_envelope_frames(&envelope)?;
+    let frame_count = u64::try_from(frames.len()).unwrap_or(u64::MAX);
+    writer.metrics.record_histogram_with_labels(
+        "ipc.response.frame_encode_duration_ms",
+        elapsed_ms(frame_encode_started_at),
+        labels.clone(),
+    );
     writer.metrics.record_histogram_with_labels(
         "ipc.response.frame_count",
-        u64::from(frame_count),
+        frame_count,
         labels.clone(),
     );
     if frame_count > 1 {
@@ -16184,7 +16205,7 @@ pub(crate) async fn send_response(
     let write_started_at = Instant::now();
     let result = {
         let mut writer_guard = writer.writer.lock().await;
-        send_envelope(&mut *writer_guard, &envelope).await
+        write_encoded_envelope_frames(&mut *writer_guard, &frames).await
     };
     writer.metrics.record_histogram_with_labels(
         "ipc.response.write_duration_ms",
