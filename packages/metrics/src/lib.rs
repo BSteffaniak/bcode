@@ -1,7 +1,6 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
-#![allow(clippy::missing_panics_doc)]
 #![allow(clippy::significant_drop_tightening)]
 
 //! Lightweight in-process metrics for Bcode runtime diagnostics.
@@ -9,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -18,14 +17,52 @@ const HISTOGRAM_BUCKETS_MS: &[u64] = &[
     1, 2, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000,
 ];
 const DEFAULT_MAX_EVENTS: usize = 10_000;
+const METRICS_EVENT_LOG_SCHEMA_VERSION: u32 = 1;
+const DEFAULT_METRICS_SEGMENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const DEFAULT_METRICS_TOTAL_MAX_BYTES: u64 = 128 * 1024 * 1024;
+const DEFAULT_METRICS_RECENT_READ_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const METRICS_MANIFEST_FILE_NAME: &str = "manifest.json";
 
 /// Metric labels used for filtering and grouping dashboard views.
 pub type MetricLabels = BTreeMap<String, String>;
 
 /// Shared metrics registry handle.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MetricsRegistry {
-    inner: Arc<Mutex<MetricsState>>,
+    inner: MetricsRegistryInner,
+}
+
+#[derive(Debug, Clone)]
+enum MetricsRegistryInner {
+    Disabled,
+    Enabled(Arc<Mutex<MetricsState>>),
+}
+
+impl Default for MetricsRegistry {
+    fn default() -> Self {
+        Self::in_memory()
+    }
+}
+
+/// Persistent metrics event-log configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetricsEventLogConfig {
+    /// Maximum size for one JSONL segment before rotating.
+    pub segment_max_bytes: u64,
+    /// Maximum total bytes to retain across closed JSONL segments and the active segment.
+    pub total_max_bytes: u64,
+    /// Maximum bytes to read while building a recent event report.
+    pub recent_read_max_bytes: u64,
+}
+
+impl Default for MetricsEventLogConfig {
+    fn default() -> Self {
+        Self {
+            segment_max_bytes: DEFAULT_METRICS_SEGMENT_MAX_BYTES,
+            total_max_bytes: DEFAULT_METRICS_TOTAL_MAX_BYTES,
+            recent_read_max_bytes: DEFAULT_METRICS_RECENT_READ_MAX_BYTES,
+        }
+    }
 }
 
 /// Point-in-time metrics snapshot suitable for IPC/status responses.
@@ -132,6 +169,16 @@ pub struct MetricsTimer {
     started_at: Instant,
 }
 
+/// Low-friction RAII metrics span.
+#[derive(Debug)]
+pub struct MetricsSpan {
+    metrics: MetricsRegistry,
+    name: String,
+    labels: MetricLabels,
+    started_at: Instant,
+    finished: bool,
+}
+
 #[derive(Debug, Default)]
 struct MetricsState {
     counters: BTreeMap<String, u64>,
@@ -139,8 +186,35 @@ struct MetricsState {
     histograms: BTreeMap<String, Histogram>,
     descriptors: BTreeMap<String, MetricDescriptor>,
     events: Vec<MetricEvent>,
-    event_log_path: Option<PathBuf>,
+    event_log: Option<MetricsEventLog>,
     max_events: usize,
+}
+
+#[derive(Debug, Clone)]
+struct MetricsEventLog {
+    root_dir: PathBuf,
+    manifest_path: PathBuf,
+    config: MetricsEventLogConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MetricsEventLogManifest {
+    schema_version: u32,
+    active_segment: String,
+    segments: Vec<MetricsEventLogSegment>,
+    event_count: u64,
+    total_segment_bytes: u64,
+    started_unix_ms: u64,
+    updated_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MetricsEventLogSegment {
+    name: String,
+    started_unix_ms: u64,
+    ended_unix_ms: Option<u64>,
+    event_count: u64,
+    bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -165,15 +239,77 @@ impl Default for Histogram {
 }
 
 impl MetricsRegistry {
-    /// Create a metrics registry that persists timeline events to `event_log_path`.
+    /// Create a disabled metrics registry. Recording calls become cheap no-ops.
     #[must_use]
-    pub fn with_event_log(event_log_path: impl Into<PathBuf>) -> Self {
+    pub const fn disabled() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(MetricsState {
-                event_log_path: Some(event_log_path.into()),
+            inner: MetricsRegistryInner::Disabled,
+        }
+    }
+
+    /// Create an in-memory metrics registry without filesystem persistence.
+    #[must_use]
+    pub fn in_memory() -> Self {
+        Self {
+            inner: MetricsRegistryInner::Enabled(Arc::new(Mutex::new(MetricsState {
                 max_events: DEFAULT_MAX_EVENTS,
                 ..MetricsState::default()
-            })),
+            }))),
+        }
+    }
+
+    /// Create a metrics registry that persists timeline events near `event_log_path`.
+    ///
+    /// Paths ending in a file name such as `events.jsonl` are treated as legacy-compatible hints;
+    /// segmented metrics are stored in the parent directory.
+    #[must_use]
+    pub fn with_event_log(event_log_path: impl Into<PathBuf>) -> Self {
+        Self::with_event_log_config(event_log_path, MetricsEventLogConfig::default())
+    }
+
+    /// Create a metrics registry that persists timeline events with explicit log settings.
+    #[must_use]
+    pub fn with_event_log_config(
+        event_log_path: impl Into<PathBuf>,
+        config: MetricsEventLogConfig,
+    ) -> Self {
+        let path = event_log_path.into();
+        let root_dir = metrics_event_log_root(&path);
+        Self {
+            inner: MetricsRegistryInner::Enabled(Arc::new(Mutex::new(MetricsState {
+                event_log: Some(MetricsEventLog::new(root_dir, config)),
+                max_events: DEFAULT_MAX_EVENTS,
+                ..MetricsState::default()
+            }))),
+        }
+    }
+
+    /// Return a copy of this registry with a different recent-event report cap.
+    #[must_use]
+    pub fn with_max_events(self, max_events: usize) -> Self {
+        if let MetricsRegistryInner::Enabled(inner) = &self.inner
+            && let Ok(mut state) = inner.lock()
+        {
+            state.max_events = max_events;
+        }
+        self
+    }
+
+    /// Return whether this registry records metrics.
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
+        matches!(self.inner, MetricsRegistryInner::Enabled(_))
+    }
+
+    /// Start a named metrics span that records duration and count when finished or dropped.
+    #[must_use]
+    pub fn span(&self, name: impl Into<String>) -> MetricsSpan {
+        MetricsSpan {
+            metrics: self.clone(),
+            name: name.into(),
+            labels: MetricLabels::new(),
+            started_at: Instant::now(),
+            finished: false,
         }
     }
 
@@ -194,8 +330,13 @@ impl MetricsRegistry {
         value: u64,
         labels: MetricLabels,
     ) {
+        let MetricsRegistryInner::Enabled(inner) = &self.inner else {
+            return;
+        };
         let key = key.into();
-        let mut state = self.inner.lock().expect("metrics registry lock poisoned");
+        let Ok(mut state) = inner.lock() else {
+            return;
+        };
         let counter = state.counters.entry(key.clone()).or_default();
         *counter = counter.saturating_add(value);
         state.observe_descriptor(&key, MetricKind::Counter, &labels);
@@ -215,8 +356,13 @@ impl MetricsRegistry {
 
     /// Set a labeled gauge value.
     pub fn set_gauge_with_labels(&self, key: impl Into<String>, value: i64, labels: MetricLabels) {
+        let MetricsRegistryInner::Enabled(inner) = &self.inner else {
+            return;
+        };
         let key = key.into();
-        let mut state = self.inner.lock().expect("metrics registry lock poisoned");
+        let Ok(mut state) = inner.lock() else {
+            return;
+        };
         state.gauges.insert(key.clone(), value);
         state.observe_descriptor(&key, MetricKind::Gauge, &labels);
         state.push_event(MetricEvent {
@@ -240,8 +386,13 @@ impl MetricsRegistry {
         value: u64,
         labels: MetricLabels,
     ) {
+        let MetricsRegistryInner::Enabled(inner) = &self.inner else {
+            return;
+        };
         let key = key.into();
-        let mut state = self.inner.lock().expect("metrics registry lock poisoned");
+        let Ok(mut state) = inner.lock() else {
+            return;
+        };
         state
             .histograms
             .entry(key.clone())
@@ -259,8 +410,13 @@ impl MetricsRegistry {
 
     /// Record a labeled timeline event.
     pub fn record_event(&self, key: impl Into<String>, value: i64, labels: MetricLabels) {
+        let MetricsRegistryInner::Enabled(inner) = &self.inner else {
+            return;
+        };
         let key = key.into();
-        let mut state = self.inner.lock().expect("metrics registry lock poisoned");
+        let Ok(mut state) = inner.lock() else {
+            return;
+        };
         state.observe_descriptor(&key, MetricKind::Event, &labels);
         state.push_event(MetricEvent {
             unix_ms: current_unix_millis(),
@@ -280,14 +436,30 @@ impl MetricsRegistry {
     /// Return a point-in-time metrics snapshot.
     #[must_use]
     pub fn snapshot(&self) -> MetricsSnapshot {
-        let state = self.inner.lock().expect("metrics registry lock poisoned");
+        let MetricsRegistryInner::Enabled(inner) = &self.inner else {
+            return MetricsSnapshot::default();
+        };
+        let Ok(state) = inner.lock() else {
+            return MetricsSnapshot::default();
+        };
         state.snapshot()
     }
 
     /// Return a rich metrics report with aggregate snapshots and recent events.
     #[must_use]
     pub fn report(&self) -> MetricsReport {
-        let state = self.inner.lock().expect("metrics registry lock poisoned");
+        let MetricsRegistryInner::Enabled(inner) = &self.inner else {
+            return MetricsReport {
+                generated_at_unix_ms: current_unix_millis(),
+                ..MetricsReport::default()
+            };
+        };
+        let Ok(state) = inner.lock() else {
+            return MetricsReport {
+                generated_at_unix_ms: current_unix_millis(),
+                ..MetricsReport::default()
+            };
+        };
         MetricsReport {
             generated_at_unix_ms: current_unix_millis(),
             snapshot: state.snapshot(),
@@ -310,6 +482,66 @@ impl MetricsTimer {
     #[must_use]
     pub fn elapsed_ms(&self) -> u64 {
         u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+impl MetricsSpan {
+    /// Add a string-like label to this span.
+    #[must_use]
+    pub fn label(mut self, key: impl Into<String>, value: &impl ToString) -> Self {
+        self.labels.insert(key.into(), value.to_string());
+        self
+    }
+
+    /// Add many labels to this span.
+    #[must_use]
+    pub fn labels(mut self, labels: MetricLabels) -> Self {
+        self.labels.extend(labels);
+        self
+    }
+
+    /// Finish this span with the default `ok` outcome.
+    pub fn finish(mut self) {
+        self.finish_with_outcome(&"ok");
+    }
+
+    /// Finish this span with an `ok` outcome.
+    pub fn finish_ok(mut self) {
+        self.finish_with_outcome(&"ok");
+    }
+
+    /// Finish this span with an `error` outcome.
+    pub fn finish_err(mut self) {
+        self.finish_with_outcome(&"error");
+    }
+
+    /// Finish this span with an outcome label.
+    pub fn finish_with_outcome(&mut self, outcome: &impl ToString) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let mut labels = self.labels.clone();
+        labels.insert("outcome".to_owned(), outcome.to_string());
+        self.metrics
+            .increment_counter_with_name_and_labels(format!("{}.total", self.name), labels.clone());
+        self.metrics.record_histogram_with_labels(
+            format!("{}.duration_ms", self.name),
+            u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            labels,
+        );
+    }
+}
+
+impl Drop for MetricsSpan {
+    fn drop(&mut self) {
+        self.finish_with_outcome(&"ok");
+    }
+}
+
+impl MetricsRegistry {
+    fn increment_counter_with_name_and_labels(&self, key: String, labels: MetricLabels) {
+        self.add_counter_with_labels(key, 1, labels);
     }
 }
 
@@ -345,8 +577,8 @@ impl MetricsState {
     }
 
     fn push_event(&mut self, event: MetricEvent) {
-        if let Some(path) = &self.event_log_path {
-            append_event(path, &event);
+        if let Some(log) = &self.event_log {
+            log.append_event(&event);
         }
         self.events.push(event);
         let max_events = if self.max_events == 0 {
@@ -361,10 +593,152 @@ impl MetricsState {
     }
 
     fn report_events(&self) -> Vec<MetricEvent> {
-        self.event_log_path.as_ref().map_or_else(
+        self.event_log.as_ref().map_or_else(
             || self.events.clone(),
-            |path| read_recent_events(path, self.max_events.max(DEFAULT_MAX_EVENTS)),
+            |log| log.read_recent_events(self.max_events.max(DEFAULT_MAX_EVENTS)),
         )
+    }
+}
+
+impl MetricsEventLog {
+    fn new(root_dir: PathBuf, config: MetricsEventLogConfig) -> Self {
+        Self {
+            manifest_path: root_dir.join(METRICS_MANIFEST_FILE_NAME),
+            root_dir,
+            config,
+        }
+    }
+
+    fn append_event(&self, event: &MetricEvent) {
+        let _ = self.try_append_event(event);
+    }
+
+    fn try_append_event(&self, event: &MetricEvent) -> std::io::Result<()> {
+        fs::create_dir_all(&self.root_dir)?;
+        let now_ms = current_unix_millis();
+        let mut manifest = self.load_or_initialize_manifest(now_ms);
+        let line = serde_json::to_string(event).unwrap_or_default();
+        let line_bytes = u64::try_from(line.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let active_path = self.root_dir.join(&manifest.active_segment);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&active_path)?;
+        writeln!(file, "{line}")?;
+        let active_bytes = fs::metadata(&active_path).map_or(line_bytes, |metadata| metadata.len());
+        if let Some(segment) = manifest
+            .segments
+            .iter_mut()
+            .find(|segment| segment.name == manifest.active_segment)
+        {
+            segment.event_count = segment.event_count.saturating_add(1);
+            segment.bytes = active_bytes;
+        }
+        manifest.event_count = manifest.event_count.saturating_add(1);
+        manifest.updated_unix_ms = now_ms;
+        manifest.total_segment_bytes = compute_total_segment_bytes(&self.root_dir, &manifest);
+        if active_bytes >= self.config.segment_max_bytes.max(1) {
+            self.rotate_manifest(&mut manifest, now_ms);
+        }
+        self.prune_closed_segments(&mut manifest)?;
+        manifest.total_segment_bytes = compute_total_segment_bytes(&self.root_dir, &manifest);
+        write_json_pretty(&self.manifest_path, &manifest)
+    }
+
+    fn read_recent_events(&self, max_events: usize) -> Vec<MetricEvent> {
+        let Some(manifest) = self.load_manifest() else {
+            return Vec::new();
+        };
+        let mut segment_batches = Vec::new();
+        let mut bytes_read = 0_u64;
+        for segment in manifest.segments.iter().rev() {
+            if bytes_read >= self.config.recent_read_max_bytes {
+                break;
+            }
+            let path = self.root_dir.join(&segment.name);
+            let Ok(metadata) = fs::metadata(&path) else {
+                continue;
+            };
+            let remaining_bytes = self.config.recent_read_max_bytes.saturating_sub(bytes_read);
+            let read_limit = metadata.len().min(remaining_bytes);
+            bytes_read = bytes_read.saturating_add(read_limit);
+            segment_batches.push(read_jsonl_events_tail(&path, read_limit));
+            if segment_batches.iter().map(Vec::len).sum::<usize>() >= max_events {
+                break;
+            }
+        }
+        let mut events = Vec::new();
+        for mut segment_events in segment_batches.into_iter().rev() {
+            events.append(&mut segment_events);
+        }
+        if events.len() > max_events {
+            let excess = events.len() - max_events;
+            events.drain(0..excess);
+        }
+        events
+    }
+
+    fn load_or_initialize_manifest(&self, now_ms: u64) -> MetricsEventLogManifest {
+        self.load_manifest()
+            .filter(|manifest| manifest.schema_version == METRICS_EVENT_LOG_SCHEMA_VERSION)
+            .unwrap_or_else(|| initial_manifest(now_ms))
+    }
+
+    fn load_manifest(&self) -> Option<MetricsEventLogManifest> {
+        fs::read(&self.manifest_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    }
+
+    fn rotate_manifest(&self, manifest: &mut MetricsEventLogManifest, now_ms: u64) {
+        if let Some(active) = manifest
+            .segments
+            .iter_mut()
+            .find(|segment| segment.name == manifest.active_segment)
+        {
+            active.ended_unix_ms = Some(now_ms);
+        }
+        let next_index = next_segment_index(&manifest.segments);
+        let segment_name = format!("events_{next_index}.jsonl");
+        manifest.active_segment.clone_from(&segment_name);
+        manifest.segments.push(MetricsEventLogSegment {
+            name: segment_name,
+            started_unix_ms: now_ms,
+            ended_unix_ms: None,
+            event_count: 0,
+            bytes: 0,
+        });
+        let _ = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root_dir.join(&manifest.active_segment));
+    }
+
+    fn prune_closed_segments(&self, manifest: &mut MetricsEventLogManifest) -> std::io::Result<()> {
+        let max_bytes = self
+            .config
+            .total_max_bytes
+            .max(self.config.segment_max_bytes.max(1));
+        while manifest.total_segment_bytes > max_bytes {
+            let Some(index) = manifest
+                .segments
+                .iter()
+                .position(|segment| segment.ended_unix_ms.is_some())
+            else {
+                break;
+            };
+            let segment = manifest.segments.remove(index);
+            let path = self.root_dir.join(&segment.name);
+            if let Err(error) = fs::remove_file(&path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(error);
+            }
+            manifest.total_segment_bytes = compute_total_segment_bytes(&self.root_dir, manifest);
+        }
+        Ok(())
     }
 }
 
@@ -399,34 +773,90 @@ impl Histogram {
     }
 }
 
-fn append_event(path: &Path, event: &MetricEvent) {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+fn metrics_event_log_root(path: &Path) -> PathBuf {
+    if path.extension().is_some() {
+        path.parent()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+    } else {
+        path.to_path_buf()
     }
-    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
-        return;
-    };
-    let Ok(line) = serde_json::to_string(event) else {
-        return;
-    };
-    let _ = writeln!(file, "{line}");
 }
 
-fn read_recent_events(path: &Path, max_events: usize) -> Vec<MetricEvent> {
-    let Ok(file) = fs::File::open(path) else {
+fn initial_manifest(now_ms: u64) -> MetricsEventLogManifest {
+    let active_segment = "events_0.jsonl".to_owned();
+    MetricsEventLogManifest {
+        schema_version: METRICS_EVENT_LOG_SCHEMA_VERSION,
+        active_segment: active_segment.clone(),
+        segments: vec![MetricsEventLogSegment {
+            name: active_segment,
+            started_unix_ms: now_ms,
+            ended_unix_ms: None,
+            event_count: 0,
+            bytes: 0,
+        }],
+        event_count: 0,
+        total_segment_bytes: 0,
+        started_unix_ms: now_ms,
+        updated_unix_ms: now_ms,
+    }
+}
+
+fn next_segment_index(segments: &[MetricsEventLogSegment]) -> u64 {
+    segments
+        .iter()
+        .filter_map(|segment| {
+            segment
+                .name
+                .strip_prefix("events_")
+                .and_then(|name| name.strip_suffix(".jsonl"))
+                .and_then(|index| index.parse::<u64>().ok())
+        })
+        .max()
+        .map_or(0, |index| index.saturating_add(1))
+}
+
+fn compute_total_segment_bytes(root_dir: &Path, manifest: &MetricsEventLogManifest) -> u64 {
+    manifest
+        .segments
+        .iter()
+        .map(|segment| {
+            fs::metadata(root_dir.join(&segment.name)).map_or(segment.bytes, |m| m.len())
+        })
+        .sum()
+}
+
+fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temp_path = path.with_extension("json.tmp");
+    fs::write(&temp_path, serde_json::to_vec_pretty(value)?)?;
+    fs::rename(temp_path, path)
+}
+
+fn read_jsonl_events_tail(path: &Path, max_bytes: u64) -> Vec<MetricEvent> {
+    let Ok(mut file) = fs::File::open(path) else {
         return Vec::new();
     };
-    let mut events = Vec::new();
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        if let Ok(event) = serde_json::from_str::<MetricEvent>(&line) {
-            events.push(event);
-        }
-        if events.len() > max_events {
-            let excess = events.len() - max_events;
-            events.drain(0..excess);
-        }
+    let Ok(file_len) = file.seek(SeekFrom::End(0)) else {
+        return Vec::new();
+    };
+    let start = file_len.saturating_sub(max_bytes);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
     }
-    events
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return Vec::new();
+    }
+    let mut lines = BufReader::new(bytes.as_slice()).lines();
+    if start > 0 {
+        let _ = lines.next();
+    }
+    lines
+        .map_while(Result::ok)
+        .filter_map(|line| serde_json::from_str::<MetricEvent>(&line).ok())
+        .collect()
 }
 
 fn infer_unit(key: &str) -> Option<String> {
@@ -444,6 +874,17 @@ fn current_unix_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_registry_is_empty_and_noops() {
+        let metrics = MetricsRegistry::disabled();
+        metrics.increment_counter("counter");
+        metrics.record_histogram("latency_ms", 5);
+
+        assert!(!metrics.is_enabled());
+        assert_eq!(metrics.snapshot(), MetricsSnapshot::default());
+        assert!(metrics.report().events.is_empty());
+    }
 
     #[test]
     fn snapshot_includes_counters_and_histograms() {
@@ -486,5 +927,80 @@ mod tests {
             report.descriptors["session.event"].label_keys,
             vec!["session_id".to_owned()]
         );
+    }
+
+    #[test]
+    fn span_records_duration_and_count() {
+        let metrics = MetricsRegistry::default();
+        {
+            let _span = metrics.span("test.span").label("kind", &"unit");
+        }
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.counters.get("test.span.total"), Some(&1));
+        assert!(snapshot.histograms.contains_key("test.span.duration_ms"));
+    }
+
+    #[test]
+    fn segmented_event_log_rotates_and_reports_chronologically() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let metrics = MetricsRegistry::with_event_log_config(
+            dir.path().join("events.jsonl"),
+            MetricsEventLogConfig {
+                segment_max_bytes: 256,
+                total_max_bytes: 16 * 1024,
+                recent_read_max_bytes: 4096,
+            },
+        );
+
+        for index in 0..20 {
+            let mut labels = MetricLabels::new();
+            labels.insert("index".to_owned(), index.to_string());
+            metrics.record_event("test.event", index, labels);
+        }
+
+        let manifest_path = dir.path().join(METRICS_MANIFEST_FILE_NAME);
+        let manifest: MetricsEventLogManifest =
+            serde_json::from_slice(&fs::read(manifest_path).expect("manifest should exist"))
+                .expect("manifest should parse");
+        assert!(manifest.segments.len() > 1);
+        assert!(manifest.active_segment.starts_with("events_"));
+
+        let report = metrics.report();
+        assert_eq!(report.events.len(), 20);
+        let values: Vec<i64> = report.events.iter().map(|event| event.value).collect();
+        assert_eq!(values, (0..20).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn segmented_event_log_prunes_closed_segments_but_keeps_active() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let metrics = MetricsRegistry::with_event_log_config(
+            dir.path().join("events.jsonl"),
+            MetricsEventLogConfig {
+                segment_max_bytes: 180,
+                total_max_bytes: 360,
+                recent_read_max_bytes: 4096,
+            },
+        );
+
+        for index in 0..30 {
+            metrics.record_event("test.event", index, MetricLabels::new());
+        }
+
+        let manifest: MetricsEventLogManifest = serde_json::from_slice(
+            &fs::read(dir.path().join(METRICS_MANIFEST_FILE_NAME)).expect("manifest should exist"),
+        )
+        .expect("manifest should parse");
+        assert!(!manifest.segments.is_empty());
+        assert!(
+            manifest
+                .segments
+                .iter()
+                .any(|segment| segment.name == manifest.active_segment
+                    && segment.ended_unix_ms.is_none())
+        );
+        assert!(dir.path().join(&manifest.active_segment).exists());
+        assert!(manifest.total_segment_bytes <= 360 || manifest.segments.len() == 1);
     }
 }

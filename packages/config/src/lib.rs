@@ -222,6 +222,8 @@ pub struct BcodeConfig {
     #[serde(default)]
     pub observability: ObservabilityConfig,
     #[serde(default)]
+    pub metrics: MetricsConfig,
+    #[serde(default)]
     pub skills: SkillsConfig,
     #[serde(default)]
     pub system_prompt: SystemPromptConfig,
@@ -248,6 +250,7 @@ impl Default for BcodeConfig {
             agent: BTreeMap::new(),
             auth: AuthConfig::default(),
             observability: ObservabilityConfig::default(),
+            metrics: MetricsConfig::default(),
             skills: SkillsConfig::default(),
             system_prompt: SystemPromptConfig::default(),
             tui: TuiConfig::default(),
@@ -1370,6 +1373,59 @@ pub enum ObservabilityLevel {
 
 const fn default_max_trace_blob_bytes() -> usize {
     10 * 1024 * 1024
+}
+
+const fn default_metrics_segment_max_bytes() -> u64 {
+    8 * 1024 * 1024
+}
+
+const fn default_metrics_total_max_bytes() -> u64 {
+    128 * 1024 * 1024
+}
+
+const fn default_metrics_recent_read_max_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+
+const fn default_metrics_max_recent_events() -> usize {
+    10_000
+}
+
+/// Runtime metrics configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "metrics")]
+pub struct MetricsConfig {
+    /// Whether runtime metrics collection is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Whether metric timeline events are persisted to segmented JSONL files.
+    #[serde(default)]
+    pub persist_events: bool,
+    /// Maximum bytes per metrics event segment before rotation.
+    #[serde(default = "default_metrics_segment_max_bytes")]
+    pub segment_max_bytes: u64,
+    /// Maximum total bytes retained across metrics event segments.
+    #[serde(default = "default_metrics_total_max_bytes")]
+    pub total_max_bytes: u64,
+    /// Maximum bytes read while building recent metrics reports.
+    #[serde(default = "default_metrics_recent_read_max_bytes")]
+    pub recent_read_max_bytes: u64,
+    /// Maximum recent metric events returned in reports.
+    #[serde(default = "default_metrics_max_recent_events")]
+    pub max_recent_events: usize,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            persist_events: false,
+            segment_max_bytes: default_metrics_segment_max_bytes(),
+            total_max_bytes: default_metrics_total_max_bytes(),
+            recent_read_max_bytes: default_metrics_recent_read_max_bytes(),
+            max_recent_events: default_metrics_max_recent_events(),
+        }
+    }
 }
 
 /// Session import configuration.

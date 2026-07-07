@@ -27,7 +27,7 @@ use bcode_ipc::{
     SessionCatalogStatus, WorktreeCreateRequest, WorktreeListRequest, WorktreeRemoveRequest,
     decode_request, event_envelope, recv_envelope, response_envelope, send_envelope,
 };
-use bcode_metrics::{MetricLabels, MetricsRegistry};
+use bcode_metrics::{MetricLabels, MetricsEventLogConfig, MetricsRegistry};
 use bcode_model::{
     CancelTurnRequest, ContentBlock, FinishTurnRequest, ImageMetadata as ModelImageMetadata,
     ImageRefContent, MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelList, ModelMessage,
@@ -1582,11 +1582,25 @@ pub async fn run_with_static_bundled(
     let daemon_status = daemon_status_from_record(&daemon_record);
     tracing::debug!(target: "bcode_server::startup", "IPC endpoint bound");
     tracing::debug!(target: "bcode_server::startup", "initializing lazy session services");
-    let metrics = MetricsRegistry::with_event_log(
-        bcode_config::default_state_dir()
-            .join("metrics")
-            .join("events.jsonl"),
-    );
+    let metrics = if config.metrics.enabled {
+        if config.metrics.persist_events {
+            MetricsRegistry::with_event_log_config(
+                bcode_config::default_state_dir()
+                    .join("metrics")
+                    .join("events.jsonl"),
+                MetricsEventLogConfig {
+                    segment_max_bytes: config.metrics.segment_max_bytes,
+                    total_max_bytes: config.metrics.total_max_bytes,
+                    recent_read_max_bytes: config.metrics.recent_read_max_bytes,
+                },
+            )
+            .with_max_events(config.metrics.max_recent_events)
+        } else {
+            MetricsRegistry::in_memory().with_max_events(config.metrics.max_recent_events)
+        }
+    } else {
+        MetricsRegistry::disabled()
+    };
     let sessions = SessionManager::persistent_lazy_with_metrics_and_lease_owner(
         default_session_store_dir(),
         metrics.clone(),
@@ -9574,14 +9588,14 @@ async fn run_model_turn(
     append_model_turn_started_event(state, session_id, turn_id.clone()).await;
     set_runtime_phase(phase, SessionRuntimePhase::ProviderActive).await;
     service_runtime_priority_commands(state, session_id, command_context).await;
-    let completion = run_model_turn_inner(
+    let completion = Box::pin(run_model_turn_inner(
         state,
         session_id,
         trigger_event,
         runtime_context,
         Arc::clone(&cancel_state),
         command_context,
-    )
+    ))
     .await;
     service_runtime_priority_commands(state, session_id, command_context).await;
     set_runtime_phase(phase, SessionRuntimePhase::FinishingTurn).await;
@@ -13006,7 +13020,7 @@ async fn execute_model_tool(
         call.id.clone(),
         call.name.clone(),
         serde_json::to_string(&call.arguments).unwrap_or_default(),
-        producer_plugin_id,
+        producer_plugin_id.clone(),
     )
     .await;
     if cancel_state.is_cancelled() {
@@ -13032,6 +13046,16 @@ async fn execute_model_tool(
         .await;
         return;
     }
+    let tool_labels = tool_invocation_metric_labels(
+        session_id,
+        &call.id,
+        &call.name,
+        producer_plugin_id.as_deref(),
+    );
+    let tool_span = state
+        .metrics
+        .span("tool.invocation")
+        .labels(tool_labels.clone());
     let tool_start = Instant::now();
     let result = invoke_model_tool(
         state,
@@ -13051,6 +13075,22 @@ async fn execute_model_tool(
     });
     let semantic_result = result.result.clone().map(service_tool_result_to_session);
     let artifact_output = result.full_output.as_deref().unwrap_or(&result.output);
+    let output_bytes = artifact_output.len();
+    state.metrics.record_histogram_with_labels(
+        "tool.invocation.output_bytes",
+        usize_to_u64(output_bytes),
+        tool_labels.clone(),
+    );
+    if result.is_error {
+        state.metrics.add_counter_with_labels(
+            "tool.invocation.errors_total",
+            1,
+            tool_labels.clone(),
+        );
+        tool_span.finish_err();
+    } else {
+        tool_span.finish_ok();
+    }
     let output_blob = (state.observability.persist_tool_io || state.observability.debug_enabled())
         .then(|| {
             state.trace_store.write_text_blob(
@@ -13070,7 +13110,7 @@ async fn execute_model_tool(
             tool_call_id: call.id.clone(),
             duration_ms: elapsed_ms(tool_start),
             is_error: result.is_error,
-            output_bytes: artifact_output.len(),
+            output_bytes,
             output: output_blob.clone(),
         },
     )
@@ -13088,6 +13128,22 @@ async fn execute_model_tool(
         },
     )
     .await;
+}
+
+fn tool_invocation_metric_labels(
+    session_id: SessionId,
+    tool_call_id: &str,
+    tool_name: &str,
+    plugin_id: Option<&str>,
+) -> MetricLabels {
+    let mut labels = MetricLabels::new();
+    labels.insert("session_id".to_owned(), session_id.to_string());
+    labels.insert("tool_call_id".to_owned(), tool_call_id.to_owned());
+    labels.insert("tool_name".to_owned(), tool_name.to_owned());
+    if let Some(plugin_id) = plugin_id {
+        labels.insert("plugin_id".to_owned(), plugin_id.to_owned());
+    }
+    labels
 }
 
 #[allow(clippy::too_many_lines)]
