@@ -2408,6 +2408,7 @@ mod tests {
                 side_effect: bcode_model::ToolSideEffect::default(),
                 requires_permission: false,
             }],
+            structured_output: None,
             parameters: bcode_model::ModelParameters::default(),
             prompt_cache: bcode_model::PromptCacheHints {
                 mode: bcode_model::PromptCacheMode::Auto,

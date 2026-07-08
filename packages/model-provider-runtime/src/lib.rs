@@ -640,6 +640,7 @@ where
             }],
         }],
         tools: Vec::new(),
+        structured_output: None,
         parameters: request.parameters,
         prompt_cache: bcode_model::PromptCacheHints::default(),
         conversation_reuse: bcode_model::ConversationReuseHints::default(),

@@ -1001,6 +1001,18 @@ pub struct NativeWebSearchResult {
     pub source: Option<String>,
 }
 
+/// Provider-neutral structured output request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructuredOutputRequest {
+    /// Human-readable output object name.
+    pub name: String,
+    /// JSON schema the provider should satisfy.
+    pub schema: serde_json::Value,
+    /// Whether provider-native strict schema validation should be requested where supported.
+    #[serde(default)]
+    pub strict: bool,
+}
+
 /// Start a provider model turn.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelTurnRequest {
@@ -1017,6 +1029,8 @@ pub struct ModelTurnRequest {
     pub tools: Vec<ToolDefinition>,
     #[serde(default)]
     pub parameters: ModelParameters,
+    #[serde(default)]
+    pub structured_output: Option<StructuredOutputRequest>,
     #[serde(default)]
     pub prompt_cache: PromptCacheHints,
     #[serde(default)]

@@ -22,6 +22,7 @@ use bcode_model::{
 use bcode_model::{ModelParameters, ProviderRequestContext};
 use bcode_session_models::SessionId;
 use bcode_tool::{ToolDefinition, ToolInvocationRequest, ToolInvocationResponse};
+use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
@@ -59,9 +60,76 @@ pub enum BcodeError {
     /// Hook callback failed.
     #[error("hook error: {0}")]
     Hook(String),
+    /// Structured output was invalid or could not be decoded.
+    #[error("structured output error: {0}")]
+    StructuredOutput(String),
     /// Tool execution failed.
     #[error("tool execution error: {0}")]
     ToolExecution(String),
+}
+
+/// Structured-output generation options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredOutputOptions {
+    /// Human-readable object/schema name sent to providers that support native structured output.
+    pub name: String,
+    /// JSON schema used for provider-native structured output and local validation.
+    pub schema: serde_json::Value,
+    /// Request strict provider-native schema validation where supported.
+    pub strict: bool,
+    /// Maximum invalid-output repair attempts after the initial provider response.
+    pub max_repairs: u32,
+}
+
+impl StructuredOutputOptions {
+    /// Build options from a Rust type implementing [`schemars::JsonSchema`].
+    ///
+    /// # Panics
+    ///
+    /// Panics only if schemars emits a schema value that cannot be serialized to JSON.
+    #[must_use]
+    pub fn for_type<T>() -> Self
+    where
+        T: schemars::JsonSchema,
+    {
+        let schema = schemars::schema_for!(T);
+        Self {
+            name: std::any::type_name::<T>()
+                .rsplit("::")
+                .next()
+                .unwrap_or("StructuredOutput")
+                .to_string(),
+            schema: serde_json::to_value(schema)
+                .expect("schemars schema should serialize to JSON value"),
+            strict: true,
+            max_repairs: 0,
+        }
+    }
+
+    /// Build options from an explicit JSON schema.
+    #[must_use]
+    pub fn json_schema(name: impl Into<String>, schema: serde_json::Value) -> Self {
+        Self {
+            name: name.into(),
+            schema,
+            strict: true,
+            max_repairs: 0,
+        }
+    }
+
+    /// Configure whether strict provider-native schema validation should be requested.
+    #[must_use]
+    pub const fn with_strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
+    }
+
+    /// Configure invalid-output repair attempts.
+    #[must_use]
+    pub const fn with_max_repairs(mut self, max_repairs: u32) -> Self {
+        self.max_repairs = max_repairs;
+        self
+    }
 }
 
 /// Context supplied to model-call hooks.
@@ -211,6 +279,79 @@ type InlineToolHandler = Arc<
         + Send
         + Sync,
 >;
+
+fn structured_prompt(prompt: &str, options: &StructuredOutputOptions) -> String {
+    format!(
+        "{prompt}\n\nReturn only a JSON object that matches this JSON Schema. Do not wrap it in Markdown fences or include explanatory text.\nSchema name: {name}\nSchema:\n{schema}",
+        name = options.name,
+        schema = options.schema
+    )
+}
+
+fn repair_prompt(
+    original_prompt: &str,
+    options: &StructuredOutputOptions,
+    invalid_output: &str,
+    error: &BcodeError,
+) -> String {
+    format!(
+        "{base}\n\nThe previous response was invalid. Error: {error}\nPrevious response:\n{invalid_output}\n\nReturn a corrected JSON object only.",
+        base = structured_prompt(original_prompt, options),
+    )
+}
+
+fn decode_structured_output<T>(schema: &serde_json::Value, text: &str) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let value = extract_structured_json(text)?;
+    validate_json_schema(schema, &value)?;
+    serde_json::from_value(value).map_err(|error| {
+        BcodeError::StructuredOutput(format!("failed to deserialize structured output: {error}"))
+    })
+}
+
+fn extract_structured_json(text: &str) -> Result<serde_json::Value> {
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let Some(slice) = json_object_slice(text) else {
+                return Err(BcodeError::StructuredOutput(format!(
+                    "model output was not valid JSON: {error}; output: {text}"
+                )));
+            };
+            serde_json::from_str(slice).map_err(|slice_error| {
+                BcodeError::StructuredOutput(format!(
+                    "failed to parse JSON object from model output: {slice_error}; output: {text}"
+                ))
+            })
+        }
+    }
+}
+
+fn json_object_slice(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    (start <= end).then_some(&text[start..=end])
+}
+
+fn validate_json_schema(schema: &serde_json::Value, value: &serde_json::Value) -> Result<()> {
+    let validator = jsonschema::validator_for(schema).map_err(|error| {
+        BcodeError::StructuredOutput(format!("invalid structured-output JSON schema: {error}"))
+    })?;
+    if validator.is_valid(value) {
+        Ok(())
+    } else {
+        let errors = validator
+            .iter_errors(value)
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(BcodeError::StructuredOutput(format!(
+            "structured output failed JSON schema validation: {errors}"
+        )))
+    }
+}
 
 #[derive(Clone)]
 struct InlineToolExecutor {
@@ -639,12 +780,114 @@ impl Agent {
     where
         P: ModelProviderInvoker,
     {
+        self.generate_text_with_provider_with_structured_output(provider, prompt, None)
+            .await
+    }
+
+    /// Generate and deserialize a structured object using the agent's embedded provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no embedded provider is configured, provider invocation fails,
+    /// structured JSON cannot be extracted, schema validation fails, or deserialization fails.
+    #[cfg(feature = "embedded-plugins")]
+    pub async fn generate_object<T>(&self, prompt: impl Into<String>) -> Result<T>
+    where
+        T: DeserializeOwned + schemars::JsonSchema,
+    {
+        let mut provider = self.provider.clone().ok_or(BcodeError::MissingProvider)?;
+        self.generate_object_with_provider(&mut provider, prompt)
+            .await
+    }
+
+    /// Generate and deserialize a structured object using a caller-supplied provider invoker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when provider invocation fails, structured JSON cannot be extracted,
+    /// schema validation fails, or deserialization fails.
+    pub async fn generate_object_with_provider<T, P>(
+        &self,
+        provider: &mut P,
+        prompt: impl Into<String>,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned + schemars::JsonSchema,
+        P: ModelProviderInvoker,
+    {
+        self.generate_object_with_provider_and_options(
+            provider,
+            prompt,
+            StructuredOutputOptions::for_type::<T>(),
+        )
+        .await
+    }
+
+    /// Generate and deserialize a structured object using explicit structured-output options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when provider invocation fails, structured JSON cannot be extracted,
+    /// schema validation fails, or deserialization fails.
+    pub async fn generate_object_with_provider_and_options<T, P>(
+        &self,
+        provider: &mut P,
+        prompt: impl Into<String>,
+        options: StructuredOutputOptions,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+        P: ModelProviderInvoker,
+    {
+        let prompt = prompt.into();
+        let schema = options.schema.clone();
+        let structured_output = bcode_model::StructuredOutputRequest {
+            name: options.name.clone(),
+            schema: schema.clone(),
+            strict: options.strict,
+        };
+        let mut current_prompt = structured_prompt(&prompt, &options);
+        let mut last_error = None;
+        for attempt in 0..=options.max_repairs {
+            let response = self
+                .generate_text_with_provider_with_structured_output(
+                    provider,
+                    current_prompt.clone(),
+                    Some(structured_output.clone()),
+                )
+                .await?;
+            match decode_structured_output(&schema, &response.text) {
+                Ok(value) => return Ok(value),
+                Err(error) if attempt < options.max_repairs => {
+                    current_prompt = repair_prompt(&prompt, &options, &response.text, &error);
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            BcodeError::StructuredOutput("structured output repair loop did not run".to_string())
+        }))
+    }
+
+    async fn generate_text_with_provider_with_structured_output<P>(
+        &self,
+        provider: &mut P,
+        prompt: impl Into<String>,
+        structured_output: Option<bcode_model::StructuredOutputRequest>,
+    ) -> Result<GenerateTextResponse>
+    where
+        P: ModelProviderInvoker,
+    {
         let prompt = prompt.into();
         let context = self.model_call_context(prompt.clone());
         self.hooks.run_before_model(&context)?;
         let response = self
             .runtime
-            .run_text_turn(provider, self.turn_request(prompt))
+            .run_text_turn(
+                provider,
+                self.turn_request_with_structured_output(prompt, structured_output),
+            )
             .await?;
         let response = GenerateTextResponse::from(response);
         self.hooks.run_after_model(
@@ -667,9 +910,10 @@ impl Agent {
     #[cfg(feature = "embedded-plugins")]
     pub fn stream_text(&self, prompt: impl Into<String>) -> Result<AgentStream> {
         let provider = self.provider.clone().ok_or(BcodeError::MissingProvider)?;
-        Ok(self
-            .runtime
-            .run_streaming_text_turn(provider, self.turn_request(prompt.into())))
+        Ok(self.runtime.run_streaming_text_turn(
+            provider,
+            self.turn_request_with_structured_output(prompt.into(), None),
+        ))
     }
 
     /// Stream text using the agent's configured embedded provider and cancellation token.
@@ -837,8 +1081,14 @@ impl Agent {
         }
     }
 
-    fn turn_request(&self, prompt: String) -> AgentTurnRequest {
-        self.turn_request_with_cancellation(prompt, CancellationToken::new())
+    fn turn_request_with_structured_output(
+        &self,
+        prompt: String,
+        structured_output: Option<bcode_model::StructuredOutputRequest>,
+    ) -> AgentTurnRequest {
+        let mut request = self.turn_request_with_cancellation(prompt, CancellationToken::new());
+        request.structured_output = structured_output;
+        request
     }
 
     fn turn_request_with_cancellation(
@@ -853,6 +1103,7 @@ impl Agent {
             system_prompt: self.system_prompt.clone(),
             prompt,
             tools: self.enabled_tool_definitions(),
+            structured_output: None,
             parameters: self.parameters.clone(),
             metadata: self.metadata.clone(),
             timeout: self.timeout,

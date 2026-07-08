@@ -125,6 +125,8 @@ pub struct AgentTurnRequest {
     pub prompt: String,
     /// Model-callable tool definitions available to the provider.
     pub tools: Vec<ToolDefinition>,
+    /// Provider-native structured output request.
+    pub structured_output: Option<bcode_model::StructuredOutputRequest>,
     /// Model parameters.
     pub parameters: ModelParameters,
     /// Host-defined metadata forwarded to the provider.
@@ -148,6 +150,7 @@ impl AgentTurnRequest {
             system_prompt: None,
             prompt: prompt.into(),
             tools: Vec::new(),
+            structured_output: None,
             parameters: ModelParameters::default(),
             metadata: BTreeMap::new(),
             timeout: Duration::from_mins(2),
@@ -998,6 +1001,7 @@ fn model_turn_request(request: &AgentTurnRequest) -> ModelTurnRequest {
             .map(model_tool_definition)
             .collect(),
         parameters: request.parameters.clone(),
+        structured_output: request.structured_output.clone(),
         prompt_cache: bcode_model::PromptCacheHints::default(),
         conversation_reuse: bcode_model::ConversationReuseHints::default(),
         metadata: request.metadata.clone(),

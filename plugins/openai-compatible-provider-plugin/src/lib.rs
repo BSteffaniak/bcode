@@ -583,6 +583,8 @@ struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ChatTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<ChatResponseFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
@@ -592,6 +594,20 @@ struct ChatCompletionRequest {
     stop: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatResponseFormat {
+    r#type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    json_schema: Option<ChatResponseJsonSchema>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatResponseJsonSchema {
+    name: String,
+    schema: serde_json::Value,
+    strict: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -643,7 +659,17 @@ struct ResponsesReasoningOptions {
 
 #[derive(Debug, Serialize)]
 struct ResponsesTextOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<ResponsesTextFormat>,
     verbosity: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesTextFormat {
+    r#type: &'static str,
+    name: String,
+    schema: serde_json::Value,
+    strict: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2591,6 +2617,7 @@ fn verification_turn_request(request: &bcode_model::VerifyModelRequest) -> Model
             }],
         }],
         tools: Vec::new(),
+        structured_output: None,
         parameters: bcode_model::ModelParameters {
             max_output_tokens: Some(16),
             ..bcode_model::ModelParameters::default()
@@ -2735,6 +2762,7 @@ async fn send_chat_completion_request(
             include_usage: true,
         }),
         tools: model_tools_to_chat_tools(request, settings.dialect)?,
+        response_format: chat_response_format(request),
         temperature: request.parameters.temperature,
         max_tokens: request.parameters.max_output_tokens,
         top_p: request.parameters.top_p,
@@ -3539,10 +3567,7 @@ fn build_responses_request(
             .uses_codex_request_shape()
             .then_some("auto"),
         parallel_tool_calls: settings.dialect.uses_codex_request_shape().then_some(true),
-        text: settings
-            .dialect
-            .uses_codex_request_shape()
-            .then_some(ResponsesTextOptions { verbosity: "low" }),
+        text: responses_text_options(settings, request),
         reasoning: responses_reasoning_options(settings, request),
         include: responses_include(settings.dialect.reasoning_request_shape(), request),
         prompt_cache_key: settings
@@ -3562,6 +3587,40 @@ fn build_responses_request(
     })?;
     merge_provider_request_options(&mut body, &request.provider_context.request)?;
     Ok(body)
+}
+
+fn chat_response_format(request: &ModelTurnRequest) -> Option<ChatResponseFormat> {
+    request
+        .structured_output
+        .as_ref()
+        .map(|structured| ChatResponseFormat {
+            r#type: "json_schema",
+            json_schema: Some(ChatResponseJsonSchema {
+                name: structured.name.clone(),
+                schema: structured.schema.clone(),
+                strict: structured.strict,
+            }),
+        })
+}
+
+fn responses_text_options(
+    settings: &Settings,
+    request: &ModelTurnRequest,
+) -> Option<ResponsesTextOptions> {
+    let format = request
+        .structured_output
+        .as_ref()
+        .map(|structured| ResponsesTextFormat {
+            r#type: "json_schema",
+            name: structured.name.clone(),
+            schema: structured.schema.clone(),
+            strict: structured.strict,
+        });
+    let verbosity = settings.dialect.uses_codex_request_shape().then_some("low");
+    (format.is_some() || verbosity.is_some()).then_some(ResponsesTextOptions {
+        format,
+        verbosity: verbosity.unwrap_or("low"),
+    })
 }
 
 fn responses_reasoning_options(
@@ -6556,6 +6615,7 @@ mod tests {
             system_prompt: None,
             messages,
             tools: Vec::new(),
+            structured_output: None,
             parameters: bcode_model::ModelParameters::default(),
             prompt_cache: bcode_model::PromptCacheHints::default(),
             conversation_reuse: bcode_model::ConversationReuseHints::default(),
@@ -6858,6 +6918,7 @@ mod tests {
                 },
             ],
             tools: Vec::new(),
+            structured_output: None,
             parameters: bcode_model::ModelParameters::default(),
             prompt_cache: bcode_model::PromptCacheHints::default(),
             conversation_reuse: bcode_model::ConversationReuseHints::default(),
@@ -6905,6 +6966,7 @@ mod tests {
                 },
             ],
             tools: Vec::new(),
+            structured_output: None,
             parameters: bcode_model::ModelParameters::default(),
             prompt_cache: bcode_model::PromptCacheHints::default(),
             conversation_reuse: bcode_model::ConversationReuseHints {
@@ -7026,6 +7088,7 @@ mod tests {
                 },
             ],
             tools: Vec::new(),
+            structured_output: None,
             parameters: bcode_model::ModelParameters::default(),
             prompt_cache: bcode_model::PromptCacheHints::default(),
             conversation_reuse: bcode_model::ConversationReuseHints {
