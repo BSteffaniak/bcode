@@ -74,6 +74,10 @@ pub enum BcodeError {
     /// Tool execution failed.
     #[error("tool execution error: {0}")]
     ToolExecution(String),
+    /// Plugin loading or execution setup failed.
+    #[cfg(feature = "embedded-plugins")]
+    #[error("plugin error: {0}")]
+    Plugin(#[from] bcode_plugin::PluginLoadError),
 }
 
 /// Structured-output generation options.

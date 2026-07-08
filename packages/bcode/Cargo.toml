@@ -16,6 +16,10 @@ path              = "src/main.rs"
 required-features = ["app"]
 
 [[example]]
+name              = "embedded_fake_provider"
+required-features = ["embedded-plugins", "static-bundled-fake-provider-plugin"]
+
+[[example]]
 name              = "daemon_client"
 required-features = ["daemon-client"]
 
