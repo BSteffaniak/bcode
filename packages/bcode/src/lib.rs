@@ -10,8 +10,6 @@
 
 use bcode_agent_permissions::{PermissionAskCallback, ask_callback};
 use bcode_agent_policy::active_tools_for;
-#[cfg(feature = "embedded-plugins")]
-use bcode_agent_runtime::RuntimeFuture;
 use bcode_agent_runtime::{AgentRuntime, AgentTurnRequest, AgentTurnResponse};
 #[cfg(feature = "embedded-plugins")]
 use bcode_model::{
@@ -1010,6 +1008,7 @@ impl AgentSession {
     }
 }
 
+/// Configured agent facade for text generation, tools, streaming, hooks, and sessions.
 #[derive(Clone)]
 pub struct Agent {
     runtime: AgentRuntime,
