@@ -22,6 +22,7 @@ bcode_agent_profile = { workspace = true }
 bcode_agent_runtime = { workspace = true }
 bcode_bundled_plugins = { workspace = true, optional = true }
 bcode_cli = { workspace = true, optional = true }
+bcode_client = { workspace = true, optional = true }
 bcode_model = { workspace = true }
 bcode_plugin = { workspace = true, optional = true }
 bcode_session_models = { workspace = true }
@@ -63,6 +64,7 @@ bundled-ocr-tesseract-v5-5-2 = [
 ]
 bundled-plugins = ["dep:bcode_bundled_plugins"]
 cli = ["dep:bcode_cli", "dep:tokio"]
+daemon-client = ["dep:bcode_client"]
 default = []
 embedded-plugins = ["dep:bcode_plugin"]
 fail-on-warnings = []

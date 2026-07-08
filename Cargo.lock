@@ -1310,6 +1310,7 @@ dependencies = [
  "bcode_agent_runtime",
  "bcode_bundled_plugins",
  "bcode_cli",
+ "bcode_client",
  "bcode_model",
  "bcode_plugin",
  "bcode_session_models",

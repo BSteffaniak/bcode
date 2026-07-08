@@ -598,16 +598,6 @@ mod bundled {
         }
     }
 
-    fn link_cpp_runtime() {
-        if cfg!(target_os = "macos") || cfg!(target_os = "ios") {
-            println!("cargo:rustc-link-lib=c++");
-        } else if cfg!(target_env = "msvc") {
-            // MSVC links the C++ runtime through compiler defaults.
-        } else {
-            println!("cargo:rustc-link-lib=stdc++");
-        }
-    }
-
     fn download_and_extract(
         url: &str,
         expected_sha256: &str,
@@ -857,14 +847,6 @@ mod bundled {
 
     fn out_dir() -> PathBuf {
         PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"))
-    }
-
-    fn static_library_name(name: &str) -> String {
-        if cfg!(target_os = "windows") {
-            format!("{name}.lib")
-        } else {
-            format!("lib{name}.a")
-        }
     }
 
     fn single_child_dir(path: &Path) -> Option<PathBuf> {

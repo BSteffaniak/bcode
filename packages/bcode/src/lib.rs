@@ -40,6 +40,10 @@ pub use bcode_agent_runtime::{
     RuntimeFuture, RuntimePermissionContext, RuntimePermissionRequest, ToolCatalog,
     ToolExecutionOutput, ToolExecutor, ToolRoundState, ToolSource, UnifiedToolCatalog,
 };
+#[cfg(feature = "daemon-client")]
+pub use bcode_client::{
+    BcodeClient, ClientConnection, ClientError, DaemonAvailability, SessionList,
+};
 pub use bcode_model::{ContentBlock as ModelContentBlock, MessageRole, ModelMessage, ToolCall};
 
 /// Result alias for Bcode SDK operations.
@@ -596,6 +600,8 @@ pub enum BcodeMode {
 pub struct Bcode {
     mode: BcodeMode,
     runtime: AgentRuntime,
+    #[cfg(feature = "daemon-client")]
+    daemon_client: Option<BcodeClient>,
     #[cfg(feature = "embedded-plugins")]
     provider: Option<PluginModelProviderInvoker>,
     #[cfg(feature = "embedded-plugins")]
@@ -633,6 +639,13 @@ impl Bcode {
     pub const fn mode(&self) -> BcodeMode {
         self.mode
     }
+
+    /// Return the configured daemon client when daemon-client mode is enabled.
+    #[cfg(feature = "daemon-client")]
+    #[must_use]
+    pub const fn daemon_client(&self) -> Option<&BcodeClient> {
+        self.daemon_client.as_ref()
+    }
 }
 
 /// Builder for [`Bcode`].
@@ -640,6 +653,8 @@ impl Bcode {
 pub struct BcodeBuilder {
     mode: BcodeMode,
     runtime: AgentRuntime,
+    #[cfg(feature = "daemon-client")]
+    daemon_client: Option<BcodeClient>,
     #[cfg(feature = "embedded-plugins")]
     provider: Option<PluginModelProviderInvoker>,
     #[cfg(feature = "embedded-plugins")]
@@ -651,6 +666,8 @@ impl Default for BcodeBuilder {
         Self {
             mode: BcodeMode::Embedded,
             runtime: AgentRuntime::new(),
+            #[cfg(feature = "daemon-client")]
+            daemon_client: None,
             #[cfg(feature = "embedded-plugins")]
             provider: None,
             #[cfg(feature = "embedded-plugins")]
@@ -674,6 +691,22 @@ impl BcodeBuilder {
         self
     }
 
+    /// Configure a daemon-backed programmatic client path.
+    #[cfg(feature = "daemon-client")]
+    #[must_use]
+    pub fn daemon_client(mut self, client: BcodeClient) -> Self {
+        self.mode = BcodeMode::Daemon;
+        self.daemon_client = Some(client);
+        self
+    }
+
+    /// Configure the default local daemon-backed programmatic client path.
+    #[cfg(feature = "daemon-client")]
+    #[must_use]
+    pub fn default_daemon_client(self) -> Self {
+        self.daemon_client(BcodeClient::default_endpoint())
+    }
+
     /// Configure a plugin-backed embedded provider invoker.
     #[cfg(feature = "embedded-plugins")]
     #[must_use]
@@ -684,7 +717,7 @@ impl BcodeBuilder {
     }
 
     /// Build the SDK handle.
-    #[cfg(not(feature = "embedded-plugins"))]
+    #[cfg(all(not(feature = "embedded-plugins"), not(feature = "daemon-client")))]
     #[must_use]
     pub const fn build(self) -> Bcode {
         Bcode {
@@ -694,12 +727,42 @@ impl BcodeBuilder {
     }
 
     /// Build the SDK handle.
-    #[cfg(feature = "embedded-plugins")]
+    #[cfg(all(not(feature = "embedded-plugins"), feature = "daemon-client"))]
+    #[must_use]
+    pub fn build(self) -> Bcode {
+        let daemon_client = self
+            .daemon_client
+            .or_else(|| (self.mode == BcodeMode::Daemon).then(BcodeClient::default_endpoint));
+        Bcode {
+            mode: self.mode,
+            runtime: self.runtime,
+            daemon_client,
+        }
+    }
+
+    /// Build the SDK handle.
+    #[cfg(all(feature = "embedded-plugins", not(feature = "daemon-client")))]
     #[must_use]
     pub fn build(self) -> Bcode {
         Bcode {
             mode: self.mode,
             runtime: self.runtime,
+            provider: self.provider,
+            plugins: self.plugins,
+        }
+    }
+
+    /// Build the SDK handle.
+    #[cfg(all(feature = "embedded-plugins", feature = "daemon-client"))]
+    #[must_use]
+    pub fn build(self) -> Bcode {
+        let daemon_client = self
+            .daemon_client
+            .or_else(|| (self.mode == BcodeMode::Daemon).then(BcodeClient::default_endpoint));
+        Bcode {
+            mode: self.mode,
+            runtime: self.runtime,
+            daemon_client,
             provider: self.provider,
             plugins: self.plugins,
         }
