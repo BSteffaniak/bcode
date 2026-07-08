@@ -7,13 +7,14 @@
 use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_daemon_lifecycle::{DaemonStartError, EnsureDaemonOptions, ensure_daemon_running};
 use bcode_ipc::{
-    ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint,
-    LocalIpcStream, PermissionSummary, PluginContributions, PluginServiceResponse,
-    PluginServiceSummary, RalphApproveRequest, RalphCancelRequest, RalphCancelResponse,
-    RalphLifecycleRequest, RalphListIterationsRequest, RalphListIterationsResponse,
-    RalphListRunsRequest, RalphListRunsResponse, RalphResumeRequest, RalphResumeResponse,
-    RalphRunRequest, RalphRunResponse, RalphRunStatusRequest, RalphRunStatusResponse,
-    RalphStatusRequest, RalphStatusResponse, Request, Response, ResponsePayload, ServerStopMode,
+    ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, InteractionInputResponse,
+    InteractionSnapshotResponse, InteractiveToolRequestSummary, IpcEndpoint, LocalIpcStream,
+    PermissionSummary, PluginContributions, PluginServiceResponse, PluginServiceSummary,
+    RalphApproveRequest, RalphCancelRequest, RalphCancelResponse, RalphLifecycleRequest,
+    RalphListIterationsRequest, RalphListIterationsResponse, RalphListRunsRequest,
+    RalphListRunsResponse, RalphResumeRequest, RalphResumeResponse, RalphRunRequest,
+    RalphRunResponse, RalphRunStatusRequest, RalphRunStatusResponse, RalphStatusRequest,
+    RalphStatusResponse, Request, Response, ResponsePayload, ServerStopMode,
     SessionCatalogSourceStatus, SessionCatalogStatus, SessionImportWarning, WorktreeCreateRequest,
     WorktreeCreateResponse, WorktreeListRequest, WorktreeListResponse, WorktreeRemoveRequest,
     WorktreeRemoveResponse, current_working_directory, decode_event, decode_response,
@@ -1731,12 +1732,52 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn list_interactive_tool_requests(
         &self,
-    ) -> Result<Vec<bcode_ipc::InteractiveToolRequestSummary>, ClientError> {
+    ) -> Result<Vec<InteractiveToolRequestSummary>, ClientError> {
         match self
             .send_request(Request::ListInteractiveToolRequests)
             .await?
         {
             ResponsePayload::InteractiveToolRequestList { requests } => Ok(requests),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Return a renderer-neutral snapshot for a pending interaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn interaction_snapshot(
+        &self,
+        interaction_id: String,
+    ) -> Result<Option<InteractionSnapshotResponse>, ClientError> {
+        match self
+            .send_request(Request::GetInteractionSnapshot { interaction_id })
+            .await?
+        {
+            ResponsePayload::InteractionSnapshot { snapshot } => Ok(snapshot),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Submit renderer-neutral input to a pending interaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn submit_interaction_input(
+        &self,
+        interaction_id: String,
+        input: bcode_tool::InteractionInput,
+    ) -> Result<InteractionInputResponse, ClientError> {
+        match self
+            .send_request(Request::SubmitInteractionInput {
+                interaction_id,
+                input,
+            })
+            .await?
+        {
+            ResponsePayload::InteractionInputSubmitted { response } => Ok(response),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

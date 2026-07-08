@@ -1500,6 +1500,7 @@ dependencies = [
  "bcode_provider_auth",
  "bcode_session_models",
  "bcode_skill_models",
+ "bcode_tool",
  "serde_json",
  "sshenv_vault",
  "thiserror 2.0.18",
