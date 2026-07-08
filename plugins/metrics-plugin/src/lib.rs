@@ -63,12 +63,31 @@ fn invoke_command_service(request: &ServiceRequest) -> ServiceResponse {
     };
     match request.command_id.as_str() {
         COMMAND_OPEN_DASHBOARD => {
-            let session_id = request.args.get("session_id").cloned();
             let mut options = serde_json::json!({
                 "metrics_path": DEFAULT_METRICS_ROOT,
             });
-            if let Some(session_id) = session_id {
-                options["session_id"] = serde_json::Value::String(session_id);
+            let mut filters = Vec::new();
+            for (key, value) in &request.args {
+                if let Some(label_key) = key
+                    .strip_prefix("label.")
+                    .or_else(|| key.strip_prefix("filter."))
+                {
+                    filters.push(serde_json::json!({
+                        "target": { "label": label_key },
+                        "op": "equals",
+                        "value": value,
+                    }));
+                }
+            }
+            if let Some(session_id) = request.args.get("session_id") {
+                filters.push(serde_json::json!({
+                    "target": { "label": "session_id" },
+                    "op": "equals",
+                    "value": session_id,
+                }));
+            }
+            if !filters.is_empty() {
+                options["query"] = serde_json::json!({ "filters": filters });
             }
             json_response(&InvokeCommandResponse {
                 success: true,

@@ -1,7 +1,9 @@
 //! Plugin-owned persisted metrics dashboard surface.
 
 use bcode_metrics::dashboard::{
-    MetricDomain, MetricDomainSummary, MetricsDashboardData, MetricsHealth, dashboard_from_report,
+    MetricDomain, MetricDomainSummary, MetricFilter, MetricFilterOp, MetricFilterTarget,
+    MetricGroupBy, MetricSort, MetricSortDirection, MetricSortField, MetricsDashboardData,
+    MetricsDashboardQuery, MetricsHealth, query_dashboard_report,
 };
 use bcode_metrics::{MetricsEventLogConfig, MetricsRegistry, MetricsReport};
 use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface};
@@ -51,7 +53,10 @@ pub struct MetricsDashboardSurface {
     recommendation_state: TableState,
     action_state: ActionRowState,
     status: String,
-    session_filter: Option<String>,
+    query: MetricsDashboardQuery,
+    facets: Vec<bcode_metrics::dashboard::MetricFacet>,
+    total_events: usize,
+    filtered_events: usize,
     tab_area: Rect,
     content_area: Rect,
     action_area: Rect,
@@ -59,22 +64,44 @@ pub struct MetricsDashboardSurface {
     recommendation_area: Rect,
 }
 
+/// Parse generic dashboard query options, accepting legacy `session_id` as a label filter.
+#[must_use]
+pub fn dashboard_query_from_options(options: &serde_json::Value) -> MetricsDashboardQuery {
+    let mut query = options
+        .get("query")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<MetricsDashboardQuery>(value).ok())
+        .unwrap_or_default();
+    if let Some(session_id) = options
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+    {
+        query.filters.push(MetricFilter {
+            target: MetricFilterTarget::Label("session_id".to_owned()),
+            op: MetricFilterOp::Equals,
+            value: Some(session_id.to_owned()),
+        });
+    }
+    query
+}
+
 impl MetricsDashboardSurface {
-    /// Load persisted metrics dashboard from `metrics_path`.
     #[must_use]
-    pub fn load(metrics_path: PathBuf, session_filter: Option<String>) -> Self {
-        let (report, status) = load_report(&metrics_path, session_filter.as_deref());
-        let dashboard = dashboard_from_report(&report);
+    pub fn load(metrics_path: PathBuf, query: MetricsDashboardQuery) -> Self {
+        let (report, query_result, status) = load_report(&metrics_path, &query);
         Self {
             metrics_path,
             report,
-            dashboard,
+            dashboard: query_result.dashboard,
             tab_state: TabBarState::new(Some(0)),
             row_state: TableState::new(Some(0)),
             recommendation_state: TableState::new(Some(0)),
             action_state: ActionRowState::new(),
             status,
-            session_filter,
+            query,
+            facets: query_result.facets,
+            total_events: query_result.total_events,
+            filtered_events: query_result.filtered_events,
             tab_area: Rect::new(0, 0, 0, 0),
             content_area: Rect::new(0, 0, 0, 0),
             action_area: Rect::new(0, 0, 0, 0),
@@ -84,9 +111,12 @@ impl MetricsDashboardSurface {
     }
 
     fn reload(&mut self) {
-        let (report, status) = load_report(&self.metrics_path, self.session_filter.as_deref());
+        let (report, query_result, status) = load_report(&self.metrics_path, &self.query);
         self.report = report;
-        self.dashboard = dashboard_from_report(&self.report);
+        self.dashboard = query_result.dashboard;
+        self.facets = query_result.facets;
+        self.total_events = query_result.total_events;
+        self.filtered_events = query_result.filtered_events;
         self.status = status;
         self.row_state = TableState::new(Some(0));
         self.recommendation_state = TableState::new(Some(0));
@@ -112,6 +142,23 @@ impl MetricsDashboardSurface {
             }
             "overview" => {
                 self.tab_state.set_selected(Some(0));
+                PluginTuiAction::Redraw
+            }
+            "sort" => {
+                self.cycle_sort();
+                PluginTuiAction::Redraw
+            }
+            "group" => {
+                self.cycle_group_by();
+                PluginTuiAction::Redraw
+            }
+            "filter" => {
+                self.filter_by_selected_row_label();
+                PluginTuiAction::Redraw
+            }
+            "clear" => {
+                self.query.filters.clear();
+                self.reload();
                 PluginTuiAction::Redraw
             }
             "close" => PluginTuiAction::Close { outcome: None },
@@ -148,7 +195,7 @@ impl MetricsDashboardSurface {
         render_status(
             status_area,
             frame,
-            "Mouse: click tabs/rows/buttons. Keys: r refresh, 1-8 tabs, q close.",
+            "Mouse: click tabs/rows/buttons. Keys: r refresh, s sort, d direction, g group, f filter row, c clear, 1-8 tabs, q close.",
         );
     }
 
@@ -160,7 +207,24 @@ impl MetricsDashboardSurface {
         render_panel_title(
             area,
             frame,
-            &format!("{} command center", domain_title(summary.domain)),
+            &format!(
+                "{} command center | {} / {} events | filters: {} | group: {} | sort: {}",
+                domain_title(summary.domain),
+                self.filtered_events,
+                self.total_events,
+                if self.query.filters.is_empty() {
+                    "none".to_owned()
+                } else {
+                    self.query
+                        .filters
+                        .iter()
+                        .map(filter_label)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                },
+                group_label(&self.query.group_by),
+                sort_label(&self.query.sort)
+            ),
         );
         let inner = inset_top(area, 1);
         let card_area = Rect::new(inner.x, inner.y, inner.width, CARD_HEIGHT);
@@ -179,7 +243,7 @@ impl MetricsDashboardSurface {
                 self.render_series(left, frame, &summary);
             }
             if let Some(right) = columns.get(1).copied() {
-                self.render_recommendations(right, frame, &summary);
+                self.render_facets(right, frame);
             }
         }
         if let Some(bottom) = rows.get(1).copied() {
@@ -200,30 +264,26 @@ impl MetricsDashboardSurface {
         spark.render(area, frame);
     }
 
-    fn render_recommendations(
-        &mut self,
-        area: Rect,
-        frame: &mut Frame<'_>,
-        summary: &MetricDomainSummary,
-    ) {
-        render_panel_title(area, frame, "Recommendations");
-        let rows = summary
-            .recommendations
+    fn render_facets(&mut self, area: Rect, frame: &mut Frame<'_>) {
+        render_panel_title(area, frame, "Label facets");
+        let rows = self
+            .facets
             .iter()
-            .map(|recommendation| {
-                table_row(vec![
-                    health_label(recommendation.health),
-                    recommendation.title.clone(),
-                    recommendation.metric.clone(),
-                    recommendation.detail.clone(),
-                ])
+            .flat_map(|facet| {
+                facet.values.iter().take(3).map(|value| {
+                    table_row(vec![
+                        facet.key.clone(),
+                        value.value.clone(),
+                        value.count.to_string(),
+                    ])
+                })
             })
+            .take(12)
             .collect::<Vec<_>>();
         let columns = vec![
-            TableColumn::new("Health").fixed(10),
-            TableColumn::new("Finding").fixed(18),
-            TableColumn::new("Metric").fixed(30),
-            TableColumn::new("Detail").fixed(60),
+            TableColumn::new("Label").fixed(20),
+            TableColumn::new("Value").fixed(38),
+            TableColumn::new("Count").fixed(8),
         ];
         self.recommendation_area = inset_top(area, 1);
         render_metric_table(
@@ -272,6 +332,58 @@ impl MetricsDashboardSurface {
         );
     }
 
+    fn selected_row(&self) -> Option<bcode_metrics::dashboard::MetricTableRow> {
+        let selected = self.row_state.selected()?;
+        self.selected_summary()?.rows.get(selected).cloned()
+    }
+
+    fn filter_by_selected_row_label(&mut self) {
+        let Some(row) = self.selected_row() else {
+            return;
+        };
+        let Some((key, value)) = row.labels.iter().next() else {
+            return;
+        };
+        self.query.filters.push(MetricFilter {
+            target: MetricFilterTarget::Label(key.clone()),
+            op: MetricFilterOp::Equals,
+            value: Some(value.clone()),
+        });
+        self.reload();
+    }
+
+    fn cycle_sort(&mut self) {
+        self.query.sort.field = match &self.query.sort.field {
+            MetricSortField::Max => MetricSortField::Count,
+            MetricSortField::Count => MetricSortField::Average,
+            MetricSortField::Average => MetricSortField::LastSeen,
+            MetricSortField::LastSeen => MetricSortField::Metric,
+            MetricSortField::Metric => MetricSortField::Group,
+            MetricSortField::Group | MetricSortField::Label(_) => MetricSortField::Max,
+        };
+        self.reload();
+    }
+
+    fn toggle_sort_direction(&mut self) {
+        self.query.sort.direction = match self.query.sort.direction {
+            MetricSortDirection::Asc => MetricSortDirection::Desc,
+            MetricSortDirection::Desc => MetricSortDirection::Asc,
+        };
+        self.reload();
+    }
+
+    fn cycle_group_by(&mut self) {
+        self.query.group_by = match &self.query.group_by {
+            MetricGroupBy::MetricAndLabels => MetricGroupBy::Metric,
+            MetricGroupBy::Metric => self.facets.first().map_or(MetricGroupBy::Domain, |facet| {
+                MetricGroupBy::Label(facet.key.clone())
+            }),
+            MetricGroupBy::Label(_) => MetricGroupBy::Domain,
+            MetricGroupBy::Domain | MetricGroupBy::Labels(_) => MetricGroupBy::MetricAndLabels,
+        };
+        self.reload();
+    }
+
     fn handle_tables(&mut self, event: &Event) -> bool {
         let Some(summary) = self.selected_summary().cloned() else {
             return false;
@@ -316,6 +428,27 @@ impl MetricsDashboardSurface {
         match stroke.key {
             KeyCode::Char('q') | KeyCode::Escape => Some(PluginTuiAction::Close { outcome: None }),
             KeyCode::Char('r') => {
+                self.reload();
+                Some(PluginTuiAction::Redraw)
+            }
+            KeyCode::Char('s') => {
+                self.cycle_sort();
+                Some(PluginTuiAction::Redraw)
+            }
+            KeyCode::Char('d') => {
+                self.toggle_sort_direction();
+                Some(PluginTuiAction::Redraw)
+            }
+            KeyCode::Char('g') => {
+                self.cycle_group_by();
+                Some(PluginTuiAction::Redraw)
+            }
+            KeyCode::Char('f') => {
+                self.filter_by_selected_row_label();
+                Some(PluginTuiAction::Redraw)
+            }
+            KeyCode::Char('c') => {
+                self.query.filters.clear();
                 self.reload();
                 Some(PluginTuiAction::Redraw)
             }
@@ -420,33 +553,79 @@ impl MetricsDashboardSurface {
     }
 }
 
-fn load_report(path: &PathBuf, session_filter: Option<&str>) -> (MetricsReport, String) {
-    let mut report =
+fn load_report(
+    path: &PathBuf,
+    query: &MetricsDashboardQuery,
+) -> (
+    MetricsReport,
+    bcode_metrics::dashboard::MetricsDashboardQueryResult,
+    String,
+) {
+    let report =
         MetricsRegistry::report_from_event_log_path(path, MetricsEventLogConfig::default(), 20_000);
-    let total_events = report.events.len();
-    if let Some(session_id) = session_filter {
-        report.events.retain(|event| {
-            event
-                .labels
-                .get("session_id")
-                .is_some_and(|label| label == session_id)
-        });
-        report.snapshot = bcode_metrics::snapshot_from_events(&report.events);
-        report.descriptors = bcode_metrics::descriptors_from_events(&report.events);
-    }
-    let filter_detail = session_filter.map_or_else(String::new, |session_id| {
-        format!("  session_id={session_id}  total_events={total_events}")
-    });
+    let query_result = query_dashboard_report(&report, query);
     let status = format!(
-        "{} events  {} metrics{}  source={}",
-        report.events.len(),
-        report.descriptors.len(),
-        filter_detail,
+        "{} / {} events  {} metrics  filters={} group={} sort={}  source={}",
+        query_result.filtered_events,
+        query_result.total_events,
+        query_result.report.descriptors.len(),
+        query.filters.len(),
+        group_label(&query.group_by),
+        sort_label(&query.sort),
         path.display()
     );
-    (report, status)
+    (report, query_result, status)
 }
 
+fn sort_label(sort: &MetricSort) -> String {
+    let field = match &sort.field {
+        MetricSortField::Metric => "metric".to_owned(),
+        MetricSortField::Group => "group".to_owned(),
+        MetricSortField::Count => "count".to_owned(),
+        MetricSortField::Average => "avg".to_owned(),
+        MetricSortField::Max => "max".to_owned(),
+        MetricSortField::LastSeen => "last_seen".to_owned(),
+        MetricSortField::Label(key) => format!("label.{key}"),
+    };
+    let direction = match sort.direction {
+        MetricSortDirection::Asc => "asc",
+        MetricSortDirection::Desc => "desc",
+    };
+    format!("{field}:{direction}")
+}
+
+fn group_label(group_by: &MetricGroupBy) -> String {
+    match group_by {
+        MetricGroupBy::Metric => "metric".to_owned(),
+        MetricGroupBy::MetricAndLabels => "metric+labels".to_owned(),
+        MetricGroupBy::Label(key) => format!("label.{key}"),
+        MetricGroupBy::Labels(keys) => format!("labels.{}", keys.join(",")),
+        MetricGroupBy::Domain => "domain".to_owned(),
+    }
+}
+
+fn filter_label(filter: &MetricFilter) -> String {
+    let target = match &filter.target {
+        MetricFilterTarget::Metric => "metric".to_owned(),
+        MetricFilterTarget::Kind => "kind".to_owned(),
+        MetricFilterTarget::Domain => "domain".to_owned(),
+        MetricFilterTarget::Value => "value".to_owned(),
+        MetricFilterTarget::Label(key) => key.clone(),
+    };
+    let op = match filter.op {
+        MetricFilterOp::Equals => "=",
+        MetricFilterOp::NotEquals => "!=",
+        MetricFilterOp::Contains => "~",
+        MetricFilterOp::Exists => " exists",
+        MetricFilterOp::Missing => " missing",
+        MetricFilterOp::GreaterThan => ">",
+        MetricFilterOp::LessThan => "<",
+    };
+    filter.value.as_ref().map_or_else(
+        || format!("{target}{op}"),
+        |value| format!("{target}{op}{value}"),
+    )
+}
 fn dashboard_tabs() -> Vec<TabItem<'static>> {
     vec![
         TabItem::new("overview", "Overview"),
@@ -490,6 +669,10 @@ const fn domain_title(domain: MetricDomain) -> &'static str {
 fn dashboard_actions() -> Vec<ActionButton> {
     vec![
         ActionButton::new("refresh", "Refresh"),
+        ActionButton::new("sort", "Sort"),
+        ActionButton::new("group", "Group"),
+        ActionButton::new("filter", "Filter Row"),
+        ActionButton::new("clear", "Clear Filters"),
         ActionButton::new("overview", "Overview"),
         ActionButton::new("close", "Close"),
     ]
@@ -852,14 +1035,6 @@ fn bar_items(rows: &[bcode_metrics::dashboard::MetricTableRow]) -> Vec<BarChartI
         .take(8)
         .map(|row| BarChartItem::new(row.metric.as_str(), row.max))
         .collect()
-}
-
-fn health_label(health: MetricsHealth) -> String {
-    match health {
-        MetricsHealth::Good => "good".to_owned(),
-        MetricsHealth::Warning => "warning".to_owned(),
-        MetricsHealth::Critical => "critical".to_owned(),
-    }
 }
 
 const fn health_color(health: MetricsHealth) -> Color {
