@@ -157,6 +157,8 @@ pub enum EnvelopeKind {
     Event,
     /// Internal continuation frame for logical envelopes that exceed one IPC frame.
     Chunk,
+    /// Internal compressed frame for large logical envelopes.
+    Compressed,
 }
 
 /// Versioned IPC envelope with request correlation support.
@@ -1297,6 +1299,18 @@ pub fn decode_event(bytes: &[u8]) -> Result<Event, CodecError> {
     decode_typed_stable(bytes)
 }
 
+const COMPRESSION_MIN_BYTES: usize = 256 * 1024;
+const COMPRESSION_LEVEL: i32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CompressedEnvelopePayload {
+    kind: EnvelopeKind,
+    request_id: u64,
+    algorithm_wire_id: u8,
+    uncompressed_len: u64,
+    data: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ChunkPayload {
     chunk_index: u32,
@@ -1331,11 +1345,48 @@ where
 ///
 /// Returns an error when serialization fails or the logical envelope is too large to chunk.
 pub fn encode_envelope_frames(envelope: &Envelope) -> Result<Vec<Vec<u8>>, CodecError> {
-    let payload = encode(envelope)?;
+    let physical_envelope = maybe_compress_envelope(envelope)?;
+    let payload = encode(&physical_envelope)?;
     if payload.len() <= MAX_FRAME_PAYLOAD_SIZE {
-        return Ok(vec![encode_envelope_frame(envelope)?]);
+        return Ok(vec![encode_envelope_frame(&physical_envelope)?]);
     }
-    encode_chunked_envelope_frames(envelope.request_id, &payload)
+    encode_chunked_envelope_frames(physical_envelope.request_id, &payload)
+}
+
+fn maybe_compress_envelope(envelope: &Envelope) -> Result<Envelope, CodecError> {
+    if !matches!(envelope.kind, EnvelopeKind::Response | EnvelopeKind::Event) {
+        return Ok(envelope.clone());
+    }
+    let policy = bmux_codec::compression::CompressionPolicy::new(
+        bmux_codec::compression::CompressionAlgorithm::Lz4,
+    )
+    .min_bytes(COMPRESSION_MIN_BYTES)
+    .level(COMPRESSION_LEVEL);
+    match bmux_codec::compression::maybe_compress_bytes(envelope.payload.clone(), policy)
+        .map_err(CodecError::Serialize)?
+    {
+        bmux_codec::compression::CompressionDecision::Plain { .. } => Ok(envelope.clone()),
+        bmux_codec::compression::CompressionDecision::Compressed {
+            algorithm,
+            uncompressed_len,
+            bytes,
+        } => Ok(Envelope::new(
+            envelope.request_id,
+            EnvelopeKind::Compressed,
+            encode(&CompressedEnvelopePayload {
+                kind: envelope.kind,
+                request_id: envelope.request_id,
+                algorithm_wire_id: algorithm.wire_id(),
+                uncompressed_len: u64::try_from(uncompressed_len).map_err(|_| {
+                    CodecError::PayloadTooLarge {
+                        actual: uncompressed_len,
+                        max: usize::MAX,
+                    }
+                })?,
+                data: bytes,
+            })?,
+        )),
+    }
 }
 
 fn encode_chunked_envelope_frames(
@@ -1441,7 +1492,7 @@ where
     if envelope.kind == EnvelopeKind::Chunk {
         recv_chunked_envelope(reader, envelope).await
     } else {
-        Ok(envelope)
+        unwrap_compressed_envelope(envelope)
     }
 }
 
@@ -1519,7 +1570,38 @@ where
             expected: ProtocolVersion::current().0,
         });
     }
-    Ok(envelope)
+    unwrap_compressed_envelope(envelope)
+}
+
+fn unwrap_compressed_envelope(envelope: Envelope) -> Result<Envelope, CodecError> {
+    if envelope.kind != EnvelopeKind::Compressed {
+        return Ok(envelope);
+    }
+    let compressed: CompressedEnvelopePayload = decode(&envelope.payload)?;
+    if matches!(
+        compressed.kind,
+        EnvelopeKind::Chunk | EnvelopeKind::Compressed
+    ) {
+        return Err(CodecError::InvalidChunk(
+            "compressed envelope cannot unwrap to chunk or compressed envelope".to_string(),
+        ));
+    }
+    let algorithm =
+        bmux_codec::compression::CompressionAlgorithm::from_wire_id(compressed.algorithm_wire_id)
+            .map_err(CodecError::Deserialize)?;
+    let expected_len =
+        usize::try_from(compressed.uncompressed_len).map_err(|_| CodecError::PayloadTooLarge {
+            actual: usize::MAX,
+            max: MAX_FRAME_PAYLOAD_SIZE,
+        })?;
+    let payload =
+        bmux_codec::compression::decompress_bytes(algorithm, &compressed.data, expected_len)
+            .map_err(CodecError::Deserialize)?;
+    Ok(Envelope::new(
+        compressed.request_id,
+        compressed.kind,
+        payload,
+    ))
 }
 
 fn decode_chunk_payload(envelope: &Envelope) -> Result<ChunkPayload, CodecError> {

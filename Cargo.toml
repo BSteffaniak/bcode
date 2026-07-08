@@ -158,6 +158,8 @@ bmux_codec = { default-features = false, features = [
     "serde",
     "positional",
     "typed-stable",
+    "compression-lz4",
+    "compression-zstd",
 ], git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 bmux_ipc = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 bmux_keyboard = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
