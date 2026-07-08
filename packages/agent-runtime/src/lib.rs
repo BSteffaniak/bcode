@@ -121,6 +121,8 @@ pub struct AgentTurnRequest {
     pub provider_context: ProviderRequestContext,
     /// Optional system prompt.
     pub system_prompt: Option<String>,
+    /// Prior conversation messages included before this turn's user prompt.
+    pub messages: Vec<ModelMessage>,
     /// User prompt for this turn.
     pub prompt: String,
     /// Model-callable tool definitions available to the provider.
@@ -148,6 +150,7 @@ impl AgentTurnRequest {
             model_id: model_id.into(),
             provider_context: ProviderRequestContext::default(),
             system_prompt: None,
+            messages: Vec::new(),
             prompt: prompt.into(),
             tools: Vec::new(),
             structured_output: None,
@@ -982,18 +985,20 @@ fn model_image_metadata(metadata: bcode_tool::ImageMetadata) -> bcode_model::Ima
 
 fn model_turn_request(request: &AgentTurnRequest) -> ModelTurnRequest {
     let session_id = SessionId::new();
+    let mut messages = request.messages.clone();
+    messages.push(ModelMessage {
+        role: MessageRole::User,
+        content: vec![ContentBlock::Text {
+            text: request.prompt.clone(),
+        }],
+    });
     ModelTurnRequest {
         session_id,
         turn_id: format!("sdk-turn-{session_id}"),
         model_id: request.model_id.clone(),
         provider_context: request.provider_context.clone(),
         system_prompt: request.system_prompt.clone(),
-        messages: vec![ModelMessage {
-            role: MessageRole::User,
-            content: vec![ContentBlock::Text {
-                text: request.prompt.clone(),
-            }],
-        }],
+        messages,
         tools: request
             .tools
             .iter()

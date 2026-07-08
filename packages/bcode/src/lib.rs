@@ -40,7 +40,7 @@ pub use bcode_agent_runtime::{
     RuntimeFuture, RuntimePermissionContext, RuntimePermissionRequest, ToolCatalog,
     ToolExecutionOutput, ToolExecutor, ToolRoundState, ToolSource, UnifiedToolCatalog,
 };
-pub use bcode_model::ToolCall;
+pub use bcode_model::{ContentBlock as ModelContentBlock, MessageRole, ModelMessage, ToolCall};
 
 /// Result alias for Bcode SDK operations.
 pub type Result<T> = std::result::Result<T, BcodeError>;
@@ -350,6 +350,20 @@ fn validate_json_schema(schema: &serde_json::Value, value: &serde_json::Value) -
         Err(BcodeError::StructuredOutput(format!(
             "structured output failed JSON schema validation: {errors}"
         )))
+    }
+}
+
+fn user_message(text: impl Into<String>) -> ModelMessage {
+    ModelMessage {
+        role: MessageRole::User,
+        content: vec![ModelContentBlock::Text { text: text.into() }],
+    }
+}
+
+fn assistant_message(text: impl Into<String>) -> ModelMessage {
+    ModelMessage {
+        role: MessageRole::Assistant,
+        content: vec![ModelContentBlock::Text { text: text.into() }],
     }
 }
 
@@ -686,7 +700,111 @@ impl BcodeBuilder {
     }
 }
 
-/// Configured agent facade.
+/// In-memory SDK session state for continuing conversations without persistence.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InMemorySession {
+    messages: Vec<ModelMessage>,
+}
+
+impl InMemorySession {
+    /// Create an empty in-memory session.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a session from caller-managed model messages.
+    #[must_use]
+    pub const fn from_messages(messages: Vec<ModelMessage>) -> Self {
+        Self { messages }
+    }
+
+    /// Return the current session transcript.
+    #[must_use]
+    pub fn messages(&self) -> &[ModelMessage] {
+        &self.messages
+    }
+
+    /// Export the session transcript for caller-managed persistence.
+    #[must_use]
+    pub fn into_messages(self) -> Vec<ModelMessage> {
+        self.messages
+    }
+
+    /// Add a message to the session transcript.
+    pub fn push_message(&mut self, message: ModelMessage) {
+        self.messages.push(message);
+    }
+
+    /// Clear the in-memory transcript.
+    pub fn clear(&mut self) {
+        self.messages.clear();
+    }
+}
+
+/// Stateful agent wrapper that keeps conversation history in memory.
+#[derive(Debug, Clone)]
+pub struct AgentSession {
+    agent: Agent,
+    session: InMemorySession,
+}
+
+impl AgentSession {
+    /// Create a stateful wrapper around an agent and in-memory session.
+    #[must_use]
+    pub const fn new(agent: Agent, session: InMemorySession) -> Self {
+        Self { agent, session }
+    }
+
+    /// Return the wrapped agent.
+    #[must_use]
+    pub const fn agent(&self) -> &Agent {
+        &self.agent
+    }
+
+    /// Return the in-memory session state.
+    #[must_use]
+    pub const fn session(&self) -> &InMemorySession {
+        &self.session
+    }
+
+    /// Export the in-memory session transcript for caller-managed persistence.
+    #[must_use]
+    pub fn into_messages(self) -> Vec<ModelMessage> {
+        self.session.into_messages()
+    }
+
+    /// Generate text and append user/assistant messages to the in-memory transcript.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when provider invocation fails, the runtime is cancelled, or the provider
+    /// reports an error.
+    pub async fn generate_text_with_provider<P>(
+        &mut self,
+        provider: &mut P,
+        prompt: impl Into<String>,
+    ) -> Result<GenerateTextResponse>
+    where
+        P: ModelProviderInvoker,
+    {
+        let prompt = prompt.into();
+        let response = self
+            .agent
+            .generate_text_with_provider_and_history(
+                provider,
+                prompt.clone(),
+                self.session.messages.clone(),
+            )
+            .await?;
+        self.session.messages.push(user_message(prompt));
+        self.session
+            .messages
+            .push(assistant_message(response.text.clone()));
+        Ok(response)
+    }
+}
+
 #[derive(Clone)]
 pub struct Agent {
     runtime: AgentRuntime,
@@ -781,6 +899,19 @@ impl Agent {
         P: ModelProviderInvoker,
     {
         self.generate_text_with_provider_with_structured_output(provider, prompt, None)
+            .await
+    }
+
+    async fn generate_text_with_provider_and_history<P>(
+        &self,
+        provider: &mut P,
+        prompt: impl Into<String>,
+        messages: Vec<ModelMessage>,
+    ) -> Result<GenerateTextResponse>
+    where
+        P: ModelProviderInvoker,
+    {
+        self.generate_text_with_provider_with_options(provider, prompt, None, messages)
             .await
     }
 
@@ -879,6 +1010,25 @@ impl Agent {
     where
         P: ModelProviderInvoker,
     {
+        self.generate_text_with_provider_with_options(
+            provider,
+            prompt,
+            structured_output,
+            Vec::new(),
+        )
+        .await
+    }
+
+    async fn generate_text_with_provider_with_options<P>(
+        &self,
+        provider: &mut P,
+        prompt: impl Into<String>,
+        structured_output: Option<bcode_model::StructuredOutputRequest>,
+        messages: Vec<ModelMessage>,
+    ) -> Result<GenerateTextResponse>
+    where
+        P: ModelProviderInvoker,
+    {
         let prompt = prompt.into();
         let context = self.model_call_context(prompt.clone());
         self.hooks.run_before_model(&context)?;
@@ -886,7 +1036,11 @@ impl Agent {
             .runtime
             .run_text_turn(
                 provider,
-                self.turn_request_with_structured_output(prompt, structured_output),
+                self.turn_request_with_structured_output_and_messages(
+                    prompt,
+                    structured_output,
+                    messages,
+                ),
             )
             .await?;
         let response = GenerateTextResponse::from(response);
@@ -912,7 +1066,7 @@ impl Agent {
         let provider = self.provider.clone().ok_or(BcodeError::MissingProvider)?;
         Ok(self.runtime.run_streaming_text_turn(
             provider,
-            self.turn_request_with_structured_output(prompt.into(), None),
+            self.turn_request_with_structured_output_and_messages(prompt.into(), None, Vec::new()),
         ))
     }
 
@@ -1081,13 +1235,15 @@ impl Agent {
         }
     }
 
-    fn turn_request_with_structured_output(
+    fn turn_request_with_structured_output_and_messages(
         &self,
         prompt: String,
         structured_output: Option<bcode_model::StructuredOutputRequest>,
+        messages: Vec<ModelMessage>,
     ) -> AgentTurnRequest {
         let mut request = self.turn_request_with_cancellation(prompt, CancellationToken::new());
         request.structured_output = structured_output;
+        request.messages = messages;
         request
     }
 
@@ -1101,6 +1257,7 @@ impl Agent {
             model_id: self.model_id.clone(),
             provider_context: self.provider_context.clone(),
             system_prompt: self.system_prompt.clone(),
+            messages: Vec::new(),
             prompt,
             tools: self.enabled_tool_definitions(),
             structured_output: None,
@@ -1110,6 +1267,18 @@ impl Agent {
             max_tool_rounds: self.max_tool_rounds,
             cancellation,
         }
+    }
+
+    /// Create a stateful in-memory session wrapper for this agent.
+    #[must_use]
+    pub fn session(self) -> AgentSession {
+        AgentSession::new(self, InMemorySession::new())
+    }
+
+    /// Create a stateful in-memory session wrapper from caller-managed messages.
+    #[must_use]
+    pub const fn session_from_messages(self, messages: Vec<ModelMessage>) -> AgentSession {
+        AgentSession::new(self, InMemorySession::from_messages(messages))
     }
 
     /// Return the configured agent name.
