@@ -2,6 +2,63 @@
 
 Bcode is a Rust-native, TUI-first, plugin-driven coding agent with a local client/server architecture.
 
+## Use Bcode as a Rust SDK
+
+The `bcode` crate can be used directly from Rust applications without launching the TUI. The default feature set is intentionally lean and TUI-independent; opt into heavier product or integration paths only when needed.
+
+```toml
+[dependencies]
+bcode = { version = "0.0.1-alpha.0", default-features = false }
+```
+
+Basic stateless text generation uses explicit imports and a provider invoker:
+
+```rust,no_run
+use bcode::{Agent, ModelProviderInvoker};
+
+# async fn run(mut provider: impl ModelProviderInvoker) -> bcode::Result<()> {
+let agent = Agent::builder().model("example-model").build();
+let response = agent
+    .generate_text_with_provider(&mut provider, "Say hello")
+    .await?;
+println!("{}", response.text);
+# Ok(())
+# }
+```
+
+### Runtime modes and features
+
+* Embedded mode runs in-process and does not require daemon IPC. Enable `embedded-plugins` when the application wants to host plugin-backed providers/tools itself.
+* Daemon mode is a separate programmatic path. Enable `daemon-client` to use `BcodeClient` through the SDK facade without pulling TUI code into the default library path.
+* The CLI/TUI product is behind the `app` feature, which enables the full CLI/TUI and bundled-plugin feature set. Library users should keep `default-features = false` unless they intentionally want product packaging.
+* Bundled OCR and static bundled plugin features are opt-in through the `bcode` crate feature flags used by the app package.
+
+### Providers
+
+For tests, examples, or custom integrations, implement `ModelProviderInvoker` and call `Agent::generate_text_with_provider`, `Agent::stream_text_with_provider`, or `Agent::generate_object_with_provider`. For plugin-backed embedded use, create a plugin runtime host and pass it through `Bcode::builder().plugin_runtime(...)` with the `embedded-plugins` feature enabled.
+
+### Custom tools
+
+Register inline tools with `Agent::builder().inline_tool(...)`. Tool definitions use `bcode_tool::ToolDefinition`, and handlers receive typed `ToolInvocationRequest` values and return `ToolInvocationResponse` values. Tool calls can be executed directly with `Agent::execute_tool_call(...)`; provider-requested tool calls are routed through the same runtime abstractions.
+
+### Streaming events
+
+Use `Agent::stream_text_with_provider(...)` for event-driven generation. The stream yields `AgentStreamItem` values containing normalized `AgentEvent` events, a final response, or an error. Events include text deltas, reasoning deltas, tool calls/results, provider warnings, usage, and provider metadata.
+
+### Structured output
+
+Use `Agent::generate_object_with_provider::<T, _>(...)` for serde-typed extraction. `StructuredOutputOptions::for_type::<T>()` derives a JSON Schema from `schemars`; `StructuredOutputOptions::json_schema(...)` accepts explicit schemas. Bcode requests provider-native structured output where available, validates returned JSON locally, and supports explicit repair attempts with `with_max_repairs(...)`.
+
+### Hooks and observability
+
+`AgentBuilder` supports `on_before_model`, `on_after_model`, `on_before_tool`, and `on_after_tool` hooks. Hook contexts expose model IDs, prompts, tool calls, metadata, latency, and runtime events so applications can add logging, metrics, policy checks, or tracing without depending on TUI internals.
+
+### Optional sessions and persistence
+
+Stateless calls do not require a session. For in-memory conversations, call `Agent::session()` or `Agent::session_from_messages(...)`; transcripts can be exported with `InMemorySession::into_messages()` for caller-managed persistence. For explicit local JSON persistence, use `LocalSessionStore` with `Agent::session_with_store(...)`. Missing stores start empty, while empty or corrupt stores return repair/replacement errors instead of silently rebuilding or replaying unbounded history.
+
+See `packages/bcode/examples/` for runnable examples covering text generation, streaming, custom tools, hooks/observability, structured output, local sessions, and daemon-client setup.
+
 ## TUI keybindings
 
 TUI keybindings are configurable in `bcode.toml` under scoped `[tui.keybindings.*]` tables. Each scope maps `key = "action.id"`, matching bmux-style key-to-action configuration. Set a key to `""`, `"none"`, or `"unbind"` to remove a default binding for that key.

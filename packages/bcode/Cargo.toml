@@ -15,6 +15,10 @@ name              = "bcode"
 path              = "src/main.rs"
 required-features = ["app"]
 
+[[example]]
+name              = "daemon_client"
+required-features = ["daemon-client"]
+
 [dependencies]
 bcode_agent_permissions = { workspace = true }
 bcode_agent_policy = { workspace = true }
