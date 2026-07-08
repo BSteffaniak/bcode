@@ -8,6 +8,36 @@ description  = "Model-callable OCR tools"
 interface_id = "bcode.tool/v1"
 name         = "OCR Tools"
 
+[[visual_adapters]]
+artifact_schema    = "bcode.ocr.request"
+id                 = "ocr-request-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.ocr.extract_result"
+id                 = "ocr-extract-result-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.ocr.status"
+id                 = "ocr-status-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
 [concurrency]
 max  = 2
 type = "limited"

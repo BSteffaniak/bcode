@@ -8,6 +8,26 @@ description  = "Model-callable Git repository access tools"
 interface_id = "bcode.tool/v1"
 name         = "Git Tools"
 
+[[visual_adapters]]
+artifact_schema    = "bcode.git.clone_request"
+id                 = "git-clone-request-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.git.clone_result"
+id                 = "git-clone-result-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
 [concurrency]
 max  = 2
 type = "limited"

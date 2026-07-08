@@ -18,6 +18,7 @@ bcode_model_provider_runtime = { workspace = true }
 bcode_plugin_sdk             = { workspace = true }
 bcode_tesseract_ocr          = { workspace = true, optional = true }
 bcode_tool                   = { workspace = true }
+bmux_tui                     = { workspace = true, optional = true }
 image                        = { workspace = true, optional = true }
 reqwest                      = { workspace = true }
 serde                        = { workspace = true, features = ["derive", "std"] }
@@ -50,7 +51,7 @@ bundled-tesseract-v5-5-2 = [
 default = []
 external-tesseract-cli = []
 fail-on-warnings = []
-static-bundled = []
+static-bundled = ["bmux_tui"]
 system-tesseract = [
     "dep:bcode_tesseract_ocr",
     "dep:image",

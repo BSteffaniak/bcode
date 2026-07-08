@@ -2,14 +2,16 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! OCR tool plugin for Bcode.
+#[cfg(feature = "static-bundled")]
+mod ocr_tui;
 
 use bcode_model_provider_runtime::ProviderRuntime;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
-    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
-    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationStreamEvent, ToolList,
-    ToolResultContent, ToolSideEffect,
+    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
+    ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult,
+    ToolInvocationStreamEvent, ToolList, ToolPluginVisualMetadata, ToolResultContent,
+    ToolSideEffect, ToolVisualPayloadSelector,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -28,6 +30,10 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_MAX_BYTES: usize = 4 * 1024 * 1024;
 const MAX_BYTES: usize = 100 * 1024 * 1024;
 const USER_AGENT: &str = concat!("Bcode/", env!("CARGO_PKG_VERSION"));
+const OCR_PLUGIN_ID: &str = "bcode.ocr";
+const OCR_REQUEST_SCHEMA: &str = "bcode.ocr.request";
+const OCR_EXTRACT_SCHEMA: &str = "bcode.ocr.extract_result";
+const OCR_STATUS_SCHEMA: &str = "bcode.ocr.status";
 
 /// OCR plugin.
 pub struct OcrPlugin {
@@ -107,7 +113,7 @@ impl OcrPlugin {
         };
         let response = match invocation.name.as_str() {
             "ocr.extract" => self.invoke_extract(&invocation, events),
-            "ocr.status" => invoke_status(),
+            "ocr.status" => invoke_status(&invocation.tool_call_id),
             _ => ToolInvocationResponse {
                 output: format!("unknown OCR tool: {}", invocation.name),
                 is_error: true,
@@ -140,7 +146,7 @@ impl OcrPlugin {
             invocation.artifact_dir.clone(),
             Some(progress),
         )) {
-            Ok(Ok(response)) => ocr_tool_response(&response),
+            Ok(Ok(response)) => ocr_tool_response(&response, &invocation.tool_call_id),
             Ok(Err(error)) => tool_error(error.to_string()),
             Err(error) => tool_error(error.to_string()),
         }
@@ -605,7 +611,13 @@ fn extract_tool_definition() -> ToolDefinition {
             permission_category: Some("read".to_string()),
             argument_extractors: Vec::new(),
         },
-        ui: bcode_tool::ToolUiMetadata::default(),
+        ui: bcode_tool::ToolUiMetadata {
+            activity_label: Some("extracting OCR text".to_string()),
+            request_visual: Some(ocr_request_visual(
+                "extracting OCR text",
+                &["path", "url", "language", "engine", "max_bytes"],
+            )),
+        },
     }
 }
 
@@ -617,12 +629,51 @@ fn status_tool_definition() -> ToolDefinition {
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: bcode_tool::ToolPolicyMetadata::default(),
-        ui: bcode_tool::ToolUiMetadata::default(),
+        ui: bcode_tool::ToolUiMetadata {
+            activity_label: Some("checking OCR status".to_string()),
+            request_visual: Some(ocr_request_visual("checking OCR status", &[])),
+        },
     }
 }
 
-fn invoke_status() -> ToolInvocationResponse {
-    json_tool_response(&status_response())
+fn ocr_request_visual(operation: &str, fields: &[&str]) -> ToolPluginVisualMetadata {
+    let mut payload = std::collections::BTreeMap::new();
+    payload.insert(
+        "operation".to_string(),
+        ToolVisualPayloadSelector {
+            fields: Vec::new(),
+            literal: Some(serde_json::Value::String(operation.to_string())),
+            required: false,
+        },
+    );
+    for field in fields {
+        payload.insert(
+            (*field).to_string(),
+            ToolVisualPayloadSelector {
+                fields: vec![(*field).to_string()],
+                literal: None,
+                required: false,
+            },
+        );
+    }
+    ToolPluginVisualMetadata {
+        producer_plugin_id: Some(OCR_PLUGIN_ID.to_string()),
+        schema: OCR_REQUEST_SCHEMA.to_string(),
+        schema_version: 1,
+        title: Some("OCR".to_string()),
+        subtitle: Some(format!("{operation} · {{bytes}}")),
+        payload,
+    }
+}
+
+fn invoke_status(tool_call_id: &str) -> ToolInvocationResponse {
+    json_tool_response_with_artifact(
+        &status_response(),
+        tool_call_id,
+        "status",
+        OCR_STATUS_SCHEMA,
+        "OCR status",
+    )
 }
 
 fn status_response() -> StatusResponse {
@@ -702,9 +753,12 @@ fn tesseract_cli_status() -> EngineStatus {
     }
 }
 
-fn ocr_tool_response(value: &ExtractResponse) -> ToolInvocationResponse {
-    let output = match serde_json::to_string_pretty(value) {
-        Ok(output) => output,
+fn ocr_tool_response(value: &ExtractResponse, tool_call_id: &str) -> ToolInvocationResponse {
+    let (output, payload) = match serde_json::to_string_pretty(value).and_then(|output| {
+        let payload = serde_json::to_value(value)?;
+        Ok((output, payload))
+    }) {
+        Ok(result) => result,
         Err(error) => return tool_error(error.to_string()),
     };
     ToolInvocationResponse {
@@ -715,7 +769,13 @@ fn ocr_tool_response(value: &ExtractResponse) -> ToolInvocationResponse {
         }],
         full_output: value.truncated.then_some(value.full_text.clone()),
         host_action: None,
-        result: None,
+        result: Some(ocr_artifact_result(
+            tool_call_id,
+            "extract",
+            OCR_EXTRACT_SCHEMA,
+            "OCR text",
+            payload,
+        )),
     }
 }
 
@@ -730,17 +790,53 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
     ServiceResponse::error("invalid_request", error.to_string())
 }
 
-fn json_tool_response<T: Serialize>(value: &T) -> ToolInvocationResponse {
-    match serde_json::to_string_pretty(value) {
-        Ok(output) => ToolInvocationResponse {
+fn json_tool_response_with_artifact<T: Serialize>(
+    value: &T,
+    tool_call_id: &str,
+    artifact_suffix: &str,
+    schema: &str,
+    title: &str,
+) -> ToolInvocationResponse {
+    match serde_json::to_string_pretty(value).and_then(|output| {
+        let payload = serde_json::to_value(value)?;
+        Ok((output, payload))
+    }) {
+        Ok((output, payload)) => ToolInvocationResponse {
             output,
             is_error: false,
             content: Vec::new(),
             full_output: None,
             host_action: None,
-            result: None,
+            result: Some(ocr_artifact_result(
+                tool_call_id,
+                artifact_suffix,
+                schema,
+                title,
+                payload,
+            )),
         },
         Err(error) => tool_error(error.to_string()),
+    }
+}
+
+fn ocr_artifact_result(
+    tool_call_id: &str,
+    artifact_suffix: &str,
+    schema: &str,
+    title: &str,
+    payload: serde_json::Value,
+) -> ToolInvocationResult {
+    ToolInvocationResult::Artifact {
+        artifact: Box::new(ToolArtifact {
+            artifact_id: format!("{tool_call_id}-ocr-{artifact_suffix}"),
+            producer_plugin_id: OCR_PLUGIN_ID.to_string(),
+            schema: schema.to_string(),
+            schema_version: 1,
+            tool_call_id: Some(tool_call_id.to_string()),
+            title: Some(title.to_string()),
+            metadata: payload,
+            refs: Vec::new(),
+        }),
     }
 }
 
@@ -758,7 +854,17 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
 #[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(OcrPlugin, include_str!("../bcode-plugin.toml"))
+    let mut vtable =
+        bcode_plugin_sdk::static_plugin_vtable!(OcrPlugin, include_str!("../bcode-plugin.toml"));
+    vtable.tui_registry = Some(ocr_tui_registry);
+    vtable
+}
+
+#[cfg(feature = "static-bundled")]
+fn ocr_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
+    let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
+    registry.register_visual_adapter(Box::new(ocr_tui::OcrTuiVisualAdapter));
+    registry
 }
 
 bcode_plugin_sdk::export_plugin!(OcrPlugin, include_str!("../bcode-plugin.toml"));

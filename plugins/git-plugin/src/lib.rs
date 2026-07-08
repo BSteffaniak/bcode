@@ -2,13 +2,14 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! Git repository access tool plugin for Bcode.
+#[cfg(feature = "static-bundled")]
+mod git_tui;
 
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
-    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
-    ToolInvocationRequest, ToolInvocationResponse, ToolList, ToolPluginVisualMetadata,
-    ToolSideEffect, ToolVisualPayloadSelector,
+    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
+    ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolList,
+    ToolPluginVisualMetadata, ToolSideEffect, ToolVisualPayloadSelector,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -16,6 +17,10 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use thiserror::Error;
+
+const GIT_PLUGIN_ID: &str = "bcode.git";
+const GIT_CLONE_REQUEST_SCHEMA: &str = "bcode.git.clone_request";
+const GIT_CLONE_RESULT_SCHEMA: &str = "bcode.git.clone_result";
 
 /// Git access plugin.
 #[derive(Default)]
@@ -86,7 +91,13 @@ fn invoke_clone(
         Err(error) => return tool_error(error.to_string()),
     };
     match clone_repository(&request, invocation.artifact_dir.as_deref()) {
-        Ok(response) => json_tool_response(&response),
+        Ok(response) => json_tool_response_with_artifact(
+            &response,
+            &invocation.tool_call_id,
+            "clone",
+            GIT_CLONE_RESULT_SCHEMA,
+            "Repository cloned",
+        ),
         Err(error) => tool_error(error.to_string()),
     }
 }
@@ -370,7 +381,7 @@ fn clone_tool_definition() -> ToolDefinition {
             activity_label: Some("cloning".to_string()),
             request_visual: Some(ToolPluginVisualMetadata {
                 producer_plugin_id: Some("bcode.git".to_string()),
-                schema: "bcode.git.clone_request".to_string(),
+                schema: GIT_CLONE_REQUEST_SCHEMA.to_string(),
                 schema_version: 1,
                 title: Some("Clone repository".to_string()),
                 subtitle: Some("cloning {url} · {bytes}".to_string()),
@@ -417,15 +428,35 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
     ServiceResponse::error("invalid_request", error.to_string())
 }
 
-fn json_tool_response<T: Serialize>(value: &T) -> ToolInvocationResponse {
-    match serde_json::to_string_pretty(value) {
-        Ok(output) => ToolInvocationResponse {
+fn json_tool_response_with_artifact<T: Serialize>(
+    value: &T,
+    tool_call_id: &str,
+    artifact_suffix: &str,
+    schema: &str,
+    title: &str,
+) -> ToolInvocationResponse {
+    match serde_json::to_string_pretty(value).and_then(|output| {
+        let payload = serde_json::to_value(value)?;
+        Ok((output, payload))
+    }) {
+        Ok((output, payload)) => ToolInvocationResponse {
             output,
             is_error: false,
             content: Vec::new(),
             full_output: None,
             host_action: None,
-            result: None,
+            result: Some(ToolInvocationResult::Artifact {
+                artifact: Box::new(ToolArtifact {
+                    artifact_id: format!("{tool_call_id}-git-{artifact_suffix}"),
+                    producer_plugin_id: GIT_PLUGIN_ID.to_string(),
+                    schema: schema.to_string(),
+                    schema_version: 1,
+                    tool_call_id: Some(tool_call_id.to_string()),
+                    title: Some(title.to_string()),
+                    metadata: payload,
+                    refs: Vec::new(),
+                }),
+            }),
         },
         Err(error) => tool_error(error.to_string()),
     }
@@ -445,7 +476,17 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
 #[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(GitPlugin, include_str!("../bcode-plugin.toml"))
+    let mut vtable =
+        bcode_plugin_sdk::static_plugin_vtable!(GitPlugin, include_str!("../bcode-plugin.toml"));
+    vtable.tui_registry = Some(git_tui_registry);
+    vtable
+}
+
+#[cfg(feature = "static-bundled")]
+fn git_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
+    let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
+    registry.register_visual_adapter(Box::new(git_tui::GitTuiVisualAdapter));
+    registry
 }
 
 bcode_plugin_sdk::export_plugin!(GitPlugin, include_str!("../bcode-plugin.toml"));

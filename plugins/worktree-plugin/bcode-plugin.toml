@@ -23,6 +23,46 @@ description = "Plugin-owned worktree removal UI"
 kind        = "command.work-tree.remove"
 title       = "Remove Worktree"
 
+[[visual_adapters]]
+artifact_schema    = "bcode.worktree.request"
+id                 = "worktree-request-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.worktree.list"
+id                 = "worktree-list-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.worktree.create_result"
+id                 = "worktree-create-result-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.worktree.remove_result"
+id                 = "worktree-remove-result-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
 [concurrency]
 max  = 2
 type = "limited"

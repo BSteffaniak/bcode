@@ -1631,6 +1631,7 @@ dependencies = [
  "bcode_model_provider_runtime",
  "bcode_plugin_sdk",
  "bcode_tool",
+ "bmux_tui",
  "pdf-extract",
  "reqwest",
  "serde",
@@ -1710,6 +1711,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_plugin_sdk",
  "bcode_tool",
+ "bmux_tui",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1899,6 +1901,7 @@ dependencies = [
  "bcode_plugin_sdk",
  "bcode_tesseract_ocr",
  "bcode_tool",
+ "bmux_tui",
  "image",
  "reqwest",
  "serde",

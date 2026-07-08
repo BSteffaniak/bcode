@@ -2,14 +2,16 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! document extraction tool plugin for Bcode.
+#[cfg(feature = "static-bundled")]
+mod document_tui;
 
 use bcode_model_provider_runtime::ProviderRuntime;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
-    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
-    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationStreamEvent, ToolList,
-    ToolSideEffect,
+    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
+    ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult,
+    ToolInvocationStreamEvent, ToolList, ToolPluginVisualMetadata, ToolSideEffect,
+    ToolVisualPayloadSelector,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -24,6 +26,10 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_MAX_BYTES: usize = 20 * 1024 * 1024;
 const MAX_BYTES: usize = 100 * 1024 * 1024;
 const USER_AGENT: &str = concat!("Bcode/", env!("CARGO_PKG_VERSION"));
+const DOCUMENT_PLUGIN_ID: &str = "bcode.document";
+const DOCUMENT_REQUEST_SCHEMA: &str = "bcode.document.request";
+const DOCUMENT_EXTRACT_SCHEMA: &str = "bcode.document.extract_result";
+const DOCUMENT_STATUS_SCHEMA: &str = "bcode.document.status";
 
 /// document extraction plugin.
 pub struct DocumentPlugin {
@@ -106,7 +112,7 @@ impl DocumentPlugin {
         }
         let response = match invocation.name.as_str() {
             "document.extract" => self.invoke_extract(&invocation, context.events),
-            "document.status" => invoke_status(),
+            "document.status" => invoke_status(&invocation.tool_call_id),
             _ => ToolInvocationResponse {
                 output: format!("unsupported document tool: {}", invocation.name),
                 is_error: true,
@@ -136,7 +142,13 @@ impl DocumentPlugin {
         let progress = ProgressReporter::new(events, invocation.tool_call_id.clone());
         progress.emit("document extraction started");
         match runtime.block_on(extract_async(request, artifact_dir, Some(progress))) {
-            Ok(Ok(response)) => json_tool_response(&response),
+            Ok(Ok(response)) => json_tool_response_with_artifact(
+                &response,
+                &invocation.tool_call_id,
+                "extract",
+                DOCUMENT_EXTRACT_SCHEMA,
+                "Document extraction",
+            ),
             Ok(Err(error)) => tool_error(error.to_string()),
             Err(error) => tool_error(error.to_string()),
         }
@@ -530,8 +542,10 @@ fn extract_tool_definition() -> ToolDefinition {
         },
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("extracting".to_string()),
-            request_visual: None,
-
+            request_visual: Some(document_request_visual(
+                "extracting document text",
+                &["path", "url", "max_bytes", "timeout_ms"],
+            )),
         },
     }
 }
@@ -547,12 +561,51 @@ fn status_tool_definition() -> ToolDefinition {
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: bcode_tool::ToolPolicyMetadata::default(),
-        ui: bcode_tool::ToolUiMetadata::default(),
+        ui: bcode_tool::ToolUiMetadata {
+            activity_label: Some("checking document extractors".to_string()),
+            request_visual: Some(document_request_visual("checking document extractors", &[])),
+        },
     }
 }
 
-fn invoke_status() -> ToolInvocationResponse {
-    json_tool_response(&status_response())
+fn document_request_visual(operation: &str, fields: &[&str]) -> ToolPluginVisualMetadata {
+    let mut payload = std::collections::BTreeMap::new();
+    payload.insert(
+        "operation".to_string(),
+        ToolVisualPayloadSelector {
+            fields: Vec::new(),
+            literal: Some(serde_json::Value::String(operation.to_string())),
+            required: false,
+        },
+    );
+    for field in fields {
+        payload.insert(
+            (*field).to_string(),
+            ToolVisualPayloadSelector {
+                fields: vec![(*field).to_string()],
+                literal: None,
+                required: false,
+            },
+        );
+    }
+    ToolPluginVisualMetadata {
+        producer_plugin_id: Some(DOCUMENT_PLUGIN_ID.to_string()),
+        schema: DOCUMENT_REQUEST_SCHEMA.to_string(),
+        schema_version: 1,
+        title: Some("Document".to_string()),
+        subtitle: Some(format!("{operation} · {{bytes}}")),
+        payload,
+    }
+}
+
+fn invoke_status(tool_call_id: &str) -> ToolInvocationResponse {
+    json_tool_response_with_artifact(
+        &status_response(),
+        tool_call_id,
+        "status",
+        DOCUMENT_STATUS_SCHEMA,
+        "Document extractors",
+    )
 }
 
 fn status_response() -> DocumentStatusResponse {
@@ -588,15 +641,35 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
     ServiceResponse::error("invalid_request", error.to_string())
 }
 
-fn json_tool_response<T: Serialize>(value: &T) -> ToolInvocationResponse {
-    match serde_json::to_string_pretty(value) {
-        Ok(output) => ToolInvocationResponse {
+fn json_tool_response_with_artifact<T: Serialize>(
+    value: &T,
+    tool_call_id: &str,
+    artifact_suffix: &str,
+    schema: &str,
+    title: &str,
+) -> ToolInvocationResponse {
+    match serde_json::to_string_pretty(value).and_then(|output| {
+        let payload = serde_json::to_value(value)?;
+        Ok((output, payload))
+    }) {
+        Ok((output, payload)) => ToolInvocationResponse {
             output,
             is_error: false,
             content: Vec::new(),
             full_output: None,
             host_action: None,
-            result: None,
+            result: Some(ToolInvocationResult::Artifact {
+                artifact: Box::new(ToolArtifact {
+                    artifact_id: format!("{tool_call_id}-document-{artifact_suffix}"),
+                    producer_plugin_id: DOCUMENT_PLUGIN_ID.to_string(),
+                    schema: schema.to_string(),
+                    schema_version: 1,
+                    tool_call_id: Some(tool_call_id.to_string()),
+                    title: Some(title.to_string()),
+                    metadata: payload,
+                    refs: Vec::new(),
+                }),
+            }),
         },
         Err(error) => tool_error(error.to_string()),
     }
@@ -616,7 +689,19 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
 #[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(DocumentPlugin, include_str!("../bcode-plugin.toml"))
+    let mut vtable = bcode_plugin_sdk::static_plugin_vtable!(
+        DocumentPlugin,
+        include_str!("../bcode-plugin.toml")
+    );
+    vtable.tui_registry = Some(document_tui_registry);
+    vtable
+}
+
+#[cfg(feature = "static-bundled")]
+fn document_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
+    let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
+    registry.register_visual_adapter(Box::new(document_tui::DocumentTuiVisualAdapter));
+    registry
 }
 
 bcode_plugin_sdk::export_plugin!(DocumentPlugin, include_str!("../bcode-plugin.toml"));

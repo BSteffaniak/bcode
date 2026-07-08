@@ -10,8 +10,9 @@ use bcode_command::{
 };
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
-    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
-    ToolInvocationRequest, ToolInvocationResponse, ToolList, ToolSideEffect,
+    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
+    ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolList,
+    ToolPluginVisualMetadata, ToolSideEffect, ToolVisualPayloadSelector,
 };
 use bcode_worktree_models::{
     WorktreeCreateRequest, WorktreeInfo, WorktreeListRequest, WorktreeRemoveRequest,
@@ -26,6 +27,12 @@ use serde::Serialize;
 use serde_json::json;
 use std::path::PathBuf;
 use std::str::FromStr;
+
+const WORKTREE_PLUGIN_ID: &str = "bcode.worktree";
+const WORKTREE_REQUEST_SCHEMA: &str = "bcode.worktree.request";
+const WORKTREE_LIST_SCHEMA: &str = "bcode.worktree.list";
+const WORKTREE_CREATE_SCHEMA: &str = "bcode.worktree.create_result";
+const WORKTREE_REMOVE_SCHEMA: &str = "bcode.worktree.remove_result";
 
 /// worktree plugin.
 #[derive(Default)]
@@ -217,7 +224,13 @@ fn invoke_list(invocation: &ToolInvocationRequest) -> ToolInvocationResponse {
         .or_else(|| invocation.cwd.clone())
         .unwrap_or_else(current_dir);
     match bcode_worktree::list_worktrees(&cwd) {
-        Ok(response) => json_tool_response(&response),
+        Ok(response) => json_tool_response_with_artifact(
+            &response,
+            &invocation.tool_call_id,
+            "list",
+            WORKTREE_LIST_SCHEMA,
+            "Worktrees",
+        ),
         Err(error) => tool_error(error.to_string()),
     }
 }
@@ -237,7 +250,13 @@ fn invoke_create(invocation: &ToolInvocationRequest) -> ToolInvocationResponse {
         Err(error) => return tool_error(error.to_string()),
     };
     match bcode_worktree::create_worktree(&config, &request, &cwd) {
-        Ok(response) => json_tool_response(&response),
+        Ok(response) => json_tool_response_with_artifact(
+            &response,
+            &invocation.tool_call_id,
+            "create",
+            WORKTREE_CREATE_SCHEMA,
+            "Worktree created",
+        ),
         Err(error) => tool_error(error.to_string()),
     }
 }
@@ -254,7 +273,13 @@ fn invoke_remove(invocation: &ToolInvocationRequest) -> ToolInvocationResponse {
         .or_else(|| invocation.cwd.clone())
         .unwrap_or_else(current_dir);
     match bcode_worktree::remove_worktree(&cwd, &request.path, request.force) {
-        Ok(response) => json_tool_response(&response),
+        Ok(response) => json_tool_response_with_artifact(
+            &response,
+            &invocation.tool_call_id,
+            "remove",
+            WORKTREE_REMOVE_SCHEMA,
+            "Worktree removed",
+        ),
         Err(error) => tool_error(error.to_string()),
     }
 }
@@ -262,7 +287,47 @@ fn invoke_remove(invocation: &ToolInvocationRequest) -> ToolInvocationResponse {
 fn tool_ui(activity_label: &str) -> bcode_tool::ToolUiMetadata {
     bcode_tool::ToolUiMetadata {
         activity_label: Some(activity_label.to_string()),
-        request_visual: None,
+        request_visual: Some(worktree_request_visual(activity_label)),
+    }
+}
+
+fn worktree_request_visual(activity_label: &str) -> ToolPluginVisualMetadata {
+    let mut payload = std::collections::BTreeMap::new();
+    payload.insert(
+        "operation".to_string(),
+        ToolVisualPayloadSelector {
+            fields: Vec::new(),
+            literal: Some(serde_json::Value::String(activity_label.to_string())),
+            required: false,
+        },
+    );
+    for field in [
+        "cwd",
+        "name",
+        "path",
+        "branch",
+        "new_branch",
+        "base_ref",
+        "detach",
+        "force",
+        "no_setup",
+    ] {
+        payload.insert(
+            field.to_string(),
+            ToolVisualPayloadSelector {
+                fields: vec![field.to_string()],
+                literal: None,
+                required: false,
+            },
+        );
+    }
+    ToolPluginVisualMetadata {
+        producer_plugin_id: Some(WORKTREE_PLUGIN_ID.to_string()),
+        schema: WORKTREE_REQUEST_SCHEMA.to_string(),
+        schema_version: 1,
+        title: Some("Worktree".to_string()),
+        subtitle: Some(format!("{activity_label} · {{bytes}}")),
+        payload,
     }
 }
 
@@ -365,15 +430,35 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
     ServiceResponse::error("invalid_request", error.to_string())
 }
 
-fn json_tool_response<T: Serialize>(value: &T) -> ToolInvocationResponse {
-    match serde_json::to_string_pretty(value) {
-        Ok(output) => ToolInvocationResponse {
+fn json_tool_response_with_artifact<T: Serialize>(
+    value: &T,
+    tool_call_id: &str,
+    artifact_suffix: &str,
+    schema: &str,
+    title: &str,
+) -> ToolInvocationResponse {
+    match serde_json::to_string_pretty(value).and_then(|output| {
+        let payload = serde_json::to_value(value)?;
+        Ok((output, payload))
+    }) {
+        Ok((output, payload)) => ToolInvocationResponse {
             output,
             is_error: false,
             content: Vec::new(),
             full_output: None,
             host_action: None,
-            result: None,
+            result: Some(ToolInvocationResult::Artifact {
+                artifact: Box::new(ToolArtifact {
+                    artifact_id: format!("{tool_call_id}-worktree-{artifact_suffix}"),
+                    producer_plugin_id: WORKTREE_PLUGIN_ID.to_string(),
+                    schema: schema.to_string(),
+                    schema_version: 1,
+                    tool_call_id: Some(tool_call_id.to_string()),
+                    title: Some(title.to_string()),
+                    metadata: payload,
+                    refs: Vec::new(),
+                }),
+            }),
         },
         Err(error) => tool_error(error.to_string()),
     }
@@ -414,7 +499,132 @@ fn worktree_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
         surface_kind: "command.work-tree.remove",
         title: "Remove Worktree",
     }));
+    registry.register_visual_adapter(Box::new(WorktreeTuiVisualAdapter));
     registry
+}
+
+struct WorktreeTuiVisualAdapter;
+
+impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for WorktreeTuiVisualAdapter {
+    fn supports(&self, kind: &str) -> bool {
+        matches!(
+            kind,
+            WORKTREE_REQUEST_SCHEMA
+                | WORKTREE_LIST_SCHEMA
+                | WORKTREE_CREATE_SCHEMA
+                | WORKTREE_REMOVE_SCHEMA
+        )
+    }
+
+    fn render_mode(
+        &self,
+        _kind: &str,
+        _payload: &serde_json::Value,
+    ) -> bcode_plugin_sdk::tui::PluginTuiVisualRenderMode {
+        bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::TranscriptBlock
+    }
+
+    fn rows(&self, kind: &str, payload: &serde_json::Value, _width: u16) -> Vec<Line> {
+        match kind {
+            WORKTREE_REQUEST_SCHEMA => worktree_request_rows(payload),
+            WORKTREE_LIST_SCHEMA => worktree_list_rows(payload),
+            WORKTREE_CREATE_SCHEMA => worktree_result_rows("Worktree created", payload),
+            WORKTREE_REMOVE_SCHEMA => worktree_result_rows("Worktree removed", payload),
+            _ => Vec::new(),
+        }
+    }
+}
+
+fn worktree_request_rows(payload: &serde_json::Value) -> Vec<Line> {
+    let arguments = payload.get("arguments").unwrap_or(payload);
+    let mut rows = worktree_header("Worktree request");
+    for key in [
+        "operation",
+        "cwd",
+        "name",
+        "path",
+        "branch",
+        "new_branch",
+        "base_ref",
+        "detach",
+        "force",
+        "no_setup",
+    ] {
+        push_visual_kv(&mut rows, key, visual_value(arguments, key));
+    }
+    rows
+}
+
+fn worktree_list_rows(payload: &serde_json::Value) -> Vec<Line> {
+    let values = payload
+        .get("worktrees")
+        .or_else(|| payload.get("entries"))
+        .and_then(serde_json::Value::as_array);
+    let count = values.map_or(0, Vec::len);
+    let mut rows = worktree_header(&format!("Worktrees ({count})"));
+    if let Some(values) = values {
+        for value in values.iter().take(20) {
+            let path = visual_text(value, "path").unwrap_or("<path>");
+            let branch = visual_text(value, "branch").or_else(|| visual_text(value, "name"));
+            rows.push(Line::from_spans(vec![
+                Span::styled("  ◆ ", Style::new().fg(Color::Cyan)),
+                Span::styled(path.to_string(), Style::new().fg(Color::White)),
+                Span::styled(
+                    branch.map_or_else(String::new, |branch| format!("  {branch}")),
+                    Style::new().fg(Color::BrightBlack),
+                ),
+            ]));
+        }
+        if values.len() > 20 {
+            rows.push(Line::from_spans(vec![Span::styled(
+                format!("  … {} more worktrees", values.len() - 20),
+                Style::new().fg(Color::BrightBlack),
+            )]));
+        }
+    }
+    rows
+}
+
+fn worktree_result_rows(title: &str, payload: &serde_json::Value) -> Vec<Line> {
+    let mut rows = worktree_header(title);
+    for key in ["path", "branch", "name", "session_id", "removed", "force"] {
+        push_visual_kv(&mut rows, key, visual_value(payload, key));
+    }
+    rows
+}
+
+fn worktree_header(title: &str) -> Vec<Line> {
+    vec![Line::from_spans(vec![
+        Span::styled("◆ ", Style::new().fg(Color::Cyan)),
+        Span::styled(title.to_string(), Style::new().fg(Color::White)),
+    ])]
+}
+
+fn push_visual_kv(rows: &mut Vec<Line>, key: &str, value: Option<String>) {
+    if let Some(value) = value.filter(|value| !value.is_empty()) {
+        rows.push(Line::from_spans(vec![
+            Span::styled(format!("  {key}: "), Style::new().fg(Color::BrightBlack)),
+            Span::styled(value, Style::new().fg(Color::White)),
+        ]));
+    }
+}
+
+fn visual_value(payload: &serde_json::Value, key: &str) -> Option<String> {
+    payload.get(key).and_then(|value| {
+        value
+            .as_str()
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                value
+                    .as_bool()
+                    .map(|value| if value { "yes" } else { "no" }.to_string())
+            })
+            .or_else(|| value.as_u64().map(|value| value.to_string()))
+    })
+}
+
+fn visual_text<'a>(payload: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    payload.get(key).and_then(serde_json::Value::as_str)
 }
 
 struct WorktreeCommandSurfaceFactory {
