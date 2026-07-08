@@ -14,8 +14,9 @@ use bcode_agent_runtime::{AgentRuntime, AgentTurnRequest, AgentTurnResponse};
 #[cfg(feature = "embedded-plugins")]
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID,
-    ModelTurnRequest, OP_CANCEL_TURN, OP_FINISH_TURN, OP_POLL_TURN_EVENTS, OP_START_TURN,
-    PollTurnEventsRequest, PollTurnEventsResponse, StartTurnResponse,
+    ModelTurnRequest, OP_CANCEL_TURN, OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS,
+    OP_POLL_TURN_EVENTS, OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse,
+    StartTurnResponse,
 };
 use bcode_model::{ModelParameters, ProviderRequestContext};
 use bcode_session_models::SessionId;
@@ -42,7 +43,10 @@ pub use bcode_agent_runtime::{
 pub use bcode_client::{
     BcodeClient, ClientConnection, ClientError, DaemonAvailability, SessionList,
 };
-pub use bcode_model::{ContentBlock as ModelContentBlock, MessageRole, ModelMessage, ToolCall};
+pub use bcode_model::{
+    ContentBlock as ModelContentBlock, MessageRole, ModelInfo, ModelList, ModelMessage,
+    ProviderCapabilities, ToolCall,
+};
 
 /// Result alias for Bcode SDK operations.
 pub type Result<T> = std::result::Result<T, BcodeError>;
@@ -321,6 +325,9 @@ pub enum BcodeError {
     /// Tool execution failed.
     #[error("tool execution error: {0}")]
     ToolExecution(String),
+    /// Provider setup or capability discovery failed.
+    #[error("provider configuration error: {0}")]
+    ProviderConfiguration(String),
     /// Plugin loading or execution setup failed.
     #[cfg(feature = "embedded-plugins")]
     #[error("plugin error: {0}")]
@@ -894,6 +901,56 @@ impl Bcode {
     #[must_use]
     pub const fn daemon_client(&self) -> Option<&BcodeClient> {
         self.daemon_client.as_ref()
+    }
+    /// Return provider capabilities for an embedded provider plugin.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no embedded plugin runtime is configured or the provider service
+    /// cannot be invoked or decoded.
+    #[cfg(feature = "embedded-plugins")]
+    pub async fn provider_capabilities(
+        &self,
+        provider_plugin_id: impl AsRef<str>,
+    ) -> Result<ProviderCapabilities> {
+        let plugins = self
+            .plugins
+            .as_ref()
+            .ok_or(BcodeError::MissingPluginRuntime)?;
+        plugins
+            .invoke_service_json_scoped(
+                provider_plugin_id.as_ref(),
+                MODEL_PROVIDER_INTERFACE_ID,
+                OP_CAPABILITIES,
+                &serde_json::Value::Null,
+                bcode_plugin::PluginInvocationScope::Global,
+            )
+            .await
+            .map_err(|error| BcodeError::ProviderConfiguration(error.to_string()))
+    }
+
+    /// Return models advertised by an embedded provider plugin.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no embedded plugin runtime is configured or the provider service
+    /// cannot be invoked or decoded.
+    #[cfg(feature = "embedded-plugins")]
+    pub async fn provider_models(&self, provider_plugin_id: impl AsRef<str>) -> Result<ModelList> {
+        let plugins = self
+            .plugins
+            .as_ref()
+            .ok_or(BcodeError::MissingPluginRuntime)?;
+        plugins
+            .invoke_service_json_scoped(
+                provider_plugin_id.as_ref(),
+                MODEL_PROVIDER_INTERFACE_ID,
+                OP_MODELS,
+                &serde_json::Value::Null,
+                bcode_plugin::PluginInvocationScope::Global,
+            )
+            .await
+            .map_err(|error| BcodeError::ProviderConfiguration(error.to_string()))
     }
 }
 
