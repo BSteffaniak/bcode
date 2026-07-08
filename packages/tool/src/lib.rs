@@ -4,6 +4,12 @@
 
 //! Model-callable tool contract types for Bcode.
 
+pub mod interaction;
+
+pub use interaction::{
+    InteractionControlId, InteractionController, InteractionInput, InteractionNavigation,
+    InteractionOutput, InteractionValue,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;

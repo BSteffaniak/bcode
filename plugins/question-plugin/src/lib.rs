@@ -5,6 +5,8 @@
 //! Interactive question tool plugin for Bcode.
 
 #[cfg(feature = "static-bundled")]
+mod question_interaction;
+#[cfg(feature = "static-bundled")]
 mod question_outcome_tui;
 #[cfg(feature = "static-bundled")]
 mod question_tui;
@@ -24,15 +26,15 @@ const TOOL_NAME: &str = "question";
 const DEFAULT_ASK_AGGRESSIVENESS: u8 = 5;
 
 #[derive(Debug, Default)]
-struct QuestionPlugin;
+pub(crate) struct QuestionPlugin;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct NormalizedQuestionRequest {
+pub(crate) struct NormalizedQuestionRequest {
     questions: Vec<Question>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct Question {
+pub(crate) struct Question {
     header: Option<String>,
     #[serde(rename = "question")]
     text: String,
@@ -45,7 +47,7 @@ struct Question {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct QuestionOption {
+pub(crate) struct QuestionOption {
     label: String,
     value: Option<String>,
     description: Option<String>,
@@ -53,40 +55,40 @@ struct QuestionOption {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum QuestionControl {
+pub(crate) enum QuestionControl {
     Radio,
     Checkbox,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum QuestionSelectionMode {
+pub(crate) enum QuestionSelectionMode {
     Single,
     Multiple,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum QuestionCustomMode {
+pub(crate) enum QuestionCustomMode {
     Exclusive,
     Additional,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct QuestionToolOutcome {
+pub(crate) struct QuestionToolOutcome {
     status: QuestionRequestStatus,
     questions: Vec<QuestionOutcome>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum QuestionRequestStatus {
+pub(crate) enum QuestionRequestStatus {
     Answered,
     Unanswered,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct QuestionOutcome {
+pub(crate) struct QuestionOutcome {
     question_index: usize,
     header: Option<String>,
     question: String,
@@ -98,7 +100,7 @@ struct QuestionOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum QuestionStatus {
+pub(crate) enum QuestionStatus {
     Answered,
     Unanswered,
     Dismissed,
@@ -107,7 +109,7 @@ enum QuestionStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "status")]
-enum QuestionResolutionPayload {
+pub(crate) enum QuestionResolutionPayload {
     Answered {
         questions: Vec<QuestionAnswerPayload>,
     },
@@ -116,7 +118,7 @@ enum QuestionResolutionPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct QuestionAnswerPayload {
+pub(crate) struct QuestionAnswerPayload {
     question_index: usize,
     #[serde(default)]
     selected: Vec<String>,
@@ -125,7 +127,7 @@ struct QuestionAnswerPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct SelectedAnswer {
+pub(crate) struct SelectedAnswer {
     label: String,
     value: String,
 }

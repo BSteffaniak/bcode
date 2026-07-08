@@ -4,17 +4,21 @@ use bcode_plugin_sdk::tui::{
     BoxedPluginTuiSurface, PluginTuiAction, PluginTuiHost, PluginTuiSurface,
     PluginTuiSurfaceFactory, PluginTuiSurfaceFuture, PluginTuiSurfaceOpenRequest,
 };
+use bcode_tool::{
+    InteractionControlId, InteractionController, InteractionInput, InteractionNavigation,
+    InteractionOutput,
+};
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::{Event, MouseButton, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
-use serde_json::json;
 
-use super::{
-    NormalizedQuestionRequest, Question, QuestionAnswerPayload, QuestionCustomMode,
-    QuestionSelectionMode,
+use super::NormalizedQuestionRequest;
+use super::question_interaction::{
+    QuestionFocusTarget, QuestionInteractionController, QuestionSnapshot, custom_control_id,
+    option_control_id,
 };
 
 /// Native inline TUI surface kind for question requests.
@@ -37,192 +41,34 @@ impl PluginTuiSurfaceFactory for QuestionInlineSurfaceFactory {
 }
 
 struct QuestionInlineSurface {
-    request: NormalizedQuestionRequest,
-    answers: Vec<QuestionAnswerPayload>,
-    focus: FocusTarget,
+    controller: QuestionInteractionController,
     last_area: Rect,
     controls: Vec<ControlRegion>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FocusTarget {
-    Question(usize),
-    Custom(usize),
-    Submit,
-    Cancel,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ControlKind {
-    Option { question: usize, option: usize },
-    Custom { question: usize },
-    Submit,
-    Cancel,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ControlRegion {
     area: Rect,
-    kind: ControlKind,
+    control_id: InteractionControlId,
 }
 
 impl QuestionInlineSurface {
     fn new(request: NormalizedQuestionRequest) -> Self {
-        let answers = request
-            .questions
-            .iter()
-            .enumerate()
-            .map(|(question_index, _)| QuestionAnswerPayload {
-                question_index,
-                selected: Vec::new(),
-                custom: None,
-            })
-            .collect();
         Self {
-            request,
-            answers,
-            focus: FocusTarget::Question(0),
+            controller: QuestionInteractionController::new(request),
             last_area: Rect::default(),
             controls: Vec::new(),
         }
     }
 
-    fn focus_next(&mut self) {
-        let targets = self.focus_targets();
-        if targets.is_empty() {
-            return;
-        }
-        let index = targets
-            .iter()
-            .position(|target| *target == self.focus)
-            .unwrap_or(0);
-        self.focus = targets[(index + 1) % targets.len()];
-    }
-
-    fn focus_previous(&mut self) {
-        let targets = self.focus_targets();
-        if targets.is_empty() {
-            return;
-        }
-        let index = targets
-            .iter()
-            .position(|target| *target == self.focus)
-            .unwrap_or(0);
-        self.focus = targets[(index + targets.len() - 1) % targets.len()];
-    }
-
-    fn focus_targets(&self) -> Vec<FocusTarget> {
-        let mut targets = Vec::new();
-        for (index, question) in self.request.questions.iter().enumerate() {
-            targets.push(FocusTarget::Question(index));
-            if question.custom {
-                targets.push(FocusTarget::Custom(index));
-            }
-        }
-        targets.push(FocusTarget::Submit);
-        targets.push(FocusTarget::Cancel);
-        targets
-    }
-
-    fn toggle_option(&mut self, question_index: usize, option_index: usize) {
-        let Some(question) = self.request.questions.get(question_index) else {
-            return;
-        };
-        let Some(option) = question.options.get(option_index) else {
-            return;
-        };
-        let value = option
-            .value
-            .clone()
-            .unwrap_or_else(|| option_index.to_string());
-        let answer = &mut self.answers[question_index];
-        if question.selection_mode == QuestionSelectionMode::Multiple {
-            if let Some(index) = answer
-                .selected
-                .iter()
-                .position(|selected| selected == &value)
-            {
-                answer.selected.remove(index);
-            } else {
-                answer.selected.push(value);
-            }
-        } else {
-            answer.selected = vec![value];
-            if question.custom_mode == QuestionCustomMode::Exclusive {
-                answer.custom = None;
-            }
-        }
-    }
-
-    fn append_custom_char(&mut self, question_index: usize, character: char) {
-        let answer = &mut self.answers[question_index];
-        let mut text = answer.custom.take().unwrap_or_default();
-        text.push(character);
-        answer.custom = Some(text);
-        if self.request.questions[question_index].custom_mode == QuestionCustomMode::Exclusive {
-            answer.selected.clear();
-        }
-    }
-
-    fn backspace_custom(&mut self, question_index: usize) {
-        let answer = &mut self.answers[question_index];
-        if let Some(text) = &mut answer.custom {
-            text.pop();
-            if text.is_empty() {
-                answer.custom = None;
-            }
-        }
-    }
-
-    fn submit_payload(&self) -> serde_json::Value {
-        json!({
-            "status": "answered",
-            "questions": self.answers,
-        })
-    }
-
-    fn activate_focused(&mut self) -> PluginTuiAction {
-        match self.focus {
-            FocusTarget::Question(question_index) => {
-                if !self.request.questions[question_index].options.is_empty() {
-                    self.toggle_option(question_index, 0);
-                }
-                PluginTuiAction::Redraw
-            }
-            FocusTarget::Custom(_) => PluginTuiAction::None,
-            FocusTarget::Submit => PluginTuiAction::Close {
-                outcome: Some(self.submit_payload()),
+    fn action_from_output(output: InteractionOutput) -> PluginTuiAction {
+        match output {
+            InteractionOutput::None => PluginTuiAction::None,
+            InteractionOutput::Redraw => PluginTuiAction::Redraw,
+            InteractionOutput::Submitted { payload } => PluginTuiAction::Close {
+                outcome: Some(payload),
             },
-            FocusTarget::Cancel => PluginTuiAction::Close { outcome: None },
-        }
-    }
-
-    fn handle_mouse(&mut self, event: &bmux_tui::event::MouseEvent) -> PluginTuiAction {
-        if !matches!(event.kind, MouseEventKind::Up(MouseButton::Left)) {
-            return PluginTuiAction::None;
-        }
-        let Some(control) = self
-            .controls
-            .iter()
-            .find(|control| control.area.contains(event.position))
-            .copied()
-        else {
-            return PluginTuiAction::None;
-        };
-        match control.kind {
-            ControlKind::Option { question, option } => {
-                self.focus = FocusTarget::Question(question);
-                self.toggle_option(question, option);
-                PluginTuiAction::Redraw
-            }
-            ControlKind::Custom { question } => {
-                self.focus = FocusTarget::Custom(question);
-                PluginTuiAction::Redraw
-            }
-            ControlKind::Submit => PluginTuiAction::Close {
-                outcome: Some(self.submit_payload()),
-            },
-            ControlKind::Cancel => PluginTuiAction::Close { outcome: None },
+            InteractionOutput::Cancelled => PluginTuiAction::Close { outcome: None },
         }
     }
 
@@ -252,66 +98,59 @@ impl QuestionInlineSurface {
         &mut self,
         frame: &mut Frame<'_>,
         y: &mut u16,
+        snapshot: &QuestionSnapshot,
         question_index: usize,
-        question: &Question,
     ) {
+        let question = &snapshot.request.questions[question_index];
         let prompt = question.header.as_ref().map_or_else(
             || question.text.clone(),
             |header| format!("{header}: {}", question.text),
         );
         self.render_line(frame, y, &Line::from(prompt));
-        self.render_options(frame, y, question_index, question);
-        self.render_custom_answer(frame, y, question_index, question);
-        self.render_line(frame, y, &Line::from(""));
-    }
-
-    fn render_options(
-        &mut self,
-        frame: &mut Frame<'_>,
-        y: &mut u16,
-        question_index: usize,
-        question: &Question,
-    ) {
         for (option_index, option) in question.options.iter().enumerate() {
-            let selected = self.answers[question_index].selected.contains(
+            let option_id = option_control_id(question_index, option_index);
+            let selected = snapshot.answers[question_index].selected.contains(
                 &option
                     .value
                     .clone()
                     .unwrap_or_else(|| option_index.to_string()),
             );
-            let marker = if question.selection_mode == QuestionSelectionMode::Multiple {
+            let marker = if question.selection_mode == super::QuestionSelectionMode::Multiple {
                 if selected { "[x]" } else { "[ ]" }
             } else if selected {
                 "(*)"
             } else {
                 "( )"
             };
-            let style = focus_style(self.focus == FocusTarget::Question(question_index));
             self.controls.push(ControlRegion {
                 area: Rect::new(self.last_area.x, *y, self.last_area.width, 1),
-                kind: ControlKind::Option {
-                    question: question_index,
-                    option: option_index,
-                },
+                control_id: option_id,
             });
             self.render_line(
                 frame,
                 y,
                 &Line::from_spans(vec![Span::styled(
                     format!("  {marker} {}", option.label),
-                    style,
+                    focus_style(matches!(
+                        snapshot.focus,
+                        QuestionFocusTarget::Question { question_index: focused }
+                            if focused == question_index
+                    )),
                 )]),
             );
         }
+        self.render_custom_answer(frame, y, snapshot, question_index);
+        self.render_line(frame, y, &Line::from(""));
     }
 
     fn render_custom_answer(
         &mut self,
         frame: &mut Frame<'_>,
         y: &mut u16,
+        snapshot: &QuestionSnapshot,
         question_index: usize,
-        question: &Question,
     ) {
+        let question = &snapshot.request.questions[question_index];
         if !question.options.is_empty() && !question.custom {
             return;
         }
@@ -320,52 +159,71 @@ impl QuestionInlineSurface {
         } else {
             "Custom answer"
         };
-        let value = self.answers[question_index]
+        let value = snapshot.answers[question_index]
             .custom
             .clone()
             .unwrap_or_default();
+        let control_id = custom_control_id(question_index);
         self.controls.push(ControlRegion {
             area: Rect::new(self.last_area.x, *y, self.last_area.width, 1),
-            kind: ControlKind::Custom {
-                question: question_index,
-            },
+            control_id,
         });
         self.render_line(
             frame,
             y,
             &Line::from_spans(vec![Span::styled(
                 format!("  {label}: {value}"),
-                focus_style(self.focus == FocusTarget::Custom(question_index)),
+                focus_style(matches!(
+                    snapshot.focus,
+                    QuestionFocusTarget::Custom { question_index: focused }
+                        if focused == question_index
+                )),
             )]),
         );
     }
 
-    fn render_actions(&mut self, frame: &mut Frame<'_>, y: &mut u16) {
+    fn render_actions(&mut self, frame: &mut Frame<'_>, y: &mut u16, snapshot: &QuestionSnapshot) {
         self.controls.push(ControlRegion {
             area: Rect::new(self.last_area.x, *y, 10, 1),
-            kind: ControlKind::Submit,
+            control_id: InteractionControlId::new("submit"),
         });
         self.controls.push(ControlRegion {
             area: Rect::new(self.last_area.x.saturating_add(11), *y, 10, 1),
-            kind: ControlKind::Cancel,
+            control_id: InteractionControlId::new("cancel"),
         });
         self.render_line(
             frame,
             y,
             &Line::from_spans(vec![
-                Span::styled("[ Submit ]", focus_style(self.focus == FocusTarget::Submit)),
+                Span::styled(
+                    "[ Submit ]",
+                    focus_style(snapshot.focus == QuestionFocusTarget::Submit),
+                ),
                 Span::raw(" "),
-                Span::styled("[ Cancel ]", focus_style(self.focus == FocusTarget::Cancel)),
+                Span::styled(
+                    "[ Cancel ]",
+                    focus_style(snapshot.focus == QuestionFocusTarget::Cancel),
+                ),
             ]),
         );
     }
-}
 
-const fn focus_style(focused: bool) -> Style {
-    if focused {
-        Style::new().add_modifier(Modifier::REVERSED)
-    } else {
-        Style::new()
+    fn handle_mouse(&mut self, event: &bmux_tui::event::MouseEvent) -> PluginTuiAction {
+        if !matches!(event.kind, MouseEventKind::Up(MouseButton::Left)) {
+            return PluginTuiAction::None;
+        }
+        let Some(control_id) = self
+            .controls
+            .iter()
+            .find(|control| control.area.contains(event.position))
+            .map(|control| control.control_id.clone())
+        else {
+            return PluginTuiAction::None;
+        };
+        Self::action_from_output(
+            self.controller
+                .handle_input(InteractionInput::Activate { control_id }),
+        )
     }
 }
 
@@ -379,8 +237,9 @@ impl PluginTuiSurface for QuestionInlineSurface {
     }
 
     fn preferred_height(&mut self, _width: u16) -> u16 {
+        let snapshot = self.controller.snapshot();
         let mut height = 2_u16;
-        for question in &self.request.questions {
+        for question in &snapshot.request.questions {
             height = height.saturating_add(1);
             height =
                 height.saturating_add(u16::try_from(question.options.len()).unwrap_or(u16::MAX));
@@ -395,42 +254,57 @@ impl PluginTuiSurface for QuestionInlineSurface {
     fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
         self.last_area = area;
         self.controls.clear();
+        let snapshot = self.controller.snapshot();
         let mut y = area.y;
         self.render_title(frame, &mut y);
-        let questions = self.request.questions.clone();
-        for (question_index, question) in questions.iter().enumerate() {
-            self.render_question(frame, &mut y, question_index, question);
+        for question_index in 0..snapshot.request.questions.len() {
+            self.render_question(frame, &mut y, &snapshot, question_index);
         }
-        self.render_actions(frame, &mut y);
+        self.render_actions(frame, &mut y, &snapshot);
     }
 
     fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
         match event {
             Event::Key(stroke) if stroke.modifiers.is_empty() => match stroke.key {
-                KeyCode::Tab | KeyCode::Down => {
-                    self.focus_next();
-                    PluginTuiAction::Redraw
+                KeyCode::Tab | KeyCode::Down => Self::action_from_output(
+                    self.controller.handle_input(InteractionInput::Navigate {
+                        direction: InteractionNavigation::Next,
+                    }),
+                ),
+                KeyCode::Up => Self::action_from_output(self.controller.handle_input(
+                    InteractionInput::Navigate {
+                        direction: InteractionNavigation::Previous,
+                    },
+                )),
+                KeyCode::Enter | KeyCode::Space => Self::action_from_output(
+                    self.controller.handle_input(InteractionInput::Activate {
+                        control_id: self.controller.focus().control_id(),
+                    }),
+                ),
+                KeyCode::Escape => {
+                    Self::action_from_output(self.controller.handle_input(InteractionInput::Cancel))
                 }
-                KeyCode::Up => {
-                    self.focus_previous();
-                    PluginTuiAction::Redraw
-                }
-                KeyCode::Enter | KeyCode::Space => self.activate_focused(),
-                KeyCode::Escape => PluginTuiAction::Close { outcome: None },
                 KeyCode::Backspace => {
-                    if let FocusTarget::Custom(question) = self.focus {
-                        self.backspace_custom(question);
+                    if let QuestionFocusTarget::Custom { question_index } = self.controller.focus()
+                    {
+                        self.controller.backspace_custom(question_index);
                         PluginTuiAction::Redraw
                     } else {
                         PluginTuiAction::None
                     }
                 }
                 KeyCode::Char(character) => {
-                    if let FocusTarget::Custom(question) = self.focus {
-                        self.append_custom_char(question, character);
+                    if let QuestionFocusTarget::Custom { question_index } = self.controller.focus()
+                    {
+                        self.controller
+                            .append_custom_text(question_index, &character.to_string());
                         PluginTuiAction::Redraw
                     } else if character == ' ' {
-                        self.activate_focused()
+                        Self::action_from_output(self.controller.handle_input(
+                            InteractionInput::Activate {
+                                control_id: self.controller.focus().control_id(),
+                            },
+                        ))
                     } else {
                         PluginTuiAction::None
                     }
@@ -447,10 +321,8 @@ impl PluginTuiSurface for QuestionInlineSurface {
             },
             Event::Mouse(mouse) => self.handle_mouse(mouse),
             Event::Paste(text) => {
-                if let FocusTarget::Custom(question) = self.focus {
-                    for character in text.chars() {
-                        self.append_custom_char(question, character);
-                    }
+                if let QuestionFocusTarget::Custom { question_index } = self.controller.focus() {
+                    self.controller.append_custom_text(question_index, text);
                     PluginTuiAction::Redraw
                 } else {
                     PluginTuiAction::None
@@ -460,5 +332,13 @@ impl PluginTuiSurface for QuestionInlineSurface {
                 PluginTuiAction::None
             }
         }
+    }
+}
+
+const fn focus_style(focused: bool) -> Style {
+    if focused {
+        Style::new().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::new()
     }
 }
