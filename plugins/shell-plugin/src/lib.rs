@@ -10,7 +10,7 @@ mod terminal_clean;
 
 use bcode_config::{
     ShellToolConfig, ShellToolEnvAutoFallback, ShellToolEnvConfig, ShellToolEnvMode,
-    ShellToolOutputConfig, default_config_paths_from_with_environment,
+    ShellToolOutputConfig, ShellToolPreludeGateTarget, default_config_paths_from_with_environment,
     load_config_from_paths_with_environment,
 };
 use bcode_plugin_sdk::prelude::*;
@@ -683,7 +683,11 @@ fn run_terminal_shell_command_inner(
         prelude_marker,
     } = command_plan;
     let mut prelude_markers = prelude_markers_from_output_config(&shell_config.output);
-    prelude_markers.extend(prelude_marker);
+    if let Some(prelude_marker) = prelude_marker {
+        prelude_markers.live.push(prelude_marker.clone());
+        prelude_markers.replay.push(prelude_marker.clone());
+        prelude_markers.clean.push(prelude_marker);
+    }
     let mut command = portable_pty::CommandBuilder::new(program);
     for arg in args {
         command.arg(arg);
@@ -886,6 +890,13 @@ struct TerminalStreamPaths {
     replay: Option<PathBuf>,
 }
 
+#[derive(Clone, Default)]
+struct PreludeGateMarkers {
+    live: Vec<String>,
+    replay: Vec<String>,
+    clean: Vec<String>,
+}
+
 #[derive(Clone)]
 struct ShellVisualStreamContext<'a> {
     arguments: &'a serde_json::Value,
@@ -893,7 +904,7 @@ struct ShellVisualStreamContext<'a> {
     columns: u16,
     rows: u16,
     timeout_ms: Option<u64>,
-    prelude_markers: Vec<String>,
+    prelude_markers: PreludeGateMarkers,
 }
 
 const PRELUDE_GATE_BUFFER_LIMIT: usize = 4 * 1024 * 1024;
@@ -970,13 +981,24 @@ fn find_first_marker(haystack: &[u8], markers: &[Vec<u8>]) -> Option<(usize, usi
         .min_by_key(|(index, _len)| *index)
 }
 
-fn prelude_markers_from_output_config(config: &ShellToolOutputConfig) -> Vec<String> {
-    config
+fn prelude_markers_from_output_config(config: &ShellToolOutputConfig) -> PreludeGateMarkers {
+    let mut markers = PreludeGateMarkers::default();
+    for gate in config
         .prelude_gates
         .iter()
         .filter(|gate| gate.enabled && !gate.marker.is_empty())
-        .map(|gate| gate.marker.clone())
-        .collect()
+    {
+        if gate.hide_from.contains(&ShellToolPreludeGateTarget::Live) {
+            markers.live.push(gate.marker.clone());
+        }
+        if gate.hide_from.contains(&ShellToolPreludeGateTarget::Replay) {
+            markers.replay.push(gate.marker.clone());
+        }
+        if gate.hide_from.contains(&ShellToolPreludeGateTarget::Clean) {
+            markers.clean.push(gate.marker.clone());
+        }
+    }
+    markers
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1058,7 +1080,14 @@ where
     let mut buffer = [0_u8; 4096];
     let mut sequence = 0_u64;
     let mut visual_output = String::new();
-    let mut prelude_gate = PreludeGate::new(visual_context.prelude_markers.clone());
+    let mut live_gate = PreludeGate::new(visual_context.prelude_markers.live.clone());
+    let mut replay_gate = PreludeGate::new(visual_context.prelude_markers.replay.clone());
+    let mut clean_gate = PreludeGate::new(visual_context.prelude_markers.clean.clone());
+    let emit = StreamChunkEmit {
+        events,
+        tool_call_id,
+        visual_context,
+    };
     loop {
         let read = reader
             .read(&mut buffer)
@@ -1067,42 +1096,43 @@ where
             break;
         }
         sequence = sequence.saturating_add(1);
-        raw.write_chunk(&mut *raw_writer, &buffer[..read], DEFAULT_MAX_OUTPUT_BYTES)?;
-        let replay_chunk = prelude_gate.write(&buffer[..read]);
-        if !replay_chunk.is_empty() {
-            write_replay_chunk(
-                &replay_chunk,
-                &mut replay,
-                &mut *replay_writer,
-                &mut cleaner,
-                &mut visual_output,
-                &FilteredVisualEmit {
-                    events,
-                    tool_call_id,
-                    visual_context: visual_context.clone(),
-                },
-                sequence,
-            )?;
-        }
-    }
-    let final_replay = prelude_gate.finish();
-    if !final_replay.is_empty() {
-        sequence = sequence.saturating_add(1);
-        write_replay_chunk(
-            &final_replay,
+        let chunk = &buffer[..read];
+        raw.write_chunk(&mut *raw_writer, chunk, DEFAULT_MAX_OUTPUT_BYTES)?;
+        let live = live_gate.write(chunk);
+        let replay_chunk = replay_gate.write(chunk);
+        let clean = clean_gate.write(chunk);
+        write_stream_outputs(
+            StreamOutputs {
+                live: &live,
+                replay: &replay_chunk,
+                clean: &clean,
+            },
             &mut replay,
             &mut *replay_writer,
             &mut cleaner,
             &mut visual_output,
-            &FilteredVisualEmit {
-                events,
-                tool_call_id,
-                visual_context: visual_context.clone(),
-            },
-            sequence,
+            emit.with_sequence(sequence),
         )?;
     }
-    let prelude_suppressed = prelude_gate.suppressed_prelude();
+    sequence = sequence.saturating_add(1);
+    let live = live_gate.finish();
+    let replay_chunk = replay_gate.finish();
+    let clean = clean_gate.finish();
+    write_stream_outputs(
+        StreamOutputs {
+            live: &live,
+            replay: &replay_chunk,
+            clean: &clean,
+        },
+        &mut replay,
+        &mut *replay_writer,
+        &mut cleaner,
+        &mut visual_output,
+        emit.with_sequence(sequence),
+    )?;
+    let prelude_suppressed = live_gate.suppressed_prelude()
+        || replay_gate.suppressed_prelude()
+        || clean_gate.suppressed_prelude();
     raw_writer.flush().map_err(|error| error.to_string())?;
     replay_writer.flush().map_err(|error| error.to_string())?;
     let clean_summary = cleaner.finish().map_err(|error| error.to_string())?;
@@ -1123,34 +1153,66 @@ where
     })
 }
 
-#[derive(Clone)]
-struct FilteredVisualEmit<'a> {
-    events: ServiceEventEmitter,
-    tool_call_id: &'a str,
-    visual_context: ShellVisualStreamContext<'a>,
+#[derive(Clone, Copy)]
+struct StreamOutputs<'a> {
+    live: &'a [u8],
+    replay: &'a [u8],
+    clean: &'a [u8],
 }
 
-fn write_replay_chunk<W: Write>(
-    chunk: &[u8],
-    retained: &mut RetainedStream,
-    artifact_writer: &mut dyn Write,
+#[derive(Clone, Copy)]
+struct StreamChunkEmit<'a, 'b> {
+    events: ServiceEventEmitter,
+    tool_call_id: &'a str,
+    visual_context: &'a ShellVisualStreamContext<'b>,
+}
+
+impl<'a, 'b> StreamChunkEmit<'a, 'b> {
+    const fn with_sequence(self, sequence: u64) -> SequencedStreamChunkEmit<'a, 'b> {
+        SequencedStreamChunkEmit {
+            events: self.events,
+            tool_call_id: self.tool_call_id,
+            visual_context: self.visual_context,
+            sequence,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SequencedStreamChunkEmit<'a, 'b> {
+    events: ServiceEventEmitter,
+    tool_call_id: &'a str,
+    visual_context: &'a ShellVisualStreamContext<'b>,
+    sequence: u64,
+}
+
+fn write_stream_outputs<W: Write>(
+    outputs: StreamOutputs<'_>,
+    replay: &mut RetainedStream,
+    replay_writer: &mut dyn Write,
     cleaner: &mut terminal_clean::TerminalCleanWriter<&mut W>,
     visual_output: &mut String,
-    emit: &FilteredVisualEmit<'_>,
-    sequence: u64,
+    emit: SequencedStreamChunkEmit<'_, '_>,
 ) -> Result<(), String> {
-    retained.write_chunk(artifact_writer, chunk, DEFAULT_MAX_OUTPUT_BYTES)?;
-    visual_output.push_str(&String::from_utf8_lossy(chunk));
-    emit_tool_output_delta(
-        emit.events,
-        emit.tool_call_id,
-        &emit.visual_context,
-        sequence,
-        visual_output.as_bytes(),
-    );
-    cleaner
-        .write_chunk(chunk)
-        .map_err(|error| error.to_string())
+    if !outputs.live.is_empty() {
+        visual_output.push_str(&String::from_utf8_lossy(outputs.live));
+        emit_tool_output_delta(
+            emit.events,
+            emit.tool_call_id,
+            emit.visual_context,
+            emit.sequence,
+            visual_output.as_bytes(),
+        );
+    }
+    if !outputs.replay.is_empty() {
+        replay.write_chunk(replay_writer, outputs.replay, DEFAULT_MAX_OUTPUT_BYTES)?;
+    }
+    if !outputs.clean.is_empty() {
+        cleaner
+            .write_chunk(outputs.clean)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn raw_artifact_path(
@@ -1793,16 +1855,80 @@ mod tests {
                     name: "enabled".to_string(),
                     marker: "__READY__".to_string(),
                     enabled: true,
+                    ..bcode_config::ShellToolPreludeGateConfig::default()
                 },
                 bcode_config::ShellToolPreludeGateConfig {
                     name: "disabled".to_string(),
                     marker: "__IGNORED__".to_string(),
                     enabled: false,
+                    ..bcode_config::ShellToolPreludeGateConfig::default()
                 },
             ],
         });
 
-        assert_eq!(markers, vec!["__READY__".to_string()]);
+        assert_eq!(markers.live, vec!["__READY__".to_string()]);
+        assert_eq!(markers.replay, vec!["__READY__".to_string()]);
+        assert_eq!(markers.clean, vec!["__READY__".to_string()]);
+    }
+
+    #[test]
+    fn prelude_gate_config_can_keep_prelude_in_clean_output() {
+        let output = read_limited_streaming(
+            std::io::Cursor::new(b"prelude\n__MARK__\nhello\n"),
+            ServiceEventEmitter::default(),
+            "call",
+            &ShellVisualStreamContext {
+                arguments: &json!({}),
+                stream: ToolOutputStream::Pty,
+                columns: 80,
+                rows: 24,
+                timeout_ms: None,
+                prelude_markers: PreludeGateMarkers {
+                    live: vec!["__MARK__".to_string()],
+                    replay: vec!["__MARK__".to_string()],
+                    clean: Vec::new(),
+                },
+            },
+            TerminalStreamPaths {
+                clean: None,
+                raw: None,
+                replay: None,
+            },
+        )
+        .expect("stream should read");
+
+        assert_eq!(output.replay.text, "hello\n");
+        assert_eq!(output.clean.text, "prelude\n__MARK__\nhello\n");
+    }
+
+    #[test]
+    fn prelude_gate_config_can_keep_prelude_in_replay_output() {
+        let output = read_limited_streaming(
+            std::io::Cursor::new(b"prelude\n__MARK__\nhello\n"),
+            ServiceEventEmitter::default(),
+            "call",
+            &ShellVisualStreamContext {
+                arguments: &json!({}),
+                stream: ToolOutputStream::Pty,
+                columns: 80,
+                rows: 24,
+                timeout_ms: None,
+                prelude_markers: PreludeGateMarkers {
+                    live: vec!["__MARK__".to_string()],
+                    replay: Vec::new(),
+                    clean: vec!["__MARK__".to_string()],
+                },
+            },
+            TerminalStreamPaths {
+                clean: None,
+                raw: None,
+                replay: None,
+            },
+        )
+        .expect("stream should read");
+
+        assert_eq!(output.replay.text, "prelude\n__MARK__\nhello\n");
+        assert_eq!(output.clean.text, "hello\n");
     }
 
     #[test]

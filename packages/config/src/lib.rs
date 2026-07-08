@@ -1896,7 +1896,7 @@ pub struct ShellToolOutputConfig {
 }
 
 /// Passive shell output prelude gate configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShellToolPreludeGateConfig {
     /// Human-readable gate name.
     pub name: String,
@@ -1905,10 +1905,44 @@ pub struct ShellToolPreludeGateConfig {
     /// Whether this gate is active.
     #[serde(default = "default_shell_prelude_gate_enabled")]
     pub enabled: bool,
+    /// Output surfaces where the marker prelude should be hidden.
+    #[serde(default = "default_shell_prelude_gate_hide_from")]
+    pub hide_from: BTreeSet<ShellToolPreludeGateTarget>,
+}
+
+impl Default for ShellToolPreludeGateConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            marker: String::new(),
+            enabled: default_shell_prelude_gate_enabled(),
+            hide_from: default_shell_prelude_gate_hide_from(),
+        }
+    }
 }
 
 const fn default_shell_prelude_gate_enabled() -> bool {
     true
+}
+
+fn default_shell_prelude_gate_hide_from() -> BTreeSet<ShellToolPreludeGateTarget> {
+    BTreeSet::from([
+        ShellToolPreludeGateTarget::Live,
+        ShellToolPreludeGateTarget::Replay,
+        ShellToolPreludeGateTarget::Clean,
+    ])
+}
+
+/// Shell output surface where a marker prelude can be hidden.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellToolPreludeGateTarget {
+    /// Live streamed terminal output.
+    Live,
+    /// Final terminal replay output.
+    Replay,
+    /// Normalized model-oriented output.
+    Clean,
 }
 
 /// Shell tool environment resolver mode.
