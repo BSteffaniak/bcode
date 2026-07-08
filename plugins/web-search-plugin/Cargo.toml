@@ -17,6 +17,7 @@ crate-type = ["cdylib", "rlib"]
 bcode_model_provider_runtime = { workspace = true }
 bcode_plugin_sdk             = { workspace = true }
 bcode_tool                   = { workspace = true }
+bmux_tui                     = { workspace = true, optional = true }
 reqwest                      = { workspace = true }
 serde                        = { workspace = true, features = ["derive", "std"] }
 serde_json                   = { workspace = true }
@@ -26,4 +27,4 @@ tokio                        = { workspace = true, features = ["macros", "time"]
 [features]
 default          = []
 fail-on-warnings = []
-static-bundled   = []
+static-bundled   = ["bmux_tui"]

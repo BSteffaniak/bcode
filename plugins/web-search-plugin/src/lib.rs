@@ -2,15 +2,16 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! web search and page fetching tool plugin for Bcode.
+#[cfg(feature = "static-bundled")]
+mod web_search_tui;
 
 use bcode_model_provider_runtime::ProviderRuntime;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
-    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolDefinition,
-    ToolInvocationHostAction, ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationStreamEvent, ToolList, ToolPluginVisualMetadata, ToolSideEffect,
-    ToolVisualPayloadSelector,
+    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
+    ToolDefinition, ToolInvocationHostAction, ToolInvocationRequest, ToolInvocationResponse,
+    ToolInvocationResult, ToolInvocationStreamEvent, ToolList, ToolPluginVisualMetadata,
+    ToolSideEffect, ToolVisualPayloadSelector,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,15 @@ const DEFAULT_MAX_RESULTS: usize = 8;
 const DEFAULT_FETCH_MAX_BYTES: usize = 256 * 1024;
 const MAX_FETCH_BYTES: usize = 2 * 1024 * 1024;
 const USER_AGENT: &str = concat!("Bcode/", env!("CARGO_PKG_VERSION"));
+const WEB_SEARCH_PLUGIN_ID: &str = "bcode.web-search";
+const WEB_SEARCH_REQUEST_SCHEMA: &str = "bcode.web-search.search_request";
+const WEB_FETCH_REQUEST_SCHEMA: &str = "bcode.web-search.fetch_request";
+const WEB_STATUS_REQUEST_SCHEMA: &str = "bcode.web-search.status_request";
+const WEB_INSPECT_REQUEST_SCHEMA: &str = "bcode.web-search.inspect_request";
+const WEB_SEARCH_RESULTS_SCHEMA: &str = "bcode.web-search.search_results";
+const WEB_FETCH_RESULT_SCHEMA: &str = "bcode.web-search.fetch_result";
+const WEB_STATUS_SCHEMA: &str = "bcode.web-search.status";
+const WEB_INSPECT_RESULT_SCHEMA: &str = "bcode.web-search.inspect_result";
 
 #[derive(Clone)]
 struct ProgressReporter {
@@ -154,7 +164,7 @@ impl WebSearchPlugin {
             search_async(request, plugin_config, Some(progress)),
             cancellation.clone(),
         )) {
-            Ok(Ok(response)) => search_tool_response(&response),
+            Ok(Ok(response)) => search_tool_response(&response, &invocation.tool_call_id),
             Ok(Err(error)) => tool_error(error.to_string()),
             Err(error) => tool_error(error.to_string()),
         }
@@ -185,7 +195,13 @@ impl WebSearchPlugin {
             fetch_async(request, plugin_config, Some(progress)),
             cancellation.clone(),
         )) {
-            Ok(Ok(response)) => json_tool_response(&response),
+            Ok(Ok(response)) => json_tool_response_with_artifact(
+                &response,
+                &invocation.tool_call_id,
+                "fetch",
+                WEB_FETCH_RESULT_SCHEMA,
+                "Fetched page",
+            ),
             Ok(Err(error)) => tool_error(error.to_string()),
             Err(error) => tool_error(error.to_string()),
         }
@@ -213,7 +229,13 @@ fn invoke_status(config: &bcode_plugin_sdk::PluginConfigContext) -> ToolInvocati
         Ok(config) => config,
         Err(error) => return tool_error(error.to_string()),
     };
-    json_tool_response(&status_response(&plugin_config))
+    json_tool_response_with_artifact(
+        &status_response(&plugin_config),
+        "web-status",
+        "status",
+        WEB_STATUS_SCHEMA,
+        "Web capabilities",
+    )
 }
 
 fn invoke_inspect(invocation: &ToolInvocationRequest) -> ToolInvocationResponse {
@@ -222,7 +244,13 @@ fn invoke_inspect(invocation: &ToolInvocationRequest) -> ToolInvocationResponse 
         Err(error) => return tool_error(error.to_string()),
     };
     match inspect_url(&request.url) {
-        Ok(response) => json_tool_response(&response),
+        Ok(response) => json_tool_response_with_artifact(
+            &response,
+            &invocation.tool_call_id,
+            "inspect",
+            WEB_INSPECT_RESULT_SCHEMA,
+            "URL inspection",
+        ),
         Err(error) => tool_error(error.to_string()),
     }
 }
@@ -1491,7 +1519,7 @@ fn query_request_visual(
     fields: &[&str],
 ) -> ToolPluginVisualMetadata {
     ToolPluginVisualMetadata {
-        producer_plugin_id: Some("bcode.web_search".to_string()),
+        producer_plugin_id: Some(WEB_SEARCH_PLUGIN_ID.to_string()),
         schema: schema.to_string(),
         schema_version: 1,
         title: Some(title.to_string()),
@@ -1537,10 +1565,18 @@ fn search_tool_definition() -> ToolDefinition {
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("searching".to_string()),
             request_visual: Some(query_request_visual(
-                "bcode.web_search.search_request",
+                WEB_SEARCH_REQUEST_SCHEMA,
                 "Search web",
                 "searching {query} · {bytes}",
-                &["query", "provider"],
+                &[
+                    "query",
+                    "provider",
+                    "max_results",
+                    "site",
+                    "freshness",
+                    "region",
+                    "safe_search",
+                ],
             )),
         },
     }
@@ -1579,10 +1615,10 @@ fn fetch_tool_definition() -> ToolDefinition {
         ui: bcode_tool::ToolUiMetadata {
             activity_label: Some("fetching".to_string()),
             request_visual: Some(query_request_visual(
-                "bcode.web_search.fetch_request",
+                WEB_FETCH_REQUEST_SCHEMA,
                 "Fetch URL",
                 "fetching {url} · {bytes}",
-                &["url"],
+                &["url", "max_bytes", "render", "prompt", "provider"],
             )),
         },
     }
@@ -1599,7 +1635,15 @@ fn status_tool_definition() -> ToolDefinition {
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: bcode_tool::ToolPolicyMetadata::default(),
-        ui: bcode_tool::ToolUiMetadata::default(),
+        ui: bcode_tool::ToolUiMetadata {
+            activity_label: Some("checking web capabilities".to_string()),
+            request_visual: Some(query_request_visual(
+                WEB_STATUS_REQUEST_SCHEMA,
+                "Web status",
+                "checking web capabilities · {bytes}",
+                &[],
+            )),
+        },
     }
 }
 
@@ -1617,7 +1661,15 @@ fn inspect_tool_definition() -> ToolDefinition {
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: bcode_tool::ToolPolicyMetadata::default(),
-        ui: bcode_tool::ToolUiMetadata::default(),
+        ui: bcode_tool::ToolUiMetadata {
+            activity_label: Some("inspecting URL".to_string()),
+            request_visual: Some(query_request_visual(
+                WEB_INSPECT_REQUEST_SCHEMA,
+                "Inspect URL",
+                "inspecting {url} · {bytes}",
+                &["url"],
+            )),
+        },
     }
 }
 
@@ -2309,31 +2361,76 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
     ServiceResponse::error("invalid_request", error.to_string())
 }
 
-fn search_tool_response(value: &SearchResponse) -> ToolInvocationResponse {
-    match serde_json::to_string_pretty(value) {
-        Ok(output) => ToolInvocationResponse {
+fn search_tool_response(value: &SearchResponse, tool_call_id: &str) -> ToolInvocationResponse {
+    match serde_json::to_string_pretty(value).and_then(|output| {
+        let payload = serde_json::to_value(value)?;
+        Ok((output, payload))
+    }) {
+        Ok((output, payload)) => ToolInvocationResponse {
             output,
             is_error: false,
             content: Vec::new(),
             full_output: None,
             host_action: value.host_action.clone(),
-            result: None,
+            result: Some(web_artifact_result(
+                tool_call_id,
+                "search",
+                WEB_SEARCH_RESULTS_SCHEMA,
+                "Search results",
+                payload,
+            )),
         },
         Err(error) => tool_error(error.to_string()),
     }
 }
 
-fn json_tool_response<T: Serialize>(value: &T) -> ToolInvocationResponse {
-    match serde_json::to_string_pretty(value) {
-        Ok(output) => ToolInvocationResponse {
+fn json_tool_response_with_artifact<T: Serialize>(
+    value: &T,
+    tool_call_id: &str,
+    artifact_suffix: &str,
+    schema: &str,
+    title: &str,
+) -> ToolInvocationResponse {
+    match serde_json::to_string_pretty(value).and_then(|output| {
+        let payload = serde_json::to_value(value)?;
+        Ok((output, payload))
+    }) {
+        Ok((output, payload)) => ToolInvocationResponse {
             output,
             is_error: false,
             content: Vec::new(),
             full_output: None,
             host_action: None,
-            result: None,
+            result: Some(web_artifact_result(
+                tool_call_id,
+                artifact_suffix,
+                schema,
+                title,
+                payload,
+            )),
         },
         Err(error) => tool_error(error.to_string()),
+    }
+}
+
+fn web_artifact_result(
+    tool_call_id: &str,
+    artifact_suffix: &str,
+    schema: &str,
+    title: &str,
+    payload: serde_json::Value,
+) -> ToolInvocationResult {
+    ToolInvocationResult::Artifact {
+        artifact: Box::new(ToolArtifact {
+            artifact_id: format!("{tool_call_id}-web-{artifact_suffix}"),
+            producer_plugin_id: WEB_SEARCH_PLUGIN_ID.to_string(),
+            schema: schema.to_string(),
+            schema_version: 1,
+            tool_call_id: Some(tool_call_id.to_string()),
+            title: Some(title.to_string()),
+            metadata: payload,
+            refs: Vec::new(),
+        }),
     }
 }
 
@@ -2351,7 +2448,19 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
 #[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(WebSearchPlugin, include_str!("../bcode-plugin.toml"))
+    let mut vtable = bcode_plugin_sdk::static_plugin_vtable!(
+        WebSearchPlugin,
+        include_str!("../bcode-plugin.toml")
+    );
+    vtable.tui_registry = Some(web_search_tui_registry);
+    vtable
+}
+
+#[cfg(feature = "static-bundled")]
+fn web_search_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
+    let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
+    registry.register_visual_adapter(Box::new(web_search_tui::WebSearchTuiVisualAdapter));
+    registry
 }
 
 bcode_plugin_sdk::export_plugin!(WebSearchPlugin, include_str!("../bcode-plugin.toml"));
@@ -2361,51 +2470,60 @@ mod tests {
 
     #[test]
     fn web_search_output_is_usable_without_presentation_events() {
-        let response = search_tool_response(&SearchResponse {
-            query: "rust".to_string(),
-            provider: "test".to_string(),
-            results: vec![SearchResult {
-                title: "Rust".to_string(),
-                url: "https://www.rust-lang.org/".to_string(),
-                snippet: "A language empowering everyone".to_string(),
-                published: None,
-                source: Some("example".to_string()),
-            }],
-            partial: false,
-            message: Some("ok".to_string()),
-            host_action: None,
-        });
+        let response = search_tool_response(
+            &SearchResponse {
+                query: "rust".to_string(),
+                provider: "test".to_string(),
+                results: vec![SearchResult {
+                    title: "Rust".to_string(),
+                    url: "https://www.rust-lang.org/".to_string(),
+                    snippet: "A language empowering everyone".to_string(),
+                    published: None,
+                    source: Some("example".to_string()),
+                }],
+                partial: false,
+                message: Some("ok".to_string()),
+                host_action: None,
+            },
+            "test-search",
+        );
 
         assert!(!response.is_error);
         assert!(response.output.contains("\"query\": \"rust\""));
         assert!(response.output.contains("Rust"));
         assert!(response.output.contains("https://www.rust-lang.org/"));
-        assert!(response.result.is_none());
+        assert!(response.result.is_some());
     }
 
     #[test]
     fn web_fetch_output_is_usable_without_presentation_events() {
-        let response = json_tool_response(&FetchResponse {
-            url: "https://example.com".to_string(),
-            final_url: "https://example.com/".to_string(),
-            status: 200,
-            title: Some("Example".to_string()),
-            content_type: Some("text/html".to_string()),
-            text: "Example Domain".to_string(),
-            markdown: None,
-            truncated: false,
-            rendered: false,
-            fallback_used: "none".to_string(),
-            content_format: "text".to_string(),
-            extraction: "plain".to_string(),
-            prompt: None,
-            prompt_response: None,
-        });
+        let response = json_tool_response_with_artifact(
+            &FetchResponse {
+                url: "https://example.com".to_string(),
+                final_url: "https://example.com/".to_string(),
+                status: 200,
+                title: Some("Example".to_string()),
+                content_type: Some("text/html".to_string()),
+                text: "Example Domain".to_string(),
+                markdown: None,
+                truncated: false,
+                rendered: false,
+                fallback_used: "none".to_string(),
+                content_format: "text".to_string(),
+                extraction: "plain".to_string(),
+                prompt: None,
+                prompt_response: None,
+            },
+            "test-fetch",
+            "fetch",
+            WEB_FETCH_RESULT_SCHEMA,
+            "Fetched page",
+        );
 
         assert!(!response.is_error);
         assert!(response.output.contains("https://example.com"));
         assert!(response.output.contains("Example Domain"));
-        assert!(response.result.is_none());
+        assert!(response.result.is_some());
     }
 
     #[test]

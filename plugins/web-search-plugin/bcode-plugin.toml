@@ -13,6 +13,86 @@ aliases    = [{ section = "tools.web_search", reason = "legacy" }]
 categories = ["web"]
 section    = "web_search"
 
+[[visual_adapters]]
+artifact_schema    = "bcode.web-search.search_request"
+id                 = "web-search-request-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.web-search.fetch_request"
+id                 = "web-fetch-request-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.web-search.status_request"
+id                 = "web-status-request-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.web-search.inspect_request"
+id                 = "web-inspect-request-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.web-search.search_results"
+id                 = "web-search-results-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.web-search.fetch_result"
+id                 = "web-fetch-result-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.web-search.status"
+id                 = "web-status-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.web-search.inspect_result"
+id                 = "web-inspect-result-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
 [concurrency]
 max  = 4
 type = "limited"

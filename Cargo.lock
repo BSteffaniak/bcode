@@ -2325,6 +2325,7 @@ dependencies = [
  "bcode_model_provider_runtime",
  "bcode_plugin_sdk",
  "bcode_tool",
+ "bmux_tui",
  "reqwest",
  "serde",
  "serde_json",
