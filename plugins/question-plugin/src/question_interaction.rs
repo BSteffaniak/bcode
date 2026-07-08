@@ -2,18 +2,16 @@
 
 use bcode_plugin_sdk::interaction::PluginInteraction;
 use bcode_tool::{
-    InteractionControlId, InteractionController, InteractionInput, InteractionNavigation,
-    InteractionOutput, InteractionValue,
+    InteractionControlId, InteractionInput, InteractionNavigation, InteractionOutput,
+    InteractionValue,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    NormalizedQuestionRequest, QuestionAnswerPayload, QuestionCustomMode, QuestionSelectionMode,
+    NormalizedQuestionRequest, QUESTION_INTERACTION_KIND, QuestionAnswerPayload,
+    QuestionCustomMode, QuestionSelectionMode,
 };
-
-/// Renderer-neutral question interaction kind.
-pub const QUESTION_INTERACTION_KIND: &str = "bcode.question";
 
 /// Renderer-neutral question focus target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,16 +207,7 @@ impl QuestionInteractionController {
             }),
         }
     }
-}
-
-impl InteractionController for QuestionInteractionController {
-    type Snapshot = QuestionSnapshot;
-
-    fn kind(&self) -> &'static str {
-        QUESTION_INTERACTION_KIND
-    }
-
-    fn snapshot(&self) -> Self::Snapshot {
+    fn snapshot(&self) -> QuestionSnapshot {
         QuestionSnapshot {
             request: self.request.clone(),
             answers: self.answers.clone(),
@@ -256,11 +245,11 @@ impl PluginInteraction for QuestionInteractionController {
     }
 
     fn snapshot(&self) -> Self::Snapshot {
-        InteractionController::snapshot(self)
+        self.snapshot()
     }
 
     fn handle_input(&mut self, input: InteractionInput) -> InteractionOutput {
-        InteractionController::handle_input(self, input)
+        self.handle_input(input)
     }
 }
 
@@ -336,15 +325,12 @@ mod tests {
     fn activates_option_and_submits_domain_payload() {
         let mut controller = QuestionInteractionController::new(request());
         assert_eq!(
-            InteractionController::handle_input(
-                &mut controller,
-                InteractionInput::Activate {
-                    control_id: option_control_id(0, 0),
-                }
-            ),
+            controller.handle_input(InteractionInput::Activate {
+                control_id: option_control_id(0, 0),
+            }),
             InteractionOutput::Redraw
         );
-        let output = InteractionController::handle_input(&mut controller, InteractionInput::Submit);
+        let output = controller.handle_input(InteractionInput::Submit);
         let InteractionOutput::Submitted { payload } = output else {
             panic!("expected submitted output");
         };

@@ -10,13 +10,15 @@ mod question_interaction;
 mod question_outcome_tui;
 #[cfg(feature = "static-bundled")]
 mod question_tui;
+mod question_types;
 
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
-    InteractiveToolResolution, InteractiveToolResumeRequest, ListToolsRequest, OP_INVOKE_TOOL,
-    OP_LIST_TOOLS, OP_RESUME_INTERACTIVE_TOOL, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
-    ToolCompatibilityAlias, ToolDefinition, ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationResult, ToolList, ToolPolicyMetadata, ToolSideEffect,
+    InteractiveToolRequest, InteractiveToolResolution, InteractiveToolResumeRequest,
+    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, OP_RESUME_INTERACTIVE_TOOL,
+    TOOL_SERVICE_INTERFACE_ID, ToolArtifact, ToolCompatibilityAlias, ToolDefinition,
+    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolList,
+    ToolPolicyMetadata, ToolSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -28,109 +30,7 @@ const DEFAULT_ASK_AGGRESSIVENESS: u8 = 5;
 #[derive(Debug, Default)]
 pub struct QuestionPlugin;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NormalizedQuestionRequest {
-    questions: Vec<Question>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Question {
-    header: Option<String>,
-    #[serde(rename = "question")]
-    text: String,
-    options: Vec<QuestionOption>,
-    control: QuestionControl,
-    selection_mode: QuestionSelectionMode,
-    custom: bool,
-    custom_mode: QuestionCustomMode,
-    required: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QuestionOption {
-    label: String,
-    value: Option<String>,
-    description: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum QuestionControl {
-    Radio,
-    Checkbox,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum QuestionSelectionMode {
-    Single,
-    Multiple,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum QuestionCustomMode {
-    Exclusive,
-    Additional,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QuestionToolOutcome {
-    status: QuestionRequestStatus,
-    questions: Vec<QuestionOutcome>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum QuestionRequestStatus {
-    Answered,
-    Unanswered,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QuestionOutcome {
-    question_index: usize,
-    header: Option<String>,
-    question: String,
-    status: QuestionStatus,
-    selected: Vec<SelectedAnswer>,
-    custom: Option<String>,
-    required: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum QuestionStatus {
-    Answered,
-    Unanswered,
-    Dismissed,
-    Aborted,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "status")]
-pub enum QuestionResolutionPayload {
-    Answered {
-        questions: Vec<QuestionAnswerPayload>,
-    },
-    Unanswered,
-    Dismissed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QuestionAnswerPayload {
-    question_index: usize,
-    #[serde(default)]
-    selected: Vec<String>,
-    #[serde(default)]
-    custom: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct SelectedAnswer {
-    label: String,
-    value: String,
-}
+pub use question_types::*;
 
 impl RustPlugin for QuestionPlugin {
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
@@ -260,20 +160,26 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             Ok(output) => output,
             Err(error) => error.to_string(),
         }),
-        host_action: Some(
-            bcode_tool::ToolInvocationHostAction::InteractiveToolRequest(
-                bcode_tool::InteractiveToolRequest {
-                    interaction_id: format!("{}-question", invocation.tool_call_id),
-                    interaction_kind: Some("bcode.question".to_string()),
-                    surface_kind: "bcode.question.inline".to_string(),
-                    request: serde_json::to_value(&request).unwrap_or(Value::Null),
-                    required: request.questions.iter().any(|question| question.required),
-                    turn_behavior: bcode_tool::InteractiveToolTurnBehavior::AwaitBeforeContinuing,
-                    render_target: bcode_tool::InteractiveToolRenderTarget::TranscriptToolCall,
-                },
-            ),
-        ),
+        host_action: Some(interactive_question_request(
+            &invocation.tool_call_id,
+            &request,
+        )),
         result: Some(ToolInvocationResult::Json { value }),
+    })
+}
+
+fn interactive_question_request(
+    tool_call_id: &str,
+    request: &NormalizedQuestionRequest,
+) -> bcode_tool::ToolInvocationHostAction {
+    bcode_tool::ToolInvocationHostAction::InteractiveToolRequest(InteractiveToolRequest {
+        interaction_id: format!("{tool_call_id}-question"),
+        interaction_kind: Some(QUESTION_INTERACTION_KIND.to_string()),
+        surface_kind: QUESTION_INLINE_SURFACE.to_string(),
+        request: serde_json::to_value(request).unwrap_or(Value::Null),
+        required: request.questions.iter().any(|question| question.required),
+        turn_behavior: bcode_tool::InteractiveToolTurnBehavior::AwaitBeforeContinuing,
+        render_target: bcode_tool::InteractiveToolRenderTarget::TranscriptToolCall,
     })
 }
 

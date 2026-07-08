@@ -13,9 +13,7 @@ use super::question_interaction::{
     QuestionFocusTarget, QuestionInteractionController, QuestionSnapshot, custom_control_id,
     option_control_id,
 };
-
-/// Native inline TUI surface kind for question requests.
-pub const QUESTION_INLINE_SURFACE: &str = "bcode.question.inline";
+use super::{QUESTION_INLINE_SURFACE, QuestionSelectionMode};
 
 /// Terminal renderer for the question interaction.
 #[derive(Default)]
@@ -74,7 +72,7 @@ impl QuestionTerminalRenderer {
                     .clone()
                     .unwrap_or_else(|| option_index.to_string()),
             );
-            let marker = if question.selection_mode == super::QuestionSelectionMode::Multiple {
+            let marker = if question.selection_mode == QuestionSelectionMode::Multiple {
                 if selected { "[x]" } else { "[ ]" }
             } else if selected {
                 "(*)"
