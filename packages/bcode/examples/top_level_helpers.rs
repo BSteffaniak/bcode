@@ -77,6 +77,15 @@ async fn main() -> bcode::Result<()> {
     let response = bcode::generate_text(&mut text_provider, "Say hello").await?;
     println!("{}", response.text);
 
+    let mut selected_provider = ExampleProvider::text("hello from the selected helper");
+    let selected = bcode::generate_text_with_model(
+        &mut selected_provider,
+        "example-provider:example-model",
+        "Say hello with an explicit selector",
+    )
+    .await?;
+    println!("{}", selected.text);
+
     let mut stream = bcode::stream_text(
         ExampleProvider::text("hello from the streaming helper"),
         "Stream hello",

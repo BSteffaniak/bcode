@@ -47,6 +47,74 @@ pub use bcode_model::{ContentBlock as ModelContentBlock, MessageRole, ModelMessa
 /// Result alias for Bcode SDK operations.
 pub type Result<T> = std::result::Result<T, BcodeError>;
 
+/// Provider/model selector used by ergonomic SDK helpers and builders.
+///
+/// A selector can hold just a model ID (`"gpt-4o-mini"`) or a provider-qualified model string
+/// (`"provider:model"`). In embedded plugin mode the provider component maps to the provider
+/// plugin ID used by [`AgentBuilder::provider_plugin`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ModelSelector {
+    provider_plugin_id: Option<String>,
+    model_id: String,
+}
+
+impl ModelSelector {
+    /// Create a selector for an unqualified model ID.
+    #[must_use]
+    pub fn new(model_id: impl Into<String>) -> Self {
+        Self {
+            provider_plugin_id: None,
+            model_id: model_id.into(),
+        }
+    }
+
+    /// Create a selector for an explicit provider plugin ID and model ID.
+    #[must_use]
+    pub fn with_provider(
+        provider_plugin_id: impl Into<String>,
+        model_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider_plugin_id: Some(provider_plugin_id.into()),
+            model_id: model_id.into(),
+        }
+    }
+
+    /// Parse either `model` or `provider:model` selector text.
+    #[must_use]
+    pub fn from_text(selector: impl AsRef<str>) -> Self {
+        let selector = selector.as_ref();
+        selector.split_once(':').map_or_else(
+            || Self::new(selector),
+            |(provider_plugin_id, model_id)| Self::with_provider(provider_plugin_id, model_id),
+        )
+    }
+
+    /// Return the provider plugin ID when the selector is provider-qualified.
+    #[must_use]
+    pub fn provider_plugin_id(&self) -> Option<&str> {
+        self.provider_plugin_id.as_deref()
+    }
+
+    /// Return the selected model ID.
+    #[must_use]
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
+}
+
+impl From<&str> for ModelSelector {
+    fn from(value: &str) -> Self {
+        Self::from_text(value)
+    }
+}
+
+impl From<String> for ModelSelector {
+    fn from(value: String) -> Self {
+        Self::from_text(value)
+    }
+}
+
 /// Generate text with a caller-supplied provider using default agent settings.
 ///
 /// This is the smallest lean-core text generation helper. It does not launch the TUI, require the
@@ -123,6 +191,66 @@ where
     Agent::builder()
         .build()
         .generate_object_with_provider_and_options(provider, prompt, options)
+        .await
+}
+
+/// Generate text with a caller-supplied provider and model selector using default agent settings.
+///
+/// # Errors
+///
+/// Returns an error when provider invocation fails, the runtime is cancelled, or the provider
+/// reports an error.
+pub async fn generate_text_with_model<P>(
+    provider: &mut P,
+    model: impl Into<ModelSelector>,
+    prompt: impl Into<String>,
+) -> Result<GenerateTextResponse>
+where
+    P: ModelProviderInvoker,
+{
+    Agent::builder()
+        .model_selector(model)
+        .build()
+        .generate_text_with_provider(provider, prompt)
+        .await
+}
+
+/// Stream text with a caller-supplied provider and model selector using default agent settings.
+#[must_use]
+pub fn stream_text_with_model<P>(
+    provider: P,
+    model: impl Into<ModelSelector>,
+    prompt: impl Into<String>,
+) -> AgentStream
+where
+    P: ModelProviderInvoker + 'static,
+{
+    Agent::builder()
+        .model_selector(model)
+        .build()
+        .stream_text_with_provider(provider, prompt)
+}
+
+/// Generate a typed structured object with a caller-supplied provider and model selector.
+///
+/// # Errors
+///
+/// Returns an error when provider invocation fails, the runtime is cancelled, the provider reports
+/// an error, the model output is not valid JSON, schema validation fails, or decoding into `T`
+/// fails.
+pub async fn generate_object_with_model<T, P>(
+    provider: &mut P,
+    model: impl Into<ModelSelector>,
+    prompt: impl Into<String>,
+) -> Result<T>
+where
+    T: DeserializeOwned + schemars::JsonSchema,
+    P: ModelProviderInvoker,
+{
+    Agent::builder()
+        .model_selector(model)
+        .build()
+        .generate_object_with_provider(provider, prompt)
         .await
 }
 
@@ -1734,6 +1862,15 @@ impl AgentBuilder {
     #[must_use]
     pub fn model(mut self, model_id: impl Into<String>) -> Self {
         self.model_id = Some(model_id.into());
+        self
+    }
+
+    /// Configure provider/model selection from a [`ModelSelector`].
+    #[must_use]
+    pub fn model_selector(mut self, selector: impl Into<ModelSelector>) -> Self {
+        let selector = selector.into();
+        self.provider_plugin_id = selector.provider_plugin_id;
+        self.model_id = Some(selector.model_id);
         self
     }
 

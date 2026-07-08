@@ -12,8 +12,7 @@ async fn main() -> bcode::Result<()> {
     let agent = bcode
         .agent()
         .name("embedded-fake-provider")
-        .provider_plugin("bcode.fake-provider")
-        .model("fake-echo")
+        .model_selector("bcode.fake-provider:fake-echo")
         .build();
 
     let response = agent.generate_text("hello embedded plugins").await?;
