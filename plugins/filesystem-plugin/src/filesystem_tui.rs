@@ -1,5 +1,6 @@
 //! Native TUI rendering for filesystem request and result visuals.
 
+use bcode_tui_components::source_preview::{SourcePreviewOptions, source_preview_lines};
 use bmux_tui::prelude::{Color, Line, Span, Style};
 use serde_json::Value;
 
@@ -89,7 +90,11 @@ fn read_rows(kind: &str, payload: &Value, width: u16) -> Vec<Line> {
     push_kv(&mut rows, "truncated", bool_text(payload, "truncated"));
     if let Some(contents) = text(payload, "contents").or_else(|| text(payload, "preview")) {
         rows.push(Line::raw(""));
-        rows.extend(preview_lines(contents, width));
+        rows.extend(preview_lines(
+            contents,
+            text(payload, "path").unwrap_or_default(),
+            width,
+        ));
     }
     rows
 }
@@ -210,10 +215,16 @@ fn grep_rows(payload: &Value, width: u16) -> Vec<Line> {
                 Span::styled(location, path_style()),
             ]));
             if let Some(line) = text(value, "line") {
-                rows.push(Line::from_spans(vec![
-                    Span::styled("    │ ", muted()),
-                    Span::raw(truncate(line, usize::from(width.saturating_sub(8)))),
-                ]));
+                let syntax_hint = text(value, "path")
+                    .or_else(|| text(payload, "path"))
+                    .unwrap_or_default();
+                rows.extend(preview_lines_with_options(
+                    line,
+                    &SourcePreviewOptions::new(syntax_hint, width)
+                        .max_lines(1)
+                        .line_prefix("    │ ", muted())
+                        .truncated_message("    … preview truncated", muted()),
+                ));
             }
         }
         if values.len() > 25 {
@@ -251,22 +262,12 @@ fn card_header(title_text: &str) -> Vec<Line> {
     ])]
 }
 
-fn preview_lines(contents: &str, width: u16) -> Vec<Line> {
-    let max_width = usize::from(width.saturating_sub(4)).max(20);
-    let mut rows = Vec::new();
-    for line in contents.lines().take(30) {
-        rows.push(Line::from_spans(vec![
-            Span::styled("  │ ", muted()),
-            Span::raw(truncate(line, max_width)),
-        ]));
-    }
-    if contents.lines().count() > 30 {
-        rows.push(Line::from_spans(vec![Span::styled(
-            "  … preview truncated",
-            muted(),
-        )]));
-    }
-    rows
+fn preview_lines(contents: &str, syntax_hint: &str, width: u16) -> Vec<Line> {
+    source_preview_lines(contents, &SourcePreviewOptions::new(syntax_hint, width))
+}
+
+fn preview_lines_with_options(contents: &str, options: &SourcePreviewOptions<'_>) -> Vec<Line> {
+    source_preview_lines(contents, options)
 }
 
 fn push_kv<T>(rows: &mut Vec<Line>, key: &str, value: Option<T>)
@@ -323,18 +324,6 @@ fn dimensions(payload: &Value) -> Option<String> {
     Some(format!("{width}×{height}"))
 }
 
-fn truncate(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_owned();
-    }
-    let mut output = value
-        .chars()
-        .take(max_chars.saturating_sub(1))
-        .collect::<String>();
-    output.push('…');
-    output
-}
-
 const fn accent() -> Style {
     Style::new().fg(Color::Cyan)
 }
@@ -387,5 +376,73 @@ mod tests {
         assert!(rendered.contains("Text matches (1)"), "{rendered}");
         assert!(rendered.contains("src/lib.rs:7"), "{rendered}");
         assert!(rendered.contains("needle here"), "{rendered}");
+    }
+
+    #[test]
+    fn renders_read_contents_with_syntax_spans() {
+        let payload = serde_json::json!({
+            "path": "src/lib.rs",
+            "contents": "pub fn main() {}",
+            "truncated": false
+        });
+        let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            &FilesystemTuiVisualAdapter,
+            "bcode.filesystem.read",
+            &payload,
+            80,
+        );
+
+        assert!(
+            rows.iter()
+                .flat_map(|line| line.spans.iter())
+                .any(|span| span.content.as_str() == "pub" && span.style.fg.is_some()),
+            "expected highlighted Rust source spans: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn renders_grep_matches_with_syntax_spans() {
+        let payload = serde_json::json!({
+            "matches": [{"path": "src/lib.rs", "line_number": 7, "line": "pub fn main() {}"}],
+            "backend": "rust",
+            "partial": false
+        });
+        let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            &FilesystemTuiVisualAdapter,
+            "bcode.filesystem.grep",
+            &payload,
+            80,
+        );
+
+        assert!(
+            rows.iter()
+                .flat_map(|line| line.spans.iter())
+                .any(|span| span.content.as_str() == "pub" && span.style.fg.is_some()),
+            "expected highlighted Rust grep spans: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn read_preview_limits_rendered_source_lines() {
+        let contents = (0..35)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let payload = serde_json::json!({
+            "path": "notes.txt",
+            "contents": contents,
+            "truncated": false
+        });
+        let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            &FilesystemTuiVisualAdapter,
+            "bcode.filesystem.read",
+            &payload,
+            80,
+        );
+        let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        assert!(rendered.contains("line 29"), "{rendered}");
+        assert!(!rendered.contains("line 30"), "{rendered}");
+        assert!(rendered.contains("preview truncated"), "{rendered}");
     }
 }
