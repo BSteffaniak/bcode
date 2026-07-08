@@ -97,10 +97,11 @@ async fn main() -> bcode::Result<()> {
         .await?;
     println!("{}", builder_response.text);
 
-    let mut stream = bcode::stream_text(
-        ExampleProvider::text("hello from the streaming helper"),
-        "Stream hello",
-    );
+    let mut stream = bcode::stream_text_builder()
+        .model("example-provider:example-model")
+        .metadata("example", "stream-builder")
+        .prompt("Stream hello")
+        .run(ExampleProvider::text("hello from the streaming builder"));
     while let Some(item) = stream.next().await {
         match item {
             AgentStreamItem::Event(AgentEvent::TextDelta(text)) => print!("{text}"),
@@ -127,7 +128,11 @@ async fn main() -> bcode::Result<()> {
     }
 
     let mut object_provider = ExampleProvider::text(r#"{"title":"top-level object"}"#);
-    let summary: Summary = bcode::generate_object(&mut object_provider, "Return JSON").await?;
+    let summary: Summary = bcode::generate_object_builder()
+        .model("example-provider:example-model")
+        .prompt("Return JSON")
+        .run(&mut object_provider)
+        .await?;
     println!("{}", summary.title);
 
     Ok(())

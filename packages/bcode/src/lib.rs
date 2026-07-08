@@ -268,6 +268,255 @@ pub fn generate_text_builder() -> GenerateTextBuilder {
     GenerateTextBuilder::new()
 }
 
+/// Builder for streaming text-generation requests.
+///
+/// This is the builder-first API for streaming text. Thin helper functions such as
+/// [`stream_text`] delegate to this type.
+#[derive(Debug, Clone)]
+pub struct StreamTextBuilder {
+    agent: AgentBuilder,
+    prompt: String,
+    cancellation: CancellationToken,
+}
+
+impl Default for StreamTextBuilder {
+    fn default() -> Self {
+        Self {
+            agent: Agent::builder(),
+            prompt: String::new(),
+            cancellation: CancellationToken::new(),
+        }
+    }
+}
+
+impl StreamTextBuilder {
+    /// Create a streaming text builder with default agent settings.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Configure the user prompt.
+    #[must_use]
+    pub fn prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.prompt = prompt.into();
+        self
+    }
+
+    /// Configure provider/model selection.
+    #[must_use]
+    pub fn model(mut self, model: impl Into<ModelSelector>) -> Self {
+        self.agent = self.agent.model_selector(model);
+        self
+    }
+
+    /// Configure the system prompt.
+    #[must_use]
+    pub fn system(mut self, system_prompt: impl Into<String>) -> Self {
+        self.agent = self.agent.system(system_prompt);
+        self
+    }
+
+    /// Configure model parameters.
+    #[must_use]
+    pub fn parameters(mut self, parameters: ModelParameters) -> Self {
+        self.agent = self.agent.parameters(parameters);
+        self
+    }
+
+    /// Add one metadata key/value pair sent to providers.
+    #[must_use]
+    pub fn metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.agent = self.agent.metadata(key, value);
+        self
+    }
+
+    /// Configure turn timeout.
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.agent = self.agent.timeout(timeout);
+        self
+    }
+
+    /// Configure cancellation for this request.
+    #[must_use]
+    pub fn cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+
+    /// Configure maximum tool rounds.
+    #[must_use]
+    pub fn max_tool_rounds(mut self, max_tool_rounds: u32) -> Self {
+        self.agent = self.agent.max_tool_rounds(max_tool_rounds);
+        self
+    }
+
+    /// Register an inline SDK tool for this streaming request.
+    #[must_use]
+    pub fn inline_tool<F>(mut self, definition: ToolDefinition, handler: F) -> Self
+    where
+        F: Fn(ToolInvocationRequest) -> std::result::Result<ToolInvocationResponse, String>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.agent = self.agent.inline_tool(definition, handler);
+        self
+    }
+
+    /// Register a plugin-backed tool definition for this streaming request.
+    #[must_use]
+    pub fn plugin_tool(mut self, definition: ToolDefinition, plugin_id: impl Into<String>) -> Self {
+        self.agent = self.agent.plugin_tool(definition, plugin_id);
+        self
+    }
+
+    /// Run the request with a caller-supplied provider.
+    #[must_use]
+    pub fn run<P>(self, provider: P) -> AgentStream
+    where
+        P: ModelProviderInvoker + 'static,
+    {
+        let agent = self.agent.build();
+        agent.stream_text_with_provider_and_cancellation(provider, self.prompt, self.cancellation)
+    }
+}
+
+/// Start building a streaming text request.
+#[must_use]
+pub fn stream_text_builder() -> StreamTextBuilder {
+    StreamTextBuilder::new()
+}
+
+/// Builder for structured object generation requests.
+///
+/// This is the builder-first API for typed structured output. Thin helper functions such as
+/// [`generate_object`] delegate to this type.
+#[derive(Debug, Clone)]
+pub struct GenerateObjectBuilder<T> {
+    agent: AgentBuilder,
+    prompt: String,
+    options: Option<StructuredOutputOptions>,
+    _output: std::marker::PhantomData<T>,
+}
+
+impl<T> Default for GenerateObjectBuilder<T> {
+    fn default() -> Self {
+        Self {
+            agent: Agent::builder(),
+            prompt: String::new(),
+            options: None,
+            _output: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T> GenerateObjectBuilder<T> {
+    /// Create a structured object generation builder with default agent settings.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Configure the user prompt.
+    #[must_use]
+    pub fn prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.prompt = prompt.into();
+        self
+    }
+
+    /// Configure provider/model selection.
+    #[must_use]
+    pub fn model(mut self, model: impl Into<ModelSelector>) -> Self {
+        self.agent = self.agent.model_selector(model);
+        self
+    }
+
+    /// Configure the system prompt.
+    #[must_use]
+    pub fn system(mut self, system_prompt: impl Into<String>) -> Self {
+        self.agent = self.agent.system(system_prompt);
+        self
+    }
+
+    /// Configure structured-output options.
+    #[must_use]
+    pub fn options(mut self, options: StructuredOutputOptions) -> Self {
+        self.options = Some(options);
+        self
+    }
+
+    /// Configure model parameters.
+    #[must_use]
+    pub fn parameters(mut self, parameters: ModelParameters) -> Self {
+        self.agent = self.agent.parameters(parameters);
+        self
+    }
+
+    /// Add one metadata key/value pair sent to providers.
+    #[must_use]
+    pub fn metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.agent = self.agent.metadata(key, value);
+        self
+    }
+
+    /// Configure turn timeout.
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.agent = self.agent.timeout(timeout);
+        self
+    }
+
+    /// Run the request with a caller-supplied provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when provider invocation fails, the runtime is cancelled, the provider
+    /// reports an error, the model output is not valid JSON, schema validation fails, or decoding
+    /// into `T` fails.
+    pub async fn run<P>(self, provider: &mut P) -> Result<T>
+    where
+        T: DeserializeOwned + schemars::JsonSchema,
+        P: ModelProviderInvoker,
+    {
+        let options = self
+            .options
+            .unwrap_or_else(StructuredOutputOptions::for_type::<T>);
+        let agent = self.agent.build();
+        agent
+            .generate_object_with_provider_and_options(provider, self.prompt, options)
+            .await
+    }
+    /// Run the request with explicit structured-output options and a caller-supplied provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when provider invocation fails, the runtime is cancelled, the provider
+    /// reports an error, the model output is not valid JSON, schema validation fails, repair
+    /// attempts are exhausted, or decoding into `T` fails.
+    pub async fn run_with_options<P>(
+        self,
+        provider: &mut P,
+        options: StructuredOutputOptions,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+        P: ModelProviderInvoker,
+    {
+        let agent = self.agent.build();
+        agent
+            .generate_object_with_provider_and_options(provider, self.prompt, options)
+            .await
+    }
+}
+
+/// Start building a structured object generation request.
+#[must_use]
+pub fn generate_object_builder<T>() -> GenerateObjectBuilder<T> {
+    GenerateObjectBuilder::new()
+}
+
 /// Generate text with a caller-supplied provider using default agent settings.
 ///
 /// This is the smallest lean-core text generation helper. It does not launch the TUI, require the
@@ -338,9 +587,7 @@ pub fn stream_text<P>(provider: P, prompt: impl Into<String>) -> AgentStream
 where
     P: ModelProviderInvoker + 'static,
 {
-    Agent::builder()
-        .build()
-        .stream_text_with_provider(provider, prompt)
+    stream_text_builder().prompt(prompt).run(provider)
 }
 
 /// Generate a typed structured object with a caller-supplied provider using default agent settings.
@@ -358,10 +605,7 @@ where
     T: DeserializeOwned + schemars::JsonSchema,
     P: ModelProviderInvoker,
 {
-    Agent::builder()
-        .build()
-        .generate_object_with_provider(provider, prompt)
-        .await
+    generate_object_builder().prompt(prompt).run(provider).await
 }
 
 /// Generate a typed structured object with explicit structured-output options.
@@ -380,9 +624,9 @@ where
     T: DeserializeOwned,
     P: ModelProviderInvoker,
 {
-    Agent::builder()
-        .build()
-        .generate_object_with_provider_and_options(provider, prompt, options)
+    generate_object_builder()
+        .prompt(prompt)
+        .run_with_options(provider, options)
         .await
 }
 
@@ -417,10 +661,10 @@ pub fn stream_text_with_model<P>(
 where
     P: ModelProviderInvoker + 'static,
 {
-    Agent::builder()
-        .model_selector(model)
-        .build()
-        .stream_text_with_provider(provider, prompt)
+    stream_text_builder()
+        .model(model)
+        .prompt(prompt)
+        .run(provider)
 }
 
 /// Generate a typed structured object with a caller-supplied provider and model selector.
@@ -439,10 +683,10 @@ where
     T: DeserializeOwned + schemars::JsonSchema,
     P: ModelProviderInvoker,
 {
-    Agent::builder()
-        .model_selector(model)
-        .build()
-        .generate_object_with_provider(provider, prompt)
+    generate_object_builder()
+        .model(model)
+        .prompt(prompt)
+        .run(provider)
         .await
 }
 
