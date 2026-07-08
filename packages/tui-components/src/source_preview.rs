@@ -1,6 +1,8 @@
 //! Source-code preview rendering helpers for Bcode TUI surfaces.
 
 use bmux_tui::prelude::{Color, Line, Span, Style};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 #[cfg(feature = "syntax")]
 use bmux_tui::prelude::Modifier;
@@ -81,8 +83,10 @@ impl<'a> SourcePreviewOptions<'a> {
 
 /// Render a bounded source-code preview.
 ///
-/// The renderer highlights only the source lines that will be displayed and
-/// never reads beyond `options.max_lines + 1` lines from `contents`.
+/// The renderer highlights only the source lines that will be displayed,
+/// preserves syntax state across those lines, and clips styled spans after
+/// highlighting so horizontal truncation does not affect tokenization.
+/// It never reads beyond `options.max_lines + 1` lines from `contents`.
 #[must_use]
 pub fn source_preview_lines(contents: &str, options: &SourcePreviewOptions<'_>) -> Vec<Line> {
     let max_width = preview_width(options.width, options.line_prefix);
@@ -94,13 +98,13 @@ pub fn source_preview_lines(contents: &str, options: &SourcePreviewOptions<'_>) 
             truncated = true;
             break;
         }
-        display_lines.push(truncate(line, max_width));
+        display_lines.push(line.to_owned());
     }
 
     let highlighted_lines = highlight_lines(options.syntax_hint, &display_lines);
     let mut rows = highlighted_lines
         .into_iter()
-        .map(|spans| preview_line(spans, options))
+        .map(|spans| preview_line(spans, options, max_width))
         .collect::<Vec<_>>();
 
     if truncated {
@@ -115,11 +119,16 @@ pub fn source_preview_lines(contents: &str, options: &SourcePreviewOptions<'_>) 
 
 fn preview_width(width: u16, prefix: &str) -> usize {
     usize::from(width)
-        .saturating_sub(prefix.chars().count())
+        .saturating_sub(UnicodeWidthStr::width(prefix))
         .max(20)
 }
 
-fn preview_line(spans: Vec<SourceSpan>, options: &SourcePreviewOptions<'_>) -> Line {
+fn preview_line(
+    spans: Vec<SourceSpan>,
+    options: &SourcePreviewOptions<'_>,
+    max_width: usize,
+) -> Line {
+    let spans = truncate_spans(spans, max_width);
     let mut output = Vec::with_capacity(spans.len().saturating_add(1));
     output.push(Span::styled(
         options.line_prefix.to_owned(),
@@ -189,16 +198,53 @@ fn plain_lines(lines: &[String]) -> Vec<Vec<SourceSpan>> {
         .collect()
 }
 
-fn truncate(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_owned();
+fn truncate_spans(spans: Vec<SourceSpan>, max_width: usize) -> Vec<SourceSpan> {
+    let total_width = spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_str()))
+        .sum::<usize>();
+    if total_width <= max_width {
+        return spans;
     }
-    let mut output = value
-        .chars()
-        .take(max_chars.saturating_sub(1))
-        .collect::<String>();
-    output.push('…');
+
+    let content_width = max_width.saturating_sub(UnicodeWidthStr::width("…"));
+    let mut output = Vec::new();
+    let mut used_width = 0usize;
+
+    for span in spans {
+        let mut content = String::new();
+        for grapheme in span.content.graphemes(true) {
+            let grapheme_width = UnicodeWidthStr::width(grapheme);
+            if used_width.saturating_add(grapheme_width) > content_width {
+                if !content.is_empty() {
+                    output.push(SourceSpan {
+                        content,
+                        style: span.style,
+                    });
+                }
+                push_truncation_marker(&mut output, span.style);
+                return output;
+            }
+            content.push_str(grapheme);
+            used_width = used_width.saturating_add(grapheme_width);
+        }
+        if !content.is_empty() {
+            output.push(SourceSpan {
+                content,
+                style: span.style,
+            });
+        }
+    }
+
+    push_truncation_marker(&mut output, None);
     output
+}
+
+fn push_truncation_marker(output: &mut Vec<SourceSpan>, style: Option<Style>) {
+    output.push(SourceSpan {
+        content: "…".to_owned(),
+        style,
+    });
 }
 
 #[cfg(feature = "syntax")]
@@ -255,6 +301,16 @@ mod tests {
         );
 
         assert!(line_text(&rows[0]).contains('…'));
+    }
+
+    #[test]
+    fn truncates_after_preserving_grapheme_boundaries() {
+        let rows = source_preview_lines(
+            "abcdefghijklmnopqr🙂b",
+            &SourcePreviewOptions::new("txt", 6),
+        );
+
+        assert_eq!(line_text(&rows[0]), "  │ abcdefghijklmnopqr…");
     }
 
     #[cfg(feature = "syntax")]
