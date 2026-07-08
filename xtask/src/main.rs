@@ -1100,6 +1100,10 @@ fn build_bcode_release(target: &str) -> Result<()> {
             .arg("--release")
             .arg("--package")
             .arg(PACKAGE_NAME)
+            .arg("--bin")
+            .arg(BINARY_NAME)
+            .arg("--features")
+            .arg("app")
             .arg("--target")
             .arg(target),
     )
