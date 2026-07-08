@@ -1,13 +1,7 @@
-//! Native TUI surface for the interactive question tool.
+//! Native TUI renderer for the interactive question tool.
 
-use bcode_plugin_sdk::tui::{
-    BoxedPluginTuiSurface, PluginTuiAction, PluginTuiHost, PluginTuiSurface,
-    PluginTuiSurfaceFactory, PluginTuiSurfaceFuture, PluginTuiSurfaceOpenRequest,
-};
-use bcode_tool::{
-    InteractionControlId, InteractionController, InteractionInput, InteractionNavigation,
-    InteractionOutput,
-};
+use bcode_plugin_sdk::tui::TerminalInteractionRenderer;
+use bcode_tool::{InteractionControlId, InteractionInput, InteractionNavigation, InteractionValue};
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::{Event, MouseButton, MouseEventKind};
 use bmux_tui::frame::Frame;
@@ -15,7 +9,6 @@ use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 
-use super::NormalizedQuestionRequest;
 use super::question_interaction::{
     QuestionFocusTarget, QuestionInteractionController, QuestionSnapshot, custom_control_id,
     option_control_id,
@@ -24,24 +17,9 @@ use super::question_interaction::{
 /// Native inline TUI surface kind for question requests.
 pub const QUESTION_INLINE_SURFACE: &str = "bcode.question.inline";
 
-/// Factory for inline question surfaces.
-pub struct QuestionInlineSurfaceFactory;
-
-impl PluginTuiSurfaceFactory for QuestionInlineSurfaceFactory {
-    fn surface_kind(&self) -> &'static str {
-        QUESTION_INLINE_SURFACE
-    }
-
-    fn open(&self, request: PluginTuiSurfaceOpenRequest) -> PluginTuiSurfaceFuture {
-        Box::pin(async move {
-            let request = serde_json::from_value::<NormalizedQuestionRequest>(request.options)?;
-            Ok(Box::new(QuestionInlineSurface::new(request)) as BoxedPluginTuiSurface)
-        })
-    }
-}
-
-struct QuestionInlineSurface {
-    controller: QuestionInteractionController,
+/// Terminal renderer for the question interaction.
+#[derive(Default)]
+pub struct QuestionTerminalRenderer {
     last_area: Rect,
     controls: Vec<ControlRegion>,
 }
@@ -52,26 +30,7 @@ struct ControlRegion {
     control_id: InteractionControlId,
 }
 
-impl QuestionInlineSurface {
-    fn new(request: NormalizedQuestionRequest) -> Self {
-        Self {
-            controller: QuestionInteractionController::new(request),
-            last_area: Rect::default(),
-            controls: Vec::new(),
-        }
-    }
-
-    fn action_from_output(output: InteractionOutput) -> PluginTuiAction {
-        match output {
-            InteractionOutput::None => PluginTuiAction::None,
-            InteractionOutput::Redraw => PluginTuiAction::Redraw,
-            InteractionOutput::Submitted { payload } => PluginTuiAction::Close {
-                outcome: Some(payload),
-            },
-            InteractionOutput::Cancelled => PluginTuiAction::Close { outcome: None },
-        }
-    }
-
+impl QuestionTerminalRenderer {
     fn render_line(&self, frame: &mut Frame<'_>, y: &mut u16, line: &Line) {
         if *y >= self.last_area.bottom() {
             return;
@@ -208,26 +167,22 @@ impl QuestionInlineSurface {
         );
     }
 
-    fn handle_mouse(&mut self, event: &bmux_tui::event::MouseEvent) -> PluginTuiAction {
+    fn mouse_input(&self, event: &bmux_tui::event::MouseEvent) -> Option<InteractionInput> {
         if !matches!(event.kind, MouseEventKind::Up(MouseButton::Left)) {
-            return PluginTuiAction::None;
+            return None;
         }
-        let Some(control_id) = self
-            .controls
+        self.controls
             .iter()
             .find(|control| control.area.contains(event.position))
-            .map(|control| control.control_id.clone())
-        else {
-            return PluginTuiAction::None;
-        };
-        Self::action_from_output(
-            self.controller
-                .handle_input(InteractionInput::Activate { control_id }),
-        )
+            .map(|control| InteractionInput::Activate {
+                control_id: control.control_id.clone(),
+            })
     }
 }
 
-impl PluginTuiSurface for QuestionInlineSurface {
+impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerminalRenderer {
+    const SURFACE_KIND: &'static str = QUESTION_INLINE_SURFACE;
+
     fn id(&self) -> &'static str {
         "question-inline"
     }
@@ -236,8 +191,7 @@ impl PluginTuiSurface for QuestionInlineSurface {
         "Question"
     }
 
-    fn preferred_height(&mut self, _width: u16) -> u16 {
-        let snapshot = self.controller.snapshot();
+    fn preferred_height(&mut self, snapshot: &QuestionSnapshot, _width: u16) -> u16 {
         let mut height = 2_u16;
         for question in &snapshot.request.questions {
             height = height.saturating_add(1);
@@ -251,62 +205,62 @@ impl PluginTuiSurface for QuestionInlineSurface {
         height.saturating_add(1)
     }
 
-    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    fn render(&mut self, snapshot: &QuestionSnapshot, area: Rect, frame: &mut Frame<'_>) {
         self.last_area = area;
         self.controls.clear();
-        let snapshot = self.controller.snapshot();
         let mut y = area.y;
         self.render_title(frame, &mut y);
         for question_index in 0..snapshot.request.questions.len() {
-            self.render_question(frame, &mut y, &snapshot, question_index);
+            self.render_question(frame, &mut y, snapshot, question_index);
         }
-        self.render_actions(frame, &mut y, &snapshot);
+        self.render_actions(frame, &mut y, snapshot);
     }
 
-    fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
+    fn input(&mut self, event: &Event, snapshot: &QuestionSnapshot) -> Option<InteractionInput> {
         match event {
             Event::Key(stroke) if stroke.modifiers.is_empty() => match stroke.key {
-                KeyCode::Tab | KeyCode::Down => Self::action_from_output(
-                    self.controller.handle_input(InteractionInput::Navigate {
-                        direction: InteractionNavigation::Next,
-                    }),
-                ),
-                KeyCode::Up => Self::action_from_output(self.controller.handle_input(
-                    InteractionInput::Navigate {
-                        direction: InteractionNavigation::Previous,
-                    },
-                )),
-                KeyCode::Enter | KeyCode::Space => Self::action_from_output(
-                    self.controller.handle_input(InteractionInput::Activate {
-                        control_id: self.controller.focus().control_id(),
-                    }),
-                ),
-                KeyCode::Escape => {
-                    Self::action_from_output(self.controller.handle_input(InteractionInput::Cancel))
-                }
+                KeyCode::Tab | KeyCode::Down => Some(InteractionInput::Navigate {
+                    direction: InteractionNavigation::Next,
+                }),
+                KeyCode::Up => Some(InteractionInput::Navigate {
+                    direction: InteractionNavigation::Previous,
+                }),
+                KeyCode::Enter | KeyCode::Space => Some(InteractionInput::Activate {
+                    control_id: snapshot.focused_control_id.clone(),
+                }),
+                KeyCode::Escape => Some(InteractionInput::Cancel),
                 KeyCode::Backspace => {
-                    if let QuestionFocusTarget::Custom { question_index } = self.controller.focus()
-                    {
-                        self.controller.backspace_custom(question_index);
-                        PluginTuiAction::Redraw
+                    if let QuestionFocusTarget::Custom { question_index } = snapshot.focus {
+                        let mut text = snapshot.answers[question_index]
+                            .custom
+                            .clone()
+                            .unwrap_or_default();
+                        text.pop();
+                        Some(InteractionInput::Change {
+                            control_id: custom_control_id(question_index),
+                            value: InteractionValue::String(text),
+                        })
                     } else {
-                        PluginTuiAction::None
+                        None
                     }
                 }
                 KeyCode::Char(character) => {
-                    if let QuestionFocusTarget::Custom { question_index } = self.controller.focus()
-                    {
-                        self.controller
-                            .append_custom_text(question_index, &character.to_string());
-                        PluginTuiAction::Redraw
+                    if let QuestionFocusTarget::Custom { question_index } = snapshot.focus {
+                        let mut text = snapshot.answers[question_index]
+                            .custom
+                            .clone()
+                            .unwrap_or_default();
+                        text.push(character);
+                        Some(InteractionInput::Change {
+                            control_id: custom_control_id(question_index),
+                            value: InteractionValue::String(text),
+                        })
                     } else if character == ' ' {
-                        Self::action_from_output(self.controller.handle_input(
-                            InteractionInput::Activate {
-                                control_id: self.controller.focus().control_id(),
-                            },
-                        ))
+                        Some(InteractionInput::Activate {
+                            control_id: snapshot.focused_control_id.clone(),
+                        })
                     } else {
-                        PluginTuiAction::None
+                        None
                     }
                 }
                 KeyCode::Left
@@ -317,19 +271,26 @@ impl PluginTuiSurface for QuestionInlineSurface {
                 | KeyCode::PageDown
                 | KeyCode::Delete
                 | KeyCode::Insert
-                | KeyCode::F(_) => PluginTuiAction::None,
+                | KeyCode::F(_) => None,
             },
-            Event::Mouse(mouse) => self.handle_mouse(mouse),
+            Event::Mouse(mouse) => self.mouse_input(mouse),
             Event::Paste(text) => {
-                if let QuestionFocusTarget::Custom { question_index } = self.controller.focus() {
-                    self.controller.append_custom_text(question_index, text);
-                    PluginTuiAction::Redraw
+                if let QuestionFocusTarget::Custom { question_index } = snapshot.focus {
+                    let mut value = snapshot.answers[question_index]
+                        .custom
+                        .clone()
+                        .unwrap_or_default();
+                    value.push_str(text);
+                    Some(InteractionInput::Change {
+                        control_id: custom_control_id(question_index),
+                        value: InteractionValue::String(value),
+                    })
                 } else {
-                    PluginTuiAction::None
+                    None
                 }
             }
             Event::Key(_) | Event::Resize(_) | Event::Focus(_) | Event::Tick | Event::User(_) => {
-                PluginTuiAction::None
+                None
             }
         }
     }

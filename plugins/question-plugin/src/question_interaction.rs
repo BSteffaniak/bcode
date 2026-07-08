@@ -1,5 +1,6 @@
 //! Renderer-neutral question interaction controller.
 
+use bcode_plugin_sdk::interaction::PluginInteraction;
 use bcode_tool::{
     InteractionControlId, InteractionController, InteractionInput, InteractionNavigation,
     InteractionOutput, InteractionValue,
@@ -64,32 +65,6 @@ pub struct QuestionSnapshot {
     pub focused_control_id: InteractionControlId,
 }
 
-/// Factory for renderer-neutral question controllers.
-pub struct QuestionInteractionControllerFactory;
-
-impl bcode_plugin_sdk::interaction::PluginInteractionControllerFactory
-    for QuestionInteractionControllerFactory
-{
-    fn interaction_kind(&self) -> &'static str {
-        QUESTION_INTERACTION_KIND
-    }
-
-    fn open(
-        &self,
-        request: serde_json::Value,
-    ) -> Result<
-        bcode_plugin_sdk::interaction::BoxedPluginInteractionController,
-        bcode_plugin_sdk::interaction::PluginInteractionError,
-    > {
-        let request = serde_json::from_value::<NormalizedQuestionRequest>(request)?;
-        Ok(Box::new(
-            bcode_plugin_sdk::interaction::JsonInteractionController::new(
-                QuestionInteractionController::new(request),
-            ),
-        ))
-    }
-}
-
 /// Renderer-neutral question controller.
 pub struct QuestionInteractionController {
     request: NormalizedQuestionRequest,
@@ -116,12 +91,6 @@ impl QuestionInteractionController {
             answers,
             focus: QuestionFocusTarget::Question { question_index: 0 },
         }
-    }
-
-    /// Return the current focus target.
-    #[must_use]
-    pub const fn focus(&self) -> QuestionFocusTarget {
-        self.focus
     }
 
     fn focus_targets(&self) -> Vec<QuestionFocusTarget> {
@@ -224,25 +193,6 @@ impl QuestionInteractionController {
         }
     }
 
-    /// Append text to a custom answer.
-    pub fn append_custom_text(&mut self, question_index: usize, text: &str) {
-        let answer = &mut self.answers[question_index];
-        let mut current = answer.custom.take().unwrap_or_default();
-        current.push_str(text);
-        self.set_custom(question_index, current);
-    }
-
-    /// Remove the last character from a custom answer.
-    pub fn backspace_custom(&mut self, question_index: usize) {
-        let answer = &mut self.answers[question_index];
-        if let Some(text) = &mut answer.custom {
-            text.pop();
-            if text.is_empty() {
-                answer.custom = None;
-            }
-        }
-    }
-
     fn set_custom(&mut self, question_index: usize, text: String) {
         let answer = &mut self.answers[question_index];
         answer.custom = (!text.is_empty()).then_some(text);
@@ -292,6 +242,25 @@ impl InteractionController for QuestionInteractionController {
             InteractionInput::Submit => self.submit(),
             InteractionInput::Cancel => InteractionOutput::Cancelled,
         }
+    }
+}
+
+impl PluginInteraction for QuestionInteractionController {
+    const KIND: &'static str = QUESTION_INTERACTION_KIND;
+
+    type Request = NormalizedQuestionRequest;
+    type Snapshot = QuestionSnapshot;
+
+    fn new(request: Self::Request) -> Self {
+        Self::new(request)
+    }
+
+    fn snapshot(&self) -> Self::Snapshot {
+        InteractionController::snapshot(self)
+    }
+
+    fn handle_input(&mut self, input: InteractionInput) -> InteractionOutput {
+        InteractionController::handle_input(self, input)
     }
 }
 
@@ -367,12 +336,15 @@ mod tests {
     fn activates_option_and_submits_domain_payload() {
         let mut controller = QuestionInteractionController::new(request());
         assert_eq!(
-            controller.handle_input(InteractionInput::Activate {
-                control_id: option_control_id(0, 0),
-            }),
+            InteractionController::handle_input(
+                &mut controller,
+                InteractionInput::Activate {
+                    control_id: option_control_id(0, 0),
+                }
+            ),
             InteractionOutput::Redraw
         );
-        let output = controller.handle_input(InteractionInput::Submit);
+        let output = InteractionController::handle_input(&mut controller, InteractionInput::Submit);
         let InteractionOutput::Submitted { payload } = output else {
             panic!("expected submitted output");
         };

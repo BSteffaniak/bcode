@@ -26,15 +26,15 @@ const TOOL_NAME: &str = "question";
 const DEFAULT_ASK_AGGRESSIVENESS: u8 = 5;
 
 #[derive(Debug, Default)]
-pub(crate) struct QuestionPlugin;
+pub struct QuestionPlugin;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct NormalizedQuestionRequest {
+pub struct NormalizedQuestionRequest {
     questions: Vec<Question>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Question {
+pub struct Question {
     header: Option<String>,
     #[serde(rename = "question")]
     text: String,
@@ -47,7 +47,7 @@ pub(crate) struct Question {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct QuestionOption {
+pub struct QuestionOption {
     label: String,
     value: Option<String>,
     description: Option<String>,
@@ -55,40 +55,40 @@ pub(crate) struct QuestionOption {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum QuestionControl {
+pub enum QuestionControl {
     Radio,
     Checkbox,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum QuestionSelectionMode {
+pub enum QuestionSelectionMode {
     Single,
     Multiple,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum QuestionCustomMode {
+pub enum QuestionCustomMode {
     Exclusive,
     Additional,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct QuestionToolOutcome {
+pub struct QuestionToolOutcome {
     status: QuestionRequestStatus,
     questions: Vec<QuestionOutcome>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum QuestionRequestStatus {
+pub enum QuestionRequestStatus {
     Answered,
     Unanswered,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct QuestionOutcome {
+pub struct QuestionOutcome {
     question_index: usize,
     header: Option<String>,
     question: String,
@@ -100,7 +100,7 @@ pub(crate) struct QuestionOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum QuestionStatus {
+pub enum QuestionStatus {
     Answered,
     Unanswered,
     Dismissed,
@@ -109,7 +109,7 @@ pub(crate) enum QuestionStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "status")]
-pub(crate) enum QuestionResolutionPayload {
+pub enum QuestionResolutionPayload {
     Answered {
         questions: Vec<QuestionAnswerPayload>,
     },
@@ -118,7 +118,7 @@ pub(crate) enum QuestionResolutionPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct QuestionAnswerPayload {
+pub struct QuestionAnswerPayload {
     question_index: usize,
     #[serde(default)]
     selected: Vec<String>,
@@ -765,16 +765,17 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 #[cfg(feature = "static-bundled")]
 fn question_interaction_registry() -> bcode_plugin_sdk::interaction::PluginInteractionRegistry {
     let mut registry = bcode_plugin_sdk::interaction::PluginInteractionRegistry::default();
-    registry.register_factory(Box::new(
-        question_interaction::QuestionInteractionControllerFactory,
-    ));
+    registry.register_interaction::<question_interaction::QuestionInteractionController>();
     registry
 }
 
 #[cfg(feature = "static-bundled")]
 fn question_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
-    registry.register_factory(Box::new(question_tui::QuestionInlineSurfaceFactory));
+    registry.register_interactive_surface::<
+        question_interaction::QuestionInteractionController,
+        question_tui::QuestionTerminalRenderer,
+    >();
     registry.register_visual_adapter(Box::new(
         question_outcome_tui::QuestionOutcomeTuiVisualAdapter,
     ));

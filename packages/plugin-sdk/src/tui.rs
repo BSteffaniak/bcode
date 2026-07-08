@@ -4,9 +4,11 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::pin::Pin;
 
+use crate::interaction::{InteractionInput, InteractionOutput, PluginInteraction};
 use bcode_session_models::{
     ProjectionWindowRequest, SessionEvent, SessionId, SessionLiveEvent, SessionSummary,
 };
@@ -220,6 +222,148 @@ pub trait PluginTuiSurface: Send {
     }
 }
 
+/// Terminal renderer/adapter for a typed renderer-neutral interaction.
+pub trait TerminalInteractionRenderer<C>: Default + Send + 'static
+where
+    C: PluginInteraction,
+{
+    /// Native terminal surface kind.
+    const SURFACE_KIND: &'static str;
+
+    /// Stable surface identifier.
+    fn id(&self) -> &'static str;
+
+    /// Human-readable surface title.
+    fn title(&self) -> &'static str;
+
+    /// Return preferred height for a snapshot at the given width.
+    #[must_use]
+    fn preferred_height(&mut self, snapshot: &C::Snapshot, width: u16) -> u16;
+
+    /// Render the snapshot.
+    fn render(&mut self, snapshot: &C::Snapshot, area: Rect, frame: &mut Frame<'_>);
+
+    /// Translate terminal input to a semantic interaction input.
+    fn input(&mut self, event: &Event, snapshot: &C::Snapshot) -> Option<InteractionInput>;
+}
+
+struct TypedTerminalInteractionSurface<C, R>
+where
+    C: PluginInteraction,
+    R: TerminalInteractionRenderer<C>,
+{
+    controller: C,
+    renderer: R,
+}
+
+impl<C, R> TypedTerminalInteractionSurface<C, R>
+where
+    C: PluginInteraction,
+    R: TerminalInteractionRenderer<C>,
+{
+    const fn new(controller: C, renderer: R) -> Self {
+        Self {
+            controller,
+            renderer,
+        }
+    }
+}
+
+impl<C, R> PluginTuiSurface for TypedTerminalInteractionSurface<C, R>
+where
+    C: PluginInteraction,
+    R: TerminalInteractionRenderer<C>,
+{
+    fn id(&self) -> &'static str {
+        self.renderer.id()
+    }
+
+    fn title(&self) -> &'static str {
+        self.renderer.title()
+    }
+
+    fn preferred_height(&mut self, width: u16) -> u16 {
+        self.renderer
+            .preferred_height(&self.controller.snapshot(), width)
+    }
+
+    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+        self.renderer
+            .render(&self.controller.snapshot(), area, frame);
+    }
+
+    fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
+        let Some(input) = self.renderer.input(event, &self.controller.snapshot()) else {
+            return PluginTuiAction::None;
+        };
+        plugin_tui_action_from_interaction_output(self.controller.handle_input(input))
+    }
+}
+
+/// Factory for typed terminal interaction surfaces.
+pub struct TypedTerminalInteractionSurfaceFactory<C, R>
+where
+    C: PluginInteraction,
+    R: TerminalInteractionRenderer<C>,
+{
+    marker: PhantomData<fn() -> (C, R)>,
+}
+
+impl<C, R> TypedTerminalInteractionSurfaceFactory<C, R>
+where
+    C: PluginInteraction,
+    R: TerminalInteractionRenderer<C>,
+{
+    /// Create a typed terminal interaction surface factory.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<C, R> Default for TypedTerminalInteractionSurfaceFactory<C, R>
+where
+    C: PluginInteraction,
+    R: TerminalInteractionRenderer<C>,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<C, R> PluginTuiSurfaceFactory for TypedTerminalInteractionSurfaceFactory<C, R>
+where
+    C: PluginInteraction,
+    R: TerminalInteractionRenderer<C>,
+{
+    fn surface_kind(&self) -> &'static str {
+        R::SURFACE_KIND
+    }
+
+    fn open(&self, request: PluginTuiSurfaceOpenRequest) -> PluginTuiSurfaceFuture {
+        Box::pin(async move {
+            let request = serde_json::from_value::<C::Request>(request.options)?;
+            Ok(Box::new(TypedTerminalInteractionSurface::<C, R>::new(
+                C::new(request),
+                R::default(),
+            )) as BoxedPluginTuiSurface)
+        })
+    }
+}
+
+fn plugin_tui_action_from_interaction_output(output: InteractionOutput) -> PluginTuiAction {
+    match output {
+        InteractionOutput::None => PluginTuiAction::None,
+        InteractionOutput::Redraw => PluginTuiAction::Redraw,
+        InteractionOutput::Submitted { payload } => PluginTuiAction::Close {
+            outcome: Some(payload),
+        },
+        InteractionOutput::Cancelled => PluginTuiAction::Close { outcome: None },
+    }
+}
+
 /// Parameters used to open a native plugin TUI surface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginTuiSurfaceOpenRequest {
@@ -268,6 +412,17 @@ impl PluginTuiRegistry {
     pub fn register_factory(&mut self, factory: Box<dyn PluginTuiSurfaceFactory>) {
         self.factories
             .insert(factory.surface_kind().to_string(), factory);
+    }
+
+    /// Register a typed terminal renderer for a renderer-neutral interaction.
+    pub fn register_interactive_surface<C, R>(&mut self)
+    where
+        C: PluginInteraction,
+        R: TerminalInteractionRenderer<C>,
+    {
+        self.register_factory(Box::new(
+            TypedTerminalInteractionSurfaceFactory::<C, R>::new(),
+        ));
     }
 
     /// Register a native TUI visual adapter.
