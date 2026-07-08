@@ -400,6 +400,13 @@ pub enum Request {
         scope: ComposerDraftScope,
     },
     ListInteractiveToolRequests,
+    GetInteractionSnapshot {
+        interaction_id: String,
+    },
+    SubmitInteractionInput {
+        interaction_id: String,
+        input: bcode_tool::InteractionInput,
+    },
     ResolveInteractiveToolRequest {
         interaction_id: String,
         resolution_json: serde_json::Value,
@@ -598,6 +605,8 @@ pub struct InteractiveToolRequestSummary {
     pub session_id: SessionId,
     pub tool_call_id: String,
     pub tool_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_kind: Option<String>,
     pub surface_kind: String,
     pub request: serde_json::Value,
     #[serde(default)]
@@ -606,6 +615,28 @@ pub struct InteractiveToolRequestSummary {
     pub turn_behavior: bcode_session_models::InteractiveToolTurnBehavior,
     #[serde(default)]
     pub render_target: bcode_session_models::InteractiveToolRenderTarget,
+}
+
+/// Renderer-neutral interactive session snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractionSnapshotResponse {
+    pub interaction_id: String,
+    pub interaction_kind: String,
+    pub snapshot: serde_json::Value,
+}
+
+/// Result from submitting renderer-neutral interaction input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum InteractionInputResponse {
+    None,
+    Redraw {
+        snapshot: InteractionSnapshotResponse,
+    },
+    Submitted {
+        payload: serde_json::Value,
+    },
+    Cancelled,
 }
 
 /// Plugin service invocation result.
@@ -1113,6 +1144,12 @@ pub enum ResponsePayload {
     },
     InteractiveToolRequestList {
         requests: Vec<InteractiveToolRequestSummary>,
+    },
+    InteractionSnapshot {
+        snapshot: Option<InteractionSnapshotResponse>,
+    },
+    InteractionInputSubmitted {
+        response: InteractionInputResponse,
     },
     InteractiveToolRequestResolved {
         resolved: bool,

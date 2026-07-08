@@ -819,11 +819,22 @@ struct PendingPermission {
     skill_decision_key: Option<SkillToolDecisionKey>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct PendingInteractiveToolRequest {
     summary: bcode_ipc::InteractiveToolRequestSummary,
+    controller: Option<Arc<Mutex<bcode_plugin_sdk::interaction::BoxedPluginInteractionController>>>,
     resolution: Arc<Mutex<Option<InteractiveToolResolution>>>,
     notify: Arc<Notify>,
+}
+
+impl std::fmt::Debug for PendingInteractiveToolRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingInteractiveToolRequest")
+            .field("summary", &self.summary)
+            .field("has_controller", &self.controller.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 struct ServerStateInit {
@@ -1887,6 +1898,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::RefreshSessionCatalog { .. } => "refresh_session_catalog",
         Request::AttachSessionProjectionWindow { .. } => "attach_session_projection_window",
         Request::ListInteractiveToolRequests => "list_interactive_tool_requests",
+        Request::GetInteractionSnapshot { .. } => "get_interaction_snapshot",
+        Request::SubmitInteractionInput { .. } => "submit_interaction_input",
         Request::ResolveInteractiveToolRequest { .. } => "resolve_interactive_tool_request",
         Request::RuntimeWorkHistory { .. } => "runtime_work_history",
         Request::ListRuntimeWork { .. } => "list_runtime_work",
@@ -2386,6 +2399,15 @@ async fn handle_permission_interaction_request(
         }
         Request::ListInteractiveToolRequests => {
             handle_list_interactive_tool_requests(request_id, state, writer).await
+        }
+        Request::GetInteractionSnapshot { interaction_id } => {
+            handle_get_interaction_snapshot(request_id, state, writer, &interaction_id).await
+        }
+        Request::SubmitInteractionInput {
+            interaction_id,
+            input,
+        } => {
+            handle_submit_interaction_input(request_id, state, writer, &interaction_id, input).await
         }
         Request::ResolveInteractiveToolRequest {
             interaction_id,
@@ -7829,6 +7851,129 @@ async fn handle_list_interactive_tool_requests(
     .await
 }
 
+async fn handle_get_interaction_snapshot(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    interaction_id: &str,
+) -> Result<(), ServerError> {
+    let pending = state
+        .pending_interactive_tools
+        .lock()
+        .await
+        .get(interaction_id)
+        .cloned();
+    let snapshot = match pending {
+        Some(pending) => interaction_snapshot(&pending).await,
+        None => None,
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::InteractionSnapshot { snapshot }),
+    )
+    .await
+}
+
+async fn handle_submit_interaction_input(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    interaction_id: &str,
+    input: bcode_tool::InteractionInput,
+) -> Result<(), ServerError> {
+    let Some(pending) = state
+        .pending_interactive_tools
+        .lock()
+        .await
+        .get(interaction_id)
+        .cloned()
+    else {
+        return send_response(
+            writer,
+            request_id,
+            Response::Ok(ResponsePayload::InteractionInputSubmitted {
+                response: bcode_ipc::InteractionInputResponse::None,
+            }),
+        )
+        .await;
+    };
+    let Some(controller) = &pending.controller else {
+        return send_response(
+            writer,
+            request_id,
+            Response::Ok(ResponsePayload::InteractionInputSubmitted {
+                response: bcode_ipc::InteractionInputResponse::None,
+            }),
+        )
+        .await;
+    };
+    let output = controller.lock().await.handle_input(input);
+    let response = match output {
+        bcode_tool::InteractionOutput::None => bcode_ipc::InteractionInputResponse::None,
+        bcode_tool::InteractionOutput::Redraw => interaction_snapshot(&pending)
+            .await
+            .map_or(bcode_ipc::InteractionInputResponse::None, |snapshot| {
+                bcode_ipc::InteractionInputResponse::Redraw { snapshot }
+            }),
+        bcode_tool::InteractionOutput::Submitted { payload } => {
+            let resolution = InteractiveToolResolution::Submitted {
+                payload: payload.clone(),
+            };
+            complete_pending_interactive_tool_request(state, &pending, resolution).await;
+            bcode_ipc::InteractionInputResponse::Submitted { payload }
+        }
+        bcode_tool::InteractionOutput::Cancelled => {
+            let resolution = InteractiveToolResolution::Aborted {
+                reason: bcode_tool::InteractiveToolAbortReason::UserDismissed,
+                message: None,
+            };
+            complete_pending_interactive_tool_request(state, &pending, resolution).await;
+            bcode_ipc::InteractionInputResponse::Cancelled
+        }
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::InteractionInputSubmitted { response }),
+    )
+    .await
+}
+
+async fn interaction_snapshot(
+    pending: &PendingInteractiveToolRequest,
+) -> Option<bcode_ipc::InteractionSnapshotResponse> {
+    let controller = pending.controller.as_ref()?;
+    let interaction_kind = pending.summary.interaction_kind.clone()?;
+    Some(bcode_ipc::InteractionSnapshotResponse {
+        interaction_id: pending.summary.interaction_id.clone(),
+        interaction_kind,
+        snapshot: controller.lock().await.snapshot_json(),
+    })
+}
+
+async fn complete_pending_interactive_tool_request(
+    state: &ServerState,
+    request: &PendingInteractiveToolRequest,
+    resolution: InteractiveToolResolution,
+) {
+    state
+        .pending_interactive_tools
+        .lock()
+        .await
+        .remove(&request.summary.interaction_id);
+    *request.resolution.lock().await = Some(resolution.clone());
+    request.notify.notify_waiters();
+    append_interactive_tool_request_resolved_event(
+        state,
+        request.summary.session_id,
+        request.summary.interaction_id.clone(),
+        request.summary.tool_call_id.clone(),
+        resolution,
+    )
+    .await;
+}
+
 async fn handle_resolve_interactive_tool_request(
     request_id: u64,
     state: &ServerState,
@@ -7850,16 +7995,7 @@ async fn handle_resolve_interactive_tool_request(
         .await;
     };
     let resolution = interactive_resolution_from_session(resolution);
-    *request.resolution.lock().await = Some(resolution.clone());
-    request.notify.notify_waiters();
-    append_interactive_tool_request_resolved_event(
-        state,
-        request.summary.session_id,
-        request.summary.interaction_id,
-        request.summary.tool_call_id,
-        resolution,
-    )
-    .await;
+    complete_pending_interactive_tool_request(state, &request, resolution).await;
     send_response(
         writer,
         request_id,
@@ -13803,18 +13939,33 @@ async fn handle_interactive_tool_request(
         ));
     }
 
+    let interaction_kind = request
+        .interaction_kind
+        .clone()
+        .unwrap_or_else(|| request.surface_kind.clone());
+    let controller = state
+        .plugins
+        .interaction_registry(plugin_id)
+        .and_then(|registry| {
+            registry
+                .open(&interaction_kind, request.request.clone())
+                .ok()
+                .map(|controller| Arc::new(Mutex::new(controller)))
+        });
     let pending = PendingInteractiveToolRequest {
         summary: bcode_ipc::InteractiveToolRequestSummary {
             interaction_id: request.interaction_id.clone(),
             session_id,
             tool_call_id: call.id.clone(),
             tool_name: call.name.clone(),
+            interaction_kind: Some(interaction_kind),
             surface_kind: request.surface_kind.clone(),
             request: request.request.clone(),
             required: request.required,
             turn_behavior: interactive_turn_behavior_to_session(request.turn_behavior),
             render_target: interactive_render_target_to_session(request.render_target),
         },
+        controller,
         resolution: Arc::new(Mutex::new(None)),
         notify: Arc::new(Notify::new()),
     };

@@ -18,6 +18,7 @@ bcode_model           = { workspace = true }
 bcode_plugin          = { workspace = true }
 bcode_session_models  = { workspace = true }
 bcode_skill_models    = { workspace = true }
+bcode_tool            = { workspace = true }
 bcode_worktree_models = { workspace = true }
 bmux_codec            = { workspace = true }
 bmux_ipc              = { workspace = true }
