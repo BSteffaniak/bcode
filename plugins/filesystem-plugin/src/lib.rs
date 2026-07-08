@@ -6,6 +6,8 @@
 
 #[cfg(feature = "static-bundled")]
 mod file_change_tui;
+#[cfg(feature = "static-bundled")]
+mod filesystem_tui;
 
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
@@ -37,6 +39,8 @@ const DEFAULT_READ_MAX_LINES: usize = 1_000;
 const DEFAULT_READ_MAX_BYTES: usize = 256 * 1024;
 const DEFAULT_ARTIFACT_READ_MAX_BYTES: usize = 64 * 1024;
 const DEFAULT_ARTIFACT_GREP_MAX_MATCHES: usize = 100;
+const FILESYSTEM_PLUGIN_ID: &str = "bcode.filesystem";
+const FILESYSTEM_REQUEST_SCHEMA: &str = "bcode.filesystem.request";
 
 /// filesystem plugin.
 #[derive(Default)]
@@ -382,7 +386,36 @@ fn compatibility_aliases_for(aliases: &[&str]) -> Vec<bcode_tool::ToolCompatibil
 fn path_tool_ui(activity_label: &str) -> bcode_tool::ToolUiMetadata {
     bcode_tool::ToolUiMetadata {
         activity_label: Some(activity_label.to_string()),
-        request_visual: None,
+        request_visual: Some(filesystem_request_visual(activity_label, &["path"])),
+    }
+}
+
+fn filesystem_request_visual(
+    operation: &str,
+    argument_fields: &[&str],
+) -> ToolPluginVisualMetadata {
+    let mut payload = std::collections::BTreeMap::new();
+    payload.insert(
+        "operation".to_string(),
+        payload_selector(
+            &[],
+            Some(serde_json::Value::String(operation.to_string())),
+            false,
+        ),
+    );
+    for field in argument_fields {
+        payload.insert(
+            (*field).to_string(),
+            payload_selector(&[*field], None, false),
+        );
+    }
+    ToolPluginVisualMetadata {
+        producer_plugin_id: Some(FILESYSTEM_PLUGIN_ID.to_string()),
+        schema: FILESYSTEM_REQUEST_SCHEMA.to_string(),
+        schema_version: 1,
+        title: Some(format!("Filesystem {operation}")),
+        subtitle: Some(format!("{operation} {{path}} · {{bytes}}")),
+        payload,
     }
 }
 
@@ -579,7 +612,13 @@ fn find_tool_definition() -> ToolDefinition {
             "read",
             bcode_tool::ToolArgumentKind::ReadPath,
         ),
-        ui: path_tool_ui("finding"),
+        ui: bcode_tool::ToolUiMetadata {
+            activity_label: Some("finding".to_string()),
+            request_visual: Some(filesystem_request_visual(
+                "finding",
+                &["path", "pattern", "max_results", "timeout_ms"],
+            )),
+        },
     }
 }
 
@@ -606,7 +645,20 @@ fn grep_tool_definition() -> ToolDefinition {
             "read",
             bcode_tool::ToolArgumentKind::ReadPath,
         ),
-        ui: path_tool_ui("searching"),
+        ui: bcode_tool::ToolUiMetadata {
+            activity_label: Some("searching".to_string()),
+            request_visual: Some(filesystem_request_visual(
+                "searching",
+                &[
+                    "path",
+                    "pattern",
+                    "glob",
+                    "ignore_case",
+                    "max_matches",
+                    "timeout_ms",
+                ],
+            )),
+        },
     }
 }
 
@@ -642,7 +694,13 @@ fn artifact_metadata_tool_definition() -> ToolDefinition {
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: bcode_tool::ToolPolicyMetadata::default(),
-        ui: bcode_tool::ToolUiMetadata::default(),
+        ui: bcode_tool::ToolUiMetadata {
+            activity_label: Some("reading artifact metadata".to_string()),
+            request_visual: Some(filesystem_request_visual(
+                "reading artifact metadata",
+                &["path"],
+            )),
+        },
     }
 }
 
@@ -663,7 +721,13 @@ fn artifact_read_tool_definition() -> ToolDefinition {
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: bcode_tool::ToolPolicyMetadata::default(),
-        ui: bcode_tool::ToolUiMetadata::default(),
+        ui: bcode_tool::ToolUiMetadata {
+            activity_label: Some("reading artifact".to_string()),
+            request_visual: Some(filesystem_request_visual(
+                "reading artifact",
+                &["path", "offset_bytes", "max_bytes", "from_end"],
+            )),
+        },
     }
 }
 
@@ -685,7 +749,13 @@ fn artifact_grep_tool_definition() -> ToolDefinition {
         side_effect: ToolSideEffect::ReadOnly,
         requires_permission: false,
         policy: bcode_tool::ToolPolicyMetadata::default(),
-        ui: bcode_tool::ToolUiMetadata::default(),
+        ui: bcode_tool::ToolUiMetadata {
+            activity_label: Some("searching artifact".to_string()),
+            request_visual: Some(filesystem_request_visual(
+                "searching artifact",
+                &["path", "pattern", "ignore_case", "max_matches"],
+            )),
+        },
     }
 }
 
@@ -707,10 +777,12 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
     }
     let cwd = request.cwd.clone();
     let response = match request.name.as_str() {
-        "filesystem.read" => tool_read(request.arguments, cwd.as_deref()),
+        "filesystem.read" => tool_read(request.arguments, cwd.as_deref(), &request.tool_call_id),
         "filesystem.write" => tool_write(request.arguments, cwd.as_deref(), &request.tool_call_id),
         "filesystem.edit" => tool_edit(request.arguments, cwd.as_deref(), &request.tool_call_id),
-        "filesystem.exists" => tool_exists(request.arguments, cwd.as_deref()),
+        "filesystem.exists" => {
+            tool_exists(request.arguments, cwd.as_deref(), &request.tool_call_id)
+        }
         "filesystem.list" => tool_list(
             request.arguments,
             cwd.as_deref(),
@@ -732,10 +804,16 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             context.events,
             &request.tool_call_id,
         ),
-        "filesystem.stat" => tool_stat(request.arguments, cwd.as_deref()),
-        "artifact.metadata" => tool_artifact_metadata(request.arguments, cwd.as_deref()),
-        "artifact.read" => tool_artifact_read(request.arguments, cwd.as_deref()),
-        "artifact.grep" => tool_artifact_grep(request.arguments, cwd.as_deref()),
+        "filesystem.stat" => tool_stat(request.arguments, cwd.as_deref(), &request.tool_call_id),
+        "artifact.metadata" => {
+            tool_artifact_metadata(request.arguments, cwd.as_deref(), &request.tool_call_id)
+        }
+        "artifact.read" => {
+            tool_artifact_read(request.arguments, cwd.as_deref(), &request.tool_call_id)
+        }
+        "artifact.grep" => {
+            tool_artifact_grep(request.arguments, cwd.as_deref(), &request.tool_call_id)
+        }
         _ => ToolInvocationResponse {
             output: format!("unknown filesystem tool: {}", request.name),
             is_error: true,
@@ -748,25 +826,42 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
     json_response(&response)
 }
 
-fn tool_read(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocationResponse {
+fn tool_read(
+    arguments: serde_json::Value,
+    cwd: Option<&Path>,
+    tool_call_id: &str,
+) -> ToolInvocationResponse {
     match serde_json::from_value::<ReadRequest>(arguments) {
-        Ok(request) => read_path_for_tool(&resolve_session_path(cwd, &request.path), &request),
+        Ok(request) => read_path_for_tool(
+            &resolve_session_path(cwd, &request.path),
+            &request,
+            tool_call_id,
+        ),
         Err(error) => tool_json_error(&error),
     }
 }
 
-fn read_path_for_tool(path: &Path, request: &ReadRequest) -> ToolInvocationResponse {
+fn read_path_for_tool(
+    path: &Path,
+    request: &ReadRequest,
+    tool_call_id: &str,
+) -> ToolInvocationResponse {
     match image_file_metadata(path) {
-        Ok(Some(image)) => image_tool_response(path, image),
+        Ok(Some(image)) => image_tool_response(path, image, tool_call_id),
         Ok(None) => match std::fs::read(path) {
-            Ok(bytes) => text_tool_response(path, request, &bytes),
+            Ok(bytes) => text_tool_response(path, request, &bytes, tool_call_id),
             Err(error) => tool_io_error(&error),
         },
         Err(error) => tool_io_error(&error),
     }
 }
 
-fn text_tool_response(path: &Path, request: &ReadRequest, bytes: &[u8]) -> ToolInvocationResponse {
+fn text_tool_response(
+    path: &Path,
+    request: &ReadRequest,
+    bytes: &[u8],
+    tool_call_id: &str,
+) -> ToolInvocationResponse {
     let Ok(contents) = std::str::from_utf8(bytes) else {
         return ToolInvocationResponse {
             output: format!(
@@ -812,23 +907,45 @@ fn text_tool_response(path: &Path, request: &ReadRequest, bytes: &[u8]) -> ToolI
         );
     }
     ToolInvocationResponse {
-        output,
+        output: output.clone(),
         is_error: false,
         content: Vec::new(),
         full_output: None,
         host_action: None,
-        result: None,
+        result: Some(filesystem_artifact_result(
+            tool_call_id,
+            "read",
+            "bcode.filesystem.read",
+            "File contents",
+            json!({
+                "path": path.display().to_string(),
+                "start_line": start_line.saturating_add(1),
+                "end_line": start_line.saturating_add(selected.len()),
+                "total_lines": total_lines,
+                "returned_bytes": retained_bytes,
+                "total_bytes": bytes.len(),
+                "truncated": next_line <= total_lines || byte_truncated,
+                "contents": output,
+            }),
+        )),
     }
 }
 
 fn tool_artifact_metadata(
     arguments: serde_json::Value,
     cwd: Option<&Path>,
+    tool_call_id: &str,
 ) -> ToolInvocationResponse {
     match serde_json::from_value::<ArtifactMetadataRequest>(arguments) {
         Ok(request) => {
             let path = resolve_session_path(cwd, &request.path);
-            json_tool_response(serde_json::to_value(artifact_metadata_response(&path)))
+            json_tool_response_with_artifact(
+                serde_json::to_value(artifact_metadata_response(&path)),
+                tool_call_id,
+                "artifact-metadata",
+                "bcode.filesystem.artifact.metadata",
+                "Artifact metadata",
+            )
         }
         Err(error) => tool_json_error(&error),
     }
@@ -869,10 +986,20 @@ fn artifact_metadata_response(path: &Path) -> ArtifactMetadataResponse {
     }
 }
 
-fn tool_artifact_read(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocationResponse {
+fn tool_artifact_read(
+    arguments: serde_json::Value,
+    cwd: Option<&Path>,
+    tool_call_id: &str,
+) -> ToolInvocationResponse {
     match serde_json::from_value::<ArtifactReadRequest>(arguments) {
         Ok(request) => match read_artifact(&resolve_session_path(cwd, &request.path), &request) {
-            Ok(response) => json_tool_response(serde_json::to_value(response)),
+            Ok(response) => json_tool_response_with_artifact(
+                serde_json::to_value(response),
+                tool_call_id,
+                "artifact-read",
+                "bcode.filesystem.artifact.read",
+                "Artifact bytes",
+            ),
             Err(error) => ToolInvocationResponse {
                 output: error,
                 is_error: true,
@@ -916,10 +1043,20 @@ fn read_artifact(
     })
 }
 
-fn tool_artifact_grep(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocationResponse {
+fn tool_artifact_grep(
+    arguments: serde_json::Value,
+    cwd: Option<&Path>,
+    tool_call_id: &str,
+) -> ToolInvocationResponse {
     match serde_json::from_value::<ArtifactGrepRequest>(arguments) {
         Ok(request) => match grep_artifact(&resolve_session_path(cwd, &request.path), &request) {
-            Ok(response) => json_tool_response(serde_json::to_value(response)),
+            Ok(response) => json_tool_response_with_artifact(
+                serde_json::to_value(response),
+                tool_call_id,
+                "artifact-grep",
+                "bcode.filesystem.artifact.grep",
+                "Artifact matches",
+            ),
             Err(error) => ToolInvocationResponse {
                 output: error,
                 is_error: true,
@@ -996,7 +1133,11 @@ fn utf8_boundary_at_or_before_bytes(bytes: &[u8], mut index: usize) -> usize {
     index
 }
 
-fn image_tool_response(path: &Path, image: ImageFileMetadata) -> ToolInvocationResponse {
+fn image_tool_response(
+    path: &Path,
+    image: ImageFileMetadata,
+    tool_call_id: &str,
+) -> ToolInvocationResponse {
     let metadata = std::fs::metadata(path);
     let byte_len = metadata.as_ref().map_or(0, std::fs::Metadata::len);
     let output = format!(
@@ -1007,6 +1148,7 @@ fn image_tool_response(path: &Path, image: ImageFileMetadata) -> ToolInvocationR
         image.height,
         byte_len
     );
+    let mime_type = image.mime_type.clone();
     ToolInvocationResponse {
         output,
         is_error: false,
@@ -1024,7 +1166,19 @@ fn image_tool_response(path: &Path, image: ImageFileMetadata) -> ToolInvocationR
         }],
         full_output: None,
         host_action: None,
-        result: None,
+        result: Some(filesystem_artifact_result(
+            tool_call_id,
+            "image",
+            "bcode.filesystem.image",
+            "Image file",
+            json!({
+                "path": path.display().to_string(),
+                "mime_type": mime_type,
+                "width": image.width,
+                "height": image.height,
+                "byte_len": byte_len,
+            }),
+        )),
     }
 }
 
@@ -1169,18 +1323,34 @@ fn tool_edit(
     }
 }
 
-fn tool_exists(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocationResponse {
+fn tool_exists(
+    arguments: serde_json::Value,
+    cwd: Option<&Path>,
+    tool_call_id: &str,
+) -> ToolInvocationResponse {
     match serde_json::from_value::<ExistsRequest>(arguments) {
-        Ok(request) => ToolInvocationResponse {
-            output: resolve_session_path(cwd, &request.path)
-                .exists()
-                .to_string(),
-            is_error: false,
-            content: Vec::new(),
-            full_output: None,
-            host_action: None,
-            result: None,
-        },
+        Ok(request) => {
+            let path = resolve_session_path(cwd, &request.path);
+            let exists = path.exists();
+            let output = exists.to_string();
+            ToolInvocationResponse {
+                output,
+                is_error: false,
+                content: Vec::new(),
+                full_output: None,
+                host_action: None,
+                result: Some(filesystem_artifact_result(
+                    tool_call_id,
+                    "exists",
+                    "bcode.filesystem.exists",
+                    "Path exists",
+                    json!({
+                        "path": path.display().to_string(),
+                        "exists": exists,
+                    }),
+                )),
+            }
+        }
         Err(error) => tool_json_error(&error),
     }
 }
@@ -1192,18 +1362,23 @@ fn tool_list(
     events: ServiceEventEmitter,
     tool_call_id: &str,
 ) -> ToolInvocationResponse {
-    json_tool_response(
-        serde_json::from_value::<ListRequest>(arguments)
-            .map(|mut request| {
-                request.path = resolve_session_path(cwd, &request.path);
-                request
-            })
-            .and_then(|request| {
-                let mut progress = ProgressReporter::new(events, tool_call_id.to_string());
-                progress.emit("list: scanning entries");
-                list_directory(&request, cancellation.clone(), Some(&mut progress))
-                    .map_err(serde_json::Error::io)
-            }),
+    let result = serde_json::from_value::<ListRequest>(arguments)
+        .map(|mut request| {
+            request.path = resolve_session_path(cwd, &request.path);
+            request
+        })
+        .and_then(|request| {
+            let mut progress = ProgressReporter::new(events, tool_call_id.to_string());
+            progress.emit("list: scanning entries");
+            list_directory(&request, cancellation.clone(), Some(&mut progress))
+                .map_err(serde_json::Error::io)
+        });
+    json_tool_response_with_artifact(
+        result,
+        tool_call_id,
+        "list",
+        "bcode.filesystem.list",
+        "Directory entries",
     )
 }
 
@@ -1214,18 +1389,23 @@ fn tool_find(
     events: ServiceEventEmitter,
     tool_call_id: &str,
 ) -> ToolInvocationResponse {
-    json_tool_response(
-        serde_json::from_value::<FindRequest>(arguments)
-            .map(|mut request| {
-                request.path = resolve_session_path(cwd, &request.path);
-                request
-            })
-            .and_then(|request| {
-                let mut progress = ProgressReporter::new(events, tool_call_id.to_string());
-                progress.emit(format!("find: searching for {}", request.pattern));
-                find_paths_with_cancellation(&request, cancellation.clone(), Some(&mut progress))
-                    .map_err(serde_json::Error::io)
-            }),
+    let result = serde_json::from_value::<FindRequest>(arguments)
+        .map(|mut request| {
+            request.path = resolve_session_path(cwd, &request.path);
+            request
+        })
+        .and_then(|request| {
+            let mut progress = ProgressReporter::new(events, tool_call_id.to_string());
+            progress.emit(format!("find: searching for {}", request.pattern));
+            find_paths_with_cancellation(&request, cancellation.clone(), Some(&mut progress))
+                .map_err(serde_json::Error::io)
+        });
+    json_tool_response_with_artifact(
+        result,
+        tool_call_id,
+        "find",
+        "bcode.filesystem.find",
+        "Path matches",
     )
 }
 
@@ -1236,29 +1416,43 @@ fn tool_grep(
     events: ServiceEventEmitter,
     tool_call_id: &str,
 ) -> ToolInvocationResponse {
-    json_tool_response(
-        serde_json::from_value::<GrepRequest>(arguments)
-            .map(|mut request| {
-                request.path = resolve_session_path(cwd, &request.path);
-                request
-            })
-            .and_then(|request| {
-                let mut progress = ProgressReporter::new(events, tool_call_id.to_string());
-                progress.emit(format!("grep: searching for {}", request.pattern));
-                grep_files_with_cancellation(&request, cancellation.clone(), Some(&mut progress))
-                    .map_err(serde_json::Error::io)
-            }),
+    let result = serde_json::from_value::<GrepRequest>(arguments)
+        .map(|mut request| {
+            request.path = resolve_session_path(cwd, &request.path);
+            request
+        })
+        .and_then(|request| {
+            let mut progress = ProgressReporter::new(events, tool_call_id.to_string());
+            progress.emit(format!("grep: searching for {}", request.pattern));
+            grep_files_with_cancellation(&request, cancellation.clone(), Some(&mut progress))
+                .map_err(serde_json::Error::io)
+        });
+    json_tool_response_with_artifact(
+        result,
+        tool_call_id,
+        "grep",
+        "bcode.filesystem.grep",
+        "Text matches",
     )
 }
 
-fn tool_stat(arguments: serde_json::Value, cwd: Option<&Path>) -> ToolInvocationResponse {
-    json_tool_response(
-        serde_json::from_value::<StatRequest>(arguments)
-            .map(|mut request| {
-                request.path = resolve_session_path(cwd, &request.path);
-                request
-            })
-            .and_then(|request| stat_path(&request).map_err(serde_json::Error::io)),
+fn tool_stat(
+    arguments: serde_json::Value,
+    cwd: Option<&Path>,
+    tool_call_id: &str,
+) -> ToolInvocationResponse {
+    let result = serde_json::from_value::<StatRequest>(arguments)
+        .map(|mut request| {
+            request.path = resolve_session_path(cwd, &request.path);
+            request
+        })
+        .and_then(|request| stat_path(&request).map_err(serde_json::Error::io));
+    json_tool_response_with_artifact(
+        result,
+        tool_call_id,
+        "stat",
+        "bcode.filesystem.stat",
+        "Path metadata",
     )
 }
 
@@ -2163,18 +2357,34 @@ fn tool_json_error(error: &serde_json::Error) -> ToolInvocationResponse {
     }
 }
 
-fn json_tool_response<T>(result: Result<T, serde_json::Error>) -> ToolInvocationResponse
+fn json_tool_response_with_artifact<T>(
+    result: Result<T, serde_json::Error>,
+    tool_call_id: &str,
+    artifact_suffix: &str,
+    schema: &str,
+    title: &str,
+) -> ToolInvocationResponse
 where
     T: Serialize,
 {
-    match result.and_then(|value| serde_json::to_string_pretty(&value)) {
-        Ok(output) => ToolInvocationResponse {
+    match result.and_then(|value| {
+        let payload = serde_json::to_value(&value)?;
+        let output = serde_json::to_string_pretty(&value)?;
+        Ok((output, payload))
+    }) {
+        Ok((output, payload)) => ToolInvocationResponse {
             output,
             is_error: false,
             content: Vec::new(),
             full_output: None,
             host_action: None,
-            result: None,
+            result: Some(filesystem_artifact_result(
+                tool_call_id,
+                artifact_suffix,
+                schema,
+                title,
+                payload,
+            )),
         },
         Err(error) => ToolInvocationResponse {
             output: error.to_string(),
@@ -2184,6 +2394,27 @@ where
             host_action: None,
             result: None,
         },
+    }
+}
+
+fn filesystem_artifact_result(
+    tool_call_id: &str,
+    artifact_suffix: &str,
+    schema: &str,
+    title: &str,
+    payload: serde_json::Value,
+) -> ToolInvocationResult {
+    ToolInvocationResult::Artifact {
+        artifact: Box::new(ToolArtifact {
+            artifact_id: format!("{tool_call_id}-filesystem-{artifact_suffix}"),
+            producer_plugin_id: FILESYSTEM_PLUGIN_ID.to_string(),
+            schema: schema.to_string(),
+            schema_version: 1,
+            tool_call_id: Some(tool_call_id.to_string()),
+            title: Some(title.to_string()),
+            metadata: payload,
+            refs: Vec::new(),
+        }),
     }
 }
 
@@ -2205,6 +2436,7 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 fn filesystem_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
     registry.register_visual_adapter(Box::new(file_change_tui::FileChangeTuiVisualAdapter));
+    registry.register_visual_adapter(Box::new(filesystem_tui::FilesystemTuiVisualAdapter));
     registry
 }
 
@@ -2395,6 +2627,7 @@ mod tests {
                 offset: Some(2),
                 limit: Some(2),
             },
+            "test-read",
         );
 
         assert!(!response.is_error);
@@ -2472,6 +2705,7 @@ mod tests {
                 offset: None,
                 limit: None,
             },
+            "test-image",
         );
 
         assert!(!response.is_error);
