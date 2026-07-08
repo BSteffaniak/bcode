@@ -633,6 +633,13 @@ fn assistant_message(text: impl Into<String>) -> ModelMessage {
     }
 }
 
+fn text_from_message(message: &ModelMessage) -> Option<String> {
+    message.content.iter().find_map(|block| match block {
+        ModelContentBlock::Text { text } => Some(text.clone()),
+        _ => None,
+    })
+}
+
 #[derive(Clone)]
 struct InlineToolExecutor {
     handlers: BTreeMap<String, InlineToolHandler>,
@@ -1280,6 +1287,71 @@ impl AgentSession {
     #[must_use]
     pub fn into_messages(self) -> Vec<ModelMessage> {
         self.session.into_messages()
+    }
+
+    /// Append a caller-managed message to the session transcript.
+    pub fn append_message(&mut self, message: ModelMessage) {
+        self.session.push_message(message);
+    }
+
+    /// Create an in-memory branch of this session without copying the configured persistence store.
+    #[must_use]
+    pub fn branch(&self) -> Self {
+        Self::new(self.agent.clone(), self.session.clone())
+    }
+
+    /// Alias for [`Self::branch`].
+    #[must_use]
+    pub fn fork(&self) -> Self {
+        self.branch()
+    }
+
+    /// Regenerate the response to the last user message.
+    ///
+    /// The previous assistant continuation after the last user message is removed, the last user
+    /// message is kept, and the regenerated assistant message is appended.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when there is no prior user message, the last user message has no text
+    /// block, provider invocation fails, the runtime is cancelled, or persistence fails.
+    pub async fn regenerate_last_with_provider<P>(
+        &mut self,
+        provider: &mut P,
+    ) -> Result<GenerateTextResponse>
+    where
+        P: ModelProviderInvoker,
+    {
+        let Some(user_index) = self
+            .session
+            .messages
+            .iter()
+            .rposition(|message| message.role == MessageRole::User)
+        else {
+            return Err(BcodeError::SessionState(
+                "cannot regenerate a session without a prior user message".to_string(),
+            ));
+        };
+        let user_message = self.session.messages[user_index].clone();
+        let prompt = text_from_message(&user_message).ok_or_else(|| {
+            BcodeError::SessionState(
+                "cannot regenerate because the last user message has no text block".to_string(),
+            )
+        })?;
+        let prior_messages = self.session.messages[..user_index].to_vec();
+        let response = self
+            .agent
+            .generate_text_with_provider_and_history(provider, prompt, prior_messages)
+            .await?;
+        self.session.messages.truncate(user_index);
+        self.session.messages.push(user_message);
+        self.session
+            .messages
+            .push(assistant_message(response.text.clone()));
+        if self.store.is_some() {
+            self.save()?;
+        }
+        Ok(response)
     }
 
     /// Generate text and append user/assistant messages to the in-memory transcript.

@@ -1,4 +1,6 @@
-use bcode::{Agent, ModelProviderInvoker, RuntimeFuture};
+use bcode::{
+    Agent, MessageRole, ModelContentBlock, ModelMessage, ModelProviderInvoker, RuntimeFuture,
+};
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, ModelTurnRequest, PollTurnEventsRequest,
     PollTurnEventsResponse, ProviderTurnEvent, StartTurnResponse, StopReason,
@@ -12,7 +14,12 @@ struct EchoProvider {
 impl EchoProvider {
     fn new() -> Self {
         Self {
-            turns: VecDeque::from(["first response".to_string(), "second response".to_string()]),
+            turns: VecDeque::from([
+                "first response".to_string(),
+                "second response".to_string(),
+                "branched response".to_string(),
+                "regenerated response".to_string(),
+            ]),
         }
     }
 }
@@ -82,11 +89,35 @@ async fn main() -> bcode::Result<()> {
         .generate_text_with_provider(&mut provider, "what did I ask you to remember?")
         .await?;
 
+    let mut branch = session.branch();
+    branch.append_message(text_message(
+        MessageRole::User,
+        "branch this conversation toward pears",
+    ));
+    let branched = branch.regenerate_last_with_provider(&mut provider).await?;
+
+    let regenerated = session.regenerate_last_with_provider(&mut provider).await?;
+    let exported = session.clone().into_messages();
+    let imported = Agent::builder()
+        .model("echo-provider")
+        .build()
+        .session_from_messages(exported);
+
     println!("first: {}", first.text);
     println!("second: {}", second.text);
+    println!("branched: {}", branched.text);
+    println!("regenerated: {}", regenerated.text);
     println!(
-        "persistable messages: {}",
-        session.session().messages().len()
+        "persistable messages: {} imported messages: {}",
+        session.session().messages().len(),
+        imported.session().messages().len()
     );
     Ok(())
+}
+
+fn text_message(role: MessageRole, text: impl Into<String>) -> ModelMessage {
+    ModelMessage {
+        role,
+        content: vec![ModelContentBlock::Text { text: text.into() }],
+    }
 }
