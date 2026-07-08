@@ -51,6 +51,7 @@ pub struct MetricsDashboardSurface {
     recommendation_state: TableState,
     action_state: ActionRowState,
     status: String,
+    session_filter: Option<String>,
     tab_area: Rect,
     content_area: Rect,
     action_area: Rect,
@@ -61,8 +62,8 @@ pub struct MetricsDashboardSurface {
 impl MetricsDashboardSurface {
     /// Load persisted metrics dashboard from `metrics_path`.
     #[must_use]
-    pub fn load(metrics_path: PathBuf) -> Self {
-        let (report, status) = load_report(&metrics_path);
+    pub fn load(metrics_path: PathBuf, session_filter: Option<String>) -> Self {
+        let (report, status) = load_report(&metrics_path, session_filter.as_deref());
         let dashboard = dashboard_from_report(&report);
         Self {
             metrics_path,
@@ -73,6 +74,7 @@ impl MetricsDashboardSurface {
             recommendation_state: TableState::new(Some(0)),
             action_state: ActionRowState::new(),
             status,
+            session_filter,
             tab_area: Rect::new(0, 0, 0, 0),
             content_area: Rect::new(0, 0, 0, 0),
             action_area: Rect::new(0, 0, 0, 0),
@@ -82,7 +84,7 @@ impl MetricsDashboardSurface {
     }
 
     fn reload(&mut self) {
-        let (report, status) = load_report(&self.metrics_path);
+        let (report, status) = load_report(&self.metrics_path, self.session_filter.as_deref());
         self.report = report;
         self.dashboard = dashboard_from_report(&self.report);
         self.status = status;
@@ -418,13 +420,28 @@ impl MetricsDashboardSurface {
     }
 }
 
-fn load_report(path: &PathBuf) -> (MetricsReport, String) {
-    let report =
+fn load_report(path: &PathBuf, session_filter: Option<&str>) -> (MetricsReport, String) {
+    let mut report =
         MetricsRegistry::report_from_event_log_path(path, MetricsEventLogConfig::default(), 20_000);
+    let total_events = report.events.len();
+    if let Some(session_id) = session_filter {
+        report.events.retain(|event| {
+            event
+                .labels
+                .get("session_id")
+                .is_some_and(|label| label == session_id)
+        });
+        report.snapshot = bcode_metrics::snapshot_from_events(&report.events);
+        report.descriptors = bcode_metrics::descriptors_from_events(&report.events);
+    }
+    let filter_detail = session_filter.map_or_else(String::new, |session_id| {
+        format!("  session_id={session_id}  total_events={total_events}")
+    });
     let status = format!(
-        "{} events  {} metrics  source={}",
+        "{} events  {} metrics{}  source={}",
         report.events.len(),
         report.descriptors.len(),
+        filter_detail,
         path.display()
     );
     (report, status)

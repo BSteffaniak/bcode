@@ -30,6 +30,35 @@ const METRICS_MANIFEST_FILE_NAME: &str = "manifest.json";
 /// Metric labels used for filtering and grouping dashboard views.
 pub type MetricLabels = BTreeMap<String, String>;
 
+/// Ambient context labels applied to metrics recorded in the current async task.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetricsContext {
+    labels: MetricLabels,
+}
+
+tokio::task_local! {
+    static CURRENT_METRICS_CONTEXT: MetricsContext;
+}
+
+/// Return the metrics context active for the current async task.
+#[must_use]
+pub fn current_metrics_context() -> MetricsContext {
+    CURRENT_METRICS_CONTEXT
+        .try_with(Clone::clone)
+        .unwrap_or_default()
+}
+
+/// Run a future with ambient metrics labels applied to all recording calls.
+///
+/// Existing task-local labels are preserved unless `context` explicitly overrides them.
+pub async fn scope_metrics_context<F, T>(context: MetricsContext, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    let scoped_context = current_metrics_context().merge_context(context);
+    CURRENT_METRICS_CONTEXT.scope(scoped_context, future).await
+}
+
 /// Shared metrics registry handle.
 #[derive(Debug, Clone)]
 pub struct MetricsRegistry {
@@ -303,6 +332,58 @@ impl Default for Histogram {
     }
 }
 
+impl MetricsContext {
+    /// Create an empty metrics context.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Return context labels.
+    #[must_use]
+    pub const fn labels(&self) -> &MetricLabels {
+        &self.labels
+    }
+
+    /// Return a copy of this context with one added label.
+    #[must_use]
+    pub fn with_label(mut self, key: impl Into<String>, value: &impl ToString) -> Self {
+        self.labels.insert(key.into(), value.to_string());
+        self
+    }
+
+    /// Return a copy of this context with `session_id` set.
+    #[must_use]
+    pub fn with_session_id(self, session_id: &impl ToString) -> Self {
+        self.with_label("session_id", session_id)
+    }
+
+    /// Return a copy of this context with `turn_id` set.
+    #[must_use]
+    pub fn with_turn_id(self, turn_id: &impl ToString) -> Self {
+        self.with_label("turn_id", turn_id)
+    }
+
+    /// Return a copy of this context with `client_id` set.
+    #[must_use]
+    pub fn with_client_id(self, client_id: &impl ToString) -> Self {
+        self.with_label("client_id", client_id)
+    }
+
+    /// Merge explicit labels with this context, preserving explicit values on conflicts.
+    #[must_use]
+    pub fn merged_labels(&self, explicit: MetricLabels) -> MetricLabels {
+        let mut labels = self.labels.clone();
+        labels.extend(explicit);
+        labels
+    }
+
+    fn merge_context(mut self, explicit: Self) -> Self {
+        self.labels.extend(explicit.labels);
+        self
+    }
+}
+
 impl MetricsRegistry {
     /// Load a metrics report from a persisted metrics event-log directory or legacy file hint.
     #[must_use]
@@ -383,6 +464,21 @@ impl MetricsRegistry {
         matches!(self.inner, MetricsRegistryInner::Enabled(_))
     }
 
+    /// Return the metrics context active for the current async task.
+    #[must_use]
+    pub fn current_context(&self) -> MetricsContext {
+        current_metrics_context()
+    }
+
+    /// Run a future with ambient labels applied to all metrics recorded in this async task.
+    pub async fn in_context<F, T>(&self, context: MetricsContext, future: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        let _ = self;
+        scope_metrics_context(context, future).await
+    }
+
     /// Start a named metrics span that records duration and count when finished or dropped.
     #[must_use]
     pub fn span(&self, name: impl Into<String>) -> MetricsSpan {
@@ -452,6 +548,7 @@ impl MetricsRegistry {
             return;
         };
         let key = key.into();
+        let labels = current_metrics_context().merged_labels(labels);
         let Ok(mut state) = inner.lock() else {
             return;
         };
@@ -478,6 +575,7 @@ impl MetricsRegistry {
             return;
         };
         let key = key.into();
+        let labels = current_metrics_context().merged_labels(labels);
         let Ok(mut state) = inner.lock() else {
             return;
         };
@@ -508,6 +606,7 @@ impl MetricsRegistry {
             return;
         };
         let key = key.into();
+        let labels = current_metrics_context().merged_labels(labels);
         let Ok(mut state) = inner.lock() else {
             return;
         };
@@ -532,6 +631,7 @@ impl MetricsRegistry {
             return;
         };
         let key = key.into();
+        let labels = current_metrics_context().merged_labels(labels);
         let Ok(mut state) = inner.lock() else {
             return;
         };
@@ -1026,7 +1126,9 @@ impl Histogram {
     }
 }
 
-fn snapshot_from_events(events: &[MetricEvent]) -> MetricsSnapshot {
+/// Build an aggregate snapshot from metric events.
+#[must_use]
+pub fn snapshot_from_events(events: &[MetricEvent]) -> MetricsSnapshot {
     let mut counters = BTreeMap::new();
     let mut gauges = BTreeMap::new();
     let mut histograms = BTreeMap::<String, Histogram>::new();
@@ -1061,7 +1163,9 @@ fn snapshot_from_events(events: &[MetricEvent]) -> MetricsSnapshot {
     }
 }
 
-fn descriptors_from_events(events: &[MetricEvent]) -> BTreeMap<String, MetricDescriptor> {
+/// Build metric descriptors from observed metric events.
+#[must_use]
+pub fn descriptors_from_events(events: &[MetricEvent]) -> BTreeMap<String, MetricDescriptor> {
     let mut descriptors = BTreeMap::new();
     for event in events {
         let descriptor =
@@ -1280,6 +1384,78 @@ mod tests {
         assert_eq!(report.events.len(), 20);
         let values: Vec<i64> = report.events.iter().map(|event| event.value).collect();
         assert_eq!(values, (0..20).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn ambient_context_labels_are_applied_to_metric_events() {
+        let metrics = MetricsRegistry::default();
+        let context = MetricsContext::new()
+            .with_session_id(&"session-a")
+            .with_turn_id(&"turn-1");
+
+        metrics
+            .in_context(context, async {
+                let mut labels = MetricLabels::new();
+                labels.insert("turn_id".to_owned(), "explicit-turn".to_owned());
+                metrics.record_histogram_with_labels("model.poll.duration_ms", 42, labels);
+                metrics.increment_counter("model.poll.iterations");
+            })
+            .await;
+
+        let report = metrics.report();
+        let histogram = report
+            .events
+            .iter()
+            .find(|event| event.name == "model.poll.duration_ms")
+            .expect("histogram event should be recorded");
+        assert_eq!(
+            histogram.labels.get("session_id"),
+            Some(&"session-a".to_owned())
+        );
+        assert_eq!(
+            histogram.labels.get("turn_id"),
+            Some(&"explicit-turn".to_owned())
+        );
+        let counter = report
+            .events
+            .iter()
+            .find(|event| event.name == "model.poll.iterations")
+            .expect("counter event should be recorded");
+        assert_eq!(
+            counter.labels.get("session_id"),
+            Some(&"session-a".to_owned())
+        );
+        assert_eq!(counter.labels.get("turn_id"), Some(&"turn-1".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn metrics_span_inherits_ambient_context_labels() {
+        let metrics = MetricsRegistry::default();
+        let context = MetricsContext::new().with_session_id(&"session-a");
+
+        metrics
+            .in_context(context, async {
+                metrics.span("session.operation").finish_ok();
+            })
+            .await;
+
+        let report = metrics.report();
+        assert!(
+            report
+                .events
+                .iter()
+                .any(|event| event.name == "session.operation.total"
+                    && event.labels.get("session_id") == Some(&"session-a".to_owned())
+                    && event.labels.get("outcome") == Some(&"ok".to_owned()))
+        );
+        assert!(
+            report
+                .events
+                .iter()
+                .any(|event| event.name == "session.operation.duration_ms"
+                    && event.labels.get("session_id") == Some(&"session-a".to_owned())
+                    && event.labels.get("outcome") == Some(&"ok".to_owned()))
+        );
     }
 
     #[test]

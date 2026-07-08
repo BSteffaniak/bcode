@@ -29,7 +29,7 @@ use bcode_ipc::{
     decode_request, encode_envelope_frames, event_envelope, recv_envelope, response_envelope,
     write_encoded_envelope_frames,
 };
-use bcode_metrics::{MetricLabels, MetricsEventLogConfig, MetricsRegistry};
+use bcode_metrics::{MetricLabels, MetricsContext, MetricsEventLogConfig, MetricsRegistry};
 use bcode_model::{
     CancelTurnRequest, ContentBlock, FinishTurnRequest, ImageMetadata as ModelImageMetadata,
     ImageRefContent, MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelList, ModelMessage,
@@ -1831,14 +1831,14 @@ async fn handle_registered_client(
         }
 
         let request = decode_request(&envelope.payload)?;
-        handle_request(
+        Box::pin(handle_request(
             request,
             envelope.request_id,
             client_id,
             state,
             &writer,
             &mut attached_session,
-        )
+        ))
         .await?;
     }
 
@@ -1849,6 +1849,59 @@ fn request_metric_labels(request: &Request) -> MetricLabels {
     let mut labels = MetricLabels::new();
     labels.insert("request_type".to_owned(), request_kind(request).to_owned());
     labels
+}
+
+fn request_metrics_context(
+    request: &Request,
+    request_id: u64,
+    client_id: ClientId,
+    attached_session: Option<SessionId>,
+) -> MetricsContext {
+    let mut context = MetricsContext::new()
+        .with_label("request_type", &request_kind(request))
+        .with_label("request_id", &request_id)
+        .with_client_id(&client_id);
+    if let Some(session_id) = request_session_id(request).or(attached_session) {
+        context = context.with_session_id(&session_id);
+    }
+    context
+}
+
+#[allow(clippy::too_many_lines)]
+const fn request_session_id(request: &Request) -> Option<SessionId> {
+    match request {
+        Request::RenameSession { session_id, .. }
+        | Request::DeleteSession { session_id }
+        | Request::SessionHistory { session_id }
+        | Request::SessionHistoryPage { session_id, .. }
+        | Request::AttachSession { session_id }
+        | Request::AttachSessionRecent { session_id, .. }
+        | Request::SendUserMessage { session_id, .. }
+        | Request::SendUserMessageWithPlacement { session_id, .. }
+        | Request::InvokeSkill { session_id, .. }
+        | Request::CancelSessionTurn { session_id, .. }
+        | Request::CancelRuntimeWork { session_id, .. }
+        | Request::CompactSession { session_id }
+        | Request::SetSessionModel { session_id, .. }
+        | Request::SetSessionReasoning { session_id, .. }
+        | Request::SessionModelStatus { session_id }
+        | Request::ActivateSkill { session_id, .. }
+        | Request::DeactivateSkill { session_id, .. }
+        | Request::ActiveSkills { session_id }
+        | Request::SetSessionAgent { session_id, .. }
+        | Request::ChangeSessionWorkingDirectory { session_id, .. }
+        | Request::ListRuntimeWork { session_id }
+        | Request::RuntimeWorkHistory { session_id, .. }
+        | Request::SubscribeRuntimeWork { session_id }
+        | Request::AttachSessionProjectionWindow { session_id, .. } => Some(*session_id),
+        Request::ForkSession {
+            source_session_id, ..
+        }
+        | Request::CloneSession {
+            source_session_id, ..
+        } => Some(*source_session_id),
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1935,14 +1988,18 @@ async fn handle_request(
     attached_session: &mut Option<SessionId>,
 ) -> Result<(), ServerError> {
     let labels = request_metric_labels(&request);
-    let result = handle_request_inner(
-        request,
-        request_id,
-        client_id,
-        state,
-        writer,
-        attached_session,
-    )
+    let context = request_metrics_context(&request, request_id, client_id, *attached_session);
+    let result = Box::pin(state.metrics.in_context(context, async {
+        Box::pin(handle_request_inner(
+            request,
+            request_id,
+            client_id,
+            state,
+            writer,
+            attached_session,
+        ))
+        .await
+    }))
     .await;
     state
         .metrics

@@ -9,6 +9,7 @@ use super::{
     title_from_first_prompt, usize_to_u64,
 };
 use crate::db::{MaterializedProjection, SessionDb};
+use bcode_metrics::MetricsContext;
 use bcode_session_models::ProjectionWindowAnchor;
 use std::sync::RwLock;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -340,8 +341,12 @@ struct SessionActor {
 
 impl SessionActor {
     async fn run(mut self) {
+        let context = MetricsContext::new().with_session_id(&self.state.summary.id);
         while let Some(command) = self.commands.recv().await {
-            if self.handle_command(command).await {
+            let should_shutdown =
+                bcode_metrics::scope_metrics_context(context.clone(), self.handle_command(command))
+                    .await;
+            if should_shutdown {
                 break;
             }
         }

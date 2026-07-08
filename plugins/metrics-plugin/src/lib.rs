@@ -62,20 +62,27 @@ fn invoke_command_service(request: &ServiceRequest) -> ServiceResponse {
         return ServiceResponse::error("invalid_request", "invalid command request payload");
     };
     match request.command_id.as_str() {
-        COMMAND_OPEN_DASHBOARD => json_response(&InvokeCommandResponse {
-            success: true,
-            message: Some("Opening metrics dashboard".to_owned()),
-            updated_model: None,
-            updated_provider: None,
-            updated_thinking: None,
-            effects: vec![CommandEffect::OpenPluginSurface {
-                surface_kind: tui::METRICS_DASHBOARD_SURFACE_KIND.to_owned(),
-                instance_id: "metrics-dashboard".to_owned(),
-                options: serde_json::json!({
-                    "metrics_path": DEFAULT_METRICS_ROOT,
-                }),
-            }],
-        }),
+        COMMAND_OPEN_DASHBOARD => {
+            let session_id = request.args.get("session_id").cloned();
+            let mut options = serde_json::json!({
+                "metrics_path": DEFAULT_METRICS_ROOT,
+            });
+            if let Some(session_id) = session_id {
+                options["session_id"] = serde_json::Value::String(session_id);
+            }
+            json_response(&InvokeCommandResponse {
+                success: true,
+                message: Some("Opening metrics dashboard".to_owned()),
+                updated_model: None,
+                updated_provider: None,
+                updated_thinking: None,
+                effects: vec![CommandEffect::OpenPluginSurface {
+                    surface_kind: tui::METRICS_DASHBOARD_SURFACE_KIND.to_owned(),
+                    instance_id: "metrics-dashboard".to_owned(),
+                    options,
+                }],
+            })
+        }
         _ => ServiceResponse::error("unknown_command", "unknown metrics command"),
     }
 }

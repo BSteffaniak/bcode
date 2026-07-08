@@ -35,7 +35,15 @@ impl PluginTuiSurfaceFactory for MetricsDashboardSurfaceFactory {
                 .map(PathBuf::from)
                 .unwrap_or_else(default_metrics_path);
             let path = resolve_repo_relative(path, request.repo_path.as_deref());
-            Ok(Box::new(MetricsDashboardSurface::load(path)) as BoxedPluginTuiSurface)
+            let session_filter = request
+                .options
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned);
+            Ok(
+                Box::new(MetricsDashboardSurface::load(path, session_filter))
+                    as BoxedPluginTuiSurface,
+            )
         })
     }
 }
