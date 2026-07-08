@@ -119,6 +119,155 @@ impl From<String> for ModelSelector {
     }
 }
 
+/// Builder for text-generation requests.
+///
+/// This is the builder-first API for text generation. Thin helper functions such as
+/// [`generate_text`] delegate to this type.
+#[derive(Debug, Clone)]
+pub struct GenerateTextBuilder {
+    agent: AgentBuilder,
+    prompt: String,
+    messages: Vec<ModelMessage>,
+    cancellation: CancellationToken,
+}
+
+impl Default for GenerateTextBuilder {
+    fn default() -> Self {
+        Self {
+            agent: Agent::builder(),
+            prompt: String::new(),
+            messages: Vec::new(),
+            cancellation: CancellationToken::new(),
+        }
+    }
+}
+
+impl GenerateTextBuilder {
+    /// Create a text-generation builder with default agent settings.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Configure the user prompt.
+    #[must_use]
+    pub fn prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.prompt = prompt.into();
+        self
+    }
+
+    /// Configure provider/model selection.
+    #[must_use]
+    pub fn model(mut self, model: impl Into<ModelSelector>) -> Self {
+        self.agent = self.agent.model_selector(model);
+        self
+    }
+
+    /// Configure the system prompt.
+    #[must_use]
+    pub fn system(mut self, system_prompt: impl Into<String>) -> Self {
+        self.agent = self.agent.system(system_prompt);
+        self
+    }
+
+    /// Configure prior conversation messages.
+    #[must_use]
+    pub fn messages(mut self, messages: Vec<ModelMessage>) -> Self {
+        self.messages = messages;
+        self
+    }
+
+    /// Append one prior conversation message.
+    #[must_use]
+    pub fn message(mut self, message: ModelMessage) -> Self {
+        self.messages.push(message);
+        self
+    }
+
+    /// Configure model parameters.
+    #[must_use]
+    pub fn parameters(mut self, parameters: ModelParameters) -> Self {
+        self.agent = self.agent.parameters(parameters);
+        self
+    }
+
+    /// Add one metadata key/value pair sent to providers.
+    #[must_use]
+    pub fn metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.agent = self.agent.metadata(key, value);
+        self
+    }
+
+    /// Configure turn timeout.
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.agent = self.agent.timeout(timeout);
+        self
+    }
+
+    /// Configure cancellation for this request.
+    #[must_use]
+    pub fn cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+
+    /// Configure maximum tool rounds.
+    #[must_use]
+    pub fn max_tool_rounds(mut self, max_tool_rounds: u32) -> Self {
+        self.agent = self.agent.max_tool_rounds(max_tool_rounds);
+        self
+    }
+
+    /// Register an inline SDK tool for this text-generation request.
+    #[must_use]
+    pub fn inline_tool<F>(mut self, definition: ToolDefinition, handler: F) -> Self
+    where
+        F: Fn(ToolInvocationRequest) -> std::result::Result<ToolInvocationResponse, String>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.agent = self.agent.inline_tool(definition, handler);
+        self
+    }
+
+    /// Register a plugin-backed tool definition for this text-generation request.
+    #[must_use]
+    pub fn plugin_tool(mut self, definition: ToolDefinition, plugin_id: impl Into<String>) -> Self {
+        self.agent = self.agent.plugin_tool(definition, plugin_id);
+        self
+    }
+
+    /// Run the request with a caller-supplied provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when provider invocation fails, cancellation is requested, the turn times
+    /// out, or the provider reports an error.
+    pub async fn run<P>(self, provider: &mut P) -> Result<GenerateTextResponse>
+    where
+        P: ModelProviderInvoker,
+    {
+        let agent = self.agent.build();
+        agent
+            .generate_text_with_provider_with_options(
+                provider,
+                self.prompt,
+                None,
+                self.messages,
+                self.cancellation,
+            )
+            .await
+    }
+}
+
+/// Start building a text-generation request.
+#[must_use]
+pub fn generate_text_builder() -> GenerateTextBuilder {
+    GenerateTextBuilder::new()
+}
+
 /// Generate text with a caller-supplied provider using default agent settings.
 ///
 /// This is the smallest lean-core text generation helper. It does not launch the TUI, require the
@@ -135,10 +284,7 @@ pub async fn generate_text<P>(
 where
     P: ModelProviderInvoker,
 {
-    Agent::builder()
-        .build()
-        .generate_text_with_provider(provider, prompt)
-        .await
+    generate_text_builder().prompt(prompt).run(provider).await
 }
 
 /// Generate text with prior conversation messages and a caller-supplied provider.
@@ -155,9 +301,10 @@ pub async fn generate_text_with_messages<P>(
 where
     P: ModelProviderInvoker,
 {
-    Agent::builder()
-        .build()
-        .generate_text_with_provider_and_messages(provider, prompt, messages)
+    generate_text_builder()
+        .messages(messages)
+        .prompt(prompt)
+        .run(provider)
         .await
 }
 
@@ -175,9 +322,10 @@ pub async fn generate_text_with_cancellation<P>(
 where
     P: ModelProviderInvoker,
 {
-    Agent::builder()
-        .build()
-        .generate_text_with_provider_and_cancellation(provider, prompt, cancellation)
+    generate_text_builder()
+        .prompt(prompt)
+        .cancellation(cancellation)
+        .run(provider)
         .await
 }
 
@@ -252,10 +400,10 @@ pub async fn generate_text_with_model<P>(
 where
     P: ModelProviderInvoker,
 {
-    Agent::builder()
-        .model_selector(model)
-        .build()
-        .generate_text_with_provider(provider, prompt)
+    generate_text_builder()
+        .model(model)
+        .prompt(prompt)
+        .run(provider)
         .await
 }
 

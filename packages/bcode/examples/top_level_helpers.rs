@@ -86,6 +86,17 @@ async fn main() -> bcode::Result<()> {
     .await?;
     println!("{}", selected.text);
 
+    let mut builder_provider = ExampleProvider::text("hello from the builder helper");
+    let builder_response = bcode::generate_text_builder()
+        .model("example-provider:example-model")
+        .system("Use concise responses.")
+        .metadata("example", "builder")
+        .timeout(std::time::Duration::from_secs(30))
+        .prompt("Say hello from the builder")
+        .run(&mut builder_provider)
+        .await?;
+    println!("{}", builder_response.text);
+
     let mut stream = bcode::stream_text(
         ExampleProvider::text("hello from the streaming helper"),
         "Stream hello",
