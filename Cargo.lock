@@ -2046,6 +2046,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "base64 0.22.1",
  "bcode_agent_profile",
+ "bcode_agent_runtime",
  "bcode_command",
  "bcode_config",
  "bcode_daemon_lifecycle",

@@ -14,6 +14,7 @@ use bcode_agent_profile::{
     AgentInfo, AgentList, EvaluateToolCallRequest, EvaluateToolCallResponse, OP_AGENT_CONTEXT,
     OP_EVALUATE_TOOL_CALL, OP_LIST_AGENTS, OP_POLICY_STATUS, PolicyStatusResponse,
 };
+use bcode_agent_runtime::CancellationToken;
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, DaemonStatus, EnvelopeKind, ErrorResponse, Event,
     IpcEndpoint, LocalIpcListener, LocalIpcStream, PermissionSummary, PluginContributions,
@@ -442,18 +443,18 @@ impl SessionTurnPermit {
 
 #[derive(Debug, Default)]
 struct TurnCancelState {
-    cancelled: std::sync::atomic::AtomicBool,
+    token: CancellationToken,
     notify: Notify,
 }
 
 impl TurnCancelState {
     fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
+        self.token.cancel();
         self.notify.notify_waiters();
     }
 
     fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+        self.token.is_cancelled()
     }
 
     async fn cancelled(&self) {
