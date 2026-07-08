@@ -4940,6 +4940,7 @@ mod tests {
                     interaction_id: "interaction".to_string(),
                     tool_call_id: "call".to_string(),
                     tool_name: "tool".to_string(),
+                    interaction_kind: Some("tool.interaction".to_string()),
                     surface_kind: "form".to_string(),
                     request_json: "{}".to_string(),
                     required: true,

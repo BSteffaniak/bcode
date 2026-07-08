@@ -8417,11 +8417,13 @@ fn print_non_trace_session_event(event: &SessionEvent) {
         SessionEventKind::InteractiveToolRequestCreated {
             interaction_id,
             tool_call_id,
+            interaction_kind,
             surface_kind,
             ..
         } => println!(
-            "#{} interactive tool request: {interaction_id} {surface_kind} ({tool_call_id})",
-            event.sequence
+            "#{} interactive tool request: {interaction_id} {} via {surface_kind} ({tool_call_id})",
+            event.sequence,
+            interaction_kind.as_deref().unwrap_or("<unknown>")
         ),
         SessionEventKind::InteractiveToolRequestResolved {
             interaction_id,

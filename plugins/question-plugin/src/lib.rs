@@ -264,6 +264,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             bcode_tool::ToolInvocationHostAction::InteractiveToolRequest(
                 bcode_tool::InteractiveToolRequest {
                     interaction_id: format!("{}-question", invocation.tool_call_id),
+                    interaction_kind: Some("bcode.question".to_string()),
                     surface_kind: "bcode.question.inline".to_string(),
                     request: serde_json::to_value(&request).unwrap_or(Value::Null),
                     required: request.questions.iter().any(|question| question.required),

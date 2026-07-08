@@ -524,6 +524,8 @@ pub enum ToolInvocationHostAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InteractiveToolRequest {
     pub interaction_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_kind: Option<String>,
     pub surface_kind: String,
     #[serde(default)]
     pub request: serde_json::Value,

@@ -1759,6 +1759,8 @@ pub enum SessionEventKind {
         interaction_id: String,
         tool_call_id: String,
         tool_name: String,
+        #[serde(default)]
+        interaction_kind: Option<String>,
         surface_kind: String,
         request_json: String,
         #[serde(default)]

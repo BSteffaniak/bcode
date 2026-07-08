@@ -15062,6 +15062,10 @@ async fn append_interactive_tool_request_created_event(
                 interaction_id: request.interaction_id.clone(),
                 tool_call_id: call.id.clone(),
                 tool_name: call.name.clone(),
+                interaction_kind: request
+                    .interaction_kind
+                    .clone()
+                    .or_else(|| Some(request.surface_kind.clone())),
                 surface_kind: request.surface_kind.clone(),
                 request_json,
                 required: request.required,
