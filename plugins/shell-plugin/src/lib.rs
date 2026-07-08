@@ -10,7 +10,8 @@ mod terminal_clean;
 
 use bcode_config::{
     ShellToolConfig, ShellToolEnvAutoFallback, ShellToolEnvConfig, ShellToolEnvMode,
-    default_config_paths_from_with_environment, load_config_from_paths_with_environment,
+    ShellToolOutputConfig, default_config_paths_from_with_environment,
+    load_config_from_paths_with_environment,
 };
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
@@ -328,12 +329,12 @@ struct LimitedOutput {
 #[derive(Debug, Clone)]
 struct TerminalStreamOutput {
     raw: LimitedOutput,
-    filtered: LimitedOutput,
+    replay: LimitedOutput,
     clean: LimitedOutput,
     raw_artifact_path: Option<PathBuf>,
-    filtered_artifact_path: Option<PathBuf>,
+    replay_artifact_path: Option<PathBuf>,
     clean_artifact_path: Option<PathBuf>,
-    direnv_prelude_suppressed: bool,
+    prelude_suppressed: bool,
 }
 
 fn resolve_effective_cwd(
@@ -423,10 +424,10 @@ fn should_use_direnv(cwd: Option<&Path>, config: ShellToolEnvConfig) -> Result<b
 struct ShellCommandPlan {
     program: String,
     args: Vec<String>,
-    direnv_prelude_marker: Option<String>,
+    prelude_marker: Option<String>,
 }
 
-fn direnv_prelude_marker(tool_call_id: &str) -> String {
+fn prelude_marker(tool_call_id: &str) -> String {
     let safe_id = tool_call_id
         .chars()
         .map(|character| {
@@ -452,7 +453,7 @@ fn direnv_shell_command_plan(
 ) -> ShellCommandPlan {
     let marker = env_config
         .hide_direnv_prelude
-        .then(|| direnv_prelude_marker(tool_call_id));
+        .then(|| prelude_marker(tool_call_id));
     let command = marker.as_deref().map_or_else(
         || command.to_owned(),
         |marker| direnv_wrapped_command(command, marker),
@@ -468,7 +469,7 @@ fn direnv_shell_command_plan(
             "-c".to_owned(),
             command,
         ],
-        direnv_prelude_marker: marker,
+        prelude_marker: marker,
     }
 }
 
@@ -490,7 +491,7 @@ fn shell_program_and_args(
         Ok(ShellCommandPlan {
             program: shell_program().to_owned(),
             args: shell_args(command),
-            direnv_prelude_marker: None,
+            prelude_marker: None,
         })
     }
 }
@@ -660,7 +661,8 @@ fn run_terminal_shell_command_inner(
 ) -> Result<ToolInvocationResponse, String> {
     let timeout = Duration::from_millis(arguments.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
     let cwd = resolve_effective_cwd(arguments, paths.session_cwd);
-    let env_config = shell_config_with_environment(cwd.as_deref(), environment)?.env;
+    let shell_config = shell_config_with_environment(cwd.as_deref(), environment)?;
+    let env_config = shell_config.env;
     let columns = arguments.terminal_columns();
     let rows = arguments.terminal_rows();
     let pty_system = portable_pty::native_pty_system();
@@ -678,8 +680,10 @@ fn run_terminal_shell_command_inner(
     let ShellCommandPlan {
         program,
         args,
-        direnv_prelude_marker,
+        prelude_marker,
     } = command_plan;
+    let mut prelude_markers = prelude_markers_from_output_config(&shell_config.output);
+    prelude_markers.extend(prelude_marker);
     let mut command = portable_pty::CommandBuilder::new(program);
     for arg in args {
         command.arg(arg);
@@ -701,7 +705,7 @@ fn run_terminal_shell_command_inner(
         .map_err(|error| error.to_string())?;
     let clean_artifact_path = clean_artifact_path(paths.artifact_dir, tool_call_id)?;
     let raw_artifact_path = raw_artifact_path(paths.artifact_dir, tool_call_id)?;
-    let filtered_artifact_path = filtered_artifact_path(paths.artifact_dir, tool_call_id)?;
+    let replay_artifact_path = replay_artifact_path(paths.artifact_dir, tool_call_id)?;
     let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
     let reader_thread = std::thread::spawn({
         let tool_call_id = tool_call_id.to_owned();
@@ -710,18 +714,18 @@ fn run_terminal_shell_command_inner(
                 &mut reader,
                 events,
                 &tool_call_id,
-                ShellVisualStreamContext {
+                &ShellVisualStreamContext {
                     arguments: &arguments_json,
                     stream: ToolOutputStream::Pty,
                     columns,
                     rows,
                     timeout_ms: Some(timeout_ms),
-                    direnv_prelude_marker: direnv_prelude_marker.as_deref(),
+                    prelude_markers,
                 },
                 TerminalStreamPaths {
                     clean: clean_artifact_path,
                     raw: raw_artifact_path,
-                    filtered: filtered_artifact_path,
+                    replay: replay_artifact_path,
                 },
             )
         }
@@ -776,19 +780,19 @@ fn terminal_shell_response(
         input.rows,
     )?;
     let raw_inline_output = limit_terminal_inline_output(&input.stream_output.raw);
-    let filtered_inline_output = limit_terminal_inline_output(&input.stream_output.filtered);
-    let artifact_inline_output = if input.stream_output.direnv_prelude_suppressed {
-        &filtered_inline_output
+    let replay_inline_output = limit_terminal_inline_output(&input.stream_output.replay);
+    let artifact_inline_output = if input.stream_output.prelude_suppressed {
+        &replay_inline_output
     } else {
         &raw_inline_output
     };
-    let replay_output = if input.stream_output.direnv_prelude_suppressed {
-        &input.stream_output.filtered
+    let replay_output = if input.stream_output.prelude_suppressed {
+        &input.stream_output.replay
     } else {
         &input.stream_output.raw
     };
-    let replay_path = if input.stream_output.direnv_prelude_suppressed {
-        input.stream_output.filtered_artifact_path.as_deref()
+    let replay_path = if input.stream_output.prelude_suppressed {
+        input.stream_output.replay_artifact_path.as_deref()
     } else {
         input.stream_output.raw_artifact_path.as_deref()
     };
@@ -879,48 +883,54 @@ fn shell_args(command: &str) -> Vec<String> {
 struct TerminalStreamPaths {
     clean: Option<PathBuf>,
     raw: Option<PathBuf>,
-    filtered: Option<PathBuf>,
+    replay: Option<PathBuf>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ShellVisualStreamContext<'a> {
     arguments: &'a serde_json::Value,
     stream: ToolOutputStream,
     columns: u16,
     rows: u16,
     timeout_ms: Option<u64>,
-    direnv_prelude_marker: Option<&'a str>,
+    prelude_markers: Vec<String>,
 }
 
-const DIRENV_PRELUDE_BUFFER_LIMIT: usize = 4 * 1024 * 1024;
+const PRELUDE_GATE_BUFFER_LIMIT: usize = 4 * 1024 * 1024;
 
-struct DirenvPreludeFilter {
-    marker: Option<Vec<u8>>,
+struct PreludeGate {
+    markers: Vec<Vec<u8>>,
     buffer: Vec<u8>,
     passed: bool,
     failed_open: bool,
 }
 
-impl DirenvPreludeFilter {
-    fn new(marker: Option<&str>) -> Self {
+impl PreludeGate {
+    fn new(markers: Vec<String>) -> Self {
+        let markers = markers
+            .into_iter()
+            .filter(|marker| !marker.is_empty())
+            .map(String::into_bytes)
+            .collect::<Vec<_>>();
+        let passed = markers.is_empty();
         Self {
-            marker: marker.map(|marker| marker.as_bytes().to_vec()),
+            markers,
             buffer: Vec::new(),
-            passed: marker.is_none(),
+            passed,
             failed_open: false,
         }
     }
 
     fn write(&mut self, chunk: &[u8]) -> Vec<u8> {
-        let Some(marker) = self.marker.as_deref() else {
+        if self.markers.is_empty() {
             return chunk.to_vec();
-        };
+        }
         if self.passed || self.failed_open {
             return chunk.to_vec();
         }
         self.buffer.extend_from_slice(chunk);
-        if let Some(index) = find_bytes(&self.buffer, marker) {
-            let mut start = index.saturating_add(marker.len());
+        if let Some((index, marker_len)) = find_first_marker(&self.buffer, &self.markers) {
+            let mut start = index.saturating_add(marker_len);
             if self.buffer.get(start) == Some(&b'\r') {
                 start = start.saturating_add(1);
             }
@@ -932,7 +942,7 @@ impl DirenvPreludeFilter {
             self.passed = true;
             return output;
         }
-        if self.buffer.len() > DIRENV_PRELUDE_BUFFER_LIMIT {
+        if self.buffer.len() > PRELUDE_GATE_BUFFER_LIMIT {
             self.failed_open = true;
             return std::mem::take(&mut self.buffer);
         }
@@ -949,8 +959,24 @@ impl DirenvPreludeFilter {
     }
 
     const fn suppressed_prelude(&self) -> bool {
-        self.marker.is_some() && self.passed && !self.failed_open
+        !self.markers.is_empty() && self.passed && !self.failed_open
     }
+}
+
+fn find_first_marker(haystack: &[u8], markers: &[Vec<u8>]) -> Option<(usize, usize)> {
+    markers
+        .iter()
+        .filter_map(|marker| find_bytes(haystack, marker).map(|index| (index, marker.len())))
+        .min_by_key(|(index, _len)| *index)
+}
+
+fn prelude_markers_from_output_config(config: &ShellToolOutputConfig) -> Vec<String> {
+    config
+        .prelude_gates
+        .iter()
+        .filter(|gate| gate.enabled && !gate.marker.is_empty())
+        .map(|gate| gate.marker.clone())
+        .collect()
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1012,16 +1038,16 @@ fn read_limited_streaming<R>(
     mut reader: R,
     events: ServiceEventEmitter,
     tool_call_id: &str,
-    visual_context: ShellVisualStreamContext<'_>,
+    visual_context: &ShellVisualStreamContext<'_>,
     paths: TerminalStreamPaths,
 ) -> Result<TerminalStreamOutput, String>
 where
     R: Read,
 {
     let mut raw = RetainedStream::new();
-    let mut filtered = RetainedStream::new();
+    let mut replay = RetainedStream::new();
     let mut raw_writer = raw_artifact_writer(paths.raw.as_deref())?;
-    let mut filtered_writer = raw_artifact_writer(paths.filtered.as_deref())?;
+    let mut replay_writer = raw_artifact_writer(paths.replay.as_deref())?;
     let mut clean_writer = clean_artifact_writer(paths.clean.as_deref())?;
     let mut cleaner = terminal_clean::TerminalCleanWriter::new(
         &mut clean_writer,
@@ -1032,7 +1058,7 @@ where
     let mut buffer = [0_u8; 4096];
     let mut sequence = 0_u64;
     let mut visual_output = String::new();
-    let mut prelude_filter = DirenvPreludeFilter::new(visual_context.direnv_prelude_marker);
+    let mut prelude_gate = PreludeGate::new(visual_context.prelude_markers.clone());
     loop {
         let read = reader
             .read(&mut buffer)
@@ -1042,48 +1068,48 @@ where
         }
         sequence = sequence.saturating_add(1);
         raw.write_chunk(&mut *raw_writer, &buffer[..read], DEFAULT_MAX_OUTPUT_BYTES)?;
-        let filtered_chunk = prelude_filter.write(&buffer[..read]);
-        if !filtered_chunk.is_empty() {
-            write_filtered_chunk(
-                &filtered_chunk,
-                &mut filtered,
-                &mut *filtered_writer,
+        let replay_chunk = prelude_gate.write(&buffer[..read]);
+        if !replay_chunk.is_empty() {
+            write_replay_chunk(
+                &replay_chunk,
+                &mut replay,
+                &mut *replay_writer,
                 &mut cleaner,
                 &mut visual_output,
-                FilteredVisualEmit {
+                &FilteredVisualEmit {
                     events,
                     tool_call_id,
-                    visual_context,
+                    visual_context: visual_context.clone(),
                 },
                 sequence,
             )?;
         }
     }
-    let final_filtered = prelude_filter.finish();
-    if !final_filtered.is_empty() {
+    let final_replay = prelude_gate.finish();
+    if !final_replay.is_empty() {
         sequence = sequence.saturating_add(1);
-        write_filtered_chunk(
-            &final_filtered,
-            &mut filtered,
-            &mut *filtered_writer,
+        write_replay_chunk(
+            &final_replay,
+            &mut replay,
+            &mut *replay_writer,
             &mut cleaner,
             &mut visual_output,
-            FilteredVisualEmit {
+            &FilteredVisualEmit {
                 events,
                 tool_call_id,
-                visual_context,
+                visual_context: visual_context.clone(),
             },
             sequence,
         )?;
     }
-    let direnv_prelude_suppressed = prelude_filter.suppressed_prelude();
+    let prelude_suppressed = prelude_gate.suppressed_prelude();
     raw_writer.flush().map_err(|error| error.to_string())?;
-    filtered_writer.flush().map_err(|error| error.to_string())?;
+    replay_writer.flush().map_err(|error| error.to_string())?;
     let clean_summary = cleaner.finish().map_err(|error| error.to_string())?;
     let clean_bytes = clean_summary.tail.into_bytes();
     Ok(TerminalStreamOutput {
         raw: raw.limited_output(DEFAULT_MAX_OUTPUT_BYTES),
-        filtered: filtered.limited_output(DEFAULT_MAX_OUTPUT_BYTES),
+        replay: replay.limited_output(DEFAULT_MAX_OUTPUT_BYTES),
         clean: limit_output_bytes_with_original(
             &clean_bytes,
             usize::try_from(clean_summary.bytes_written).unwrap_or(usize::MAX),
@@ -1091,26 +1117,26 @@ where
             clean_summary.tail_truncated,
         ),
         raw_artifact_path: paths.raw,
-        filtered_artifact_path: paths.filtered,
+        replay_artifact_path: paths.replay,
         clean_artifact_path: paths.clean,
-        direnv_prelude_suppressed,
+        prelude_suppressed,
     })
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct FilteredVisualEmit<'a> {
     events: ServiceEventEmitter,
     tool_call_id: &'a str,
     visual_context: ShellVisualStreamContext<'a>,
 }
 
-fn write_filtered_chunk<W: Write>(
+fn write_replay_chunk<W: Write>(
     chunk: &[u8],
     retained: &mut RetainedStream,
     artifact_writer: &mut dyn Write,
     cleaner: &mut terminal_clean::TerminalCleanWriter<&mut W>,
     visual_output: &mut String,
-    emit: FilteredVisualEmit<'_>,
+    emit: &FilteredVisualEmit<'_>,
     sequence: u64,
 ) -> Result<(), String> {
     retained.write_chunk(artifact_writer, chunk, DEFAULT_MAX_OUTPUT_BYTES)?;
@@ -1118,7 +1144,7 @@ fn write_filtered_chunk<W: Write>(
     emit_tool_output_delta(
         emit.events,
         emit.tool_call_id,
-        emit.visual_context,
+        &emit.visual_context,
         sequence,
         visual_output.as_bytes(),
     );
@@ -1136,12 +1162,12 @@ fn raw_artifact_path(
     })
 }
 
-fn filtered_artifact_path(
+fn replay_artifact_path(
     artifact_dir: Option<&Path>,
     tool_call_id: &str,
 ) -> Result<Option<PathBuf>, String> {
     artifact_path(artifact_dir, tool_call_id, |safe_tool_call_id| {
-        format!("tool-output-{safe_tool_call_id}-filtered-pty.txt")
+        format!("tool-output-{safe_tool_call_id}-replay-pty.txt")
     })
 }
 
@@ -1200,7 +1226,7 @@ fn current_unix_millis() -> u64 {
 fn emit_tool_output_delta(
     events: ServiceEventEmitter,
     tool_call_id: &str,
-    visual_context: ShellVisualStreamContext<'_>,
+    visual_context: &ShellVisualStreamContext<'_>,
     sequence: u64,
     bytes: &[u8],
 ) {
@@ -1716,8 +1742,8 @@ mod tests {
     }
 
     #[test]
-    fn direnv_prelude_filter_suppresses_until_marker() {
-        let mut filter = DirenvPreludeFilter::new(Some("__MARK__"));
+    fn prelude_gate_suppresses_until_marker() {
+        let mut filter = PreludeGate::new(vec!["__MARK__".to_string()]);
 
         assert!(filter.write(b"direnv: loading\n").is_empty());
         assert_eq!(filter.write(b"__MARK__\nhello\n"), b"hello\n");
@@ -1726,31 +1752,61 @@ mod tests {
     }
 
     #[test]
-    fn direnv_prelude_filter_handles_split_marker() {
-        let mut filter = DirenvPreludeFilter::new(Some("__MARK__"));
+    fn prelude_gate_handles_split_marker() {
+        let mut filter = PreludeGate::new(vec!["__MARK__".to_string()]);
 
         assert!(filter.write(b"noise\n__MA").is_empty());
         assert_eq!(filter.write(b"RK__\r\noutput"), b"output");
     }
 
     #[test]
-    fn direnv_prelude_filter_preserves_output_without_marker() {
-        let mut filter = DirenvPreludeFilter::new(Some("__MARK__"));
+    fn prelude_gate_preserves_output_without_marker() {
+        let mut filter = PreludeGate::new(vec!["__MARK__".to_string()]);
 
         assert!(filter.write(b"direnv error\n").is_empty());
         assert_eq!(filter.finish(), b"direnv error\n");
     }
 
     #[test]
-    fn direnv_prelude_filter_passes_through_when_disabled() {
-        let mut filter = DirenvPreludeFilter::new(None);
+    fn prelude_gate_passes_through_when_disabled() {
+        let mut filter = PreludeGate::new(Vec::new());
 
         assert_eq!(filter.write(b"hello"), b"hello");
         assert!(filter.finish().is_empty());
     }
 
     #[test]
-    fn terminal_response_uses_filtered_pty_artifact_when_direnv_prelude_was_suppressed() {
+    fn prelude_gate_uses_earliest_generic_marker() {
+        let mut filter = PreludeGate::new(vec!["__SECOND__".to_string(), "__FIRST__".to_string()]);
+
+        assert_eq!(
+            filter.write(b"noise\n__FIRST__\noutput\n__SECOND__\n"),
+            b"output\n__SECOND__\n"
+        );
+    }
+
+    #[test]
+    fn output_config_builds_enabled_prelude_markers() {
+        let markers = prelude_markers_from_output_config(&ShellToolOutputConfig {
+            prelude_gates: vec![
+                bcode_config::ShellToolPreludeGateConfig {
+                    name: "enabled".to_string(),
+                    marker: "__READY__".to_string(),
+                    enabled: true,
+                },
+                bcode_config::ShellToolPreludeGateConfig {
+                    name: "disabled".to_string(),
+                    marker: "__IGNORED__".to_string(),
+                    enabled: false,
+                },
+            ],
+        });
+
+        assert_eq!(markers, vec!["__READY__".to_string()]);
+    }
+
+    #[test]
+    fn terminal_response_uses_replay_pty_artifact_when_direnv_prelude_was_suppressed() {
         let raw = LimitedOutput {
             text: "direnv: loading\n__BCODE_DIRENV_READY_call__\n\u{1b}[31mhello\u{1b}[0m\n"
                 .to_string(),
@@ -1758,7 +1814,7 @@ mod tests {
             retained_bytes: 61,
             truncated: false,
         };
-        let filtered = LimitedOutput {
+        let replay = LimitedOutput {
             text: "\u{1b}[31mhello\u{1b}[0m\n".to_string(),
             original_bytes: 15,
             retained_bytes: 15,
@@ -1790,12 +1846,12 @@ mod tests {
                 started: Instant::now(),
                 stream_output: &TerminalStreamOutput {
                     raw,
-                    filtered,
+                    replay,
                     clean,
                     raw_artifact_path: Some(PathBuf::from("/tmp/raw.txt")),
-                    filtered_artifact_path: Some(PathBuf::from("/tmp/filtered.txt")),
+                    replay_artifact_path: Some(PathBuf::from("/tmp/replay.txt")),
                     clean_artifact_path: Some(PathBuf::from("/tmp/clean.txt")),
-                    direnv_prelude_suppressed: true,
+                    prelude_suppressed: true,
                 },
                 columns: 80,
                 rows: 24,
@@ -1824,10 +1880,10 @@ mod tests {
             .refs
             .iter()
             .find(|reference| reference.key == TERMINAL_PTY_STREAM_REF_KEY)
-            .expect("filtered pty replay ref should exist");
+            .expect("replay pty ref should exist");
         assert_eq!(
             replay_ref.storage_uri.as_deref(),
-            Some("file:///tmp/filtered.txt")
+            Some("file:///tmp/replay.txt")
         );
     }
 
@@ -1839,7 +1895,7 @@ mod tests {
             retained_bytes: 13,
             truncated: false,
         };
-        let filtered = raw.clone();
+        let replay = raw.clone();
         let clean = raw.clone();
         let response = terminal_shell_response(
             "call",
@@ -1861,12 +1917,12 @@ mod tests {
                 started: Instant::now(),
                 stream_output: &TerminalStreamOutput {
                     raw,
-                    filtered,
+                    replay,
                     clean,
                     raw_artifact_path: Some(PathBuf::from("/tmp/raw.txt")),
-                    filtered_artifact_path: Some(PathBuf::from("/tmp/filtered.txt")),
+                    replay_artifact_path: Some(PathBuf::from("/tmp/replay.txt")),
                     clean_artifact_path: Some(PathBuf::from("/tmp/clean.txt")),
-                    direnv_prelude_suppressed: false,
+                    prelude_suppressed: false,
                 },
                 columns: 80,
                 rows: 24,
@@ -1898,9 +1954,7 @@ mod tests {
             "call-1",
         );
 
-        let marker = plan
-            .direnv_prelude_marker
-            .expect("direnv marker should be set");
+        let marker = plan.prelude_marker.expect("direnv marker should be set");
         assert_eq!(plan.program, "direnv");
         assert!(plan.args.iter().any(|arg| arg.contains(&marker)));
         assert!(plan.args.iter().any(|arg| arg.contains("echo hello")));
@@ -1919,7 +1973,7 @@ mod tests {
             "call-1",
         );
 
-        assert!(plan.direnv_prelude_marker.is_none());
+        assert!(plan.prelude_marker.is_none());
         assert!(plan.args.iter().any(|arg| arg == "echo hello"));
     }
 }

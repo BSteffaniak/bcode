@@ -1825,6 +1825,10 @@ pub struct ShellToolConfig {
     #[config_doc(nested)]
     #[serde(default)]
     pub env: ShellToolEnvConfig,
+    /// Shell output handling configuration.
+    #[config_doc(nested)]
+    #[serde(default)]
+    pub output: ShellToolOutputConfig,
     /// Maximum bytes retained per stdout/stderr stream from non-terminal shell commands.
     #[serde(default = "default_shell_max_output_bytes")]
     pub max_output_bytes: usize,
@@ -1837,6 +1841,7 @@ impl Default for ShellToolConfig {
     fn default() -> Self {
         Self {
             env: ShellToolEnvConfig::default(),
+            output: ShellToolOutputConfig::default(),
             max_output_bytes: default_shell_max_output_bytes(),
             inline_output_bytes: default_shell_inline_output_bytes(),
         }
@@ -1877,6 +1882,32 @@ impl Default for ShellToolEnvConfig {
 }
 
 const fn default_hide_direnv_prelude() -> bool {
+    true
+}
+
+/// Shell tool output handling configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc, Default)]
+#[config_doc(section = "output")]
+pub struct ShellToolOutputConfig {
+    /// Passive output prelude gates that suppress output before a marker appears.
+    #[config_doc(skip)]
+    #[serde(default)]
+    pub prelude_gates: Vec<ShellToolPreludeGateConfig>,
+}
+
+/// Passive shell output prelude gate configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ShellToolPreludeGateConfig {
+    /// Human-readable gate name.
+    pub name: String,
+    /// Marker that indicates real command output has begun.
+    pub marker: String,
+    /// Whether this gate is active.
+    #[serde(default = "default_shell_prelude_gate_enabled")]
+    pub enabled: bool,
+}
+
+const fn default_shell_prelude_gate_enabled() -> bool {
     true
 }
 
