@@ -22,7 +22,7 @@ use bcode_model::{
 use bcode_model::{ModelParameters, ProviderRequestContext};
 use bcode_session_models::SessionId;
 use bcode_tool::{ToolDefinition, ToolInvocationRequest, ToolInvocationResponse};
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
@@ -63,6 +63,12 @@ pub enum BcodeError {
     /// Structured output was invalid or could not be decoded.
     #[error("structured output error: {0}")]
     StructuredOutput(String),
+    /// Session persistence failed.
+    #[error("session persistence error: {0}")]
+    SessionPersistence(String),
+    /// Session state is missing, stale, corrupt, or requires repair.
+    #[error("session state requires attention: {0}")]
+    SessionState(String),
     /// Tool execution failed.
     #[error("tool execution error: {0}")]
     ToolExecution(String),
@@ -700,6 +706,98 @@ impl BcodeBuilder {
     }
 }
 
+/// On-disk payload used by [`LocalSessionStore`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedSession {
+    /// Session ID associated with the transcript.
+    pub session_id: SessionId,
+    /// Caller-managed conversation transcript.
+    pub messages: Vec<ModelMessage>,
+}
+
+/// Explicit local JSON session store for SDK-managed persistence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalSessionStore {
+    path: PathBuf,
+}
+
+impl LocalSessionStore {
+    /// Create a local session store at an explicit file path.
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// Return the configured store path.
+    #[must_use]
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Load the session, returning `Ok(None)` when the file does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session file cannot be read, is stale/empty, or contains corrupt
+    /// JSON that requires caller attention.
+    pub fn load(&self) -> Result<Option<PersistedSession>> {
+        let contents = match std::fs::read_to_string(&self.path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(BcodeError::SessionPersistence(format!(
+                    "failed to read session store {}: {error}",
+                    self.path.display()
+                )));
+            }
+        };
+        if contents.trim().is_empty() {
+            return Err(BcodeError::SessionState(format!(
+                "session store {} is empty and requires repair or replacement",
+                self.path.display()
+            )));
+        }
+        serde_json::from_str(&contents).map(Some).map_err(|error| {
+            BcodeError::SessionState(format!(
+                "session store {} is corrupt and requires repair or replacement: {error}",
+                self.path.display()
+            ))
+        })
+    }
+
+    /// Save the complete session payload atomically enough for local SDK use.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when parent directories or files cannot be written.
+    pub fn save(&self, session: &PersistedSession) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                BcodeError::SessionPersistence(format!(
+                    "failed to create session store directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let encoded = serde_json::to_string_pretty(session).map_err(|error| {
+            BcodeError::SessionPersistence(format!("failed to encode session store JSON: {error}"))
+        })?;
+        let temporary_path = self.path.with_extension("tmp");
+        std::fs::write(&temporary_path, encoded).map_err(|error| {
+            BcodeError::SessionPersistence(format!(
+                "failed to write temporary session store {}: {error}",
+                temporary_path.display()
+            ))
+        })?;
+        std::fs::rename(&temporary_path, &self.path).map_err(|error| {
+            BcodeError::SessionPersistence(format!(
+                "failed to replace session store {}: {error}",
+                self.path.display()
+            ))
+        })
+    }
+}
+
 /// In-memory SDK session state for continuing conversations without persistence.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InMemorySession {
@@ -747,13 +845,25 @@ impl InMemorySession {
 pub struct AgentSession {
     agent: Agent,
     session: InMemorySession,
+    store: Option<LocalSessionStore>,
 }
 
 impl AgentSession {
     /// Create a stateful wrapper around an agent and in-memory session.
     #[must_use]
     pub const fn new(agent: Agent, session: InMemorySession) -> Self {
-        Self { agent, session }
+        Self {
+            agent,
+            session,
+            store: None,
+        }
+    }
+
+    /// Attach an explicit local session store and save after successful turns.
+    #[must_use]
+    pub fn with_store(mut self, store: LocalSessionStore) -> Self {
+        self.store = Some(store);
+        self
     }
 
     /// Return the wrapped agent.
@@ -766,6 +876,35 @@ impl AgentSession {
     #[must_use]
     pub const fn session(&self) -> &InMemorySession {
         &self.session
+    }
+
+    /// Return the configured local store, when persistence was explicitly enabled.
+    #[must_use]
+    pub const fn store(&self) -> Option<&LocalSessionStore> {
+        self.store.as_ref()
+    }
+
+    /// Return the session payload that can be saved by caller-managed persistence.
+    #[must_use]
+    pub fn persisted_session(&self) -> PersistedSession {
+        PersistedSession {
+            session_id: self.agent.session_id,
+            messages: self.session.messages.clone(),
+        }
+    }
+
+    /// Save to the configured local store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this session has no configured store or when saving fails.
+    pub fn save(&self) -> Result<()> {
+        let store = self.store.as_ref().ok_or_else(|| {
+            BcodeError::SessionPersistence(
+                "local session storage is not configured for this session".to_string(),
+            )
+        })?;
+        store.save(&self.persisted_session())
     }
 
     /// Export the in-memory session transcript for caller-managed persistence.
@@ -801,6 +940,9 @@ impl AgentSession {
         self.session
             .messages
             .push(assistant_message(response.text.clone()));
+        if self.store.is_some() {
+            self.save()?;
+        }
         Ok(response)
     }
 }
@@ -1279,6 +1421,22 @@ impl Agent {
     #[must_use]
     pub const fn session_from_messages(self, messages: Vec<ModelMessage>) -> AgentSession {
         AgentSession::new(self, InMemorySession::from_messages(messages))
+    }
+
+    /// Create a stateful session backed by an explicit local store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store exists but cannot be read or requires repair.
+    pub fn session_with_store(mut self, store: LocalSessionStore) -> Result<AgentSession> {
+        let persisted = store.load()?;
+        let session = if let Some(persisted) = persisted {
+            self.session_id = persisted.session_id;
+            InMemorySession::from_messages(persisted.messages)
+        } else {
+            InMemorySession::new()
+        };
+        Ok(AgentSession::new(self, session).with_store(store))
     }
 
     /// Return the configured agent name.
