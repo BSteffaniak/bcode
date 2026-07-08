@@ -137,6 +137,26 @@ where
         .await
 }
 
+/// Generate text with prior conversation messages and a caller-supplied provider.
+///
+/// # Errors
+///
+/// Returns an error when provider invocation fails, the runtime is cancelled, or the provider
+/// reports an error.
+pub async fn generate_text_with_messages<P>(
+    provider: &mut P,
+    messages: Vec<ModelMessage>,
+    prompt: impl Into<String>,
+) -> Result<GenerateTextResponse>
+where
+    P: ModelProviderInvoker,
+{
+    Agent::builder()
+        .build()
+        .generate_text_with_provider_and_messages(provider, prompt, messages)
+        .await
+}
+
 /// Generate text with a caller-supplied provider and cancellation token using default settings.
 ///
 /// # Errors
@@ -1334,6 +1354,25 @@ impl Agent {
         P: ModelProviderInvoker,
     {
         self.generate_text_with_provider_with_structured_output(provider, prompt, None)
+            .await
+    }
+
+    /// Generate text using a caller-supplied provider invoker and prior conversation messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when provider invocation fails, the runtime is cancelled, or the provider
+    /// reports an error.
+    pub async fn generate_text_with_provider_and_messages<P>(
+        &self,
+        provider: &mut P,
+        prompt: impl Into<String>,
+        messages: Vec<ModelMessage>,
+    ) -> Result<GenerateTextResponse>
+    where
+        P: ModelProviderInvoker,
+    {
+        self.generate_text_with_provider_and_history(provider, prompt, messages)
             .await
     }
 
