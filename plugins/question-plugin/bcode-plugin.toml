@@ -16,6 +16,11 @@ priority           = 100
 producer_default   = true
 surfaces           = ["tui"]
 
+[[tui_surfaces]]
+description = "Inline interactive question surface"
+kind        = "bcode.question.inline"
+title       = "Question"
+
 [runtime]
 abi_version    = 1
 event_symbol   = "bcode_plugin_handle_event_v1"

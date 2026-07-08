@@ -662,15 +662,8 @@ fn push_transcript_item_rows(
                 plugin_host,
             );
         }
-        TranscriptItemKind::InteractiveToolRequest {
-            surface_kind,
-            request_json,
-            ..
-        } if surface_kind == super::protocol_surface::BMUX_PROTOCOL_INLINE_SURFACE => {
-            push_interactive_protocol_placeholder_rows(rows, request_json, width);
-        }
         TranscriptItemKind::InteractiveToolRequest { .. } => {
-            push_detail_block(rows, "Interactive tool", item.text(), Color::Cyan, width);
+            push_interactive_surface_placeholder_rows(rows, width);
         }
         TranscriptItemKind::InteractiveToolResolution { .. } => {
             push_detail_block(rows, "Interactive tool", item.text(), Color::Green, width);
@@ -713,11 +706,7 @@ fn push_transcript_item_rows(
     }
 }
 
-fn push_interactive_protocol_placeholder_rows(
-    rows: &mut Vec<Line>,
-    request_json: &str,
-    width: u16,
-) {
+fn push_interactive_surface_placeholder_rows(rows: &mut Vec<Line>, width: u16) {
     push_wrapped_styled_text(
         rows,
         Vec::new(),
@@ -727,9 +716,7 @@ fn push_interactive_protocol_placeholder_rows(
         Style::new().fg(Color::Cyan),
     );
     let surface_width = width.saturating_sub(2);
-    let height =
-        super::protocol_surface::measure_tree_json_height(request_json, width.saturating_sub(2));
-    for index in 0..height {
+    for index in 0..6 {
         let marker = if index == 0 { "┌" } else { "│" };
         rows.push(Line::from_spans(vec![
             Span::styled(marker, muted_style()),

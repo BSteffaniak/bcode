@@ -2149,6 +2149,12 @@ impl PluginRuntimeHost {
         self.command_registry.commands_for_surface(surface)
     }
 
+    /// Return loaded plugin ids.
+    #[must_use]
+    pub fn plugin_ids(&self) -> Vec<String> {
+        self.registry.manifests.keys().cloned().collect()
+    }
+
     /// Return loaded plugin executor handles keyed by plugin ID.
     #[must_use]
     pub fn executors(&self) -> &BTreeMap<String, Arc<PluginExecutorHandle>> {

@@ -2171,7 +2171,7 @@ impl BmuxApp {
                 tool_call_id,
                 resolution_json,
             } => {
-                if self.resolve_interactive_protocol_tool_result(
+                if self.resolve_interactive_surface_tool_result(
                     interaction_id,
                     tool_call_id,
                     resolution_json,
@@ -2711,7 +2711,7 @@ impl BmuxApp {
         self.status = tool_request_status(arguments_json).unwrap_or_else(|| "started".to_owned());
     }
 
-    fn resolve_interactive_protocol_tool_result(
+    fn resolve_interactive_surface_tool_result(
         &mut self,
         interaction_id: &str,
         tool_call_id: &str,
@@ -2726,18 +2726,16 @@ impl BmuxApp {
                         interaction_id: item_interaction_id,
                         tool_call_id: item_tool_call_id,
                         tool_name,
-                        surface_kind,
+                        surface_kind: _,
                         request_json,
                         ..
                     } if item_interaction_id == interaction_id
-                        && item_tool_call_id == tool_call_id
-                        && surface_kind
-                            == super::protocol_surface::BMUX_PROTOCOL_INLINE_SURFACE =>
+                        && item_tool_call_id == tool_call_id =>
                     {
                         Some((
                             tool_name.clone(),
                             request_json.clone(),
-                            submitted_protocol_state_json(resolution_json)?,
+                            submitted_interactive_payload_json(resolution_json)?,
                         ))
                     }
                     _ => None,
@@ -2745,13 +2743,14 @@ impl BmuxApp {
         else {
             return false;
         };
-        self.transcript
-            .retain(|item| !item_is_protocol_submission_surface_for_tool_call(item, tool_call_id));
+        self.transcript.retain(|item| {
+            !item_is_interactive_submission_surface_for_tool_call(item, tool_call_id)
+        });
         self.transcript.push(tool_result_item(
             tool_call_id,
             Some(&tool_name),
             None,
-            &format!("protocol submission\n{state_json}"),
+            &format!("interactive submission\n{state_json}"),
             false,
         ));
         self.finish_tool_request_preview(tool_call_id);
@@ -4001,7 +4000,7 @@ fn working_directory_changed_message(
     )
 }
 
-fn item_is_protocol_submission_surface_for_tool_call(
+fn item_is_interactive_submission_surface_for_tool_call(
     item: &TranscriptItem,
     tool_call_id: &str,
 ) -> bool {
@@ -4015,23 +4014,13 @@ fn item_is_protocol_submission_surface_for_tool_call(
     )
 }
 
-fn submitted_protocol_state_json(resolution_json: &str) -> Option<String> {
+fn submitted_interactive_payload_json(resolution_json: &str) -> Option<String> {
     let resolution = serde_json::from_str::<serde_json::Value>(resolution_json).ok()?;
-    let values = resolution
+    let payload = resolution
         .get("payload")
-        .and_then(|payload| payload.get("values"))
         .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-    serde_json::to_string(&serde_json::json!({
-        "focus": {
-            "focused": null,
-            "traversal_order": [],
-        },
-        "values": values,
-        "expanded": [],
-        "selected": [],
-    }))
-    .ok()
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::to_string_pretty(&payload).ok()
 }
 
 const fn live_tool_preview_truncated(_preview: &LiveToolArgumentPreview) -> bool {

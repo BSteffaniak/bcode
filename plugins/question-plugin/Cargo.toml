@@ -14,15 +14,14 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bcode_plugin_sdk            = { workspace = true }
-bcode_tool                  = { workspace = true }
-bmux_tui                    = { workspace = true, optional = true }
-bmux_tui_component_protocol = { workspace = true, features = ["serde"] }
-bmux_tui_components         = { workspace = true, features = ["protocol"] }
-serde                       = { workspace = true }
-serde_json                  = { workspace = true }
+bcode_plugin_sdk = { workspace = true }
+bcode_tool       = { workspace = true }
+bmux_keyboard    = { workspace = true, optional = true }
+bmux_tui         = { workspace = true, optional = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
 
 [features]
 default          = []
 fail-on-warnings = []
-static-bundled   = ["bmux_tui"]
+static-bundled   = ["bmux_keyboard", "bmux_tui"]

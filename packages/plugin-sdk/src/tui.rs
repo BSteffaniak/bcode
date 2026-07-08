@@ -194,6 +194,12 @@ pub trait PluginTuiSurface: Send {
     /// Human-readable surface title.
     fn title(&self) -> &'static str;
 
+    /// Return preferred height for this surface at the given width.
+    #[must_use]
+    fn preferred_height(&mut self, _width: u16) -> u16 {
+        1
+    }
+
     /// Render this surface inside the host-assigned area.
     fn render(&mut self, area: Rect, frame: &mut Frame<'_>);
 

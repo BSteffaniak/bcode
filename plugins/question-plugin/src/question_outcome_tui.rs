@@ -1,7 +1,6 @@
 //! Native TUI rendering for question outcome artifacts.
 
 use bmux_tui::prelude::Line;
-use serde_json::Value;
 
 /// Native TUI visual adapter for question outcome artifacts.
 pub struct QuestionOutcomeTuiVisualAdapter;
@@ -19,41 +18,33 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for QuestionOutcomeTuiVisualA
                 Line::from(payload.to_string()),
             ];
         };
-        let tree = super::question_result_component_tree(&outcome);
-        let mut text = Vec::new();
-        collect_protocol_text(&tree, &mut text);
 
         let mut rows = vec![Line::from(format!(
             "Question outcome · {:?}",
             outcome.status
         ))];
-        rows.extend(
-            text.into_iter()
-                .filter(|line| !line.trim().is_empty())
-                .map(Line::from),
-        );
-        rows
-    }
-}
-
-fn collect_protocol_text(value: &Value, output: &mut Vec<String>) {
-    match value {
-        Value::Object(object) => {
-            for key in ["text", "value", "label"] {
-                if let Some(text) = object.get(key).and_then(Value::as_str) {
-                    output.extend(text.lines().map(str::to_owned));
+        for question in &outcome.questions {
+            if let Some(header) = &question.header {
+                rows.push(Line::from(header.clone()));
+            }
+            rows.push(Line::from(question.question.clone()));
+            if question.selected.is_empty() {
+                if let Some(custom) = &question.custom {
+                    rows.push(Line::from(custom.clone()));
+                }
+            } else {
+                rows.extend(
+                    question
+                        .selected
+                        .iter()
+                        .map(|answer| Line::from(format!("✓ {}", answer.label))),
+                );
+                if let Some(custom) = &question.custom {
+                    rows.push(Line::from(format!("Custom answer: {custom}")));
                 }
             }
-            for value in object.values() {
-                collect_protocol_text(value, output);
-            }
         }
-        Value::Array(values) => {
-            for value in values {
-                collect_protocol_text(value, output);
-            }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        rows
     }
 }
 

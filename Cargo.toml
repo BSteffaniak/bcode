@@ -173,7 +173,6 @@ bmux_plugin_sdk = { default-features = false, git = "https://github.com/BSteffan
 bmux_terminal_grid = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 bmux_text_edit = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 bmux_tui = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
-bmux_tui_component_protocol = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 bmux_tui_components = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 
 # External dependencies
@@ -382,5 +381,4 @@ opt-level = 0
 # bmux_terminal_grid          = { path = "/Volumes/ehdd/GitHub/bmux/packages/terminal-grid" }
 # bmux_text_edit              = { path = "/Volumes/ehdd/GitHub/bmux/packages/text-edit" }
 # bmux_tui                    = { path = "/Volumes/ehdd/GitHub/bmux/packages/tui" }
-# bmux_tui_component_protocol = { path = "/Volumes/ehdd/GitHub/bmux/packages/tui-component-protocol" }
 # bmux_tui_components         = { path = "/Volumes/ehdd/GitHub/bmux/packages/tui-components" }
