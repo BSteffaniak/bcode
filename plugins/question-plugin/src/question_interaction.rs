@@ -64,6 +64,32 @@ pub struct QuestionSnapshot {
     pub focused_control_id: InteractionControlId,
 }
 
+/// Factory for renderer-neutral question controllers.
+pub struct QuestionInteractionControllerFactory;
+
+impl bcode_plugin_sdk::interaction::PluginInteractionControllerFactory
+    for QuestionInteractionControllerFactory
+{
+    fn interaction_kind(&self) -> &'static str {
+        QUESTION_INTERACTION_KIND
+    }
+
+    fn open(
+        &self,
+        request: serde_json::Value,
+    ) -> Result<
+        bcode_plugin_sdk::interaction::BoxedPluginInteractionController,
+        bcode_plugin_sdk::interaction::PluginInteractionError,
+    > {
+        let request = serde_json::from_value::<NormalizedQuestionRequest>(request)?;
+        Ok(Box::new(
+            bcode_plugin_sdk::interaction::JsonInteractionController::new(
+                QuestionInteractionController::new(request),
+            ),
+        ))
+    }
+}
+
 /// Renderer-neutral question controller.
 pub struct QuestionInteractionController {
     request: NormalizedQuestionRequest,

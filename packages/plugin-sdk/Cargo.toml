@@ -13,6 +13,7 @@ version     = { workspace = true }
 [dependencies]
 bcode_command        = { workspace = true }
 bcode_session_models = { workspace = true }
+bcode_tool           = { workspace = true }
 bmux_tui             = { workspace = true }
 serde                = { workspace = true, features = ["derive", "std"] }
 serde_json           = { workspace = true }

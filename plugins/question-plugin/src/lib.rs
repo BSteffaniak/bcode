@@ -758,7 +758,17 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
         include_str!("../bcode-plugin.toml")
     );
     vtable.tui_registry = Some(question_tui_registry);
+    vtable.interaction_registry = Some(question_interaction_registry);
     vtable
+}
+
+#[cfg(feature = "static-bundled")]
+fn question_interaction_registry() -> bcode_plugin_sdk::interaction::PluginInteractionRegistry {
+    let mut registry = bcode_plugin_sdk::interaction::PluginInteractionRegistry::default();
+    registry.register_factory(Box::new(
+        question_interaction::QuestionInteractionControllerFactory,
+    ));
+    registry
 }
 
 #[cfg(feature = "static-bundled")]

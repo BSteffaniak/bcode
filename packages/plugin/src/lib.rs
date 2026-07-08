@@ -4,6 +4,7 @@
 
 mod bmux_host_adapter;
 
+use bcode_plugin_sdk::interaction::PluginInteractionRegistry;
 use bcode_plugin_sdk::tui::PluginTuiRegistry;
 use bcode_plugin_sdk::{
     CURRENT_PLUGIN_ABI_VERSION, CommandRegistrationCallback, DEFAULT_NATIVE_ACTIVATE_SYMBOL,
@@ -2094,6 +2095,7 @@ pub struct PluginRuntimeHost {
     configs: Arc<BTreeMap<String, ResolvedPluginConfig>>,
     command_registry: Arc<bcode_command::CommandRegistry>,
     tui_registries: Arc<BTreeMap<String, PluginTuiRegistry>>,
+    interaction_registries: Arc<BTreeMap<String, PluginInteractionRegistry>>,
     resources: Arc<PluginResourceLimiter>,
     metrics: bcode_metrics::MetricsRegistry,
 }
@@ -2177,6 +2179,18 @@ impl PluginRuntimeHost {
     #[must_use]
     pub fn tui_registry(&self, plugin_id: &str) -> Option<&PluginTuiRegistry> {
         self.tui_registries.get(plugin_id)
+    }
+
+    /// Return renderer-neutral interaction registries keyed by plugin ID.
+    #[must_use]
+    pub fn interaction_registries(&self) -> &BTreeMap<String, PluginInteractionRegistry> {
+        &self.interaction_registries
+    }
+
+    /// Return a renderer-neutral interaction registry for a loaded plugin.
+    #[must_use]
+    pub fn interaction_registry(&self, plugin_id: &str) -> Option<&PluginInteractionRegistry> {
+        self.interaction_registries.get(plugin_id)
     }
 
     /// Return plugin executor status snapshots.
@@ -2626,14 +2640,18 @@ impl From<PluginHost> for PluginRuntimeHost {
         let mut executors = BTreeMap::new();
         let mut event_dispatchers = BTreeMap::new();
         let mut tui_registries = BTreeMap::new();
+        let mut interaction_registries = BTreeMap::new();
         for plugin in loaded {
             let manifest = plugin.manifest().clone();
             let plugin_id = manifest.id.clone();
             manifests.insert(plugin_id.clone(), manifest.clone());
-            if let LoadedPluginBackend::Static { vtable } = &plugin.backend
-                && let Some(tui_registry) = vtable.tui_registry
-            {
-                tui_registries.insert(plugin_id.clone(), tui_registry());
+            if let LoadedPluginBackend::Static { vtable } = &plugin.backend {
+                if let Some(tui_registry) = vtable.tui_registry {
+                    tui_registries.insert(plugin_id.clone(), tui_registry());
+                }
+                if let Some(interaction_registry) = vtable.interaction_registry {
+                    interaction_registries.insert(plugin_id.clone(), interaction_registry());
+                }
             }
             let metrics = Arc::new(PluginExecutorMetrics::default());
             let concurrency = PluginConcurrency::from(&manifest.concurrency);
@@ -2670,6 +2688,7 @@ impl From<PluginHost> for PluginRuntimeHost {
             event_dispatchers: Arc::new(event_dispatchers),
             configs: Arc::new(configs),
             tui_registries: Arc::new(tui_registries),
+            interaction_registries: Arc::new(interaction_registries),
             command_registry: Arc::new(std::mem::take(&mut host.command_registry)),
             resources: Arc::default(),
             metrics: bcode_metrics::MetricsRegistry::disabled(),
@@ -3777,6 +3796,7 @@ library = "libdisabled.dylib"
                 invoke_service: service,
                 invoke_service_streaming: test_streaming_service,
                 tui_registry: None,
+                interaction_registry: None,
                 handle_event: event,
             },
         )];
@@ -3835,6 +3855,7 @@ library = "libexample_static.dylib"
                 invoke_service: service,
                 invoke_service_streaming: test_streaming_service,
                 tui_registry: None,
+                interaction_registry: None,
                 handle_event: event,
             },
         )];
@@ -3941,6 +3962,7 @@ library = "libcommands.dylib"
                     invoke_service: test_service,
                     invoke_service_streaming: test_streaming_service,
                     tui_registry: None,
+                    interaction_registry: None,
                     handle_event: test_handle_event,
                 },
             },
@@ -4583,6 +4605,7 @@ library = "libexample_plugin.dylib"
                                     },
                                 handle_event,
                                 tui_registry: None,
+                                interaction_registry: None,
                             },
                         },
                     },
@@ -4619,6 +4642,7 @@ library = "libexample_plugin.dylib"
                                     },
                                 handle_event,
                                 tui_registry: None,
+                                interaction_registry: None,
                             },
                         },
                     },
@@ -4736,6 +4760,7 @@ library = "libexample_plugin.dylib"
                             invoke_service_streaming: service_streaming,
                             handle_event: test_handle_event,
                             tui_registry: None,
+                            interaction_registry: None,
                         },
                     },
                 }],
@@ -4864,6 +4889,7 @@ library = "libexample_plugin.dylib"
                             invoke_service_streaming: service_streaming,
                             handle_event: test_handle_event,
                             tui_registry: None,
+                            interaction_registry: None,
                         },
                     },
                 }],
@@ -5023,6 +5049,7 @@ library = "libexample_plugin.dylib"
             invoke_service: test_large_service,
             invoke_service_streaming: test_large_chunking_service,
             tui_registry: None,
+            interaction_registry: None,
             handle_event: test_handle_event,
         }
     }
@@ -5039,6 +5066,7 @@ library = "libexample_plugin.dylib"
                 test_large_service(instance, input_ptr, input_len, output, cap, len)
             },
             tui_registry: None,
+            interaction_registry: None,
             handle_event: test_handle_event,
         }
     }
@@ -5053,6 +5081,7 @@ library = "libexample_plugin.dylib"
             invoke_service: test_service,
             invoke_service_streaming: test_streaming_service,
             tui_registry: None,
+            interaction_registry: None,
             handle_event: test_handle_event,
         }
     }

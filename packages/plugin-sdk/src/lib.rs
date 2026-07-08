@@ -4,6 +4,7 @@
 
 //! Plugin author SDK for Bcode native plugins.
 
+pub mod interaction;
 pub mod tui;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -885,6 +886,8 @@ pub struct StaticPluginVtable {
     pub handle_event: fn(*const c_void, *const u8, usize) -> i32,
     /// Native TUI registry provider, when statically linked.
     pub tui_registry: Option<fn() -> crate::tui::PluginTuiRegistry>,
+    /// Renderer-neutral interaction registry provider, when statically linked.
+    pub interaction_registry: Option<fn() -> crate::interaction::PluginInteractionRegistry>,
 }
 
 impl std::fmt::Debug for StaticPluginVtable {
@@ -1180,6 +1183,7 @@ macro_rules! static_plugin_vtable {
             invoke_service_streaming: $crate::static_invoke_service_streaming_export::<$plugin>,
             handle_event: $crate::static_handle_event_export::<$plugin>,
             tui_registry: None,
+            interaction_registry: None,
         }
     }};
 }
@@ -1264,6 +1268,7 @@ macro_rules! static_concurrent_plugin_vtable {
             invoke_service_streaming,
             handle_event,
             tui_registry: None,
+            interaction_registry: None,
         }
     }};
 }
