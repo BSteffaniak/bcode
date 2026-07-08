@@ -1,4 +1,4 @@
-use bcode::{AgentEvent, AgentStreamItem, ModelProviderInvoker, RuntimeFuture};
+use bcode::{AgentEvent, AgentStreamItem, CancellationToken, ModelProviderInvoker, RuntimeFuture};
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, ModelTurnRequest, PollTurnEventsRequest,
     PollTurnEventsResponse, ProviderTurnEvent, StartTurnResponse, StopReason,
@@ -100,6 +100,19 @@ async fn main() -> bcode::Result<()> {
             AgentStreamItem::Error(error) => return Err(error.into()),
             AgentStreamItem::Event(_) => {}
         }
+    }
+
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let mut cancelled_provider = ExampleProvider::text("this should not be generated");
+    if let Err(error) = bcode::generate_text_with_cancellation(
+        &mut cancelled_provider,
+        "Cancel before generation",
+        cancellation,
+    )
+    .await
+    {
+        println!("cancelled: {error}");
     }
 
     let mut object_provider = ExampleProvider::text(r#"{"title":"top-level object"}"#);

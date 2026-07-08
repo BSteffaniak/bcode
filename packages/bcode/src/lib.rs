@@ -137,6 +137,26 @@ where
         .await
 }
 
+/// Generate text with a caller-supplied provider and cancellation token using default settings.
+///
+/// # Errors
+///
+/// Returns an error when provider invocation fails, cancellation is requested, the turn times out,
+/// or the provider reports an error.
+pub async fn generate_text_with_cancellation<P>(
+    provider: &mut P,
+    prompt: impl Into<String>,
+    cancellation: CancellationToken,
+) -> Result<GenerateTextResponse>
+where
+    P: ModelProviderInvoker,
+{
+    Agent::builder()
+        .build()
+        .generate_text_with_provider_and_cancellation(provider, prompt, cancellation)
+        .await
+}
+
 /// Stream text with a caller-supplied provider using default agent settings.
 ///
 /// This is the smallest lean-core streaming helper. It returns normalized [`AgentStreamItem`]
@@ -1317,6 +1337,31 @@ impl Agent {
             .await
     }
 
+    /// Generate text using a caller-supplied provider invoker and cancellation token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when provider invocation fails, cancellation is requested, the turn times
+    /// out, or the provider reports an error.
+    pub async fn generate_text_with_provider_and_cancellation<P>(
+        &self,
+        provider: &mut P,
+        prompt: impl Into<String>,
+        cancellation: CancellationToken,
+    ) -> Result<GenerateTextResponse>
+    where
+        P: ModelProviderInvoker,
+    {
+        self.generate_text_with_provider_with_options(
+            provider,
+            prompt,
+            None,
+            Vec::new(),
+            cancellation,
+        )
+        .await
+    }
+
     async fn generate_text_with_provider_and_history<P>(
         &self,
         provider: &mut P,
@@ -1326,8 +1371,14 @@ impl Agent {
     where
         P: ModelProviderInvoker,
     {
-        self.generate_text_with_provider_with_options(provider, prompt, None, messages)
-            .await
+        self.generate_text_with_provider_with_options(
+            provider,
+            prompt,
+            None,
+            messages,
+            CancellationToken::new(),
+        )
+        .await
     }
 
     /// Generate and deserialize a structured object using the agent's embedded provider.
@@ -1430,6 +1481,7 @@ impl Agent {
             prompt,
             structured_output,
             Vec::new(),
+            CancellationToken::new(),
         )
         .await
     }
@@ -1440,6 +1492,7 @@ impl Agent {
         prompt: impl Into<String>,
         structured_output: Option<bcode_model::StructuredOutputRequest>,
         messages: Vec<ModelMessage>,
+        cancellation: CancellationToken,
     ) -> Result<GenerateTextResponse>
     where
         P: ModelProviderInvoker,
@@ -1451,10 +1504,11 @@ impl Agent {
             .runtime
             .run_text_turn(
                 provider,
-                self.turn_request_with_structured_output_and_messages(
+                self.turn_request_with_structured_output_messages_and_cancellation(
                     prompt,
                     structured_output,
                     messages,
+                    cancellation,
                 ),
             )
             .await?;
@@ -1481,7 +1535,12 @@ impl Agent {
         let provider = self.provider.clone().ok_or(BcodeError::MissingProvider)?;
         Ok(self.runtime.run_streaming_text_turn(
             provider,
-            self.turn_request_with_structured_output_and_messages(prompt.into(), None, Vec::new()),
+            self.turn_request_with_structured_output_messages_and_cancellation(
+                prompt.into(),
+                None,
+                Vec::new(),
+                CancellationToken::new(),
+            ),
         ))
     }
 
@@ -1650,13 +1709,14 @@ impl Agent {
         }
     }
 
-    fn turn_request_with_structured_output_and_messages(
+    fn turn_request_with_structured_output_messages_and_cancellation(
         &self,
         prompt: String,
         structured_output: Option<bcode_model::StructuredOutputRequest>,
         messages: Vec<ModelMessage>,
+        cancellation: CancellationToken,
     ) -> AgentTurnRequest {
-        let mut request = self.turn_request_with_cancellation(prompt, CancellationToken::new());
+        let mut request = self.turn_request_with_cancellation(prompt, cancellation);
         request.structured_output = structured_output;
         request.messages = messages;
         request
