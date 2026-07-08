@@ -29,7 +29,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 /// Boxed future returned by runtime extension traits.
 pub type RuntimeFuture<'a, T> =
@@ -88,7 +88,13 @@ pub enum RuntimeError {
 /// Cancellation state shared between callers and a running turn.
 #[derive(Debug, Clone, Default)]
 pub struct CancellationToken {
-    cancelled: Arc<AtomicBool>,
+    inner: Arc<CancellationState>,
+}
+
+#[derive(Debug, Default)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    notify: Notify,
 }
 
 impl CancellationToken {
@@ -100,13 +106,28 @@ impl CancellationToken {
 
     /// Mark this token as cancelled.
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
+        self.inner.cancelled.store(true, Ordering::SeqCst);
+        self.inner.notify.notify_waiters();
     }
 
     /// Return whether cancellation has been requested.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+        self.inner.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Wait until cancellation is requested.
+    pub async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            let notified = self.inner.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 

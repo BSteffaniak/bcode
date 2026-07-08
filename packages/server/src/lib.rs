@@ -441,29 +441,7 @@ impl SessionTurnPermit {
     }
 }
 
-#[derive(Debug, Default)]
-struct TurnCancelState {
-    token: CancellationToken,
-    notify: Notify,
-}
-
-impl TurnCancelState {
-    fn cancel(&self) {
-        self.token.cancel();
-        self.notify.notify_waiters();
-    }
-
-    fn is_cancelled(&self) -> bool {
-        self.token.is_cancelled()
-    }
-
-    async fn cancelled(&self) {
-        if self.is_cancelled() {
-            return;
-        }
-        self.notify.notified().await;
-    }
-}
+type TurnCancelState = CancellationToken;
 
 #[derive(Debug, Clone)]
 struct ActiveModelTurn {
