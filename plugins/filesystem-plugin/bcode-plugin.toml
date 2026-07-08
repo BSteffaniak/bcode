@@ -14,12 +14,123 @@ interface_id = "bcode.tool/v1"
 name         = "Filesystem Tools"
 
 [[visual_adapters]]
+artifact_schema    = "bcode.filesystem.change"
 id                 = "filesystem-change-card"
 max_schema_version = 1
 min_schema_version = 1
 priority           = 100
 producer_default   = true
-schema             = "bcode.filesystem.change"
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.filesystem.request"
+id                 = "filesystem-request-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.filesystem.read"
+id                 = "filesystem-read-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.filesystem.image"
+id                 = "filesystem-image-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.filesystem.exists"
+id                 = "filesystem-exists-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.filesystem.list"
+id                 = "filesystem-list-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.filesystem.find"
+id                 = "filesystem-find-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.filesystem.grep"
+id                 = "filesystem-grep-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.filesystem.stat"
+id                 = "filesystem-stat-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.filesystem.artifact.metadata"
+id                 = "filesystem-artifact-metadata-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.filesystem.artifact.read"
+id                 = "filesystem-artifact-read-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.filesystem.artifact.grep"
+id                 = "filesystem-artifact-grep-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "transcript_block"
 surfaces           = ["tui"]
 
 [concurrency]
