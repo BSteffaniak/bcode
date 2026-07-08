@@ -47,6 +47,85 @@ pub use bcode_model::{ContentBlock as ModelContentBlock, MessageRole, ModelMessa
 /// Result alias for Bcode SDK operations.
 pub type Result<T> = std::result::Result<T, BcodeError>;
 
+/// Generate text with a caller-supplied provider using default agent settings.
+///
+/// This is the smallest lean-core text generation helper. It does not launch the TUI, require the
+/// daemon, or enable app/bundled-plugin features.
+///
+/// # Errors
+///
+/// Returns an error when provider invocation fails, the runtime is cancelled, or the provider
+/// reports an error.
+pub async fn generate_text<P>(
+    provider: &mut P,
+    prompt: impl Into<String>,
+) -> Result<GenerateTextResponse>
+where
+    P: ModelProviderInvoker,
+{
+    Agent::builder()
+        .build()
+        .generate_text_with_provider(provider, prompt)
+        .await
+}
+
+/// Stream text with a caller-supplied provider using default agent settings.
+///
+/// This is the smallest lean-core streaming helper. It returns normalized [`AgentStreamItem`]
+/// values and does not launch the TUI, require the daemon, or enable app/bundled-plugin features.
+#[must_use]
+pub fn stream_text<P>(provider: P, prompt: impl Into<String>) -> AgentStream
+where
+    P: ModelProviderInvoker + 'static,
+{
+    Agent::builder()
+        .build()
+        .stream_text_with_provider(provider, prompt)
+}
+
+/// Generate a typed structured object with a caller-supplied provider using default agent settings.
+///
+/// The helper derives a JSON Schema from `T`, requests structured output, validates the returned
+/// JSON locally, and decodes it into `T`.
+///
+/// # Errors
+///
+/// Returns an error when provider invocation fails, the runtime is cancelled, the provider reports
+/// an error, the model output is not valid JSON, schema validation fails, or decoding into `T`
+/// fails.
+pub async fn generate_object<T, P>(provider: &mut P, prompt: impl Into<String>) -> Result<T>
+where
+    T: DeserializeOwned + schemars::JsonSchema,
+    P: ModelProviderInvoker,
+{
+    Agent::builder()
+        .build()
+        .generate_object_with_provider(provider, prompt)
+        .await
+}
+
+/// Generate a typed structured object with explicit structured-output options.
+///
+/// # Errors
+///
+/// Returns an error when provider invocation fails, the runtime is cancelled, the provider reports
+/// an error, the model output is not valid JSON, schema validation fails, repair attempts are
+/// exhausted, or decoding into `T` fails.
+pub async fn generate_object_with_options<T, P>(
+    provider: &mut P,
+    prompt: impl Into<String>,
+    options: StructuredOutputOptions,
+) -> Result<T>
+where
+    T: DeserializeOwned,
+    P: ModelProviderInvoker,
+{
+    Agent::builder()
+        .build()
+        .generate_object_with_provider_and_options(provider, prompt, options)
+        .await
+}
+
 /// High-level SDK error.
 #[derive(Debug, Error)]
 pub enum BcodeError {
