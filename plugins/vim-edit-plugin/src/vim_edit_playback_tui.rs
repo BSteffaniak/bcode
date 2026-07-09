@@ -272,6 +272,9 @@ fn request_rows(title: &str, payload: &Value) -> Vec<Line> {
 }
 
 fn live_rows(payload: &Value, width: u16) -> Vec<Line> {
+    if selected_context(payload).is_none() && payload.get("cursor").is_none() {
+        return live_lifecycle_rows(payload, width);
+    }
     let mut rows = vim_screen_rows("nvim live", payload, selected_context(payload), width);
     rows.push(Line::from_spans(vec![
         Span::styled("  step ", muted()),
@@ -279,6 +282,30 @@ fn live_rows(payload: &Value, width: u16) -> Vec<Line> {
         Span::styled(" · ", muted()),
         Span::styled(step_text(payload), value_style()),
     ]));
+    rows
+}
+
+fn live_lifecycle_rows(payload: &Value, width: u16) -> Vec<Line> {
+    let phase = text(payload, "phase").unwrap_or("running");
+    let path = text(payload, "path").unwrap_or("<file>");
+    let title = format!("╭─ nvim live: {path} ── {phase} ");
+    let mut rows = vec![Line::from_spans(vec![Span::styled(
+        pad_rule(&title, width, '─', '╮'),
+        border(),
+    )])];
+    push_kv(&mut rows, "phase", phase);
+    if let Some(tool_name) = text(payload, "tool_name") {
+        push_kv(&mut rows, "tool", tool_name);
+    }
+    if let Some(error) = text(payload, "error").filter(|error| !error.is_empty()) {
+        push_kv(&mut rows, "error", error);
+    } else if phase == "started" {
+        push_kv(&mut rows, "status", "starting Neovim");
+    }
+    rows.push(Line::from_spans(vec![Span::styled(
+        pad_rule("╰", width, '─', '╯'),
+        border(),
+    )]));
     rows
 }
 
@@ -536,4 +563,70 @@ const fn value_style() -> Style {
 }
 const fn cursor_line_style() -> Style {
     Style::new().fg(Color::Yellow)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn row_text(rows: &[Line]) -> String {
+        rows.iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn sparse_started_live_payload_renders_status_not_fake_vim_state() {
+        let payload = json!({
+            "tool_name": "vim_edit.apply",
+            "phase": "started",
+            "path": "/tmp/demo.txt",
+            "error": null,
+        });
+        let text = row_text(&live_rows(&payload, 80));
+        assert!(text.contains("phase"));
+        assert!(text.contains("started"));
+        assert!(text.contains("starting Neovim"));
+        assert!(!text.contains("?:?"), "{text}");
+        assert!(!text.contains("step 1/1"), "{text}");
+    }
+
+    #[test]
+    fn sparse_error_live_payload_renders_error_not_fake_vim_state() {
+        let payload = json!({
+            "tool_name": "vim_edit.apply",
+            "phase": "error",
+            "path": "/tmp/demo.txt",
+            "error": "nvim not found",
+        });
+        let text = row_text(&live_rows(&payload, 80));
+        assert!(text.contains("error"));
+        assert!(text.contains("nvim not found"));
+        assert!(!text.contains("?:?"), "{text}");
+        assert!(!text.contains("step 1/1"), "{text}");
+    }
+
+    #[test]
+    fn rich_live_payload_still_renders_vim_context() {
+        let payload = json!({
+            "tool_name": "vim_edit.apply",
+            "phase": "running",
+            "path": "/tmp/demo.txt",
+            "step_index": 0,
+            "step_total": 1,
+            "step": { "insert": { "text": "hello" } },
+            "cursor": { "line": 1, "column": 6 },
+            "nvim_mode": "i",
+            "context": {
+                "start_line": 1,
+                "lines": ["hello"]
+            }
+        });
+        let text = row_text(&live_rows(&payload, 80));
+        assert!(text.contains("hello"));
+        assert!(text.contains("1:6"));
+        assert!(text.contains("step"));
+    }
 }
