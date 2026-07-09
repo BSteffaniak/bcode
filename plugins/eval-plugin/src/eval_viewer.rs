@@ -147,6 +147,13 @@ impl EvalRunPickerSurface {
         }
     }
 
+    fn run_suite(&mut self) {
+        match EvalWizard::run_suite_from_runs(&self.runs, &self.runs_root) {
+            Ok(wizard) => self.active_wizard = Some(wizard),
+            Err(error) => self.status = error,
+        }
+    }
+
     fn new_campaign(&mut self) {
         match EvalWizard::new_campaign_from_runs(&self.runs, &self.campaigns_root) {
             Ok(wizard) => self.active_wizard = Some(wizard),
@@ -159,6 +166,7 @@ impl EvalRunPickerSurface {
             "Eval Home Help",
             vec![
                 "Open: open selected run or campaign",
+                "Run Suite: execute a discovered suite",
                 "New Campaign: create a campaign from discovered runs",
                 "Start Campaign: create from selected run",
                 "Attach Run: record selected run into a campaign",
@@ -201,6 +209,13 @@ impl EvalRunPickerSurface {
                     self.refresh();
                 }
                 Err(error) => self.status = format!("failed to create campaign: {error}"),
+            },
+            EvalWizardCompletion::RunSuite(options) => match bcode_eval::run_suite(&options) {
+                Ok(run) => {
+                    self.status = format!("completed run {}", run.manifest.run_id);
+                    self.refresh();
+                }
+                Err(error) => self.status = format!("failed to run suite: {error}"),
             },
             EvalWizardCompletion::RecordGeneration(options) => {
                 match bcode_eval::record_improvement_generation(options) {
@@ -267,6 +282,10 @@ impl EvalRunPickerSurface {
             }
             "start-campaign" => {
                 self.start_campaign_from_selected_run();
+                PluginTuiAction::Redraw
+            }
+            "run-suite" => {
+                self.run_suite();
                 PluginTuiAction::Redraw
             }
             "new-campaign" => {
@@ -395,6 +414,10 @@ impl PluginTuiSurface for EvalRunPickerSurface {
                     self.start_campaign_from_selected_run();
                     return PluginTuiAction::Redraw;
                 }
+                KeyCode::Char('u') => {
+                    self.run_suite();
+                    return PluginTuiAction::Redraw;
+                }
                 KeyCode::Char('n') => {
                     self.new_campaign();
                     return PluginTuiAction::Redraw;
@@ -424,6 +447,7 @@ impl PluginTuiSurface for EvalRunPickerSurface {
 #[derive(Debug, Clone)]
 enum EvalWizard {
     StartCampaign(Box<StartCampaignWizard>),
+    RunSuite(Box<RunSuiteWizard>),
     RecordGeneration(Box<RecordGenerationWizard>),
     DecideGeneration(Box<DecideGenerationWizard>),
     Help(HelpWizard),
@@ -434,6 +458,16 @@ struct HelpWizard {
     state: DialogState,
     title: &'static str,
     body: Vec<Line>,
+}
+
+#[derive(Debug, Clone)]
+struct RunSuiteWizard {
+    state: DialogState,
+    suite_choices: Vec<StartCampaignSuiteChoice>,
+    suite_index: usize,
+    output_root: PathBuf,
+    run_id: TextInputState,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -539,6 +573,7 @@ enum EvalWizardCompletion {
         suite_path: PathBuf,
         options: bcode_eval::EvalImprovementStartOptions,
     },
+    RunSuite(bcode_eval::EvalRunOptions),
     RecordGeneration(bcode_eval::EvalImprovementRecordOptions),
     DecideGeneration(bcode_eval::EvalImprovementDecisionOptions),
 }
@@ -550,6 +585,24 @@ impl EvalWizard {
             title,
             body: lines.into_iter().map(Line::from).collect(),
         })
+    }
+
+    fn run_suite_from_runs(
+        runs: &[EvalRunSummary],
+        output_root: &std::path::Path,
+    ) -> Result<Self, String> {
+        let choices = suite_choices_from_runs(runs);
+        if choices.is_empty() {
+            return Err("no suites with recorded paths are available".to_string());
+        }
+        Ok(Self::RunSuite(Box::new(RunSuiteWizard {
+            state: DialogState::new(),
+            suite_choices: choices,
+            suite_index: 0,
+            output_root: output_root.to_path_buf(),
+            run_id: text_state(""),
+            error: None,
+        })))
     }
 
     fn decide_generation(
@@ -594,25 +647,7 @@ impl EvalWizard {
         runs: &[EvalRunSummary],
         campaigns_root: &std::path::Path,
     ) -> Result<Self, String> {
-        let mut choices = Vec::new();
-        let mut seen = std::collections::BTreeSet::new();
-        for run in runs {
-            if !seen.insert(run.suite_id.clone()) {
-                continue;
-            }
-            let Ok(run_data) = EvalRunData::load(&run.run_dir) else {
-                continue;
-            };
-            let Some(suite_path) = run_data.result.manifest.suite_path else {
-                continue;
-            };
-            choices.push(StartCampaignSuiteChoice {
-                suite_id: run.suite_id.clone(),
-                suite_path,
-                baseline_run: Some(run.run_dir.clone()),
-                run_id: Some(run.run_id.clone()),
-            });
-        }
+        let choices = suite_choices_from_runs(runs);
         if choices.is_empty() {
             return Err("no runs with recorded suite paths are available".to_string());
         }
@@ -773,6 +808,7 @@ impl EvalWizard {
     fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
         match self {
             Self::StartCampaign(wizard) => wizard.render(area, frame),
+            Self::RunSuite(wizard) => wizard.render(area, frame),
             Self::RecordGeneration(wizard) => wizard.render(area, frame),
             Self::DecideGeneration(wizard) => wizard.render(area, frame),
             Self::Help(wizard) => wizard.render(area, frame),
@@ -804,6 +840,7 @@ impl EvalWizard {
         }
         let actions = match self {
             Self::StartCampaign(_) => wizard_actions("create"),
+            Self::RunSuite(_) => wizard_actions("run"),
             Self::RecordGeneration(_) => wizard_actions("record"),
             Self::DecideGeneration(wizard) => wizard_actions(match wizard.status {
                 bcode_eval_models::EvalImprovementVerdictStatus::Promoted => "promote",
@@ -826,6 +863,7 @@ impl EvalWizard {
     const fn title(&self) -> &'static str {
         match self {
             Self::StartCampaign(_) => "Start Improvement Campaign",
+            Self::RunSuite(_) => "Run Eval Suite",
             Self::RecordGeneration(_) => "Record Generation",
             Self::DecideGeneration(wizard) => match wizard.status {
                 bcode_eval_models::EvalImprovementVerdictStatus::Promoted => "Promote Generation",
@@ -838,6 +876,7 @@ impl EvalWizard {
     const fn dialog_state_mut(&mut self) -> &mut DialogState {
         match self {
             Self::StartCampaign(wizard) => &mut wizard.state,
+            Self::RunSuite(wizard) => &mut wizard.state,
             Self::RecordGeneration(wizard) => &mut wizard.state,
             Self::DecideGeneration(wizard) => &mut wizard.state,
             Self::Help(wizard) => &mut wizard.state,
@@ -866,13 +905,17 @@ impl EvalWizard {
                     RecordGenerationField::Rationale => RecordGenerationField::Summary,
                 }
             }
-            Self::DecideGeneration(_) | Self::Help(_) => {}
+            Self::RunSuite(_) | Self::DecideGeneration(_) | Self::Help(_) => {}
         }
     }
 
     fn cycle_choice(&mut self, forward: bool) {
         match self {
             Self::StartCampaign(wizard) if wizard.focus == StartCampaignField::Suite => {
+                wizard.suite_index =
+                    cycle_index(wizard.suite_choices.len(), wizard.suite_index, forward);
+            }
+            Self::RunSuite(wizard) => {
                 wizard.suite_index =
                     cycle_index(wizard.suite_choices.len(), wizard.suite_index, forward);
             }
@@ -906,6 +949,7 @@ impl EvalWizard {
     fn handle_inputs(&mut self, area: Rect, event: &Event) -> bool {
         match self {
             Self::StartCampaign(wizard) => wizard.handle_inputs(area, event),
+            Self::RunSuite(wizard) => wizard.handle_inputs(area, event),
             Self::RecordGeneration(wizard) => wizard.handle_inputs(area, event),
             Self::DecideGeneration(wizard) => wizard.handle_inputs(area, event),
             Self::Help(_) => false,
@@ -919,6 +963,15 @@ impl EvalWizard {
                     suite_path: wizard.suite_path(),
                     options: wizard.options(),
                 }),
+                Err(error) => {
+                    wizard.error = Some(error);
+                    EvalWizardOutcome::Redraw
+                }
+            },
+            Self::RunSuite(wizard) => match wizard.validate() {
+                Ok(()) => {
+                    EvalWizardOutcome::Complete(EvalWizardCompletion::RunSuite(wizard.options()))
+                }
                 Err(error) => {
                     wizard.error = Some(error);
                     EvalWizardOutcome::Redraw
@@ -943,6 +996,59 @@ impl EvalWizard {
                 }
             },
             Self::Help(_) => EvalWizardOutcome::Cancel,
+        }
+    }
+}
+
+impl RunSuiteWizard {
+    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+        let choice = &self.suite_choices[self.suite_index];
+        let mut body = vec![
+            Line::from(format!("Suite: {}", choice.suite_id)),
+            Line::from(format!("Path: {}", choice.suite_path.display())),
+            Line::from("Use arrows or click Suite to cycle choices."),
+        ];
+        if let Some(error) = &self.error {
+            body.push(Line::from(format!("Error: {error}")));
+        }
+        Dialog::new(&body, &wizard_actions("run"), eval_modal_theme())
+            .title("Run Eval Suite")
+            .sizing(wizard_sizing())
+            .render(area, &self.state, frame);
+        let layout = wizard_layout(area);
+        render_input_box(
+            layout.primary,
+            frame,
+            "Run id (optional)",
+            &mut self.run_id,
+            true,
+            1,
+        );
+    }
+
+    fn handle_inputs(&mut self, area: Rect, event: &Event) -> bool {
+        let layout = wizard_layout(area);
+        if event_click_in(event, layout.choice) {
+            self.suite_index = cycle_index(self.suite_choices.len(), self.suite_index, true);
+            return true;
+        }
+        handle_input_box(layout.primary, &mut self.run_id, event, true)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let choice = &self.suite_choices[self.suite_index];
+        bcode_eval::load_suite(&choice.suite_path)
+            .map(|_| ())
+            .map_err(|error| format!("suite is invalid: {error}"))
+    }
+
+    fn options(&self) -> bcode_eval::EvalRunOptions {
+        let choice = &self.suite_choices[self.suite_index];
+        let run_id = input_text(&self.run_id);
+        bcode_eval::EvalRunOptions {
+            suite_path: choice.suite_path.clone(),
+            output_root: self.output_root.clone(),
+            run_id: (!run_id.is_empty()).then_some(run_id),
         }
     }
 }
@@ -1422,6 +1528,29 @@ fn cycle_risk(
     cycle_value(&[Risk::Low, Risk::Medium, Risk::High], risk, forward)
 }
 
+fn suite_choices_from_runs(runs: &[EvalRunSummary]) -> Vec<StartCampaignSuiteChoice> {
+    let mut choices = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for run in runs {
+        if !seen.insert(run.suite_id.clone()) {
+            continue;
+        }
+        let Ok(run_data) = EvalRunData::load(&run.run_dir) else {
+            continue;
+        };
+        let Some(suite_path) = run_data.result.manifest.suite_path else {
+            continue;
+        };
+        choices.push(StartCampaignSuiteChoice {
+            suite_id: run.suite_id.clone(),
+            suite_path,
+            baseline_run: Some(run.run_dir.clone()),
+            run_id: Some(run.run_id.clone()),
+        });
+    }
+    choices
+}
+
 fn optional_path(value: &str) -> Option<PathBuf> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1502,6 +1631,7 @@ fn wizard_actions(primary: &'static str) -> Vec<ActionButton> {
             primary,
             match primary {
                 "create" => "Create",
+                "run" => "Run",
                 "record" => "Record",
                 "promote" => "Promote",
                 "reject" => "Reject",
@@ -1687,6 +1817,9 @@ impl EvalCampaignViewerSurface {
                     }
                     Err(error) => self.status = format!("failed to update generation: {error}"),
                 }
+            }
+            EvalWizardCompletion::RunSuite(_) => {
+                self.status = "run suite is only available from eval home".to_string();
             }
             EvalWizardCompletion::StartCampaign { .. } => {
                 self.status = "start campaign is only available from eval home".to_string();
@@ -4239,6 +4372,7 @@ fn format_signed_number(value: f64) -> String {
 fn picker_actions() -> Vec<ActionButton> {
     vec![
         ActionButton::new("open", "Enter Open"),
+        ActionButton::new("run-suite", "U Run Suite"),
         ActionButton::new("new-campaign", "N New Campaign"),
         ActionButton::new("start-campaign", "S Start Campaign"),
         ActionButton::new("attach-run", "A Attach Run"),
