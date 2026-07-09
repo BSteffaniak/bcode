@@ -4510,14 +4510,17 @@ impl OpenAiCompatibleProviderPlugin {
 }
 
 fn catalog_hints(settings: &Settings) -> ModelCatalogHints {
+    let provider_id = catalog_provider_id(settings).map(str::to_string);
     if settings.model_ids_are_explicit {
         return ModelCatalogHints {
-            provider_id: Some(catalog_provider_id(settings).to_string()),
+            provider_id,
             expansion: CatalogExpansionPolicy::None,
             support: None,
         };
     }
-    let provider_id = catalog_provider_id(settings);
+    let Some(provider_id) = provider_id else {
+        return ModelCatalogHints::default();
+    };
     let support = (provider_id == "openai").then(|| ModelCatalogSupportHint {
         provider: "openai".to_string(),
         auth_mode: if matches!(settings.auth, AuthSettings::ChatGpt { .. }) {
@@ -4526,11 +4529,16 @@ fn catalog_hints(settings: &Settings) -> ModelCatalogHints {
             "api_key"
         }
         .to_string(),
-        api_surface: settings.dialect.metadata_value().to_string(),
+        api_surface: if matches!(settings.auth, AuthSettings::ChatGpt { .. }) {
+            "chatgpt_codex"
+        } else {
+            settings.dialect.metadata_value()
+        }
+        .to_string(),
         integration: Some("bcode".to_string()),
     });
     ModelCatalogHints {
-        provider_id: Some(provider_id.to_string()),
+        provider_id: Some(provider_id),
         expansion: CatalogExpansionPolicy::SupportedOnly,
         support,
     }
@@ -4543,7 +4551,7 @@ fn model_list_request(request: &ServiceRequest) -> ModelListRequest {
 }
 
 fn apply_provider_static_metadata(settings: &Settings, models: Vec<ModelInfo>) -> Vec<ModelInfo> {
-    if catalog_provider_id(settings) != "xai" {
+    if catalog_provider_id(settings) != Some("xai") {
         return models;
     }
     models.into_iter().map(apply_xai_static_metadata).collect()
@@ -4669,14 +4677,19 @@ fn model_infos_from_items_without_catalog(
         .collect()
 }
 
-fn catalog_provider_id(settings: &Settings) -> &'static str {
+fn catalog_provider_id(settings: &Settings) -> Option<&'static str> {
     if discovery::is_xai_provider(
         Some(&settings.base_url),
         Some(settings.dialect.metadata_value()),
     ) {
-        "xai"
+        Some("xai")
+    } else if matches!(settings.auth, AuthSettings::ChatGpt { .. })
+        || settings.base_url.contains("api.openai.com")
+        || settings.base_url.contains("chatgpt.com")
+    {
+        Some("openai")
     } else {
-        "openai"
+        None
     }
 }
 

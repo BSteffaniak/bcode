@@ -95,21 +95,66 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelCatalogDiagnostics {
+    /// Embedded catalog revision.
+    pub embedded_revision: String,
+    /// Effective remote catalog revision, when cached or refreshed data is active.
+    pub remote_revision: Option<String>,
+    /// Whether remote catalog use is enabled.
+    pub remote_enabled: bool,
+    /// Last refresh failure.
+    pub last_refresh_error: Option<String>,
+    /// Whether a refresh is currently running.
+    pub refresh_in_progress: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct ModelCatalogResolver {
-    catalog: tokio::sync::RwLock<ModelCatalog>,
+    catalog: std::sync::Arc<tokio::sync::RwLock<std::sync::Arc<ModelCatalog>>>,
+    diagnostics: std::sync::Arc<tokio::sync::RwLock<ModelCatalogDiagnostics>>,
+    refresh_gate: std::sync::Arc<tokio::sync::Mutex<()>>,
+    options: RemoteCatalogOptions,
 }
 
 impl ModelCatalogResolver {
-    /// Create a resolver from the embedded catalog and opportunistically overlay remote data.
+    /// Create a resolver from embedded and usable cached catalog data.
+    ///
+    /// This constructor performs no network I/O.
     ///
     /// # Errors
     ///
-    /// Returns an error when the embedded catalog is invalid.
-    pub async fn new() -> Result<Self> {
-        let catalog = ModelCatalog::load_bundled_with_remote_overlay().await?;
+    /// Returns an error when the embedded catalog or HTTP client configuration is invalid.
+    pub fn new(options: RemoteCatalogOptions) -> Result<Self> {
+        let mut document = load_embedded_catalog()?;
+        let embedded_revision = document.catalog_revision.clone();
+        let mut remote_revision = None;
+        if !options.disabled {
+            let client = RemoteCatalogClient::new(options.clone())?;
+            if let Ok(remote) = client.cached_catalog() {
+                remote_revision = Some(remote.catalog_revision.clone());
+                overlay_remote_catalog(&mut document, &remote);
+            }
+            let provider_ids = document.providers.keys().cloned().collect::<Vec<_>>();
+            let snapshots = provider_ids
+                .iter()
+                .filter_map(|provider_id| client.cached_live_snapshot(provider_id).ok())
+                .collect::<Vec<_>>();
+            overlay_remote_live(&mut document, &snapshots);
+        }
         Ok(Self {
-            catalog: tokio::sync::RwLock::new(catalog),
+            catalog: std::sync::Arc::new(tokio::sync::RwLock::new(std::sync::Arc::new(
+                ModelCatalog::new(document),
+            ))),
+            diagnostics: std::sync::Arc::new(tokio::sync::RwLock::new(ModelCatalogDiagnostics {
+                embedded_revision,
+                remote_revision,
+                remote_enabled: !options.disabled,
+                last_refresh_error: None,
+                refresh_in_progress: false,
+            })),
+            refresh_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            options,
         })
     }
 
@@ -120,11 +165,63 @@ impl ModelCatalogResolver {
     /// Panics if the compile-time embedded catalog is invalid.
     #[must_use]
     pub fn embedded() -> Self {
-        Self {
-            catalog: tokio::sync::RwLock::new(
-                ModelCatalog::load_bundled().expect("embedded model catalog must be valid"),
-            ),
+        let options = RemoteCatalogOptions {
+            disabled: true,
+            ..RemoteCatalogOptions::default()
+        };
+        Self::new(options).expect("embedded model catalog must be valid")
+    }
+
+    /// Spawn a coalesced background refresh without delaying the caller.
+    pub fn spawn_refresh(&self) {
+        if self.options.disabled {
+            return;
         }
+        let resolver = self.clone();
+        tokio::spawn(async move {
+            resolver.refresh_now().await;
+        });
+    }
+
+    /// Refresh remote data and atomically replace the active snapshot on success.
+    pub async fn refresh_now(&self) {
+        let Ok(_gate) = self.refresh_gate.try_lock() else {
+            return;
+        };
+        self.diagnostics.write().await.refresh_in_progress = true;
+        let result = self.fetch_refreshed_catalog().await;
+        let mut diagnostics = self.diagnostics.write().await;
+        diagnostics.refresh_in_progress = false;
+        match result {
+            Ok((catalog, revision)) => {
+                *self.catalog.write().await = std::sync::Arc::new(catalog);
+                diagnostics.remote_revision = Some(revision);
+                diagnostics.last_refresh_error = None;
+            }
+            Err(error) => diagnostics.last_refresh_error = Some(error.to_string()),
+        }
+    }
+
+    async fn fetch_refreshed_catalog(&self) -> Result<(ModelCatalog, String)> {
+        let client = RemoteCatalogClient::new(self.options.clone())?;
+        let mut document = load_embedded_catalog()?;
+        let remote = client.fetch_catalog().await?;
+        let revision = remote.catalog_revision.clone();
+        overlay_remote_catalog(&mut document, &remote);
+        let provider_ids = document.providers.keys().cloned().collect::<Vec<_>>();
+        let mut snapshots = Vec::new();
+        for provider_id in &provider_ids {
+            if let Ok(snapshot) = client.fetch_live_snapshot(provider_id).await {
+                snapshots.push(snapshot);
+            }
+        }
+        overlay_remote_live(&mut document, &snapshots);
+        Ok((ModelCatalog::new(document), revision))
+    }
+
+    /// Return current resolver diagnostics.
+    pub async fn diagnostics(&self) -> ModelCatalogDiagnostics {
+        self.diagnostics.read().await.clone()
     }
 
     /// Resolve provider-returned models through the shared catalog policy.
@@ -132,44 +229,40 @@ impl ModelCatalogResolver {
         let Some(provider_id) = list.catalog.provider_id.as_deref() else {
             return list;
         };
-        let models = {
-            let catalog = self.catalog.read().await;
-            let resolved = match list.catalog.expansion {
-                bcode_model::CatalogExpansionPolicy::None => {
-                    catalog.merge_provider_models(provider_id, list.models, false)
-                }
-                bcode_model::CatalogExpansionPolicy::AllCatalogModels => {
-                    catalog.merge_provider_models(provider_id, list.models, true)
-                }
-                bcode_model::CatalogExpansionPolicy::SupportedOnly => {
-                    let mut resolved =
-                        catalog.merge_provider_models(provider_id, list.models, false);
-                    let mut seen = resolved
-                        .iter()
-                        .map(|model| model.model_id.clone())
-                        .collect::<std::collections::BTreeSet<_>>();
-                    let catalog_models = list.catalog.support.as_ref().map_or_else(
-                        || catalog.provider_models_as_model_info(provider_id),
-                        |support| {
-                            let target = ModelSupportTarget::new(
-                                support.provider.clone(),
-                                support.auth_mode.clone(),
-                                support.api_surface.clone(),
-                                support.integration.clone(),
-                            );
-                            catalog.provider_models_for_support_target(provider_id, &target, false)
-                        },
-                    );
-                    resolved.extend(
-                        catalog_models
-                            .into_iter()
-                            .filter(|model| seen.insert(model.model_id.clone())),
-                    );
-                    resolved
-                }
-            };
-            drop(catalog);
-            resolved
+        let catalog = self.catalog.read().await.clone();
+        let models = match list.catalog.expansion {
+            bcode_model::CatalogExpansionPolicy::None => {
+                catalog.merge_provider_models(provider_id, list.models, false)
+            }
+            bcode_model::CatalogExpansionPolicy::AllCatalogModels => {
+                catalog.merge_provider_models(provider_id, list.models, true)
+            }
+            bcode_model::CatalogExpansionPolicy::SupportedOnly => {
+                let mut resolved = catalog.merge_provider_models(provider_id, list.models, false);
+                let Some(support) = list.catalog.support.as_ref() else {
+                    return bcode_model::ModelList {
+                        models: resolved,
+                        catalog: list.catalog,
+                    };
+                };
+                let mut seen = resolved
+                    .iter()
+                    .map(|model| model.model_id.clone())
+                    .collect::<std::collections::BTreeSet<_>>();
+                let target = ModelSupportTarget::new(
+                    support.provider.clone(),
+                    support.auth_mode.clone(),
+                    support.api_surface.clone(),
+                    support.integration.clone(),
+                );
+                resolved.extend(
+                    catalog
+                        .provider_models_for_support_target(provider_id, &target, false)
+                        .into_iter()
+                        .filter(|model| seen.insert(model.model_id.clone())),
+                );
+                resolved
+            }
         };
         bcode_model::ModelList {
             models,

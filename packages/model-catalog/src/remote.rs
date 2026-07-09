@@ -83,6 +83,42 @@ impl RemoteCatalogClient {
         Ok(Self { options, http })
     }
 
+    /// Read a cached catalog without performing network I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no usable cache exists or cached JSON is invalid.
+    pub fn cached_catalog(&self) -> Result<CatalogDocument> {
+        self.read_usable_cache("catalog.json")
+    }
+
+    /// Read a cached provider-live snapshot without performing network I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no usable cache exists or cached JSON is invalid.
+    pub fn cached_live_snapshot(&self, provider_id: &str) -> Result<LiveCatalogSnapshot> {
+        self.read_usable_cache(&format!("live-{provider_id}.json"))
+    }
+
+    fn read_usable_cache<T>(&self, cache_name: &str) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        if self.options.disabled {
+            return Err(Error::RemoteCatalog(
+                "remote model catalog is disabled".to_string(),
+            ));
+        }
+        let path = self.options.cache_dir.join(cache_name);
+        if !cache_is_usable_stale(&path, self.options.max_stale) {
+            return Err(Error::RemoteCatalog(
+                "no usable remote model catalog cache".to_string(),
+            ));
+        }
+        read_cached_json(&path)
+    }
+
     /// Fetch the merged remote catalog, using a bounded cache fallback.
     ///
     /// # Errors

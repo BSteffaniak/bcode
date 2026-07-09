@@ -1665,7 +1665,9 @@ pub async fn run_with_static_bundled(
         sessions,
         plugins,
         ServerStateInit {
-            model_catalog: Some(bcode_model_catalog::ModelCatalogResolver::new().await?),
+            model_catalog: Some(bcode_model_catalog::ModelCatalogResolver::new(
+                bcode_model_catalog::RemoteCatalogOptions::default(),
+            )?),
             selected_provider_plugin_id: resolved_model.provider_plugin_id,
             selected_model_id: resolved_model.model_id,
             selected_provider_context,
@@ -1698,6 +1700,7 @@ pub async fn run_with_static_bundled(
         },
     ));
     state.start_catalog_event_forwarder();
+    state.model_catalog.spawn_refresh();
     interrupt_stale_ralph_runs_best_effort(&state);
     if config.daemon.idle_shutdown {
         state.start_idle_shutdown_watcher(Duration::from_secs(
