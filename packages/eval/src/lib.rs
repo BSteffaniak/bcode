@@ -12,12 +12,15 @@
 //! Leaf eval runner, judges, reports, comparisons, and baselines for Bcode.
 
 use bcode_eval_models::{
-    CURRENT_SCHEMA_VERSION, EvalArtifactRef, EvalBaseline, EvalCase, EvalCaseRunResult,
-    EvalComparisonReport, EvalComparisonVariant, EvalDiagnostic, EvalDiagnosticSeverity,
-    EvalExecutorKind, EvalIsolation, EvalJudgeConfig, EvalJudgeResult, EvalMeasurementSet,
-    EvalMetricDirection, EvalObservation, EvalRegexTarget, EvalRegressionReport,
-    EvalRepetitionResult, EvalRunManifest, EvalRunResult, EvalSuite, EvalVariant,
-    EvalVariantRunResult,
+    CURRENT_IMPROVEMENT_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION, EvalArtifactRef, EvalBaseline,
+    EvalCase, EvalCaseRunResult, EvalComparisonReport, EvalComparisonVariant, EvalDiagnostic,
+    EvalDiagnosticSeverity, EvalExecutorKind, EvalImprovementCampaign, EvalImprovementDelta,
+    EvalImprovementDeltaKind, EvalImprovementGeneration, EvalImprovementMetricDelta,
+    EvalImprovementMetricDeltaSet, EvalImprovementRisk, EvalImprovementVerdict,
+    EvalImprovementVerdictStatus, EvalIsolation, EvalJudgeConfig, EvalJudgeResult,
+    EvalMeasurementSet, EvalMetricDirection, EvalObservation, EvalRegexTarget,
+    EvalRegressionReport, EvalRepetitionResult, EvalRunManifest, EvalRunResult, EvalSuite,
+    EvalVariant, EvalVariantRunResult,
 };
 use regex::Regex;
 use serde::Serialize;
@@ -1530,6 +1533,463 @@ fn run_judge(
         start.elapsed().as_millis() as f64,
     );
     Ok(result)
+}
+
+/// Options for starting an eval improvement campaign.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalImprovementStartOptions {
+    /// Output root for campaign directories.
+    pub output_root: PathBuf,
+    /// Optional explicit campaign id.
+    pub campaign_id: Option<String>,
+    /// Optional campaign name.
+    pub name: Option<String>,
+    /// Optional baseline run directory or summary path.
+    pub baseline_run: Option<PathBuf>,
+}
+
+/// Options for manually recording an improvement generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalImprovementRecordOptions {
+    /// Campaign directory or campaign.json path.
+    pub campaign: PathBuf,
+    /// Parent generation id.
+    pub parent_id: Option<String>,
+    /// Branch name.
+    pub branch: String,
+    /// Delta kind.
+    pub delta_kind: EvalImprovementDeltaKind,
+    /// Delta summary.
+    pub summary: String,
+    /// Optional run directory or summary path.
+    pub run: Option<PathBuf>,
+    /// Optional patch path to copy into the generation delta directory.
+    pub patch: Option<PathBuf>,
+    /// Risk level.
+    pub risk: EvalImprovementRisk,
+    /// Optional rationale.
+    pub rationale: Option<String>,
+}
+
+/// Start an eval improvement campaign with a baseline generation.
+///
+/// # Errors
+///
+/// Returns an error when the suite cannot be loaded, artifacts cannot be written, or the campaign already exists.
+pub fn start_improvement_campaign(
+    suite_path: impl AsRef<Path>,
+    options: EvalImprovementStartOptions,
+) -> Result<EvalImprovementCampaign, EvalError> {
+    let suite_path = suite_path.as_ref();
+    let suite = load_suite(suite_path)?;
+    let now = unix_ms();
+    let campaign_id = options
+        .campaign_id
+        .unwrap_or_else(|| format!("{}-{now}", suite.id));
+    validate_id("campaign", &campaign_id)?;
+    let output_dir = options.output_root.join(&campaign_id);
+    if output_dir.exists() {
+        return Err(EvalError::Validation(format!(
+            "campaign already exists: {}",
+            output_dir.display()
+        )));
+    }
+    fs::create_dir_all(output_dir.join("generations/0000-baseline/delta"))?;
+    fs::create_dir_all(output_dir.join("branches"))?;
+    fs::create_dir_all(output_dir.join("reports"))?;
+    fs::copy(suite_path, output_dir.join("suite.snapshot.toml"))?;
+
+    let baseline_run = options.baseline_run.map(normalize_run_dir).transpose()?;
+    let campaign = EvalImprovementCampaign {
+        schema_version: CURRENT_IMPROVEMENT_SCHEMA_VERSION,
+        id: campaign_id,
+        name: options
+            .name
+            .unwrap_or_else(|| format!("{} improvement", suite.name)),
+        suite_path: suite_path.to_path_buf(),
+        suite_id: suite.id,
+        created_unix_ms: now,
+        output_dir: output_dir.clone(),
+        baseline_generation_id: "0000-baseline".to_string(),
+        latest_generation_id: Some("0000-baseline".to_string()),
+        best_generation_id: Some("0000-baseline".to_string()),
+        metadata: BTreeMap::new(),
+    };
+    let generation = EvalImprovementGeneration {
+        id: "0000-baseline".to_string(),
+        parent_id: None,
+        branch: "main".to_string(),
+        created_unix_ms: now,
+        delta: EvalImprovementDelta {
+            kind: EvalImprovementDeltaKind::Baseline,
+            summary: "Baseline generation".to_string(),
+            affected_files: Vec::new(),
+            affected_surfaces: Vec::new(),
+            patch_path: None,
+            overlay_paths: Vec::new(),
+            rationale: Some("Initial campaign baseline".to_string()),
+            expected_impact: None,
+            risk: EvalImprovementRisk::Low,
+        },
+        run_dir: baseline_run,
+        vs_parent: None,
+        vs_baseline: None,
+        verdict: EvalImprovementVerdict {
+            status: EvalImprovementVerdictStatus::Baseline,
+            rationale: Some("Baseline generation".to_string()),
+            promotable: false,
+        },
+        metadata: BTreeMap::new(),
+    };
+    write_json_pretty(output_dir.join("campaign.json"), &campaign)?;
+    write_generation(&output_dir, &generation)?;
+    write_campaign_report(&campaign)?;
+    Ok(campaign)
+}
+
+/// Record a manual improvement generation in a campaign.
+///
+/// # Errors
+///
+/// Returns an error when the campaign cannot be loaded, the parent is missing, or artifacts cannot be written.
+pub fn record_improvement_generation(
+    options: EvalImprovementRecordOptions,
+) -> Result<EvalImprovementGeneration, EvalError> {
+    let mut campaign = load_improvement_campaign(&options.campaign)?;
+    let campaign_dir = campaign.output_dir.clone();
+    let parent_id = options
+        .parent_id
+        .clone()
+        .or_else(|| campaign.latest_generation_id.clone())
+        .unwrap_or_else(|| campaign.baseline_generation_id.clone());
+    let parent = load_improvement_generation(&campaign_dir, &parent_id)?;
+    let next_id = next_generation_id(&campaign_dir)?;
+    let generation_dir = campaign_dir.join("generations").join(&next_id);
+    fs::create_dir_all(generation_dir.join("delta"))?;
+    let patch_path = if let Some(patch) = options.patch.as_ref() {
+        let destination = generation_dir.join("delta/patch.diff");
+        fs::copy(patch, &destination)?;
+        Some(PathBuf::from("delta/patch.diff"))
+    } else {
+        None
+    };
+    let run_dir = options.run.map(normalize_run_dir).transpose()?;
+    let vs_parent = metric_delta_for_runs(parent.run_dir.as_deref(), run_dir.as_deref())?;
+    let baseline = load_improvement_generation(&campaign_dir, &campaign.baseline_generation_id)?;
+    let vs_baseline = metric_delta_for_runs(baseline.run_dir.as_deref(), run_dir.as_deref())?;
+    let verdict = verdict_from_deltas(vs_parent.as_ref(), vs_baseline.as_ref());
+    let generation = EvalImprovementGeneration {
+        id: next_id.clone(),
+        parent_id: Some(parent_id),
+        branch: options.branch,
+        created_unix_ms: unix_ms(),
+        delta: EvalImprovementDelta {
+            kind: options.delta_kind,
+            summary: options.summary,
+            affected_files: Vec::new(),
+            affected_surfaces: Vec::new(),
+            patch_path,
+            overlay_paths: Vec::new(),
+            rationale: options.rationale,
+            expected_impact: None,
+            risk: options.risk,
+        },
+        run_dir,
+        vs_parent,
+        vs_baseline,
+        verdict,
+        metadata: BTreeMap::new(),
+    };
+    write_generation(&campaign_dir, &generation)?;
+    campaign.latest_generation_id = Some(next_id.clone());
+    if generation.verdict.status == EvalImprovementVerdictStatus::Improved {
+        campaign.best_generation_id = Some(next_id);
+    }
+    write_json_pretty(campaign_dir.join("campaign.json"), &campaign)?;
+    write_campaign_report(&campaign)?;
+    Ok(generation)
+}
+
+/// Load an eval improvement campaign.
+///
+/// # Errors
+///
+/// Returns an error when the campaign JSON cannot be read or decoded.
+pub fn load_improvement_campaign(
+    path: impl AsRef<Path>,
+) -> Result<EvalImprovementCampaign, EvalError> {
+    let path = path.as_ref();
+    let campaign_path = if path.is_dir() {
+        path.join("campaign.json")
+    } else {
+        path.to_path_buf()
+    };
+    let mut campaign =
+        serde_json::from_str::<EvalImprovementCampaign>(&fs::read_to_string(&campaign_path)?)?;
+    if campaign.output_dir.is_relative() {
+        campaign.output_dir = campaign_path
+            .parent()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+            .join(&campaign.output_dir);
+    }
+    Ok(campaign)
+}
+
+/// Load all generations for a campaign.
+///
+/// # Errors
+///
+/// Returns an error when the campaign or a generation cannot be read.
+pub fn load_improvement_generations(
+    campaign: impl AsRef<Path>,
+) -> Result<Vec<EvalImprovementGeneration>, EvalError> {
+    let campaign = load_improvement_campaign(campaign)?;
+    let generations_dir = campaign.output_dir.join("generations");
+    let mut generations = Vec::new();
+    for entry in fs::read_dir(generations_dir)? {
+        let entry = entry?;
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let generation_path = entry.path().join("generation.json");
+        if generation_path.exists() {
+            generations.push(serde_json::from_str::<EvalImprovementGeneration>(
+                &fs::read_to_string(generation_path)?,
+            )?);
+        }
+    }
+    generations.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(generations)
+}
+
+/// Render a Markdown improvement campaign report.
+#[must_use]
+pub fn render_improvement_campaign_markdown(
+    campaign: &EvalImprovementCampaign,
+    generations: &[EvalImprovementGeneration],
+) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "# Eval Improvement Campaign: {}\n\n",
+        campaign.name
+    ));
+    output.push_str(&format!("* Campaign: `{}`\n", campaign.id));
+    output.push_str(&format!("* Suite: `{}`\n", campaign.suite_id));
+    output.push_str(&format!(
+        "* Baseline generation: `{}`\n",
+        campaign.baseline_generation_id
+    ));
+    if let Some(best) = &campaign.best_generation_id {
+        output.push_str(&format!("* Best generation: `{best}`\n"));
+    }
+    output.push_str("\n| Generation | Parent | Branch | Delta | Pass rate | Score | Verdict |\n");
+    output.push_str("|---|---|---|---|---:|---:|---|\n");
+    for generation in generations {
+        let (pass_rate, score) = generation
+            .run_dir
+            .as_deref()
+            .and_then(|path| load_run_result(path).ok())
+            .map_or((None, None), |run| {
+                (Some(run_pass_rate(&run)), Some(best_overall_score(&run)))
+            });
+        output.push_str(&format!(
+            "| `{}` | {} | `{}` | {} | {} | {} | {:?} |\n",
+            generation.id,
+            generation
+                .parent_id
+                .as_ref()
+                .map_or_else(|| "—".to_string(), |id| format!("`{id}`")),
+            generation.branch,
+            generation.delta.summary.replace('|', "\\|"),
+            pass_rate.map_or_else(|| "—".to_string(), |value| format!("{:.1}%", value * 100.0)),
+            score.map_or_else(|| "—".to_string(), |value| format!("{value:.3}")),
+            generation.verdict.status,
+        ));
+    }
+    output
+}
+
+fn write_campaign_report(campaign: &EvalImprovementCampaign) -> Result<(), EvalError> {
+    let generations = load_improvement_generations(&campaign.output_dir).unwrap_or_default();
+    fs::write(
+        campaign.output_dir.join("reports/campaign.md"),
+        render_improvement_campaign_markdown(campaign, &generations),
+    )?;
+    Ok(())
+}
+
+fn write_generation(
+    campaign_dir: &Path,
+    generation: &EvalImprovementGeneration,
+) -> Result<(), EvalError> {
+    let generation_dir = campaign_dir.join("generations").join(&generation.id);
+    fs::create_dir_all(&generation_dir)?;
+    write_json_pretty(generation_dir.join("generation.json"), generation)?;
+    fs::write(
+        generation_dir.join("delta/summary.md"),
+        delta_markdown(generation),
+    )?;
+    Ok(())
+}
+
+fn delta_markdown(generation: &EvalImprovementGeneration) -> String {
+    format!(
+        "# Generation {} Delta\n\n* Kind: `{:?}`\n* Summary: {}\n* Risk: `{:?}`\n\n{}\n",
+        generation.id,
+        generation.delta.kind,
+        generation.delta.summary,
+        generation.delta.risk,
+        generation.delta.rationale.clone().unwrap_or_default()
+    )
+}
+
+fn load_improvement_generation(
+    campaign_dir: &Path,
+    id: &str,
+) -> Result<EvalImprovementGeneration, EvalError> {
+    Ok(serde_json::from_str::<EvalImprovementGeneration>(
+        &fs::read_to_string(
+            campaign_dir
+                .join("generations")
+                .join(id)
+                .join("generation.json"),
+        )?,
+    )?)
+}
+
+fn next_generation_id(campaign_dir: &Path) -> Result<String, EvalError> {
+    let generations = load_improvement_generations(campaign_dir)?;
+    let mut max_id = 0_u32;
+    for generation in generations {
+        if let Ok(value) = generation.id.parse::<u32>() {
+            max_id = max_id.max(value);
+        }
+    }
+    Ok(format!("{:04}", max_id + 1))
+}
+
+fn normalize_run_dir(path: PathBuf) -> Result<PathBuf, EvalError> {
+    if path.is_dir() {
+        Ok(path)
+    } else {
+        path.parent().map_or_else(
+            || {
+                Err(EvalError::Validation(
+                    "run summary has no parent directory".to_string(),
+                ))
+            },
+            |parent| Ok(parent.to_path_buf()),
+        )
+    }
+}
+
+fn metric_delta_for_runs(
+    before: Option<&Path>,
+    after: Option<&Path>,
+) -> Result<Option<EvalImprovementMetricDeltaSet>, EvalError> {
+    let Some(after) = after else {
+        return Ok(None);
+    };
+    let after = load_run_result(after)?;
+    let before = before.map(load_run_result).transpose()?;
+    Ok(Some(metric_delta_set(before.as_ref(), &after)))
+}
+
+fn metric_delta_set(
+    before: Option<&EvalRunResult>,
+    after: &EvalRunResult,
+) -> EvalImprovementMetricDeltaSet {
+    let mut before_metrics = before.map_or_else(BTreeMap::new, run_summary_metrics);
+    let after_metrics = run_summary_metrics(after);
+    for key in after_metrics.keys() {
+        before_metrics.entry(key.clone()).or_insert(0.0);
+    }
+    before_metrics
+        .into_iter()
+        .map(|(key, before_value)| {
+            let after_value = after_metrics.get(&key).copied();
+            let absolute = after_value.map(|value| value - before_value);
+            let percent = after_value.and_then(|value| {
+                if before_value.abs() < f64::EPSILON {
+                    None
+                } else {
+                    Some((value - before_value) / before_value * 100.0)
+                }
+            });
+            (
+                key,
+                EvalImprovementMetricDelta {
+                    before: Some(before_value),
+                    after: after_value,
+                    absolute,
+                    percent,
+                },
+            )
+        })
+        .collect()
+}
+
+fn run_summary_metrics(run: &EvalRunResult) -> BTreeMap<String, f64> {
+    let mut metrics = BTreeMap::new();
+    metrics.insert("pass_rate".to_string(), run_pass_rate(run));
+    metrics.insert("overall_score".to_string(), best_overall_score(run));
+    for variant in &run.variants {
+        for (key, value) in &variant.measurements {
+            metrics
+                .entry(key.clone())
+                .and_modify(|existing| *existing = existing.midpoint(*value))
+                .or_insert(*value);
+        }
+    }
+    metrics
+}
+
+fn run_pass_rate(run: &EvalRunResult) -> f64 {
+    if run.variants.is_empty() {
+        return 0.0;
+    }
+    run.variants
+        .iter()
+        .map(|variant| variant.pass_rate)
+        .sum::<f64>()
+        / run.variants.len() as f64
+}
+
+fn best_overall_score(run: &EvalRunResult) -> f64 {
+    run.variants
+        .iter()
+        .map(|variant| variant.score.overall)
+        .fold(0.0_f64, f64::max)
+}
+
+fn verdict_from_deltas(
+    vs_parent: Option<&EvalImprovementMetricDeltaSet>,
+    _vs_baseline: Option<&EvalImprovementMetricDeltaSet>,
+) -> EvalImprovementVerdict {
+    let status = vs_parent
+        .and_then(|metrics| metrics.get("pass_rate").and_then(|metric| metric.absolute))
+        .map_or(EvalImprovementVerdictStatus::NeedsReview, |delta| {
+            if delta > 0.0 {
+                EvalImprovementVerdictStatus::Improved
+            } else if delta < 0.0 {
+                EvalImprovementVerdictStatus::Regressed
+            } else {
+                EvalImprovementVerdictStatus::Mixed
+            }
+        });
+    EvalImprovementVerdict {
+        status,
+        rationale: Some("Derived from pass-rate delta against parent".to_string()),
+        promotable: status == EvalImprovementVerdictStatus::Improved,
+    }
+}
+
+fn write_json_pretty(path: impl AsRef<Path>, value: &impl Serialize) -> Result<(), EvalError> {
+    if let Some(parent) = path.as_ref().parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_string_pretty(value)?)?;
+    Ok(())
 }
 
 /// Create a useful eval suite skeleton on disk.

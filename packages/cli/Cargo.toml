@@ -17,6 +17,7 @@ bcode_code_review_models     = { workspace = true }
 bcode_config                 = { workspace = true }
 bcode_daemon_lifecycle       = { workspace = true }
 bcode_eval                   = { workspace = true }
+bcode_eval_models            = { workspace = true }
 bcode_ipc                    = { workspace = true }
 bcode_metrics                = { workspace = true }
 bcode_model                  = { workspace = true }

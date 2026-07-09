@@ -125,6 +125,20 @@ Measurements are raw, durable, and namespaced by string keys. Standard metrics i
 
 Future agent/session adapters should map existing provider/tool/session telemetry into eval measurements without changing core types.
 
+## Improvement Campaigns
+
+Self-improving eval work is tracked as durable campaigns under `target/bcode-evals/improvements`.
+A campaign contains a baseline generation and a lineage of later generations.
+Each generation records:
+
+* parent generation and branch
+* delta kind, summary, risk, rationale, patch, and overlays
+* optional eval run artifact directory
+* metric deltas versus parent and baseline
+* verdict and promotion eligibility
+
+This makes iterative prompt/tool/policy experiments replayable and auditable. The campaign history is append-oriented so users can inspect every change, jump back to earlier generations, and later branch new improvement paths without losing evidence.
+
 ## Artifact Layout
 
 Runs are stored under an output root, defaulting to `target/bcode-evals/runs`.

@@ -1280,6 +1280,70 @@ enum EvalCommand {
     },
     /// Open the eval run picker TUI directly.
     ViewerPicker,
+    /// Manage multi-generation eval improvement campaigns.
+    Improve {
+        /// Improvement campaign command.
+        #[command(subcommand)]
+        command: EvalImproveCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EvalImproveCommand {
+    /// Start an improvement campaign for a suite.
+    Start {
+        /// Suite TOML path.
+        suite: PathBuf,
+        /// Output root for campaign directories.
+        #[arg(long, default_value = "target/bcode-evals/improvements")]
+        output_root: PathBuf,
+        /// Optional explicit campaign id.
+        #[arg(long)]
+        campaign_id: Option<String>,
+        /// Optional campaign name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Optional baseline run directory or summary.json path.
+        #[arg(long)]
+        baseline_run: Option<PathBuf>,
+    },
+    /// Record a manual generation with an optional run and patch.
+    Record {
+        /// Campaign directory or campaign.json path.
+        campaign: PathBuf,
+        /// Parent generation id. Defaults to campaign latest.
+        #[arg(long)]
+        parent: Option<String>,
+        /// Branch name.
+        #[arg(long, default_value = "main")]
+        branch: String,
+        /// Delta kind, for example `system_prompt_overlay` or `tool_behavior_patch`.
+        #[arg(long, default_value = "mixed")]
+        kind: String,
+        /// Delta summary.
+        #[arg(long)]
+        summary: String,
+        /// Optional run directory or summary.json path.
+        #[arg(long)]
+        run: Option<PathBuf>,
+        /// Optional patch path to copy into generation artifacts.
+        #[arg(long)]
+        patch: Option<PathBuf>,
+        /// Risk level: low, medium, or high.
+        #[arg(long, default_value = "medium")]
+        risk: String,
+        /// Optional rationale.
+        #[arg(long)]
+        rationale: Option<String>,
+    },
+    /// Print campaign status and generation timeline.
+    Status {
+        /// Campaign directory or campaign.json path.
+        campaign: PathBuf,
+        /// Print JSON output.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1459,8 +1523,113 @@ async fn handle_eval_command(command: EvalCommand) -> Result<(), CliError> {
         EvalCommand::ViewerPicker => {
             bcode_tui::run_eval_viewer_picker(PathBuf::from(".")).await?;
         }
+        EvalCommand::Improve { command } => {
+            handle_eval_improve_command(command)?;
+        }
     }
     Ok(())
+}
+
+fn handle_eval_improve_command(command: EvalImproveCommand) -> Result<(), CliError> {
+    match command {
+        EvalImproveCommand::Start {
+            suite,
+            output_root,
+            campaign_id,
+            name,
+            baseline_run,
+        } => {
+            let campaign = bcode_eval::start_improvement_campaign(
+                suite,
+                bcode_eval::EvalImprovementStartOptions {
+                    output_root,
+                    campaign_id,
+                    name,
+                    baseline_run,
+                },
+            )?;
+            println!("improvement campaign: {}", campaign.id);
+            println!("path: {}", campaign.output_dir.display());
+        }
+        EvalImproveCommand::Record {
+            campaign,
+            parent,
+            branch,
+            kind,
+            summary,
+            run,
+            patch,
+            risk,
+            rationale,
+        } => {
+            let generation = bcode_eval::record_improvement_generation(
+                bcode_eval::EvalImprovementRecordOptions {
+                    campaign,
+                    parent_id: parent,
+                    branch,
+                    delta_kind: parse_improvement_delta_kind(&kind)?,
+                    summary,
+                    run,
+                    patch,
+                    risk: parse_improvement_risk(&risk)?,
+                    rationale,
+                },
+            )?;
+            println!("recorded generation {}", generation.id);
+        }
+        EvalImproveCommand::Status { campaign, json } => {
+            let campaign = bcode_eval::load_improvement_campaign(campaign)?;
+            let generations = bcode_eval::load_improvement_generations(&campaign.output_dir)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&(campaign, generations))?
+                );
+            } else {
+                print!(
+                    "{}",
+                    bcode_eval::render_improvement_campaign_markdown(&campaign, &generations)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_improvement_delta_kind(
+    value: &str,
+) -> Result<bcode_eval_models::EvalImprovementDeltaKind, CliError> {
+    use bcode_eval_models::EvalImprovementDeltaKind as Kind;
+    match value {
+        "baseline" => Ok(Kind::Baseline),
+        "system_prompt_overlay" => Ok(Kind::SystemPromptOverlay),
+        "system_prompt_patch" => Ok(Kind::SystemPromptPatch),
+        "tool_description_overlay" => Ok(Kind::ToolDescriptionOverlay),
+        "tool_schema_patch" => Ok(Kind::ToolSchemaPatch),
+        "tool_behavior_patch" => Ok(Kind::ToolBehaviorPatch),
+        "agent_profile_overlay" => Ok(Kind::AgentProfileOverlay),
+        "permission_policy_overlay" => Ok(Kind::PermissionPolicyOverlay),
+        "model_change" => Ok(Kind::ModelChange),
+        "eval_case_change" => Ok(Kind::EvalCaseChange),
+        "judge_change" => Ok(Kind::JudgeChange),
+        "scoring_change" => Ok(Kind::ScoringChange),
+        "mixed" => Ok(Kind::Mixed),
+        _ => Err(CliError::EvalCheckFailed(format!(
+            "unknown improvement delta kind: {value}"
+        ))),
+    }
+}
+
+fn parse_improvement_risk(value: &str) -> Result<bcode_eval_models::EvalImprovementRisk, CliError> {
+    use bcode_eval_models::EvalImprovementRisk as Risk;
+    match value {
+        "low" => Ok(Risk::Low),
+        "medium" => Ok(Risk::Medium),
+        "high" => Ok(Risk::High),
+        _ => Err(CliError::EvalCheckFailed(format!(
+            "unknown improvement risk: {value}"
+        ))),
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]

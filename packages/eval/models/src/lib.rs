@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+/// Current eval improvement campaign schema version.
+pub const CURRENT_IMPROVEMENT_SCHEMA_VERSION: u32 = 1;
+
 /// Current eval suite schema version.
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
@@ -619,6 +622,216 @@ pub struct EvalRegressionReport {
     pub regressed: bool,
     /// Diagnostics.
     pub diagnostics: Vec<EvalDiagnostic>,
+}
+
+/// Improvement campaign metadata for multi-generation eval self-improvement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvalImprovementCampaign {
+    /// Campaign schema version.
+    pub schema_version: u32,
+    /// Stable campaign id.
+    pub id: String,
+    /// Human-readable campaign name.
+    pub name: String,
+    /// Suite path used to create the campaign.
+    pub suite_path: PathBuf,
+    /// Suite id captured at campaign creation.
+    pub suite_id: String,
+    /// Unix timestamp in milliseconds when the campaign was created.
+    pub created_unix_ms: u128,
+    /// Campaign artifact root.
+    pub output_dir: PathBuf,
+    /// Baseline generation id.
+    pub baseline_generation_id: String,
+    /// Latest generation id on the main line.
+    #[serde(default)]
+    pub latest_generation_id: Option<String>,
+    /// Best known generation id.
+    #[serde(default)]
+    pub best_generation_id: Option<String>,
+    /// Arbitrary campaign metadata.
+    #[serde(default)]
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+/// Generation record for one eval improvement attempt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvalImprovementGeneration {
+    /// Generation id, for example `0003`.
+    pub id: String,
+    /// Parent generation id.
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    /// Branch name.
+    pub branch: String,
+    /// Unix timestamp in milliseconds when created.
+    pub created_unix_ms: u128,
+    /// Delta that produced this generation.
+    pub delta: EvalImprovementDelta,
+    /// Eval run directory for this generation, when available.
+    #[serde(default)]
+    pub run_dir: Option<PathBuf>,
+    /// Comparison against parent, when available.
+    #[serde(default)]
+    pub vs_parent: Option<EvalImprovementMetricDeltaSet>,
+    /// Comparison against baseline, when available.
+    #[serde(default)]
+    pub vs_baseline: Option<EvalImprovementMetricDeltaSet>,
+    /// Verdict for this generation.
+    pub verdict: EvalImprovementVerdict,
+    /// Arbitrary generation metadata.
+    #[serde(default)]
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+/// Improvement delta metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvalImprovementDelta {
+    /// Delta kind.
+    pub kind: EvalImprovementDeltaKind,
+    /// Short human-readable summary.
+    pub summary: String,
+    /// Affected files, relative to repository root when possible.
+    #[serde(default)]
+    pub affected_files: Vec<PathBuf>,
+    /// Runtime surfaces affected by this delta.
+    #[serde(default)]
+    pub affected_surfaces: Vec<String>,
+    /// Patch path relative to the generation directory.
+    #[serde(default)]
+    pub patch_path: Option<PathBuf>,
+    /// Overlay paths relative to the generation directory.
+    #[serde(default)]
+    pub overlay_paths: Vec<PathBuf>,
+    /// LLM or human rationale for this change.
+    #[serde(default)]
+    pub rationale: Option<String>,
+    /// Expected impact before running the generation.
+    #[serde(default)]
+    pub expected_impact: Option<String>,
+    /// Risk level.
+    pub risk: EvalImprovementRisk,
+}
+
+/// Kinds of eval improvement deltas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvalImprovementDeltaKind {
+    /// Baseline generation with no change.
+    Baseline,
+    /// Temporary system prompt overlay.
+    SystemPromptOverlay,
+    /// Patch to the real system prompt source/configuration.
+    SystemPromptPatch,
+    /// Temporary tool description overlay.
+    ToolDescriptionOverlay,
+    /// Patch to tool schema.
+    ToolSchemaPatch,
+    /// Patch to tool implementation behavior.
+    ToolBehaviorPatch,
+    /// Temporary agent profile overlay.
+    AgentProfileOverlay,
+    /// Temporary permission policy overlay.
+    PermissionPolicyOverlay,
+    /// Model or model-parameter change.
+    ModelChange,
+    /// Eval case change.
+    EvalCaseChange,
+    /// Judge change.
+    JudgeChange,
+    /// Score configuration change.
+    ScoringChange,
+    /// Multiple change kinds.
+    Mixed,
+}
+
+/// Risk level for an improvement proposal or delta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvalImprovementRisk {
+    /// Low-risk isolated overlay or documentation-only change.
+    Low,
+    /// Medium-risk behavior/configuration change.
+    Medium,
+    /// High-risk source, policy, or broad prompt change.
+    High,
+}
+
+/// Improvement verdict for a generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvalImprovementVerdict {
+    /// Verdict status.
+    pub status: EvalImprovementVerdictStatus,
+    /// Human-readable rationale.
+    #[serde(default)]
+    pub rationale: Option<String>,
+    /// Whether this generation is eligible for promotion.
+    pub promotable: bool,
+}
+
+/// Verdict status for an improvement generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvalImprovementVerdictStatus {
+    /// Baseline generation.
+    Baseline,
+    /// Improved against parent and/or baseline.
+    Improved,
+    /// Regressed against parent and/or baseline.
+    Regressed,
+    /// Mixed result with tradeoffs.
+    Mixed,
+    /// Needs human review or additional evals.
+    NeedsReview,
+    /// Rejected.
+    Rejected,
+    /// Promoted.
+    Promoted,
+}
+
+/// Metric deltas for comparing generations.
+pub type EvalImprovementMetricDeltaSet = BTreeMap<String, EvalImprovementMetricDelta>;
+
+/// One metric delta value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvalImprovementMetricDelta {
+    /// Previous value.
+    #[serde(default)]
+    pub before: Option<f64>,
+    /// Current value.
+    #[serde(default)]
+    pub after: Option<f64>,
+    /// Absolute delta, `after - before`.
+    #[serde(default)]
+    pub absolute: Option<f64>,
+    /// Percent delta.
+    #[serde(default)]
+    pub percent: Option<f64>,
+}
+
+/// Improvement proposal captured before a generation is created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvalImprovementProposal {
+    /// Proposal id.
+    pub id: String,
+    /// Proposed delta kind.
+    pub kind: EvalImprovementDeltaKind,
+    /// Proposal summary.
+    pub summary: String,
+    /// Evidence supporting the proposal.
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    /// Candidate change description.
+    pub candidate_change: String,
+    /// Expected impact.
+    #[serde(default)]
+    pub expected_impact: Option<String>,
+    /// Risk level.
+    pub risk: EvalImprovementRisk,
+    /// Whether source changes are required.
+    pub requires_code_change: bool,
+    /// Whether human review is required before promotion.
+    pub requires_human_review: bool,
 }
 
 const fn default_true() -> bool {
