@@ -1886,13 +1886,29 @@ const fn default_hide_direnv_prelude() -> bool {
 }
 
 /// Shell tool output handling configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "output")]
 pub struct ShellToolOutputConfig {
+    /// Whether shell commands are formatted for display in the terminal UI.
+    #[serde(default = "default_shell_format_commands")]
+    pub format_commands: bool,
     /// Passive output prelude gates that suppress output before a marker appears.
     #[config_doc(skip)]
     #[serde(default)]
     pub prelude_gates: Vec<ShellToolPreludeGateConfig>,
+}
+
+impl Default for ShellToolOutputConfig {
+    fn default() -> Self {
+        Self {
+            format_commands: default_shell_format_commands(),
+            prelude_gates: Vec::new(),
+        }
+    }
+}
+
+const fn default_shell_format_commands() -> bool {
+    true
 }
 
 /// Passive shell output prelude gate configuration.

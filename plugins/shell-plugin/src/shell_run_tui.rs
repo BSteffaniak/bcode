@@ -48,7 +48,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
             _ => serde_json::to_string_pretty(payload).unwrap_or_default(),
         });
 
-        let mut lines = shell_terminal_prompt_rows(payload);
+        let mut lines = shell_terminal_prompt_rows(payload, width);
         lines.extend(shell_status_rows(payload));
         lines.extend(terminal_viewer_rows(
             TerminalViewerInput {
@@ -82,7 +82,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
 
 fn shell_request_rows(payload: &serde_json::Value, width: u16) -> Vec<Line> {
     let Some(runtime) = payload.get("_bcode_runtime") else {
-        return shell_terminal_prompt_rows(payload);
+        return shell_terminal_prompt_rows(payload, width);
     };
     let output = runtime
         .get("output")
@@ -90,7 +90,7 @@ fn shell_request_rows(payload: &serde_json::Value, width: u16) -> Vec<Line> {
         .unwrap_or_default();
     let columns = payload_u16(runtime, "columns").unwrap_or(DEFAULT_TERMINAL_COLUMNS);
     let rows = payload_u16(runtime, "rows").unwrap_or(DEFAULT_TERMINAL_ROWS);
-    let mut lines = shell_terminal_prompt_rows(payload);
+    let mut lines = shell_terminal_prompt_rows(payload, width);
     lines.extend(shell_status_rows(runtime));
     lines.extend(terminal_viewer_rows(
         TerminalViewerInput {
@@ -133,34 +133,140 @@ fn shell_status_rows(payload: &serde_json::Value) -> Vec<Line> {
     ])]
 }
 
-fn shell_terminal_prompt_rows(payload: &serde_json::Value) -> Vec<Line> {
+fn shell_terminal_prompt_rows(payload: &serde_json::Value, width: u16) -> Vec<Line> {
     let arguments = payload.get("arguments").unwrap_or(payload);
     let command = arguments
         .get("command")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     let cwd = arguments.get("cwd").and_then(serde_json::Value::as_str);
+    let format_commands = arguments
+        .get("format_commands")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
     if command.is_empty() {
         return Vec::new();
     }
     let mut lines = Vec::new();
-    for (index, line) in command.lines().enumerate() {
-        let mut spans = Vec::new();
-        if index == 0 {
-            spans.push(Span::styled("  ", muted_style()));
-            if let Some(cwd) = cwd {
-                spans.push(Span::styled(short_cwd(cwd), path_style()));
-                spans.push(Span::styled(" ❯ ", prompt_style()));
-            } else {
-                spans.push(Span::styled("❯ ", prompt_style()));
-            }
+    for (source_index, source_line) in command.lines().enumerate() {
+        let prompt_width = if source_index == 0 {
+            prompt_spans(cwd).iter().map(span_width).sum()
         } else {
-            spans.push(Span::styled("    ", muted_style()));
+            4
+        };
+        let display_lines = if format_commands {
+            format_shell_command_line(source_line, width.saturating_sub(prompt_width))
+        } else {
+            vec![source_line.to_owned()]
+        };
+        for (display_index, line) in display_lines.iter().enumerate() {
+            let mut spans = Vec::new();
+            if source_index == 0 && display_index == 0 {
+                spans.extend(prompt_spans(cwd));
+            } else {
+                spans.push(Span::styled("    ", muted_style()));
+            }
+            spans.extend(shell_command_spans(line));
+            lines.push(Line::from_spans(spans));
         }
-        spans.extend(shell_command_spans(line));
-        lines.push(Line::from_spans(spans));
     }
     lines
+}
+
+fn prompt_spans(cwd: Option<&str>) -> Vec<Span> {
+    let mut spans = vec![Span::styled("  ", muted_style())];
+    if let Some(cwd) = cwd {
+        spans.push(Span::styled(short_cwd(cwd), path_style()));
+        spans.push(Span::styled(" ❯ ", prompt_style()));
+    } else {
+        spans.push(Span::styled("❯ ", prompt_style()));
+    }
+    spans
+}
+
+fn span_width(span: &Span) -> u16 {
+    u16::try_from(span.content.chars().count()).unwrap_or(u16::MAX)
+}
+
+fn format_shell_command_line(line: &str, available_width: u16) -> Vec<String> {
+    let tokens = shell_command_tokens(line);
+    if tokens.is_empty() {
+        return vec![String::new()];
+    }
+    let max_width = usize::from(available_width.max(24));
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for token in tokens {
+        let break_before = is_shell_break_operator(&token) && !current.is_empty();
+        let needs_space = !current.is_empty();
+        let next_len = current.len() + usize::from(needs_space) + token.len();
+        if break_before || next_len > max_width && !current.is_empty() {
+            lines.push(current);
+            current = String::new();
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(&token);
+        if is_shell_break_operator(&token) {
+            lines.push(current);
+            current = String::new();
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        vec![String::new()]
+    } else {
+        lines
+    }
+}
+
+fn shell_command_tokens(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for character in line.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            current.push(character);
+            escaped = true;
+            continue;
+        }
+        if let Some(quote_character) = quote {
+            current.push(character);
+            if character == quote_character {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            current.push(character);
+            quote = Some(character);
+            continue;
+        }
+        if character.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        current.push(character);
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn is_shell_break_operator(token: &str) -> bool {
+    matches!(token, "|" | "&&" | "||" | ";")
 }
 
 fn short_cwd(cwd: &str) -> String {
@@ -289,6 +395,63 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    #[test]
+    fn adapter_formats_long_shell_commands_by_default() {
+        let payload = serde_json::json!({
+            "command": "cargo test --workspace --all-targets && cargo clippy --workspace --all-targets -- -D warnings | tee /tmp/bcode-shell.log",
+            "cwd": "/Users/example/project"
+        });
+        let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            &ShellRunTuiVisualAdapter,
+            "bcode.tool.request.shell.run",
+            &payload,
+            64,
+        );
+        let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        assert!(rendered.contains("&&"), "{rendered}");
+        assert!(rendered.contains('|'), "{rendered}");
+        assert!(rendered.lines().count() > 1, "{rendered}");
+    }
+
+    #[test]
+    fn adapter_preserves_unformatted_shell_commands_when_disabled() {
+        let command = "cargo test --workspace --all-targets && cargo clippy --workspace --all-targets -- -D warnings";
+        let payload = serde_json::json!({
+            "command": command,
+            "format_commands": false
+        });
+        let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            &ShellRunTuiVisualAdapter,
+            "bcode.tool.request.shell.run",
+            &payload,
+            48,
+        );
+        let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        assert_eq!(rendered.lines().count(), 1, "{rendered}");
+        assert!(rendered.contains(command), "{rendered}");
+    }
+
+    #[test]
+    fn adapter_does_not_split_quoted_shell_tokens() {
+        let payload = serde_json::json!({
+            "command": "printf 'hello world from a quoted argument' && echo done"
+        });
+        let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            &ShellRunTuiVisualAdapter,
+            "bcode.tool.request.shell.run",
+            &payload,
+            32,
+        );
+        let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        assert!(
+            rendered.contains("'hello world from a quoted argument'"),
+            "{rendered}"
+        );
     }
 
     #[test]

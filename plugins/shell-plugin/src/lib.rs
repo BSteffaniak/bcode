@@ -44,6 +44,8 @@ enum ShellRunResult {
         retained_output_bytes: Option<u64>,
         columns: u16,
         rows: u16,
+        #[serde(default = "default_format_commands")]
+        format_commands: bool,
     },
     Captured {
         exit_code: Option<i32>,
@@ -68,6 +70,10 @@ const MAX_INLINE_TERMINAL_OUTPUT_BYTES: usize = 16 * 1024;
 const TERMINAL_PTY_STREAM_REF_KEY: &str = "terminal_pty_stream";
 const TERMINAL_PTY_STREAM_CONTENT_TYPE: &str =
     "application/x-bcode-terminal-pty-stream; charset=utf-8";
+
+const fn default_format_commands() -> bool {
+    true
+}
 
 /// shell plugin.
 #[derive(Default)]
@@ -114,6 +120,8 @@ struct ShellRunArguments {
     columns: Option<u16>,
     #[serde(default)]
     rows: Option<u16>,
+    #[serde(default)]
+    format_commands: Option<bool>,
 }
 
 impl ShellRunArguments {
@@ -148,7 +156,11 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
                     "cwd": { "type": "string" },
                     "timeout_ms": { "type": "integer", "minimum": 1 },
                     "columns": { "type": "integer", "minimum": 1 },
-                    "rows": { "type": "integer", "minimum": 1 }
+                    "rows": { "type": "integer", "minimum": 1 },
+                    "format_commands": {
+                        "type": "boolean",
+                        "description": "Format the displayed shell command for readability. Defaults to shell output configuration."
+                    }
                 }
             }),
             side_effect: ToolSideEffect::ExecuteProcess,
@@ -188,9 +200,16 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
                                 required: false,
                             },
                         ),
+                        (
+                            "format_commands".to_string(),
+                            bcode_tool::ToolVisualPayloadSelector {
+                                fields: vec!["format_commands".to_string()],
+                                literal: None,
+                                required: false,
+                            },
+                        ),
                     ]),
                 }),
-
             },
         }],
     })
@@ -427,6 +446,20 @@ struct ShellCommandPlan {
     prelude_marker: Option<String>,
 }
 
+fn shell_format_commands(
+    arguments: &ShellRunArguments,
+    output_config: &ShellToolOutputConfig,
+    arguments_json: &mut serde_json::Value,
+) -> bool {
+    let format_commands = arguments
+        .format_commands
+        .unwrap_or(output_config.format_commands);
+    if let Some(arguments) = arguments_json.as_object_mut() {
+        arguments.insert("format_commands".to_owned(), json!(format_commands));
+    }
+    format_commands
+}
+
 fn prelude_marker(tool_call_id: &str) -> String {
     let safe_id = tool_call_id
         .chars()
@@ -655,13 +688,15 @@ fn run_terminal_shell_command_inner(
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
     tool_call_id: &str,
     arguments: &ShellRunArguments,
-    arguments_json: serde_json::Value,
+    mut arguments_json: serde_json::Value,
     paths: TerminalRunPaths<'_>,
     environment: &impl bcode_config::ConfigEnvironment,
 ) -> Result<ToolInvocationResponse, String> {
     let timeout = Duration::from_millis(arguments.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
     let cwd = resolve_effective_cwd(arguments, paths.session_cwd);
     let shell_config = shell_config_with_environment(cwd.as_deref(), environment)?;
+    let format_commands =
+        shell_format_commands(arguments, &shell_config.output, &mut arguments_json);
     let env_config = shell_config.env;
     let columns = arguments.terminal_columns();
     let rows = arguments.terminal_rows();
@@ -756,6 +791,7 @@ fn run_terminal_shell_command_inner(
             stream_output: &stream_output,
             columns,
             rows,
+            format_commands,
         },
     )
 }
@@ -769,6 +805,7 @@ struct TerminalShellResponseInput<'a> {
     stream_output: &'a TerminalStreamOutput,
     columns: u16,
     rows: u16,
+    format_commands: bool,
 }
 
 fn terminal_shell_response(
@@ -827,6 +864,7 @@ fn terminal_shell_response(
                 ),
                 columns: input.columns,
                 rows: input.rows,
+                format_commands: input.format_commands,
             },
             input
                 .stream_output
@@ -1612,6 +1650,7 @@ mod tests {
                 timeout_ms: Some(100),
                 columns: None,
                 rows: None,
+                format_commands: None,
             },
             json!({}),
             TerminalRunPaths {
@@ -1651,6 +1690,7 @@ mod tests {
                 timeout_ms: Some(1_000),
                 columns: None,
                 rows: None,
+                format_commands: None,
             },
             json!({}),
             TerminalRunPaths {
@@ -1679,6 +1719,7 @@ mod tests {
                 timeout_ms: Some(5_000),
                 columns: Some(80),
                 rows: Some(24),
+                format_commands: None,
             },
             json!({}),
             TerminalRunPaths {
@@ -1723,6 +1764,7 @@ mod tests {
                 timeout_ms: Some(5_000),
                 columns: Some(80),
                 rows: Some(24),
+                format_commands: None,
             },
             json!({}),
             TerminalRunPaths {
@@ -1865,6 +1907,7 @@ mod tests {
                     ..bcode_config::ShellToolPreludeGateConfig::default()
                 },
             ],
+            ..ShellToolOutputConfig::default()
         });
 
         assert_eq!(markers.live, vec!["__READY__".to_string()]);
@@ -1962,6 +2005,7 @@ mod tests {
                     timeout_ms: None,
                     columns: Some(80),
                     rows: Some(24),
+                    format_commands: None,
                 },
                 cwd: None,
                 status: TerminalShellStatus {
@@ -1982,6 +2026,7 @@ mod tests {
                 },
                 columns: 80,
                 rows: 24,
+                format_commands: true,
             },
         )
         .expect("terminal response should encode");
@@ -2033,6 +2078,7 @@ mod tests {
                     timeout_ms: None,
                     columns: Some(80),
                     rows: Some(24),
+                    format_commands: None,
                 },
                 cwd: None,
                 status: TerminalShellStatus {
@@ -2053,6 +2099,7 @@ mod tests {
                 },
                 columns: 80,
                 rows: 24,
+                format_commands: true,
             },
         )
         .expect("terminal response should encode");
