@@ -44,7 +44,7 @@ pub fn home(snapshot: &SessionViewSnapshot, sessions: &[SessionSummary]) -> Cont
                         div color="#8b949e" font-size=12 { "No sessions loaded yet." }
                     } @else {
                         @for session in sessions {
-                            div padding="8, 0" border-bottom="1, #30363d" {
+                            anchor href=(format!("/session/{}", session.id)) text-decoration="none" {
                                 div color="#f0f6fc" font-size=13 { (session.title().unwrap_or("Untitled session")) }
                                 div color="#8b949e" font-size=11 { (session.working_directory.display().to_string()) }
                             }
