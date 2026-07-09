@@ -22,7 +22,7 @@ use bcode_model::{ModelParameters, ProviderRequestContext};
 use bcode_session_models::SessionId;
 use bcode_tool::{ToolDefinition, ToolInvocationRequest, ToolInvocationResponse};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -517,6 +517,229 @@ pub fn generate_object_builder<T>() -> GenerateObjectBuilder<T> {
     GenerateObjectBuilder::new()
 }
 
+/// Item produced by structured object streaming.
+#[derive(Debug)]
+pub enum ObjectStreamItem<T> {
+    /// Raw assistant text delta from the provider.
+    RawDelta(String),
+    /// Parsed partial JSON object state from the accumulated stream buffer.
+    Partial(serde_json::Value),
+    /// Parsed partial JSON object state that currently satisfies the configured schema.
+    ValidatedPartial(serde_json::Value),
+    /// Non-text runtime event forwarded from the underlying model stream.
+    Event(AgentEvent),
+    /// Final typed object and the completed runtime response metadata.
+    Finished {
+        /// Decoded structured object.
+        object: T,
+        /// Runtime response metadata.
+        response: GenerateTextResponse,
+    },
+    /// Error that terminated object streaming or final decoding.
+    Error(BcodeError),
+}
+
+/// Typed asynchronous stream of structured object events.
+#[derive(Debug)]
+pub struct ObjectStream<T> {
+    stream: AgentStream,
+    schema: serde_json::Value,
+    buffer: String,
+    pending: VecDeque<ObjectStreamItem<T>>,
+}
+
+impl<T> ObjectStream<T>
+where
+    T: DeserializeOwned,
+{
+    /// Receive the next structured object stream item.
+    pub async fn next(&mut self) -> Option<ObjectStreamItem<T>> {
+        if let Some(item) = self.pending.pop_front() {
+            return Some(item);
+        }
+        loop {
+            match self.stream.next().await? {
+                AgentStreamItem::Event(AgentEvent::TextDelta(delta)) => {
+                    self.buffer.push_str(&delta);
+                    self.pending.push_back(ObjectStreamItem::RawDelta(delta));
+                    if let Some(value) = json_value_from_text(&self.buffer) {
+                        self.pending
+                            .push_back(ObjectStreamItem::Partial(value.clone()));
+                        if validate_json_schema(&self.schema, &value).is_ok() {
+                            self.pending
+                                .push_back(ObjectStreamItem::ValidatedPartial(value));
+                        }
+                    }
+                }
+                AgentStreamItem::Event(event) => {
+                    self.pending.push_back(ObjectStreamItem::Event(event));
+                }
+                AgentStreamItem::Finished(response) => {
+                    let response = GenerateTextResponse::from(response);
+                    match decode_structured_output(&self.schema, &response.text) {
+                        Ok(object) => self
+                            .pending
+                            .push_back(ObjectStreamItem::Finished { object, response }),
+                        Err(error) => self.pending.push_back(ObjectStreamItem::Error(error)),
+                    }
+                }
+                AgentStreamItem::Error(error) => self
+                    .pending
+                    .push_back(ObjectStreamItem::Error(BcodeError::Runtime(error))),
+            }
+            if let Some(item) = self.pending.pop_front() {
+                return Some(item);
+            }
+        }
+    }
+}
+
+/// Builder for streaming structured object generation requests.
+#[derive(Debug, Clone)]
+pub struct StreamObjectBuilder<T> {
+    agent: AgentBuilder,
+    prompt: String,
+    options: Option<StructuredOutputOptions>,
+    cancellation: CancellationToken,
+    _output: std::marker::PhantomData<T>,
+}
+
+impl<T> Default for StreamObjectBuilder<T> {
+    fn default() -> Self {
+        Self {
+            agent: Agent::builder(),
+            prompt: String::new(),
+            options: None,
+            cancellation: CancellationToken::new(),
+            _output: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T> StreamObjectBuilder<T> {
+    /// Create a structured object streaming builder with default agent settings.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Configure the user prompt.
+    #[must_use]
+    pub fn prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.prompt = prompt.into();
+        self
+    }
+
+    /// Configure provider/model selection.
+    #[must_use]
+    pub fn model(mut self, model: impl Into<ModelSelector>) -> Self {
+        self.agent = self.agent.model_selector(model);
+        self
+    }
+
+    /// Configure the system prompt.
+    #[must_use]
+    pub fn system(mut self, system_prompt: impl Into<String>) -> Self {
+        self.agent = self.agent.system(system_prompt);
+        self
+    }
+
+    /// Configure structured-output options.
+    #[must_use]
+    pub fn options(mut self, options: StructuredOutputOptions) -> Self {
+        self.options = Some(options);
+        self
+    }
+
+    /// Add one metadata key/value pair sent to providers.
+    #[must_use]
+    pub fn metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.agent = self.agent.metadata(key, value);
+        self
+    }
+
+    /// Configure turn timeout.
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.agent = self.agent.timeout(timeout);
+        self
+    }
+
+    /// Configure cancellation for this request.
+    #[must_use]
+    pub fn cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+
+    /// Run the request with a caller-supplied provider and schema derived from `T`.
+    #[must_use]
+    pub fn run<P>(self, provider: P) -> ObjectStream<T>
+    where
+        T: DeserializeOwned + schemars::JsonSchema,
+        P: ModelProviderInvoker + 'static,
+    {
+        self.run_with_options(provider, StructuredOutputOptions::for_type::<T>())
+    }
+
+    /// Run the request with explicit structured-output options.
+    #[must_use]
+    pub fn run_with_options<P>(
+        self,
+        provider: P,
+        options: StructuredOutputOptions,
+    ) -> ObjectStream<T>
+    where
+        T: DeserializeOwned,
+        P: ModelProviderInvoker + 'static,
+    {
+        let prompt = structured_prompt(&self.prompt, &options);
+        let StructuredOutputOptions {
+            name,
+            schema,
+            strict,
+            max_repairs: _,
+        } = options;
+        let structured_output = bcode_model::StructuredOutputRequest {
+            name,
+            schema: schema.clone(),
+            strict,
+        };
+        let agent = self.agent.build();
+        let stream = agent.runtime.run_streaming_text_turn(
+            provider,
+            agent.turn_request_with_structured_output_messages_and_cancellation(
+                prompt,
+                Some(structured_output),
+                Vec::new(),
+                self.cancellation,
+            ),
+        );
+        ObjectStream {
+            stream,
+            schema,
+            buffer: String::new(),
+            pending: VecDeque::new(),
+        }
+    }
+}
+
+/// Start building a structured object streaming request.
+#[must_use]
+pub fn stream_object_builder<T>() -> StreamObjectBuilder<T> {
+    StreamObjectBuilder::new()
+}
+
+/// Stream a typed structured object with a caller-supplied provider using default settings.
+#[must_use]
+pub fn stream_object<T, P>(provider: P, prompt: impl Into<String>) -> ObjectStream<T>
+where
+    T: DeserializeOwned + schemars::JsonSchema,
+    P: ModelProviderInvoker + 'static,
+{
+    stream_object_builder().prompt(prompt).run(provider)
+}
+
 /// Generate text with a caller-supplied provider using default agent settings.
 ///
 /// This is the smallest lean-core text generation helper. It does not launch the TUI, require the
@@ -991,6 +1214,11 @@ fn json_object_slice(text: &str) -> Option<&str> {
     let start = text.find('{')?;
     let end = text.rfind('}')?;
     (start <= end).then_some(&text[start..=end])
+}
+
+fn json_value_from_text(text: &str) -> Option<serde_json::Value> {
+    let slice = json_object_slice(text)?;
+    serde_json::from_str(slice).ok()
 }
 
 fn validate_json_schema(schema: &serde_json::Value, value: &serde_json::Value) -> Result<()> {

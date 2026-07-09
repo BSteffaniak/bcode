@@ -1,4 +1,7 @@
-use bcode::{AgentEvent, AgentStreamItem, CancellationToken, ModelProviderInvoker, RuntimeFuture};
+use bcode::{
+    AgentEvent, AgentStreamItem, CancellationToken, ModelProviderInvoker, ObjectStreamItem,
+    RuntimeFuture,
+};
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, ModelTurnRequest, PollTurnEventsRequest,
     PollTurnEventsResponse, ProviderTurnEvent, StartTurnResponse, StopReason,
@@ -134,6 +137,26 @@ async fn main() -> bcode::Result<()> {
         .run(&mut object_provider)
         .await?;
     println!("{}", summary.title);
+
+    let mut streamed_object = bcode::stream_object::<Summary, _>(
+        ExampleProvider::text(r#"{"title":"streamed object"}"#),
+        "Stream JSON",
+    );
+    while let Some(item) = streamed_object.next().await {
+        match item {
+            ObjectStreamItem::RawDelta(delta) => print!("{delta}"),
+            ObjectStreamItem::ValidatedPartial(value) => println!("\nvalid partial: {value}"),
+            ObjectStreamItem::Finished { object, response } => {
+                println!(
+                    "\nstreamed object: {} stop={:?}",
+                    object.title, response.runtime.stop_reason
+                );
+                break;
+            }
+            ObjectStreamItem::Error(error) => return Err(error),
+            ObjectStreamItem::Partial(_) | ObjectStreamItem::Event(_) => {}
+        }
+    }
 
     Ok(())
 }
