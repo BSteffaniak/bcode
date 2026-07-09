@@ -13,7 +13,7 @@ use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface};
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::{Event, MouseEventKind};
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::Rect;
+use bmux_tui::geometry::{Insets, Rect, Size};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowOutcome, ActionRowState};
@@ -21,6 +21,8 @@ use bmux_tui_components::bar_chart::{
     BarChart, BarChartItem, BarChartPolicy, BarChartStyles, BarChartValuePlacement,
 };
 use bmux_tui_components::button::ButtonStyles;
+use bmux_tui_components::dialog::{Dialog, DialogOutcome, DialogState};
+use bmux_tui_components::modal_frame::{ModalSizing, ModalTheme};
 use bmux_tui_components::sparkline::{Sparkline, SparklinePolicy, SparklineStyles};
 use bmux_tui_components::tab_bar::{TabBar, TabBarOutcome, TabBarState, TabBarStyles, TabItem};
 use bmux_tui_components::table::{
@@ -57,6 +59,7 @@ pub struct EvalRunPickerSurface {
     action_state: ActionRowState,
     embedded_viewer: Option<EvalRunViewerSurface>,
     embedded_campaign: Option<EvalCampaignViewerSurface>,
+    active_wizard: Option<EvalWizard>,
     status: String,
     table_area: Rect,
     action_area: Rect,
@@ -82,6 +85,7 @@ impl EvalRunPickerSurface {
             action_state: ActionRowState::new(),
             embedded_viewer: None,
             embedded_campaign: None,
+            active_wizard: None,
             status,
             table_area: Rect::new(0, 0, 0, 0),
             action_area: Rect::new(0, 0, 0, 0),
@@ -124,6 +128,64 @@ impl EvalRunPickerSurface {
                 .map(|(index, _)| OverviewRow::Run(index)),
         );
         rows
+    }
+
+    fn selected_overview_row(&self) -> Option<OverviewRow> {
+        let index = self.table_state.selected()?;
+        self.overview_rows().get(index).copied()
+    }
+
+    fn selected_run_summary(&self) -> Option<&EvalRunSummary> {
+        match self.selected_overview_row()? {
+            OverviewRow::Run(index) => self.runs.get(index),
+            OverviewRow::Campaign(_) => None,
+        }
+    }
+
+    fn start_campaign_from_selected_run(&mut self) {
+        let Some(run) = self.selected_run_summary() else {
+            self.status = "select a run to start a campaign".to_string();
+            return;
+        };
+        match EvalWizard::start_campaign_from_run(run, &self.campaigns_root) {
+            Ok(wizard) => self.active_wizard = Some(wizard),
+            Err(error) => self.status = error,
+        }
+    }
+
+    fn attach_selected_run_to_campaign(&mut self) {
+        let Some(run) = self.selected_run_summary() else {
+            self.status = "select a run to attach to a campaign".to_string();
+            return;
+        };
+        match EvalWizard::attach_run_to_campaign(run, &self.campaigns) {
+            Ok(wizard) => self.active_wizard = Some(wizard),
+            Err(error) => self.status = error,
+        }
+    }
+
+    fn complete_wizard(&mut self, completion: EvalWizardCompletion) {
+        match completion {
+            EvalWizardCompletion::StartCampaign {
+                suite_path,
+                options,
+            } => match bcode_eval::start_improvement_campaign(suite_path, options) {
+                Ok(campaign) => {
+                    self.status = format!("created campaign {}", campaign.id);
+                    self.refresh();
+                }
+                Err(error) => self.status = format!("failed to create campaign: {error}"),
+            },
+            EvalWizardCompletion::RecordGeneration(options) => {
+                match bcode_eval::record_improvement_generation(options) {
+                    Ok(generation) => {
+                        self.status = format!("recorded generation {}", generation.id);
+                        self.refresh();
+                    }
+                    Err(error) => self.status = format!("failed to record generation: {error}"),
+                }
+            }
+        }
     }
 
     /// Open the currently selected run or campaign, if any.
@@ -174,6 +236,14 @@ impl EvalRunPickerSurface {
                 self.open_selected();
                 PluginTuiAction::Redraw
             }
+            "start-campaign" => {
+                self.start_campaign_from_selected_run();
+                PluginTuiAction::Redraw
+            }
+            "attach-run" => {
+                self.attach_selected_run_to_campaign();
+                PluginTuiAction::Redraw
+            }
             "refresh" => {
                 self.refresh();
                 PluginTuiAction::Redraw
@@ -202,6 +272,10 @@ impl PluginTuiSurface for EvalRunPickerSurface {
             viewer.render(area, frame);
             return;
         }
+        if let Some(wizard) = self.active_wizard.as_mut() {
+            wizard.render(area, frame);
+            return;
+        }
         render_header(area, frame, "Eval Overview", &self.status);
         let body = body_area(area);
         let (table_area, action_area, status_area) = split_body_actions(body);
@@ -221,6 +295,21 @@ impl PluginTuiSurface for EvalRunPickerSurface {
     }
 
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        if let Some(wizard) = self.active_wizard.as_mut() {
+            match wizard.handle_event(self.table_area, event) {
+                EvalWizardOutcome::Continue => return PluginTuiAction::None,
+                EvalWizardOutcome::Redraw => return PluginTuiAction::Redraw,
+                EvalWizardOutcome::Cancel => {
+                    self.active_wizard = None;
+                    return PluginTuiAction::Redraw;
+                }
+                EvalWizardOutcome::Complete(completion) => {
+                    self.active_wizard = None;
+                    self.complete_wizard(completion);
+                    return PluginTuiAction::Redraw;
+                }
+            }
+        }
         if let Some(viewer) = self.embedded_viewer.as_mut() {
             let action = viewer.handle_event(event, host);
             if matches!(action, PluginTuiAction::Close { .. }) {
@@ -264,6 +353,14 @@ impl PluginTuiSurface for EvalRunPickerSurface {
                     self.open_selected();
                     return PluginTuiAction::Redraw;
                 }
+                KeyCode::Char('s') => {
+                    self.start_campaign_from_selected_run();
+                    return PluginTuiAction::Redraw;
+                }
+                KeyCode::Char('a') => {
+                    self.attach_selected_run_to_campaign();
+                    return PluginTuiAction::Redraw;
+                }
                 KeyCode::Char('r') => {
                     self.refresh();
                     return PluginTuiAction::Redraw;
@@ -276,6 +373,318 @@ impl PluginTuiSurface for EvalRunPickerSurface {
         }
         PluginTuiAction::None
     }
+}
+
+#[derive(Debug, Clone)]
+enum EvalWizard {
+    StartCampaign(StartCampaignWizard),
+    RecordGeneration(RecordGenerationWizard),
+}
+
+#[derive(Debug, Clone)]
+struct StartCampaignWizard {
+    state: DialogState,
+    body: Vec<Line>,
+    suite_path: PathBuf,
+    options: bcode_eval::EvalImprovementStartOptions,
+}
+
+#[derive(Debug, Clone)]
+struct RecordGenerationWizard {
+    state: DialogState,
+    body: Vec<Line>,
+    options: bcode_eval::EvalImprovementRecordOptions,
+}
+
+#[derive(Debug, Clone)]
+enum EvalWizardOutcome {
+    Continue,
+    Redraw,
+    Cancel,
+    Complete(EvalWizardCompletion),
+}
+
+#[derive(Debug, Clone)]
+enum EvalWizardCompletion {
+    StartCampaign {
+        suite_path: PathBuf,
+        options: bcode_eval::EvalImprovementStartOptions,
+    },
+    RecordGeneration(bcode_eval::EvalImprovementRecordOptions),
+}
+
+impl EvalWizard {
+    fn start_campaign_from_run(
+        run: &EvalRunSummary,
+        campaigns_root: &std::path::Path,
+    ) -> Result<Self, String> {
+        let run_data = EvalRunData::load(&run.run_dir)
+            .map_err(|error| format!("failed to load selected run: {error}"))?;
+        let suite_path = run_data
+            .result
+            .manifest
+            .suite_path
+            .ok_or_else(|| "selected run does not record a suite path".to_string())?;
+        let campaign_id =
+            unique_campaign_id(campaigns_root, &format!("{}-improvement", run.suite_id));
+        let name = format!("{} improvement", run.suite_id);
+        let options = bcode_eval::EvalImprovementStartOptions {
+            output_root: campaigns_root.to_path_buf(),
+            campaign_id: Some(campaign_id.clone()),
+            name: Some(name.clone()),
+            baseline_run: Some(run.run_dir.clone()),
+            objective: bcode_eval_models::EvalImprovementObjective::Progression,
+        };
+        let body = vec![
+            Line::from("Create an improvement campaign from this run."),
+            Line::from(""),
+            Line::from(format!("Run: {}", run.run_id)),
+            Line::from(format!("Suite: {}", run.suite_id)),
+            Line::from(format!("Campaign: {campaign_id}")),
+            Line::from(format!("Name: {name}")),
+            Line::from("Objective: Track improvement over time"),
+            Line::from(""),
+            Line::from("Press Create to save the baseline generation."),
+        ];
+        Ok(Self::StartCampaign(StartCampaignWizard {
+            state: DialogState::new(),
+            body,
+            suite_path,
+            options,
+        }))
+    }
+
+    fn attach_run_to_campaign(
+        run: &EvalRunSummary,
+        campaigns: &[EvalCampaignSummary],
+    ) -> Result<Self, String> {
+        let campaign = campaigns
+            .iter()
+            .filter(|campaign| campaign.suite_id == run.suite_id)
+            .max_by_key(|campaign| campaign.modified_ms)
+            .ok_or_else(|| format!("no campaign found for suite {}", run.suite_id))?;
+        let summary = format!("Recorded run {}", run.run_id);
+        let parent_id = campaign.latest_generation_id.clone();
+        let options = bcode_eval::EvalImprovementRecordOptions {
+            campaign: campaign.campaign_dir.clone(),
+            parent_id,
+            branch: "main".to_string(),
+            delta_kind: bcode_eval_models::EvalImprovementDeltaKind::Mixed,
+            summary: summary.clone(),
+            run: Some(run.run_dir.clone()),
+            patch: None,
+            risk: bcode_eval_models::EvalImprovementRisk::Low,
+            rationale: Some("Recorded from the eval overview TUI.".to_string()),
+        };
+        let body = vec![
+            Line::from("Attach this run as the next campaign generation."),
+            Line::from(""),
+            Line::from(format!("Run: {}", run.run_id)),
+            Line::from(format!("Campaign: {}", campaign.campaign_id)),
+            Line::from(format!(
+                "Parent: {}",
+                options
+                    .parent_id
+                    .clone()
+                    .unwrap_or_else(|| "latest".to_string())
+            )),
+            Line::from(format!("Summary: {summary}")),
+            Line::from("Kind: Mixed / not sure"),
+            Line::from("Risk: Low"),
+        ];
+        Ok(Self::RecordGeneration(RecordGenerationWizard {
+            state: DialogState::new(),
+            body,
+            options,
+        }))
+    }
+
+    fn record_generation_for_campaign(
+        data: &EvalCampaignData,
+        selected: Option<&EvalImprovementGeneration>,
+    ) -> Result<Self, String> {
+        let runs_root = data
+            .campaign_dir
+            .parent()
+            .and_then(std::path::Path::parent)
+            .map_or_else(
+                || PathBuf::from("target/bcode-evals/runs"),
+                |root| root.join("runs"),
+            );
+        let used_runs = data
+            .generations
+            .iter()
+            .filter_map(|generation| generation.run_dir.as_ref())
+            .collect::<std::collections::BTreeSet<_>>();
+        let run = discover_runs(&runs_root)
+            .into_iter()
+            .filter(|run| run.suite_id == data.campaign.suite_id)
+            .find(|run| !used_runs.contains(&run.run_dir))
+            .ok_or_else(|| format!("no unused runs found for suite {}", data.campaign.suite_id))?;
+        let parent_id = selected
+            .map(|generation| generation.id.clone())
+            .or_else(|| data.campaign.latest_generation_id.clone());
+        let summary = format!("Recorded run {}", run.run_id);
+        let options = bcode_eval::EvalImprovementRecordOptions {
+            campaign: data.campaign_dir.clone(),
+            parent_id,
+            branch: "main".to_string(),
+            delta_kind: bcode_eval_models::EvalImprovementDeltaKind::Mixed,
+            summary: summary.clone(),
+            run: Some(run.run_dir.clone()),
+            patch: None,
+            risk: bcode_eval_models::EvalImprovementRisk::Low,
+            rationale: Some("Recorded from the campaign timeline TUI.".to_string()),
+        };
+        let body = vec![
+            Line::from("Record the latest unused run as a new generation."),
+            Line::from(""),
+            Line::from(format!("Campaign: {}", data.campaign.id)),
+            Line::from(format!("Run: {}", run.run_id)),
+            Line::from(format!(
+                "Parent: {}",
+                options
+                    .parent_id
+                    .clone()
+                    .unwrap_or_else(|| "latest".to_string())
+            )),
+            Line::from(format!("Summary: {summary}")),
+            Line::from("Kind: Mixed / not sure"),
+            Line::from("Risk: Low"),
+        ];
+        Ok(Self::RecordGeneration(RecordGenerationWizard {
+            state: DialogState::new(),
+            body,
+            options,
+        }))
+    }
+
+    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+        let (title, body, state, actions) = match self {
+            Self::StartCampaign(wizard) => (
+                "Start Improvement Campaign",
+                wizard.body.as_slice(),
+                &wizard.state,
+                wizard_actions("create"),
+            ),
+            Self::RecordGeneration(wizard) => (
+                "Record Generation",
+                wizard.body.as_slice(),
+                &wizard.state,
+                wizard_actions("record"),
+            ),
+        };
+        let dialog = Dialog::new(body, &actions, eval_modal_theme())
+            .title(title)
+            .sizing(ModalSizing::new(
+                Size::new(52, 12),
+                Size::new(92, 18),
+                Insets::all(2),
+            ));
+        dialog.render(area, state, frame);
+    }
+
+    fn handle_event(&mut self, area: Rect, event: &Event) -> EvalWizardOutcome {
+        if let Event::Key(stroke) = event {
+            match stroke.key {
+                KeyCode::Escape | KeyCode::Char('q') => return EvalWizardOutcome::Cancel,
+                KeyCode::Enter | KeyCode::Char('y') => return self.complete(),
+                _ => {}
+            }
+        }
+        let actions = match self {
+            Self::StartCampaign(_) => wizard_actions("create"),
+            Self::RecordGeneration(_) => wizard_actions("record"),
+        };
+        let outcome = match self {
+            Self::StartCampaign(wizard) => Dialog::new(&wizard.body, &actions, eval_modal_theme())
+                .title("Start Improvement Campaign")
+                .sizing(ModalSizing::new(
+                    Size::new(52, 12),
+                    Size::new(92, 18),
+                    Insets::all(2),
+                ))
+                .handle_event(area, &mut wizard.state, event),
+            Self::RecordGeneration(wizard) => {
+                Dialog::new(&wizard.body, &actions, eval_modal_theme())
+                    .title("Record Generation")
+                    .sizing(ModalSizing::new(
+                        Size::new(52, 12),
+                        Size::new(92, 18),
+                        Insets::all(2),
+                    ))
+                    .handle_event(area, &mut wizard.state, event)
+            }
+        };
+        match outcome {
+            DialogOutcome::Ignored => EvalWizardOutcome::Continue,
+            DialogOutcome::Redraw => EvalWizardOutcome::Redraw,
+            DialogOutcome::Action { id, .. } if id == "cancel" => EvalWizardOutcome::Cancel,
+            DialogOutcome::Action { .. } => self.complete(),
+        }
+    }
+
+    fn complete(&self) -> EvalWizardOutcome {
+        match self {
+            Self::StartCampaign(wizard) => {
+                EvalWizardOutcome::Complete(EvalWizardCompletion::StartCampaign {
+                    suite_path: wizard.suite_path.clone(),
+                    options: wizard.options.clone(),
+                })
+            }
+            Self::RecordGeneration(wizard) => EvalWizardOutcome::Complete(
+                EvalWizardCompletion::RecordGeneration(wizard.options.clone()),
+            ),
+        }
+    }
+}
+
+fn wizard_actions(primary: &'static str) -> Vec<ActionButton> {
+    vec![
+        ActionButton::new(
+            primary,
+            match primary {
+                "create" => "Create",
+                "record" => "Record",
+                _ => "Confirm",
+            },
+        ),
+        ActionButton::new("cancel", "Cancel"),
+    ]
+}
+
+const fn eval_modal_theme() -> ModalTheme {
+    ModalTheme::dark(ACCENT)
+}
+
+fn unique_campaign_id(root: &std::path::Path, base: &str) -> String {
+    let mut candidate = sanitize_id(base);
+    if !root.join(&candidate).exists() {
+        return candidate;
+    }
+    for index in 2..1000_u16 {
+        let next = format!("{}-{index}", sanitize_id(base));
+        if !root.join(&next).exists() {
+            return next;
+        }
+        candidate = next;
+    }
+    candidate
+}
+
+fn sanitize_id(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -291,6 +700,7 @@ pub struct EvalCampaignViewerSurface {
     action_state: ActionRowState,
     selected_run_viewer: Option<EvalRunViewerSurface>,
     detail_view: Option<EvalGenerationDetailSurface>,
+    active_wizard: Option<EvalWizard>,
     view_mode: CampaignViewMode,
     status: String,
     table_area: Rect,
@@ -324,6 +734,7 @@ impl EvalCampaignViewerSurface {
             action_state: ActionRowState::new(),
             selected_run_viewer: None,
             detail_view: None,
+            active_wizard: None,
             view_mode,
             status,
             table_area: Rect::new(0, 0, 0, 0),
@@ -368,11 +779,38 @@ impl EvalCampaignViewerSurface {
         self.status = format!("view mode: {}", self.view_mode.label());
     }
 
+    fn record_generation(&mut self) {
+        match EvalWizard::record_generation_for_campaign(&self.data, self.selected_generation()) {
+            Ok(wizard) => self.active_wizard = Some(wizard),
+            Err(error) => self.status = error,
+        }
+    }
+
+    fn complete_wizard(&mut self, completion: EvalWizardCompletion) {
+        match completion {
+            EvalWizardCompletion::RecordGeneration(options) => {
+                match bcode_eval::record_improvement_generation(options) {
+                    Ok(generation) => {
+                        self.status = format!("recorded generation {}", generation.id);
+                        if let Ok(data) = EvalCampaignData::load(&self.data.campaign_dir) {
+                            self.data = data;
+                        }
+                    }
+                    Err(error) => self.status = format!("failed to record generation: {error}"),
+                }
+            }
+            EvalWizardCompletion::StartCampaign { .. } => {
+                self.status = "start campaign is only available from eval home".to_string();
+            }
+        }
+    }
+
     fn handle_action(&mut self, action: &str) -> PluginTuiAction {
         match action {
             "details" => self.open_selected_detail(),
             "open-run" => self.open_selected_run(),
             "view-mode" => self.cycle_view_mode(),
+            "record-generation" => self.record_generation(),
             "refresh" => match EvalCampaignData::load(&self.data.campaign_dir) {
                 Ok(data) => {
                     self.data = data;
@@ -403,6 +841,10 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
         }
         if let Some(detail) = self.detail_view.as_mut() {
             detail.render(area, frame);
+            return;
+        }
+        if let Some(wizard) = self.active_wizard.as_mut() {
+            wizard.render(area, frame);
             return;
         }
         render_header(
@@ -438,6 +880,21 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
     }
 
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        if let Some(wizard) = self.active_wizard.as_mut() {
+            match wizard.handle_event(self.table_area, event) {
+                EvalWizardOutcome::Continue => return PluginTuiAction::None,
+                EvalWizardOutcome::Redraw => return PluginTuiAction::Redraw,
+                EvalWizardOutcome::Cancel => {
+                    self.active_wizard = None;
+                    return PluginTuiAction::Redraw;
+                }
+                EvalWizardOutcome::Complete(completion) => {
+                    self.active_wizard = None;
+                    self.complete_wizard(completion);
+                    return PluginTuiAction::Redraw;
+                }
+            }
+        }
         if let Some(viewer) = self.selected_run_viewer.as_mut() {
             let action = viewer.handle_event(event, host);
             if matches!(action, PluginTuiAction::Close { .. }) {
@@ -488,7 +945,7 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
                     self.cycle_view_mode();
                     return PluginTuiAction::Redraw;
                 }
-                KeyCode::Char('r') => return self.handle_action("refresh"),
+                KeyCode::Char('r') => return self.handle_action("record-generation"),
                 KeyCode::Char('q') | KeyCode::Escape => {
                     return PluginTuiAction::Close { outcome: None };
                 }
@@ -2592,7 +3049,8 @@ fn campaign_actions() -> Vec<ActionButton> {
         ActionButton::new("details", "Enter Details"),
         ActionButton::new("open-run", "O Open Run"),
         ActionButton::new("view-mode", "V View"),
-        ActionButton::new("refresh", "R Refresh"),
+        ActionButton::new("record-generation", "R Record"),
+        ActionButton::new("refresh", "Refresh"),
         ActionButton::new("back", "Esc Back"),
     ]
 }
@@ -2867,6 +3325,8 @@ fn format_signed_number(value: f64) -> String {
 fn picker_actions() -> Vec<ActionButton> {
     vec![
         ActionButton::new("open", "Enter Open"),
+        ActionButton::new("start-campaign", "S Start Campaign"),
+        ActionButton::new("attach-run", "A Attach Run"),
         ActionButton::new("refresh", "R Refresh"),
         ActionButton::new("close", "Esc Close"),
     ]

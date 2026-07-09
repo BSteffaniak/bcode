@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bcode_command       = { workspace = true }
+bcode_eval          = { workspace = true }
 bcode_eval_models   = { workspace = true }
 bcode_plugin_sdk    = { workspace = true }
 bmux_keyboard       = { workspace = true }
