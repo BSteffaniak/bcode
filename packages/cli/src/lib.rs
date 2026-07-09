@@ -205,7 +205,10 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Blims { command } => blims::handle_blims_command(command).await?,
         Commands::Eval { command } => Box::pin(handle_eval_command(command)).await?,
         Commands::Metrics { path, repo } => bcode_tui::run_metrics_dashboard(repo, path).await?,
-        Commands::Web => handle_web_command().await?,
+        Commands::Web {
+            bind,
+            allow_non_loopback,
+        } => handle_web_command(bind, allow_non_loopback).await?,
         Commands::Review { command } => Box::pin(handle_review_command(command)).await?,
         Commands::Ralph { repo } => handle_ralph_command(repo).await?,
         Commands::Plugin { command } => handle_plugin_command(command).await?,
@@ -263,13 +266,27 @@ async fn handle_plugin_command(command: PluginCommand) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn handle_web_command() -> Result<(), CliError> {
-    let state = bcode_web_render::WebRenderState::new(BcodeClient::default_endpoint());
+async fn handle_web_command(
+    bind: std::net::IpAddr,
+    allow_non_loopback: bool,
+) -> Result<(), CliError> {
+    let bind = bcode_web_render::validate_bind_address(bind, allow_non_loopback)
+        .map_err(|error| CliError::WebRender(error.to_owned()))?;
+    let access_token = random_web_access_token()?;
+    let state = bcode_web_render::WebRenderState::new(
+        BcodeClient::default_endpoint(),
+        access_token.clone(),
+    );
     let builder = bcode_web_render::init(&state)
         .await?
+        .with_actix_bind_address(bind.to_string())
         .with_viewport(bcode_web_render::VIEWPORT.clone());
     let app = bcode_web_render::build_app(builder)
         .map_err(|error| CliError::WebRender(error.to_string()))?;
+    eprintln!(
+        "Bcode web renderer: http://{}/?token={access_token}",
+        std::net::SocketAddr::new(bind, 8343)
+    );
     app.handle_serve()
         .map_err(|error| CliError::WebRender(error.to_string()))?;
     Ok(())
@@ -504,7 +521,7 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
         | Commands::Blims { .. }
         | Commands::Eval { .. }
         | Commands::Metrics { .. }
-        | Commands::Web
+        | Commands::Web { .. }
         | Commands::Review { .. }
         | Commands::Ralph { .. }
         | Commands::Plugin { .. }
@@ -1004,7 +1021,14 @@ enum Commands {
         repo: PathBuf,
     },
     /// Serve the `HyperChad` web renderer.
-    Web,
+    Web {
+        /// Address to bind. Defaults to IPv4 loopback.
+        #[arg(long, default_value_t = bcode_web_render::DEFAULT_BIND_ADDRESS)]
+        bind: std::net::IpAddr,
+        /// Explicitly allow binding to a non-loopback address.
+        #[arg(long, requires = "bind")]
+        allow_non_loopback: bool,
+    },
     Review {
         #[command(subcommand)]
         command: Option<ReviewCommand>,
@@ -6088,6 +6112,14 @@ fn oauth_callback_url_from_text(input: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
+fn random_web_access_token() -> Result<String, CliError> {
+    let mut data = [0_u8; 32];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut data)
+        .map_err(|error| CliError::WebRender(error.to_string()))?;
+    Ok(URL_SAFE_NO_PAD.encode(data))
+}
+
 fn random_urlsafe(bytes: usize) -> Result<String, CliError> {
     let mut data = vec![0_u8; bytes];
     rand::rngs::OsRng
@@ -9062,4 +9094,46 @@ fn print_model_usage_event(
         usage.cache_write_input_tokens,
         usage.reasoning_tokens,
     );
+}
+
+#[cfg(test)]
+mod web_command_tests {
+    use super::*;
+
+    #[test]
+    fn web_command_defaults_to_loopback_without_external_opt_in() {
+        let cli = Cli::try_parse_from(["bcode", "web"]).expect("web command should parse");
+        let Some(Commands::Web {
+            bind,
+            allow_non_loopback,
+        }) = cli.command
+        else {
+            panic!("expected web command");
+        };
+
+        assert_eq!(bind, bcode_web_render::DEFAULT_BIND_ADDRESS);
+        assert!(!allow_non_loopback);
+    }
+
+    #[test]
+    fn web_command_parses_explicit_external_bind_opt_in() {
+        let cli =
+            Cli::try_parse_from(["bcode", "web", "--bind", "0.0.0.0", "--allow-non-loopback"])
+                .expect("external web bind should parse with opt-in");
+        let Some(Commands::Web {
+            bind,
+            allow_non_loopback,
+        }) = cli.command
+        else {
+            panic!("expected web command");
+        };
+
+        assert_eq!(
+            bind,
+            "0.0.0.0"
+                .parse::<std::net::IpAddr>()
+                .expect("address should parse")
+        );
+        assert!(allow_non_loopback);
+    }
 }

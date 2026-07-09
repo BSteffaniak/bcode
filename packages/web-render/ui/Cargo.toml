@@ -26,6 +26,7 @@ hyperchad_renderer = { workspace = true }
 hyperchad_template = { workspace = true }
 hyperchad_transformer = { workspace = true }
 hyperchad_transformer_models = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
 [features]

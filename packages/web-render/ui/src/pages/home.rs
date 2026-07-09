@@ -1,15 +1,68 @@
 //! Home page for the Bcode web renderer.
 
+use std::collections::BTreeMap;
+use std::sync::LazyLock;
+
 use bcode_session_models::SessionSummary;
 use bcode_session_view_models::{
-    InteractionViewSummary, PermissionView, SessionViewSnapshot, ToolInvocationViewStatus,
-    TranscriptViewItemKind,
+    InteractionViewSummary, PermissionView, PluginVisualView, SessionViewSnapshot,
+    ToolInvocationViewStatus, TranscriptViewItemKind,
 };
 use hyperchad::template::{Containers, container};
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+struct QuestionSnapshot {
+    request: QuestionRequest,
+    answers: Vec<QuestionAnswer>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuestionRequest {
+    questions: Vec<Question>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Question {
+    header: Option<String>,
+    #[serde(rename = "question")]
+    text: String,
+    options: Vec<QuestionOption>,
+    custom: bool,
+    required: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuestionOption {
+    label: String,
+    value: Option<String>,
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuestionAnswer {
+    question_index: usize,
+    selected: Vec<String>,
+    custom: Option<String>,
+}
+
+type VisualAdapter = fn(&PluginVisualView) -> Option<Containers>;
+
+static VISUAL_ADAPTERS: LazyLock<BTreeMap<(&'static str, u32), VisualAdapter>> =
+    LazyLock::new(|| {
+        BTreeMap::from([(
+            ("bcode.tool.request.shell.run", 1),
+            render_shell_request as VisualAdapter,
+        )])
+    });
 
 /// Render the Bcode web renderer shell.
 #[must_use]
-pub fn home(snapshot: &SessionViewSnapshot, sessions: &[SessionSummary]) -> Containers {
+pub fn home(
+    snapshot: &SessionViewSnapshot,
+    sessions: &[SessionSummary],
+    access_token: &str,
+) -> Containers {
     let title = snapshot
         .title
         .as_deref()
@@ -21,9 +74,9 @@ pub fn home(snapshot: &SessionViewSnapshot, sessions: &[SessionSummary]) -> Cont
         })
         .unwrap_or("No session attached");
     let status = if snapshot.session_id.is_some() {
-        "connected"
+        "daemon connected · session attached"
     } else {
-        "ready"
+        "daemon connected · no active session"
     };
 
     container! {
@@ -45,7 +98,7 @@ pub fn home(snapshot: &SessionViewSnapshot, sessions: &[SessionSummary]) -> Cont
                         div color="#8b949e" font-size=12 { "No sessions loaded yet." }
                     } @else {
                         @for session in sessions {
-                            anchor href=(format!("/session/{}", session.id)) text-decoration="none" {
+                            anchor href=(format!("/session/{}?token={access_token}", session.id)) text-decoration="none" {
                                 div color="#f0f6fc" font-size=13 { (session.title().unwrap_or("Untitled session")) }
                                 div color="#8b949e" font-size=11 { (session.working_directory.display().to_string()) }
                             }
@@ -71,6 +124,10 @@ pub fn home(snapshot: &SessionViewSnapshot, sessions: &[SessionSummary]) -> Cont
                         }
                     }
 
+                    @if !snapshot.runtime_work.is_empty() {
+                        (runtime_work_section(&snapshot.runtime_work))
+                    }
+
                     section background="#161b22" border="1, #30363d" border-radius=10 padding=16 margin-bottom=18 {
                         h2 color="#f0f6fc" font-size=16 margin-bottom=14 { "transcript" }
                         @if snapshot.transcript.items.is_empty() {
@@ -86,7 +143,7 @@ pub fn home(snapshot: &SessionViewSnapshot, sessions: &[SessionSummary]) -> Cont
                         section background="#161b22" border="1, #30363d" border-radius=10 padding=16 margin-bottom=18 {
                             h2 color="#f0f6fc" font-size=16 margin-bottom=14 { "interactions" }
                             @for interaction in &snapshot.interactions {
-                                (interaction_request(interaction, snapshot.session_id))
+                                (interaction_request(interaction, snapshot.session_id, access_token))
                             }
                         }
                     }
@@ -95,7 +152,7 @@ pub fn home(snapshot: &SessionViewSnapshot, sessions: &[SessionSummary]) -> Cont
                         section background="#161b22" border="1, #30363d" border-radius=10 padding=16 margin-bottom=18 {
                             h2 color="#f0f6fc" font-size=16 margin-bottom=14 { "permissions" }
                             @for permission in &snapshot.permissions {
-                                (permission_request(permission, snapshot.session_id))
+                                (permission_request(permission, snapshot.session_id, access_token))
                             }
                         }
                     }
@@ -107,7 +164,7 @@ pub fn home(snapshot: &SessionViewSnapshot, sessions: &[SessionSummary]) -> Cont
                                 (message)
                             }
                         }
-                        (composer(snapshot))
+                        (composer(snapshot, access_token))
                     }
                 }
             }
@@ -115,8 +172,31 @@ pub fn home(snapshot: &SessionViewSnapshot, sessions: &[SessionSummary]) -> Cont
     }
 }
 
-fn composer(snapshot: &SessionViewSnapshot) -> Containers {
-    let action = "/actions/submit-message";
+fn runtime_work_section(runtime_work: &[bcode_session_view_models::RuntimeWorkView]) -> Containers {
+    container! {
+        section background="#161b22" border="1, #30363d" border-radius=10 padding=16 margin-bottom=18 {
+            h2 color="#f0f6fc" font-size=16 margin-bottom=14 { "runtime work" }
+            @for work in runtime_work {
+                div background="#0d1117" border="1, #30363d" border-radius=6 padding=10 margin-bottom=8 {
+                    div color="#f0f6fc" {
+                        (work.work_id.to_string()) " · " (format!("{:?}", work.status))
+                    }
+                    @if let Some(message) = &work.message {
+                        div color="#8b949e" font-size=12 margin-top=4 { (message) }
+                    }
+                    @if let (Some(completed), Some(total)) = (work.completed_units, work.total_units) {
+                        div color="#58a6ff" font-size=11 margin-top=4 {
+                            (completed.to_string()) "/" (total.to_string())
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn composer(snapshot: &SessionViewSnapshot, access_token: &str) -> Containers {
+    let action = format!("/actions/submit-message?token={access_token}");
     container! {
         div {
             form hx-post=(action) hx-target="#bcode-web-shell" hx-swap=this background="#0d1117" border="1, #30363d" border-radius=8 padding=12 {
@@ -125,7 +205,7 @@ fn composer(snapshot: &SessionViewSnapshot) -> Containers {
                 }
                 input type=hidden name="placement" value="steering";
                 @if let Some(session_id) = snapshot.session_id {
-                    textarea name="text" rows="5" placeholder="Send a message to this session" hx-post=(format!("/actions/update-draft/{session_id}")) hx-trigger="change" hx-target="#bcode-web-shell" hx-swap=this width=100% padding=10 border="1, #30363d" border-radius=6 background="#010409" color="#c9d1d9" {
+                    textarea name="text" rows="5" placeholder="Send a message to this session" hx-post=(format!("/actions/update-draft/{session_id}?token={access_token}")) hx-trigger="change" hx-target="#bcode-web-shell" hx-swap=this width=100% padding=10 border="1, #30363d" border-radius=6 background="#010409" color="#c9d1d9" {
                         (snapshot.composer.draft)
                     }
                 } @else {
@@ -138,7 +218,7 @@ fn composer(snapshot: &SessionViewSnapshot) -> Containers {
                 }
             }
             @if let Some(session_id) = snapshot.session_id {
-                form hx-post="/actions/cancel-turn" hx-target="#bcode-web-shell" hx-swap=this margin-top=10 {
+                form hx-post=(format!("/actions/cancel-turn?token={access_token}")) hx-target="#bcode-web-shell" hx-swap=this margin-top=10 {
                     input type=hidden name="session_id" value=(session_id.to_string());
                     input type=hidden name="clear_queue" value="true";
                     button type=submit background="#da3633" color=white border-radius=6 padding="8, 14" {
@@ -153,6 +233,7 @@ fn composer(snapshot: &SessionViewSnapshot) -> Containers {
 fn interaction_request(
     interaction: &InteractionViewSummary,
     session_id: Option<bcode_session_models::SessionId>,
+    access_token: &str,
 ) -> Containers {
     container! {
         div border="1, #58a6ff" border-radius=8 padding=10 margin-bottom=10 {
@@ -160,35 +241,186 @@ fn interaction_request(
                 (interaction.title.as_deref().unwrap_or("Interactive request"))
             }
             div color="#8b949e" font-size=12 margin-bottom=8 { (interaction.kind) }
-            @if let Some(snapshot) = &interaction.snapshot {
+            @if interaction.kind == "bcode.question" {
+                @if let Some(snapshot) = interaction.snapshot.as_ref().and_then(|value| serde_json::from_value::<QuestionSnapshot>(value.clone()).ok()) {
+                    (question_interaction(&snapshot, interaction, session_id, access_token))
+                } @else if let Some(snapshot) = &interaction.snapshot {
+                    (json_panel("controller snapshot", snapshot))
+                }
+            } @else if let Some(snapshot) = &interaction.snapshot {
                 (json_panel("controller snapshot", snapshot))
             }
             @if let Some(session_id) = session_id {
-                form hx-post="/actions/interaction" hx-target="#bcode-web-shell" hx-swap=this margin-top=10 {
-                    input type=hidden name="session_id" value=(session_id.to_string());
-                    input type=hidden name="interaction_id" value=(interaction.interaction_id.clone());
-                    div gap=8 {
-                        select name="kind" selected="submit" padding=8 border="1, #30363d" border-radius=6 background="#010409" color="#c9d1d9" {
-                            option value="activate" { "activate control" }
-                            option value="change" { "change control value" }
-                            option value="focus" { "focus control" }
-                            option value="blur" { "blur control" }
-                            option value="navigate" { "navigate focus" }
-                            option value="submit" { "submit interaction" }
-                            option value="cancel" { "cancel interaction" }
-                        }
-                        input name="control_id" type=text placeholder="control id (activate/change/focus/blur)" padding=8 border="1, #30363d" border-radius=6 background="#010409" color="#c9d1d9";
-                        input name="value" type=text placeholder="JSON value (change only, e.g. &quot;answer&quot;)" padding=8 border="1, #30363d" border-radius=6 background="#010409" color="#c9d1d9";
-                        select name="direction" selected="next" padding=8 border="1, #30363d" border-radius=6 background="#010409" color="#c9d1d9" {
-                            option value="next" { "next" }
-                            option value="previous" { "previous" }
-                        }
+                (generic_interaction_controls(interaction, session_id, access_token))
+            }
+        }
+    }
+}
+
+fn generic_interaction_controls(
+    interaction: &InteractionViewSummary,
+    session_id: bcode_session_models::SessionId,
+    access_token: &str,
+) -> Containers {
+    container! {
+        details margin-top=10 {
+            summary color="#8b949e" { "generic semantic controls" }
+            form hx-post=(format!("/actions/interaction?token={access_token}")) hx-target="#bcode-web-shell" hx-swap=this margin-top=8 {
+                input type=hidden name="session_id" value=(session_id.to_string());
+                input type=hidden name="interaction_id" value=(interaction.interaction_id.clone());
+                div gap=8 {
+                    select name="kind" selected="submit" padding=8 border="1, #30363d" border-radius=6 background="#010409" color="#c9d1d9" {
+                        option value="activate" { "activate control" }
+                        option value="change" { "change control value" }
+                        option value="focus" { "focus control" }
+                        option value="blur" { "blur control" }
+                        option value="navigate" { "navigate focus" }
+                        option value="submit" { "submit interaction" }
+                        option value="cancel" { "cancel interaction" }
                     }
-                    button type=submit background="#1f6feb" color=white border-radius=6 padding="6, 12" margin-top=8 {
-                        "send interaction input"
+                    input name="control_id" type=text placeholder="control id (activate/change/focus/blur)" padding=8 border="1, #30363d" border-radius=6 background="#010409" color="#c9d1d9";
+                    input name="value" type=text placeholder="JSON value (change only)" padding=8 border="1, #30363d" border-radius=6 background="#010409" color="#c9d1d9";
+                    input type=hidden name="value_is_json" value="true";
+                    select name="direction" selected="next" padding=8 border="1, #30363d" border-radius=6 background="#010409" color="#c9d1d9" {
+                        option value="next" { "next" }
+                        option value="previous" { "previous" }
+                    }
+                }
+                button type=submit background="#1f6feb" color=white border-radius=6 padding="6, 12" margin-top=8 {
+                    "send interaction input"
+                }
+            }
+        }
+    }
+}
+
+fn question_interaction(
+    snapshot: &QuestionSnapshot,
+    interaction: &InteractionViewSummary,
+    session_id: Option<bcode_session_models::SessionId>,
+    access_token: &str,
+) -> Containers {
+    container! {
+        div gap=12 {
+            @for (question_index, question) in snapshot.request.questions.iter().enumerate() {
+                div background="#0d1117" border="1, #30363d" border-radius=6 padding=10 {
+                    @if let Some(header) = &question.header {
+                        div color="#58a6ff" font-size=12 margin-bottom=4 { (header) }
+                    }
+                    div color="#f0f6fc" margin-bottom=8 {
+                        (question.text.clone())
+                        @if question.required { span color="#f85149" { " *" } }
+                    }
+                    @if let Some(session_id) = session_id {
+                        div gap=6 {
+                            @for (option_index, option) in question.options.iter().enumerate() {
+                                (question_option(
+                                    snapshot,
+                                    interaction,
+                                    session_id,
+                                    access_token,
+                                    question_index,
+                                    option_index,
+                                    option,
+                                ))
+                            }
+                            @if question.custom || question.options.is_empty() {
+                                (question_custom_answer(
+                                    snapshot,
+                                    interaction,
+                                    session_id,
+                                    access_token,
+                                    question_index,
+                                ))
+                            }
+                        }
                     }
                 }
             }
+            @if let Some(session_id) = session_id {
+                div direction=row gap=8 {
+                    (question_terminal_action(interaction, session_id, access_token, "submit", "submit answers", "#238636"))
+                    (question_terminal_action(interaction, session_id, access_token, "cancel", "cancel", "#da3633"))
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn question_option(
+    snapshot: &QuestionSnapshot,
+    interaction: &InteractionViewSummary,
+    session_id: bcode_session_models::SessionId,
+    access_token: &str,
+    question_index: usize,
+    option_index: usize,
+    option: &QuestionOption,
+) -> Containers {
+    let selected_value = option
+        .value
+        .as_deref()
+        .map_or_else(|| option_index.to_string(), ToOwned::to_owned);
+    let selected = snapshot
+        .answers
+        .iter()
+        .find(|answer| answer.question_index == question_index)
+        .is_some_and(|answer| answer.selected.contains(&selected_value));
+    container! {
+        form hx-post=(format!("/actions/interaction?token={access_token}")) hx-target="#bcode-web-shell" hx-swap=this {
+            input type=hidden name="session_id" value=(session_id.to_string());
+            input type=hidden name="interaction_id" value=(interaction.interaction_id.clone());
+            input type=hidden name="kind" value="activate";
+            input type=hidden name="control_id" value=(format!("question-{question_index}.option-{option_index}"));
+            button type=submit width=100% background=(if selected { "#1f6feb" } else { "#161b22" }) color="#f0f6fc" border="1, #30363d" border-radius=6 padding=8 {
+                (if selected { "✓ " } else { "" }) (option.label.clone())
+                @if let Some(description) = &option.description {
+                    div color="#8b949e" font-size=11 margin-top=3 { (description) }
+                }
+            }
+        }
+    }
+}
+
+fn question_custom_answer(
+    snapshot: &QuestionSnapshot,
+    interaction: &InteractionViewSummary,
+    session_id: bcode_session_models::SessionId,
+    access_token: &str,
+    question_index: usize,
+) -> Containers {
+    let value = snapshot
+        .answers
+        .iter()
+        .find(|answer| answer.question_index == question_index)
+        .and_then(|answer| answer.custom.as_deref())
+        .unwrap_or_default();
+    container! {
+        form hx-post=(format!("/actions/interaction?token={access_token}")) hx-target="#bcode-web-shell" hx-swap=this direction=row gap=6 {
+            input type=hidden name="session_id" value=(session_id.to_string());
+            input type=hidden name="interaction_id" value=(interaction.interaction_id.clone());
+            input type=hidden name="kind" value="change";
+            input type=hidden name="control_id" value=(format!("question-{question_index}.custom"));
+            input name="value" type=text value=(value) placeholder="custom answer" flex=1 padding=8 border="1, #30363d" border-radius=6 background="#010409" color="#c9d1d9";
+            button type=submit background="#1f6feb" color=white border-radius=6 padding="6, 12" { "set" }
+        }
+    }
+}
+
+fn question_terminal_action(
+    interaction: &InteractionViewSummary,
+    session_id: bcode_session_models::SessionId,
+    access_token: &str,
+    kind: &str,
+    label: &str,
+    color: &str,
+) -> Containers {
+    container! {
+        form hx-post=(format!("/actions/interaction?token={access_token}")) hx-target="#bcode-web-shell" hx-swap=this {
+            input type=hidden name="session_id" value=(session_id.to_string());
+            input type=hidden name="interaction_id" value=(interaction.interaction_id.clone());
+            input type=hidden name="kind" value=(kind);
+            button type=submit background=(color) color=white border-radius=6 padding="6, 12" { (label) }
         }
     }
 }
@@ -196,6 +428,7 @@ fn interaction_request(
 fn permission_request(
     permission: &PermissionView,
     session_id: Option<bcode_session_models::SessionId>,
+    access_token: &str,
 ) -> Containers {
     container! {
         div border="1, #f2cc60" border-radius=8 padding=10 margin-bottom=10 {
@@ -207,7 +440,7 @@ fn permission_request(
                 }
             } @else if let Some(session_id) = session_id {
                 div direction=row gap=8 margin-top=10 {
-                    form hx-post="/actions/permission" hx-target="#bcode-web-shell" hx-swap=this {
+                    form hx-post=(format!("/actions/permission?token={access_token}")) hx-target="#bcode-web-shell" hx-swap=this {
                         input type=hidden name="session_id" value=(session_id.to_string());
                         input type=hidden name="permission_id" value=(permission.permission_id.clone());
                         input type=hidden name="approved" value="true";
@@ -219,7 +452,7 @@ fn permission_request(
                         }
                         button type=submit background="#238636" color=white border-radius=6 padding="6, 12" { "approve" }
                     }
-                    form hx-post="/actions/permission" hx-target="#bcode-web-shell" hx-swap=this {
+                    form hx-post=(format!("/actions/permission?token={access_token}")) hx-target="#bcode-web-shell" hx-swap=this {
                         input type=hidden name="session_id" value=(session_id.to_string());
                         input type=hidden name="permission_id" value=(permission.permission_id.clone());
                         input type=hidden name="approved" value="false";
@@ -277,7 +510,7 @@ fn transcript_item_body(kind: &TranscriptViewItemKind) -> Containers {
                     }
                 }
                 @if let Some(visual) = &tool.request_visual {
-                    (json_panel("request visual", &visual.generic_payload))
+                    (render_plugin_visual("request visual", visual))
                 }
                 @if let Some(result) = &tool.result {
                     (json_panel("semantic result", &serde_json::to_value(result).unwrap_or(serde_json::Value::Null)))
@@ -306,9 +539,45 @@ fn transcript_item_body(kind: &TranscriptViewItemKind) -> Containers {
             }
         },
         TranscriptViewItemKind::PluginVisual { visual } => {
-            json_panel("plugin visual", &visual.generic_payload)
+            render_plugin_visual("plugin visual", visual)
         }
     }
+}
+
+fn render_plugin_visual(title: &str, visual: &PluginVisualView) -> Containers {
+    let rich = VISUAL_ADAPTERS
+        .get(&(
+            visual.descriptor.schema.as_str(),
+            visual.descriptor.schema_version,
+        ))
+        .and_then(|adapter| adapter(visual));
+    container! {
+        @if let Some(rich) = rich {
+            (rich)
+        }
+        (json_panel(title, &visual.generic_payload))
+    }
+}
+
+fn render_shell_request(visual: &PluginVisualView) -> Option<Containers> {
+    let payload = &visual.descriptor.payload;
+    let arguments = payload.get("arguments").unwrap_or(payload);
+    let command = arguments.get("command")?.as_str()?;
+    let cwd = arguments.get("cwd").and_then(serde_json::Value::as_str);
+    let output = payload
+        .pointer("/_bcode_runtime/output")
+        .and_then(serde_json::Value::as_str);
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            @if let Some(cwd) = cwd {
+                div color="#8b949e" font-size=11 margin-bottom=4 { (cwd) }
+            }
+            div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (command) }
+            @if let Some(output) = output {
+                div color="#c9d1d9" font-family="monospace" white-space="preserve-wrap" border-top="1, #30363d" margin-top=8 padding-top=8 { (output) }
+            }
+        }
+    })
 }
 
 fn json_panel(title: &str, value: &serde_json::Value) -> Containers {
@@ -346,10 +615,125 @@ const fn tool_status_color(status: ToolInvocationViewStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bcode_session_models::{PluginVisualDescriptor, ToolArtifact};
-    use bcode_session_view_models::{
-        PluginVisualView, ToolArtifactView, ToolInvocationView, ToolResultView, ToolTimingView,
+    use bcode_session_models::{
+        InteractiveToolRenderTarget, InteractiveToolTurnBehavior, PluginVisualDescriptor,
+        RuntimeWorkId, RuntimeWorkStatus, ToolArtifact,
     };
+    use bcode_session_view_models::{
+        RuntimeWorkView, ToolArtifactView, ToolInvocationView, ToolResultView, ToolTimingView,
+    };
+
+    #[test]
+    fn web_shell_renders_all_primary_regions_including_runtime_state() {
+        let mut snapshot = SessionViewSnapshot::empty();
+        snapshot.session_id = Some(bcode_session_models::SessionId::new());
+        snapshot.runtime_work.push(RuntimeWorkView {
+            work_id: RuntimeWorkId::new("work-1"),
+            status: RuntimeWorkStatus::Running,
+            message: Some("indexing".to_owned()),
+            completed_units: Some(2),
+            total_units: Some(4),
+            updated_at_ms: Some(1),
+        });
+
+        let rendered = format!("{:?}", home(&snapshot, &[], "secret-token"));
+        assert!(rendered.contains("sessions"));
+        assert!(rendered.contains("transcript"));
+        assert!(rendered.contains("composer"));
+        assert!(rendered.contains("daemon connected · session attached"));
+        assert!(rendered.contains("runtime work"));
+        assert!(rendered.contains("work-1"));
+    }
+
+    #[test]
+    fn access_token_is_propagated_to_browser_actions() {
+        let rendered = format!(
+            "{:?}",
+            home(&SessionViewSnapshot::empty(), &[], "secret-token")
+        );
+
+        assert!(rendered.contains("/actions/submit-message?token=secret-token"));
+    }
+
+    #[test]
+    fn question_snapshot_renders_polished_controls_and_generic_fallback() {
+        let interaction = InteractionViewSummary {
+            interaction_id: "interaction-1".to_owned(),
+            kind: "bcode.question".to_owned(),
+            tool_call_id: Some("call-1".to_owned()),
+            title: Some("Choose".to_owned()),
+            snapshot: Some(serde_json::json!({
+                "request": {
+                    "questions": [{
+                        "header": "Decision",
+                        "question": "Proceed?",
+                        "options": [{"label": "Yes", "value": "yes", "description": "Continue"}],
+                        "control": "radio",
+                        "selection_mode": "single",
+                        "custom": true,
+                        "custom_mode": "additional",
+                        "required": true
+                    }]
+                },
+                "answers": [{"question_index": 0, "selected": ["yes"], "custom": null}],
+                "focus": {"type": "question", "question_index": 0},
+                "focused_control_id": "question-0"
+            })),
+            render_target: InteractiveToolRenderTarget::TranscriptToolCall,
+            turn_behavior: InteractiveToolTurnBehavior::AwaitBeforeContinuing,
+        };
+
+        let rendered = format!(
+            "{:?}",
+            interaction_request(
+                &interaction,
+                Some(bcode_session_models::SessionId::new()),
+                "secret-token"
+            )
+        );
+        assert!(rendered.contains("Proceed?"));
+        assert!(rendered.contains("Continue"));
+        assert!(rendered.contains("question-0.option-0"));
+        assert!(rendered.contains("submit answers"));
+        assert!(rendered.contains("generic semantic controls"));
+    }
+
+    #[test]
+    fn shell_visual_adapter_is_versioned_and_keeps_generic_fallback() {
+        let visual = PluginVisualView::from(PluginVisualDescriptor {
+            visual_id: Some("shell-1".to_owned()),
+            producer_plugin_id: Some("bcode.shell".to_owned()),
+            schema: "bcode.tool.request.shell.run".to_owned(),
+            schema_version: 1,
+            title: Some("Shell command".to_owned()),
+            subtitle: None,
+            payload: serde_json::json!({
+                "arguments": {"command": "printf sentinel", "cwd": "/tmp"},
+                "_bcode_runtime": {"output": "sentinel output"}
+            }),
+        });
+
+        let rendered = format!("{:?}", render_plugin_visual("plugin visual", &visual));
+        assert!(rendered.contains("printf sentinel"));
+        assert!(rendered.contains("sentinel output"));
+        assert!(rendered.contains("plugin visual"));
+    }
+
+    #[test]
+    fn unknown_visual_schema_uses_generic_fallback() {
+        let visual = PluginVisualView::from(PluginVisualDescriptor {
+            visual_id: None,
+            producer_plugin_id: Some("fixture".to_owned()),
+            schema: "fixture.unknown".to_owned(),
+            schema_version: 99,
+            title: None,
+            subtitle: None,
+            payload: serde_json::json!({"sentinel": "generic-only"}),
+        });
+
+        let rendered = format!("{:?}", render_plugin_visual("plugin visual", &visual));
+        assert!(rendered.contains("generic-only"));
+    }
 
     #[test]
     fn generic_plugin_visual_keeps_schema_payload_in_render_tree() {

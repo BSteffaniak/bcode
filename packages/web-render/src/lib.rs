@@ -4,6 +4,7 @@
 
 //! `HyperChad` web renderer host for Bcode sessions.
 
+use std::net::IpAddr;
 use std::str::FromStr as _;
 use std::sync::{Arc, LazyLock};
 
@@ -20,6 +21,25 @@ use serde::Deserialize;
 
 static BACKGROUND_COLOR: LazyLock<Color> = LazyLock::new(|| Color::from_hex("#0d1117"));
 
+/// Default loopback address for the local web renderer.
+pub const DEFAULT_BIND_ADDRESS: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+/// Validate a requested web renderer bind address.
+///
+/// # Errors
+///
+/// Returns an error when a non-loopback address is requested without explicit opt-in.
+pub const fn validate_bind_address(
+    address: IpAddr,
+    allow_non_loopback: bool,
+) -> Result<IpAddr, &'static str> {
+    if address.is_loopback() || allow_non_loopback {
+        Ok(address)
+    } else {
+        Err("non-loopback web binds require explicit opt-in")
+    }
+}
+
 /// Number of recent history events projected into the first web-render snapshot.
 pub const INITIAL_HISTORY_EVENT_LIMIT: usize = 500;
 
@@ -31,6 +51,7 @@ pub static VIEWPORT: LazyLock<String> =
 #[derive(Debug, Clone)]
 pub struct WebRenderState {
     client: BcodeClient,
+    access_token: Arc<str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,14 +102,32 @@ struct InteractionForm {
     kind: InteractionInputKind,
     control_id: Option<String>,
     value: Option<String>,
+    #[serde(default)]
+    value_is_json: bool,
     direction: Option<String>,
 }
 
 impl WebRenderState {
-    /// Create web renderer state from a daemon client.
+    /// Create web renderer state from a daemon client and per-launch access token.
     #[must_use]
-    pub const fn new(client: BcodeClient) -> Self {
-        Self { client }
+    pub fn new(client: BcodeClient, access_token: impl Into<Arc<str>>) -> Self {
+        Self {
+            client,
+            access_token: access_token.into(),
+        }
+    }
+
+    /// Return the per-launch browser access token.
+    #[must_use]
+    pub fn access_token(&self) -> &str {
+        &self.access_token
+    }
+
+    fn authorizes(&self, request: &RouteRequest) -> bool {
+        request
+            .query
+            .get("token")
+            .is_some_and(|token| token == self.access_token())
     }
 
     /// Return the daemon client used by this web renderer.
@@ -166,15 +205,27 @@ pub fn router_from_state(state: WebRenderState) -> Router {
     let permission_state = state.clone();
     let interaction_state = state;
     Router::new()
-        .with_route("/", move |_| {
+        .with_route("/", move |request| {
             let state = root_state.clone();
-            async move { state.render_initial().await }
+            async move {
+                if state.authorizes(&request) {
+                    state.render_initial().await
+                } else {
+                    unauthorized_page()
+                }
+            }
         })
         .with_route(
             RoutePath::LiteralPrefix("/session/".to_string()),
             move |request| {
                 let state = session_state.clone();
-                async move { state.render_session_request(&request).await }
+                async move {
+                    if state.authorizes(&request) {
+                        state.render_session_request(&request).await
+                    } else {
+                        unauthorized_page()
+                    }
+                }
             },
         )
         .with_route("/actions/submit-message", move |request| {
@@ -206,7 +257,7 @@ impl WebRenderState {
     async fn render_initial(&self) -> hyperchad::template::Containers {
         match self.initial_state().await {
             Ok((snapshot, sessions)) => {
-                bcode_web_render_ui::pages::home::home(&snapshot, &sessions)
+                bcode_web_render_ui::pages::home::home(&snapshot, &sessions, self.access_token())
             }
             Err(error) => error_page(&error.to_string()),
         }
@@ -230,6 +281,9 @@ impl WebRenderState {
         &self,
         request: RouteRequest,
     ) -> hyperchad::template::Containers {
+        if !self.authorizes(&request) {
+            return unauthorized_page();
+        }
         let form = match request.parse_form::<PromptForm>() {
             Ok(form) => form,
             Err(error) => return error_page(&error.to_string()),
@@ -274,6 +328,9 @@ impl WebRenderState {
     }
 
     async fn handle_cancel_turn(&self, request: RouteRequest) -> hyperchad::template::Containers {
+        if !self.authorizes(&request) {
+            return unauthorized_page();
+        }
         let form = match request.parse_form::<CancelTurnForm>() {
             Ok(form) => form,
             Err(error) => return error_page(&error.to_string()),
@@ -298,6 +355,9 @@ impl WebRenderState {
     }
 
     async fn handle_update_draft(&self, request: RouteRequest) -> hyperchad::template::Containers {
+        if !self.authorizes(&request) {
+            return unauthorized_page();
+        }
         let Some(session_id) = request
             .path
             .strip_prefix("/actions/update-draft/")
@@ -326,6 +386,9 @@ impl WebRenderState {
     }
 
     async fn handle_permission(&self, request: RouteRequest) -> hyperchad::template::Containers {
+        if !self.authorizes(&request) {
+            return unauthorized_page();
+        }
         let form = match request.parse_form::<PermissionForm>() {
             Ok(form) => form,
             Err(error) => return error_page(&error.to_string()),
@@ -351,6 +414,9 @@ impl WebRenderState {
     }
 
     async fn handle_interaction(&self, request: RouteRequest) -> hyperchad::template::Containers {
+        if !self.authorizes(&request) {
+            return unauthorized_page();
+        }
         let form = match request.parse_form::<InteractionForm>() {
             Ok(form) => form,
             Err(error) => return error_page(&error.to_string()),
@@ -399,7 +465,11 @@ impl WebRenderState {
             None => match self.initial_state().await {
                 Ok((mut snapshot, sessions)) => {
                     snapshot.composer.disabled_reason = Some(status.to_owned());
-                    bcode_web_render_ui::pages::home::home(&snapshot, &sessions)
+                    bcode_web_render_ui::pages::home::home(
+                        &snapshot,
+                        &sessions,
+                        self.access_token(),
+                    )
                 }
                 Err(error) => error_page(&error.to_string()),
             },
@@ -424,7 +494,7 @@ impl WebRenderState {
         match self.session_snapshot(session_id).await {
             Ok(mut snapshot) => {
                 snapshot.composer.disabled_reason = Some(status.to_owned());
-                bcode_web_render_ui::pages::home::home(&snapshot, sessions)
+                bcode_web_render_ui::pages::home::home(&snapshot, sessions, self.access_token())
             }
             Err(error) => error_page(&error.to_string()),
         }
@@ -455,8 +525,12 @@ fn interaction_input_from_form(
                 .value
                 .as_deref()
                 .ok_or_else(|| "interaction value is required".to_owned())?;
-            let value = serde_json::from_str::<InteractionValue>(value)
-                .map_err(|error| format!("invalid interaction value JSON: {error}"))?;
+            let value = if form.value_is_json {
+                serde_json::from_str::<InteractionValue>(value)
+                    .map_err(|error| format!("invalid interaction value JSON: {error}"))?
+            } else {
+                InteractionValue::String(value.to_owned())
+            };
             Ok(InteractionInput::Change {
                 control_id: control_id()?,
                 value,
@@ -490,11 +564,15 @@ fn parse_session_id(value: &str) -> Option<SessionId> {
     SessionId::from_str(value).ok()
 }
 
+fn unauthorized_page() -> hyperchad::template::Containers {
+    error_page("missing or invalid web renderer access token")
+}
+
 fn error_page(message: &str) -> hyperchad::template::Containers {
     let mut snapshot = SessionViewSnapshot::empty();
     snapshot.title = Some("Web renderer error".to_owned());
     snapshot.composer.disabled_reason = Some(message.to_owned());
-    bcode_web_render_ui::pages::home::home(&snapshot, &[])
+    bcode_web_render_ui::pages::home::home(&snapshot, &[], "")
 }
 
 /// Build the application router for the current snapshot and session list.
@@ -505,7 +583,7 @@ pub fn router(snapshot: SessionViewSnapshot, sessions: Vec<SessionSummary>) -> R
     Router::new().with_static_route(&["/", "/session"], move |_| {
         let snapshot = Arc::clone(&snapshot);
         let sessions = Arc::clone(&sessions);
-        async move { bcode_web_render_ui::pages::home::home(&snapshot, &sessions) }
+        async move { bcode_web_render_ui::pages::home::home(&snapshot, &sessions, "") }
     })
 }
 
@@ -530,6 +608,7 @@ pub fn init_with_snapshot(
 ) -> AppBuilder {
     with_browser_runtime(
         AppBuilder::new()
+            .with_actix_bind_address(DEFAULT_BIND_ADDRESS.to_string())
             .with_router(router(snapshot, sessions))
             .with_background(*BACKGROUND_COLOR)
             .with_title("bcode web".to_string())
@@ -548,6 +627,7 @@ pub async fn init(state: &WebRenderState) -> Result<AppBuilder, ClientError> {
     state.client().ensure_daemon_available().await?;
     Ok(with_browser_runtime(
         AppBuilder::new()
+            .with_actix_bind_address(DEFAULT_BIND_ADDRESS.to_string())
             .with_router(router_from_state(state.clone()))
             .with_background(*BACKGROUND_COLOR)
             .with_title("bcode web".to_string())
@@ -577,13 +657,42 @@ mod tests {
     }
 
     #[test]
-    fn interaction_change_form_maps_to_typed_input() {
+    fn bind_address_policy_requires_non_loopback_opt_in() {
+        let loopback = "127.0.0.1".parse().expect("loopback should parse");
+        let external = "0.0.0.0".parse().expect("external address should parse");
+
+        assert_eq!(validate_bind_address(loopback, false), Ok(loopback));
+        assert!(validate_bind_address(external, false).is_err());
+        assert_eq!(validate_bind_address(external, true), Ok(external));
+    }
+
+    #[test]
+    fn access_token_authorization_requires_exact_query_value() {
+        let state = WebRenderState::new(BcodeClient::default_endpoint(), "secret-token");
+        let valid = RouteRequest::from_path(
+            "/?token=secret-token",
+            hyperchad::router::RequestInfo::default(),
+        );
+        let missing = RouteRequest::from_path("/", hyperchad::router::RequestInfo::default());
+        let invalid = RouteRequest::from_path(
+            "/?token=other-token",
+            hyperchad::router::RequestInfo::default(),
+        );
+
+        assert!(state.authorizes(&valid));
+        assert!(!state.authorizes(&missing));
+        assert!(!state.authorizes(&invalid));
+    }
+
+    #[test]
+    fn interaction_change_form_preserves_plain_text_that_looks_like_json() {
         let form = InteractionForm {
             session_id: SessionId::new().to_string(),
             interaction_id: "interaction-1".to_owned(),
             kind: InteractionInputKind::Change,
             control_id: Some("answer".to_owned()),
-            value: Some("\"yes\"".to_owned()),
+            value: Some("true".to_owned()),
+            value_is_json: false,
             direction: None,
         };
 
@@ -591,7 +700,28 @@ mod tests {
             interaction_input_from_form(&form),
             Ok(bcode_tool::InteractionInput::Change {
                 control_id: bcode_tool::InteractionControlId::new("answer"),
-                value: bcode_tool::InteractionValue::String("yes".to_owned()),
+                value: bcode_tool::InteractionValue::String("true".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn interaction_change_form_parses_explicit_json_values() {
+        let form = InteractionForm {
+            session_id: SessionId::new().to_string(),
+            interaction_id: "interaction-1".to_owned(),
+            kind: InteractionInputKind::Change,
+            control_id: Some("toggle".to_owned()),
+            value: Some("true".to_owned()),
+            value_is_json: true,
+            direction: None,
+        };
+
+        assert_eq!(
+            interaction_input_from_form(&form),
+            Ok(bcode_tool::InteractionInput::Change {
+                control_id: bcode_tool::InteractionControlId::new("toggle"),
+                value: bcode_tool::InteractionValue::Bool(true),
             })
         );
     }
@@ -604,6 +734,7 @@ mod tests {
             kind: InteractionInputKind::Navigate,
             control_id: None,
             value: None,
+            value_is_json: false,
             direction: Some("sideways".to_owned()),
         };
 

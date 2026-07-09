@@ -23,7 +23,9 @@ Renderers must not depend on TUI frame, key, mouse, or BMUX drawing types. They 
 
 `packages/web-render` owns the HyperChad host, daemon connection, session selection, browser routes, and mapping HyperChad form events into shared semantic actions.
 
-`packages/web-render/ui` owns only HyperChad presentation. Plugin visuals, artifacts, and interaction snapshots have a generic structured-data fallback here.
+`packages/web-render/ui` owns only HyperChad presentation. Plugin visuals, artifacts, and interaction snapshots have a generic structured-data fallback here. Rich visual adapters are registered by exact plugin-owned `(schema, schema_version)` keys and must retain that fallback.
+
+The local web host binds to loopback unless the CLI receives explicit non-loopback opt-in. Each launch generates a capability token; page and action routes must validate it before reading daemon state or executing effects, and generated links/forms propagate it.
 
 Plugins own domain schemas and renderer-neutral interaction controllers. A renderer may add rich schema-specific adapters, but it must preserve the generic fallback and must not move plugin behavior into renderer code.
 
