@@ -1649,6 +1649,8 @@ pub fn start_improvement_campaign(
             status: EvalImprovementVerdictStatus::Baseline,
             rationale: Some("Baseline generation".to_string()),
             promotable: false,
+            decided_by: None,
+            decided_unix_ms: None,
         },
         metadata: BTreeMap::new(),
     };
@@ -1747,6 +1749,8 @@ pub struct EvalImprovementDecisionOptions {
     pub status: EvalImprovementVerdictStatus,
     /// Required human-readable rationale.
     pub rationale: String,
+    /// Optional actor responsible for the decision.
+    pub actor: Option<String>,
 }
 
 /// Promote or reject an improvement generation.
@@ -1787,6 +1791,13 @@ pub fn decide_improvement_generation(
     generation.verdict.status = options.status;
     generation.verdict.rationale = Some(rationale.to_string());
     generation.verdict.promotable = false;
+    generation.verdict.decided_by = options
+        .actor
+        .as_deref()
+        .map(str::trim)
+        .filter(|actor| !actor.is_empty())
+        .map(str::to_string);
+    generation.verdict.decided_unix_ms = Some(unix_ms());
     if options.status == EvalImprovementVerdictStatus::Promoted {
         campaign.best_generation_id = Some(generation.id.clone());
     }
@@ -2067,6 +2078,8 @@ fn verdict_from_deltas(
         status,
         rationale: Some("Derived from pass-rate delta against parent".to_string()),
         promotable: status == EvalImprovementVerdictStatus::Improved,
+        decided_by: None,
+        decided_unix_ms: None,
     }
 }
 

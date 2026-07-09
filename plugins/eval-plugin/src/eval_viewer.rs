@@ -526,6 +526,7 @@ struct DecideGenerationWizard {
     campaign: PathBuf,
     generation_id: String,
     status: bcode_eval_models::EvalImprovementVerdictStatus,
+    context: Vec<Line>,
     rationale: TextInputState,
     error: Option<String>,
 }
@@ -681,6 +682,24 @@ impl EvalWizard {
             campaign: data.campaign_dir.clone(),
             generation_id: generation.id.clone(),
             status,
+            context: vec![
+                Line::from(format!("Risk: {:?}", generation.delta.risk)),
+                Line::from(format!(
+                    "Affected files: {}",
+                    generation.delta.affected_files.len()
+                )),
+                Line::from(format!(
+                    "Affected surfaces: {}",
+                    generation.delta.affected_surfaces.join(", ")
+                )),
+                Line::from(format!(
+                    "Metric deltas: {}",
+                    generation
+                        .vs_parent
+                        .as_ref()
+                        .map_or(0, std::collections::BTreeMap::len)
+                )),
+            ],
             rationale: text_state(""),
             error: None,
         })))
@@ -1120,6 +1139,7 @@ impl DecideGenerationWizard {
             Line::from(format!("Decision: {action}")),
             Line::from("A rationale is required."),
         ];
+        body.extend(self.context.clone());
         if let Some(error) = &self.error {
             body.push(Line::from(format!("Error: {error}")));
         }
@@ -1164,6 +1184,9 @@ impl DecideGenerationWizard {
             generation_id: self.generation_id.clone(),
             status: self.status,
             rationale: input_text(&self.rationale),
+            actor: std::env::var("USER")
+                .ok()
+                .filter(|actor| !actor.trim().is_empty()),
         }
     }
 }
@@ -2408,9 +2431,11 @@ pub struct EvalGenerationDetailSurface {
     tab_state: TabBarState,
     action_state: ActionRowState,
     selected_run_viewer: Option<EvalRunViewerSurface>,
+    active_wizard: Option<EvalWizard>,
     rerun_task: Option<Receiver<Result<CampaignRunCompletion, String>>>,
     tab_area: Rect,
     action_area: Rect,
+    surface_area: Rect,
     status: String,
 }
 
@@ -2423,9 +2448,61 @@ impl EvalGenerationDetailSurface {
             tab_state: TabBarState::new(Some(0)),
             action_state: ActionRowState::new(),
             selected_run_viewer: None,
+            active_wizard: None,
             rerun_task: None,
             tab_area: Rect::new(0, 0, 0, 0),
             action_area: Rect::new(0, 0, 0, 0),
+            surface_area: Rect::new(0, 0, 0, 0),
+        }
+    }
+
+    fn open_branch_wizard(&mut self) {
+        let generation = self.generation().cloned();
+        match generation.as_ref().map_or_else(
+            || Err("generation not found".to_string()),
+            |generation| EvalWizard::record_generation_for_campaign(&self.data, Some(generation)),
+        ) {
+            Ok(wizard) => self.active_wizard = Some(wizard),
+            Err(error) => self.status = error,
+        }
+    }
+
+    fn open_decision_wizard(&mut self, status: bcode_eval_models::EvalImprovementVerdictStatus) {
+        let generation = self.generation().cloned();
+        match generation.as_ref().map_or_else(
+            || Err("generation not found".to_string()),
+            |generation| EvalWizard::decide_generation(&self.data, generation, status),
+        ) {
+            Ok(wizard) => self.active_wizard = Some(wizard),
+            Err(error) => self.status = error,
+        }
+    }
+
+    fn complete_wizard(&mut self, completion: EvalWizardCompletion) {
+        match completion {
+            EvalWizardCompletion::RecordGeneration(options) => {
+                match bcode_eval::record_improvement_generation(*options) {
+                    Ok(generation) => {
+                        self.status = format!("recorded branch {}", generation.id);
+                    }
+                    Err(error) => self.status = format!("branch failed: {error}"),
+                }
+            }
+            EvalWizardCompletion::DecideGeneration(options) => {
+                match bcode_eval::decide_improvement_generation(options.as_ref()) {
+                    Ok(generation) => {
+                        self.status = format!(
+                            "generation {} is now {:?}",
+                            generation.id, generation.verdict.status
+                        );
+                    }
+                    Err(error) => self.status = format!("decision failed: {error}"),
+                }
+            }
+            _ => {}
+        }
+        if let Ok(data) = EvalCampaignData::load(&self.data.campaign_dir) {
+            self.data = data;
         }
     }
 
@@ -2677,6 +2754,11 @@ impl PluginTuiSurface for EvalGenerationDetailSurface {
     }
 
     fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+        self.surface_area = area;
+        if let Some(wizard) = self.active_wizard.as_mut() {
+            wizard.render(area, frame);
+            return;
+        }
         if let Some(viewer) = self.selected_run_viewer.as_mut() {
             viewer.render(area, frame);
             return;
@@ -2723,6 +2805,21 @@ impl PluginTuiSurface for EvalGenerationDetailSurface {
     }
 
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        if let Some(wizard) = self.active_wizard.as_mut() {
+            match wizard.handle_event(self.surface_area, event) {
+                EvalWizardOutcome::Continue => return PluginTuiAction::None,
+                EvalWizardOutcome::Redraw => return PluginTuiAction::Redraw,
+                EvalWizardOutcome::Cancel => {
+                    self.active_wizard = None;
+                    return PluginTuiAction::Redraw;
+                }
+                EvalWizardOutcome::Complete(completion) => {
+                    self.active_wizard = None;
+                    self.complete_wizard(completion);
+                    return PluginTuiAction::Redraw;
+                }
+            }
+        }
         if let Some(viewer) = self.selected_run_viewer.as_mut() {
             let action = viewer.handle_event(event, host);
             if matches!(action, PluginTuiAction::Close { .. }) {
@@ -2754,6 +2851,13 @@ impl PluginTuiSurface for EvalGenerationDetailSurface {
                     self.rerun(host);
                     return PluginTuiAction::Redraw;
                 }
+                "branch" => self.open_branch_wizard(),
+                "promote" => self.open_decision_wizard(
+                    bcode_eval_models::EvalImprovementVerdictStatus::Promoted,
+                ),
+                "reject" => self.open_decision_wizard(
+                    bcode_eval_models::EvalImprovementVerdictStatus::Rejected,
+                ),
                 "back" => return PluginTuiAction::Close { outcome: None },
                 _ => {}
             },
@@ -2772,6 +2876,19 @@ impl PluginTuiSurface for EvalGenerationDetailSurface {
                 }
                 KeyCode::Char('r') => {
                     self.rerun(host);
+                    return PluginTuiAction::Redraw;
+                }
+                KeyCode::Char('b') => {
+                    self.open_branch_wizard();
+                    return PluginTuiAction::Redraw;
+                }
+                KeyCode::Char('p' | 'x') => {
+                    let status = if stroke.key == KeyCode::Char('p') {
+                        bcode_eval_models::EvalImprovementVerdictStatus::Promoted
+                    } else {
+                        bcode_eval_models::EvalImprovementVerdictStatus::Rejected
+                    };
+                    self.open_decision_wizard(status);
                     return PluginTuiAction::Redraw;
                 }
                 KeyCode::Char('q') | KeyCode::Escape => {
@@ -4677,6 +4794,9 @@ fn generation_detail_actions() -> Vec<ActionButton> {
     vec![
         ActionButton::new("open-run", "O Open Run"),
         ActionButton::new("rerun", "R Rerun"),
+        ActionButton::new("branch", "B Branch"),
+        ActionButton::new("promote", "P Promote"),
+        ActionButton::new("reject", "X Reject"),
         ActionButton::new("back", "Esc Back"),
     ]
 }

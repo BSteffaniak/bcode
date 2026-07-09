@@ -785,6 +785,12 @@ pub struct EvalImprovementVerdict {
     pub rationale: Option<String>,
     /// Whether this generation is eligible for promotion.
     pub promotable: bool,
+    /// Actor responsible for a terminal human decision.
+    #[serde(default)]
+    pub decided_by: Option<String>,
+    /// Unix timestamp in milliseconds for the terminal human decision.
+    #[serde(default)]
+    pub decided_unix_ms: Option<u128>,
 }
 
 /// Verdict status for an improvement generation.
