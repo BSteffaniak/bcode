@@ -420,8 +420,8 @@ impl PluginTuiSurface for EvalRunPickerSurface {
 
 #[derive(Debug, Clone)]
 enum EvalWizard {
-    StartCampaign(StartCampaignWizard),
-    RecordGeneration(RecordGenerationWizard),
+    StartCampaign(Box<StartCampaignWizard>),
+    RecordGeneration(Box<RecordGenerationWizard>),
     Help(HelpWizard),
 }
 
@@ -468,9 +468,10 @@ struct RecordGenerationWizard {
     campaign_index: usize,
     parent_choices: Vec<RecordParentChoice>,
     parent_index: usize,
+    run_choices: Vec<RecordRunChoice>,
+    run_index: usize,
     branch: String,
     delta_kind: bcode_eval_models::EvalImprovementDeltaKind,
-    run: Option<PathBuf>,
     risk: bcode_eval_models::EvalImprovementRisk,
     context: Vec<Line>,
     summary: TextInputState,
@@ -492,11 +493,18 @@ struct RecordParentChoice {
     parent_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct RecordRunChoice {
+    label: String,
+    run_dir: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecordGenerationField {
     Summary,
     Campaign,
     Parent,
+    Run,
     Patch,
     Kind,
     Risk,
@@ -587,7 +595,7 @@ impl EvalWizard {
         let campaign_id =
             unique_campaign_id(campaigns_root, &format!("{}-improvement", choice.suite_id));
         let name = format!("{} improvement", choice.suite_id);
-        Self::StartCampaign(StartCampaignWizard {
+        Self::StartCampaign(Box::new(StartCampaignWizard {
             state: DialogState::new(),
             suite_choices: choices,
             suite_index,
@@ -597,7 +605,7 @@ impl EvalWizard {
             focus: StartCampaignField::CampaignId,
             objective: EvalImprovementObjective::Progression,
             error: None,
-        })
+        }))
     }
 
     fn attach_run_to_campaign(
@@ -625,7 +633,7 @@ impl EvalWizard {
             Line::from("Attach this run as the next campaign generation."),
             Line::from(format!("Run: {}", run.run_id)),
         ];
-        Ok(Self::RecordGeneration(RecordGenerationWizard {
+        Ok(Self::RecordGeneration(Box::new(RecordGenerationWizard {
             state: DialogState::new(),
             campaign_choices,
             campaign_index: 0,
@@ -634,9 +642,13 @@ impl EvalWizard {
                 parent_id,
             }],
             parent_index: 0,
+            run_choices: vec![RecordRunChoice {
+                label: run.run_id.clone(),
+                run_dir: Some(run.run_dir.clone()),
+            }],
+            run_index: 0,
             branch: "main".to_string(),
             delta_kind: bcode_eval_models::EvalImprovementDeltaKind::Mixed,
-            run: Some(run.run_dir.clone()),
             risk: bcode_eval_models::EvalImprovementRisk::Low,
             context,
             summary: text_state(&summary),
@@ -644,7 +656,7 @@ impl EvalWizard {
             patch_path: text_state(""),
             focus: RecordGenerationField::Summary,
             error: None,
-        }))
+        })))
     }
 
     fn record_generation_for_campaign(
@@ -664,10 +676,13 @@ impl EvalWizard {
             .iter()
             .filter_map(|generation| generation.run_dir.as_ref())
             .collect::<std::collections::BTreeSet<_>>();
-        let run = discover_runs(&runs_root)
+        let runs = discover_runs(&runs_root)
             .into_iter()
             .filter(|run| run.suite_id == data.campaign.suite_id)
-            .find(|run| !used_runs.contains(&run.run_dir))
+            .filter(|run| !used_runs.contains(&run.run_dir))
+            .collect::<Vec<_>>();
+        let run = runs
+            .first()
             .ok_or_else(|| format!("no unused runs found for suite {}", data.campaign.suite_id))?;
         let parent_id = selected
             .map(|generation| generation.id.clone())
@@ -693,7 +708,7 @@ impl EvalWizard {
             Line::from("Record the latest unused run as a new generation."),
             Line::from(format!("Run: {}", run.run_id)),
         ];
-        Ok(Self::RecordGeneration(RecordGenerationWizard {
+        Ok(Self::RecordGeneration(Box::new(RecordGenerationWizard {
             state: DialogState::new(),
             campaign_choices: vec![RecordCampaignChoice {
                 label: data.campaign.id.clone(),
@@ -702,9 +717,16 @@ impl EvalWizard {
             campaign_index: 0,
             parent_choices,
             parent_index,
+            run_choices: runs
+                .iter()
+                .map(|run| RecordRunChoice {
+                    label: run.run_id.clone(),
+                    run_dir: Some(run.run_dir.clone()),
+                })
+                .collect(),
+            run_index: 0,
             branch: "main".to_string(),
             delta_kind: bcode_eval_models::EvalImprovementDeltaKind::Mixed,
-            run: Some(run.run_dir),
             risk: bcode_eval_models::EvalImprovementRisk::Low,
             context,
             summary: text_state(&summary),
@@ -712,7 +734,7 @@ impl EvalWizard {
             patch_path: text_state(""),
             focus: RecordGenerationField::Summary,
             error: None,
-        }))
+        })))
     }
 
     fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
@@ -793,7 +815,8 @@ impl EvalWizard {
                 wizard.focus = match wizard.focus {
                     RecordGenerationField::Summary => RecordGenerationField::Campaign,
                     RecordGenerationField::Campaign => RecordGenerationField::Parent,
-                    RecordGenerationField::Parent => RecordGenerationField::Patch,
+                    RecordGenerationField::Parent => RecordGenerationField::Run,
+                    RecordGenerationField::Run => RecordGenerationField::Patch,
                     RecordGenerationField::Patch => RecordGenerationField::Kind,
                     RecordGenerationField::Kind => RecordGenerationField::Risk,
                     RecordGenerationField::Risk => RecordGenerationField::Rationale,
@@ -823,6 +846,9 @@ impl EvalWizard {
             Self::RecordGeneration(wizard) if wizard.focus == RecordGenerationField::Parent => {
                 wizard.parent_index =
                     cycle_index(wizard.parent_choices.len(), wizard.parent_index, forward);
+            }
+            Self::RecordGeneration(wizard) if wizard.focus == RecordGenerationField::Run => {
+                wizard.run_index = cycle_index(wizard.run_choices.len(), wizard.run_index, forward);
             }
             Self::RecordGeneration(wizard) if wizard.focus == RecordGenerationField::Kind => {
                 wizard.delta_kind = cycle_delta_kind(wizard.delta_kind, forward);
@@ -1013,6 +1039,7 @@ impl RecordGenerationWizard {
             "Parent: {}",
             self.selected_parent().label
         )));
+        body.push(Line::from(format!("Run: {}", self.selected_run().label)));
         body.push(Line::from(format!(
             "Kind: {}",
             delta_kind_label(self.delta_kind)
@@ -1084,6 +1111,10 @@ impl RecordGenerationWizard {
             self.focus = RecordGenerationField::Risk;
             self.risk = cycle_risk(self.risk, true);
             return true;
+        } else if event_click_in(event, layout.choice_third) {
+            self.focus = RecordGenerationField::Run;
+            self.run_index = cycle_index(self.run_choices.len(), self.run_index, true);
+            return true;
         }
         let summary = handle_input_box(
             layout.primary,
@@ -1114,6 +1145,10 @@ impl RecordGenerationWizard {
         &self.parent_choices[self.parent_index]
     }
 
+    fn selected_run(&self) -> &RecordRunChoice {
+        &self.run_choices[self.run_index]
+    }
+
     fn validate(&self) -> Result<(), String> {
         if input_text(&self.summary).is_empty() {
             return Err("summary is required".to_string());
@@ -1132,7 +1167,7 @@ impl RecordGenerationWizard {
             branch: self.branch.clone(),
             delta_kind: self.delta_kind,
             summary: input_text(&self.summary),
-            run: self.run.clone(),
+            run: self.selected_run().run_dir.clone(),
             patch: optional_path(&input_text(&self.patch_path)),
             risk: self.risk,
             rationale: Some(input_text(&self.rationale)).filter(|text| !text.trim().is_empty()),
@@ -1149,6 +1184,7 @@ struct WizardLayout {
     choice_alt: Rect,
     choice_second: Rect,
     choice_second_alt: Rect,
+    choice_third: Rect,
 }
 
 fn wizard_layout(area: Rect) -> WizardLayout {
@@ -1175,6 +1211,7 @@ fn wizard_layout(area: Rect) -> WizardLayout {
             body.width / 2,
             1,
         ),
+        choice_third: Rect::new(body.x, body.y.saturating_add(16), body.width, 1),
     }
 }
 
