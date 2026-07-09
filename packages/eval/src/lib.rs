@@ -1713,6 +1713,66 @@ pub fn record_improvement_generation(
     Ok(generation)
 }
 
+/// Options for updating a generation's human-review decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalImprovementDecisionOptions {
+    /// Campaign directory or campaign JSON path.
+    pub campaign: PathBuf,
+    /// Generation id to update.
+    pub generation_id: String,
+    /// New terminal decision.
+    pub status: EvalImprovementVerdictStatus,
+    /// Required human-readable rationale.
+    pub rationale: String,
+}
+
+/// Promote or reject an improvement generation.
+///
+/// # Errors
+///
+/// Returns an error when:
+///
+/// * The campaign or generation cannot be loaded.
+/// * The requested status is not `Promoted` or `Rejected`.
+/// * The rationale is empty.
+/// * A baseline generation is selected.
+pub fn decide_improvement_generation(
+    options: &EvalImprovementDecisionOptions,
+) -> Result<EvalImprovementGeneration, EvalError> {
+    if !matches!(
+        options.status,
+        EvalImprovementVerdictStatus::Promoted | EvalImprovementVerdictStatus::Rejected
+    ) {
+        return Err(EvalError::Validation(
+            "generation decision must be promoted or rejected".to_string(),
+        ));
+    }
+    let rationale = options.rationale.trim();
+    if rationale.is_empty() {
+        return Err(EvalError::Validation(
+            "generation decision rationale is required".to_string(),
+        ));
+    }
+    let mut campaign = load_improvement_campaign(&options.campaign)?;
+    let campaign_dir = campaign.output_dir.clone();
+    let mut generation = load_improvement_generation(&campaign_dir, &options.generation_id)?;
+    if generation.id == campaign.baseline_generation_id {
+        return Err(EvalError::Validation(
+            "the baseline generation cannot be promoted or rejected".to_string(),
+        ));
+    }
+    generation.verdict.status = options.status;
+    generation.verdict.rationale = Some(rationale.to_string());
+    generation.verdict.promotable = false;
+    if options.status == EvalImprovementVerdictStatus::Promoted {
+        campaign.best_generation_id = Some(generation.id.clone());
+    }
+    write_generation(&campaign_dir, &generation)?;
+    write_json_pretty(campaign_dir.join("campaign.json"), &campaign)?;
+    write_campaign_report(&campaign)?;
+    Ok(generation)
+}
+
 /// Load an eval improvement campaign.
 ///
 /// # Errors

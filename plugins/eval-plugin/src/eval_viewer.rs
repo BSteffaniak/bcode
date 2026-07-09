@@ -211,6 +211,9 @@ impl EvalRunPickerSurface {
                     Err(error) => self.status = format!("failed to record generation: {error}"),
                 }
             }
+            EvalWizardCompletion::DecideGeneration(_) => {
+                self.status = "generation decisions are only available in campaigns".to_string();
+            }
         }
     }
 
@@ -422,6 +425,7 @@ impl PluginTuiSurface for EvalRunPickerSurface {
 enum EvalWizard {
     StartCampaign(Box<StartCampaignWizard>),
     RecordGeneration(Box<RecordGenerationWizard>),
+    DecideGeneration(Box<DecideGenerationWizard>),
     Help(HelpWizard),
 }
 
@@ -430,6 +434,16 @@ struct HelpWizard {
     state: DialogState,
     title: &'static str,
     body: Vec<Line>,
+}
+
+#[derive(Debug, Clone)]
+struct DecideGenerationWizard {
+    state: DialogState,
+    campaign: PathBuf,
+    generation_id: String,
+    status: bcode_eval_models::EvalImprovementVerdictStatus,
+    rationale: TextInputState,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -526,6 +540,7 @@ enum EvalWizardCompletion {
         options: bcode_eval::EvalImprovementStartOptions,
     },
     RecordGeneration(bcode_eval::EvalImprovementRecordOptions),
+    DecideGeneration(bcode_eval::EvalImprovementDecisionOptions),
 }
 
 impl EvalWizard {
@@ -535,6 +550,24 @@ impl EvalWizard {
             title,
             body: lines.into_iter().map(Line::from).collect(),
         })
+    }
+
+    fn decide_generation(
+        data: &EvalCampaignData,
+        generation: &EvalImprovementGeneration,
+        status: bcode_eval_models::EvalImprovementVerdictStatus,
+    ) -> Result<Self, String> {
+        if generation.id == data.campaign.baseline_generation_id {
+            return Err("the baseline generation cannot be promoted or rejected".to_string());
+        }
+        Ok(Self::DecideGeneration(Box::new(DecideGenerationWizard {
+            state: DialogState::new(),
+            campaign: data.campaign_dir.clone(),
+            generation_id: generation.id.clone(),
+            status,
+            rationale: text_state(""),
+            error: None,
+        })))
     }
 
     fn start_campaign_from_run(
@@ -741,6 +774,7 @@ impl EvalWizard {
         match self {
             Self::StartCampaign(wizard) => wizard.render(area, frame),
             Self::RecordGeneration(wizard) => wizard.render(area, frame),
+            Self::DecideGeneration(wizard) => wizard.render(area, frame),
             Self::Help(wizard) => wizard.render(area, frame),
         }
     }
@@ -771,6 +805,10 @@ impl EvalWizard {
         let actions = match self {
             Self::StartCampaign(_) => wizard_actions("create"),
             Self::RecordGeneration(_) => wizard_actions("record"),
+            Self::DecideGeneration(wizard) => wizard_actions(match wizard.status {
+                bcode_eval_models::EvalImprovementVerdictStatus::Promoted => "promote",
+                _ => "reject",
+            }),
             Self::Help(_) => vec![ActionButton::new("cancel", "Close")],
         };
         let outcome = Dialog::new(&[], &actions, eval_modal_theme())
@@ -789,6 +827,10 @@ impl EvalWizard {
         match self {
             Self::StartCampaign(_) => "Start Improvement Campaign",
             Self::RecordGeneration(_) => "Record Generation",
+            Self::DecideGeneration(wizard) => match wizard.status {
+                bcode_eval_models::EvalImprovementVerdictStatus::Promoted => "Promote Generation",
+                _ => "Reject Generation",
+            },
             Self::Help(wizard) => wizard.title,
         }
     }
@@ -797,6 +839,7 @@ impl EvalWizard {
         match self {
             Self::StartCampaign(wizard) => &mut wizard.state,
             Self::RecordGeneration(wizard) => &mut wizard.state,
+            Self::DecideGeneration(wizard) => &mut wizard.state,
             Self::Help(wizard) => &mut wizard.state,
         }
     }
@@ -823,7 +866,7 @@ impl EvalWizard {
                     RecordGenerationField::Rationale => RecordGenerationField::Summary,
                 }
             }
-            Self::Help(_) => {}
+            Self::DecideGeneration(_) | Self::Help(_) => {}
         }
     }
 
@@ -864,6 +907,7 @@ impl EvalWizard {
         match self {
             Self::StartCampaign(wizard) => wizard.handle_inputs(area, event),
             Self::RecordGeneration(wizard) => wizard.handle_inputs(area, event),
+            Self::DecideGeneration(wizard) => wizard.handle_inputs(area, event),
             Self::Help(_) => false,
         }
     }
@@ -889,7 +933,75 @@ impl EvalWizard {
                     EvalWizardOutcome::Redraw
                 }
             },
+            Self::DecideGeneration(wizard) => match wizard.validate() {
+                Ok(()) => EvalWizardOutcome::Complete(EvalWizardCompletion::DecideGeneration(
+                    wizard.options(),
+                )),
+                Err(error) => {
+                    wizard.error = Some(error);
+                    EvalWizardOutcome::Redraw
+                }
+            },
             Self::Help(_) => EvalWizardOutcome::Cancel,
+        }
+    }
+}
+
+impl DecideGenerationWizard {
+    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+        let action = match self.status {
+            bcode_eval_models::EvalImprovementVerdictStatus::Promoted => "promote",
+            _ => "reject",
+        };
+        let mut body = vec![
+            Line::from(format!("Generation: {}", self.generation_id)),
+            Line::from(format!("Decision: {action}")),
+            Line::from("A rationale is required."),
+        ];
+        if let Some(error) = &self.error {
+            body.push(Line::from(format!("Error: {error}")));
+        }
+        Dialog::new(&body, &wizard_actions(action), eval_modal_theme())
+            .title(if action == "promote" {
+                "Promote Generation"
+            } else {
+                "Reject Generation"
+            })
+            .sizing(wizard_sizing())
+            .render(area, &self.state, frame);
+        render_input_box(
+            wizard_layout(area).primary,
+            frame,
+            "Rationale",
+            &mut self.rationale,
+            true,
+            1,
+        );
+    }
+
+    fn handle_inputs(&mut self, area: Rect, event: &Event) -> bool {
+        handle_input_box(
+            wizard_layout(area).primary,
+            &mut self.rationale,
+            event,
+            true,
+        )
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if input_text(&self.rationale).is_empty() {
+            Err("decision rationale is required".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn options(&self) -> bcode_eval::EvalImprovementDecisionOptions {
+        bcode_eval::EvalImprovementDecisionOptions {
+            campaign: self.campaign.clone(),
+            generation_id: self.generation_id.clone(),
+            status: self.status,
+            rationale: input_text(&self.rationale),
         }
     }
 }
@@ -1391,6 +1503,8 @@ fn wizard_actions(primary: &'static str) -> Vec<ActionButton> {
             match primary {
                 "create" => "Create",
                 "record" => "Record",
+                "promote" => "Promote",
+                "reject" => "Reject",
                 _ => "Confirm",
             },
         ),
@@ -1526,6 +1640,20 @@ impl EvalCampaignViewerSurface {
         self.status = format!("view mode: {}", self.view_mode.label());
     }
 
+    fn decide_selected_generation(
+        &mut self,
+        status: bcode_eval_models::EvalImprovementVerdictStatus,
+    ) {
+        let Some(generation) = self.selected_generation().cloned() else {
+            self.status = "select a generation first".to_string();
+            return;
+        };
+        match EvalWizard::decide_generation(&self.data, &generation, status) {
+            Ok(wizard) => self.active_wizard = Some(wizard),
+            Err(error) => self.status = error,
+        }
+    }
+
     fn record_generation(&mut self) {
         match EvalWizard::record_generation_for_campaign(&self.data, self.selected_generation()) {
             Ok(wizard) => self.active_wizard = Some(wizard),
@@ -1546,6 +1674,20 @@ impl EvalCampaignViewerSurface {
                     Err(error) => self.status = format!("failed to record generation: {error}"),
                 }
             }
+            EvalWizardCompletion::DecideGeneration(options) => {
+                match bcode_eval::decide_improvement_generation(&options) {
+                    Ok(generation) => {
+                        self.status = format!(
+                            "generation {} is now {:?}",
+                            generation.id, generation.verdict.status
+                        );
+                        if let Ok(data) = EvalCampaignData::load(&self.data.campaign_dir) {
+                            self.data = data;
+                        }
+                    }
+                    Err(error) => self.status = format!("failed to update generation: {error}"),
+                }
+            }
             EvalWizardCompletion::StartCampaign { .. } => {
                 self.status = "start campaign is only available from eval home".to_string();
             }
@@ -1558,6 +1700,24 @@ impl EvalCampaignViewerSurface {
             "open-run" => self.open_selected_run(),
             "view-mode" => self.cycle_view_mode(),
             "record-generation" => self.record_generation(),
+            "promote" => self.decide_selected_generation(
+                bcode_eval_models::EvalImprovementVerdictStatus::Promoted,
+            ),
+            "reject" => self.decide_selected_generation(
+                bcode_eval_models::EvalImprovementVerdictStatus::Rejected,
+            ),
+            "help" => {
+                self.active_wizard = Some(EvalWizard::help(
+                    "Campaign Help",
+                    vec![
+                        "Details: inspect the selected generation",
+                        "Open Run: inspect its eval run",
+                        "Record: add a generation from an unused run",
+                        "Promote/Reject: record a reviewed terminal decision",
+                        "View: cycle progression and comparison lenses",
+                    ],
+                ));
+            }
             "refresh" => match EvalCampaignData::load(&self.data.campaign_dir) {
                 Ok(data) => {
                     self.data = data;
@@ -1694,6 +1854,9 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
                     return PluginTuiAction::Redraw;
                 }
                 KeyCode::Char('r') => return self.handle_action("record-generation"),
+                KeyCode::Char('p') => return self.handle_action("promote"),
+                KeyCode::Char('x') => return self.handle_action("reject"),
+                KeyCode::Char('?') => return self.handle_action("help"),
                 KeyCode::Char('q') | KeyCode::Escape => {
                     return PluginTuiAction::Close { outcome: None };
                 }
@@ -3798,6 +3961,9 @@ fn campaign_actions() -> Vec<ActionButton> {
         ActionButton::new("open-run", "O Open Run"),
         ActionButton::new("view-mode", "V View"),
         ActionButton::new("record-generation", "R Record"),
+        ActionButton::new("promote", "P Promote"),
+        ActionButton::new("reject", "X Reject"),
+        ActionButton::new("help", "? Help"),
         ActionButton::new("refresh", "Refresh"),
         ActionButton::new("back", "Esc Back"),
     ]
