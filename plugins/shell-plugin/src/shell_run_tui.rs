@@ -133,7 +133,7 @@ fn shell_status_rows(payload: &serde_json::Value) -> Vec<Line> {
     ])]
 }
 
-fn shell_terminal_prompt_rows(payload: &serde_json::Value, width: u16) -> Vec<Line> {
+fn shell_terminal_prompt_rows(payload: &serde_json::Value, _width: u16) -> Vec<Line> {
     let arguments = payload.get("arguments").unwrap_or(payload);
     let command = arguments
         .get("command")
@@ -147,30 +147,25 @@ fn shell_terminal_prompt_rows(payload: &serde_json::Value, width: u16) -> Vec<Li
     if command.is_empty() {
         return Vec::new();
     }
-    let mut lines = Vec::new();
-    for (source_index, source_line) in command.lines().enumerate() {
-        let prompt_width = if source_index == 0 {
-            prompt_spans(cwd).iter().map(span_width).sum()
-        } else {
-            4
-        };
-        let display_lines = if format_commands {
-            format_shell_command_line(source_line, width.saturating_sub(prompt_width))
-        } else {
-            vec![source_line.to_owned()]
-        };
-        for (display_index, line) in display_lines.iter().enumerate() {
-            let mut spans = Vec::new();
-            if source_index == 0 && display_index == 0 {
-                spans.extend(prompt_spans(cwd));
+
+    let display_command = if format_commands {
+        format_shell_command_for_display(command)
+    } else {
+        command.to_owned()
+    };
+    display_command
+        .lines()
+        .enumerate()
+        .map(|(index, line)| {
+            let mut spans = if index == 0 {
+                prompt_spans(cwd)
             } else {
-                spans.push(Span::styled("    ", muted_style()));
-            }
+                vec![Span::styled("    ", muted_style())]
+            };
             spans.extend(shell_command_spans(line));
-            lines.push(Line::from_spans(spans));
-        }
-    }
-    lines
+            Line::from_spans(spans)
+        })
+        .collect()
 }
 
 fn prompt_spans(cwd: Option<&str>) -> Vec<Span> {
@@ -184,89 +179,23 @@ fn prompt_spans(cwd: Option<&str>) -> Vec<Span> {
     spans
 }
 
-fn span_width(span: &Span) -> u16 {
-    u16::try_from(span.content.chars().count()).unwrap_or(u16::MAX)
-}
+fn format_shell_command_for_display(command: &str) -> String {
+    use shuck_formatter::{
+        FormattedSource, IndentStyle, ShellDialect, ShellFormatOptions, format_source,
+    };
 
-fn format_shell_command_line(line: &str, available_width: u16) -> Vec<String> {
-    let tokens = shell_command_tokens(line);
-    if tokens.is_empty() {
-        return vec![String::new()];
-    }
-    let max_width = usize::from(available_width.max(24));
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    for token in tokens {
-        let break_before = is_shell_break_operator(&token) && !current.is_empty();
-        let needs_space = !current.is_empty();
-        let next_len = current.len() + usize::from(needs_space) + token.len();
-        if break_before || next_len > max_width && !current.is_empty() {
-            lines.push(current);
-            current = String::new();
-        }
-        if !current.is_empty() {
-            current.push(' ');
-        }
-        current.push_str(&token);
-        if is_shell_break_operator(&token) {
-            lines.push(current);
-            current = String::new();
-        }
-    }
-    if !current.is_empty() {
-        lines.push(current);
-    }
-    if lines.is_empty() {
-        vec![String::new()]
-    } else {
-        lines
+    let options = ShellFormatOptions::default()
+        .with_dialect(ShellDialect::Bash)
+        .with_indent_style(IndentStyle::Space)
+        .with_indent_width(2);
+    match format_source(command, None, &options) {
+        Ok(FormattedSource::Formatted(formatted)) => trim_formatted_shell_command(&formatted),
+        Ok(FormattedSource::Unchanged) | Err(_) => command.to_owned(),
     }
 }
 
-fn shell_command_tokens(line: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut quote = None;
-    let mut escaped = false;
-    for character in line.chars() {
-        if escaped {
-            current.push(character);
-            escaped = false;
-            continue;
-        }
-        if character == '\\' {
-            current.push(character);
-            escaped = true;
-            continue;
-        }
-        if let Some(quote_character) = quote {
-            current.push(character);
-            if character == quote_character {
-                quote = None;
-            }
-            continue;
-        }
-        if matches!(character, '\'' | '"') {
-            current.push(character);
-            quote = Some(character);
-            continue;
-        }
-        if character.is_whitespace() {
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
-            }
-            continue;
-        }
-        current.push(character);
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
-}
-
-fn is_shell_break_operator(token: &str) -> bool {
-    matches!(token, "|" | "&&" | "||" | ";")
+fn trim_formatted_shell_command(command: &str) -> String {
+    command.trim_end_matches(['\r', '\n']).to_owned()
 }
 
 fn short_cwd(cwd: &str) -> String {
@@ -398,9 +327,9 @@ mod tests {
     }
 
     #[test]
-    fn adapter_formats_long_shell_commands_by_default() {
+    fn adapter_formats_shell_commands_by_default() {
         let payload = serde_json::json!({
-            "command": "cargo test --workspace --all-targets && cargo clippy --workspace --all-targets -- -D warnings | tee /tmp/bcode-shell.log",
+            "command": "if true;then echo 'hello world';else echo nope;fi",
             "cwd": "/Users/example/project"
         });
         let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
@@ -411,14 +340,14 @@ mod tests {
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
-        assert!(rendered.contains("&&"), "{rendered}");
-        assert!(rendered.contains('|'), "{rendered}");
-        assert!(rendered.lines().count() > 1, "{rendered}");
+        assert!(rendered.contains("; then"), "{rendered}");
+        assert!(rendered.contains("; else"), "{rendered}");
+        assert!(!rendered.contains(";then"), "{rendered}");
     }
 
     #[test]
     fn adapter_preserves_unformatted_shell_commands_when_disabled() {
-        let command = "cargo test --workspace --all-targets && cargo clippy --workspace --all-targets -- -D warnings";
+        let command = "if true;then echo 'hello world';else echo nope;fi";
         let payload = serde_json::json!({
             "command": command,
             "format_commands": false

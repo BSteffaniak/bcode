@@ -2150,6 +2150,7 @@ dependencies = [
  "portable-pty",
  "serde",
  "serde_json",
+ "shuck-formatter",
  "tempfile",
  "tokio",
  "url 2.5.8",
@@ -3105,6 +3106,20 @@ dependencies = [
  "castaway",
  "cfg-if",
  "itoa",
+ "ryu",
+ "static_assertions",
+]
+
+[[package]]
+name = "compact_str"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7fd622ebbb56a5b2ccb651b32b911cdeb2a9b4b11776b2473bf26a26a286244e"
+dependencies = [
+ "castaway",
+ "cfg-if",
+ "itoa",
+ "rustversion",
  "ryu",
  "static_assertions",
 ]
@@ -8642,6 +8657,48 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "shuck-ast"
+version = "0.0.41"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ffcdc94579e5bd855a6b4d99507857cebd82d23495e073e0211f7ce1bd2aa1c"
+dependencies = [
+ "compact_str 0.8.2",
+]
+
+[[package]]
+name = "shuck-formatter"
+version = "0.0.41"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "912caf96f150c873b233c27fb539341e4373521a5be790b7ddb449e48fa43435"
+dependencies = [
+ "memchr",
+ "shuck-ast",
+ "shuck-indexer",
+ "shuck-parser",
+]
+
+[[package]]
+name = "shuck-indexer"
+version = "0.0.41"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42fe28110eebe28f8ee5669b189daaca90a8ef1e592434ae69987545e36636cc"
+dependencies = [
+ "shuck-ast",
+ "shuck-parser",
+]
+
+[[package]]
+name = "shuck-parser"
+version = "0.0.41"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bedf58e95b2eae2e04addf94042b28532e3a3b7e1ca84f5b10c1d842dc584aab"
+dependencies = [
+ "memchr",
+ "shuck-ast",
+ "smallvec",
+]
+
+[[package]]
 name = "shuttle"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9173,7 +9230,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50b8dbdc2be434883934cda8c3f6638130390032c44e1952e543252fcafd67e0"
 dependencies = [
  "ascii",
- "compact_str",
+ "compact_str 0.7.1",
  "dragonbox_ecma",
  "memchr",
  "num-bigint",

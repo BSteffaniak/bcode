@@ -23,6 +23,7 @@ bmux_tui             = { workspace = true, optional = true }
 portable-pty         = { workspace = true }
 serde                = { workspace = true, features = ["derive", "std"] }
 serde_json           = { workspace = true }
+shuck-formatter      = { workspace = true, optional = true }
 tokio                = { workspace = true, features = ["rt"] }
 url                  = { workspace = true }
 vte                  = { workspace = true }
@@ -33,4 +34,4 @@ tempfile = { workspace = true }
 [features]
 default          = []
 fail-on-warnings = []
-static-bundled   = ["bcode_tui_components", "bmux_tui"]
+static-bundled   = ["bcode_tui_components", "bmux_tui", "shuck-formatter"]
