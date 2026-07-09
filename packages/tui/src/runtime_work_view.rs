@@ -71,10 +71,6 @@ impl RuntimeWorkViewState {
         }
     }
 
-    pub fn is_busy(&self) -> bool {
-        !self.active.is_empty()
-    }
-
     pub fn is_cancelling(&self) -> bool {
         self.active
             .values()

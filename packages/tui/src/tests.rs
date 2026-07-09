@@ -67,6 +67,7 @@ struct FileChangeResult {
 }
 
 use super::{
+    activity::ActivityState,
     app::{BmuxApp, KeyActivationOutcome},
     input,
     input::KeyRequest,
@@ -218,7 +219,7 @@ fn immediate_theme_transition_ignores_curve() {
 fn provider_tool_call_delta_trace_does_not_replace_status() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-    app.set_status("thinking".to_owned());
+    app.set_status("existing notice".to_owned());
     app.absorb_session_event(&SessionEvent {
         schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
         sequence: 1,
@@ -238,7 +239,93 @@ fn provider_tool_call_delta_trace_does_not_replace_status() {
         },
     });
 
-    assert_eq!(app.status(), "thinking");
+    assert_eq!(app.status(), "existing notice");
+}
+
+#[test]
+fn model_turn_progress_uses_specific_activity_phases_without_overwriting_notices() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_status("existing notice".to_owned());
+
+    app.absorb_session_event(&SessionEvent {
+        schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+        sequence: 1,
+        timestamp_ms: 1,
+        session_id,
+        provenance: None,
+        kind: SessionEventKind::ModelTurnStarted {
+            turn_id: "turn-1".to_owned(),
+        },
+    });
+    assert_eq!(app.activity(), &ActivityState::PreparingModelRequest);
+    assert_eq!(app.status(), "existing notice");
+
+    app.absorb_session_event(&SessionEvent {
+        schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+        sequence: 2,
+        timestamp_ms: 2,
+        session_id,
+        provenance: None,
+        kind: SessionEventKind::TraceEvent {
+            trace: Box::new(SessionTraceEvent {
+                timestamp_ms: 2,
+                turn_id: Some("turn-1".to_owned()),
+                phase: SessionTracePhase::ModelRequestBuilt,
+                payload: SessionTracePayload::ModelRequestBuilt {
+                    provider: "openai".to_owned(),
+                    model: "gpt".to_owned(),
+                    agent_id: "build".to_owned(),
+                    message_count: 1,
+                    tool_count: 0,
+                    system_prompt_chars: 0,
+                    prompt_cache_mode: "off".to_owned(),
+                    conversation_reuse_mode: "off".to_owned(),
+                    uses_previous_provider_response: false,
+                    metadata: BTreeMap::new(),
+                    request: None,
+                },
+            }),
+        },
+    });
+    assert_eq!(
+        app.activity(),
+        &ActivityState::StartingProviderRequest {
+            provider: "openai".to_owned(),
+            round: None,
+        }
+    );
+
+    app.absorb_session_event(&SessionEvent {
+        schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+        sequence: 3,
+        timestamp_ms: 3,
+        session_id,
+        provenance: None,
+        kind: SessionEventKind::TraceEvent {
+            trace: Box::new(SessionTraceEvent {
+                timestamp_ms: 3,
+                turn_id: Some("turn-1".to_owned()),
+                phase: SessionTracePhase::ModelProviderRoundStarted,
+                payload: SessionTracePayload::ProviderRound {
+                    provider_turn_id: Some("provider-turn-1".to_owned()),
+                    provider: "openai".to_owned(),
+                    round: Some(1),
+                    stop_reason: None,
+                    duration_ms: None,
+                    error: None,
+                },
+            }),
+        },
+    });
+    assert_eq!(
+        app.activity(),
+        &ActivityState::WaitingForProvider {
+            provider: "openai".to_owned(),
+            round: Some(1),
+        }
+    );
+    assert_eq!(app.status(), "existing notice");
 }
 
 #[test]
@@ -268,8 +355,10 @@ fn provider_tool_call_progress_status_formats_bytes() {
     });
 
     assert_eq!(
-        app.status(),
-        "assembling example.write arguments (1.5 KiB received)"
+        app.activity(),
+        &ActivityState::ProviderStream {
+            detail: "assembling example.write arguments (1.5 KiB received)".to_owned(),
+        }
     );
 }
 
@@ -290,8 +379,10 @@ fn live_provider_tool_call_progress_updates_status() {
     });
 
     assert_eq!(
-        app.status(),
-        "assembling example.write arguments (4.0 KiB received)"
+        app.activity(),
+        &ActivityState::ProviderStream {
+            detail: "assembling example.write arguments (4.0 KiB received)".to_owned(),
+        }
     );
 }
 

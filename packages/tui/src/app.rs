@@ -306,6 +306,7 @@ pub struct BmuxApp {
     pending_transcript_top_anchor_sequence: Option<u64>,
     older_history: OlderHistoryState,
     activity: ActivityState,
+    activity_started_at: Instant,
     daemon_connection: DaemonConnectionState,
     status: String,
     key_hints: String,
@@ -512,6 +513,7 @@ impl BmuxApp {
             pending_transcript_top_anchor_sequence: None,
             older_history: OlderHistoryState::new(history, has_older_history),
             activity: ActivityState::Idle,
+            activity_started_at: now,
             daemon_connection: DaemonConnectionState::Connecting,
             status: String::from("Connecting to daemon… Enter submits; Esc/Ctrl-C exits."),
             key_hints: String::from("enter send · escape interrupt · ctrl+d exit · ctrl+p palette"),
@@ -1207,6 +1209,12 @@ impl BmuxApp {
     #[must_use]
     pub const fn activity(&self) -> &ActivityState {
         &self.activity
+    }
+
+    /// Return when the current activity phase began.
+    #[must_use]
+    pub const fn activity_started_at(&self) -> Instant {
+        self.activity_started_at
     }
 
     /// Return daemon connection state for startup/readiness chrome.
@@ -2129,7 +2137,7 @@ impl BmuxApp {
                 ..
             } => {
                 if application.live_activity() {
-                    self.set_activity(ActivityState::Thinking);
+                    self.set_activity(ActivityState::PreparingFollowUpRequest);
                 }
                 self.active_tool_calls.remove(tool_call_id);
                 self.push_tool_result(
@@ -2209,7 +2217,7 @@ impl BmuxApp {
                 approved,
             } => {
                 if application.live_activity() {
-                    self.set_activity(ActivityState::Thinking);
+                    self.set_activity(ActivityState::PreparingFollowUpRequest);
                 }
                 self.set_permission_status(permission_id, *approved);
             }
@@ -2217,8 +2225,7 @@ impl BmuxApp {
                 self.apply_model_changed(provider, model);
             }
             SessionEventKind::ModelTurnStarted { .. } if application.live_activity() => {
-                self.set_activity(ActivityState::Thinking);
-                "thinking".clone_into(&mut self.status);
+                self.set_activity(ActivityState::PreparingModelRequest);
             }
             SessionEventKind::ModelTurnCancelRequested { .. } if application.live_activity() => {
                 self.set_cancelling();
@@ -2339,13 +2346,11 @@ impl BmuxApp {
 
     pub fn apply_runtime_work_snapshots(&mut self, snapshots: &[bcode_ipc::RuntimeWorkSnapshot]) {
         self.runtime_work.apply_snapshots(snapshots);
-        if let Some(status) = self.runtime_work.status_label() {
-            self.status = status;
-        }
+        let status = self.runtime_work.status_label();
         if self.runtime_work.is_cancelling() {
             self.set_cancelling();
-        } else if self.runtime_work.is_busy() {
-            self.set_activity(ActivityState::Thinking);
+        } else if let Some(detail) = status {
+            self.set_activity(ActivityState::RuntimeWork { detail });
         } else {
             self.set_activity(ActivityState::Idle);
         }
@@ -2598,7 +2603,7 @@ impl BmuxApp {
     }
 
     fn push_live_user_message(&mut self, sequence: u64, text: &str, timestamp_ms: u64) {
-        self.set_activity(ActivityState::Thinking);
+        self.set_activity(ActivityState::PreparingModelRequest);
         self.push_user_message(sequence, text, timestamp_ms);
     }
 
@@ -2643,7 +2648,7 @@ impl BmuxApp {
     ) {
         self.transcript.finish_streaming_item(role, text);
         if application.live_activity() && matches!(self.activity, ActivityState::Streaming { .. }) {
-            self.set_activity(ActivityState::Thinking);
+            self.set_activity(ActivityState::FinalizingModelTurn);
         }
     }
 
@@ -3325,13 +3330,11 @@ impl BmuxApp {
 
     fn apply_runtime_work_event(&mut self, event: &SessionEvent) {
         self.runtime_work.apply_event(event);
-        if let Some(status) = self.runtime_work.status_label() {
-            self.status = status;
-        }
+        let status = self.runtime_work.status_label();
         if self.runtime_work.is_cancelling() {
             self.set_cancelling();
-        } else if self.runtime_work.is_busy() {
-            self.set_activity(ActivityState::Thinking);
+        } else if let Some(detail) = status {
+            self.set_activity(ActivityState::RuntimeWork { detail });
         } else {
             self.set_activity(ActivityState::Idle);
         }
@@ -3346,6 +3349,9 @@ impl BmuxApp {
 
     fn set_activity(&mut self, activity: ActivityState) {
         if self.activity != activity {
+            if !self.activity.same_phase_as(&activity) {
+                self.activity_started_at = Instant::now();
+            }
             self.activity = activity;
         }
     }
@@ -3385,25 +3391,80 @@ impl BmuxApp {
                 ..
             } => self.apply_compaction_trace(trace.phase, reason, *compacted, message.as_deref()),
             SessionTracePayload::ModelRequestBuilt {
+                provider,
                 uses_previous_provider_response,
                 message_count,
                 metadata,
                 ..
-            } => self.token_usage.apply_model_request(
-                *uses_previous_provider_response,
-                *message_count,
-                metadata
-                    .get("sent_message_count")
-                    .and_then(|value| value.parse().ok()),
-                metadata
-                    .get("prompt_cache_points")
-                    .and_then(|value| value.parse().ok()),
-            ),
-            SessionTracePayload::ProviderRound { .. }
-            | SessionTracePayload::ToolInvocationStarted { .. }
-            | SessionTracePayload::ToolPolicyEvaluated { .. }
-            | SessionTracePayload::ToolPermissionWait { .. }
-            | SessionTracePayload::ToolInvocationFinished { .. }
+            } => {
+                self.token_usage.apply_model_request(
+                    *uses_previous_provider_response,
+                    *message_count,
+                    metadata
+                        .get("sent_message_count")
+                        .and_then(|value| value.parse().ok()),
+                    metadata
+                        .get("prompt_cache_points")
+                        .and_then(|value| value.parse().ok()),
+                );
+                self.set_activity(ActivityState::StartingProviderRequest {
+                    provider: provider.clone(),
+                    round: None,
+                });
+            }
+            SessionTracePayload::ProviderRound {
+                provider,
+                round,
+                stop_reason,
+                ..
+            } => match trace.phase {
+                SessionTracePhase::ModelProviderRoundStarted => {
+                    self.set_activity(ActivityState::WaitingForProvider {
+                        provider: provider.clone(),
+                        round: *round,
+                    });
+                }
+                SessionTracePhase::ModelProviderRoundFinished => {
+                    self.set_activity(
+                        if stop_reason.as_deref().is_some_and(|reason| {
+                            reason.eq_ignore_ascii_case("tool_call")
+                                || reason.eq_ignore_ascii_case("toolcall")
+                                || reason.eq_ignore_ascii_case("tool_calls")
+                        }) {
+                            ActivityState::PreparingToolExecution {
+                                name: "provider tool call".to_owned(),
+                            }
+                        } else {
+                            ActivityState::FinalizingModelTurn
+                        },
+                    );
+                }
+                _ => {}
+            },
+            SessionTracePayload::ToolInvocationStarted { tool_name, .. } => {
+                self.set_activity(ActivityState::RunningTool {
+                    name: tool_name.clone(),
+                });
+            }
+            SessionTracePayload::ToolPermissionWait {
+                tool_call_id,
+                approved,
+                ..
+            } => {
+                let tool_name = self.tool_call_contexts.get(tool_call_id).map_or_else(
+                    || "unknown tool".to_owned(),
+                    |context| context.tool_name.clone(),
+                );
+                self.set_activity(if approved.is_none() {
+                    ActivityState::WaitingPermission { name: tool_name }
+                } else {
+                    ActivityState::PreparingFollowUpRequest
+                });
+            }
+            SessionTracePayload::ToolInvocationFinished { .. } => {
+                self.set_activity(ActivityState::PreparingFollowUpRequest);
+            }
+            SessionTracePayload::ToolPolicyEvaluated { .. }
             | SessionTracePayload::ToolInvocationStreamEvent(_) => {}
         }
     }
@@ -3414,14 +3475,10 @@ impl BmuxApp {
                 self.set_activity(ActivityState::ProviderStream {
                     detail: "provider stream started".to_owned(),
                 });
-                "provider stream started".clone_into(&mut self.status);
             }
             ProviderStreamEvent::ToolCallStarted { tool_name, .. } => {
                 let detail = format!("provider stream tool started: {tool_name}");
-                self.set_activity(ActivityState::ProviderStream {
-                    detail: detail.clone(),
-                });
-                self.status = detail;
+                self.set_activity(ActivityState::ProviderStream { detail });
             }
             ProviderStreamEvent::ToolCallProgress {
                 tool_name,
@@ -3432,15 +3489,13 @@ impl BmuxApp {
                     "assembling {tool_name} arguments ({} received)",
                     format_provider_bytes(*argument_bytes)
                 );
-                self.set_activity(ActivityState::ProviderStream {
-                    detail: detail.clone(),
-                });
-                self.status = detail;
+                self.set_activity(ActivityState::ProviderStream { detail });
             }
             ProviderStreamEvent::ToolCallFinished { tool_name, .. } => {
-                self.status = format!("provider stream tool finished: {tool_name}");
                 if matches!(self.activity, ActivityState::ProviderStream { .. }) {
-                    self.set_activity(ActivityState::Thinking);
+                    self.set_activity(ActivityState::PreparingToolExecution {
+                        name: tool_name.clone(),
+                    });
                 }
             }
             ProviderStreamEvent::NoProgressWarning {
@@ -3456,10 +3511,7 @@ impl BmuxApp {
                         )
                     },
                 );
-                self.set_activity(ActivityState::ProviderStream {
-                    detail: detail.clone(),
-                });
-                self.status = detail;
+                self.set_activity(ActivityState::ProviderStream { detail });
             }
             ProviderStreamEvent::RetryScheduled {
                 message,
@@ -3469,7 +3521,6 @@ impl BmuxApp {
                     message: message.clone(),
                     retry_at_unix: *retry_at_unix,
                 });
-                self.status = format!("{message}; retrying soon");
             }
         }
     }
@@ -3499,12 +3550,12 @@ impl BmuxApp {
                 );
                 self.status = detail;
                 if compacted {
-                    self.set_activity(ActivityState::Thinking);
+                    self.set_activity(ActivityState::PreparingModelRequest);
                 }
             }
             SessionTracePhase::ContextCompactionSkipped => {
                 if matches!(self.activity, ActivityState::Compacting { .. }) {
-                    self.set_activity(ActivityState::Thinking);
+                    self.set_activity(ActivityState::PreparingModelRequest);
                 }
                 if let Some(message) = message {
                     message.clone_into(&mut self.status);

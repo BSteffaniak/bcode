@@ -3116,7 +3116,7 @@ impl ReviewAgentThreadState {
             return "failed";
         }
         match self.phase {
-            ReviewAgentThreadPhase::Pending => "thinking",
+            ReviewAgentThreadPhase::Pending => "waiting to create session",
             ReviewAgentThreadPhase::CreatingSession => "creating session",
             ReviewAgentThreadPhase::Running if self.answer.trim().is_empty() => "working",
             ReviewAgentThreadPhase::Running => "writing answer",

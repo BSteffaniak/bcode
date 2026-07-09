@@ -7,8 +7,36 @@ use bcode_session_models::ModelTurnOutcome;
 pub enum ActivityState {
     /// No active model/tool work.
     Idle,
-    /// Waiting for a model response.
-    Thinking,
+    /// Preparing the model request payload.
+    PreparingModelRequest,
+    /// Starting a provider request.
+    StartingProviderRequest {
+        /// Provider identifier.
+        provider: String,
+        /// Provider round, when known.
+        round: Option<u32>,
+    },
+    /// Waiting for a provider response.
+    WaitingForProvider {
+        /// Provider identifier.
+        provider: String,
+        /// Provider round, when known.
+        round: Option<u32>,
+    },
+    /// Preparing tool execution from a provider tool call.
+    PreparingToolExecution {
+        /// Tool name.
+        name: String,
+    },
+    /// Preparing a follow-up request after a tool or permission step.
+    PreparingFollowUpRequest,
+    /// Finalizing the active model turn.
+    FinalizingModelTurn,
+    /// Running tracked background/runtime work.
+    RuntimeWork {
+        /// Concrete runtime-work progress label.
+        detail: String,
+    },
     /// Compacting context before a model response.
     Compacting {
         /// User-facing progress detail.
@@ -48,6 +76,45 @@ pub enum ActivityState {
     },
     /// Cancelling the active turn.
     Cancelling,
+}
+
+impl ActivityState {
+    /// Return whether two values represent the same timed phase.
+    #[must_use]
+    pub fn same_phase_as(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::StartingProviderRequest {
+                    provider: left_provider,
+                    round: left_round,
+                },
+                Self::StartingProviderRequest {
+                    provider: right_provider,
+                    round: right_round,
+                },
+            )
+            | (
+                Self::WaitingForProvider {
+                    provider: left_provider,
+                    round: left_round,
+                },
+                Self::WaitingForProvider {
+                    provider: right_provider,
+                    round: right_round,
+                },
+            ) => left_provider == right_provider && left_round == right_round,
+            (
+                Self::PreparingToolExecution { name: left },
+                Self::PreparingToolExecution { name: right },
+            )
+            | (Self::RunningTool { name: left }, Self::RunningTool { name: right })
+            | (Self::WaitingPermission { name: left }, Self::WaitingPermission { name: right })
+            | (Self::WaitingInteraction { name: left }, Self::WaitingInteraction { name: right }) => {
+                left == right
+            }
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
+        }
+    }
 }
 
 /// Return a status label for a model turn outcome.

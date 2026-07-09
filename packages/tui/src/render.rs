@@ -793,9 +793,9 @@ fn push_markdown_message_block(
 
 fn push_reasoning_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) {
     let title = if item.streaming() {
-        "thinking …"
+        "Reasoning …"
     } else {
-        "thinking"
+        "Reasoning"
     };
     push_markdown_message_block(
         rows,
@@ -1597,7 +1597,11 @@ impl ChromeLine {
 fn statusline_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
     let muted = Style::new().fg(Color::BrightBlack);
     let mut line = ChromeLine::new(" · ", muted).required(
-        activity_label(app.activity(), app.daemon_connection()),
+        activity_label(
+            app.activity(),
+            app.activity_started_at(),
+            app.daemon_connection(),
+        ),
         Style::new().fg(theme.accent),
         true,
     );
@@ -1704,7 +1708,13 @@ fn truncate_chrome_part(part: &str, max_width: usize) -> String {
     format!("…{suffix}")
 }
 
-fn activity_label(activity: &ActivityState, daemon_connection: DaemonConnectionState) -> String {
+fn activity_label(
+    activity: &ActivityState,
+    started_at: std::time::Instant,
+    daemon_connection: DaemonConnectionState,
+) -> String {
+    let elapsed = format_activity_elapsed(started_at.elapsed());
+    let active = |label: String| format!("{} {label} · {elapsed}", spinner_frame());
     match activity {
         ActivityState::Idle => match daemon_connection {
             DaemonConnectionState::Connecting => format!("{} connecting…", spinner_frame()),
@@ -1714,15 +1724,28 @@ fn activity_label(activity: &ActivityState, daemon_connection: DaemonConnectionS
             }
             DaemonConnectionState::Unavailable => "daemon unavailable".to_owned(),
         },
-        ActivityState::Thinking => format!("{} thinking", spinner_frame()),
-        ActivityState::Compacting { detail } => {
-            format!("{} compacting · {detail}", spinner_frame())
+        ActivityState::PreparingModelRequest => active("preparing model request".to_owned()),
+        ActivityState::StartingProviderRequest { provider, round } => active(format!(
+            "starting {provider} request{}",
+            format_round(*round)
+        )),
+        ActivityState::WaitingForProvider { provider, round } => active(format!(
+            "waiting for {provider} response{}",
+            format_round(*round)
+        )),
+        ActivityState::PreparingToolExecution { name } => {
+            active(format!("preparing tool execution · {name}"))
         }
+        ActivityState::PreparingFollowUpRequest => {
+            active("preparing follow-up model request".to_owned())
+        }
+        ActivityState::FinalizingModelTurn => active("finalizing model turn".to_owned()),
+        ActivityState::RuntimeWork { detail } | ActivityState::ProviderStream { detail } => {
+            active(detail.clone())
+        }
+        ActivityState::Compacting { detail } => active(format!("compacting · {detail}")),
         ActivityState::Streaming { chars } => {
-            format!("{} streaming · {chars} chars", spinner_frame())
-        }
-        ActivityState::ProviderStream { detail } => {
-            format!("{} provider stream · {detail}", spinner_frame())
+            active(format!("receiving model output · {chars} chars"))
         }
         ActivityState::RetryWait {
             message,
@@ -1732,16 +1755,28 @@ fn activity_label(activity: &ActivityState, daemon_connection: DaemonConnectionS
             spinner_frame(),
             format_retry_remaining(*retry_at_unix)
         ),
-        ActivityState::RunningTool { name } => {
-            format!("{} {}", spinner_frame(), tool_activity_label(name))
-        }
-        ActivityState::WaitingPermission { name } => {
-            format!("permission {}", tool_activity_label(name))
-        }
+        ActivityState::RunningTool { name } => active(tool_activity_label(name)),
+        ActivityState::WaitingPermission { name } => active(format!(
+            "waiting for permission · {}",
+            tool_activity_label(name)
+        )),
         ActivityState::WaitingInteraction { name } => {
-            format!("waiting for {}", tool_activity_label(name))
+            active(format!("waiting for input · {}", tool_activity_label(name)))
         }
-        ActivityState::Cancelling => format!("{} cancelling", spinner_frame()),
+        ActivityState::Cancelling => active("cancelling".to_owned()),
+    }
+}
+
+fn format_round(round: Option<u32>) -> String {
+    round.map_or_else(String::new, |round| format!(" · round {round}"))
+}
+
+fn format_activity_elapsed(elapsed: std::time::Duration) -> String {
+    let millis = elapsed.as_millis();
+    if millis < 1_000 {
+        format!("{millis}ms")
+    } else {
+        format!("{:.1}s", elapsed.as_secs_f64())
     }
 }
 
