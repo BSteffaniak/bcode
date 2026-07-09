@@ -2,7 +2,7 @@
 
 use bcode_session_models::SessionSummary;
 use bcode_session_view_models::{
-    SessionViewSnapshot, ToolInvocationViewStatus, TranscriptViewItemKind,
+    PermissionView, SessionViewSnapshot, ToolInvocationViewStatus, TranscriptViewItemKind,
 };
 use hyperchad::template::{Containers, container};
 
@@ -26,7 +26,7 @@ pub fn home(snapshot: &SessionViewSnapshot, sessions: &[SessionSummary]) -> Cont
     };
 
     container! {
-        div padding=24 background="#0d1117" color="#c9d1d9" font-family="monospace" {
+        div #bcode-web-shell padding=24 background="#0d1117" color="#c9d1d9" font-family="monospace" {
             header justify-content=space-between align-items=center margin-bottom=24 {
                 div {
                     h1 color="#7ee787" font-size=28 margin-bottom=4 { "bcode web" }
@@ -81,15 +81,96 @@ pub fn home(snapshot: &SessionViewSnapshot, sessions: &[SessionSummary]) -> Cont
                         }
                     }
 
-                    section background="#161b22" border="1, #30363d" border-radius=10 padding=16 {
-                        h2 color="#f0f6fc" font-size=16 margin-bottom=12 { "composer" }
-                        div background="#0d1117" border="1, #30363d" border-radius=8 padding=12 color="#8b949e" font-size=13 {
-                            @if snapshot.composer.draft.is_empty() {
-                                "Draft is empty. HyperChad action wiring will submit semantic SessionViewAction values in a later step."
-                            } @else {
-                                (snapshot.composer.draft)
+                    @if !snapshot.permissions.is_empty() {
+                        section background="#161b22" border="1, #30363d" border-radius=10 padding=16 margin-bottom=18 {
+                            h2 color="#f0f6fc" font-size=16 margin-bottom=14 { "permissions" }
+                            @for permission in &snapshot.permissions {
+                                (permission_request(permission, snapshot.session_id))
                             }
                         }
+                    }
+
+                    section background="#161b22" border="1, #30363d" border-radius=10 padding=16 {
+                        h2 color="#f0f6fc" font-size=16 margin-bottom=12 { "composer" }
+                        @if let Some(message) = &snapshot.composer.disabled_reason {
+                            div background="#0d1117" border="1, #30363d" border-radius=8 padding=10 color="#8b949e" font-size=12 margin-bottom=12 {
+                                (message)
+                            }
+                        }
+                        (composer(snapshot))
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn composer(snapshot: &SessionViewSnapshot) -> Containers {
+    let action = "/actions/submit-message";
+    container! {
+        div {
+            form hx-post=(action) hx-target="#bcode-web-shell" hx-swap=this background="#0d1117" border="1, #30363d" border-radius=8 padding=12 {
+                @if let Some(session_id) = snapshot.session_id {
+                    input type=hidden name="session_id" value=(session_id.to_string());
+                }
+                input type=hidden name="placement" value="steering";
+                textarea name="text" rows="5" placeholder="Send a message to this session" width=100% padding=10 border="1, #30363d" border-radius=6 background="#010409" color="#c9d1d9" {
+                    (snapshot.composer.draft)
+                }
+                button type=submit background="#238636" color=white border-radius=6 padding="8, 14" margin-top=10 {
+                    "send"
+                }
+            }
+            @if let Some(session_id) = snapshot.session_id {
+                form hx-post="/actions/cancel-turn" hx-target="#bcode-web-shell" hx-swap=this margin-top=10 {
+                    input type=hidden name="session_id" value=(session_id.to_string());
+                    input type=hidden name="clear_queue" value="true";
+                    button type=submit background="#da3633" color=white border-radius=6 padding="8, 14" {
+                        "cancel turn"
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn permission_request(
+    permission: &PermissionView,
+    session_id: Option<bcode_session_models::SessionId>,
+) -> Containers {
+    container! {
+        div border="1, #f2cc60" border-radius=8 padding=10 margin-bottom=10 {
+            div color="#f2cc60" margin-bottom=6 { (permission.title.as_deref().unwrap_or("Permission requested")) }
+            div color="#c9d1d9" { (permission.detail.as_deref().unwrap_or("No details provided.")) }
+            @if permission.resolved {
+                div color="#8b949e" font-size=12 margin-top=8 {
+                    "resolved: " (if permission.approved.unwrap_or(false) { "approved" } else { "denied" })
+                }
+            } @else if let Some(session_id) = session_id {
+                div direction=row gap=8 margin-top=10 {
+                    form hx-post="/actions/permission" hx-target="#bcode-web-shell" hx-swap=this {
+                        input type=hidden name="session_id" value=(session_id.to_string());
+                        input type=hidden name="permission_id" value=(permission.permission_id.clone());
+                        input type=hidden name="approved" value="true";
+                        @if permission.can_remember {
+                            span color="#8b949e" font-size=11 margin-right=8 {
+                                input type=checkbox name="remember" value="true";
+                                " remember"
+                            }
+                        }
+                        button type=submit background="#238636" color=white border-radius=6 padding="6, 12" { "approve" }
+                    }
+                    form hx-post="/actions/permission" hx-target="#bcode-web-shell" hx-swap=this {
+                        input type=hidden name="session_id" value=(session_id.to_string());
+                        input type=hidden name="permission_id" value=(permission.permission_id.clone());
+                        input type=hidden name="approved" value="false";
+                        @if permission.can_remember {
+                            span color="#8b949e" font-size=11 margin-right=8 {
+                                input type=checkbox name="remember" value="true";
+                                " remember"
+                            }
+                        }
+                        button type=submit background="#da3633" color=white border-radius=6 padding="6, 12" { "deny" }
                     }
                 }
             }

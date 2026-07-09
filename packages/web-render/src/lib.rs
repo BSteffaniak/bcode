@@ -8,12 +8,15 @@ use std::str::FromStr as _;
 use std::sync::{Arc, LazyLock};
 
 use bcode_client::{AttachedSessionHistory, BcodeClient, ClientError};
-use bcode_session_models::SessionSummary;
-use bcode_session_view::SessionView;
-use bcode_session_view_models::SessionViewSnapshot;
+use bcode_session_models::{SessionId, SessionSummary};
+use bcode_session_view::{SessionView, execute_session_view_action};
+use bcode_session_view_models::{
+    ComposerDraftViewScope, PromptPlacementView, SessionViewAction, SessionViewSnapshot,
+};
 use hyperchad::app::{App, AppBuilder, renderer::DefaultRenderer};
 use hyperchad::color::Color;
 use hyperchad::router::{RoutePath, RouteRequest, Router};
+use serde::Deserialize;
 
 static BACKGROUND_COLOR: LazyLock<Color> = LazyLock::new(|| Color::from_hex("#0d1117"));
 
@@ -28,6 +31,36 @@ pub static VIEWPORT: LazyLock<String> =
 #[derive(Debug, Clone)]
 pub struct WebRenderState {
     client: BcodeClient,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromptForm {
+    session_id: Option<String>,
+    text: String,
+    #[serde(default)]
+    placement: PromptPlacementView,
+}
+
+#[derive(Debug, Deserialize)]
+struct CancelTurnForm {
+    session_id: String,
+    #[serde(default)]
+    clear_queue: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateDraftForm {
+    session_id: String,
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PermissionForm {
+    session_id: String,
+    permission_id: String,
+    approved: bool,
+    #[serde(default)]
+    remember: bool,
 }
 
 impl WebRenderState {
@@ -105,6 +138,11 @@ pub fn snapshot_from_attached_history(attached: AttachedSessionHistory) -> Sessi
 #[must_use]
 pub fn router_from_state(state: WebRenderState) -> Router {
     let root_state = state.clone();
+    let session_state = state.clone();
+    let submit_state = state.clone();
+    let cancel_state = state.clone();
+    let draft_state = state.clone();
+    let permission_state = state;
     Router::new()
         .with_route("/", move |_| {
             let state = root_state.clone();
@@ -113,10 +151,26 @@ pub fn router_from_state(state: WebRenderState) -> Router {
         .with_route(
             RoutePath::LiteralPrefix("/session/".to_string()),
             move |request| {
-                let state = state.clone();
+                let state = session_state.clone();
                 async move { state.render_session_request(&request).await }
             },
         )
+        .with_route("/actions/submit-message", move |request| {
+            let state = submit_state.clone();
+            async move { state.handle_submit_message(request).await }
+        })
+        .with_route("/actions/cancel-turn", move |request| {
+            let state = cancel_state.clone();
+            async move { state.handle_cancel_turn(request).await }
+        })
+        .with_route("/actions/update-draft", move |request| {
+            let state = draft_state.clone();
+            async move { state.handle_update_draft(request).await }
+        })
+        .with_route("/actions/permission", move |request| {
+            let state = permission_state.clone();
+            async move { state.handle_permission(request).await }
+        })
 }
 
 impl WebRenderState {
@@ -140,16 +194,184 @@ impl WebRenderState {
         let Some(session_id) = session_id_from_path(&request.path) else {
             return error_page("invalid session path");
         };
+        self.render_session(session_id, &sessions).await
+    }
+
+    async fn handle_submit_message(
+        &self,
+        request: RouteRequest,
+    ) -> hyperchad::template::Containers {
+        let form = match request.parse_form::<PromptForm>() {
+            Ok(form) => form,
+            Err(error) => return error_page(&error.to_string()),
+        };
+        let session_id = form.session_id.as_deref().and_then(parse_session_id);
+        if form.text.trim().is_empty() {
+            return self
+                .render_session_or_initial(session_id, "prompt cannot be empty")
+                .await;
+        }
+        let launch_working_directory = if session_id.is_none() {
+            match std::env::current_dir() {
+                Ok(working_directory) => Some(working_directory),
+                Err(error) => return error_page(&error.to_string()),
+            }
+        } else {
+            None
+        };
+        let action = SessionViewAction::SubmitMessage {
+            session_id,
+            launch_working_directory,
+            text: form.text,
+            placement: form.placement,
+        };
+        match execute_session_view_action(&self.client, action).await {
+            Ok(bcode_session_view_models::SessionViewActionOutcome::MessageAccepted {
+                session_id,
+                ..
+            }) => {
+                self.render_session_or_initial(Some(session_id), "message accepted")
+                    .await
+            }
+            Ok(_) => {
+                self.render_session_or_initial(session_id, "message accepted")
+                    .await
+            }
+            Err(error) => {
+                self.render_session_or_initial(session_id, &error.to_string())
+                    .await
+            }
+        }
+    }
+
+    async fn handle_cancel_turn(&self, request: RouteRequest) -> hyperchad::template::Containers {
+        let form = match request.parse_form::<CancelTurnForm>() {
+            Ok(form) => form,
+            Err(error) => return error_page(&error.to_string()),
+        };
+        let Some(session_id) = parse_session_id(&form.session_id) else {
+            return error_page("invalid session id");
+        };
+        let action = SessionViewAction::CancelTurn {
+            session_id,
+            clear_queue: form.clear_queue,
+        };
+        match execute_session_view_action(&self.client, action).await {
+            Ok(_) => {
+                self.render_session_or_initial(Some(session_id), "turn cancelled")
+                    .await
+            }
+            Err(error) => {
+                self.render_session_or_initial(Some(session_id), &error.to_string())
+                    .await
+            }
+        }
+    }
+
+    async fn handle_update_draft(&self, request: RouteRequest) -> hyperchad::template::Containers {
+        let form = match request.parse_form::<UpdateDraftForm>() {
+            Ok(form) => form,
+            Err(error) => return error_page(&error.to_string()),
+        };
+        let Some(session_id) = parse_session_id(&form.session_id) else {
+            return error_page("invalid session id");
+        };
+        let action = SessionViewAction::UpdateDraft {
+            scope: ComposerDraftViewScope::Session { session_id },
+            text: form.text,
+        };
+        match execute_session_view_action(&self.client, action).await {
+            Ok(_) => {
+                self.render_session_or_initial(Some(session_id), "draft saved")
+                    .await
+            }
+            Err(error) => {
+                self.render_session_or_initial(Some(session_id), &error.to_string())
+                    .await
+            }
+        }
+    }
+
+    async fn handle_permission(&self, request: RouteRequest) -> hyperchad::template::Containers {
+        let form = match request.parse_form::<PermissionForm>() {
+            Ok(form) => form,
+            Err(error) => return error_page(&error.to_string()),
+        };
+        let Some(session_id) = parse_session_id(&form.session_id) else {
+            return error_page("invalid session id");
+        };
+        let action = SessionViewAction::ResolvePermission {
+            permission_id: form.permission_id,
+            approved: form.approved,
+            remember: form.remember,
+        };
+        match execute_session_view_action(&self.client, action).await {
+            Ok(_) => {
+                self.render_session_or_initial(Some(session_id), "permission resolved")
+                    .await
+            }
+            Err(error) => {
+                self.render_session_or_initial(Some(session_id), &error.to_string())
+                    .await
+            }
+        }
+    }
+
+    async fn render_session_or_initial(
+        &self,
+        session_id: Option<SessionId>,
+        status: &str,
+    ) -> hyperchad::template::Containers {
+        let sessions = match self.client.list_sessions().await {
+            Ok(sessions) => sessions,
+            Err(error) => return error_page(&error.to_string()),
+        };
+        match session_id {
+            Some(session_id) => {
+                self.render_session_with_status(session_id, &sessions, status)
+                    .await
+            }
+            None => match self.initial_state().await {
+                Ok((mut snapshot, sessions)) => {
+                    snapshot.composer.disabled_reason = Some(status.to_owned());
+                    bcode_web_render_ui::pages::home::home(&snapshot, &sessions)
+                }
+                Err(error) => error_page(&error.to_string()),
+            },
+        }
+    }
+
+    async fn render_session(
+        &self,
+        session_id: SessionId,
+        sessions: &[SessionSummary],
+    ) -> hyperchad::template::Containers {
+        self.render_session_with_status(session_id, sessions, "connected")
+            .await
+    }
+
+    async fn render_session_with_status(
+        &self,
+        session_id: SessionId,
+        sessions: &[SessionSummary],
+        status: &str,
+    ) -> hyperchad::template::Containers {
         match self.session_snapshot(session_id).await {
-            Ok(snapshot) => bcode_web_render_ui::pages::home::home(&snapshot, &sessions),
+            Ok(mut snapshot) => {
+                snapshot.composer.disabled_reason = Some(status.to_owned());
+                bcode_web_render_ui::pages::home::home(&snapshot, sessions)
+            }
             Err(error) => error_page(&error.to_string()),
         }
     }
 }
 
-fn session_id_from_path(path: &str) -> Option<bcode_session_models::SessionId> {
-    path.strip_prefix("/session/")
-        .and_then(|value| bcode_session_models::SessionId::from_str(value).ok())
+fn session_id_from_path(path: &str) -> Option<SessionId> {
+    path.strip_prefix("/session/").and_then(parse_session_id)
+}
+
+fn parse_session_id(value: &str) -> Option<SessionId> {
+    SessionId::from_str(value).ok()
 }
 
 fn error_page(message: &str) -> hyperchad::template::Containers {

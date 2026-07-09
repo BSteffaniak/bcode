@@ -24,7 +24,10 @@ hyperchad = { workspace = true, features = [
     "json",
     "renderer",
     "router",
+    "router-form",
+    "router-static-routes",
 ] }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
 [features]
