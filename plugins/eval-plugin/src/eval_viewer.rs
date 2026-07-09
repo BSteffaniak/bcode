@@ -63,6 +63,7 @@ pub struct EvalRunPickerSurface {
     status: String,
     table_area: Rect,
     action_area: Rect,
+    surface_area: Rect,
 }
 
 impl EvalRunPickerSurface {
@@ -89,6 +90,7 @@ impl EvalRunPickerSurface {
             status,
             table_area: Rect::new(0, 0, 0, 0),
             action_area: Rect::new(0, 0, 0, 0),
+            surface_area: Rect::new(0, 0, 0, 0),
         }
     }
 
@@ -264,6 +266,7 @@ impl PluginTuiSurface for EvalRunPickerSurface {
     }
 
     fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+        self.surface_area = area;
         if let Some(viewer) = self.embedded_viewer.as_mut() {
             viewer.render(area, frame);
             return;
@@ -296,7 +299,7 @@ impl PluginTuiSurface for EvalRunPickerSurface {
 
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
         if let Some(wizard) = self.active_wizard.as_mut() {
-            match wizard.handle_event(self.table_area, event) {
+            match wizard.handle_event(self.surface_area, event) {
                 EvalWizardOutcome::Continue => return PluginTuiAction::None,
                 EvalWizardOutcome::Redraw => return PluginTuiAction::Redraw,
                 EvalWizardOutcome::Cancel => {
@@ -705,6 +708,7 @@ pub struct EvalCampaignViewerSurface {
     status: String,
     table_area: Rect,
     action_area: Rect,
+    surface_area: Rect,
 }
 
 impl EvalCampaignViewerSurface {
@@ -739,6 +743,7 @@ impl EvalCampaignViewerSurface {
             status,
             table_area: Rect::new(0, 0, 0, 0),
             action_area: Rect::new(0, 0, 0, 0),
+            surface_area: Rect::new(0, 0, 0, 0),
         })
     }
 
@@ -835,6 +840,7 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
     }
 
     fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+        self.surface_area = area;
         if let Some(viewer) = self.selected_run_viewer.as_mut() {
             viewer.render(area, frame);
             return;
@@ -881,7 +887,7 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
 
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
         if let Some(wizard) = self.active_wizard.as_mut() {
-            match wizard.handle_event(self.table_area, event) {
+            match wizard.handle_event(self.surface_area, event) {
                 EvalWizardOutcome::Continue => return PluginTuiAction::None,
                 EvalWizardOutcome::Redraw => return PluginTuiAction::Redraw,
                 EvalWizardOutcome::Cancel => {
