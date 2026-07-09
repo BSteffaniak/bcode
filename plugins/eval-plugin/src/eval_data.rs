@@ -6,6 +6,7 @@ use bcode_eval_models::{
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Loaded eval run data for the viewer.
@@ -540,7 +541,13 @@ pub struct TextArtifact {
     pub title: String,
     /// Text body.
     pub text: String,
+    /// Whether the source exceeded the read limit.
+    pub truncated: bool,
+    /// Whether the source appears to be binary.
+    pub binary: bool,
 }
+
+const MAX_ARTIFACT_BYTES: u64 = 1_048_576;
 
 /// Load a repetition artifact by kind.
 #[must_use]
@@ -553,13 +560,12 @@ pub fn load_repetition_artifact(
         .artifacts
         .iter()
         .find(|artifact| artifact.kind == kind)?;
-    let path = if artifact.path.is_absolute() {
-        artifact.path.clone()
+    let relative = if artifact.path.is_absolute() {
+        return None;
     } else if artifact.path.components().count() > 1 {
-        run_dir.join(&artifact.path)
+        artifact.path.clone()
     } else {
-        run_dir
-            .join("cases")
+        PathBuf::from("cases")
             .join(&repetition.case_id)
             .join("variants")
             .join(&repetition.variant_id)
@@ -567,10 +573,29 @@ pub fn load_repetition_artifact(
             .join(format!("{:04}", repetition.repetition))
             .join(&artifact.path)
     };
-    let text = fs::read_to_string(&path).ok()?;
+    let canonical_root = run_dir.canonicalize().ok()?;
+    let path = canonical_root.join(relative).canonicalize().ok()?;
+    if !path.starts_with(&canonical_root) || !path.is_file() {
+        return None;
+    }
+    let metadata = fs::metadata(&path).ok()?;
+    let truncated = metadata.len() > MAX_ARTIFACT_BYTES;
+    let file = fs::File::open(&path).ok()?;
+    let mut bytes = Vec::new();
+    std::io::Read::take(file, MAX_ARTIFACT_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let binary = bytes.contains(&0);
+    let text = if binary {
+        format!("Binary artifact ({} bytes)", metadata.len())
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
     Some(TextArtifact {
         title: format!("{}: {}", kind, path.display()),
         text,
+        truncated,
+        binary,
     })
 }
 
@@ -584,4 +609,61 @@ pub fn measurement_totals(data: &EvalRunData) -> BTreeMap<String, f64> {
         }
     }
     totals
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bcode_eval_models::EvalArtifactRef;
+
+    fn repetition(path: PathBuf) -> EvalRepetitionResult {
+        EvalRepetitionResult {
+            case_id: "case".to_string(),
+            variant_id: "variant".to_string(),
+            repetition: 1,
+            passed: true,
+            exit_code: Some(0),
+            wall_time_ms: 1,
+            measurements: BTreeMap::new(),
+            judges: Vec::new(),
+            diagnostics: Vec::new(),
+            artifacts: vec![EvalArtifactRef {
+                kind: "diff".to_string(),
+                path,
+            }],
+        }
+    }
+
+    #[test]
+    fn artifact_loader_rejects_paths_outside_run_root() {
+        let root = std::env::temp_dir().join(format!("bcode-eval-artifact-{}", std::process::id()));
+        let outside = root.with_extension("outside");
+        fs::create_dir_all(&root).expect("create run root");
+        fs::write(&outside, "secret").expect("write outside file");
+        let result = load_repetition_artifact(
+            &root,
+            &repetition(PathBuf::from("../").join(outside.file_name().expect("file name"))),
+            "diff",
+        );
+        assert!(result.is_none());
+        let _ = fs::remove_file(outside);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn artifact_loader_detects_binary_content() {
+        let root =
+            std::env::temp_dir().join(format!("bcode-eval-binary-artifact-{}", std::process::id()));
+        let path = root
+            .join("cases/case/variants/variant/repetitions/0001")
+            .join("artifact.bin");
+        fs::create_dir_all(path.parent().expect("artifact parent")).expect("create run root");
+        fs::write(&path, [0, 1, 2]).expect("write binary file");
+        let artifact =
+            load_repetition_artifact(&root, &repetition(PathBuf::from("artifact.bin")), "diff")
+                .expect("load binary artifact");
+        assert!(artifact.binary);
+        assert!(!artifact.truncated);
+        let _ = fs::remove_dir_all(root);
+    }
 }

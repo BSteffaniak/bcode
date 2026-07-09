@@ -2771,7 +2771,7 @@ pub struct EvalRunViewerSurface {
     rep_state: TableState,
     action_state: ActionRowState,
     artifact_scroll: usize,
-    artifact: Option<(String, String)>,
+    artifact: Option<(String, String, bool, bool)>,
     status: String,
     tab_area: Rect,
     content_area: Rect,
@@ -2833,7 +2833,12 @@ impl EvalRunViewerSurface {
             return;
         };
         if let Some(artifact) = load_repetition_artifact(&self.data.run_dir, repetition, kind) {
-            self.artifact = Some((artifact.title, artifact.text));
+            self.artifact = Some((
+                artifact.title,
+                artifact.text,
+                artifact.truncated,
+                artifact.binary,
+            ));
             self.tab_state
                 .set_selected(Some(ViewerTab::Artifact.index()));
             self.artifact_scroll = 0;
@@ -3333,7 +3338,7 @@ impl EvalRunViewerSurface {
     }
 
     fn render_artifact(&self, area: Rect, frame: &mut Frame<'_>) {
-        let Some((title, text)) = &self.artifact else {
+        let Some((title, text, truncated, binary)) = &self.artifact else {
             render_panel_title(area, frame, "Artifact viewer");
             render_status(
                 inset_top(area, 1),
@@ -3343,13 +3348,33 @@ impl EvalRunViewerSurface {
             return;
         };
         render_panel_title(area, frame, title);
+        let notice = match (*binary, *truncated) {
+            (true, true) => "Binary artifact; preview metadata is truncated",
+            (true, false) => "Binary artifact; text preview unavailable",
+            (false, true) => "Artifact preview truncated at 1 MiB",
+            (false, false) => "",
+        };
+        let content_offset = u16::from(!notice.is_empty());
+        if !notice.is_empty() {
+            frame.write_line_with_fallback_style(
+                Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+                &Line::from_spans(vec![Span::styled(notice, Style::new().fg(WARNING))]),
+                Style::new().bg(PANEL),
+            );
+        }
         for (row, line) in text
             .lines()
             .skip(self.artifact_scroll)
-            .take(usize::from(area.height.saturating_sub(1)))
+            .take(usize::from(
+                area.height.saturating_sub(1).saturating_sub(content_offset),
+            ))
             .enumerate()
         {
-            let y = area.y.saturating_add(1).saturating_add(usize_to_u16(row));
+            let y = area
+                .y
+                .saturating_add(1)
+                .saturating_add(content_offset)
+                .saturating_add(usize_to_u16(row));
             frame.write_line_with_fallback_style(
                 Rect::new(area.x, y, area.width, 1),
                 &artifact_line(line),
