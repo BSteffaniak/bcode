@@ -154,6 +154,20 @@ impl EvalRunPickerSurface {
         }
     }
 
+    fn show_help(&mut self) {
+        self.active_wizard = Some(EvalWizard::help(
+            "Eval Home Help",
+            vec![
+                "Open: open selected run or campaign",
+                "New Campaign: create a campaign from discovered runs",
+                "Start Campaign: create from selected run",
+                "Attach Run: record selected run into a campaign",
+                "Refresh: reload runs and campaigns",
+                "Every action is clickable; keyboard shortcuts call the same actions.",
+            ],
+        ));
+    }
+
     fn start_campaign_from_selected_run(&mut self) {
         let Some(run) = self.selected_run_summary() else {
             self.status = "select a run to start a campaign".to_string();
@@ -262,6 +276,10 @@ impl EvalRunPickerSurface {
             }
             "refresh" => {
                 self.refresh();
+                PluginTuiAction::Redraw
+            }
+            "help" => {
+                self.show_help();
                 PluginTuiAction::Redraw
             }
             "close" => PluginTuiAction::Close { outcome: None },
@@ -386,6 +404,10 @@ impl PluginTuiSurface for EvalRunPickerSurface {
                     self.refresh();
                     return PluginTuiAction::Redraw;
                 }
+                KeyCode::Char('?') => {
+                    self.show_help();
+                    return PluginTuiAction::Redraw;
+                }
                 KeyCode::Char('q') | KeyCode::Escape => {
                     return PluginTuiAction::Close { outcome: None };
                 }
@@ -400,6 +422,14 @@ impl PluginTuiSurface for EvalRunPickerSurface {
 enum EvalWizard {
     StartCampaign(StartCampaignWizard),
     RecordGeneration(RecordGenerationWizard),
+    Help(HelpWizard),
+}
+
+#[derive(Debug, Clone)]
+struct HelpWizard {
+    state: DialogState,
+    title: &'static str,
+    body: Vec<Line>,
 }
 
 #[derive(Debug, Clone)]
@@ -412,6 +442,7 @@ struct StartCampaignWizard {
     name: TextInputState,
     focus: StartCampaignField,
     objective: EvalImprovementObjective,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -440,12 +471,13 @@ struct RecordGenerationWizard {
     branch: String,
     delta_kind: bcode_eval_models::EvalImprovementDeltaKind,
     run: Option<PathBuf>,
-    patch: Option<PathBuf>,
     risk: bcode_eval_models::EvalImprovementRisk,
     context: Vec<Line>,
     summary: TextInputState,
     rationale: TextInputState,
+    patch_path: TextInputState,
     focus: RecordGenerationField,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -465,6 +497,7 @@ enum RecordGenerationField {
     Summary,
     Campaign,
     Parent,
+    Patch,
     Kind,
     Risk,
     Rationale,
@@ -488,6 +521,14 @@ enum EvalWizardCompletion {
 }
 
 impl EvalWizard {
+    fn help(title: &'static str, lines: Vec<&'static str>) -> Self {
+        Self::Help(HelpWizard {
+            state: DialogState::new(),
+            title,
+            body: lines.into_iter().map(Line::from).collect(),
+        })
+    }
+
     fn start_campaign_from_run(
         run: &EvalRunSummary,
         campaigns_root: &std::path::Path,
@@ -555,6 +596,7 @@ impl EvalWizard {
             name: text_state(&name),
             focus: StartCampaignField::CampaignId,
             objective: EvalImprovementObjective::Progression,
+            error: None,
         })
     }
 
@@ -595,12 +637,13 @@ impl EvalWizard {
             branch: "main".to_string(),
             delta_kind: bcode_eval_models::EvalImprovementDeltaKind::Mixed,
             run: Some(run.run_dir.clone()),
-            patch: None,
             risk: bcode_eval_models::EvalImprovementRisk::Low,
             context,
             summary: text_state(&summary),
             rationale: text_state("Recorded from the eval overview TUI."),
+            patch_path: text_state(""),
             focus: RecordGenerationField::Summary,
+            error: None,
         }))
     }
 
@@ -662,12 +705,13 @@ impl EvalWizard {
             branch: "main".to_string(),
             delta_kind: bcode_eval_models::EvalImprovementDeltaKind::Mixed,
             run: Some(run.run_dir),
-            patch: None,
             risk: bcode_eval_models::EvalImprovementRisk::Low,
             context,
             summary: text_state(&summary),
             rationale: text_state("Recorded from the campaign timeline TUI."),
+            patch_path: text_state(""),
             focus: RecordGenerationField::Summary,
+            error: None,
         }))
     }
 
@@ -675,6 +719,7 @@ impl EvalWizard {
         match self {
             Self::StartCampaign(wizard) => wizard.render(area, frame),
             Self::RecordGeneration(wizard) => wizard.render(area, frame),
+            Self::Help(wizard) => wizard.render(area, frame),
         }
     }
 
@@ -704,6 +749,7 @@ impl EvalWizard {
         let actions = match self {
             Self::StartCampaign(_) => wizard_actions("create"),
             Self::RecordGeneration(_) => wizard_actions("record"),
+            Self::Help(_) => vec![ActionButton::new("cancel", "Close")],
         };
         let outcome = Dialog::new(&[], &actions, eval_modal_theme())
             .title(self.title())
@@ -721,6 +767,7 @@ impl EvalWizard {
         match self {
             Self::StartCampaign(_) => "Start Improvement Campaign",
             Self::RecordGeneration(_) => "Record Generation",
+            Self::Help(wizard) => wizard.title,
         }
     }
 
@@ -728,6 +775,7 @@ impl EvalWizard {
         match self {
             Self::StartCampaign(wizard) => &mut wizard.state,
             Self::RecordGeneration(wizard) => &mut wizard.state,
+            Self::Help(wizard) => &mut wizard.state,
         }
     }
 
@@ -745,12 +793,14 @@ impl EvalWizard {
                 wizard.focus = match wizard.focus {
                     RecordGenerationField::Summary => RecordGenerationField::Campaign,
                     RecordGenerationField::Campaign => RecordGenerationField::Parent,
-                    RecordGenerationField::Parent => RecordGenerationField::Kind,
+                    RecordGenerationField::Parent => RecordGenerationField::Patch,
+                    RecordGenerationField::Patch => RecordGenerationField::Kind,
                     RecordGenerationField::Kind => RecordGenerationField::Risk,
                     RecordGenerationField::Risk => RecordGenerationField::Rationale,
                     RecordGenerationField::Rationale => RecordGenerationField::Summary,
                 }
             }
+            Self::Help(_) => {}
         }
     }
 
@@ -788,21 +838,46 @@ impl EvalWizard {
         match self {
             Self::StartCampaign(wizard) => wizard.handle_inputs(area, event),
             Self::RecordGeneration(wizard) => wizard.handle_inputs(area, event),
+            Self::Help(_) => false,
         }
     }
 
-    fn complete(&self) -> EvalWizardOutcome {
+    fn complete(&mut self) -> EvalWizardOutcome {
         match self {
-            Self::StartCampaign(wizard) => {
-                EvalWizardOutcome::Complete(EvalWizardCompletion::StartCampaign {
+            Self::StartCampaign(wizard) => match wizard.validate() {
+                Ok(()) => EvalWizardOutcome::Complete(EvalWizardCompletion::StartCampaign {
                     suite_path: wizard.suite_path(),
                     options: wizard.options(),
-                })
-            }
-            Self::RecordGeneration(wizard) => EvalWizardOutcome::Complete(
-                EvalWizardCompletion::RecordGeneration(wizard.options()),
-            ),
+                }),
+                Err(error) => {
+                    wizard.error = Some(error);
+                    EvalWizardOutcome::Redraw
+                }
+            },
+            Self::RecordGeneration(wizard) => match wizard.validate() {
+                Ok(()) => EvalWizardOutcome::Complete(EvalWizardCompletion::RecordGeneration(
+                    wizard.options(),
+                )),
+                Err(error) => {
+                    wizard.error = Some(error);
+                    EvalWizardOutcome::Redraw
+                }
+            },
+            Self::Help(_) => EvalWizardOutcome::Cancel,
         }
+    }
+}
+
+impl HelpWizard {
+    fn render(&self, area: Rect, frame: &mut Frame<'_>) {
+        Dialog::new(
+            &self.body,
+            &[ActionButton::new("cancel", "Close")],
+            eval_modal_theme(),
+        )
+        .title(self.title)
+        .sizing(wizard_sizing())
+        .render(area, &self.state, frame);
     }
 }
 
@@ -811,7 +886,7 @@ impl StartCampaignWizard {
         let actions = wizard_actions("create");
         let choice = self.selected_choice();
         let run_label = choice.run_id.as_deref().unwrap_or("no baseline run");
-        let body = vec![
+        let mut body = vec![
             Line::from("Create an improvement campaign."),
             Line::from(format!("Run: {run_label}")),
             Line::from(format!("Suite: {}", choice.suite_id)),
@@ -822,6 +897,9 @@ impl StartCampaignWizard {
             Line::from(format!("Objective: {}", objective_label(self.objective))),
             Line::from("Click fields/buttons or use Tab, arrows, Enter, Esc."),
         ];
+        if let Some(error) = &self.error {
+            body.push(Line::from(format!("Error: {error}")));
+        }
         Dialog::new(&body, &actions, eval_modal_theme())
             .title("Start Improvement Campaign")
             .sizing(wizard_sizing())
@@ -883,6 +961,35 @@ impl StartCampaignWizard {
         self.selected_choice().suite_path.clone()
     }
 
+    fn validate(&self) -> Result<(), String> {
+        let campaign_id = input_text(&self.campaign_id);
+        if campaign_id.is_empty() {
+            return Err("campaign id is required".to_string());
+        }
+        if sanitize_id(&campaign_id) != campaign_id {
+            return Err(
+                "campaign id may only contain ASCII letters, numbers, '-' and '_'".to_string(),
+            );
+        }
+        if input_text(&self.name).is_empty() {
+            return Err("campaign name is required".to_string());
+        }
+        if !self.suite_path().exists() {
+            return Err(format!(
+                "suite path does not exist: {}",
+                self.suite_path().display()
+            ));
+        }
+        let output_path = self.output_root.join(&campaign_id);
+        if output_path.exists() {
+            return Err(format!(
+                "campaign already exists: {}",
+                output_path.display()
+            ));
+        }
+        Ok(())
+    }
+
     fn options(&self) -> bcode_eval::EvalImprovementStartOptions {
         bcode_eval::EvalImprovementStartOptions {
             output_root: self.output_root.clone(),
@@ -911,9 +1018,16 @@ impl RecordGenerationWizard {
             delta_kind_label(self.delta_kind)
         )));
         body.push(Line::from(format!("Risk: {}", risk_label(self.risk))));
+        body.push(Line::from(format!(
+            "Patch: {}",
+            empty_label(&input_text(&self.patch_path))
+        )));
         body.push(Line::from(
             "Click fields/buttons or use Tab, arrows, Enter, Esc.",
         ));
+        if let Some(error) = &self.error {
+            body.push(Line::from(format!("Error: {error}")));
+        }
         Dialog::new(&body, &actions, eval_modal_theme())
             .title("Record Generation")
             .sizing(wizard_sizing())
@@ -933,7 +1047,15 @@ impl RecordGenerationWizard {
             "Rationale",
             &mut self.rationale,
             self.focus == RecordGenerationField::Rationale,
-            2,
+            1,
+        );
+        render_input_box(
+            layout.tertiary,
+            frame,
+            "Patch path (optional)",
+            &mut self.patch_path,
+            self.focus == RecordGenerationField::Patch,
+            1,
         );
     }
 
@@ -943,6 +1065,8 @@ impl RecordGenerationWizard {
             self.focus = RecordGenerationField::Summary;
         } else if event_click_in(event, layout.secondary) {
             self.focus = RecordGenerationField::Rationale;
+        } else if event_click_in(event, layout.tertiary) {
+            self.focus = RecordGenerationField::Patch;
         } else if event_click_in(event, layout.choice) {
             self.focus = RecordGenerationField::Campaign;
             self.campaign_index =
@@ -951,6 +1075,14 @@ impl RecordGenerationWizard {
         } else if event_click_in(event, layout.choice_alt) {
             self.focus = RecordGenerationField::Parent;
             self.parent_index = cycle_index(self.parent_choices.len(), self.parent_index, true);
+            return true;
+        } else if event_click_in(event, layout.choice_second) {
+            self.focus = RecordGenerationField::Kind;
+            self.delta_kind = cycle_delta_kind(self.delta_kind, true);
+            return true;
+        } else if event_click_in(event, layout.choice_second_alt) {
+            self.focus = RecordGenerationField::Risk;
+            self.risk = cycle_risk(self.risk, true);
             return true;
         }
         let summary = handle_input_box(
@@ -965,7 +1097,13 @@ impl RecordGenerationWizard {
             event,
             self.focus == RecordGenerationField::Rationale,
         );
-        summary || rationale
+        let patch = handle_input_box(
+            layout.tertiary,
+            &mut self.patch_path,
+            event,
+            self.focus == RecordGenerationField::Patch,
+        );
+        summary || rationale || patch
     }
 
     fn selected_campaign(&self) -> &RecordCampaignChoice {
@@ -976,6 +1114,17 @@ impl RecordGenerationWizard {
         &self.parent_choices[self.parent_index]
     }
 
+    fn validate(&self) -> Result<(), String> {
+        if input_text(&self.summary).is_empty() {
+            return Err("summary is required".to_string());
+        }
+        let patch = input_text(&self.patch_path);
+        if !patch.is_empty() && !std::path::Path::new(&patch).exists() {
+            return Err(format!("patch path does not exist: {patch}"));
+        }
+        Ok(())
+    }
+
     fn options(&self) -> bcode_eval::EvalImprovementRecordOptions {
         bcode_eval::EvalImprovementRecordOptions {
             campaign: self.selected_campaign().campaign_dir.clone(),
@@ -984,7 +1133,7 @@ impl RecordGenerationWizard {
             delta_kind: self.delta_kind,
             summary: input_text(&self.summary),
             run: self.run.clone(),
-            patch: self.patch.clone(),
+            patch: optional_path(&input_text(&self.patch_path)),
             risk: self.risk,
             rationale: Some(input_text(&self.rationale)).filter(|text| !text.trim().is_empty()),
         }
@@ -995,8 +1144,11 @@ impl RecordGenerationWizard {
 struct WizardLayout {
     primary: Rect,
     secondary: Rect,
+    tertiary: Rect,
     choice: Rect,
     choice_alt: Rect,
+    choice_second: Rect,
+    choice_second_alt: Rect,
 }
 
 fn wizard_layout(area: Rect) -> WizardLayout {
@@ -1007,11 +1159,19 @@ fn wizard_layout(area: Rect) -> WizardLayout {
         .body;
     WizardLayout {
         primary: Rect::new(body.x, body.y.saturating_add(4), body.width, 3),
-        secondary: Rect::new(body.x, body.y.saturating_add(7), body.width, 4),
-        choice: Rect::new(body.x, body.y.saturating_add(11), body.width / 2, 1),
+        secondary: Rect::new(body.x, body.y.saturating_add(7), body.width, 3),
+        tertiary: Rect::new(body.x, body.y.saturating_add(10), body.width, 3),
+        choice: Rect::new(body.x, body.y.saturating_add(14), body.width / 2, 1),
         choice_alt: Rect::new(
             body.x.saturating_add(body.width / 2),
-            body.y.saturating_add(11),
+            body.y.saturating_add(14),
+            body.width / 2,
+            1,
+        ),
+        choice_second: Rect::new(body.x, body.y.saturating_add(15), body.width / 2, 1),
+        choice_second_alt: Rect::new(
+            body.x.saturating_add(body.width / 2),
+            body.y.saturating_add(15),
             body.width / 2,
             1,
         ),
@@ -1019,7 +1179,7 @@ fn wizard_layout(area: Rect) -> WizardLayout {
 }
 
 const fn wizard_sizing() -> ModalSizing {
-    ModalSizing::new(Size::new(56, 15), Size::new(96, 23), Insets::all(2))
+    ModalSizing::new(Size::new(56, 18), Size::new(96, 28), Insets::all(2))
 }
 
 fn render_input_box(
@@ -1111,6 +1271,23 @@ fn cycle_risk(
 ) -> bcode_eval_models::EvalImprovementRisk {
     use bcode_eval_models::EvalImprovementRisk as Risk;
     cycle_value(&[Risk::Low, Risk::Medium, Risk::High], risk, forward)
+}
+
+fn optional_path(value: &str) -> Option<PathBuf> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(trimmed))
+    }
+}
+
+fn empty_label(value: &str) -> &str {
+    if value.trim().is_empty() {
+        "none"
+    } else {
+        value
+    }
 }
 
 fn cycle_index(len: usize, current: usize, forward: bool) -> usize {
@@ -3863,6 +4040,7 @@ fn picker_actions() -> Vec<ActionButton> {
         ActionButton::new("start-campaign", "S Start Campaign"),
         ActionButton::new("attach-run", "A Attach Run"),
         ActionButton::new("refresh", "R Refresh"),
+        ActionButton::new("help", "? Help"),
         ActionButton::new("close", "Esc Close"),
     ]
 }
