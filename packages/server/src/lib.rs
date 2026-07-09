@@ -130,6 +130,8 @@ pub enum ServerError {
     DaemonLifecycle(#[from] bcode_daemon_lifecycle::DaemonLifecycleError),
     #[error("blocking task join error: {0}")]
     BlockingTask(#[from] tokio::task::JoinError),
+    #[error("model catalog error: {0}")]
+    ModelCatalog(#[from] bcode_model_catalog::Error),
     #[error("model turn completion channel closed: {0}")]
     ModelTurnCompletionClosed(#[from] oneshot::error::RecvError),
 }
@@ -139,6 +141,7 @@ pub struct ServerState {
     pub sessions: SessionManager,
     pub session_catalog: Arc<session_catalog::SessionCatalog>,
     pub plugins: bcode_plugin::PluginRuntimeHost,
+    model_catalog: bcode_model_catalog::ModelCatalogResolver,
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
     selected_provider_context: bcode_model::ProviderRequestContext,
@@ -838,6 +841,7 @@ impl std::fmt::Debug for PendingInteractiveToolRequest {
 }
 
 struct ServerStateInit {
+    model_catalog: Option<bcode_model_catalog::ModelCatalogResolver>,
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
     selected_provider_context: bcode_model::ProviderRequestContext,
@@ -875,6 +879,9 @@ impl ServerState {
             sessions,
             session_catalog: Arc::new(session_catalog::SessionCatalog::default()),
             plugins,
+            model_catalog: init
+                .model_catalog
+                .expect("server model catalog resolver must be initialized"),
             selected_provider_plugin_id: init.selected_provider_plugin_id,
             selected_model_id: init.selected_model_id,
             selected_provider_context: init.selected_provider_context,
@@ -1658,6 +1665,7 @@ pub async fn run_with_static_bundled(
         sessions,
         plugins,
         ServerStateInit {
+            model_catalog: Some(bcode_model_catalog::ModelCatalogResolver::new().await?),
             selected_provider_plugin_id: resolved_model.provider_plugin_id,
             selected_model_id: resolved_model.model_id,
             selected_provider_context,
@@ -6746,14 +6754,28 @@ async fn handle_default_model_status(
     .await
 }
 
+async fn resolved_provider_models(
+    state: &ServerState,
+    provider_plugin_id: Option<String>,
+    request: bcode_model::ModelListRequest,
+) -> Result<ModelList, String> {
+    let models = invoke_model_provider_json_blocking::<_, ModelList>(
+        state,
+        provider_plugin_id,
+        OP_MODELS,
+        request,
+    )
+    .await?;
+    Ok(state.model_catalog.resolve(models).await)
+}
+
 async fn model_status_for_selection(
     state: &ServerState,
     selection: SessionModelSelection,
 ) -> bcode_ipc::SessionModelStatus {
-    let mut models = invoke_model_provider_json_blocking::<_, ModelList>(
+    let mut models = resolved_provider_models(
         state,
         selection.provider_plugin_id.clone(),
-        OP_MODELS,
         bcode_model::ModelListRequest {
             provider_context: selection.provider_context.clone(),
             selected_model_id: selection.model_id.clone(),
@@ -6838,10 +6860,9 @@ async fn handle_session_model_list(
             .as_ref()
             .and_then(|context| context.selected_provider_plugin_id.clone())
     });
-    match invoke_model_provider_json_blocking::<_, ModelList>(
+    match resolved_provider_models(
         state,
         selected_provider_plugin_id.clone(),
-        OP_MODELS,
         bcode_model::ModelListRequest {
             provider_context: runtime_context
                 .map_or_else(bcode_model::ProviderRequestContext::default, |context| {
@@ -7372,10 +7393,9 @@ async fn skill_model_exists(
     provider_plugin_id: Option<&str>,
     model_id: &str,
 ) -> bool {
-    invoke_model_provider_json_blocking::<_, ModelList>(
+    resolved_provider_models(
         state,
         provider_plugin_id.map(ToOwned::to_owned),
-        OP_MODELS,
         bcode_model::ModelListRequest {
             provider_context: state.selected_provider_context.clone(),
             selected_model_id: Some(model_id.to_string()),
@@ -12664,10 +12684,9 @@ async fn resolve_model_reasoning_info_from_provider(
     selected_model_id: Option<&str>,
     provider_context: bcode_model::ProviderRequestContext,
 ) -> Option<bcode_model::ModelReasoningInfo> {
-    let models = invoke_model_provider_json_blocking::<_, ModelList>(
+    let models = resolved_provider_models(
         state,
         provider_plugin_id.map(ToOwned::to_owned),
-        OP_MODELS,
         bcode_model::ModelListRequest {
             provider_context,
             selected_model_id: selected_model_id.map(ToOwned::to_owned),
@@ -12708,10 +12727,9 @@ async fn resolve_model_cache_info(
     provider_plugin_id: Option<&str>,
     selected_model_id: Option<&str>,
 ) -> Option<bcode_model::ModelCacheInfo> {
-    let models = invoke_model_provider_json_blocking::<_, ModelList>(
+    let models = resolved_provider_models(
         state,
         provider_plugin_id.map(ToOwned::to_owned),
-        OP_MODELS,
         bcode_model::ModelListRequest {
             provider_context: bcode_model::ProviderRequestContext::default(),
             selected_model_id: selected_model_id.map(ToOwned::to_owned),
@@ -18738,6 +18756,7 @@ mod tests {
             sessions,
             bcode_plugin::PluginHost::default().into(),
             ServerStateInit {
+                model_catalog: Some(bcode_model_catalog::ModelCatalogResolver::embedded()),
                 selected_provider_plugin_id: None,
                 selected_model_id: None,
                 selected_provider_context: bcode_model::ProviderRequestContext::default(),
@@ -19201,6 +19220,7 @@ mod tests {
             sessions,
             bcode_plugin::PluginHost::default().into(),
             ServerStateInit {
+                model_catalog: Some(bcode_model_catalog::ModelCatalogResolver::embedded()),
                 selected_provider_plugin_id: None,
                 selected_model_id: None,
                 selected_provider_context: bcode_model::ProviderRequestContext::default(),
@@ -19306,6 +19326,7 @@ mod tests {
             sessions,
             bcode_plugin::PluginHost::default().into(),
             ServerStateInit {
+                model_catalog: Some(bcode_model_catalog::ModelCatalogResolver::embedded()),
                 selected_provider_plugin_id: None,
                 selected_model_id: None,
                 selected_provider_context: bcode_model::ProviderRequestContext::default(),

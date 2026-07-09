@@ -95,6 +95,89 @@ impl From<serde_json::Error> for Error {
     }
 }
 
+#[derive(Debug)]
+pub struct ModelCatalogResolver {
+    catalog: tokio::sync::RwLock<ModelCatalog>,
+}
+
+impl ModelCatalogResolver {
+    /// Create a resolver from the embedded catalog and opportunistically overlay remote data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the embedded catalog is invalid.
+    pub async fn new() -> Result<Self> {
+        let catalog = ModelCatalog::load_bundled_with_remote_overlay().await?;
+        Ok(Self {
+            catalog: tokio::sync::RwLock::new(catalog),
+        })
+    }
+
+    /// Create a resolver using only the embedded catalog.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the compile-time embedded catalog is invalid.
+    #[must_use]
+    pub fn embedded() -> Self {
+        Self {
+            catalog: tokio::sync::RwLock::new(
+                ModelCatalog::load_bundled().expect("embedded model catalog must be valid"),
+            ),
+        }
+    }
+
+    /// Resolve provider-returned models through the shared catalog policy.
+    pub async fn resolve(&self, list: bcode_model::ModelList) -> bcode_model::ModelList {
+        let Some(provider_id) = list.catalog.provider_id.as_deref() else {
+            return list;
+        };
+        let models = {
+            let catalog = self.catalog.read().await;
+            let resolved = match list.catalog.expansion {
+                bcode_model::CatalogExpansionPolicy::None => {
+                    catalog.merge_provider_models(provider_id, list.models, false)
+                }
+                bcode_model::CatalogExpansionPolicy::AllCatalogModels => {
+                    catalog.merge_provider_models(provider_id, list.models, true)
+                }
+                bcode_model::CatalogExpansionPolicy::SupportedOnly => {
+                    let mut resolved =
+                        catalog.merge_provider_models(provider_id, list.models, false);
+                    let mut seen = resolved
+                        .iter()
+                        .map(|model| model.model_id.clone())
+                        .collect::<std::collections::BTreeSet<_>>();
+                    let catalog_models = list.catalog.support.as_ref().map_or_else(
+                        || catalog.provider_models_as_model_info(provider_id),
+                        |support| {
+                            let target = ModelSupportTarget::new(
+                                support.provider.clone(),
+                                support.auth_mode.clone(),
+                                support.api_surface.clone(),
+                                support.integration.clone(),
+                            );
+                            catalog.provider_models_for_support_target(provider_id, &target, false)
+                        },
+                    );
+                    resolved.extend(
+                        catalog_models
+                            .into_iter()
+                            .filter(|model| seen.insert(model.model_id.clone())),
+                    );
+                    resolved
+                }
+            };
+            drop(catalog);
+            resolved
+        };
+        bcode_model::ModelList {
+            models,
+            catalog: list.catalog,
+        }
+    }
+}
+
 /// Runtime wrapper around a model catalog document.
 #[derive(Debug, Clone)]
 pub struct ModelCatalog {

@@ -225,10 +225,46 @@ pub struct ModelListRequest {
     pub selected_model_id: Option<String>,
 }
 
+/// Catalog model expansion policy requested by a provider.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogExpansionPolicy {
+    /// Enrich only provider-returned models.
+    #[default]
+    None,
+    /// Add catalog models matching the provider support target.
+    SupportedOnly,
+    /// Add every catalog model for the provider.
+    AllCatalogModels,
+}
+
+/// Provider-neutral catalog support target.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCatalogSupportHint {
+    pub provider: String,
+    pub auth_mode: String,
+    pub api_surface: String,
+    #[serde(default)]
+    pub integration: Option<String>,
+}
+
+/// Provider hints consumed by the host catalog resolver.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCatalogHints {
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub expansion: CatalogExpansionPolicy,
+    #[serde(default)]
+    pub support: Option<ModelCatalogSupportHint>,
+}
+
 /// Model listing response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelList {
     pub models: Vec<ModelInfo>,
+    #[serde(default)]
+    pub catalog: ModelCatalogHints,
 }
 
 /// Model metadata exposed by a provider.
@@ -1637,6 +1673,7 @@ mod tests {
                     rule: "hidden".to_string(),
                 },
             }],
+            catalog: super::ModelCatalogHints::default(),
         };
 
         let encoded = serde_json::to_string(&list).expect("model list should encode");

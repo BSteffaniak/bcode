@@ -2051,6 +2051,7 @@ mod tests {
                     }),
                     visibility: bcode_model::ModelVisibility::Visible,
                 }],
+                catalog: bcode_model::ModelCatalogHints::default(),
             },
         });
 

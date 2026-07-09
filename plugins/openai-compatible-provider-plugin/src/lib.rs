@@ -10,8 +10,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bcode_config::AuthMode;
 use bcode_model::{
-    AckResponse, CancelTurnRequest, ContentBlock, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID,
-    MessageRole, ModelCapability, ModelInfo, ModelList, ModelListRequest, ModelMessage,
+    AckResponse, CancelTurnRequest, CatalogExpansionPolicy, ContentBlock, FinishTurnRequest,
+    MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelCapability, ModelCatalogHints,
+    ModelCatalogSupportHint, ModelInfo, ModelList, ModelListRequest, ModelMessage,
     ModelMetadataSource, ModelPricingInfo, ModelPricingSource, ModelPricingUnit,
     ModelReasoningCapabilitySource, ModelTokenPrice, ModelTurnRequest, NativeWebSearchRequest,
     NativeWebSearchResponse, NativeWebSearchResult, OP_AUTH_PRIME, OP_AUTH_RESET_CREDIT_CONSUME,
@@ -22,7 +23,6 @@ use bcode_model::{
     ProviderRequestContext, ProviderRequestProjection, ProviderRetryRule, ProviderRetryRuleMatch,
     ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage, ToolCall, ValidateConfigResponse,
 };
-use bcode_model_catalog_models::ModelSupportTarget;
 use bcode_model_provider_runtime::{
     ProviderRuntime, retry_hint_from_json_value, retry_hint_from_response_parts,
 };
@@ -4489,38 +4489,50 @@ fn unsupported_content_type_retry_rule() -> ProviderRetryRule {
 impl OpenAiCompatibleProviderPlugin {
     fn models(&self, request: &ModelListRequest) -> ModelList {
         let settings = settings_for_context(&request.provider_context);
-        let models = if let Some(models) = self.models_from_context(
-            &settings,
-            &request.provider_context,
-            request.selected_model_id.as_deref(),
-        ) {
-            models
-        } else {
-            let candidates = model_infos_from_ids_without_catalog(
-                &settings.model_ids,
-                settings.default_model.as_deref(),
-            );
-            if let Ok(runtime) = &self.runtime {
-                let async_settings = settings.clone();
-                let async_candidates = candidates.clone();
-                runtime
-                    .block_on(async move {
-                        enrich_model_infos_with_catalog_and_live(
-                            &async_settings,
-                            None,
-                            async_candidates,
-                        )
-                        .await
-                    })
-                    .unwrap_or_else(|_| merge_with_bundled_catalog(&settings, candidates))
-            } else {
-                merge_with_bundled_catalog(&settings, candidates)
-            }
-        };
+        let models = self
+            .models_from_context(
+                &settings,
+                &request.provider_context,
+                request.selected_model_id.as_deref(),
+            )
+            .unwrap_or_else(|| {
+                model_infos_from_ids_without_catalog(
+                    &settings.model_ids,
+                    settings.default_model.as_deref(),
+                )
+            });
         let models = ensure_selected_model_info(models, request.selected_model_id.as_deref());
         ModelList {
             models: apply_provider_static_metadata(&settings, models),
+            catalog: catalog_hints(&settings),
         }
+    }
+}
+
+fn catalog_hints(settings: &Settings) -> ModelCatalogHints {
+    if settings.model_ids_are_explicit {
+        return ModelCatalogHints {
+            provider_id: Some(catalog_provider_id(settings).to_string()),
+            expansion: CatalogExpansionPolicy::None,
+            support: None,
+        };
+    }
+    let provider_id = catalog_provider_id(settings);
+    let support = (provider_id == "openai").then(|| ModelCatalogSupportHint {
+        provider: "openai".to_string(),
+        auth_mode: if matches!(settings.auth, AuthSettings::ChatGpt { .. }) {
+            "chatgpt_subscription"
+        } else {
+            "api_key"
+        }
+        .to_string(),
+        api_surface: settings.dialect.metadata_value().to_string(),
+        integration: Some("bcode".to_string()),
+    });
+    ModelCatalogHints {
+        provider_id: Some(provider_id.to_string()),
+        expansion: CatalogExpansionPolicy::SupportedOnly,
+        support,
     }
 }
 
@@ -4575,19 +4587,17 @@ fn ensure_selected_model_info(
     {
         return models;
     }
-    let mut selected =
-        model_infos_from_ids(&[selected_model_id.to_string()], Some(selected_model_id));
+    let mut selected = model_infos_from_ids_without_catalog(
+        &[selected_model_id.to_string()],
+        Some(selected_model_id),
+    );
     models.append(&mut selected);
     models
 }
 
+#[cfg(test)]
 fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Vec<ModelInfo> {
-    let discovered = model_infos_from_ids_without_catalog(model_ids, default_model);
-    if let Ok(catalog) = bcode_model_catalog::ModelCatalog::load_bundled() {
-        catalog.merge_provider_models("openai", discovered, true)
-    } else {
-        discovered
-    }
+    model_infos_from_ids_without_catalog(model_ids, default_model)
 }
 
 fn model_infos_from_ids_without_catalog(
@@ -4611,13 +4621,7 @@ fn model_infos_from_items(
     models: Vec<ModelResponseItem>,
     default_model: Option<&str>,
 ) -> Vec<ModelInfo> {
-    let discovered = model_infos_from_items_without_catalog(models, default_model);
-
-    if let Ok(catalog) = bcode_model_catalog::ModelCatalog::load_bundled() {
-        catalog.merge_provider_models("openai", discovered, true)
-    } else {
-        discovered
-    }
+    model_infos_from_items_without_catalog(models, default_model)
 }
 
 fn model_infos_from_items_without_catalog(
@@ -4665,36 +4669,6 @@ fn model_infos_from_items_without_catalog(
         .collect()
 }
 
-fn merge_with_bundled_catalog(settings: &Settings, models: Vec<ModelInfo>) -> Vec<ModelInfo> {
-    let Ok(catalog) = bcode_model_catalog::ModelCatalog::load_bundled() else {
-        return models;
-    };
-    catalog.merge_provider_models(
-        catalog_provider_id(settings),
-        models,
-        !settings.model_ids_are_explicit,
-    )
-}
-
-async fn enrich_model_infos_with_catalog_and_live(
-    settings: &Settings,
-    api_key: Option<&str>,
-    models: Vec<ModelInfo>,
-) -> Vec<ModelInfo> {
-    let provider_id = catalog_provider_id(settings);
-    let Ok(mut catalog) =
-        bcode_model_catalog::ModelCatalog::load_bundled_with_remote_overlay().await
-    else {
-        return models;
-    };
-
-    if let Some(snapshot) = live_catalog_snapshot(settings, api_key).await {
-        catalog = catalog.with_live_snapshots(std::slice::from_ref(&snapshot));
-    }
-
-    catalog.merge_provider_models(provider_id, models, !settings.model_ids_are_explicit)
-}
-
 fn catalog_provider_id(settings: &Settings) -> &'static str {
     if discovery::is_xai_provider(
         Some(&settings.base_url),
@@ -4703,19 +4677,6 @@ fn catalog_provider_id(settings: &Settings) -> &'static str {
         "xai"
     } else {
         "openai"
-    }
-}
-
-async fn live_catalog_snapshot(
-    settings: &Settings,
-    api_key: Option<&str>,
-) -> Option<bcode_model_catalog_models::LiveCatalogSnapshot> {
-    match catalog_provider_id(settings) {
-        "xai" => {
-            let api_key = api_key.map(str::to_string);
-            bcode_model_discovery::xai::discover(api_key).await.ok()
-        }
-        _ => None,
     }
 }
 
@@ -5003,8 +4964,7 @@ async fn models_from_settings_async(
     api_key: &str,
     selected_model_id: Option<&str>,
 ) -> Result<Vec<ModelInfo>, ProviderError> {
-    let candidates = resolve_model_candidates(settings, api_key, selected_model_id).await?;
-    Ok(enrich_model_infos_with_catalog_and_live(settings, Some(api_key), candidates).await)
+    resolve_model_candidates(settings, api_key, selected_model_id).await
 }
 
 async fn resolve_model_candidates(
@@ -5037,7 +4997,7 @@ async fn resolve_model_candidates(
     // Live fetch failed – fall back to previous behavior
 
     if settings.model_ids_are_explicit {
-        return Ok(model_infos_from_ids(
+        return Ok(model_infos_from_ids_without_catalog(
             &configured_model_ids,
             settings.default_model.as_deref(),
         ));
@@ -5222,34 +5182,16 @@ fn diagnostics_metadata(
     metadata
 }
 
-fn openai_provider_catalog() -> Option<bcode_model_catalog_models::ProviderCatalog> {
-    bcode_model_catalog::ModelCatalog::load_bundled()
-        .ok()
-        .and_then(|catalog| catalog.provider("openai").cloned())
-}
-
 fn openai_default_model_id() -> String {
-    openai_provider_catalog()
-        .and_then(|provider| provider.default_model_id)
-        .unwrap_or_else(|| "model".to_string())
+    "gpt-5.5".to_string()
 }
 
 fn openai_default_codex_model_id() -> String {
-    openai_provider_catalog()
-        .and_then(|provider| provider.default_codex_model_id)
-        .unwrap_or_else(|| "model".to_string())
+    "gpt-5.6-sol".to_string()
 }
 
 fn catalog_fallback_model_ids() -> Vec<String> {
-    let target = ModelSupportTarget::new(
-        "openai",
-        "chatgpt_subscription",
-        "chatgpt_codex",
-        Some("bcode"),
-    );
-    bcode_model_catalog::ModelCatalog::load_bundled()
-        .map(|catalog| catalog.fallback_model_ids_for_support_target("openai", &target))
-        .unwrap_or_default()
+    vec![openai_default_codex_model_id()]
 }
 
 fn settings() -> Settings {
@@ -6870,19 +6812,19 @@ mod tests {
     }
 
     #[test]
-    fn model_infos_include_catalog_context_windows() {
+    fn model_infos_are_raw_provider_candidates() {
         let model_infos = model_infos_from_ids(&["gpt-4.1-mini".to_string()], None);
 
-        assert_eq!(model_infos[0].context_window, Some(1_047_576));
-        assert_eq!(model_infos[0].max_output_tokens, Some(32_768));
+        assert_eq!(model_infos[0].context_window, None);
+        assert_eq!(model_infos[0].max_output_tokens, None);
     }
 
     #[test]
-    fn unknown_model_infos_include_provider_defaults() {
+    fn unknown_model_infos_are_raw_provider_candidates() {
         let model_infos = model_infos_from_ids(&["custom-proxy-model".to_string()], None);
 
-        assert_eq!(model_infos[0].context_window, Some(128_000));
-        assert_eq!(model_infos[0].max_output_tokens, Some(16_384));
+        assert_eq!(model_infos[0].context_window, None);
+        assert_eq!(model_infos[0].max_output_tokens, None);
     }
 
     #[test]

@@ -276,6 +276,7 @@ fn models() -> ModelList {
             pricing: None,
             visibility: bcode_model::ModelVisibility::Visible,
         }],
+        catalog: bcode_model::ModelCatalogHints::default(),
     }
 }
 

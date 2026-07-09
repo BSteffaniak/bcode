@@ -22,8 +22,8 @@ use aws_smithy_types::{Document, Number};
 use base64::Engine as _;
 use bcode_model::{
     AckResponse, CancelTurnRequest, ContentBlock, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID,
-    MessageRole, ModelCapability, ModelInfo, ModelList, ModelListRequest, ModelMessage,
-    ModelTurnRequest, OP_CANCEL_TURN, OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS,
+    MessageRole, ModelCapability, ModelCatalogHints, ModelInfo, ModelList, ModelListRequest,
+    ModelMessage, ModelTurnRequest, OP_CANCEL_TURN, OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS,
     OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG, PollTurnEventsRequest,
     PollTurnEventsResponse, ProviderCapabilities, ProviderCapability, ProviderError,
     ProviderErrorCategory, ProviderRequestContext, ProviderRequestProjection, ProviderTurnEvent,
@@ -1140,6 +1140,10 @@ impl BedrockProviderPlugin {
                     model_infos_from_ids(&settings.model_ids, settings.default_model.as_deref()),
                     request.selected_model_id.as_deref(),
                 ),
+                catalog: ModelCatalogHints {
+                    provider_id: Some("bedrock".to_string()),
+                    ..ModelCatalogHints::default()
+                },
             };
         }
         let discovered = self
@@ -1166,6 +1170,10 @@ impl BedrockProviderPlugin {
                 discovered.models,
                 request.selected_model_id.as_deref(),
             ),
+            catalog: ModelCatalogHints {
+                provider_id: Some("bedrock".to_string()),
+                ..ModelCatalogHints::default()
+            },
         }
     }
 
@@ -1263,7 +1271,7 @@ fn ensure_selected_model_info(
 }
 
 fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Vec<ModelInfo> {
-    let models = model_ids
+    model_ids
         .iter()
         .map(|model_id| ModelInfo {
             model_id: model_id.clone(),
@@ -1284,13 +1292,7 @@ fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Ve
             pricing: None,
             visibility: bcode_model::ModelVisibility::Visible,
         })
-        .collect::<Vec<_>>();
-
-    if let Ok(catalog) = bcode_model_catalog::ModelCatalog::load_bundled() {
-        catalog.merge_provider_models("bedrock", models, false)
-    } else {
-        models
-    }
+        .collect::<Vec<_>>()
 }
 
 fn bedrock_model_cache_info() -> bcode_model::ModelCacheInfo {
@@ -1895,13 +1897,6 @@ async fn discover_models(settings: &Settings) -> Result<ModelDiscovery, Provider
             visibility: bcode_model::ModelVisibility::Visible,
         })
         .collect();
-    let models = if let Ok(catalog) =
-        bcode_model_catalog::ModelCatalog::load_bundled_with_remote_overlay().await
-    {
-        catalog.merge_provider_models("bedrock", models, false)
-    } else {
-        models
-    };
     Ok(ModelDiscovery {
         models,
         default_model_id,
@@ -2342,22 +2337,22 @@ mod tests {
     }
 
     #[test]
-    fn explicit_bedrock_model_infos_include_context_windows() {
+    fn explicit_bedrock_model_infos_are_raw_provider_candidates() {
         let models = model_infos_from_ids(
             &["anthropic.claude-3-5-sonnet-20241022-v2:0".to_string()],
             None,
         );
 
-        assert_eq!(models[0].context_window, Some(200_000));
-        assert_eq!(models[0].max_output_tokens, Some(64_000));
+        assert_eq!(models[0].context_window, None);
+        assert_eq!(models[0].max_output_tokens, None);
     }
 
     #[test]
-    fn unknown_bedrock_model_infos_include_provider_defaults() {
+    fn unknown_bedrock_model_infos_are_raw_provider_candidates() {
         let models = model_infos_from_ids(&["provider.future-model-v1:0".to_string()], None);
 
-        assert_eq!(models[0].context_window, Some(128_000));
-        assert_eq!(models[0].max_output_tokens, Some(16_384));
+        assert_eq!(models[0].context_window, None);
+        assert_eq!(models[0].max_output_tokens, None);
     }
 
     #[test]
