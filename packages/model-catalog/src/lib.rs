@@ -151,7 +151,7 @@ impl ModelCatalog {
     ///
     /// Returns an error if bundled catalog source loading or validation fails.
     pub async fn load_bundled_with_remote_options(options: &RemoteCatalogOptions) -> Result<Self> {
-        let mut document = load_catalog(&default_source_dir())?;
+        let mut document = load_embedded_catalog()?;
         apply_remote_overlay_best_effort(&mut document, options).await;
         // Also apply any local live snapshots from the dedicated env var path
         apply_local_live_overlay_best_effort(&mut document);
@@ -385,14 +385,20 @@ fn enrich_from_defaults(mut model: ModelInfo, defaults: &ModelCatalogDefaults) -
 }
 
 fn enrich_from_entry(mut model: ModelInfo, entry: &ModelCatalogEntry) -> ModelInfo {
+    let remote = entry_is_remote(entry);
+    let catalog_source = if remote {
+        ModelMetadataSource::RemoteCatalog
+    } else {
+        ModelMetadataSource::BundledCatalog
+    };
     model.display_name.clone_from(&entry.display_name);
     if model.context_window.is_none() && entry.context_window.is_some() {
         model.context_window = entry.context_window;
-        model.metadata_source = Some(ModelMetadataSource::BundledCatalog);
+        model.metadata_source = Some(catalog_source);
     }
     if model.max_output_tokens.is_none() && entry.max_output_tokens.is_some() {
         model.max_output_tokens = entry.max_output_tokens;
-        model.metadata_source = Some(ModelMetadataSource::BundledCatalog);
+        model.metadata_source = Some(catalog_source);
     }
     model
         .capabilities
@@ -401,7 +407,7 @@ fn enrich_from_entry(mut model: ModelInfo, entry: &ModelCatalogEntry) -> ModelIn
         model.cache = cache_info_from_catalog(&entry.capabilities);
     }
     if model.pricing.is_none()
-        && let Some(pricing) = pricing_from_catalog(entry.pricing.as_ref())
+        && let Some(pricing) = pricing_from_catalog(entry.pricing.as_ref(), remote)
     {
         model.pricing = Some(pricing);
     }
@@ -433,8 +439,12 @@ fn model_info_from_catalog_entry(entry: &ModelCatalogEntry) -> ModelInfo {
         capabilities: capabilities_from_catalog(&entry.capabilities),
         reasoning: reasoning_from_catalog(entry),
         cache: cache_info_from_catalog(&entry.capabilities),
-        metadata_source: Some(ModelMetadataSource::BundledCatalog),
-        pricing: pricing_from_catalog(entry.pricing.as_ref()),
+        metadata_source: Some(if entry_is_remote(entry) {
+            ModelMetadataSource::RemoteCatalog
+        } else {
+            ModelMetadataSource::BundledCatalog
+        }),
+        pricing: pricing_from_catalog(entry.pricing.as_ref(), entry_is_remote(entry)),
         visibility: bcode_model::ModelVisibility::Visible,
     };
     if entry.bcode_support == BcodeSupportStatus::Unsupported {
@@ -479,7 +489,18 @@ fn cache_info_from_catalog(capabilities: &CatalogCapabilities) -> ModelCacheInfo
     cache
 }
 
-fn pricing_from_catalog(pricing: Option<&CatalogPricing>) -> Option<ModelPricingInfo> {
+fn entry_is_remote(entry: &ModelCatalogEntry) -> bool {
+    entry
+        .live
+        .as_ref()
+        .and_then(|live| live.source.as_deref())
+        .is_some_and(|source| source.starts_with("remote_"))
+}
+
+fn pricing_from_catalog(
+    pricing: Option<&CatalogPricing>,
+    remote: bool,
+) -> Option<ModelPricingInfo> {
     let pricing = pricing?;
     Some(ModelPricingInfo {
         currency: pricing.currency.clone(),
@@ -492,7 +513,11 @@ fn pricing_from_catalog(pricing: Option<&CatalogPricing>) -> Option<ModelPricing
             .cache_write_input_micros
             .map(ModelTokenPrice::from_micros),
         output: pricing.output_micros.map(ModelTokenPrice::from_micros),
-        source: ModelPricingSource::BundledCatalog,
+        source: if remote {
+            ModelPricingSource::RemoteCatalog
+        } else {
+            ModelPricingSource::BundledCatalog
+        },
     })
 }
 
@@ -1051,6 +1076,56 @@ status = "stable"
             .expect("alias should resolve");
 
         assert_eq!(entry.model_id, "gpt-4o");
+    }
+
+    #[test]
+    fn overlay_marks_remote_models_and_remote_values_take_precedence() {
+        let mut local = load_embedded_catalog().expect("embedded catalog should load");
+        let mut remote = CatalogDocument::empty("remote", "2026-01-01T00:00:00Z");
+        let mut provider = local
+            .providers
+            .get("openai")
+            .expect("openai provider exists")
+            .clone();
+        provider.default_codex_model_id = Some("remote-default".to_string());
+        let entry = provider.models.get_mut("gpt-5.6-sol").expect("sol exists");
+        entry.display_name = "Remote Sol".to_string();
+        entry.context_window = Some(999_999);
+        entry.pricing.as_mut().expect("pricing exists").input_micros = Some(42);
+        remote.providers.insert("openai".to_string(), provider);
+
+        overlay_remote_catalog(&mut local, &remote);
+        let catalog = ModelCatalog::new(local);
+        let provider = catalog.provider("openai").expect("openai provider exists");
+        let entry = catalog.model("openai", "gpt-5.6-sol").expect("sol exists");
+
+        assert_eq!(
+            provider.default_codex_model_id.as_deref(),
+            Some("remote-default")
+        );
+        assert_eq!(entry.display_name, "Remote Sol");
+        assert_eq!(entry.context_window, Some(999_999));
+        assert_eq!(
+            entry
+                .pricing
+                .as_ref()
+                .and_then(|pricing| pricing.input_micros),
+            Some(42)
+        );
+        assert!(entry_is_remote(entry));
+        let model = catalog
+            .provider_models_as_model_info("openai")
+            .into_iter()
+            .find(|model| model.model_id == "gpt-5.6-sol")
+            .expect("sol model info exists");
+        assert_eq!(
+            model.metadata_source,
+            Some(ModelMetadataSource::RemoteCatalog)
+        );
+        assert_eq!(
+            model.pricing.map(|pricing| pricing.source),
+            Some(ModelPricingSource::RemoteCatalog)
+        );
     }
 
     #[test]

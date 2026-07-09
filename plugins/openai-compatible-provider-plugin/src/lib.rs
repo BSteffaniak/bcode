@@ -4496,7 +4496,26 @@ impl OpenAiCompatibleProviderPlugin {
         ) {
             models
         } else {
-            model_infos_from_ids(&settings.model_ids, settings.default_model.as_deref())
+            let candidates = model_infos_from_ids_without_catalog(
+                &settings.model_ids,
+                settings.default_model.as_deref(),
+            );
+            if let Ok(runtime) = &self.runtime {
+                let async_settings = settings.clone();
+                let async_candidates = candidates.clone();
+                runtime
+                    .block_on(async move {
+                        enrich_model_infos_with_catalog_and_live(
+                            &async_settings,
+                            None,
+                            async_candidates,
+                        )
+                        .await
+                    })
+                    .unwrap_or_else(|_| merge_with_bundled_catalog(&settings, candidates))
+            } else {
+                merge_with_bundled_catalog(&settings, candidates)
+            }
         };
         let models = ensure_selected_model_info(models, request.selected_model_id.as_deref());
         ModelList {
@@ -4563,7 +4582,19 @@ fn ensure_selected_model_info(
 }
 
 fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Vec<ModelInfo> {
-    model_infos_from_items(
+    let discovered = model_infos_from_ids_without_catalog(model_ids, default_model);
+    if let Ok(catalog) = bcode_model_catalog::ModelCatalog::load_bundled() {
+        catalog.merge_provider_models("openai", discovered, true)
+    } else {
+        discovered
+    }
+}
+
+fn model_infos_from_ids_without_catalog(
+    model_ids: &[String],
+    default_model: Option<&str>,
+) -> Vec<ModelInfo> {
+    model_infos_from_items_without_catalog(
         model_ids
             .iter()
             .map(|model_id| ModelResponseItem {
@@ -4577,6 +4608,19 @@ fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Ve
 }
 
 fn model_infos_from_items(
+    models: Vec<ModelResponseItem>,
+    default_model: Option<&str>,
+) -> Vec<ModelInfo> {
+    let discovered = model_infos_from_items_without_catalog(models, default_model);
+
+    if let Ok(catalog) = bcode_model_catalog::ModelCatalog::load_bundled() {
+        catalog.merge_provider_models("openai", discovered, true)
+    } else {
+        discovered
+    }
+}
+
+fn model_infos_from_items_without_catalog(
     models: Vec<ModelResponseItem>,
     default_model: Option<&str>,
 ) -> Vec<ModelInfo> {
@@ -4602,7 +4646,7 @@ fn model_infos_from_items(
     let selected_default = default_model
         .map(ToString::to_string)
         .or_else(|| models.first().map(|model| model.id.clone()));
-    let discovered = models
+    models
         .into_iter()
         .map(|model| ModelInfo {
             is_default: selected_default.as_deref() == Some(model.id.as_str()),
@@ -4618,13 +4662,18 @@ fn model_infos_from_items(
             pricing: pricing_from_provider_api(&model.metadata),
             visibility: bcode_model::ModelVisibility::Visible,
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
 
-    if let Ok(catalog) = bcode_model_catalog::ModelCatalog::load_bundled() {
-        catalog.merge_provider_models("openai", discovered, true)
-    } else {
-        discovered
-    }
+fn merge_with_bundled_catalog(settings: &Settings, models: Vec<ModelInfo>) -> Vec<ModelInfo> {
+    let Ok(catalog) = bcode_model_catalog::ModelCatalog::load_bundled() else {
+        return models;
+    };
+    catalog.merge_provider_models(
+        catalog_provider_id(settings),
+        models,
+        !settings.model_ids_are_explicit,
+    )
 }
 
 async fn enrich_model_infos_with_catalog_and_live(
@@ -4643,7 +4692,7 @@ async fn enrich_model_infos_with_catalog_and_live(
         catalog = catalog.with_live_snapshots(std::slice::from_ref(&snapshot));
     }
 
-    catalog.merge_provider_models(provider_id, models, true)
+    catalog.merge_provider_models(provider_id, models, !settings.model_ids_are_explicit)
 }
 
 fn catalog_provider_id(settings: &Settings) -> &'static str {

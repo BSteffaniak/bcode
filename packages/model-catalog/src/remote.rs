@@ -187,23 +187,23 @@ pub fn overlay_remote_live(local: &mut CatalogDocument, snapshots: &[LiveCatalog
 }
 
 fn overlay_provider(local: &mut ProviderCatalog, remote: &ProviderCatalog) {
-    if local.website_url.is_none() {
+    if remote.website_url.is_some() {
         local.website_url.clone_from(&remote.website_url);
     }
-    if local.default_model_id.is_none() {
+    if remote.default_model_id.is_some() {
         local.default_model_id.clone_from(&remote.default_model_id);
     }
-    if local.default_codex_model_id.is_none() {
+    if remote.default_codex_model_id.is_some() {
         local
             .default_codex_model_id
             .clone_from(&remote.default_codex_model_id);
     }
-    if local.fallback_model_ids.is_empty() {
+    if !remote.fallback_model_ids.is_empty() {
         local
             .fallback_model_ids
             .clone_from(&remote.fallback_model_ids);
     }
-    if local.defaults.is_none() {
+    if remote.defaults.is_some() {
         local.defaults.clone_from(&remote.defaults);
     }
 
@@ -219,38 +219,54 @@ fn overlay_provider(local: &mut ProviderCatalog, remote: &ProviderCatalog) {
 }
 
 fn overlay_entry(local: &mut ModelCatalogEntry, remote: &ModelCatalogEntry) {
-    if local.display_name == local.model_id && remote.display_name != remote.model_id {
-        local.display_name.clone_from(&remote.display_name);
+    let local_supported_by = local.supported_by.clone();
+    local.display_name.clone_from(&remote.display_name);
+    local.aliases.clone_from(&remote.aliases);
+    local.status = remote.status;
+    local.bcode_support = remote.bcode_support;
+    local.context_window = remote.context_window.or(local.context_window);
+    local.max_output_tokens = remote.max_output_tokens.or(local.max_output_tokens);
+    if remote.family.is_some() {
+        local.family.clone_from(&remote.family);
     }
-    if local.context_window.is_none() {
-        local.context_window = remote.context_window;
+    if remote.provider_model_kind.is_some() {
+        local
+            .provider_model_kind
+            .clone_from(&remote.provider_model_kind);
     }
-    if local.max_output_tokens.is_none() {
-        local.max_output_tokens = remote.max_output_tokens;
+    if remote.replaced_by.is_some() {
+        local.replaced_by.clone_from(&remote.replaced_by);
     }
-    local.capabilities = crate::merge_capabilities(&local.capabilities, &remote.capabilities);
-    if local.reasoning.is_none() {
+    if remote.notes.is_some() {
+        local.notes.clone_from(&remote.notes);
+    }
+    if remote.documentation_url.is_some() {
+        local
+            .documentation_url
+            .clone_from(&remote.documentation_url);
+    }
+    if remote.pricing.is_some() {
+        local.pricing.clone_from(&remote.pricing);
+    }
+    local.capabilities = remote.capabilities.clone();
+    if remote.reasoning.is_some() {
         local.reasoning.clone_from(&remote.reasoning);
     }
-    if local.live.is_none() {
-        local.live = remote.live.clone().map(remote_live_metadata);
-    }
+    local.supported_by.clone_from(&remote.supported_by);
+    local.supported_by.extend(local_supported_by);
+    local.live = Some(remote_live_metadata(
+        remote.live.clone().unwrap_or_default(),
+    ));
 }
 
 fn mark_remote_only(entry: &mut ModelCatalogEntry) {
-    entry.status = bcode_model_catalog_models::CatalogModelStatus::Unknown;
-    entry.bcode_support = bcode_model_catalog_models::BcodeSupportStatus::Unknown;
-    entry.live = entry.live.clone().map(remote_live_metadata).or_else(|| {
-        Some(LiveModelMetadata {
-            source: Some("remote_catalog".to_string()),
-            ..LiveModelMetadata::default()
-        })
-    });
+    entry.live = Some(remote_live_metadata(entry.live.clone().unwrap_or_default()));
 }
 
 fn remote_live_metadata(mut live: LiveModelMetadata) -> LiveModelMetadata {
     live.source = Some(match live.source.as_deref() {
         Some("provider_live") => "remote_provider_live".to_string(),
+        Some(source) if source.starts_with("remote_") => source.to_string(),
         Some(source) => format!("remote_{source}"),
         None => "remote_catalog".to_string(),
     });

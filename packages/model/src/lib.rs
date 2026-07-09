@@ -332,6 +332,7 @@ impl ModelTokenPrice {
 pub enum ModelPricingSource {
     UserOverride,
     ProviderApi,
+    RemoteCatalog,
     BundledCatalog,
     PatternMatch,
     Unknown,
@@ -382,6 +383,9 @@ fn price_bucket_micros(tokens: u32, price: Option<ModelTokenPrice>) -> u64 {
 pub enum ModelMetadataSource {
     ConfigOverride,
     ProviderApi,
+    /// Remote model catalog.
+    RemoteCatalog,
+    /// Catalog embedded in the Bcode binary.
     BundledCatalog,
     PatternMatch,
     ProviderDefault,
