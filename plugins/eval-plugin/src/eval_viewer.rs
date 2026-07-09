@@ -1770,6 +1770,54 @@ impl EvalCampaignViewerSurface {
         self.status = format!("view mode: {}", self.view_mode.label());
     }
 
+    fn run_next(&mut self) {
+        let parent_id = self
+            .selected_generation()
+            .map(|generation| generation.id.clone())
+            .or_else(|| self.data.campaign.latest_generation_id.clone());
+        let run_options = bcode_eval::EvalRunOptions {
+            suite_path: self.data.campaign.suite_path.clone(),
+            output_root: self
+                .data
+                .campaign_dir
+                .parent()
+                .and_then(std::path::Path::parent)
+                .map_or_else(
+                    || PathBuf::from("target/bcode-evals/runs"),
+                    |root| root.join("runs"),
+                ),
+            run_id: None,
+        };
+        self.status = "running campaign suite...".to_string();
+        match bcode_eval::run_suite(&run_options) {
+            Ok(run) => {
+                let options = bcode_eval::EvalImprovementRecordOptions {
+                    campaign: self.data.campaign_dir.clone(),
+                    parent_id,
+                    branch: "main".to_string(),
+                    delta_kind: bcode_eval_models::EvalImprovementDeltaKind::Mixed,
+                    summary: format!("Rerun {}", run.manifest.run_id),
+                    run: Some(run.manifest.output_dir),
+                    patch: None,
+                    risk: bcode_eval_models::EvalImprovementRisk::Low,
+                    rationale: Some("Executed and recorded from the campaign TUI.".to_string()),
+                };
+                match bcode_eval::record_improvement_generation(options) {
+                    Ok(generation) => {
+                        self.status = format!("ran and recorded generation {}", generation.id);
+                        if let Ok(data) = EvalCampaignData::load(&self.data.campaign_dir) {
+                            self.data = data;
+                        }
+                    }
+                    Err(error) => {
+                        self.status = format!("run completed but recording failed: {error}");
+                    }
+                }
+            }
+            Err(error) => self.status = format!("suite run failed: {error}"),
+        }
+    }
+
     fn decide_selected_generation(
         &mut self,
         status: bcode_eval_models::EvalImprovementVerdictStatus,
@@ -1833,6 +1881,7 @@ impl EvalCampaignViewerSurface {
             "open-run" => self.open_selected_run(),
             "view-mode" => self.cycle_view_mode(),
             "record-generation" => self.record_generation(),
+            "run-next" => self.run_next(),
             "promote" => self.decide_selected_generation(
                 bcode_eval_models::EvalImprovementVerdictStatus::Promoted,
             ),
@@ -1846,6 +1895,7 @@ impl EvalCampaignViewerSurface {
                         "Details: inspect the selected generation",
                         "Open Run: inspect its eval run",
                         "Record: add a generation from an unused run",
+                        "Run Next: execute the suite and record against the selection",
                         "Promote/Reject: record a reviewed terminal decision",
                         "View: cycle progression and comparison lenses",
                     ],
@@ -1987,6 +2037,7 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
                     return PluginTuiAction::Redraw;
                 }
                 KeyCode::Char('r') => return self.handle_action("record-generation"),
+                KeyCode::Char('u') => return self.handle_action("run-next"),
                 KeyCode::Char('p') => return self.handle_action("promote"),
                 KeyCode::Char('x') => return self.handle_action("reject"),
                 KeyCode::Char('?') => return self.handle_action("help"),
@@ -2082,6 +2133,51 @@ impl EvalGenerationDetailSurface {
         match EvalRunViewerSurface::load(run_dir) {
             Ok(viewer) => self.selected_run_viewer = Some(viewer),
             Err(error) => self.status = format!("failed to open run: {error}"),
+        }
+    }
+
+    fn rerun(&mut self) {
+        let run_options = bcode_eval::EvalRunOptions {
+            suite_path: self.data.campaign.suite_path.clone(),
+            output_root: self
+                .data
+                .campaign_dir
+                .parent()
+                .and_then(std::path::Path::parent)
+                .map_or_else(
+                    || PathBuf::from("target/bcode-evals/runs"),
+                    |root| root.join("runs"),
+                ),
+            run_id: None,
+        };
+        self.status = "rerunning suite...".to_string();
+        match bcode_eval::run_suite(&run_options) {
+            Ok(run) => {
+                let options = bcode_eval::EvalImprovementRecordOptions {
+                    campaign: self.data.campaign_dir.clone(),
+                    parent_id: Some(self.generation_id.clone()),
+                    branch: self.generation().map_or_else(
+                        || "main".to_string(),
+                        |generation| generation.branch.clone(),
+                    ),
+                    delta_kind: bcode_eval_models::EvalImprovementDeltaKind::Mixed,
+                    summary: format!("Rerun {}", run.manifest.run_id),
+                    run: Some(run.manifest.output_dir),
+                    patch: None,
+                    risk: bcode_eval_models::EvalImprovementRisk::Low,
+                    rationale: Some("Rerun from generation detail TUI.".to_string()),
+                };
+                match bcode_eval::record_improvement_generation(options) {
+                    Ok(generation) => {
+                        self.status = format!("recorded rerun as generation {}", generation.id);
+                        if let Ok(data) = EvalCampaignData::load(&self.data.campaign_dir) {
+                            self.data = data;
+                        }
+                    }
+                    Err(error) => self.status = format!("rerun recording failed: {error}"),
+                }
+            }
+            Err(error) => self.status = format!("rerun failed: {error}"),
         }
     }
 
@@ -2299,6 +2395,10 @@ impl PluginTuiSurface for EvalGenerationDetailSurface {
                     self.open_run();
                     return PluginTuiAction::Redraw;
                 }
+                "rerun" => {
+                    self.rerun();
+                    return PluginTuiAction::Redraw;
+                }
                 "back" => return PluginTuiAction::Close { outcome: None },
                 _ => {}
             },
@@ -2313,6 +2413,10 @@ impl PluginTuiSurface for EvalGenerationDetailSurface {
                 }
                 KeyCode::Char('o') => {
                     self.open_run();
+                    return PluginTuiAction::Redraw;
+                }
+                KeyCode::Char('r') => {
+                    self.rerun();
                     return PluginTuiAction::Redraw;
                 }
                 KeyCode::Char('q') | KeyCode::Escape => {
@@ -4094,6 +4198,7 @@ fn campaign_actions() -> Vec<ActionButton> {
         ActionButton::new("open-run", "O Open Run"),
         ActionButton::new("view-mode", "V View"),
         ActionButton::new("record-generation", "R Record"),
+        ActionButton::new("run-next", "U Run Next"),
         ActionButton::new("promote", "P Promote"),
         ActionButton::new("reject", "X Reject"),
         ActionButton::new("help", "? Help"),
@@ -4113,6 +4218,7 @@ fn generation_detail_tabs() -> Vec<TabItem<'static>> {
 fn generation_detail_actions() -> Vec<ActionButton> {
     vec![
         ActionButton::new("open-run", "O Open Run"),
+        ActionButton::new("rerun", "R Rerun"),
         ActionButton::new("back", "Esc Back"),
     ]
 }
