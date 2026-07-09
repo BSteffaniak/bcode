@@ -1,6 +1,9 @@
 //! Plugin-local eval artifact loading and aggregation.
 
-use bcode_eval_models::{EvalRepetitionResult, EvalRunResult, EvalSuite, EvalVariantRunResult};
+use bcode_eval_models::{
+    EvalImprovementCampaign, EvalImprovementGeneration, EvalRepetitionResult, EvalRunResult,
+    EvalSuite, EvalVariantRunResult,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -66,6 +69,180 @@ impl EvalRunData {
             }
         }
         names.into_iter().collect()
+    }
+}
+
+/// Loaded eval improvement campaign data for the viewer.
+#[derive(Debug, Clone)]
+pub struct EvalCampaignData {
+    /// Campaign directory.
+    pub campaign_dir: PathBuf,
+    /// Campaign metadata.
+    pub campaign: EvalImprovementCampaign,
+    /// Ordered generations.
+    pub generations: Vec<EvalImprovementGeneration>,
+}
+
+impl EvalCampaignData {
+    /// Load an improvement campaign from a campaign directory or campaign JSON path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when campaign metadata or generation JSON cannot be read.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let path = path.as_ref();
+        let campaign_path = if path.is_dir() {
+            path.join("campaign.json")
+        } else {
+            path.to_path_buf()
+        };
+        let campaign_dir = campaign_path
+            .parent()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        let mut campaign =
+            serde_json::from_str::<EvalImprovementCampaign>(&fs::read_to_string(&campaign_path)?)?;
+        campaign.output_dir.clone_from(&campaign_dir);
+        let generations_dir = campaign_dir.join("generations");
+        let mut generations = Vec::new();
+        if let Ok(entries) = fs::read_dir(generations_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path().join("generation.json");
+                if !path.exists() {
+                    continue;
+                }
+                if let Ok(text) = fs::read_to_string(path)
+                    && let Ok(generation) = serde_json::from_str::<EvalImprovementGeneration>(&text)
+                {
+                    generations.push(generation);
+                }
+            }
+        }
+        generations.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(Self {
+            campaign_dir,
+            campaign,
+            generations,
+        })
+    }
+
+    /// Load a generation's run data, when it has an associated run.
+    #[must_use]
+    pub fn generation_run(&self, generation: &EvalImprovementGeneration) -> Option<EvalRunData> {
+        generation
+            .run_dir
+            .as_ref()
+            .and_then(|run_dir| EvalRunData::load(run_dir).ok())
+    }
+
+    /// Return the parent generation for a generation.
+    #[must_use]
+    pub fn parent_generation(
+        &self,
+        generation: &EvalImprovementGeneration,
+    ) -> Option<&EvalImprovementGeneration> {
+        generation.parent_id.as_ref().and_then(|id| {
+            self.generations
+                .iter()
+                .find(|candidate| &candidate.id == id)
+        })
+    }
+}
+
+/// Campaign metadata for picker rows.
+#[derive(Debug, Clone)]
+pub struct EvalCampaignSummary {
+    /// Campaign directory.
+    pub campaign_dir: PathBuf,
+    /// Campaign id.
+    pub campaign_id: String,
+    /// Suite id.
+    pub suite_id: String,
+    /// Generation count.
+    pub generations: usize,
+    /// Best generation id.
+    pub best_generation_id: Option<String>,
+    /// Latest generation id.
+    pub latest_generation_id: Option<String>,
+    /// Directory modification time in milliseconds since Unix epoch, when available.
+    pub modified_ms: u128,
+}
+
+/// Discover improvement campaigns below a root directory.
+#[must_use]
+pub fn discover_campaigns(root: impl AsRef<Path>) -> Vec<EvalCampaignSummary> {
+    let root = root.as_ref();
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut campaigns = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() || !path.join("campaign.json").exists() {
+            continue;
+        }
+        let Ok(data) = EvalCampaignData::load(&path) else {
+            continue;
+        };
+        let modified_ms = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_millis());
+        campaigns.push(EvalCampaignSummary {
+            campaign_dir: path,
+            campaign_id: data.campaign.id,
+            suite_id: data.campaign.suite_id,
+            generations: data.generations.len(),
+            best_generation_id: data.campaign.best_generation_id,
+            latest_generation_id: data.campaign.latest_generation_id,
+            modified_ms,
+        });
+    }
+    campaigns.sort_by_key(|campaign| std::cmp::Reverse(campaign.modified_ms));
+    campaigns
+}
+
+/// Average pass rate across variants.
+#[must_use]
+pub fn run_pass_rate(result: &EvalRunResult) -> f64 {
+    if result.variants.is_empty() {
+        return 0.0;
+    }
+    let variant_count =
+        u32::try_from(result.variants.len()).map_or_else(|_| f64::from(u32::MAX), f64::from);
+    result
+        .variants
+        .iter()
+        .map(|variant| variant.pass_rate)
+        .sum::<f64>()
+        / variant_count
+}
+
+/// Best overall score across variants.
+#[must_use]
+pub fn run_best_score(result: &EvalRunResult) -> f64 {
+    result
+        .variants
+        .iter()
+        .map(|variant| variant.score.overall)
+        .fold(0.0_f64, f64::max)
+}
+
+/// Average variant measurement value for a run.
+#[must_use]
+pub fn run_avg_measurement(result: &EvalRunResult, metric: &str) -> Option<f64> {
+    let values = result
+        .variants
+        .iter()
+        .filter_map(|variant| variant.measurements.get(metric).copied())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        None
+    } else {
+        let value_count =
+            u32::try_from(values.len()).map_or_else(|_| f64::from(u32::MAX), f64::from);
+        Some(values.iter().sum::<f64>() / value_count)
     }
 }
 

@@ -1,10 +1,12 @@
 //! Plugin-owned eval picker and run viewer surfaces.
 
 use crate::eval_data::{
-    EvalRunData, EvalRunSummary, best_variant, case_avg_metric, diff_variant_count, discover_runs,
-    format_duration_ms, format_number, load_repetition_artifact, sum_variant_metric,
+    EvalCampaignData, EvalCampaignSummary, EvalRunData, EvalRunSummary, best_variant,
+    case_avg_metric, diff_variant_count, discover_campaigns, discover_runs, format_duration_ms,
+    format_number, load_repetition_artifact, run_avg_measurement, run_best_score, run_pass_rate,
+    sum_variant_metric,
 };
-use bcode_eval_models::EvalRepetitionResult;
+use bcode_eval_models::{EvalImprovementGeneration, EvalRepetitionResult};
 use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface};
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::{Event, MouseEventKind};
@@ -46,10 +48,13 @@ const CARD_HEIGHT: u16 = 4;
 /// Eval run picker surface.
 pub struct EvalRunPickerSurface {
     runs_root: PathBuf,
+    campaigns_root: PathBuf,
     runs: Vec<EvalRunSummary>,
+    campaigns: Vec<EvalCampaignSummary>,
     table_state: TableState,
     action_state: ActionRowState,
     embedded_viewer: Option<EvalRunViewerSurface>,
+    embedded_campaign: Option<EvalCampaignViewerSurface>,
     status: String,
     table_area: Rect,
     action_area: Rect,
@@ -60,13 +65,21 @@ impl EvalRunPickerSurface {
     #[must_use]
     pub fn load(runs_root: PathBuf) -> Self {
         let runs = discover_runs(&runs_root);
-        let status = format!("{} runs in {}", runs.len(), runs_root.display());
+        let campaigns_root = runs_root.parent().map_or_else(
+            || PathBuf::from("target/bcode-evals/improvements"),
+            |parent| parent.join("improvements"),
+        );
+        let campaigns = discover_campaigns(&campaigns_root);
+        let status = format!("{} runs, {} campaigns", runs.len(), campaigns.len());
         Self {
             runs_root,
+            campaigns_root,
             runs,
+            campaigns,
             table_state: TableState::new(Some(0)),
             action_state: ActionRowState::new(),
             embedded_viewer: None,
+            embedded_campaign: None,
             status,
             table_area: Rect::new(0, 0, 0, 0),
             action_area: Rect::new(0, 0, 0, 0),
@@ -75,34 +88,80 @@ impl EvalRunPickerSurface {
 
     fn refresh(&mut self) {
         self.runs = discover_runs(&self.runs_root);
-        if self.runs.is_empty() {
+        self.campaigns = discover_campaigns(&self.campaigns_root);
+        let row_count = self.overview_rows().len();
+        if row_count == 0 {
             self.table_state.set_selected(None);
         } else if self
             .table_state
             .selected()
-            .is_none_or(|index| index >= self.runs.len())
+            .is_none_or(|index| index >= row_count)
         {
             self.table_state.set_selected(Some(0));
         }
-        self.status = format!("{} runs in {}", self.runs.len(), self.runs_root.display());
+        self.status = format!(
+            "{} runs in {}; {} campaigns in {}",
+            self.runs.len(),
+            self.runs_root.display(),
+            self.campaigns.len(),
+            self.campaigns_root.display()
+        );
     }
 
-    /// Open the currently selected run, if any.
+    fn overview_rows(&self) -> Vec<OverviewRow> {
+        let mut rows = self
+            .campaigns
+            .iter()
+            .enumerate()
+            .map(|(index, _)| OverviewRow::Campaign(index))
+            .collect::<Vec<_>>();
+        rows.extend(
+            self.runs
+                .iter()
+                .enumerate()
+                .map(|(index, _)| OverviewRow::Run(index)),
+        );
+        rows
+    }
+
+    /// Open the currently selected run or campaign, if any.
     pub fn open_selected(&mut self) {
         let Some(index) = self.table_state.selected() else {
             self.status = "no run selected".to_string();
             return;
         };
-        let Some(run) = self.runs.get(index) else {
-            self.status = "selected run no longer exists".to_string();
+        let Some(row) = self.overview_rows().get(index).copied() else {
+            self.status = "selected item no longer exists".to_string();
             return;
         };
-        match EvalRunViewerSurface::load(run.run_dir.clone()) {
-            Ok(viewer) => {
-                self.embedded_viewer = Some(viewer);
+        match row {
+            OverviewRow::Run(run_index) => {
+                let Some(run) = self.runs.get(run_index) else {
+                    self.status = "selected run no longer exists".to_string();
+                    return;
+                };
+                match EvalRunViewerSurface::load(run.run_dir.clone()) {
+                    Ok(viewer) => {
+                        self.embedded_viewer = Some(viewer);
+                    }
+                    Err(error) => {
+                        self.status = format!("failed to open run: {error}");
+                    }
+                }
             }
-            Err(error) => {
-                self.status = format!("failed to open run: {error}");
+            OverviewRow::Campaign(campaign_index) => {
+                let Some(campaign) = self.campaigns.get(campaign_index) else {
+                    self.status = "selected campaign no longer exists".to_string();
+                    return;
+                };
+                match EvalCampaignViewerSurface::load(campaign.campaign_dir.clone()) {
+                    Ok(viewer) => {
+                        self.embedded_campaign = Some(viewer);
+                    }
+                    Err(error) => {
+                        self.status = format!("failed to open campaign: {error}");
+                    }
+                }
             }
         }
     }
@@ -137,14 +196,18 @@ impl PluginTuiSurface for EvalRunPickerSurface {
             viewer.render(area, frame);
             return;
         }
-        render_header(area, frame, "Eval Runs", &self.status);
+        if let Some(viewer) = self.embedded_campaign.as_mut() {
+            viewer.render(area, frame);
+            return;
+        }
+        render_header(area, frame, "Eval Overview", &self.status);
         let body = body_area(area);
         let (table_area, action_area, status_area) = split_body_actions(body);
         self.table_area = inset_top(table_area, 1);
         self.action_area = action_area;
-        render_panel_title(table_area, frame, "Recent eval runs");
-        let columns = picker_columns();
-        let rows = picker_rows(&self.runs);
+        render_panel_title(table_area, frame, "Eval runs and improvement campaigns");
+        let columns = overview_columns();
+        let rows = overview_table_rows(&self.runs, &self.campaigns);
         render_eval_table(frame, self.table_area, &columns, &rows, &self.table_state);
         let actions = picker_actions();
         themed_action_row(&actions).render_state(action_area, &self.action_state, frame);
@@ -164,8 +227,16 @@ impl PluginTuiSurface for EvalRunPickerSurface {
             }
             return action;
         }
-        let columns = picker_columns();
-        let rows = picker_rows(&self.runs);
+        if let Some(viewer) = self.embedded_campaign.as_mut() {
+            let action = viewer.handle_event(event, host);
+            if matches!(action, PluginTuiAction::Close { .. }) {
+                self.embedded_campaign = None;
+                return PluginTuiAction::Redraw;
+            }
+            return action;
+        }
+        let columns = overview_columns();
+        let rows = overview_table_rows(&self.runs, &self.campaigns);
         if handle_eval_table_event(
             self.table_area,
             &columns,
@@ -195,6 +266,184 @@ impl PluginTuiSurface for EvalRunPickerSurface {
                     self.refresh();
                     return PluginTuiAction::Redraw;
                 }
+                KeyCode::Char('q') | KeyCode::Escape => {
+                    return PluginTuiAction::Close { outcome: None };
+                }
+                _ => {}
+            }
+        }
+        PluginTuiAction::None
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OverviewRow {
+    Run(usize),
+    Campaign(usize),
+}
+
+/// Eval improvement campaign viewer surface.
+pub struct EvalCampaignViewerSurface {
+    data: EvalCampaignData,
+    generation_state: TableState,
+    action_state: ActionRowState,
+    selected_run_viewer: Option<EvalRunViewerSurface>,
+    status: String,
+    table_area: Rect,
+    action_area: Rect,
+}
+
+impl EvalCampaignViewerSurface {
+    /// Load viewer for a campaign path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the campaign cannot be loaded.
+    pub fn load(path: PathBuf) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let data = EvalCampaignData::load(path)?;
+        let status = format!(
+            "{} generations; best={}; latest={}",
+            data.generations.len(),
+            data.campaign
+                .best_generation_id
+                .clone()
+                .unwrap_or_else(|| "n/a".to_string()),
+            data.campaign
+                .latest_generation_id
+                .clone()
+                .unwrap_or_else(|| "n/a".to_string())
+        );
+        Ok(Self {
+            data,
+            generation_state: TableState::new(Some(0)),
+            action_state: ActionRowState::new(),
+            selected_run_viewer: None,
+            status,
+            table_area: Rect::new(0, 0, 0, 0),
+            action_area: Rect::new(0, 0, 0, 0),
+        })
+    }
+
+    fn selected_generation(&self) -> Option<&EvalImprovementGeneration> {
+        self.generation_state
+            .selected()
+            .and_then(|index| self.data.generations.get(index))
+    }
+
+    fn open_selected_run(&mut self) {
+        let Some(generation) = self.selected_generation() else {
+            self.status = "select a generation first".to_string();
+            return;
+        };
+        let Some(run_dir) = generation.run_dir.clone() else {
+            self.status = "selected generation has no run".to_string();
+            return;
+        };
+        match EvalRunViewerSurface::load(run_dir) {
+            Ok(viewer) => self.selected_run_viewer = Some(viewer),
+            Err(error) => self.status = format!("failed to open generation run: {error}"),
+        }
+    }
+
+    fn handle_action(&mut self, action: &str) -> PluginTuiAction {
+        match action {
+            "open-run" => self.open_selected_run(),
+            "refresh" => match EvalCampaignData::load(&self.data.campaign_dir) {
+                Ok(data) => {
+                    self.data = data;
+                    self.status = "reloaded campaign".to_string();
+                }
+                Err(error) => self.status = format!("reload failed: {error}"),
+            },
+            "back" | "close" => return PluginTuiAction::Close { outcome: None },
+            _ => {}
+        }
+        PluginTuiAction::Redraw
+    }
+}
+
+impl PluginTuiSurface for EvalCampaignViewerSurface {
+    fn id(&self) -> &'static str {
+        "bcode.eval-campaign-viewer"
+    }
+
+    fn title(&self) -> &'static str {
+        "Eval Improvement Campaign"
+    }
+
+    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+        if let Some(viewer) = self.selected_run_viewer.as_mut() {
+            viewer.render(area, frame);
+            return;
+        }
+        render_header(
+            area,
+            frame,
+            &format!("Eval Campaign: {}", self.data.campaign.id),
+            &self.status,
+        );
+        let body = body_area(area);
+        let (table_area, action_area, status_area) = split_body_actions(body);
+        self.table_area = inset_top(table_area, 1);
+        self.action_area = action_area;
+        render_panel_title(
+            table_area,
+            frame,
+            "Generation timeline — A=parent, B=current",
+        );
+        let columns = campaign_columns();
+        let rows = campaign_rows(&self.data);
+        render_eval_table(
+            frame,
+            self.table_area,
+            &columns,
+            &rows,
+            &self.generation_state,
+        );
+        themed_action_row(&campaign_actions()).render_state(action_area, &self.action_state, frame);
+        render_status(
+            status_area,
+            frame,
+            "Enter opens the B run. Rows show deltas, A/B pass and score changes. Esc returns.",
+        );
+    }
+
+    fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        if let Some(viewer) = self.selected_run_viewer.as_mut() {
+            let action = viewer.handle_event(event, host);
+            if matches!(action, PluginTuiAction::Close { .. }) {
+                self.selected_run_viewer = None;
+                return PluginTuiAction::Redraw;
+            }
+            return action;
+        }
+        let columns = campaign_columns();
+        let rows = campaign_rows(&self.data);
+        if handle_eval_table_event(
+            self.table_area,
+            &columns,
+            &rows,
+            &mut self.generation_state,
+            event,
+        ) {
+            return PluginTuiAction::Redraw;
+        }
+        match themed_action_row(&campaign_actions()).handle_event(
+            self.action_area,
+            &mut self.action_state,
+            event,
+        ) {
+            ActionRowOutcome::Activated { id, .. } => return self.handle_action(&id),
+            outcome if outcome.needs_redraw() => return PluginTuiAction::Redraw,
+            _ => {}
+        }
+        if let Event::Key(stroke) = event {
+            match stroke.key {
+                KeyCode::Enter => {
+                    self.open_selected_run();
+                    return PluginTuiAction::Redraw;
+                }
+                KeyCode::Char('r') => return self.handle_action("refresh"),
                 KeyCode::Char('q') | KeyCode::Escape => {
                     return PluginTuiAction::Close { outcome: None };
                 }
@@ -1741,30 +1990,148 @@ const fn split_body_actions(area: Rect) -> (Rect, Rect, Rect) {
     (content, action, status)
 }
 
-fn picker_columns<'a>() -> Vec<TableColumn<'a>> {
+fn overview_columns<'a>() -> Vec<TableColumn<'a>> {
     vec![
-        TableColumn::new("Run").flex(3),
+        TableColumn::new("Type").fixed(10),
+        TableColumn::new("Name").flex(3),
         TableColumn::new("Suite").flex(2),
-        TableColumn::new("Passed").fixed(8).align(TableAlign::Right),
-        TableColumn::new("Variants")
-            .fixed(9)
-            .align(TableAlign::Right),
-        TableColumn::new("Winner").flex(2),
+        TableColumn::new("Status").flex(2),
+        TableColumn::new("Best/Latest").flex(2),
     ]
 }
 
-fn picker_rows(runs: &[EvalRunSummary]) -> Vec<TableRow> {
-    runs.iter()
-        .map(|run| {
+fn overview_table_rows(
+    runs: &[EvalRunSummary],
+    campaigns: &[EvalCampaignSummary],
+) -> Vec<TableRow> {
+    let mut rows = campaigns
+        .iter()
+        .map(|campaign| {
             string_row(vec![
-                run.run_id.clone(),
-                run.suite_id.clone(),
-                pass_label(run.passed),
-                run.variants.to_string(),
-                run.winner.clone().unwrap_or_else(|| "n/a".to_string()),
+                "campaign".to_string(),
+                campaign.campaign_id.clone(),
+                campaign.suite_id.clone(),
+                format!("{} generations", campaign.generations),
+                format!(
+                    "{}/{}",
+                    campaign
+                        .best_generation_id
+                        .clone()
+                        .unwrap_or_else(|| "n/a".to_string()),
+                    campaign
+                        .latest_generation_id
+                        .clone()
+                        .unwrap_or_else(|| "n/a".to_string())
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    rows.extend(runs.iter().map(|run| {
+        string_row(vec![
+            "run".to_string(),
+            run.run_id.clone(),
+            run.suite_id.clone(),
+            pass_label(run.passed),
+            run.winner.clone().unwrap_or_else(|| "n/a".to_string()),
+        ])
+    }));
+    rows
+}
+
+fn campaign_columns<'a>() -> Vec<TableColumn<'a>> {
+    vec![
+        TableColumn::new("Gen").fixed(8),
+        TableColumn::new("Parent").fixed(8),
+        TableColumn::new("Delta").flex(3),
+        TableColumn::new("A Pass").fixed(8).align(TableAlign::Right),
+        TableColumn::new("B Pass").fixed(8).align(TableAlign::Right),
+        TableColumn::new("Score Δ")
+            .fixed(9)
+            .align(TableAlign::Right),
+        TableColumn::new("Cost Δ").fixed(9).align(TableAlign::Right),
+        TableColumn::new("Tokens Δ")
+            .fixed(10)
+            .align(TableAlign::Right),
+        TableColumn::new("Verdict").fixed(12),
+    ]
+}
+
+fn campaign_rows(data: &EvalCampaignData) -> Vec<TableRow> {
+    data.generations
+        .iter()
+        .map(|generation| {
+            let current = data.generation_run(generation);
+            let parent = data
+                .parent_generation(generation)
+                .and_then(|parent| data.generation_run(parent));
+            let a_pass = parent.as_ref().map_or_else(
+                || "—".to_string(),
+                |run| format!("{:.1}%", run_pass_rate(&run.result) * 100.0),
+            );
+            let b_pass = current.as_ref().map_or_else(
+                || "—".to_string(),
+                |run| format!("{:.1}%", run_pass_rate(&run.result) * 100.0),
+            );
+            let score_delta = match (parent.as_ref(), current.as_ref()) {
+                (Some(parent), Some(current)) => {
+                    format_signed(run_best_score(&current.result) - run_best_score(&parent.result))
+                }
+                _ => "—".to_string(),
+            };
+            let cost_delta = metric_delta(parent.as_ref(), current.as_ref(), "estimated_cost_usd")
+                .map_or_else(|| "—".to_string(), format_signed);
+            let token_delta = metric_delta(parent.as_ref(), current.as_ref(), "total_tokens")
+                .map_or_else(|| "—".to_string(), format_signed_number);
+            string_row(vec![
+                generation.id.clone(),
+                generation
+                    .parent_id
+                    .clone()
+                    .unwrap_or_else(|| "—".to_string()),
+                generation.delta.summary.clone(),
+                a_pass,
+                b_pass,
+                score_delta,
+                cost_delta,
+                token_delta,
+                format!("{:?}", generation.verdict.status),
             ])
         })
         .collect()
+}
+
+fn campaign_actions() -> Vec<ActionButton> {
+    vec![
+        ActionButton::new("open-run", "Enter Open B Run"),
+        ActionButton::new("refresh", "R Refresh"),
+        ActionButton::new("back", "Esc Back"),
+    ]
+}
+
+fn metric_delta(
+    parent: Option<&EvalRunData>,
+    current: Option<&EvalRunData>,
+    metric: &str,
+) -> Option<f64> {
+    let current = run_avg_measurement(&current?.result, metric)?;
+    let parent = run_avg_measurement(&parent?.result, metric)?;
+    Some(current - parent)
+}
+
+fn format_signed(value: f64) -> String {
+    if value >= 0.0 {
+        format!("+{value:.3}")
+    } else {
+        format!("{value:.3}")
+    }
+}
+
+fn format_signed_number(value: f64) -> String {
+    if value >= 0.0 {
+        format!("+{}", format_number(value))
+    } else {
+        format!("-{}", format_number(value.abs()))
+    }
 }
 
 fn picker_actions() -> Vec<ActionButton> {
