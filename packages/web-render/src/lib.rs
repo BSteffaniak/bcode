@@ -50,7 +50,6 @@ struct CancelTurnForm {
 
 #[derive(Debug, Deserialize)]
 struct UpdateDraftForm {
-    session_id: String,
     text: String,
 }
 
@@ -61,6 +60,28 @@ struct PermissionForm {
     approved: bool,
     #[serde(default)]
     remember: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum InteractionInputKind {
+    Activate,
+    Change,
+    Focus,
+    Blur,
+    Navigate,
+    Submit,
+    Cancel,
+}
+
+#[derive(Debug, Deserialize)]
+struct InteractionForm {
+    session_id: String,
+    interaction_id: String,
+    kind: InteractionInputKind,
+    control_id: Option<String>,
+    value: Option<String>,
+    direction: Option<String>,
 }
 
 impl WebRenderState {
@@ -142,7 +163,8 @@ pub fn router_from_state(state: WebRenderState) -> Router {
     let submit_state = state.clone();
     let cancel_state = state.clone();
     let draft_state = state.clone();
-    let permission_state = state;
+    let permission_state = state.clone();
+    let interaction_state = state;
     Router::new()
         .with_route("/", move |_| {
             let state = root_state.clone();
@@ -163,13 +185,20 @@ pub fn router_from_state(state: WebRenderState) -> Router {
             let state = cancel_state.clone();
             async move { state.handle_cancel_turn(request).await }
         })
-        .with_route("/actions/update-draft", move |request| {
-            let state = draft_state.clone();
-            async move { state.handle_update_draft(request).await }
-        })
+        .with_route(
+            RoutePath::LiteralPrefix("/actions/update-draft/".to_string()),
+            move |request| {
+                let state = draft_state.clone();
+                async move { state.handle_update_draft(request).await }
+            },
+        )
         .with_route("/actions/permission", move |request| {
             let state = permission_state.clone();
             async move { state.handle_permission(request).await }
+        })
+        .with_route("/actions/interaction", move |request| {
+            let state = interaction_state.clone();
+            async move { state.handle_interaction(request).await }
         })
 }
 
@@ -269,12 +298,16 @@ impl WebRenderState {
     }
 
     async fn handle_update_draft(&self, request: RouteRequest) -> hyperchad::template::Containers {
+        let Some(session_id) = request
+            .path
+            .strip_prefix("/actions/update-draft/")
+            .and_then(parse_session_id)
+        else {
+            return error_page("invalid session path");
+        };
         let form = match request.parse_form::<UpdateDraftForm>() {
             Ok(form) => form,
             Err(error) => return error_page(&error.to_string()),
-        };
-        let Some(session_id) = parse_session_id(&form.session_id) else {
-            return error_page("invalid session id");
         };
         let action = SessionViewAction::UpdateDraft {
             scope: ComposerDraftViewScope::Session { session_id },
@@ -308,6 +341,38 @@ impl WebRenderState {
         match execute_session_view_action(&self.client, action).await {
             Ok(_) => {
                 self.render_session_or_initial(Some(session_id), "permission resolved")
+                    .await
+            }
+            Err(error) => {
+                self.render_session_or_initial(Some(session_id), &error.to_string())
+                    .await
+            }
+        }
+    }
+
+    async fn handle_interaction(&self, request: RouteRequest) -> hyperchad::template::Containers {
+        let form = match request.parse_form::<InteractionForm>() {
+            Ok(form) => form,
+            Err(error) => return error_page(&error.to_string()),
+        };
+        let Some(session_id) = parse_session_id(&form.session_id) else {
+            return error_page("invalid session id");
+        };
+        let input = match interaction_input_from_form(&form) {
+            Ok(input) => input,
+            Err(message) => {
+                return self
+                    .render_session_or_initial(Some(session_id), &message)
+                    .await;
+            }
+        };
+        let action = SessionViewAction::SubmitInteractionInput {
+            interaction_id: form.interaction_id,
+            input,
+        };
+        match execute_session_view_action(&self.client, action).await {
+            Ok(_) => {
+                self.render_session_or_initial(Some(session_id), "interaction input accepted")
                     .await
             }
             Err(error) => {
@@ -366,6 +431,57 @@ impl WebRenderState {
     }
 }
 
+fn interaction_input_from_form(
+    form: &InteractionForm,
+) -> Result<bcode_tool::InteractionInput, String> {
+    use bcode_tool::{
+        InteractionControlId, InteractionInput, InteractionNavigation, InteractionValue,
+    };
+
+    let control_id = || {
+        form.control_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(InteractionControlId::new)
+            .ok_or_else(|| "interaction control id is required".to_owned())
+    };
+
+    match form.kind {
+        InteractionInputKind::Activate => Ok(InteractionInput::Activate {
+            control_id: control_id()?,
+        }),
+        InteractionInputKind::Change => {
+            let value = form
+                .value
+                .as_deref()
+                .ok_or_else(|| "interaction value is required".to_owned())?;
+            let value = serde_json::from_str::<InteractionValue>(value)
+                .map_err(|error| format!("invalid interaction value JSON: {error}"))?;
+            Ok(InteractionInput::Change {
+                control_id: control_id()?,
+                value,
+            })
+        }
+        InteractionInputKind::Focus => Ok(InteractionInput::Focus {
+            control_id: control_id()?,
+        }),
+        InteractionInputKind::Blur => Ok(InteractionInput::Blur {
+            control_id: control_id()?,
+        }),
+        InteractionInputKind::Navigate => match form.direction.as_deref() {
+            Some("next") => Ok(InteractionInput::Navigate {
+                direction: InteractionNavigation::Next,
+            }),
+            Some("previous") => Ok(InteractionInput::Navigate {
+                direction: InteractionNavigation::Previous,
+            }),
+            _ => Err("interaction navigation direction must be next or previous".to_owned()),
+        },
+        InteractionInputKind::Submit => Ok(InteractionInput::Submit),
+        InteractionInputKind::Cancel => Ok(InteractionInput::Cancel),
+    }
+}
+
 fn session_id_from_path(path: &str) -> Option<SessionId> {
     path.strip_prefix("/session/").and_then(parse_session_id)
 }
@@ -393,18 +509,34 @@ pub fn router(snapshot: SessionViewSnapshot, sessions: Vec<SessionSummary>) -> R
     })
 }
 
+fn with_browser_runtime(builder: AppBuilder) -> AppBuilder {
+    builder.with_static_asset_route(hyperchad::renderer::assets::StaticAssetRoute {
+        route: format!(
+            "js/{}",
+            hyperchad::renderer_vanilla_js::SCRIPT_NAME_HASHED.as_str()
+        ),
+        target: hyperchad::renderer::assets::AssetPathTarget::FileContents(
+            hyperchad::renderer_vanilla_js::SCRIPT.as_bytes().into(),
+        ),
+        not_found_behavior: None,
+    })
+}
+
 /// Initialize the web renderer application builder with a static initial snapshot.
 #[must_use]
 pub fn init_with_snapshot(
     snapshot: SessionViewSnapshot,
     sessions: Vec<SessionSummary>,
 ) -> AppBuilder {
-    AppBuilder::new()
-        .with_router(router(snapshot, sessions))
-        .with_background(*BACKGROUND_COLOR)
-        .with_title("bcode web".to_string())
-        .with_description("HyperChad web renderer for Bcode sessions".to_string())
-        .with_size(1200.0, 800.0)
+    with_browser_runtime(
+        AppBuilder::new()
+            .with_router(router(snapshot, sessions))
+            .with_background(*BACKGROUND_COLOR)
+            .with_title("bcode web".to_string())
+            .with_description("HyperChad web renderer for Bcode sessions".to_string())
+            .with_viewport(VIEWPORT.clone())
+            .with_size(1200.0, 800.0),
+    )
 }
 
 /// Initialize the web renderer application builder from daemon state.
@@ -414,12 +546,15 @@ pub fn init_with_snapshot(
 /// Returns an error when initial daemon state cannot be loaded.
 pub async fn init(state: &WebRenderState) -> Result<AppBuilder, ClientError> {
     state.client().ensure_daemon_available().await?;
-    Ok(AppBuilder::new()
-        .with_router(router_from_state(state.clone()))
-        .with_background(*BACKGROUND_COLOR)
-        .with_title("bcode web".to_string())
-        .with_description("HyperChad web renderer for Bcode sessions".to_string())
-        .with_size(1200.0, 800.0))
+    Ok(with_browser_runtime(
+        AppBuilder::new()
+            .with_router(router_from_state(state.clone()))
+            .with_background(*BACKGROUND_COLOR)
+            .with_title("bcode web".to_string())
+            .with_description("HyperChad web renderer for Bcode sessions".to_string())
+            .with_viewport(VIEWPORT.clone())
+            .with_size(1200.0, 800.0),
+    ))
 }
 
 /// Build the application from the provided builder.
@@ -439,6 +574,50 @@ mod tests {
     fn web_renderer_init_smoke_test() {
         let builder = init_with_snapshot(SessionViewSnapshot::empty(), Vec::new());
         drop(builder);
+    }
+
+    #[test]
+    fn interaction_change_form_maps_to_typed_input() {
+        let form = InteractionForm {
+            session_id: SessionId::new().to_string(),
+            interaction_id: "interaction-1".to_owned(),
+            kind: InteractionInputKind::Change,
+            control_id: Some("answer".to_owned()),
+            value: Some("\"yes\"".to_owned()),
+            direction: None,
+        };
+
+        assert_eq!(
+            interaction_input_from_form(&form),
+            Ok(bcode_tool::InteractionInput::Change {
+                control_id: bcode_tool::InteractionControlId::new("answer"),
+                value: bcode_tool::InteractionValue::String("yes".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn interaction_navigation_form_requires_valid_direction() {
+        let form = InteractionForm {
+            session_id: SessionId::new().to_string(),
+            interaction_id: "interaction-1".to_owned(),
+            kind: InteractionInputKind::Navigate,
+            control_id: None,
+            value: None,
+            direction: Some("sideways".to_owned()),
+        };
+
+        assert_eq!(
+            interaction_input_from_form(&form),
+            Err("interaction navigation direction must be next or previous".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn web_renderer_app_build_smoke_test() {
+        tokio::task::yield_now().await;
+        let builder = init_with_snapshot(SessionViewSnapshot::empty(), Vec::new());
+        assert!(build_app(builder).is_ok());
     }
 
     #[test]

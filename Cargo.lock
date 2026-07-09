@@ -2358,10 +2358,12 @@ dependencies = [
  "bcode_session_models",
  "bcode_session_view",
  "bcode_session_view_models",
+ "bcode_tool",
  "bcode_web_render_ui",
  "hyperchad",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

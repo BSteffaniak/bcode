@@ -17,18 +17,29 @@ bcode_client = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_session_view = { workspace = true }
 bcode_session_view_models = { workspace = true }
+bcode_tool = { workspace = true }
 bcode_web_render_ui = { workspace = true }
 hyperchad = { workspace = true, features = [
     "app",
     "color",
     "json",
     "renderer",
+    "renderer-vanilla-js",
+    "renderer-vanilla-js-hash",
+    "renderer-vanilla-js-plugin-form",
+    "renderer-vanilla-js-plugin-idiomorph",
+    "renderer-vanilla-js-plugin-nav",
+    "renderer-vanilla-js-plugin-routing",
+    "renderer-vanilla-js-script",
     "router",
     "router-form",
     "router-static-routes",
 ] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [features]
 actix            = ["hyperchad/renderer-html-actix"]

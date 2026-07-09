@@ -2,7 +2,8 @@
 
 use bcode_session_models::SessionSummary;
 use bcode_session_view_models::{
-    PermissionView, SessionViewSnapshot, ToolInvocationViewStatus, TranscriptViewItemKind,
+    InteractionViewSummary, PermissionView, SessionViewSnapshot, ToolInvocationViewStatus,
+    TranscriptViewItemKind,
 };
 use hyperchad::template::{Containers, container};
 
@@ -81,6 +82,15 @@ pub fn home(snapshot: &SessionViewSnapshot, sessions: &[SessionSummary]) -> Cont
                         }
                     }
 
+                    @if !snapshot.interactions.is_empty() {
+                        section background="#161b22" border="1, #30363d" border-radius=10 padding=16 margin-bottom=18 {
+                            h2 color="#f0f6fc" font-size=16 margin-bottom=14 { "interactions" }
+                            @for interaction in &snapshot.interactions {
+                                (interaction_request(interaction, snapshot.session_id))
+                            }
+                        }
+                    }
+
                     @if !snapshot.permissions.is_empty() {
                         section background="#161b22" border="1, #30363d" border-radius=10 padding=16 margin-bottom=18 {
                             h2 color="#f0f6fc" font-size=16 margin-bottom=14 { "permissions" }
@@ -114,8 +124,14 @@ fn composer(snapshot: &SessionViewSnapshot) -> Containers {
                     input type=hidden name="session_id" value=(session_id.to_string());
                 }
                 input type=hidden name="placement" value="steering";
-                textarea name="text" rows="5" placeholder="Send a message to this session" width=100% padding=10 border="1, #30363d" border-radius=6 background="#010409" color="#c9d1d9" {
-                    (snapshot.composer.draft)
+                @if let Some(session_id) = snapshot.session_id {
+                    textarea name="text" rows="5" placeholder="Send a message to this session" hx-post=(format!("/actions/update-draft/{session_id}")) hx-trigger="change" hx-target="#bcode-web-shell" hx-swap=this width=100% padding=10 border="1, #30363d" border-radius=6 background="#010409" color="#c9d1d9" {
+                        (snapshot.composer.draft)
+                    }
+                } @else {
+                    textarea name="text" rows="5" placeholder="Send a message to start a session" width=100% padding=10 border="1, #30363d" border-radius=6 background="#010409" color="#c9d1d9" {
+                        (snapshot.composer.draft)
+                    }
                 }
                 button type=submit background="#238636" color=white border-radius=6 padding="8, 14" margin-top=10 {
                     "send"
@@ -127,6 +143,49 @@ fn composer(snapshot: &SessionViewSnapshot) -> Containers {
                     input type=hidden name="clear_queue" value="true";
                     button type=submit background="#da3633" color=white border-radius=6 padding="8, 14" {
                         "cancel turn"
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn interaction_request(
+    interaction: &InteractionViewSummary,
+    session_id: Option<bcode_session_models::SessionId>,
+) -> Containers {
+    container! {
+        div border="1, #58a6ff" border-radius=8 padding=10 margin-bottom=10 {
+            div color="#58a6ff" margin-bottom=6 {
+                (interaction.title.as_deref().unwrap_or("Interactive request"))
+            }
+            div color="#8b949e" font-size=12 margin-bottom=8 { (interaction.kind) }
+            @if let Some(snapshot) = &interaction.snapshot {
+                (json_panel("controller snapshot", snapshot))
+            }
+            @if let Some(session_id) = session_id {
+                form hx-post="/actions/interaction" hx-target="#bcode-web-shell" hx-swap=this margin-top=10 {
+                    input type=hidden name="session_id" value=(session_id.to_string());
+                    input type=hidden name="interaction_id" value=(interaction.interaction_id.clone());
+                    div gap=8 {
+                        select name="kind" selected="submit" padding=8 border="1, #30363d" border-radius=6 background="#010409" color="#c9d1d9" {
+                            option value="activate" { "activate control" }
+                            option value="change" { "change control value" }
+                            option value="focus" { "focus control" }
+                            option value="blur" { "blur control" }
+                            option value="navigate" { "navigate focus" }
+                            option value="submit" { "submit interaction" }
+                            option value="cancel" { "cancel interaction" }
+                        }
+                        input name="control_id" type=text placeholder="control id (activate/change/focus/blur)" padding=8 border="1, #30363d" border-radius=6 background="#010409" color="#c9d1d9";
+                        input name="value" type=text placeholder="JSON value (change only, e.g. &quot;answer&quot;)" padding=8 border="1, #30363d" border-radius=6 background="#010409" color="#c9d1d9";
+                        select name="direction" selected="next" padding=8 border="1, #30363d" border-radius=6 background="#010409" color="#c9d1d9" {
+                            option value="next" { "next" }
+                            option value="previous" { "previous" }
+                        }
+                    }
+                    button type=submit background="#1f6feb" color=white border-radius=6 padding="6, 12" margin-top=8 {
+                        "send interaction input"
                     }
                 }
             }
@@ -281,5 +340,66 @@ const fn tool_status_color(status: ToolInvocationViewStatus) -> &'static str {
         ToolInvocationViewStatus::Requested => "#8b949e",
         ToolInvocationViewStatus::Running => "#7ee787",
         ToolInvocationViewStatus::Finished => "#58a6ff",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bcode_session_models::{PluginVisualDescriptor, ToolArtifact};
+    use bcode_session_view_models::{
+        PluginVisualView, ToolArtifactView, ToolInvocationView, ToolResultView, ToolTimingView,
+    };
+
+    #[test]
+    fn generic_plugin_visual_keeps_schema_payload_in_render_tree() {
+        let kind = TranscriptViewItemKind::PluginVisual {
+            visual: PluginVisualView::from(PluginVisualDescriptor {
+                visual_id: Some("visual-1".to_owned()),
+                producer_plugin_id: Some("fixture-plugin".to_owned()),
+                schema: "fixture.visual".to_owned(),
+                schema_version: 1,
+                title: Some("Fixture visual".to_owned()),
+                subtitle: None,
+                payload: serde_json::json!({"sentinel": "visual-payload"}),
+            }),
+        };
+
+        let rendered = format!("{:?}", transcript_item_body(&kind));
+        assert!(rendered.contains("fixture.visual"));
+        assert!(rendered.contains("visual-payload"));
+    }
+
+    #[test]
+    fn generic_tool_artifact_keeps_schema_metadata_in_render_tree() {
+        let artifact = ToolArtifactView::from(ToolArtifact {
+            artifact_id: "artifact-1".to_owned(),
+            producer_plugin_id: "fixture-plugin".to_owned(),
+            schema: "fixture.artifact".to_owned(),
+            schema_version: 1,
+            tool_call_id: Some("call-1".to_owned()),
+            title: Some("Fixture artifact".to_owned()),
+            metadata: serde_json::json!({"sentinel": "artifact-metadata"}),
+            refs: Vec::new(),
+        });
+        let kind = TranscriptViewItemKind::ToolInvocation {
+            tool: Box::new(ToolInvocationView {
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: Some("fixture-plugin".to_owned()),
+                tool_name: Some("fixture".to_owned()),
+                arguments_json: None,
+                request_visual: None,
+                status: ToolInvocationViewStatus::Finished,
+                result_text: None,
+                is_error: Some(false),
+                result: Some(ToolResultView::Artifact { artifact }),
+                output: None,
+                timing: ToolTimingView::default(),
+            }),
+        };
+
+        let rendered = format!("{:?}", transcript_item_body(&kind));
+        assert!(rendered.contains("fixture.artifact"));
+        assert!(rendered.contains("artifact-metadata"));
     }
 }
