@@ -1676,6 +1676,7 @@ dependencies = [
  "bcode_eval_models",
  "bcode_plugin_sdk",
  "bmux_keyboard",
+ "bmux_text_edit",
  "bmux_tui",
  "bmux_tui_components",
  "serde",

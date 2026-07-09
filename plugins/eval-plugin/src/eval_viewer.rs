@@ -11,6 +11,7 @@ use bcode_eval_models::{
 };
 use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface};
 use bmux_keyboard::KeyCode;
+use bmux_text_edit::TextEditBuffer;
 use bmux_tui::event::{Event, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
@@ -28,6 +29,8 @@ use bmux_tui_components::tab_bar::{TabBar, TabBarOutcome, TabBarState, TabBarSty
 use bmux_tui_components::table::{
     Table, TableAlign, TableColumn, TableOutcome, TableRow, TableState, TableStyles,
 };
+use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
+use bmux_tui_components::text_input_box::{TextInputBox, TextInputBoxOutcome, TextInputBoxPolicy};
 use std::path::PathBuf;
 
 const TITLE_HEIGHT: u16 = 2;
@@ -387,16 +390,46 @@ enum EvalWizard {
 #[derive(Debug, Clone)]
 struct StartCampaignWizard {
     state: DialogState,
-    body: Vec<Line>,
     suite_path: PathBuf,
-    options: bcode_eval::EvalImprovementStartOptions,
+    output_root: PathBuf,
+    baseline_run: PathBuf,
+    run_id: String,
+    suite_id: String,
+    campaign_id: TextInputState,
+    name: TextInputState,
+    focus: StartCampaignField,
+    objective: EvalImprovementObjective,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartCampaignField {
+    CampaignId,
+    Name,
+    Objective,
 }
 
 #[derive(Debug, Clone)]
 struct RecordGenerationWizard {
     state: DialogState,
-    body: Vec<Line>,
-    options: bcode_eval::EvalImprovementRecordOptions,
+    campaign: PathBuf,
+    parent_id: Option<String>,
+    branch: String,
+    delta_kind: bcode_eval_models::EvalImprovementDeltaKind,
+    run: Option<PathBuf>,
+    patch: Option<PathBuf>,
+    risk: bcode_eval_models::EvalImprovementRisk,
+    context: Vec<Line>,
+    summary: TextInputState,
+    rationale: TextInputState,
+    focus: RecordGenerationField,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordGenerationField {
+    Summary,
+    Kind,
+    Risk,
+    Rationale,
 }
 
 #[derive(Debug, Clone)]
@@ -431,29 +464,17 @@ impl EvalWizard {
         let campaign_id =
             unique_campaign_id(campaigns_root, &format!("{}-improvement", run.suite_id));
         let name = format!("{} improvement", run.suite_id);
-        let options = bcode_eval::EvalImprovementStartOptions {
-            output_root: campaigns_root.to_path_buf(),
-            campaign_id: Some(campaign_id.clone()),
-            name: Some(name.clone()),
-            baseline_run: Some(run.run_dir.clone()),
-            objective: bcode_eval_models::EvalImprovementObjective::Progression,
-        };
-        let body = vec![
-            Line::from("Create an improvement campaign from this run."),
-            Line::from(""),
-            Line::from(format!("Run: {}", run.run_id)),
-            Line::from(format!("Suite: {}", run.suite_id)),
-            Line::from(format!("Campaign: {campaign_id}")),
-            Line::from(format!("Name: {name}")),
-            Line::from("Objective: Track improvement over time"),
-            Line::from(""),
-            Line::from("Press Create to save the baseline generation."),
-        ];
         Ok(Self::StartCampaign(StartCampaignWizard {
             state: DialogState::new(),
-            body,
             suite_path,
-            options,
+            output_root: campaigns_root.to_path_buf(),
+            baseline_run: run.run_dir.clone(),
+            run_id: run.run_id.clone(),
+            suite_id: run.suite_id.clone(),
+            campaign_id: text_state(&campaign_id),
+            name: text_state(&name),
+            focus: StartCampaignField::CampaignId,
+            objective: EvalImprovementObjective::Progression,
         }))
     }
 
@@ -466,39 +487,30 @@ impl EvalWizard {
             .filter(|campaign| campaign.suite_id == run.suite_id)
             .max_by_key(|campaign| campaign.modified_ms)
             .ok_or_else(|| format!("no campaign found for suite {}", run.suite_id))?;
-        let summary = format!("Recorded run {}", run.run_id);
         let parent_id = campaign.latest_generation_id.clone();
-        let options = bcode_eval::EvalImprovementRecordOptions {
-            campaign: campaign.campaign_dir.clone(),
-            parent_id,
-            branch: "main".to_string(),
-            delta_kind: bcode_eval_models::EvalImprovementDeltaKind::Mixed,
-            summary: summary.clone(),
-            run: Some(run.run_dir.clone()),
-            patch: None,
-            risk: bcode_eval_models::EvalImprovementRisk::Low,
-            rationale: Some("Recorded from the eval overview TUI.".to_string()),
-        };
-        let body = vec![
+        let summary = format!("Recorded run {}", run.run_id);
+        let context = vec![
             Line::from("Attach this run as the next campaign generation."),
-            Line::from(""),
             Line::from(format!("Run: {}", run.run_id)),
             Line::from(format!("Campaign: {}", campaign.campaign_id)),
             Line::from(format!(
                 "Parent: {}",
-                options
-                    .parent_id
-                    .clone()
-                    .unwrap_or_else(|| "latest".to_string())
+                parent_id.clone().unwrap_or_else(|| "latest".to_string())
             )),
-            Line::from(format!("Summary: {summary}")),
-            Line::from("Kind: Mixed / not sure"),
-            Line::from("Risk: Low"),
         ];
         Ok(Self::RecordGeneration(RecordGenerationWizard {
             state: DialogState::new(),
-            body,
-            options,
+            campaign: campaign.campaign_dir.clone(),
+            parent_id,
+            branch: "main".to_string(),
+            delta_kind: bcode_eval_models::EvalImprovementDeltaKind::Mixed,
+            run: Some(run.run_dir.clone()),
+            patch: None,
+            risk: bcode_eval_models::EvalImprovementRisk::Low,
+            context,
+            summary: text_state(&summary),
+            rationale: text_state("Recorded from the eval overview TUI."),
+            focus: RecordGenerationField::Summary,
         }))
     }
 
@@ -528,97 +540,69 @@ impl EvalWizard {
             .map(|generation| generation.id.clone())
             .or_else(|| data.campaign.latest_generation_id.clone());
         let summary = format!("Recorded run {}", run.run_id);
-        let options = bcode_eval::EvalImprovementRecordOptions {
-            campaign: data.campaign_dir.clone(),
-            parent_id,
-            branch: "main".to_string(),
-            delta_kind: bcode_eval_models::EvalImprovementDeltaKind::Mixed,
-            summary: summary.clone(),
-            run: Some(run.run_dir.clone()),
-            patch: None,
-            risk: bcode_eval_models::EvalImprovementRisk::Low,
-            rationale: Some("Recorded from the campaign timeline TUI.".to_string()),
-        };
-        let body = vec![
+        let context = vec![
             Line::from("Record the latest unused run as a new generation."),
-            Line::from(""),
             Line::from(format!("Campaign: {}", data.campaign.id)),
             Line::from(format!("Run: {}", run.run_id)),
             Line::from(format!(
                 "Parent: {}",
-                options
-                    .parent_id
-                    .clone()
-                    .unwrap_or_else(|| "latest".to_string())
+                parent_id.clone().unwrap_or_else(|| "latest".to_string())
             )),
-            Line::from(format!("Summary: {summary}")),
-            Line::from("Kind: Mixed / not sure"),
-            Line::from("Risk: Low"),
         ];
         Ok(Self::RecordGeneration(RecordGenerationWizard {
             state: DialogState::new(),
-            body,
-            options,
+            campaign: data.campaign_dir.clone(),
+            parent_id,
+            branch: "main".to_string(),
+            delta_kind: bcode_eval_models::EvalImprovementDeltaKind::Mixed,
+            run: Some(run.run_dir),
+            patch: None,
+            risk: bcode_eval_models::EvalImprovementRisk::Low,
+            context,
+            summary: text_state(&summary),
+            rationale: text_state("Recorded from the campaign timeline TUI."),
+            focus: RecordGenerationField::Summary,
         }))
     }
 
     fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
-        let (title, body, state, actions) = match self {
-            Self::StartCampaign(wizard) => (
-                "Start Improvement Campaign",
-                wizard.body.as_slice(),
-                &wizard.state,
-                wizard_actions("create"),
-            ),
-            Self::RecordGeneration(wizard) => (
-                "Record Generation",
-                wizard.body.as_slice(),
-                &wizard.state,
-                wizard_actions("record"),
-            ),
-        };
-        let dialog = Dialog::new(body, &actions, eval_modal_theme())
-            .title(title)
-            .sizing(ModalSizing::new(
-                Size::new(52, 12),
-                Size::new(92, 18),
-                Insets::all(2),
-            ));
-        dialog.render(area, state, frame);
+        match self {
+            Self::StartCampaign(wizard) => wizard.render(area, frame),
+            Self::RecordGeneration(wizard) => wizard.render(area, frame),
+        }
     }
 
     fn handle_event(&mut self, area: Rect, event: &Event) -> EvalWizardOutcome {
         if let Event::Key(stroke) = event {
             match stroke.key {
                 KeyCode::Escape | KeyCode::Char('q') => return EvalWizardOutcome::Cancel,
+                KeyCode::Tab => {
+                    self.focus_next();
+                    return EvalWizardOutcome::Redraw;
+                }
                 KeyCode::Enter | KeyCode::Char('y') => return self.complete(),
+                KeyCode::Left => {
+                    self.cycle_choice(false);
+                    return EvalWizardOutcome::Redraw;
+                }
+                KeyCode::Right => {
+                    self.cycle_choice(true);
+                    return EvalWizardOutcome::Redraw;
+                }
                 _ => {}
             }
+        }
+        if self.handle_inputs(area, event) {
+            return EvalWizardOutcome::Redraw;
         }
         let actions = match self {
             Self::StartCampaign(_) => wizard_actions("create"),
             Self::RecordGeneration(_) => wizard_actions("record"),
         };
-        let outcome = match self {
-            Self::StartCampaign(wizard) => Dialog::new(&wizard.body, &actions, eval_modal_theme())
-                .title("Start Improvement Campaign")
-                .sizing(ModalSizing::new(
-                    Size::new(52, 12),
-                    Size::new(92, 18),
-                    Insets::all(2),
-                ))
-                .handle_event(area, &mut wizard.state, event),
-            Self::RecordGeneration(wizard) => {
-                Dialog::new(&wizard.body, &actions, eval_modal_theme())
-                    .title("Record Generation")
-                    .sizing(ModalSizing::new(
-                        Size::new(52, 12),
-                        Size::new(92, 18),
-                        Insets::all(2),
-                    ))
-                    .handle_event(area, &mut wizard.state, event)
-            }
-        };
+        let outcome = Dialog::new(&[], &actions, eval_modal_theme())
+            .title(self.title())
+            .sizing(wizard_sizing())
+            .handle_event(area, self.dialog_state_mut(), event);
         match outcome {
             DialogOutcome::Ignored => EvalWizardOutcome::Continue,
             DialogOutcome::Redraw => EvalWizardOutcome::Redraw,
@@ -627,18 +611,395 @@ impl EvalWizard {
         }
     }
 
+    const fn title(&self) -> &'static str {
+        match self {
+            Self::StartCampaign(_) => "Start Improvement Campaign",
+            Self::RecordGeneration(_) => "Record Generation",
+        }
+    }
+
+    const fn dialog_state_mut(&mut self) -> &mut DialogState {
+        match self {
+            Self::StartCampaign(wizard) => &mut wizard.state,
+            Self::RecordGeneration(wizard) => &mut wizard.state,
+        }
+    }
+
+    const fn focus_next(&mut self) {
+        match self {
+            Self::StartCampaign(wizard) => {
+                wizard.focus = match wizard.focus {
+                    StartCampaignField::CampaignId => StartCampaignField::Name,
+                    StartCampaignField::Name => StartCampaignField::Objective,
+                    StartCampaignField::Objective => StartCampaignField::CampaignId,
+                }
+            }
+            Self::RecordGeneration(wizard) => {
+                wizard.focus = match wizard.focus {
+                    RecordGenerationField::Summary => RecordGenerationField::Kind,
+                    RecordGenerationField::Kind => RecordGenerationField::Risk,
+                    RecordGenerationField::Risk => RecordGenerationField::Rationale,
+                    RecordGenerationField::Rationale => RecordGenerationField::Summary,
+                }
+            }
+        }
+    }
+
+    fn cycle_choice(&mut self, forward: bool) {
+        match self {
+            Self::StartCampaign(wizard) if wizard.focus == StartCampaignField::Objective => {
+                wizard.objective = cycle_objective(wizard.objective, forward);
+            }
+            Self::RecordGeneration(wizard) if wizard.focus == RecordGenerationField::Kind => {
+                wizard.delta_kind = cycle_delta_kind(wizard.delta_kind, forward);
+            }
+            Self::RecordGeneration(wizard) if wizard.focus == RecordGenerationField::Risk => {
+                wizard.risk = cycle_risk(wizard.risk, forward);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_inputs(&mut self, area: Rect, event: &Event) -> bool {
+        match self {
+            Self::StartCampaign(wizard) => wizard.handle_inputs(area, event),
+            Self::RecordGeneration(wizard) => wizard.handle_inputs(area, event),
+        }
+    }
+
     fn complete(&self) -> EvalWizardOutcome {
         match self {
             Self::StartCampaign(wizard) => {
                 EvalWizardOutcome::Complete(EvalWizardCompletion::StartCampaign {
                     suite_path: wizard.suite_path.clone(),
-                    options: wizard.options.clone(),
+                    options: wizard.options(),
                 })
             }
             Self::RecordGeneration(wizard) => EvalWizardOutcome::Complete(
-                EvalWizardCompletion::RecordGeneration(wizard.options.clone()),
+                EvalWizardCompletion::RecordGeneration(wizard.options()),
             ),
         }
+    }
+}
+
+impl StartCampaignWizard {
+    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+        let actions = wizard_actions("create");
+        let body = vec![
+            Line::from("Create an improvement campaign from this run."),
+            Line::from(format!("Run: {}", self.run_id)),
+            Line::from(format!("Suite: {}", self.suite_id)),
+            Line::from(""),
+            Line::from(""),
+            Line::from(""),
+            Line::from(format!("Objective: {}", objective_label(self.objective))),
+            Line::from("Click fields/buttons or use Tab, arrows, Enter, Esc."),
+        ];
+        Dialog::new(&body, &actions, eval_modal_theme())
+            .title("Start Improvement Campaign")
+            .sizing(wizard_sizing())
+            .render(area, &self.state, frame);
+        let layout = wizard_layout(area);
+        render_input_box(
+            layout.primary,
+            frame,
+            "Campaign id",
+            &mut self.campaign_id,
+            self.focus == StartCampaignField::CampaignId,
+            1,
+        );
+        render_input_box(
+            layout.secondary,
+            frame,
+            "Campaign name",
+            &mut self.name,
+            self.focus == StartCampaignField::Name,
+            1,
+        );
+    }
+
+    fn handle_inputs(&mut self, area: Rect, event: &Event) -> bool {
+        let layout = wizard_layout(area);
+        if event_click_in(event, layout.primary) {
+            self.focus = StartCampaignField::CampaignId;
+        } else if event_click_in(event, layout.secondary) {
+            self.focus = StartCampaignField::Name;
+        } else if event_click_in(event, layout.choice) {
+            self.focus = StartCampaignField::Objective;
+            self.objective = cycle_objective(self.objective, true);
+            return true;
+        }
+        let id = handle_input_box(
+            layout.primary,
+            &mut self.campaign_id,
+            event,
+            self.focus == StartCampaignField::CampaignId,
+        );
+        let name = handle_input_box(
+            layout.secondary,
+            &mut self.name,
+            event,
+            self.focus == StartCampaignField::Name,
+        );
+        id || name
+    }
+
+    fn options(&self) -> bcode_eval::EvalImprovementStartOptions {
+        bcode_eval::EvalImprovementStartOptions {
+            output_root: self.output_root.clone(),
+            campaign_id: Some(input_text(&self.campaign_id)),
+            name: Some(input_text(&self.name)),
+            baseline_run: Some(self.baseline_run.clone()),
+            objective: self.objective,
+        }
+    }
+}
+
+impl RecordGenerationWizard {
+    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+        let actions = wizard_actions("record");
+        let mut body = self.context.clone();
+        body.push(Line::from(format!(
+            "Kind: {}",
+            delta_kind_label(self.delta_kind)
+        )));
+        body.push(Line::from(format!("Risk: {}", risk_label(self.risk))));
+        body.push(Line::from(
+            "Click fields/buttons or use Tab, arrows, Enter, Esc.",
+        ));
+        Dialog::new(&body, &actions, eval_modal_theme())
+            .title("Record Generation")
+            .sizing(wizard_sizing())
+            .render(area, &self.state, frame);
+        let layout = wizard_layout(area);
+        render_input_box(
+            layout.primary,
+            frame,
+            "Summary",
+            &mut self.summary,
+            self.focus == RecordGenerationField::Summary,
+            1,
+        );
+        render_input_box(
+            layout.secondary,
+            frame,
+            "Rationale",
+            &mut self.rationale,
+            self.focus == RecordGenerationField::Rationale,
+            2,
+        );
+    }
+
+    fn handle_inputs(&mut self, area: Rect, event: &Event) -> bool {
+        let layout = wizard_layout(area);
+        if event_click_in(event, layout.primary) {
+            self.focus = RecordGenerationField::Summary;
+        } else if event_click_in(event, layout.secondary) {
+            self.focus = RecordGenerationField::Rationale;
+        } else if event_click_in(event, layout.choice) {
+            self.focus = RecordGenerationField::Kind;
+            self.delta_kind = cycle_delta_kind(self.delta_kind, true);
+            return true;
+        } else if event_click_in(event, layout.choice_alt) {
+            self.focus = RecordGenerationField::Risk;
+            self.risk = cycle_risk(self.risk, true);
+            return true;
+        }
+        let summary = handle_input_box(
+            layout.primary,
+            &mut self.summary,
+            event,
+            self.focus == RecordGenerationField::Summary,
+        );
+        let rationale = handle_input_box(
+            layout.secondary,
+            &mut self.rationale,
+            event,
+            self.focus == RecordGenerationField::Rationale,
+        );
+        summary || rationale
+    }
+
+    fn options(&self) -> bcode_eval::EvalImprovementRecordOptions {
+        bcode_eval::EvalImprovementRecordOptions {
+            campaign: self.campaign.clone(),
+            parent_id: self.parent_id.clone(),
+            branch: self.branch.clone(),
+            delta_kind: self.delta_kind,
+            summary: input_text(&self.summary),
+            run: self.run.clone(),
+            patch: self.patch.clone(),
+            risk: self.risk,
+            rationale: Some(input_text(&self.rationale)).filter(|text| !text.trim().is_empty()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WizardLayout {
+    primary: Rect,
+    secondary: Rect,
+    choice: Rect,
+    choice_alt: Rect,
+}
+
+fn wizard_layout(area: Rect) -> WizardLayout {
+    let body = Dialog::new(&[], &wizard_actions("confirm"), eval_modal_theme())
+        .title("Wizard")
+        .sizing(wizard_sizing())
+        .layout(area)
+        .body;
+    WizardLayout {
+        primary: Rect::new(body.x, body.y.saturating_add(4), body.width, 3),
+        secondary: Rect::new(body.x, body.y.saturating_add(7), body.width, 4),
+        choice: Rect::new(body.x, body.y.saturating_add(10), body.width / 2, 1),
+        choice_alt: Rect::new(
+            body.x.saturating_add(body.width / 2),
+            body.y.saturating_add(10),
+            body.width / 2,
+            1,
+        ),
+    }
+}
+
+const fn wizard_sizing() -> ModalSizing {
+    ModalSizing::new(Size::new(56, 15), Size::new(96, 23), Insets::all(2))
+}
+
+fn render_input_box(
+    area: Rect,
+    frame: &mut Frame<'_>,
+    label: &'static str,
+    state: &mut TextInputState,
+    focused: bool,
+    rows: u16,
+) {
+    TextInputBox::new(TextInputPolicy::chat_composer())
+        .label(label)
+        .policy(TextInputBoxPolicy {
+            field_chrome: true,
+            panel_chrome: true,
+            background: true,
+            cursor: true,
+            focused,
+            disabled: false,
+            min_rows: rows,
+            max_rows: Some(rows),
+        })
+        .render(area, state, frame);
+}
+
+fn handle_input_box(area: Rect, state: &mut TextInputState, event: &Event, focused: bool) -> bool {
+    if !focused && !event_click_in(event, area) {
+        return false;
+    }
+    matches!(
+        TextInputBox::new(TextInputPolicy::chat_composer()).handle_event(area, state, event),
+        TextInputBoxOutcome::Edited | TextInputBoxOutcome::Redraw | TextInputBoxOutcome::Submitted
+    )
+}
+
+const fn event_click_in(event: &Event, area: Rect) -> bool {
+    matches!(
+        event,
+        Event::Mouse(mouse)
+            if matches!(mouse.kind, MouseEventKind::Down(_))
+                && mouse.position.x >= area.x
+                && mouse.position.x < area.x.saturating_add(area.width)
+                && mouse.position.y >= area.y
+                && mouse.position.y < area.y.saturating_add(area.height)
+    )
+}
+
+fn text_state(value: &str) -> TextInputState {
+    TextInputState::new(TextEditBuffer::from_text(value.to_string()))
+}
+
+fn input_text(state: &TextInputState) -> String {
+    state.buffer().text().trim().to_string()
+}
+
+fn cycle_objective(objective: EvalImprovementObjective, forward: bool) -> EvalImprovementObjective {
+    let items = [
+        EvalImprovementObjective::Progression,
+        EvalImprovementObjective::ParentComparison,
+        EvalImprovementObjective::BaselineComparison,
+        EvalImprovementObjective::VariantComparison,
+    ];
+    cycle_value(&items, objective, forward)
+}
+
+fn cycle_delta_kind(
+    kind: bcode_eval_models::EvalImprovementDeltaKind,
+    forward: bool,
+) -> bcode_eval_models::EvalImprovementDeltaKind {
+    use bcode_eval_models::EvalImprovementDeltaKind as Kind;
+    let items = [
+        Kind::SystemPromptOverlay,
+        Kind::ToolDescriptionOverlay,
+        Kind::ToolBehaviorPatch,
+        Kind::AgentProfileOverlay,
+        Kind::PermissionPolicyOverlay,
+        Kind::ModelChange,
+        Kind::EvalCaseChange,
+        Kind::JudgeChange,
+        Kind::ScoringChange,
+        Kind::Mixed,
+    ];
+    cycle_value(&items, kind, forward)
+}
+
+fn cycle_risk(
+    risk: bcode_eval_models::EvalImprovementRisk,
+    forward: bool,
+) -> bcode_eval_models::EvalImprovementRisk {
+    use bcode_eval_models::EvalImprovementRisk as Risk;
+    cycle_value(&[Risk::Low, Risk::Medium, Risk::High], risk, forward)
+}
+
+fn cycle_value<T: Copy + PartialEq>(items: &[T], current: T, forward: bool) -> T {
+    let index = items.iter().position(|item| *item == current).unwrap_or(0);
+    let next = if forward {
+        (index + 1) % items.len()
+    } else {
+        index.checked_sub(1).unwrap_or(items.len() - 1)
+    };
+    items[next]
+}
+
+const fn objective_label(objective: EvalImprovementObjective) -> &'static str {
+    match objective {
+        EvalImprovementObjective::Progression => "Track improvement over time",
+        EvalImprovementObjective::ParentComparison => "Compare each generation to parent",
+        EvalImprovementObjective::BaselineComparison => "Compare against baseline",
+        EvalImprovementObjective::VariantComparison => "Compare candidates",
+    }
+}
+
+const fn risk_label(risk: bcode_eval_models::EvalImprovementRisk) -> &'static str {
+    match risk {
+        bcode_eval_models::EvalImprovementRisk::Low => "Low",
+        bcode_eval_models::EvalImprovementRisk::Medium => "Medium",
+        bcode_eval_models::EvalImprovementRisk::High => "High",
+    }
+}
+
+const fn delta_kind_label(kind: bcode_eval_models::EvalImprovementDeltaKind) -> &'static str {
+    use bcode_eval_models::EvalImprovementDeltaKind as Kind;
+    match kind {
+        Kind::Baseline => "Baseline",
+        Kind::SystemPromptOverlay => "System prompt guidance",
+        Kind::SystemPromptPatch => "System prompt patch",
+        Kind::ToolDescriptionOverlay => "Tool description/schema",
+        Kind::ToolSchemaPatch => "Tool schema patch",
+        Kind::ToolBehaviorPatch => "Tool implementation",
+        Kind::AgentProfileOverlay => "Agent profile",
+        Kind::PermissionPolicyOverlay => "Permission policy",
+        Kind::ModelChange => "Model/settings",
+        Kind::EvalCaseChange => "Eval case",
+        Kind::JudgeChange => "Judge/scoring",
+        Kind::ScoringChange => "Scoring change",
+        Kind::Mixed => "Mixed / not sure",
     }
 }
 
