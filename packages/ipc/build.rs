@@ -14,6 +14,7 @@ fn main() {
 
     println!("cargo:rerun-if-changed=../../Cargo.lock");
     println!("cargo:rerun-if-changed=../../Cargo.toml");
+    println!("cargo:rerun-if-changed=../../catalog");
     println!("cargo:rerun-if-changed=../../packages");
     println!("cargo:rerun-if-changed=../../plugins");
     println!("cargo:rerun-if-changed=../../.git/HEAD");

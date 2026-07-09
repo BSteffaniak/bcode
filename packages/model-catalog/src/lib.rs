@@ -22,6 +22,17 @@ use std::path::{Path, PathBuf};
 /// Environment variable pointing to a directory of local live snapshots.
 const LOCAL_LIVE_DIR_ENV: &str = "BCODE_MODEL_CATALOG_LIVE_DIR";
 
+const EMBEDDED_PROVIDER_CATALOGS: &[(&str, &str)] = &[
+    (
+        "bedrock.toml",
+        include_str!("../../../catalog/models/providers/bedrock.toml"),
+    ),
+    (
+        "openai.toml",
+        include_str!("../../../catalog/models/providers/openai.toml"),
+    ),
+];
+
 mod remote;
 mod verification;
 
@@ -110,13 +121,13 @@ impl ModelCatalog {
         self
     }
 
-    /// Load the checked-in bundled catalog source.
+    /// Load the embedded bundled catalog source.
     ///
     /// # Errors
     ///
-    /// Returns an error if catalog source loading or validation fails.
+    /// Returns an error if embedded catalog source parsing or validation fails.
     pub fn load_bundled() -> Result<Self> {
-        load_catalog(&default_source_dir()).map(Self::new)
+        load_embedded_catalog().map(Self::new)
     }
 
     /// Load the bundled catalog and opportunistically overlay remote catalog data.
@@ -515,15 +526,29 @@ pub enum OutputFormat {
     PrettyJson,
 }
 
-/// Load a catalog document from a source directory containing provider TOML files.
+/// Load the embedded catalog bundled into this binary.
 ///
 /// # Errors
 ///
-/// Returns an error if:
+/// Returns an error when embedded provider TOML parsing or validation fails.
+pub fn load_embedded_catalog() -> Result<CatalogDocument> {
+    let mut catalog = CatalogDocument::empty(catalog_revision(), generated_at());
+
+    for (name, contents) in EMBEDDED_PROVIDER_CATALOGS {
+        let provider = parse_provider_catalog(contents, name)?;
+        insert_provider_catalog(&mut catalog, provider, name)?;
+    }
+
+    validate_catalog(&catalog)?;
+    Ok(catalog)
+}
+
+/// Load a catalog from provider TOML files in a source directory.
 ///
-/// * the source directory cannot be read;
-/// * a provider TOML file cannot be parsed;
-/// * catalog validation fails.
+/// # Errors
+///
+/// Returns an error when the source directory cannot be read, provider TOML cannot be parsed,
+/// or catalog validation fails.
 pub fn load_catalog(source_dir: &Path) -> Result<CatalogDocument> {
     let providers_dir = source_dir.join("providers");
     let mut catalog = CatalogDocument::empty(catalog_revision(), generated_at());
@@ -535,26 +560,39 @@ pub fn load_catalog(source_dir: &Path) -> Result<CatalogDocument> {
             continue;
         }
         let contents = fs::read_to_string(&path)?;
-        let provider: ProviderCatalog = toml::from_str(&contents)?;
-        if provider.provider_id.trim().is_empty() {
-            return Err(Error::Validation(format!(
-                "provider id is empty in {}",
-                path.display()
-            )));
-        }
-        let previous = catalog
-            .providers
-            .insert(provider.provider_id.clone(), provider);
-        if previous.is_some() {
-            return Err(Error::Validation(format!(
-                "duplicate provider id in {}",
-                path.display()
-            )));
-        }
+        let source = path.display().to_string();
+        let provider = parse_provider_catalog(&contents, &source)?;
+        insert_provider_catalog(&mut catalog, provider, &source)?;
     }
 
     validate_catalog(&catalog)?;
     Ok(catalog)
+}
+
+fn parse_provider_catalog(contents: &str, source: &str) -> Result<ProviderCatalog> {
+    let provider: ProviderCatalog = toml::from_str(contents)?;
+    if provider.provider_id.trim().is_empty() {
+        return Err(Error::Validation(format!(
+            "provider id is empty in {source}"
+        )));
+    }
+    Ok(provider)
+}
+
+fn insert_provider_catalog(
+    catalog: &mut CatalogDocument,
+    provider: ProviderCatalog,
+    source: &str,
+) -> Result<()> {
+    let previous = catalog
+        .providers
+        .insert(provider.provider_id.clone(), provider);
+    if previous.is_some() {
+        return Err(Error::Validation(format!(
+            "duplicate provider id in {source}"
+        )));
+    }
+    Ok(())
 }
 
 /// Validate a catalog document.
@@ -912,6 +950,97 @@ mod tests {
             Some(2_500_000)
         );
         assert!(enriched.capabilities.contains(&ModelCapability::ToolCalls));
+    }
+
+    #[test]
+    fn bundled_catalog_includes_gpt_5_6_models() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+
+        for model_id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert!(
+                catalog.model("openai", model_id).is_some(),
+                "{model_id} should be in the embedded OpenAI catalog"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_fallback_prefers_gpt_5_6_sol_then_terra_then_5_5() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let provider = catalog.provider("openai").expect("openai provider exists");
+
+        assert_eq!(
+            provider
+                .fallback_model_ids
+                .iter()
+                .take(3)
+                .collect::<Vec<_>>(),
+            vec!["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.5"]
+        );
+    }
+
+    #[test]
+    fn gpt_5_6_sol_uses_exact_metadata_not_broad_gpt_5_alias() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let entry = catalog
+            .model("openai", "gpt-5.6-sol")
+            .expect("gpt-5.6-sol should resolve exactly");
+
+        assert_eq!(entry.model_id, "gpt-5.6-sol");
+        assert_eq!(entry.context_window, Some(1_050_000));
+        assert_eq!(entry.max_output_tokens, Some(128_000));
+        assert_eq!(
+            entry
+                .pricing
+                .as_ref()
+                .and_then(|pricing| pricing.input_micros),
+            Some(5_000_000)
+        );
+        assert_eq!(
+            entry
+                .pricing
+                .as_ref()
+                .and_then(|pricing| pricing.output_micros),
+            Some(30_000_000)
+        );
+        assert!(
+            entry
+                .reasoning
+                .as_ref()
+                .is_some_and(|reasoning| reasoning.effort_values.contains("max"))
+        );
+    }
+
+    #[test]
+    fn bundled_catalog_ignores_stale_cwd_catalog() {
+        let original_cwd = std::env::current_dir().expect("cwd should be available");
+        let temp_dir =
+            std::env::temp_dir().join(format!("bcode-stale-catalog-test-{}", std::process::id()));
+        let catalog_dir = temp_dir.join("catalog/models/providers");
+        std::fs::create_dir_all(&catalog_dir).expect("temp catalog dir should be created");
+        std::fs::write(
+            catalog_dir.join("openai.toml"),
+            r#"
+provider_id = "openai"
+display_name = "Stale OpenAI"
+kind = "open_ai_compatible"
+fallback_model_ids = ["stale-model"]
+
+[models."stale-model"]
+model_id = "stale-model"
+display_name = "Stale Model"
+status = "stable"
+"#,
+        )
+        .expect("stale catalog should be written");
+
+        std::env::set_current_dir(&temp_dir).expect("cwd should switch to temp dir");
+        let catalog = ModelCatalog::load_bundled().expect("embedded catalog should load");
+        std::env::set_current_dir(original_cwd).expect("cwd should be restored");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        assert!(catalog.model("openai", "gpt-5.6-sol").is_some());
+        assert!(catalog.model("openai", "stale-model").is_none());
     }
 
     #[test]
