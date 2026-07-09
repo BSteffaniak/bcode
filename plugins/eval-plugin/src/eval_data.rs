@@ -4,7 +4,7 @@ use bcode_eval_models::{
     EvalImprovementCampaign, EvalImprovementGeneration, EvalRepetitionResult, EvalRunResult,
     EvalSuite, EvalVariantRunResult,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -146,6 +146,85 @@ impl EvalCampaignData {
                 .find(|candidate| &candidate.id == id)
         })
     }
+}
+
+/// Discovered eval suite manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalSuiteSummary {
+    /// Suite id, when the manifest loaded successfully.
+    pub suite_id: String,
+    /// Suite manifest path.
+    pub suite_path: PathBuf,
+    /// Number of configured cases.
+    pub cases: usize,
+    /// Number of configured variants.
+    pub variants: usize,
+    /// Load failure, when malformed.
+    pub error: Option<String>,
+}
+
+/// Discover suite manifests from historical paths and conventional repository roots.
+///
+/// Discovery is bounded and read-only. At most 2,048 directories and 512 manifests are examined.
+#[must_use]
+pub fn discover_suites(
+    historical_paths: impl IntoIterator<Item = PathBuf>,
+) -> Vec<EvalSuiteSummary> {
+    const MAX_DIRECTORIES: usize = 2_048;
+    const MAX_SUITES: usize = 512;
+
+    let mut paths = historical_paths.into_iter().collect::<BTreeSet<_>>();
+    let mut queue = VecDeque::from([PathBuf::from("evals"), PathBuf::from("fixtures/evals")]);
+    let mut visited = 0_usize;
+    while let Some(directory) = queue.pop_front() {
+        if visited >= MAX_DIRECTORIES || paths.len() >= MAX_SUITES {
+            break;
+        }
+        visited = visited.saturating_add(1);
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                queue.push_back(path);
+            } else if path.file_name().is_some_and(|name| name == "suite.toml") {
+                paths.insert(path);
+                if paths.len() >= MAX_SUITES {
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut suites = paths
+        .into_iter()
+        .map(|suite_path| match bcode_eval::load_suite(&suite_path) {
+            Ok(suite) => EvalSuiteSummary {
+                suite_id: suite.id,
+                suite_path,
+                cases: suite.cases.len(),
+                variants: suite.variants.len(),
+                error: None,
+            },
+            Err(error) => EvalSuiteSummary {
+                suite_id: suite_path.parent().and_then(Path::file_name).map_or_else(
+                    || "invalid-suite".to_string(),
+                    |name| name.to_string_lossy().into_owned(),
+                ),
+                suite_path,
+                cases: 0,
+                variants: 0,
+                error: Some(error.to_string()),
+            },
+        })
+        .collect::<Vec<_>>();
+    suites.sort_by(|left, right| {
+        left.suite_id
+            .cmp(&right.suite_id)
+            .then_with(|| left.suite_path.cmp(&right.suite_path))
+    });
+    suites
 }
 
 /// Campaign metadata for picker rows.

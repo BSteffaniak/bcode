@@ -2,9 +2,9 @@
 
 use crate::eval_data::{
     EvalCampaignData, EvalCampaignSummary, EvalRunData, EvalRunSummary, best_variant,
-    case_avg_metric, diff_variant_count, discover_campaigns, discover_runs, format_duration_ms,
-    format_number, load_repetition_artifact, run_avg_measurement, run_best_score, run_pass_rate,
-    sum_variant_metric,
+    case_avg_metric, diff_variant_count, discover_campaigns, discover_runs, discover_suites,
+    format_duration_ms, format_number, load_repetition_artifact, run_avg_measurement,
+    run_best_score, run_pass_rate, sum_variant_metric,
 };
 use bcode_eval_models::{
     EvalImprovementGeneration, EvalImprovementObjective, EvalRepetitionResult,
@@ -696,7 +696,7 @@ impl EvalWizard {
     ) -> Result<Self, String> {
         let choices = suite_choices_from_runs(runs);
         if choices.is_empty() {
-            return Err("no runs with recorded suite paths are available".to_string());
+            return Err("no valid eval suites were discovered".to_string());
         }
         Ok(Self::start_campaign_wizard(choices, 0, campaigns_root))
     }
@@ -1576,26 +1576,24 @@ fn cycle_risk(
 }
 
 fn suite_choices_from_runs(runs: &[EvalRunSummary]) -> Vec<StartCampaignSuiteChoice> {
-    let mut choices = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    for run in runs {
-        if !seen.insert(run.suite_id.clone()) {
-            continue;
-        }
-        let Ok(run_data) = EvalRunData::load(&run.run_dir) else {
-            continue;
-        };
-        let Some(suite_path) = run_data.result.manifest.suite_path else {
-            continue;
-        };
-        choices.push(StartCampaignSuiteChoice {
-            suite_id: run.suite_id.clone(),
-            suite_path,
-            baseline_run: Some(run.run_dir.clone()),
-            run_id: Some(run.run_id.clone()),
-        });
-    }
-    choices
+    let historical = runs
+        .iter()
+        .filter_map(|run| EvalRunData::load(&run.run_dir).ok())
+        .filter_map(|data| data.result.manifest.suite_path)
+        .collect::<Vec<_>>();
+    discover_suites(historical)
+        .into_iter()
+        .filter(|suite| suite.error.is_none())
+        .map(|suite| {
+            let baseline = runs.iter().find(|run| run.suite_id == suite.suite_id);
+            StartCampaignSuiteChoice {
+                suite_id: suite.suite_id,
+                suite_path: suite.suite_path,
+                baseline_run: baseline.map(|run| run.run_dir.clone()),
+                run_id: baseline.map(|run| run.run_id.clone()),
+            }
+        })
+        .collect()
 }
 
 fn optional_path(value: &str) -> Option<PathBuf> {
