@@ -514,13 +514,19 @@ fn read_tool_definition() -> ToolDefinition {
 fn write_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "filesystem.write".to_string(),
-        description: "Write a UTF-8 text file, creating parent directories".to_string(),
+        description: "Write a UTF-8 text file, creating parent directories. Emit the path argument before contents so live previews can identify the file type.".to_string(),
         input_schema: json!({
             "type": "object",
             "required": ["path", "contents"],
             "properties": {
-                "path": { "type": "string" },
-                "contents": { "type": "string" }
+                "path": {
+                    "type": "string",
+                    "description": "Target file path. Provide this before contents."
+                },
+                "contents": {
+                    "type": "string",
+                    "description": "Complete UTF-8 file contents. Provide after path."
+                }
             }
         }),
         side_effect: ToolSideEffect::WriteFiles,
@@ -533,14 +539,23 @@ fn write_tool_definition() -> ToolDefinition {
 fn edit_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "filesystem.edit".to_string(),
-        description: "Replace one unique text occurrence in a UTF-8 text file".to_string(),
+        description: "Replace one unique text occurrence in a UTF-8 text file. Emit the path argument before old_text and new_text so live previews can identify the file type.".to_string(),
         input_schema: json!({
             "type": "object",
             "required": ["path", "old_text", "new_text"],
             "properties": {
-                "path": { "type": "string" },
-                "old_text": { "type": "string" },
-                "new_text": { "type": "string" }
+                "path": {
+                    "type": "string",
+                    "description": "Target file path. Provide this before old_text and new_text."
+                },
+                "old_text": {
+                    "type": "string",
+                    "description": "Exact existing text to replace. Provide after path."
+                },
+                "new_text": {
+                    "type": "string",
+                    "description": "Replacement text. Provide after path."
+                }
             }
         }),
         side_effect: ToolSideEffect::WriteFiles,
