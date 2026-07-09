@@ -35,6 +35,16 @@ const DEFAULT_CONTEXT_RADIUS: usize = 3;
 const NVIM_EXECUTABLE: &str = "nvim";
 const NVIM_MODE_KEY: &str = "mode";
 
+/// Granularity for live Vim edit observations.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VimEditObservationGranularity {
+    /// Observe after each requested step.
+    #[default]
+    Step,
+    /// Observe after each key token inside key steps.
+    Key,
+}
+
 /// Request to run Vim edit steps against a single file.
 #[derive(Debug, Clone)]
 pub struct VimEditRequest {
@@ -50,6 +60,8 @@ pub struct VimEditRequest {
     pub sandbox: VimEditSandbox,
     /// Timeout for the full operation.
     pub timeout: Duration,
+    /// Live observation granularity.
+    pub observation_granularity: VimEditObservationGranularity,
 }
 
 /// Whether to preview edits or write the final buffer back to disk.
@@ -162,6 +174,8 @@ pub struct VimEditMultiFileRequest {
     pub sandbox: VimEditSandbox,
     /// Timeout for the whole ordered workflow.
     pub timeout: Duration,
+    /// Live observation granularity.
+    pub observation_granularity: VimEditObservationGranularity,
 }
 
 /// Result of a multi-file Vim edit request.
@@ -322,6 +336,12 @@ pub struct VimEditFrame {
     pub step_total: usize,
     /// Step that produced this frame.
     pub step: VimEditStep,
+    /// Zero-indexed key-token substep within a key step.
+    pub substep_index: Option<usize>,
+    /// Total key-token substeps within a key step.
+    pub substep_total: Option<usize>,
+    /// Key token that produced this frame.
+    pub input_token: Option<String>,
     /// Cursor before this step.
     pub before_cursor: CursorPosition,
     /// Cursor after this step.
@@ -355,6 +375,16 @@ pub struct VimEditFailureState {
 /// Error returned while running a Vim edit operation.
 #[derive(Debug, Error)]
 pub enum VimEditError {
+    /// Vim key notation was malformed.
+    #[error("invalid Vim key notation at byte {index} in {input:?}: {message}")]
+    InvalidKeyNotation {
+        /// Full input.
+        input: String,
+        /// Byte index of the malformed token.
+        index: usize,
+        /// Human-readable error.
+        message: String,
+    },
     /// The requested file could not be inspected.
     #[error("failed to inspect {path:?}: {source}")]
     Metadata { path: PathBuf, source: io::Error },
@@ -844,6 +874,7 @@ async fn run_vim_multi_file_edit_prepare(
     session_result
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_vim_multi_file_session(
     session: &NeovimSession,
     request: &VimEditMultiFileRequest,
@@ -880,7 +911,27 @@ async fn run_vim_multi_file_session(
                     message: error.to_string(),
                 });
             }
-            if let Err(error) = session.apply_step(step).await {
+            let emitted_key_frames = request.observation_granularity
+                == VimEditObservationGranularity::Key
+                && observer.is_some()
+                && key_step_is_safe_to_split(step);
+            let step_result = if emitted_key_frames {
+                observe_key_step(KeyStepObservation {
+                    session,
+                    step,
+                    step_index,
+                    step_total,
+                    file_index,
+                    file_total: request.files.len(),
+                    path: &entry.path,
+                    previous_buffer: &mut previous_buffer,
+                    observer: &mut observer,
+                })
+                .await
+            } else {
+                session.apply_step(step).await
+            };
+            if let Err(error) = step_result {
                 let state = session.failure_state(step_index).await;
                 let message = classify_step_error(step, &error.to_string());
                 return Err(VimEditError::StepFailed { state, message });
@@ -902,7 +953,7 @@ async fn run_vim_multi_file_session(
                 changed,
                 message,
             };
-            if let Some(observer) = observer.as_deref_mut() {
+            if !emitted_key_frames && let Some(observer) = observer.as_deref_mut() {
                 observer(VimEditFrame {
                     file_index,
                     file_total: request.files.len(),
@@ -910,6 +961,9 @@ async fn run_vim_multi_file_session(
                     step_index,
                     step_total,
                     step: event.step.clone(),
+                    substep_index: None,
+                    substep_total: None,
+                    input_token: None,
                     before_cursor: event.before_cursor,
                     after_cursor: event.after_cursor,
                     nvim_mode: event.nvim_mode.clone(),
@@ -1016,7 +1070,26 @@ async fn run_vim_edit_session(
                 message: error.to_string(),
             });
         }
-        let step_result = session.apply_step(step).await;
+        let emitted_key_frames = request.observation_granularity
+            == VimEditObservationGranularity::Key
+            && observer.is_some()
+            && key_step_is_safe_to_split(step);
+        let step_result = if emitted_key_frames {
+            observe_key_step(KeyStepObservation {
+                session,
+                step,
+                step_index,
+                step_total: request.steps.len(),
+                file_index: 0,
+                file_total: 1,
+                path: &request.path,
+                previous_buffer: &mut previous_buffer,
+                observer: &mut observer,
+            })
+            .await
+        } else {
+            session.apply_step(step).await
+        };
         if let Err(error) = step_result {
             let state = session.failure_state(step_index).await;
             let message = classify_step_error(step, &error.to_string());
@@ -1039,7 +1112,7 @@ async fn run_vim_edit_session(
             changed,
             message,
         };
-        if let Some(observer) = observer.as_deref_mut() {
+        if !emitted_key_frames && let Some(observer) = observer.as_deref_mut() {
             observer(VimEditFrame {
                 file_index: 0,
                 file_total: 1,
@@ -1047,6 +1120,9 @@ async fn run_vim_edit_session(
                 step_index,
                 step_total: request.steps.len(),
                 step: event.step.clone(),
+                substep_index: None,
+                substep_total: None,
+                input_token: None,
                 before_cursor: event.before_cursor,
                 after_cursor: event.after_cursor,
                 nvim_mode: event.nvim_mode.clone(),
@@ -1063,6 +1139,103 @@ async fn run_vim_edit_session(
     let nvim_mode = session.mode().await?;
     let final_context = session.context(DEFAULT_CONTEXT_RADIUS).await?;
     Ok((final_text, cursor, nvim_mode, final_context, events))
+}
+
+fn key_step_is_safe_to_split(step: &VimEditStep) -> bool {
+    let VimEditStep::Keys { input } = step else {
+        return false;
+    };
+    let Ok(tokens) = tokenize_vim_keys(input) else {
+        return true;
+    };
+    !tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "c" | "d" | "y" | "p" | "P" | "r" | "R" | "g" | "z" | "<C-v>" | "v" | "V"
+        )
+    })
+}
+
+struct KeyStepObservation<'a, 'b> {
+    session: &'a NeovimSession,
+    step: &'a VimEditStep,
+    step_index: usize,
+    step_total: usize,
+    file_index: usize,
+    file_total: usize,
+    path: &'a Path,
+    previous_buffer: &'a mut String,
+    observer: &'a mut Option<VimEditFrameSink<'b>>,
+}
+
+async fn observe_key_step(context: KeyStepObservation<'_, '_>) -> Result<(), VimEditError> {
+    let KeyStepObservation {
+        session,
+        step,
+        step_index,
+        step_total,
+        file_index,
+        file_total,
+        path,
+        previous_buffer,
+        observer,
+    } = context;
+    let VimEditStep::Keys { input } = step else {
+        return session.apply_step(step).await;
+    };
+    let tokens = tokenize_vim_keys(input)?;
+    session.clear_vim_error().await?;
+    let substep_total = tokens.len();
+    for (substep_index, token) in tokens.iter().enumerate() {
+        let before_cursor = session.cursor().await?;
+        session.input_key_token(token).await?;
+        let after_cursor = session.cursor().await?;
+        let nvim_mode = session.mode().await?;
+        let context = session.context(DEFAULT_CONTEXT_RADIUS).await?;
+        let next_buffer = session.buffer_text().await?;
+        let changed = next_buffer != *previous_buffer;
+        *previous_buffer = next_buffer;
+        if let Some(observer) = observer.as_deref_mut() {
+            observer(VimEditFrame {
+                file_index,
+                file_total,
+                path: path.to_path_buf(),
+                step_index,
+                step_total,
+                step: step.clone(),
+                substep_index: Some(substep_index),
+                substep_total: Some(substep_total),
+                input_token: Some(token.clone()),
+                before_cursor,
+                after_cursor,
+                nvim_mode,
+                context,
+                changed,
+                message: Some("key token completed successfully".to_string()),
+            });
+        }
+    }
+    session.fail_on_vim_error().await
+}
+
+fn tokenize_vim_keys(input: &str) -> Result<Vec<String>, VimEditError> {
+    let mut tokens = Vec::new();
+    let mut chars = input.char_indices();
+    while let Some((index, ch)) = chars.next() {
+        if ch != '<' {
+            tokens.push(ch.to_string());
+            continue;
+        }
+        let Some((end, _)) = chars.by_ref().find(|(_, candidate)| *candidate == '>') else {
+            return Err(VimEditError::InvalidKeyNotation {
+                input: input.to_string(),
+                index,
+                message: "unclosed angle key token".to_string(),
+            });
+        };
+        tokens.push(input[index..=end].to_string());
+    }
+    Ok(tokens)
 }
 
 fn read_text_file(path: &Path) -> Result<String, VimEditError> {
@@ -1158,17 +1331,7 @@ impl NeovimSession {
     async fn apply_step(&self, step: &VimEditStep) -> Result<(), VimEditError> {
         self.clear_vim_error().await?;
         match step {
-            VimEditStep::Keys { input } => {
-                let keys = self
-                    .nvim
-                    .replace_termcodes(input, true, true, true)
-                    .await
-                    .map_err(rpc_call_error)?;
-                self.nvim
-                    .feedkeys(&keys, "x", false)
-                    .await
-                    .map_err(rpc_call_error)?;
-            }
+            VimEditStep::Keys { input } => self.apply_key_input(input).await?,
             VimEditStep::Insert { text } => {
                 self.nvim
                     .paste(text, false, -1)
@@ -1179,6 +1342,22 @@ impl NeovimSession {
             VimEditStep::Ex { command } => self.nvim_command(command).await?,
         }
         self.fail_on_vim_error().await
+    }
+
+    async fn apply_key_input(&self, input: &str) -> Result<(), VimEditError> {
+        let keys = self
+            .nvim
+            .replace_termcodes(input, true, true, true)
+            .await
+            .map_err(rpc_call_error)?;
+        self.nvim
+            .feedkeys(&keys, "x", false)
+            .await
+            .map_err(rpc_call_error)
+    }
+
+    async fn input_key_token(&self, input: &str) -> Result<(), VimEditError> {
+        self.apply_key_input(input).await
     }
 
     async fn clear_vim_error(&self) -> Result<(), VimEditError> {
@@ -1485,6 +1664,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tokenize_vim_keys_splits_plain_chars() {
+        assert_eq!(tokenize_vim_keys("ciw").expect("tokens"), ["c", "i", "w"]);
+    }
+
+    #[test]
+    fn tokenize_vim_keys_preserves_angle_tokens() {
+        assert_eq!(
+            tokenize_vim_keys("/target<CR>").expect("tokens"),
+            ["/", "t", "a", "r", "g", "e", "t", "<CR>"]
+        );
+    }
+
+    #[test]
+    fn tokenize_vim_keys_rejects_unclosed_angle_token() {
+        let error = tokenize_vim_keys("foo<Esc").expect_err("invalid token");
+        assert!(error.to_string().contains("unclosed angle key token"));
+    }
+
+    #[test]
     fn interactive_session_snapshot_input_finish_apply_when_nvim_is_available() {
         if !nvim_available() {
             eprintln!("skipping Neovim integration test because `nvim` is not available");
@@ -1499,6 +1697,7 @@ mod tests {
             mode: VimEditMode::Preview,
             sandbox: VimEditSandbox::Default,
             timeout: Duration::from_secs(5),
+            observation_granularity: VimEditObservationGranularity::Step,
         })
         .expect("start session");
         let initial = session.snapshot().expect("initial snapshot");
@@ -1555,6 +1754,7 @@ mod tests {
             mode: VimEditMode::Preview,
             sandbox: VimEditSandbox::Default,
             timeout: Duration::from_secs(5),
+            observation_granularity: VimEditObservationGranularity::Step,
         })
         .expect("start session");
         session
@@ -1586,6 +1786,7 @@ mod tests {
             mode: VimEditMode::Preview,
             sandbox: VimEditSandbox::Default,
             timeout: Duration::from_secs(5),
+            observation_granularity: VimEditObservationGranularity::Step,
         })
         .expect("start session");
         let error = session
@@ -1616,6 +1817,7 @@ mod tests {
             mode: VimEditMode::Preview,
             sandbox: VimEditSandbox::Default,
             timeout: Duration::from_secs(5),
+            observation_granularity: VimEditObservationGranularity::Step,
         })
         .expect("start session");
         session
@@ -1645,6 +1847,7 @@ mod tests {
             mode: VimEditMode::Preview,
             sandbox: VimEditSandbox::Default,
             timeout: Duration::from_secs(5),
+            observation_granularity: VimEditObservationGranularity::Step,
         })
         .expect("start session");
         let error = session
@@ -1667,6 +1870,7 @@ mod tests {
             mode: VimEditMode::Preview,
             sandbox: VimEditSandbox::Default,
             timeout: Duration::from_secs(1),
+            observation_granularity: VimEditObservationGranularity::Step,
         }) else {
             panic!("missing nvim should fail");
         };
@@ -1808,6 +2012,7 @@ mod tests {
             mode: VimEditMode::Apply,
             sandbox: VimEditSandbox::Default,
             timeout: Duration::from_secs(5),
+            observation_granularity: VimEditObservationGranularity::Step,
         })
         .expect_err("missing search pattern should fail");
         let VimEditError::StepFailed { state, message } = error else {
@@ -1841,6 +2046,7 @@ mod tests {
             mode: VimEditMode::Preview,
             sandbox: VimEditSandbox::Default,
             timeout: Duration::from_secs(5),
+            observation_granularity: VimEditObservationGranularity::Step,
         })
         .expect("run vim edit");
         let event = result.events.first().expect("event captured");
@@ -1874,6 +2080,7 @@ mod tests {
             mode: VimEditMode::Preview,
             sandbox: VimEditSandbox::DangerouslyDisabled,
             timeout: Duration::from_secs(5),
+            observation_granularity: VimEditObservationGranularity::Step,
         })
         .expect_err("invalid Ex command should fail");
         let VimEditError::StepFailed { message, .. } = error else {
@@ -1972,6 +2179,7 @@ mod tests {
             mode: VimEditMode::Preview,
             sandbox: VimEditSandbox::Default,
             timeout: Duration::from_secs(1),
+            observation_granularity: VimEditObservationGranularity::Step,
         };
         assert_eq!(request.sandbox, VimEditSandbox::Default);
     }
@@ -1989,6 +2197,7 @@ mod tests {
             mode: VimEditMode::Preview,
             sandbox: VimEditSandbox::Default,
             timeout: Duration::from_secs(1),
+            observation_granularity: VimEditObservationGranularity::Step,
         })
         .expect_err("large file should fail before nvim spawn");
         assert!(matches!(error, VimEditError::FileTooLarge { .. }));
@@ -2005,6 +2214,7 @@ mod tests {
             mode: VimEditMode::Preview,
             sandbox: VimEditSandbox::Default,
             timeout: Duration::from_secs(1),
+            observation_granularity: VimEditObservationGranularity::Step,
         })
         .expect_err("non-utf8 file should fail before nvim spawn");
         assert!(matches!(error, VimEditError::NonUtf8 { .. }));
@@ -2027,6 +2237,7 @@ mod tests {
             mode: VimEditMode::Preview,
             sandbox: VimEditSandbox::DangerouslyDisabled,
             timeout: Duration::from_secs(5),
+            observation_granularity: VimEditObservationGranularity::Step,
         })
         .expect("run vim edit");
         assert!(result.changed);
@@ -2055,6 +2266,7 @@ mod tests {
             mode: VimEditMode::Apply,
             sandbox: VimEditSandbox::Default,
             timeout: Duration::from_secs(5),
+            observation_granularity: VimEditObservationGranularity::Step,
         })
         .expect("modeline should not make buffer unmodifiable");
         assert!(result.changed);
@@ -2083,6 +2295,7 @@ mod tests {
             mode: VimEditMode::Preview,
             sandbox: VimEditSandbox::Default,
             timeout: Duration::from_secs(1),
+            observation_granularity: VimEditObservationGranularity::Step,
         })
         .expect_err("missing nvim should error");
         assert!(matches!(error, VimEditError::StartNeovim { .. }));
@@ -2117,6 +2330,7 @@ mod tests {
             mode: VimEditMode::Apply,
             sandbox: VimEditSandbox::Default,
             timeout: Duration::from_secs(5),
+            observation_granularity: VimEditObservationGranularity::Step,
         })
         .expect("run vim edit");
 
@@ -2144,6 +2358,7 @@ mod tests {
             mode: VimEditMode::Apply,
             sandbox: VimEditSandbox::Default,
             timeout: Duration::from_secs(5),
+            observation_granularity: VimEditObservationGranularity::Step,
         })
         .expect("run vim edit");
 
@@ -2167,6 +2382,7 @@ mod tests {
             mode: VimEditMode::Apply,
             sandbox: VimEditSandbox::Default,
             timeout: Duration::from_secs(5),
+            observation_granularity: VimEditObservationGranularity::Step,
         })
         .expect_err("unsafe apply should fail");
         assert!(matches!(
@@ -2197,6 +2413,7 @@ mod tests {
             mode: VimEditMode::Preview,
             sandbox: VimEditSandbox::Default,
             timeout: Duration::from_nanos(1),
+            observation_granularity: VimEditObservationGranularity::Step,
         })
         .expect_err("timeout should error");
         assert!(matches!(error, VimEditError::Timeout { .. }));
@@ -2237,6 +2454,7 @@ mod tests {
             mode: VimEditMode::Preview,
             sandbox: VimEditSandbox::Default,
             timeout: Duration::from_millis(250),
+            observation_granularity: VimEditObservationGranularity::Step,
         })
         .expect_err("fake nvim should time out");
         assert!(matches!(error, VimEditError::Timeout { .. }));
@@ -2285,6 +2503,7 @@ mod tests {
             mode: VimEditMode::Preview,
             sandbox: VimEditSandbox::Default,
             timeout: Duration::from_secs(5),
+            observation_granularity: VimEditObservationGranularity::Step,
         })
         .expect("run vim edit");
 
@@ -2323,6 +2542,7 @@ mod tests {
             mode: VimEditMode::Apply,
             sandbox: VimEditSandbox::Default,
             timeout: Duration::from_secs(5),
+            observation_granularity: VimEditObservationGranularity::Step,
         })
         .expect("run vim edit");
 
@@ -2361,6 +2581,7 @@ mod tests {
             mode: VimEditMode::Apply,
             sandbox: VimEditSandbox::Default,
             timeout: Duration::from_secs(5),
+            observation_granularity: VimEditObservationGranularity::Step,
         })
         .expect("run vim edit");
 

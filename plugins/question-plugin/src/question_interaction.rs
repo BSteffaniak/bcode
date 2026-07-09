@@ -223,7 +223,7 @@ impl QuestionInteractionController {
                 self.change_control(&control_id, &value)
             }
             InteractionInput::Focus { control_id } => self.focus_control(&control_id),
-            InteractionInput::Blur { .. } => InteractionOutput::None,
+            InteractionInput::Blur { .. } | InteractionInput::Tick => InteractionOutput::None,
             InteractionInput::Navigate { direction } => {
                 self.navigate(direction);
                 InteractionOutput::Redraw

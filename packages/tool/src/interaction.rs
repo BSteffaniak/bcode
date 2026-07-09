@@ -30,6 +30,8 @@ pub enum InteractionValue {
     Null,
     /// Boolean value.
     Bool(bool),
+    /// Numeric value.
+    Number(i64),
     /// String value.
     String(String),
     /// List value.
@@ -44,7 +46,7 @@ impl InteractionValue {
     pub const fn as_str(&self) -> Option<&str> {
         match self {
             Self::String(value) => Some(value.as_str()),
-            Self::Null | Self::Bool(_) | Self::List(_) | Self::Object(_) => None,
+            Self::Null | Self::Bool(_) | Self::Number(_) | Self::List(_) | Self::Object(_) => None,
         }
     }
 }
@@ -90,6 +92,8 @@ pub enum InteractionInput {
         /// Direction to move focus.
         direction: InteractionNavigation,
     },
+    /// Timer tick for interactions with time-based state.
+    Tick,
     /// Submit the interaction.
     Submit,
     /// Cancel/dismiss the interaction.

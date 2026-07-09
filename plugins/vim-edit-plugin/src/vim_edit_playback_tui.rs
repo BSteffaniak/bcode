@@ -138,6 +138,9 @@ impl TerminalInteractionRenderer<super::vim_edit_interaction::VimEditPlaybackInt
                 KeyCode::Char('d') => Some(InteractionInput::Activate {
                     control_id: bcode_tool::InteractionControlId::new("diff"),
                 }),
+                KeyCode::Char('a') => Some(InteractionInput::Activate {
+                    control_id: bcode_tool::InteractionControlId::new("apply_requested"),
+                }),
                 KeyCode::Tab | KeyCode::Down => Some(InteractionInput::Navigate {
                     direction: InteractionNavigation::Next,
                 }),
@@ -148,9 +151,7 @@ impl TerminalInteractionRenderer<super::vim_edit_interaction::VimEditPlaybackInt
                 KeyCode::Escape | KeyCode::Char('q') => Some(InteractionInput::Cancel),
                 _ => None,
             },
-            Event::Tick => Some(InteractionInput::Activate {
-                control_id: bcode_tool::InteractionControlId::new("tick"),
-            }),
+            Event::Tick => Some(InteractionInput::Tick),
             _ => None,
         }
     }

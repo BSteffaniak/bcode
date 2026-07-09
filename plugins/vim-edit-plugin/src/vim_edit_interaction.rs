@@ -3,6 +3,7 @@
 use bcode_plugin_sdk::interaction::PluginInteraction;
 use bcode_tool::{
     InteractionControlId, InteractionInput, InteractionNavigation, InteractionOutput,
+    InteractionValue,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -31,6 +32,8 @@ pub enum VimEditPlaybackFocusTarget {
     Timeline,
     /// Toggle diff control.
     Diff,
+    /// Request applying a preview.
+    ApplyRequested,
     /// Close playback control.
     Close,
 }
@@ -49,6 +52,7 @@ impl VimEditPlaybackFocusTarget {
             Self::Last => "last",
             Self::Timeline => "timeline",
             Self::Diff => "diff",
+            Self::ApplyRequested => "apply_requested",
             Self::Close => "close",
         })
     }
@@ -74,6 +78,8 @@ pub struct VimEditPlaybackSnapshot {
     pub show_diff: bool,
     /// Whether autoplay is active.
     pub playing: bool,
+    /// Autoplay interval in milliseconds.
+    pub playback_interval_ms: u64,
     /// Current focus target.
     pub focus: VimEditPlaybackFocusTarget,
     /// Current focused control id.
@@ -158,12 +164,20 @@ impl VimEditPlaybackInteractionController {
             "previous_changed" => self.select_changed(ChangeDirection::Previous),
             "previous" => self.select_previous(),
             "play_pause" => self.playing = !self.playing,
-            "tick" if self.playing => self.select_next(),
             "next" => self.select_next(),
             "next_changed" => self.select_changed(ChangeDirection::Next),
             "last" => self.select_last(),
             "timeline" => self.show_timeline = !self.show_timeline,
             "diff" => self.show_diff = !self.show_diff,
+            "apply_requested" => {
+                return InteractionOutput::Submitted {
+                    payload: serde_json::json!({
+                        "action": "apply_requested",
+                        "tool_name": "vim_edit.apply",
+                        "arguments": self.request.playback.get("original_arguments").cloned().unwrap_or(Value::Null),
+                    }),
+                };
+            }
             "close" => {
                 return InteractionOutput::Submitted {
                     payload: serde_json::json!({ "action": "closed" }),
@@ -192,9 +206,33 @@ impl VimEditPlaybackInteractionController {
             "last" => VimEditPlaybackFocusTarget::Last,
             "timeline" => VimEditPlaybackFocusTarget::Timeline,
             "diff" => VimEditPlaybackFocusTarget::Diff,
+            "apply_requested" => VimEditPlaybackFocusTarget::ApplyRequested,
             "close" => VimEditPlaybackFocusTarget::Close,
             _ => self.focus,
         };
+    }
+
+    fn change(
+        &mut self,
+        control_id: &InteractionControlId,
+        value: &InteractionValue,
+    ) -> InteractionOutput {
+        if control_id.as_str() != "selected_frame" {
+            return InteractionOutput::None;
+        }
+        let index = match value {
+            InteractionValue::Number(value) => usize::try_from(*value).ok(),
+            InteractionValue::String(value) => value.parse::<usize>().ok(),
+            InteractionValue::Null
+            | InteractionValue::Bool(_)
+            | InteractionValue::List(_)
+            | InteractionValue::Object(_) => None,
+        };
+        let Some(index) = index else {
+            return InteractionOutput::None;
+        };
+        self.selected_frame = index.min(self.frame_count().saturating_sub(1));
+        InteractionOutput::Redraw
     }
 
     fn snapshot(&self) -> VimEditPlaybackSnapshot {
@@ -204,6 +242,7 @@ impl VimEditPlaybackInteractionController {
             show_timeline: self.show_timeline,
             show_diff: self.show_diff,
             playing: self.playing,
+            playback_interval_ms: 150,
             focus: self.focus,
             focused_control_id: self.focus.control_id(),
         }
@@ -222,9 +261,12 @@ impl VimEditPlaybackInteractionController {
             }
             InteractionInput::Submit => self.activate(&self.focus.control_id()),
             InteractionInput::Cancel => InteractionOutput::Cancelled,
-            InteractionInput::Change { .. } | InteractionInput::Blur { .. } => {
-                InteractionOutput::None
+            InteractionInput::Tick if self.playing => {
+                self.select_next();
+                InteractionOutput::Redraw
             }
+            InteractionInput::Tick | InteractionInput::Blur { .. } => InteractionOutput::None,
+            InteractionInput::Change { control_id, value } => self.change(&control_id, &value),
         }
     }
 }
@@ -245,7 +287,8 @@ const fn next_focus(focus: VimEditPlaybackFocusTarget) -> VimEditPlaybackFocusTa
         VimEditPlaybackFocusTarget::NextChanged => VimEditPlaybackFocusTarget::Last,
         VimEditPlaybackFocusTarget::Last => VimEditPlaybackFocusTarget::Timeline,
         VimEditPlaybackFocusTarget::Timeline => VimEditPlaybackFocusTarget::Diff,
-        VimEditPlaybackFocusTarget::Diff | VimEditPlaybackFocusTarget::Close => {
+        VimEditPlaybackFocusTarget::Diff => VimEditPlaybackFocusTarget::ApplyRequested,
+        VimEditPlaybackFocusTarget::ApplyRequested | VimEditPlaybackFocusTarget::Close => {
             VimEditPlaybackFocusTarget::Close
         }
     }
@@ -253,7 +296,8 @@ const fn next_focus(focus: VimEditPlaybackFocusTarget) -> VimEditPlaybackFocusTa
 
 const fn previous_focus(focus: VimEditPlaybackFocusTarget) -> VimEditPlaybackFocusTarget {
     match focus {
-        VimEditPlaybackFocusTarget::Close => VimEditPlaybackFocusTarget::Diff,
+        VimEditPlaybackFocusTarget::Close => VimEditPlaybackFocusTarget::ApplyRequested,
+        VimEditPlaybackFocusTarget::ApplyRequested => VimEditPlaybackFocusTarget::Diff,
         VimEditPlaybackFocusTarget::Diff => VimEditPlaybackFocusTarget::Timeline,
         VimEditPlaybackFocusTarget::Timeline => VimEditPlaybackFocusTarget::Last,
         VimEditPlaybackFocusTarget::Last => VimEditPlaybackFocusTarget::NextChanged,
