@@ -228,6 +228,81 @@ pub fn discover_suites(
     suites
 }
 
+/// Aggregate for one case in one campaign generation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvalCaseHistoryCell {
+    /// Generation id.
+    pub generation_id: String,
+    /// Average pass rate across variants containing the case.
+    pub pass_rate: f64,
+    /// Average judge score across repetitions when available.
+    pub score: Option<f64>,
+    /// Repetition count.
+    pub repetitions: usize,
+}
+
+/// Campaign history for one case.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvalCaseHistoryRow {
+    /// Case id.
+    pub case_id: String,
+    /// Generation cells in campaign order.
+    pub cells: Vec<EvalCaseHistoryCell>,
+}
+
+/// Build a campaign-wide case history matrix.
+#[must_use]
+pub fn campaign_case_history(data: &EvalCampaignData) -> Vec<EvalCaseHistoryRow> {
+    let mut rows = BTreeMap::<String, Vec<EvalCaseHistoryCell>>::new();
+    for generation in &data.generations {
+        let Some(run) = data.generation_run(generation) else {
+            continue;
+        };
+        let mut cases = BTreeMap::<String, (f64, usize, f64, usize, usize)>::new();
+        for variant in &run.result.variants {
+            for case in &variant.cases {
+                let entry = cases.entry(case.case_id.clone()).or_default();
+                entry.0 += case.pass_rate;
+                entry.1 = entry.1.saturating_add(1);
+                for repetition in &case.repetitions {
+                    entry.4 = entry.4.saturating_add(1);
+                    for judge in &repetition.judges {
+                        if let Some(score) = judge.score {
+                            entry.2 += score;
+                            entry.3 = entry.3.saturating_add(1);
+                        }
+                    }
+                }
+            }
+        }
+        for (case_id, (pass_total, variants, score_total, scores, repetitions)) in cases {
+            rows.entry(case_id).or_default().push(EvalCaseHistoryCell {
+                generation_id: generation.id.clone(),
+                pass_rate: pass_total / len_as_f64(variants),
+                score: (scores > 0).then(|| score_total / len_as_f64(scores)),
+                repetitions,
+            });
+        }
+    }
+    rows.into_iter()
+        .map(|(case_id, cells)| EvalCaseHistoryRow { case_id, cells })
+        .collect()
+}
+
+/// Return all measurement names present across campaign generation runs.
+#[must_use]
+pub fn campaign_metric_names(data: &EvalCampaignData) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    for generation in &data.generations {
+        if let Some(run) = data.generation_run(generation) {
+            for repetition in run.repetitions() {
+                names.extend(repetition.measurements.keys().cloned());
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
 /// Campaign metadata for picker rows.
 #[derive(Debug, Clone)]
 pub struct EvalCampaignSummary {

@@ -2,9 +2,10 @@
 
 use crate::eval_data::{
     EvalCampaignData, EvalCampaignSummary, EvalRunData, EvalRunSummary, best_variant,
-    case_avg_metric, diff_variant_count, discover_campaigns, discover_runs, discover_suites,
-    format_duration_ms, format_number, load_repetition_artifact, run_avg_measurement,
-    run_best_score, run_pass_rate, sum_variant_metric,
+    campaign_case_history, campaign_metric_names, case_avg_metric, diff_variant_count,
+    discover_campaigns, discover_runs, discover_suites, format_duration_ms, format_number,
+    load_repetition_artifact, run_avg_measurement, run_best_score, run_pass_rate,
+    sum_variant_metric,
 };
 use bcode_eval_models::{
     EvalImprovementGeneration, EvalImprovementObjective, EvalRepetitionResult,
@@ -1913,6 +1914,8 @@ pub struct EvalCampaignViewerSurface {
     active_wizard: Option<EvalWizard>,
     run_task: Option<Receiver<Result<CampaignRunCompletion, String>>>,
     view_mode: CampaignViewMode,
+    metric_names: Vec<String>,
+    metric_index: usize,
     status: String,
     table_area: Rect,
     action_area: Rect,
@@ -1940,6 +1943,7 @@ impl EvalCampaignViewerSurface {
                 .unwrap_or_else(|| "n/a".to_string())
         );
         let view_mode = CampaignViewMode::from_objective(data.campaign.objective);
+        let metric_names = campaign_metric_names(&data);
         Ok(Self {
             data,
             generation_state: TableState::new(Some(0)),
@@ -1949,6 +1953,8 @@ impl EvalCampaignViewerSurface {
             active_wizard: None,
             run_task: None,
             view_mode,
+            metric_names,
+            metric_index: 0,
             status,
             table_area: Rect::new(0, 0, 0, 0),
             action_area: Rect::new(0, 0, 0, 0),
@@ -2211,9 +2217,23 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
         let (table_area, action_area, status_area) = split_body_actions(body);
         self.table_area = inset_top(table_area, 1);
         self.action_area = action_area;
-        render_panel_title(table_area, frame, "Generation timeline");
-        let columns = campaign_columns(self.view_mode);
-        let rows = campaign_rows(&self.data, self.view_mode);
+        let (columns, rows, title) = match self.view_mode {
+            CampaignViewMode::CaseHistory => {
+                let (columns, rows) = case_history_table(&self.data);
+                (columns, rows, "Case history across generations")
+            }
+            CampaignViewMode::Metrics => {
+                let metric = self.metric_names.get(self.metric_index).map(String::as_str);
+                let (columns, rows) = campaign_metric_table(&self.data, metric);
+                (columns, rows, "Dynamic campaign metric")
+            }
+            _ => (
+                campaign_columns(self.view_mode),
+                campaign_rows(&self.data, self.view_mode),
+                "Generation timeline",
+            ),
+        };
+        render_panel_title(table_area, frame, title);
         render_eval_table(
             frame,
             self.table_area,
@@ -2261,8 +2281,17 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
             }
             return action;
         }
-        let columns = campaign_columns(self.view_mode);
-        let rows = campaign_rows(&self.data, self.view_mode);
+        let (columns, rows) = match self.view_mode {
+            CampaignViewMode::CaseHistory => case_history_table(&self.data),
+            CampaignViewMode::Metrics => campaign_metric_table(
+                &self.data,
+                self.metric_names.get(self.metric_index).map(String::as_str),
+            ),
+            _ => (
+                campaign_columns(self.view_mode),
+                campaign_rows(&self.data, self.view_mode),
+            ),
+        };
         if handle_eval_table_event(
             self.table_area,
             &columns,
@@ -2293,6 +2322,14 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
                 }
                 KeyCode::Char('v') => {
                     self.cycle_view_mode();
+                    return PluginTuiAction::Redraw;
+                }
+                KeyCode::Char('m') => {
+                    self.metric_index =
+                        cycle_index(self.metric_names.len(), self.metric_index, true);
+                    if let Some(metric) = self.metric_names.get(self.metric_index) {
+                        self.status = format!("metric: {metric}");
+                    }
                     return PluginTuiAction::Redraw;
                 }
                 KeyCode::Char('r') => return self.handle_action("record-generation", host),
@@ -2327,6 +2364,8 @@ enum CampaignViewMode {
     ParentDelta,
     BaselineDelta,
     Comparison,
+    CaseHistory,
+    Metrics,
 }
 
 impl CampaignViewMode {
@@ -2344,7 +2383,9 @@ impl CampaignViewMode {
             Self::Progression => Self::ParentDelta,
             Self::ParentDelta => Self::BaselineDelta,
             Self::BaselineDelta => Self::Comparison,
-            Self::Comparison => Self::Progression,
+            Self::Comparison => Self::CaseHistory,
+            Self::CaseHistory => Self::Metrics,
+            Self::Metrics => Self::Progression,
         }
     }
 
@@ -2354,6 +2395,8 @@ impl CampaignViewMode {
             Self::ParentDelta => "Parent Δ",
             Self::BaselineDelta => "Baseline Δ",
             Self::Comparison => "Comparison",
+            Self::CaseHistory => "Case History",
+            Self::Metrics => "Metrics",
         }
     }
 }
@@ -4371,6 +4414,73 @@ fn overview_table_rows(
     rows
 }
 
+fn case_history_table(data: &EvalCampaignData) -> (Vec<TableColumn<'_>>, Vec<TableRow>) {
+    let generations = data
+        .generations
+        .iter()
+        .map(|generation| generation.id.as_str())
+        .collect::<Vec<_>>();
+    let mut columns = vec![TableColumn::new("Case").flex(2)];
+    columns.extend(generations.iter().map(|generation| {
+        TableColumn::new(generation)
+            .fixed(14)
+            .align(TableAlign::Right)
+    }));
+    let rows = campaign_case_history(data)
+        .into_iter()
+        .map(|row| {
+            let cells = generations.iter().map(|generation| {
+                row.cells
+                    .iter()
+                    .find(|cell| cell.generation_id == *generation)
+                    .map_or_else(
+                        || "—".to_string(),
+                        |cell| {
+                            let score = cell
+                                .score
+                                .map_or_else(|| "—".to_string(), |score| format!("{score:.2}"));
+                            format!(
+                                "{:.0}%/{score}/{}",
+                                cell.pass_rate * 100.0,
+                                cell.repetitions
+                            )
+                        },
+                    )
+            });
+            string_row(std::iter::once(row.case_id).chain(cells).collect())
+        })
+        .collect();
+    (columns, rows)
+}
+
+fn campaign_metric_table(
+    data: &EvalCampaignData,
+    metric: Option<&str>,
+) -> (Vec<TableColumn<'static>>, Vec<TableRow>) {
+    let columns = vec![
+        TableColumn::new("Generation").fixed(14),
+        TableColumn::new("Metric").flex(2),
+        TableColumn::new("Average")
+            .fixed(16)
+            .align(TableAlign::Right),
+    ];
+    let rows = data
+        .generations
+        .iter()
+        .map(|generation| {
+            let value = metric
+                .and_then(|name| data.generation_run(generation).map(|run| (name, run)))
+                .and_then(|(name, run)| run_avg_measurement(&run.result, name));
+            string_row(vec![
+                generation.id.clone(),
+                metric.unwrap_or("no measurements").to_string(),
+                value.map_or_else(|| "—".to_string(), |value| format!("{value:.3}")),
+            ])
+        })
+        .collect();
+    (columns, rows)
+}
+
 fn campaign_columns<'a>(mode: CampaignViewMode) -> Vec<TableColumn<'a>> {
     match mode {
         CampaignViewMode::Progression => vec![
@@ -4406,6 +4516,10 @@ fn campaign_columns<'a>(mode: CampaignViewMode) -> Vec<TableColumn<'a>> {
                 .align(TableAlign::Right),
             TableColumn::new("Verdict").fixed(12),
         ],
+        CampaignViewMode::CaseHistory | CampaignViewMode::Metrics => vec![
+            TableColumn::new("Item").flex(2),
+            TableColumn::new("Value").flex(1),
+        ],
         CampaignViewMode::Comparison => vec![
             TableColumn::new("Gen").fixed(8),
             TableColumn::new("Parent").fixed(8),
@@ -4440,6 +4554,9 @@ fn campaign_rows(data: &EvalCampaignData, mode: CampaignViewMode) -> Vec<TableRo
                 campaign_delta_row(data, generation, baseline)
             }
             CampaignViewMode::Comparison => campaign_comparison_row(data, generation),
+            CampaignViewMode::CaseHistory | CampaignViewMode::Metrics => {
+                string_row(vec![generation.id.clone(), "—".to_string()])
+            }
         })
         .collect()
 }
