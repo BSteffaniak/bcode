@@ -1,9 +1,9 @@
 //! Native TUI rendering for Vim edit visuals and playback interaction.
 
 use bcode_plugin_sdk::tui::TerminalInteractionRenderer;
-use bcode_tool::{InteractionInput, InteractionNavigation};
+use bcode_tool::{InteractionControlId, InteractionInput, InteractionNavigation, InteractionValue};
 use bmux_keyboard::KeyCode;
-use bmux_tui::event::Event;
+use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::{Color, Line, Modifier, Span, Style};
@@ -53,7 +53,93 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for VimEditPlaybackTuiVisualA
 
 /// Terminal renderer for interactive Vim edit playback.
 #[derive(Default)]
-pub struct VimEditPlaybackTerminalRenderer;
+pub struct VimEditPlaybackTerminalRenderer {
+    regions: Vec<PlaybackMouseRegion>,
+}
+
+#[derive(Clone)]
+struct PlaybackMouseRegion {
+    area: Rect,
+    input: InteractionInput,
+}
+
+impl VimEditPlaybackTerminalRenderer {
+    fn capture_regions(
+        &mut self,
+        snapshot: &VimEditPlaybackSnapshot,
+        area: Rect,
+        row_count: usize,
+    ) {
+        let controls_y = area
+            .y
+            .saturating_add(u16::try_from(row_count.saturating_sub(1)).unwrap_or(u16::MAX));
+        let controls = [
+            ("first", 1_u16, 7_u16),
+            ("previous", 9, 7),
+            ("play_pause", 17, 8),
+            ("next", 27, 7),
+            ("last", 35, 7),
+            ("previous_changed", 43, 9),
+            ("next_changed", 54, 9),
+            ("timeline", 65, 10),
+            ("diff", 77, 6),
+            ("apply_requested", 85, 7),
+            ("close", 94, 7),
+        ];
+        for (control_id, x, width) in controls {
+            if x < area.width {
+                self.regions.push(PlaybackMouseRegion {
+                    area: Rect::new(area.x.saturating_add(x), controls_y, width, 1),
+                    input: InteractionInput::Activate {
+                        control_id: InteractionControlId::new(control_id),
+                    },
+                });
+            }
+        }
+        if snapshot.show_timeline {
+            let timeline_start = Self::timeline_row_start(&snapshot.playback);
+            if let Some(events) = events(&snapshot.playback) {
+                for index in 0..events.len().min(16) {
+                    let y = area
+                        .y
+                        .saturating_add(u16::try_from(timeline_start + index).unwrap_or(u16::MAX));
+                    if y < area.y.saturating_add(area.height) {
+                        self.regions.push(PlaybackMouseRegion {
+                            area: Rect::new(area.x, y, area.width, 1),
+                            input: InteractionInput::Change {
+                                control_id: InteractionControlId::new("selected_frame"),
+                                value: InteractionValue::Number(
+                                    i64::try_from(index).unwrap_or(i64::MAX),
+                                ),
+                            },
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn timeline_row_start(playback: &Value) -> usize {
+        vim_screen_rows(
+            "nvim playback",
+            playback,
+            selected_context(playback),
+            u16::MAX,
+        )
+        .len()
+        .saturating_add(2)
+    }
+
+    fn mouse_input(&self, event: &MouseEvent) -> Option<InteractionInput> {
+        if !matches!(event.kind, MouseEventKind::Up(MouseButton::Left)) {
+            return None;
+        }
+        self.regions
+            .iter()
+            .find(|region| region.area.contains(event.position))
+            .map(|region| region.input.clone())
+    }
+}
 
 impl TerminalInteractionRenderer<super::vim_edit_interaction::VimEditPlaybackInteractionController>
     for VimEditPlaybackTerminalRenderer
@@ -84,16 +170,15 @@ impl TerminalInteractionRenderer<super::vim_edit_interaction::VimEditPlaybackInt
     }
 
     fn render(&mut self, snapshot: &VimEditPlaybackSnapshot, area: Rect, frame: &mut Frame<'_>) {
-        for (offset, line) in playback_rows(
+        self.regions.clear();
+        let rows = playback_rows(
             &snapshot.playback,
             Some(snapshot.selected_frame),
             snapshot.show_timeline,
             snapshot.show_diff,
             area.width,
-        )
-        .iter()
-        .enumerate()
-        {
+        );
+        for (offset, line) in rows.iter().enumerate() {
             let Ok(offset) = u16::try_from(offset) else {
                 break;
             };
@@ -102,6 +187,7 @@ impl TerminalInteractionRenderer<super::vim_edit_interaction::VimEditPlaybackInt
             }
             frame.write_line(Rect::new(area.x, area.y + offset, area.width, 1), line);
         }
+        self.capture_regions(snapshot, area, rows.len());
     }
 
     fn input(
@@ -152,6 +238,7 @@ impl TerminalInteractionRenderer<super::vim_edit_interaction::VimEditPlaybackInt
                 _ => None,
             },
             Event::Tick => Some(InteractionInput::Tick),
+            Event::Mouse(mouse) => self.mouse_input(mouse),
             _ => None,
         }
     }
@@ -228,7 +315,28 @@ fn playback_rows(
         rows.push(Line::from_spans(vec![Span::styled("Diff", accent())]));
         rows.extend(diff_rows(diff, width));
     }
+    rows.push(playback_control_row(payload));
     rows
+}
+
+fn playback_control_row(payload: &Value) -> Line {
+    let preview = text(payload, "tool_mode") == Some("preview");
+    let mut spans = vec![
+        Span::styled(" [First] ", muted()),
+        Span::styled("[Prev] ", muted()),
+        Span::styled("[Play] ", accent()),
+        Span::styled("[Next] ", muted()),
+        Span::styled("[Last] ", muted()),
+        Span::styled("[Prev Δ] ", muted()),
+        Span::styled("[Next Δ] ", muted()),
+        Span::styled("[Timeline] ", muted()),
+        Span::styled("[Diff] ", muted()),
+    ];
+    if preview {
+        spans.push(Span::styled("[Apply] ", accent()));
+    }
+    spans.push(Span::styled("[Close]", muted()));
+    Line::from_spans(spans)
 }
 
 fn vim_screen_rows(title: &str, payload: &Value, context: Option<&Value>, width: u16) -> Vec<Line> {

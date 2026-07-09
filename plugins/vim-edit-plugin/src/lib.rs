@@ -147,7 +147,7 @@ fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
     match request.operation.as_str() {
         OP_LIST_TOOLS => list_tools(request),
         OP_INVOKE_TOOL => invoke_tool(context),
-        OP_RESUME_INTERACTIVE_TOOL => resume_interactive_tool(request),
+        OP_RESUME_INTERACTIVE_TOOL => resume_interactive_tool(context),
         _ => ServiceResponse::error(
             "unsupported_operation",
             "unsupported vim edit tool service operation",
@@ -155,25 +155,33 @@ fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
     }
 }
 
-fn resume_interactive_tool(request: &ServiceRequest) -> ServiceResponse {
-    let resume = match request.payload_json::<InteractiveToolResumeRequest>() {
+fn resume_interactive_tool(context: &NativeServiceContext) -> ServiceResponse {
+    let resume = match context
+        .request
+        .payload_json::<InteractiveToolResumeRequest>()
+    {
         Ok(resume) => resume,
         Err(error) => return invalid_request(&error),
     };
-    let output = match &resume.resolution {
-        bcode_tool::InteractiveToolResolution::Submitted { payload }
-            if payload.get("action").and_then(serde_json::Value::as_str)
-                == Some("apply_requested") =>
-        {
-            format!(
-                "User requested applying the Vim preview. Invoke vim_edit.apply with these arguments to write changes: {}",
-                payload
-                    .get("arguments")
-                    .unwrap_or(&resume.original_arguments)
-            )
-        }
-        _ => format!("Vim edit playback closed: {}", resume.interaction_id),
-    };
+    if let bcode_tool::InteractiveToolResolution::Submitted { payload } = &resume.resolution
+        && payload.get("action").and_then(serde_json::Value::as_str) == Some("apply_requested")
+    {
+        let arguments = payload
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| resume.original_arguments.clone());
+        let response = tool_vim_edit_with_nvim_executable(
+            arguments,
+            None,
+            VimEditMode::Apply,
+            &resume.tool_call_id,
+            "vim_edit.apply",
+            None,
+            context.events,
+        );
+        return json_response(&response);
+    }
+    let output = format!("Vim edit playback closed: {}", resume.interaction_id);
     json_response(&ToolInvocationResponse {
         output,
         is_error: false,
@@ -1210,6 +1218,59 @@ mod tests {
             response
                 .output
                 .contains("definitely-missing-bcode-plugin-nvim")
+        );
+    }
+
+    #[test]
+    fn resume_apply_request_runs_apply_when_nvim_is_available() {
+        if !nvim_available() {
+            eprintln!("skipping Neovim integration test because `nvim` is not available");
+            return;
+        }
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        std::fs::write(file.path(), "foo").expect("write temp file");
+        let original_arguments = json!({
+            "path": file.path(),
+            "steps": [{ "ex": "%s/foo/bar/" }]
+        });
+        let resume = InteractiveToolResumeRequest {
+            tool_call_id: "call-apply".to_string(),
+            tool_name: "vim_edit.preview".to_string(),
+            interaction_id: "call-apply-vim-edit-playback".to_string(),
+            original_arguments: original_arguments.clone(),
+            interactive_request: InteractiveToolRequest {
+                interaction_id: "call-apply-vim-edit-playback".to_string(),
+                interaction_kind: Some(VIM_EDIT_PLAYBACK_INTERACTION_KIND.to_string()),
+                surface_kind: VIM_EDIT_PLAYBACK_SURFACE.to_string(),
+                request: json!({ "playback": { "original_arguments": original_arguments } }),
+                required: false,
+                turn_behavior:
+                    bcode_tool::InteractiveToolTurnBehavior::CompleteTurnWithPendingInteraction,
+                render_target: bcode_tool::InteractiveToolRenderTarget::TranscriptToolCall,
+            },
+            resolution: bcode_tool::InteractiveToolResolution::Submitted {
+                payload: json!({ "action": "apply_requested" }),
+            },
+        };
+        let context = NativeServiceContext {
+            plugin_id: VIM_EDIT_PLUGIN_ID.to_string(),
+            request: ServiceRequest {
+                interface_id: TOOL_SERVICE_INTERFACE_ID.to_string(),
+                operation: OP_RESUME_INTERACTIVE_TOOL.to_string(),
+                payload: serde_json::to_vec(&resume).expect("resume payload"),
+            },
+            config: bcode_plugin_sdk::PluginConfigContext::default(),
+            events: ServiceEventEmitter::default(),
+            cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+        };
+        let service_response = resume_interactive_tool(&context);
+        assert!(service_response.error.is_none(), "{service_response:?}");
+        let response: ToolInvocationResponse =
+            serde_json::from_slice(&service_response.payload).expect("tool response");
+        assert!(!response.is_error, "{}", response.output);
+        assert_eq!(
+            std::fs::read_to_string(file.path()).expect("read file"),
+            "bar"
         );
     }
 
