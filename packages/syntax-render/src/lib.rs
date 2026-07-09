@@ -1,4 +1,11 @@
 //! Syntax-highlighted terminal rendering for Bcode text surfaces.
+//!
+//! Syntax definitions come from `two-face`'s `bat`-curated Syntect bundle.
+//! Callers may identify syntaxes with language names, common Markdown fence
+//! aliases, exact filenames, or file extensions. Unknown hints safely render as
+//! plain text. Prefer updating the bundled definitions for future language
+//! coverage; add aliases here only when common user-facing hints differ from
+//! the syntax metadata.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
@@ -118,7 +125,7 @@ impl SyntaxHighlighter {
 }
 
 fn syntax_set() -> &'static SyntaxSet {
-    SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
+    SYNTAX_SET.get_or_init(two_face::syntax::extra_newlines)
 }
 
 fn theme() -> &'static Theme {
@@ -135,17 +142,14 @@ fn theme() -> &'static Theme {
 
 fn syntax_for(path_or_language: &str) -> Option<&'static SyntaxReference> {
     let syntaxes = syntax_set();
-    let lower_language = path_or_language.to_ascii_lowercase();
-    let normalized_language = match lower_language.as_str() {
-        "toml" | "cargo.toml" => "conf",
-        other => other,
-    };
+    let normalized_hint = path_or_language.trim().to_ascii_lowercase();
+    let language = language_alias(&normalized_hint);
+
     syntaxes
-        .find_syntax_by_token(normalized_language)
-        .or_else(|| syntaxes.find_syntax_by_extension(normalized_language))
+        .find_syntax_by_token(language)
         .or_else(|| {
-            let path = Path::new(path_or_language);
-            path.file_name()
+            Path::new(path_or_language)
+                .file_name()
                 .and_then(std::ffi::OsStr::to_str)
                 .and_then(|file_name| syntaxes.find_syntax_by_extension(file_name))
         })
@@ -155,6 +159,17 @@ fn syntax_for(path_or_language: &str) -> Option<&'static SyntaxReference> {
                 .and_then(std::ffi::OsStr::to_str)
                 .and_then(|extension| syntaxes.find_syntax_by_extension(extension))
         })
+}
+
+fn language_alias(language: &str) -> &str {
+    match language {
+        "c++" => "cpp",
+        "js" => "javascript",
+        "py" => "python",
+        "shell" => "bash",
+        "ts" => "typescript",
+        other => other,
+    }
 }
 
 fn highlight_line_tokens_with(
@@ -235,36 +250,100 @@ const fn syntax_style_to_tui(style: SyntaxStyle) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::SyntaxHighlighter;
+    use super::{SyntaxHighlighter, syntax_for};
 
     #[test]
-    fn detects_common_file_extensions() {
-        let highlighter = SyntaxHighlighter::new();
+    fn detects_curated_syntaxes_from_languages_and_paths() {
+        let cases = [
+            ("toml", "TOML"),
+            ("Cargo.toml", "TOML"),
+            ("packages/example/Cargo.toml", "TOML"),
+            ("nix", "Nix"),
+            ("default.nix", "Nix"),
+            ("flake.nix", "Nix"),
+            ("Dockerfile", "Dockerfile"),
+            ("typescript", "TypeScript"),
+            ("file.ts", "TypeScript"),
+            ("file.tsx", "TypeScriptReact"),
+            ("main.tf", "Terraform"),
+            ("build.zig", "Zig"),
+            ("src/lib.rs", "Rust"),
+        ];
 
-        assert!(highlighter.can_highlight("src/lib.rs"));
-        assert!(highlighter.can_highlight("data.json"));
-        assert!(highlighter.can_highlight("json"));
+        for (hint, expected_name) in cases {
+            let syntax = syntax_for(hint).unwrap_or_else(|| panic!("missing syntax for {hint}"));
+            assert_eq!(syntax.name, expected_name, "wrong syntax for {hint}");
+        }
+    }
+
+    #[test]
+    fn detects_common_language_aliases() {
+        let cases = [
+            ("shell", "Bourne Again Shell (bash)"),
+            ("js", "JavaScript"),
+            ("ts", "TypeScript"),
+            ("c++", "C++"),
+            ("py", "Python"),
+        ];
+
+        for (hint, expected_name) in cases {
+            let syntax = syntax_for(hint).unwrap_or_else(|| panic!("missing syntax for {hint}"));
+            assert_eq!(syntax.name, expected_name, "wrong syntax for {hint}");
+        }
+    }
+
+    #[test]
+    fn detection_is_case_insensitive() {
+        assert_eq!(
+            syntax_for("TOML").map(|syntax| syntax.name.as_str()),
+            Some("TOML")
+        );
+        assert_eq!(
+            syntax_for("config.NIX").map(|syntax| syntax.name.as_str()),
+            Some("Nix")
+        );
     }
 
     #[test]
     fn falls_back_for_unknown_extensions() {
-        let spans = SyntaxHighlighter::new().highlight_line("file.unknown-bcode", "plain text");
+        let highlighter = SyntaxHighlighter::new();
+        assert!(!highlighter.can_highlight("file.unknown-bcode"));
+
+        let spans = highlighter.highlight_line_tokens("file.unknown-bcode", "plain text");
 
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, "plain text");
     }
 
     #[test]
-    fn highlights_known_syntax() {
-        let spans = SyntaxHighlighter::new().highlight_line("rust", "pub fn main() {}");
+    fn highlights_curated_syntaxes_without_changing_text() {
+        let highlighter = SyntaxHighlighter::new();
+        let cases = [
+            ("toml", "[package]\nname = \"bcode\""),
+            ("nix", "{ pkgs, ... }: pkgs.mkShell { }"),
+        ];
 
-        assert_eq!(
-            spans
+        for (hint, source) in cases {
+            let lines = source.lines().collect::<Vec<_>>();
+            let token_lines = highlighter.highlight_lines_tokens(hint, &lines);
+            let reconstructed = token_lines
                 .iter()
-                .map(|span| span.content.as_str())
-                .collect::<String>(),
-            "pub fn main() {}"
-        );
-        assert!(spans.iter().any(|span| span.style.fg.is_some()));
+                .map(|line| {
+                    line.iter()
+                        .map(|span| span.content.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            assert_eq!(reconstructed, source);
+            assert!(
+                token_lines
+                    .iter()
+                    .flatten()
+                    .any(|span| { span.style != super::default_syntax_style() }),
+                "expected syntax styles for {hint}"
+            );
+        }
     }
 }

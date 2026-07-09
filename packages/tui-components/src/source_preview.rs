@@ -328,4 +328,20 @@ mod tests {
             rows[0]
         );
     }
+
+    #[cfg(feature = "syntax")]
+    #[test]
+    fn highlights_toml_from_nested_path() {
+        let rows = source_preview_lines(
+            "[package]\nname = \"bcode\"",
+            &SourcePreviewOptions::new("packages/example/Cargo.toml", 80),
+        );
+
+        assert!(
+            rows.iter()
+                .flat_map(|row| row.spans.iter().skip(1))
+                .any(|span| span.style.fg.is_some()),
+            "expected TOML highlighting: {rows:?}"
+        );
+    }
 }

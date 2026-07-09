@@ -300,6 +300,9 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
     "fmt",
     "std",
 ] }
+two-face = { version = "0.5.1", default-features = false, features = [
+    "syntect-onig",
+] }
 unicode-segmentation = { version = "1.13.0", default-features = false }
 unicode-width = { version = "0.2.2", default-features = false }
 url = { version = "2.5.7", default-features = false, features = ["std"] }

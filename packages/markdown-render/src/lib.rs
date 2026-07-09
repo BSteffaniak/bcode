@@ -714,14 +714,22 @@ fn apply_code_block_syntax_highlighting(
     if !highlighter.can_highlight(language) {
         return;
     }
-    for row in code_rows {
-        let text = row
-            .spans
-            .iter()
-            .map(|span| span.content.as_str())
-            .collect::<String>();
-        row.spans = highlighter
-            .highlight_line(language, &text)
+    let text = code_rows
+        .iter()
+        .map(|row| {
+            row.spans
+                .iter()
+                .map(|span| span.content.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    let lines = text.iter().map(String::as_str).collect::<Vec<_>>();
+
+    for (row, highlighted) in code_rows
+        .iter_mut()
+        .zip(highlighter.highlight_lines(language, &lines))
+    {
+        row.spans = highlighted
             .into_iter()
             .map(|span| Span::styled(span.content, theme.code_block_text.patch(span.style)))
             .collect();
@@ -888,6 +896,42 @@ mod tests {
                 .flat_map(|line| &line.spans)
                 .any(|span| { !span.content.trim().is_empty() && span.style.fg.is_some() })
         );
+    }
+
+    #[test]
+    fn highlights_toml_and_nix_code_blocks_without_changing_text() {
+        for (language, source) in [
+            ("toml", "description = \"\"\"first\nsecond\"\"\""),
+            ("nix", "let value = ''first\nsecond''; in value"),
+        ] {
+            let markdown = format!("```{language}\n{source}\n```");
+            let rows = render_markdown_lines(&markdown, MarkdownRenderOptions::new(80));
+            let output = rows
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            for source_line in source.lines() {
+                assert!(
+                    output.contains(source_line),
+                    "missing {source_line:?} in {output:?}"
+                );
+            }
+            assert!(
+                rows.iter().flat_map(|line| &line.spans).any(|span| !span
+                    .content
+                    .trim()
+                    .is_empty()
+                    && span.style.fg.is_some()),
+                "expected highlighted {language} spans"
+            );
+        }
     }
 
     #[test]

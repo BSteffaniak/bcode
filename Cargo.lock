@@ -2199,6 +2199,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_tui",
  "syntect",
+ "two-face",
 ]
 
 [[package]]
@@ -10839,6 +10840,17 @@ dependencies = [
  "turso_sdk_kit",
  "turso_sdk_kit_macros",
  "turso_sync_engine",
+]
+
+[[package]]
+name = "two-face"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b285c51f8a6ade109ed4566d33ac4fb289fb5d6cf87ed70908a5eaf65e948e34"
+dependencies = [
+ "serde",
+ "serde_derive",
+ "syntect",
 ]
 
 [[package]]
