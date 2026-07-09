@@ -1567,6 +1567,14 @@ pub struct EvalImprovementRecordOptions {
     pub run: Option<PathBuf>,
     /// Optional patch path to copy into the generation delta directory.
     pub patch: Option<PathBuf>,
+    /// Overlay paths to copy into the generation delta directory.
+    pub overlays: Vec<PathBuf>,
+    /// Affected files, relative to repository root when possible.
+    pub affected_files: Vec<PathBuf>,
+    /// Runtime surfaces affected by this delta.
+    pub affected_surfaces: Vec<String>,
+    /// Expected impact before running the generation.
+    pub expected_impact: Option<String>,
     /// Risk level.
     pub risk: EvalImprovementRisk,
     /// Optional rationale.
@@ -1676,6 +1684,21 @@ pub fn record_improvement_generation(
     } else {
         None
     };
+    let mut overlay_paths = Vec::new();
+    for (index, overlay) in options.overlays.iter().enumerate() {
+        if !overlay.is_file() {
+            return Err(EvalError::Validation(format!(
+                "overlay is not a file: {}",
+                overlay.display()
+            )));
+        }
+        let extension = overlay
+            .extension()
+            .map_or_else(String::new, |value| format!(".{}", value.to_string_lossy()));
+        let relative = PathBuf::from(format!("delta/overlay-{:02}{extension}", index + 1));
+        fs::copy(overlay, generation_dir.join(&relative))?;
+        overlay_paths.push(relative);
+    }
     let run_dir = options.run.map(normalize_run_dir).transpose()?;
     let vs_parent = metric_delta_for_runs(parent.run_dir.as_deref(), run_dir.as_deref())?;
     let baseline = load_improvement_generation(&campaign_dir, &campaign.baseline_generation_id)?;
@@ -1689,12 +1712,12 @@ pub fn record_improvement_generation(
         delta: EvalImprovementDelta {
             kind: options.delta_kind,
             summary: options.summary,
-            affected_files: Vec::new(),
-            affected_surfaces: Vec::new(),
+            affected_files: options.affected_files,
+            affected_surfaces: options.affected_surfaces,
             patch_path,
-            overlay_paths: Vec::new(),
+            overlay_paths,
             rationale: options.rationale,
-            expected_impact: None,
+            expected_impact: options.expected_impact,
             risk: options.risk,
         },
         run_dir,

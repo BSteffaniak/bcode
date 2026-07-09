@@ -242,19 +242,21 @@ impl EvalRunPickerSurface {
 
     fn complete_wizard(&mut self, completion: EvalWizardCompletion, host: &dyn PluginTuiHost) {
         match completion {
-            EvalWizardCompletion::StartCampaign {
-                suite_path,
-                options,
-            } => match bcode_eval::start_improvement_campaign(suite_path, options) {
-                Ok(campaign) => {
-                    self.status = format!("created campaign {}", campaign.id);
-                    self.refresh();
+            EvalWizardCompletion::StartCampaign(completion) => {
+                match bcode_eval::start_improvement_campaign(
+                    completion.suite_path,
+                    completion.options,
+                ) {
+                    Ok(campaign) => {
+                        self.status = format!("created campaign {}", campaign.id);
+                        self.refresh();
+                    }
+                    Err(error) => self.status = format!("failed to create campaign: {error}"),
                 }
-                Err(error) => self.status = format!("failed to create campaign: {error}"),
-            },
-            EvalWizardCompletion::RunSuite(options) => self.start_run_task(options, host),
+            }
+            EvalWizardCompletion::RunSuite(options) => self.start_run_task(*options, host),
             EvalWizardCompletion::RecordGeneration(options) => {
-                match bcode_eval::record_improvement_generation(options) {
+                match bcode_eval::record_improvement_generation(*options) {
                     Ok(generation) => {
                         self.status = format!("recorded generation {}", generation.id);
                         self.refresh();
@@ -565,13 +567,18 @@ struct RecordGenerationWizard {
     parent_index: usize,
     run_choices: Vec<RecordRunChoice>,
     run_index: usize,
-    branch: String,
+    allow_duplicate_run: bool,
+    branch: TextInputState,
     delta_kind: bcode_eval_models::EvalImprovementDeltaKind,
     risk: bcode_eval_models::EvalImprovementRisk,
     context: Vec<Line>,
     summary: TextInputState,
     rationale: TextInputState,
     patch_path: TextInputState,
+    overlays: TextInputState,
+    affected_files: TextInputState,
+    affected_surfaces: TextInputState,
+    expected_impact: TextInputState,
     focus: RecordGenerationField,
     error: Option<String>,
 }
@@ -600,7 +607,12 @@ enum RecordGenerationField {
     Campaign,
     Parent,
     Run,
+    Branch,
     Patch,
+    Overlays,
+    AffectedFiles,
+    AffectedSurfaces,
+    ExpectedImpact,
     Kind,
     Risk,
     Rationale,
@@ -615,14 +627,17 @@ enum EvalWizardOutcome {
 }
 
 #[derive(Debug, Clone)]
+struct StartCampaignCompletion {
+    suite_path: PathBuf,
+    options: bcode_eval::EvalImprovementStartOptions,
+}
+
+#[derive(Debug, Clone)]
 enum EvalWizardCompletion {
-    StartCampaign {
-        suite_path: PathBuf,
-        options: bcode_eval::EvalImprovementStartOptions,
-    },
-    RunSuite(bcode_eval::EvalRunOptions),
-    RecordGeneration(bcode_eval::EvalImprovementRecordOptions),
-    DecideGeneration(bcode_eval::EvalImprovementDecisionOptions),
+    StartCampaign(Box<StartCampaignCompletion>),
+    RunSuite(Box<bcode_eval::EvalRunOptions>),
+    RecordGeneration(Box<bcode_eval::EvalImprovementRecordOptions>),
+    DecideGeneration(Box<bcode_eval::EvalImprovementDecisionOptions>),
 }
 
 impl EvalWizard {
@@ -762,13 +777,18 @@ impl EvalWizard {
                 run_dir: Some(run.run_dir.clone()),
             }],
             run_index: 0,
-            branch: "main".to_string(),
+            allow_duplicate_run: false,
+            branch: text_state("main"),
             delta_kind: bcode_eval_models::EvalImprovementDeltaKind::Mixed,
             risk: bcode_eval_models::EvalImprovementRisk::Low,
             context,
             summary: text_state(&summary),
             rationale: text_state("Recorded from the eval overview TUI."),
             patch_path: text_state(""),
+            overlays: text_state(""),
+            affected_files: text_state(""),
+            affected_surfaces: text_state(""),
+            expected_impact: text_state(""),
             focus: RecordGenerationField::Summary,
             error: None,
         })))
@@ -778,38 +798,12 @@ impl EvalWizard {
         data: &EvalCampaignData,
         selected: Option<&EvalImprovementGeneration>,
     ) -> Result<Self, String> {
-        let runs_root = data
-            .campaign_dir
-            .parent()
-            .and_then(std::path::Path::parent)
-            .map_or_else(
-                || PathBuf::from("target/bcode-evals/runs"),
-                |root| root.join("runs"),
-            );
-        let used_runs = data
-            .generations
-            .iter()
-            .filter_map(|generation| generation.run_dir.as_ref())
-            .collect::<std::collections::BTreeSet<_>>();
-        let runs = discover_runs(&runs_root)
-            .into_iter()
-            .filter(|run| run.suite_id == data.campaign.suite_id)
-            .filter(|run| !used_runs.contains(&run.run_dir))
-            .collect::<Vec<_>>();
-        let run = runs
-            .first()
-            .ok_or_else(|| format!("no unused runs found for suite {}", data.campaign.suite_id))?;
+        let (run_choices, run_index) = campaign_run_choices(data)?;
+        let run = &run_choices[run_index];
         let parent_id = selected
             .map(|generation| generation.id.clone())
             .or_else(|| data.campaign.latest_generation_id.clone());
-        let parent_choices = data
-            .generations
-            .iter()
-            .map(|generation| RecordParentChoice {
-                label: generation.id.clone(),
-                parent_id: Some(generation.id.clone()),
-            })
-            .collect::<Vec<_>>();
+        let parent_choices = campaign_parent_choices(data);
         let parent_index = parent_id
             .as_ref()
             .and_then(|id| {
@@ -818,10 +812,10 @@ impl EvalWizard {
                     .position(|choice| choice.parent_id.as_ref() == Some(id))
             })
             .unwrap_or(0);
-        let summary = format!("Recorded run {}", run.run_id);
+        let summary = format!("Recorded {}", run.label);
         let context = vec![
-            Line::from("Record the latest unused run as a new generation."),
-            Line::from(format!("Run: {}", run.run_id)),
+            Line::from("Record a run or metadata-only generation."),
+            Line::from(format!("Run: {}", run.label)),
         ];
         Ok(Self::RecordGeneration(Box::new(RecordGenerationWizard {
             state: DialogState::new(),
@@ -832,21 +826,20 @@ impl EvalWizard {
             campaign_index: 0,
             parent_choices,
             parent_index,
-            run_choices: runs
-                .iter()
-                .map(|run| RecordRunChoice {
-                    label: run.run_id.clone(),
-                    run_dir: Some(run.run_dir.clone()),
-                })
-                .collect(),
-            run_index: 0,
-            branch: "main".to_string(),
+            run_choices,
+            run_index,
+            allow_duplicate_run: false,
+            branch: text_state("main"),
             delta_kind: bcode_eval_models::EvalImprovementDeltaKind::Mixed,
             risk: bcode_eval_models::EvalImprovementRisk::Low,
             context,
             summary: text_state(&summary),
             rationale: text_state("Recorded from the campaign timeline TUI."),
             patch_path: text_state(""),
+            overlays: text_state(""),
+            affected_files: text_state(""),
+            affected_surfaces: text_state(""),
+            expected_impact: text_state(""),
             focus: RecordGenerationField::Summary,
             error: None,
         })))
@@ -869,6 +862,12 @@ impl EvalWizard {
                 KeyCode::Tab => {
                     self.focus_next();
                     return EvalWizardOutcome::Redraw;
+                }
+                KeyCode::Char('d') => {
+                    if let Self::RecordGeneration(wizard) = self {
+                        wizard.allow_duplicate_run = !wizard.allow_duplicate_run;
+                        return EvalWizardOutcome::Redraw;
+                    }
                 }
                 KeyCode::Enter | KeyCode::Char('y') => return self.complete(),
                 KeyCode::Left => {
@@ -945,8 +944,15 @@ impl EvalWizard {
                     RecordGenerationField::Summary => RecordGenerationField::Campaign,
                     RecordGenerationField::Campaign => RecordGenerationField::Parent,
                     RecordGenerationField::Parent => RecordGenerationField::Run,
-                    RecordGenerationField::Run => RecordGenerationField::Patch,
-                    RecordGenerationField::Patch => RecordGenerationField::Kind,
+                    RecordGenerationField::Run => RecordGenerationField::Branch,
+                    RecordGenerationField::Branch => RecordGenerationField::Patch,
+                    RecordGenerationField::Patch => RecordGenerationField::Overlays,
+                    RecordGenerationField::Overlays => RecordGenerationField::AffectedFiles,
+                    RecordGenerationField::AffectedFiles => RecordGenerationField::AffectedSurfaces,
+                    RecordGenerationField::AffectedSurfaces => {
+                        RecordGenerationField::ExpectedImpact
+                    }
+                    RecordGenerationField::ExpectedImpact => RecordGenerationField::Kind,
                     RecordGenerationField::Kind => RecordGenerationField::Risk,
                     RecordGenerationField::Risk => RecordGenerationField::Rationale,
                     RecordGenerationField::Rationale => RecordGenerationField::Summary,
@@ -1006,19 +1012,21 @@ impl EvalWizard {
     fn complete(&mut self) -> EvalWizardOutcome {
         match self {
             Self::StartCampaign(wizard) => match wizard.validate() {
-                Ok(()) => EvalWizardOutcome::Complete(EvalWizardCompletion::StartCampaign {
-                    suite_path: wizard.suite_path(),
-                    options: wizard.options(),
-                }),
+                Ok(()) => EvalWizardOutcome::Complete(EvalWizardCompletion::StartCampaign(
+                    Box::new(StartCampaignCompletion {
+                        suite_path: wizard.suite_path(),
+                        options: wizard.options(),
+                    }),
+                )),
                 Err(error) => {
                     wizard.error = Some(error);
                     EvalWizardOutcome::Redraw
                 }
             },
             Self::RunSuite(wizard) => match wizard.validate() {
-                Ok(()) => {
-                    EvalWizardOutcome::Complete(EvalWizardCompletion::RunSuite(wizard.options()))
-                }
+                Ok(()) => EvalWizardOutcome::Complete(EvalWizardCompletion::RunSuite(Box::new(
+                    wizard.options(),
+                ))),
                 Err(error) => {
                     wizard.error = Some(error);
                     EvalWizardOutcome::Redraw
@@ -1026,7 +1034,7 @@ impl EvalWizard {
             },
             Self::RecordGeneration(wizard) => match wizard.validate() {
                 Ok(()) => EvalWizardOutcome::Complete(EvalWizardCompletion::RecordGeneration(
-                    wizard.options(),
+                    Box::new(wizard.options()),
                 )),
                 Err(error) => {
                     wizard.error = Some(error);
@@ -1035,7 +1043,7 @@ impl EvalWizard {
             },
             Self::DecideGeneration(wizard) => match wizard.validate() {
                 Ok(()) => EvalWizardOutcome::Complete(EvalWizardCompletion::DecideGeneration(
-                    wizard.options(),
+                    Box::new(wizard.options()),
                 )),
                 Err(error) => {
                     wizard.error = Some(error);
@@ -1306,13 +1314,25 @@ impl RecordGenerationWizard {
         )));
         body.push(Line::from(format!("Run: {}", self.selected_run().label)));
         body.push(Line::from(format!(
+            "Allow duplicate run: {} (D toggles)",
+            if self.allow_duplicate_run {
+                "yes"
+            } else {
+                "no"
+            }
+        )));
+        body.push(Line::from(format!(
             "Kind: {}",
             delta_kind_label(self.delta_kind)
         )));
         body.push(Line::from(format!("Risk: {}", risk_label(self.risk))));
         body.push(Line::from(format!(
-            "Patch: {}",
-            empty_label(&input_text(&self.patch_path))
+            "Branch: {}",
+            empty_label(&input_text(&self.branch))
+        )));
+        body.push(Line::from(format!(
+            "Metadata field: {}",
+            self.metadata_field_label()
         )));
         body.push(Line::from(
             "Click fields/buttons or use Tab, arrows, Enter, Esc.",
@@ -1341,12 +1361,15 @@ impl RecordGenerationWizard {
             self.focus == RecordGenerationField::Rationale,
             1,
         );
+        let metadata_focus = self.metadata_focus();
+        let metadata_label = self.metadata_field_label();
+        let metadata = self.metadata_state_mut();
         render_input_box(
             layout.tertiary,
             frame,
-            "Patch path (optional)",
-            &mut self.patch_path,
-            self.focus == RecordGenerationField::Patch,
+            metadata_label,
+            metadata,
+            metadata_focus,
             1,
         );
     }
@@ -1358,7 +1381,9 @@ impl RecordGenerationWizard {
         } else if event_click_in(event, layout.secondary) {
             self.focus = RecordGenerationField::Rationale;
         } else if event_click_in(event, layout.tertiary) {
-            self.focus = RecordGenerationField::Patch;
+            if !self.metadata_focus() {
+                self.focus = RecordGenerationField::Branch;
+            }
         } else if event_click_in(event, layout.choice) {
             self.focus = RecordGenerationField::Campaign;
             self.campaign_index =
@@ -1393,13 +1418,48 @@ impl RecordGenerationWizard {
             event,
             self.focus == RecordGenerationField::Rationale,
         );
-        let patch = handle_input_box(
+        let metadata_focus = self.metadata_focus();
+        let metadata = handle_input_box(
             layout.tertiary,
-            &mut self.patch_path,
+            self.metadata_state_mut(),
             event,
-            self.focus == RecordGenerationField::Patch,
+            metadata_focus,
         );
-        summary || rationale || patch
+        summary || rationale || metadata
+    }
+
+    const fn metadata_focus(&self) -> bool {
+        matches!(
+            self.focus,
+            RecordGenerationField::Branch
+                | RecordGenerationField::Patch
+                | RecordGenerationField::Overlays
+                | RecordGenerationField::AffectedFiles
+                | RecordGenerationField::AffectedSurfaces
+                | RecordGenerationField::ExpectedImpact
+        )
+    }
+
+    const fn metadata_field_label(&self) -> &'static str {
+        match self.focus {
+            RecordGenerationField::Branch => "Branch",
+            RecordGenerationField::Overlays => "Overlay paths (comma-separated)",
+            RecordGenerationField::AffectedFiles => "Affected files (comma-separated)",
+            RecordGenerationField::AffectedSurfaces => "Affected surfaces (comma-separated)",
+            RecordGenerationField::ExpectedImpact => "Expected impact",
+            _ => "Patch path (optional)",
+        }
+    }
+
+    const fn metadata_state_mut(&mut self) -> &mut TextInputState {
+        match self.focus {
+            RecordGenerationField::Branch => &mut self.branch,
+            RecordGenerationField::Overlays => &mut self.overlays,
+            RecordGenerationField::AffectedFiles => &mut self.affected_files,
+            RecordGenerationField::AffectedSurfaces => &mut self.affected_surfaces,
+            RecordGenerationField::ExpectedImpact => &mut self.expected_impact,
+            _ => &mut self.patch_path,
+        }
     }
 
     fn selected_campaign(&self) -> &RecordCampaignChoice {
@@ -1418,9 +1478,23 @@ impl RecordGenerationWizard {
         if input_text(&self.summary).is_empty() {
             return Err("summary is required".to_string());
         }
+        if self.selected_run().label.ends_with(" (duplicate)") && !self.allow_duplicate_run {
+            return Err("selected run is already attached; press D to allow duplicate".to_string());
+        }
+        let branch = input_text(&self.branch);
+        if branch.is_empty() || sanitize_id(&branch) != branch {
+            return Err(
+                "branch may only contain lowercase ASCII letters, numbers, '-' and '_'".to_string(),
+            );
+        }
         let patch = input_text(&self.patch_path);
-        if !patch.is_empty() && !std::path::Path::new(&patch).exists() {
-            return Err(format!("patch path does not exist: {patch}"));
+        if !patch.is_empty() && !std::path::Path::new(&patch).is_file() {
+            return Err(format!("patch path is not a file: {patch}"));
+        }
+        for overlay in comma_paths(&input_text(&self.overlays)) {
+            if !overlay.is_file() {
+                return Err(format!("overlay path is not a file: {}", overlay.display()));
+            }
         }
         Ok(())
     }
@@ -1429,11 +1503,15 @@ impl RecordGenerationWizard {
         bcode_eval::EvalImprovementRecordOptions {
             campaign: self.selected_campaign().campaign_dir.clone(),
             parent_id: self.selected_parent().parent_id.clone(),
-            branch: self.branch.clone(),
+            branch: input_text(&self.branch),
             delta_kind: self.delta_kind,
             summary: input_text(&self.summary),
             run: self.selected_run().run_dir.clone(),
             patch: optional_path(&input_text(&self.patch_path)),
+            overlays: comma_paths(&input_text(&self.overlays)),
+            affected_files: comma_paths(&input_text(&self.affected_files)),
+            affected_surfaces: comma_values(&input_text(&self.affected_surfaces)),
+            expected_impact: optional_text(&input_text(&self.expected_impact)),
             risk: self.risk,
             rationale: Some(input_text(&self.rationale)).filter(|text| !text.trim().is_empty()),
         }
@@ -1575,6 +1653,81 @@ fn cycle_risk(
     cycle_value(&[Risk::Low, Risk::Medium, Risk::High], risk, forward)
 }
 
+fn campaign_run_choices(data: &EvalCampaignData) -> Result<(Vec<RecordRunChoice>, usize), String> {
+    let runs_root = data
+        .campaign_dir
+        .parent()
+        .and_then(std::path::Path::parent)
+        .map_or_else(
+            || PathBuf::from("target/bcode-evals/runs"),
+            |root| root.join("runs"),
+        );
+    let used_runs = data
+        .generations
+        .iter()
+        .filter_map(|generation| generation.run_dir.as_ref())
+        .collect::<std::collections::BTreeSet<_>>();
+    let all_runs = discover_runs(&runs_root)
+        .into_iter()
+        .filter(|run| run.suite_id == data.campaign.suite_id)
+        .collect::<Vec<_>>();
+    if all_runs.is_empty() {
+        return Err(format!(
+            "no runs found for suite {}",
+            data.campaign.suite_id
+        ));
+    }
+    let mut choices = vec![RecordRunChoice {
+        label: "no run".to_string(),
+        run_dir: None,
+    }];
+    choices.extend(all_runs.iter().map(|run| RecordRunChoice {
+        label: if used_runs.contains(&run.run_dir) {
+            format!("{} (duplicate)", run.run_id)
+        } else {
+            run.run_id.clone()
+        },
+        run_dir: Some(run.run_dir.clone()),
+    }));
+    let index = choices
+        .iter()
+        .position(|choice| {
+            choice
+                .run_dir
+                .as_ref()
+                .is_some_and(|run_dir| !used_runs.contains(run_dir))
+        })
+        .unwrap_or(0);
+    Ok((choices, index))
+}
+
+fn campaign_parent_choices(data: &EvalCampaignData) -> Vec<RecordParentChoice> {
+    data.generations
+        .iter()
+        .map(|generation| {
+            let mut labels = Vec::new();
+            if generation.id == data.campaign.baseline_generation_id {
+                labels.push("baseline");
+            }
+            if data.campaign.latest_generation_id.as_ref() == Some(&generation.id) {
+                labels.push("latest");
+            }
+            if data.campaign.best_generation_id.as_ref() == Some(&generation.id) {
+                labels.push("best");
+            }
+            let suffix = if labels.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", labels.join(", "))
+            };
+            RecordParentChoice {
+                label: format!("{}{suffix}", generation.id),
+                parent_id: Some(generation.id.clone()),
+            }
+        })
+        .collect()
+}
+
 fn suite_choices_from_runs(runs: &[EvalRunSummary]) -> Vec<StartCampaignSuiteChoice> {
     let historical = runs
         .iter()
@@ -1594,6 +1747,24 @@ fn suite_choices_from_runs(runs: &[EvalRunSummary]) -> Vec<StartCampaignSuiteCho
             }
         })
         .collect()
+}
+
+fn comma_values(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn comma_paths(value: &str) -> Vec<PathBuf> {
+    comma_values(value).into_iter().map(PathBuf::from).collect()
+}
+
+fn optional_text(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn optional_path(value: &str) -> Option<PathBuf> {
@@ -1859,6 +2030,10 @@ impl EvalCampaignViewerSurface {
                         summary: format!("Rerun {run_id}"),
                         run: Some(run.manifest.output_dir),
                         patch: None,
+                        overlays: Vec::new(),
+                        affected_files: Vec::new(),
+                        affected_surfaces: Vec::new(),
+                        expected_impact: None,
                         risk: bcode_eval_models::EvalImprovementRisk::Low,
                         rationale: Some("Executed and recorded from the campaign TUI.".to_string()),
                     };
@@ -1926,7 +2101,7 @@ impl EvalCampaignViewerSurface {
     fn complete_wizard(&mut self, completion: EvalWizardCompletion) {
         match completion {
             EvalWizardCompletion::RecordGeneration(options) => {
-                match bcode_eval::record_improvement_generation(options) {
+                match bcode_eval::record_improvement_generation(*options) {
                     Ok(generation) => {
                         self.status = format!("recorded generation {}", generation.id);
                         if let Ok(data) = EvalCampaignData::load(&self.data.campaign_dir) {
@@ -1937,7 +2112,7 @@ impl EvalCampaignViewerSurface {
                 }
             }
             EvalWizardCompletion::DecideGeneration(options) => {
-                match bcode_eval::decide_improvement_generation(&options) {
+                match bcode_eval::decide_improvement_generation(options.as_ref()) {
                     Ok(generation) => {
                         self.status = format!(
                             "generation {} is now {:?}",
@@ -1953,7 +2128,7 @@ impl EvalCampaignViewerSurface {
             EvalWizardCompletion::RunSuite(_) => {
                 self.status = "run suite is only available from eval home".to_string();
             }
-            EvalWizardCompletion::StartCampaign { .. } => {
+            EvalWizardCompletion::StartCampaign(_) => {
                 self.status = "start campaign is only available from eval home".to_string();
             }
         }
@@ -2271,6 +2446,10 @@ impl EvalGenerationDetailSurface {
                         summary: format!("Rerun {run_id}"),
                         run: Some(run.manifest.output_dir),
                         patch: None,
+                        overlays: Vec::new(),
+                        affected_files: Vec::new(),
+                        affected_surfaces: Vec::new(),
+                        expected_impact: None,
                         risk: bcode_eval_models::EvalImprovementRisk::Low,
                         rationale: Some("Rerun from generation detail TUI.".to_string()),
                     };
