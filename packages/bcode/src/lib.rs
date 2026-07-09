@@ -1478,6 +1478,111 @@ impl ModelProviderInvoker for PluginModelProviderInvoker {
     }
 }
 
+/// Provider registry entry used by the SDK facade.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderRegistration {
+    /// Provider plugin ID.
+    pub provider_plugin_id: String,
+    /// Provider capability metadata, when discovered or supplied.
+    pub capabilities: Option<ProviderCapabilities>,
+    /// Provider model metadata, when discovered or supplied.
+    pub models: Option<ModelList>,
+}
+
+/// Explicit SDK provider registry/default facade.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderRegistry {
+    providers: BTreeMap<String, ProviderRegistration>,
+    default_model: Option<ModelSelector>,
+}
+
+impl ProviderRegistry {
+    /// Create an empty provider registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a provider by plugin ID.
+    #[must_use]
+    pub fn provider(mut self, provider_plugin_id: impl Into<String>) -> Self {
+        let provider_plugin_id = provider_plugin_id.into();
+        self.providers
+            .entry(provider_plugin_id.clone())
+            .or_insert_with(|| ProviderRegistration {
+                provider_plugin_id,
+                capabilities: None,
+                models: None,
+            });
+        self
+    }
+
+    /// Register provider capabilities.
+    #[must_use]
+    pub fn provider_capabilities(mut self, capabilities: ProviderCapabilities) -> Self {
+        let provider_plugin_id = capabilities.provider_id.clone();
+        let entry = self
+            .providers
+            .entry(provider_plugin_id.clone())
+            .or_insert_with(|| ProviderRegistration {
+                provider_plugin_id,
+                capabilities: None,
+                models: None,
+            });
+        entry.capabilities = Some(capabilities);
+        self
+    }
+
+    /// Register provider model metadata.
+    #[must_use]
+    pub fn provider_models(
+        mut self,
+        provider_plugin_id: impl Into<String>,
+        models: ModelList,
+    ) -> Self {
+        let provider_plugin_id = provider_plugin_id.into();
+        let entry = self
+            .providers
+            .entry(provider_plugin_id.clone())
+            .or_insert_with(|| ProviderRegistration {
+                provider_plugin_id,
+                capabilities: None,
+                models: None,
+            });
+        entry.models = Some(models);
+        self
+    }
+
+    /// Configure the default provider/model selector used by agents built from [`Bcode`].
+    #[must_use]
+    pub fn default_model(mut self, model: impl Into<ModelSelector>) -> Self {
+        self.default_model = Some(model.into());
+        self
+    }
+
+    /// Return the default model selector.
+    #[must_use]
+    pub const fn default_model_selector(&self) -> Option<&ModelSelector> {
+        self.default_model.as_ref()
+    }
+
+    /// Return a registered provider by plugin ID.
+    #[must_use]
+    pub fn provider_registration(&self, provider_plugin_id: &str) -> Option<&ProviderRegistration> {
+        self.providers.get(provider_plugin_id)
+    }
+
+    /// Return registered provider IDs.
+    pub fn provider_ids(&self) -> impl Iterator<Item = &str> {
+        self.providers.keys().map(String::as_str)
+    }
+
+    /// Return all registered providers.
+    pub fn providers(&self) -> impl Iterator<Item = &ProviderRegistration> {
+        self.providers.values()
+    }
+}
+
 /// Bcode SDK runtime mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum BcodeMode {
@@ -1493,6 +1598,7 @@ pub enum BcodeMode {
 pub struct Bcode {
     mode: BcodeMode,
     runtime: AgentRuntime,
+    provider_registry: ProviderRegistry,
     #[cfg(feature = "daemon-client")]
     daemon_client: Option<BcodeClient>,
     #[cfg(feature = "embedded-plugins")]
@@ -1524,7 +1630,23 @@ impl Bcode {
         } else {
             builder
         };
-        builder
+        if let Some(selector) = self.provider_registry.default_model_selector() {
+            builder.model_selector(selector.clone())
+        } else {
+            builder
+        }
+    }
+
+    /// Return the configured provider registry.
+    #[must_use]
+    pub const fn provider_registry(&self) -> &ProviderRegistry {
+        &self.provider_registry
+    }
+
+    /// Return the default model selector from the configured provider registry.
+    #[must_use]
+    pub const fn default_model_selector(&self) -> Option<&ModelSelector> {
+        self.provider_registry.default_model_selector()
     }
 
     /// Return the configured runtime mode.
@@ -1596,6 +1718,7 @@ impl Bcode {
 pub struct BcodeBuilder {
     mode: BcodeMode,
     runtime: AgentRuntime,
+    provider_registry: ProviderRegistry,
     #[cfg(feature = "daemon-client")]
     daemon_client: Option<BcodeClient>,
     #[cfg(feature = "embedded-plugins")]
@@ -1609,6 +1732,7 @@ impl Default for BcodeBuilder {
         Self {
             mode: BcodeMode::Embedded,
             runtime: AgentRuntime::new(),
+            provider_registry: ProviderRegistry::new(),
             #[cfg(feature = "daemon-client")]
             daemon_client: None,
             #[cfg(feature = "embedded-plugins")]
@@ -1631,6 +1755,27 @@ impl BcodeBuilder {
     #[must_use]
     pub const fn runtime(mut self, runtime: AgentRuntime) -> Self {
         self.runtime = runtime;
+        self
+    }
+
+    /// Configure the provider registry/defaults used by this SDK handle.
+    #[must_use]
+    pub fn provider_registry(mut self, provider_registry: ProviderRegistry) -> Self {
+        self.provider_registry = provider_registry;
+        self
+    }
+
+    /// Configure the default provider/model selector for agents built from this SDK handle.
+    #[must_use]
+    pub fn default_model(mut self, model: impl Into<ModelSelector>) -> Self {
+        self.provider_registry = self.provider_registry.default_model(model);
+        self
+    }
+
+    /// Register a provider plugin ID in this SDK handle's provider registry.
+    #[must_use]
+    pub fn provider(mut self, provider_plugin_id: impl Into<String>) -> Self {
+        self.provider_registry = self.provider_registry.provider(provider_plugin_id);
         self
     }
 
@@ -1662,10 +1807,11 @@ impl BcodeBuilder {
     /// Build the SDK handle.
     #[cfg(all(not(feature = "embedded-plugins"), not(feature = "daemon-client")))]
     #[must_use]
-    pub const fn build(self) -> Bcode {
+    pub fn build(self) -> Bcode {
         Bcode {
             mode: self.mode,
             runtime: self.runtime,
+            provider_registry: self.provider_registry,
         }
     }
 
@@ -1679,6 +1825,7 @@ impl BcodeBuilder {
         Bcode {
             mode: self.mode,
             runtime: self.runtime,
+            provider_registry: self.provider_registry,
             daemon_client,
         }
     }
@@ -1690,6 +1837,7 @@ impl BcodeBuilder {
         Bcode {
             mode: self.mode,
             runtime: self.runtime,
+            provider_registry: self.provider_registry,
             provider: self.provider,
             plugins: self.plugins,
         }
@@ -1705,6 +1853,7 @@ impl BcodeBuilder {
         Bcode {
             mode: self.mode,
             runtime: self.runtime,
+            provider_registry: self.provider_registry,
             daemon_client,
             provider: self.provider,
             plugins: self.plugins,

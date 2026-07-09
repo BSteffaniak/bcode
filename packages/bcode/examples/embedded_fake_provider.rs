@@ -8,7 +8,17 @@ async fn main() -> bcode::Result<()> {
     let plugins =
         PluginRuntimeHost::load_defaults_with_static_bundled(&selection, &static_plugins)?;
 
-    let bcode = Bcode::builder().plugin_runtime(plugins).build();
+    let bcode = Bcode::builder()
+        .plugin_runtime(plugins)
+        .provider("bcode.fake-provider")
+        .default_model("bcode.fake-provider:fake-echo")
+        .build();
+    println!(
+        "default model: {:?}",
+        bcode
+            .default_model_selector()
+            .map(|selector| selector.model_id())
+    );
     let capabilities = bcode.provider_capabilities("bcode.fake-provider").await?;
     let models = bcode.provider_models("bcode.fake-provider").await?;
     println!(
@@ -17,11 +27,7 @@ async fn main() -> bcode::Result<()> {
         models.models.len()
     );
 
-    let agent = bcode
-        .agent()
-        .name("embedded-fake-provider")
-        .model_selector("bcode.fake-provider:fake-echo")
-        .build();
+    let agent = bcode.agent().name("embedded-fake-provider").build();
 
     let response = agent.generate_text("hello embedded plugins").await?;
     println!("{}", response.text);
