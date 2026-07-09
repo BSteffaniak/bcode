@@ -6,7 +6,9 @@ use crate::eval_data::{
     format_number, load_repetition_artifact, run_avg_measurement, run_best_score, run_pass_rate,
     sum_variant_metric,
 };
-use bcode_eval_models::{EvalImprovementGeneration, EvalRepetitionResult};
+use bcode_eval_models::{
+    EvalImprovementGeneration, EvalImprovementObjective, EvalRepetitionResult,
+};
 use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface};
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::{Event, MouseEventKind};
@@ -288,6 +290,8 @@ pub struct EvalCampaignViewerSurface {
     generation_state: TableState,
     action_state: ActionRowState,
     selected_run_viewer: Option<EvalRunViewerSurface>,
+    detail_view: Option<EvalGenerationDetailSurface>,
+    view_mode: CampaignViewMode,
     status: String,
     table_area: Rect,
     action_area: Rect,
@@ -313,11 +317,14 @@ impl EvalCampaignViewerSurface {
                 .clone()
                 .unwrap_or_else(|| "n/a".to_string())
         );
+        let view_mode = CampaignViewMode::from_objective(data.campaign.objective);
         Ok(Self {
             data,
             generation_state: TableState::new(Some(0)),
             action_state: ActionRowState::new(),
             selected_run_viewer: None,
+            detail_view: None,
+            view_mode,
             status,
             table_area: Rect::new(0, 0, 0, 0),
             action_area: Rect::new(0, 0, 0, 0),
@@ -345,9 +352,27 @@ impl EvalCampaignViewerSurface {
         }
     }
 
+    fn open_selected_detail(&mut self) {
+        let Some(generation) = self.selected_generation().cloned() else {
+            self.status = "select a generation first".to_string();
+            return;
+        };
+        self.detail_view = Some(EvalGenerationDetailSurface::new(
+            self.data.clone(),
+            generation.id,
+        ));
+    }
+
+    fn cycle_view_mode(&mut self) {
+        self.view_mode = self.view_mode.next();
+        self.status = format!("view mode: {}", self.view_mode.label());
+    }
+
     fn handle_action(&mut self, action: &str) -> PluginTuiAction {
         match action {
+            "details" => self.open_selected_detail(),
             "open-run" => self.open_selected_run(),
+            "view-mode" => self.cycle_view_mode(),
             "refresh" => match EvalCampaignData::load(&self.data.campaign_dir) {
                 Ok(data) => {
                     self.data = data;
@@ -376,23 +401,27 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
             viewer.render(area, frame);
             return;
         }
+        if let Some(detail) = self.detail_view.as_mut() {
+            detail.render(area, frame);
+            return;
+        }
         render_header(
             area,
             frame,
-            &format!("Eval Campaign: {}", self.data.campaign.id),
+            &format!(
+                "Eval Campaign: {} — {}",
+                self.data.campaign.id,
+                self.view_mode.label()
+            ),
             &self.status,
         );
         let body = body_area(area);
         let (table_area, action_area, status_area) = split_body_actions(body);
         self.table_area = inset_top(table_area, 1);
         self.action_area = action_area;
-        render_panel_title(
-            table_area,
-            frame,
-            "Generation timeline — A=parent, B=current",
-        );
-        let columns = campaign_columns();
-        let rows = campaign_rows(&self.data);
+        render_panel_title(table_area, frame, "Generation timeline");
+        let columns = campaign_columns(self.view_mode);
+        let rows = campaign_rows(&self.data, self.view_mode);
         render_eval_table(
             frame,
             self.table_area,
@@ -404,7 +433,7 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
         render_status(
             status_area,
             frame,
-            "Enter opens the B run. Rows show deltas, A/B pass and score changes. Esc returns.",
+            "Enter details. O opens run. V cycles progression/comparison view. Esc returns.",
         );
     }
 
@@ -417,8 +446,16 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
             }
             return action;
         }
-        let columns = campaign_columns();
-        let rows = campaign_rows(&self.data);
+        if let Some(detail) = self.detail_view.as_mut() {
+            let action = detail.handle_event(event, host);
+            if matches!(action, PluginTuiAction::Close { .. }) {
+                self.detail_view = None;
+                return PluginTuiAction::Redraw;
+            }
+            return action;
+        }
+        let columns = campaign_columns(self.view_mode);
+        let rows = campaign_rows(&self.data, self.view_mode);
         if handle_eval_table_event(
             self.table_area,
             &columns,
@@ -440,7 +477,15 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
         if let Event::Key(stroke) = event {
             match stroke.key {
                 KeyCode::Enter => {
+                    self.open_selected_detail();
+                    return PluginTuiAction::Redraw;
+                }
+                KeyCode::Char('o') => {
                     self.open_selected_run();
+                    return PluginTuiAction::Redraw;
+                }
+                KeyCode::Char('v') => {
+                    self.cycle_view_mode();
                     return PluginTuiAction::Redraw;
                 }
                 KeyCode::Char('r') => return self.handle_action("refresh"),
@@ -451,6 +496,348 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
             }
         }
         PluginTuiAction::None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CampaignViewMode {
+    Progression,
+    ParentDelta,
+    BaselineDelta,
+    Comparison,
+}
+
+impl CampaignViewMode {
+    const fn from_objective(objective: EvalImprovementObjective) -> Self {
+        match objective {
+            EvalImprovementObjective::Progression => Self::Progression,
+            EvalImprovementObjective::ParentComparison => Self::ParentDelta,
+            EvalImprovementObjective::BaselineComparison => Self::BaselineDelta,
+            EvalImprovementObjective::VariantComparison => Self::Comparison,
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::Progression => Self::ParentDelta,
+            Self::ParentDelta => Self::BaselineDelta,
+            Self::BaselineDelta => Self::Comparison,
+            Self::Comparison => Self::Progression,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Progression => "Progression",
+            Self::ParentDelta => "Parent Δ",
+            Self::BaselineDelta => "Baseline Δ",
+            Self::Comparison => "Comparison",
+        }
+    }
+}
+
+/// Generation detail surface shown from a campaign timeline.
+pub struct EvalGenerationDetailSurface {
+    data: EvalCampaignData,
+    generation_id: String,
+    tab_state: TabBarState,
+    action_state: ActionRowState,
+    selected_run_viewer: Option<EvalRunViewerSurface>,
+    tab_area: Rect,
+    action_area: Rect,
+    status: String,
+}
+
+impl EvalGenerationDetailSurface {
+    fn new(data: EvalCampaignData, generation_id: String) -> Self {
+        Self {
+            status: "inspect generation details, delta, metrics, or run".to_string(),
+            data,
+            generation_id,
+            tab_state: TabBarState::new(Some(0)),
+            action_state: ActionRowState::new(),
+            selected_run_viewer: None,
+            tab_area: Rect::new(0, 0, 0, 0),
+            action_area: Rect::new(0, 0, 0, 0),
+        }
+    }
+
+    fn generation(&self) -> Option<&EvalImprovementGeneration> {
+        self.data
+            .generations
+            .iter()
+            .find(|generation| generation.id == self.generation_id)
+    }
+
+    fn open_run(&mut self) {
+        let Some(generation) = self.generation() else {
+            self.status = "generation not found".to_string();
+            return;
+        };
+        let Some(run_dir) = generation.run_dir.clone() else {
+            self.status = "generation has no run".to_string();
+            return;
+        };
+        match EvalRunViewerSurface::load(run_dir) {
+            Ok(viewer) => self.selected_run_viewer = Some(viewer),
+            Err(error) => self.status = format!("failed to open run: {error}"),
+        }
+    }
+
+    fn selected_tab(&self) -> GenerationDetailTab {
+        GenerationDetailTab::from_index(self.tab_state.selected().unwrap_or(0))
+    }
+
+    fn render_summary(&self, area: Rect, frame: &mut Frame<'_>) {
+        let Some(generation) = self.generation() else {
+            render_lines(area, frame, &[Line::from("generation not found")]);
+            return;
+        };
+        let current = self.data.generation_run(generation);
+        let parent = self
+            .data
+            .parent_generation(generation)
+            .and_then(|parent| self.data.generation_run(parent));
+        let baseline = self
+            .data
+            .generations
+            .iter()
+            .find(|candidate| candidate.id == self.data.campaign.baseline_generation_id)
+            .and_then(|baseline| self.data.generation_run(baseline));
+        let mut lines = vec![
+            Line::from_spans(vec![Span::styled(
+                format!("Generation {}", generation.id),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(format!("Change: {}", generation.delta.summary)),
+            Line::from(format!("Kind: {:?}", generation.delta.kind)),
+            Line::from(format!("Risk: {:?}", generation.delta.risk)),
+            Line::from(format!("Verdict: {:?}", generation.verdict.status)),
+            Line::from(""),
+            Line::from("Current performance"),
+        ];
+        lines.extend(metric_summary_lines(current.as_ref()));
+        lines.push(Line::from(""));
+        lines.push(Line::from(format!(
+            "vs parent: {} pass, {} score",
+            pass_delta_label(parent.as_ref(), current.as_ref()),
+            score_delta_label(parent.as_ref(), current.as_ref())
+        )));
+        lines.push(Line::from(format!(
+            "vs baseline: {} pass, {} score",
+            pass_delta_label(baseline.as_ref(), current.as_ref()),
+            score_delta_label(baseline.as_ref(), current.as_ref())
+        )));
+        render_lines(area, frame, &lines);
+    }
+
+    fn render_delta(&self, area: Rect, frame: &mut Frame<'_>) {
+        let Some(generation) = self.generation() else {
+            render_lines(area, frame, &[Line::from("generation not found")]);
+            return;
+        };
+        let mut lines = vec![
+            Line::from_spans(vec![Span::styled(
+                "What changed",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(format!("Summary: {}", generation.delta.summary)),
+            Line::from(format!("Kind: {:?}", generation.delta.kind)),
+            Line::from(format!("Risk: {:?}", generation.delta.risk)),
+        ];
+        if let Some(rationale) = &generation.delta.rationale {
+            lines.push(Line::from(""));
+            lines.push(Line::from("Rationale:"));
+            lines.extend(
+                rationale
+                    .lines()
+                    .map(|line| Line::from(format!("  {line}"))),
+            );
+        }
+        if !generation.delta.affected_surfaces.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from("Affected surfaces:"));
+            lines.extend(
+                generation
+                    .delta
+                    .affected_surfaces
+                    .iter()
+                    .map(|surface| Line::from(format!("  * {surface}"))),
+            );
+        }
+        if !generation.delta.affected_files.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from("Affected files:"));
+            lines.extend(
+                generation
+                    .delta
+                    .affected_files
+                    .iter()
+                    .map(|path| Line::from(format!("  * {}", path.display()))),
+            );
+        }
+        if let Some(patch_path) = &generation.delta.patch_path {
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!("Patch: {}", patch_path.display())));
+        }
+        if !generation.delta.overlay_paths.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from("Overlays:"));
+            lines.extend(
+                generation
+                    .delta
+                    .overlay_paths
+                    .iter()
+                    .map(|path| Line::from(format!("  * {}", path.display()))),
+            );
+        }
+        render_lines(area, frame, &lines);
+    }
+
+    fn render_metrics(&self, area: Rect, frame: &mut Frame<'_>) {
+        let Some(generation) = self.generation() else {
+            render_lines(area, frame, &[Line::from("generation not found")]);
+            return;
+        };
+        let current = self.data.generation_run(generation);
+        let parent = self
+            .data
+            .parent_generation(generation)
+            .and_then(|parent| self.data.generation_run(parent));
+        let rows = metric_comparison_rows(parent.as_ref(), current.as_ref());
+        render_eval_table(
+            frame,
+            area,
+            &metric_columns(),
+            &rows,
+            &TableState::new(None),
+        );
+    }
+}
+
+impl PluginTuiSurface for EvalGenerationDetailSurface {
+    fn id(&self) -> &'static str {
+        "bcode.eval-generation-detail"
+    }
+
+    fn title(&self) -> &'static str {
+        "Eval Generation"
+    }
+
+    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+        if let Some(viewer) = self.selected_run_viewer.as_mut() {
+            viewer.render(area, frame);
+            return;
+        }
+        render_header(
+            area,
+            frame,
+            &format!("Generation {}", self.generation_id),
+            &self.status,
+        );
+        let tabs = generation_detail_tabs();
+        self.tab_area = Rect::new(
+            area.x,
+            area.y.saturating_add(TITLE_HEIGHT),
+            area.width,
+            TAB_HEIGHT,
+        );
+        TabBar::new(&tabs)
+            .styles(eval_tab_styles())
+            .render(self.tab_area, &self.tab_state, frame);
+        let body = Rect::new(
+            area.x,
+            area.y.saturating_add(TITLE_HEIGHT + TAB_HEIGHT),
+            area.width,
+            area.height.saturating_sub(TITLE_HEIGHT + TAB_HEIGHT),
+        );
+        let (content_area, action_area, status_area) = split_body_actions(body);
+        self.action_area = action_area;
+        match self.selected_tab() {
+            GenerationDetailTab::Summary => self.render_summary(content_area, frame),
+            GenerationDetailTab::Delta => self.render_delta(content_area, frame),
+            GenerationDetailTab::Metrics => self.render_metrics(content_area, frame),
+        }
+        themed_action_row(&generation_detail_actions()).render_state(
+            action_area,
+            &self.action_state,
+            frame,
+        );
+        render_status(
+            status_area,
+            frame,
+            "Tab switches panes. O opens run. Esc returns.",
+        );
+    }
+
+    fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        if let Some(viewer) = self.selected_run_viewer.as_mut() {
+            let action = viewer.handle_event(event, host);
+            if matches!(action, PluginTuiAction::Close { .. }) {
+                self.selected_run_viewer = None;
+                return PluginTuiAction::Redraw;
+            }
+            return action;
+        }
+        let tabs = generation_detail_tabs();
+        match TabBar::new(&tabs).styles(eval_tab_styles()).handle_event(
+            self.tab_area,
+            &mut self.tab_state,
+            event,
+        ) {
+            TabBarOutcome::Selected(_) | TabBarOutcome::Redraw => return PluginTuiAction::Redraw,
+            TabBarOutcome::Ignored => {}
+        }
+        match themed_action_row(&generation_detail_actions()).handle_event(
+            self.action_area,
+            &mut self.action_state,
+            event,
+        ) {
+            ActionRowOutcome::Activated { id, .. } => match id.as_str() {
+                "open-run" => {
+                    self.open_run();
+                    return PluginTuiAction::Redraw;
+                }
+                "back" => return PluginTuiAction::Close { outcome: None },
+                _ => {}
+            },
+            outcome if outcome.needs_redraw() => return PluginTuiAction::Redraw,
+            _ => {}
+        }
+        if let Event::Key(stroke) = event {
+            match stroke.key {
+                KeyCode::Tab => {
+                    cycle_tab(&mut self.tab_state, generation_detail_tabs().len());
+                    return PluginTuiAction::Redraw;
+                }
+                KeyCode::Char('o') => {
+                    self.open_run();
+                    return PluginTuiAction::Redraw;
+                }
+                KeyCode::Char('q') | KeyCode::Escape => {
+                    return PluginTuiAction::Close { outcome: None };
+                }
+                _ => {}
+            }
+        }
+        PluginTuiAction::None
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GenerationDetailTab {
+    Summary,
+    Delta,
+    Metrics,
+}
+
+impl GenerationDetailTab {
+    const fn from_index(index: usize) -> Self {
+        match index {
+            1 => Self::Delta,
+            2 => Self::Metrics,
+            _ => Self::Summary,
+        }
     }
 }
 
@@ -2038,74 +2425,417 @@ fn overview_table_rows(
     rows
 }
 
-fn campaign_columns<'a>() -> Vec<TableColumn<'a>> {
-    vec![
-        TableColumn::new("Gen").fixed(8),
-        TableColumn::new("Parent").fixed(8),
-        TableColumn::new("Delta").flex(3),
-        TableColumn::new("A Pass").fixed(8).align(TableAlign::Right),
-        TableColumn::new("B Pass").fixed(8).align(TableAlign::Right),
-        TableColumn::new("Score Δ")
-            .fixed(9)
-            .align(TableAlign::Right),
-        TableColumn::new("Cost Δ").fixed(9).align(TableAlign::Right),
-        TableColumn::new("Tokens Δ")
-            .fixed(10)
-            .align(TableAlign::Right),
-        TableColumn::new("Verdict").fixed(12),
-    ]
+fn campaign_columns<'a>(mode: CampaignViewMode) -> Vec<TableColumn<'a>> {
+    match mode {
+        CampaignViewMode::Progression => vec![
+            TableColumn::new("Gen").fixed(8),
+            TableColumn::new("Change").flex(3),
+            TableColumn::new("Pass").fixed(8).align(TableAlign::Right),
+            TableColumn::new("Score").fixed(8).align(TableAlign::Right),
+            TableColumn::new("Cost").fixed(9).align(TableAlign::Right),
+            TableColumn::new("Tokens")
+                .fixed(10)
+                .align(TableAlign::Right),
+            TableColumn::new("Latency")
+                .fixed(10)
+                .align(TableAlign::Right),
+            TableColumn::new("Δ Parent")
+                .fixed(10)
+                .align(TableAlign::Right),
+            TableColumn::new("Verdict").fixed(12),
+        ],
+        CampaignViewMode::ParentDelta | CampaignViewMode::BaselineDelta => vec![
+            TableColumn::new("Gen").fixed(8),
+            TableColumn::new("Change").flex(3),
+            TableColumn::new("Pass Δ").fixed(9).align(TableAlign::Right),
+            TableColumn::new("Score Δ")
+                .fixed(9)
+                .align(TableAlign::Right),
+            TableColumn::new("Cost Δ").fixed(9).align(TableAlign::Right),
+            TableColumn::new("Tokens Δ")
+                .fixed(10)
+                .align(TableAlign::Right),
+            TableColumn::new("Latency Δ")
+                .fixed(11)
+                .align(TableAlign::Right),
+            TableColumn::new("Verdict").fixed(12),
+        ],
+        CampaignViewMode::Comparison => vec![
+            TableColumn::new("Gen").fixed(8),
+            TableColumn::new("Parent").fixed(8),
+            TableColumn::new("Change").flex(3),
+            TableColumn::new("Parent Pass")
+                .fixed(12)
+                .align(TableAlign::Right),
+            TableColumn::new("Current Pass")
+                .fixed(13)
+                .align(TableAlign::Right),
+            TableColumn::new("Score Δ")
+                .fixed(9)
+                .align(TableAlign::Right),
+            TableColumn::new("Verdict").fixed(12),
+        ],
+    }
 }
 
-fn campaign_rows(data: &EvalCampaignData) -> Vec<TableRow> {
+fn campaign_rows(data: &EvalCampaignData, mode: CampaignViewMode) -> Vec<TableRow> {
     data.generations
         .iter()
-        .map(|generation| {
-            let current = data.generation_run(generation);
-            let parent = data
-                .parent_generation(generation)
-                .and_then(|parent| data.generation_run(parent));
-            let a_pass = parent.as_ref().map_or_else(
-                || "—".to_string(),
-                |run| format!("{:.1}%", run_pass_rate(&run.result) * 100.0),
-            );
-            let b_pass = current.as_ref().map_or_else(
-                || "—".to_string(),
-                |run| format!("{:.1}%", run_pass_rate(&run.result) * 100.0),
-            );
-            let score_delta = match (parent.as_ref(), current.as_ref()) {
-                (Some(parent), Some(current)) => {
-                    format_signed(run_best_score(&current.result) - run_best_score(&parent.result))
-                }
-                _ => "—".to_string(),
-            };
-            let cost_delta = metric_delta(parent.as_ref(), current.as_ref(), "estimated_cost_usd")
-                .map_or_else(|| "—".to_string(), format_signed);
-            let token_delta = metric_delta(parent.as_ref(), current.as_ref(), "total_tokens")
-                .map_or_else(|| "—".to_string(), format_signed_number);
-            string_row(vec![
-                generation.id.clone(),
-                generation
-                    .parent_id
-                    .clone()
-                    .unwrap_or_else(|| "—".to_string()),
-                generation.delta.summary.clone(),
-                a_pass,
-                b_pass,
-                score_delta,
-                cost_delta,
-                token_delta,
-                format!("{:?}", generation.verdict.status),
-            ])
+        .map(|generation| match mode {
+            CampaignViewMode::Progression => campaign_progression_row(data, generation),
+            CampaignViewMode::ParentDelta => {
+                campaign_delta_row(data, generation, data.parent_generation(generation))
+            }
+            CampaignViewMode::BaselineDelta => {
+                let baseline = data
+                    .generations
+                    .iter()
+                    .find(|candidate| candidate.id == data.campaign.baseline_generation_id);
+                campaign_delta_row(data, generation, baseline)
+            }
+            CampaignViewMode::Comparison => campaign_comparison_row(data, generation),
         })
         .collect()
 }
 
+fn campaign_progression_row(
+    data: &EvalCampaignData,
+    generation: &EvalImprovementGeneration,
+) -> TableRow {
+    let current = data.generation_run(generation);
+    let parent = data
+        .parent_generation(generation)
+        .and_then(|parent| data.generation_run(parent));
+    string_row(vec![
+        generation.id.clone(),
+        generation.delta.summary.clone(),
+        current.as_ref().map_or_else(
+            || "—".to_string(),
+            |run| format_percent(run_pass_rate(&run.result)),
+        ),
+        current.as_ref().map_or_else(
+            || "—".to_string(),
+            |run| format_score(run_best_score(&run.result)),
+        ),
+        current
+            .as_ref()
+            .and_then(|run| run_avg_measurement(&run.result, "estimated_cost_usd"))
+            .map_or_else(|| "—".to_string(), format_cost),
+        current
+            .as_ref()
+            .and_then(|run| run_avg_measurement(&run.result, "total_tokens"))
+            .map_or_else(|| "—".to_string(), format_number),
+        current
+            .as_ref()
+            .and_then(|run| run_avg_measurement(&run.result, "wall_time_ms"))
+            .map_or_else(|| "—".to_string(), format_duration_ms),
+        pass_delta(parent.as_ref(), current.as_ref())
+            .map_or_else(|| "—".to_string(), format_signed_percent),
+        format!("{:?}", generation.verdict.status),
+    ])
+}
+
+fn campaign_delta_row(
+    data: &EvalCampaignData,
+    generation: &EvalImprovementGeneration,
+    comparison: Option<&EvalImprovementGeneration>,
+) -> TableRow {
+    let current = data.generation_run(generation);
+    let compare = comparison.and_then(|generation| data.generation_run(generation));
+    string_row(vec![
+        generation.id.clone(),
+        generation.delta.summary.clone(),
+        pass_delta(compare.as_ref(), current.as_ref())
+            .map_or_else(|| "—".to_string(), format_signed_percent),
+        score_delta(compare.as_ref(), current.as_ref())
+            .map_or_else(|| "—".to_string(), format_signed),
+        metric_delta(compare.as_ref(), current.as_ref(), "estimated_cost_usd")
+            .map_or_else(|| "—".to_string(), format_signed_cost),
+        metric_delta(compare.as_ref(), current.as_ref(), "total_tokens")
+            .map_or_else(|| "—".to_string(), format_signed_number),
+        metric_delta(compare.as_ref(), current.as_ref(), "wall_time_ms")
+            .map_or_else(|| "—".to_string(), format_signed_duration),
+        format!("{:?}", generation.verdict.status),
+    ])
+}
+
+fn campaign_comparison_row(
+    data: &EvalCampaignData,
+    generation: &EvalImprovementGeneration,
+) -> TableRow {
+    let current = data.generation_run(generation);
+    let parent_generation = data.parent_generation(generation);
+    let parent = parent_generation.and_then(|parent| data.generation_run(parent));
+    string_row(vec![
+        generation.id.clone(),
+        generation
+            .parent_id
+            .clone()
+            .unwrap_or_else(|| "—".to_string()),
+        generation.delta.summary.clone(),
+        parent.as_ref().map_or_else(
+            || "—".to_string(),
+            |run| format_percent(run_pass_rate(&run.result)),
+        ),
+        current.as_ref().map_or_else(
+            || "—".to_string(),
+            |run| format_percent(run_pass_rate(&run.result)),
+        ),
+        score_delta(parent.as_ref(), current.as_ref())
+            .map_or_else(|| "—".to_string(), format_signed),
+        format!("{:?}", generation.verdict.status),
+    ])
+}
+
 fn campaign_actions() -> Vec<ActionButton> {
     vec![
-        ActionButton::new("open-run", "Enter Open B Run"),
+        ActionButton::new("details", "Enter Details"),
+        ActionButton::new("open-run", "O Open Run"),
+        ActionButton::new("view-mode", "V View"),
         ActionButton::new("refresh", "R Refresh"),
         ActionButton::new("back", "Esc Back"),
     ]
+}
+
+fn generation_detail_tabs() -> Vec<TabItem<'static>> {
+    vec![
+        TabItem::new("summary", "Summary"),
+        TabItem::new("delta", "Delta"),
+        TabItem::new("metrics", "Metrics"),
+    ]
+}
+
+fn generation_detail_actions() -> Vec<ActionButton> {
+    vec![
+        ActionButton::new("open-run", "O Open Run"),
+        ActionButton::new("back", "Esc Back"),
+    ]
+}
+
+fn metric_columns<'a>() -> Vec<TableColumn<'a>> {
+    vec![
+        TableColumn::new("Metric").flex(2),
+        TableColumn::new("Parent")
+            .fixed(12)
+            .align(TableAlign::Right),
+        TableColumn::new("Current")
+            .fixed(12)
+            .align(TableAlign::Right),
+        TableColumn::new("Delta").fixed(12).align(TableAlign::Right),
+    ]
+}
+
+fn metric_comparison_rows(
+    parent: Option<&EvalRunData>,
+    current: Option<&EvalRunData>,
+) -> Vec<TableRow> {
+    vec![
+        metric_comparison_required_row(
+            "Pass rate",
+            parent,
+            current,
+            pass_value,
+            format_percent,
+            format_signed_percent,
+        ),
+        metric_comparison_required_row(
+            "Score",
+            parent,
+            current,
+            score_value,
+            format_score,
+            format_signed,
+        ),
+        metric_comparison_row(
+            "Cost",
+            parent,
+            current,
+            cost_value,
+            format_cost,
+            format_signed_cost,
+        ),
+        metric_comparison_row(
+            "Tokens",
+            parent,
+            current,
+            token_value,
+            format_number,
+            format_signed_number,
+        ),
+        metric_comparison_row(
+            "Latency",
+            parent,
+            current,
+            latency_value,
+            format_duration_ms,
+            format_signed_duration,
+        ),
+    ]
+}
+
+fn metric_comparison_row(
+    label: &str,
+    parent: Option<&EvalRunData>,
+    current: Option<&EvalRunData>,
+    value: fn(&EvalRunData) -> Option<f64>,
+    format: fn(f64) -> String,
+    format_delta: fn(f64) -> String,
+) -> TableRow {
+    let parent_value = parent.and_then(value);
+    let current_value = current.and_then(value);
+    string_row(vec![
+        label.to_string(),
+        parent_value.map_or_else(|| "—".to_string(), format),
+        current_value.map_or_else(|| "—".to_string(), format),
+        parent_value.zip(current_value).map_or_else(
+            || "—".to_string(),
+            |(parent, current)| format_delta(current - parent),
+        ),
+    ])
+}
+
+fn metric_comparison_required_row(
+    label: &str,
+    parent: Option<&EvalRunData>,
+    current: Option<&EvalRunData>,
+    value: fn(&EvalRunData) -> f64,
+    format: fn(f64) -> String,
+    format_delta: fn(f64) -> String,
+) -> TableRow {
+    let parent_value = parent.map(value);
+    let current_value = current.map(value);
+    string_row(vec![
+        label.to_string(),
+        parent_value.map_or_else(|| "—".to_string(), format),
+        current_value.map_or_else(|| "—".to_string(), format),
+        parent_value.zip(current_value).map_or_else(
+            || "—".to_string(),
+            |(parent, current)| format_delta(current - parent),
+        ),
+    ])
+}
+
+fn metric_summary_lines(current: Option<&EvalRunData>) -> Vec<Line> {
+    vec![
+        Line::from(format!(
+            "  Pass: {}",
+            current.map_or_else(|| "—".to_string(), |run| format_percent(pass_value(run)))
+        )),
+        Line::from(format!(
+            "  Score: {}",
+            current.map_or_else(|| "—".to_string(), |run| format_score(score_value(run)))
+        )),
+        Line::from(format!(
+            "  Cost: {}",
+            current
+                .and_then(cost_value)
+                .map_or_else(|| "—".to_string(), format_cost)
+        )),
+        Line::from(format!(
+            "  Tokens: {}",
+            current
+                .and_then(token_value)
+                .map_or_else(|| "—".to_string(), format_number)
+        )),
+        Line::from(format!(
+            "  Latency: {}",
+            current
+                .and_then(latency_value)
+                .map_or_else(|| "—".to_string(), format_duration_ms)
+        )),
+    ]
+}
+
+fn pass_value(run: &EvalRunData) -> f64 {
+    run_pass_rate(&run.result)
+}
+
+fn score_value(run: &EvalRunData) -> f64 {
+    run_best_score(&run.result)
+}
+
+fn cost_value(run: &EvalRunData) -> Option<f64> {
+    run_avg_measurement(&run.result, "estimated_cost_usd")
+}
+
+fn token_value(run: &EvalRunData) -> Option<f64> {
+    run_avg_measurement(&run.result, "total_tokens")
+}
+
+fn latency_value(run: &EvalRunData) -> Option<f64> {
+    run_avg_measurement(&run.result, "wall_time_ms")
+}
+
+fn pass_delta(parent: Option<&EvalRunData>, current: Option<&EvalRunData>) -> Option<f64> {
+    Some(pass_value(current?) - pass_value(parent?))
+}
+
+fn score_delta(parent: Option<&EvalRunData>, current: Option<&EvalRunData>) -> Option<f64> {
+    Some(score_value(current?) - score_value(parent?))
+}
+
+fn pass_delta_label(parent: Option<&EvalRunData>, current: Option<&EvalRunData>) -> String {
+    pass_delta(parent, current).map_or_else(|| "—".to_string(), format_signed_percent)
+}
+
+fn score_delta_label(parent: Option<&EvalRunData>, current: Option<&EvalRunData>) -> String {
+    score_delta(parent, current).map_or_else(|| "—".to_string(), format_signed)
+}
+
+fn render_lines(area: Rect, frame: &mut Frame<'_>, lines: &[Line]) {
+    for (row, line) in lines.iter().take(usize::from(area.height)).enumerate() {
+        frame.write_line_with_fallback_style(
+            Rect::new(
+                area.x,
+                area.y.saturating_add(usize_to_u16(row)),
+                area.width,
+                1,
+            ),
+            line,
+            Style::new().bg(PANEL),
+        );
+    }
+}
+
+fn cycle_tab(state: &mut TabBarState, len: usize) {
+    let next = (state.selected().unwrap_or(0) + 1) % len.max(1);
+    state.set_selected(Some(next));
+}
+
+fn format_percent(value: f64) -> String {
+    format!("{:.1}%", value * 100.0)
+}
+
+fn format_signed_percent(value: f64) -> String {
+    if value >= 0.0 {
+        format!("+{:.1}%", value * 100.0)
+    } else {
+        format!("{:.1}%", value * 100.0)
+    }
+}
+
+fn format_score(value: f64) -> String {
+    format!("{value:.3}")
+}
+
+fn format_cost(value: f64) -> String {
+    format!("${value:.3}")
+}
+
+fn format_signed_cost(value: f64) -> String {
+    if value >= 0.0 {
+        format!("+${value:.3}")
+    } else {
+        format!("-${:.3}", value.abs())
+    }
+}
+
+fn format_signed_duration(value: f64) -> String {
+    if value >= 0.0 {
+        format!("+{}", format_duration_ms(value))
+    } else {
+        format!("-{}", format_duration_ms(value.abs()))
+    }
 }
 
 fn metric_delta(

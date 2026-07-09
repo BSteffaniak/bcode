@@ -16,9 +16,9 @@ use bcode_eval_models::{
     EvalCase, EvalCaseRunResult, EvalComparisonReport, EvalComparisonVariant, EvalDiagnostic,
     EvalDiagnosticSeverity, EvalExecutorKind, EvalImprovementCampaign, EvalImprovementDelta,
     EvalImprovementDeltaKind, EvalImprovementGeneration, EvalImprovementMetricDelta,
-    EvalImprovementMetricDeltaSet, EvalImprovementRisk, EvalImprovementVerdict,
-    EvalImprovementVerdictStatus, EvalIsolation, EvalJudgeConfig, EvalJudgeResult,
-    EvalMeasurementSet, EvalMetricDirection, EvalObservation, EvalRegexTarget,
+    EvalImprovementMetricDeltaSet, EvalImprovementObjective, EvalImprovementRisk,
+    EvalImprovementVerdict, EvalImprovementVerdictStatus, EvalIsolation, EvalJudgeConfig,
+    EvalJudgeResult, EvalMeasurementSet, EvalMetricDirection, EvalObservation, EvalRegexTarget,
     EvalRegressionReport, EvalRepetitionResult, EvalRunManifest, EvalRunResult, EvalSuite,
     EvalVariant, EvalVariantRunResult,
 };
@@ -1546,6 +1546,8 @@ pub struct EvalImprovementStartOptions {
     pub name: Option<String>,
     /// Optional baseline run directory or summary path.
     pub baseline_run: Option<PathBuf>,
+    /// Campaign objective/display lens.
+    pub objective: EvalImprovementObjective,
 }
 
 /// Options for manually recording an improvement generation.
@@ -1613,6 +1615,7 @@ pub fn start_improvement_campaign(
         baseline_generation_id: "0000-baseline".to_string(),
         latest_generation_id: Some("0000-baseline".to_string()),
         best_generation_id: Some("0000-baseline".to_string()),
+        objective: options.objective,
         metadata: BTreeMap::new(),
     };
     let generation = EvalImprovementGeneration {

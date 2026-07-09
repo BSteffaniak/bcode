@@ -1306,6 +1306,9 @@ enum EvalImproveCommand {
         /// Optional baseline run directory or summary.json path.
         #[arg(long)]
         baseline_run: Option<PathBuf>,
+        /// Objective: progression, parent-comparison, baseline-comparison, or variant-comparison.
+        #[arg(long, default_value = "progression")]
+        objective: String,
     },
     /// Record a manual generation with an optional run and patch.
     Record {
@@ -1538,6 +1541,7 @@ fn handle_eval_improve_command(command: EvalImproveCommand) -> Result<(), CliErr
             campaign_id,
             name,
             baseline_run,
+            objective,
         } => {
             let campaign = bcode_eval::start_improvement_campaign(
                 suite,
@@ -1546,6 +1550,7 @@ fn handle_eval_improve_command(command: EvalImproveCommand) -> Result<(), CliErr
                     campaign_id,
                     name,
                     baseline_run,
+                    objective: parse_improvement_objective(&objective)?,
                 },
             )?;
             println!("improvement campaign: {}", campaign.id);
@@ -1628,6 +1633,21 @@ fn parse_improvement_risk(value: &str) -> Result<bcode_eval_models::EvalImprovem
         "high" => Ok(Risk::High),
         _ => Err(CliError::EvalCheckFailed(format!(
             "unknown improvement risk: {value}"
+        ))),
+    }
+}
+
+fn parse_improvement_objective(
+    value: &str,
+) -> Result<bcode_eval_models::EvalImprovementObjective, CliError> {
+    use bcode_eval_models::EvalImprovementObjective as Objective;
+    match value {
+        "progression" => Ok(Objective::Progression),
+        "parent-comparison" | "parent_comparison" => Ok(Objective::ParentComparison),
+        "baseline-comparison" | "baseline_comparison" => Ok(Objective::BaselineComparison),
+        "variant-comparison" | "variant_comparison" => Ok(Objective::VariantComparison),
+        _ => Err(CliError::EvalCheckFailed(format!(
+            "unknown improvement objective: {value}"
         ))),
     }
 }

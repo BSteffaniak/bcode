@@ -649,9 +649,27 @@ pub struct EvalImprovementCampaign {
     /// Best known generation id.
     #[serde(default)]
     pub best_generation_id: Option<String>,
+    /// Campaign objective used as the default viewer lens.
+    #[serde(default)]
+    pub objective: EvalImprovementObjective,
     /// Arbitrary campaign metadata.
     #[serde(default)]
     pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+/// Campaign objective/display lens for eval improvement history.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvalImprovementObjective {
+    /// Track improvement over generations.
+    #[default]
+    Progression,
+    /// Emphasize each generation's delta from its parent.
+    ParentComparison,
+    /// Emphasize each generation's delta from the baseline.
+    BaselineComparison,
+    /// Compare selected variants/generations.
+    VariantComparison,
 }
 
 /// Generation record for one eval improvement attempt.
