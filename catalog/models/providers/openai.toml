@@ -3,8 +3,10 @@ display_name = "OpenAI"
 kind = "open_ai_compatible"
 website_url = "https://openai.com"
 default_model_id = "gpt-4.1-mini"
-default_codex_model_id = "gpt-5.5"
+default_codex_model_id = "gpt-5.6-sol"
 fallback_model_ids = [
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
   "gpt-5.5",
   "gpt-5.4",
   "gpt-5.4-mini",
@@ -371,6 +373,105 @@ native_web_search = true
 
 [models."o4-mini".reasoning]
 effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
+
+[models."gpt-5.6-sol"]
+model_id = "gpt-5.6-sol"
+display_name = "GPT-5.6 Sol"
+aliases = ["gpt-5.6", "gpt-5.6-sol*"]
+status = "stable"
+bcode_support = "supported"
+family = "gpt-5.6"
+context_window = 1050000
+max_output_tokens = 128000
+supported_by = [{ provider = "openai", auth_mode = "chatgpt_subscription", api_surface = "chatgpt_codex", integration = "bcode" }]
+
+[models."gpt-5.6-sol".pricing]
+currency = "USD"
+unit = "per_million_tokens"
+input_micros = 5000000
+output_micros = 30000000
+
+[models."gpt-5.6-sol".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+native_web_search = true
+
+[models."gpt-5.6-sol".reasoning]
+effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
+
+[models."gpt-5.6-terra"]
+model_id = "gpt-5.6-terra"
+display_name = "GPT-5.6 Terra"
+aliases = ["gpt-5.6-terra*"]
+status = "stable"
+bcode_support = "supported"
+family = "gpt-5.6"
+context_window = 1050000
+max_output_tokens = 128000
+supported_by = [{ provider = "openai", auth_mode = "chatgpt_subscription", api_surface = "chatgpt_codex", integration = "bcode" }]
+
+[models."gpt-5.6-terra".pricing]
+currency = "USD"
+unit = "per_million_tokens"
+input_micros = 2500000
+output_micros = 15000000
+
+[models."gpt-5.6-terra".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+native_web_search = true
+
+[models."gpt-5.6-terra".reasoning]
+effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
+
+[models."gpt-5.6-luna"]
+model_id = "gpt-5.6-luna"
+display_name = "GPT-5.6 Luna"
+aliases = ["gpt-5.6-luna*"]
+status = "stable"
+bcode_support = "supported"
+family = "gpt-5.6"
+context_window = 1050000
+max_output_tokens = 128000
+supported_by = [{ provider = "openai", auth_mode = "chatgpt_subscription", api_surface = "chatgpt_codex", integration = "bcode" }]
+
+[models."gpt-5.6-luna".pricing]
+currency = "USD"
+unit = "per_million_tokens"
+input_micros = 1000000
+output_micros = 6000000
+
+[models."gpt-5.6-luna".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+native_web_search = true
+
+[models."gpt-5.6-luna".reasoning]
+effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
 default_effort = "medium"
 summary_values = ["auto", "concise", "detailed"]
 default_summary = "auto"
