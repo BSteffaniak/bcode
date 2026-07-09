@@ -86,6 +86,8 @@ pub enum CliError {
     Plugin(#[from] bcode_plugin::PluginLoadError),
     #[error("plugin service call error: {0}")]
     PluginServiceCall(#[from] bcode_plugin::PluginServiceCallError),
+    #[error("Web renderer error: {0}")]
+    WebRender(String),
     #[error("sshenv error: {0}")]
     Sshenv(String),
     #[error("interrupted: {0}")]
@@ -203,6 +205,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Blims { command } => blims::handle_blims_command(command).await?,
         Commands::Eval { command } => Box::pin(handle_eval_command(command)).await?,
         Commands::Metrics { path, repo } => bcode_tui::run_metrics_dashboard(repo, path).await?,
+        Commands::Web => handle_web_command().await?,
         Commands::Review { command } => Box::pin(handle_review_command(command)).await?,
         Commands::Ralph { repo } => handle_ralph_command(repo).await?,
         Commands::Plugin { command } => handle_plugin_command(command).await?,
@@ -257,6 +260,18 @@ async fn handle_plugin_command(command: PluginCommand) -> Result<(), CliError> {
             payload,
         } => publish_plugin_event(&root, &topic, payload, daemon).await?,
     }
+    Ok(())
+}
+
+async fn handle_web_command() -> Result<(), CliError> {
+    let state = bcode_web_render::WebRenderState::new(BcodeClient::default_endpoint());
+    let builder = bcode_web_render::init(&state)
+        .await?
+        .with_viewport(bcode_web_render::VIEWPORT.clone());
+    let app = bcode_web_render::build_app(builder)
+        .map_err(|error| CliError::WebRender(error.to_string()))?;
+    app.handle_serve()
+        .map_err(|error| CliError::WebRender(error.to_string()))?;
     Ok(())
 }
 
@@ -489,6 +504,7 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
         | Commands::Blims { .. }
         | Commands::Eval { .. }
         | Commands::Metrics { .. }
+        | Commands::Web
         | Commands::Review { .. }
         | Commands::Ralph { .. }
         | Commands::Plugin { .. }
@@ -987,6 +1003,8 @@ enum Commands {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
+    /// Serve the `HyperChad` web renderer.
+    Web,
     Review {
         #[command(subcommand)]
         command: Option<ReviewCommand>,

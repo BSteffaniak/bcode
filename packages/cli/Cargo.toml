@@ -11,44 +11,50 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-base64                       = { workspace = true }
-bcode_client                 = { workspace = true }
-bcode_code_review_models     = { workspace = true }
-bcode_config                 = { workspace = true }
-bcode_daemon_lifecycle       = { workspace = true }
-bcode_eval                   = { workspace = true }
-bcode_eval_models            = { workspace = true }
-bcode_ipc                    = { workspace = true }
-bcode_metrics                = { workspace = true }
-bcode_model                  = { workspace = true }
+base64 = { workspace = true }
+bcode_client = { workspace = true }
+bcode_code_review_models = { workspace = true }
+bcode_config = { workspace = true }
+bcode_daemon_lifecycle = { workspace = true }
+bcode_eval = { workspace = true }
+bcode_eval_models = { workspace = true }
+bcode_ipc = { workspace = true }
+bcode_metrics = { workspace = true }
+bcode_model = { workspace = true }
 bcode_model_provider_runtime = { workspace = true }
-bcode_plugin                 = { workspace = true }
-bcode_provider_auth          = { workspace = true }
-bcode_server                 = { workspace = true }
-bcode_session                = { workspace = true }
-bcode_session_import         = { workspace = true }
-bcode_session_models         = { workspace = true }
-bcode_settings               = { workspace = true }
-bcode_skill                  = { workspace = true }
-bcode_skill_models           = { workspace = true }
-bcode_tui                    = { workspace = true }
-bcode_worktree_models        = { workspace = true }
-bmux_keyboard                = { workspace = true }
-bmux_tui                     = { workspace = true, features = ["crossterm"] }
-clap                         = { workspace = true, features = ["derive", "help", "std", "usage"] }
-crossterm                    = { workspace = true, features = ["events"] }
-rand                         = { workspace = true }
-reqwest                      = { workspace = true }
-rpassword                    = { workspace = true }
-serde                        = { workspace = true, features = ["derive"] }
-serde_json                   = { workspace = true }
-sha2                         = { workspace = true }
-sshenv_vault                 = { workspace = true }
-thiserror                    = { workspace = true }
-tokio                        = { workspace = true, features = ["signal", "time"] }
-tracing                      = { workspace = true }
-tracing-subscriber           = { workspace = true }
-zeroize                      = { workspace = true }
+bcode_plugin = { workspace = true }
+bcode_provider_auth = { workspace = true }
+bcode_server = { workspace = true }
+bcode_session = { workspace = true }
+bcode_session_import = { workspace = true }
+bcode_session_models = { workspace = true }
+bcode_settings = { workspace = true }
+bcode_skill = { workspace = true }
+bcode_skill_models = { workspace = true }
+bcode_tui = { workspace = true }
+bcode_web_render = { workspace = true, features = [
+    "actix",
+    "assets",
+    "html",
+    "static-routes",
+] }
+bcode_worktree_models = { workspace = true }
+bmux_keyboard = { workspace = true }
+bmux_tui = { workspace = true, features = ["crossterm"] }
+clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
+crossterm = { workspace = true, features = ["events"] }
+rand = { workspace = true }
+reqwest = { workspace = true }
+rpassword = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sshenv_vault = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["signal", "time"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+zeroize = { workspace = true }
 
 [features]
 _static-bundled = []

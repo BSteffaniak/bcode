@@ -1,0 +1,36 @@
+[package]
+authors     = { workspace = true }
+categories  = ["web-programming"]
+description = "HyperChad web renderer for Bcode sessions"
+edition     = { workspace = true }
+keywords    = ["bcode", "web", "renderer"]
+license     = { workspace = true }
+name        = "bcode_web_render"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+
+[dependencies]
+bcode_client = { workspace = true }
+bcode_session_models = { workspace = true }
+bcode_session_view = { workspace = true }
+bcode_session_view_models = { workspace = true }
+bcode_web_render_ui = { workspace = true }
+hyperchad = { workspace = true, features = [
+    "app",
+    "color",
+    "json",
+    "renderer",
+    "router",
+] }
+serde_json = { workspace = true }
+
+[features]
+actix            = ["hyperchad/renderer-html-actix"]
+assets           = ["hyperchad/renderer-assets"]
+default          = ["actix", "html", "assets", "static-routes"]
+fail-on-warnings = ["bcode_web_render_ui/fail-on-warnings"]
+html             = ["hyperchad/renderer-html"]
+static-routes    = ["hyperchad/router-static-routes"]

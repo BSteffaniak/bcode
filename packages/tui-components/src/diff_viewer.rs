@@ -393,7 +393,7 @@ fn apply_syntax_highlighting(label: &str, lines: &mut [DiffLine]) {
 }
 
 #[cfg(not(feature = "syntax"))]
-fn apply_syntax_highlighting(_label: &str, _lines: &mut [DiffLine]) {}
+const fn apply_syntax_highlighting(_label: &str, _lines: &mut [DiffLine]) {}
 
 fn lcs_table(old_lines: &[&str], new_lines: &[&str]) -> Vec<Vec<usize>> {
     let mut table =
