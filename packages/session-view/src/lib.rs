@@ -7,6 +7,10 @@
 //! This crate owns the application of durable and live session events into semantic view state that
 //! terminal, web, and future renderers can consume without inheriting terminal layout concerns.
 
+mod actions;
+
+pub use actions::execute_session_view_action;
+
 use bcode_session_models::{
     SessionEvent, SessionEventKind, SessionId, SessionLiveEvent, SessionLiveEventKind,
     ToolInvocationProjection, ToolInvocationStreamEvent, apply_tool_invocation_projection_event,

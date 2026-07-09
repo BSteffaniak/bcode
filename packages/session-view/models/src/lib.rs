@@ -467,6 +467,50 @@ pub struct InteractionViewSummary {
     pub turn_behavior: InteractiveToolTurnBehavior,
 }
 
+/// Prompt placement semantics for renderer-neutral prompt submission.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptPlacementView {
+    /// Insert the prompt at the next safe conversation boundary.
+    #[default]
+    Steering,
+    /// Queue the prompt as a follow-up turn after the active turn finishes.
+    FollowUp,
+}
+
+/// Composer draft scope for renderer-neutral draft updates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ComposerDraftViewScope {
+    /// Draft belongs to a persisted session.
+    Session { session_id: SessionId },
+    /// Draft belongs to the unsaved draft session for the launch working directory.
+    DraftSession { launch_working_directory: PathBuf },
+}
+
+/// Result of executing a renderer-neutral session action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionViewActionOutcome {
+    /// No response payload is required.
+    None,
+    /// A prompt was accepted and may have created a session.
+    MessageAccepted {
+        /// Session that received the message.
+        session_id: SessionId,
+        /// Whether the message was queued.
+        queued: bool,
+        /// Queue position, when queued.
+        queue_position: Option<usize>,
+    },
+    /// Cancellation request result.
+    Cancelled { cancelled: bool },
+    /// Permission resolution result.
+    PermissionResolved { resolved: bool },
+    /// Interaction input response as generic JSON.
+    InteractionInput { response: serde_json::Value },
+}
+
 /// Semantic renderer action shared by terminal, web, and future renderers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -475,8 +519,12 @@ pub enum SessionViewAction {
     SubmitMessage {
         /// Target session, when already attached.
         session_id: Option<SessionId>,
+        /// Working directory to use when a draft/new session must be created.
+        launch_working_directory: Option<PathBuf>,
         /// Prompt text.
         text: String,
+        /// Prompt placement semantics.
+        placement: PromptPlacementView,
     },
     /// Cancel the active model turn.
     CancelTurn {
@@ -508,8 +556,8 @@ pub enum SessionViewAction {
     },
     /// Update the local composer draft.
     UpdateDraft {
-        /// Target session if persisted, otherwise `None` for launch-local draft.
-        session_id: Option<SessionId>,
+        /// Draft scope to update.
+        scope: ComposerDraftViewScope,
         /// Draft text.
         text: String,
     },

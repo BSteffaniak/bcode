@@ -11,8 +11,11 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bcode_client              = { workspace = true }
+bcode_ipc                 = { workspace = true }
 bcode_session_models      = { workspace = true }
 bcode_session_view_models = { workspace = true }
+bcode_skill_models        = { workspace = true }
 serde_json                = { workspace = true, features = ["std"] }
 
 [features]
