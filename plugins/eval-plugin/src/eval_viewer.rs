@@ -147,6 +147,13 @@ impl EvalRunPickerSurface {
         }
     }
 
+    fn new_campaign(&mut self) {
+        match EvalWizard::new_campaign_from_runs(&self.runs, &self.campaigns_root) {
+            Ok(wizard) => self.active_wizard = Some(wizard),
+            Err(error) => self.status = error,
+        }
+    }
+
     fn start_campaign_from_selected_run(&mut self) {
         let Some(run) = self.selected_run_summary() else {
             self.status = "select a run to start a campaign".to_string();
@@ -243,6 +250,10 @@ impl EvalRunPickerSurface {
             }
             "start-campaign" => {
                 self.start_campaign_from_selected_run();
+                PluginTuiAction::Redraw
+            }
+            "new-campaign" => {
+                self.new_campaign();
                 PluginTuiAction::Redraw
             }
             "attach-run" => {
@@ -363,6 +374,10 @@ impl PluginTuiSurface for EvalRunPickerSurface {
                     self.start_campaign_from_selected_run();
                     return PluginTuiAction::Redraw;
                 }
+                KeyCode::Char('n') => {
+                    self.new_campaign();
+                    return PluginTuiAction::Redraw;
+                }
                 KeyCode::Char('a') => {
                     self.attach_selected_run_to_campaign();
                     return PluginTuiAction::Redraw;
@@ -390,15 +405,21 @@ enum EvalWizard {
 #[derive(Debug, Clone)]
 struct StartCampaignWizard {
     state: DialogState,
-    suite_path: PathBuf,
+    suite_choices: Vec<StartCampaignSuiteChoice>,
+    suite_index: usize,
     output_root: PathBuf,
-    baseline_run: PathBuf,
-    run_id: String,
-    suite_id: String,
     campaign_id: TextInputState,
     name: TextInputState,
     focus: StartCampaignField,
     objective: EvalImprovementObjective,
+}
+
+#[derive(Debug, Clone)]
+struct StartCampaignSuiteChoice {
+    suite_id: String,
+    suite_path: PathBuf,
+    baseline_run: Option<PathBuf>,
+    run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -461,21 +482,63 @@ impl EvalWizard {
             .manifest
             .suite_path
             .ok_or_else(|| "selected run does not record a suite path".to_string())?;
-        let campaign_id =
-            unique_campaign_id(campaigns_root, &format!("{}-improvement", run.suite_id));
-        let name = format!("{} improvement", run.suite_id);
-        Ok(Self::StartCampaign(StartCampaignWizard {
-            state: DialogState::new(),
-            suite_path,
-            output_root: campaigns_root.to_path_buf(),
-            baseline_run: run.run_dir.clone(),
-            run_id: run.run_id.clone(),
+        let choice = StartCampaignSuiteChoice {
             suite_id: run.suite_id.clone(),
+            suite_path,
+            baseline_run: Some(run.run_dir.clone()),
+            run_id: Some(run.run_id.clone()),
+        };
+        Ok(Self::start_campaign_wizard(vec![choice], 0, campaigns_root))
+    }
+
+    fn new_campaign_from_runs(
+        runs: &[EvalRunSummary],
+        campaigns_root: &std::path::Path,
+    ) -> Result<Self, String> {
+        let mut choices = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for run in runs {
+            if !seen.insert(run.suite_id.clone()) {
+                continue;
+            }
+            let Ok(run_data) = EvalRunData::load(&run.run_dir) else {
+                continue;
+            };
+            let Some(suite_path) = run_data.result.manifest.suite_path else {
+                continue;
+            };
+            choices.push(StartCampaignSuiteChoice {
+                suite_id: run.suite_id.clone(),
+                suite_path,
+                baseline_run: Some(run.run_dir.clone()),
+                run_id: Some(run.run_id.clone()),
+            });
+        }
+        if choices.is_empty() {
+            return Err("no runs with recorded suite paths are available".to_string());
+        }
+        Ok(Self::start_campaign_wizard(choices, 0, campaigns_root))
+    }
+
+    fn start_campaign_wizard(
+        choices: Vec<StartCampaignSuiteChoice>,
+        suite_index: usize,
+        campaigns_root: &std::path::Path,
+    ) -> Self {
+        let choice = &choices[suite_index];
+        let campaign_id =
+            unique_campaign_id(campaigns_root, &format!("{}-improvement", choice.suite_id));
+        let name = format!("{} improvement", choice.suite_id);
+        Self::StartCampaign(StartCampaignWizard {
+            state: DialogState::new(),
+            suite_choices: choices,
+            suite_index,
+            output_root: campaigns_root.to_path_buf(),
             campaign_id: text_state(&campaign_id),
             name: text_state(&name),
             focus: StartCampaignField::CampaignId,
             objective: EvalImprovementObjective::Progression,
-        }))
+        })
     }
 
     fn attach_run_to_campaign(
@@ -671,7 +734,7 @@ impl EvalWizard {
         match self {
             Self::StartCampaign(wizard) => {
                 EvalWizardOutcome::Complete(EvalWizardCompletion::StartCampaign {
-                    suite_path: wizard.suite_path.clone(),
+                    suite_path: wizard.suite_path(),
                     options: wizard.options(),
                 })
             }
@@ -685,10 +748,12 @@ impl EvalWizard {
 impl StartCampaignWizard {
     fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
         let actions = wizard_actions("create");
+        let choice = self.selected_choice();
+        let run_label = choice.run_id.as_deref().unwrap_or("no baseline run");
         let body = vec![
-            Line::from("Create an improvement campaign from this run."),
-            Line::from(format!("Run: {}", self.run_id)),
-            Line::from(format!("Suite: {}", self.suite_id)),
+            Line::from("Create an improvement campaign."),
+            Line::from(format!("Run: {run_label}")),
+            Line::from(format!("Suite: {}", choice.suite_id)),
             Line::from(""),
             Line::from(""),
             Line::from(""),
@@ -744,12 +809,20 @@ impl StartCampaignWizard {
         id || name
     }
 
+    fn selected_choice(&self) -> &StartCampaignSuiteChoice {
+        &self.suite_choices[self.suite_index]
+    }
+
+    fn suite_path(&self) -> PathBuf {
+        self.selected_choice().suite_path.clone()
+    }
+
     fn options(&self) -> bcode_eval::EvalImprovementStartOptions {
         bcode_eval::EvalImprovementStartOptions {
             output_root: self.output_root.clone(),
             campaign_id: Some(input_text(&self.campaign_id)),
             name: Some(input_text(&self.name)),
-            baseline_run: Some(self.baseline_run.clone()),
+            baseline_run: self.selected_choice().baseline_run.clone(),
             objective: self.objective,
         }
     }
@@ -3692,6 +3765,7 @@ fn format_signed_number(value: f64) -> String {
 fn picker_actions() -> Vec<ActionButton> {
     vec![
         ActionButton::new("open", "Enter Open"),
+        ActionButton::new("new-campaign", "N New Campaign"),
         ActionButton::new("start-campaign", "S Start Campaign"),
         ActionButton::new("attach-run", "A Attach Run"),
         ActionButton::new("refresh", "R Refresh"),
