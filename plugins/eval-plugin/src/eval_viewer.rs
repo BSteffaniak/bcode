@@ -32,6 +32,7 @@ use bmux_tui_components::table::{
 use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
 use bmux_tui_components::text_input_box::{TextInputBox, TextInputBoxOutcome, TextInputBoxPolicy};
 use std::path::PathBuf;
+use std::sync::mpsc::{self as std_mpsc, Receiver};
 
 const TITLE_HEIGHT: u16 = 2;
 const TAB_HEIGHT: u16 = 1;
@@ -63,6 +64,7 @@ pub struct EvalRunPickerSurface {
     embedded_viewer: Option<EvalRunViewerSurface>,
     embedded_campaign: Option<EvalCampaignViewerSurface>,
     active_wizard: Option<EvalWizard>,
+    run_task: Option<Receiver<Result<bcode_eval_models::EvalRunResult, String>>>,
     status: String,
     table_area: Rect,
     action_area: Rect,
@@ -90,6 +92,7 @@ impl EvalRunPickerSurface {
             embedded_viewer: None,
             embedded_campaign: None,
             active_wizard: None,
+            run_task: None,
             status,
             table_area: Rect::new(0, 0, 0, 0),
             action_area: Rect::new(0, 0, 0, 0),
@@ -147,6 +150,45 @@ impl EvalRunPickerSurface {
         }
     }
 
+    fn start_run_task(&mut self, options: bcode_eval::EvalRunOptions, host: &dyn PluginTuiHost) {
+        if self.run_task.is_some() {
+            self.status = "an eval suite is already running".to_string();
+            return;
+        }
+        let (sender, receiver) = std_mpsc::channel();
+        host.spawn_blocking(Box::new(move || {
+            let result = bcode_eval::run_suite(&options).map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        }));
+        self.run_task = Some(receiver);
+        self.status = "running eval suite in background...".to_string();
+    }
+
+    fn poll_run_task(&mut self) -> PluginTuiAction {
+        let Some(receiver) = self.run_task.as_ref() else {
+            return PluginTuiAction::None;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(run)) => {
+                self.run_task = None;
+                self.status = format!("completed run {}", run.manifest.run_id);
+                self.refresh();
+                PluginTuiAction::Redraw
+            }
+            Ok(Err(error)) => {
+                self.run_task = None;
+                self.status = format!("failed to run suite: {error}");
+                PluginTuiAction::Redraw
+            }
+            Err(std_mpsc::TryRecvError::Disconnected) => {
+                self.run_task = None;
+                self.status = "eval suite task disconnected".to_string();
+                PluginTuiAction::Redraw
+            }
+            Err(std_mpsc::TryRecvError::Empty) => PluginTuiAction::None,
+        }
+    }
+
     fn run_suite(&mut self) {
         match EvalWizard::run_suite_from_runs(&self.runs, &self.runs_root) {
             Ok(wizard) => self.active_wizard = Some(wizard),
@@ -198,7 +240,7 @@ impl EvalRunPickerSurface {
         }
     }
 
-    fn complete_wizard(&mut self, completion: EvalWizardCompletion) {
+    fn complete_wizard(&mut self, completion: EvalWizardCompletion, host: &dyn PluginTuiHost) {
         match completion {
             EvalWizardCompletion::StartCampaign {
                 suite_path,
@@ -210,13 +252,7 @@ impl EvalRunPickerSurface {
                 }
                 Err(error) => self.status = format!("failed to create campaign: {error}"),
             },
-            EvalWizardCompletion::RunSuite(options) => match bcode_eval::run_suite(&options) {
-                Ok(run) => {
-                    self.status = format!("completed run {}", run.manifest.run_id);
-                    self.refresh();
-                }
-                Err(error) => self.status = format!("failed to run suite: {error}"),
-            },
+            EvalWizardCompletion::RunSuite(options) => self.start_run_task(options, host),
             EvalWizardCompletion::RecordGeneration(options) => {
                 match bcode_eval::record_improvement_generation(options) {
                     Ok(generation) => {
@@ -362,7 +398,7 @@ impl PluginTuiSurface for EvalRunPickerSurface {
                 }
                 EvalWizardOutcome::Complete(completion) => {
                     self.active_wizard = None;
-                    self.complete_wizard(completion);
+                    self.complete_wizard(completion, host);
                     return PluginTuiAction::Redraw;
                 }
             }
@@ -439,6 +475,17 @@ impl PluginTuiSurface for EvalRunPickerSurface {
                 }
                 _ => {}
             }
+        }
+        PluginTuiAction::None
+    }
+
+    fn poll(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        let task_action = self.poll_run_task();
+        if !matches!(task_action, PluginTuiAction::None) {
+            return task_action;
+        }
+        if let Some(viewer) = self.embedded_campaign.as_mut() {
+            return viewer.poll(host);
         }
         PluginTuiAction::None
     }
@@ -1682,6 +1729,11 @@ enum OverviewRow {
     Campaign(usize),
 }
 
+struct CampaignRunCompletion {
+    run_id: String,
+    generation: EvalImprovementGeneration,
+}
+
 /// Eval improvement campaign viewer surface.
 pub struct EvalCampaignViewerSurface {
     data: EvalCampaignData,
@@ -1690,6 +1742,7 @@ pub struct EvalCampaignViewerSurface {
     selected_run_viewer: Option<EvalRunViewerSurface>,
     detail_view: Option<EvalGenerationDetailSurface>,
     active_wizard: Option<EvalWizard>,
+    run_task: Option<Receiver<Result<CampaignRunCompletion, String>>>,
     view_mode: CampaignViewMode,
     status: String,
     table_area: Rect,
@@ -1725,6 +1778,7 @@ impl EvalCampaignViewerSurface {
             selected_run_viewer: None,
             detail_view: None,
             active_wizard: None,
+            run_task: None,
             view_mode,
             status,
             table_area: Rect::new(0, 0, 0, 0),
@@ -1770,7 +1824,11 @@ impl EvalCampaignViewerSurface {
         self.status = format!("view mode: {}", self.view_mode.label());
     }
 
-    fn run_next(&mut self) {
+    fn run_next(&mut self, host: &dyn PluginTuiHost) {
+        if self.run_task.is_some() {
+            self.status = "a campaign suite is already running".to_string();
+            return;
+        }
         let parent_id = self
             .selected_generation()
             .map(|generation| generation.id.clone())
@@ -1788,33 +1846,61 @@ impl EvalCampaignViewerSurface {
                 ),
             run_id: None,
         };
-        self.status = "running campaign suite...".to_string();
-        match bcode_eval::run_suite(&run_options) {
-            Ok(run) => {
-                let options = bcode_eval::EvalImprovementRecordOptions {
-                    campaign: self.data.campaign_dir.clone(),
-                    parent_id,
-                    branch: "main".to_string(),
-                    delta_kind: bcode_eval_models::EvalImprovementDeltaKind::Mixed,
-                    summary: format!("Rerun {}", run.manifest.run_id),
-                    run: Some(run.manifest.output_dir),
-                    patch: None,
-                    risk: bcode_eval_models::EvalImprovementRisk::Low,
-                    rationale: Some("Executed and recorded from the campaign TUI.".to_string()),
-                };
-                match bcode_eval::record_improvement_generation(options) {
-                    Ok(generation) => {
-                        self.status = format!("ran and recorded generation {}", generation.id);
-                        if let Ok(data) = EvalCampaignData::load(&self.data.campaign_dir) {
-                            self.data = data;
-                        }
-                    }
-                    Err(error) => {
-                        self.status = format!("run completed but recording failed: {error}");
-                    }
+        let campaign = self.data.campaign_dir.clone();
+        let (sender, receiver) = std_mpsc::channel();
+        host.spawn_blocking(Box::new(move || {
+            let result = bcode_eval::run_suite(&run_options)
+                .map_err(|error| error.to_string())
+                .and_then(|run| {
+                    let run_id = run.manifest.run_id.clone();
+                    let options = bcode_eval::EvalImprovementRecordOptions {
+                        campaign,
+                        parent_id,
+                        branch: "main".to_string(),
+                        delta_kind: bcode_eval_models::EvalImprovementDeltaKind::Mixed,
+                        summary: format!("Rerun {run_id}"),
+                        run: Some(run.manifest.output_dir),
+                        patch: None,
+                        risk: bcode_eval_models::EvalImprovementRisk::Low,
+                        rationale: Some("Executed and recorded from the campaign TUI.".to_string()),
+                    };
+                    bcode_eval::record_improvement_generation(options)
+                        .map(|generation| CampaignRunCompletion { run_id, generation })
+                        .map_err(|error| format!("run completed but recording failed: {error}"))
+                });
+            let _ = sender.send(result);
+        }));
+        self.run_task = Some(receiver);
+        self.status = "running campaign suite in background...".to_string();
+    }
+
+    fn poll_run_task(&mut self) -> PluginTuiAction {
+        let Some(receiver) = self.run_task.as_ref() else {
+            return PluginTuiAction::None;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(completion)) => {
+                self.run_task = None;
+                self.status = format!(
+                    "completed run {} as generation {}",
+                    completion.run_id, completion.generation.id
+                );
+                if let Ok(data) = EvalCampaignData::load(&self.data.campaign_dir) {
+                    self.data = data;
                 }
+                PluginTuiAction::Redraw
             }
-            Err(error) => self.status = format!("suite run failed: {error}"),
+            Ok(Err(error)) => {
+                self.run_task = None;
+                self.status = error;
+                PluginTuiAction::Redraw
+            }
+            Err(std_mpsc::TryRecvError::Disconnected) => {
+                self.run_task = None;
+                self.status = "campaign run task disconnected".to_string();
+                PluginTuiAction::Redraw
+            }
+            Err(std_mpsc::TryRecvError::Empty) => PluginTuiAction::None,
         }
     }
 
@@ -1875,13 +1961,13 @@ impl EvalCampaignViewerSurface {
         }
     }
 
-    fn handle_action(&mut self, action: &str) -> PluginTuiAction {
+    fn handle_action(&mut self, action: &str, host: &dyn PluginTuiHost) -> PluginTuiAction {
         match action {
             "details" => self.open_selected_detail(),
             "open-run" => self.open_selected_run(),
             "view-mode" => self.cycle_view_mode(),
             "record-generation" => self.record_generation(),
-            "run-next" => self.run_next(),
+            "run-next" => self.run_next(host),
             "promote" => self.decide_selected_generation(
                 bcode_eval_models::EvalImprovementVerdictStatus::Promoted,
             ),
@@ -2018,7 +2104,7 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
             &mut self.action_state,
             event,
         ) {
-            ActionRowOutcome::Activated { id, .. } => return self.handle_action(&id),
+            ActionRowOutcome::Activated { id, .. } => return self.handle_action(&id, host),
             outcome if outcome.needs_redraw() => return PluginTuiAction::Redraw,
             _ => {}
         }
@@ -2036,16 +2122,27 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
                     self.cycle_view_mode();
                     return PluginTuiAction::Redraw;
                 }
-                KeyCode::Char('r') => return self.handle_action("record-generation"),
-                KeyCode::Char('u') => return self.handle_action("run-next"),
-                KeyCode::Char('p') => return self.handle_action("promote"),
-                KeyCode::Char('x') => return self.handle_action("reject"),
-                KeyCode::Char('?') => return self.handle_action("help"),
+                KeyCode::Char('r') => return self.handle_action("record-generation", host),
+                KeyCode::Char('u') => return self.handle_action("run-next", host),
+                KeyCode::Char('p') => return self.handle_action("promote", host),
+                KeyCode::Char('x') => return self.handle_action("reject", host),
+                KeyCode::Char('?') => return self.handle_action("help", host),
                 KeyCode::Char('q') | KeyCode::Escape => {
                     return PluginTuiAction::Close { outcome: None };
                 }
                 _ => {}
             }
+        }
+        PluginTuiAction::None
+    }
+
+    fn poll(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        let task_action = self.poll_run_task();
+        if !matches!(task_action, PluginTuiAction::None) {
+            return task_action;
+        }
+        if let Some(detail) = self.detail_view.as_mut() {
+            return detail.poll(host);
         }
         PluginTuiAction::None
     }
@@ -2095,6 +2192,7 @@ pub struct EvalGenerationDetailSurface {
     tab_state: TabBarState,
     action_state: ActionRowState,
     selected_run_viewer: Option<EvalRunViewerSurface>,
+    rerun_task: Option<Receiver<Result<CampaignRunCompletion, String>>>,
     tab_area: Rect,
     action_area: Rect,
     status: String,
@@ -2109,6 +2207,7 @@ impl EvalGenerationDetailSurface {
             tab_state: TabBarState::new(Some(0)),
             action_state: ActionRowState::new(),
             selected_run_viewer: None,
+            rerun_task: None,
             tab_area: Rect::new(0, 0, 0, 0),
             action_area: Rect::new(0, 0, 0, 0),
         }
@@ -2136,7 +2235,11 @@ impl EvalGenerationDetailSurface {
         }
     }
 
-    fn rerun(&mut self) {
+    fn rerun(&mut self, host: &dyn PluginTuiHost) {
+        if self.rerun_task.is_some() {
+            self.status = "this generation is already rerunning".to_string();
+            return;
+        }
         let run_options = bcode_eval::EvalRunOptions {
             suite_path: self.data.campaign.suite_path.clone(),
             output_root: self
@@ -2150,34 +2253,66 @@ impl EvalGenerationDetailSurface {
                 ),
             run_id: None,
         };
-        self.status = "rerunning suite...".to_string();
-        match bcode_eval::run_suite(&run_options) {
-            Ok(run) => {
-                let options = bcode_eval::EvalImprovementRecordOptions {
-                    campaign: self.data.campaign_dir.clone(),
-                    parent_id: Some(self.generation_id.clone()),
-                    branch: self.generation().map_or_else(
-                        || "main".to_string(),
-                        |generation| generation.branch.clone(),
-                    ),
-                    delta_kind: bcode_eval_models::EvalImprovementDeltaKind::Mixed,
-                    summary: format!("Rerun {}", run.manifest.run_id),
-                    run: Some(run.manifest.output_dir),
-                    patch: None,
-                    risk: bcode_eval_models::EvalImprovementRisk::Low,
-                    rationale: Some("Rerun from generation detail TUI.".to_string()),
-                };
-                match bcode_eval::record_improvement_generation(options) {
-                    Ok(generation) => {
-                        self.status = format!("recorded rerun as generation {}", generation.id);
-                        if let Ok(data) = EvalCampaignData::load(&self.data.campaign_dir) {
-                            self.data = data;
-                        }
-                    }
-                    Err(error) => self.status = format!("rerun recording failed: {error}"),
+        let campaign = self.data.campaign_dir.clone();
+        let parent_id = self.generation_id.clone();
+        let branch = self.generation().map_or_else(
+            || "main".to_string(),
+            |generation| generation.branch.clone(),
+        );
+        let (sender, receiver) = std_mpsc::channel();
+        host.spawn_blocking(Box::new(move || {
+            let result = bcode_eval::run_suite(&run_options)
+                .map_err(|error| error.to_string())
+                .and_then(|run| {
+                    let run_id = run.manifest.run_id.clone();
+                    let options = bcode_eval::EvalImprovementRecordOptions {
+                        campaign,
+                        parent_id: Some(parent_id),
+                        branch,
+                        delta_kind: bcode_eval_models::EvalImprovementDeltaKind::Mixed,
+                        summary: format!("Rerun {run_id}"),
+                        run: Some(run.manifest.output_dir),
+                        patch: None,
+                        risk: bcode_eval_models::EvalImprovementRisk::Low,
+                        rationale: Some("Rerun from generation detail TUI.".to_string()),
+                    };
+                    bcode_eval::record_improvement_generation(options)
+                        .map(|generation| CampaignRunCompletion { run_id, generation })
+                        .map_err(|error| format!("rerun recording failed: {error}"))
+                });
+            let _ = sender.send(result);
+        }));
+        self.rerun_task = Some(receiver);
+        self.status = "rerunning suite in background...".to_string();
+    }
+
+    fn poll_rerun_task(&mut self) -> PluginTuiAction {
+        let Some(receiver) = self.rerun_task.as_ref() else {
+            return PluginTuiAction::None;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(completion)) => {
+                self.rerun_task = None;
+                self.status = format!(
+                    "completed run {} as generation {}",
+                    completion.run_id, completion.generation.id
+                );
+                if let Ok(data) = EvalCampaignData::load(&self.data.campaign_dir) {
+                    self.data = data;
                 }
+                PluginTuiAction::Redraw
             }
-            Err(error) => self.status = format!("rerun failed: {error}"),
+            Ok(Err(error)) => {
+                self.rerun_task = None;
+                self.status = error;
+                PluginTuiAction::Redraw
+            }
+            Err(std_mpsc::TryRecvError::Disconnected) => {
+                self.rerun_task = None;
+                self.status = "rerun task disconnected".to_string();
+                PluginTuiAction::Redraw
+            }
+            Err(std_mpsc::TryRecvError::Empty) => PluginTuiAction::None,
         }
     }
 
@@ -2396,7 +2531,7 @@ impl PluginTuiSurface for EvalGenerationDetailSurface {
                     return PluginTuiAction::Redraw;
                 }
                 "rerun" => {
-                    self.rerun();
+                    self.rerun(host);
                     return PluginTuiAction::Redraw;
                 }
                 "back" => return PluginTuiAction::Close { outcome: None },
@@ -2416,7 +2551,7 @@ impl PluginTuiSurface for EvalGenerationDetailSurface {
                     return PluginTuiAction::Redraw;
                 }
                 KeyCode::Char('r') => {
-                    self.rerun();
+                    self.rerun(host);
                     return PluginTuiAction::Redraw;
                 }
                 KeyCode::Char('q') | KeyCode::Escape => {
@@ -2426,6 +2561,10 @@ impl PluginTuiSurface for EvalGenerationDetailSurface {
             }
         }
         PluginTuiAction::None
+    }
+
+    fn poll(&mut self, _host: &dyn PluginTuiHost) -> PluginTuiAction {
+        self.poll_rerun_task()
     }
 }
 
