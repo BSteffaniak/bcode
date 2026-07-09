@@ -380,14 +380,13 @@ fn run_single_vim_edit_tool(
     match run_result {
         Ok(result) => {
             sequence = sequence.saturating_add(1);
-            emit_vim_live_phase(
+            emit_vim_live_finished_result(
                 &events,
                 run.tool_call_id,
                 sequence,
                 run.tool_name,
-                "finished",
-                Some(&display_path),
-                None,
+                &display_path,
+                &result,
             );
             vim_edit_success_response(
                 &display_path,
@@ -474,14 +473,12 @@ fn run_multi_file_vim_edit_tool(
     match run_result {
         Ok(result) => {
             sequence = sequence.saturating_add(1);
-            emit_vim_live_phase(
+            emit_vim_live_finished_multi_result(
                 &events,
                 run.tool_call_id,
                 sequence,
                 run.tool_name,
-                "finished",
-                None,
-                None,
+                &result,
             );
             vim_edit_multi_file_success_response(
                 &result,
@@ -539,6 +536,140 @@ fn emit_vim_live_phase(
     if let Ok(payload) = serde_json::to_vec(&event) {
         events.emit(&payload);
     }
+}
+
+fn emit_vim_live_payload(
+    events: &ServiceEventEmitter,
+    tool_call_id: &str,
+    sequence: u64,
+    tool_name: &str,
+    path: &str,
+    payload: serde_json::Value,
+    streaming: bool,
+) {
+    let event = ToolInvocationStreamEvent::VisualUpdate {
+        tool_call_id: tool_call_id.to_string(),
+        sequence,
+        streaming,
+        visual: ToolStreamVisualUpdate {
+            visual_id: Some(format!("{tool_call_id}-vim-live")),
+            producer_plugin_id: Some(VIM_EDIT_PLUGIN_ID.to_string()),
+            schema: VIM_EDIT_LIVE_SCHEMA.to_string(),
+            schema_version: 1,
+            title: Some("Vim edit live".to_string()),
+            subtitle: Some(format!("{path} · {tool_name}")),
+            payload,
+        },
+    };
+    if let Ok(payload) = serde_json::to_vec(&event) {
+        events.emit(&payload);
+    }
+}
+
+fn emit_vim_live_finished_result(
+    events: &ServiceEventEmitter,
+    tool_call_id: &str,
+    sequence: u64,
+    tool_name: &str,
+    path: &str,
+    result: &VimEditResult,
+) {
+    let last_event = result.events.last();
+    let payload = json!({
+        "tool_name": tool_name,
+        "phase": "finished",
+        "path": path,
+        "file_index": 0,
+        "file_total": 1,
+        "step_index": last_event.map_or(0, |event| event.step_index),
+        "step_total": result.events.len(),
+        "step": last_event.map(|event| event.step.clone()),
+        "substep_index": null,
+        "substep_total": null,
+        "input_token": null,
+        "before_cursor": last_event.map_or(result.cursor, |event| event.before_cursor),
+        "after_cursor": result.cursor,
+        "cursor": result.cursor,
+        "nvim_mode": result.nvim_mode,
+        "context": result.final_context,
+        "changed": result.changed,
+        "message": "vim edit finished",
+        "error": null,
+    });
+    emit_vim_live_payload(
+        events,
+        tool_call_id,
+        sequence,
+        tool_name,
+        path,
+        payload,
+        false,
+    );
+}
+
+fn emit_vim_live_finished_multi_result(
+    events: &ServiceEventEmitter,
+    tool_call_id: &str,
+    sequence: u64,
+    tool_name: &str,
+    result: &bcode_vim_edit::VimEditMultiFileEditResult,
+) {
+    let Some((file_index, file)) = result
+        .files
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, file)| !file.events.is_empty())
+        .or_else(|| result.files.iter().enumerate().next_back())
+    else {
+        emit_vim_live_phase(
+            events,
+            tool_call_id,
+            sequence,
+            tool_name,
+            "finished",
+            None,
+            None,
+        );
+        return;
+    };
+    let last_event = file.events.last();
+    let path = file.path.display().to_string();
+    let step_total = result
+        .files
+        .iter()
+        .map(|file| file.events.len())
+        .sum::<usize>();
+    let payload = json!({
+        "tool_name": tool_name,
+        "phase": "finished",
+        "path": path,
+        "file_index": file_index,
+        "file_total": result.files.len(),
+        "step_index": last_event.map_or(0, |event| event.step_index),
+        "step_total": step_total,
+        "step": last_event.map(|event| event.step.clone()),
+        "substep_index": null,
+        "substep_total": null,
+        "input_token": null,
+        "before_cursor": last_event.map_or(file.cursor, |event| event.before_cursor),
+        "after_cursor": file.cursor,
+        "cursor": file.cursor,
+        "nvim_mode": file.nvim_mode,
+        "context": file.final_context,
+        "changed": result.changed,
+        "message": "vim edit finished",
+        "error": null,
+    });
+    emit_vim_live_payload(
+        events,
+        tool_call_id,
+        sequence,
+        tool_name,
+        &path,
+        payload,
+        false,
+    );
 }
 
 fn emit_vim_live_frame(
@@ -1320,6 +1451,10 @@ mod tests {
             panic!("expected final event");
         };
         assert_eq!(last.payload["phase"], "finished");
+        assert!(last.payload.get("context").is_some(), "{last:#?}");
+        assert!(last.payload.get("cursor").is_some(), "{last:#?}");
+        assert!(last.payload.get("step").is_some(), "{last:#?}");
+        assert_eq!(last.payload["nvim_mode"], "n");
         assert!(!**streaming);
     }
 
