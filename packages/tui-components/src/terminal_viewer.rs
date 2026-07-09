@@ -8,7 +8,40 @@ use bmux_tui::ansi::ansi_to_lines;
 use bmux_tui::prelude::{Color, Line, Span, Style};
 use bmux_tui::style::Modifier;
 
-const MAX_INLINE_TERMINAL_ROWS: usize = 28;
+/// Default maximum number of terminal rows rendered inline.
+pub const MAX_INLINE_TERMINAL_ROWS: usize = 28;
+
+/// Stateful sizing policy for live terminal previews.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TerminalViewerLiveState {
+    visible_rows: usize,
+}
+
+impl TerminalViewerLiveState {
+    /// Return the currently reserved live terminal rows.
+    #[must_use]
+    pub const fn visible_rows(self) -> usize {
+        self.visible_rows
+    }
+
+    /// Grow the reserved live terminal rows to fit `input`, capped by `max_rows`.
+    pub fn update(&mut self, input: TerminalViewerInput<'_>, max_rows: usize) {
+        let content_rows = terminal_viewer_content_row_count(input, max_rows);
+        self.visible_rows = self.visible_rows.max(content_rows).min(max_rows);
+    }
+}
+
+/// Terminal row sizing policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalViewerSizing {
+    /// Render only current compact transcript content.
+    Compact,
+    /// Render a live preview with a stable, caller-managed row reservation.
+    Live {
+        visible_rows: usize,
+        max_rows: usize,
+    },
+}
 
 /// Input used to render terminal transcript rows.
 #[derive(Debug, Clone, Copy)]
@@ -33,6 +66,8 @@ pub struct TerminalViewerInput<'a> {
     pub output_bytes: Option<u64>,
     /// Retained output byte length, when known.
     pub retained_output_bytes: Option<u64>,
+    /// Terminal row sizing policy.
+    pub sizing: TerminalViewerSizing,
 }
 
 /// Render terminal transcript rows using terminal-grid semantics.
@@ -112,15 +147,48 @@ fn terminal_output_lines(input: &TerminalViewerInput<'_>) -> Vec<Line> {
     };
     stream.process(input.output.as_bytes());
     let grid = stream.grid();
-    let rows = grid.main_content_tail_rows(MAX_INLINE_TERMINAL_ROWS);
-    let lines = rows
+    let max_rows = match input.sizing {
+        TerminalViewerSizing::Compact => MAX_INLINE_TERMINAL_ROWS,
+        TerminalViewerSizing::Live { max_rows, .. } => max_rows,
+    };
+    let rows = grid.main_content_tail_rows(max_rows);
+    let mut lines = rows
         .iter()
         .map(|row| terminal_grid_row_to_line(grid, row))
         .collect::<Vec<_>>();
-    preview_lines(&lines, MAX_INLINE_TERMINAL_ROWS)
-        .into_iter()
-        .cloned()
-        .collect()
+    match input.sizing {
+        TerminalViewerSizing::Compact => preview_lines(&lines, max_rows)
+            .into_iter()
+            .cloned()
+            .collect(),
+        TerminalViewerSizing::Live {
+            visible_rows,
+            max_rows,
+        } => {
+            let target_rows = visible_rows.max(1).min(max_rows);
+            if lines.len() > target_rows {
+                lines = lines[lines.len().saturating_sub(target_rows)..].to_vec();
+            }
+            while lines.len() < target_rows {
+                lines.push(Line::default());
+            }
+            lines
+        }
+    }
+}
+
+fn terminal_viewer_content_row_count(input: TerminalViewerInput<'_>, max_rows: usize) -> usize {
+    let Ok(mut stream) = TerminalGridStream::new(
+        input.columns.max(1),
+        input.rows.max(1),
+        GridLimits {
+            scrollback_rows: max_rows.saturating_mul(8),
+        },
+    ) else {
+        return ansi_to_lines(input.output).len().max(1).min(max_rows);
+    };
+    stream.process(input.output.as_bytes());
+    stream.grid().main_content_tail_rows(max_rows).len().max(1)
 }
 
 fn terminal_grid_row_to_line(grid: &TerminalGrid, row: &PhysicalRow) -> Line {
@@ -318,6 +386,7 @@ mod tests {
                 output_bytes: Some(13),
                 retained_output_bytes: Some(13),
                 show_status: true,
+                sizing: TerminalViewerSizing::Compact,
             },
             100,
         );
@@ -325,5 +394,61 @@ mod tests {
 
         assert!(rendered.contains("second"), "{rendered}");
         assert!(!rendered.contains("first"), "{rendered}");
+    }
+
+    #[test]
+    fn live_terminal_state_grows_but_does_not_shrink() {
+        let mut state = TerminalViewerLiveState::default();
+        let one_line = TerminalViewerInput {
+            output: "one\n",
+            columns: 80,
+            rows: 24,
+            exit_code: None,
+            timed_out: None,
+            elapsed: None,
+            output_truncated: false,
+            output_bytes: None,
+            retained_output_bytes: None,
+            show_status: false,
+            sizing: TerminalViewerSizing::Compact,
+        };
+        state.update(one_line, 28);
+        assert_eq!(state.visible_rows(), 1);
+
+        let three_lines = TerminalViewerInput {
+            output: "one\ntwo\nthree\n",
+            ..one_line
+        };
+        state.update(three_lines, 28);
+        assert_eq!(state.visible_rows(), 3);
+
+        state.update(one_line, 28);
+        assert_eq!(state.visible_rows(), 3);
+    }
+
+    #[test]
+    fn live_terminal_rows_pad_to_reserved_height() {
+        let rows = terminal_viewer_rows(
+            TerminalViewerInput {
+                output: "one\n",
+                columns: 80,
+                rows: 24,
+                exit_code: None,
+                timed_out: None,
+                elapsed: None,
+                output_truncated: false,
+                output_bytes: None,
+                retained_output_bytes: None,
+                show_status: false,
+                sizing: TerminalViewerSizing::Live {
+                    visible_rows: 3,
+                    max_rows: 28,
+                },
+            },
+            100,
+        );
+
+        assert_eq!(rows.len(), 3);
+        assert!(rendered_text(&rows).contains("one"));
     }
 }

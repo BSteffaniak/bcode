@@ -1350,6 +1350,7 @@ fn emit_tool_output_delta(
                         "columns": visual_context.columns,
                         "rows": visual_context.rows,
                         "timeout_ms": visual_context.timeout_ms,
+                        "live_state_key": tool_call_id,
                         "streaming": true,
                     }
                 }),
@@ -1507,7 +1508,7 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 #[cfg(feature = "static-bundled")]
 fn shell_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
-    registry.register_visual_adapter(Box::new(shell_run_tui::ShellRunTuiVisualAdapter));
+    registry.register_visual_adapter(Box::new(shell_run_tui::ShellRunTuiVisualAdapter::default()));
     registry
 }
 

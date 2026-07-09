@@ -1,8 +1,13 @@
 //! Native TUI rendering for shell run artifacts.
 
-use bcode_tui_components::terminal_viewer::{TerminalViewerInput, terminal_viewer_rows};
+use bcode_tui_components::terminal_viewer::{
+    MAX_INLINE_TERMINAL_ROWS, TerminalViewerInput, TerminalViewerLiveState, TerminalViewerSizing,
+    terminal_viewer_rows,
+};
 use bmux_tui::prelude::{Color, Line, Span, Style};
+use std::collections::BTreeMap;
 use std::fs;
+use std::sync::Mutex;
 
 const DEFAULT_TERMINAL_COLUMNS: u16 = 120;
 const DEFAULT_TERMINAL_ROWS: u16 = 30;
@@ -10,7 +15,10 @@ const TERMINAL_PTY_STREAM_REF_KEY: &str = "terminal_pty_stream";
 const TERMINAL_PTY_STREAM_CONTENT_TYPE: &str = "application/x-bcode-terminal-pty-stream";
 
 /// Native TUI visual adapter for shell run artifacts.
-pub struct ShellRunTuiVisualAdapter;
+#[derive(Default)]
+pub struct ShellRunTuiVisualAdapter {
+    live_states: Mutex<BTreeMap<String, TerminalViewerLiveState>>,
+}
 
 impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter {
     fn supports(&self, kind: &str) -> bool {
@@ -31,7 +39,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
 
     fn rows(&self, kind: &str, payload: &serde_json::Value, width: u16) -> Vec<Line> {
         if kind == "bcode.tool.request.shell.run" {
-            return shell_request_rows(payload, width);
+            return self.shell_request_rows(payload, width);
         }
         let mode = payload
             .get("mode")
@@ -73,6 +81,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
                     .get("retained_output_bytes")
                     .and_then(serde_json::Value::as_u64),
                 show_status: false,
+                sizing: TerminalViewerSizing::Compact,
             },
             width,
         ));
@@ -80,20 +89,22 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
     }
 }
 
-fn shell_request_rows(payload: &serde_json::Value, width: u16) -> Vec<Line> {
-    let Some(runtime) = payload.get("_bcode_runtime") else {
-        return shell_terminal_prompt_rows(payload, width);
-    };
-    let output = runtime
-        .get("output")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let columns = payload_u16(runtime, "columns").unwrap_or(DEFAULT_TERMINAL_COLUMNS);
-    let rows = payload_u16(runtime, "rows").unwrap_or(DEFAULT_TERMINAL_ROWS);
-    let mut lines = shell_terminal_prompt_rows(payload, width);
-    lines.extend(shell_status_rows(runtime));
-    lines.extend(terminal_viewer_rows(
-        TerminalViewerInput {
+impl ShellRunTuiVisualAdapter {
+    fn shell_request_rows(&self, payload: &serde_json::Value, width: u16) -> Vec<Line> {
+        let Some(runtime) = payload.get("_bcode_runtime") else {
+            return shell_terminal_prompt_rows(payload, width);
+        };
+        let output = runtime
+            .get("output")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let columns = payload_u16(runtime, "columns").unwrap_or(DEFAULT_TERMINAL_COLUMNS);
+        let rows = payload_u16(runtime, "rows").unwrap_or(DEFAULT_TERMINAL_ROWS);
+        let streaming = runtime
+            .get("streaming")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let mut input = TerminalViewerInput {
             output,
             columns,
             rows,
@@ -106,10 +117,39 @@ fn shell_request_rows(payload: &serde_json::Value, width: u16) -> Vec<Line> {
             output_bytes: None,
             retained_output_bytes: None,
             show_status: false,
-        },
-        width,
-    ));
-    lines
+            sizing: TerminalViewerSizing::Compact,
+        };
+        if streaming {
+            let key = runtime
+                .get("live_state_key")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    payload
+                        .get("arguments")
+                        .and_then(|arguments| arguments.get("command"))
+                        .and_then(serde_json::Value::as_str)
+                })
+                .unwrap_or("shell-live-terminal");
+            let visible_rows = self.live_visible_rows(key, input);
+            input.sizing = TerminalViewerSizing::Live {
+                visible_rows,
+                max_rows: MAX_INLINE_TERMINAL_ROWS,
+            };
+        }
+        let mut lines = shell_terminal_prompt_rows(payload, width);
+        lines.extend(shell_status_rows(runtime));
+        lines.extend(terminal_viewer_rows(input, width));
+        lines
+    }
+
+    fn live_visible_rows(&self, key: &str, input: TerminalViewerInput<'_>) -> usize {
+        let Ok(mut states) = self.live_states.lock() else {
+            return 1;
+        };
+        let state = states.entry(key.to_owned()).or_default();
+        state.update(input, MAX_INLINE_TERMINAL_ROWS);
+        state.visible_rows()
+    }
 }
 
 fn shell_status_rows(payload: &serde_json::Value) -> Vec<Line> {
@@ -333,7 +373,7 @@ mod tests {
             "cwd": "/Users/example/project"
         });
         let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
-            &ShellRunTuiVisualAdapter,
+            &ShellRunTuiVisualAdapter::default(),
             "bcode.tool.request.shell.run",
             &payload,
             64,
@@ -353,7 +393,7 @@ mod tests {
             "format_commands": false
         });
         let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
-            &ShellRunTuiVisualAdapter,
+            &ShellRunTuiVisualAdapter::default(),
             "bcode.tool.request.shell.run",
             &payload,
             48,
@@ -370,7 +410,7 @@ mod tests {
             "command": "printf 'hello world from a quoted argument' && echo done"
         });
         let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
-            &ShellRunTuiVisualAdapter,
+            &ShellRunTuiVisualAdapter::default(),
             "bcode.tool.request.shell.run",
             &payload,
             32,
@@ -392,7 +432,7 @@ mod tests {
             "rows": 24
         });
         let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
-            &ShellRunTuiVisualAdapter,
+            &ShellRunTuiVisualAdapter::default(),
             "bcode.shell.run",
             &payload,
             100,
@@ -422,7 +462,7 @@ mod tests {
             }]
         });
         let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
-            &ShellRunTuiVisualAdapter,
+            &ShellRunTuiVisualAdapter::default(),
             "bcode.shell.run",
             &payload,
             100,
