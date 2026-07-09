@@ -1,0 +1,20 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Renderer-neutral session view projection for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "session", "view"]
+license     = { workspace = true }
+name        = "bcode_session_view"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_session_models      = { workspace = true }
+bcode_session_view_models = { workspace = true }
+serde_json                = { workspace = true, features = ["std"] }
+
+[features]
+default          = []
+fail-on-warnings = []

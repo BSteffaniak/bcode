@@ -1,0 +1,21 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Renderer-neutral session view models for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "session", "view", "models"]
+license     = { workspace = true }
+name        = "bcode_session_view_models"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_session_models = { workspace = true }
+bcode_tool           = { workspace = true }
+serde                = { workspace = true, features = ["derive", "std"] }
+serde_json           = { workspace = true, features = ["std"] }
+
+[features]
+default          = []
+fail-on-warnings = []

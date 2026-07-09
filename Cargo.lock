@@ -2122,6 +2122,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_session_view"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_session_models",
+ "bcode_session_view_models",
+ "serde_json",
+]
+
+[[package]]
+name = "bcode_session_view_models"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_session_models",
+ "bcode_tool",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bcode_settings"
 version = "0.0.1-alpha.0"
 dependencies = [
