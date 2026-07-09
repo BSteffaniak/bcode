@@ -9,13 +9,49 @@ interface_id = "bcode.tool/v1"
 name         = "Vim Edit Tools"
 
 [[visual_adapters]]
+artifact_schema    = "bcode.vim-edit.request.preview"
+id                 = "vim-edit-preview-request-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "full_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.vim-edit.request.apply"
+id                 = "vim-edit-apply-request-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "full_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.vim-edit.live"
+id                 = "vim-edit-live-card"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 100
+producer_default   = true
+render_mode        = "full_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.vim-edit.playback"
 id                 = "vim-edit-playback-card"
 max_schema_version = 1
 min_schema_version = 1
 priority           = 100
 producer_default   = true
-schema             = "bcode.vim-edit.playback"
+render_mode        = "full_block"
 surfaces           = ["tui"]
+
+[[tui_surfaces]]
+description = "Interactive Vim edit playback UI"
+kind        = "tool.vim-edit.playback"
+title       = "Vim Edit Playback"
 
 [concurrency]
 max  = 2

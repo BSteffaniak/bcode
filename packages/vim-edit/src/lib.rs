@@ -307,6 +307,38 @@ pub struct VimEditEvent {
     pub message: Option<String>,
 }
 
+/// Compact live frame emitted while Vim edit execution progresses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VimEditFrame {
+    /// Current file index in the request.
+    pub file_index: usize,
+    /// Total file entries in the request.
+    pub file_total: usize,
+    /// Current edited file path.
+    pub path: PathBuf,
+    /// Zero-indexed global step number.
+    pub step_index: usize,
+    /// Total ordered steps.
+    pub step_total: usize,
+    /// Step that produced this frame.
+    pub step: VimEditStep,
+    /// Cursor before this step.
+    pub before_cursor: CursorPosition,
+    /// Cursor after this step.
+    pub after_cursor: CursorPosition,
+    /// Neovim mode after this step.
+    pub nvim_mode: String,
+    /// Bounded context after this step.
+    pub context: TextContext,
+    /// Whether this step changed the buffer.
+    pub changed: bool,
+    /// Optional status message.
+    pub message: Option<String>,
+}
+
+/// Sink for compact live Vim edit frames.
+pub type VimEditFrameSink<'a> = &'a mut (dyn FnMut(VimEditFrame) + Send);
+
 /// State captured when one Vim edit step fails.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VimEditFailureState {
@@ -397,6 +429,18 @@ pub enum VimEditError {
 pub fn run_vim_multi_file_edit(
     request: &VimEditMultiFileRequest,
 ) -> Result<VimEditMultiFileEditResult, VimEditError> {
+    run_vim_multi_file_edit_observed(request, None)
+}
+
+/// Run multi-file Vim edit steps and emit compact live frames after each completed step.
+///
+/// # Errors
+///
+/// Returns the same errors as [`run_vim_multi_file_edit`].
+pub fn run_vim_multi_file_edit_observed(
+    request: &VimEditMultiFileRequest,
+    observer: Option<VimEditFrameSink<'_>>,
+) -> Result<VimEditMultiFileEditResult, VimEditError> {
     Builder::new_current_thread()
         .enable_all()
         .build()
@@ -404,13 +448,14 @@ pub fn run_vim_multi_file_edit(
             executable: "tokio runtime".to_string(),
             source,
         })?
-        .block_on(run_vim_multi_file_edit_inner(request))
+        .block_on(run_vim_multi_file_edit_inner(request, observer))
 }
 
 async fn run_vim_multi_file_edit_inner(
     request: &VimEditMultiFileRequest,
+    observer: Option<VimEditFrameSink<'_>>,
 ) -> Result<VimEditMultiFileEditResult, VimEditError> {
-    let execution = run_vim_multi_file_edit_prepare(request).await?;
+    let execution = run_vim_multi_file_edit_prepare(request, observer).await?;
     if request.mode == VimEditMode::Apply {
         for file in &execution.files {
             if file.original != file.final_text {
@@ -731,6 +776,18 @@ async fn session_snapshot(
 /// * default sandbox mode rejects a step
 /// * the operation times out
 pub fn run_vim_edit(request: VimEditRequest) -> Result<VimEditResult, VimEditError> {
+    run_vim_edit_observed(request, None)
+}
+
+/// Run Vim edit steps and emit compact live frames after each completed step.
+///
+/// # Errors
+///
+/// Returns the same errors as [`run_vim_edit`].
+pub fn run_vim_edit_observed(
+    request: VimEditRequest,
+    observer: Option<VimEditFrameSink<'_>>,
+) -> Result<VimEditResult, VimEditError> {
     Builder::new_current_thread()
         .enable_all()
         .build()
@@ -738,11 +795,14 @@ pub fn run_vim_edit(request: VimEditRequest) -> Result<VimEditResult, VimEditErr
             executable: "tokio runtime".to_string(),
             source,
         })?
-        .block_on(run_vim_edit_inner(request))
+        .block_on(run_vim_edit_inner(request, observer))
 }
 
-async fn run_vim_edit_inner(request: VimEditRequest) -> Result<VimEditResult, VimEditError> {
-    let execution = run_vim_edit_prepare(&request).await?;
+async fn run_vim_edit_inner(
+    request: VimEditRequest,
+    observer: Option<VimEditFrameSink<'_>>,
+) -> Result<VimEditResult, VimEditError> {
+    let execution = run_vim_edit_prepare(&request, observer).await?;
     if request.mode == VimEditMode::Apply && execution.result.changed {
         fs::write(&request.path, execution.final_text.as_bytes()).map_err(|source| {
             VimEditError::WriteFile {
@@ -756,6 +816,7 @@ async fn run_vim_edit_inner(request: VimEditRequest) -> Result<VimEditResult, Vi
 
 async fn run_vim_multi_file_edit_prepare(
     request: &VimEditMultiFileRequest,
+    observer: Option<VimEditFrameSink<'_>>,
 ) -> Result<MultiFileExecution, VimEditError> {
     let mut files = BTreeMap::<PathBuf, (String, NamedTempFile)>::new();
     for entry in &request.files {
@@ -773,7 +834,7 @@ async fn run_vim_multi_file_edit_prepare(
             .unwrap_or_else(|| Path::new(NVIM_EXECUTABLE)),
     )
     .await?;
-    let operation = run_vim_multi_file_session(&session, request, &files);
+    let operation = run_vim_multi_file_session(&session, request, &files, observer);
     let session_result = time::timeout(request.timeout, operation)
         .await
         .unwrap_or(Err(VimEditError::Timeout {
@@ -787,13 +848,19 @@ async fn run_vim_multi_file_session(
     session: &NeovimSession,
     request: &VimEditMultiFileRequest,
     files: &BTreeMap<PathBuf, (String, NamedTempFile)>,
+    mut observer: Option<VimEditFrameSink<'_>>,
 ) -> Result<MultiFileExecution, VimEditError> {
     session.configure_isolation().await?;
     let mut previous_buffers = BTreeMap::<PathBuf, String>::new();
     let mut events_by_path = BTreeMap::<PathBuf, Vec<VimEditEvent>>::new();
     let mut step_index = 0usize;
+    let step_total = request
+        .files
+        .iter()
+        .map(|entry| entry.steps.len())
+        .sum::<usize>();
 
-    for entry in &request.files {
+    for (file_index, entry) in request.files.iter().enumerate() {
         let Some((_, temp_file)) = files.get(&entry.path) else {
             return Err(VimEditError::ReadFile {
                 path: entry.path.clone(),
@@ -824,19 +891,37 @@ async fn run_vim_multi_file_session(
             let next_buffer = session.buffer_text().await?;
             let changed = next_buffer != previous_buffer;
             previous_buffer = next_buffer;
+            let message = Some("step completed successfully".to_string());
+            let event = VimEditEvent {
+                step_index,
+                step: step.clone(),
+                before_cursor,
+                after_cursor,
+                nvim_mode,
+                context,
+                changed,
+                message,
+            };
+            if let Some(observer) = observer.as_deref_mut() {
+                observer(VimEditFrame {
+                    file_index,
+                    file_total: request.files.len(),
+                    path: entry.path.clone(),
+                    step_index,
+                    step_total,
+                    step: event.step.clone(),
+                    before_cursor: event.before_cursor,
+                    after_cursor: event.after_cursor,
+                    nvim_mode: event.nvim_mode.clone(),
+                    context: event.context.clone(),
+                    changed: event.changed,
+                    message: event.message.clone(),
+                });
+            }
             events_by_path
                 .entry(entry.path.clone())
                 .or_default()
-                .push(VimEditEvent {
-                    step_index,
-                    step: step.clone(),
-                    before_cursor,
-                    after_cursor,
-                    nvim_mode,
-                    context,
-                    changed,
-                    message: Some("step completed successfully".to_string()),
-                });
+                .push(event);
             step_index = step_index.saturating_add(1);
         }
         previous_buffers.insert(entry.path.clone(), previous_buffer);
@@ -867,7 +952,10 @@ async fn run_vim_multi_file_session(
     })
 }
 
-async fn run_vim_edit_prepare(request: &VimEditRequest) -> Result<VimEditExecution, VimEditError> {
+async fn run_vim_edit_prepare(
+    request: &VimEditRequest,
+    observer: Option<VimEditFrameSink<'_>>,
+) -> Result<VimEditExecution, VimEditError> {
     let original = read_text_file(&request.path)?;
     let temp_file = temp_file_with_contents(&original)?;
     let session = NeovimSession::start(
@@ -877,7 +965,7 @@ async fn run_vim_edit_prepare(request: &VimEditRequest) -> Result<VimEditExecuti
             .unwrap_or_else(|| Path::new(NVIM_EXECUTABLE)),
     )
     .await?;
-    let operation = run_vim_edit_session(&session, request, temp_file.path());
+    let operation = run_vim_edit_session(&session, request, temp_file.path(), observer);
     let session_result = time::timeout(request.timeout, operation)
         .await
         .unwrap_or(Err(VimEditError::Timeout {
@@ -912,6 +1000,7 @@ async fn run_vim_edit_session(
     session: &NeovimSession,
     request: &VimEditRequest,
     temp_path: &Path,
+    mut observer: Option<VimEditFrameSink<'_>>,
 ) -> Result<SessionEditOutput, VimEditError> {
     session.configure_isolation().await?;
     session.edit_path(temp_path).await?;
@@ -939,7 +1028,8 @@ async fn run_vim_edit_session(
         let next_buffer = session.buffer_text().await?;
         let changed = next_buffer != previous_buffer;
         previous_buffer = next_buffer;
-        events.push(VimEditEvent {
+        let message = Some("step completed successfully".to_string());
+        let event = VimEditEvent {
             step_index,
             step: step.clone(),
             before_cursor,
@@ -947,8 +1037,25 @@ async fn run_vim_edit_session(
             nvim_mode,
             context,
             changed,
-            message: Some("step completed successfully".to_string()),
-        });
+            message,
+        };
+        if let Some(observer) = observer.as_deref_mut() {
+            observer(VimEditFrame {
+                file_index: 0,
+                file_total: 1,
+                path: request.path.clone(),
+                step_index,
+                step_total: request.steps.len(),
+                step: event.step.clone(),
+                before_cursor: event.before_cursor,
+                after_cursor: event.after_cursor,
+                nvim_mode: event.nvim_mode.clone(),
+                context: event.context.clone(),
+                changed: event.changed,
+                message: event.message.clone(),
+            });
+        }
+        events.push(event);
     }
 
     let final_text = previous_buffer;

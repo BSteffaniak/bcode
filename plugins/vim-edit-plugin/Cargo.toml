@@ -17,6 +17,7 @@ crate-type = ["cdylib", "rlib"]
 bcode_plugin_sdk = { workspace = true }
 bcode_tool       = { workspace = true }
 bcode_vim_edit   = { workspace = true }
+bmux_keyboard    = { workspace = true, optional = true }
 serde            = { workspace = true, features = ["derive", "std"] }
 serde_json       = { workspace = true }
 
@@ -26,7 +27,7 @@ tempfile = { workspace = true }
 [features]
 default          = []
 fail-on-warnings = []
-static-bundled   = ["bmux_tui"]
+static-bundled   = ["bmux_keyboard", "bmux_tui"]
 
 [dependencies.bmux_tui]
 optional  = true
