@@ -931,6 +931,21 @@ pub enum BcodeError {
     /// Structured output was invalid or could not be decoded.
     #[error("structured output error: {0}")]
     StructuredOutput(String),
+    /// Model output was not valid JSON for structured decoding.
+    #[error("structured output invalid JSON: {0}")]
+    StructuredInvalidJson(String),
+    /// Structured output JSON schema was invalid.
+    #[error("structured output invalid schema: {0}")]
+    StructuredInvalidSchema(String),
+    /// Structured output failed JSON schema validation.
+    #[error("structured output schema validation failed: {0}")]
+    StructuredSchemaValidation(String),
+    /// Structured output could not be deserialized into the requested Rust type.
+    #[error("structured output decode failed: {0}")]
+    StructuredDecode(String),
+    /// Structured output repair attempts were exhausted.
+    #[error("structured output repair exhausted: {0}")]
+    StructuredRepairExhausted(String),
     /// Session persistence failed.
     #[error("session persistence error: {0}")]
     SessionPersistence(String),
@@ -1187,9 +1202,7 @@ where
 {
     let value = extract_structured_json(text)?;
     validate_json_schema(schema, &value)?;
-    serde_json::from_value(value).map_err(|error| {
-        BcodeError::StructuredOutput(format!("failed to deserialize structured output: {error}"))
-    })
+    serde_json::from_value(value).map_err(|error| BcodeError::StructuredDecode(error.to_string()))
 }
 
 fn extract_structured_json(text: &str) -> Result<serde_json::Value> {
@@ -1197,12 +1210,12 @@ fn extract_structured_json(text: &str) -> Result<serde_json::Value> {
         Ok(value) => Ok(value),
         Err(error) => {
             let Some(slice) = json_object_slice(text) else {
-                return Err(BcodeError::StructuredOutput(format!(
+                return Err(BcodeError::StructuredInvalidJson(format!(
                     "model output was not valid JSON: {error}; output: {text}"
                 )));
             };
             serde_json::from_str(slice).map_err(|slice_error| {
-                BcodeError::StructuredOutput(format!(
+                BcodeError::StructuredInvalidJson(format!(
                     "failed to parse JSON object from model output: {slice_error}; output: {text}"
                 ))
             })
@@ -1222,9 +1235,8 @@ fn json_value_from_text(text: &str) -> Option<serde_json::Value> {
 }
 
 fn validate_json_schema(schema: &serde_json::Value, value: &serde_json::Value) -> Result<()> {
-    let validator = jsonschema::validator_for(schema).map_err(|error| {
-        BcodeError::StructuredOutput(format!("invalid structured-output JSON schema: {error}"))
-    })?;
+    let validator = jsonschema::validator_for(schema)
+        .map_err(|error| BcodeError::StructuredInvalidSchema(error.to_string()))?;
     if validator.is_valid(value) {
         Ok(())
     } else {
@@ -1233,9 +1245,7 @@ fn validate_json_schema(schema: &serde_json::Value, value: &serde_json::Value) -
             .map(|error| error.to_string())
             .collect::<Vec<_>>()
             .join("; ");
-        Err(BcodeError::StructuredOutput(format!(
-            "structured output failed JSON schema validation: {errors}"
-        )))
+        Err(BcodeError::StructuredSchemaValidation(errors))
     }
 }
 
@@ -2247,12 +2257,26 @@ impl Agent {
                     current_prompt = repair_prompt(&prompt, &options, &response.text, &error);
                     last_error = Some(error);
                 }
+                Err(error) if options.max_repairs > 0 => {
+                    return Err(BcodeError::StructuredRepairExhausted(format!(
+                        "structured output remained invalid after {} repair attempts: {error}",
+                        options.max_repairs
+                    )));
+                }
                 Err(error) => return Err(error),
             }
         }
-        Err(last_error.unwrap_or_else(|| {
-            BcodeError::StructuredOutput("structured output repair loop did not run".to_string())
-        }))
+        Err(BcodeError::StructuredRepairExhausted(
+            last_error.map_or_else(
+                || "structured output repair loop did not run".to_string(),
+                |error| {
+                    format!(
+                        "structured output remained invalid after {} repair attempts: {error}",
+                        options.max_repairs
+                    )
+                },
+            ),
+        ))
     }
 
     async fn generate_text_with_provider_with_structured_output<P>(
