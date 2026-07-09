@@ -595,6 +595,9 @@ pub enum SessionLiveEventKind {
 /// Plugin-owned visual descriptor for transcript rendering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginVisualDescriptor {
+    /// Stable producer-owned visual instance id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visual_id: Option<String>,
     /// Producer plugin id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub producer_plugin_id: Option<String>,

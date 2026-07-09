@@ -4188,6 +4188,7 @@ fn file_change_preview(
     payload.insert("truncated".to_owned(), serde_json::Value::Bool(truncated));
     LiveToolArgumentPreview {
         visual: PluginVisualDescriptor {
+            visual_id: None,
             producer_plugin_id: Some("bcode.filesystem".to_owned()),
             schema: "bcode.filesystem.change".to_owned(),
             schema_version: 1,
@@ -4211,6 +4212,7 @@ fn shell_request_preview(command: &str, cwd: Option<&str>) -> LiveToolArgumentPr
     }
     LiveToolArgumentPreview {
         visual: PluginVisualDescriptor {
+            visual_id: None,
             producer_plugin_id: Some("bcode.shell".to_owned()),
             schema: "bcode.tool.request.shell.run".to_owned(),
             schema_version: 1,
@@ -4245,6 +4247,7 @@ fn web_search_request_preview(query: &str) -> LiveToolArgumentPreview {
     );
     LiveToolArgumentPreview {
         visual: PluginVisualDescriptor {
+            visual_id: None,
             producer_plugin_id: Some("bcode.web_search".to_owned()),
             schema: "bcode.web_search.search_request".to_owned(),
             schema_version: 1,
@@ -4288,6 +4291,7 @@ fn live_shell_transcript_block_renders_generic_elapsed() {
                 tool_call_id: "call-shell".to_owned(),
                 sequence: 1,
                 visual: PluginVisualDescriptor {
+                    visual_id: None,
                     producer_plugin_id: Some("bcode.shell".to_owned()),
                     schema: "bcode.tool.request.shell.run".to_owned(),
                     schema_version: 1,

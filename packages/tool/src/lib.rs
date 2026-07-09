@@ -388,6 +388,8 @@ pub struct ToolInvocationRequest {
 /// Plugin-owned visual update emitted while a tool invocation is running.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolStreamVisualUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visual_id: Option<String>,
     pub producer_plugin_id: Option<String>,
     pub schema: String,
     pub schema_version: u32,

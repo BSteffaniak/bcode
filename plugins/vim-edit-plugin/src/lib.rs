@@ -39,6 +39,10 @@ const VIM_EDIT_LIVE_SCHEMA: &str = "bcode.vim-edit.live";
 const VIM_EDIT_PLAYBACK_SCHEMA: &str = "bcode.vim-edit.playback";
 const VIM_EDIT_PLAYBACK_INTERACTION_KIND: &str = "bcode.vim-edit.playback";
 const VIM_EDIT_PLAYBACK_SURFACE: &str = "tool.vim-edit.playback";
+const MAX_PLAYBACK_FRAMES: usize = 500;
+const MAX_CONTEXT_LINES: usize = 15;
+const MAX_CONTEXT_LINE_CHARS: usize = 240;
+const MAX_DIFF_BYTES: usize = 256 * 1024;
 
 /// Vim edit plugin.
 #[derive(Default)]
@@ -263,62 +267,236 @@ fn tool_vim_edit_with_nvim_executable(
             steps,
             sandbox,
             timeout_ms,
-        } => {
-            let path = resolve_path(cwd, &path);
-            let display_path = path.display().to_string();
-            let edit_request = VimEditRequest {
+        } => run_single_vim_edit_tool(
+            SingleVimEditToolRun {
                 path,
-                nvim_executable,
-                steps: steps.into_iter().map(Into::into).collect(),
+                steps,
+                sandbox,
+                timeout_ms,
+                cwd,
                 mode,
-                sandbox: sandbox.into(),
-                timeout: Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)),
-            };
-            let mut sequence = 0u64;
-            let mut observer = |frame: VimEditFrame| {
-                sequence = sequence.saturating_add(1);
-                emit_vim_live_frame(&events, tool_call_id, sequence, tool_name, &frame);
-            };
-            match run_vim_edit_observed(edit_request, Some(&mut observer)) {
-                Ok(result) => {
-                    vim_edit_success_response(&display_path, &result, tool_call_id, tool_name)
-                }
-                Err(error) => vim_edit_error_response(Some(&display_path), error.to_string()),
-            }
-        }
+                tool_call_id,
+                tool_name,
+                nvim_executable,
+            },
+            events,
+        ),
         VimEditToolRequest::Multi {
             files,
             sandbox,
             timeout_ms,
-        } => {
-            let entries = files
-                .into_iter()
-                .map(|file| VimEditMultiFileEntry {
-                    path: resolve_path(cwd, &file.path),
-                    steps: file.steps.into_iter().map(Into::into).collect(),
-                })
-                .collect::<Vec<_>>();
-            let mut sequence = 0u64;
-            let mut observer = |frame: VimEditFrame| {
-                sequence = sequence.saturating_add(1);
-                emit_vim_live_frame(&events, tool_call_id, sequence, tool_name, &frame);
-            };
-            match run_vim_multi_file_edit_observed(
-                &VimEditMultiFileRequest {
-                    files: entries,
-                    nvim_executable,
-                    mode,
-                    sandbox: sandbox.into(),
-                    timeout: Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)),
-                },
-                Some(&mut observer),
-            ) {
-                Ok(result) => {
-                    vim_edit_multi_file_success_response(&result, tool_call_id, tool_name)
-                }
-                Err(error) => vim_edit_error_response(None, error.to_string()),
-            }
+        } => run_multi_file_vim_edit_tool(
+            MultiFileVimEditToolRun {
+                files,
+                sandbox,
+                timeout_ms,
+                cwd,
+                mode,
+                tool_call_id,
+                tool_name,
+                nvim_executable,
+            },
+            events,
+        ),
+    }
+}
+
+struct SingleVimEditToolRun<'a> {
+    path: PathBuf,
+    steps: Vec<VimEditToolStep>,
+    sandbox: VimEditToolSandbox,
+    timeout_ms: Option<u64>,
+    cwd: Option<&'a Path>,
+    mode: VimEditMode,
+    tool_call_id: &'a str,
+    tool_name: &'a str,
+    nvim_executable: Option<PathBuf>,
+}
+
+fn run_single_vim_edit_tool(
+    run: SingleVimEditToolRun<'_>,
+    events: ServiceEventEmitter,
+) -> ToolInvocationResponse {
+    let path = resolve_path(run.cwd, &run.path);
+    let display_path = path.display().to_string();
+    let edit_request = VimEditRequest {
+        path,
+        nvim_executable: run.nvim_executable,
+        steps: run.steps.into_iter().map(Into::into).collect(),
+        mode: run.mode,
+        sandbox: run.sandbox.into(),
+        timeout: Duration::from_millis(run.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)),
+    };
+    let mut sequence = 0u64;
+    emit_vim_live_phase(
+        &events,
+        run.tool_call_id,
+        sequence,
+        run.tool_name,
+        "started",
+        Some(&display_path),
+        None,
+    );
+    let run_result = {
+        let mut observer = |frame: VimEditFrame| {
+            sequence = sequence.saturating_add(1);
+            emit_vim_live_frame(
+                &events,
+                run.tool_call_id,
+                sequence,
+                run.tool_name,
+                "running",
+                &frame,
+            );
+        };
+        run_vim_edit_observed(edit_request, Some(&mut observer))
+    };
+    match run_result {
+        Ok(result) => {
+            sequence = sequence.saturating_add(1);
+            emit_vim_live_phase(
+                &events,
+                run.tool_call_id,
+                sequence,
+                run.tool_name,
+                "finished",
+                Some(&display_path),
+                None,
+            );
+            vim_edit_success_response(&display_path, &result, run.tool_call_id, run.tool_name)
         }
+        Err(error) => {
+            let error = error.to_string();
+            sequence = sequence.saturating_add(1);
+            emit_vim_live_phase(
+                &events,
+                run.tool_call_id,
+                sequence,
+                run.tool_name,
+                "error",
+                Some(&display_path),
+                Some(&error),
+            );
+            vim_edit_error_response(Some(&display_path), error)
+        }
+    }
+}
+
+struct MultiFileVimEditToolRun<'a> {
+    files: Vec<VimEditMultiFileToolEntry>,
+    sandbox: VimEditToolSandbox,
+    timeout_ms: Option<u64>,
+    cwd: Option<&'a Path>,
+    mode: VimEditMode,
+    tool_call_id: &'a str,
+    tool_name: &'a str,
+    nvim_executable: Option<PathBuf>,
+}
+
+fn run_multi_file_vim_edit_tool(
+    run: MultiFileVimEditToolRun<'_>,
+    events: ServiceEventEmitter,
+) -> ToolInvocationResponse {
+    let entries = run
+        .files
+        .into_iter()
+        .map(|file| VimEditMultiFileEntry {
+            path: resolve_path(run.cwd, &file.path),
+            steps: file.steps.into_iter().map(Into::into).collect(),
+        })
+        .collect::<Vec<_>>();
+    let mut sequence = 0u64;
+    emit_vim_live_phase(
+        &events,
+        run.tool_call_id,
+        sequence,
+        run.tool_name,
+        "started",
+        None,
+        None,
+    );
+    let request = VimEditMultiFileRequest {
+        files: entries,
+        nvim_executable: run.nvim_executable,
+        mode: run.mode,
+        sandbox: run.sandbox.into(),
+        timeout: Duration::from_millis(run.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)),
+    };
+    let run_result = {
+        let mut observer = |frame: VimEditFrame| {
+            sequence = sequence.saturating_add(1);
+            emit_vim_live_frame(
+                &events,
+                run.tool_call_id,
+                sequence,
+                run.tool_name,
+                "running",
+                &frame,
+            );
+        };
+        run_vim_multi_file_edit_observed(&request, Some(&mut observer))
+    };
+    match run_result {
+        Ok(result) => {
+            sequence = sequence.saturating_add(1);
+            emit_vim_live_phase(
+                &events,
+                run.tool_call_id,
+                sequence,
+                run.tool_name,
+                "finished",
+                None,
+                None,
+            );
+            vim_edit_multi_file_success_response(&result, run.tool_call_id, run.tool_name)
+        }
+        Err(error) => {
+            let error = error.to_string();
+            sequence = sequence.saturating_add(1);
+            emit_vim_live_phase(
+                &events,
+                run.tool_call_id,
+                sequence,
+                run.tool_name,
+                "error",
+                None,
+                Some(&error),
+            );
+            vim_edit_error_response(None, error)
+        }
+    }
+}
+
+fn emit_vim_live_phase(
+    events: &ServiceEventEmitter,
+    tool_call_id: &str,
+    sequence: u64,
+    tool_name: &str,
+    phase: &str,
+    path: Option<&str>,
+    error: Option<&str>,
+) {
+    let event = ToolInvocationStreamEvent::VisualUpdate {
+        tool_call_id: tool_call_id.to_string(),
+        sequence,
+        streaming: !matches!(phase, "finished" | "error"),
+        visual: ToolStreamVisualUpdate {
+            visual_id: Some(format!("{tool_call_id}-vim-live")),
+            producer_plugin_id: Some(VIM_EDIT_PLUGIN_ID.to_string()),
+            schema: VIM_EDIT_LIVE_SCHEMA.to_string(),
+            schema_version: 1,
+            title: Some("Vim edit live".to_string()),
+            subtitle: path.map(ToOwned::to_owned),
+            payload: json!({
+                "tool_name": tool_name,
+                "phase": phase,
+                "path": path,
+                "error": error,
+            }),
+        },
+    };
+    if let Ok(payload) = serde_json::to_vec(&event) {
+        events.emit(&payload);
     }
 }
 
@@ -327,6 +505,7 @@ fn emit_vim_live_frame(
     tool_call_id: &str,
     sequence: u64,
     tool_name: &str,
+    phase: &str,
     frame: &VimEditFrame,
 ) {
     let event = ToolInvocationStreamEvent::VisualUpdate {
@@ -334,6 +513,7 @@ fn emit_vim_live_frame(
         sequence,
         streaming: true,
         visual: ToolStreamVisualUpdate {
+            visual_id: Some(format!("{tool_call_id}-vim-live")),
             producer_plugin_id: Some(VIM_EDIT_PLUGIN_ID.to_string()),
             schema: VIM_EDIT_LIVE_SCHEMA.to_string(),
             schema_version: 1,
@@ -346,7 +526,7 @@ fn emit_vim_live_frame(
             )),
             payload: json!({
                 "tool_name": tool_name,
-                "phase": "running",
+                "phase": phase,
                 "path": frame.path.display().to_string(),
                 "file_index": frame.file_index,
                 "file_total": frame.file_total,
@@ -423,6 +603,9 @@ fn vim_edit_change_artifact(
     } else {
         "vim edit produced no changes"
     };
+    let diff = truncated_text(&result.diff, MAX_DIFF_BYTES);
+    let frames = single_file_playback_frames(path, result);
+    let frames_truncated = result.events.len() > frames.len();
     ToolInvocationResult::Artifact {
         artifact: Box::new(ToolArtifact {
             artifact_id: format!("{tool_call_id}-vim-edit-playback"),
@@ -438,11 +621,15 @@ fn vim_edit_change_artifact(
                 "summary": summary,
                 "path": path,
                 "changed": result.changed,
-                "diff": result.diff,
+                "diff": diff.text,
+                "diff_truncated": diff.truncated,
                 "cursor": result.cursor,
                 "nvim_mode": result.nvim_mode,
-                "final_context": result.final_context,
+                "final_context": bounded_context(&result.final_context),
                 "events": result.events,
+                "frames": frames,
+                "frame_count": result.events.len(),
+                "frames_truncated": frames_truncated,
                 "changed_ranges": [],
                 "selected_ranges": [],
                 "playback_controls": {
@@ -460,13 +647,25 @@ fn vim_edit_multi_file_success_response(
     tool_call_id: &str,
     tool_name: &str,
 ) -> ToolInvocationResponse {
+    let diff = truncated_text(&result.diff, MAX_DIFF_BYTES);
+    let frames = multi_file_playback_frames(result);
+    let frame_count = result
+        .files
+        .iter()
+        .map(|file| file.events.len())
+        .sum::<usize>();
+    let frames_truncated = frame_count > frames.len();
     let output = json!({
         "success": true,
         "error": null,
         "tool_name": tool_name,
         "changed": result.changed,
-        "diff": result.diff,
+        "diff": diff.text,
+        "diff_truncated": diff.truncated,
         "files": result.files,
+        "frames": frames,
+        "frame_count": frame_count,
+        "frames_truncated": frames_truncated,
     });
     let mut response = json_tool_response(&output, false);
     response.host_action = Some(vim_edit_playback_host_action(tool_call_id, &output));
@@ -483,6 +682,120 @@ fn vim_edit_multi_file_success_response(
         }),
     });
     response
+}
+
+#[derive(Debug, Clone)]
+struct TruncatedText {
+    text: String,
+    truncated: bool,
+}
+
+fn truncated_text(value: &str, max_bytes: usize) -> TruncatedText {
+    if value.len() <= max_bytes {
+        return TruncatedText {
+            text: value.to_string(),
+            truncated: false,
+        };
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    let mut text = value[..end].to_string();
+    text.push_str("\n… truncated …");
+    TruncatedText {
+        text,
+        truncated: true,
+    }
+}
+
+fn bounded_context(context: &bcode_vim_edit::TextContext) -> serde_json::Value {
+    let lines = context
+        .lines
+        .iter()
+        .take(MAX_CONTEXT_LINES)
+        .map(|line| truncated_text(line, MAX_CONTEXT_LINE_CHARS).text)
+        .collect::<Vec<_>>();
+    json!({
+        "start_line": context.start_line,
+        "lines": lines,
+    })
+}
+
+fn single_file_playback_frames(path: &str, result: &VimEditResult) -> Vec<serde_json::Value> {
+    let total = result.events.len();
+    bounded_event_indexes(total)
+        .into_iter()
+        .enumerate()
+        .map(|(frame_index, event_index)| {
+            let event = &result.events[event_index];
+            json!({
+                "frame_index": frame_index,
+                "file_index": 0,
+                "file_total": 1,
+                "path": path,
+                "step_index": event.step_index,
+                "step_total": total,
+                "step": event.step,
+                "before_cursor": event.before_cursor,
+                "after_cursor": event.after_cursor,
+                "cursor": event.after_cursor,
+                "nvim_mode": event.nvim_mode,
+                "context": bounded_context(&event.context),
+                "changed": event.changed,
+                "message": event.message,
+            })
+        })
+        .collect()
+}
+
+fn multi_file_playback_frames(
+    result: &bcode_vim_edit::VimEditMultiFileEditResult,
+) -> Vec<serde_json::Value> {
+    let mut events = result
+        .files
+        .iter()
+        .enumerate()
+        .flat_map(|(file_index, file)| {
+            file.events
+                .iter()
+                .map(move |event| (file_index, file, event))
+        })
+        .collect::<Vec<_>>();
+    events.sort_by_key(|(_, _, event)| event.step_index);
+    let total = events.len();
+    bounded_event_indexes(total)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(frame_index, event_index)| {
+            let (file_index, file, event) = events.get(event_index)?;
+            Some(json!({
+                "frame_index": frame_index,
+                "file_index": file_index,
+                "file_total": result.files.len(),
+                "path": file.path,
+                "step_index": event.step_index,
+                "step_total": total,
+                "step": event.step,
+                "before_cursor": event.before_cursor,
+                "after_cursor": event.after_cursor,
+                "cursor": event.after_cursor,
+                "nvim_mode": event.nvim_mode,
+                "context": bounded_context(&event.context),
+                "changed": event.changed,
+                "message": event.message,
+            }))
+        })
+        .collect()
+}
+
+fn bounded_event_indexes(total: usize) -> Vec<usize> {
+    if total <= MAX_PLAYBACK_FRAMES {
+        return (0..total).collect();
+    }
+    let head = MAX_PLAYBACK_FRAMES / 5;
+    let tail = MAX_PLAYBACK_FRAMES.saturating_sub(head);
+    (0..head).chain(total.saturating_sub(tail)..total).collect()
 }
 
 fn vim_edit_error_response(path: Option<&str>, error: String) -> ToolInvocationResponse {
@@ -863,6 +1176,10 @@ mod tests {
         assert_eq!(artifact.metadata["summary"], "vim edit changed file");
         assert_eq!(artifact.metadata["success"], true);
         assert!(artifact.metadata.get("events").is_some());
+        assert!(artifact.metadata.get("frames").is_some());
+        assert_eq!(artifact.metadata["frame_count"], 0);
+        assert_eq!(artifact.metadata["frames_truncated"], false);
+        assert_eq!(artifact.metadata["diff_truncated"], false);
         assert!(artifact.metadata.get("final_context").is_some());
     }
 

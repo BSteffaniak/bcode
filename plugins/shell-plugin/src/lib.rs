@@ -1299,6 +1299,7 @@ fn emit_tool_output_delta(
             tool_call_id: tool_call_id.to_owned(),
             sequence,
             visual: ToolStreamVisualUpdate {
+                visual_id: None,
                 producer_plugin_id: Some("bcode.shell".to_owned()),
                 schema: "bcode.tool.request.shell.run".to_owned(),
                 schema_version: 1,

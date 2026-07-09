@@ -537,7 +537,10 @@ pub fn streaming_tool_visual_item(
     streaming: bool,
 ) -> TranscriptItem {
     let artifact = ToolArtifact {
-        artifact_id: format!("{tool_call_id}-stream-visual"),
+        artifact_id: visual
+            .visual_id
+            .clone()
+            .unwrap_or_else(|| format!("{tool_call_id}-stream-visual")),
         producer_plugin_id: visual
             .producer_plugin_id
             .clone()
@@ -567,14 +570,14 @@ pub fn streaming_tool_visual_item(
 
 /// Upsert a plugin-owned visual update item for a tool call.
 pub fn upsert_tool_visual_item(items: &mut Vec<TranscriptItem>, item: TranscriptItem) -> usize {
-    let Some((tool_call_id, schema)) = tool_visual_identity(&item) else {
+    let Some((tool_call_id, visual_key)) = tool_visual_identity(&item) else {
         items.push(item);
         return items.len().saturating_sub(1);
     };
     let tool_call_id = tool_call_id.to_owned();
-    let schema = schema.to_owned();
+    let visual_key = visual_key.to_owned();
     if let Some(index) = items.iter().position(|existing| {
-        tool_visual_identity(existing) == Some((tool_call_id.as_str(), schema.as_str()))
+        tool_visual_identity(existing) == Some((tool_call_id.as_str(), visual_key.as_str()))
     }) {
         let mut item = item;
         item.copy_tool_timing_from(&items[index]);
@@ -609,7 +612,7 @@ fn tool_visual_identity(item: &TranscriptItem) -> Option<(&str, &str)> {
     else {
         return None;
     };
-    Some((tool_call_id.as_str(), artifact.schema.as_str()))
+    Some((tool_call_id.as_str(), artifact.artifact_id.as_str()))
 }
 
 /// Build a streaming transcript item for live tool output.

@@ -4141,6 +4141,7 @@ mod tests {
     fn visual_status_template_omits_unresolved_placeholders() {
         let preview = LiveToolArgumentPreview {
             visual: bcode_session_models::PluginVisualDescriptor {
+                visual_id: None,
                 producer_plugin_id: Some("bcode.filesystem".to_owned()),
                 schema: "bcode.filesystem.change".to_owned(),
                 schema_version: 1,

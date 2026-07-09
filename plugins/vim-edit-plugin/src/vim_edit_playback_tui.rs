@@ -117,6 +117,21 @@ impl TerminalInteractionRenderer<super::vim_edit_interaction::VimEditPlaybackInt
                 KeyCode::Right | KeyCode::Char('l') => Some(InteractionInput::Activate {
                     control_id: bcode_tool::InteractionControlId::new("next"),
                 }),
+                KeyCode::Char('g') | KeyCode::Home => Some(InteractionInput::Activate {
+                    control_id: bcode_tool::InteractionControlId::new("first"),
+                }),
+                KeyCode::Char('G') | KeyCode::End => Some(InteractionInput::Activate {
+                    control_id: bcode_tool::InteractionControlId::new("last"),
+                }),
+                KeyCode::Char('[') => Some(InteractionInput::Activate {
+                    control_id: bcode_tool::InteractionControlId::new("previous_changed"),
+                }),
+                KeyCode::Char(']') => Some(InteractionInput::Activate {
+                    control_id: bcode_tool::InteractionControlId::new("next_changed"),
+                }),
+                KeyCode::Char(' ') => Some(InteractionInput::Activate {
+                    control_id: bcode_tool::InteractionControlId::new("play_pause"),
+                }),
                 KeyCode::Char('t') => Some(InteractionInput::Activate {
                     control_id: bcode_tool::InteractionControlId::new("timeline"),
                 }),
@@ -133,6 +148,9 @@ impl TerminalInteractionRenderer<super::vim_edit_interaction::VimEditPlaybackInt
                 KeyCode::Escape | KeyCode::Char('q') => Some(InteractionInput::Cancel),
                 _ => None,
             },
+            Event::Tick => Some(InteractionInput::Activate {
+                control_id: bcode_tool::InteractionControlId::new("tick"),
+            }),
             _ => None,
         }
     }

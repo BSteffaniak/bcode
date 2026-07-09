@@ -8613,6 +8613,7 @@ fn live_tool_argument_preview_from_fields(
     let payload = resolve_visual_payload(fields, &metadata.payload)?;
     Some(LiveToolArgumentPreview {
         visual: PluginVisualDescriptor {
+            visual_id: None,
             producer_plugin_id: metadata.producer_plugin_id.clone(),
             schema: metadata.schema.clone(),
             schema_version: metadata.schema_version,
@@ -14292,6 +14293,7 @@ fn convert_tool_stream_event(event: ServiceToolInvocationStreamEvent) -> ToolInv
             tool_call_id,
             sequence,
             visual: bcode_session_models::PluginVisualDescriptor {
+                visual_id: visual.visual_id,
                 producer_plugin_id: visual.producer_plugin_id,
                 schema: visual.schema,
                 schema_version: visual.schema_version,
