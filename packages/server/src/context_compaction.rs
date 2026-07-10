@@ -35,6 +35,13 @@ pub enum CompactionError {
     #[error("compaction cancelled")]
     Cancelled,
     #[error(
+        "current indivisible turn cannot fit available input capacity: estimated {estimated_tokens} tokens > available {available_input_tokens}"
+    )]
+    UncompactableCurrentTurn {
+        estimated_tokens: u64,
+        available_input_tokens: u64,
+    },
+    #[error(
         "request remains too large after compaction: estimated {estimated_tokens} tokens >= threshold {threshold_tokens}"
     )]
     RequestStillTooLarge {
@@ -568,6 +575,24 @@ pub async fn request_exceeds_compaction_capacity(
 }
 
 #[allow(clippy::too_many_lines)]
+pub fn ensure_compactable_current_turn(
+    history: &[bcode_session_models::SessionEvent],
+    tool_output_context_chars: usize,
+    available_input_tokens: u64,
+) -> Result<(), CompactionError> {
+    let active_unit_tokens = conversational_units(history, tool_output_context_chars)
+        .last()
+        .map_or(0, |unit| unit.estimated_tokens);
+    if active_unit_tokens > available_input_tokens {
+        return Err(CompactionError::UncompactableCurrentTurn {
+            estimated_tokens: active_unit_tokens,
+            available_input_tokens,
+        });
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
 pub async fn maybe_auto_compact_session_context(
     state: &ServerState,
     session_id: SessionId,
@@ -614,6 +639,11 @@ pub async fn maybe_auto_compact_session_context(
         evaluation.requested_max_output_tokens,
         model_status.max_output_tokens,
     );
+    ensure_compactable_current_turn(
+        &history,
+        state.tool_output_context_chars,
+        capacity.available_input_tokens,
+    )?;
     let threshold_tokens = capacity.threshold_tokens;
     if projected_context_tokens < threshold_tokens {
         append_context_compaction_trace(

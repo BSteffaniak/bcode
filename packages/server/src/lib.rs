@@ -7961,6 +7961,21 @@ async fn send_compaction_noop_response(
     .await
 }
 
+async fn send_uncompactable_current_turn_response(
+    writer: &SharedWriter,
+    request_id: u64,
+) -> Result<(), ServerError> {
+    send_response(
+        writer,
+        request_id,
+        Response::Err(ErrorResponse::new(
+            "uncompactable_current_turn",
+            "current turn cannot fit the model input capacity and cannot be partially compacted",
+        )),
+    )
+    .await
+}
+
 async fn handle_compact_session(
     request_id: u64,
     client_id: ClientId,
@@ -8037,6 +8052,9 @@ async fn handle_compact_session(
                 )),
             )
             .await
+        }
+        Err(CompactionError::UncompactableCurrentTurn { .. }) => {
+            send_uncompactable_current_turn_response(writer, request_id).await
         }
         Err(CompactionError::RequestStillTooLarge { .. }) => {
             send_response(
@@ -17871,6 +17889,179 @@ mod tests {
         assert_eq!(request.parameters.temperature, None);
         assert_eq!(request.parameters.max_output_tokens, None);
         assert_eq!(request.parameters.top_p, None);
+    }
+
+    #[test]
+    fn multiple_sequential_user_turns_are_distinct_complete_units() {
+        let session_id = SessionId::new();
+        let history = vec![
+            session_event(
+                session_id,
+                1,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "one".into(),
+                },
+            ),
+            session_event(
+                session_id,
+                2,
+                SessionEventKind::AssistantMessage {
+                    text: "first".into(),
+                },
+            ),
+            session_event(
+                session_id,
+                3,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "two".into(),
+                },
+            ),
+            session_event(
+                session_id,
+                4,
+                SessionEventKind::AssistantMessage {
+                    text: "second".into(),
+                },
+            ),
+            session_event(
+                session_id,
+                5,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "three".into(),
+                },
+            ),
+        ];
+        let units = conversational_units(&history, 1_000);
+        assert_eq!(units.len(), 3);
+        assert_eq!(
+            units
+                .iter()
+                .map(|unit| unit.events.len())
+                .collect::<Vec<_>>(),
+            vec![2, 2, 1]
+        );
+    }
+
+    #[test]
+    fn multi_round_tool_chain_stays_in_one_unit() {
+        let session_id = SessionId::new();
+        let mut history = vec![session_event(
+            session_id,
+            1,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "work".into(),
+            },
+        )];
+        for (sequence, call) in [(2, "a"), (4, "b")] {
+            history.push(session_event(
+                session_id,
+                sequence,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: call.into(),
+                    tool_name: "tool".into(),
+                    arguments_json: "{}".into(),
+                    producer_plugin_id: None,
+                    request_visual: None,
+                    legacy_request_presentation: None,
+                },
+            ));
+            history.push(session_event(
+                session_id,
+                sequence + 1,
+                SessionEventKind::ToolCallFinished {
+                    tool_call_id: call.into(),
+                    result: "ok".into(),
+                    is_error: false,
+                    output: None,
+                    semantic_result: None,
+                },
+            ));
+        }
+        history.push(session_event(
+            session_id,
+            6,
+            SessionEventKind::AssistantMessage {
+                text: "done".into(),
+            },
+        ));
+        let units = conversational_units(&history, 1_000);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].events.len(), 6);
+    }
+
+    #[test]
+    fn provider_marker_portable_summary_is_plan_base() {
+        let session_id = SessionId::new();
+        let snapshot = bcode_session_models::ProviderContextSnapshot {
+            format_version: 1,
+            provider_plugin_id: "provider".into(),
+            model_id: "model".into(),
+            compatibility_key: "surface".into(),
+            auth_profile: None,
+            origin: bcode_session_models::ProviderContextSnapshotOrigin::Explicit,
+            messages_json: "[]".into(),
+            portable_summary: "portable provider summary".into(),
+        };
+        let history = vec![
+            session_event(
+                session_id,
+                1,
+                SessionEventKind::ProviderContextCompacted {
+                    snapshot,
+                    compacted_through_sequence: 7,
+                },
+            ),
+            session_event(
+                session_id,
+                2,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "old".into(),
+                },
+            ),
+            session_event(
+                session_id,
+                3,
+                SessionEventKind::AssistantMessage {
+                    text: "answer".into(),
+                },
+            ),
+            session_event(
+                session_id,
+                4,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "active".into(),
+                },
+            ),
+        ];
+        let plan = structural_compaction_plan(&history, 1_000, 0).expect("plan");
+        assert_eq!(plan.prior_boundary, Some(7));
+        assert_eq!(plan.portable_fallback, "portable provider summary");
+    }
+
+    #[test]
+    fn oversized_active_unit_is_explicitly_uncompactable() {
+        let session_id = SessionId::new();
+        let history = vec![session_event(
+            session_id,
+            1,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "x".repeat(4_000),
+            },
+        )];
+        let error =
+            ensure_compactable_current_turn(&history, 1_000, 10).expect_err("uncompactable");
+        assert!(matches!(
+            error,
+            CompactionError::UncompactableCurrentTurn { .. }
+        ));
+        assert!(ensure_compactable_current_turn(&history, 1_000, 2_000).is_ok());
     }
 
     #[test]
