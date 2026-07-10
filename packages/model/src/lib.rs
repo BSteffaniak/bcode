@@ -225,17 +225,41 @@ pub struct ModelListRequest {
     pub selected_model_id: Option<String>,
 }
 
-/// Catalog model expansion policy requested by a provider.
+/// Authority represented by a provider model listing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CatalogExpansionPolicy {
-    /// Enrich only provider-returned models.
+pub enum ModelListAuthority {
+    /// User configuration explicitly controls membership.
+    Explicit,
+    /// Provider discovery authoritatively controls membership.
+    Authoritative,
+    /// Provider discovery may be supplemented by catalog data.
+    Partial,
+    /// Provider returned fallback candidates only.
     #[default]
-    None,
-    /// Add catalog models matching the provider support target.
-    SupportedOnly,
-    /// Add every catalog model for the provider.
-    AllCatalogModels,
+    Fallback,
+}
+
+/// Provider-neutral catalog resolution policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ModelCatalogPolicy {
+    /// Provider has no catalog mapping.
+    #[default]
+    Unmapped,
+    /// Enrich existing models without expanding membership.
+    EnrichOnly {
+        provider_id: String,
+        authority: ModelListAuthority,
+    },
+    /// Expand with models matching a support target.
+    ExpandSupported {
+        provider_id: String,
+        target: ModelCatalogSupportHint,
+        authority: ModelListAuthority,
+    },
+    /// Expand with every model in the provider catalog.
+    ExpandAll { provider_id: String },
 }
 
 /// Provider-neutral catalog support target.
@@ -252,11 +276,7 @@ pub struct ModelCatalogSupportHint {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCatalogHints {
     #[serde(default)]
-    pub provider_id: Option<String>,
-    #[serde(default)]
-    pub expansion: CatalogExpansionPolicy,
-    #[serde(default)]
-    pub support: Option<ModelCatalogSupportHint>,
+    pub policy: ModelCatalogPolicy,
 }
 
 /// Model listing response.

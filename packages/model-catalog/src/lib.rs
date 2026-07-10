@@ -226,34 +226,30 @@ impl ModelCatalogResolver {
 
     /// Resolve provider-returned models through the shared catalog policy.
     pub async fn resolve(&self, list: bcode_model::ModelList) -> bcode_model::ModelList {
-        let Some(provider_id) = list.catalog.provider_id.as_deref() else {
-            return list;
-        };
         let catalog = self.catalog.read().await.clone();
-        let models = match list.catalog.expansion {
-            bcode_model::CatalogExpansionPolicy::None => {
+        let models = match &list.catalog.policy {
+            bcode_model::ModelCatalogPolicy::Unmapped => return list,
+            bcode_model::ModelCatalogPolicy::EnrichOnly { provider_id, .. } => {
                 catalog.merge_provider_models(provider_id, list.models, false)
             }
-            bcode_model::CatalogExpansionPolicy::AllCatalogModels => {
+            bcode_model::ModelCatalogPolicy::ExpandAll { provider_id } => {
                 catalog.merge_provider_models(provider_id, list.models, true)
             }
-            bcode_model::CatalogExpansionPolicy::SupportedOnly => {
+            bcode_model::ModelCatalogPolicy::ExpandSupported {
+                provider_id,
+                target,
+                ..
+            } => {
                 let mut resolved = catalog.merge_provider_models(provider_id, list.models, false);
-                let Some(support) = list.catalog.support.as_ref() else {
-                    return bcode_model::ModelList {
-                        models: resolved,
-                        catalog: list.catalog,
-                    };
-                };
                 let mut seen = resolved
                     .iter()
                     .map(|model| model.model_id.clone())
                     .collect::<std::collections::BTreeSet<_>>();
                 let target = ModelSupportTarget::new(
-                    support.provider.clone(),
-                    support.auth_mode.clone(),
-                    support.api_surface.clone(),
-                    support.integration.clone(),
+                    target.provider.clone(),
+                    target.auth_mode.clone(),
+                    target.api_surface.clone(),
+                    target.integration.clone(),
                 );
                 resolved.extend(
                     catalog

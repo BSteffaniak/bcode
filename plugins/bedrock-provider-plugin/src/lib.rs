@@ -1141,8 +1141,10 @@ impl BedrockProviderPlugin {
                     request.selected_model_id.as_deref(),
                 ),
                 catalog: ModelCatalogHints {
-                    provider_id: Some("bedrock".to_string()),
-                    ..ModelCatalogHints::default()
+                    policy: bcode_model::ModelCatalogPolicy::EnrichOnly {
+                        provider_id: "bedrock".to_string(),
+                        authority: bcode_model::ModelListAuthority::Explicit,
+                    },
                 },
             };
         }
@@ -1171,8 +1173,10 @@ impl BedrockProviderPlugin {
                 request.selected_model_id.as_deref(),
             ),
             catalog: ModelCatalogHints {
-                provider_id: Some("bedrock".to_string()),
-                ..ModelCatalogHints::default()
+                policy: bcode_model::ModelCatalogPolicy::EnrichOnly {
+                    provider_id: "bedrock".to_string(),
+                    authority: bcode_model::ModelListAuthority::Authoritative,
+                },
             },
         }
     }

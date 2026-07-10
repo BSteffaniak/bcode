@@ -10,18 +10,18 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bcode_config::AuthMode;
 use bcode_model::{
-    AckResponse, CancelTurnRequest, CatalogExpansionPolicy, ContentBlock, FinishTurnRequest,
-    MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelCapability, ModelCatalogHints,
-    ModelCatalogSupportHint, ModelInfo, ModelList, ModelListRequest, ModelMessage,
-    ModelMetadataSource, ModelPricingInfo, ModelPricingSource, ModelPricingUnit,
-    ModelReasoningCapabilitySource, ModelTokenPrice, ModelTurnRequest, NativeWebSearchRequest,
-    NativeWebSearchResponse, NativeWebSearchResult, OP_AUTH_PRIME, OP_AUTH_RESET_CREDIT_CONSUME,
-    OP_AUTH_RESET_CREDITS, OP_AUTH_USAGE, OP_CANCEL_TURN, OP_CAPABILITIES, OP_FINISH_TURN,
-    OP_MODELS, OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG,
-    OP_VERIFY_MODEL, PollTurnEventsRequest, PollTurnEventsResponse, ProviderAuthCandidate,
-    ProviderCapabilities, ProviderCapability, ProviderError, ProviderErrorCategory,
-    ProviderRequestContext, ProviderRequestProjection, ProviderRetryRule, ProviderRetryRuleMatch,
-    ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage, ToolCall, ValidateConfigResponse,
+    AckResponse, CancelTurnRequest, ContentBlock, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID,
+    MessageRole, ModelCapability, ModelCatalogHints, ModelCatalogPolicy, ModelCatalogSupportHint,
+    ModelInfo, ModelList, ModelListAuthority, ModelListRequest, ModelMessage, ModelMetadataSource,
+    ModelPricingInfo, ModelPricingSource, ModelPricingUnit, ModelReasoningCapabilitySource,
+    ModelTokenPrice, ModelTurnRequest, NativeWebSearchRequest, NativeWebSearchResponse,
+    NativeWebSearchResult, OP_AUTH_PRIME, OP_AUTH_RESET_CREDIT_CONSUME, OP_AUTH_RESET_CREDITS,
+    OP_AUTH_USAGE, OP_CANCEL_TURN, OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS,
+    OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG, OP_VERIFY_MODEL,
+    PollTurnEventsRequest, PollTurnEventsResponse, ProviderAuthCandidate, ProviderCapabilities,
+    ProviderCapability, ProviderError, ProviderErrorCategory, ProviderRequestContext,
+    ProviderRequestProjection, ProviderRetryRule, ProviderRetryRuleMatch, ProviderTurnEvent,
+    StartTurnResponse, StopReason, TokenUsage, ToolCall, ValidateConfigResponse,
 };
 use bcode_model_provider_runtime::{
     ProviderRuntime, retry_hint_from_json_value, retry_hint_from_response_parts,
@@ -4513,9 +4513,12 @@ fn catalog_hints(settings: &Settings) -> ModelCatalogHints {
     let provider_id = catalog_provider_id(settings).map(str::to_string);
     if settings.model_ids_are_explicit {
         return ModelCatalogHints {
-            provider_id,
-            expansion: CatalogExpansionPolicy::None,
-            support: None,
+            policy: provider_id.map_or(ModelCatalogPolicy::Unmapped, |provider_id| {
+                ModelCatalogPolicy::EnrichOnly {
+                    provider_id,
+                    authority: ModelListAuthority::Explicit,
+                }
+            }),
         };
     }
     let Some(provider_id) = provider_id else {
@@ -4538,9 +4541,16 @@ fn catalog_hints(settings: &Settings) -> ModelCatalogHints {
         integration: Some("bcode".to_string()),
     });
     ModelCatalogHints {
-        provider_id: Some(provider_id),
-        expansion: CatalogExpansionPolicy::SupportedOnly,
-        support,
+        policy: ModelCatalogPolicy::ExpandSupported {
+            provider_id,
+            target: support.unwrap_or_else(|| ModelCatalogSupportHint {
+                provider: "xai".to_string(),
+                auth_mode: "api_key".to_string(),
+                api_surface: "responses".to_string(),
+                integration: Some("bcode".to_string()),
+            }),
+            authority: ModelListAuthority::Fallback,
+        },
     }
 }
 
