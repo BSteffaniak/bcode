@@ -18,6 +18,12 @@ use hyperchad_docs_config_derive::{ConfigDoc, ConfigDocEnum};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod context_management;
+pub use context_management::{
+    CompactContextRequest, CompactContextResponse, ContextManagementCapabilities,
+    ContextManagementCapabilitiesRequest, ContextManagementRequest, ProviderContextFormat,
+};
+
 /// Provider context setting for explicit catalog provider mapping.
 pub const CATALOG_PROVIDER_ID_SETTING: &str = "catalog_provider_id";
 
@@ -236,66 +242,6 @@ pub enum ProviderCapability {
     NativeContextCompaction,
     NativeWebSearch,
     CodeSearch,
-}
-
-/// Provider-owned identity for an opaque replacement-context format.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProviderContextFormat {
-    /// Provider format version understood by the emitting plugin.
-    #[serde(default = "default_provider_context_format_version")]
-    pub version: u16,
-    /// Stable, non-secret provider-surface compatibility key.
-    pub compatibility_key: String,
-}
-
-const fn default_provider_context_format_version() -> u16 {
-    1
-}
-
-/// Context-management capabilities for one active provider/model surface.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextManagementCapabilities {
-    /// Provider autonomously manages context without an explicit compaction request.
-    #[serde(default)]
-    pub provider_managed: bool,
-    /// Provider supports [`OP_COMPACT_CONTEXT`] for this surface.
-    #[serde(default)]
-    pub native_compaction: bool,
-    /// Opaque context format produced by both supported compaction mechanisms.
-    #[serde(default)]
-    pub context_format: Option<ProviderContextFormat>,
-}
-
-/// Request for context-management capability discovery.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextManagementCapabilitiesRequest {
-    #[serde(default)]
-    pub provider_context: ProviderRequestContext,
-    #[serde(default)]
-    pub model_id: Option<String>,
-}
-
-/// Request for provider-native compaction of model-visible context.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompactContextRequest {
-    pub session_id: SessionId,
-    #[serde(default)]
-    pub provider_context: ProviderRequestContext,
-    pub model_id: String,
-    #[serde(default)]
-    pub system_prompt: Option<String>,
-    pub messages: Vec<ModelMessage>,
-    #[serde(default)]
-    pub tools: Vec<ToolDefinition>,
-}
-
-/// Provider-native compacted replacement context.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompactContextResponse {
-    /// Lossless opaque replacement messages.
-    pub messages: Vec<ModelMessage>,
-    /// Provider-owned format required to replay `messages`.
-    pub context_format: ProviderContextFormat,
 }
 
 /// Model listing request.
@@ -1153,14 +1099,6 @@ pub struct StructuredOutputRequest {
     /// Whether provider-native strict schema validation should be requested where supported.
     #[serde(default)]
     pub strict: bool,
-}
-
-/// Provider context-management request for a model turn.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextManagementRequest {
-    /// Token threshold at which a supporting provider should compact context.
-    #[serde(default)]
-    pub compact_threshold: Option<u64>,
 }
 
 /// Start a provider model turn.

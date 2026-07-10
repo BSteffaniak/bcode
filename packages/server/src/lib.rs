@@ -6428,7 +6428,7 @@ async fn process_compact_session_command(
     )
     .await;
     set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
-    result
+    result.map(|completion| completion.message)
 }
 
 async fn append_turn_user_message(
@@ -7928,6 +7928,22 @@ async fn handle_subscribe_runtime_work(
     .await
 }
 
+async fn send_compaction_noop_response(
+    writer: &SharedWriter,
+    request_id: u64,
+    message: String,
+) -> Result<(), ServerError> {
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::SessionCompacted {
+            compacted: false,
+            message,
+        }),
+    )
+    .await
+}
+
 async fn handle_compact_session(
     request_id: u64,
     client_id: ClientId,
@@ -7960,17 +7976,10 @@ async fn handle_compact_session(
             )
             .await
         }
-        Err(CompactionError::NothingToCompact(message)) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionCompacted {
-                    compacted: false,
-                    message,
-                }),
-            )
-            .await
-        }
+        Err(
+            CompactionError::NothingToCompact(message)
+            | CompactionError::InsufficientProgress { message, .. },
+        ) => send_compaction_noop_response(writer, request_id, message).await,
         Err(CompactionError::Session(error)) => {
             send_response(
                 writer,
@@ -9210,6 +9219,11 @@ enum CompactionAuthority {
 enum CompactionError {
     #[error("nothing to compact: {0}")]
     NothingToCompact(String),
+    #[error("insufficient compaction progress through #{compacted_through_sequence}: {message}")]
+    InsufficientProgress {
+        message: String,
+        compacted_through_sequence: u64,
+    },
     #[error("session error: {0}")]
     Session(#[from] bcode_session::SessionError),
     #[error("model provider unavailable")]
@@ -9229,6 +9243,11 @@ enum CompactionError {
     Provider(String),
 }
 
+struct CompactionCompletion {
+    message: String,
+    compacted_through_sequence: u64,
+}
+
 struct CompactionTranscript {
     previous_summary: Option<String>,
     lines: Vec<CompactionLine>,
@@ -9240,6 +9259,7 @@ struct CompactionTranscript {
 #[derive(Debug, Clone, Copy)]
 struct CompactionProgressRequirement {
     minimum_reclaimable_tokens: u64,
+    previous_compacted_through_sequence: Option<u64>,
 }
 
 struct CompactionLine {
@@ -9257,11 +9277,14 @@ const COMPACTION_MAX_CARRIED_SUMMARY_CHARS: usize = 6_000;
 const COMPACTION_MAX_EVENT_CONTENT_CHARS: usize = 4_000;
 const COMPACTION_TOOL_RESULT_CHARS: usize = 2_000;
 
-const fn compaction_plan_meets_progress_requirement(
+fn compaction_plan_meets_progress_requirement(
     transcript: &CompactionTranscript,
     requirement: CompactionProgressRequirement,
 ) -> bool {
     transcript.estimated_reclaimable_tokens >= requirement.minimum_reclaimable_tokens
+        && requirement
+            .previous_compacted_through_sequence
+            .is_none_or(|boundary| transcript.compacted_through_sequence > boundary)
 }
 
 async fn compact_session_context_before_sequence(
@@ -9269,7 +9292,7 @@ async fn compact_session_context_before_sequence(
     session_id: SessionId,
     selection: &SessionModelSelection,
     first_kept_sequence: u64,
-) -> Result<String, CompactionError> {
+) -> Result<CompactionCompletion, CompactionError> {
     compact_session_context_with_limit(
         state,
         session_id,
@@ -9290,7 +9313,7 @@ async fn compact_session_context_with_limit(
     command_context: Option<&mut RuntimeCommandContext<'_>>,
     authority: CompactionAuthority,
     progress_requirement: Option<CompactionProgressRequirement>,
-) -> Result<String, CompactionError> {
+) -> Result<CompactionCompletion, CompactionError> {
     if authority == CompactionAuthority::Manual && state.session_has_active_turn(session_id).await {
         return Err(CompactionError::Busy);
     }
@@ -9318,10 +9341,13 @@ async fn compact_session_context_with_limit(
     if let Some(requirement) = progress_requirement
         && !compaction_plan_meets_progress_requirement(&transcript, requirement)
     {
-        return Err(CompactionError::NothingToCompact(format!(
-            "plan would reclaim approximately {} tokens, below the required {} tokens",
-            transcript.estimated_reclaimable_tokens, requirement.minimum_reclaimable_tokens
-        )));
+        return Err(CompactionError::InsufficientProgress {
+            message: format!(
+                "plan would reclaim approximately {} tokens, below the required {} tokens or without advancing the prior boundary",
+                transcript.estimated_reclaimable_tokens, requirement.minimum_reclaimable_tokens
+            ),
+            compacted_through_sequence: transcript.compacted_through_sequence,
+        });
     }
 
     if !has_model_provider(state, selection.provider_plugin_id.as_deref()) {
@@ -9379,10 +9405,13 @@ async fn compact_session_context_with_limit(
     };
     publish_session_event(state, &event).await;
 
-    Ok(format!(
-        "compacted {} events through #{}",
-        transcript.event_count, transcript.compacted_through_sequence
-    ))
+    Ok(CompactionCompletion {
+        message: format!(
+            "compacted {} events through #{}",
+            transcript.event_count, transcript.compacted_through_sequence
+        ),
+        compacted_through_sequence: transcript.compacted_through_sequence,
+    })
 }
 
 async fn provider_context_management_capabilities(
@@ -9689,6 +9718,7 @@ struct ProactiveCompactionEvaluation {
     candidate_input_tokens: Option<u64>,
     requested_max_output_tokens: Option<u32>,
     decision: CompactionDecision,
+    previous_compacted_through_sequence: Option<u64>,
 }
 
 async fn request_exceeds_compaction_capacity(
@@ -9706,7 +9736,7 @@ async fn request_exceeds_compaction_capacity(
         model_status.max_output_tokens,
     );
     let estimated_tokens = estimated_model_request_tokens(request);
-    (estimated_tokens >= capacity.threshold_tokens).then_some((estimated_tokens, capacity))
+    (estimated_tokens > capacity.available_input_tokens).then_some((estimated_tokens, capacity))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -9717,9 +9747,9 @@ async fn maybe_auto_compact_session_context(
     cancel_state: &TurnCancelState,
     command_context: &mut RuntimeCommandContext<'_>,
     evaluation: ProactiveCompactionEvaluation,
-) -> Result<bool, CompactionError> {
+) -> Result<Option<u64>, CompactionError> {
     if evaluation.decision.strategy != AutomaticCompactionStrategy::LocalProactive {
-        return Ok(false);
+        return Ok(None);
     }
 
     let history = state.sessions.model_context_events(session_id).await?;
@@ -9747,7 +9777,7 @@ async fn maybe_auto_compact_session_context(
             ),
         )
         .await;
-        return Ok(false);
+        return Ok(None);
     };
     let threshold_percent = state.auto_compaction.proactive_threshold_percent;
     let capacity = compaction_capacity_tokens(
@@ -9773,7 +9803,7 @@ async fn maybe_auto_compact_session_context(
             )),
         )
         .await;
-        return Ok(false);
+        return Ok(None);
     }
 
     append_context_compaction_trace(
@@ -9794,7 +9824,7 @@ async fn maybe_auto_compact_session_context(
     if cancel_state.is_cancelled() {
         return Err(CompactionError::Cancelled);
     }
-    let message = compact_session_context_with_limit(
+    let completion = compact_session_context_with_limit(
         state,
         session_id,
         selection,
@@ -9807,6 +9837,7 @@ async fn maybe_auto_compact_session_context(
                 .saturating_add(estimated_tokens_from_chars(
                     COMPACTION_MAX_CARRIED_SUMMARY_CHARS,
                 )),
+            previous_compacted_through_sequence: evaluation.previous_compacted_through_sequence,
         }),
     )
     .await?;
@@ -9816,10 +9847,10 @@ async fn maybe_auto_compact_session_context(
         "threshold_exceeded",
         projected_context_chars,
         true,
-        Some(message),
+        Some(completion.message),
     )
     .await;
-    Ok(true)
+    Ok(Some(completion.compacted_through_sequence))
 }
 
 async fn append_context_compaction_trace(
@@ -10633,7 +10664,8 @@ async fn run_model_turn_inner(
         remote_catalog_retry_rules(state, provider_plugin_id.as_deref()).await;
     let mut round = 0_u32;
     let mut recovery = ModelTurnRecoveryState::default();
-    let mut proactive_compaction_completed = false;
+    let mut last_proactive_compaction_boundary = None;
+    let mut last_proactive_attempt_boundary = None;
     append_context_compaction_trace(
         state,
         session_id,
@@ -10673,8 +10705,8 @@ async fn run_model_turn_inner(
                 return ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message);
             }
         };
-        let should_evaluate_proactive = !proactive_compaction_completed
-            && compaction_decision.strategy == AutomaticCompactionStrategy::LocalProactive;
+        let should_evaluate_proactive =
+            compaction_decision.strategy == AutomaticCompactionStrategy::LocalProactive;
         if should_evaluate_proactive {
             set_runtime_phase(phase, SessionRuntimePhase::Compacting).await;
         }
@@ -10689,18 +10721,30 @@ async fn run_model_turn_inner(
                     candidate_input_tokens: Some(estimated_model_request_tokens(&request)),
                     requested_max_output_tokens: request.parameters.max_output_tokens,
                     decision: compaction_decision,
+                    previous_compacted_through_sequence: last_proactive_attempt_boundary,
                 },
             )
             .await
         } else {
-            Ok(false)
+            Ok(None)
         };
         if should_evaluate_proactive {
             set_runtime_phase(phase, SessionRuntimePhase::ProviderActive).await;
         }
         match compaction_result {
-            Ok(true) => {
-                proactive_compaction_completed = true;
+            Ok(Some(compacted_through_sequence)) => {
+                if last_proactive_compaction_boundary
+                    .is_some_and(|boundary| compacted_through_sequence <= boundary)
+                {
+                    return ModelTurnCompletion::with_message(
+                        ModelTurnOutcome::Error,
+                        format!(
+                            "proactive compaction made no boundary progress beyond #{compacted_through_sequence}"
+                        ),
+                    );
+                }
+                last_proactive_attempt_boundary = Some(compacted_through_sequence);
+                last_proactive_compaction_boundary = Some(compacted_through_sequence);
                 request = match build_model_turn_request(
                     state,
                     session_id,
@@ -10727,7 +10771,7 @@ async fn run_model_turn_inner(
                 {
                     let error = CompactionError::RequestStillTooLarge {
                         estimated_tokens,
-                        threshold_tokens: capacity.threshold_tokens,
+                        threshold_tokens: capacity.available_input_tokens,
                     };
                     append_context_compaction_trace(
                         state,
@@ -10744,12 +10788,27 @@ async fn run_model_turn_inner(
                     );
                 }
             }
-            Ok(false) => {}
+            Ok(None) => {}
             Err(CompactionError::Cancelled) => {
                 return ModelTurnCompletion::with_message(
                     ModelTurnOutcome::Cancelled,
                     "model turn cancelled",
                 );
+            }
+            Err(CompactionError::InsufficientProgress {
+                message,
+                compacted_through_sequence,
+            }) => {
+                last_proactive_attempt_boundary = Some(compacted_through_sequence);
+                append_context_compaction_trace(
+                    state,
+                    session_id,
+                    "insufficient_progress",
+                    0,
+                    false,
+                    Some(message),
+                )
+                .await;
             }
             Err(CompactionError::NothingToCompact(message)) => {
                 append_context_compaction_trace(
@@ -10758,13 +10817,9 @@ async fn run_model_turn_inner(
                     "nothing_to_compact",
                     0,
                     false,
-                    Some(message.clone()),
+                    Some(message),
                 )
                 .await;
-                return ModelTurnCompletion::with_message(
-                    ModelTurnOutcome::Error,
-                    format!("request exceeds the proactive compaction threshold, but {message}"),
-                );
             }
             Err(error) => {
                 append_system_event(
@@ -11419,14 +11474,14 @@ async fn compact_session_after_context_overflow(
     match compact_session_context_before_sequence(state, session_id, selection, first_kept_sequence)
         .await
     {
-        Ok(message) => {
+        Ok(completion) => {
             append_context_compaction_trace(
                 state,
                 session_id,
                 "overflow",
                 0,
                 true,
-                Some(format!("{message}; retrying model turn")),
+                Some(format!("{}; retrying model turn", completion.message)),
             )
             .await;
             Ok(())
@@ -19254,12 +19309,41 @@ mod tests {
             &transcript,
             CompactionProgressRequirement {
                 minimum_reclaimable_tokens: 101,
+                previous_compacted_through_sequence: None,
             }
         ));
         assert!(compaction_plan_meets_progress_requirement(
             &transcript,
             CompactionProgressRequirement {
                 minimum_reclaimable_tokens: 100,
+                previous_compacted_through_sequence: None,
+            }
+        ));
+        assert!(!compaction_plan_meets_progress_requirement(
+            &transcript,
+            CompactionProgressRequirement {
+                minimum_reclaimable_tokens: 100,
+                previous_compacted_through_sequence: Some(1),
+            }
+        ));
+
+        let materially_advanced = CompactionTranscript {
+            compacted_through_sequence: 5,
+            estimated_reclaimable_tokens: 4_000,
+            ..transcript
+        };
+        assert!(compaction_plan_meets_progress_requirement(
+            &materially_advanced,
+            CompactionProgressRequirement {
+                minimum_reclaimable_tokens: 2_000,
+                previous_compacted_through_sequence: Some(1),
+            }
+        ));
+        assert!(!compaction_plan_meets_progress_requirement(
+            &materially_advanced,
+            CompactionProgressRequirement {
+                minimum_reclaimable_tokens: 4_001,
+                previous_compacted_through_sequence: Some(1),
             }
         ));
     }
