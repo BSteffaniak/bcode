@@ -19,6 +19,12 @@ if grep -R --include='*.rs' -n 'ensure_selected_model_info' plugins/*-provider-p
   exit 1
 fi
 
+if grep -R --include='*.rs' -nE 'gpt-5\.5|gpt-5\.6-sol' plugins/*-provider-plugin/src \
+  | grep -vE ':[0-9]+:.*(test|build_responses_request|Some\()'; then
+  echo "provider plugins must not contain catalog-owned model defaults" >&2
+  exit 1
+fi
+
 count="$(grep -c 'invoke_model_provider_json_blocking::<_, ModelList>' packages/server/src/lib.rs)"
 if [[ "$count" != "1" ]]; then
   echo "expected exactly one direct server OP_MODELS invocation, found $count" >&2

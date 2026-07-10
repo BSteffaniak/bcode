@@ -1793,11 +1793,19 @@ async fn auth_prime_inner(
         });
     }
 
+    let Some(model_id) = request
+        .model_id
+        .clone()
+        .filter(|model_id| !model_id.is_empty())
+    else {
+        return Err(provider_error(
+            "missing_model_id",
+            ProviderErrorCategory::InvalidRequest,
+            "auth prime requires a concrete model ID",
+        ));
+    };
     let verify_request = bcode_model::VerifyModelRequest {
-        model_id: request
-            .model_id
-            .clone()
-            .unwrap_or_else(openai_default_codex_model_id),
+        model_id,
         prompt: "Reply with exactly: ok".to_string(),
         timeout_seconds: request.timeout_seconds.or(Some(20)),
         provider_context: request.provider_context.clone(),
@@ -5186,18 +5194,6 @@ fn diagnostics_metadata(
     metadata
 }
 
-fn openai_default_model_id() -> String {
-    "gpt-5.5".to_string()
-}
-
-fn openai_default_codex_model_id() -> String {
-    "gpt-5.6-sol".to_string()
-}
-
-fn catalog_fallback_model_ids() -> Vec<String> {
-    vec![openai_default_codex_model_id()]
-}
-
 fn settings() -> Settings {
     settings_for_context(&ProviderRequestContext::default())
 }
@@ -5210,13 +5206,10 @@ fn settings_for_context(context: &ProviderRequestContext) -> Settings {
     let chatgpt_mode = (context_has_chatgpt_auth(context)
         || (allow_saved_auth && saved_openai_auth_is_chatgpt(&saved)))
         && !xai_mode;
-    let default_codex_model_id = openai_default_codex_model_id();
     let fallback_model = if xai_mode {
         DEFAULT_XAI_MODEL_ID.to_string()
-    } else if chatgpt_mode {
-        default_codex_model_id.clone()
     } else {
-        openai_default_model_id()
+        "model".to_string()
     };
     let default_model = first_context_env(
         context,
@@ -5226,8 +5219,7 @@ fn settings_for_context(context: &ProviderRequestContext) -> Settings {
             "BCODE_OPENAI_MODEL",
             "OPENAI_MODEL",
         ],
-    )
-    .or_else(|| chatgpt_mode.then(|| default_codex_model_id.clone()));
+    );
     let model_ids_env = first_context_env(
         context,
         [
@@ -5802,13 +5794,11 @@ fn saved_chatgpt_auth_settings(saved: &SavedOpenAiAuth) -> (AuthSettings, AuthDi
     )
 }
 
-fn default_model_ids(chatgpt_mode: bool, xai_mode: bool) -> Vec<String> {
+fn default_model_ids(_chatgpt_mode: bool, xai_mode: bool) -> Vec<String> {
     if xai_mode {
         return vec![DEFAULT_XAI_MODEL_ID.to_string()];
     }
-    chatgpt_mode
-        .then(catalog_fallback_model_ids)
-        .unwrap_or_default()
+    Vec::new()
 }
 
 #[derive(Debug, Deserialize)]
@@ -6443,7 +6433,7 @@ mod tests {
             dialect,
             base_url: DEFAULT_BASE_URL.to_string(),
             default_model: Some("model".to_string()),
-            fallback_model: openai_default_model_id(),
+            fallback_model: "model".to_string(),
             model_ids: vec!["model".to_string()],
             model_ids_are_explicit: true,
             catalog_provider_id: None,

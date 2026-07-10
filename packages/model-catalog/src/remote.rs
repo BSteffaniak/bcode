@@ -61,6 +61,26 @@ impl Default for RemoteCatalogOptions {
     }
 }
 
+/// State of a remote catalog cache entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogCacheState {
+    Disabled,
+    Missing,
+    Fresh,
+    Stale,
+    Expired,
+    Corrupt,
+}
+
+/// Inspected cached value and its state.
+#[derive(Debug)]
+pub struct CachedValue<T> {
+    pub value: Option<T>,
+    pub state: CatalogCacheState,
+    pub age: Option<Duration>,
+    pub path: PathBuf,
+}
+
 /// Fetch/cache client for the remote model catalog API.
 #[derive(Debug, Clone)]
 pub struct RemoteCatalogClient {
@@ -81,6 +101,68 @@ impl RemoteCatalogClient {
             .build()
             .map_err(|error| Error::RemoteCatalog(error.to_string()))?;
         Ok(Self { options, http })
+    }
+
+    /// Inspect a cached catalog without performing network I/O.
+    #[must_use]
+    pub fn inspect_cached_catalog(&self) -> CachedValue<CatalogDocument> {
+        self.inspect_cache("catalog.json")
+    }
+
+    fn inspect_cache<T>(&self, cache_name: &str) -> CachedValue<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let path = self.options.cache_dir.join(cache_name);
+        if self.options.disabled {
+            return CachedValue {
+                value: None,
+                state: CatalogCacheState::Disabled,
+                age: None,
+                path,
+            };
+        }
+        let age = fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok());
+        let Some(age) = age else {
+            return CachedValue {
+                value: None,
+                state: CatalogCacheState::Missing,
+                age: None,
+                path,
+            };
+        };
+        let state = if age <= self.options.fresh_for {
+            CatalogCacheState::Fresh
+        } else if age <= self.options.max_stale {
+            CatalogCacheState::Stale
+        } else {
+            CatalogCacheState::Expired
+        };
+        if state == CatalogCacheState::Expired {
+            return CachedValue {
+                value: None,
+                state,
+                age: Some(age),
+                path,
+            };
+        }
+        match read_cached_json(&path) {
+            Ok(value) => CachedValue {
+                value: Some(value),
+                state,
+                age: Some(age),
+                path,
+            },
+            Err(_) => CachedValue {
+                value: None,
+                state: CatalogCacheState::Corrupt,
+                age: Some(age),
+                path,
+            },
+        }
     }
 
     /// Read a cached catalog without performing network I/O.
@@ -158,11 +240,14 @@ impl RemoteCatalogClient {
 
         match self.fetch_remote(path).await {
             Ok(body) => {
+                let parsed = serde_json::from_str(&body).map_err(Error::Json)?;
                 if let Some(parent) = cache_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                fs::write(&cache_path, body.as_bytes())?;
-                serde_json::from_str(&body).map_err(Error::Json)
+                let temporary = cache_path.with_extension("json.tmp");
+                fs::write(&temporary, body.as_bytes())?;
+                fs::rename(&temporary, &cache_path)?;
+                Ok(parsed)
             }
             Err(error) if cache_is_usable_stale(&cache_path, self.options.max_stale) => {
                 read_cached_json(&cache_path).map_err(|cache_error| {
