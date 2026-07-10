@@ -1560,29 +1560,29 @@ fn wizard_layout(area: Rect) -> WizardLayout {
         .layout(area)
         .body;
     WizardLayout {
-        primary: Rect::new(body.x, body.y.saturating_add(4), body.width, 3),
-        secondary: Rect::new(body.x, body.y.saturating_add(7), body.width, 3),
-        tertiary: Rect::new(body.x, body.y.saturating_add(10), body.width, 3),
-        choice: Rect::new(body.x, body.y.saturating_add(14), body.width / 2, 1),
+        primary: Rect::new(body.x, body.y.saturating_add(4), body.width, 4),
+        secondary: Rect::new(body.x, body.y.saturating_add(8), body.width, 4),
+        tertiary: Rect::new(body.x, body.y.saturating_add(12), body.width, 4),
+        choice: Rect::new(body.x, body.y.saturating_add(17), body.width / 2, 1),
         choice_alt: Rect::new(
             body.x.saturating_add(body.width / 2),
-            body.y.saturating_add(14),
+            body.y.saturating_add(17),
             body.width / 2,
             1,
         ),
-        choice_second: Rect::new(body.x, body.y.saturating_add(15), body.width / 2, 1),
+        choice_second: Rect::new(body.x, body.y.saturating_add(18), body.width / 2, 1),
         choice_second_alt: Rect::new(
             body.x.saturating_add(body.width / 2),
-            body.y.saturating_add(15),
+            body.y.saturating_add(18),
             body.width / 2,
             1,
         ),
-        choice_third: Rect::new(body.x, body.y.saturating_add(16), body.width, 1),
+        choice_third: Rect::new(body.x, body.y.saturating_add(19), body.width, 1),
     }
 }
 
 const fn wizard_sizing() -> ModalSizing {
-    ModalSizing::new(Size::new(56, 18), Size::new(96, 28), Insets::all(2))
+    ModalSizing::new(Size::new(56, 24), Size::new(96, 34), Insets::all(2))
 }
 
 fn render_input_box(
@@ -1613,7 +1613,10 @@ fn handle_input_box(area: Rect, state: &mut TextInputState, event: &Event, focus
         return false;
     }
     matches!(
-        TextInputBox::new(TextInputPolicy::chat_composer()).handle_event(area, state, event),
+        TextInputBox::new(TextInputPolicy::chat_composer())
+            .label("")
+            .policy(TextInputBoxPolicy::labeled_field())
+            .handle_event(area, state, event),
         TextInputBoxOutcome::Edited | TextInputBoxOutcome::Redraw | TextInputBoxOutcome::Submitted
     )
 }
@@ -5240,4 +5243,35 @@ const fn table_action(outcome: TableOutcome) -> bool {
         outcome,
         TableOutcome::Selected(_) | TableOutcome::Focused(_) | TableOutcome::Redraw
     )
+}
+
+#[cfg(test)]
+mod interaction_tests {
+    use bmux_keyboard::{KeyCode, KeyStroke};
+    use bmux_tui::event::Event;
+    use bmux_tui::prelude::Rect;
+
+    use super::{handle_input_box, input_text, text_state};
+
+    #[test]
+    fn focused_wizard_input_accepts_plain_text() {
+        let mut state = text_state("");
+        let area = Rect::new(0, 0, 40, 4);
+
+        for character in "query data".chars() {
+            let key = if character == ' ' {
+                KeyCode::Space
+            } else {
+                KeyCode::Char(character)
+            };
+            assert!(handle_input_box(
+                area,
+                &mut state,
+                &Event::Key(KeyStroke::simple(key)),
+                true,
+            ));
+        }
+
+        assert_eq!(input_text(&state), "query data");
+    }
 }
