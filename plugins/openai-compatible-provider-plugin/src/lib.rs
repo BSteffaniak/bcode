@@ -3,6 +3,11 @@
 #![allow(clippy::multiple_crate_versions)]
 
 //! OpenAI-compatible model provider plugin for Bcode.
+//!
+//! `OpenAI` Responses context items are opaque provider data. Explicit and provider-managed
+//! compaction preserve each raw item as JSON and attach one provider-owned format identity used by
+//! the host to decide whether the item may be replayed. Unknown item fields must survive an exact
+//! deserialize/persist/replay round trip.
 
 mod discovery;
 
@@ -21,9 +26,10 @@ use bcode_model::{
     OP_CAPABILITIES, OP_COMPACT_CONTEXT, OP_CONTEXT_MANAGEMENT_CAPABILITIES, OP_FINISH_TURN,
     OP_MODELS, OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG,
     OP_VERIFY_MODEL, PollTurnEventsRequest, PollTurnEventsResponse, ProviderAuthCandidate,
-    ProviderCapabilities, ProviderCapability, ProviderError, ProviderErrorCategory,
-    ProviderRequestContext, ProviderRequestProjection, ProviderRetryRule, ProviderRetryRuleMatch,
-    ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage, ToolCall, ValidateConfigResponse,
+    ProviderCapabilities, ProviderCapability, ProviderContextFormat, ProviderError,
+    ProviderErrorCategory, ProviderRequestContext, ProviderRequestProjection, ProviderRetryRule,
+    ProviderRetryRuleMatch, ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage, ToolCall,
+    ValidateConfigResponse,
 };
 use bcode_model_provider_runtime::{
     ProviderRuntime, retry_hint_from_json_value, retry_hint_from_response_parts,
@@ -51,6 +57,18 @@ const OPENAI_CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_CODEX_API_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 const OPENAI_DIALECT_SETTING: &str = "dialect";
 const OPENAI_NAMESPACED_DIALECT_SETTING: &str = "openai.dialect";
+const OPENAI_CONTEXT_FORMAT_VERSION: u16 = 1;
+
+fn openai_context_format(settings: &Settings) -> ProviderContextFormat {
+    ProviderContextFormat {
+        version: OPENAI_CONTEXT_FORMAT_VERSION,
+        compatibility_key: format!(
+            "{}|{}",
+            settings.dialect.metadata_value(),
+            settings.base_url.trim_end_matches('/')
+        ),
+    }
+}
 
 /// OpenAI-compatible model provider plugin.
 pub struct OpenAiCompatibleProviderPlugin {
@@ -260,16 +278,19 @@ impl OpenAiCompatibleProviderPlugin {
             Err(error) => return invalid_request(&error),
         };
         let settings = settings_for_context(&request.provider_context);
-        let explicit_native = request
-            .provider_context
-            .settings
-            .get("native_context_compaction")
-            .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1");
         let official_responses = settings.dialect == OpenAiCompatibleDialect::ResponsesApi
             && settings.base_url.trim_end_matches('/') == DEFAULT_BASE_URL;
+        let opted_in_responses = settings.dialect == OpenAiCompatibleDialect::ResponsesApi
+            && request
+                .provider_context
+                .settings
+                .get("native_context_compaction")
+                .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1");
+        let supported = official_responses || opted_in_responses;
         json_response(&ContextManagementCapabilities {
-            provider_managed: official_responses,
-            native_compaction: official_responses || explicit_native,
+            provider_managed: supported,
+            native_compaction: supported,
+            context_format: supported.then(|| openai_context_format(&settings)),
         })
     }
 
@@ -3004,6 +3025,10 @@ async fn compact_context_inner(
     if !response.output.iter().any(|item| {
         item.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
             && item
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+            && item
                 .get("encrypted_content")
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|value| !value.is_empty())
@@ -3027,6 +3052,7 @@ async fn compact_context_inner(
             })
             .into_iter()
             .collect(),
+        context_format: openai_context_format(&settings),
     })
 }
 
@@ -3130,9 +3156,11 @@ async fn read_responses_stream_events(
     let suppress_provider_reuse_state = request
         .metadata
         .contains_key("suppress_provider_reuse_state");
+    let context_format = openai_context_format(&settings_for_context(&request.provider_context));
     let processor = ResponsesStreamProcessor {
         turn,
         dialect,
+        context_format,
         name_map: &name_map,
         suppress_provider_reuse_state,
     };
@@ -3165,6 +3193,7 @@ async fn read_responses_stream_events(
 struct ResponsesStreamProcessor<'a> {
     turn: &'a TurnState,
     dialect: OpenAiCompatibleDialect,
+    context_format: ProviderContextFormat,
     name_map: &'a BTreeMap<String, String>,
     suppress_provider_reuse_state: bool,
 }
@@ -3244,7 +3273,7 @@ fn process_responses_stream_line(
                 });
             }
         }
-        "response.output_item.added" | "response.output_item.done" => {
+        "response.output_item.added" => {
             process_responses_output_item(
                 &event,
                 processor.turn,
@@ -3253,7 +3282,21 @@ fn process_responses_stream_line(
                 processor.name_map,
             );
             process_responses_reasoning_output_item(&event, reasoning_items);
-            process_responses_compaction_output_item(&event, processor.turn, processor.dialect);
+        }
+        "response.output_item.done" => {
+            process_responses_output_item(
+                &event,
+                processor.turn,
+                tool_calls,
+                saw_tool_call,
+                processor.name_map,
+            );
+            process_responses_reasoning_output_item(&event, reasoning_items);
+            process_responses_compaction_output_item(
+                &event,
+                processor.turn,
+                &processor.context_format,
+            );
         }
         "response.function_call_arguments.delta" => {
             process_responses_function_arguments_delta(&event, processor.turn, tool_calls);
@@ -3367,12 +3410,16 @@ fn process_responses_output_item(
 fn process_responses_compaction_output_item(
     event: &serde_json::Value,
     turn: &TurnState,
-    dialect: OpenAiCompatibleDialect,
+    context_format: &ProviderContextFormat,
 ) {
     let Some(item) = event.get("item") else {
         return;
     };
     if item.get("type").and_then(serde_json::Value::as_str) != Some("compaction")
+        || item
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
         || item
             .get("encrypted_content")
             .and_then(serde_json::Value::as_str)
@@ -3387,7 +3434,7 @@ fn process_responses_compaction_output_item(
                 value: item.clone(),
             }],
         }],
-        compatibility_key: dialect.metadata_value().to_string(),
+        context_format: context_format.clone(),
     });
 }
 
@@ -7605,6 +7652,10 @@ mod tests {
         ResponsesStreamProcessor {
             turn,
             dialect: OpenAiCompatibleDialect::ResponsesApi,
+            context_format: ProviderContextFormat {
+                version: 1,
+                compatibility_key: "test".to_string(),
+            },
             name_map,
             suppress_provider_reuse_state: false,
         }
@@ -7751,6 +7802,10 @@ mod tests {
         let processor = ResponsesStreamProcessor {
             turn: &turn,
             dialect: OpenAiCompatibleDialect::ChatGptCodex,
+            context_format: ProviderContextFormat {
+                version: 1,
+                compatibility_key: "test".to_string(),
+            },
             name_map: &name_map,
             suppress_provider_reuse_state: false,
         };
@@ -7820,6 +7875,10 @@ mod tests {
         let processor = ResponsesStreamProcessor {
             turn: &turn,
             dialect: OpenAiCompatibleDialect::ChatGptCodex,
+            context_format: ProviderContextFormat {
+                version: 1,
+                compatibility_key: "test".to_string(),
+            },
             name_map: &name_map,
             suppress_provider_reuse_state: false,
         };
@@ -7897,6 +7956,52 @@ mod tests {
         );
 
         assert_eq!(error.category, ProviderErrorCategory::InvalidRequest);
+    }
+
+    #[test]
+    fn managed_compaction_emits_once_on_completed_item_and_preserves_unknown_fields() {
+        let turn = TurnState::default();
+        let mut tool_calls = BTreeMap::new();
+        let mut reasoning_items = BTreeMap::new();
+        let mut saw_tool_call = false;
+        let name_map = BTreeMap::new();
+        let processor = test_responses_stream_processor(&turn, &name_map);
+        let item = serde_json::json!({
+            "type": "compaction",
+            "id": "cmp_1",
+            "encrypted_content": "opaque",
+            "future_field": { "preserve": true }
+        });
+        for event_type in ["response.output_item.added", "response.output_item.done"] {
+            let line = format!(
+                "data: {}",
+                serde_json::json!({ "type": event_type, "item": item })
+            );
+            process_responses_stream_line(
+                &line,
+                &processor,
+                &mut tool_calls,
+                &mut reasoning_items,
+                &mut saw_tool_call,
+            )
+            .expect("stream event should process");
+        }
+
+        let events = turn.drain();
+        let compacted = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderTurnEvent::ContextCompacted { messages, .. } => Some(messages),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(compacted.len(), 1);
+        assert!(matches!(
+            &compacted[0][0].content[0],
+            ContentBlock::ProviderExtension { value }
+                if value.pointer("/future_field/preserve").and_then(serde_json::Value::as_bool)
+                    == Some(true)
+        ));
     }
 
     #[test]

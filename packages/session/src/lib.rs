@@ -7,6 +7,12 @@
 #![allow(clippy::significant_drop_tightening)]
 
 //! Session lifecycle, attachment management, and append-only event history.
+//!
+//! Model context is a bounded projection of canonical events. Local and provider-native
+//! compaction markers are equivalent boundaries: the newest marker is selected by its own event
+//! sequence, while its `compacted_through_sequence` identifies the canonical prefix it replaces.
+//! Normal model-context reads return that marker plus later semantic events without replaying or
+//! repairing the complete event log.
 
 mod actor;
 pub mod db;

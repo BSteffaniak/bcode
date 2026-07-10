@@ -2,7 +2,16 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! Model provider service contract types for Bcode.
+//! Model-provider service contracts for Bcode.
+//!
+//! Context management has two distinct provider capabilities:
+//!
+//! * explicit native compaction replaces a host-selected, structurally complete prefix;
+//! * provider-managed compaction emits replacement context while serving a normal request.
+//!
+//! Opaque replacement context is replayable only on a provider surface whose
+//! [`ProviderContextFormat`] exactly matches the format that produced it. Providers must preserve
+//! opaque items losslessly; hosts must retain a portable summary for incompatible surfaces.
 
 use bcode_session_models::SessionId;
 use hyperchad_docs_config_derive::{ConfigDoc, ConfigDocEnum};
@@ -229,6 +238,20 @@ pub enum ProviderCapability {
     CodeSearch,
 }
 
+/// Provider-owned identity for an opaque replacement-context format.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderContextFormat {
+    /// Provider format version understood by the emitting plugin.
+    #[serde(default = "default_provider_context_format_version")]
+    pub version: u16,
+    /// Stable, non-secret provider-surface compatibility key.
+    pub compatibility_key: String,
+}
+
+const fn default_provider_context_format_version() -> u16 {
+    1
+}
+
 /// Context-management capabilities for one active provider/model surface.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextManagementCapabilities {
@@ -238,6 +261,9 @@ pub struct ContextManagementCapabilities {
     /// Provider supports [`OP_COMPACT_CONTEXT`] for this surface.
     #[serde(default)]
     pub native_compaction: bool,
+    /// Opaque context format produced by both supported compaction mechanisms.
+    #[serde(default)]
+    pub context_format: Option<ProviderContextFormat>,
 }
 
 /// Request for context-management capability discovery.
@@ -266,7 +292,10 @@ pub struct CompactContextRequest {
 /// Provider-native compacted replacement context.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactContextResponse {
+    /// Lossless opaque replacement messages.
     pub messages: Vec<ModelMessage>,
+    /// Provider-owned format required to replay `messages`.
+    pub context_format: ProviderContextFormat,
 }
 
 /// Model listing request.
@@ -1500,9 +1529,8 @@ pub enum ProviderTurnEvent {
     ContextCompacted {
         /// Lossless provider-native replacement output items.
         messages: Vec<ModelMessage>,
-        /// Non-secret compatibility identity for replaying the opaque items.
-        #[serde(default)]
-        compatibility_key: String,
+        /// Provider-owned format required to replay the opaque messages.
+        context_format: ProviderContextFormat,
     },
     /// Provider-specific metadata that the host may use for invisible optimization state.
     ProviderMetadata {

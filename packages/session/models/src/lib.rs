@@ -2,7 +2,13 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! Shared session models for bcode.
+//! Shared session models for Bcode.
+//!
+//! Compaction snapshots are durable replacement-context boundaries. Their event sequence orders
+//! competing boundaries; `compacted_through_sequence` names the canonical prefix replaced by the
+//! snapshot. Provider snapshots contain opaque messages that may be replayed only when provider,
+//! model, auth profile, format version, and compatibility key match. The portable summary is the
+//! required fallback for every other surface.
 
 use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
 use serde::{Deserialize, Serialize};
