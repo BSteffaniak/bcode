@@ -48,6 +48,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use zeroize::Zeroizing;
 
+mod context_compaction;
+
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 const DEFAULT_XAI_MODEL_ID: &str = "grok-4.3"; // from https://docs.x.ai/developers/models/grok-4.3
@@ -57,34 +59,6 @@ const OPENAI_CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_CODEX_API_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 const OPENAI_DIALECT_SETTING: &str = "dialect";
 const OPENAI_NAMESPACED_DIALECT_SETTING: &str = "openai.dialect";
-const OPENAI_CONTEXT_FORMAT_VERSION: u16 = 1;
-
-fn openai_context_format(settings: &Settings) -> ProviderContextFormat {
-    ProviderContextFormat {
-        version: OPENAI_CONTEXT_FORMAT_VERSION,
-        compatibility_key: format!(
-            "{}|{}",
-            settings.dialect.metadata_value(),
-            settings.base_url.trim_end_matches('/')
-        ),
-    }
-}
-
-fn openai_context_compaction_opted_in(provider_context: &ProviderRequestContext) -> bool {
-    provider_context
-        .settings
-        .get("native_context_compaction")
-        .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1")
-}
-
-fn supports_openai_context_compaction(
-    dialect: OpenAiCompatibleDialect,
-    base_url: &str,
-    opted_in: bool,
-) -> bool {
-    dialect == OpenAiCompatibleDialect::ResponsesApi
-        && (base_url.trim_end_matches('/') == DEFAULT_BASE_URL || opted_in)
-}
 
 /// OpenAI-compatible model provider plugin.
 pub struct OpenAiCompatibleProviderPlugin {
@@ -294,13 +268,17 @@ impl OpenAiCompatibleProviderPlugin {
             Err(error) => return invalid_request(&error),
         };
         let settings = settings_for_context(&request.provider_context);
-        let opted_in = openai_context_compaction_opted_in(&request.provider_context);
-        let supported =
-            supports_openai_context_compaction(settings.dialect, &settings.base_url, opted_in);
+        let opted_in =
+            context_compaction::openai_context_compaction_opted_in(&request.provider_context);
+        let supported = context_compaction::supports_openai_context_compaction(
+            settings.dialect,
+            &settings.base_url,
+            opted_in,
+        );
         json_response(&ContextManagementCapabilities {
             provider_managed: supported,
             native_compaction: supported,
-            context_format: supported.then(|| openai_context_format(&settings)),
+            context_format: supported.then(|| context_compaction::openai_context_format(&settings)),
         })
     }
 
@@ -310,11 +288,13 @@ impl OpenAiCompatibleProviderPlugin {
             Err(error) => return invalid_request(&error),
         };
         match &self.runtime {
-            Ok(runtime) => match runtime.block_on(compact_context_inner(request)) {
-                Ok(Ok(response)) => json_response(&response),
-                Ok(Err(error)) => ServiceResponse::error(error.code, error.message),
-                Err(error) => ServiceResponse::error("runtime_error", error.to_string()),
-            },
+            Ok(runtime) => {
+                match runtime.block_on(context_compaction::compact_context_inner(request)) {
+                    Ok(Ok(response)) => json_response(&response),
+                    Ok(Err(error)) => ServiceResponse::error(error.code, error.message),
+                    Err(error) => ServiceResponse::error("runtime_error", error.to_string()),
+                }
+            }
             Err(error) => ServiceResponse::error("runtime_error", error),
         }
     }
@@ -2906,170 +2886,6 @@ async fn send_chat_completion_request(
     Ok(response)
 }
 
-#[derive(Debug, Deserialize)]
-struct ResponsesCompactBody {
-    object: String,
-    #[serde(default)]
-    output: Vec<serde_json::Value>,
-}
-
-#[allow(clippy::too_many_lines)]
-async fn compact_context_inner(
-    request: CompactContextRequest,
-) -> Result<CompactContextResponse, ProviderError> {
-    let settings = settings_for_context(&request.provider_context);
-    if !supports_openai_context_compaction(
-        settings.dialect,
-        &settings.base_url,
-        openai_context_compaction_opted_in(&request.provider_context),
-    ) {
-        return Err(provider_error(
-            "native_compaction_unsupported",
-            ProviderErrorCategory::UnsupportedFeature,
-            "provider-native compaction requires an official OpenAI Responses API surface or explicit native context compaction opt-in",
-        ));
-    }
-    let Some(access_token) = settings.auth.token() else {
-        return Err(provider_error(
-            "missing_openai_auth",
-            ProviderErrorCategory::Auth,
-            "provider-native compaction requires OpenAI authentication",
-        ));
-    };
-    let turn_request = ModelTurnRequest {
-        session_id: request.session_id,
-        turn_id: "context-compaction".to_string(),
-        model_id: request.model_id.clone(),
-        provider_context: request.provider_context,
-        system_prompt: request.system_prompt,
-        messages: request.messages,
-        tools: request.tools,
-        parameters: bcode_model::ModelParameters::default(),
-        structured_output: None,
-        context_management: bcode_model::ContextManagementRequest::default(),
-        prompt_cache: bcode_model::PromptCacheHints::default(),
-        conversation_reuse: bcode_model::ConversationReuseHints::default(),
-        metadata: BTreeMap::new(),
-    };
-    let projection = responses_projection(
-        &turn_request,
-        responses_instruction_strategy(&settings),
-        false,
-        settings.dialect,
-    );
-    let body = serde_json::json!({
-        "model": request.model_id,
-        "input": projection.input,
-        "instructions": projection.instructions,
-    });
-    let client = model_stream_client(settings.request_timeout).map_err(|error| {
-        provider_error(
-            "client_build_failed",
-            ProviderErrorCategory::ProviderInternal,
-            error.to_string(),
-        )
-    })?;
-    let endpoint = match settings.dialect {
-        OpenAiCompatibleDialect::ChatGptCodex => {
-            format!("{OPENAI_CODEX_API_ENDPOINT}/compact")
-        }
-        OpenAiCompatibleDialect::ResponsesApi => {
-            format!(
-                "{}/responses/compact",
-                settings.base_url.trim_end_matches('/')
-            )
-        }
-        OpenAiCompatibleDialect::ChatCompletions => unreachable!(),
-    };
-    let mut builder = client
-        .post(endpoint)
-        .bearer_auth(access_token)
-        .header("originator", "bcode")
-        .header("User-Agent", "bcode/0.0.1")
-        .header("session_id", request.session_id.to_string())
-        .json(&body);
-    if settings.dialect.uses_codex_request_shape() {
-        builder = builder.header("OpenAI-Beta", "responses=experimental");
-    }
-    if let AuthSettings::ChatGpt {
-        account_id: Some(account_id),
-        ..
-    } = &settings.auth
-    {
-        builder = builder.header("ChatGPT-Account-Id", account_id);
-    }
-    let response = builder.send().await.map_err(|error| {
-        provider_error(
-            "request_failed",
-            if error.is_timeout() {
-                ProviderErrorCategory::Timeout
-            } else {
-                ProviderErrorCategory::Network
-            },
-            error.to_string(),
-        )
-    })?;
-    let status = response.status();
-    if !status.is_success() {
-        let headers = response.headers().clone();
-        let body = response.text().await.unwrap_or_default();
-        return Err(error_from_status_and_headers(
-            status.as_u16(),
-            Some(&headers),
-            &body,
-        ));
-    }
-    let response = response
-        .json::<ResponsesCompactBody>()
-        .await
-        .map_err(|error| {
-            provider_error(
-                "invalid_compaction_response",
-                ProviderErrorCategory::ProviderInternal,
-                error.to_string(),
-            )
-        })?;
-    if response.object != "response.compaction" {
-        return Err(provider_error(
-            "invalid_compaction_response",
-            ProviderErrorCategory::ProviderInternal,
-            format!("unexpected compaction object type: {}", response.object),
-        ));
-    }
-    if !response.output.iter().any(|item| {
-        item.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
-            && item
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|value| !value.is_empty())
-            && item
-                .get("encrypted_content")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|value| !value.is_empty())
-    }) {
-        return Err(provider_error(
-            "invalid_compaction_response",
-            ProviderErrorCategory::ProviderInternal,
-            "compaction response did not contain a valid compaction item",
-        ));
-    }
-    let content = response
-        .output
-        .into_iter()
-        .map(|value| ContentBlock::ProviderExtension { value })
-        .collect::<Vec<_>>();
-    Ok(CompactContextResponse {
-        messages: (!content.is_empty())
-            .then_some(ModelMessage {
-                role: MessageRole::Assistant,
-                content,
-            })
-            .into_iter()
-            .collect(),
-        context_format: openai_context_format(&settings),
-    })
-}
-
 async fn send_responses_request(
     client: &Client,
     settings: &Settings,
@@ -3170,7 +2986,8 @@ async fn read_responses_stream_events(
     let suppress_provider_reuse_state = request
         .metadata
         .contains_key("suppress_provider_reuse_state");
-    let context_format = openai_context_format(&settings_for_context(&request.provider_context));
+    let context_format =
+        context_compaction::openai_context_format(&settings_for_context(&request.provider_context));
     let processor = ResponsesStreamProcessor {
         turn,
         dialect,
@@ -3306,7 +3123,7 @@ fn process_responses_stream_line(
                 processor.name_map,
             );
             process_responses_reasoning_output_item(&event, reasoning_items);
-            process_responses_compaction_output_item(
+            context_compaction::process_responses_compaction_output_item(
                 &event,
                 processor.turn,
                 &processor.context_format,
@@ -3419,37 +3236,6 @@ fn process_responses_output_item(
         });
         entry.started = true;
     }
-}
-
-fn process_responses_compaction_output_item(
-    event: &serde_json::Value,
-    turn: &TurnState,
-    context_format: &ProviderContextFormat,
-) {
-    let Some(item) = event.get("item") else {
-        return;
-    };
-    if item.get("type").and_then(serde_json::Value::as_str) != Some("compaction")
-        || item
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .is_none_or(str::is_empty)
-        || item
-            .get("encrypted_content")
-            .and_then(serde_json::Value::as_str)
-            .is_none_or(str::is_empty)
-    {
-        return;
-    }
-    turn.push(ProviderTurnEvent::ContextCompacted {
-        messages: vec![ModelMessage {
-            role: MessageRole::Assistant,
-            content: vec![ContentBlock::ProviderExtension {
-                value: item.clone(),
-            }],
-        }],
-        context_format: context_format.clone(),
-    });
 }
 
 fn process_responses_reasoning_output_item(
@@ -8020,27 +7806,27 @@ mod tests {
 
     #[test]
     fn context_compaction_capability_requires_supported_responses_surface() {
-        assert!(supports_openai_context_compaction(
+        assert!(context_compaction::supports_openai_context_compaction(
             OpenAiCompatibleDialect::ResponsesApi,
             "https://api.openai.com/v1/",
             false,
         ));
-        assert!(supports_openai_context_compaction(
+        assert!(context_compaction::supports_openai_context_compaction(
             OpenAiCompatibleDialect::ResponsesApi,
             "https://example.test/v1",
             true,
         ));
-        assert!(!supports_openai_context_compaction(
+        assert!(!context_compaction::supports_openai_context_compaction(
             OpenAiCompatibleDialect::ResponsesApi,
             "https://example.test/v1",
             false,
         ));
-        assert!(!supports_openai_context_compaction(
+        assert!(!context_compaction::supports_openai_context_compaction(
             OpenAiCompatibleDialect::ChatCompletions,
             DEFAULT_BASE_URL,
             true,
         ));
-        assert!(!supports_openai_context_compaction(
+        assert!(!context_compaction::supports_openai_context_compaction(
             OpenAiCompatibleDialect::ChatGptCodex,
             OPENAI_CODEX_API_ENDPOINT,
             true,
