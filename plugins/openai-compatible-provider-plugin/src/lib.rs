@@ -2994,6 +2994,7 @@ async fn read_responses_stream_events(
         context_format,
         name_map: &name_map,
         suppress_provider_reuse_state,
+        completed_compaction_items: std::cell::RefCell::new(BTreeSet::new()),
     };
     loop {
         if turn.is_cancelled() {
@@ -3027,6 +3028,7 @@ struct ResponsesStreamProcessor<'a> {
     context_format: ProviderContextFormat,
     name_map: &'a BTreeMap<String, String>,
     suppress_provider_reuse_state: bool,
+    completed_compaction_items: std::cell::RefCell<BTreeSet<(u32, String)>>,
 }
 
 fn process_responses_stream_buffer(
@@ -3127,6 +3129,7 @@ fn process_responses_stream_line(
                 &event,
                 processor.turn,
                 &processor.context_format,
+                &processor.completed_compaction_items,
             );
         }
         "response.function_call_arguments.delta" => {
@@ -7458,6 +7461,7 @@ mod tests {
             },
             name_map,
             suppress_provider_reuse_state: false,
+            completed_compaction_items: std::cell::RefCell::new(BTreeSet::new()),
         }
     }
 
@@ -7608,6 +7612,7 @@ mod tests {
             },
             name_map: &name_map,
             suppress_provider_reuse_state: false,
+            completed_compaction_items: std::cell::RefCell::new(BTreeSet::new()),
         };
 
         let added = process_responses_stream_line(
@@ -7681,6 +7686,7 @@ mod tests {
             },
             name_map: &name_map,
             suppress_provider_reuse_state: false,
+            completed_compaction_items: std::cell::RefCell::new(BTreeSet::new()),
         };
 
         let outcome = process_responses_stream_line(

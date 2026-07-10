@@ -228,11 +228,34 @@ pub fn process_responses_compaction_output_item(
     event: &serde_json::Value,
     turn: &TurnState,
     context_format: &ProviderContextFormat,
+    completed_items: &std::cell::RefCell<BTreeSet<(u32, String)>>,
 ) {
     let Some(item) = event.get("item") else {
         return;
     };
+    if item.get("type").and_then(serde_json::Value::as_str) != Some("compaction") {
+        return;
+    }
     if !valid_compaction_item(item) {
+        turn.push(ProviderTurnEvent::Warning {
+            message:
+                "provider emitted a malformed compaction item; no context boundary was created"
+                    .to_string(),
+        });
+        return;
+    }
+    let Some(id) = item.get("id").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    let output_index = event
+        .get("output_index")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(u32::MAX);
+    if !completed_items
+        .borrow_mut()
+        .insert((output_index, id.to_string()))
+    {
         return;
     }
     turn.push(ProviderTurnEvent::ContextCompacted {
@@ -333,6 +356,102 @@ mod tests {
         })
         .expect("valid response");
         assert_eq!(output, vec![item]);
+    }
+
+    #[test]
+    fn unknown_nested_fields_survive_model_message_persistence_round_trip() {
+        let item = serde_json::json!({
+            "type": "compaction", "id": "cmp", "encrypted_content": "opaque",
+            "future": {"nested": [true, 42, {"key": "value"}]}
+        });
+        let messages = vec![ModelMessage {
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::ProviderExtension {
+                value: item.clone(),
+            }],
+        }];
+        let persisted = serde_json::to_string(&messages).expect("persist messages");
+        let replayed: Vec<ModelMessage> =
+            serde_json::from_str(&persisted).expect("replay messages");
+        assert_eq!(replayed, messages);
+        assert!(matches!(
+            &replayed[0].content[0],
+            ContentBlock::ProviderExtension { value } if value == &item
+        ));
+    }
+
+    #[test]
+    fn managed_compaction_deduplicates_and_warns_without_boundaries_for_malformed_items() {
+        let turn = TurnState::default();
+        let format = ProviderContextFormat {
+            version: 1,
+            compatibility_key: "surface".to_string(),
+        };
+        let completed = std::cell::RefCell::new(BTreeSet::new());
+        let valid = serde_json::json!({
+            "output_index": 2,
+            "item": {"type": "compaction", "id": "cmp", "encrypted_content": "opaque"}
+        });
+        process_responses_compaction_output_item(&valid, &turn, &format, &completed);
+        process_responses_compaction_output_item(&valid, &turn, &format, &completed);
+        process_responses_compaction_output_item(
+            &serde_json::json!({
+                "output_index": 3,
+                "item": {"type": "compaction", "id": "bad", "encrypted_content": ""}
+            }),
+            &turn,
+            &format,
+            &completed,
+        );
+        let events = turn.drain();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProviderTurnEvent::ContextCompacted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProviderTurnEvent::Warning { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProviderTurnEvent::TextDelta { .. }))
+        );
+    }
+
+    #[test]
+    fn capability_predicate_is_truthful_for_every_surface() {
+        assert!(supports_openai_context_compaction(
+            OpenAiCompatibleDialect::ResponsesApi,
+            DEFAULT_BASE_URL,
+            false
+        ));
+        assert!(supports_openai_context_compaction(
+            OpenAiCompatibleDialect::ResponsesApi,
+            "https://custom.example/v1",
+            true
+        ));
+        assert!(!supports_openai_context_compaction(
+            OpenAiCompatibleDialect::ResponsesApi,
+            "https://custom.example/v1",
+            false
+        ));
+        assert!(!supports_openai_context_compaction(
+            OpenAiCompatibleDialect::ChatCompletions,
+            DEFAULT_BASE_URL,
+            true
+        ));
+        assert!(!supports_openai_context_compaction(
+            OpenAiCompatibleDialect::ChatGptCodex,
+            OPENAI_CODEX_API_ENDPOINT,
+            true
+        ));
     }
 
     #[test]
