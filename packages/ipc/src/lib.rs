@@ -411,6 +411,8 @@ pub enum Request {
         interaction_id: String,
         resolution_json: serde_json::Value,
     },
+    /// Inspect effective model catalog and refresh state.
+    ModelCatalogDiagnostics,
 }
 
 /// Server stop request policy.
@@ -1153,6 +1155,18 @@ pub enum ResponsePayload {
     },
     InteractiveToolRequestResolved {
         resolved: bool,
+    },
+    /// Effective model catalog diagnostics.
+    ModelCatalogDiagnostics {
+        embedded_revision: String,
+        remote_revision: Option<String>,
+        remote_enabled: bool,
+        cache_state: String,
+        cache_age_seconds: Option<u64>,
+        refresh_in_progress: bool,
+        last_refresh_attempt_ms: Option<u64>,
+        last_refresh_success_ms: Option<u64>,
+        last_refresh_error: Option<String>,
     },
 }
 

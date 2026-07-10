@@ -1921,6 +1921,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::Hello { .. } => "hello",
         Request::Ping => "ping",
         Request::ServerStatus => "server_status",
+        Request::ModelCatalogDiagnostics => "model_catalog_diagnostics",
         Request::ServerStop { .. } => "server_stop",
         Request::CreateSession { .. } => "create_session",
         Request::ListSessions { .. } => "list_sessions",
@@ -2058,6 +2059,9 @@ async fn handle_request_inner(
         }
         Request::Ping => handle_ping(request_id, writer).await,
         Request::ServerStatus => handle_server_status(request_id, state, writer).await,
+        Request::ModelCatalogDiagnostics => {
+            handle_model_catalog_diagnostics(request_id, state, writer).await
+        }
         Request::ServerStop { mode } => handle_server_stop(request_id, state, writer, mode).await,
         Request::SetComposerDraft { scope, text } => {
             handle_set_composer_draft(request_id, state, writer, scope, text).await
@@ -2562,6 +2566,34 @@ async fn handle_server_status(
         writer,
         request_id,
         Response::Ok(ResponsePayload::ServerStatus { status }),
+    )
+    .await
+}
+
+async fn handle_model_catalog_diagnostics(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    let diagnostics = state.model_catalog.diagnostics().await;
+    let epoch_ms = |time: Option<std::time::SystemTime>| {
+        time.and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|value| u64::try_from(value.as_millis()).ok())
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::ModelCatalogDiagnostics {
+            embedded_revision: diagnostics.embedded_revision,
+            remote_revision: diagnostics.remote_revision,
+            remote_enabled: diagnostics.remote_enabled,
+            cache_state: format!("{:?}", diagnostics.cache_state).to_lowercase(),
+            cache_age_seconds: diagnostics.cache_age.map(|age| age.as_secs()),
+            refresh_in_progress: diagnostics.refresh_in_progress,
+            last_refresh_attempt_ms: epoch_ms(diagnostics.last_refresh_attempt),
+            last_refresh_success_ms: epoch_ms(diagnostics.last_refresh_success),
+            last_refresh_error: diagnostics.last_refresh_error,
+        }),
     )
     .await
 }
