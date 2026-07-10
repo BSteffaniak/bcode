@@ -1,0 +1,16 @@
+name: Architecture Guards
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  model-catalog:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check model catalog architecture
+        run: scripts/check-model-catalog-architecture.sh

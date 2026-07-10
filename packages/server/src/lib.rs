@@ -6757,10 +6757,11 @@ async fn handle_default_model_status(
     .await
 }
 
-async fn resolved_provider_models(
+async fn resolved_provider_models_view(
     state: &ServerState,
     provider_plugin_id: Option<String>,
     request: bcode_model::ModelListRequest,
+    view: bcode_model_catalog::ModelListView,
 ) -> Result<ModelList, String> {
     let selected_model_id = request.selected_model_id.clone();
     let models = invoke_model_provider_json_blocking::<_, ModelList>(
@@ -6773,8 +6774,22 @@ async fn resolved_provider_models(
     state.model_catalog.refresh_if_stale();
     Ok(state
         .model_catalog
-        .resolve_selection(models, selected_model_id.as_deref(), None)
+        .resolve_view(models, selected_model_id.as_deref(), None, view)
         .await)
+}
+
+async fn resolved_provider_models(
+    state: &ServerState,
+    provider_plugin_id: Option<String>,
+    request: bcode_model::ModelListRequest,
+) -> Result<ModelList, String> {
+    resolved_provider_models_view(
+        state,
+        provider_plugin_id,
+        request,
+        bcode_model_catalog::ModelListView::Complete,
+    )
+    .await
 }
 
 async fn effective_model_id(
@@ -6890,7 +6905,7 @@ async fn handle_session_model_list(
             .as_ref()
             .and_then(|context| context.selected_provider_plugin_id.clone())
     });
-    match resolved_provider_models(
+    match resolved_provider_models_view(
         state,
         selected_provider_plugin_id.clone(),
         bcode_model::ModelListRequest {
@@ -6900,6 +6915,7 @@ async fn handle_session_model_list(
                 }),
             selected_model_id: None,
         },
+        bcode_model_catalog::ModelListView::UserVisible,
     )
     .await
     {
