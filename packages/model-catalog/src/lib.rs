@@ -254,8 +254,18 @@ impl ModelCatalogResolver {
 
     /// Resolve provider-returned models through the shared catalog policy.
     pub async fn resolve(&self, list: bcode_model::ModelList) -> bcode_model::ModelList {
+        self.resolve_selection(list, None, None).await
+    }
+
+    /// Resolve models, preserve selected/configured membership, and choose exactly one default.
+    pub async fn resolve_selection(
+        &self,
+        list: bcode_model::ModelList,
+        selected_model_id: Option<&str>,
+        configured_model_id: Option<&str>,
+    ) -> bcode_model::ModelList {
         let catalog = self.catalog.read().await.clone();
-        let models = match &list.catalog.policy {
+        let mut models = match &list.catalog.policy {
             bcode_model::ModelCatalogPolicy::Unmapped => return list,
             bcode_model::ModelCatalogPolicy::EnrichOnly { provider_id, .. } => {
                 catalog.merge_provider_models(provider_id, list.models, false)
@@ -288,6 +298,38 @@ impl ModelCatalogResolver {
                 resolved
             }
         };
+        let preferred = configured_model_id
+            .filter(|model_id| !model_id.trim().is_empty())
+            .or_else(|| selected_model_id.filter(|model_id| !model_id.trim().is_empty()));
+        if let Some(model_id) = preferred
+            && !models.iter().any(|model| model.model_id == model_id)
+        {
+            models.push(bcode_model::ModelInfo {
+                model_id: model_id.to_string(),
+                display_name: model_id.to_string(),
+                is_default: false,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: std::collections::BTreeSet::new(),
+                reasoning: None,
+                cache: bcode_model::ModelCacheInfo::default(),
+                metadata_source: None,
+                pricing: None,
+                visibility: bcode_model::ModelVisibility::Visible,
+            });
+        }
+        let provider_default = models
+            .iter()
+            .find(|model| model.is_default)
+            .map(|model| model.model_id.clone());
+        let effective_default = preferred
+            .filter(|model_id| models.iter().any(|model| model.model_id == *model_id))
+            .map(str::to_string)
+            .or(provider_default)
+            .or_else(|| models.first().map(|model| model.model_id.clone()));
+        for model in &mut models {
+            model.is_default = effective_default.as_deref() == Some(model.model_id.as_str());
+        }
         bcode_model::ModelList {
             models,
             catalog: list.catalog,

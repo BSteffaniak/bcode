@@ -14,6 +14,11 @@ if grep -R --include='*.rs' -nE 'load_bundled|RemoteCatalogClient|load_bundled_w
   exit 1
 fi
 
+if grep -R --include='*.rs' -n 'ensure_selected_model_info' plugins/*-provider-plugin/src; then
+  echo "provider plugins must not insert selected models" >&2
+  exit 1
+fi
+
 count="$(grep -c 'invoke_model_provider_json_blocking::<_, ModelList>' packages/server/src/lib.rs)"
 if [[ "$count" != "1" ]]; then
   echo "expected exactly one direct server OP_MODELS invocation, found $count" >&2

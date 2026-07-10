@@ -1136,9 +1136,9 @@ impl BedrockProviderPlugin {
         let settings = Settings::resolve_from_context(&request.provider_context);
         if settings.model_ids_are_explicit || settings.default_model.is_some() {
             return ModelList {
-                models: ensure_selected_model_info(
-                    model_infos_from_ids(&settings.model_ids, settings.default_model.as_deref()),
-                    request.selected_model_id.as_deref(),
+                models: model_infos_from_ids(
+                    &settings.model_ids,
+                    settings.default_model.as_deref(),
                 ),
                 catalog: ModelCatalogHints {
                     policy: bcode_model::ModelCatalogPolicy::EnrichOnly {
@@ -1168,10 +1168,7 @@ impl BedrockProviderPlugin {
                 ModelDiscovery::default()
             });
         ModelList {
-            models: ensure_selected_model_info(
-                discovered.models,
-                request.selected_model_id.as_deref(),
-            ),
+            models: discovered.models,
             catalog: ModelCatalogHints {
                 policy: bcode_model::ModelCatalogPolicy::EnrichOnly {
                     provider_id: "bedrock".to_string(),
@@ -1252,26 +1249,6 @@ fn model_list_request(request: &ServiceRequest) -> ModelListRequest {
     request
         .payload_json::<ModelListRequest>()
         .unwrap_or_default()
-}
-
-fn ensure_selected_model_info(
-    mut models: Vec<ModelInfo>,
-    selected_model_id: Option<&str>,
-) -> Vec<ModelInfo> {
-    let Some(selected_model_id) = selected_model_id.filter(|model_id| !model_id.trim().is_empty())
-    else {
-        return models;
-    };
-    if models
-        .iter()
-        .any(|model| model.model_id == selected_model_id)
-    {
-        return models;
-    }
-    let mut selected =
-        model_infos_from_ids(&[selected_model_id.to_string()], Some(selected_model_id));
-    models.append(&mut selected);
-    models
 }
 
 fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Vec<ModelInfo> {

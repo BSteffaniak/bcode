@@ -6762,6 +6762,7 @@ async fn resolved_provider_models(
     provider_plugin_id: Option<String>,
     request: bcode_model::ModelListRequest,
 ) -> Result<ModelList, String> {
+    let selected_model_id = request.selected_model_id.clone();
     let models = invoke_model_provider_json_blocking::<_, ModelList>(
         state,
         provider_plugin_id,
@@ -6770,7 +6771,10 @@ async fn resolved_provider_models(
     )
     .await?;
     state.model_catalog.refresh_if_stale();
-    Ok(state.model_catalog.resolve(models).await)
+    Ok(state
+        .model_catalog
+        .resolve_selection(models, selected_model_id.as_deref(), None)
+        .await)
 }
 
 async fn model_status_for_selection(

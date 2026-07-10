@@ -4502,7 +4502,6 @@ impl OpenAiCompatibleProviderPlugin {
                     settings.default_model.as_deref(),
                 )
             });
-        let models = ensure_selected_model_info(models, request.selected_model_id.as_deref());
         ModelList {
             models: apply_provider_static_metadata(&settings, models),
             catalog: catalog_hints(&settings),
@@ -4590,28 +4589,6 @@ fn xai_static_context_window(model_id: &str) -> Option<u32> {
         return Some(256_000);
     }
     None
-}
-
-fn ensure_selected_model_info(
-    mut models: Vec<ModelInfo>,
-    selected_model_id: Option<&str>,
-) -> Vec<ModelInfo> {
-    let Some(selected_model_id) = selected_model_id.filter(|model_id| !model_id.trim().is_empty())
-    else {
-        return models;
-    };
-    if models
-        .iter()
-        .any(|model| model.model_id == selected_model_id)
-    {
-        return models;
-    }
-    let mut selected = model_infos_from_ids_without_catalog(
-        &[selected_model_id.to_string()],
-        Some(selected_model_id),
-    );
-    models.append(&mut selected);
-    models
 }
 
 #[cfg(test)]
