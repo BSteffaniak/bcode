@@ -47,11 +47,59 @@ fn valid_compaction_item(item: &serde_json::Value) -> bool {
             .is_some_and(|value| !value.is_empty())
 }
 
+#[derive(Debug, Serialize)]
+struct ResponsesCompactRequest {
+    model: String,
+    input: Vec<ResponsesInputItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ResponsesCompactBody {
     object: String,
     #[serde(default)]
     output: Vec<serde_json::Value>,
+}
+
+fn compact_endpoint(settings: &Settings) -> String {
+    match settings.dialect {
+        OpenAiCompatibleDialect::ChatGptCodex => {
+            format!("{OPENAI_CODEX_API_ENDPOINT}/compact")
+        }
+        OpenAiCompatibleDialect::ResponsesApi => format!(
+            "{}/responses/compact",
+            settings.base_url.trim_end_matches('/')
+        ),
+        OpenAiCompatibleDialect::ChatCompletions => unreachable!(),
+    }
+}
+
+fn validate_compact_response(
+    response: ResponsesCompactBody,
+) -> Result<Vec<serde_json::Value>, ProviderError> {
+    if response.object != "response.compaction" {
+        return Err(provider_error(
+            "invalid_compaction_response",
+            ProviderErrorCategory::ProviderInternal,
+            format!("unexpected compaction object type: {}", response.object),
+        ));
+    }
+    if response.output.is_empty() {
+        return Err(provider_error(
+            "invalid_compaction_response",
+            ProviderErrorCategory::ProviderInternal,
+            "compaction response output was empty",
+        ));
+    }
+    if !response.output.iter().any(valid_compaction_item) {
+        return Err(provider_error(
+            "invalid_compaction_response",
+            ProviderErrorCategory::ProviderInternal,
+            "compaction response did not contain a valid compaction item",
+        ));
+    }
+    Ok(response.output)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -98,11 +146,11 @@ pub async fn compact_context_inner(
         false,
         settings.dialect,
     );
-    let body = serde_json::json!({
-        "model": request.model_id,
-        "input": projection.input,
-        "instructions": projection.instructions,
-    });
+    let body = ResponsesCompactRequest {
+        model: request.model_id,
+        input: projection.input,
+        instructions: projection.instructions,
+    };
     let client = model_stream_client(settings.request_timeout).map_err(|error| {
         provider_error(
             "client_build_failed",
@@ -110,18 +158,7 @@ pub async fn compact_context_inner(
             error.to_string(),
         )
     })?;
-    let endpoint = match settings.dialect {
-        OpenAiCompatibleDialect::ChatGptCodex => {
-            format!("{OPENAI_CODEX_API_ENDPOINT}/compact")
-        }
-        OpenAiCompatibleDialect::ResponsesApi => {
-            format!(
-                "{}/responses/compact",
-                settings.base_url.trim_end_matches('/')
-            )
-        }
-        OpenAiCompatibleDialect::ChatCompletions => unreachable!(),
-    };
+    let endpoint = compact_endpoint(&settings);
     let mut builder = client
         .post(endpoint)
         .bearer_auth(access_token)
@@ -170,22 +207,8 @@ pub async fn compact_context_inner(
                 error.to_string(),
             )
         })?;
-    if response.object != "response.compaction" {
-        return Err(provider_error(
-            "invalid_compaction_response",
-            ProviderErrorCategory::ProviderInternal,
-            format!("unexpected compaction object type: {}", response.object),
-        ));
-    }
-    if !response.output.iter().any(valid_compaction_item) {
-        return Err(provider_error(
-            "invalid_compaction_response",
-            ProviderErrorCategory::ProviderInternal,
-            "compaction response did not contain a valid compaction item",
-        ));
-    }
-    let content = response
-        .output
+    let output = validate_compact_response(response)?;
+    let content = output
         .into_iter()
         .map(|value| ContentBlock::ProviderExtension { value })
         .collect::<Vec<_>>();
@@ -225,7 +248,92 @@ pub fn process_responses_compaction_output_item(
 
 #[cfg(test)]
 mod tests {
-    use super::valid_compaction_item;
+    use super::*;
+
+    #[test]
+    fn compact_request_serializes_only_supported_fields() {
+        let request = ResponsesCompactRequest {
+            model: "gpt-5".to_string(),
+            input: vec![ResponsesInputItem::Message {
+                role: "user".to_string(),
+                content: vec![ResponsesContent::InputText {
+                    text: "hello".to_string(),
+                }],
+            }],
+            instructions: None,
+        };
+        assert_eq!(
+            serde_json::to_value(request).expect("serialize compact request"),
+            serde_json::json!({
+                "model": "gpt-5",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}]
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn compact_endpoint_uses_exact_responses_url() {
+        let mut context = ProviderRequestContext::default();
+        context.settings.insert(
+            "base_url".to_string(),
+            "https://example.test/v1/".to_string(),
+        );
+        context.settings.insert(
+            "dialect".to_string(),
+            OpenAiCompatibleDialect::ResponsesApi
+                .metadata_value()
+                .to_string(),
+        );
+        let settings = settings_for_context(&context);
+        assert_eq!(
+            compact_endpoint(&settings),
+            "https://example.test/v1/responses/compact"
+        );
+    }
+
+    #[test]
+    fn compact_response_requires_object_nonempty_output_and_valid_item() {
+        for body in [
+            ResponsesCompactBody {
+                object: "response".to_string(),
+                output: vec![
+                    serde_json::json!({"type": "compaction", "id": "id", "encrypted_content": "opaque"}),
+                ],
+            },
+            ResponsesCompactBody {
+                object: "response.compaction".to_string(),
+                output: Vec::new(),
+            },
+            ResponsesCompactBody {
+                object: "response.compaction".to_string(),
+                output: vec![
+                    serde_json::json!({"type": "compaction", "id": "", "encrypted_content": "opaque"}),
+                ],
+            },
+        ] {
+            assert!(validate_compact_response(body).is_err());
+        }
+    }
+
+    #[test]
+    fn compact_response_preserves_exact_unknown_nested_json() {
+        let item = serde_json::json!({
+            "type": "compaction",
+            "id": "cmp_1",
+            "encrypted_content": "opaque",
+            "unknown": {"nested": [1, {"future": true}]}
+        });
+        let output = validate_compact_response(ResponsesCompactBody {
+            object: "response.compaction".to_string(),
+            output: vec![item.clone()],
+        })
+        .expect("valid response");
+        assert_eq!(output, vec![item]);
+    }
 
     #[test]
     fn compaction_item_validation_is_shared_by_explicit_and_managed_paths() {
