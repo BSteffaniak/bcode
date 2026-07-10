@@ -2730,10 +2730,7 @@ impl CompactionMode {
     /// Return whether proactive threshold-based compaction may run.
     #[must_use]
     pub const fn is_proactive_enabled(self) -> bool {
-        matches!(
-            self,
-            Self::Auto | Self::Proactive | Self::ProactiveAndOverflow
-        )
+        matches!(self, Self::Proactive | Self::ProactiveAndOverflow)
     }
 
     /// Return whether provider context-length overflow should trigger compaction and retry.
@@ -6438,6 +6435,16 @@ max_tool_rounds = 3
         assert_eq!(config.model.compaction.proactive_threshold_percent, 90);
         assert_eq!(config.model.compaction.keep_recent_tokens, 20_000);
         assert_eq!(config.model.compaction.context_chars, 0);
+    }
+
+    #[test]
+    fn auto_compaction_mode_is_overflow_only_for_host_policy() {
+        assert!(!CompactionMode::Auto.is_proactive_enabled());
+        assert!(CompactionMode::Auto.is_overflow_recovery_enabled());
+        assert!(CompactionMode::Proactive.is_proactive_enabled());
+        assert!(!CompactionMode::Proactive.is_overflow_recovery_enabled());
+        assert!(CompactionMode::ProactiveAndOverflow.is_proactive_enabled());
+        assert!(CompactionMode::ProactiveAndOverflow.is_overflow_recovery_enabled());
     }
 
     #[test]

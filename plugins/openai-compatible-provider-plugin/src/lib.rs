@@ -70,6 +70,15 @@ fn openai_context_format(settings: &Settings) -> ProviderContextFormat {
     }
 }
 
+fn supports_openai_context_compaction(
+    dialect: OpenAiCompatibleDialect,
+    base_url: &str,
+    opted_in: bool,
+) -> bool {
+    dialect == OpenAiCompatibleDialect::ResponsesApi
+        && (base_url.trim_end_matches('/') == DEFAULT_BASE_URL || opted_in)
+}
+
 /// OpenAI-compatible model provider plugin.
 pub struct OpenAiCompatibleProviderPlugin {
     state: Mutex<OpenAiCompatibleProviderState>,
@@ -278,15 +287,13 @@ impl OpenAiCompatibleProviderPlugin {
             Err(error) => return invalid_request(&error),
         };
         let settings = settings_for_context(&request.provider_context);
-        let official_responses = settings.dialect == OpenAiCompatibleDialect::ResponsesApi
-            && settings.base_url.trim_end_matches('/') == DEFAULT_BASE_URL;
-        let opted_in_responses = settings.dialect == OpenAiCompatibleDialect::ResponsesApi
-            && request
-                .provider_context
-                .settings
-                .get("native_context_compaction")
-                .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1");
-        let supported = official_responses || opted_in_responses;
+        let opted_in = request
+            .provider_context
+            .settings
+            .get("native_context_compaction")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1");
+        let supported =
+            supports_openai_context_compaction(settings.dialect, &settings.base_url, opted_in);
         json_response(&ContextManagementCapabilities {
             provider_managed: supported,
             native_compaction: supported,
@@ -8001,6 +8008,35 @@ mod tests {
             ContentBlock::ProviderExtension { value }
                 if value.pointer("/future_field/preserve").and_then(serde_json::Value::as_bool)
                     == Some(true)
+        ));
+    }
+
+    #[test]
+    fn context_compaction_capability_requires_supported_responses_surface() {
+        assert!(supports_openai_context_compaction(
+            OpenAiCompatibleDialect::ResponsesApi,
+            "https://api.openai.com/v1/",
+            false,
+        ));
+        assert!(supports_openai_context_compaction(
+            OpenAiCompatibleDialect::ResponsesApi,
+            "https://example.test/v1",
+            true,
+        ));
+        assert!(!supports_openai_context_compaction(
+            OpenAiCompatibleDialect::ResponsesApi,
+            "https://example.test/v1",
+            false,
+        ));
+        assert!(!supports_openai_context_compaction(
+            OpenAiCompatibleDialect::ChatCompletions,
+            DEFAULT_BASE_URL,
+            true,
+        ));
+        assert!(!supports_openai_context_compaction(
+            OpenAiCompatibleDialect::ChatGptCodex,
+            OPENAI_CODEX_API_ENDPOINT,
+            true,
         ));
     }
 

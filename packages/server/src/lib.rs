@@ -9139,6 +9139,7 @@ struct ProviderErrorRetryContext<'a> {
     provider_retry_rules: &'a [bcode_model::ProviderRetryRule],
     remote_catalog_retry_rules: &'a [bcode_model::ProviderRetryRule],
     cancel_state: &'a TurnCancelState,
+    compaction_decision: CompactionDecision,
 }
 
 enum ModelTurnRetry {
@@ -9362,6 +9363,24 @@ async fn provider_context_management_capabilities(
         .ok()
 }
 
+#[derive(Debug, Clone)]
+struct AutomaticCompactionPolicy {
+    decision: CompactionDecision,
+    capabilities: Option<bcode_model::ContextManagementCapabilities>,
+}
+
+async fn automatic_compaction_policy(
+    state: &ServerState,
+    selection: &SessionModelSelection,
+) -> AutomaticCompactionPolicy {
+    let capabilities = provider_context_management_capabilities(state, selection).await;
+    let decision = resolve_compaction_decision(state.auto_compaction.mode, capabilities.as_ref());
+    AutomaticCompactionPolicy {
+        decision,
+        capabilities,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn compact_context_with_selected_backend(
     state: &ServerState,
@@ -9503,6 +9522,133 @@ fn context_occupancy_tokens(
         .saturating_add(estimated_tokens_from_chars(delta_chars))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutomaticCompactionStrategy {
+    ProviderManaged,
+    LocalProactive,
+    OverflowOnly,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompactionDecision {
+    strategy: AutomaticCompactionStrategy,
+    overflow_recovery: bool,
+    reason: &'static str,
+}
+
+fn resolve_compaction_decision(
+    mode: bcode_config::CompactionMode,
+    capabilities: Option<&bcode_model::ContextManagementCapabilities>,
+) -> CompactionDecision {
+    let provider_managed = capabilities.is_some_and(|capabilities| {
+        capabilities.provider_managed
+            && capabilities.context_format.as_ref().is_some_and(|format| {
+                format.version > 0 && !format.compatibility_key.trim().is_empty()
+            })
+    });
+    match mode {
+        bcode_config::CompactionMode::Off => CompactionDecision {
+            strategy: AutomaticCompactionStrategy::Disabled,
+            overflow_recovery: false,
+            reason: "automatic compaction is disabled",
+        },
+        bcode_config::CompactionMode::OnOverflow => CompactionDecision {
+            strategy: AutomaticCompactionStrategy::OverflowOnly,
+            overflow_recovery: true,
+            reason: "configured for overflow recovery only",
+        },
+        bcode_config::CompactionMode::Proactive => CompactionDecision {
+            strategy: AutomaticCompactionStrategy::LocalProactive,
+            overflow_recovery: false,
+            reason: "configured for host proactive compaction",
+        },
+        bcode_config::CompactionMode::ProactiveAndOverflow => CompactionDecision {
+            strategy: AutomaticCompactionStrategy::LocalProactive,
+            overflow_recovery: true,
+            reason: "configured for host proactive compaction with overflow recovery",
+        },
+        bcode_config::CompactionMode::Auto if provider_managed => CompactionDecision {
+            strategy: AutomaticCompactionStrategy::ProviderManaged,
+            overflow_recovery: true,
+            reason: "active provider surface advertises managed compaction",
+        },
+        bcode_config::CompactionMode::Auto => CompactionDecision {
+            strategy: AutomaticCompactionStrategy::OverflowOnly,
+            overflow_recovery: true,
+            reason: "active provider surface does not advertise managed compaction",
+        },
+    }
+}
+
+fn request_output_reserve_tokens(
+    context_window: u32,
+    requested_max_output_tokens: Option<u32>,
+    provider_max_output_tokens: Option<u32>,
+) -> u32 {
+    let requested_or_default =
+        requested_max_output_tokens.unwrap_or_else(|| (context_window / 8).max(1));
+    provider_max_output_tokens
+        .map_or(requested_or_default, |maximum| {
+            requested_or_default.min(maximum)
+        })
+        .min(context_window)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputReserveSource {
+    Request,
+    Default,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompactionCapacity {
+    threshold_tokens: u64,
+    output_reserve_tokens: u64,
+    output_reserve_source: OutputReserveSource,
+    safety_margin_tokens: u64,
+    available_input_tokens: u64,
+}
+
+fn compaction_capacity_tokens(
+    context_window: u32,
+    threshold_percent: u8,
+    requested_max_output_tokens: Option<u32>,
+    provider_max_output_tokens: Option<u32>,
+) -> CompactionCapacity {
+    let output_reserve_source = if requested_max_output_tokens.is_some() {
+        OutputReserveSource::Request
+    } else {
+        OutputReserveSource::Default
+    };
+    let output_reserve_tokens = u64::from(request_output_reserve_tokens(
+        context_window,
+        requested_max_output_tokens,
+        provider_max_output_tokens,
+    ));
+    let safety_margin_tokens = u64::from(context_window) / 50;
+    let available_input_tokens = u64::from(context_window)
+        .saturating_sub(output_reserve_tokens)
+        .saturating_sub(safety_margin_tokens);
+    let threshold_tokens = (u64::from(context_window)
+        .saturating_mul(u64::from(threshold_percent.clamp(1, 100)))
+        / 100)
+        .min(available_input_tokens);
+    CompactionCapacity {
+        threshold_tokens,
+        output_reserve_tokens,
+        output_reserve_source,
+        safety_margin_tokens,
+        available_input_tokens,
+    }
+}
+
+struct ProactiveCompactionEvaluation {
+    candidate_input_tokens: Option<u64>,
+    requested_max_output_tokens: Option<u32>,
+    decision: CompactionDecision,
+}
+
 #[allow(clippy::too_many_lines)]
 async fn maybe_auto_compact_session_context(
     state: &ServerState,
@@ -9510,38 +9656,16 @@ async fn maybe_auto_compact_session_context(
     selection: &SessionModelSelection,
     cancel_state: &TurnCancelState,
     command_context: &mut RuntimeCommandContext<'_>,
-    candidate_input_tokens: Option<u64>,
+    evaluation: ProactiveCompactionEvaluation,
 ) -> Result<bool, CompactionError> {
-    if !state.auto_compaction.mode.is_proactive_enabled() {
-        return Ok(false);
-    }
-    if matches!(
-        state.auto_compaction.mode,
-        bcode_config::CompactionMode::Auto
-    ) && selection
-        .provider_plugin_id
-        .as_deref()
-        .is_some_and(|provider| has_model_provider(state, Some(provider)))
-        && provider_context_management_capabilities(state, selection)
-            .await
-            .is_some_and(|capabilities| capabilities.provider_managed)
-    {
-        append_context_compaction_trace(
-            state,
-            session_id,
-            "provider_managed",
-            0,
-            false,
-            Some("active provider surface manages context autonomously".to_string()),
-        )
-        .await;
+    if evaluation.decision.strategy != AutomaticCompactionStrategy::LocalProactive {
         return Ok(false);
     }
 
     let history = state.sessions.model_context_events(session_id).await?;
     let projected_context_chars =
         projected_model_context_chars(&history, state.tool_output_context_chars);
-    let projected_context_tokens = candidate_input_tokens.unwrap_or_else(|| {
+    let projected_context_tokens = evaluation.candidate_input_tokens.unwrap_or_else(|| {
         context_occupancy_tokens(
             &history,
             selection,
@@ -9565,22 +9689,14 @@ async fn maybe_auto_compact_session_context(
         .await;
         return Ok(false);
     };
-    let threshold_percent = state
-        .auto_compaction
-        .proactive_threshold_percent
-        .clamp(1, 100);
-    let output_reserve = u64::from(
-        model_status
-            .max_output_tokens
-            .unwrap_or_else(|| (context_window_tokens / 8).max(1)),
+    let threshold_percent = state.auto_compaction.proactive_threshold_percent;
+    let capacity = compaction_capacity_tokens(
+        context_window_tokens,
+        threshold_percent,
+        evaluation.requested_max_output_tokens,
+        model_status.max_output_tokens,
     );
-    let safety_margin = u64::from(context_window_tokens) / 50;
-    let available_input_tokens = u64::from(context_window_tokens)
-        .saturating_sub(output_reserve)
-        .saturating_sub(safety_margin);
-    let threshold_tokens =
-        (u64::from(context_window_tokens).saturating_mul(u64::from(threshold_percent)) / 100)
-            .min(available_input_tokens);
+    let threshold_tokens = capacity.threshold_tokens;
     if projected_context_tokens < threshold_tokens {
         append_context_compaction_trace(
             state,
@@ -9589,7 +9705,11 @@ async fn maybe_auto_compact_session_context(
             projected_context_chars,
             false,
             Some(format!(
-                "projected context ~{projected_context_tokens} tokens < model-aware threshold {threshold_tokens} tokens ({threshold_percent}% of {context_window_tokens})"
+                "projected context ~{projected_context_tokens} tokens < threshold {threshold_tokens} tokens ({threshold_percent}% of {context_window_tokens}; output reserve {} from {:?}; safety margin {}; available input {})",
+                capacity.output_reserve_tokens,
+                capacity.output_reserve_source,
+                capacity.safety_margin_tokens,
+                capacity.available_input_tokens,
             )),
         )
         .await;
@@ -9603,7 +9723,11 @@ async fn maybe_auto_compact_session_context(
         projected_context_chars,
         false,
         Some(format!(
-            "projected context ~{projected_context_tokens} tokens >= model-aware threshold {threshold_tokens} tokens ({threshold_percent}% of {context_window_tokens})"
+            "projected context ~{projected_context_tokens} tokens >= threshold {threshold_tokens} tokens ({threshold_percent}% of {context_window_tokens}; output reserve {} from {:?}; safety margin {}; available input {})",
+            capacity.output_reserve_tokens,
+            capacity.output_reserve_source,
+            capacity.safety_margin_tokens,
+            capacity.available_input_tokens,
         )),
     )
     .await;
@@ -10259,21 +10383,21 @@ fn compaction_lines_to_summarize(
     keep_recent_tokens: usize,
 ) -> Vec<CompactionLine> {
     if candidates.len() <= 1 {
-        return candidates;
+        return Vec::new();
     }
 
     let mut kept_recent_tokens = 0_usize;
     let mut keep_start = candidates.len();
     for (index, line) in candidates.iter().enumerate().rev() {
-        kept_recent_tokens = kept_recent_tokens.saturating_add(line.estimated_tokens);
-        keep_start = index;
         if kept_recent_tokens >= keep_recent_tokens {
             break;
         }
+        kept_recent_tokens = kept_recent_tokens.saturating_add(line.estimated_tokens);
+        keep_start = index;
     }
 
     if keep_start == 0 {
-        keep_start = candidates.len().saturating_sub(1);
+        return Vec::new();
     }
     candidates.truncate(keep_start);
     while candidates.last().is_some_and(|line| !line.can_cut_after) {
@@ -10430,11 +10554,26 @@ async fn run_model_turn_inner(
     }
 
     let provider_plugin_id = selection.provider_plugin_id.clone();
+    let compaction_policy = automatic_compaction_policy(state, &selection).await;
+    let compaction_decision = compaction_policy.decision;
     let provider_retry_rules = provider_retry_rules(state, provider_plugin_id.as_deref()).await;
     let remote_catalog_retry_rules =
         remote_catalog_retry_rules(state, provider_plugin_id.as_deref()).await;
     let mut round = 0_u32;
     let mut recovery = ModelTurnRecoveryState::default();
+    let mut proactive_compaction_completed = false;
+    append_context_compaction_trace(
+        state,
+        session_id,
+        "strategy_resolved",
+        0,
+        false,
+        Some(format!(
+            "automatic compaction strategy {:?}: {}",
+            compaction_decision.strategy, compaction_decision.reason
+        )),
+    )
+    .await;
     loop {
         if cancel_state.is_cancelled() {
             return ModelTurnCompletion::with_message(
@@ -10451,6 +10590,7 @@ async fn run_model_turn_inner(
             selection.model_id.as_deref(),
             recovery.retry_instruction,
             &selection,
+            &compaction_policy,
         )
         .await
         {
@@ -10461,19 +10601,34 @@ async fn run_model_turn_inner(
                 return ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message);
             }
         };
-        set_runtime_phase(phase, SessionRuntimePhase::Compacting).await;
-        let compaction_result = maybe_auto_compact_session_context(
-            state,
-            session_id,
-            &selection,
-            cancel_state.as_ref(),
-            command_context,
-            Some(estimated_model_request_tokens(&request)),
-        )
-        .await;
-        set_runtime_phase(phase, SessionRuntimePhase::ProviderActive).await;
+        let should_evaluate_proactive = !proactive_compaction_completed
+            && compaction_decision.strategy == AutomaticCompactionStrategy::LocalProactive;
+        if should_evaluate_proactive {
+            set_runtime_phase(phase, SessionRuntimePhase::Compacting).await;
+        }
+        let compaction_result = if should_evaluate_proactive {
+            maybe_auto_compact_session_context(
+                state,
+                session_id,
+                &selection,
+                cancel_state.as_ref(),
+                command_context,
+                ProactiveCompactionEvaluation {
+                    candidate_input_tokens: Some(estimated_model_request_tokens(&request)),
+                    requested_max_output_tokens: request.parameters.max_output_tokens,
+                    decision: compaction_decision,
+                },
+            )
+            .await
+        } else {
+            Ok(false)
+        };
+        if should_evaluate_proactive {
+            set_runtime_phase(phase, SessionRuntimePhase::ProviderActive).await;
+        }
         match compaction_result {
             Ok(true) => {
+                proactive_compaction_completed = true;
                 request = match build_model_turn_request(
                     state,
                     session_id,
@@ -10483,6 +10638,7 @@ async fn run_model_turn_inner(
                     selection.model_id.as_deref(),
                     recovery.retry_instruction,
                     &selection,
+                    &compaction_policy,
                 )
                 .await
                 {
@@ -10500,6 +10656,17 @@ async fn run_model_turn_inner(
                     ModelTurnOutcome::Cancelled,
                     "model turn cancelled",
                 );
+            }
+            Err(CompactionError::NothingToCompact(message)) => {
+                append_context_compaction_trace(
+                    state,
+                    session_id,
+                    "nothing_to_compact",
+                    0,
+                    false,
+                    Some(message),
+                )
+                .await;
             }
             Err(error) => {
                 append_system_event(
@@ -10552,6 +10719,7 @@ async fn run_model_turn_inner(
             provider_retry_rules: &provider_retry_rules,
             remote_catalog_retry_rules: &remote_catalog_retry_rules,
             cancel_state: cancel_state.as_ref(),
+            compaction_decision,
         };
         match maybe_retry_after_provider_error(
             state,
@@ -10628,7 +10796,11 @@ async fn maybe_retry_after_provider_error(
         return ModelTurnRetry::Continue;
     }
 
-    if should_retry_after_context_overflow(state, error, recovery.retried_after_context_overflow) {
+    if should_retry_after_context_overflow(
+        context.compaction_decision,
+        error,
+        recovery.retried_after_context_overflow,
+    ) {
         recovery.retried_after_context_overflow = true;
         return match compact_session_after_context_overflow(
             state,
@@ -11113,13 +11285,11 @@ fn format_retry_delay(delay: Duration) -> String {
 }
 
 fn should_retry_after_context_overflow(
-    state: &ServerState,
+    decision: CompactionDecision,
     error: &bcode_model::ProviderError,
     already_retried: bool,
 ) -> bool {
-    !already_retried
-        && state.auto_compaction.mode.is_overflow_recovery_enabled()
-        && is_context_length_provider_error(error)
+    !already_retried && decision.overflow_recovery && is_context_length_provider_error(error)
 }
 
 fn should_retry_after_malformed_tool_arguments(
@@ -12782,6 +12952,7 @@ async fn build_model_turn_request(
     selected_model_id: Option<&str>,
     retry_instruction: Option<&str>,
     selection: &SessionModelSelection,
+    compaction_policy: &AutomaticCompactionPolicy,
 ) -> Result<ModelTurnRequest, bcode_session::SessionError> {
     let metric_labels =
         model_request_metric_labels(session_id, provider_plugin_id, selected_model_id, round);
@@ -12803,9 +12974,8 @@ async fn build_model_turn_request(
         history.len() as u64,
         metric_labels.clone(),
     );
-    let context_management_capabilities =
-        provider_context_management_capabilities(state, selection).await;
-    let context_format = context_management_capabilities
+    let context_format = compaction_policy
+        .capabilities
         .as_ref()
         .and_then(|capabilities| capabilities.context_format.as_ref());
     let convert_timer = state.metrics.timer();
@@ -13037,28 +13207,19 @@ async fn build_model_turn_request(
         metric_labels.clone(),
     );
     let request_assembly_timer = state.metrics.timer();
-    let context_management = if state.auto_compaction.mode == bcode_config::CompactionMode::Auto
-        && context_management_capabilities
-            .as_ref()
-            .is_some_and(|capabilities| capabilities.provider_managed)
+    let context_management = if compaction_policy.decision.strategy
+        == AutomaticCompactionStrategy::ProviderManaged
     {
         let status = model_status_for_selection(state, selection.clone(), Some(session_id)).await;
         bcode_model::ContextManagementRequest {
             compact_threshold: status.context_window.map(|window| {
-                let output_reserve = status
-                    .max_output_tokens
-                    .unwrap_or_else(|| (window / 8).max(1));
-                let safety_margin = window / 50;
-                let available_input = window
-                    .saturating_sub(output_reserve)
-                    .saturating_sub(safety_margin);
-                (u64::from(window).saturating_mul(u64::from(
-                    state
-                        .auto_compaction
-                        .proactive_threshold_percent
-                        .clamp(1, 100),
-                )) / 100)
-                    .min(u64::from(available_input))
+                compaction_capacity_tokens(
+                    window,
+                    state.auto_compaction.proactive_threshold_percent,
+                    parameters.max_output_tokens,
+                    status.max_output_tokens,
+                )
+                .threshold_tokens
             }),
         }
     } else {
@@ -17636,6 +17797,84 @@ mod tests {
     }
 
     #[test]
+    fn automatic_compaction_policy_routes_modes_and_capabilities() {
+        let valid_capabilities = bcode_model::ContextManagementCapabilities {
+            provider_managed: true,
+            native_compaction: true,
+            context_format: Some(bcode_model::ProviderContextFormat {
+                version: 1,
+                compatibility_key: "responses-v1".to_string(),
+            }),
+        };
+        let invalid_capabilities = bcode_model::ContextManagementCapabilities {
+            provider_managed: true,
+            native_compaction: true,
+            context_format: Some(bcode_model::ProviderContextFormat {
+                version: 1,
+                compatibility_key: String::new(),
+            }),
+        };
+
+        assert_eq!(
+            resolve_compaction_decision(
+                bcode_config::CompactionMode::Auto,
+                Some(&valid_capabilities),
+            )
+            .strategy,
+            AutomaticCompactionStrategy::ProviderManaged
+        );
+        assert_eq!(
+            resolve_compaction_decision(bcode_config::CompactionMode::Auto, None).strategy,
+            AutomaticCompactionStrategy::OverflowOnly
+        );
+        assert_eq!(
+            resolve_compaction_decision(
+                bcode_config::CompactionMode::Auto,
+                Some(&invalid_capabilities),
+            )
+            .strategy,
+            AutomaticCompactionStrategy::OverflowOnly
+        );
+        assert_eq!(
+            resolve_compaction_decision(bcode_config::CompactionMode::Proactive, None).strategy,
+            AutomaticCompactionStrategy::LocalProactive
+        );
+        assert_eq!(
+            resolve_compaction_decision(bcode_config::CompactionMode::Off, None).strategy,
+            AutomaticCompactionStrategy::Disabled
+        );
+    }
+
+    #[test]
+    fn output_reserve_uses_request_or_bounded_default_not_provider_maximum() {
+        assert_eq!(
+            request_output_reserve_tokens(128_000, None, Some(100_000)),
+            16_000
+        );
+        assert_eq!(
+            request_output_reserve_tokens(128_000, Some(24_000), Some(100_000)),
+            24_000
+        );
+        assert_eq!(
+            request_output_reserve_tokens(128_000, Some(120_000), Some(100_000)),
+            100_000
+        );
+        assert_eq!(
+            compaction_capacity_tokens(128_000, 90, None, Some(100_000)),
+            CompactionCapacity {
+                threshold_tokens: 109_440,
+                output_reserve_tokens: 16_000,
+                output_reserve_source: OutputReserveSource::Default,
+                safety_margin_tokens: 2_560,
+                available_input_tokens: 109_440,
+            }
+        );
+        assert!(
+            31_000 < compaction_capacity_tokens(128_000, 90, None, Some(100_000)).threshold_tokens
+        );
+    }
+
+    #[test]
     fn skill_tool_decision_key_uses_sorted_skills_and_git_root_workspace() {
         let temp = tempfile::tempdir().expect("temp dir");
         shell_git(&["init"], temp.path());
@@ -18830,19 +19069,35 @@ mod tests {
     fn compaction_transcript_truncates_large_tool_results() {
         let session_id = SessionId::new();
         let transcript = compaction_transcript(
-            &[session_event(
-                session_id,
-                1,
-                SessionEventKind::ToolCallFinished {
-                    tool_call_id: "call-1".to_string(),
-                    result: format!("{}middle{}", "x".repeat(2_000), "y".repeat(2_000)),
-                    is_error: false,
-                    output: None,
-                    semantic_result: None,
-                },
-            )],
+            &[
+                session_event(
+                    session_id,
+                    1,
+                    SessionEventKind::AssistantMessage {
+                        text: "calling tool".to_string(),
+                    },
+                ),
+                session_event(
+                    session_id,
+                    2,
+                    SessionEventKind::ToolCallFinished {
+                        tool_call_id: "call-1".to_string(),
+                        result: format!("{}middle{}", "x".repeat(2_000), "y".repeat(2_000)),
+                        is_error: false,
+                        output: None,
+                        semantic_result: None,
+                    },
+                ),
+                session_event(
+                    session_id,
+                    3,
+                    SessionEventKind::AssistantMessage {
+                        text: "recent tail".to_string(),
+                    },
+                ),
+            ],
             1_000,
-            COMPACTION_DEFAULT_KEEP_RECENT_CHARS,
+            1,
         )
         .expect("compaction transcript");
 
@@ -18880,6 +19135,29 @@ mod tests {
 
         assert!(transcript.compacted_through_sequence < 5);
         assert!(transcript.event_count < history.len());
+    }
+
+    #[test]
+    fn compaction_does_not_summarize_when_entire_context_fits_retained_budget() {
+        let lines = compaction_lines_to_summarize(
+            vec![
+                CompactionLine {
+                    sequence: 1,
+                    text: "older turn".to_string(),
+                    estimated_tokens: 4,
+                    can_cut_after: true,
+                },
+                CompactionLine {
+                    sequence: 2,
+                    text: "recent turn".to_string(),
+                    estimated_tokens: 4,
+                    can_cut_after: true,
+                },
+            ],
+            20,
+        );
+
+        assert!(lines.is_empty());
     }
 
     #[test]
