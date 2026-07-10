@@ -1126,6 +1126,14 @@ pub struct StructuredOutputRequest {
     pub strict: bool,
 }
 
+/// Provider context-management request for a model turn.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextManagementRequest {
+    /// Token threshold at which a supporting provider should compact context.
+    #[serde(default)]
+    pub compact_threshold: Option<u64>,
+}
+
 /// Start a provider model turn.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelTurnRequest {
@@ -1144,6 +1152,8 @@ pub struct ModelTurnRequest {
     pub parameters: ModelParameters,
     #[serde(default)]
     pub structured_output: Option<StructuredOutputRequest>,
+    #[serde(default)]
+    pub context_management: ContextManagementRequest,
     #[serde(default)]
     pub prompt_cache: PromptCacheHints,
     #[serde(default)]
@@ -1485,6 +1495,14 @@ pub enum ProviderTurnEvent {
     /// Provider reported actual request projection/sending metadata.
     RequestProjection {
         projection: ProviderRequestProjection,
+    },
+    /// Provider compacted the active conversation while serving this turn.
+    ContextCompacted {
+        /// Lossless provider-native replacement output items.
+        messages: Vec<ModelMessage>,
+        /// Non-secret compatibility identity for replaying the opaque items.
+        #[serde(default)]
+        compatibility_key: String,
     },
     /// Provider-specific metadata that the host may use for invisible optimization state.
     ProviderMetadata {

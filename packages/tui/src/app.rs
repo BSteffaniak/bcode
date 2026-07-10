@@ -1054,7 +1054,10 @@ impl BmuxApp {
             });
         self.token_usage.apply_model_info(model.as_ref());
         if let Some(input_tokens) = status.context_input_tokens {
-            self.token_usage.observe_context_usage(input_tokens);
+            self.token_usage.observe_context_usage(
+                input_tokens,
+                status.context_usage_source.as_deref() == Some("estimated"),
+            );
         }
     }
 
@@ -2253,8 +2256,19 @@ impl BmuxApp {
                 self.push_provider_compaction(&snapshot.provider_plugin_id);
             }
             SessionEventKind::ContextUsageObserved { snapshot } => {
-                self.token_usage
-                    .observe_context_usage(snapshot.input_tokens);
+                let active_provider = self
+                    .selected_provider_plugin_id
+                    .as_deref()
+                    .unwrap_or("<auto>");
+                let active_model = self.selected_model_id.as_deref().unwrap_or("<default>");
+                if snapshot.provider_plugin_id == active_provider
+                    && snapshot.model_id == active_model
+                {
+                    self.token_usage.observe_context_usage(
+                        snapshot.input_tokens,
+                        snapshot.source == bcode_session_models::ContextUsageSource::Estimated,
+                    );
+                }
             }
             SessionEventKind::WorkingDirectoryChanged {
                 old_working_directory,
@@ -3352,6 +3366,7 @@ impl BmuxApp {
 
     fn push_compaction(&mut self, summary: &str) {
         self.token_usage.latest_context_input_tokens = None;
+        self.token_usage.context_usage_estimated = false;
         self.token_usage.latest_cached_input_tokens = None;
         self.token_usage.latest_cache_write_input_tokens = None;
         self.transcript.push(TranscriptItem::new(
@@ -3362,6 +3377,7 @@ impl BmuxApp {
 
     fn push_provider_compaction(&mut self, provider_plugin_id: &str) {
         self.token_usage.latest_context_input_tokens = None;
+        self.token_usage.context_usage_estimated = false;
         self.token_usage.latest_cached_input_tokens = None;
         self.token_usage.latest_cache_write_input_tokens = None;
         self.transcript.push(TranscriptItem::new(
@@ -3834,6 +3850,7 @@ struct TokenUsageMeter {
     session_tokens: u64,
     session_cost_micros: Option<u64>,
     latest_context_input_tokens: Option<u32>,
+    context_usage_estimated: bool,
     latest_cached_input_tokens: Option<u32>,
     latest_cache_write_input_tokens: Option<u32>,
     provider_reuse_active: bool,
@@ -3874,8 +3891,9 @@ impl TokenUsageMeter {
         self.latest_cache_write_input_tokens = usage.cache_write_input_tokens;
     }
 
-    fn observe_context_usage(&mut self, input_tokens: u64) {
+    fn observe_context_usage(&mut self, input_tokens: u64, estimated: bool) {
         self.latest_context_input_tokens = Some(u32::try_from(input_tokens).unwrap_or(u32::MAX));
+        self.context_usage_estimated = estimated;
     }
 
     fn apply_model_info(&mut self, model: Option<&bcode_model::ModelInfo>) {
@@ -3887,6 +3905,7 @@ impl TokenUsageMeter {
 
     fn clear_model_info(&mut self) {
         self.latest_context_input_tokens = None;
+        self.context_usage_estimated = false;
         self.latest_cached_input_tokens = None;
         self.latest_cache_write_input_tokens = None;
         self.context_window = None;
@@ -3946,7 +3965,12 @@ impl TokenUsageMeter {
     fn context_summary(&self) -> String {
         match (self.latest_context_input_tokens, self.context_window) {
             (Some(input), Some(window)) if window > 0 => format!(
-                "{}/{} {}%",
+                "{}{}/{} {}%",
+                if self.context_usage_estimated {
+                    "~"
+                } else {
+                    ""
+                },
                 format_context_count(u64::from(input)),
                 compact_context_window(u64::from(window)),
                 context_window_percentage(input, window)

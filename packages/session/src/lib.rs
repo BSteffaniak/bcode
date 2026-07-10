@@ -2699,6 +2699,7 @@ impl SessionState {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn apply_persisted_event(&mut self, event: SessionEvent, activity_timestamp_ms: u64) {
         self.summary.updated_at_ms = activity_timestamp_ms;
         self.next_sequence += 1;
@@ -2781,6 +2782,10 @@ impl SessionState {
                 self.current_agent = Some(agent_id.clone());
             }
             SessionEventKind::ContextCompacted {
+                compacted_through_sequence,
+                ..
+            }
+            | SessionEventKind::ProviderContextCompacted {
                 compacted_through_sequence,
                 ..
             } => {
@@ -2905,22 +2910,24 @@ fn input_history_from_events(history: &[SessionEvent]) -> Vec<SessionInputHistor
 }
 
 fn model_context_events_from_history(history: &[SessionEvent]) -> Vec<SessionEvent> {
-    let latest_compaction = history.iter().enumerate().rev().find_map(|(index, event)| {
-        if matches!(event.kind, SessionEventKind::ContextCompacted { .. }) {
-            Some(index)
-        } else {
-            None
-        }
-    });
-    let Some(index) = latest_compaction else {
+    let latest_compaction =
+        history
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, event)| match &event.kind {
+                SessionEventKind::ContextCompacted {
+                    compacted_through_sequence,
+                    ..
+                }
+                | SessionEventKind::ProviderContextCompacted {
+                    compacted_through_sequence,
+                    ..
+                } => Some((index, *compacted_through_sequence)),
+                _ => None,
+            });
+    let Some((index, compacted_through_sequence)) = latest_compaction else {
         return history.to_vec();
-    };
-    let compacted_through_sequence = match &history[index].kind {
-        SessionEventKind::ContextCompacted {
-            compacted_through_sequence,
-            ..
-        } => *compacted_through_sequence,
-        _ => return history.to_vec(),
     };
     std::iter::once(history[index].clone())
         .chain(
@@ -2928,6 +2935,13 @@ fn model_context_events_from_history(history: &[SessionEvent]) -> Vec<SessionEve
                 .iter()
                 .filter(|event| event.sequence > compacted_through_sequence)
                 .filter(|event| event.sequence != history[index].sequence)
+                .filter(|event| {
+                    !matches!(
+                        event.kind,
+                        SessionEventKind::ContextCompacted { .. }
+                            | SessionEventKind::ProviderContextCompacted { .. }
+                    )
+                })
                 .cloned(),
         )
         .collect()

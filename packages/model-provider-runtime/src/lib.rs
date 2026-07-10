@@ -641,6 +641,7 @@ where
         }],
         tools: Vec::new(),
         structured_output: None,
+        context_management: bcode_model::ContextManagementRequest::default(),
         parameters: request.parameters,
         prompt_cache: bcode_model::PromptCacheHints::default(),
         conversation_reuse: bcode_model::ConversationReuseHints::default(),

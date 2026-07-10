@@ -202,7 +202,7 @@ pub struct SessionDbState {
     pub updated_at_ms: Option<u64>,
     /// Whether the input-history projection has at least one user message.
     pub has_user_message: bool,
-    /// Latest context-compaction event sequence, if any.
+    /// Latest compacted-through canonical sequence, if any.
     pub latest_compaction_sequence: Option<u64>,
 }
 
@@ -737,18 +737,20 @@ impl SessionDb {
     }
 
     async fn latest_context_compaction_sequence(&self) -> SessionDbResult<Option<u64>> {
-        let row = self
-            .db
-            .select("events")
-            .columns(&["event_seq"])
-            .where_eq("event_type", "context_compacted")
-            .sort("event_seq", SortDirection::Desc)
-            .limit(1)
-            .execute_first(&**self.db)
-            .await?;
-        row.as_ref()
-            .map(|row| required_i64(row, "event_seq").map(i64_to_u64))
-            .transpose()
+        Ok(self
+            .latest_context_compaction_event()
+            .await?
+            .and_then(|event| match event.kind {
+                SessionEventKind::ContextCompacted {
+                    compacted_through_sequence,
+                    ..
+                }
+                | SessionEventKind::ProviderContextCompacted {
+                    compacted_through_sequence,
+                    ..
+                } => Some(compacted_through_sequence),
+                _ => None,
+            }))
     }
 
     /// Return the session id owned by this database.
@@ -1010,6 +1012,11 @@ impl SessionDb {
             let payload = required_string(&row, "payload")?;
             if let Some(event) = decode_session_event_degraded(&payload)
                 && event.sequence != compaction_event.sequence
+                && !matches!(
+                    event.kind,
+                    SessionEventKind::ContextCompacted { .. }
+                        | SessionEventKind::ProviderContextCompacted { .. }
+                )
             {
                 events.push(event);
             }

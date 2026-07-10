@@ -260,12 +260,16 @@ impl OpenAiCompatibleProviderPlugin {
             Err(error) => return invalid_request(&error),
         };
         let settings = settings_for_context(&request.provider_context);
+        let explicit_native = request
+            .provider_context
+            .settings
+            .get("native_context_compaction")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1");
+        let official_responses = settings.dialect == OpenAiCompatibleDialect::ResponsesApi
+            && settings.base_url.trim_end_matches('/') == DEFAULT_BASE_URL;
         json_response(&ContextManagementCapabilities {
-            provider_managed: false,
-            native_compaction: !matches!(
-                settings.dialect,
-                OpenAiCompatibleDialect::ChatCompletions
-            ),
+            provider_managed: official_responses,
+            native_compaction: official_responses || explicit_native,
         })
     }
 
@@ -674,6 +678,8 @@ struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     previous_response_id: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    context_management: Vec<ResponsesContextManagement>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ResponsesTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<&'static str>,
@@ -693,6 +699,12 @@ struct ResponsesRequest {
     max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f32>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesContextManagement {
+    r#type: &'static str,
+    compact_threshold: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -741,6 +753,12 @@ enum ResponsesInputItem {
         #[serde(default)]
         summary: Vec<ResponsesReasoningSummary>,
         encrypted_content: String,
+    },
+    Compaction {
+        id: String,
+        encrypted_content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        created_by: Option<String>,
     },
 }
 
@@ -2671,6 +2689,7 @@ fn verification_turn_request(request: &bcode_model::VerifyModelRequest) -> Model
         }],
         tools: Vec::new(),
         structured_output: None,
+        context_management: bcode_model::ContextManagementRequest::default(),
         parameters: bcode_model::ModelParameters {
             max_output_tokens: Some(16),
             ..bcode_model::ModelParameters::default()
@@ -2858,6 +2877,7 @@ async fn send_chat_completion_request(
 
 #[derive(Debug, Deserialize)]
 struct ResponsesCompactBody {
+    object: String,
     #[serde(default)]
     output: Vec<serde_json::Value>,
 }
@@ -2867,7 +2887,7 @@ async fn compact_context_inner(
     request: CompactContextRequest,
 ) -> Result<CompactContextResponse, ProviderError> {
     let settings = settings_for_context(&request.provider_context);
-    if matches!(settings.dialect, OpenAiCompatibleDialect::ChatCompletions) {
+    if settings.dialect != OpenAiCompatibleDialect::ResponsesApi {
         return Err(provider_error(
             "native_compaction_unsupported",
             ProviderErrorCategory::UnsupportedFeature,
@@ -2891,6 +2911,7 @@ async fn compact_context_inner(
         tools: request.tools,
         parameters: bcode_model::ModelParameters::default(),
         structured_output: None,
+        context_management: bcode_model::ContextManagementRequest::default(),
         prompt_cache: bcode_model::PromptCacheHints::default(),
         conversation_reuse: bcode_model::ConversationReuseHints::default(),
         metadata: BTreeMap::new(),
@@ -2905,8 +2926,6 @@ async fn compact_context_inner(
         "model": request.model_id,
         "input": projection.input,
         "instructions": projection.instructions,
-        "tools": model_tools_to_responses_tools(&turn_request, settings.dialect)?,
-        "parallel_tool_calls": true,
     });
     let client = model_stream_client(settings.request_timeout).map_err(|error| {
         provider_error(
@@ -2975,6 +2994,26 @@ async fn compact_context_inner(
                 error.to_string(),
             )
         })?;
+    if response.object != "response.compaction" {
+        return Err(provider_error(
+            "invalid_compaction_response",
+            ProviderErrorCategory::ProviderInternal,
+            format!("unexpected compaction object type: {}", response.object),
+        ));
+    }
+    if !response.output.iter().any(|item| {
+        item.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
+            && item
+                .get("encrypted_content")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+    }) {
+        return Err(provider_error(
+            "invalid_compaction_response",
+            ProviderErrorCategory::ProviderInternal,
+            "compaction response did not contain a valid compaction item",
+        ));
+    }
     let content = response
         .output
         .into_iter()
@@ -3214,6 +3253,7 @@ fn process_responses_stream_line(
                 processor.name_map,
             );
             process_responses_reasoning_output_item(&event, reasoning_items);
+            process_responses_compaction_output_item(&event, processor.turn, processor.dialect);
         }
         "response.function_call_arguments.delta" => {
             process_responses_function_arguments_delta(&event, processor.turn, tool_calls);
@@ -3322,6 +3362,33 @@ fn process_responses_output_item(
         });
         entry.started = true;
     }
+}
+
+fn process_responses_compaction_output_item(
+    event: &serde_json::Value,
+    turn: &TurnState,
+    dialect: OpenAiCompatibleDialect,
+) {
+    let Some(item) = event.get("item") else {
+        return;
+    };
+    if item.get("type").and_then(serde_json::Value::as_str) != Some("compaction")
+        || item
+            .get("encrypted_content")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        return;
+    }
+    turn.push(ProviderTurnEvent::ContextCompacted {
+        messages: vec![ModelMessage {
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::ProviderExtension {
+                value: item.clone(),
+            }],
+        }],
+        compatibility_key: dialect.metadata_value().to_string(),
+    });
 }
 
 fn process_responses_reasoning_output_item(
@@ -3751,6 +3818,15 @@ fn build_responses_request(
         stream: true,
         store: responses_store_enabled(settings, request),
         previous_response_id,
+        context_management: request
+            .context_management
+            .compact_threshold
+            .map(|compact_threshold| ResponsesContextManagement {
+                r#type: "compaction",
+                compact_threshold,
+            })
+            .into_iter()
+            .collect(),
         tools: model_tools_to_responses_tools(request, settings.dialect)?,
         tool_choice: settings
             .dialect
@@ -4146,6 +4222,18 @@ fn push_sanitized_responses_input_item(
                 id,
                 summary,
                 encrypted_content,
+            });
+        }
+        ResponsesInputItem::Compaction {
+            id,
+            encrypted_content,
+            created_by,
+        } => {
+            append_missing_responses_tool_outputs(input, pending_tool_call_ids);
+            input.push(ResponsesInputItem::Compaction {
+                id,
+                encrypted_content,
+                created_by,
             });
         }
     }
@@ -6806,6 +6894,7 @@ mod tests {
             messages,
             tools: Vec::new(),
             structured_output: None,
+            context_management: bcode_model::ContextManagementRequest::default(),
             parameters: bcode_model::ModelParameters::default(),
             prompt_cache: bcode_model::PromptCacheHints::default(),
             conversation_reuse: bcode_model::ConversationReuseHints::default(),
@@ -6843,6 +6932,27 @@ mod tests {
             body.get("custom_boolean")
                 .and_then(serde_json::Value::as_bool),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn responses_request_projects_provider_managed_compaction_threshold() {
+        let mut request = test_request(vec![text_message(MessageRole::User, "hello")]);
+        request.context_management.compact_threshold = Some(80_000);
+        let settings = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+
+        let body =
+            build_responses_request(&settings, &request, "gpt-5").expect("request should build");
+
+        assert_eq!(
+            body.pointer("/context_management/0/type")
+                .and_then(serde_json::Value::as_str),
+            Some("compaction")
+        );
+        assert_eq!(
+            body.pointer("/context_management/0/compact_threshold")
+                .and_then(serde_json::Value::as_u64),
+            Some(80_000)
         );
     }
 
@@ -7109,6 +7219,7 @@ mod tests {
             ],
             tools: Vec::new(),
             structured_output: None,
+            context_management: bcode_model::ContextManagementRequest::default(),
             parameters: bcode_model::ModelParameters::default(),
             prompt_cache: bcode_model::PromptCacheHints::default(),
             conversation_reuse: bcode_model::ConversationReuseHints::default(),
@@ -7157,6 +7268,7 @@ mod tests {
             ],
             tools: Vec::new(),
             structured_output: None,
+            context_management: bcode_model::ContextManagementRequest::default(),
             parameters: bcode_model::ModelParameters::default(),
             prompt_cache: bcode_model::PromptCacheHints::default(),
             conversation_reuse: bcode_model::ConversationReuseHints {
@@ -7279,6 +7391,7 @@ mod tests {
             ],
             tools: Vec::new(),
             structured_output: None,
+            context_management: bcode_model::ContextManagementRequest::default(),
             parameters: bcode_model::ModelParameters::default(),
             prompt_cache: bcode_model::PromptCacheHints::default(),
             conversation_reuse: bcode_model::ConversationReuseHints {

@@ -6412,6 +6412,7 @@ async fn process_compact_session_command(
         &selection,
         None,
         Some(&mut command_context),
+        CompactionAuthority::Manual,
     )
     .await;
     set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
@@ -9162,6 +9163,14 @@ impl ModelTurnCompletion {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactionAuthority {
+    /// Exclusive command serialized by the session runtime.
+    Manual,
+    /// Compaction performed by the model turn that owns the session runtime.
+    CurrentTurn,
+}
+
 #[derive(Debug, Error)]
 enum CompactionError {
     #[error("nothing to compact: {0}")]
@@ -9202,7 +9211,15 @@ async fn compact_session_context(
     session_id: SessionId,
     selection: &SessionModelSelection,
 ) -> Result<String, CompactionError> {
-    compact_session_context_with_limit(state, session_id, selection, None, None).await
+    compact_session_context_with_limit(
+        state,
+        session_id,
+        selection,
+        None,
+        None,
+        CompactionAuthority::CurrentTurn,
+    )
+    .await
 }
 
 async fn compact_session_context_before_sequence(
@@ -9217,6 +9234,7 @@ async fn compact_session_context_before_sequence(
         selection,
         Some(first_kept_sequence),
         None,
+        CompactionAuthority::CurrentTurn,
     )
     .await
 }
@@ -9227,8 +9245,9 @@ async fn compact_session_context_with_limit(
     selection: &SessionModelSelection,
     first_kept_sequence: Option<u64>,
     command_context: Option<&mut RuntimeCommandContext<'_>>,
+    authority: CompactionAuthority,
 ) -> Result<String, CompactionError> {
-    if state.session_has_active_turn(session_id).await {
+    if authority == CompactionAuthority::Manual && state.session_has_active_turn(session_id).await {
         return Err(CompactionError::Busy);
     }
 
@@ -9259,18 +9278,34 @@ async fn compact_session_context_with_limit(
         return Err(CompactionError::ProviderUnavailable);
     }
 
+    let compactable_history = transcript_history
+        .iter()
+        .filter(|event| event.sequence <= transcript.compacted_through_sequence)
+        .cloned()
+        .collect::<Vec<_>>();
     let native_snapshot =
-        compact_context_with_selected_backend(state, session_id, selection, &transcript_history)
+        compact_context_with_selected_backend(state, session_id, selection, &compactable_history)
             .await?;
-    let portable_summary =
-        collect_compaction_summary(state, session_id, selection, &transcript, command_context)
-            .await?;
-    let portable_summary = portable_summary.trim().to_string();
-    if portable_summary.is_empty() {
-        return Err(CompactionError::Provider(
-            "provider returned an empty compaction summary".to_string(),
-        ));
-    }
+    let portable_summary = if native_snapshot.is_some() {
+        match collect_compaction_summary(state, session_id, selection, &transcript, command_context)
+            .await
+        {
+            Ok(summary) if !summary.trim().is_empty() => summary.trim().to_string(),
+            Ok(_) => local_compaction_summary(&transcript, "provider returned an empty summary"),
+            Err(error) => local_compaction_summary(&transcript, &compaction_error_detail(error)),
+        }
+    } else {
+        let summary =
+            collect_compaction_summary(state, session_id, selection, &transcript, command_context)
+                .await?;
+        let summary = summary.trim().to_string();
+        if summary.is_empty() {
+            return Err(CompactionError::Provider(
+                "provider returned an empty compaction summary".to_string(),
+            ));
+        }
+        summary
+    };
     let event = if let Some(mut snapshot) = native_snapshot {
         snapshot.portable_summary = portable_summary;
         state
@@ -9319,6 +9354,18 @@ async fn provider_context_management_capabilities(
         .ok()
 }
 
+fn provider_context_compatibility_key(selection: &SessionModelSelection) -> String {
+    let context = &selection.provider_context;
+    let dialect = context.settings.get("dialect").map_or("", String::as_str);
+    let base_url = context.settings.get("base_url").map_or("", String::as_str);
+    format!(
+        "{}|{}|{}",
+        context.model_profile.as_deref().unwrap_or_default(),
+        dialect,
+        base_url.trim_end_matches('/')
+    )
+}
+
 async fn compact_context_with_selected_backend(
     state: &ServerState,
     session_id: SessionId,
@@ -9353,6 +9400,8 @@ async fn compact_context_with_selected_backend(
         state.tool_output_context_chars,
         Some(provider_plugin_id),
         Some(&model_id),
+        selection.provider_context.auth_profile.as_deref(),
+        Some(&provider_context_compatibility_key(selection)),
     );
     let response = state
         .plugins
@@ -9378,8 +9427,12 @@ async fn compact_context_with_selected_backend(
                 ))
             })?;
             Ok(Some(bcode_session_models::ProviderContextSnapshot {
+                format_version: 1,
                 provider_plugin_id: provider_plugin_id.to_string(),
                 model_id,
+                compatibility_key: provider_context_compatibility_key(selection),
+                auth_profile: selection.provider_context.auth_profile.clone(),
+                origin: bcode_session_models::ProviderContextSnapshotOrigin::Explicit,
                 messages_json: encoded,
                 portable_summary: String::new(),
             }))
@@ -9453,19 +9506,6 @@ async fn maybe_auto_compact_session_context(
     if !state.auto_compaction.mode.is_proactive_enabled() {
         return Ok(());
     }
-    if state.session_has_active_turn(session_id).await {
-        append_context_compaction_trace(
-            state,
-            session_id,
-            "active_turn",
-            0,
-            false,
-            Some("skipping auto compaction while a turn is active".to_string()),
-        )
-        .await;
-        return Ok(());
-    }
-
     if matches!(
         state.auto_compaction.mode,
         bcode_config::CompactionMode::Auto
@@ -9518,8 +9558,18 @@ async fn maybe_auto_compact_session_context(
         .auto_compaction
         .proactive_threshold_percent
         .clamp(1, 100);
+    let output_reserve = u64::from(
+        model_status
+            .max_output_tokens
+            .unwrap_or_else(|| (context_window_tokens / 8).max(1)),
+    );
+    let safety_margin = u64::from(context_window_tokens) / 50;
+    let available_input_tokens = u64::from(context_window_tokens)
+        .saturating_sub(output_reserve)
+        .saturating_sub(safety_margin);
     let threshold_tokens =
-        u64::from(context_window_tokens).saturating_mul(u64::from(threshold_percent)) / 100;
+        (u64::from(context_window_tokens).saturating_mul(u64::from(threshold_percent)) / 100)
+            .min(available_input_tokens);
     if projected_context_tokens < threshold_tokens {
         append_context_compaction_trace(
             state,
@@ -9761,6 +9811,7 @@ fn build_compaction_request(
         }],
         tools: Vec::new(),
         structured_output: None,
+        context_management: bcode_model::ContextManagementRequest::default(),
         parameters: ModelParameters::default(),
         prompt_cache: bcode_model::PromptCacheHints::default(),
         conversation_reuse: bcode_model::ConversationReuseHints::default(),
@@ -10096,6 +10147,7 @@ async fn handle_compaction_events(
             ProviderTurnEvent::TurnStarted
             | ProviderTurnEvent::ReasoningDelta { .. }
             | ProviderTurnEvent::RequestProjection { .. }
+            | ProviderTurnEvent::ContextCompacted { .. }
             | ProviderTurnEvent::ProviderMetadata { .. }
             | ProviderTurnEvent::RetryScheduled { .. } => {}
         }
@@ -10324,10 +10376,6 @@ async fn run_model_turn_inner(
     let selection =
         session_model_selection_with_runtime_context(state, session_id, runtime_context).await;
 
-    if let Err(error) = maybe_auto_compact_session_context(state, session_id, &selection).await {
-        let message = format!("auto compaction failed: {error}");
-        append_system_event(state, session_id, message).await;
-    }
     if !has_model_provider(state, selection.provider_plugin_id.as_deref()) {
         return ModelTurnCompletion::with_message(
             ModelTurnOutcome::ProviderUnavailable,
@@ -10342,6 +10390,21 @@ async fn run_model_turn_inner(
     let mut round = 0_u32;
     let mut recovery = ModelTurnRecoveryState::default();
     loop {
+        if cancel_state.is_cancelled() {
+            return ModelTurnCompletion::with_message(
+                ModelTurnOutcome::Cancelled,
+                "model turn cancelled",
+            );
+        }
+        if let Err(error) = maybe_auto_compact_session_context(state, session_id, &selection).await
+        {
+            append_system_event(
+                state,
+                session_id,
+                format!("auto compaction failed: {error}"),
+            )
+            .await;
+        }
         if cancel_state.is_cancelled() {
             return ModelTurnCompletion::with_message(
                 ModelTurnOutcome::Cancelled,
@@ -11494,6 +11557,7 @@ const fn model_event_is_progress(event: &ProviderTurnEvent) -> bool {
         }
         ProviderTurnEvent::ToolCallDelta { delta, .. } => !delta.is_empty(),
         ProviderTurnEvent::RequestProjection { .. }
+        | ProviderTurnEvent::ContextCompacted { .. }
         | ProviderTurnEvent::TurnStarted
         | ProviderTurnEvent::Usage { .. }
         | ProviderTurnEvent::Warning { .. }
@@ -11709,6 +11773,54 @@ async fn handle_provider_turn_event(
             update_provider_usage_state(state, session_id, &usage).await;
             append_provider_context_usage_observation(state, session_id, &usage).await;
             append_model_usage_event(state, session_id, turn_id.to_string(), usage).await;
+        }
+        ProviderTurnEvent::ContextCompacted {
+            messages,
+            compatibility_key,
+        } => {
+            let selection = session_model_selection(state, session_id).await;
+            let history = state
+                .sessions
+                .model_context_events(session_id)
+                .await
+                .unwrap_or_default();
+            let compacted_through_sequence = history
+                .iter()
+                .filter(|event| {
+                    !matches!(
+                        event.kind,
+                        SessionEventKind::ContextUsageObserved { .. }
+                            | SessionEventKind::ProviderContextCompacted { .. }
+                    )
+                })
+                .map(|event| event.sequence)
+                .max()
+                .unwrap_or_default();
+            if let Ok(messages_json) = serde_json::to_string(&messages) {
+                let snapshot = bcode_session_models::ProviderContextSnapshot {
+                    format_version: 1,
+                    provider_plugin_id: selection
+                        .provider_plugin_id
+                        .unwrap_or_else(|| "<auto>".to_string()),
+                    model_id: model_id_for_provider_request(selection.model_id.as_deref()),
+                    compatibility_key,
+                    auth_profile: selection.provider_context.auth_profile,
+                    origin: bcode_session_models::ProviderContextSnapshotOrigin::ProviderManaged,
+                    messages_json,
+                    portable_summary: "Provider-managed context checkpoint; use canonical session history when switching provider surfaces.".to_string(),
+                };
+                if let Ok(event) = state
+                    .sessions
+                    .append_provider_context_compacted(
+                        session_id,
+                        snapshot,
+                        compacted_through_sequence,
+                    )
+                    .await
+                {
+                    publish_session_event(state, &event).await;
+                }
+            }
         }
         ProviderTurnEvent::RequestProjection { projection } => {
             handle_provider_request_projection_event(state, session_id, turn_id, projection).await;
@@ -12588,6 +12700,8 @@ async fn build_model_turn_request(
         state.tool_output_context_chars,
         provider_plugin_id,
         Some(&model_id_for_provider_request(selected_model_id)),
+        selection.provider_context.auth_profile.as_deref(),
+        Some(&provider_context_compatibility_key(selection)),
     );
     state.metrics.record_histogram_with_labels(
         "model.request_build.convert_events_duration_ms",
@@ -12804,6 +12918,25 @@ async fn build_model_turn_request(
         metric_labels.clone(),
     );
     let request_assembly_timer = state.metrics.timer();
+    let context_management = if state.auto_compaction.mode == bcode_config::CompactionMode::Auto
+        && provider_context_management_capabilities(state, selection)
+            .await
+            .is_some_and(|capabilities| capabilities.provider_managed)
+    {
+        let status = model_status_for_selection(state, selection.clone(), Some(session_id)).await;
+        bcode_model::ContextManagementRequest {
+            compact_threshold: status.context_window.map(|window| {
+                u64::from(window).saturating_mul(u64::from(
+                    state
+                        .auto_compaction
+                        .proactive_threshold_percent
+                        .clamp(1, 100),
+                )) / 100
+            }),
+        }
+    } else {
+        bcode_model::ContextManagementRequest::default()
+    };
     let request = ModelTurnRequest {
         session_id,
         turn_id: format!("{}-{}-{round}", session_id, trigger_event.sequence),
@@ -12813,17 +12946,22 @@ async fn build_model_turn_request(
         messages,
         tools,
         structured_output: None,
+        context_management,
         parameters,
         prompt_cache,
         conversation_reuse,
         metadata,
     };
     let local_context_estimate = estimated_model_request_tokens(&request);
+    let turn_id = request.turn_id.clone();
     let snapshot = bcode_session_models::ContextUsageSnapshot {
         provider_plugin_id: provider_plugin_id.unwrap_or("<auto>").to_string(),
         model_id: request.model_id.clone(),
         input_tokens: local_context_estimate,
         context_through_sequence,
+        turn_id: Some(turn_id),
+        auth_profile: request.provider_context.auth_profile.clone(),
+        estimated_input_tokens: Some(local_context_estimate),
         source: bcode_session_models::ContextUsageSource::Estimated,
     };
     if let Ok(event) = state
@@ -12865,10 +13003,24 @@ fn estimated_model_request_tokens(request: &ModelTurnRequest) -> u64 {
                 + tool.input_schema.to_string().chars().count()
         })
         .sum::<usize>();
+    let extension_chars = request
+        .provider_context
+        .request
+        .iter()
+        .map(|(key, value)| {
+            key.chars().count()
+                + serde_json::to_string(value).map_or(0, |value| value.chars().count())
+        })
+        .sum::<usize>();
+    let structural_chars = request.messages.len().saturating_mul(16)
+        + request.tools.len().saturating_mul(24)
+        + request.metadata.len().saturating_mul(8);
     estimated_tokens_from_chars(
         message_chars
             .saturating_add(system_chars)
-            .saturating_add(tool_chars),
+            .saturating_add(tool_chars)
+            .saturating_add(extension_chars)
+            .saturating_add(structural_chars),
     )
 }
 
@@ -15196,7 +15348,14 @@ fn session_events_to_model_messages_with_limit(
     history: &[bcode_session_models::SessionEvent],
     tool_output_context_chars: usize,
 ) -> Vec<ModelMessage> {
-    session_events_to_model_messages_for_target(history, tool_output_context_chars, None, None)
+    session_events_to_model_messages_for_target(
+        history,
+        tool_output_context_chars,
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
 fn session_events_to_model_messages_for_target(
@@ -15204,6 +15363,8 @@ fn session_events_to_model_messages_for_target(
     tool_output_context_chars: usize,
     provider_plugin_id: Option<&str>,
     model_id: Option<&str>,
+    auth_profile: Option<&str>,
+    compatibility_key: Option<&str>,
 ) -> Vec<ModelMessage> {
     let history = compact_attach_history(history.to_vec());
     let latest_compaction =
@@ -15243,6 +15404,8 @@ fn session_events_to_model_messages_for_target(
         tool_output_context_chars,
         provider_plugin_id,
         model_id,
+        auth_profile,
+        compatibility_key,
     )
 }
 
@@ -15252,6 +15415,8 @@ fn session_events_to_sanitized_model_messages(
     tool_output_context_chars: usize,
     provider_plugin_id: Option<&str>,
     model_id: Option<&str>,
+    auth_profile: Option<&str>,
+    compatibility_key: Option<&str>,
 ) -> Vec<ModelMessage> {
     let mut messages = Vec::new();
     let mut seen_tool_call_ids = BTreeSet::new();
@@ -15337,6 +15502,12 @@ fn session_events_to_sanitized_model_messages(
                 append_missing_tool_results(&mut messages, &mut pending_tool_call_ids);
                 if provider_plugin_id == Some(snapshot.provider_plugin_id.as_str())
                     && model_id == Some(snapshot.model_id.as_str())
+                    && snapshot
+                        .auth_profile
+                        .as_deref()
+                        .is_none_or(|profile| auth_profile == Some(profile))
+                    && (snapshot.compatibility_key.is_empty()
+                        || compatibility_key == Some(snapshot.compatibility_key.as_str()))
                 {
                     if let Ok(provider_messages) =
                         serde_json::from_str::<Vec<ModelMessage>>(&snapshot.messages_json)
@@ -16383,18 +16554,42 @@ async fn append_provider_context_usage_observation(
             return;
         }
     };
+    let baseline = history.iter().rev().find_map(|event| match &event.kind {
+        SessionEventKind::ContextUsageObserved { snapshot }
+            if snapshot.provider_plugin_id
+                == selection.provider_plugin_id.as_deref().unwrap_or("<auto>")
+                && snapshot.model_id
+                    == model_id_for_provider_request(selection.model_id.as_deref())
+                && snapshot.source == bcode_session_models::ContextUsageSource::Estimated =>
+        {
+            Some(snapshot)
+        }
+        _ => None,
+    });
     let snapshot = bcode_session_models::ContextUsageSnapshot {
         provider_plugin_id: selection
             .provider_plugin_id
             .unwrap_or_else(|| "<auto>".to_string()),
         model_id: model_id_for_provider_request(selection.model_id.as_deref()),
         input_tokens: u64::from(input_tokens),
-        context_through_sequence: history
-            .iter()
-            .filter(|event| !matches!(event.kind, SessionEventKind::ContextUsageObserved { .. }))
-            .map(|event| event.sequence)
-            .max()
-            .unwrap_or_default(),
+        context_through_sequence: baseline.map_or_else(
+            || {
+                history
+                    .iter()
+                    .filter(|event| {
+                        !matches!(event.kind, SessionEventKind::ContextUsageObserved { .. })
+                    })
+                    .map(|event| event.sequence)
+                    .max()
+                    .unwrap_or_default()
+            },
+            |snapshot| snapshot.context_through_sequence,
+        ),
+        turn_id: baseline.and_then(|snapshot| snapshot.turn_id.clone()),
+        auth_profile: baseline
+            .and_then(|snapshot| snapshot.auth_profile.clone())
+            .or(selection.provider_context.auth_profile),
+        estimated_input_tokens: baseline.map(|snapshot| snapshot.input_tokens),
         source: bcode_session_models::ContextUsageSource::Provider,
     };
     match state
@@ -17444,6 +17639,7 @@ mod tests {
             messages,
             tools: Vec::new(),
             structured_output: None,
+            context_management: bcode_model::ContextManagementRequest::default(),
             parameters: ModelParameters::default(),
             prompt_cache: bcode_model::PromptCacheHints::default(),
             conversation_reuse: bcode_model::ConversationReuseHints::default(),
@@ -19821,8 +20017,12 @@ mod tests {
             1,
             SessionEventKind::ProviderContextCompacted {
                 snapshot: bcode_session_models::ProviderContextSnapshot {
+                    format_version: 1,
                     provider_plugin_id: "provider-a".to_string(),
                     model_id: "model-a".to_string(),
+                    compatibility_key: String::new(),
+                    auth_profile: None,
+                    origin: bcode_session_models::ProviderContextSnapshotOrigin::Explicit,
                     messages_json: serde_json::to_string(&provider_messages).expect("messages"),
                     portable_summary: "portable context".to_string(),
                 },
@@ -19835,12 +20035,16 @@ mod tests {
             1_000,
             Some("provider-a"),
             Some("model-a"),
+            None,
+            None,
         );
         let mismatched = session_events_to_model_messages_for_target(
             &history,
             1_000,
             Some("provider-b"),
             Some("model-b"),
+            None,
+            None,
         );
 
         assert_eq!(matching, provider_messages);

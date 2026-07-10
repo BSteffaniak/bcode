@@ -2385,6 +2385,7 @@ mod tests {
                 requires_permission: false,
             }],
             structured_output: None,
+            context_management: bcode_model::ContextManagementRequest::default(),
             parameters: bcode_model::ModelParameters::default(),
             prompt_cache: bcode_model::PromptCacheHints {
                 mode: bcode_model::PromptCacheMode::Auto,

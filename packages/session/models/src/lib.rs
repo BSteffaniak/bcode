@@ -196,7 +196,7 @@ fn tool_projection_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &st
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 26;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 27;
 
 /// Return the current Unix timestamp in milliseconds.
 #[must_use]
@@ -1520,22 +1520,58 @@ pub struct ContextUsageSnapshot {
     pub input_tokens: u64,
     /// Last canonical event represented by the observed request.
     pub context_through_sequence: u64,
+    /// Model turn/request identifier associated with this observation.
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    /// Effective non-secret auth profile used for this request.
+    #[serde(default)]
+    pub auth_profile: Option<String>,
+    /// Conservative local estimate captured for the same request.
+    #[serde(default)]
+    pub estimated_input_tokens: Option<u64>,
     /// Observation source.
     pub source: ContextUsageSource,
+}
+
+/// Origin of a provider-native replacement context.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderContextSnapshotOrigin {
+    /// Bcode explicitly invoked the provider's native compaction operation.
+    #[default]
+    Explicit,
+    /// The provider compacted context while serving a normal model turn.
+    ProviderManaged,
 }
 
 /// Durable provider-native replacement context.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderContextSnapshot {
+    /// Snapshot payload format version.
+    #[serde(default = "default_provider_context_snapshot_version")]
+    pub format_version: u16,
     /// Provider plugin that owns the opaque replacement items.
     pub provider_plugin_id: String,
     /// Model for which the replacement context was produced.
     pub model_id: String,
+    /// Non-secret provider surface identity required to replay opaque context safely.
+    #[serde(default)]
+    pub compatibility_key: String,
+    /// Effective non-secret auth profile used to create the context.
+    #[serde(default)]
+    pub auth_profile: Option<String>,
+    /// How the provider-native replacement was created.
+    #[serde(default)]
+    pub origin: ProviderContextSnapshotOrigin,
     /// Serialized provider-neutral model messages containing provider extensions.
     pub messages_json: String,
     /// Portable summary used when the active provider or model no longer matches.
     #[serde(default)]
     pub portable_summary: String,
+}
+
+const fn default_provider_context_snapshot_version() -> u16 {
+    1
 }
 
 /// Session event payload.

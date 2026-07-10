@@ -230,6 +230,8 @@ pub enum AgentRuntimeEvent {
     Usage(TokenUsage),
     /// Provider reported actual request projection metadata.
     RequestProjection(ProviderRequestProjection),
+    /// Provider compacted the active context while serving the turn.
+    ContextCompacted,
     /// Provider-specific metadata used for invisible optimization state.
     ProviderMetadata {
         /// Metadata key.
@@ -1028,6 +1030,7 @@ fn model_turn_request(request: &AgentTurnRequest) -> ModelTurnRequest {
             .collect(),
         parameters: request.parameters.clone(),
         structured_output: request.structured_output.clone(),
+        context_management: bcode_model::ContextManagementRequest::default(),
         prompt_cache: bcode_model::PromptCacheHints::default(),
         conversation_reuse: bcode_model::ConversationReuseHints::default(),
         metadata: request.metadata.clone(),
@@ -1087,6 +1090,9 @@ fn normalize_provider_event(
         }
         ProviderTurnEvent::RequestProjection { projection } => Ok(EventDisposition::Continue(
             AgentRuntimeEvent::RequestProjection(projection),
+        )),
+        ProviderTurnEvent::ContextCompacted { .. } => Ok(EventDisposition::Continue(
+            AgentRuntimeEvent::ContextCompacted,
         )),
         ProviderTurnEvent::ProviderMetadata { key, value } => Ok(EventDisposition::Continue(
             AgentRuntimeEvent::ProviderMetadata { key, value },
