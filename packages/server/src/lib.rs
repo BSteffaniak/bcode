@@ -6769,6 +6769,7 @@ async fn resolved_provider_models(
         request,
     )
     .await?;
+    state.model_catalog.refresh_if_stale();
     Ok(state.model_catalog.resolve(models).await)
 }
 

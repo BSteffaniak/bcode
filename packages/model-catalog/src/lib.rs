@@ -103,6 +103,10 @@ pub struct ModelCatalogDiagnostics {
     pub remote_revision: Option<String>,
     /// Whether remote catalog use is enabled.
     pub remote_enabled: bool,
+    /// Last refresh attempt time.
+    pub last_refresh_attempt: Option<std::time::SystemTime>,
+    /// Last successful refresh time.
+    pub last_refresh_success: Option<std::time::SystemTime>,
     /// Last refresh failure.
     pub last_refresh_error: Option<String>,
     /// Whether a refresh is currently running.
@@ -150,6 +154,8 @@ impl ModelCatalogResolver {
                 embedded_revision,
                 remote_revision,
                 remote_enabled: !options.disabled,
+                last_refresh_attempt: None,
+                last_refresh_success: None,
                 last_refresh_error: None,
                 refresh_in_progress: false,
             })),
@@ -174,9 +180,26 @@ impl ModelCatalogResolver {
 
     /// Spawn a coalesced background refresh without delaying the caller.
     pub fn spawn_refresh(&self) {
+        self.refresh_if_stale();
+    }
+
+    /// Spawn a background refresh when cached data is stale or the retry interval elapsed.
+    pub fn refresh_if_stale(&self) {
         if self.options.disabled {
             return;
         }
+        let Ok(diagnostics) = self.diagnostics.try_read() else {
+            return;
+        };
+        let recently_attempted = diagnostics.last_refresh_attempt.is_some_and(|attempt| {
+            attempt
+                .elapsed()
+                .is_ok_and(|elapsed| elapsed < std::time::Duration::from_mins(1))
+        });
+        if diagnostics.refresh_in_progress || recently_attempted {
+            return;
+        }
+        drop(diagnostics);
         let resolver = self.clone();
         tokio::spawn(async move {
             resolver.refresh_now().await;
@@ -188,7 +211,11 @@ impl ModelCatalogResolver {
         let Ok(_gate) = self.refresh_gate.try_lock() else {
             return;
         };
-        self.diagnostics.write().await.refresh_in_progress = true;
+        {
+            let mut diagnostics = self.diagnostics.write().await;
+            diagnostics.refresh_in_progress = true;
+            diagnostics.last_refresh_attempt = Some(std::time::SystemTime::now());
+        }
         let result = self.fetch_refreshed_catalog().await;
         let mut diagnostics = self.diagnostics.write().await;
         diagnostics.refresh_in_progress = false;
@@ -196,6 +223,7 @@ impl ModelCatalogResolver {
             Ok((catalog, revision)) => {
                 *self.catalog.write().await = std::sync::Arc::new(catalog);
                 diagnostics.remote_revision = Some(revision);
+                diagnostics.last_refresh_success = Some(std::time::SystemTime::now());
                 diagnostics.last_refresh_error = None;
             }
             Err(error) => diagnostics.last_refresh_error = Some(error.to_string()),

@@ -9,6 +9,9 @@ use hyperchad_docs_config_derive::{ConfigDoc, ConfigDocEnum};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Provider context setting for explicit catalog provider mapping.
+pub const CATALOG_PROVIDER_ID_SETTING: &str = "catalog_provider_id";
+
 /// Plugin service interface for model providers.
 pub const MODEL_PROVIDER_INTERFACE_ID: &str = "bcode.model-provider/v1";
 

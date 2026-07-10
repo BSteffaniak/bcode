@@ -413,6 +413,7 @@ struct Settings {
     fallback_model: String,
     model_ids: Vec<String>,
     model_ids_are_explicit: bool,
+    catalog_provider_id: Option<String>,
     request_timeout: Option<Duration>,
     /// When true, live model discovery is disabled even for discoverable providers.
     /// Sourced from declarative provider config via context.settings.
@@ -4687,7 +4688,10 @@ fn model_infos_from_items_without_catalog(
         .collect()
 }
 
-fn catalog_provider_id(settings: &Settings) -> Option<&'static str> {
+fn catalog_provider_id(settings: &Settings) -> Option<&str> {
+    if let Some(provider_id) = settings.catalog_provider_id.as_deref() {
+        return Some(provider_id);
+    }
     if discovery::is_xai_provider(
         Some(&settings.base_url),
         Some(settings.dialect.metadata_value()),
@@ -5320,6 +5324,13 @@ fn settings_for_context(context: &ProviderRequestContext) -> Settings {
         fallback_model,
         model_ids,
         model_ids_are_explicit: model_ids_env.is_some(),
+        catalog_provider_id: context
+            .settings
+            .get(bcode_model::CATALOG_PROVIDER_ID_SETTING)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
         request_timeout,
         live_discovery_disabled: context
             .settings
@@ -6458,6 +6469,7 @@ mod tests {
             fallback_model: openai_default_model_id(),
             model_ids: vec!["model".to_string()],
             model_ids_are_explicit: true,
+            catalog_provider_id: None,
             request_timeout: None,
             live_discovery_disabled: false,
         }
