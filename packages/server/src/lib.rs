@@ -6777,6 +6777,28 @@ async fn resolved_provider_models(
         .await)
 }
 
+async fn effective_model_id(
+    state: &ServerState,
+    selection: &SessionModelSelection,
+) -> Result<String, String> {
+    let models = resolved_provider_models(
+        state,
+        selection.provider_plugin_id.clone(),
+        bcode_model::ModelListRequest {
+            provider_context: selection.provider_context.clone(),
+            selected_model_id: selection.model_id.clone(),
+        },
+    )
+    .await?;
+    models
+        .models
+        .iter()
+        .find(|model| model.is_default)
+        .or_else(|| models.models.first())
+        .map(|model| model.model_id.clone())
+        .ok_or_else(|| "model provider has no usable models".to_string())
+}
+
 async fn model_status_for_selection(
     state: &ServerState,
     selection: SessionModelSelection,
@@ -9359,7 +9381,8 @@ async fn collect_compaction_summary_once(
         "{session_id}-compact-{}",
         transcript.compacted_through_sequence
     );
-    let request = build_compaction_request(session_id, selection, prompt_text, turn_id.clone());
+    let mut request = build_compaction_request(session_id, selection, prompt_text, turn_id.clone());
+    request.model_id = effective_model_id(state, selection).await?;
     let compaction_cancel_state = TurnCancelState::default();
     let provider_turn_id = if let Some(context) = &mut command_context {
         match wait_for_provider_call(
@@ -12390,7 +12413,9 @@ async fn build_model_turn_request(
         tools.len() as u64,
         metric_labels.clone(),
     );
-    let model_id = model_id_for_provider_request(selected_model_id);
+    let model_id = effective_model_id(state, selection)
+        .await
+        .unwrap_or_else(|_| model_id_for_provider_request(selected_model_id));
     let reasoning_capabilities = resolve_model_reasoning_info(
         state,
         provider_plugin_id,
