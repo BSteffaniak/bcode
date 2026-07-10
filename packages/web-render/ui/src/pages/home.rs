@@ -50,10 +50,26 @@ type VisualAdapter = fn(&PluginVisualView) -> Option<Containers>;
 
 static VISUAL_ADAPTERS: LazyLock<BTreeMap<(&'static str, u32), VisualAdapter>> =
     LazyLock::new(|| {
-        BTreeMap::from([(
-            ("bcode.tool.request.shell.run", 1),
-            render_shell_request as VisualAdapter,
-        )])
+        let structured = render_structured_visual as VisualAdapter;
+        BTreeMap::from([
+            (
+                ("bcode.tool.request.shell.run", 1),
+                render_shell_request as VisualAdapter,
+            ),
+            (("bcode.filesystem.request", 1), structured),
+            (("bcode.document.request", 1), structured),
+            (("bcode.ocr.request", 1), structured),
+            (("bcode.web-search.search_request", 1), structured),
+            (("bcode.web-search.fetch_request", 1), structured),
+            (("bcode.web-search.status_request", 1), structured),
+            (("bcode.web-search.inspect_request", 1), structured),
+            (("bcode.git.clone_request", 1), structured),
+            (("bcode.worktree.request", 1), structured),
+            (("bcode.vim-edit.request.preview", 1), structured),
+            (("bcode.vim-edit.request.apply", 1), structured),
+            (("bcode.vim-edit.live", 1), structured),
+            (("bcode.vim-edit.playback", 1), structured),
+        ])
     });
 
 /// Render the Bcode web renderer shell.
@@ -98,7 +114,7 @@ pub fn home(
                         div color="#8b949e" font-size=12 { "No sessions loaded yet." }
                     } @else {
                         @for session in sessions {
-                            anchor href=(format!("/session/{}?token={access_token}", session.id)) text-decoration="none" {
+                            anchor href=(format!("/session/{}?token={access_token}&hyperchad-event-scope={access_token}:{}", session.id, session.id)) text-decoration="none" {
                                 div color="#f0f6fc" font-size=13 { (session.title().unwrap_or("Untitled session")) }
                                 div color="#8b949e" font-size=11 { (session.working_directory.display().to_string()) }
                             }
@@ -559,6 +575,43 @@ fn render_plugin_visual(title: &str, visual: &PluginVisualView) -> Containers {
     }
 }
 
+fn render_structured_visual(visual: &PluginVisualView) -> Option<Containers> {
+    let payload = &visual.descriptor.payload;
+    let arguments = payload.get("arguments").unwrap_or(payload);
+    let object = arguments.as_object()?;
+    let fields = object
+        .iter()
+        .filter(|(key, value)| {
+            !key.starts_with('_') && !value.is_null() && !value.is_object() && !value.is_array()
+        })
+        .map(|(key, value)| {
+            let value = value
+                .as_str()
+                .map_or_else(|| value.to_string(), ToOwned::to_owned);
+            (key.replace('_', " "), value)
+        })
+        .collect::<Vec<_>>();
+    if fields.is_empty() {
+        return None;
+    }
+    let title = visual
+        .descriptor
+        .title
+        .as_deref()
+        .unwrap_or(visual.descriptor.schema.as_str());
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div color="#58a6ff" margin-bottom=8 { (title) }
+            @for (key, value) in fields {
+                div direction=row gap=8 margin-bottom=4 {
+                    span color="#8b949e" min-width=120 { (key) }
+                    span color="#f0f6fc" white-space="preserve-wrap" { (value) }
+                }
+            }
+        }
+    })
+}
+
 fn render_shell_request(visual: &PluginVisualView) -> Option<Containers> {
     let payload = &visual.descriptor.payload;
     let arguments = payload.get("arguments").unwrap_or(payload);
@@ -656,6 +709,40 @@ mod tests {
     }
 
     #[test]
+    fn session_links_propagate_access_token_and_live_scope() {
+        let session = bcode_session_models::SessionSummary {
+            id: bcode_session_models::SessionId::new(),
+            name: Some("session".to_owned()),
+            explicit_name: None,
+            derived_title: None,
+            title_source: bcode_session_models::SessionTitleSource::Explicit,
+            client_count: 0,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            working_directory: "/tmp/project".into(),
+            import: None,
+            fork: None,
+        };
+        let rendered = format!(
+            "{:?}",
+            home(
+                &SessionViewSnapshot::empty(),
+                std::slice::from_ref(&session),
+                "secret-token"
+            )
+        );
+        assert!(
+            rendered.contains(&format!(
+                "token=secret-token&amp;hyperchad-event-scope=secret-token:{}",
+                session.id
+            )) || rendered.contains(&format!(
+                "token=secret-token&hyperchad-event-scope=secret-token:{}",
+                session.id
+            ))
+        );
+    }
+
+    #[test]
     fn question_snapshot_renders_polished_controls_and_generic_fallback() {
         let interaction = InteractionViewSummary {
             interaction_id: "interaction-1".to_owned(),
@@ -696,6 +783,48 @@ mod tests {
         assert!(rendered.contains("question-0.option-0"));
         assert!(rendered.contains("submit answers"));
         assert!(rendered.contains("generic semantic controls"));
+    }
+
+    #[test]
+    fn bundled_visual_registry_covers_actual_high_value_request_schemas() {
+        for schema in [
+            "bcode.filesystem.request",
+            "bcode.document.request",
+            "bcode.ocr.request",
+            "bcode.web-search.search_request",
+            "bcode.web-search.fetch_request",
+            "bcode.web-search.status_request",
+            "bcode.web-search.inspect_request",
+            "bcode.git.clone_request",
+            "bcode.worktree.request",
+            "bcode.vim-edit.request.preview",
+            "bcode.vim-edit.request.apply",
+            "bcode.vim-edit.live",
+            "bcode.vim-edit.playback",
+        ] {
+            assert!(
+                VISUAL_ADAPTERS.contains_key(&(schema, 1)),
+                "missing {schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_request_adapter_renders_meaningful_fields_and_fallback() {
+        let visual = PluginVisualView::from(PluginVisualDescriptor {
+            visual_id: Some("filesystem-1".to_owned()),
+            producer_plugin_id: Some("bcode.filesystem".to_owned()),
+            schema: "bcode.filesystem.request".to_owned(),
+            schema_version: 1,
+            title: Some("Read file".to_owned()),
+            subtitle: None,
+            payload: serde_json::json!({"operation": "read", "path": "/tmp/sentinel.txt"}),
+        });
+
+        let rendered = format!("{:?}", render_plugin_visual("request visual", &visual));
+        assert!(rendered.contains("Read file"));
+        assert!(rendered.contains("/tmp/sentinel.txt"));
+        assert!(rendered.contains("request visual"));
     }
 
     #[test]

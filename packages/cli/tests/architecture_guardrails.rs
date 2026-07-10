@@ -5,6 +5,25 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+const RENDERER_NEUTRAL_SCAN_ROOTS: &[&str] = &["packages/session-view", "packages/web-render"];
+
+const BCODE_BROWSER_TRANSPORT_NEEDLES: &[&str] = &[
+    "WebSocket",
+    "EventSource",
+    "text/event-stream",
+    "tokio-tungstenite",
+    "tokio_tungstenite",
+    "actix-ws",
+    "actix_ws",
+];
+
+const TERMINAL_PLUGIN_API_NEEDLES: &[&str] = &[
+    "PluginTuiSurface",
+    "PluginTuiVisualAdapter",
+    "bcode_plugin_sdk::tui",
+    "bmux_tui",
+];
+
 const CORE_SCAN_ROOTS: &[&str] = &[
     "packages/server",
     "packages/config",
@@ -110,6 +129,103 @@ struct BoundaryOffender {
     needle: &'static str,
     category: &'static str,
     line: String,
+}
+
+#[test]
+fn web_renderer_uses_hyperchad_instead_of_bcode_owned_browser_transport() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let web_root = workspace_root.join("packages/web-render");
+    let mut offenders = Vec::new();
+    collect_literal_offenders(&web_root, BCODE_BROWSER_TRANSPORT_NEEDLES, &mut offenders);
+    collect_browser_source_files(&web_root, &mut offenders);
+    assert!(
+        offenders.is_empty(),
+        "Bcode-owned browser transport bypasses HyperChad:\n{}",
+        offenders.join("\n")
+    );
+}
+
+fn collect_browser_source_files(path: &Path, offenders: &mut Vec<String>) {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    if metadata.is_dir() {
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(should_skip_dir)
+        {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            collect_browser_source_files(&entry.path(), offenders);
+        }
+        return;
+    }
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "js" | "jsx" | "ts" | "tsx"
+            )
+        })
+    {
+        offenders.push(format!(
+            "{}: browser source belongs in HyperChad",
+            path.display()
+        ));
+    }
+}
+
+#[test]
+fn renderer_neutral_and_web_crates_do_not_depend_on_terminal_plugin_apis() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut offenders = Vec::new();
+    for root in RENDERER_NEUTRAL_SCAN_ROOTS {
+        collect_literal_offenders(
+            &workspace_root.join(root),
+            TERMINAL_PLUGIN_API_NEEDLES,
+            &mut offenders,
+        );
+    }
+    assert!(
+        offenders.is_empty(),
+        "terminal plugin APIs leaked into renderer-neutral/web crates:\n{}",
+        offenders.join("\n")
+    );
+}
+
+fn collect_literal_offenders(path: &Path, needles: &[&str], offenders: &mut Vec<String>) {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    if metadata.is_dir() {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            collect_literal_offenders(&entry.path(), needles, offenders);
+        }
+        return;
+    }
+    if !should_scan_file(path) {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for (index, line) in text.lines().enumerate() {
+        for needle in needles {
+            if line.contains(needle) {
+                offenders.push(format!("{}:{}: {needle}", path.display(), index + 1));
+            }
+        }
+    }
 }
 
 /// Enforces that remaining hardcoded bundled tool/plugin references in core crates are

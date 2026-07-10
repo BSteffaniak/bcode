@@ -24,6 +24,7 @@ hyperchad = { workspace = true, features = [
     "color",
     "json",
     "renderer",
+    "renderer-html-sse",
     "renderer-vanilla-js",
     "renderer-vanilla-js-hash",
     "renderer-vanilla-js-plugin-form",
@@ -37,6 +38,8 @@ hyperchad = { workspace = true, features = [
 ] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync"] }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

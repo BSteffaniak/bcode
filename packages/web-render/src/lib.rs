@@ -4,11 +4,12 @@
 
 //! `HyperChad` web renderer host for Bcode sessions.
 
+use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::str::FromStr as _;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
-use bcode_client::{AttachedSessionHistory, BcodeClient, ClientError};
+use bcode_client::{AttachedSessionHistory, BcodeClient, ClientError, SessionWatchEvent};
 use bcode_session_models::{SessionId, SessionSummary};
 use bcode_session_view::{SessionView, execute_session_view_action};
 use bcode_session_view_models::{
@@ -16,6 +17,7 @@ use bcode_session_view_models::{
 };
 use hyperchad::app::{App, AppBuilder, renderer::DefaultRenderer};
 use hyperchad::color::Color;
+use hyperchad::renderer::Renderer as _;
 use hyperchad::router::{RoutePath, RouteRequest, Router};
 use serde::Deserialize;
 
@@ -52,6 +54,15 @@ pub static VIEWPORT: LazyLock<String> =
 pub struct WebRenderState {
     client: BcodeClient,
     access_token: Arc<str>,
+    watched_sessions: Arc<Mutex<BTreeSet<SessionId>>>,
+    renderer_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ScopedSnapshotUpdate>>>>,
+}
+
+#[derive(Debug)]
+struct ScopedSnapshotUpdate {
+    scope: String,
+    snapshot: SessionViewSnapshot,
+    sessions: Vec<SessionSummary>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,7 +125,37 @@ impl WebRenderState {
         Self {
             client,
             access_token: access_token.into(),
+            watched_sessions: Arc::new(Mutex::new(BTreeSet::new())),
+            renderer_tx: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn ensure_session_watcher(&self, session_id: SessionId) {
+        let mut watched = self
+            .watched_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !watched.insert(session_id) {
+            return;
+        }
+        drop(watched);
+
+        let client = self.client.clone();
+        let access_token = Arc::clone(&self.access_token);
+        let renderer_tx = Arc::clone(&self.renderer_tx);
+        let watched_sessions = Arc::clone(&self.watched_sessions);
+        tokio::spawn(async move {
+            if let Err(error) =
+                watch_session_updates(client, access_token, session_id, Arc::clone(&renderer_tx))
+                    .await
+            {
+                tracing::error!("web session watcher failed for {session_id}: {error}");
+            }
+            watched_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&session_id);
+        });
     }
 
     /// Return the per-launch browser access token.
@@ -257,6 +298,9 @@ impl WebRenderState {
     async fn render_initial(&self) -> hyperchad::template::Containers {
         match self.initial_state().await {
             Ok((snapshot, sessions)) => {
+                if let Some(session_id) = snapshot.session_id {
+                    self.ensure_session_watcher(session_id);
+                }
                 bcode_web_render_ui::pages::home::home(&snapshot, &sessions, self.access_token())
             }
             Err(error) => error_page(&error.to_string()),
@@ -481,6 +525,7 @@ impl WebRenderState {
         session_id: SessionId,
         sessions: &[SessionSummary],
     ) -> hyperchad::template::Containers {
+        self.ensure_session_watcher(session_id);
         self.render_session_with_status(session_id, sessions, "connected")
             .await
     }
@@ -635,6 +680,81 @@ pub async fn init(state: &WebRenderState) -> Result<AppBuilder, ClientError> {
             .with_viewport(VIEWPORT.clone())
             .with_size(1200.0, 800.0),
     ))
+}
+
+async fn watch_session_updates(
+    client: BcodeClient,
+    access_token: Arc<str>,
+    session_id: SessionId,
+    renderer_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ScopedSnapshotUpdate>>>>,
+) -> Result<(), ClientError> {
+    let mut watcher = client
+        .watch_session(session_id, INITIAL_HISTORY_EVENT_LIMIT)
+        .await?;
+    watcher
+        .take_initial()
+        .ok_or(ClientError::UnexpectedResponse)?;
+
+    loop {
+        let event = watcher.next_event().await?;
+        let mut connection = client.connect("bcode-web-render-live").await?;
+        let attached = connection
+            .attach_session_recent_with_input_history(session_id, INITIAL_HISTORY_EVENT_LIMIT)
+            .await?;
+        let mut view = SessionView::new();
+        view.apply_history(&attached.history);
+        if let SessionWatchEvent::Live(event) = event {
+            view.apply_live_event(&event);
+        }
+        let mut snapshot = view.into_snapshot();
+        snapshot.session_id = Some(attached.session.id);
+        snapshot.title = attached.session.title().map(ToOwned::to_owned);
+        snapshot.working_directory = Some(attached.session.working_directory.clone());
+        snapshot.composer.draft = attached.draft.unwrap_or_default();
+        snapshot.composer.can_submit = true;
+        snapshot.session_summary = Some(attached.session);
+        let sessions = client.list_sessions().await?;
+        let update = ScopedSnapshotUpdate {
+            scope: format!("{access_token}:{session_id}"),
+            snapshot,
+            sessions,
+        };
+        let sender = renderer_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(sender) = sender
+            && sender.send(update).await.is_err()
+        {
+            return Ok(());
+        }
+    }
+}
+
+/// Configure scoped live snapshot rendering on a built application.
+pub fn configure_live_updates(app: &mut App<DefaultRenderer>, state: &WebRenderState) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ScopedSnapshotUpdate>(1);
+    *state
+        .renderer_tx
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
+    let renderer = app.renderer.clone();
+    let access_token = Arc::clone(&state.access_token);
+    tokio::spawn(async move {
+        while let Some(update) = rx.recv().await {
+            let containers = bcode_web_render_ui::pages::home::home(
+                &update.snapshot,
+                &update.sessions,
+                &access_token,
+            );
+            if let Err(error) = renderer
+                .render_scoped(update.scope, containers.into())
+                .await
+            {
+                tracing::error!("failed to render scoped web snapshot: {error}");
+            }
+        }
+    });
 }
 
 /// Build the application from the provided builder.

@@ -574,6 +574,47 @@ impl SessionCatalogWatcher {
     }
 }
 
+/// Session update received by a long-lived watcher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionWatchEvent {
+    /// Durable session event.
+    Durable(Box<SessionEvent>),
+    /// Ephemeral live session event.
+    Live(Box<bcode_session_models::SessionLiveEvent>),
+}
+
+/// Event-driven session watcher initialized with bounded recent history.
+#[derive(Debug)]
+pub struct SessionWatcher {
+    connection: ClientConnection,
+    initial: Option<AttachedSessionHistory>,
+}
+
+impl SessionWatcher {
+    /// Take the bounded initial session state captured while subscribing.
+    #[must_use]
+    pub const fn take_initial(&mut self) -> Option<AttachedSessionHistory> {
+        self.initial.take()
+    }
+
+    /// Wait for the next durable or live session event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon connection closes or the event cannot be decoded.
+    pub async fn next_event(&mut self) -> Result<SessionWatchEvent, ClientError> {
+        loop {
+            match self.connection.recv_event().await? {
+                Event::Session(event) => return Ok(SessionWatchEvent::Durable(Box::new(event))),
+                Event::SessionLive(event) => {
+                    return Ok(SessionWatchEvent::Live(Box::new(event)));
+                }
+                Event::RuntimeWork(_) | Event::SessionCatalogUpdated { .. } => {}
+            }
+        }
+    }
+}
+
 /// Event-driven runtime-work watcher.
 #[derive(Debug)]
 pub struct RuntimeWorkWatcher {
@@ -671,6 +712,26 @@ impl BcodeClient {
         Ok(SessionCatalogWatcher {
             connection,
             last_revision: 0,
+        })
+    }
+
+    /// Create an event-driven session watcher with bounded recent history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the attachment.
+    pub async fn watch_session(
+        &self,
+        session_id: SessionId,
+        history_limit: usize,
+    ) -> Result<SessionWatcher, ClientError> {
+        let mut connection = self.connect("bcode-session-view").await?;
+        let initial = connection
+            .attach_session_recent_with_input_history(session_id, history_limit)
+            .await?;
+        Ok(SessionWatcher {
+            connection,
+            initial: Some(initial),
         })
     }
 

@@ -207,8 +207,9 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Metrics { path, repo } => bcode_tui::run_metrics_dashboard(repo, path).await?,
         Commands::Web {
             bind,
+            port,
             allow_non_loopback,
-        } => handle_web_command(bind, allow_non_loopback).await?,
+        } => handle_web_command(bind, port, allow_non_loopback).await?,
         Commands::Review { command } => Box::pin(handle_review_command(command)).await?,
         Commands::Ralph { repo } => handle_ralph_command(repo).await?,
         Commands::Plugin { command } => handle_plugin_command(command).await?,
@@ -268,28 +269,62 @@ async fn handle_plugin_command(command: PluginCommand) -> Result<(), CliError> {
 
 async fn handle_web_command(
     bind: std::net::IpAddr,
+    requested_port: Option<u16>,
     allow_non_loopback: bool,
 ) -> Result<(), CliError> {
     let bind = bcode_web_render::validate_bind_address(bind, allow_non_loopback)
         .map_err(|error| CliError::WebRender(error.to_owned()))?;
+    let port = requested_port.unwrap_or(0);
     let access_token = random_web_access_token()?;
     let state = bcode_web_render::WebRenderState::new(
         BcodeClient::default_endpoint(),
         access_token.clone(),
     );
-    let builder = bcode_web_render::init(&state)
-        .await?
-        .with_actix_bind_address(bind.to_string())
-        .with_viewport(bcode_web_render::VIEWPORT.clone());
-    let app = bcode_web_render::build_app(builder)
-        .map_err(|error| CliError::WebRender(error.to_string()))?;
-    eprintln!(
-        "Bcode web renderer: http://{}/?token={access_token}",
-        std::net::SocketAddr::new(bind, 8343)
+    let builder = bcode_web_render::init(&state).await?;
+    let initial_session_id = initial_web_session_id(&state).await;
+    let launch_query = initial_session_id.map_or_else(
+        || format!("token={access_token}"),
+        |session_id| {
+            format!("token={access_token}&hyperchad-event-scope={access_token}:{session_id}")
+        },
     );
-    app.handle_serve()
+    let builder = builder
+        .with_actix_bind_address(bind.to_string())
+        .with_actix_port(port)
+        .with_actix_on_bound(move |address| {
+            eprintln!("Bcode web renderer: http://{address}/?{launch_query}");
+        })
+        .with_viewport(bcode_web_render::VIEWPORT.clone());
+    let mut app = bcode_web_render::build_app(builder)
+        .map_err(|error| CliError::WebRender(error.to_string()))?;
+    bcode_web_render::configure_live_updates(&mut app, &state);
+    tokio::task::spawn_blocking(move || app.handle_serve())
+        .await
+        .map_err(|error| CliError::WebRender(format!("web renderer task failed: {error}")))?
         .map_err(|error| CliError::WebRender(error.to_string()))?;
     Ok(())
+}
+
+async fn initial_web_session_id(
+    state: &bcode_web_render::WebRenderState,
+) -> Option<bcode_session_models::SessionId> {
+    const ATTEMPTS: usize = 5;
+    for attempt in 0..ATTEMPTS {
+        match state.initial_state().await {
+            Ok((snapshot, sessions)) => {
+                if let Some(session_id) = snapshot.session_id {
+                    return Some(session_id);
+                }
+                if sessions.is_empty() && attempt + 1 == ATTEMPTS {
+                    return None;
+                }
+            }
+            Err(_) if attempt + 1 == ATTEMPTS => return None,
+            Err(_) => {}
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    None
 }
 
 fn handle_onboard_flags(
@@ -1025,6 +1060,9 @@ enum Commands {
         /// Address to bind. Defaults to IPv4 loopback.
         #[arg(long, default_value_t = bcode_web_render::DEFAULT_BIND_ADDRESS)]
         bind: std::net::IpAddr,
+        /// Port to bind. Defaults to an OS-assigned available port.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+        port: Option<u16>,
         /// Explicitly allow binding to a non-loopback address.
         #[arg(long, requires = "bind")]
         allow_non_loopback: bool,
@@ -9105,6 +9143,7 @@ mod web_command_tests {
         let cli = Cli::try_parse_from(["bcode", "web"]).expect("web command should parse");
         let Some(Commands::Web {
             bind,
+            port,
             allow_non_loopback,
         }) = cli.command
         else {
@@ -9112,16 +9151,25 @@ mod web_command_tests {
         };
 
         assert_eq!(bind, bcode_web_render::DEFAULT_BIND_ADDRESS);
+        assert_eq!(port, None);
         assert!(!allow_non_loopback);
     }
 
     #[test]
     fn web_command_parses_explicit_external_bind_opt_in() {
-        let cli =
-            Cli::try_parse_from(["bcode", "web", "--bind", "0.0.0.0", "--allow-non-loopback"])
-                .expect("external web bind should parse with opt-in");
+        let cli = Cli::try_parse_from([
+            "bcode",
+            "web",
+            "--bind",
+            "0.0.0.0",
+            "--port",
+            "4321",
+            "--allow-non-loopback",
+        ])
+        .expect("external web bind should parse with opt-in");
         let Some(Commands::Web {
             bind,
+            port,
             allow_non_loopback,
         }) = cli.command
         else {
@@ -9134,6 +9182,7 @@ mod web_command_tests {
                 .parse::<std::net::IpAddr>()
                 .expect("address should parse")
         );
+        assert_eq!(port, Some(4321));
         assert!(allow_non_loopback);
     }
 }
