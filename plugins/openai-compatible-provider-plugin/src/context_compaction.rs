@@ -333,8 +333,18 @@ mod tests {
             },
             ResponsesCompactBody {
                 object: "response.compaction".to_string(),
+                output: vec![serde_json::json!({"type": "message", "id": "msg", "content": []})],
+            },
+            ResponsesCompactBody {
+                object: "response.compaction".to_string(),
                 output: vec![
                     serde_json::json!({"type": "compaction", "id": "", "encrypted_content": "opaque"}),
+                ],
+            },
+            ResponsesCompactBody {
+                object: "response.compaction".to_string(),
+                output: vec![
+                    serde_json::json!({"type": "compaction", "id": "cmp", "encrypted_content": ""}),
                 ],
             },
         ] {

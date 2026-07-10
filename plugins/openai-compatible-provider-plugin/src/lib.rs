@@ -3668,15 +3668,19 @@ fn build_responses_request(
         stream: true,
         store: responses_store_enabled(settings, request),
         previous_response_id,
-        context_management: request
-            .context_management
-            .compact_threshold
-            .map(|compact_threshold| ResponsesContextManagement {
-                r#type: "compaction",
-                compact_threshold,
-            })
-            .into_iter()
-            .collect(),
+        context_management: (context_compaction::supports_openai_context_compaction(
+            settings.dialect,
+            &settings.base_url,
+            context_compaction::openai_context_compaction_opted_in(&request.provider_context),
+        ))
+        .then_some(request.context_management.compact_threshold)
+        .flatten()
+        .map(|compact_threshold| ResponsesContextManagement {
+            r#type: "compaction",
+            compact_threshold,
+        })
+        .into_iter()
+        .collect(),
         tools: model_tools_to_responses_tools(request, settings.dialect)?,
         tool_choice: settings
             .dialect
@@ -6799,6 +6803,38 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("compaction")
         );
+        assert_eq!(
+            body.pointer("/context_management/0/compact_threshold")
+                .and_then(serde_json::Value::as_u64),
+            Some(80_000)
+        );
+    }
+
+    #[test]
+    fn responses_request_omits_managed_compaction_without_capability() {
+        let mut request = test_request(vec![text_message(MessageRole::User, "hello")]);
+        request.context_management.compact_threshold = Some(80_000);
+        let mut settings =
+            test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+        settings.base_url = "https://custom.example/v1".to_string();
+
+        let body = build_responses_request(&settings, &request, "gpt-5").expect("request");
+        assert!(body.get("context_management").is_none());
+    }
+
+    #[test]
+    fn responses_request_projects_opted_in_custom_managed_compaction() {
+        let mut request = test_request(vec![text_message(MessageRole::User, "hello")]);
+        request.context_management.compact_threshold = Some(80_000);
+        request
+            .provider_context
+            .settings
+            .insert("native_context_compaction".to_string(), "true".to_string());
+        let mut settings =
+            test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+        settings.base_url = "https://custom.example/v1".to_string();
+
+        let body = build_responses_request(&settings, &request, "gpt-5").expect("request");
         assert_eq!(
             body.pointer("/context_management/0/compact_threshold")
                 .and_then(serde_json::Value::as_u64),
