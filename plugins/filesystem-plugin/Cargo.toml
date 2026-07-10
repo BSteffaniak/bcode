@@ -21,6 +21,7 @@ bcode_tui_components = { workspace = true, features = [
     "syntax",
 ], optional = true }
 bmux_tui = { workspace = true, optional = true }
+devicons = { workspace = true, optional = true }
 image = { workspace = true }
 png = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
@@ -29,4 +30,4 @@ serde_json = { workspace = true }
 [features]
 default          = []
 fail-on-warnings = []
-static-bundled   = ["bcode_tui_components", "bmux_tui"]
+static-bundled   = ["bcode_tui_components", "bmux_tui", "devicons"]

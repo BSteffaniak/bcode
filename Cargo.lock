@@ -1703,6 +1703,7 @@ dependencies = [
  "bcode_tool",
  "bcode_tui_components",
  "bmux_tui",
+ "devicons",
  "image",
  "png",
  "serde",
@@ -3618,6 +3619,15 @@ dependencies = [
  "rustc_version",
  "syn",
  "unicode-xid",
+]
+
+[[package]]
+name = "devicons"
+version = "0.6.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "830e47e2f330cf4fdd5a958dcef921b9523ffc21ab6713aa5e77ba2cce03904b"
+dependencies = [
+ "lazy_static",
 ]
 
 [[package]]
