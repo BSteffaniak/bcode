@@ -878,18 +878,20 @@ impl EvalWizard {
     fn handle_event(&mut self, area: Rect, event: &Event) -> EvalWizardOutcome {
         if let Event::Key(stroke) = event {
             match stroke.key {
-                KeyCode::Escape | KeyCode::Char('q') => return EvalWizardOutcome::Cancel,
+                KeyCode::Escape => return EvalWizardOutcome::Cancel,
                 KeyCode::Tab => {
                     self.focus_next();
                     return EvalWizardOutcome::Redraw;
                 }
-                KeyCode::Char('d') => {
-                    if let Self::RecordGeneration(wizard) = self {
-                        wizard.allow_duplicate_run = !wizard.allow_duplicate_run;
-                        return EvalWizardOutcome::Redraw;
-                    }
-                }
-                KeyCode::Enter | KeyCode::Char('y') => return self.complete(),
+                _ => {}
+            }
+        }
+        if self.handle_inputs(area, event) {
+            return EvalWizardOutcome::Redraw;
+        }
+        if let Event::Key(stroke) = event {
+            match stroke.key {
+                KeyCode::Enter => return self.complete(),
                 KeyCode::Left => {
                     self.cycle_choice(false);
                     return EvalWizardOutcome::Redraw;
@@ -900,9 +902,6 @@ impl EvalWizard {
                 }
                 _ => {}
             }
-        }
-        if self.handle_inputs(area, event) {
-            return EvalWizardOutcome::Redraw;
         }
         let actions = match self {
             Self::StartCampaign(_) => wizard_actions("create"),
@@ -1218,7 +1217,7 @@ impl StartCampaignWizard {
             Line::from(""),
             Line::from(""),
             Line::from(format!("Objective: {}", objective_label(self.objective))),
-            Line::from("Click fields/buttons or use Tab, arrows, Enter, Esc."),
+            Line::from("Click fields/buttons or use Tab and Esc. Enter submits the field."),
         ];
         if let Some(error) = &self.error {
             body.push(Line::from(format!("Error: {error}")));
@@ -1359,7 +1358,7 @@ impl RecordGenerationWizard {
             self.metadata_field_label()
         )));
         body.push(Line::from(
-            "Click fields/buttons or use Tab, arrows, Enter, Esc.",
+            "Click fields/buttons or use Tab and Esc. Enter submits the field.",
         ));
         if let Some(error) = &self.error {
             body.push(Line::from(format!("Error: {error}")));
