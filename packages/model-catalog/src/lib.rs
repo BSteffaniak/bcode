@@ -103,6 +103,10 @@ pub struct ModelCatalogDiagnostics {
     pub remote_revision: Option<String>,
     /// Whether remote catalog use is enabled.
     pub remote_enabled: bool,
+    /// State of the remote catalog cache at startup.
+    pub cache_state: remote::CatalogCacheState,
+    /// Age of the remote catalog cache at startup.
+    pub cache_age: Option<std::time::Duration>,
     /// Last refresh attempt time.
     pub last_refresh_attempt: Option<std::time::SystemTime>,
     /// Last successful refresh time.
@@ -111,6 +115,15 @@ pub struct ModelCatalogDiagnostics {
     pub last_refresh_error: Option<String>,
     /// Whether a refresh is currently running.
     pub refresh_in_progress: bool,
+}
+
+/// Model list projection requested by a consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelListView {
+    /// Complete resolved membership, including explicitly usable hidden models.
+    Complete,
+    /// Models intended for ordinary picker/list presentation.
+    UserVisible,
 }
 
 #[derive(Debug, Clone)]
@@ -133,9 +146,14 @@ impl ModelCatalogResolver {
         let mut document = load_embedded_catalog()?;
         let embedded_revision = document.catalog_revision.clone();
         let mut remote_revision = None;
+        let mut cache_state = remote::CatalogCacheState::Disabled;
+        let mut cache_age = None;
         if !options.disabled {
             let client = RemoteCatalogClient::new(options.clone())?;
-            if let Ok(remote) = client.cached_catalog() {
+            let cached = client.inspect_cached_catalog();
+            cache_state = cached.state;
+            cache_age = cached.age;
+            if let Some(remote) = cached.value {
                 remote_revision = Some(remote.catalog_revision.clone());
                 overlay_remote_catalog(&mut document, &remote);
             }
@@ -154,6 +172,8 @@ impl ModelCatalogResolver {
                 embedded_revision,
                 remote_revision,
                 remote_enabled: !options.disabled,
+                cache_state,
+                cache_age,
                 last_refresh_attempt: None,
                 last_refresh_success: None,
                 last_refresh_error: None,
@@ -223,6 +243,8 @@ impl ModelCatalogResolver {
             Ok((catalog, revision)) => {
                 *self.catalog.write().await = std::sync::Arc::new(catalog);
                 diagnostics.remote_revision = Some(revision);
+                diagnostics.cache_state = remote::CatalogCacheState::Fresh;
+                diagnostics.cache_age = Some(std::time::Duration::ZERO);
                 diagnostics.last_refresh_success = Some(std::time::SystemTime::now());
                 diagnostics.last_refresh_error = None;
             }
@@ -250,6 +272,24 @@ impl ModelCatalogResolver {
     /// Return current resolver diagnostics.
     pub async fn diagnostics(&self) -> ModelCatalogDiagnostics {
         self.diagnostics.read().await.clone()
+    }
+
+    pub async fn resolve_view(
+        &self,
+        list: bcode_model::ModelList,
+        selected_model_id: Option<&str>,
+        configured_model_id: Option<&str>,
+        view: ModelListView,
+    ) -> bcode_model::ModelList {
+        let mut resolved = self
+            .resolve_selection(list, selected_model_id, configured_model_id)
+            .await;
+        if view == ModelListView::UserVisible {
+            resolved
+                .models
+                .retain(|model| model.visibility == bcode_model::ModelVisibility::Visible);
+        }
+        resolved
     }
 
     /// Resolve provider-returned models through the shared catalog policy.
