@@ -2481,6 +2481,44 @@ impl SessionManager {
         .await
     }
 
+    /// Append a provider-native context compaction boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_provider_context_compacted(
+        &self,
+        session_id: SessionId,
+        snapshot: bcode_session_models::ProviderContextSnapshot,
+        compacted_through_sequence: u64,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(
+            session_id,
+            SessionEventKind::ProviderContextCompacted {
+                snapshot,
+                compacted_through_sequence,
+            },
+        )
+        .await
+    }
+
+    /// Append a context occupancy observation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_context_usage_observed(
+        &self,
+        session_id: SessionId,
+        snapshot: bcode_session_models::ContextUsageSnapshot,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(
+            session_id,
+            SessionEventKind::ContextUsageObserved { snapshot },
+        )
+        .await
+    }
+
     /// Append a diagnostic trace event.
     ///
     /// # Errors

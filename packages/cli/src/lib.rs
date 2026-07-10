@@ -8369,6 +8369,8 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ModelTurnFinished { .. } => "model_turn_finished",
         SessionEventKind::ModelUsage { .. } => "model_usage",
         SessionEventKind::ContextCompacted { .. } => "context_compacted",
+        SessionEventKind::ProviderContextCompacted { .. } => "provider_context_compacted",
+        SessionEventKind::ContextUsageObserved { .. } => "context_usage_observed",
         SessionEventKind::SessionRenamed { .. } => "session_renamed",
         SessionEventKind::TraceEvent { .. } => "trace_event",
         SessionEventKind::SkillInvoked { .. } => "skill_invoked",
@@ -8782,6 +8784,21 @@ fn print_non_trace_session_event(event: &SessionEvent) {
         } => println!(
             "#{} context compacted through #{compacted_through_sequence}",
             event.sequence
+        ),
+        SessionEventKind::ProviderContextCompacted {
+            snapshot,
+            compacted_through_sequence,
+        } => println!(
+            "#{} provider context compacted through #{compacted_through_sequence}: {} {}",
+            event.sequence, snapshot.provider_plugin_id, snapshot.model_id
+        ),
+        SessionEventKind::ContextUsageObserved { snapshot } => println!(
+            "#{} context usage: {} tokens for {} through #{} ({:?})",
+            event.sequence,
+            snapshot.input_tokens,
+            snapshot.model_id,
+            snapshot.context_through_sequence,
+            snapshot.source
         ),
         SessionEventKind::ModelTurnStarted { turn_id } => {
             println!("#{} model turn started: {turn_id}", event.sequence);

@@ -196,7 +196,7 @@ fn tool_projection_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &st
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 25;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 26;
 
 /// Return the current Unix timestamp in milliseconds.
 #[must_use]
@@ -1499,6 +1499,45 @@ pub enum TraceRedaction {
     ManualRequired,
 }
 
+/// Source and confidence of a context occupancy observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextUsageSource {
+    /// Exact usage reported by the active provider surface.
+    Provider,
+    /// Conservative local projection of the model-visible request.
+    Estimated,
+}
+
+/// Durable context occupancy observation tied to a model request boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextUsageSnapshot {
+    /// Provider plugin used for the observed request.
+    pub provider_plugin_id: String,
+    /// Model used for the observed request.
+    pub model_id: String,
+    /// Full active input context occupancy.
+    pub input_tokens: u64,
+    /// Last canonical event represented by the observed request.
+    pub context_through_sequence: u64,
+    /// Observation source.
+    pub source: ContextUsageSource,
+}
+
+/// Durable provider-native replacement context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderContextSnapshot {
+    /// Provider plugin that owns the opaque replacement items.
+    pub provider_plugin_id: String,
+    /// Model for which the replacement context was produced.
+    pub model_id: String,
+    /// Serialized provider-neutral model messages containing provider extensions.
+    pub messages_json: String,
+    /// Portable summary used when the active provider or model no longer matches.
+    #[serde(default)]
+    pub portable_summary: String,
+}
+
 /// Session event payload.
 ///
 /// IMPORTANT: This enum is persisted with `bmux_codec`, whose binary enum
@@ -1777,6 +1816,15 @@ pub enum SessionEventKind {
         interaction_id: String,
         tool_call_id: String,
         resolution_json: String,
+    },
+    /// Provider-native context installed at a durable compaction boundary.
+    ProviderContextCompacted {
+        snapshot: ProviderContextSnapshot,
+        compacted_through_sequence: u64,
+    },
+    /// Exact or estimated context occupancy associated with a request boundary.
+    ContextUsageObserved {
+        snapshot: ContextUsageSnapshot,
     },
 }
 

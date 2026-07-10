@@ -1053,6 +1053,9 @@ impl BmuxApp {
                 visibility: bcode_model::ModelVisibility::Visible,
             });
         self.token_usage.apply_model_info(model.as_ref());
+        if let Some(input_tokens) = status.context_input_tokens {
+            self.token_usage.observe_context_usage(input_tokens);
+        }
     }
 
     /// Return pending submissions that have not been committed by the session stream.
@@ -2246,6 +2249,13 @@ impl BmuxApp {
                 self.push_model_usage(turn_id, usage, application);
             }
             SessionEventKind::ContextCompacted { summary, .. } => self.push_compaction(summary),
+            SessionEventKind::ProviderContextCompacted { snapshot, .. } => {
+                self.push_provider_compaction(&snapshot.provider_plugin_id);
+            }
+            SessionEventKind::ContextUsageObserved { snapshot } => {
+                self.token_usage
+                    .observe_context_usage(snapshot.input_tokens);
+            }
             SessionEventKind::WorkingDirectoryChanged {
                 old_working_directory,
                 new_working_directory,
@@ -3341,9 +3351,22 @@ impl BmuxApp {
     }
 
     fn push_compaction(&mut self, summary: &str) {
+        self.token_usage.latest_context_input_tokens = None;
+        self.token_usage.latest_cached_input_tokens = None;
+        self.token_usage.latest_cache_write_input_tokens = None;
         self.transcript.push(TranscriptItem::new(
             "Compaction",
             format!("context compacted: {summary}"),
+        ));
+    }
+
+    fn push_provider_compaction(&mut self, provider_plugin_id: &str) {
+        self.token_usage.latest_context_input_tokens = None;
+        self.token_usage.latest_cached_input_tokens = None;
+        self.token_usage.latest_cache_write_input_tokens = None;
+        self.transcript.push(TranscriptItem::new(
+            "Compaction",
+            format!("provider compacted context ({provider_plugin_id})"),
         ));
     }
 
@@ -3829,6 +3852,7 @@ impl TokenUsageMeter {
         if let Some(pricing) = &self.pricing {
             let usage = bcode_model::TokenUsage {
                 input_tokens: usage.input_tokens,
+                context_input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
                 total_tokens: usage.total_tokens,
                 cached_input_tokens: usage.cached_input_tokens,
@@ -3850,6 +3874,10 @@ impl TokenUsageMeter {
         self.latest_cache_write_input_tokens = usage.cache_write_input_tokens;
     }
 
+    fn observe_context_usage(&mut self, input_tokens: u64) {
+        self.latest_context_input_tokens = Some(u32::try_from(input_tokens).unwrap_or(u32::MAX));
+    }
+
     fn apply_model_info(&mut self, model: Option<&bcode_model::ModelInfo>) {
         if let Some(model) = model {
             self.context_window = model.context_window;
@@ -3858,6 +3886,9 @@ impl TokenUsageMeter {
     }
 
     fn clear_model_info(&mut self) {
+        self.latest_context_input_tokens = None;
+        self.latest_cached_input_tokens = None;
+        self.latest_cache_write_input_tokens = None;
         self.context_window = None;
         self.pricing = None;
     }
@@ -3913,18 +3944,18 @@ impl TokenUsageMeter {
     }
 
     fn context_summary(&self) -> String {
-        if let Some(window) = self.context_window
-            && window > 0
-        {
-            let input = self.latest_context_input_tokens.unwrap_or_default();
-            return format!(
-                "ctx {}/{} {}%",
-                compact_u64(u64::from(input)),
-                compact_u64(u64::from(window)),
+        match (self.latest_context_input_tokens, self.context_window) {
+            (Some(input), Some(window)) if window > 0 => format!(
+                "{}/{} {}%",
+                format_context_count(u64::from(input)),
+                compact_context_window(u64::from(window)),
                 context_window_percentage(input, window)
-            );
+            ),
+            (None, Some(window)) if window > 0 => {
+                format!("—/{} —%", compact_context_window(u64::from(window)))
+            }
+            _ => "—/— —%".to_owned(),
         }
-        "ctx limit unknown".to_owned()
     }
 }
 
@@ -3944,17 +3975,48 @@ fn model_to_display_selection(model: &str) -> Option<String> {
     }
 }
 
-fn compact_u64(value: u64) -> String {
+fn format_context_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut output = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, byte) in digits.bytes().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            output.push(',');
+        }
+        output.push(char::from(byte));
+    }
+    output
+}
+
+fn compact_context_window(value: u64) -> String {
     if value >= 1_000_000 {
-        let whole = value / 1_000_000;
-        let decimal = (value % 1_000_000) / 100_000;
-        format!("{whole}.{decimal}m")
+        format!("{}m", value / 1_000_000)
     } else if value >= 1_000 {
-        let whole = value / 1_000;
-        let decimal = (value % 1_000) / 100;
-        format!("{whole}.{decimal}k")
+        format!("{}k", value / 1_000)
     } else {
         value.to_string()
+    }
+}
+
+fn compact_u64(value: u64) -> String {
+    if value >= 1_000_000 {
+        compact_decimal(value, 1_000_000, 'm')
+    } else if value >= 1_000 {
+        compact_decimal(value, 1_000, 'k')
+    } else {
+        value.to_string()
+    }
+}
+
+fn compact_decimal(value: u64, unit: u64, suffix: char) -> String {
+    let hundredths = value.saturating_mul(100) / unit;
+    let whole = hundredths / 100;
+    let fraction = hundredths % 100;
+    if fraction == 0 {
+        format!("{whole}{suffix}")
+    } else if fraction.is_multiple_of(10) {
+        format!("{whole}.{}{suffix}", fraction / 10)
+    } else {
+        format!("{whole}.{fraction:02}{suffix}")
     }
 }
 
@@ -4128,6 +4190,8 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::PermissionResolved { .. }
         | SessionEventKind::ModelUsage { .. }
         | SessionEventKind::ContextCompacted { .. }
+        | SessionEventKind::ProviderContextCompacted { .. }
+        | SessionEventKind::ContextUsageObserved { .. }
         | SessionEventKind::WorkingDirectoryChanged { .. }
         | SessionEventKind::SkillInvoked { .. }
         | SessionEventKind::SkillInvocationFailed { .. }

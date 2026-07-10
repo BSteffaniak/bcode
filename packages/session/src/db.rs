@@ -985,18 +985,22 @@ impl SessionDb {
         let Some(compaction_event) = self.latest_context_compaction_event().await? else {
             return self.latest_model_context_events().await;
         };
-        let SessionEventKind::ContextCompacted {
-            compacted_through_sequence,
-            ..
-        } = &compaction_event.kind
-        else {
-            return Ok(vec![compaction_event]);
+        let compacted_through_sequence = match &compaction_event.kind {
+            SessionEventKind::ContextCompacted {
+                compacted_through_sequence,
+                ..
+            }
+            | SessionEventKind::ProviderContextCompacted {
+                compacted_through_sequence,
+                ..
+            } => *compacted_through_sequence,
+            _ => return Ok(vec![compaction_event]),
         };
         let rows = self
             .db
             .select("events")
             .columns(&["payload"])
-            .where_gt("event_seq", seq_to_value(*compacted_through_sequence))
+            .where_gt("event_seq", seq_to_value(compacted_through_sequence))
             .sort("event_seq", SortDirection::Asc)
             .execute(&**self.db)
             .await?;
@@ -1071,20 +1075,30 @@ impl SessionDb {
     }
 
     async fn latest_context_compaction_event(&self) -> SessionDbResult<Option<SessionEvent>> {
-        let row = self
-            .db
-            .select("events")
-            .columns(&["payload"])
-            .where_eq("event_type", "context_compacted")
-            .sort("event_seq", SortDirection::Desc)
-            .limit(1)
-            .execute_first(&**self.db)
-            .await?;
-        let Some(row) = row.as_ref() else {
-            return Ok(None);
-        };
-        let payload = required_string(row, "payload")?;
-        Ok(decode_session_event_degraded(&payload))
+        let mut latest = None;
+        for event_type in ["context_compacted", "provider_context_compacted"] {
+            let row = self
+                .db
+                .select("events")
+                .columns(&["payload"])
+                .where_eq("event_type", event_type)
+                .sort("event_seq", SortDirection::Desc)
+                .limit(1)
+                .execute_first(&**self.db)
+                .await?;
+            let Some(row) = row.as_ref() else {
+                continue;
+            };
+            let payload = required_string(row, "payload")?;
+            if let Some(event) = decode_session_event_degraded(&payload)
+                && latest
+                    .as_ref()
+                    .is_none_or(|current: &SessionEvent| event.sequence > current.sequence)
+            {
+                latest = Some(event);
+            }
+        }
+        Ok(latest)
     }
 
     /// Return events from the canonical event table for the inclusive sequence range.
@@ -1812,6 +1826,8 @@ const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ModelTurnFinished { .. } => "model_turn_finished",
         SessionEventKind::ModelUsage { .. } => "model_usage",
         SessionEventKind::ContextCompacted { .. } => "context_compacted",
+        SessionEventKind::ProviderContextCompacted { .. } => "provider_context_compacted",
+        SessionEventKind::ContextUsageObserved { .. } => "context_usage_observed",
         SessionEventKind::SessionRenamed { .. } => "session_renamed",
         SessionEventKind::TraceEvent { .. } => "trace_event",
         SessionEventKind::SkillInvoked { .. } => "skill_invoked",
@@ -1963,6 +1979,8 @@ const fn is_model_context_event_type(event_type: &str) -> bool {
             | b"system_message"
             | b"working_directory_changed"
             | b"context_compacted"
+            | b"provider_context_compacted"
+            | b"context_usage_observed"
     )
 }
 

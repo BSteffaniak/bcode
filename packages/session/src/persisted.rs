@@ -6,10 +6,11 @@
 //! non-self-describing `bmux_codec` wire format.
 
 use bcode_session_models::{
-    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, LegacyToolRequestPresentationMetadata,
-    ModelTurnOutcome, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent,
-    SessionEventKind, SessionEventProvenance, SessionForkKind, SessionId, SessionTokenUsage,
-    SessionTraceEvent, ToolArtifact, ToolInvocationResult, ToolInvocationStreamEvent, TraceBlobRef,
+    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ContextUsageSnapshot,
+    LegacyToolRequestPresentationMetadata, ModelTurnOutcome, ProviderContextSnapshot,
+    RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
+    SessionEventProvenance, SessionForkKind, SessionId, SessionTokenUsage, SessionTraceEvent,
+    ToolArtifact, ToolInvocationResult, ToolInvocationStreamEvent, TraceBlobRef,
     current_unix_timestamp_ms,
 };
 use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
@@ -435,6 +436,13 @@ enum PersistedSessionEventKind {
         #[serde(default)]
         summary: Option<String>,
     },
+    ProviderContextCompacted {
+        snapshot: ProviderContextSnapshot,
+        compacted_through_sequence: u64,
+    },
+    ContextUsageObserved {
+        snapshot: ContextUsageSnapshot,
+    },
 }
 
 impl From<&SessionEventKind> for PersistedSessionEventKind {
@@ -773,6 +781,16 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 effort: effort.clone(),
                 summary: summary.clone(),
             },
+            SessionEventKind::ProviderContextCompacted {
+                snapshot,
+                compacted_through_sequence,
+            } => Self::ProviderContextCompacted {
+                snapshot: snapshot.clone(),
+                compacted_through_sequence: *compacted_through_sequence,
+            },
+            SessionEventKind::ContextUsageObserved { snapshot } => Self::ContextUsageObserved {
+                snapshot: snapshot.clone(),
+            },
         }
     }
 }
@@ -1102,6 +1120,16 @@ impl PersistedSessionEventKind {
             },
             Self::ReasoningChanged { effort, summary } => {
                 SessionEventKind::ReasoningChanged { effort, summary }
+            }
+            Self::ProviderContextCompacted {
+                snapshot,
+                compacted_through_sequence,
+            } => SessionEventKind::ProviderContextCompacted {
+                snapshot,
+                compacted_through_sequence,
+            },
+            Self::ContextUsageObserved { snapshot } => {
+                SessionEventKind::ContextUsageObserved { snapshot }
             }
         }
     }

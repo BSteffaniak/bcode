@@ -2680,38 +2680,50 @@ const fn default_overload_max_delay_ms() -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "compaction")]
 pub struct CompactionConfig {
-    /// Automatic compaction mode. Defaults to `auto`.
+    /// Automatic compaction trigger policy. Defaults to capability-driven `auto`.
     #[serde(default)]
     pub mode: CompactionMode,
-    /// Projected conversation character count that triggers automatic compaction.
-    #[serde(default = "default_auto_compaction_context_chars")]
+    /// Compaction implementation preference. Defaults to provider-native with local fallback.
+    #[serde(default)]
+    pub backend: CompactionBackend,
+    /// Percentage of the selected model's context window that triggers proactive compaction.
+    #[serde(default = "default_proactive_compaction_threshold_percent")]
+    pub proactive_threshold_percent: u8,
+    /// Approximate recent context tokens retained verbatim after local compaction.
+    #[serde(default = "default_compaction_keep_recent_tokens")]
+    pub keep_recent_tokens: u32,
+    /// Legacy projected-character threshold. Retained only for configuration compatibility.
+    #[serde(default)]
     pub context_chars: usize,
 }
 
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
-            mode: CompactionMode::OnOverflow,
-            context_chars: default_auto_compaction_context_chars(),
+            mode: CompactionMode::Auto,
+            backend: CompactionBackend::Auto,
+            proactive_threshold_percent: default_proactive_compaction_threshold_percent(),
+            keep_recent_tokens: default_compaction_keep_recent_tokens(),
+            context_chars: 0,
         }
     }
 }
 
-/// Automatic context compaction mode.
+/// Automatic context compaction trigger policy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionMode {
+    /// Capability-driven policy: prefer provider management and otherwise recover on overflow.
+    #[default]
+    Auto,
     /// Disable automatic compaction entirely. Manual compaction remains available.
     Off,
     /// Compact only after the provider reports a context-length overflow.
-    #[default]
     OnOverflow,
-    /// Compact before model turns when the projected context character threshold is exceeded.
+    /// Compact before model turns at the model-aware token threshold.
     Proactive,
     /// Compact proactively and also recover from provider context-length overflows.
     ProactiveAndOverflow,
-    /// Legacy spelling for automatic compaction.
-    Auto,
 }
 
 impl CompactionMode {
@@ -2734,6 +2746,19 @@ impl CompactionMode {
     }
 }
 
+/// Preferred implementation for a compaction operation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionBackend {
+    /// Prefer provider-native compaction when supported, otherwise use local compaction.
+    #[default]
+    Auto,
+    /// Require provider-native compaction.
+    ProviderNative,
+    /// Always use Bcode's local compaction implementation.
+    Local,
+}
+
 const fn default_tool_output_context_chars() -> usize {
     4_000
 }
@@ -2746,8 +2771,12 @@ const fn default_streaming_no_progress_timeout_secs() -> u64 {
     300
 }
 
-const fn default_auto_compaction_context_chars() -> usize {
-    120_000
+const fn default_proactive_compaction_threshold_percent() -> u8 {
+    90
+}
+
+const fn default_compaction_keep_recent_tokens() -> u32 {
+    20_000
 }
 
 /// Provider-native conversation reuse configuration.
@@ -4013,8 +4042,28 @@ fn write_model_compaction_toml(output: &mut String, compaction: &CompactionConfi
         toml_string(compaction_mode_name(compaction.mode))
     )
     .expect("writing to string should not fail");
-    writeln!(output, "context_chars = {}", compaction.context_chars)
-        .expect("writing to string should not fail");
+    writeln!(
+        output,
+        "backend = {}",
+        toml_string(compaction_backend_name(compaction.backend))
+    )
+    .expect("writing to string should not fail");
+    writeln!(
+        output,
+        "proactive_threshold_percent = {}",
+        compaction.proactive_threshold_percent
+    )
+    .expect("writing to string should not fail");
+    writeln!(
+        output,
+        "keep_recent_tokens = {}",
+        compaction.keep_recent_tokens
+    )
+    .expect("writing to string should not fail");
+    if compaction.context_chars > 0 {
+        writeln!(output, "context_chars = {}", compaction.context_chars)
+            .expect("writing to string should not fail");
+    }
     output.push('\n');
 }
 
@@ -4626,6 +4675,14 @@ const fn conversation_reuse_mode_name(mode: bcode_model::ConversationReuseMode) 
     match mode {
         bcode_model::ConversationReuseMode::Off => "off",
         bcode_model::ConversationReuseMode::Auto => "auto",
+    }
+}
+
+const fn compaction_backend_name(backend: CompactionBackend) -> &'static str {
+    match backend {
+        CompactionBackend::Auto => "auto",
+        CompactionBackend::ProviderNative => "provider_native",
+        CompactionBackend::Local => "local",
     }
 }
 
@@ -5356,8 +5413,8 @@ fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BcodeConfig, CompactionMode, ConfigDocSchema, ConfigEnvironmentSnapshot, ConfigError,
-        ConfigLoadOverrides, ContextStrategyMode, FieldDoc, NestedFieldDoc,
+        BcodeConfig, CompactionBackend, CompactionMode, ConfigDocSchema, ConfigEnvironmentSnapshot,
+        ConfigError, ConfigLoadOverrides, ContextStrategyMode, FieldDoc, NestedFieldDoc,
         TuiAccentTransitionCurve, TuiMouseConfig, default_config_paths_from,
         default_permissions_state_path, load_config_from_paths,
         load_config_from_paths_with_overrides, load_permissions_state_from, merge_config_values,
@@ -5489,7 +5546,13 @@ mod tests {
             &fields,
             "model",
             "compaction",
-            &[("mode", "on_overflow"), ("context_chars", "120000")],
+            &[
+                ("mode", "auto"),
+                ("backend", "auto"),
+                ("proactive_threshold_percent", "90"),
+                ("keep_recent_tokens", "20000"),
+                ("context_chars", "0"),
+            ],
         );
         assert_nested_defaults(
             &fields,
@@ -6370,8 +6433,11 @@ max_tool_rounds = 3
 
         assert_eq!(config.model.effective_max_tool_rounds(), None);
         assert_eq!(config.model.tool_output.context_chars, 4_000);
-        assert_eq!(config.model.compaction.mode, CompactionMode::OnOverflow);
-        assert_eq!(config.model.compaction.context_chars, 120_000);
+        assert_eq!(config.model.compaction.mode, CompactionMode::Auto);
+        assert_eq!(config.model.compaction.backend, CompactionBackend::Auto);
+        assert_eq!(config.model.compaction.proactive_threshold_percent, 90);
+        assert_eq!(config.model.compaction.keep_recent_tokens, 20_000);
+        assert_eq!(config.model.compaction.context_chars, 0);
     }
 
     #[test]
@@ -6393,12 +6459,18 @@ context_chars = 1200
             r#"
 [model.compaction]
 mode = "off"
+backend = "local"
+proactive_threshold_percent = 85
+keep_recent_tokens = 24000
 context_chars = 90000
 "#,
         )
         .expect("config should parse");
 
         assert_eq!(config.model.compaction.mode, CompactionMode::Off);
+        assert_eq!(config.model.compaction.backend, CompactionBackend::Local);
+        assert_eq!(config.model.compaction.proactive_threshold_percent, 85);
+        assert_eq!(config.model.compaction.keep_recent_tokens, 24_000);
         assert_eq!(config.model.compaction.context_chars, 90_000);
     }
 

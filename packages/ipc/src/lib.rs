@@ -542,6 +542,10 @@ pub struct SessionModelStatus {
     #[serde(default)]
     pub context_window: Option<u32>,
     #[serde(default)]
+    pub context_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub context_usage_source: Option<String>,
+    #[serde(default)]
     pub max_output_tokens: Option<u32>,
     #[serde(default)]
     pub reasoning: Option<bcode_model::ModelReasoningInfo>,
@@ -555,6 +559,10 @@ pub struct SessionModelStatus {
     pub conversation_reuse_mode: Option<String>,
     #[serde(default)]
     pub compaction_mode: Option<String>,
+    #[serde(default)]
+    pub compaction_backend: Option<String>,
+    #[serde(default)]
+    pub proactive_compaction_threshold_percent: Option<u8>,
     #[serde(default)]
     pub cache: Option<bcode_model::ModelCacheInfo>,
     #[serde(default)]

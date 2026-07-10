@@ -10,18 +10,20 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bcode_config::AuthMode;
 use bcode_model::{
-    AckResponse, CancelTurnRequest, ContentBlock, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID,
-    MessageRole, ModelCapability, ModelCatalogHints, ModelCatalogPolicy, ModelCatalogSupportHint,
-    ModelInfo, ModelList, ModelListAuthority, ModelListRequest, ModelMessage, ModelMetadataSource,
-    ModelPricingInfo, ModelPricingSource, ModelPricingUnit, ModelReasoningCapabilitySource,
-    ModelTokenPrice, ModelTurnRequest, NativeWebSearchRequest, NativeWebSearchResponse,
-    NativeWebSearchResult, OP_AUTH_PRIME, OP_AUTH_RESET_CREDIT_CONSUME, OP_AUTH_RESET_CREDITS,
-    OP_AUTH_USAGE, OP_CANCEL_TURN, OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS,
-    OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG, OP_VERIFY_MODEL,
-    PollTurnEventsRequest, PollTurnEventsResponse, ProviderAuthCandidate, ProviderCapabilities,
-    ProviderCapability, ProviderError, ProviderErrorCategory, ProviderRequestContext,
-    ProviderRequestProjection, ProviderRetryRule, ProviderRetryRuleMatch, ProviderTurnEvent,
-    StartTurnResponse, StopReason, TokenUsage, ToolCall, ValidateConfigResponse,
+    AckResponse, CancelTurnRequest, CompactContextRequest, CompactContextResponse, ContentBlock,
+    ContextManagementCapabilities, ContextManagementCapabilitiesRequest, FinishTurnRequest,
+    MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelCapability, ModelCatalogHints,
+    ModelCatalogPolicy, ModelCatalogSupportHint, ModelInfo, ModelList, ModelListAuthority,
+    ModelListRequest, ModelMessage, ModelMetadataSource, ModelPricingInfo, ModelPricingSource,
+    ModelPricingUnit, ModelReasoningCapabilitySource, ModelTokenPrice, ModelTurnRequest,
+    NativeWebSearchRequest, NativeWebSearchResponse, NativeWebSearchResult, OP_AUTH_PRIME,
+    OP_AUTH_RESET_CREDIT_CONSUME, OP_AUTH_RESET_CREDITS, OP_AUTH_USAGE, OP_CANCEL_TURN,
+    OP_CAPABILITIES, OP_COMPACT_CONTEXT, OP_CONTEXT_MANAGEMENT_CAPABILITIES, OP_FINISH_TURN,
+    OP_MODELS, OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG,
+    OP_VERIFY_MODEL, PollTurnEventsRequest, PollTurnEventsResponse, ProviderAuthCandidate,
+    ProviderCapabilities, ProviderCapability, ProviderError, ProviderErrorCategory,
+    ProviderRequestContext, ProviderRequestProjection, ProviderRetryRule, ProviderRetryRuleMatch,
+    ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage, ToolCall, ValidateConfigResponse,
 };
 use bcode_model_provider_runtime::{
     ProviderRuntime, retry_hint_from_json_value, retry_hint_from_response_parts,
@@ -210,6 +212,10 @@ impl OpenAiCompatibleProviderPlugin {
 
         match context.request.operation.as_str() {
             OP_CAPABILITIES => json_response(&capabilities()),
+            OP_CONTEXT_MANAGEMENT_CAPABILITIES => {
+                Self::context_management_capabilities(&context.request)
+            }
+            OP_COMPACT_CONTEXT => self.compact_context(&context.request),
             OP_MODELS => self.models_response(&context.request),
             OP_VALIDATE_CONFIG => json_response(&self.validate_config()),
             OP_VERIFY_MODEL => self.verify_model(&context.request),
@@ -242,6 +248,36 @@ impl OpenAiCompatibleProviderPlugin {
             Ok(runtime) => match runtime.block_on(verify_model_inner(request)) {
                 Ok(Ok(response)) => json_response(&response),
                 Ok(Err(error)) => json_response(&verify_response_from_provider_error(&error)),
+                Err(error) => ServiceResponse::error("runtime_error", error.to_string()),
+            },
+            Err(error) => ServiceResponse::error("runtime_error", error),
+        }
+    }
+
+    fn context_management_capabilities(request: &ServiceRequest) -> ServiceResponse {
+        let request = match request.payload_json::<ContextManagementCapabilitiesRequest>() {
+            Ok(request) => request,
+            Err(error) => return invalid_request(&error),
+        };
+        let settings = settings_for_context(&request.provider_context);
+        json_response(&ContextManagementCapabilities {
+            provider_managed: false,
+            native_compaction: !matches!(
+                settings.dialect,
+                OpenAiCompatibleDialect::ChatCompletions
+            ),
+        })
+    }
+
+    fn compact_context(&self, request: &ServiceRequest) -> ServiceResponse {
+        let request = match request.payload_json::<CompactContextRequest>() {
+            Ok(request) => request,
+            Err(error) => return invalid_request(&error),
+        };
+        match &self.runtime {
+            Ok(runtime) => match runtime.block_on(compact_context_inner(request)) {
+                Ok(Ok(response)) => json_response(&response),
+                Ok(Err(error)) => ServiceResponse::error(error.code, error.message),
                 Err(error) => ServiceResponse::error("runtime_error", error.to_string()),
             },
             Err(error) => ServiceResponse::error("runtime_error", error),
@@ -520,6 +556,17 @@ impl AuthSettings {
     const fn is_configured(&self) -> bool {
         !matches!(self, Self::Missing)
     }
+
+    fn token(&self) -> Option<&str> {
+        match self {
+            Self::Missing => None,
+            Self::ApiKey(token)
+            | Self::ChatGpt {
+                access_token: token,
+                ..
+            } => Some(token),
+        }
+    }
 }
 
 fn auth_trace_metadata(settings: &Settings, context: &ProviderRequestContext) -> String {
@@ -673,12 +720,11 @@ struct ResponsesTextFormat {
     strict: bool,
 }
 
-#[derive(Debug, Serialize)]
-#[cfg_attr(test, derive(Deserialize))]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ResponsesInputItem {
     Message {
-        role: &'static str,
+        role: String,
         content: Vec<ResponsesContent>,
     },
     FunctionCall {
@@ -698,15 +744,13 @@ enum ResponsesInputItem {
     },
 }
 
-#[derive(Debug, Serialize)]
-#[cfg_attr(test, derive(Deserialize))]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ResponsesReasoningSummary {
     SummaryText { text: String },
 }
 
-#[derive(Debug, Serialize)]
-#[cfg_attr(test, derive(Deserialize))]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ResponsesContent {
     InputText { text: String },
@@ -2812,6 +2856,141 @@ async fn send_chat_completion_request(
     Ok(response)
 }
 
+#[derive(Debug, Deserialize)]
+struct ResponsesCompactBody {
+    #[serde(default)]
+    output: Vec<serde_json::Value>,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn compact_context_inner(
+    request: CompactContextRequest,
+) -> Result<CompactContextResponse, ProviderError> {
+    let settings = settings_for_context(&request.provider_context);
+    if matches!(settings.dialect, OpenAiCompatibleDialect::ChatCompletions) {
+        return Err(provider_error(
+            "native_compaction_unsupported",
+            ProviderErrorCategory::UnsupportedFeature,
+            "provider-native compaction requires an OpenAI Responses API surface",
+        ));
+    }
+    let Some(access_token) = settings.auth.token() else {
+        return Err(provider_error(
+            "missing_openai_auth",
+            ProviderErrorCategory::Auth,
+            "provider-native compaction requires OpenAI authentication",
+        ));
+    };
+    let turn_request = ModelTurnRequest {
+        session_id: request.session_id,
+        turn_id: "context-compaction".to_string(),
+        model_id: request.model_id.clone(),
+        provider_context: request.provider_context,
+        system_prompt: request.system_prompt,
+        messages: request.messages,
+        tools: request.tools,
+        parameters: bcode_model::ModelParameters::default(),
+        structured_output: None,
+        prompt_cache: bcode_model::PromptCacheHints::default(),
+        conversation_reuse: bcode_model::ConversationReuseHints::default(),
+        metadata: BTreeMap::new(),
+    };
+    let projection = responses_projection(
+        &turn_request,
+        responses_instruction_strategy(&settings),
+        false,
+        settings.dialect,
+    );
+    let body = serde_json::json!({
+        "model": request.model_id,
+        "input": projection.input,
+        "instructions": projection.instructions,
+        "tools": model_tools_to_responses_tools(&turn_request, settings.dialect)?,
+        "parallel_tool_calls": true,
+    });
+    let client = model_stream_client(settings.request_timeout).map_err(|error| {
+        provider_error(
+            "client_build_failed",
+            ProviderErrorCategory::ProviderInternal,
+            error.to_string(),
+        )
+    })?;
+    let endpoint = match settings.dialect {
+        OpenAiCompatibleDialect::ChatGptCodex => {
+            format!("{OPENAI_CODEX_API_ENDPOINT}/compact")
+        }
+        OpenAiCompatibleDialect::ResponsesApi => {
+            format!(
+                "{}/responses/compact",
+                settings.base_url.trim_end_matches('/')
+            )
+        }
+        OpenAiCompatibleDialect::ChatCompletions => unreachable!(),
+    };
+    let mut builder = client
+        .post(endpoint)
+        .bearer_auth(access_token)
+        .header("originator", "bcode")
+        .header("User-Agent", "bcode/0.0.1")
+        .header("session_id", request.session_id.to_string())
+        .json(&body);
+    if settings.dialect.uses_codex_request_shape() {
+        builder = builder.header("OpenAI-Beta", "responses=experimental");
+    }
+    if let AuthSettings::ChatGpt {
+        account_id: Some(account_id),
+        ..
+    } = &settings.auth
+    {
+        builder = builder.header("ChatGPT-Account-Id", account_id);
+    }
+    let response = builder.send().await.map_err(|error| {
+        provider_error(
+            "request_failed",
+            if error.is_timeout() {
+                ProviderErrorCategory::Timeout
+            } else {
+                ProviderErrorCategory::Network
+            },
+            error.to_string(),
+        )
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        let headers = response.headers().clone();
+        let body = response.text().await.unwrap_or_default();
+        return Err(error_from_status_and_headers(
+            status.as_u16(),
+            Some(&headers),
+            &body,
+        ));
+    }
+    let response = response
+        .json::<ResponsesCompactBody>()
+        .await
+        .map_err(|error| {
+            provider_error(
+                "invalid_compaction_response",
+                ProviderErrorCategory::ProviderInternal,
+                error.to_string(),
+            )
+        })?;
+    let content = response
+        .output
+        .into_iter()
+        .map(|value| ContentBlock::ProviderExtension { value })
+        .collect::<Vec<_>>();
+    Ok(CompactContextResponse {
+        messages: (!content.is_empty())
+            .then_some(ModelMessage {
+                role: MessageRole::Assistant,
+                content,
+            })
+            .into_iter()
+            .collect(),
+    })
+}
+
 async fn send_responses_request(
     client: &Client,
     settings: &Settings,
@@ -3373,8 +3552,10 @@ fn token_usage_from_openai_usage(usage: OpenAiUsage) -> TokenUsage {
                 .output_tokens_details
                 .and_then(|details| details.reasoning_tokens)
         });
+    let input_tokens = usage.prompt_tokens.or(usage.input_tokens);
     TokenUsage {
-        input_tokens: usage.prompt_tokens.or(usage.input_tokens),
+        input_tokens,
+        context_input_tokens: input_tokens,
         output_tokens: usage.completion_tokens.or(usage.output_tokens),
         total_tokens: usage.total_tokens,
         cached_input_tokens,
@@ -3920,7 +4101,7 @@ fn push_sanitized_responses_input_item(
             if !seen_tool_call_ids.insert(call_id.clone()) {
                 append_missing_responses_tool_outputs(input, pending_tool_call_ids);
                 input.push(ResponsesInputItem::Message {
-                    role: "user",
+                    role: "user".to_string(),
                     content: vec![ResponsesContent::InputText {
                         text: format!(
                             "Historical assistant tool call omitted from structured tool protocol because its call id was duplicated. Call id: {call_id}; tool: {name}; arguments: {arguments}"
@@ -3942,7 +4123,7 @@ fn push_sanitized_responses_input_item(
             } else {
                 append_missing_responses_tool_outputs(input, pending_tool_call_ids);
                 input.push(ResponsesInputItem::Message {
-                    role: "user",
+                    role: "user".to_string(),
                     content: vec![ResponsesContent::InputText {
                         text: format!(
                             "Historical tool result omitted from structured tool protocol because its matching assistant tool call is unavailable. Call id: {call_id}; result: {output}"
@@ -3989,6 +4170,19 @@ fn model_message_to_responses_input(
     message: &ModelMessage,
     dialect: OpenAiCompatibleDialect,
 ) -> Vec<ResponsesInputItem> {
+    let extension_items = message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ProviderExtension { value } => {
+                serde_json::from_value::<ResponsesInputItem>(value.clone()).ok()
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !extension_items.is_empty() {
+        return extension_items;
+    }
     match message.role {
         MessageRole::System => Vec::new(),
         MessageRole::User => responses_message("user", message, true),
@@ -4021,7 +4215,10 @@ fn responses_message(
     if content.is_empty() {
         return Vec::new();
     }
-    vec![ResponsesInputItem::Message { role, content }]
+    vec![ResponsesInputItem::Message {
+        role: role.to_string(),
+        content,
+    }]
 }
 
 fn responses_assistant_items(
@@ -4054,7 +4251,7 @@ fn responses_tool_items(message: &ModelMessage) -> Vec<ResponsesInputItem> {
             match content {
                 bcode_model::ToolResultContent::Image { image } => {
                     items.push(ResponsesInputItem::Message {
-                        role: "user",
+                        role: "user".to_string(),
                         content: vec![
                             ResponsesContent::InputText {
                                 text: format!(
@@ -4070,7 +4267,7 @@ fn responses_tool_items(message: &ModelMessage) -> Vec<ResponsesInputItem> {
                 }
                 bcode_model::ToolResultContent::ImageRef { image } => {
                     items.push(ResponsesInputItem::Message {
-                        role: "user",
+                        role: "user".to_string(),
                         content: vec![ResponsesContent::InputText {
                             text: image_ref_text(&result.call_id, image),
                         }],
@@ -4078,7 +4275,7 @@ fn responses_tool_items(message: &ModelMessage) -> Vec<ResponsesInputItem> {
                 }
                 bcode_model::ToolResultContent::Text { text } => {
                     items.push(ResponsesInputItem::Message {
-                        role: "user",
+                        role: "user".to_string(),
                         content: vec![ResponsesContent::InputText { text: text.clone() }],
                     });
                 }
@@ -7127,8 +7324,8 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert!(matches!(
             &items[0],
-            ResponsesInputItem::Message { role: "user", content }
-                if matches!(
+            ResponsesInputItem::Message { role, content }
+                if role == "user" && matches!(
                     &content[0],
                     ResponsesContent::InputText { text }
                         if text.contains("matching assistant tool call is unavailable")
@@ -7171,7 +7368,7 @@ mod tests {
         ));
         assert!(matches!(
             &items[2],
-            ResponsesInputItem::Message { role: "user", .. }
+            ResponsesInputItem::Message { role, .. } if role == "user"
         ));
     }
 

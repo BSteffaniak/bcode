@@ -1197,6 +1197,17 @@ fn non_streaming_transcript_item_from_event(
             false,
             TranscriptItemKind::Meta,
         )),
+        SessionEventKind::ProviderContextCompacted { snapshot, .. } => {
+            Some(TranscriptItem::with_kind(
+                "Compaction",
+                format!(
+                    "provider compacted context ({})",
+                    snapshot.provider_plugin_id
+                ),
+                false,
+                TranscriptItemKind::Meta,
+            ))
+        }
         SessionEventKind::SkillInvoked {
             skill_id,
             arguments,

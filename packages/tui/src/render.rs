@@ -1606,7 +1606,11 @@ fn statusline_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
         true,
     );
 
-    for (token_segment, priority) in compact_statusline_token_segments(&app.token_summary()) {
+    let mut token_segments = compact_statusline_token_segments(&app.token_summary()).into_iter();
+    if let Some((context_segment, _)) = token_segments.next() {
+        line = line.required(context_segment, muted, false);
+    }
+    for (token_segment, priority) in token_segments {
         line = line.optional(token_segment, muted, priority, false);
     }
 
@@ -1646,9 +1650,8 @@ fn compact_statusline_token_segments(summary: &str) -> Vec<(String, u8)> {
     summary
         .split(" · ")
         .filter_map(|part| match part {
-            "ctx limit unknown" => Some(("ctx unknown".to_owned(), 85)),
             "reuse on" => Some(("reuse".to_owned(), 50)),
-            _ if part.starts_with("ctx ") => Some((part.to_owned(), 95)),
+            _ if part.ends_with('%') && part.contains('/') => Some((part.to_owned(), 95)),
             _ => part
                 .strip_prefix("spent ")
                 .and_then(|value| value.strip_suffix(" tok"))

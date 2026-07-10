@@ -1183,6 +1183,8 @@ fn header_drops_low_priority_segments_in_narrow_panes() {
         provider_plugin_id: Some("very-long-provider-plugin-id".to_owned()),
         model_id: Some("very-long-model-id".to_owned()),
         context_window: None,
+        context_input_tokens: None,
+        context_usage_source: None,
         max_output_tokens: None,
         reasoning: None,
         reasoning_effort: None,
@@ -1190,6 +1192,8 @@ fn header_drops_low_priority_segments_in_narrow_panes() {
         prompt_cache_mode: None,
         conversation_reuse_mode: None,
         compaction_mode: None,
+        compaction_backend: None,
+        proactive_compaction_threshold_percent: None,
         cache: None,
         metadata_source: None,
         pricing: None,
@@ -1385,6 +1389,8 @@ fn header_and_footer_include_model_agent_and_token_context() {
         provider_plugin_id: Some("provider.example".to_owned()),
         model_id: Some("model-example".to_owned()),
         context_window: Some(1024),
+        context_input_tokens: None,
+        context_usage_source: None,
         max_output_tokens: None,
         reasoning: None,
         reasoning_effort: None,
@@ -1392,6 +1398,8 @@ fn header_and_footer_include_model_agent_and_token_context() {
         prompt_cache_mode: None,
         conversation_reuse_mode: None,
         compaction_mode: None,
+        compaction_backend: None,
+        proactive_compaction_threshold_percent: None,
         cache: None,
         metadata_source: None,
         pricing: None,
@@ -1412,7 +1420,7 @@ fn header_and_footer_include_model_agent_and_token_context() {
     assert!(output.contains("model-example"));
     assert!(output.contains("plan"));
     assert!(!output.contains("agent plan"));
-    assert!(output.contains("ctx 512/1.0k 50%"));
+    assert!(output.contains("512/1k 50%"), "{output}");
     assert!(output.contains("read 256"));
     assert!(output.contains("write 128"));
     assert!(output.contains("spent 640"));
@@ -1441,6 +1449,8 @@ fn status_line_prioritizes_context_over_spent_tokens() {
         provider_plugin_id: Some("provider.example".to_owned()),
         model_id: Some("model-example".to_owned()),
         context_window: Some(128_000),
+        context_input_tokens: None,
+        context_usage_source: None,
         max_output_tokens: None,
         reasoning: None,
         reasoning_effort: None,
@@ -1448,6 +1458,8 @@ fn status_line_prioritizes_context_over_spent_tokens() {
         prompt_cache_mode: None,
         conversation_reuse_mode: None,
         compaction_mode: None,
+        compaction_backend: None,
+        proactive_compaction_threshold_percent: None,
         cache: None,
         metadata_source: None,
         pricing: None,
@@ -1458,7 +1470,7 @@ fn status_line_prioritizes_context_over_spent_tokens() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("ctx 512/128.0k 0%"), "{output}");
+    assert!(output.contains("512/128k 0%"), "{output}");
     assert!(!output.contains("spent 640"), "{output}");
 }
 
@@ -1488,7 +1500,7 @@ fn status_line_includes_unknown_context_before_spent_tokens() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("ctx unknown"), "{output}");
+    assert!(output.contains("—/— —%"), "{output}");
     assert!(!output.contains("spent 1.6m"), "{output}");
 }
 
@@ -1505,7 +1517,7 @@ fn status_line_drops_low_priority_segments_in_narrow_panes() {
     let output = rendered_text(&buffer);
 
     assert!(output.contains("ready"));
-    assert!(output.contains("important status message"));
+    assert!(output.contains("—/— —%"));
     assert!(!output.contains("enter send"));
     assert!(!output.contains("spent"));
 }
@@ -5499,6 +5511,8 @@ fn thinking_label_uses_effective_values() {
         provider_plugin_id: None,
         model_id: None,
         context_window: None,
+        context_input_tokens: None,
+        context_usage_source: None,
         max_output_tokens: None,
         reasoning: Some(bcode_model::ModelReasoningInfo {
             effort_values: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
@@ -5514,6 +5528,8 @@ fn thinking_label_uses_effective_values() {
         prompt_cache_mode: None,
         conversation_reuse_mode: None,
         compaction_mode: None,
+        compaction_backend: None,
+        proactive_compaction_threshold_percent: None,
         cache: None,
         metadata_source: None,
         pricing: None,
@@ -5533,6 +5549,8 @@ fn thinking_dialog_cycles_supported_values() {
         provider_plugin_id: None,
         model_id: None,
         context_window: None,
+        context_input_tokens: None,
+        context_usage_source: None,
         max_output_tokens: None,
         reasoning: Some(bcode_model::ModelReasoningInfo {
             effort_values: vec!["low".to_owned(), "medium".to_owned()],
@@ -5548,6 +5566,8 @@ fn thinking_dialog_cycles_supported_values() {
         prompt_cache_mode: None,
         conversation_reuse_mode: None,
         compaction_mode: None,
+        compaction_backend: None,
+        proactive_compaction_threshold_percent: None,
         cache: None,
         metadata_source: None,
         pricing: None,
@@ -5570,6 +5590,8 @@ fn thinking_dialog_can_start_focused_on_effort_or_summary() {
         provider_plugin_id: None,
         model_id: None,
         context_window: None,
+        context_input_tokens: None,
+        context_usage_source: None,
         max_output_tokens: None,
         reasoning: Some(bcode_model::ModelReasoningInfo {
             effort_values: vec!["low".to_owned(), "medium".to_owned()],
@@ -5585,6 +5607,8 @@ fn thinking_dialog_can_start_focused_on_effort_or_summary() {
         prompt_cache_mode: None,
         conversation_reuse_mode: None,
         compaction_mode: None,
+        compaction_backend: None,
+        proactive_compaction_threshold_percent: None,
         cache: None,
         metadata_source: None,
         pricing: None,
@@ -5611,6 +5635,8 @@ fn thinking_dialog_does_not_cycle_when_reasoning_is_unsupported() {
         provider_plugin_id: None,
         model_id: None,
         context_window: None,
+        context_input_tokens: None,
+        context_usage_source: None,
         max_output_tokens: None,
         reasoning: None,
         reasoning_effort: None,
@@ -5618,6 +5644,8 @@ fn thinking_dialog_does_not_cycle_when_reasoning_is_unsupported() {
         prompt_cache_mode: None,
         conversation_reuse_mode: None,
         compaction_mode: None,
+        compaction_backend: None,
+        proactive_compaction_threshold_percent: None,
         cache: None,
         metadata_source: None,
         pricing: None,
