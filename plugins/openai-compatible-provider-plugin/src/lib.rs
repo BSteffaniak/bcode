@@ -70,6 +70,13 @@ fn openai_context_format(settings: &Settings) -> ProviderContextFormat {
     }
 }
 
+fn openai_context_compaction_opted_in(provider_context: &ProviderRequestContext) -> bool {
+    provider_context
+        .settings
+        .get("native_context_compaction")
+        .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1")
+}
+
 fn supports_openai_context_compaction(
     dialect: OpenAiCompatibleDialect,
     base_url: &str,
@@ -287,11 +294,7 @@ impl OpenAiCompatibleProviderPlugin {
             Err(error) => return invalid_request(&error),
         };
         let settings = settings_for_context(&request.provider_context);
-        let opted_in = request
-            .provider_context
-            .settings
-            .get("native_context_compaction")
-            .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1");
+        let opted_in = openai_context_compaction_opted_in(&request.provider_context);
         let supported =
             supports_openai_context_compaction(settings.dialect, &settings.base_url, opted_in);
         json_response(&ContextManagementCapabilities {
@@ -2915,11 +2918,15 @@ async fn compact_context_inner(
     request: CompactContextRequest,
 ) -> Result<CompactContextResponse, ProviderError> {
     let settings = settings_for_context(&request.provider_context);
-    if settings.dialect != OpenAiCompatibleDialect::ResponsesApi {
+    if !supports_openai_context_compaction(
+        settings.dialect,
+        &settings.base_url,
+        openai_context_compaction_opted_in(&request.provider_context),
+    ) {
         return Err(provider_error(
             "native_compaction_unsupported",
             ProviderErrorCategory::UnsupportedFeature,
-            "provider-native compaction requires an OpenAI Responses API surface",
+            "provider-native compaction requires an official OpenAI Responses API surface or explicit native context compaction opt-in",
         ));
     }
     let Some(access_token) = settings.auth.token() else {
