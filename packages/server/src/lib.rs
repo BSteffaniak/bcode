@@ -17874,6 +17874,237 @@ mod tests {
     }
 
     #[test]
+    fn structural_plan_groups_turns_and_excludes_retained_tail() {
+        let session_id = SessionId::new();
+        let history = vec![
+            session_event(
+                session_id,
+                1,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "older question".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                2,
+                SessionEventKind::AssistantMessage {
+                    text: "older answer".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                3,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "active question".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                4,
+                SessionEventKind::AssistantMessage {
+                    text: "active answer".to_string(),
+                },
+            ),
+        ];
+        let plan = structural_compaction_plan(&history, 1_000, 0).expect("structural plan");
+        assert_eq!(plan.compacted_through_sequence, 2);
+        assert_eq!(plan.compactable_prefix.len(), 2);
+        assert_eq!(plan.retained_tail.len(), 2);
+        assert!(
+            plan.summary_input
+                .iter()
+                .any(|line| line.contains("older question"))
+        );
+        assert!(
+            !plan
+                .summary_input
+                .iter()
+                .any(|line| line.contains("active question"))
+        );
+        assert_eq!(
+            plan.provider_native_messages,
+            session_events_to_model_messages_with_limit(&plan.compactable_prefix, 1_000)
+        );
+    }
+
+    #[test]
+    fn conversational_unit_keeps_tool_chain_and_post_tool_continuation_together() {
+        let session_id = SessionId::new();
+        let history = vec![
+            session_event(
+                session_id,
+                1,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "inspect".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                2,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-1".to_string(),
+                    tool_name: "read".to_string(),
+                    arguments_json: "{}".to_string(),
+                    producer_plugin_id: None,
+                    request_visual: None,
+                    legacy_request_presentation: None,
+                },
+            ),
+            session_event(
+                session_id,
+                3,
+                SessionEventKind::ToolCallFinished {
+                    tool_call_id: "call-1".to_string(),
+                    result: "done".to_string(),
+                    is_error: false,
+                    output: None,
+                    semantic_result: None,
+                },
+            ),
+            session_event(
+                session_id,
+                4,
+                SessionEventKind::AssistantMessage {
+                    text: "finished inspection".to_string(),
+                },
+            ),
+        ];
+        let units = conversational_units(&history, 1_000);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].events.len(), 4);
+        assert!(!units[0].interrupted_tool_chain);
+    }
+
+    #[test]
+    fn interrupted_tool_chain_is_indivisible_and_retained() {
+        let session_id = SessionId::new();
+        let history = vec![
+            session_event(
+                session_id,
+                1,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "older".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                2,
+                SessionEventKind::AssistantMessage {
+                    text: "answered".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                3,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "active".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                4,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "pending".to_string(),
+                    tool_name: "shell".to_string(),
+                    arguments_json: "{}".to_string(),
+                    producer_plugin_id: None,
+                    request_visual: None,
+                    legacy_request_presentation: None,
+                },
+            ),
+        ];
+        let plan = structural_compaction_plan(&history, 1_000, 0).expect("structural plan");
+        assert_eq!(plan.compacted_through_sequence, 2);
+        assert_eq!(plan.retained_tail[0].sequence, 3);
+        let units = conversational_units(&history, 1_000);
+        assert!(units.last().expect("active unit").interrupted_tool_chain);
+    }
+
+    #[test]
+    fn structural_plan_uses_newest_marker_and_portable_fallback() {
+        let session_id = SessionId::new();
+        let history = vec![
+            session_event(
+                session_id,
+                1,
+                SessionEventKind::ContextCompacted {
+                    summary: "old summary".to_string(),
+                    compacted_through_sequence: 0,
+                },
+            ),
+            session_event(
+                session_id,
+                2,
+                SessionEventKind::ContextCompacted {
+                    summary: "new summary".to_string(),
+                    compacted_through_sequence: 1,
+                },
+            ),
+            session_event(
+                session_id,
+                3,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "older".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                4,
+                SessionEventKind::AssistantMessage {
+                    text: "answer".to_string(),
+                },
+            ),
+            session_event(
+                session_id,
+                5,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "active".to_string(),
+                },
+            ),
+        ];
+        let plan = structural_compaction_plan(&history, 1_000, 0).expect("structural plan");
+        assert_eq!(plan.prior_boundary, Some(1));
+        assert_eq!(plan.portable_fallback, "new summary");
+        assert_eq!(plan.compactable_prefix[0].sequence, 3);
+    }
+
+    #[test]
+    fn working_directory_event_is_preserved_as_a_complete_unit() {
+        let session_id = SessionId::new();
+        let history = vec![
+            session_event(
+                session_id,
+                1,
+                SessionEventKind::WorkingDirectoryChanged {
+                    old_working_directory: PathBuf::from("/old"),
+                    new_working_directory: PathBuf::from("/new"),
+                },
+            ),
+            session_event(
+                session_id,
+                2,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "continue".to_string(),
+                },
+            ),
+        ];
+        let units = conversational_units(&history, 1_000);
+        assert_eq!(units.len(), 2);
+        assert!(matches!(
+            units[0].events[0].kind,
+            SessionEventKind::WorkingDirectoryChanged { .. }
+        ));
+    }
+
+    #[test]
     fn compaction_transcript_truncates_large_tool_results() {
         let session_id = SessionId::new();
         let transcript = compaction_transcript(

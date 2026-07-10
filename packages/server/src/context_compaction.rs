@@ -50,6 +50,26 @@ pub struct CompactionCompletion {
     pub compacted_through_sequence: u64,
 }
 
+pub struct CompactionPlan {
+    pub prior_boundary: Option<u64>,
+    pub compactable_prefix: Vec<bcode_session_models::SessionEvent>,
+    pub retained_tail: Vec<bcode_session_models::SessionEvent>,
+    pub compacted_through_sequence: u64,
+    pub summary_input: Vec<String>,
+    pub provider_native_messages: Vec<ModelMessage>,
+    pub portable_fallback: String,
+    pub estimated_prefix_tokens: u64,
+    pub estimated_tail_tokens: u64,
+}
+
+pub struct ConversationalUnit {
+    pub events: Vec<bcode_session_models::SessionEvent>,
+    pub summary_input: Vec<String>,
+    pub estimated_tokens: u64,
+    pub begins_with_user: bool,
+    pub interrupted_tool_chain: bool,
+}
+
 pub struct CompactionTranscript {
     pub previous_summary: Option<String>,
     pub lines: Vec<CompactionLine>,
@@ -65,10 +85,28 @@ pub struct CompactionProgressRequirement {
 }
 
 pub struct CompactionLine {
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub sequence: u64,
     pub text: String,
+    #[cfg(test)]
     pub estimated_tokens: usize,
+    #[cfg(test)]
     pub can_cut_after: bool,
+}
+
+#[allow(clippy::missing_const_for_fn, unused_variables)]
+fn compaction_line(event: &bcode_session_models::SessionEvent, text: String) -> CompactionLine {
+    CompactionLine {
+        #[cfg(test)]
+        sequence: event.sequence,
+        #[cfg(test)]
+        estimated_tokens: usize::try_from(estimated_tokens_from_chars(text.chars().count()))
+            .unwrap_or(usize::MAX),
+        #[cfg(test)]
+        can_cut_after: true,
+        text,
+    }
 }
 
 pub const COMPACTION_SYSTEM_PROMPT: &str = "You compact coding-agent session history. Produce only a durable continuation summary for future model turns. Preserve all facts needed to continue the work, including user goals, decisions, constraints, files changed, commands run, validation results, current blockers, and next steps. Do not invent details. Do not include markdown fences.";
@@ -107,6 +145,7 @@ pub async fn compact_session_context_before_sequence(
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn compact_session_context_with_limit(
     state: &ServerState,
     session_id: SessionId,
@@ -131,7 +170,7 @@ pub async fn compact_session_context_with_limit(
                 .collect()
         },
     );
-    let Some(transcript) = compaction_transcript(
+    let Some(plan) = structural_compaction_plan(
         &transcript_history,
         state.tool_output_context_chars,
         usize::try_from(state.auto_compaction.keep_recent_tokens).unwrap_or(usize::MAX),
@@ -140,6 +179,24 @@ pub async fn compact_session_context_with_limit(
             "nothing new to compact".to_string(),
         ));
     };
+    let transcript = compaction_transcript_from_plan(&plan, state.tool_output_context_chars);
+    debug_assert!(
+        plan.retained_tail
+            .iter()
+            .all(|event| event.sequence > plan.compacted_through_sequence)
+    );
+    debug_assert_eq!(
+        plan.provider_native_messages,
+        session_events_to_model_messages_with_limit(
+            &plan.compactable_prefix,
+            state.tool_output_context_chars,
+        )
+    );
+    debug_assert_eq!(plan.summary_input.len(), transcript.lines.len());
+    debug_assert!(
+        plan.prior_boundary
+            .is_none_or(|boundary| plan.compacted_through_sequence > boundary)
+    );
     if let Some(requirement) = progress_requirement
         && !compaction_plan_meets_progress_requirement(&transcript, requirement)
     {
@@ -156,14 +213,13 @@ pub async fn compact_session_context_with_limit(
         return Err(CompactionError::ProviderUnavailable);
     }
 
-    let compactable_history = transcript_history
-        .iter()
-        .filter(|event| event.sequence <= transcript.compacted_through_sequence)
-        .cloned()
-        .collect::<Vec<_>>();
-    let native_snapshot =
-        compact_context_with_selected_backend(state, session_id, selection, &compactable_history)
-            .await?;
+    let native_snapshot = compact_context_with_selected_backend(
+        state,
+        session_id,
+        selection,
+        &plan.compactable_prefix,
+    )
+    .await?;
     let portable_summary = if native_snapshot.is_some() {
         match collect_compaction_summary(state, session_id, selection, &transcript, command_context)
             .await
@@ -209,8 +265,10 @@ pub async fn compact_session_context_with_limit(
 
     Ok(CompactionCompletion {
         message: format!(
-            "compacted {} events through #{}",
-            transcript.event_count, transcript.compacted_through_sequence
+            "compacted {} events through #{} (retained approximately {} tokens)",
+            transcript.event_count,
+            transcript.compacted_through_sequence,
+            plan.estimated_tail_tokens,
         ),
         compacted_through_sequence: transcript.compacted_through_sequence,
     })
@@ -1151,34 +1209,41 @@ pub async fn finish_provider_turn(
     .await;
 }
 
-pub fn compaction_transcript(
-    history: &[bcode_session_models::SessionEvent],
+pub fn conversational_units(
+    events: &[bcode_session_models::SessionEvent],
     tool_output_context_chars: usize,
-    keep_recent_tokens: usize,
-) -> Option<CompactionTranscript> {
-    let history = compact_attach_history(history.to_vec());
-    let latest_compaction =
-        history
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, event)| match &event.kind {
-                SessionEventKind::ContextCompacted { summary, .. } => {
-                    Some((index, summary.clone()))
-                }
-                SessionEventKind::ProviderContextCompacted { snapshot, .. } => {
-                    Some((index, snapshot.portable_summary.clone()))
-                }
-                _ => None,
-            });
-
-    let previous_summary = latest_compaction
-        .as_ref()
-        .map(|(_, summary)| summary.clone());
-    let start_index = latest_compaction.map_or(0, |(index, _)| index.saturating_add(1));
-    let mut candidates = Vec::new();
+) -> Vec<ConversationalUnit> {
+    let mut units = Vec::<ConversationalUnit>::new();
     let mut pending_tool_calls = BTreeSet::new();
-    for event in &history[start_index..] {
+
+    for event in events {
+        let starts_user_unit = matches!(event.kind, SessionEventKind::UserMessage { .. })
+            && pending_tool_calls.is_empty();
+        let starts_orphan_assistant_unit =
+            matches!(event.kind, SessionEventKind::AssistantMessage { .. })
+                && pending_tool_calls.is_empty()
+                && units
+                    .last()
+                    .is_some_and(|unit| !unit.begins_with_user && !unit.events.is_empty());
+        let starts_unit = starts_user_unit
+            || starts_orphan_assistant_unit
+            || units.is_empty()
+            || (pending_tool_calls.is_empty()
+                && matches!(
+                    event.kind,
+                    SessionEventKind::SystemMessage { .. }
+                        | SessionEventKind::WorkingDirectoryChanged { .. }
+                ));
+        if starts_unit {
+            units.push(ConversationalUnit {
+                events: Vec::new(),
+                summary_input: Vec::new(),
+                estimated_tokens: 0,
+                begins_with_user: matches!(event.kind, SessionEventKind::UserMessage { .. }),
+                interrupted_tool_chain: false,
+            });
+        }
+        let unit = units.last_mut().expect("unit is created before use");
         match &event.kind {
             SessionEventKind::ToolCallRequested { tool_call_id, .. } => {
                 pending_tool_calls.insert(tool_call_id.clone());
@@ -1189,38 +1254,147 @@ pub fn compaction_transcript(
             _ => {}
         }
         if let Some(text) = session_event_compaction_line(event, tool_output_context_chars) {
-            let estimated_tokens =
-                usize::try_from(estimated_tokens_from_chars(text.chars().count()))
-                    .unwrap_or(usize::MAX);
-            candidates.push(CompactionLine {
-                sequence: event.sequence,
-                text,
-                estimated_tokens,
-                can_cut_after: session_event_is_safe_compaction_cut(
-                    event,
-                    pending_tool_calls.is_empty(),
-                ),
-            });
+            unit.summary_input.push(text);
         }
+        unit.events.push(event.clone());
+    }
+    if !pending_tool_calls.is_empty()
+        && let Some(unit) = units.last_mut()
+    {
+        unit.interrupted_tool_chain = true;
+    }
+    for unit in &mut units {
+        let messages =
+            session_events_to_model_messages_with_limit(&unit.events, tool_output_context_chars);
+        unit.estimated_tokens =
+            estimated_tokens_from_chars(messages.iter().map(model_message_context_chars).sum());
+    }
+    units
+}
+
+pub fn structural_compaction_plan(
+    history: &[bcode_session_models::SessionEvent],
+    tool_output_context_chars: usize,
+    keep_recent_tokens: usize,
+) -> Option<CompactionPlan> {
+    let history = compact_attach_history(history.to_vec());
+    let latest_marker =
+        history
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, event)| match &event.kind {
+                SessionEventKind::ContextCompacted {
+                    summary,
+                    compacted_through_sequence,
+                } => Some((index, *compacted_through_sequence, summary.clone())),
+                SessionEventKind::ProviderContextCompacted {
+                    snapshot,
+                    compacted_through_sequence,
+                } => Some((
+                    index,
+                    *compacted_through_sequence,
+                    snapshot.portable_summary.clone(),
+                )),
+                _ => None,
+            });
+    let prior_boundary = latest_marker.as_ref().map(|(_, boundary, _)| *boundary);
+    let portable_fallback = latest_marker
+        .as_ref()
+        .map_or_else(String::new, |(_, _, summary)| summary.clone());
+    let start_index = latest_marker.map_or(0, |(index, _, _)| index.saturating_add(1));
+    let units = conversational_units(&history[start_index..], tool_output_context_chars);
+    if units.len() <= 1 {
+        return None;
     }
 
-    let lines = compaction_lines_to_summarize(candidates, keep_recent_tokens);
-    let compacted_through_sequence = lines.last()?.sequence;
-    let event_count = lines.len();
-
-    let estimated_reclaimable_tokens = lines.iter().fold(0_u64, |total, line| {
-        total.saturating_add(u64::try_from(line.estimated_tokens).unwrap_or(u64::MAX))
+    let mut retained_tokens = 0_u64;
+    let mut retained_start = units.len().saturating_sub(1);
+    for (index, unit) in units.iter().enumerate().rev() {
+        if retained_tokens >= u64::try_from(keep_recent_tokens).unwrap_or(u64::MAX) {
+            break;
+        }
+        retained_tokens = retained_tokens.saturating_add(unit.estimated_tokens);
+        retained_start = index;
+    }
+    if retained_start == 0 {
+        return None;
+    }
+    // An interrupted tool chain and the active newest user turn are retained as complete units.
+    let compactable_units = &units[..retained_start];
+    let retained_units = &units[retained_start..];
+    let compactable_prefix = compactable_units
+        .iter()
+        .flat_map(|unit| unit.events.iter().cloned())
+        .collect::<Vec<_>>();
+    let retained_tail = retained_units
+        .iter()
+        .flat_map(|unit| unit.events.iter().cloned())
+        .collect::<Vec<_>>();
+    let compacted_through_sequence = compactable_prefix.last()?.sequence;
+    let summary_input = compactable_units
+        .iter()
+        .flat_map(|unit| unit.summary_input.iter().cloned())
+        .collect::<Vec<_>>();
+    let provider_native_messages =
+        session_events_to_model_messages_with_limit(&compactable_prefix, tool_output_context_chars);
+    let estimated_prefix_tokens = compactable_units.iter().fold(0_u64, |total, unit| {
+        total.saturating_add(unit.estimated_tokens)
+    });
+    let estimated_tail_tokens = retained_units.iter().fold(0_u64, |total, unit| {
+        total.saturating_add(unit.estimated_tokens)
     });
 
-    Some(CompactionTranscript {
-        previous_summary,
-        lines,
+    Some(CompactionPlan {
+        prior_boundary,
+        compactable_prefix,
+        retained_tail,
         compacted_through_sequence,
-        event_count,
-        estimated_reclaimable_tokens,
+        summary_input,
+        provider_native_messages,
+        portable_fallback,
+        estimated_prefix_tokens,
+        estimated_tail_tokens,
     })
 }
 
+pub fn compaction_transcript_from_plan(
+    plan: &CompactionPlan,
+    tool_output_context_chars: usize,
+) -> CompactionTranscript {
+    let previous_summary =
+        (!plan.portable_fallback.is_empty()).then(|| plan.portable_fallback.clone());
+    let lines = plan
+        .compactable_prefix
+        .iter()
+        .filter_map(|event| {
+            session_event_compaction_line(event, tool_output_context_chars)
+                .map(|text| compaction_line(event, text))
+        })
+        .collect::<Vec<_>>();
+    CompactionTranscript {
+        previous_summary,
+        event_count: plan.compactable_prefix.len(),
+        estimated_reclaimable_tokens: plan.estimated_prefix_tokens,
+        compacted_through_sequence: plan.compacted_through_sequence,
+        lines,
+    }
+}
+
+#[cfg(test)]
+pub fn compaction_transcript(
+    history: &[bcode_session_models::SessionEvent],
+    tool_output_context_chars: usize,
+    keep_recent_tokens: usize,
+) -> Option<CompactionTranscript> {
+    let plan = structural_compaction_plan(history, tool_output_context_chars, keep_recent_tokens)?;
+    Some(compaction_transcript_from_plan(
+        &plan,
+        tool_output_context_chars,
+    ))
+}
+
+#[cfg(test)]
 pub fn compaction_lines_to_summarize(
     mut candidates: Vec<CompactionLine>,
     keep_recent_tokens: usize,
@@ -1249,6 +1423,8 @@ pub fn compaction_lines_to_summarize(
     candidates
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 const fn session_event_is_safe_compaction_cut(
     event: &bcode_session_models::SessionEvent,
     no_pending_tool_calls: bool,
@@ -1306,6 +1482,15 @@ pub fn session_event_compaction_line(
             "#{} system:\n{}",
             event.sequence,
             truncate_text(text, COMPACTION_MAX_EVENT_CONTENT_CHARS)
+        )),
+        SessionEventKind::WorkingDirectoryChanged {
+            old_working_directory,
+            new_working_directory,
+        } => Some(format!(
+            "#{} working directory changed from {} to {}",
+            event.sequence,
+            old_working_directory.display(),
+            new_working_directory.display()
         )),
         _ => None,
     }
