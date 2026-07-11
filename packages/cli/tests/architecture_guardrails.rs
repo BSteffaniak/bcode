@@ -12,11 +12,14 @@ const PLUGIN_OWNED_CORE_CLI_NEEDLES: &[&str] = &[
     "Commands::Ralph",
     "Commands::Metrics",
     "Commands::Provider",
+    "Commands::Skill",
     "enum WorktreeCommand",
     "enum ProviderCommand",
+    "enum SkillCommand",
     "handle_worktree_command",
     "handle_ralph_command",
     "handle_provider_command",
+    "handle_skill_command",
     "run_metrics_dashboard(repo, path)",
 ];
 

@@ -4,6 +4,9 @@
 
 //! skills command palette plugin for Bcode.
 
+#[cfg(feature = "static-bundled")]
+mod cli;
+
 use bcode_command::{
     COMMAND_INTERFACE_ID, CommandAction, CommandContribution, CommandEffect, CommandOwner,
     CommandSurface, InvokeCommandRequest, InvokeCommandResponse, OP_INVOKE_COMMAND,
@@ -118,6 +121,10 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     let mut vtable =
         bcode_plugin_sdk::static_plugin_vtable!(SkillsPlugin, include_str!("../bcode-plugin.toml"));
     vtable.tui_registry = Some(skills_tui_registry);
+    #[cfg(feature = "static-bundled")]
+    {
+        vtable.cli_registration = Some(cli::registration);
+    }
     vtable
 }
 
