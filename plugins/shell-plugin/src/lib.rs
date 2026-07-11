@@ -13,6 +13,7 @@ use bcode_config::{
     ShellToolOutputConfig, ShellToolPreludeGateTarget, default_config_paths_from_with_environment,
     load_config_from_paths_with_environment,
 };
+use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
@@ -433,7 +434,7 @@ fn should_use_direnv(cwd: Option<&Path>, config: ShellToolEnvConfig) -> Result<b
             } else {
                 Err(format!(
                     "found {}, but `direnv` is not available on PATH; install direnv or set `[tools.shell.env] auto_fallback = \"inherit\"`",
-                    envrc.display()
+                    display(&envrc, cwd)
                 ))
             }
         }

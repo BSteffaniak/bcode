@@ -9,6 +9,7 @@ mod file_change_tui;
 #[cfg(feature = "static-bundled")]
 mod filesystem_tui;
 
+use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ImageMetadata, ImageRefContent, ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS,
@@ -850,6 +851,7 @@ fn tool_read(
         Ok(request) => read_path_for_tool(
             &resolve_session_path(cwd, &request.path),
             &request,
+            cwd.unwrap_or_else(|| Path::new(".")),
             tool_call_id,
         ),
         Err(error) => tool_json_error(&error),
@@ -859,12 +861,13 @@ fn tool_read(
 fn read_path_for_tool(
     path: &Path,
     request: &ReadRequest,
+    working_directory: &Path,
     tool_call_id: &str,
 ) -> ToolInvocationResponse {
     match image_file_metadata(path) {
         Ok(Some(image)) => image_tool_response(path, image, tool_call_id),
         Ok(None) => match std::fs::read(path) {
-            Ok(bytes) => text_tool_response(path, request, &bytes, tool_call_id),
+            Ok(bytes) => text_tool_response(path, request, &bytes, working_directory, tool_call_id),
             Err(error) => tool_io_error(&error),
         },
         Err(error) => tool_io_error(&error),
@@ -875,13 +878,14 @@ fn text_tool_response(
     path: &Path,
     request: &ReadRequest,
     bytes: &[u8],
+    working_directory: &Path,
     tool_call_id: &str,
 ) -> ToolInvocationResponse {
     let Ok(contents) = std::str::from_utf8(bytes) else {
         return ToolInvocationResponse {
             output: format!(
                 "Binary file could not be decoded as UTF-8.\nPath: {}\nSize: {} bytes\nUse a specialized tool to inspect this file type.",
-                path.display(),
+                display(path, working_directory),
                 bytes.len()
             ),
             is_error: true,
@@ -2642,6 +2646,7 @@ mod tests {
                 offset: Some(2),
                 limit: Some(2),
             },
+            &root,
             "test-read",
         );
 
@@ -2720,6 +2725,7 @@ mod tests {
                 offset: None,
                 limit: None,
             },
+            &root,
             "test-image",
         );
 
