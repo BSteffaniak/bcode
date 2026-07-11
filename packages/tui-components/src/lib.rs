@@ -6,4 +6,5 @@
 
 pub mod diff_viewer;
 pub mod source_preview;
+pub mod source_viewer;
 pub mod terminal_viewer;

@@ -1,5 +1,6 @@
 //! Generic diff viewer component for Bcode TUI presentations.
 
+use crate::source_viewer::pad_card_spans;
 #[cfg(feature = "syntax")]
 use bcode_syntax_render::SyntaxHighlighter;
 #[cfg(feature = "syntax")]
@@ -728,23 +729,6 @@ fn continuation_prefix(gutter_style: Style) -> Vec<Span> {
         Span::styled("    ", gutter_style),
         Span::styled(" │ ", gutter_style),
     ]
-}
-
-fn pad_card_spans(spans: &mut Vec<Span>, target_width: usize, style: Style) {
-    let current_width = spans_width(spans);
-    if current_width < target_width {
-        spans.push(Span::styled(
-            " ".repeat(target_width - current_width),
-            style,
-        ));
-    }
-}
-
-fn spans_width(spans: &[Span]) -> usize {
-    spans
-        .iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_str()))
-        .sum()
 }
 
 fn content_spans(line: &DiffLine, fallback_style: Style) -> Vec<Span> {

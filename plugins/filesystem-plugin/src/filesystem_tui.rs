@@ -1,6 +1,7 @@
 //! Native TUI rendering for filesystem request and result visuals.
 
 use bcode_tui_components::source_preview::{SourcePreviewOptions, source_preview_lines};
+use bcode_tui_components::source_viewer::{SourceViewerInput, source_viewer_rows};
 use bmux_tui::prelude::{Color, Line, Span, Style};
 use devicons::{FileIcon, Theme, icon_for_file};
 use serde_json::Value;
@@ -91,9 +92,20 @@ fn read_rows(kind: &str, payload: &Value, width: u16) -> Vec<Line> {
     push_kv(&mut rows, "truncated", bool_text(payload, "truncated"));
     if let Some(contents) = text(payload, "contents").or_else(|| text(payload, "preview")) {
         rows.push(Line::raw(""));
-        rows.extend(preview_lines(
-            contents,
-            text(payload, "path").unwrap_or_default(),
+        let numbered = !kind.contains("artifact");
+        rows.extend(source_viewer_rows(
+            SourceViewerInput {
+                label: text(payload, "path").unwrap_or_default(),
+                contents,
+                start_line: payload
+                    .get("start_line")
+                    .and_then(Value::as_u64)
+                    .and_then(|line| usize::try_from(line).ok())
+                    .unwrap_or(1),
+                max_lines: 30,
+                truncated_message: "preview truncated",
+                line_numbers: numbered,
+            },
             width,
         ));
     }
@@ -264,10 +276,6 @@ fn card_header(title_text: &str) -> Vec<Line> {
         Span::styled("◆ ", accent()),
         Span::styled(title_text.to_owned(), title()),
     ])]
-}
-
-fn preview_lines(contents: &str, syntax_hint: &str, width: u16) -> Vec<Line> {
-    source_preview_lines(contents, &SourcePreviewOptions::new(syntax_hint, width))
 }
 
 fn preview_lines_with_options(contents: &str, options: &SourcePreviewOptions<'_>) -> Vec<Line> {
@@ -513,10 +521,11 @@ mod tests {
     }
 
     #[test]
-    fn renders_read_contents_with_syntax_spans() {
+    fn renders_read_contents_with_syntax_spans_and_absolute_line_numbers() {
         let payload = serde_json::json!({
             "path": "src/lib.rs",
-            "contents": "pub fn main() {}",
+            "contents": "pub fn main() {}\nlet value = 1;",
+            "start_line": 9,
             "truncated": false
         });
         let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
@@ -525,13 +534,35 @@ mod tests {
             &payload,
             80,
         );
+        let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(rendered.contains("9 │ pub fn main() {}"), "{rendered}");
+        assert!(rendered.contains("10 │ let value = 1;"), "{rendered}");
 
         assert!(
             rows.iter()
                 .flat_map(|line| line.spans.iter())
-                .any(|span| span.content.as_str() == "pub" && span.style.fg.is_some()),
+                .any(|span| span.content.as_str() == "p" && span.style.fg.is_some()),
             "expected highlighted Rust source spans: {rows:?}"
         );
+    }
+
+    #[test]
+    fn artifact_reads_use_unnumbered_source_cards() {
+        let payload = serde_json::json!({
+            "path": "trace.txt",
+            "contents": "partial bytes",
+            "offset_bytes": 12,
+            "truncated": true
+        });
+        let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            &FilesystemTuiVisualAdapter,
+            "bcode.filesystem.artifact.read",
+            &payload,
+            80,
+        );
+        let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(rendered.contains("partial bytes"), "{rendered}");
+        assert!(!rendered.contains("1 │ partial bytes"), "{rendered}");
     }
 
     #[test]
