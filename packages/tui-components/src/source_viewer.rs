@@ -169,9 +169,7 @@ pub(crate) const fn muted_style() -> Style {
 }
 
 pub(crate) const fn gutter_style() -> Style {
-    Style::new()
-        .fg(Color::BrightBlack)
-        .bg(Color::Rgb(30, 30, 30))
+    Style::new().fg(Color::BrightBlack)
 }
 
 pub(crate) fn pad_card_spans(spans: &mut Vec<Span>, target_width: usize, style: Style) {
