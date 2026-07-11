@@ -1796,6 +1796,7 @@ dependencies = [
 name = "bcode_metrics_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_client",
  "bcode_command",
  "bcode_metrics",
  "bcode_plugin_sdk",

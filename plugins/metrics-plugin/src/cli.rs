@@ -15,6 +15,18 @@ use crate::tui::METRICS_DASHBOARD_SURFACE_KIND;
     about = "Open the persisted performance metrics dashboard"
 )]
 struct MetricsCli {
+    /// Print the current in-memory metrics snapshot as JSON.
+    #[arg(long)]
+    json: bool,
+    /// Print the persisted metrics report as JSON.
+    #[arg(long)]
+    report: bool,
+    /// Analyze the persisted metrics report.
+    #[arg(long)]
+    analyze: bool,
+    /// Write a standalone HTML dashboard.
+    #[arg(long)]
+    html: Option<PathBuf>,
     /// Metrics event log path. Defaults to Bcode's persisted metrics store.
     #[arg(long)]
     path: Option<PathBuf>,
@@ -33,6 +45,37 @@ pub(super) fn registration() -> StaticCliRegistration {
 fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
     Box::pin(async move {
         let cli = MetricsCli::from_arg_matches(&matches).map_err(|error| error.to_string())?;
+        if cli.json || cli.report || cli.analyze || cli.html.is_some() {
+            let status = bcode_client::BcodeClient::default_endpoint()
+                .server_status()
+                .await
+                .map_err(|error| error.to_string())?;
+            if let Some(path) = cli.html {
+                let payload = serde_json::to_string_pretty(&status.metrics_report)
+                    .map_err(|error| error.to_string())?;
+                std::fs::write(&path, payload).map_err(|error| error.to_string())?;
+                println!("metrics report: {}", path.display());
+            } else if cli.analyze {
+                let analysis = bcode_metrics::analyze_metrics_report(&status.metrics_report);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&analysis).map_err(|error| error.to_string())?
+                );
+            } else if cli.report {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&status.metrics_report)
+                        .map_err(|error| error.to_string())?
+                );
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&status.metrics)
+                        .map_err(|error| error.to_string())?
+                );
+            }
+            return Ok(StaticCliOutcome::default());
+        }
         let mut options = BTreeMap::new();
         if let Some(path) = cli.path {
             options.insert(
