@@ -14,6 +14,7 @@ use bcode_ipc::{Event, PermissionSummary, ServerStatus, default_endpoint};
 use bcode_model_provider_runtime::{
     BlockingModelProviderInvoker, SingleTurnRequest, SingleTurnStatus, run_single_turn_blocking,
 };
+use bcode_plugin_sdk::path::{display, display_from_current_dir};
 use bcode_session_import::{
     DiscoverImportableSessionsRequest, DiscoverImportableSessionsResponse,
     ListImportSourcesResponse, OP_DISCOVER_IMPORTABLE_SESSIONS, OP_LIST_IMPORT_SOURCES,
@@ -1352,7 +1353,7 @@ async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
             let path = bcode_config::ignore_model_in_state(&provider, model_id.clone())?;
             println!(
                 "Ignored model '{model_id}' for provider '{provider}' in {}",
-                path.display()
+                display_from_current_dir(&path)
             );
         }
         ModelCommand::Unignore { model_id, provider } => {
@@ -1360,7 +1361,7 @@ async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
             let path = bcode_config::unignore_model_in_state(&provider, &model_id)?;
             println!(
                 "Removed state ignore for model '{model_id}' and provider '{provider}' in {}",
-                path.display()
+                display_from_current_dir(&path)
             );
         }
         ModelCommand::Ignored { provider } => {
@@ -2977,10 +2978,10 @@ fn auth_profile_list() -> Result<(), CliError> {
             summary.scheme.as_deref().unwrap_or("-"),
             summary.provider.as_deref().unwrap_or("-"),
             summary.storage_profile.as_deref().unwrap_or("-"),
-            summary
-                .vault
-                .as_ref()
-                .map_or_else(|| "-".to_string(), |vault| vault.display().to_string())
+            summary.vault.as_ref().map_or_else(
+                || "-".to_string(),
+                |vault| display_from_current_dir(vault).to_string()
+            )
         );
     }
     Ok(())
@@ -3008,7 +3009,7 @@ fn auth_profile_show(profile: &str) -> Result<(), CliError> {
         println!("Storage profile: {storage_profile}");
     }
     if let Some(vault) = summary.vault {
-        println!("Vault: {}", vault.display());
+        println!("Vault: {}", display_from_current_dir(&vault));
     }
     Ok(())
 }
@@ -3188,7 +3189,7 @@ fn auth_pool_profile_vault(config: &bcode_config::BcodeConfig, profile: &str) ->
         .into_iter()
         .find(|summary| summary.profile == profile)
         .and_then(|summary| summary.vault)
-        .map(|vault| vault.display().to_string())
+        .map(|vault| display_from_current_dir(&vault).to_string())
 }
 
 fn auth_pool_reset_cooldown(pool_name: &str, profile: Option<&str>) {
@@ -3278,7 +3279,10 @@ fn auth_status() -> Result<(), CliError> {
         storage_profile,
         policy,
     );
-    println!("  Vault: {}", security_status.vault_path.display());
+    println!(
+        "  Vault: {}",
+        display_from_current_dir(&security_status.vault_path)
+    );
     println!("  Vault exists: {}", security_status.vault_exists);
     match security_status.vault_version {
         Some(version) => println!("  Vault format: v{version}"),
@@ -3998,7 +4002,7 @@ fn open_auth_store(vault_path: &Path) -> Result<sshenv_vault::SshenvStore, CliEr
         let archive_path = archive_incompatible_auth_vault(vault_path, &error)?;
         println!(
             "Archived incompatible auth vault to {}; initialized a fresh Bcode-managed auth vault.",
-            archive_path.display()
+            display_from_current_dir(&archive_path)
         );
         initialize_auth_vault(vault_path, &store, &managed_recipient_key)?;
     }
@@ -4030,14 +4034,14 @@ fn archive_incompatible_auth_vault(
         fs::rename(vault_path, &archive_path).map_err(|error| {
             CliError::BundledPluginInstallFailed(format!(
                 "failed to archive incompatible auth vault {} after Bcode-managed unlock failed ({unlock_error}): {error}",
-                vault_path.display()
+                display_from_current_dir(vault_path)
             ))
         })?;
         return Ok(archive_path);
     }
     Err(CliError::BundledPluginInstallFailed(format!(
         "failed to choose archive path for incompatible auth vault {} after Bcode-managed unlock failed ({unlock_error})",
-        vault_path.display()
+        display_from_current_dir(vault_path)
     )))
 }
 
@@ -4328,7 +4332,9 @@ fn report_login_completion(
             println!("Config is declarative; no config file update needed.");
         }
         LoginConfigUpdate::Writable => match update_config() {
-            Ok(config_path) => println!("Config updated: {}", config_path.display()),
+            Ok(config_path) => {
+                println!("Config updated: {}", display_from_current_dir(&config_path));
+            }
             Err(error) => {
                 eprintln!("Config update failed: {error}");
                 eprintln!(
@@ -4868,7 +4874,7 @@ fn list_plugins(roots: &[std::path::PathBuf]) -> Result<(), CliError> {
             plugin.manifest.id,
             plugin.manifest.version,
             plugin.manifest.name,
-            plugin.manifest_path.display()
+            display_from_current_dir(&plugin.manifest_path)
         );
     }
     Ok(())
@@ -5271,7 +5277,7 @@ fn verify_models(
             fs::create_dir_all(parent)?;
         }
         fs::write(&output, body)?;
-        println!("wrote {}", output.display());
+        println!("wrote {}", display_from_current_dir(&output));
     } else {
         println!("{body}");
     }
@@ -5665,7 +5671,7 @@ async fn server_status(verbose: bool) -> Result<(), CliError> {
     if verbose {
         print_metrics_summary(&status.metrics);
     }
-    println!("log: {}", daemon_log_path().display());
+    println!("log: {}", display_from_current_dir(daemon_log_path()));
     for session in status.sessions {
         println!(
             "{}\t{}\t{} clients",
@@ -6296,7 +6302,7 @@ fn print_semantic_migration_audit(
     report: &bcode_session::semantic_migration::SemanticMigrationAuditReport,
 ) {
     println!("semantic migration audit");
-    println!("root: {}", report.root.display());
+    println!("root: {}", display_from_current_dir(&report.root));
     println!("sessions scanned: {}", report.sessions_scanned);
     println!("sessions decoded: {}", report.sessions_decoded);
     println!("events scanned: {}", report.events_scanned);
@@ -6352,7 +6358,7 @@ fn print_semantic_migration_audit(
                 "  {:?}: {} ({})",
                 issue.issue,
                 issue.detail,
-                issue.path.display()
+                display_from_current_dir(&issue.path)
             );
         }
     }
@@ -6508,9 +6514,9 @@ fn discover_session_ids(root: &Path) -> Result<Vec<SessionId>, CliError> {
 fn print_repair_report(report: &bcode_session::repair::RepairReport) {
     println!("target: {}", repair_target_label(&report.target));
     println!("status: {:?}", report.status);
-    println!("db: {}", report.db_path.display());
+    println!("db: {}", display_from_current_dir(&report.db_path));
     if let Some(backup_path) = &report.backup_path {
-        println!("backup: {}", backup_path.display());
+        println!("backup: {}", display_from_current_dir(backup_path));
     }
     if let Some(error) = &report.initial_error {
         println!("initial error: {error}");
@@ -6705,10 +6711,10 @@ async fn handle_session_import_command(command: SessionImportCommand) -> Result<
             } else {
                 for session in sessions.sessions {
                     let title = session.title.as_deref().unwrap_or("<untitled>");
-                    let cwd = session
-                        .working_directory
-                        .as_ref()
-                        .map_or_else(|| "-".to_owned(), |cwd| cwd.display().to_string());
+                    let cwd = session.working_directory.as_ref().map_or_else(
+                        || "-".to_owned(),
+                        |cwd| display_from_current_dir(cwd).to_string(),
+                    );
                     let messages = session
                         .message_count
                         .map_or_else(|| "-".to_owned(), |count| count.to_string());
@@ -7051,8 +7057,8 @@ fn print_non_trace_session_event(event: &SessionEvent) {
             println!(
                 "#{} working directory changed: {} -> {}",
                 event.sequence,
-                old_working_directory.display(),
-                new_working_directory.display()
+                display(old_working_directory, old_working_directory),
+                display(new_working_directory, old_working_directory)
             );
         }
         SessionEventKind::SessionImported {
