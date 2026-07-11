@@ -65,10 +65,6 @@ pub enum CliError {
     Json(#[from] serde_json::Error),
     #[error("settings error: {0}")]
     Settings(#[from] bcode_settings::SettingsError),
-    #[error("skill error: {0}")]
-    Skill(#[from] bcode_skill::SkillRegistryError),
-    #[error("skill model error: {0}")]
-    SkillModel(#[from] bcode_skill_models::SkillError),
     #[error("TUI error: {0}")]
     Tui(#[from] bcode_tui::TuiError),
     #[error("plugin error: {0}")]
@@ -87,10 +83,6 @@ pub enum CliError {
     LoginProfile(String),
     #[error("Blims error: {0}")]
     Blims(String),
-    #[error("eval error: {0}")]
-    Eval(#[from] bcode_eval::EvalError),
-    #[error("eval check failed: {0}")]
-    EvalCheckFailed(String),
     #[error("bundled plugin install failed: {0}")]
     BundledPluginInstallFailed(String),
     #[error("plugin service error {code}: {message}")]
@@ -103,11 +95,6 @@ pub enum CliError {
     PluginCli(String),
     #[error("{0}")]
     AuthPrimeFailed(String),
-    #[error("skill check failed: {warning_count} warnings, {error_count} errors")]
-    SkillCheckFailed {
-        warning_count: usize,
-        error_count: usize,
-    },
 }
 
 use std::sync::OnceLock;
