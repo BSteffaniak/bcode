@@ -846,7 +846,7 @@ pub async fn collect_compaction_summary_once(
         return Err("compaction cancelled".to_string());
     }
     let provider_turn_id = if let Some(context) = &mut command_context {
-        match wait_for_provider_call(
+        match wait_for_finalizable_provider_call(
             state,
             session_id,
             context,
@@ -860,8 +860,18 @@ pub async fn collect_compaction_summary_once(
         )
         .await
         {
-            ProviderCallWait::Completed(result) => result?.provider_turn_id,
-            ProviderCallWait::Cancelled => return Err("compaction cancelled".to_string()),
+            FinalizedProviderCall::Completed(result) => result?.provider_turn_id,
+            FinalizedProviderCall::Cancelled(result) => {
+                if let Ok(response) = result {
+                    finish_provider_turn(
+                        state,
+                        selection.provider_plugin_id.clone(),
+                        response.provider_turn_id,
+                    )
+                    .await;
+                }
+                return Err("compaction cancelled".to_string());
+            }
         }
     } else {
         invoke_model_provider_json_blocking::<_, StartTurnResponse>(
@@ -886,7 +896,15 @@ pub async fn collect_compaction_summary_once(
         )
         .await
     } else {
-        poll_compaction_summary(state, session_id, selection, &provider_turn_id, &turn_id).await
+        poll_compaction_summary(
+            state,
+            session_id,
+            selection,
+            &provider_turn_id,
+            &turn_id,
+            cancel_state,
+        )
+        .await
     }
     .map_err(compaction_error_detail);
     finish_provider_turn(
@@ -1107,7 +1125,7 @@ pub async fn wait_for_compaction_progress_actor_aware(
                 let _sent = command.response.send(cancelled);
             }
             if cancel_state.is_cancelled() {
-                Err(CompactionError::Provider("compaction cancelled".to_string()))
+                Err(CompactionError::Cancelled)
             } else {
                 Ok(idle_for)
             }
@@ -1134,6 +1152,7 @@ pub async fn poll_compaction_summary(
     selection: &SessionModelSelection,
     provider_turn_id: &str,
     turn_id: &str,
+    cancel_state: &TurnCancelState,
 ) -> Result<String, CompactionError> {
     let mut summary = String::new();
     let mut idle_for = Duration::ZERO;
@@ -1141,16 +1160,18 @@ pub async fn poll_compaction_summary(
         let poll = PollTurnEventsRequest {
             provider_turn_id: provider_turn_id.to_string(),
         };
-        let response = poll_model_turn(
-            state,
-            session_id,
-            selection.provider_plugin_id.as_deref(),
-            &poll,
-        )
-        .await
-        .map_err(CompactionError::Provider)?;
+        let response = tokio::select! {
+            () = cancel_state.cancelled() => return Err(CompactionError::Cancelled),
+            response = poll_model_turn(
+                state,
+                session_id,
+                selection.provider_plugin_id.as_deref(),
+                &poll,
+            ) => response.map_err(CompactionError::Provider)?,
+        };
         if response.events.is_empty() {
-            idle_for = wait_for_compaction_progress(&state.model_streaming, idle_for).await?;
+            idle_for = wait_for_compaction_progress(&state.model_streaming, idle_for, cancel_state)
+                .await?;
             continue;
         }
         let saw_progress = compaction_events_include_progress(&response.events);
@@ -1161,8 +1182,12 @@ pub async fn poll_compaction_summary(
                 if saw_progress {
                     idle_for = Duration::ZERO;
                 } else {
-                    idle_for =
-                        wait_for_compaction_progress(&state.model_streaming, idle_for).await?;
+                    idle_for = wait_for_compaction_progress(
+                        &state.model_streaming,
+                        idle_for,
+                        cancel_state,
+                    )
+                    .await?;
                 }
             }
             CompactionPollStatus::Finished => return Ok(summary),
@@ -1187,6 +1212,7 @@ pub const fn compaction_event_is_progress(event: &ProviderTurnEvent) -> bool {
 pub async fn wait_for_compaction_progress(
     streaming: &bcode_config::StreamingConfig,
     idle_for: Duration,
+    cancel_state: &TurnCancelState,
 ) -> Result<Duration, CompactionError> {
     let idle_for = idle_for.saturating_add(MODEL_POLL_INTERVAL);
     let timeout = Duration::from_secs(streaming.no_progress_timeout_secs);
@@ -1196,8 +1222,10 @@ pub async fn wait_for_compaction_progress(
             timeout.as_secs()
         )));
     }
-    tokio::time::sleep(MODEL_POLL_INTERVAL).await;
-    Ok(idle_for)
+    tokio::select! {
+        () = tokio::time::sleep(MODEL_POLL_INTERVAL) => Ok(idle_for),
+        () = cancel_state.cancelled() => Err(CompactionError::Cancelled),
+    }
 }
 
 pub enum CompactionPollStatus {

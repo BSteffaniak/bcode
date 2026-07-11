@@ -369,6 +369,11 @@ enum ProviderCallWait<T> {
     Cancelled,
 }
 
+enum FinalizedProviderCall<T> {
+    Completed(T),
+    Cancelled(T),
+}
+
 struct RuntimeCommandContext<'a> {
     followup_commands: &'a mut mpsc::Receiver<FollowupCommand>,
     steering_commands: &'a mut mpsc::Receiver<SteeringCommand>,
@@ -6089,6 +6094,58 @@ async fn process_steering_message_command(
     };
     if let Some(sender) = completion_sender {
         let _sent = sender.send(completion);
+    }
+}
+
+async fn wait_for_finalizable_provider_call<'a, T>(
+    state: &ServerState,
+    session_id: SessionId,
+    context: &mut RuntimeCommandContext<'_>,
+    cancel_state: &TurnCancelState,
+    mut provider_call: ProviderCallFuture<'a, T>,
+) -> FinalizedProviderCall<T>
+where
+    T: Send + 'a,
+{
+    loop {
+        tokio::select! {
+            result = &mut provider_call => return FinalizedProviderCall::Completed(result),
+            cancel_command = context.cancel_commands.recv() => {
+                if let Some(command) = cancel_command {
+                    let cancelled = process_cancel_turn_command(
+                        state,
+                        session_id,
+                        context.followup_commands,
+                        context.queued_followups,
+                        command.clear_queue,
+                        command.requested_by,
+                    )
+                    .await;
+                    let _sent = command.response.send(cancelled);
+                }
+                if cancel_state.is_cancelled() {
+                    return FinalizedProviderCall::Cancelled(provider_call.await);
+                }
+            }
+            steering_command = context.steering_commands.recv() => {
+                if let Some(command) = steering_command {
+                    process_steering_message_command(
+                        state,
+                        session_id,
+                        command.client_id,
+                        command.text,
+                        command.completion,
+                    )
+                    .await;
+                }
+                if cancel_state.is_cancelled() {
+                    return FinalizedProviderCall::Cancelled(provider_call.await);
+                }
+            }
+            () = cancel_state.cancelled() => {
+                return FinalizedProviderCall::Cancelled(provider_call.await);
+            }
+        }
     }
 }
 
