@@ -6,6 +6,7 @@
 
 use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_metrics::MetricsSnapshot;
+use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_session_models::{
     ClientId, ProjectionWindowRequest, RuntimeWorkId, RuntimeWorkKind, RuntimeWorkStatus,
     SessionEvent, SessionHistoryPage, SessionHistoryQuery, SessionId, SessionInputHistoryEntry,
@@ -1787,7 +1788,7 @@ fn prepare_unix_socket_path_for_bind(path: &Path) -> Result<(), IpcTransportErro
             std::io::ErrorKind::AddrInUse,
             format!(
                 "refusing to replace live IPC socket {}; another bcode daemon is listening",
-                path.display()
+                display_from_current_dir(path)
             ),
         )
         .into()),

@@ -4,6 +4,7 @@
 //! them because they may inspect and mutate WAL sidecar files after creating backups.
 
 use crate::{db, lease};
+use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_session_models::SessionId;
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
@@ -304,7 +305,7 @@ where
         "truncate_wal_tail",
         &format!(
             "truncate {} from {} to {} bytes to remove incomplete final frame",
-            wal_repair.path.display(),
+            display_from_current_dir(&wal_repair.path),
             wal_repair.current_len,
             wal_repair.truncate_len
         ),

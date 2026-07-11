@@ -1,5 +1,6 @@
 //! Home page for the Bcode web renderer.
 
+use bcode_plugin_sdk::path::display_from_current_dir;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
@@ -116,7 +117,7 @@ pub fn home(
                         @for session in sessions {
                             anchor href=(format!("/session/{}?token={access_token}&hyperchad-event-scope={access_token}:{}", session.id, session.id)) text-decoration="none" {
                                 div color="#f0f6fc" font-size=13 { (session.title().unwrap_or("Untitled session")) }
-                                div color="#8b949e" font-size=11 { (session.working_directory.display().to_string()) }
+                                div color="#8b949e" font-size=11 { (display_from_current_dir(&session.working_directory).to_string()) }
                             }
                         }
                     }
@@ -135,7 +136,7 @@ pub fn home(
                                 }
                             }
                             div color="#8b949e" font-size=12 {
-                                (snapshot.working_directory.as_ref().map_or_else(|| "—".to_string(), |path| path.display().to_string()))
+                                (snapshot.working_directory.as_ref().map_or_else(|| "—".to_string(), |path| display_from_current_dir(path).to_string()))
                             }
                         }
                     }

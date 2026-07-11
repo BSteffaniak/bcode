@@ -5,6 +5,7 @@
 mod bmux_host_adapter;
 
 use bcode_plugin_sdk::interaction::PluginInteractionRegistry;
+use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::tui::PluginTuiRegistry;
 use bcode_plugin_sdk::{
     CURRENT_PLUGIN_ABI_VERSION, CommandRegistrationCallback, DEFAULT_NATIVE_ACTIVATE_SYMBOL,
@@ -3417,7 +3418,7 @@ pub fn load_registered_plugin(plugin: &RegisteredPlugin) -> Result<LoadedPlugin,
     tracing::debug!(
         target: "bcode_plugin::startup",
         plugin_id = %plugin.manifest.id,
-        library = %library_path.display(),
+        library = %display_from_current_dir(&library_path),
         "loading native library"
     );
     let library =

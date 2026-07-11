@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bcode_plugin_sdk = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_session_view_models = { workspace = true }
 hyperchad = { workspace = true, features = [
