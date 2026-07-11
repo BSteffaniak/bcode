@@ -11,6 +11,7 @@ use bcode_command::{
     COMMAND_INTERFACE_ID, CommandAction, CommandContribution, CommandEffect, CommandOwner,
     CommandSurface, InvokeCommandRequest, InvokeCommandResponse, OP_INVOKE_COMMAND,
 };
+use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
@@ -146,11 +147,14 @@ fn list_worktrees_command(request: &InvokeCommandRequest) -> ServiceResponse {
         .map_or_else(current_dir, PathBuf::from);
     match bcode_worktree::list_worktrees(&cwd) {
         Ok(response) => {
-            let mut lines = vec![format!("Worktrees for {}", response.repo_root.display())];
+            let mut lines = vec![format!(
+                "Worktrees for {}",
+                display(&response.repo_root, &cwd)
+            )];
             lines.extend(response.worktrees.into_iter().map(|worktree| {
                 let marker = if worktree.is_main { "main" } else { "linked" };
                 let branch = worktree.branch.unwrap_or_else(|| "<detached>".to_owned());
-                format!("* {marker} {branch} — {}", worktree.path.display())
+                format!("* {marker} {branch} — {}", display(&worktree.path, &cwd))
             }));
             json_response(&InvokeCommandResponse {
                 success: true,

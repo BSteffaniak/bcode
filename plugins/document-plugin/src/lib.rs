@@ -6,6 +6,7 @@
 mod document_tui;
 
 use bcode_model_provider_runtime::ProviderRuntime;
+use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
@@ -60,16 +61,25 @@ impl RustPlugin for DocumentPlugin {
 struct ProgressReporter {
     events: ServiceEventEmitter,
     tool_call_id: String,
+    working_directory: PathBuf,
     sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ProgressReporter {
-    fn new(events: ServiceEventEmitter, tool_call_id: String) -> Self {
+    fn new(events: ServiceEventEmitter, tool_call_id: String, working_directory: PathBuf) -> Self {
         Self {
             events,
             tool_call_id,
+            working_directory,
             sequence: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    fn emit_path(&self, label: &str, path: &Path) {
+        self.emit(format!(
+            "{label}: {}",
+            display(path, &self.working_directory)
+        ));
     }
 
     fn emit(&self, message: impl Into<String>) {
@@ -139,7 +149,11 @@ impl DocumentPlugin {
             Err(error) => return tool_error(format!("document runtime unavailable: {error}")),
         };
         let artifact_dir = invocation.artifact_dir.clone();
-        let progress = ProgressReporter::new(events, invocation.tool_call_id.clone());
+        let progress = ProgressReporter::new(
+            events,
+            invocation.tool_call_id.clone(),
+            invocation.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
+        );
         progress.emit("document extraction started");
         match runtime.block_on(extract_async(request, artifact_dir, Some(progress))) {
             Ok(Ok(response)) => json_tool_response_with_artifact(
@@ -247,13 +261,13 @@ async fn extract_async(
             )
             .await?;
             if let Some(progress) = &progress {
-                progress.emit(format!("document downloaded: {}", path.display()));
+                progress.emit_path("document downloaded", &path);
             }
             path
         }
         DocumentSource::Path(path) => {
             if let Some(progress) = &progress {
-                progress.emit(format!("document source path: {}", path.display()));
+                progress.emit_path("document source path", path);
             }
             path.clone()
         }
@@ -433,7 +447,7 @@ async fn download_document(
     let path = artifact_root.join(format!("{}.{extension}", stable_name(&final_url)));
     std::fs::write(&path, &bytes[..bytes.len().min(max_bytes)])?;
     if let Some(progress) = &progress {
-        progress.emit(format!("document artifact written: {}", path.display()));
+        progress.emit_path("document artifact written", &path);
     }
     Ok(path)
 }
