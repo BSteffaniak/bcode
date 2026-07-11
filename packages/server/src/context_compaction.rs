@@ -854,15 +854,32 @@ pub async fn collect_compaction_summary_once(
             }
         }
     } else {
-        invoke_model_provider_json_blocking::<_, StartTurnResponse>(
-            state,
-            selection.provider_plugin_id.clone(),
-            OP_START_TURN,
-            request,
+        match finalize_provider_call_after_cancellation(
+            cancel_state,
+            Box::pin(invoke_model_provider_json_blocking::<_, StartTurnResponse>(
+                state,
+                selection.provider_plugin_id.clone(),
+                OP_START_TURN,
+                request,
+            )),
         )
         .await
-        .map_err(CompactionError::Provider)?
-        .provider_turn_id
+        {
+            FinalizedProviderCall::Completed(result) => {
+                result.map_err(CompactionError::Provider)?.provider_turn_id
+            }
+            FinalizedProviderCall::Cancelled(result) => {
+                if let Ok(response) = result {
+                    finish_provider_turn(
+                        state,
+                        selection.provider_plugin_id.clone(),
+                        response.provider_turn_id,
+                    )
+                    .await;
+                }
+                return Err(CompactionError::Cancelled);
+            }
+        }
     };
 
     let result = if let Some(context) = command_context {
@@ -1529,5 +1546,25 @@ mod cancellation_tests {
         .await;
 
         assert!(matches!(result, Err(CompactionError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn cancellation_waits_for_started_provider_call_to_be_finalizable() {
+        let cancel_state = TurnCancelState::default();
+        cancel_state.cancel();
+
+        let outcome = finalize_provider_call_after_cancellation(
+            &cancel_state,
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                "provider-turn-id"
+            }),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            FinalizedProviderCall::Cancelled("provider-turn-id")
+        ));
     }
 }

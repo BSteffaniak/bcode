@@ -374,6 +374,19 @@ enum FinalizedProviderCall<T> {
     Cancelled(T),
 }
 
+async fn finalize_provider_call_after_cancellation<'a, T>(
+    cancel_state: &TurnCancelState,
+    mut provider_call: ProviderCallFuture<'a, T>,
+) -> FinalizedProviderCall<T>
+where
+    T: Send + 'a,
+{
+    tokio::select! {
+        result = &mut provider_call => FinalizedProviderCall::Completed(result),
+        () = cancel_state.cancelled() => FinalizedProviderCall::Cancelled(provider_call.await),
+    }
+}
+
 struct RuntimeCommandContext<'a> {
     followup_commands: &'a mut mpsc::Receiver<FollowupCommand>,
     steering_commands: &'a mut mpsc::Receiver<SteeringCommand>,
@@ -10305,6 +10318,10 @@ async fn compact_session_after_context_overflow(
             .await;
             Ok(())
         }
+        Err(CompactionError::Cancelled) => Err(ModelTurnCompletion::with_message(
+            ModelTurnOutcome::Cancelled,
+            "model turn cancelled",
+        )),
         Err(error) => {
             let message = format!("context overflow compaction failed: {error}");
             append_system_event(state, session_id, message.clone()).await;
