@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use bcode_config::{TuiAccentTransitionCurve, TuiConfig, TuiThemeConfig, TuiThinkingConfig};
+use bcode_plugin_sdk::path::display;
 use bcode_session_models::{
     LiveToolArgumentPreview, ModelTurnOutcome, ProviderStreamEvent, RuntimeWorkStatus,
     SessionEvent, SessionEventKind, SessionHistoryCursor, SessionId, SessionInputHistoryEntry,
@@ -2686,7 +2687,10 @@ impl BmuxApp {
         let message =
             working_directory_changed_message(old_working_directory, new_working_directory);
         self.transcript.push(TranscriptItem::new("System", message));
-        self.status = format!("working directory: {}", new_working_directory.display());
+        self.status = format!(
+            "working directory: {}",
+            display(new_working_directory, old_working_directory)
+        );
     }
 
     fn push_streaming_item(&mut self, role: &'static str, text: &str) {
@@ -4216,8 +4220,8 @@ fn working_directory_changed_message(
 ) -> String {
     format!(
         "Working directory changed from `{}` to `{}`. Treat prior file/path assumptions as possibly stale unless reconfirmed.",
-        old_working_directory.display(),
-        new_working_directory.display()
+        display(old_working_directory, old_working_directory),
+        display(new_working_directory, old_working_directory)
     )
 }
 

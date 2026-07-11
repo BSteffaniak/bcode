@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use bcode_plugin_sdk::path::display;
 use bcode_session_models::{
     SessionEvent, SessionEventKind, SessionTokenUsage, ToolArtifact, ToolInvocationProjection,
     ToolInvocationResult, ToolInvocationStreamEvent,
@@ -1242,8 +1243,8 @@ fn working_directory_changed_message(
 ) -> String {
     format!(
         "Working directory changed from `{}` to `{}`. Treat prior file/path assumptions as possibly stale unless reconfirmed.",
-        old_working_directory.display(),
-        new_working_directory.display()
+        display(old_working_directory, old_working_directory),
+        display(new_working_directory, old_working_directory)
     )
 }
 

@@ -826,8 +826,8 @@ impl WorktreeCommandSurface {
         match bcode_worktree::create_worktree(&config, &request, &self.repo_path) {
             Ok(response) => bcode_plugin_sdk::tui::PluginTuiAction::Close {
                 outcome: Some(serde_json::json!({
-                    "status": format!("created worktree {}", response.path.display()),
-                    "append_text": format!("Created worktree: {}", response.path.display()),
+                    "status": format!("created worktree {}", display(&response.path, &self.repo_path)),
+                    "append_text": format!("Created worktree: {}", display(&response.path, &self.repo_path)),
                     "set_session_working_directory": response.path.display().to_string(),
                 })),
             },
@@ -873,8 +873,8 @@ impl WorktreeCommandSurface {
         };
         bcode_plugin_sdk::tui::PluginTuiAction::Close {
             outcome: Some(serde_json::json!({
-                "status": format!("attaching worktree {}", worktree.path.display()),
-                "append_text": format!("Attaching session to worktree: {}", worktree.path.display()),
+                "status": format!("attaching worktree {}", display(&worktree.path, &self.repo_path)),
+                "append_text": format!("Attaching session to worktree: {}", display(&worktree.path, &self.repo_path)),
                 "set_session_working_directory": worktree.path.display().to_string(),
             })),
         }
@@ -891,8 +891,8 @@ impl WorktreeCommandSurface {
         match bcode_worktree::remove_worktree(&self.repo_path, &worktree.path, false) {
             Ok(response) => bcode_plugin_sdk::tui::PluginTuiAction::Close {
                 outcome: Some(serde_json::json!({
-                    "status": format!("removed worktree {}", response.path.display()),
-                    "append_text": format!("Removed worktree: {}", response.path.display()),
+                    "status": format!("removed worktree {}", display(&response.path, &self.repo_path)),
+                    "append_text": format!("Removed worktree: {}", display(&response.path, &self.repo_path)),
                 })),
             },
             Err(error) => {
@@ -922,7 +922,10 @@ fn worktree_surface_state(
             lines.extend(worktrees.iter().map(|worktree| {
                 let marker = if worktree.is_main { "main" } else { "linked" };
                 let branch = worktree.branch.as_deref().unwrap_or("<detached>");
-                format!("* {marker} {branch} — {}", worktree.path.display())
+                format!(
+                    "* {marker} {branch} — {}",
+                    display(&worktree.path, repo_path)
+                )
             }));
             (lines, worktrees)
         }

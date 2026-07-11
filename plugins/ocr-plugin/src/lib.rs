@@ -6,6 +6,7 @@
 mod ocr_tui;
 
 use bcode_model_provider_runtime::ProviderRuntime;
+use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
@@ -144,6 +145,7 @@ impl OcrPlugin {
         match runtime.block_on(extract_async(
             request,
             invocation.artifact_dir.clone(),
+            invocation.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
             Some(progress),
         )) {
             Ok(Ok(response)) => ocr_tool_response(&response, &invocation.tool_call_id),
@@ -276,6 +278,7 @@ enum OcrError {
 async fn extract_async(
     request: ExtractRequest,
     artifact_dir: Option<PathBuf>,
+    working_directory: PathBuf,
     progress: Option<ProgressReporter>,
 ) -> Result<ExtractResponse, OcrError> {
     validate_options(request.options.as_ref())?;
@@ -306,7 +309,10 @@ async fn extract_async(
         }
     };
     if let Some(progress) = &progress {
-        progress.emit(format!("OCR source path: {}", input_path.display()));
+        progress.emit(format!(
+            "OCR source path: {}",
+            display(&input_path, &working_directory)
+        ));
         progress.emit(format!("{engine} OCR started"));
     }
     let full_text = run_ocr_engine(
