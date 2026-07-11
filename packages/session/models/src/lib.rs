@@ -1806,6 +1806,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_context_usage_snapshot_defaults_new_attempt_identity_fields() {
+        let decoded: ContextUsageSnapshot = serde_json::from_str(
+            r#"{"provider_plugin_id":"provider","model_id":"model","input_tokens":42,"context_through_sequence":7,"source":"estimated"}"#,
+        )
+        .expect("legacy context usage should decode");
+
+        assert_eq!(decoded.request_id, None);
+        assert_eq!(decoded.model_turn_id, None);
+        assert_eq!(decoded.round, None);
+        assert_eq!(decoded.request_fingerprint, None);
+        assert_eq!(decoded.turn_id, None);
+        assert_eq!(decoded.auth_profile, None);
+        assert_eq!(decoded.estimated_input_tokens, None);
+        assert_eq!(decoded.context_format_version, None);
+        assert_eq!(decoded.compatibility_key, None);
+    }
+
+    #[test]
     fn semantic_tool_result_json_decodes_current_shapes() {
         for (payload, expected) in semantic_tool_result_fixtures() {
             let decoded: ToolInvocationResult =

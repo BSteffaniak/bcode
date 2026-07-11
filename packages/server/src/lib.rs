@@ -26,7 +26,7 @@ use context_compaction::{
     append_context_compaction_trace, automatic_compaction_policy,
     compact_session_context_before_sequence, compact_session_context_with_limit,
     compaction_capacity_tokens, maybe_auto_compact_session_context,
-    request_exceeds_compaction_capacity,
+    provider_context_management_capabilities, request_exceeds_compaction_capacity,
 };
 pub mod session_catalog;
 mod session_import;
@@ -469,7 +469,11 @@ impl SessionTurnPermit {
 type TurnCancelState = CancellationToken;
 
 #[derive(Debug, Clone)]
-struct ActiveModelTurn {
+struct ModelRequestAttempt {
+    request_id: String,
+    model_turn_id: String,
+    round: u32,
+    request_fingerprint: String,
     provider_plugin_id: Option<String>,
     provider_turn_id: String,
     reuse_key: Option<String>,
@@ -478,6 +482,8 @@ struct ActiveModelTurn {
     context_through_sequence: u64,
     model_id: String,
     auth_profile: Option<String>,
+    context_format_version: Option<u16>,
+    compatibility_key: Option<String>,
     portable_context: String,
     estimated_input_tokens: u64,
 }
@@ -487,7 +493,7 @@ struct RuntimeCurrentTurn {
     client_id: ClientId,
     turn_id: String,
     cancel_state: Arc<TurnCancelState>,
-    model: Option<ActiveModelTurn>,
+    model: Option<ModelRequestAttempt>,
 }
 
 impl RuntimeCurrentTurn {
@@ -522,6 +528,8 @@ struct ProviderStateKey {
     provider_plugin_id: String,
     model_id: String,
     auth_profile: Option<String>,
+    context_format_version: Option<u16>,
+    compatibility_key: Option<String>,
     stable_prompt_hash: String,
     tools_hash: String,
     parameters_hash: String,
@@ -1017,7 +1025,10 @@ impl ServerState {
         self.session_current_turn(session_id).await.is_some()
     }
 
-    async fn active_model_turn_snapshot(&self, session_id: SessionId) -> Option<ActiveModelTurn> {
+    async fn active_model_turn_snapshot(
+        &self,
+        session_id: SessionId,
+    ) -> Option<ModelRequestAttempt> {
         self.session_current_turn(session_id)
             .await
             .and_then(|turn| turn.model)
@@ -6163,7 +6174,10 @@ async fn finish_current_turn(context: &RuntimeCommandContext<'_>) {
     *current_turn = None;
 }
 
-async fn begin_provider_round(context: &RuntimeCommandContext<'_>, model_turn: ActiveModelTurn) {
+async fn begin_provider_round(
+    context: &RuntimeCommandContext<'_>,
+    model_turn: ModelRequestAttempt,
+) {
     let mut current_turn_guard = context.current_turn.lock().await;
     let Some(current_turn) = current_turn_guard.as_mut() else {
         debug_assert!(
@@ -6180,7 +6194,7 @@ async fn begin_provider_round(context: &RuntimeCommandContext<'_>, model_turn: A
     drop(current_turn_guard);
 }
 
-async fn finish_provider_round(context: &RuntimeCommandContext<'_>) -> Option<ActiveModelTurn> {
+async fn finish_provider_round(context: &RuntimeCommandContext<'_>) -> Option<ModelRequestAttempt> {
     let mut current_turn_guard = context.current_turn.lock().await;
     let Some(current_turn) = current_turn_guard.as_mut() else {
         debug_assert!(
@@ -6932,6 +6946,7 @@ async fn model_status_for_selection(
         .and_then(|model_id| model_reasoning_override(&selection.provider_context, model_id));
     let base_reasoning = selection
         .reasoning_capabilities
+        .clone()
         .or_else(|| model.as_ref().and_then(|model| model.reasoning.clone()));
     let history = if let Some(session_id) = session_id {
         state
@@ -6942,12 +6957,24 @@ async fn model_status_for_selection(
     } else {
         Vec::new()
     };
+    let context_format = provider_context_management_capabilities(state, &selection)
+        .await
+        .and_then(|capabilities| capabilities.context_format)
+        .filter(|format| format.version > 0 && !format.compatibility_key.trim().is_empty());
+    let active_auth_profile = selection.provider_context.auth_profile.as_deref();
     let context_usage = history.iter().rev().find_map(|event| match &event.kind {
         SessionEventKind::ContextUsageObserved { snapshot }
             if snapshot.provider_plugin_id
                 == selection.provider_plugin_id.as_deref().unwrap_or("<auto>")
                 && snapshot.model_id
-                    == model_id_for_provider_request(selection.model_id.as_deref()) =>
+                    == model_id_for_provider_request(selection.model_id.as_deref())
+                && snapshot.auth_profile.as_deref() == active_auth_profile
+                && snapshot.context_format_version
+                    == context_format.as_ref().map(|format| format.version)
+                && snapshot.compatibility_key.as_deref()
+                    == context_format
+                        .as_ref()
+                        .map(|format| format.compatibility_key.as_str()) =>
         {
             Some(snapshot)
         }
@@ -6962,6 +6989,9 @@ async fn model_status_for_selection(
             bcode_session_models::ContextUsageSource::Provider => "provider".to_string(),
             bcode_session_models::ContextUsageSource::Estimated => "estimated".to_string(),
         }),
+        auth_profile: selection.provider_context.auth_profile,
+        context_format_version: context_format.as_ref().map(|format| format.version),
+        compatibility_key: context_format.map(|format| format.compatibility_key),
         max_output_tokens,
         reasoning: merge_reasoning_override(base_reasoning, reasoning_override),
         reasoning_effort: selection.reasoning_effort,
@@ -10312,7 +10342,15 @@ async fn run_model_turn_round(
         }
     };
 
-    let active_model_turn = ActiveModelTurn {
+    let request_fingerprint = stable_json_hash(request);
+    let active_model_turn = ModelRequestAttempt {
+        request_id: request.turn_id.clone(),
+        model_turn_id: request
+            .turn_id
+            .rsplit_once('-')
+            .map_or_else(|| request.turn_id.clone(), |(turn, _)| turn.to_string()),
+        round: model_round_from_turn_id(&request.turn_id).unwrap_or_default(),
+        request_fingerprint,
         provider_plugin_id: provider_plugin_id.map(ToString::to_string),
         provider_turn_id: start.provider_turn_id.clone(),
         reuse_key: request.conversation_reuse.key.clone(),
@@ -10324,6 +10362,11 @@ async fn run_model_turn_round(
             .unwrap_or_default(),
         model_id: request.model_id.clone(),
         auth_profile: request.provider_context.auth_profile.clone(),
+        context_format_version: request
+            .metadata
+            .get("bcode_context_format_version")
+            .and_then(|value| value.parse().ok()),
+        compatibility_key: request.metadata.get("bcode_compatibility_key").cloned(),
         portable_context: bounded_portable_context(&request.messages),
         estimated_input_tokens: estimated_model_request_tokens(request),
     };
@@ -10902,6 +10945,8 @@ async fn handle_provider_turn_event(
             if let Ok(messages_json) = serde_json::to_string(&messages) {
                 let snapshot = bcode_session_models::ProviderContextSnapshot {
                     format_version: context_format.version,
+                    request_fingerprint: Some(active_turn.request_fingerprint.clone()),
+                    request_id: Some(active_turn.request_id.clone()),
                     provider_plugin_id: active_turn
                         .provider_plugin_id
                         .unwrap_or_else(|| "<auto>".to_string()),
@@ -11991,11 +12036,18 @@ async fn build_model_turn_request(
     let mut provider_context = selection.provider_context.clone();
     select_host_auth_pool_candidate(state, provider_plugin_id, &mut provider_context).await;
     let projection_timer = state.metrics.timer();
+    let context_format = compaction_policy
+        .capabilities
+        .as_ref()
+        .and_then(|capabilities| capabilities.context_format.as_ref())
+        .filter(|format| format.version > 0 && !format.compatibility_key.trim().is_empty());
     let projection = ConversationProjection::new(&ConversationProjectionInput {
         session_id,
         provider_plugin_id: provider_plugin_id.unwrap_or("<auto>"),
         model_id: &model_id,
         auth_profile: provider_context.auth_profile.as_deref(),
+        context_format_version: context_format.map(|format| format.version),
+        compatibility_key: context_format.map(|format| format.compatibility_key.as_str()),
         system_prompt: &system_prompt,
         tools: &tools,
         parameters: &parameters,
@@ -12025,6 +12077,21 @@ async fn build_model_turn_request(
         "bcode_context_through_sequence".to_string(),
         context_through_sequence.to_string(),
     );
+    if let Some(format) = compaction_policy
+        .capabilities
+        .as_ref()
+        .and_then(|capabilities| capabilities.context_format.as_ref())
+        .filter(|format| format.version > 0 && !format.compatibility_key.trim().is_empty())
+    {
+        metadata.insert(
+            "bcode_context_format_version".to_string(),
+            format.version.to_string(),
+        );
+        metadata.insert(
+            "bcode_compatibility_key".to_string(),
+            format.compatibility_key.clone(),
+        );
+    }
     state.metrics.record_histogram_with_labels(
         "model.request_build.metadata_duration_ms",
         metadata_timer.elapsed_ms(),
@@ -12094,9 +12161,21 @@ async fn append_estimated_context_usage(
         model_id: request.model_id.clone(),
         input_tokens,
         context_through_sequence,
+        request_id: Some(request.turn_id.clone()),
+        model_turn_id: request
+            .turn_id
+            .rsplit_once('-')
+            .map(|(turn, _)| turn.to_string()),
+        round: model_round_from_turn_id(&request.turn_id),
+        request_fingerprint: Some(stable_json_hash(request)),
         turn_id: Some(request.turn_id.clone()),
         auth_profile: request.provider_context.auth_profile.clone(),
         estimated_input_tokens: Some(input_tokens),
+        context_format_version: request
+            .metadata
+            .get("bcode_context_format_version")
+            .and_then(|value| value.parse().ok()),
+        compatibility_key: request.metadata.get("bcode_compatibility_key").cloned(),
         source: bcode_session_models::ContextUsageSource::Estimated,
     };
     if let Ok(event) = state
@@ -12658,6 +12737,8 @@ struct ConversationProjectionInput<'a> {
     provider_plugin_id: &'a str,
     model_id: &'a str,
     auth_profile: Option<&'a str>,
+    context_format_version: Option<u16>,
+    compatibility_key: Option<&'a str>,
     system_prompt: &'a str,
     tools: &'a [bcode_model::ToolDefinition],
     parameters: &'a ModelParameters,
@@ -12676,6 +12757,8 @@ impl ConversationProjection {
                 provider_plugin_id: input.provider_plugin_id.to_string(),
                 model_id: input.model_id.to_string(),
                 auth_profile: input.auth_profile.map(ToString::to_string),
+                context_format_version: input.context_format_version,
+                compatibility_key: input.compatibility_key.map(ToString::to_string),
                 stable_prompt_hash,
                 tools_hash,
                 parameters_hash,
@@ -12703,6 +12786,19 @@ impl ConversationProjection {
                 "auth_profile".to_string(),
                 self.key
                     .auth_profile
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+            (
+                "context_format_version".to_string(),
+                self.key
+                    .context_format_version
+                    .map_or_else(|| "-".to_string(), |version| version.to_string()),
+            ),
+            (
+                "compatibility_key".to_string(),
+                self.key
+                    .compatibility_key
                     .clone()
                     .unwrap_or_else(|| "-".to_string()),
             ),
@@ -15693,7 +15789,7 @@ async fn append_provider_context_usage_observation(
     state: &ServerState,
     session_id: SessionId,
     usage: &TokenUsage,
-    attempt: Option<&ActiveModelTurn>,
+    attempt: Option<&ModelRequestAttempt>,
 ) {
     let Some(input_tokens) = usage.context_input_tokens() else {
         return;
@@ -15710,9 +15806,15 @@ async fn append_provider_context_usage_observation(
         model_id: attempt.model_id.clone(),
         input_tokens: u64::from(input_tokens),
         context_through_sequence: attempt.context_through_sequence,
+        request_id: Some(attempt.request_id.clone()),
+        model_turn_id: Some(attempt.model_turn_id.clone()),
+        round: Some(attempt.round),
+        request_fingerprint: Some(attempt.request_fingerprint.clone()),
         turn_id: Some(attempt.provider_turn_id.clone()),
         auth_profile: attempt.auth_profile.clone(),
         estimated_input_tokens: Some(attempt.estimated_input_tokens),
+        context_format_version: attempt.context_format_version,
+        compatibility_key: attempt.compatibility_key.clone(),
         source: bcode_session_models::ContextUsageSource::Provider,
     };
     match state
@@ -16779,6 +16881,18 @@ mod tests {
     }
 
     #[test]
+    fn provider_attempt_request_ids_are_unique_across_rounds() {
+        let session_id = SessionId::new();
+        let trigger_sequence = 42;
+        let first = format!("{session_id}-{trigger_sequence}-{}", 0);
+        let second = format!("{session_id}-{trigger_sequence}-{}", 1);
+
+        assert_ne!(first, second);
+        assert_eq!(model_round_from_turn_id(&first), Some(0));
+        assert_eq!(model_round_from_turn_id(&second), Some(1));
+    }
+
+    #[test]
     fn conversation_reuse_key_differs_by_auth_profile() {
         let session_id = SessionId::new();
         let messages = vec![test_model_message(MessageRole::User, "hello")];
@@ -16789,6 +16903,8 @@ mod tests {
             provider_plugin_id: "provider",
             model_id: "model",
             auth_profile: Some("openai"),
+            context_format_version: Some(1),
+            compatibility_key: Some("responses-v1"),
             system_prompt: "system",
             tools: &tools,
             parameters: &parameters,
@@ -16799,6 +16915,8 @@ mod tests {
             provider_plugin_id: "provider",
             model_id: "model",
             auth_profile: Some("openai-2"),
+            context_format_version: Some(1),
+            compatibility_key: Some("responses-v1"),
             system_prompt: "system",
             tools: &tools,
             parameters: &parameters,
@@ -16806,6 +16924,41 @@ mod tests {
         });
 
         assert_ne!(first.reuse_key(), second.reuse_key());
+    }
+
+    #[test]
+    fn conversation_reuse_key_differs_by_context_compatibility_identity() {
+        let session_id = SessionId::new();
+        let messages = vec![test_model_message(MessageRole::User, "hello")];
+        let tools = Vec::new();
+        let parameters = ModelParameters::default();
+        let projection = |version, key| {
+            ConversationProjection::new(&ConversationProjectionInput {
+                session_id,
+                provider_plugin_id: "provider",
+                model_id: "model",
+                auth_profile: Some("openai"),
+                context_format_version: version,
+                compatibility_key: key,
+                system_prompt: "system",
+                tools: &tools,
+                parameters: &parameters,
+                messages: &messages,
+            })
+        };
+
+        assert_ne!(
+            projection(Some(1), Some("responses-v1")).reuse_key(),
+            projection(Some(2), Some("responses-v1")).reuse_key()
+        );
+        assert_ne!(
+            projection(Some(1), Some("responses-v1")).reuse_key(),
+            projection(Some(1), Some("responses-v2")).reuse_key()
+        );
+        assert_ne!(
+            projection(Some(1), Some("responses-v1")).reuse_key(),
+            projection(None, None).reuse_key()
+        );
     }
 
     #[test]
@@ -17998,6 +18151,8 @@ mod tests {
         let session_id = SessionId::new();
         let snapshot = bcode_session_models::ProviderContextSnapshot {
             format_version: 1,
+            request_fingerprint: None,
+            request_id: None,
             provider_plugin_id: "provider".into(),
             model_id: "model".into(),
             compatibility_key: "surface".into(),
@@ -19728,6 +19883,8 @@ mod tests {
             SessionEventKind::ProviderContextCompacted {
                 snapshot: bcode_session_models::ProviderContextSnapshot {
                     format_version: 1,
+                    request_fingerprint: None,
+                    request_id: None,
                     provider_plugin_id: "provider-a".to_string(),
                     model_id: "model-a".to_string(),
                     compatibility_key: "surface-a".to_string(),
@@ -19818,6 +19975,8 @@ mod tests {
             SessionEventKind::ProviderContextCompacted {
                 snapshot: bcode_session_models::ProviderContextSnapshot {
                     format_version: 1,
+                    request_fingerprint: None,
+                    request_id: None,
                     provider_plugin_id: "provider-a".to_string(),
                     model_id: "model-a".to_string(),
                     compatibility_key: "surface-a".to_string(),
@@ -20116,7 +20275,11 @@ mod tests {
         .await;
         assert!(current_turn.lock().await.is_some());
 
-        let model_turn = ActiveModelTurn {
+        let model_turn = ModelRequestAttempt {
+            request_id: "request-test".to_string(),
+            model_turn_id: "model-turn-test".to_string(),
+            round: 0,
+            request_fingerprint: "fingerprint-test".to_string(),
             provider_plugin_id: Some("provider-test".to_owned()),
             provider_turn_id: "provider-turn-test".to_owned(),
             reuse_key: None,
@@ -20124,6 +20287,8 @@ mod tests {
             context_through_sequence: 1,
             model_id: "model-test".to_string(),
             auth_profile: None,
+            context_format_version: None,
+            compatibility_key: None,
             portable_context: "context".to_string(),
             estimated_input_tokens: 1,
         };

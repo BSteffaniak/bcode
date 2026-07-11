@@ -258,6 +258,9 @@ pub struct BmuxApp {
     working_directory: Option<std::path::PathBuf>,
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
+    selected_auth_profile: Option<String>,
+    selected_context_format_version: Option<u16>,
+    selected_compatibility_key: Option<String>,
     current_agent_id: String,
     current_agent_accent: Option<String>,
     pending_agent_id: Option<String>,
@@ -465,6 +468,9 @@ impl BmuxApp {
             working_directory: None,
             selected_provider_plugin_id: None,
             selected_model_id: None,
+            selected_auth_profile: None,
+            selected_context_format_version: None,
+            selected_compatibility_key: None,
             current_agent_id: "build".to_owned(),
             current_agent_accent: None,
             pending_agent_id: None,
@@ -1021,6 +1027,9 @@ impl BmuxApp {
         if status.model_id.is_some() {
             self.selected_model_id = status.model_id;
         }
+        self.selected_auth_profile = status.auth_profile;
+        self.selected_context_format_version = status.context_format_version;
+        self.selected_compatibility_key = status.compatibility_key;
         self.reasoning_effort = status.reasoning_effort.clone();
         self.reasoning_summary = status.reasoning_summary.clone();
         self.reasoning_support = if status.reasoning.is_some() {
@@ -2263,6 +2272,9 @@ impl BmuxApp {
                 let active_model = self.selected_model_id.as_deref().unwrap_or("<default>");
                 if snapshot.provider_plugin_id == active_provider
                     && snapshot.model_id == active_model
+                    && snapshot.auth_profile == self.selected_auth_profile
+                    && snapshot.context_format_version == self.selected_context_format_version
+                    && snapshot.compatibility_key == self.selected_compatibility_key
                 {
                     self.token_usage.observe_context_usage(
                         snapshot.input_tokens,
@@ -4312,9 +4324,15 @@ mod tests {
             model_id: "model".to_string(),
             input_tokens: 2_500,
             context_through_sequence: 1,
+            request_id: Some("request".to_string()),
+            model_turn_id: Some("turn".to_string()),
+            round: Some(0),
+            request_fingerprint: Some("fingerprint".to_string()),
             turn_id: Some("turn".to_string()),
             auth_profile: None,
             estimated_input_tokens: Some(2_500),
+            context_format_version: None,
+            compatibility_key: None,
             source,
         }
     }
@@ -4364,6 +4382,54 @@ mod tests {
     }
 
     #[test]
+    fn live_usage_requires_provider_model_auth_and_surface_identity() {
+        let history = vec![context_event(
+            1,
+            SessionEventKind::ModelChanged {
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+            },
+        )];
+        let matching = || {
+            let mut app = BmuxApp::new_with_history(None, &history, &[], false);
+            app.selected_auth_profile = Some("profile".to_string());
+            app.selected_context_format_version = Some(2);
+            app.selected_compatibility_key = Some("surface".to_string());
+            let mut snapshot = usage_snapshot(bcode_session_models::ContextUsageSource::Provider);
+            snapshot.auth_profile = Some("profile".to_string());
+            snapshot.context_format_version = Some(2);
+            snapshot.compatibility_key = Some("surface".to_string());
+            (app, snapshot)
+        };
+        let (mut app, snapshot) = matching();
+        app.apply_session_event(
+            &context_event(2, SessionEventKind::ContextUsageObserved { snapshot }),
+            SessionEventApplication::Live,
+        );
+        assert_eq!(app.token_usage.latest_context_input_tokens, Some(2_500));
+
+        for mismatch in ["provider", "model", "auth", "version", "key"] {
+            let (mut app, mut snapshot) = matching();
+            match mismatch {
+                "provider" => snapshot.provider_plugin_id = "other".to_string(),
+                "model" => snapshot.model_id = "other".to_string(),
+                "auth" => snapshot.auth_profile = Some("other".to_string()),
+                "version" => snapshot.context_format_version = Some(3),
+                "key" => snapshot.compatibility_key = Some("other".to_string()),
+                _ => unreachable!(),
+            }
+            app.apply_session_event(
+                &context_event(2, SessionEventKind::ContextUsageObserved { snapshot }),
+                SessionEventApplication::Live,
+            );
+            assert_eq!(
+                app.token_usage.latest_context_input_tokens, None,
+                "{mismatch}"
+            );
+        }
+    }
+
+    #[test]
     fn live_estimated_usage_preserves_approximate_source() {
         let history = vec![context_event(
             1,
@@ -4384,6 +4450,39 @@ mod tests {
         );
         assert_eq!(app.token_usage.latest_context_input_tokens, Some(2_500));
         assert!(app.token_usage.context_usage_estimated);
+    }
+
+    #[test]
+    fn exact_provider_usage_replaces_estimated_usage_for_same_surface() {
+        let history = vec![context_event(
+            1,
+            SessionEventKind::ModelChanged {
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+            },
+        )];
+        let mut app = BmuxApp::new_with_history(None, &history, &[], false);
+        app.apply_session_event(
+            &context_event(
+                2,
+                SessionEventKind::ContextUsageObserved {
+                    snapshot: usage_snapshot(bcode_session_models::ContextUsageSource::Estimated),
+                },
+            ),
+            SessionEventApplication::Live,
+        );
+        assert!(app.token_usage.context_usage_estimated);
+        let mut exact = usage_snapshot(bcode_session_models::ContextUsageSource::Provider);
+        exact.input_tokens = 2_400;
+        app.apply_session_event(
+            &context_event(
+                3,
+                SessionEventKind::ContextUsageObserved { snapshot: exact },
+            ),
+            SessionEventApplication::Live,
+        );
+        assert_eq!(app.token_usage.latest_context_input_tokens, Some(2_400));
+        assert!(!app.token_usage.context_usage_estimated);
     }
 
     #[test]
@@ -4426,6 +4525,8 @@ mod tests {
     ) -> bcode_session_models::ProviderContextSnapshot {
         bcode_session_models::ProviderContextSnapshot {
             format_version: 1,
+            request_fingerprint: None,
+            request_id: None,
             provider_plugin_id: "provider".to_string(),
             model_id: "model".to_string(),
             compatibility_key: "surface".to_string(),

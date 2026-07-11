@@ -2177,6 +2177,8 @@ mod tests {
             SessionEventKind::ProviderContextCompacted {
                 snapshot: bcode_session_models::ProviderContextSnapshot {
                     format_version: 1,
+                    request_fingerprint: None,
+                    request_id: None,
                     provider_plugin_id: "provider".to_string(),
                     model_id: "model".to_string(),
                     compatibility_key: "surface".to_string(),
@@ -2676,6 +2678,8 @@ mod tests {
             SessionEventKind::ProviderContextCompacted {
                 snapshot: bcode_session_models::ProviderContextSnapshot {
                     format_version: 7,
+                    request_fingerprint: None,
+                    request_id: None,
                     provider_plugin_id: "provider".to_string(),
                     model_id: "model".to_string(),
                     compatibility_key: "surface".to_string(),

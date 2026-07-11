@@ -30,6 +30,18 @@ pub struct ContextUsageSnapshot {
     pub input_tokens: u64,
     /// Last canonical event represented by the observed request.
     pub context_through_sequence: u64,
+    /// Unique host request-attempt identifier.
+    #[serde(default)]
+    pub request_id: Option<String>,
+    /// Owning model-turn identifier.
+    #[serde(default)]
+    pub model_turn_id: Option<String>,
+    /// Zero-based provider round within the model turn.
+    #[serde(default)]
+    pub round: Option<u32>,
+    /// Stable fingerprint of the exact assembled request.
+    #[serde(default)]
+    pub request_fingerprint: Option<String>,
     /// Model turn/request identifier associated with this observation.
     #[serde(default)]
     pub turn_id: Option<String>,
@@ -39,6 +51,12 @@ pub struct ContextUsageSnapshot {
     /// Conservative local estimate captured for the same request.
     #[serde(default)]
     pub estimated_input_tokens: Option<u64>,
+    /// Provider context format version used for this request, when supported.
+    #[serde(default)]
+    pub context_format_version: Option<u16>,
+    /// Provider context compatibility identity used for this request, when supported.
+    #[serde(default)]
+    pub compatibility_key: Option<String>,
     /// Observation source.
     pub source: ContextUsageSource,
 }
@@ -60,6 +78,12 @@ pub struct ProviderContextSnapshot {
     /// Snapshot payload format version.
     #[serde(default = "default_provider_context_snapshot_version")]
     pub format_version: u16,
+    /// Stable fingerprint of the exact request that produced this snapshot, when provider-managed.
+    #[serde(default)]
+    pub request_fingerprint: Option<String>,
+    /// Unique host request-attempt identifier, when provider-managed.
+    #[serde(default)]
+    pub request_id: Option<String>,
     /// Provider plugin that owns the opaque replacement items.
     pub provider_plugin_id: String,
     /// Model for which the replacement context was produced.

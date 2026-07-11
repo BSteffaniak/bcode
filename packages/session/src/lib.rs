@@ -3082,6 +3082,8 @@ mod tests {
     fn provider_snapshot() -> ProviderContextSnapshot {
         ProviderContextSnapshot {
             format_version: 1,
+            request_fingerprint: None,
+            request_id: None,
             provider_plugin_id: "provider".to_string(),
             model_id: "model".to_string(),
             compatibility_key: "surface".to_string(),

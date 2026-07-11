@@ -394,6 +394,8 @@ pub async fn compact_context_with_selected_backend(
             })?;
             Ok(Some(bcode_session_models::ProviderContextSnapshot {
                 format_version: response.context_format.version,
+                request_fingerprint: None,
+                request_id: None,
                 provider_plugin_id: provider_plugin_id.to_string(),
                 model_id,
                 compatibility_key: response.context_format.compatibility_key,

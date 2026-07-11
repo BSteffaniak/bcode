@@ -546,6 +546,12 @@ pub struct SessionModelStatus {
     #[serde(default)]
     pub context_usage_source: Option<String>,
     #[serde(default)]
+    pub auth_profile: Option<String>,
+    #[serde(default)]
+    pub context_format_version: Option<u16>,
+    #[serde(default)]
+    pub compatibility_key: Option<String>,
+    #[serde(default)]
     pub max_output_tokens: Option<u32>,
     #[serde(default)]
     pub reasoning: Option<bcode_model::ModelReasoningInfo>,
