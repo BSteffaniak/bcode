@@ -568,6 +568,8 @@ struct ProviderContinuationState {
     provider_response_id: String,
     reusable_message_count: usize,
     updated_sequence: u64,
+    #[serde(default)]
+    rebase_on_next_projection: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -8507,6 +8509,14 @@ struct ModelPollOutcome {
     stop_reason: Option<bcode_model::StopReason>,
     completion: Option<ModelTurnCompletion>,
     provider_error: Option<bcode_model::ProviderError>,
+    pending_managed_compaction: Option<PendingManagedCompaction>,
+    pending_provider_response_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingManagedCompaction {
+    snapshot: bcode_session_models::ProviderContextSnapshot,
+    compacted_through_sequence: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -9483,6 +9493,15 @@ async fn run_model_turn_inner(
     let provider_retry_rules = provider_retry_rules(state, provider_plugin_id.as_deref()).await;
     let remote_catalog_retry_rules =
         remote_catalog_retry_rules(state, provider_plugin_id.as_deref()).await;
+    let static_context =
+        match prepare_static_model_turn_context(state, session_id, trigger_event.sequence).await {
+            Ok(context) => context,
+            Err(error) => {
+                let message = format!("model turn preparation error: {error}");
+                append_system_event(state, session_id, message.clone()).await;
+                return ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message);
+            }
+        };
     let mut round = 0_u32;
     let mut recovery = ModelTurnRecoveryState::default();
     let mut last_proactive_compaction_boundary = None;
@@ -9516,6 +9535,7 @@ async fn run_model_turn_inner(
             recovery.retry_instruction,
             &selection,
             &compaction_policy,
+            &static_context,
         )
         .await
         {
@@ -9576,6 +9596,7 @@ async fn run_model_turn_inner(
                     recovery.retry_instruction,
                     &selection,
                     &compaction_policy,
+                    &static_context,
                 )
                 .await
                 {
@@ -9667,14 +9688,14 @@ async fn run_model_turn_inner(
             round,
         )
         .await;
-        let outcome = match run_model_turn_round(
+        let outcome = match Box::pin(run_model_turn_round(
             state,
             session_id,
             provider_plugin_id.as_deref(),
             &request,
             Arc::clone(&cancel_state),
             command_context,
-        )
+        ))
         .await
         {
             Ok(outcome) => outcome,
@@ -10538,6 +10559,39 @@ async fn run_model_turn_round(
     service_runtime_priority_commands(state, session_id, command_context).await;
     ensure_terminal_poll_outcome(state, session_id, &mut outcome).await;
 
+    let round_succeeded = !cancel_state.is_cancelled()
+        && outcome.stop_reason != Some(bcode_model::StopReason::Cancelled)
+        && outcome.stop_reason != Some(bcode_model::StopReason::Error)
+        && outcome.completion.is_none();
+    let managed_compaction_persisted = if round_succeeded
+        && let Some(compaction) = outcome.pending_managed_compaction.take()
+        && let Ok(event) = state
+            .sessions
+            .append_provider_context_compacted(
+                session_id,
+                compaction.snapshot,
+                compaction.compacted_through_sequence,
+            )
+            .await
+    {
+        publish_session_event(state, &event).await;
+        state.invalidate_session_continuations(session_id).await;
+        true
+    } else {
+        false
+    };
+    if round_succeeded && let Some(response_id) = outcome.pending_provider_response_id.take() {
+        update_provider_metadata_state(
+            state,
+            session_id,
+            "provider_response_id",
+            response_id,
+            Some(request.messages.len().saturating_add(1)),
+            managed_compaction_persisted,
+        )
+        .await;
+    }
+
     if !assistant_text.is_empty() {
         append_assistant_message_event(state, session_id, assistant_text).await;
     }
@@ -11099,24 +11153,16 @@ async fn handle_provider_turn_event(
                 messages_json,
                 portable_summary: active_turn.portable_context,
             };
-            if let Ok(event) = state
-                .sessions
-                .append_provider_context_compacted(
-                    session_id,
-                    snapshot,
-                    active_turn.context_through_sequence,
-                )
-                .await
-            {
-                publish_session_event(state, &event).await;
-                state.invalidate_session_continuations(session_id).await;
-            }
+            outcome.pending_managed_compaction = Some(PendingManagedCompaction {
+                snapshot,
+                compacted_through_sequence: active_turn.context_through_sequence,
+            });
         }
         ProviderTurnEvent::RequestProjection { projection } => {
             handle_provider_request_projection_event(state, session_id, turn_id, projection).await;
         }
         ProviderTurnEvent::ProviderMetadata { key, value } => {
-            handle_provider_metadata_event(state, session_id, turn_id, key, value).await;
+            handle_provider_metadata_event(state, session_id, turn_id, key, value, outcome).await;
         }
         ProviderTurnEvent::TurnStarted => {
             publish_provider_stream_progress_live(
@@ -11404,6 +11450,7 @@ async fn handle_provider_metadata_event(
     turn_id: &str,
     key: String,
     value: String,
+    outcome: &mut ModelPollOutcome,
 ) {
     append_provider_event_trace(
         state,
@@ -11413,7 +11460,11 @@ async fn handle_provider_metadata_event(
         Some(provider_metadata_trace_detail(&key, &value)),
     )
     .await;
-    update_provider_metadata_state(state, session_id, &key, value).await;
+    if key == "provider_response_id" {
+        outcome.pending_provider_response_id = Some(value);
+    } else {
+        update_provider_metadata_state(state, session_id, &key, value, None, false).await;
+    }
 }
 
 fn provider_metadata_trace_detail(key: &str, value: &str) -> String {
@@ -11523,6 +11574,8 @@ async fn update_provider_metadata_state(
     session_id: SessionId,
     key: &str,
     value: String,
+    reusable_message_count: Option<usize>,
+    rebase_on_next_projection: bool,
 ) {
     let reuse_key = state
         .active_model_turn_snapshot(session_id)
@@ -11548,10 +11601,13 @@ async fn update_provider_metadata_state(
     if key != "provider_response_id" {
         return;
     }
-    let reusable_message_count = state
-        .active_model_turn_snapshot(session_id)
-        .await
-        .map_or(0, |turn| turn.request_message_count.saturating_add(1));
+    let reusable_message_count = match reusable_message_count {
+        Some(message_count) => message_count,
+        None => state
+            .active_model_turn_snapshot(session_id)
+            .await
+            .map_or(0, |turn| turn.request_message_count.saturating_add(1)),
+    };
 
     let mut provider_state = state.provider_state.lock().await;
     let record = provider_state.records.entry(reuse_key).or_default();
@@ -11560,6 +11616,7 @@ async fn update_provider_metadata_state(
         provider_response_id: value,
         reusable_message_count,
         updated_sequence: reusable_message_count.try_into().unwrap_or(u64::MAX),
+        rebase_on_next_projection,
     });
     provider_state.save();
 }
@@ -11979,6 +12036,79 @@ fn provider_managed_context_request(
     }
 }
 
+#[derive(Clone)]
+struct StaticModelTurnContext {
+    system_prompt: String,
+    system_messages: Vec<ModelMessage>,
+    tools: Vec<bcode_model::ToolDefinition>,
+}
+
+async fn prepare_static_model_turn_context(
+    state: &ServerState,
+    session_id: SessionId,
+    trigger_event_sequence: u64,
+) -> Result<StaticModelTurnContext, bcode_session::SessionError> {
+    let agent_id = session_agent_selection(state, session_id).await;
+    let agent_context = agent_context(state, session_id, &agent_id).await;
+    let working_directory = state.sessions.session_working_directory(session_id).await?;
+    let skill_catalog = if state.system_prompt.sections.skill_catalog {
+        state.skills.as_ref().map_or_else(String::new, |registry| {
+            format_skill_catalog_for_prompt(&registry.list(), &state.skill_prompt_options)
+        })
+    } else {
+        String::new()
+    };
+    let (system_prompt, dynamic_system_context) = build_coding_system_prompt_parts(
+        &working_directory,
+        &state.system_prompt,
+        agent_context
+            .as_ref()
+            .and_then(|context| context.system_prompt_suffix.as_deref()),
+        Some(&skill_catalog),
+    );
+    let mut system_messages = Vec::new();
+    if !dynamic_system_context.is_empty() {
+        system_messages.push(ModelMessage {
+            role: MessageRole::System,
+            content: vec![ContentBlock::Text {
+                text: dynamic_system_context,
+            }],
+        });
+    }
+    for skill_context in turn_skill_contexts(state, session_id, trigger_event_sequence).await {
+        let preview = skill_context_preview(&skill_context.context);
+        system_messages.push(ModelMessage {
+            role: MessageRole::System,
+            content: vec![ContentBlock::Text {
+                text: skill_context.context,
+            }],
+        });
+        let _ = state
+            .sessions
+            .append_event(
+                session_id,
+                SessionEventKind::SkillContextLoaded {
+                    skill_id: skill_context.skill_id,
+                    bytes_loaded: skill_context.bytes_loaded,
+                    truncated: skill_context.truncated,
+                    loaded_at_ms: current_time_ms(),
+                    preview: Some(preview),
+                    source: Some(skill_context.source),
+                },
+            )
+            .await;
+    }
+    let enabled_tools = agent_context
+        .as_ref()
+        .and_then(|context| context.enabled_tools.clone());
+    let tools = collect_model_tools(state, enabled_tools).await;
+    Ok(StaticModelTurnContext {
+        system_prompt,
+        system_messages,
+        tools,
+    })
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn build_model_turn_request(
     state: &ServerState,
@@ -11990,6 +12120,7 @@ async fn build_model_turn_request(
     retry_instruction: Option<&str>,
     selection: &SessionModelSelection,
     compaction_policy: &AutomaticCompactionPolicy,
+    static_context: &StaticModelTurnContext,
 ) -> Result<ModelTurnRequest, bcode_session::SessionError> {
     let metric_labels =
         model_request_metric_labels(session_id, provider_plugin_id, selected_model_id, round);
@@ -12050,53 +12181,9 @@ async fn build_model_turn_request(
         prompt_cache_timer.elapsed_ms(),
         metric_labels.clone(),
     );
-    let agent_timer = state.metrics.timer();
-    let agent_id = session_agent_selection(state, session_id).await;
-    let agent_context = agent_context(state, session_id, &agent_id).await;
-    state.metrics.record_histogram_with_labels(
-        "model.request_build.agent_context_duration_ms",
-        agent_timer.elapsed_ms(),
-        metric_labels.clone(),
-    );
-    let working_directory_timer = state.metrics.timer();
-    let working_directory = state.sessions.session_working_directory(session_id).await?;
-    state.metrics.record_histogram_with_labels(
-        "model.request_build.working_directory_duration_ms",
-        working_directory_timer.elapsed_ms(),
-        metric_labels.clone(),
-    );
-    let system_prompt_timer = state.metrics.timer();
-    let skill_catalog = if state.system_prompt.sections.skill_catalog {
-        state.skills.as_ref().map_or_else(String::new, |registry| {
-            format_skill_catalog_for_prompt(&registry.list(), &state.skill_prompt_options)
-        })
-    } else {
-        String::new()
-    };
-    let (system_prompt, dynamic_system_context) = build_coding_system_prompt_parts(
-        &working_directory,
-        &state.system_prompt,
-        agent_context
-            .as_ref()
-            .and_then(|context| context.system_prompt_suffix.as_deref()),
-        Some(&skill_catalog),
-    );
-    state.metrics.record_histogram_with_labels(
-        "model.request_build.system_prompt_duration_ms",
-        system_prompt_timer.elapsed_ms(),
-        metric_labels.clone(),
-    );
     let mut system_prefix_len = 0;
-    if !dynamic_system_context.trim().is_empty() {
-        messages.insert(
-            system_prefix_len,
-            ModelMessage {
-                role: MessageRole::System,
-                content: vec![ContentBlock::Text {
-                    text: dynamic_system_context,
-                }],
-            },
-        );
+    for message in static_context.system_messages.iter().cloned() {
+        messages.insert(system_prefix_len, message);
         system_prefix_len += 1;
     }
     if let Some(instruction) = retry_instruction
@@ -12111,62 +12198,9 @@ async fn build_model_turn_request(
                 }],
             },
         );
-        system_prefix_len += 1;
     }
-    let skill_context_timer = state.metrics.timer();
-    let skill_contexts = turn_skill_contexts(state, session_id, trigger_event.sequence).await;
-    state.metrics.record_histogram_with_labels(
-        "model.request_build.skill_context_duration_ms",
-        skill_context_timer.elapsed_ms(),
-        metric_labels.clone(),
-    );
-    state.metrics.record_histogram_with_labels(
-        "model.context.skill_context_count",
-        skill_contexts.len() as u64,
-        metric_labels.clone(),
-    );
-    for skill_context in skill_contexts {
-        let preview = skill_context_preview(&skill_context.context);
-        messages.insert(
-            system_prefix_len,
-            ModelMessage {
-                role: MessageRole::System,
-                content: vec![ContentBlock::Text {
-                    text: skill_context.context,
-                }],
-            },
-        );
-        system_prefix_len += 1;
-        let _ = state
-            .sessions
-            .append_event(
-                session_id,
-                SessionEventKind::SkillContextLoaded {
-                    skill_id: skill_context.skill_id,
-                    bytes_loaded: skill_context.bytes_loaded,
-                    truncated: skill_context.truncated,
-                    loaded_at_ms: current_time_ms(),
-                    preview: Some(preview),
-                    source: Some(skill_context.source),
-                },
-            )
-            .await;
-    }
-    let enabled_tools = agent_context
-        .as_ref()
-        .and_then(|context| context.enabled_tools.clone());
-    let tool_collection_timer = state.metrics.timer();
-    let tools = collect_model_tools(state, enabled_tools).await;
-    state.metrics.record_histogram_with_labels(
-        "model.request_build.tool_collection_duration_ms",
-        tool_collection_timer.elapsed_ms(),
-        metric_labels.clone(),
-    );
-    state.metrics.record_histogram_with_labels(
-        "model.context.tool_count",
-        tools.len() as u64,
-        metric_labels.clone(),
-    );
+    let system_prompt = static_context.system_prompt.clone();
+    let tools = static_context.tools.clone();
     let model_id = effective_model_id(state, selection)
         .await
         .unwrap_or_else(|_| model_id_for_provider_request(selected_model_id));
@@ -12968,6 +13002,21 @@ impl ConversationProjection {
     }
 }
 
+fn reusable_continuation(
+    record: Option<&ProviderStateRecord>,
+    message_count: usize,
+) -> Option<ProviderContinuationState> {
+    record
+        .and_then(|record| record.continuation.clone())
+        .map(|mut continuation| {
+            if continuation.rebase_on_next_projection {
+                continuation.reusable_message_count = message_count;
+            }
+            continuation
+        })
+        .filter(|continuation| continuation.reusable_message_count <= message_count)
+}
+
 async fn plan_conversation_reuse(
     state: &ServerState,
     projection: &ConversationProjection,
@@ -12986,10 +13035,7 @@ async fn plan_conversation_reuse(
         .records
         .get(&reuse_key)
         .cloned();
-    let previous = record
-        .as_ref()
-        .and_then(|record| record.continuation.clone())
-        .filter(|continuation| continuation.reusable_message_count <= message_count);
+    let previous = reusable_continuation(record.as_ref(), message_count);
 
     bcode_model::ConversationReuseHints {
         mode,
@@ -16882,6 +16928,27 @@ mod tests {
     }
 
     #[test]
+    fn managed_compaction_continuation_rebases_to_replacement_projection() {
+        let record = ProviderStateRecord {
+            continuation: Some(ProviderContinuationState {
+                provider_response_id: "post-compaction-response".to_string(),
+                reusable_message_count: 42,
+                updated_sequence: 42,
+                rebase_on_next_projection: true,
+            }),
+            ..ProviderStateRecord::default()
+        };
+
+        let continuation = reusable_continuation(Some(&record), 3).expect("continuation");
+
+        assert_eq!(
+            continuation.provider_response_id,
+            "post-compaction-response"
+        );
+        assert_eq!(continuation.reusable_message_count, 3);
+    }
+
+    #[test]
     fn overflow_recovery_retries_at_most_once() {
         let decision = CompactionDecision {
             strategy: AutomaticCompactionStrategy::OverflowOnly,
@@ -17221,6 +17288,7 @@ mod tests {
                             provider_response_id: "stale".to_string(),
                             reusable_message_count: 1,
                             updated_sequence: 1,
+                            rebase_on_next_projection: false,
                         }),
                         ..ProviderStateRecord::default()
                     },
