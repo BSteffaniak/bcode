@@ -2052,6 +2052,7 @@ name = "bcode_ralph"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_config",
+ "bcode_plugin_sdk",
  "bcode_session_models",
  "serde",
  "serde_json",

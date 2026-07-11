@@ -6,6 +6,7 @@
 
 //! Local Ralph loop state management for the TUI.
 
+use bcode_plugin_sdk::path::{display, display_from_current_dir};
 use bcode_session_models::{SessionEvent, SessionEventKind};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -687,8 +688,8 @@ fn work_prompt(summary: &RalphLoopSummary, charter_doc: &str, progress_doc: &str
          Immutable charter:\n\n{charter_doc}\n\n\
          Progress doc:\n\n{progress_doc}",
         loop_name = summary.loop_name,
-        charter_doc_path = summary.charter_doc_path.display(),
-        progress_doc_path = summary.progress_doc_path.display(),
+        charter_doc_path = display(&summary.charter_doc_path, &summary.state_dir),
+        progress_doc_path = display(&summary.progress_doc_path, &summary.state_dir),
         checked = summary.checklist_summary.checked_count,
         unchecked = summary.checklist_summary.unchecked_count,
         charter_doc = charter_doc
@@ -704,8 +705,8 @@ fn audit_prompt(summary: &RalphLoopSummary, charter_doc: &str, progress_doc: &st
          Immutable charter:\n\n{charter_doc}\n\n\
          Progress doc:\n\n{progress_doc}",
         loop_name = summary.loop_name,
-        charter_doc_path = summary.charter_doc_path.display(),
-        progress_doc_path = summary.progress_doc_path.display(),
+        charter_doc_path = display(&summary.charter_doc_path, &summary.state_dir),
+        progress_doc_path = display(&summary.progress_doc_path, &summary.state_dir),
         charter_doc = charter_doc
     )
 }
@@ -719,8 +720,8 @@ fn replan_prompt(summary: &RalphLoopSummary, charter_doc: &str, progress_doc: &s
          Immutable charter:\n\n{charter_doc}\n\n\
          Progress doc:\n\n{progress_doc}",
         loop_name = summary.loop_name,
-        charter_doc_path = summary.charter_doc_path.display(),
-        progress_doc_path = summary.progress_doc_path.display(),
+        charter_doc_path = display(&summary.charter_doc_path, &summary.state_dir),
+        progress_doc_path = display(&summary.progress_doc_path, &summary.state_dir),
         charter_doc = charter_doc
     )
 }
@@ -3088,10 +3089,10 @@ fn initial_charter_doc(
          - Progress doc: `{progress_doc}`\n\
          - Context pack: `{context_pack}`\n\
          - Ralph state directory: `{state_dir}`\n",
-        repo_root = repo_root.display(),
-        progress_doc = paths.progress_doc_path.display(),
-        context_pack = paths.context_pack_path.display(),
-        state_dir = paths.state_dir.display()
+        repo_root = display_from_current_dir(repo_root),
+        progress_doc = display(&paths.progress_doc_path, repo_root),
+        context_pack = display(&paths.context_pack_path, repo_root),
+        state_dir = display(&paths.state_dir, repo_root)
     )
 }
 
@@ -3128,10 +3129,10 @@ fn initial_progress_doc(
          ## Session handoff notes\n\n\
          - Canonical progress doc path: `{progress_doc}`\n\
          - Ralph state directory: `{state_dir}`\n",
-        repo_root = repo_root.display(),
-        charter_doc = paths.charter_doc_path.display(),
-        progress_doc = paths.progress_doc_path.display(),
-        state_dir = paths.state_dir.display()
+        repo_root = display_from_current_dir(repo_root),
+        charter_doc = display(&paths.charter_doc_path, repo_root),
+        progress_doc = display(&paths.progress_doc_path, repo_root),
+        state_dir = display(&paths.state_dir, repo_root)
     )
 }
 
@@ -3216,11 +3217,11 @@ fn charter_doc_from_context(
          - Context pack: `{context_pack}`\n\
          - Ralph state directory: `{state_dir}`\n",
         goal = markdown_paragraph(latest_user_goal),
-        repo_root = repo_root.display(),
+        repo_root = display_from_current_dir(repo_root),
         event_count = context_pack.event_count,
-        progress_doc = paths.progress_doc_path.display(),
-        context_pack = paths.context_pack_path.display(),
-        state_dir = paths.state_dir.display()
+        progress_doc = display(&paths.progress_doc_path, repo_root),
+        context_pack = display(&paths.context_pack_path, repo_root),
+        state_dir = display(&paths.state_dir, repo_root)
     )
 }
 
@@ -3291,12 +3292,12 @@ fn progress_doc_from_context(
          - Ralph state directory: `{state_dir}`\n\
          - Context pack path: `{context_pack}`\n",
         goal = markdown_paragraph(latest_user_goal),
-        repo_root = repo_root.display(),
+        repo_root = display_from_current_dir(repo_root),
         event_count = context_pack.event_count,
-        charter_doc = paths.charter_doc_path.display(),
-        progress_doc = paths.progress_doc_path.display(),
-        state_dir = paths.state_dir.display(),
-        context_pack = paths.context_pack_path.display()
+        charter_doc = display(&paths.charter_doc_path, repo_root),
+        progress_doc = display(&paths.progress_doc_path, repo_root),
+        state_dir = display(&paths.state_dir, repo_root),
+        context_pack = display(&paths.context_pack_path, repo_root)
     )
 }
 
@@ -3884,7 +3885,7 @@ mod tests {
         assert!(charter.contains("immutable high-level source of truth"));
         assert!(charter.contains("Origin Session"));
         assert!(progress.contains("Immutable charter"));
-        assert!(progress.contains(&state.charter_doc_path.display().to_string()));
+        assert!(progress.contains(&display(&state.charter_doc_path, repo.path()).to_string()));
     }
 
     #[test]
@@ -3923,7 +3924,7 @@ mod tests {
             charter.contains("Do not mark work complete unless it has actually been verified.")
         );
         assert!(progress.contains("Alignment guidance"));
-        assert!(progress.contains(&state.charter_doc_path.display().to_string()));
+        assert!(progress.contains(&display(&state.charter_doc_path, repo.path()).to_string()));
     }
 
     #[test]
@@ -3942,7 +3943,7 @@ mod tests {
         let replan = build_prompt(&summary, RalphPromptKind::Replan).expect("replan prompt builds");
 
         assert!(audit.contains("Immutable charter:"));
-        assert!(audit.contains(&state.charter_doc_path.display().to_string()));
+        assert!(audit.contains(&display(&state.charter_doc_path, &state.state_dir).to_string()));
         assert!(audit.contains("Do not rewrite the charter"));
         assert!(replan.contains("Immutable charter:"));
         assert!(replan.contains("recalibrate it toward the charter"));
