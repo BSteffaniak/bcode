@@ -35,19 +35,20 @@ pub fn source_viewer_rows(input: SourceViewerInput<'_>, width: u16) -> Vec<Line>
     } else {
         0
     };
-    let body_width = usize::from(width)
+    let card_width = width.saturating_sub(2);
+    let body_width = usize::from(card_width)
         .saturating_sub(number_width)
-        .saturating_sub(10)
+        .saturating_sub(7)
         .max(1);
     let highlighted = highlight_lines(input.label, &lines[..displayed]);
     let mut rows = Vec::new();
-    rows.push(card_border(width, "┌", "┐"));
+    rows.push(card_border(card_width, "┌", "┐"));
     for (index, spans) in highlighted.into_iter().enumerate() {
         let chunks = wrap_spans(spans, body_width);
         for (chunk_index, chunk) in chunks.into_iter().enumerate() {
             let number = (chunk_index == 0 && input.line_numbers)
                 .then(|| input.start_line.saturating_add(index));
-            rows.push(source_card_row(chunk, number, number_width, width));
+            rows.push(source_card_row(chunk, number, number_width, card_width));
         }
     }
     if lines.len() > displayed {
@@ -55,10 +56,10 @@ pub fn source_viewer_rows(input: SourceViewerInput<'_>, width: u16) -> Vec<Line>
             vec![Span::styled(input.truncated_message, muted_style())],
             None,
             number_width,
-            width,
+            card_width,
         ));
     }
-    rows.push(card_border(width, "└", "┘"));
+    rows.push(card_border(card_width, "└", "┘"));
     rows
 }
 
@@ -95,7 +96,7 @@ fn source_card_row(
 }
 
 fn card_border(width: u16, left: &str, right: &str) -> Line {
-    let inner = usize::from(width).saturating_sub(4);
+    let inner = usize::from(width.saturating_sub(2));
     Line::from_spans(vec![
         Span::styled("  ", muted_style()),
         Span::styled(left, muted_style()),
@@ -221,6 +222,32 @@ mod tests {
         let output = rendered(&rows);
         assert!(output.contains(" 9 │ nine"), "{output}");
         assert!(output.contains("10 │ ten"), "{output}");
+    }
+
+    #[test]
+    fn rows_fit_available_width_and_keep_right_border() {
+        let width = 24;
+        let rows = source_viewer_rows(
+            SourceViewerInput {
+                label: "file.rs",
+                contents: "a source line long enough to wrap",
+                start_line: 42,
+                max_lines: 30,
+                truncated_message: "truncated",
+                line_numbers: true,
+            },
+            width,
+        );
+
+        for row in &rows {
+            let text = row
+                .spans
+                .iter()
+                .map(|span| span.content.as_str())
+                .collect::<String>();
+            assert!(UnicodeWidthStr::width(text.as_str()) <= usize::from(width));
+            assert!(text.ends_with('│') || text.ends_with('┐') || text.ends_with('┘'));
+        }
     }
 
     #[test]
