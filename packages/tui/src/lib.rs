@@ -361,6 +361,17 @@ pub async fn run_plugin_surface(
     if surface_kind == "ralph-home" {
         return run_ralph_home().await;
     }
+    if surface_kind == "eval-run-picker" {
+        return run_eval_viewer_picker(repo_path.unwrap_or_else(|| std::path::PathBuf::from(".")))
+            .await;
+    }
+    if surface_kind == "eval-run-viewer" {
+        return run_eval_viewer(
+            repo_path.unwrap_or_else(|| std::path::PathBuf::from(".")),
+            options.get("run").map(std::path::PathBuf::from),
+        )
+        .await;
+    }
     if surface_kind == "metrics-dashboard" {
         return run_metrics_dashboard(
             repo_path.unwrap_or_else(|| std::path::PathBuf::from(".")),

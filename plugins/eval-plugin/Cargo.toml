@@ -14,17 +14,21 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bcode_command       = { workspace = true }
-bcode_eval          = { workspace = true }
-bcode_eval_models   = { workspace = true }
-bcode_plugin_sdk    = { workspace = true }
-bmux_keyboard       = { workspace = true }
-bmux_text_edit      = { workspace = true }
-bmux_tui            = { workspace = true }
-bmux_tui_components = { workspace = true, features = ["text-input"] }
-serde               = { workspace = true }
-serde_json          = { workspace = true }
-toml                = { workspace = true }
+bcode_client         = { workspace = true }
+bcode_command        = { workspace = true }
+bcode_eval           = { workspace = true }
+bcode_eval_models    = { workspace = true }
+bcode_plugin_sdk     = { workspace = true }
+bcode_session_models = { workspace = true }
+bmux_keyboard        = { workspace = true }
+bmux_text_edit       = { workspace = true }
+bmux_tui             = { workspace = true }
+bmux_tui_components  = { workspace = true, features = ["text-input"] }
+clap                 = { workspace = true, features = ["derive", "std"] }
+serde                = { workspace = true }
+serde_json           = { workspace = true }
+thiserror            = { workspace = true }
+toml                 = { workspace = true }
 
 [features]
 default          = []

@@ -4,6 +4,9 @@
 
 //! Eval run viewer plugin for Bcode.
 
+#[cfg(feature = "static-bundled")]
+mod cli;
+
 pub mod eval_data;
 pub mod eval_viewer;
 pub mod tui;
@@ -146,6 +149,7 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     let mut vtable =
         bcode_plugin_sdk::static_plugin_vtable!(EvalPlugin, include_str!("../bcode-plugin.toml"));
     vtable.tui_registry = Some(tui::tui_registry);
+    vtable.cli_registration = Some(cli::registration);
     vtable
 }
 
